@@ -22,7 +22,15 @@ logger = logging.getLogger(__name__)
 OBJECTIVE_STATUSES = frozenset({"open", "blocked_owner", "done"})
 UNIT_KINDS = frozenset({"kanban", "delegate_task", "bot_chat"})
 UNIT_STATUSES = frozenset(
-    {"pending", "running", "guarded", "blocked", "done", "failed"}
+    {
+        "pending",
+        "running",
+        "guarded",
+        "blocked",
+        "awaiting_verification",
+        "done",
+        "failed",
+    }
 )
 EXEMPTION_VALUES = frozenset({"update_existing_pr", "operator_requeue"})
 EXEMPTION_COMMENT_NEEDLES = (
@@ -87,6 +95,23 @@ CREATE TABLE IF NOT EXISTS kanban_supervisor_events (
     payload TEXT,
     created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS kanban_reconcile_grants (
+    id TEXT PRIMARY KEY,
+    objective_id TEXT NOT NULL,
+    supervisor_task_id TEXT NOT NULL,
+    descendant_task_id TEXT NOT NULL,
+    transition TEXT NOT NULL,
+    evidence_hash TEXT NOT NULL,
+    consumed_at INTEGER,
+    created_at INTEGER NOT NULL,
+    UNIQUE(
+        objective_id, supervisor_task_id, descendant_task_id,
+        transition, evidence_hash
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_reconcile_grants_supervisor
+    ON kanban_reconcile_grants(supervisor_task_id, consumed_at);
 """
 
 
@@ -575,12 +600,20 @@ def note_delegate_stop(
     subagent_id: str,
     status: str = "done",
     summary: Optional[str] = None,
+    result: Any = None,
 ) -> None:
     if not subagent_id:
         return
-    unit_status = "done" if status in {"completed", "done", "ok", "success"} else (
-        "failed" if status in {"failed", "error", "timeout", "cancelled"} else "done"
-    )
+    from hermes_cli.kanban_supervision_contract import classify_terminal_result
+
+    if result is not None:
+        structured = result
+    elif summary or (status and status != "done"):
+        structured = {"status": status, "summary": summary}
+    else:
+        # Bare process/CLI exit with the default status is not a result.
+        structured = None
+    classification = classify_terminal_result(structured)
     try:
         from hermes_cli import kanban_db as kb
 
@@ -590,9 +623,19 @@ def note_delegate_stop(
                 conn,
                 kind="delegate_task",
                 ref=subagent_id,
-                status=unit_status,
-                proof={"summary": (summary or "")[:500], "child_status": status},
+                status="awaiting_verification",
+                proof={
+                    "summary": (summary or "")[:500],
+                    "child_status": status,
+                    "classification": classification,
+                    "result": structured,
+                    "terminal": "process_exit",
+                    "verified": False,
+                },
             )
+            from hermes_cli.kanban_supervision_contract import wake_after_process_exit
+
+            wake_after_process_exit(conn, kind="delegate_task", ref=subagent_id)
         finally:
             conn.close()
     except Exception:
@@ -640,9 +683,18 @@ def note_bot_chat_handoff(
         return None
 
 
-def note_bot_chat_complete(*, session_id: str, owner_profile: Optional[str] = None) -> None:
+def note_bot_chat_complete(
+    *,
+    session_id: str,
+    owner_profile: Optional[str] = None,
+    result: Any = None,
+) -> None:
+    """Record Bot Chat process exit. Exit is not unit completion."""
     if not session_id:
         return
+    from hermes_cli.kanban_supervision_contract import classify_terminal_result
+
+    classification = classify_terminal_result(result)
     try:
         from hermes_cli import kanban_db as kb
         from hermes_cli.profiles import get_active_profile_name
@@ -655,9 +707,19 @@ def note_bot_chat_complete(*, session_id: str, owner_profile: Optional[str] = No
                 conn,
                 kind="bot_chat",
                 ref=session_id,
-                status="done",
-                proof={"session_id": session_id, "terminal": "cli_return"},
+                status="awaiting_verification",
+                proof={
+                    "session_id": session_id,
+                    "ref": ref,
+                    "terminal": "process_exit",
+                    "classification": classification,
+                    "result": result,
+                    "verified": False,
+                },
             )
+            from hermes_cli.kanban_supervision_contract import wake_after_process_exit
+
+            wake_after_process_exit(conn, kind="bot_chat", ref=session_id)
         finally:
             conn.close()
     except Exception:
@@ -1749,12 +1811,14 @@ def _unit_satisfies_predicate(conn: sqlite3.Connection, unit: dict) -> bool:
     if not proof:
         return False
     if predicate == "jude_verdict_pass":
+        if proof.get("blockers") or proof.get("stale"):
+            return False
         recorded = (proof or {}).get("head")
         if recorded:
             current = _task_git_head(conn, unit["ref"])
             if current and current != recorded:
                 return False
-        return (proof or {}).get("verdict") == "pass"
+        return (proof or {}).get("verdict") == "pass" and proof.get("verified") is not False
     if predicate == "task_done_with_proof":
         if unit.get("kind") == "kanban":
             task = conn.execute(
@@ -1765,11 +1829,15 @@ def _unit_satisfies_predicate(conn: sqlite3.Connection, unit: dict) -> bool:
                 return False
         return True
     if predicate == "child_completed":
-        return str(proof.get("child_status") or "").lower() in {
-            "completed", "done", "ok", "success",
-        }
+        return (
+            proof.get("verified") is True
+            and str(proof.get("classification") or "").lower() == "success"
+        )
     if predicate == "bot_chat_terminal":
-        return bool(proof.get("terminal") or proof.get("session_id"))
+        return (
+            proof.get("verified") is True
+            and str(proof.get("classification") or "").lower() == "success"
+        )
     return False
 
 
@@ -1919,6 +1987,12 @@ def supervise_once(
         return result
     ensure_supervisor_tables(conn)
     result.invalidated_reviews = invalidate_stale_reviews(conn)
+    from hermes_cli.kanban_supervision_contract import reconcile_process_exits
+
+    for action in reconcile_process_exits(conn):
+        wake = action.get("wake") or {}
+        if wake.get("ok"):
+            result.wake_retries.append(str(action.get("unit_id") or ""))
     if _table_exists(conn, "kanban_objectives"):
         for row in conn.execute(
             "SELECT id FROM kanban_objectives WHERE status != 'done'"

@@ -69,8 +69,8 @@ def test_schema_creates_budget_decisions_table(kanban_home):
             )
         }
         assert "kanban_budget_decisions" in names
-        assert "kanban_objectives" not in names
-        assert "kanban_objective_units" not in names
+        # Integrated 2776+2777 boards also create the supervisor ledger
+        # on connect. This test only requires the budget table.
     finally:
         conn.close()
 

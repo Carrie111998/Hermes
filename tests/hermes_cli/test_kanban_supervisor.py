@@ -267,6 +267,22 @@ def test_delegate_child_finishing_after_parent_return_still_reconciles(
         subagent_id="sa-0-deadbeef", status="completed", summary="ok",
     )
     with kb.connect() as conn:
+        units = {u["ref"]: u for u in sup.list_units(conn, oid)}
+        assert units["sa-0-deadbeef"]["status"] == "awaiting_verification"
+        assert not sup.objective_is_complete(conn, oid)
+        from hermes_cli.kanban_supervision_contract import (
+            canonical_evidence_hash,
+            process_exit_evidence,
+            verify_process_exit,
+        )
+
+        proof = json.loads(units["sa-0-deadbeef"]["proof"])
+        digest = canonical_evidence_hash(process_exit_evidence(proof))
+        verified = verify_process_exit(
+            conn, kind="delegate_task", ref="sa-0-deadbeef", evidence_hash=digest,
+        )
+        assert verified["ok"] is True
+        assert verified["status"] == "done"
         kb.complete_task(conn, root, summary="parent done")
         status = sup.reconcile_objective(conn, oid)
         units = {u["ref"]: u for u in sup.list_units(conn, oid)}
@@ -287,12 +303,13 @@ def test_bot_chat_completing_after_delegator_return_still_reconciles(
         monkeypatch.setenv("HERMES_OBJECTIVE_ID", oid)
     monkeypatch.setenv("HERMES_PROFILE", "jude")
     sup.note_bot_chat_handoff(session_id="20260819_bot", title="Bot Chat")
-    # Delegator process gone.
+    # Delegator process gone. Exit is not completion.
     sup.note_bot_chat_complete(session_id="20260819_bot", owner_profile="jude")
     with kb.connect() as conn:
         units = sup.list_units(conn, oid)
         bot = [u for u in units if u["kind"] == "bot_chat"]
-        assert bot and bot[0]["status"] == "done"
+        assert bot and bot[0]["status"] == "awaiting_verification"
+        assert not sup.objective_is_complete(conn, oid)
 
 
 def test_starvation_emits_once_and_survives_reload(kanban_home, monkeypatch):
