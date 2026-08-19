@@ -67,6 +67,7 @@ def _clean_env(monkeypatch):
         "OPENROUTER_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY",
         "OPENAI_MODEL", "LLM_MODEL", "NOUS_INFERENCE_BASE_URL",
         "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+        "COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN",
         "NVIDIA_API_KEY", "NVIDIA_BASE_URL",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -1954,6 +1955,32 @@ def test_resolve_api_key_provider_skips_unconfigured_anthropic(monkeypatch):
 # ---------------------------------------------------------------------------
 # model="default" elimination (#7512)
 # ---------------------------------------------------------------------------
+
+
+def test_resolve_api_key_provider_skips_unconfigured_copilot(monkeypatch):
+    """A generic GitHub credential must not trigger Copilot auxiliary probing."""
+    from collections import OrderedDict
+    from hermes_cli.auth import ProviderConfig
+
+    fake_registry = OrderedDict({
+        "copilot": ProviderConfig(
+            id="copilot",
+            name="GitHub Copilot",
+            auth_type="api_key",
+            inference_base_url="https://api.githubcopilot.com",
+            api_key_env_vars=("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"),
+        ),
+    })
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_classic_pat_for_git_only")
+    monkeypatch.setattr("hermes_cli.auth.PROVIDER_REGISTRY", fake_registry)
+    monkeypatch.setattr("agent.auxiliary_client._select_pool_entry", lambda _pid: (False, None))
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_api_key_provider_credentials",
+        lambda _pid: pytest.fail("unconfigured Copilot must not resolve GitHub credentials"),
+    )
+
+    from agent.auxiliary_client import _resolve_api_key_provider
+    assert _resolve_api_key_provider() == (None, None)
 
 
 # ---------------------------------------------------------------------------

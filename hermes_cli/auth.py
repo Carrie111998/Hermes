@@ -679,6 +679,15 @@ def _resolve_api_key_provider_secret(
 ) -> tuple[str, str]:
     """Resolve an API-key provider's token and indicate where it came from."""
     if provider_id == "copilot":
+        # GH_TOKEN and GITHUB_TOKEN are commonly present for git, the GitHub
+        # CLI, or CI. Do not probe Copilot unless the user explicitly chose it;
+        # a classic ghp_* token otherwise emits a warning on every status check.
+        try:
+            if not is_provider_explicitly_configured("copilot"):
+                return "", ""
+        except Exception:
+            # Preserve resolver behavior if config inspection itself is unavailable.
+            pass
         # Use the dedicated copilot auth module for proper token validation
         try:
             from hermes_cli.copilot_auth import resolve_copilot_token, get_copilot_api_token
@@ -1941,6 +1950,10 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     # Exclude CLAUDE_CODE_OAUTH_TOKEN — it's set by Claude Code itself,
     # not by the user explicitly configuring anthropic in Hermes.
     _IMPLICIT_ENV_VARS = {"CLAUDE_CODE_OAUTH_TOKEN"}
+    if normalized == "copilot":
+        # Generic GitHub credentials are commonly configured for gh and git,
+        # not as a user choice to enable Copilot inference.
+        _IMPLICIT_ENV_VARS |= {"GH_TOKEN", "GITHUB_TOKEN"}
     pconfig = PROVIDER_REGISTRY.get(normalized)
     # Fallback to ProviderDef from models.dev catalog when the provider
     # isn't in the manually-maintained PROVIDER_REGISTRY (e.g. openrouter).
@@ -1971,6 +1984,8 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
                 # the user deletes the env var (#55790) — only count it when
                 # the referenced var still resolves to a usable secret NOW.
                 env_var = entry.get("source", "").split(":", 1)[1].strip()
+                if env_var in _IMPLICIT_ENV_VARS:
+                    continue
                 if env_var and has_usable_secret(os.getenv(env_var, "")):
                     return True
                 continue

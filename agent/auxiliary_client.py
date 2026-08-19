@@ -2702,16 +2702,16 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
         if _is_provider_unhealthy(provider_id):
             logger.debug("Auxiliary api-key chain: %s is unhealthy, skipping", provider_id)
             continue
-        if provider_id == "anthropic":
-            # Only try anthropic when the user has explicitly configured it.
-            # Without this gate, Claude Code credentials get silently used
-            # as auxiliary fallback when the user's primary provider fails.
+        if provider_id in {"anthropic", "copilot"}:
+            # Do not treat broad ambient credentials as an opt-in to these
+            # providers when resolving auxiliary fallbacks.
             try:
                 from hermes_cli.auth import is_provider_explicitly_configured
-                if not is_provider_explicitly_configured("anthropic"):
+                if not is_provider_explicitly_configured(provider_id):
                     continue
             except ImportError:
                 pass
+        if provider_id == "anthropic":
             return _try_anthropic()
 
         pool_present, entry = _select_pool_entry(provider_id)
