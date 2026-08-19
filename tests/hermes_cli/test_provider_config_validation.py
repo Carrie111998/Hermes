@@ -61,6 +61,32 @@ class TestNormalizeCustomProviderEntry:
         assert normalized["base_url"] == "https://valid-url.example/v1"
 
 
+    @pytest.mark.parametrize(
+        "invalid_endpoint",
+        ["http://[::1", "http://localhost:notaport"],
+    )
+    def test_endpoint_helper_falls_through_when_canonical_host_or_port_is_malformed(
+        self, invalid_endpoint
+    ):
+        """Malformed canonical URLs must not raise or block a valid API alias."""
+        entry = {
+            "base_url": invalid_endpoint,
+            "api": "https://valid-api.example/v1",
+        }
+        invalid_fields = []
+
+        endpoint = get_custom_provider_endpoint(
+            entry,
+            on_invalid_endpoint=lambda key, value: invalid_fields.append((key, value)),
+        )
+        normalized = _normalize_custom_provider_entry(entry, provider_key="test")
+
+        assert endpoint == "https://valid-api.example/v1"
+        assert normalized is not None
+        assert normalized["base_url"] == "https://valid-api.example/v1"
+        assert invalid_fields == [("base_url", invalid_endpoint)]
+
+
     def test_endpoint_helper_accepts_normalizer_camelcase_base_url_alias(self):
         """Raw consumers must accept the normalizer's baseUrl compatibility alias."""
         entry = {

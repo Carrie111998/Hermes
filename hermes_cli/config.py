@@ -1355,9 +1355,15 @@ def get_custom_provider_endpoint(
                 return candidate
             from urllib.parse import urlparse
 
-            parsed = urlparse(candidate)
-            if parsed.scheme and parsed.netloc:
-                return candidate
+            try:
+                parsed = urlparse(candidate)
+                hostname = parsed.hostname
+                _ = parsed.port
+            except ValueError:
+                pass
+            else:
+                if parsed.scheme and hostname:
+                    return candidate
             if on_invalid_endpoint:
                 on_invalid_endpoint(key, candidate)
     return ""
