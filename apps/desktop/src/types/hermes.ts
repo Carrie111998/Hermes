@@ -699,6 +699,8 @@ export interface SessionRuntimeInfo {
 }
 
 export interface UsageStats {
+  /** Cache-read prompt tokens (prompt cache hit). Absent on older backends. */
+  cache_read?: number
   calls: number
   context_max?: number
   context_percent?: number
