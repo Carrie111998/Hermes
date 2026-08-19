@@ -57,13 +57,16 @@ READ_PREVIEW_SCHEMA = {
         "Read what's currently shown in the in-app browser / preview pane of the "
         "Hermes desktop GUI (the pane open_preview opens beside this chat). Call "
         "with no arguments for the first window of the active tab's content. "
-        "Returns JSON {kind, url, title, text, start, end, total_chars, note?}: "
-        "a URL (Browser) tab's text is the rendered page's visible text — page "
-        "through longer pages with `start`/`count` (character offsets, capped "
-        "per read); a file tab answers identity only (read the file with "
-        "read_file); an artifact tab points back at the conversation. Use after "
-        "open_preview, or whenever the user refers to what's on screen in the "
-        "browser ('what does this page say?')."
+        "Returns JSON {kind, url, title, text, start, end, total_chars, note?, "
+        "scroll_y?, scroll_height?, viewport_height?, scroll_ratio?, "
+        "visible_headings?, visible_text?, selection_text?}. For a URL (Browser) "
+        "tab, `text` is CSS-visible text from the whole rendered page and remains "
+        "pageable with `start`/`count`; when the user refers to 'this', 'here', or "
+        "what they are reading, prefer the bounded viewport-local "
+        "`visible_headings`, `visible_text`, and `selection_text` fields. A file "
+        "tab answers identity only (read the file with read_file); an artifact tab "
+        "points back at the conversation. Use after open_preview, or whenever the "
+        "user refers to what's on screen in the browser."
     ),
     "parameters": {
         "type": "object",

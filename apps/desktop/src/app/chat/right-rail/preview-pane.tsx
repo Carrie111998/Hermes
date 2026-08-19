@@ -29,6 +29,7 @@ import { type ConsoleEntry } from './preview-console-state'
 import { previewConsoleState } from './preview-console-store'
 import { LocalFilePreview, PreviewEmptyState } from './preview-file'
 import { PREVIEW_BROWSER_ATTR, registerPreviewNav } from './preview-nav'
+import { type ExtractedPreviewPage, PREVIEW_PAGE_EXTRACT_SCRIPT } from './preview-page-extract'
 import { registerPreviewPageReader } from './preview-reader'
 import { registerPreviewTourRunner } from './preview-tour-runner'
 
@@ -429,10 +430,8 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     return registerPreviewNav(tabId, { back: goBack, forward: goForward, reload: reloadPreview })
   }, [goBack, goForward, isRemoteHtml, isWebPreview, reloadPreview, tabId])
 
-  // Publish the PAGE reader for this tab (the read_preview tool): extract the
-  // rendered page's title + visible text from the webview. innerText (not
-  // textContent) so hidden nodes and script/style bodies stay out, matching
-  // what the user actually sees.
+  // Publish the PAGE reader for this tab (the read_preview tool): extract both
+  // full-page text for pagination and bounded viewport-local context.
   useEffect(() => {
     if (!isWebPreview || !tabId) {
       return
@@ -445,10 +444,11 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
         throw new Error('preview webview is not ready')
       }
 
-      const text = await webview.executeJavaScript('document.body ? document.body.innerText : ""')
+      const extracted = (await webview.executeJavaScript(PREVIEW_PAGE_EXTRACT_SCRIPT)) as ExtractedPreviewPage
 
       return {
-        text: typeof text === 'string' ? text : '',
+        ...extracted,
+        text: typeof extracted?.text === 'string' ? extracted.text : '',
         title: webview.getTitle?.() ?? '',
         url: webview.getURL?.() ?? ''
       }

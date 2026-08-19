@@ -15,6 +15,14 @@
 import { $rightRailActiveTabId } from '@/store/layout'
 import { $previewTabs } from '@/store/preview'
 
+import {
+  PREVIEW_SELECTION_TEXT_MAX_CHARS,
+  PREVIEW_VISIBLE_HEADING_LIMIT,
+  PREVIEW_VISIBLE_HEADING_TEXT_MAX_CHARS,
+  PREVIEW_VISIBLE_TEXT_MAX_CHARS,
+  type PreviewViewportHeading
+} from './preview-page-extract'
+
 export interface PreviewReadOptions {
   /** Characters to return from `start` (capped at PREVIEW_READ_MAX_CHARS). */
   count?: number
@@ -27,18 +35,32 @@ export interface PreviewReadResult {
   kind: string
   note?: string
   path?: string
+  scroll_height?: number
+  scroll_ratio?: number
+  scroll_y?: number
+  selection_text?: string
   start: number
   text: string
   title: string
   total_chars: number
   url: string
+  viewport_height?: number
+  visible_headings?: PreviewViewportHeading[]
+  visible_text?: string
 }
 
 /** What a pane's page reader extracts — the reader module owns the windowing. */
 interface PreviewPage {
+  scroll_height?: number
+  scroll_ratio?: number
+  scroll_y?: number
+  selection_text?: string
   text: string
   title: string
   url: string
+  viewport_height?: number
+  visible_headings?: PreviewViewportHeading[]
+  visible_text?: string
 }
 
 type PageReader = () => Promise<PreviewPage>
@@ -48,6 +70,42 @@ type PageReader = () => Promise<PreviewPage>
 export const PREVIEW_READ_MAX_CHARS = 24_000
 
 const readers = new Map<string, PageReader>()
+
+function boundedNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0
+}
+
+function viewportContext(page: PreviewPage): Partial<PreviewReadResult> {
+  if (typeof page.visible_text !== 'string') {
+    return {}
+  }
+
+  const viewportHeight = boundedNumber(page.viewport_height)
+  const scrollHeight = Math.max(viewportHeight, boundedNumber(page.scroll_height))
+  const maxScrollY = Math.max(0, scrollHeight - viewportHeight)
+  const scrollY = Math.min(boundedNumber(page.scroll_y), maxScrollY)
+  const selection = typeof page.selection_text === 'string' ? page.selection_text.trim() : ''
+
+  const headings = Array.isArray(page.visible_headings)
+    ? page.visible_headings
+        .slice(0, PREVIEW_VISIBLE_HEADING_LIMIT)
+        .map(heading => ({
+          level: Math.min(6, Math.max(1, Math.trunc(boundedNumber(heading?.level) || 1))),
+          text: typeof heading?.text === 'string' ? heading.text.trim().slice(0, PREVIEW_VISIBLE_HEADING_TEXT_MAX_CHARS) : ''
+        }))
+        .filter(heading => heading.text.length > 0)
+    : []
+
+  return {
+    scroll_height: scrollHeight,
+    scroll_ratio: maxScrollY > 0 ? scrollY / maxScrollY : 0,
+    scroll_y: scrollY,
+    ...(selection ? { selection_text: selection.slice(0, PREVIEW_SELECTION_TEXT_MAX_CHARS) } : {}),
+    viewport_height: viewportHeight,
+    visible_headings: headings,
+    visible_text: page.visible_text.slice(0, PREVIEW_VISIBLE_TEXT_MAX_CHARS)
+  }
+}
 
 /** Register a live preview's page reader; returns an idempotent unregister. */
 export function registerPreviewPageReader(tabId: string, reader: PageReader): () => void {
@@ -90,7 +148,13 @@ export async function readActivePreview(opts: PreviewReadOptions = {}): Promise<
       const page = await reader()
 
       return windowText(
-        { kind: target.kind, path: target.path, title: page.title || target.label, url: page.url || target.url },
+        {
+          kind: target.kind,
+          path: target.path,
+          title: page.title || target.label,
+          url: page.url || target.url,
+          ...viewportContext(page)
+        },
         page.text,
         opts
       )

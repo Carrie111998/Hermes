@@ -28,7 +28,15 @@ def test_empty_answer_means_nothing_open():
 
 
 def test_passes_json_through():
-    payload = {"kind": "url", "url": "https://news.ycombinator.com", "title": "HN", "text": "hello"}
+    payload = {
+        "kind": "url",
+        "url": "https://news.ycombinator.com",
+        "title": "HN",
+        "text": "whole page",
+        "scroll_ratio": 0.5,
+        "visible_headings": [{"level": 2, "text": "Current stories"}],
+        "visible_text": "hello",
+    }
     result = json.loads(rp.read_preview_tool(callback=lambda **_: json.dumps(payload)))
     assert result == payload
 
