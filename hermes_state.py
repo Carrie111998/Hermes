@@ -2340,7 +2340,19 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
                 "schema surgery to avoid racing it"
             )
             return report
+        # Re-apply the configured journal mode after surgery (#89674): every
+        # repair strategy below rewrites the file in place, and a rebuilt
+        # SQLite file comes back in the default journal mode (delete) —
+        # silently moving a WAL store out of WAL with nothing in the logs
+        # recording the flip. The open-time WAL-reset gate never sees this
+        # flip because it happens inside the repair path (distinct from the
+        # open-time flip #89393 warns about). The canonical
+        # database.journal_mode setting is the target — probing the DAMAGED
+        # file cannot be trusted, since the corruption itself is what drops
+        # the WAL bit from the header.
         result = _repair_state_db_schema_locked(db_path, backup=backup, report=report)
+        if result.get("repaired"):
+            _restore_journal_mode_after_repair(db_path, resolve_journal_mode())
         # Persist the outcome AFTER surgery, keyed on the post-attempt
         # fingerprint — that is the file state the NEXT attempt's exhaustion
         # probe will observe. Failures count toward the cross-restart cap;
@@ -2350,6 +2362,72 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         # while the backup dedupe/cap above bounds the disk cost either way.)
         _record_repair_outcome(db_path, repaired=bool(result.get("repaired")))
         return result
+
+
+def _restore_journal_mode_after_repair(db_path: Path, target_mode: str) -> None:
+    """Re-apply the configured journal mode after schema surgery (#89674).
+
+    A repaired/rebuilt SQLite file comes back in the default journal mode
+    (delete). Without this restore, a corruption event deterministically
+    moves a WAL store out of WAL and nothing records the change — the
+    WAL-reset gate at open time never sees the flip because it happened
+    inside the repair path, not at open (the open-time flip #89393 warns
+    about is a different door).
+
+    Best-effort by design: the repair itself already succeeded, so failures
+    to re-apply are logged at WARNING naming the modes and the
+    ``database.journal_mode`` config key, never raised. The switch goes
+    through :func:`_set_journal_mode_no_wait` so a concurrent opener's locks
+    abort the flip instead of sneaking it between transactions — the same
+    exclusivity rule every other journal-mode switch in this module follows.
+    """
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            post_mode = _on_disk_journal_mode(conn)
+            if post_mode == target_mode:
+                return
+            if post_mode is None:
+                logger.warning(
+                    "state.db repair at %s: journal mode could not be probed "
+                    "after surgery (target %r from database.journal_mode); "
+                    "verify with PRAGMA journal_mode on the next open",
+                    db_path, target_mode,
+                )
+                return
+            try:
+                actual = _set_journal_mode_no_wait(conn, target_mode)
+            except sqlite3.OperationalError as exc:
+                logger.warning(
+                    "state.db repair at %s: journal_mode %r -> %r could not "
+                    "be restored (%s); the database is left in %r — reissue "
+                    "the pragma or reopen to apply database.journal_mode",
+                    db_path, post_mode, target_mode, exc, post_mode,
+                )
+                return
+            if actual != target_mode:
+                logger.warning(
+                    "state.db repair at %s: journal_mode %r -> %r was not "
+                    "accepted (SQLite reported %r); the database is left in "
+                    "%r — reissue the pragma or reopen to apply "
+                    "database.journal_mode",
+                    db_path, post_mode, target_mode, actual or "no result",
+                    post_mode,
+                )
+                return
+            logger.warning(
+                "state.db repair changed journal_mode %r -> %r; restored "
+                "%r (per database.journal_mode)",
+                post_mode, target_mode, actual,
+            )
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError) as exc:
+        logger.warning(
+            "state.db repair at %s: post-surgery journal-mode restore "
+            "failed (%s); verify with PRAGMA journal_mode on the next open",
+            db_path, exc,
+        )
 
 
 def _repair_state_db_schema_locked(
