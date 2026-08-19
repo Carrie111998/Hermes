@@ -448,44 +448,12 @@ from typing import Optional
 # SUSPENDED pending AppX activation -- a parent that exits first strands it forever.
 from hermes_constants import real_executable
 
-from hermes_cli.subcommands.cron import build_cron_parser
-from hermes_cli.subcommands.gateway import build_gateway_parser
-from hermes_cli.subcommands.profile import build_profile_parser
-from hermes_cli.subcommands.model import build_model_parser
-from hermes_cli.subcommands.setup import build_setup_parser
-from hermes_cli.subcommands.postinstall import build_postinstall_parser
-from hermes_cli.subcommands.whatsapp import build_whatsapp_parser
-from hermes_cli.subcommands.slack import build_slack_parser
-from hermes_cli.subcommands.login import build_login_parser
-from hermes_cli.subcommands.logout import build_logout_parser
-from hermes_cli.subcommands.auth import build_auth_parser
-from hermes_cli.subcommands.status import build_status_parser
-from hermes_cli.subcommands.webhook import build_webhook_parser
-from hermes_cli.subcommands.hooks import build_hooks_parser
-from hermes_cli.subcommands.doctor import build_doctor_parser
-from hermes_cli.subcommands.security import build_security_parser
-from hermes_cli.subcommands.dump import build_dump_parser
-from hermes_cli.subcommands.debug import build_debug_parser
-from hermes_cli.subcommands.backup import build_backup_parser
-from hermes_cli.subcommands.import_cmd import build_import_cmd_parser
-from hermes_cli.subcommands.config import build_config_parser
-from hermes_cli.subcommands.console import build_console_parser
-from hermes_cli.subcommands.version import build_version_parser
-from hermes_cli.subcommands.update import build_update_parser
-from hermes_cli.subcommands.uninstall import build_uninstall_parser
-from hermes_cli.subcommands.dashboard import build_dashboard_parser
-from hermes_cli.subcommands.gui import build_gui_parser
-from hermes_cli.subcommands.logs import build_logs_parser
-from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
-from hermes_cli.subcommands.memory import build_memory_parser
-from hermes_cli.subcommands.acp import build_acp_parser
-from hermes_cli.subcommands.tools import build_tools_parser
-from hermes_cli.subcommands.insights import build_insights_parser
-from hermes_cli.subcommands.skills import build_skills_parser
-from hermes_cli.subcommands.pairing import build_pairing_parser
-from hermes_cli.subcommands.plugins import build_plugins_parser
-from hermes_cli.subcommands.mcp import build_mcp_parser
-from hermes_cli.subcommands.claw import build_claw_parser
+# The ~38 ``build_*_parser`` imports that used to live here are now local
+# imports at the top of ``main()``. Each is used exactly once, to build its
+# subparser, so importing them at module scope charged every invocation for
+# every subcommand's dependencies before argparse knew which one was being
+# run. That is what put ``hermes send --help`` at 444 modules.
+# See hermes_cli/_fast_send.py.
 
 
 def _require_tty(command_name: str) -> None:
@@ -718,6 +686,24 @@ def _apply_profile_override() -> None:
 
 _RAW_ARGV_BEFORE_PROFILE_STRIP = list(sys.argv)
 _apply_profile_override()
+
+# ``hermes send`` fast path. Must sit exactly here: AFTER
+# ``_apply_profile_override()`` (which strips ``--profile``/``-p`` from argv and
+# sets HERMES_HOME, both of which ``send`` needs) and BEFORE the config /
+# env_loader / ``setup_logging()`` block below, which is what we are trying not
+# to pay for. ``send_cmd`` bridges ~/.hermes/.env + config.yaml via its own
+# ``_load_hermes_env()``, so it does not depend on that block.
+#
+# NOTE: skipping ``setup_logging()`` means a fast-path ``send`` does not write
+# to agent.log. That is deliberate -- the QueueListener thread and its import
+# chain cost 154 modules -- and errors still reach stderr via logging's
+# lastResort handler. Set HERMES_NO_FAST_SEND=1 to restore the logged path.
+try:
+    from hermes_cli._fast_send import try_fast_send as _try_fast_send
+except Exception:
+    _try_fast_send = None  # never let the fast path break the CLI
+if _try_fast_send is not None and _try_fast_send():
+    raise SystemExit(0)
 
 # Earliest-possible gateway spawn record. `_apply_profile_override()` above is
 # what makes this point viable at all: it resolves HERMES_HOME, so the log's
@@ -13240,65 +13226,13 @@ _BUILTIN_SUBCOMMANDS = frozenset(
 )
 
 
-# Top-level flags that take a value. Needed by ``_first_positional_argv``
-# so that in ``hermes -m gpt5 chat``, ``gpt5`` is correctly skipped as a
-# flag value rather than misclassified as a subcommand. Kept in sync with
-# the top-level flags declared in ``hermes_cli/_parser.py``.
-#
-# Correctness-safe either way: missing an entry here only makes the
-# fast-path bail out too eagerly (we run plugin discovery when we didn't
-# need to); extra entries would make us skip a real positional.
-_TOP_LEVEL_VALUE_FLAGS = frozenset(
-    {
-        "-z", "--oneshot",
-        "-m", "--model",
-        "--provider",
-        "-t", "--toolsets",
-        "-r", "--resume",
-        "-s", "--skills",
-        "--usage-file",
-        # ``-c / --continue`` is nargs='?' (optional value). Treat it as
-        # value-taking: if the next token is a subcommand-looking word
-        # the user almost certainly meant it as the session name, and
-        # either interpretation keeps us on the safe side.
-        "-c", "--continue",
-    }
-)
-
-
-def _first_positional_argv() -> str | None:
-    """Return the first non-flag, non-flag-value token in ``sys.argv[1:]``.
-
-    Used by ``main()`` to decide whether plugin discovery has to run at
-    argparse-setup time. Handles common invocations like
-    ``hermes -m gpt5 --provider openai chat "msg"`` by skipping the
-    values attached to known top-level flags.
-
-    Does NOT fully simulate argparse — unknown ``--foo=bar`` / ``--foo
-    bar`` flags degrade gracefully (``bar`` may be wrongly classified as
-    a positional, which at worst forces a one-time plugin discovery).
-    """
-    argv = sys.argv[1:]
-    i = 0
-    while i < len(argv):
-        tok = argv[i]
-        if tok == "--":
-            # Everything after ``--`` is positional.
-            if i + 1 < len(argv):
-                return argv[i + 1]
-            return None
-        if tok.startswith("-"):
-            # ``--flag=value`` carries its value inline — single token.
-            if "=" in tok:
-                i += 1
-                continue
-            if tok in _TOP_LEVEL_VALUE_FLAGS and i + 1 < len(argv):
-                i += 2
-                continue
-            i += 1
-            continue
-        return tok
-    return None
+# ``_first_positional_argv`` and its ``TOP_LEVEL_VALUE_FLAGS`` table moved to
+# ``hermes_cli/_fast_send.py`` so the pre-argparse ``send`` fast path can do its
+# argv inspection without importing this 15k-line module's dependency graph.
+# Re-exported under its original private name because it is part of this
+# module's de-facto surface: ``_plugin_cli_discovery_needed`` below and both
+# termux fast paths call it.
+from hermes_cli._fast_send import first_positional_argv as _first_positional_argv  # noqa: E402
 
 
 def _plugin_cli_discovery_needed() -> bool:
@@ -13757,6 +13691,51 @@ def main():
         return
     if _try_termux_fast_cli_launch():
         return
+
+    # Imported here rather than at module scope: each is used exactly once, to
+    # build its subparser, so importing them up top charged every invocation for
+    # every subcommand's dependencies before argparse knew which one was being
+    # run. That is what put ``hermes send --help`` at 444 modules. Keeping them
+    # as plain local imports (rather than a helper that splices into globals())
+    # keeps them visible to ruff/F821. See hermes_cli/_fast_send.py.
+    from hermes_cli.subcommands.cron import build_cron_parser
+    from hermes_cli.subcommands.gateway import build_gateway_parser
+    from hermes_cli.subcommands.profile import build_profile_parser
+    from hermes_cli.subcommands.model import build_model_parser
+    from hermes_cli.subcommands.setup import build_setup_parser
+    from hermes_cli.subcommands.postinstall import build_postinstall_parser
+    from hermes_cli.subcommands.whatsapp import build_whatsapp_parser
+    from hermes_cli.subcommands.slack import build_slack_parser
+    from hermes_cli.subcommands.login import build_login_parser
+    from hermes_cli.subcommands.logout import build_logout_parser
+    from hermes_cli.subcommands.auth import build_auth_parser
+    from hermes_cli.subcommands.status import build_status_parser
+    from hermes_cli.subcommands.webhook import build_webhook_parser
+    from hermes_cli.subcommands.hooks import build_hooks_parser
+    from hermes_cli.subcommands.doctor import build_doctor_parser
+    from hermes_cli.subcommands.security import build_security_parser
+    from hermes_cli.subcommands.dump import build_dump_parser
+    from hermes_cli.subcommands.debug import build_debug_parser
+    from hermes_cli.subcommands.backup import build_backup_parser
+    from hermes_cli.subcommands.import_cmd import build_import_cmd_parser
+    from hermes_cli.subcommands.config import build_config_parser
+    from hermes_cli.subcommands.console import build_console_parser
+    from hermes_cli.subcommands.version import build_version_parser
+    from hermes_cli.subcommands.update import build_update_parser
+    from hermes_cli.subcommands.uninstall import build_uninstall_parser
+    from hermes_cli.subcommands.dashboard import build_dashboard_parser
+    from hermes_cli.subcommands.gui import build_gui_parser
+    from hermes_cli.subcommands.logs import build_logs_parser
+    from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
+    from hermes_cli.subcommands.memory import build_memory_parser
+    from hermes_cli.subcommands.acp import build_acp_parser
+    from hermes_cli.subcommands.tools import build_tools_parser
+    from hermes_cli.subcommands.insights import build_insights_parser
+    from hermes_cli.subcommands.skills import build_skills_parser
+    from hermes_cli.subcommands.pairing import build_pairing_parser
+    from hermes_cli.subcommands.plugins import build_plugins_parser
+    from hermes_cli.subcommands.mcp import build_mcp_parser
+    from hermes_cli.subcommands.claw import build_claw_parser
 
     from hermes_cli._parser import build_top_level_parser
 
