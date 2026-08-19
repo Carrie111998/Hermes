@@ -33,6 +33,7 @@ import { PanelEmpty } from '../overlays/panel'
 import { ConfigField } from './config-field'
 import {
   clearsEnabledToolsets,
+  diffConfig,
   enumOptionsFor,
   getNested,
   isExternalMemoryProvider,
@@ -121,11 +122,17 @@ function ConfigSettingsInner({
   // Seed the local draft once, the first time the shared record lands.
   // Background refetches thereafter must not clobber in-progress edits.
   const configSeeded = useRef(false)
+  // Snapshot of the record as it was when the draft was seeded. Autosave
+  // diffs the draft against this (not against disk) so a field the user
+  // never touched — possibly changed out-of-band by `hermes config set`
+  // while this page sat open — is never resent with its stale value.
+  const configBaselineRef = useRef<HermesConfigRecord | null>(null)
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     if (loadedConfig && !configSeeded.current) {
       configSeeded.current = true
+      configBaselineRef.current = loadedConfig
       savedDiscoverySignatureRef.current = repoDiscoveryPolicySignature(repoDiscoveryPolicyFromConfig(loadedConfig))
       setConfig(loadedConfig)
     }
@@ -137,6 +144,7 @@ function ConfigSettingsInner({
   // the pending debounced autosave is cancelled by its effect cleanup.
   useOnProfileSwitch(() => {
     configSeeded.current = false
+    configBaselineRef.current = null
     savedDiscoverySignatureRef.current = undefined
     setConfig(null)
     saveVersionRef.current = 0
@@ -177,7 +185,8 @@ function ConfigSettingsInner({
     const t = window.setTimeout(() => {
       void (async () => {
         try {
-          const result = await saveHermesConfig(config, scopeProfile ?? undefined)
+          const patch = diffConfig(configBaselineRef.current ?? {}, config)
+          const result = await saveHermesConfig(patch, scopeProfile ?? undefined)
 
           if (!result.ok) {
             throw new Error(c.autosaveFailed)
