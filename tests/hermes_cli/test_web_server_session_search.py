@@ -144,7 +144,7 @@ def test_desktop_session_search_merges_id_matches_before_content_matches(monkeyp
                 "role": "assistant",
                 "source": "desktop",
                 "model": "gpt",
-                "session_started": 200,
+                "started_at": 200,
             },
         ]
     }
