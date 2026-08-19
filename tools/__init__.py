@@ -8,6 +8,7 @@ eagerly import the full tool stack, because several subsystems load tools while
 Callers should import concrete submodules directly, for example:
 
     import tools.web_tools
+    import tools.graphify_tool
     from tools import browser_tool
 
 Python will resolve those submodules via the package path without needing them
