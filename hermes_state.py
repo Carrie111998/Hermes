@@ -8695,9 +8695,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         and OFFSET still apply efficiently.
 
         ``search_query`` matches case-insensitive substrings against each
-        surfaced row's title and id (and, like ``id_query``, every title/id in
-        its forward compression chain). A punctuation-stripped variant is also
-        matched so e.g. ``an94`` finds ``AN-94``. Only honored in the
+        surfaced row's title, gateway display_name, and id (and, like
+        ``id_query``, every title/id/display_name in its forward compression
+        chain). A punctuation-stripped variant is also matched so e.g.
+        ``an94`` finds ``AN-94`` or ``#an-94-ops``. Only honored in the
         ``order_by_last_active`` path.
 
         Pass ``compact_rows=True`` for dashboard and picker callers that only
@@ -8826,8 +8827,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 id_params.append(_like_pattern(id_needle))
             if search_needle:
                 # Same chain-membership trick as id_query, but matching either
-                # the title or the id of any session in the chain. The compact
-                # (punctuation-stripped) variant lets `an94` match `AN-94`.
+                # the title, the gateway display_name, or the id of any session
+                # in the chain. display_name is the persisted gateway peer/chat
+                # identity (issue #9006), so `/sessions search` finds a channel
+                # or DM by name, not only by title. The compact
+                # (punctuation-stripped) variant lets `an94` match `AN-94` and
+                # `#an-94-ops`.
                 compact_needle = re.sub(r"[\W_]+", "", search_needle)
                 compact_sql = (
                     "REPLACE(REPLACE(REPLACE(REPLACE(LOWER(COALESCE({0}, '')),"
@@ -8838,14 +8843,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     " JOIN sessions cs ON cs.id = cq.cur_id"
                     " WHERE cq.root_id = s.id"
                     " AND (LOWER(COALESCE(cs.title, '')) LIKE ? ESCAPE '\\'"
+                    " OR LOWER(COALESCE(cs.display_name, '')) LIKE ? ESCAPE '\\'"
                     " OR LOWER(cq.cur_id) LIKE ? ESCAPE '\\'"
                 )
-                id_params.extend([_like_pattern(search_needle)] * 2)
+                id_params.extend([_like_pattern(search_needle)] * 3)
                 if compact_needle:
                     search_clause += (
                         f" OR {compact_sql.format('cs.title')} LIKE ? ESCAPE '\\'"
+                        f" OR {compact_sql.format('cs.display_name')} LIKE ? ESCAPE '\\'"
                     )
-                    id_params.append(_like_pattern(compact_needle))
+                    id_params.extend([_like_pattern(compact_needle)] * 2)
                 filter_clauses.append(search_clause + "))")
             if filter_clauses:
                 combined = " AND ".join(filter_clauses)

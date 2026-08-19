@@ -135,3 +135,70 @@ class TestQuerySessionListingLaneScope:
         )
 
         assert [row["id"] for row in rows] == ["foreign_59"]
+
+
+class TestQuerySessionListingDisplayName:
+    """`/sessions search` finds gateway sessions by persisted display_name.
+
+    display_name is the gateway's peer/chat presentation identity (issue
+    #9006): a channel like `#finance` is how a user refers to a conversation,
+    so the shared listing seam must match it alongside title/id. This is the
+    focused prior art from upstream #71912.
+    """
+
+    @pytest.fixture
+    def db(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session(
+            "budget_review",
+            "telegram",
+            user_id="1",
+            chat_id="100",
+            display_name="Acme Guild / #finance",
+        )
+        db.set_session_title("budget_review", "Quarterly Budget Review")
+        db.create_session(
+            "ops_channel",
+            "discord",
+            user_id="1",
+            chat_id="200",
+            display_name="#an-94-ops",
+        )
+        db.set_session_title("ops_channel", "Build Ops")
+        yield db
+        db.close()
+
+    def test_display_name_match_via_listing_seam(self, db):
+        # Title ("Quarterly Budget Review") and id ("budget_review") do NOT
+        # contain "finance"; only the gateway display_name does.
+        rows = query_session_listing(db, source="telegram", search_query="finance")
+        assert [row["id"] for row in rows] == ["budget_review"]
+
+    def test_display_name_compact_variant(self, db):
+        # Compact query: "an94" matches display_name "#an-94-ops" even though
+        # the title ("Build Ops") and id ("ops_channel") don't contain it.
+        rows = query_session_listing(db, source="discord", search_query="an94")
+        assert [row["id"] for row in rows] == ["ops_channel"]
+
+    def test_literal_wildcards_do_not_widen(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "literal.db")
+        db.create_session(
+            "under", "telegram", user_id="1", chat_id="1", display_name="under_score"
+        )
+        try:
+            # "%" is escaped: a bare "%" query must not act as a
+            # match-everything wildcard (it should not match "under_score").
+            rows = query_session_listing(db, source="telegram", search_query="%")
+            assert rows == []
+            # "_" is escaped: the display_name "under_score" is matched
+            # literally, not widened into a one-character wildcard.
+            rows = query_session_listing(
+                db, source="telegram", search_query="under_score"
+            )
+            assert [row["id"] for row in rows] == ["under"]
+        finally:
+            db.close()

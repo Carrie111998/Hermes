@@ -1177,6 +1177,9 @@ export interface SessionSearchResult {
   session_started: number | null
   snippet: string
   source: string | null
+  /** Stored session title, when the backend hydrated the row (metadata/ID
+   *  hits carry it; message-content hits may not). */
+  title?: string | null
 }
 
 export interface SessionSearchResponse {
