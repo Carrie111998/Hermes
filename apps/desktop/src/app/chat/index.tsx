@@ -75,6 +75,7 @@ import {
 import { advanceTranscriptWindow, type TranscriptWindowState } from './transcript-window'
 
 interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
+  focusOnSessionChange?: boolean
   gateway: HermesGateway | null
   modelMenuContent?: React.ReactNode
   onToggleSelectedPin: () => void
@@ -322,6 +323,7 @@ function ChatRuntimeBoundary({
 // useCallback at the call sites) memo() lets the whole chat shell skip those.
 export const ChatView = memo(function ChatView({
   className,
+  focusOnSessionChange = true,
   gateway,
   modelMenuContent,
   onToggleSelectedPin,
@@ -652,7 +654,7 @@ export const ChatView = memo(function ChatView({
               busy={busy}
               cwd={currentCwd}
               disabled={!gatewayOpen}
-              focusKey={activeSessionId}
+              focusKey={focusOnSessionChange ? activeSessionId : null}
               gateway={gateway}
               maxRecordingSeconds={maxVoiceRecordingSeconds}
               onAddContextRef={onAddContextRef}

@@ -139,6 +139,7 @@ export function SessionSurfaceChat({ profile, runtimeSessionId, storedSessionId 
     <SessionViewProvider value={view}>
       <ComposerScopeProvider value={scope}>
         <ChatView
+          focusOnSessionChange={false}
           gateway={gateway}
           modelMenuContent={
             <ModelMenuPanel
