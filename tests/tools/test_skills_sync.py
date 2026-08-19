@@ -80,6 +80,7 @@ class TestDirHash:
         cache_dir = cached_skill / "scripts" / "__pycache__"
         cache_dir.mkdir()
         (cache_dir / "main.cpython-311.pyc").write_bytes(b"bytecode")
+        (cache_dir / "cache-metadata.json").write_text('{"format": 1}')
         (cached_skill / "scripts" / "legacy.pyc").write_bytes(b"legacy bytecode")
         (cached_skill / "scripts" / "optimized.pyo").write_bytes(b"optimized bytecode")
 
