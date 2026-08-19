@@ -416,7 +416,10 @@ class TestBoundedHintRead:
         # Real regular file so path construction is normal; open is mocked hang.
         hint.write_text("should never be returned if open hangs")
 
+        open_calls = {"n": 0}
+
         def hanging_open(*_args, **_kwargs):
+            open_calls["n"] += 1
             time.sleep(30)
             raise AssertionError("open should have been abandoned on timeout")
 
@@ -426,6 +429,7 @@ class TestBoundedHintRead:
         elapsed = time.monotonic() - started
 
         assert result is None
+        assert open_calls["n"] >= 1  # load path actually reached bounded open/read
         # Must actually wait near the timeout (proves we reached _read_hint_text),
         # but nowhere near a multi-minute wedge.
         # macOS default APFS is case-insensitive, so AGENTS.md and agents.md are
