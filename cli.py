@@ -4967,6 +4967,32 @@ class _VoiceInputMessage:
         return self.text
 
 
+class _SyntheticNotificationMessage:
+    """Sentinel wrapper for injected background notifications in ``_pending_input``.
+
+    Carries the structured display typing of a synthesized turn (e.g. an
+    async-delegation completion) so the CLI persistence path can write the
+    row with its ``display_kind``/``display_metadata`` instead of degrading
+    it into an ordinary user message. Mirrors the TUI poller's
+    ``display_kind="async_delegation_complete"`` injection.
+    """
+
+    __slots__ = ("text", "display_kind", "display_metadata")
+
+    def __init__(
+        self,
+        text: str,
+        display_kind: "str | None" = None,
+        display_metadata: "dict | None" = None,
+    ):
+        self.text = text
+        self.display_kind = display_kind
+        self.display_metadata = display_metadata
+
+    def __str__(self) -> str:
+        return self.text
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -12808,6 +12834,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             claim = claim_event_delivery(event, consumer)
             if claim is None:
                 continue
+            # Async-delegation completions are internal control turns for the
+            # parent agent. Carry their structured display typing so the row
+            # persists as async_delegation_complete (hidden from the visible
+            # transcript) instead of an ordinary user message — same contract
+            # as the TUI poller injection path.
+            if event.get("type") == "async_delegation":
+                from tools.process_registry import async_delegation_display_metadata
+
+                synthetic_message = _SyntheticNotificationMessage(
+                    synthetic_message,
+                    display_kind="async_delegation_complete",
+                    display_metadata=async_delegation_display_metadata(event),
+                )
             self._pending_input.put(synthetic_message)
             complete_event_delivery(event, claim)
 
@@ -16063,7 +16102,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
+    def chat(
+        self,
+        message,
+        images: Optional[list] = None,
+        voice_input: bool = False,
+        display_kind: Optional[str] = None,
+        display_metadata: Optional[dict] = None,
+    ) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -16080,6 +16126,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             images: Optional list of Path objects for attached images
             voice_input: True when the message came from voice transcription
                 (gates the concise voice-response prefix, #65827)
+            display_kind: Structured display typing for synthesized turns
+                (async-delegation completions). Persisted on the user row so
+                renderers keep the internal control turn out of the visible
+                transcript.
+            display_metadata: Display-only payload for that kind.
             
         Returns:
             The agent's response, or None on error
@@ -16424,6 +16475,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         stream_callback=stream_callback,
                         task_id=self.session_id,
                         persist_user_message=_persist_clean_user_message,
+                        persist_user_display_kind=display_kind,
+                        persist_user_display_metadata=display_metadata,
                         moa_config=_moa_cfg,
                     )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
@@ -20172,6 +20225,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if is_voice_input:
                         user_input = user_input.text
 
+                    # Injected background notifications (async-delegation
+                    # completions) arrive wrapped with their structured display
+                    # typing so the persisted row stays an internal control
+                    # turn instead of a visible user message.
+                    display_kind = None
+                    display_metadata = None
+                    if isinstance(user_input, _SyntheticNotificationMessage):
+                        display_kind = user_input.display_kind
+                        display_metadata = user_input.display_metadata
+                        user_input = user_input.text
+
                     if not user_input:
                         continue
 
@@ -20286,7 +20350,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
+                        self.chat(
+                            user_input,
+                            images=submit_images or None,
+                            voice_input=is_voice_input,
+                            display_kind=display_kind,
+                            display_metadata=display_metadata,
+                        )
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""

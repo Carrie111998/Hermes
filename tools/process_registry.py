@@ -2874,6 +2874,68 @@ def _format_async_delegation(evt: dict) -> str:
     return "\n".join(lines)
 
 
+def async_delegation_display_metadata(evt: dict) -> dict:
+    """Build display-only metadata for an async-delegation completion event.
+
+    Shared by every surface that injects a delegation completion as a
+    synthetic turn (TUI/Desktop poller, CLI drain) so the persisted
+    ``display_metadata`` payload stays identical regardless of transport.
+    Rows are typed ``display_kind="async_delegation_complete"``; renderers
+    treat that kind as internal and keep it out of the user-visible
+    transcript, but the metadata remains available for status surfaces
+    (Agents panel, transient toasts).
+    """
+    raw_results = evt.get("results")
+    results: list[dict] = [
+        result for result in raw_results if isinstance(result, dict)
+    ] if isinstance(raw_results, list) else []
+    task_count = len(results) or 1
+    completed_count = sum(
+        1 for result in results
+        if result.get("status") in {"completed", "success"}
+    )
+    failed_count = sum(
+        1 for result in results
+        if result.get("status") in {"failed", "error"}
+    )
+    metadata = {
+        "delegation_id": str(evt.get("delegation_id") or ""),
+        "task_count": task_count,
+        "completed_count": completed_count or task_count - failed_count,
+        "failed_count": failed_count,
+    }
+    duration = evt.get("total_duration_seconds") or evt.get("duration_seconds")
+    if isinstance(duration, (int, float)):
+        metadata["duration_seconds"] = duration
+    return metadata
+
+
+# Fixed machine-generated prefixes of the async-delegation completion blocks
+# rendered by ``_format_async_delegation`` (batch and single forms). Used ONLY
+# for the read-time migration of legacy rows persisted without a display kind
+# (see ``infer_legacy_display_kind``) — never as a renderer filter.
+ASYNC_DELEGATION_COMPLETE_PREFIXES = (
+    "[ASYNC DELEGATION BATCH COMPLETE",
+    "[ASYNC DELEGATION COMPLETE",
+)
+
+
+def infer_legacy_display_kind(role: str, text: "str | None") -> "str | None":
+    """Retype a legacy synthetic row that was persisted without a display kind.
+
+    Rows written before the display-kind threading shipped with
+    ``display_kind=NULL`` and would hydrate as full user bubbles. Their block
+    format carries a fixed, machine-generated prefix, so display projections
+    retype them on read. This is a one-time repair of already-written rows —
+    renderers filter by the structured kind and never string-match.
+    """
+    if role != "user" or not isinstance(text, str):
+        return None
+    if text.lstrip().startswith(ASYNC_DELEGATION_COMPLETE_PREFIXES):
+        return "async_delegation_complete"
+    return None
+
+
 def _delegation_attribution_line(evt: dict) -> "str | None":
     """One-line delegation attribution for a child-originated process event.
 

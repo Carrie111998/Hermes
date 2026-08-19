@@ -2783,6 +2783,72 @@ def test_history_to_messages_drops_display_hidden_scaffolding():
     assert all("api_content" not in m for m in projected)
 
 
+def test_history_to_messages_migrates_legacy_untyped_delegation_rows():
+    # Rows persisted before display-kind threading shipped with
+    # display_kind=NULL. Their block format carries a fixed machine-generated
+    # prefix, so this display projection retypes them on read (same helper as
+    # the REST transcript endpoint) and forwards the structured kind; clients
+    # then filter it as an internal control turn. The read-time sniff is a
+    # one-time row migration, NOT a renderer filter.
+    history = [
+        {"role": "user", "content": "real question"},
+        {"role": "assistant", "content": "real answer"},
+        {
+            "role": "user",
+            "content": (
+                "[ASYNC DELEGATION BATCH COMPLETE — deleg_x]\n"
+                "A background fan-out of 1 subagent(s) you dispatched earlier "
+                "has finished. Consolidated results below.\n"
+                "Dispatched: 2026-08-19 21:02:19 (6m28s ago)\n"
+                "Context you provided: inspect git diff\n"
+                "Role: leaf   Model: ?   Total duration: 389.05s\n"
+                "--- ✓ TASK 1/1: independently inspect"
+            ),
+        },
+        {"role": "user", "content": "follow-up question"},
+    ]
+
+    projected = server._history_to_messages(history)
+
+    assert projected == [
+        {"role": "user", "text": "real question"},
+        {"role": "assistant", "text": "real answer"},
+        {
+            "role": "user",
+            "text": (
+                "[ASYNC DELEGATION BATCH COMPLETE — deleg_x]\n"
+                "A background fan-out of 1 subagent(s) you dispatched earlier "
+                "has finished. Consolidated results below.\n"
+                "Dispatched: 2026-08-19 21:02:19 (6m28s ago)\n"
+                "Context you provided: inspect git diff\n"
+                "Role: leaf   Model: ?   Total duration: 389.05s\n"
+                "--- ✓ TASK 1/1: independently inspect"
+            ),
+            "display_kind": "async_delegation_complete",
+        },
+        {"role": "user", "text": "follow-up question"},
+    ]
+
+
+def test_history_to_messages_does_not_retype_typed_rows_or_real_user_text():
+    # Real user text that happens to mention the marker string must stay
+    # untouched — only rows persisted WITHOUT a display_kind are retyped.
+    history = [
+        {"role": "user", "content": "what does [ASYNC DELEGATION COMPLETE] mean?"},
+        {
+            "role": "user",
+            "content": "[ASYNC DELEGATION BATCH COMPLETE — deleg_y]",
+            "display_kind": "model_switch",
+        },
+    ]
+
+    projected = server._history_to_messages(history)
+
+    assert projected[0]["text"] == "what does [ASYNC DELEGATION COMPLETE] mean?"
+    assert "display_kind" not in projected[0]
+    assert projected[1]["display_kind"] == "model_switch"
+
+
 def test_history_to_messages_projects_a_skill_turn_to_its_invocation():
     # A /skill invocation is persisted EXPANDED: the activation note plus the
     # entire skill body. That payload is model-facing scaffolding -- this

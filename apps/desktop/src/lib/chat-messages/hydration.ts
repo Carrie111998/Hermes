@@ -54,7 +54,12 @@ function displayContentForMessage(role: SessionMessage['role'], content: unknown
 }
 
 function transcriptContent(displayKind: SessionMessage['display_kind'], content: string): string | null {
-  return displayKind === 'hidden' ? null : content
+  // `hidden` is model-facing scaffolding; `async_delegation_complete` is an
+  // internal control turn (the parent-agent wake for a finished subagent
+  // batch). Neither belongs in the user-visible transcript — the completion
+  // surfaces transiently via the live status feed, and the agent's follow-up
+  // reply remains. Filtering is by structured kind only, never by content.
+  return displayKind === 'hidden' || displayKind === 'async_delegation_complete' ? null : content
 }
 
 // A remote backend older than this app serves display_metadata as raw JSON text,
@@ -71,12 +76,6 @@ function parseDisplayMetadata(metadata: SessionMessage['display_metadata']): nul
   }
 
   return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null
-}
-
-function timelineTaskCount(metadata: SessionMessage['display_metadata']): number | undefined {
-  const count = parseDisplayMetadata(metadata)?.task_count
-
-  return typeof count === 'number' ? count : undefined
 }
 
 function messageReactions(metadata: SessionMessage['display_metadata']): MessageReaction[] {
@@ -104,13 +103,8 @@ function timelineDisplayContent(message: SessionMessage, content: string): strin
     return 'personality changed'
   }
 
-  if (message.display_kind === 'async_delegation_complete') {
-    const count = timelineTaskCount(message.display_metadata)
-
-    return count === undefined
-      ? 'background agent work finished'
-      : `${count} background agent${count === 1 ? '' : 's'} finished`
-  }
+  // `async_delegation_complete` is intentionally absent: it is filtered by
+  // transcriptContent as an internal control turn and never reaches here.
 
   return content
 }
@@ -198,7 +192,6 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
 
     const displayRole =
       message.display_kind === 'model_switch' ||
-      message.display_kind === 'async_delegation_complete' ||
       message.display_kind === 'auto_continue' ||
       message.display_kind === 'personality_switch'
         ? 'system'
