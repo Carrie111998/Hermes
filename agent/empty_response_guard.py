@@ -238,12 +238,26 @@ def deterministic_empty(agent: Any) -> bool:
     output tokens, and an identical (model, provider, finish_reason)
     signature. Any attempt with missing usage or non-zero output keeps
     this False (fail open — transients deserve their retries).
+    
+    When the streak has no known cost (local/self-hosted endpoints),
+    this guard fails open and returns False, preserving the full retry
+    budget. The deterministic-empty detection exists to prevent repeat
+    *charges* on paid routes; with no known charge, skipping retries
+    has no upside.
     """
     if not guard_enabled(agent):
         return False
     attempts = getattr(agent, _ATTEMPTS_ATTR, None) or []
     if len(attempts) < 2:
         return False
+    
+    # Fail open when the streak has no known cost (local endpoints).
+    # The cost-aware budget guard (empty_retry_budget) already handles
+    # this correctly; deterministic_empty must mirror that logic.
+    cost = streak_cost_usd(agent)
+    if cost is None:
+        return False
+    
     first = attempts[0]
     return all(
         a.usage_present and a.zero_output and a.signature == first.signature
