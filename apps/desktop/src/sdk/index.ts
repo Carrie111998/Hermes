@@ -521,10 +521,21 @@ export const host = {
       throw new Error('Session open was superseded by a newer selection.')
     }
 
+    let hydrationResumeRequested = false
+
     if (options.awaitHydration) {
       // Keep the target-specific overlay visible through transcript hydration,
       // not merely through the gateway/profile activation that precedes it.
       $gatewaySwapTarget.set(targetProfile)
+
+      // A plugin open with an explicit owner must carry that ownership into
+      // route-resume BEFORE navigation. Otherwise the route effect can run
+      // first, lose the known profile, and resolveStoredSession() falls back to
+      // probing every installed profile for the id.
+      if (profile) {
+        requestSessionResume(storedSessionId, profile)
+        hydrationResumeRequested = true
+      }
     }
 
     try {
@@ -557,8 +568,8 @@ export const host = {
         Boolean($activeSessionId.get()) &&
         (!expectHistory || $messages.get().length > 0)
 
-      if (options.awaitHydration && !surfaceHealthy) {
-        requestSessionResume(storedSessionId)
+      if (options.awaitHydration && !surfaceHealthy && !hydrationResumeRequested) {
+        requestSessionResume(storedSessionId, profile || undefined)
       }
 
       if (options.awaitHydration) {

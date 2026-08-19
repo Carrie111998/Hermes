@@ -72,6 +72,30 @@ describe('resolveStoredSession profile ownership', () => {
     expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'default')
   })
 
+  it('uses an explicit owner hint without probing unrelated profiles', async () => {
+    $profiles.set(profiles('default', 'katana', 'agency-ai-engineer'))
+    $activeGatewayProfile.set('katana')
+    mockGetSession.mockResolvedValueOnce(session({ id: 's1', profile: 'default' }))
+
+    const resolved = await resolveStoredSession('s1', 'katana')
+
+    expect(resolved?.profile).toBe('katana')
+    expect(mockGetSession).toHaveBeenCalledTimes(1)
+    expect(mockGetSession).toHaveBeenCalledWith('s1', 'katana')
+  })
+
+  it('does not scan other profiles when an explicit owner hint misses', async () => {
+    $profiles.set(profiles('default', 'katana', 'agency-ai-engineer'))
+    $activeGatewayProfile.set('katana')
+    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
+
+    const resolved = await resolveStoredSession('s1', 'katana')
+
+    expect(resolved).toBeUndefined()
+    expect(mockGetSession).toHaveBeenCalledTimes(1)
+    expect(mockGetSession).toHaveBeenCalledWith('s1', 'katana')
+  })
+
   it('accepts a profile-less cache hit for single-profile users', async () => {
     $profiles.set(profiles('default'))
     $sessions.set([session({ id: 's1' })])
