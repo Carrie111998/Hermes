@@ -465,7 +465,9 @@ def test_merge_interrupted_history_matrix():
             COMPRESSED_SUMMARY_METADATA_KEY: True,
         }
     ]
-    assert server._interrupted_result_allows_rewrite(live, compacted, {"compressed": True})
+    assert server._interrupted_result_allows_rewrite(
+        live, compacted, {"compressed": True}, turn_start_history=turn_start
+    )
     assert (
         server._merge_interrupted_api_history(
             live, compacted, turn_start_history=turn_start, allow_rewrite=True
@@ -487,7 +489,8 @@ def test_merge_interrupted_history_matrix():
         }
     ]
     assert not server._interrupted_result_allows_rewrite(
-        live_with_summary, stale_marked, {"compressed": True}
+        live_with_summary, stale_marked, {"compressed": True},
+        turn_start_history=live_with_summary,
     )
     assert (
         server._merge_interrupted_api_history(
@@ -497,4 +500,66 @@ def test_merge_interrupted_history_matrix():
             allow_rewrite=False,
         )
         == live_with_summary
+    )
+
+    # Repeated current prompt must survive even if an earlier turn used the same text.
+    for prompt in ("continue", "yes", "no", "try again"):
+        turn = [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "old"},
+        ]
+        returned = [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "old"},
+            {"role": "user", "content": prompt},
+        ]
+        merged = server._merge_interrupted_api_history(
+            turn, returned, turn_start_history=turn, current_prompt=prompt
+        )
+        assert [row["content"] for row in merged] == [prompt, "old", prompt]
+        assert len(merged) == 3
+
+    # Repeated structured tool shape in a previous turn must not erase this turn's copy.
+    tool_turn = [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "name": "web"}]},
+        {"role": "tool", "content": "ok", "tool_call_id": "c1", "name": "web"},
+    ]
+    tool_returned = [
+        *tool_turn,
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "name": "web"}]},
+    ]
+    merged = server._merge_interrupted_api_history(
+        tool_turn, tool_returned, turn_start_history=tool_turn
+    )
+    assert len(merged) == 3
+    assert merged[-1]["tool_calls"] == [{"id": "c1", "name": "web"}]
+
+    # Older summary A must not authorize rewrite after live moved to summary B.
+    live_newer = [
+        {
+            "role": "user",
+            "content": f"{LEGACY_SUMMARY_PREFIX} summary B",
+            COMPRESSED_SUMMARY_METADATA_KEY: True,
+        },
+        {"role": "user", "content": "later"},
+    ]
+    stale_older = [
+        {
+            "role": "user",
+            "content": f"{LEGACY_SUMMARY_PREFIX} summary A",
+            COMPRESSED_SUMMARY_METADATA_KEY: True,
+        },
+        {"role": "user", "content": "later"},
+    ]
+    assert not server._interrupted_result_allows_rewrite(
+        live_newer, stale_older, {"compressed": True}, turn_start_history=live_newer
+    )
+    assert (
+        server._merge_interrupted_api_history(
+            live_newer,
+            stale_older,
+            turn_start_history=live_newer,
+            allow_rewrite=False,
+        )
+        == live_newer
     )
