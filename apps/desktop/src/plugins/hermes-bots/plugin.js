@@ -59,6 +59,7 @@ import {
   Switch,
   Textarea,
   Tip,
+  usePluginI18n,
   useQuery,
   useValue
 } from '@hermes/plugin-sdk'
@@ -83,12 +84,68 @@ const blobatarSvg = typeof sdk === 'undefined' ? undefined : sdk.blobatarSvg
 const createBudgetedLoop = typeof sdk === 'undefined' ? undefined : sdk.createBudgetedLoop
 
 const ID = 'hermes-bots'
+const BOT_SESSION_LOCALES = {
+  en: {
+    sessions: {
+      default: 'Default',
+      defaultLabel: title => `Default session: ${title}`,
+      makeDefault: 'Make default',
+      makeDefaultLabel: title => `Make default: ${title}`,
+      changeFailed: 'Could not change default session',
+      persistenceFailed: 'Could not save the new default; kept the previous session.'
+    }
+  },
+  ja: {
+    sessions: {
+      default: 'デフォルト',
+      defaultLabel: title => `デフォルトのセッション: ${title}`,
+      makeDefault: 'デフォルトにする',
+      makeDefaultLabel: title => `デフォルトにする: ${title}`,
+      changeFailed: 'デフォルトのセッションを変更できませんでした',
+      persistenceFailed: '新しいデフォルトを保存できなかったため、以前のセッションを維持しました。'
+    }
+  },
+  zh: {
+    sessions: {
+      default: '默认',
+      defaultLabel: title => `默认会话：${title}`,
+      makeDefault: '设为默认',
+      makeDefaultLabel: title => `设为默认：${title}`,
+      changeFailed: '无法更改默认会话',
+      persistenceFailed: '无法保存新的默认会话；已保留之前的会话。'
+    }
+  },
+  'zh-hant': {
+    sessions: {
+      default: '預設',
+      defaultLabel: title => `預設工作階段：${title}`,
+      makeDefault: '設為預設',
+      makeDefaultLabel: title => `設為預設：${title}`,
+      changeFailed: '無法變更預設工作階段',
+      persistenceFailed: '無法儲存新的預設工作階段；已保留先前的工作階段。'
+    }
+  }
+}
 const ROSTER_KEY = [ID, 'roster']
 const ROUTINES_KEY = [ID, 'routines']
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
+const DEFAULT_SESSION_ECHO_GUARD_MS = 15000
 
 /** Captured in register() so components can reach plugin storage. */
 let pluginCtx = null
+
+function botSessionMessage(key, ...args) {
+  const path = `sessions.${key}`
+  try {
+    const translated = pluginCtx?.i18n?.t?.(path, ...args)
+    if (translated && translated !== path) return translated
+  } catch {
+    /* fall through to English */
+  }
+
+  const fallback = BOT_SESSION_LOCALES.en.sessions[key]
+  return typeof fallback === 'function' ? fallback(...args) : fallback
+}
 
 /** Live roster snapshot for imperative handlers (context menus). */
 const $lastRoster = atom([])
@@ -295,6 +352,11 @@ function groupActivityTone(kind) {
 function handleSessionsGatewayTransition() {
   $sessionsGatewayGeneration.set($sessionsGatewayGeneration.get() + 1)
   $botSelectedSessions.set({})
+  for (const state of defaultSessionWrites.values()) {
+    state.cancelled = true
+  }
+  defaultSessionWrites.clear()
+  botMetaWriteChains.clear()
   // A gateway swap invalidates any in-flight room drive: bump every room's
   // epoch so running loops bail at their next member boundary.
   const rooms = { ...$groupChats.get() }
@@ -310,33 +372,118 @@ function handleSessionsGatewayTransition() {
  *  { [botName]: { shape, color, title } } */
 const $botMeta = atom({})
 
-async function saveBotMeta(name, patch) {
+/** Per-profile serial write state for the user-selected canonical session. */
+const defaultSessionWrites = new Map()
+/** Every profiles.configure snapshot for a Bot shares one ordered lane. */
+const botMetaWriteChains = new Map()
+
+function setBotMetaLocal(name, patch) {
   const prevMeta = $botMeta.get()[name] || {}
-  const next = { ...$botMeta.get(), [name]: { ...prevMeta, ...patch } }
+  const nextMeta = { ...prevMeta, ...patch }
+  const next = { ...$botMeta.get(), [name]: nextMeta }
   $botMeta.set(next)
 
-  // Local plugin storage: instant, and the fallback for older gateways.
   try {
     Promise.resolve(pluginCtx?.storage?.set?.('bot-meta', next)).catch(() => undefined)
   } catch {
-    /* storage unavailable — look persists for this window only */
+    /* storage unavailable — meta persists for this window only */
   }
+
+  return { prevMeta, nextMeta }
+}
+
+function queueBotMetaServerWrite(name, gatewayGeneration, options = {}) {
+  let lane = botMetaWriteChains.get(name)
+  if (!lane) {
+    lane = { tail: Promise.resolve(), patch: {} }
+    botMetaWriteChains.set(name, lane)
+  }
+  const previous = lane.tail
+  const hasChatOverride = Object.prototype.hasOwnProperty.call(options, 'chat')
+  const requestedPatch = { ...(options.patch || {}) }
+  delete requestedPatch.image
+  delete requestedPatch.pet
+  if (options.protectChat) delete requestedPatch.chat
+  const finish = persistence => {
+    if (typeof options.onResult === 'function') options.onResult(persistence)
+    return persistence
+  }
+  const persist = async () => {
+    if (gatewayGeneration !== $sessionsGatewayGeneration.get()) {
+      return finish({ serverPersisted: false, serverOutcome: 'cancelled' })
+    }
+
+    let serverOutcome = 'unsupported'
+    let protectDefaultChat = false
+    try {
+      // Materialize the full replacement snapshot only after older writes have
+      // settled. Unrelated writes must carry the last confirmed canonical chat,
+      // never a still-optimistic choice that may roll back while queued.
+      const latestMeta = $botMeta.get()[name] || {}
+      const serverMeta = { ...latestMeta, ...lane.patch, ...requestedPatch }
+      const defaultWrite = defaultSessionWrites.get(name)
+      protectDefaultChat = Boolean(defaultWrite)
+      if (hasChatOverride) {
+        serverMeta.chat = options.chat
+      } else if (defaultWrite) {
+        serverMeta.chat = defaultWrite.confirmedChat
+      }
+      const { image, pet, ...rest } = serverMeta
+      const result = await host.request('profiles.configure', { name, ui_meta: { 'hermes-bots': rest } })
+      if (result?.applied?.ui_meta === true) {
+        serverOutcome = 'persisted'
+      } else if (result && typeof result === 'object' && result.applied && typeof result.applied === 'object') {
+        serverOutcome = 'failed'
+      }
+    } catch {
+      /* older/unavailable gateway — the local fallback remains saved */
+    }
+
+    if (gatewayGeneration === $sessionsGatewayGeneration.get()) {
+      const carriedPatch = { ...requestedPatch }
+      const activeDefaultWrite = defaultSessionWrites.get(name)
+      if (hasChatOverride || protectDefaultChat || activeDefaultWrite) {
+        delete carriedPatch.chat
+        delete lane.patch.chat
+      }
+      lane.patch = { ...lane.patch, ...carriedPatch }
+    }
+
+    return finish({ serverPersisted: serverOutcome === 'persisted', serverOutcome })
+  }
+
+  let task
+  task = previous.then(persist, persist).finally(() => {
+    if (botMetaWriteChains.get(name) === lane && lane.tail === task) {
+      if (Object.keys(lane.patch).length) setBotMetaLocal(name, lane.patch)
+      botMetaWriteChains.delete(name)
+    }
+  })
+  lane.tail = task
+  return task
+}
+
+async function saveBotMeta(name, patch, options = {}) {
+  const writeLocal = options.writeLocal !== false
+  const localPatch = { ...patch }
+  const protectChat = writeLocal && defaultSessionWrites.has(name) && Object.prototype.hasOwnProperty.call(localPatch, 'chat')
+  if (protectChat) delete localPatch.chat
+  const prevMeta = writeLocal
+    ? setBotMetaLocal(name, localPatch).prevMeta
+    : $botMeta.get()[name] || {}
 
   // Server-side (source of truth when supported): profile.yaml ui_meta,
   // namespaced under this plugin's id — every client machine sees the same
-  // roster. Return the outcome so user-initiated saves can distinguish a
-  // cross-machine save from a local-only fallback instead of reporting a
-  // false success. Data-URL fields are stripped from ui_meta (64KB cap,
-  // rides every profiles.list); the avatar IMAGE goes to the profile asset
-  // store instead (profiles.set_asset), which is server-side and uncapped by
-  // the list call — so pfps follow the profile across machines too.
-  let serverRequest = null
-  try {
-    const { image, pet, ...rest } = next[name] || {}
-    serverRequest = Promise.resolve(host.request('profiles.configure', { name, ui_meta: { 'hermes-bots': rest } }))
-  } catch {
-    /* older/unavailable gateway — the local fallback remains saved */
+  // roster. Writes for one profile share a serial lane, and each full snapshot
+  // is materialized only when its turn begins.
+  const serverOptions = { patch, protectChat }
+  if (Object.prototype.hasOwnProperty.call(options, 'serverChat')) {
+    serverOptions.chat = options.serverChat
   }
+  if (typeof options.onServerResult === 'function') {
+    serverOptions.onResult = options.onServerResult
+  }
+  const serverPersistence = queueBotMetaServerWrite(name, $sessionsGatewayGeneration.get(), serverOptions)
 
   // Avatar image → profile asset store (feature-detected; local storage
   // remains the fallback rendering source on older gateways) — but only when
@@ -355,30 +502,9 @@ async function saveBotMeta(name, patch) {
     }
   }
 
-  // Three-way outcome so callers can tell a REAL remote failure from the
-  // documented legacy fallback ("older gateways reject the param shape;
-  // that's fine, local wins"):
-  //   'persisted'   — gateway confirmed applied.ui_meta === true
-  //   'unsupported' — older gateway: request rejected, or response carries
-  //                   no `applied` contract at all. Silent local fallback;
-  //                   an error toast here would fire on EVERY save forever.
-  //   'failed'      — gateway speaks the contract and explicitly reported
-  //                   the ui_meta write did NOT apply.
-  let serverOutcome = 'unsupported'
-  if (serverRequest) {
-    try {
-      const result = await serverRequest
-      if (result?.applied?.ui_meta === true) {
-        serverOutcome = 'persisted'
-      } else if (result && typeof result === 'object' && result.applied && typeof result.applied === 'object') {
-        serverOutcome = 'failed'
-      }
-    } catch {
-      /* older/unavailable gateway — the local fallback remains saved */
-    }
-  }
-
-  return { serverPersisted: serverOutcome === 'persisted', serverOutcome }
+  // Three-way outcome: persisted, unsupported (legacy/local fallback), or
+  // failed (the backend explicitly rejected the authoritative ui_meta write).
+  return serverPersistence
 }
 
 // ── hidden bots (right-click → Hide Bot) ────────────────────────────────────
@@ -665,7 +791,7 @@ function pullServerAvatars(roster) {
  *  naive replace would wipe a just-saved image avatar on the next roster
  *  paint. When server bot metadata exists, an omitted chat is authoritative
  *  deletion; local still fills all gaps for older gateways with no metadata. */
-function mergeServerMeta(roster) {
+function mergeServerMeta(roster, now = Date.now()) {
   const local = $botMeta.get()
   let changed = false
   const next = { ...local }
@@ -675,6 +801,27 @@ function mergeServerMeta(roster) {
     if (server && typeof server === 'object') {
       const mine = next[bot.name] || {}
       const merged = { ...mine, ...server }
+      const defaultWrite = defaultSessionWrites.get(bot.name)
+      let preserveDefaultChat = false
+
+      if (defaultWrite && (defaultWrite.pending > 0 || defaultWrite.awaitingEcho)) {
+        const serverChat = Object.prototype.hasOwnProperty.call(server, 'chat') ? server.chat : null
+        const echoExpired = defaultWrite.awaitingEcho && now >= defaultWrite.echoUntil
+        if (
+          defaultWrite.pending === 0 &&
+          defaultWrite.awaitingEcho &&
+          (serverChat === defaultWrite.desiredChat || echoExpired)
+        ) {
+          defaultSessionWrites.delete(bot.name)
+        } else {
+          preserveDefaultChat = true
+          if (Object.prototype.hasOwnProperty.call(mine, 'chat')) {
+            merged.chat = mine.chat
+          } else {
+            delete merged.chat
+          }
+        }
+      }
 
       // Local-only fields survive the server overlay.
       if (mine.image) {
@@ -685,6 +832,7 @@ function mergeServerMeta(roster) {
       // Without this deletion sync, ctx.storage resurrects stale sessions
       // after the server pin is cleared and even after a full app restart.
       if (
+        !preserveDefaultChat &&
         Object.prototype.hasOwnProperty.call(mine, 'chat') &&
         !Object.prototype.hasOwnProperty.call(server, 'chat')
       ) {
@@ -7773,6 +7921,17 @@ function openBotSessionsWorkspace(bot) {
   }
 }
 
+function defaultProfileSessionId(bot, meta) {
+  const pinned = typeof meta?.chat === 'string' ? meta.chat : ''
+  const preferred = bot?.preferred_session
+
+  if (pinned && preferred?.id === pinned) {
+    return preferred.resolved_id || preferred.id
+  }
+
+  return pinned
+}
+
 function filterProfileSessions(sessions, query) {
   const needle = String(query || '').trim().toLowerCase()
   const rows = Array.isArray(sessions) ? sessions : []
@@ -7816,25 +7975,120 @@ async function openProfileSession(botName, session, gatewayGeneration) {
   $botSelectedSessions.set({ ...$botSelectedSessions.get(), [profile]: id })
 }
 
-function ProfileSessionRow({ session, botName, active, gatewayGeneration }) {
-  return jsxs('button', {
-    type: 'button',
-    'aria-current': active ? 'page' : undefined,
-    onClick: () => void openProfileSession(botName, session, gatewayGeneration).catch(err => host.notifyError(err, 'Could not open session')),
+async function makeProfileSessionDefault(botName, session, gatewayGeneration) {
+  const profile = String(botName || '')
+  const id = String(session?.id || '')
+  if (!NAME_RE.test(profile) || !id || gatewayGeneration !== $sessionsGatewayGeneration.get()) return null
+
+  let state = defaultSessionWrites.get(profile)
+  if (!state) {
+    const currentChat = typeof $botMeta.get()[profile]?.chat === 'string' ? $botMeta.get()[profile].chat : null
+    state = {
+      pending: 0,
+      generation: 0,
+      desiredChat: currentChat,
+      confirmedChat: currentChat,
+      confirmedPersisted: false,
+      awaitingEcho: false,
+      echoUntil: 0
+    }
+    defaultSessionWrites.set(profile, state)
+  }
+
+  const generation = ++state.generation
+  state.pending += 1
+  state.desiredChat = id
+  state.awaitingEcho = false
+  state.echoUntil = 0
+  setBotMetaLocal(profile, { chat: id })
+
+  const applyPersistence = persistence => {
+    if (state.cancelled || gatewayGeneration !== $sessionsGatewayGeneration.get()) return
+
+    if (persistence.serverOutcome === 'failed') {
+      if (generation === state.generation) {
+        state.desiredChat = state.confirmedChat
+        state.awaitingEcho = state.confirmedPersisted
+        state.echoUntil = state.awaitingEcho ? Date.now() + DEFAULT_SESSION_ECHO_GUARD_MS : 0
+        setBotMetaLocal(profile, { chat: state.confirmedChat })
+        queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
+        host.notify({ kind: 'error', message: botSessionMessage('persistenceFailed') })
+      }
+      return
+    }
+
+    state.confirmedChat = id
+    state.confirmedPersisted = persistence.serverOutcome === 'persisted'
+    if (generation === state.generation) {
+      state.desiredChat = id
+      state.awaitingEcho = state.confirmedPersisted
+      state.echoUntil = state.awaitingEcho ? Date.now() + DEFAULT_SESSION_ECHO_GUARD_MS : 0
+      queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
+    }
+  }
+
+  const persist = async () => {
+    if (state.cancelled || gatewayGeneration !== $sessionsGatewayGeneration.get()) {
+      return { serverPersisted: false, serverOutcome: 'cancelled' }
+    }
+
+    return saveBotMeta(profile, { chat: id }, {
+      writeLocal: false,
+      serverChat: id,
+      onServerResult: applyPersistence
+    })
+  }
+  const task = persist().finally(() => {
+    state.pending -= 1
+    if (state.pending === 0 && !state.awaitingEcho && defaultSessionWrites.get(profile) === state) {
+      defaultSessionWrites.delete(profile)
+    }
+  })
+
+  return task
+}
+
+function ProfileSessionRow({ session, botName, active, isDefault, gatewayGeneration, copy = BOT_SESSION_LOCALES.en.sessions }) {
+  const label = session.title || 'Untitled session'
+
+  return jsxs('div', {
     className: cn(
-      'flex w-full flex-col gap-0.5 overflow-hidden rounded-md px-2 py-1.5 text-left transition-colors',
+      'flex w-full items-center gap-2 overflow-hidden rounded-md pr-2 transition-colors',
       'hover:bg-(--chrome-action-hover)',
       active && 'bg-(--ui-row-active-background)'
     ),
     children: [
-      jsx('span', {
-        className: 'truncate text-[0.8125rem] font-medium',
-        children: session.title || 'Untitled session'
+      jsxs('button', {
+        type: 'button',
+        'aria-current': active ? 'page' : undefined,
+        onClick: () => void openProfileSession(botName, session, gatewayGeneration).catch(err => host.notifyError(err, 'Could not open session')),
+        className: 'flex min-w-0 flex-1 flex-col gap-0.5 overflow-hidden px-2 py-1.5 text-left',
+        children: [
+          jsx('span', {
+            className: 'truncate text-[0.8125rem] font-medium',
+            children: label
+          }),
+          jsx('div', {
+            className: 'truncate text-[0.7rem] text-(--ui-text-tertiary)',
+            children: session.preview || session.source || 'No messages yet'
+          })
+        ]
       }),
-      jsx('div', {
-        className: 'truncate text-[0.7rem] text-(--ui-text-tertiary)',
-        children: session.preview || session.source || 'No messages yet'
-      })
+      isDefault
+        ? jsx('span', {
+            role: 'status',
+            'aria-live': 'polite',
+            'aria-label': copy.defaultLabel(label),
+            className: 'shrink-0 text-[0.65rem] font-medium text-(--ui-text-secondary)',
+            children: copy.default
+          })
+        : jsx(Button, {
+            variant: 'textStrong',
+            size: 'inline',
+            'aria-label': copy.makeDefaultLabel(label),
+            onClick: () => makeProfileSessionDefault(botName, session, gatewayGeneration).catch(err => host.notifyError(err, copy.changeFailed)),
+            children: copy.makeDefault
+          })
     ]
   })
 }
@@ -7843,11 +8097,21 @@ function ProfileSessionsWorkspace({ bot }) {
   const gatewayGeneration = useValue($sessionsGatewayGeneration)
   const { data, isLoading, error } = useProfileSessions(bot.name, gatewayGeneration)
   const selectedByProfile = useValue($botSelectedSessions)
+  const metaByName = useValue($botMeta)
+  const translate = usePluginI18n(ID)
   const [query, setQuery] = useState('')
   const sourceSessions = data?.sessions || []
   const sessions = filterProfileSessions(sourceSessions, query)
   const inventoryBounded = sourceSessions.length >= PROFILE_SESSION_LIST_LIMIT
   const selectedId = selectedByProfile[bot.name] || ''
+  const defaultSessionId = defaultProfileSessionId(bot, metaByName[bot.name])
+  const copy = {
+    default: translate('sessions.default'),
+    defaultLabel: title => translate('sessions.defaultLabel', title),
+    makeDefault: translate('sessions.makeDefault'),
+    makeDefaultLabel: title => translate('sessions.makeDefaultLabel', title),
+    changeFailed: translate('sessions.changeFailed')
+  }
 
   const header = jsxs('div', {
     className: 'flex items-center gap-2 px-2.5 pt-2.5 pb-2',
@@ -7860,7 +8124,7 @@ function ProfileSessionsWorkspace({ bot }) {
       }),
       jsx('div', {
         className: 'min-w-0 flex-1 truncate text-sm font-semibold',
-        children: `${displayName(bot, $botMeta.get()[bot.name])} sessions`
+        children: `${displayName(bot, metaByName[bot.name])} sessions`
       })
     ]
   })
@@ -7903,7 +8167,9 @@ function ProfileSessionsWorkspace({ bot }) {
                       session,
                       botName: bot.name,
                       active: selectedId === session.id,
-                      gatewayGeneration
+                      isDefault: defaultSessionId === session.id,
+                      gatewayGeneration,
+                      copy
                     }, session.id))
                   : jsx('div', {
                       className: 'px-2 py-3 text-center text-xs text-(--ui-text-tertiary)',
@@ -9939,12 +10205,33 @@ function BotsPane() {
 
 // ── plugin ───────────────────────────────────────────────────────────────────
 
+// Focused runtime seam for behavior tests. The default export exposes it only
+// when the test harness opts in, keeping production and the direct-file door unchanged.
+const botSessionsRuntime = Object.freeze({
+  openBotSessionsWorkspace,
+  openProfileSession,
+  filterProfileSessions,
+  defaultProfileSessionId,
+  makeProfileSessionDefault,
+  saveBotMeta,
+  ProfileSessionRow,
+  BOT_SESSION_LOCALES,
+  mergeServerMeta,
+  $botMeta,
+  $botSessionsWorkspace,
+  $botSelectedSessions,
+  $sessionsGatewayGeneration,
+  handleSessionsGatewayTransition
+})
+
 export default {
   id: ID,
   name: 'Bots',
   description: 'Bot Mode — a one-chat-per-agent roster with avatars, routines, group chats, and bot-to-bot messaging. Ships with the app; disable here if unwanted.',
+  testing: globalThis.__HERMES_BOTS_TEST__ ? botSessionsRuntime : undefined,
   register(ctx) {
     pluginCtx = ctx
+    ctx.i18n?.register?.(BOT_SESSION_LOCALES)
     startFaceClock()
     // Disabling the plugin (or a hot reload) must actually stop the clock —
     // before this, the rAF loop + 1Hz document scan ran until app restart.
