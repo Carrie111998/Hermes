@@ -44,7 +44,11 @@ function buildSessionSurfaceView(profile: string, runtimeSessionId: string, stor
     $provider: computed($state, state => state?.provider ?? ''),
     $reasoningEffort: computed($state, state => state?.reasoningEffort ?? ''),
     $runtimeId,
-    $storedId: atom(storedSessionId)
+    $storedId: atom(storedSessionId),
+    // Per-surface turn clock (mirrors the tile refactor): a surface must time
+    // ITS OWN turn, never the primary chat's, so the clock lives beside the
+    // other per-surface signals on SessionView.
+    $turnStartedAt: computed($state, state => state?.turnStartedAt ?? null)
   }
 }
 
