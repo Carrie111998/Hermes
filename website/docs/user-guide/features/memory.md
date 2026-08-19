@@ -238,7 +238,25 @@ memory:
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
   write_approval: false     # false = write freely (default) | true = require approval
+  pressure_review_ratio: 0.9  # fire an early consolidation review at 90% full (0 = off)
 ```
+
+### Memory pressure (`pressure_review_ratio`)
+
+Both stores are hard-capped, and a store that silently fills up eventually
+rejects writes until the model consolidates mid-turn. To get ahead of that,
+Hermes checks fill level at the start of each turn: when either store crosses
+`pressure_review_ratio` (default `0.9`, i.e. 90% of its char limit), the
+post-turn background review fires **early** — without waiting out the
+`nudge_interval` — and its prompt is steered toward consolidation (merge
+overlapping facts, drop stale ones) instead of new saves.
+
+The trigger is edge-based: it fires once per threshold crossing and re-arms
+only after consolidation brings the store back under the ratio, so a
+persistently full store doesn't spawn a review every turn. Set
+`pressure_review_ratio: 0` to disable the pressure trigger; the interval-based
+review is unaffected. The pressure signal only ever reaches the background
+fork — the main conversation's system prompt is never modified mid-session.
 
 ## Controlling memory writes (`write_approval`)
 

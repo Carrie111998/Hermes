@@ -387,6 +387,40 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
+    def usage_ratio(self, target: str) -> float:
+        """Live fill ratio of one store (0.0-1.0+), from current entries.
+
+        Reads the LIVE entry lists (not the frozen system-prompt snapshot),
+        so mid-session writes are reflected. A zero/negative limit reads as
+        0.0 — an unbounded store can never signal pressure.
+        """
+        limit = self._char_limit(target)
+        if limit <= 0:
+            return 0.0
+        return self._char_count(target) / limit
+
+    def pressure_report(self, threshold: float) -> List[Dict[str, Any]]:
+        """Stores at or above ``threshold`` fill ratio, most-full first.
+
+        Returns ``[{"target", "pct", "current", "limit"}, ...]`` — empty when
+        nothing is under pressure. Used by the turn-start pressure trigger
+        (ported from code-yeongyu/oh-my-openagent's memory-pressure line,
+        adapted to fire the background review instead of mutating the
+        system prompt, which would break prefix caching).
+        """
+        report: List[Dict[str, Any]] = []
+        for target in ("memory", "user"):
+            ratio = self.usage_ratio(target)
+            if ratio >= threshold:
+                report.append({
+                    "target": target,
+                    "pct": min(100, int(ratio * 100)),
+                    "current": self._char_count(target),
+                    "limit": self._char_limit(target),
+                })
+        report.sort(key=lambda r: r["pct"], reverse=True)
+        return report
+
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()

@@ -719,6 +719,40 @@ def build_turn_context(
             should_review_memory = True
             agent._turns_since_memory = 0
 
+    # Memory-pressure trigger: when a memory store is nearly full, fire the
+    # review early instead of waiting out the turn interval, and steer the
+    # fork toward consolidation. Ported from code-yeongyu/oh-my-openagent's
+    # memory-pressure surfacing (omo-senpi #7006/#7008), adapted to Hermes'
+    # background-review architecture: omo injects a pressure line into the
+    # per-run system prompt, which Hermes cannot do (prefix-cache integrity),
+    # so the pressure signal routes to the post-turn review fork instead —
+    # the main conversation's context is never touched. Edge-triggered: one
+    # review per threshold crossing, re-armed only after pressure clears.
+    if (not should_review_memory
+            and agent._memory_nudge_interval > 0
+            and "memory" in agent.valid_tool_names
+            and agent._memory_store):
+        try:
+            ratio = getattr(agent, "_memory_pressure_review_ratio", 0.9)
+            pressure = (
+                agent._memory_store.pressure_report(ratio) if ratio > 0 else []
+            )
+            if pressure:
+                if not getattr(agent, "_memory_pressure_review_fired", False):
+                    agent._memory_pressure_review_fired = True
+                    should_review_memory = True
+                    agent._turns_since_memory = 0
+                    agent._memory_pressure_focus = "; ".join(
+                        f"{p['target'].upper()} store at {p['pct']}% "
+                        f"({p['current']:,}/{p['limit']:,} chars)"
+                        for p in pressure
+                    )
+            else:
+                # Pressure cleared (consolidation or pruning) — re-arm.
+                agent._memory_pressure_review_fired = False
+        except Exception:
+            pass  # Pressure check is best-effort; never block the turn.
+
     # Cosmetic side-signal: detect an affection "reaction" (ily / <3 / good bot)
     # and notify the host so it can play hearts. Token-free, never touches the
     # conversation, and never fatal — a purely optional UI beat.

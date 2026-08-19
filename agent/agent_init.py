@@ -1813,6 +1813,12 @@ def init_agent(
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
+            try:
+                agent._memory_pressure_review_ratio = float(
+                    mem_config.get("pressure_review_ratio", 0.9)
+                )
+            except (TypeError, ValueError):
+                agent._memory_pressure_review_ratio = 0.9
             if agent._memory_enabled or agent._user_profile_enabled:
                 from tools.memory_tool import MemoryStore
                 agent._memory_store = MemoryStore(

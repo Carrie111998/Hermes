@@ -1358,6 +1358,23 @@ def spawn_background_review_thread(
             f"{focus}"
         )
 
+    # Memory-pressure steering: when the trigger that fired this review was a
+    # near-full memory store (turn_context sets ``_memory_pressure_focus``),
+    # tell the fork up front so it prioritizes consolidation over new saves.
+    # Consumed once — cleared here so a later interval-triggered review does
+    # not repeat a stale pressure line.
+    pressure_focus = getattr(agent, "_memory_pressure_focus", None)
+    if review_memory and isinstance(pressure_focus, str) and pressure_focus.strip():
+        agent._memory_pressure_focus = None
+        prompt = (
+            f"{prompt}\n\n"
+            f"MEMORY PRESSURE: {pressure_focus}. This review fired early "
+            f"because the store is nearly full. Prioritize consolidating "
+            f"existing entries — merge overlapping facts, drop stale or "
+            f"superseded ones — over adding new content. Free enough room "
+            f"that the next save does not hit the hard cap."
+        )
+
     def _target() -> None:
         _run_review_in_thread(agent, messages_snapshot, prompt, task_cfg)
 

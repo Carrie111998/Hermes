@@ -1853,6 +1853,13 @@ DEFAULT_CONFIG = {
         "write_approval": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        # Fire the background memory review EARLY when a store reaches this
+        # fill ratio (0.9 = 90%), steering the fork toward consolidation so
+        # writes never slam into the hard cap. 0 disables the pressure
+        # trigger (interval-based review still runs). Ported from
+        # code-yeongyu/oh-my-openagent's memory-pressure surfacing, adapted
+        # to the background-review fork (prefix-cache safe).
+        "pressure_review_ratio": 0.9,
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".
