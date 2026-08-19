@@ -4547,6 +4547,93 @@ def test_prompt_submit_expected_stored_session_id_accepts_compression_parent(mon
         server._sessions.pop("runtime-tip", None)
 
 
+def test_prompt_submit_session_lineage_failure_is_retryable_without_mutation(monkeypatch):
+    """A failed lineage read is temporary, not proof of a destination mismatch."""
+    history = [{"role": "user", "content": "before"}]
+    session = _session(session_key="continuation-tip", history=list(history))
+    server._sessions["runtime-tip"] = session
+
+    class _BrokenDb:
+        def resolve_resume_session_id(self, _session_id):
+            raise RuntimeError("lineage database unavailable")
+
+    monkeypatch.setattr(server, "_get_db", lambda: _BrokenDb())
+    monkeypatch.setattr(
+        server,
+        "_claim_prompt_submit_intent",
+        lambda *_args, **_kwargs: pytest.fail("must not claim client intent"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_start_inflight_turn",
+        lambda *_args, **_kwargs: pytest.fail("must not start inflight turn"),
+    )
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "lineage-unavailable",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "runtime-tip",
+                    "expected_stored_session_id": "lineage-root",
+                    "client_request_id": "lineage-intent",
+                    "text": "continue",
+                },
+            }
+        )
+
+        assert response["error"] == {
+            "code": 4022,
+            "message": "stored session lineage is temporarily unavailable; retry later",
+        }
+        assert session["history"] == history
+        assert session["running"] is False
+    finally:
+        server._sessions.pop("runtime-tip", None)
+
+
+def test_prompt_submit_unavailable_ledger_returns_temporary_error(monkeypatch):
+    """The first idempotent submit opens the ledger without making import fatal."""
+    history = [{"role": "user", "content": "before"}]
+    session = _session(session_key="stored-a", history=list(history))
+    server._sessions["runtime-a"] = session
+    monkeypatch.setattr(server, "_prompt_intents", None)
+
+    def _unavailable_ledger(**_kwargs):
+        raise PermissionError("state directory is read-only")
+
+    monkeypatch.setattr(server, "PromptIntentLedger", _unavailable_ledger)
+    monkeypatch.setattr(
+        server,
+        "_start_inflight_turn",
+        lambda *_args, **_kwargs: pytest.fail("must not start inflight turn"),
+    )
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "ledger-unavailable",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "runtime-a",
+                    "expected_stored_session_id": "stored-a",
+                    "client_request_id": "unavailable-ledger-intent",
+                    "text": "hello",
+                },
+            }
+        )
+
+        assert response["error"] == {
+            "code": 4022,
+            "message": "prompt idempotency is temporarily unavailable; retry later",
+        }
+        assert session["history"] == history
+        assert session["running"] is False
+    finally:
+        server._sessions.pop("runtime-a", None)
+
+
 def test_prompt_submit_expected_stored_session_id_uses_profile_database(monkeypatch, tmp_path):
     """Continuation resolution must use the live session's profile state.db."""
     from hermes_state import SessionDB
@@ -4649,7 +4736,7 @@ def test_prompt_submit_deduplicates_lost_ack_retry_within_stored_session(
     monkeypatch.setattr(server, "_prompt_intents", ledger)
     counts = {"build": 0, "execute": 0, "inflight": 0, "persist": 0, "seed": 0}
 
-    def _run_once(_rid, _sid, live_session, _text):
+    def _run_once(_rid, _sid, live_session, _text, **_kwargs):
         counts["execute"] += 1
         live_session["running"] = False
 

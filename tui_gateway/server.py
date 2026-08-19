@@ -1229,10 +1229,10 @@ _REAPER_SCAN_S = 300.0
 
 # Accepted prompt intents outlive any one ephemeral runtime session id, so a
 # lost-ack retry after session.resume still collapses onto the original turn.
-_prompt_intents = PromptIntentLedger(
-    db_path=_hermes_home / "state" / "prompt_intents.sqlite3",
-    session_ttl_s=_SESSION_TTL_S,
-)
+# Open the ledger on the first idempotent submit instead of at module import:
+# read-only commands must still start when HERMES_HOME is temporarily unwritable.
+_prompt_intents: PromptIntentLedger | None = None
+_prompt_intents_lock = threading.Lock()
 
 
 def _transport_is_dead(transport) -> bool:
@@ -2591,8 +2591,14 @@ def _prompt_submit_session_contract(
                     }
                     resolved_current_ids.discard("")
         except Exception:
-            logger.debug(
-                "failed to resolve prompt.submit session contract", exc_info=True
+            logger.warning(
+                "prompt.submit session contract resolution unavailable",
+                exc_info=True,
+            )
+            return _err(
+                rid,
+                4022,
+                "stored session lineage is temporarily unavailable; retry later",
             )
 
     matches = (
@@ -2618,12 +2624,24 @@ def _claim_prompt_submit_intent(
     params: dict, rid, session: dict
 ) -> dict | None:
     """Atomically reserve a client prompt intent, or return its retry result."""
+    global _prompt_intents
+
     client_request_id = str(params.get("client_request_id") or "").strip()
     if not client_request_id:
         return None
 
     try:
-        claim = _prompt_intents.claim(
+        ledger = _prompt_intents
+        if ledger is None:
+            with _prompt_intents_lock:
+                ledger = _prompt_intents
+                if ledger is None:
+                    ledger = PromptIntentLedger(
+                        db_path=_hermes_home / "state" / "prompt_intents.sqlite3",
+                        session_ttl_s=_SESSION_TTL_S,
+                    )
+                    _prompt_intents = ledger
+        claim = ledger.claim(
             profile_scope=str(session.get("profile_home") or get_hermes_home()),
             request_id=client_request_id,
             route_identity=(
@@ -2636,7 +2654,7 @@ def _claim_prompt_submit_intent(
             text=params.get("text"),
             truncate_ordinal=params.get("truncate_before_user_ordinal"),
         )
-    except sqlite3.Error:
+    except (OSError, sqlite3.Error):
         logger.warning("prompt intent ledger unavailable", exc_info=True)
         return _err(
             rid,
@@ -2693,7 +2711,10 @@ def _claim_prompt_submit_intent(
 
 def _abort_prompt_submit_intent(params: dict, session: dict) -> None:
     """Release an accepted intent when setup failed before agent execution."""
-    _prompt_intents.abort(
+    ledger = _prompt_intents
+    if ledger is None:
+        return
+    ledger.abort(
         profile_scope=str(session.get("profile_home") or get_hermes_home()),
         request_id=str(params.get("client_request_id") or ""),
     )
