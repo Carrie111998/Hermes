@@ -6101,10 +6101,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # active_count() iterates an in-memory records dict under a lock —
         # cheap and only counts records still in the "running" state.
         try:
-            from tools.async_delegation import active_count as _async_active_count
+            from tools.async_delegation import active_count as _async_active_count, list_async_delegations
             snapshot["active_background_subagents"] = _async_active_count()
+            
+            # Extract names of currently running subagents
+            active_dels = list_async_delegations()
+            running_names = []
+            for d in active_dels:
+                if d.get("status") in ("running", "stalling", "finalizing"):
+                    # Check task definitions or goals
+                    tasks = d.get("tasks", [])
+                    for t in tasks:
+                        t_name = t.get("agent") or t.get("name")
+                        if t_name and t_name not in running_names:
+                            running_names.append(t_name)
+                    if not tasks and d.get("agent"):
+                        running_names.append(d["agent"])
+            if running_names:
+                snapshot["subagents_label"] = "🤖 " + ", ".join(running_names) + " ●"
+            else:
+                snapshot["subagents_label"] = ""
         except Exception:
-            pass
+            snapshot["subagents_label"] = ""
 
         # Standing /goal state (Ralph loop). GoalManager is cached on self and
         # keeps its state in memory, so this is a cheap attribute read — no DB
@@ -6953,7 +6971,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         frags.append(("class:status-bar-strong", f"⚙ {bg_proc_count}"))
                     if bg_subagent_count:
                         frags.append(("class:status-bar-dim", " · "))
-                        frags.append(("class:status-bar-strong", f"⛓ {bg_subagent_count}"))
+                        if snapshot.get("subagents_label"):
+                            frags.append(("class:status-bar-accent", snapshot["subagents_label"]))
+                        else:
+                            frags.append(("class:status-bar-strong", f"⛓ {bg_subagent_count}"))
                     if goal_segment:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-strong", goal_segment))
@@ -6973,6 +6994,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if yolo_active:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
+                    if snapshot.get("cwd_label"):
+                        frags.append(("class:status-bar-dim", " · "))
+                        frags.append(("class:status-bar-strong", snapshot["cwd_label"]))
                     frags.append(("class:status-bar", " "))
                 else:
                     if snapshot["context_length"]:
@@ -7008,7 +7032,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         frags.append(("class:status-bar-strong", f"⚙ {bg_proc_count}"))
                     if bg_subagent_count:
                         frags.append(("class:status-bar-dim", " │ "))
-                        frags.append(("class:status-bar-strong", f"⛓ {bg_subagent_count}"))
+                        if snapshot.get("subagents_label"):
+                            frags.append(("class:status-bar-accent", snapshot["subagents_label"]))
+                        else:
+                            frags.append(("class:status-bar-strong", f"⛓ {bg_subagent_count}"))
                     if goal_segment:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-strong", goal_segment))
