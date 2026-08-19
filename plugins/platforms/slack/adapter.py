@@ -5775,6 +5775,34 @@ class SlackAdapter(BasePlatformAdapter):
             if not isinstance(updated_message, dict):
                 return
 
+            # A bot/app-authored root whose EDIT did not change the visible text
+            # must never wake the agent. Some integrations (e.g. an escalation
+            # poster syncing ticket status/fields) periodically edit their own
+            # root messages; each edit arrives as message_changed and, when
+            # unwrapped below into a normal inbound, is fed to the model as a
+            # fresh message that re-answers an already-handled thread. Drop the
+            # event when (a) the edited message is bot/app-authored AND (b) the
+            # body text is byte-identical to previous_message. Human edits that
+            # add an @mention change the text, so they still wake the agent.
+            prev_message = event.get("previous_message")
+            updated_is_bot = bool(
+                updated_message.get("bot_id")
+                or updated_message.get("app_id")
+                or updated_message.get("subtype") == "bot_message"
+            )
+            if updated_is_bot and isinstance(prev_message, dict):
+                if (updated_message.get("text") or "") == (
+                    prev_message.get("text") or ""
+                ):
+                    logger.info(
+                        "[Slack] Dropping bot metadata-only edit "
+                        "(message_changed, bot-authored, text-unchanged): "
+                        "webchat=%s ts=%s",
+                        event.get("channel", ""),
+                        str(updated_message.get("ts") or ""),
+                    )
+                    return
+
             original_message_ts = str(updated_message.get("ts") or "")
             if (
                 original_message_ts
