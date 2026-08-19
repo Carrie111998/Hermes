@@ -2340,19 +2340,21 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
                 "schema surgery to avoid racing it"
             )
             return report
-        # Re-apply the configured journal mode after surgery (#89674): every
-        # repair strategy below rewrites the file in place, and a rebuilt
-        # SQLite file comes back in the default journal mode (delete) —
-        # silently moving a WAL store out of WAL with nothing in the logs
-        # recording the flip. The open-time WAL-reset gate never sees this
-        # flip because it happens inside the repair path (distinct from the
-        # open-time flip #89393 warns about). The canonical
-        # database.journal_mode setting is the target — probing the DAMAGED
-        # file cannot be trusted, since the corruption itself is what drops
-        # the WAL bit from the header.
+        # Re-apply the journal mode after surgery (#89674): every repair
+        # strategy below rewrites the file in place, and a rebuilt SQLite
+        # file comes back in the default journal mode (delete) — silently
+        # moving a WAL store out of WAL with nothing in the logs recording
+        # the flip. The open-time WAL-reset gate never sees this flip
+        # because it happens inside the repair path (distinct from the
+        # open-time flip #89393 warns about). Probe the mode BEFORE surgery
+        # so the WARNING can name what the file actually ran as; a probe of
+        # the damaged file may fail, in which case the canonical
+        # database.journal_mode setting is the restore target.
+        before_mode = _probe_journal_mode_for_repair(db_path)
         result = _repair_state_db_schema_locked(db_path, backup=backup, report=report)
         if result.get("repaired"):
-            _restore_journal_mode_after_repair(db_path, resolve_journal_mode())
+            result["journal_mode_before"] = before_mode
+            _restore_journal_mode_after_repair(db_path, before_mode)
         # Persist the outcome AFTER surgery, keyed on the post-attempt
         # fingerprint — that is the file state the NEXT attempt's exhaustion
         # probe will observe. Failures count toward the cross-restart cap;
@@ -2364,8 +2366,26 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         return result
 
 
-def _restore_journal_mode_after_repair(db_path: Path, target_mode: str) -> None:
-    """Re-apply the configured journal mode after schema surgery (#89674).
+def _probe_journal_mode_for_repair(db_path: Path) -> Optional[str]:
+    """Best-effort journal-mode probe for a (possibly malformed) DB file.
+
+    Returns the on-disk mode (``wal``/``delete``), or ``None`` when the file
+    cannot be opened or probed — a malformed header or a concurrent opener's
+    locks are both expected on the repair path. Callers fall back to the
+    configured ``database.journal_mode`` for ``None``.
+    """
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            return _on_disk_journal_mode(conn)
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError):
+        return None
+
+
+def _restore_journal_mode_after_repair(db_path: Path, before_mode: Optional[str]) -> None:
+    """Re-apply the journal mode after schema surgery (#89674).
 
     A repaired/rebuilt SQLite file comes back in the default journal mode
     (delete). Without this restore, a corruption event deterministically
@@ -2374,54 +2394,35 @@ def _restore_journal_mode_after_repair(db_path: Path, target_mode: str) -> None:
     inside the repair path, not at open (the open-time flip #89393 warns
     about is a different door).
 
+    The restore runs through :func:`apply_wal_with_fallback` — the canonical
+    journal-mode path — rather than issuing a switch pragma directly, so it
+    inherits the vulnerable-SQLite WAL-reset gate (a rebuilt file IS a new
+    database: on a vulnerable runtime the gate deliberately keeps it in
+    DELETE, and "restore could not reach WAL" there is the expected outcome,
+    not a failure), the macOS-NFS silent-refusal handling, and the WAL
+    companions (size limit, checkpoint barrier, synchronous=FULL) that the
+    front door applies. ``before_mode`` is the pre-surgery probe (None when
+    the damaged file could not be probed) and is only used for the log
+    comparison — the restore target itself is whatever the canonical path
+    resolves from ``database.journal_mode``.
+
     Best-effort by design: the repair itself already succeeded, so failures
-    to re-apply are logged at WARNING naming the modes and the
-    ``database.journal_mode`` config key, never raised. The switch goes
-    through :func:`_set_journal_mode_no_wait` so a concurrent opener's locks
-    abort the flip instead of sneaking it between transactions — the same
-    exclusivity rule every other journal-mode switch in this module follows.
+    to re-apply are logged at WARNING, never raised.
     """
     try:
         conn = sqlite3.connect(str(db_path))
         try:
-            post_mode = _on_disk_journal_mode(conn)
-            if post_mode == target_mode:
-                return
-            if post_mode is None:
-                logger.warning(
-                    "state.db repair at %s: journal mode could not be probed "
-                    "after surgery (target %r from database.journal_mode); "
-                    "verify with PRAGMA journal_mode on the next open",
-                    db_path, target_mode,
-                )
-                return
-            try:
-                actual = _set_journal_mode_no_wait(conn, target_mode)
-            except sqlite3.OperationalError as exc:
-                logger.warning(
-                    "state.db repair at %s: journal_mode %r -> %r could not "
-                    "be restored (%s); the database is left in %r — reissue "
-                    "the pragma or reopen to apply database.journal_mode",
-                    db_path, post_mode, target_mode, exc, post_mode,
-                )
-                return
-            if actual != target_mode:
-                logger.warning(
-                    "state.db repair at %s: journal_mode %r -> %r was not "
-                    "accepted (SQLite reported %r); the database is left in "
-                    "%r — reissue the pragma or reopen to apply "
-                    "database.journal_mode",
-                    db_path, post_mode, target_mode, actual or "no result",
-                    post_mode,
-                )
-                return
-            logger.warning(
-                "state.db repair changed journal_mode %r -> %r; restored "
-                "%r (per database.journal_mode)",
-                post_mode, target_mode, actual,
-            )
+            after = apply_wal_with_fallback(conn, db_label=db_path.name)
         finally:
             conn.close()
+        if before_mode and after != before_mode:
+            logger.warning(
+                "state.db repair changed journal_mode %r -> %r "
+                "(pre-surgery probe %r; restore resolved through "
+                "apply_wal_with_fallback per database.journal_mode and the "
+                "WAL-reset gate)",
+                before_mode, after, before_mode,
+            )
     except (sqlite3.Error, OSError) as exc:
         logger.warning(
             "state.db repair at %s: post-surgery journal-mode restore "
