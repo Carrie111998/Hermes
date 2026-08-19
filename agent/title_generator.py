@@ -282,6 +282,19 @@ def derive_title(user_message: str) -> Optional[str]:
     return line or None
 
 
+def _is_response_format_unsupported(exc: BaseException) -> bool:
+    """True when the upstream rejected the structured-output format itself.
+
+    Some OpenAI-compatible upstreams (Console Go / opencode-go) answer any
+    ``response_format`` with a 400 (``This response_format type is unavailable
+    now``) before the model is even called. Retrying without it is safe
+    because title extraction already falls back to a loose JSON scan of the
+    plain ``{"title": ...}`` response; any other error must not be swallowed.
+    """
+    message = str(exc)
+    return "response_format" in message and "unavailable" in message
+
+
 def _extract_title_text(content: str) -> str:
     """Pull the title out of a model response.
 
@@ -400,17 +413,38 @@ def generate_title(
     ]
 
     try:
-        response = call_llm(
-            task="title_generation",
-            messages=messages,
-            # A title is a handful of tokens. The old 500-token ceiling let a
-            # chatty model burn seconds generating prose we then threw away.
-            max_tokens=64,
-            temperature=0.3,
-            timeout=timeout,
-            main_runtime=main_runtime,
-            extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
-        )
+        try:
+            response = call_llm(
+                task="title_generation",
+                messages=messages,
+                # A title is a handful of tokens. The old 500-token ceiling let a
+                # chatty model burn seconds generating prose we then threw away.
+                max_tokens=64,
+                temperature=0.3,
+                timeout=timeout,
+                main_runtime=main_runtime,
+                extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
+            )
+        except Exception as first_error:
+            # Some OpenAI-compatible upstreams (e.g. Console Go / opencode-go)
+            # reject json_schema response_format outright with a 400 before the
+            # model is ever called. Retry once without it: extraction already
+            # falls back to a loose JSON scan, so the structured-output
+            # constraint is a nicety, not a requirement.
+            if not _is_response_format_unsupported(first_error):
+                raise
+            logger.debug(
+                "Title upstream rejected response_format; retrying without it: %s",
+                first_error,
+            )
+            response = call_llm(
+                task="title_generation",
+                messages=messages,
+                max_tokens=64,
+                temperature=0.3,
+                timeout=timeout,
+                main_runtime=main_runtime,
+            )
         content = response.choices[0].message.content or ""
         title = _clean_title(_extract_title_text(content))
         # Answer-shaped output guard: titling is a 3-7 word task, so a title

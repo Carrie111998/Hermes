@@ -2721,6 +2721,38 @@ class TestAnthropicAuxiliaryReasoningTranslation:
         )
         assert "_reasoning_config" not in openai_wire_kwargs
 
+    def test_build_call_kwargs_strips_response_format_on_anthropic_wire(self):
+        """Anthropic Messages has no ``response_format``; a retry/fallback rebuilt
+        through this shared builder must not forward it verbatim (#83390)."""
+        rf = {"type": "json_schema", "json_schema": {"name": "t"}}
+
+        anthropic_kwargs = _build_call_kwargs(
+            "anthropic",
+            "claude-fable-5",
+            [{"role": "user", "content": "hi"}],
+            extra_body={"response_format": rf},
+            base_url="https://api.anthropic.com/v1",
+        )
+        assert "response_format" not in anthropic_kwargs.get("extra_body", {})
+
+        proxy_kwargs = _build_call_kwargs(
+            "custom",
+            "claude-fable-5",
+            [{"role": "user", "content": "hi"}],
+            extra_body={"response_format": rf},
+            base_url="https://example.test/anthropic/v1",
+        )
+        assert "response_format" not in proxy_kwargs.get("extra_body", {})
+
+        openai_kwargs = _build_call_kwargs(
+            "custom",
+            "gpt-compatible",
+            [{"role": "user", "content": "hi"}],
+            extra_body={"response_format": rf},
+            base_url="https://example.test/v1",
+        )
+        assert openai_kwargs["extra_body"]["response_format"] == rf
+
 
 class TestAuxiliaryProviderProfileReasoning:
     """Auxiliary calls must reuse provider-profile reasoning wire shapes."""

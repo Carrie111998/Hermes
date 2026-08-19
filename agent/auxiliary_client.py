@@ -8678,6 +8678,26 @@ def _build_call_kwargs(
                 sticky_key = None
             if sticky_key:
                 merged_extra["session_id"] = sticky_key
+    # Providers whose wire is Anthropic Messages have no ``response_format``
+    # field. The native adapter translates it into ``output_config.format`` on
+    # the direct path (build_anthropic_kwargs), but retry / fallback routes
+    # that rebuild their request through this shared builder would otherwise
+    # forward the raw field verbatim and get a hard 400 ("Extra inputs are not
+    # permitted") the moment a payment/auth fallback fires. Strip it here so a
+    # fallback onto an Anthropic-compatible endpoint can't 400 #83390.
+    if merged_extra and "response_format" in merged_extra:
+        _is_anthropic_wire = (
+            _provider_for_portal == "anthropic"
+            or _endpoint_speaks_anthropic_messages(effective_base)
+            or _is_anthropic_compat_endpoint(_provider_for_portal, effective_base)
+        )
+        if _is_anthropic_wire:
+            merged_extra.pop("response_format", None)
+            logger.debug(
+                "_build_call_kwargs: stripped response_format for Anthropic wire "
+                "(provider=%s base_url=%s)",
+                provider, effective_base,
+            )
     if merged_extra:
         kwargs["extra_body"] = merged_extra
 
