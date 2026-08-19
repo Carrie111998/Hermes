@@ -56,10 +56,32 @@ def _seed_prior_run(conn, task_id: str, *, outcome: str = "reclaimed") -> None:
 class FakeRemoko(sup.RemokoClient):
     def __init__(self) -> None:
         self.calls: list[dict] = []
+        self.requests: dict[str, dict] = {}
 
     def request(self, payload: dict) -> dict:
+        rid = f"rk-{len(self.calls) + 1}"
+        rec = {
+            "request_id": rid,
+            "id": rid,
+            "external_id": payload.get("external_id"),
+            "status": "pending",
+            "answer": None,
+            "choices": list(payload.get("choices") or []),
+        }
         self.calls.append(payload)
-        return {"request_id": f"rk-{len(self.calls)}", "id": f"rk-{len(self.calls)}"}
+        self.requests[rid] = rec
+        return {"request_id": rid, "id": rid}
+
+    def get_request(self, request_id: str) -> dict:
+        rec = self.requests.get(str(request_id))
+        if rec is None:
+            return {}
+        return dict(rec)
+
+    def answer(self, request_id: str, answer: str) -> None:
+        rec = self.requests[str(request_id)]
+        rec["status"] = "answered"
+        rec["answer"] = answer
 
 
 def test_never_run_ready_child_with_pr_comment_is_dispatchable(
@@ -337,6 +359,9 @@ def test_typed_owner_blocker_one_remoko_revalidate_resume_complete(
         # Duplicate tick must not send a second Remoko card.
         sup.supervise_once(conn, remoko=remoko)
         assert len(remoko.calls) == 1
+        obj = sup.get_objective(conn, oid)
+        assert obj is not None
+        remoko.answer(obj["remoko_request_id"], "Update existing PR")
         reported: list[dict] = []
 
         def _report(**kwargs):
@@ -349,6 +374,7 @@ def test_typed_owner_blocker_one_remoko_revalidate_resume_complete(
             answer="Update existing PR",
             expected_external_id=ext,
             report_execution=_report,
+            remoko=remoko,
         )
         assert ok is True
         assert reported and reported[0]["status"] == "accepted"
@@ -357,6 +383,7 @@ def test_typed_owner_blocker_one_remoko_revalidate_resume_complete(
             objective_id=oid,
             answer="Update existing PR",
             expected_external_id="obj-other-key",
+            remoko=remoko,
         )
         kb.complete_task(conn, child, summary="updated existing PR")
         kb.complete_task(conn, root, summary="root done")
@@ -571,16 +598,83 @@ def test_resume_requires_persisted_request_and_known_choice(kanban_home):
         ext = remoko.calls[0]["external_id"]
         assert not sup.revalidate_owner_answer(
             conn, objective_id=oid, answer="not a choice",
-            expected_external_id=ext,
+            expected_external_id=ext, remoko=remoko,
         )
         assert not sup.resume_after_owner_answer(
             conn, objective_id=oid, task_id=root,
-            answer="Wait", expected_external_id=ext,
+            answer="Wait", expected_external_id=ext, remoko=remoko,
+        )
+        remoko.answer(rid, "Update existing PR")
+        assert sup.resume_after_owner_answer(
+            conn, objective_id=oid, task_id=root,
+            answer="Update existing PR", expected_external_id=ext, remoko=remoko,
+        )
+
+
+def test_resume_requires_live_remoko_owner_answer(kanban_home):
+    remoko = FakeRemoko()
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root", assignee="default")
+        oid = sup.ensure_objective(conn, root)
+        rid = sup.request_owner_blocker(
+            conn, objective_id=oid, task_id=root,
+            decision_key="active_pr_starvation",
+            purpose="stuck",
+            choices=["Update existing PR", "Open a new PR", "Leave it parked", "Wait"],
+            remoko=remoko,
+        )
+        ext = remoko.calls[0]["external_id"]
+        assert remoko.get_request(rid)["status"] == "pending"
+        assert not sup.revalidate_owner_answer(
+            conn, objective_id=oid, answer="Update existing PR",
+            expected_external_id=ext, remoko=remoko,
+        )
+        assert not sup.resume_after_owner_answer(
+            conn, objective_id=oid, task_id=root,
+            answer="Update existing PR", expected_external_id=ext, remoko=remoko,
+        )
+        remoko.answer(rid, "Update existing PR")
+        assert sup.revalidate_owner_answer(
+            conn, objective_id=oid, answer="Update existing PR",
+            expected_external_id=ext, remoko=remoko,
         )
         assert sup.resume_after_owner_answer(
             conn, objective_id=oid, task_id=root,
-            answer="Update existing PR", expected_external_id=ext,
+            answer="Update existing PR", expected_external_id=ext, remoko=remoko,
         )
+
+
+def test_concurrent_ticks_create_one_remoko_request(kanban_home):
+    import threading
+
+    remoko = FakeRemoko()
+    results: list[str | None] = []
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root", assignee="default")
+        oid = sup.ensure_objective(conn, root)
+
+    def worker():
+        with kb.connect() as conn:
+            results.append(
+                sup.request_owner_blocker(
+                    conn, objective_id=oid, task_id=root,
+                    decision_key="active_pr_starvation",
+                    purpose="stuck", remoko=remoko,
+                )
+            )
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    sent = [rid for rid in results if rid]
+    assert len(remoko.calls) == 1
+    assert len(set(sent)) == 1
+    with kb.connect() as conn:
+        obj = sup.get_objective(conn, oid)
+        assert obj is not None
+        assert obj["remoko_request_id"] == sent[0]
 
 
 def test_failed_unit_does_not_complete_objective(kanban_home):

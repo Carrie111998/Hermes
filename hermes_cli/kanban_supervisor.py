@@ -1118,6 +1118,46 @@ class RemokoClient:
     def request(self, payload: dict) -> dict:
         raise NotImplementedError
 
+    def get_request(self, request_id: str) -> dict:
+        raise NotImplementedError
+
+
+def _unwrap_remoko_payload(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    content = raw.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if item.get("type") == "text" and isinstance(text, str) and text.strip():
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    continue
+                if isinstance(parsed, dict):
+                    return parsed
+    result = raw.get("result")
+    if isinstance(result, dict):
+        nested = _unwrap_remoko_payload(result)
+        return nested or result
+    return raw
+
+
+def _live_owner_answer(raw: Any) -> Optional[str]:
+    data = _unwrap_remoko_payload(raw)
+    status = str(data.get("status") or data.get("state") or "").strip().lower()
+    if status in {"pending", "waiting", "open", "unanswered", "cancelled", "canceled", "expired"}:
+        return None
+    for key in ("answer", "choice", "selected", "user_response", "response"):
+        value = data.get(key)
+        if isinstance(value, list) and value:
+            value = value[0]
+        if value not in {None, ""}:
+            return str(value)
+    return None
+
 
 def _live_remoko_client() -> Optional[RemokoClient]:
     """Use the live Remoko MCP surface when importable. Never invent an inbox."""
@@ -1140,7 +1180,30 @@ def _live_remoko_client() -> Optional[RemokoClient]:
                 return result
             return {"raw": result}
 
+        def get_request(self, request_id: str) -> dict:
+            result = call_mcp_tool("mcp__remoko__get_response", {"request_id": request_id})
+            if isinstance(result, dict):
+                return result
+            return {"raw": result}
+
     return _McpRemoko()
+
+
+def _existing_remoko_request_id(
+    conn: sqlite3.Connection, obj: dict[str, Any], external_id: str
+) -> Optional[str]:
+    if obj.get("remoko_external_id") == external_id and obj.get("remoko_request_id"):
+        return str(obj["remoko_request_id"])
+    return None
+
+
+def _delete_supervisor_event(conn: sqlite3.Connection, event_key: str) -> None:
+    if not _table_exists(conn, "kanban_supervisor_events"):
+        return
+    conn.execute(
+        "DELETE FROM kanban_supervisor_events WHERE event_key = ?",
+        (event_key,),
+    )
 
 
 def request_owner_blocker(
@@ -1158,16 +1221,41 @@ def request_owner_blocker(
     remoko: Optional[RemokoClient] = None,
 ) -> Optional[str]:
     """Exactly one deduplicated Remoko request per objective+decision_key."""
+    from hermes_cli.kanban_db import _append_event, block_task, write_txn
+
     ensure_supervisor_tables(conn)
     obj = get_objective(conn, objective_id)
     if obj is None:
         return None
     external_id = f"obj-{objective_id}-{decision_key}"
-    if obj.get("remoko_external_id") == external_id and obj.get("remoko_request_id"):
-        return str(obj["remoko_request_id"])
     event_key = f"remoko:{objective_id}:{decision_key}"
-    if _supervisor_event_seen(conn, event_key) and obj.get("remoko_request_id"):
-        return str(obj["remoko_request_id"])
+    existing = _existing_remoko_request_id(conn, obj, external_id)
+    if existing:
+        return existing
+    with write_txn(conn, allow_nested=True):
+        obj = get_objective(conn, objective_id)
+        if obj is None:
+            return None
+        existing = _existing_remoko_request_id(conn, obj, external_id)
+        if existing:
+            return existing
+        if _supervisor_event_seen(conn, event_key):
+            return _existing_remoko_request_id(conn, obj, external_id)
+        claimed = _record_supervisor_event(
+            conn,
+            event_key=event_key,
+            kind="owner_blocker",
+            task_id=task_id,
+            objective_id=objective_id,
+            payload={
+                "external_id": external_id,
+                "decision_key": decision_key,
+                "status": "reserving",
+                "choices": list(choices or [])[:4],
+            },
+        )
+        if not claimed:
+            return _existing_remoko_request_id(conn, obj, external_id)
 
     payload = {
         "question": purpose[:200],
@@ -1186,52 +1274,64 @@ def request_owner_blocker(
     client = remoko if remoko is not None else _live_remoko_client()
     if client is None:
         logger.warning("remoko unavailable; not fabricating request id for %s", external_id)
+        with write_txn(conn, allow_nested=True):
+            _delete_supervisor_event(conn, event_key)
         return None
     try:
         result = client.request(payload)
     except Exception:
         logger.warning("remoko request failed for %s", external_id, exc_info=True)
+        with write_txn(conn, allow_nested=True):
+            _delete_supervisor_event(conn, event_key)
         return None
     request_id = str((result or {}).get("request_id") or (result or {}).get("id") or "")
     if not request_id or request_id == external_id:
         logger.warning("remoko returned no real request_id for %s", external_id)
+        with write_txn(conn, allow_nested=True):
+            _delete_supervisor_event(conn, event_key)
         return None
 
-    _record_supervisor_event(
-        conn,
-        event_key=event_key,
-        kind="owner_blocker",
-        task_id=task_id,
-        objective_id=objective_id,
-        payload={
-            "external_id": external_id,
-            "decision_key": decision_key,
-            "request_id": request_id,
-            "choices": list(choices or [])[:4],
-        },
-    )
-    conn.execute(
-        """
-        UPDATE kanban_objectives
-           SET remoko_request_id = ?, remoko_external_id = ?,
-               status = 'blocked_owner', updated_at = ?
-         WHERE id = ?
-        """,
-        (request_id, external_id, _now(), objective_id),
-    )
-    from hermes_cli.kanban_db import _append_event, block_task
-
-    _append_event(
-        conn,
-        task_id,
-        "owner_blocker",
-        {
-            "objective_id": objective_id,
-            "external_id": external_id,
-            "request_id": request_id,
-            "decision_key": decision_key,
-        },
-    )
+    with write_txn(conn, allow_nested=True):
+        conn.execute(
+            """
+            UPDATE kanban_supervisor_events
+               SET payload = ?
+             WHERE event_key = ?
+            """,
+            (
+                json.dumps(
+                    {
+                        "external_id": external_id,
+                        "decision_key": decision_key,
+                        "request_id": request_id,
+                        "status": "sent",
+                        "choices": list(choices or [])[:4],
+                    },
+                    ensure_ascii=False,
+                ),
+                event_key,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE kanban_objectives
+               SET remoko_request_id = ?, remoko_external_id = ?,
+                   status = 'blocked_owner', updated_at = ?
+             WHERE id = ?
+            """,
+            (request_id, external_id, _now(), objective_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "owner_blocker",
+            {
+                "objective_id": objective_id,
+                "external_id": external_id,
+                "request_id": request_id,
+                "decision_key": decision_key,
+            },
+        )
     try:
         block_task(
             conn,
@@ -1252,8 +1352,9 @@ def revalidate_owner_answer(
     expected_external_id: str,
     current_head: Optional[str] = None,
     expected_head: Optional[str] = None,
+    remoko: Optional[RemokoClient] = None,
 ) -> bool:
-    """Revalidate a Remoko answer against current repo/task state."""
+    """Revalidate a Remoko answer against the live inbox and current repo/task state."""
     obj = get_objective(conn, objective_id)
     if obj is None:
         return False
@@ -1264,6 +1365,24 @@ def revalidate_owner_answer(
     if expected_head and current_head and expected_head != current_head:
         return False
     if answer in {None, ""}:
+        return False
+    client = remoko if remoko is not None else _live_remoko_client()
+    if client is None:
+        return False
+    try:
+        live_raw = client.get_request(str(obj["remoko_request_id"]))
+    except Exception:
+        logger.warning("remoko get_request failed for %s", obj.get("remoko_request_id"), exc_info=True)
+        return False
+    live = _unwrap_remoko_payload(live_raw)
+    live_ext = live.get("external_id")
+    if live_ext and live_ext != expected_external_id:
+        return False
+    live_rid = live.get("request_id") or live.get("id")
+    if live_rid and str(live_rid) != str(obj["remoko_request_id"]):
+        return False
+    live_answer = _live_owner_answer(live)
+    if live_answer is None or str(answer) != live_answer:
         return False
     choices = _owner_blocker_choices(conn, objective_id, expected_external_id)
     if choices and str(answer) not in choices:
@@ -1306,12 +1425,14 @@ def resume_after_owner_answer(
     answer: Any,
     expected_external_id: str,
     report_execution: Optional[Callable[..., Any]] = None,
+    remoko: Optional[RemokoClient] = None,
 ) -> bool:
     if not revalidate_owner_answer(
         conn,
         objective_id=objective_id,
         answer=answer,
         expected_external_id=expected_external_id,
+        remoko=remoko,
     ):
         return False
     if str(answer).strip().lower() in _PARK_ANSWERS:
