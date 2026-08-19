@@ -820,33 +820,36 @@ def _touch_stale_kill_activity(agent, elapsed: float) -> None:
 def _check_stale_giveup(agent) -> None:
     """Fail fast while open, allowing one recovery probe per cooldown."""
     _giveup = env_int("HERMES_STREAM_STALE_GIVEUP", 5)
-    _streak = _stale_streak(agent)
-    if _giveup > 0 and _streak >= _giveup:
+    if _giveup <= 0:
+        return
+    with _STALE_CIRCUIT_STATE_LOCK:
+        _streak = _stale_streak(agent)
+        if _streak < _giveup:
+            return
         now = time.monotonic()
-        with _STALE_CIRCUIT_STATE_LOCK:
-            try:
-                opened_at = float(agent._stale_circuit_opened_at)
-            except (AttributeError, TypeError, ValueError):
-                opened_at = now
-                agent._stale_circuit_opened_at = now
+        try:
+            opened_at = float(agent._stale_circuit_opened_at)
+        except (AttributeError, TypeError, ValueError):
+            opened_at = now
+            agent._stale_circuit_opened_at = now
 
-            elapsed = now - opened_at
-            if elapsed >= _STALE_CIRCUIT_RECOVERY_COOLDOWN_S:
-                # Claim this window before dispatch so concurrent calls cannot
-                # all become probes. A stale probe refreshes the timestamp in
-                # _bump_stale_streak; a successful one clears it in reset.
-                agent._stale_circuit_opened_at = now
-                logger.warning(
-                    "Stale-call circuit breaker entering half-open state after "
-                    "%.0fs; probing provider recovery.",
-                    elapsed,
-                )
-                return
-
-            retry_after = max(
-                1,
-                math.ceil(_STALE_CIRCUIT_RECOVERY_COOLDOWN_S - elapsed),
+        elapsed = now - opened_at
+        if elapsed >= _STALE_CIRCUIT_RECOVERY_COOLDOWN_S:
+            # Claim this window before dispatch so concurrent calls cannot
+            # all become probes. A stale probe refreshes the timestamp in
+            # _bump_stale_streak; a successful one clears it in reset.
+            agent._stale_circuit_opened_at = now
+            logger.warning(
+                "Stale-call circuit breaker entering half-open state after "
+                "%.0fs; probing provider recovery.",
+                elapsed,
             )
+            return
+
+        retry_after = max(
+            1,
+            math.ceil(_STALE_CIRCUIT_RECOVERY_COOLDOWN_S - elapsed),
+        )
         raise RuntimeError(
             "Provider has been unresponsive (no response received) for "
             f"{_streak} consecutive stale attempts — aborting this call to "

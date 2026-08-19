@@ -135,6 +135,43 @@ class TestStreamStaleCircuitBreaker:
         agent._anthropic_client.messages.stream.assert_called_once()
         assert agent._consecutive_stale_streams == 0
 
+    def test_guard_reads_streak_under_state_lock(self, monkeypatch):
+        """A concurrent success reset cannot land after the guard snapshots
+        the old streak but before it decides whether the breaker is open."""
+        import agent.chat_completion_helpers as helpers
+
+        monkeypatch.setenv("HERMES_STREAM_STALE_GIVEUP", "3")
+
+        class AuditedLock:
+            held = False
+
+            def __enter__(self):
+                self.held = True
+
+            def __exit__(self, exc_type, exc, tb):
+                self.held = False
+
+        lock = AuditedLock()
+
+        class AgentState:
+            _stale_circuit_opened_at = 100.0
+            unsafe_reads = 0
+
+            @property
+            def _consecutive_stale_streams(self):
+                if not lock.held:
+                    self.unsafe_reads += 1
+                return 3
+
+        agent = AgentState()
+        monkeypatch.setattr(helpers, "_STALE_CIRCUIT_STATE_LOCK", lock)
+        monkeypatch.setattr(helpers.time, "monotonic", lambda: 100.0)
+
+        with pytest.raises(RuntimeError, match="unresponsive"):
+            helpers._check_stale_giveup(agent)
+
+        assert agent.unsafe_reads == 0
+
     @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
     def test_success_resets_streak(self, monkeypatch):
         """A stream that completes successfully clears the consecutive-stale
