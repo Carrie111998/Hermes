@@ -26,6 +26,7 @@ from hermes_state_common import (
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_VERSION,
     _FTS_CJK_TRIGGERS,
+    _RESET_END_REASONS,
     escape_like as _escape_like,
 )
 
@@ -77,6 +78,11 @@ FROM sessions child
 LEFT JOIN sessions parent ON parent.id = child.parent_session_id
 WHERE child.id = ?
 """
+
+
+def _chunked(values: List[Any], size: int) -> List[List[Any]]:
+    """Split *values* into ``size``-bounded chunks (SQLite var-limit safety)."""
+    return [values[i:i + size] for i in range(0, len(values), size)]
 
 
 def _lineage_markers(
@@ -2545,6 +2551,220 @@ class SessionSearchMixin:
             node = str(parent)
             ancestors.add(node)
         return ancestors
+
+    def resolve_lineage_winners(
+        self,
+        candidates: List[Dict[str, Any]],
+        *,
+        result_limit: int = 3,
+        excluded_lineage_roots: Tuple[str, ...] = (),
+        current_session_id: Optional[str] = None,
+        work_budget: Optional[int] = None,
+        out_of_context_end_reasons: Optional[Collection[str]] = None,
+    ) -> Dict[str, Any]:
+        """Select ranked session-search winners from pre-ranked candidates.
+
+        Consumes the current-upstream ranked candidate rows produced by
+        ``search_messages()`` (already ordered by relevance/recency and
+        automation-demotion) and replaces the generic-parent ancestry walk
+        with the accepted #68 compression-continuation resolver: one
+        query-local memo/path-compression pass from candidate 1, one coherent
+        read snapshot, one work budget, fail-closed missing-parent/cycle
+        outcomes, and early-K stop.  It never rewrites the match anchor to the
+        root session.
+
+        ``candidates`` is the bounded ranked raw-hit set; each row must carry
+        at least ``id`` (message id) and ``session_id`` (owning session).
+        Winner dedupe, current-session exclusion, and exact-title exclusion
+        share the same compression-root meaning.  ``excluded_lineage_roots``
+        are pre-resolved by the caller with the same compression-lineage
+        implementation (exact-title slot).  ``current_session_id`` is
+        re-resolved inside this snapshot with the same memo/state used for
+        candidate roots.  ``out_of_context_end_reasons`` carries the tool
+        layer's fresh-reset set so a /new-style predecessor of the current
+        session stays discoverable (#85756).
+
+        Returns ``{"winners": [...], "stats": {...}}``.  ``stats`` reports
+        ``lineage_bound_hit`` so callers can surface a B-exhausted partial
+        prefix as an explicit truncation instead of a complete top-K answer.
+        """
+        result_limit = max(0, min(int(result_limit), 100))
+        # Resolved at call time so tests / diagnostics can override the module
+        # budget with a monkeypatch (same pattern as the accepted #68
+        # implementation, which reads the module global per query).
+        if work_budget is None:
+            work_budget = _LINEAGE_WORK_BUDGET
+        else:
+            work_budget = int(work_budget)
+        excluded_roots = {
+            str(root) for root in (excluded_lineage_roots or ()) if root
+        }
+        if out_of_context_end_reasons is None:
+            out_of_context_end_reasons = frozenset(_RESET_END_REASONS) | {
+                "new_session"
+            }
+
+        state = _LineageResolutionState(work_budget)
+        winners: List[Dict[str, Any]] = []
+        seen_roots: set = set()
+
+        with self._read_ctx() as conn:
+            started_tx = not conn.in_transaction
+            if started_tx:
+                conn.execute("BEGIN")
+            try:
+                # Batched archive metadata (owner end_reason + message
+                # compacted) used only by the current-context visibility
+                # check.  These are NOT lineage-node fetches and do not count
+                # toward the work budget.
+                end_reason_by_owner: Dict[str, Any] = {}
+                compacted_by_message: Dict[int, Any] = {}
+                owners = [
+                    str(c["session_id"])
+                    for c in candidates
+                    if c.get("session_id")
+                ]
+                messages = [
+                    c["id"] for c in candidates if c.get("id") is not None
+                ]
+                for chunk in _chunked(owners, 400):
+                    marks = ",".join("?" for _ in chunk)
+                    for row in conn.execute(
+                        f"SELECT id, end_reason FROM sessions "
+                        f"WHERE id IN ({marks})",
+                        chunk,
+                    ).fetchall():
+                        end_reason_by_owner[str(row["id"])] = row["end_reason"]
+                for chunk in _chunked(messages, 400):
+                    marks = ",".join("?" for _ in chunk)
+                    for row in conn.execute(
+                        f"SELECT id, compacted FROM messages "
+                        f"WHERE id IN ({marks})",
+                        chunk,
+                    ).fetchall():
+                        compacted_by_message[row["id"]] = row["compacted"]
+
+                def _is_archived(candidate: Dict[str, Any]) -> bool:
+                    """True when a hit's content left the live context.
+
+                    Matches the tool layer's ``_session_left_live_context``
+                    plus per-message in-place compaction: a compression-ended
+                    or fresh-reset owner, or an archived message row, is no
+                    longer in anyone's active context and stays discoverable.
+                    """
+                    end_reason = end_reason_by_owner.get(
+                        str(candidate.get("session_id") or "")
+                    )
+                    return (
+                        end_reason == "compression"
+                        or end_reason in out_of_context_end_reasons
+                        or int(compacted_by_message.get(candidate.get("id")) or 0) == 1
+                    )
+
+                current_root: Optional[str] = None
+                current_ancestors: set = set()
+                if current_session_id:
+                    # Re-resolve the raw current identity inside this winner
+                    # snapshot with the SAME memo/state so current-session
+                    # exclusion and candidate dedupe share one root meaning.
+                    outcome = self._resolve_compression_lineage_on_conn(
+                        conn, str(current_session_id), state
+                    )
+                    if outcome is _BUDGET_EXHAUSTED:
+                        state.bound_hit = True
+                    elif outcome is _UNRESOLVED:
+                        # Conservative: an unresolved current session excludes
+                        # only its own id rather than broadening exclusion to
+                        # an unproven ancestor.
+                        current_root = str(current_session_id)
+                    else:
+                        current_root = outcome
+                        current_ancestors = (
+                            self._current_lineage_ancestors_on_conn(
+                                conn, str(current_session_id), state
+                            )
+                        )
+
+                # Resolve each owner exactly ONCE (lazily, on first encounter)
+                # while iterating the bounded raw hits in rank order.  Winner
+                # ordering therefore follows the rank of each owner's FIRST
+                # displayable anchor — a live current-lineage hit is skipped
+                # so a later compacted-history hit of the same owner can still
+                # surface, but it must not let that owner jump ahead of a
+                # higher-ranked displayable winner from another session.
+                owner_resolved: set = set()
+                owner_root: Dict[str, Optional[str]] = {}
+                for candidate in candidates:
+                    if len(winners) >= result_limit:
+                        break
+                    owner = str(candidate["session_id"])
+                    if owner not in owner_resolved:
+                        owner_resolved.add(owner)
+                        state.candidates_inspected += 1
+                        outcome = self._resolve_compression_lineage_on_conn(
+                            conn, owner, state
+                        )
+                        if outcome is _BUDGET_EXHAUSTED:
+                            state.bound_hit = True
+                            # Stop the entire ranked scan: the bound candidate
+                            # may have produced a higher-ranked new root than
+                            # every later candidate, so skipping it would
+                            # violate ranking.
+                            break
+                        owner_root[owner] = (
+                            outcome if outcome is not _UNRESOLVED else None
+                        )
+                    root = owner_root[owner]
+                    if root is None:
+                        continue
+                    if root in excluded_roots or root in seen_roots:
+                        continue
+                    in_current_context = (
+                        (current_root is not None and root == current_root)
+                        or owner in current_ancestors
+                    )
+                    if in_current_context and not _is_archived(candidate):
+                        # Live content of the current lineage stays hidden;
+                        # the owner's displayable anchor is a later compacted
+                        # hit, so this hit does not (yet) produce a winner.
+                        continue
+                    # First displayable hit of this owner in rank order.
+                    seen_roots.add(root)
+                    state.accepted_roots = len(seen_roots)
+                    winner = dict(candidate)
+                    winner["lineage_root_id"] = root
+                    winners.append(winner)
+
+                stats = {
+                    "candidate_count": len(candidates),
+                    "candidate_unique_sessions": len(set(owners)),
+                    "lineage_count": len(seen_roots),
+                    "winner_count": len(winners),
+                    "lineage_work": state.work,
+                    "lineage_memo_hits": state.memo_hits,
+                    "lineage_memo_entries": len(state.memo),
+                    "lineage_candidates_inspected": state.candidates_inspected,
+                    "lineage_bound_hit": state.bound_hit,
+                }
+            finally:
+                if started_tx and conn.in_transaction:
+                    conn.rollback()
+
+        logger.info(
+            "SESSION_WINNERS_LINEAGE candidates=%d unique_sessions=%d "
+            "lineage_count=%d winner_count=%d lineage_work=%d "
+            "lineage_memo_hits=%d lineage_candidates_inspected=%d "
+            "lineage_bound_hit=%s",
+            stats["candidate_count"],
+            stats["candidate_unique_sessions"],
+            stats["lineage_count"],
+            stats["winner_count"],
+            stats["lineage_work"],
+            stats["lineage_memo_hits"],
+            stats["lineage_candidates_inspected"],
+            stats["lineage_bound_hit"],
+        )
+        return {"winners": winners, "stats": stats}
 
     def search_sessions_by_id(
         self,
