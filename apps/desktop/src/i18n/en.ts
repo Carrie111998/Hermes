@@ -52,6 +52,9 @@ export const en: Translations = {
     revealInSidebar: 'Reveal in filetree',
     copyPath: 'Copy Path',
     copyRelativePath: 'Copy Relative Path',
+    download: 'Download',
+    downloadSaved: 'Saved',
+    downloadFailed: 'Download failed',
     rename: 'Rename…',
     delete: 'Delete',
     renameTitle: 'Rename',
@@ -519,11 +522,12 @@ export const en: Translations = {
       terminalFontPreview: 'Glyph preview',
       terminalFontReset: 'Use default',
       translucencyTitle: 'Window Translucency',
-      translucencyDesc: 'See your desktop through the whole window. macOS and Windows only.',
-      translucencyGlassDesc:
-        'Matte glass: the desktop shows through as a smooth blur while text stays sharp. macOS only.',
+      translucencyDesc: 'See your desktop through the whole window, text and all.',
+      translucencyGlassDesc: 'Matte glass: the desktop shows through as a smooth blur while text stays sharp.',
       translucencyModeClear: 'Clear',
       translucencyModeGlass: 'Glass',
+      translucencyTintTitle: 'Tint',
+      translucencyFadeTitle: 'Fade',
       translucencyFrostTitle: 'Frost',
       translucencyFrost: {
         'under-window': 'Deep',
@@ -2430,6 +2434,7 @@ export const en: Translations = {
       openPr: 'Open PR',
       ghMissing: 'Install the GitHub CLI (gh) and sign in to open PRs',
       agentShip: 'Ask Hermes to open PR',
+      agentShipUnavailable: "The chat that owns these changes isn't on screen.",
       agentShipPrompt:
         'Review the current changes, commit them with a clear conventional-commit message, push the branch, and open a pull request.',
       newBranch: 'New branch',
