@@ -7,16 +7,24 @@ one Remoko tap grants +90 turns, parks, or stops the work.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional, Protocol
+from typing import Any, Iterator, Mapping, Optional, Protocol
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # Windows — sidecar claim still serializes in-process.
+    _fcntl = None
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +49,9 @@ MAX_RECOMMENDED_GRANTS = 3
 BUDGET_EXHAUST_NEEDLE = "Iteration budget exhausted"
 DEFAULT_BASE_MAX_TURNS = 90
 HEADLINE = "Keep this work going?"
+SEND_CLAIM_PREFIX = "sending:"
+SEND_CLAIM_TTL_SECONDS = 30.0
+_SIDECAR_THREAD_LOCK = threading.Lock()
 
 DECISION_STATUSES = frozenset(
     {STATUS_PENDING, STATUS_GRANTED, STATUS_PARKED, STATUS_STOPPED}
@@ -646,6 +657,144 @@ def _send_card(
     return _extract_request_id(result)
 
 
+def _new_send_claim() -> str:
+    return f"{SEND_CLAIM_PREFIX}{os.getpid()}:{time.time_ns()}:{secrets.token_hex(8)}"
+
+
+def _send_claim_age_seconds(request_id: Optional[str]) -> Optional[float]:
+    rid = str(request_id or "").strip()
+    if not rid.startswith(SEND_CLAIM_PREFIX):
+        return None
+    parts = rid.split(":")
+    if len(parts) < 4:
+        return float("inf")
+    try:
+        minted_ns = int(parts[2])
+    except ValueError:
+        return float("inf")
+    return max(0.0, (time.time_ns() - minted_ns) / 1e9)
+
+
+def _has_live_request_id(request_id: Optional[str]) -> bool:
+    rid = str(request_id or "").strip()
+    return bool(rid) and _send_claim_age_seconds(rid) is None
+
+
+def _request_is_claimable(request_id: Optional[str]) -> bool:
+    """Empty or a stale sending token may be claimed. A live Remoko id may not."""
+    rid = str(request_id or "").strip()
+    if not rid:
+        return True
+    age = _send_claim_age_seconds(rid)
+    if age is None:
+        return False
+    return age >= SEND_CLAIM_TTL_SECONDS
+
+
+def _send_claimed_card(
+    remoko_client: RemokoClient,
+    card: Mapping[str, Any],
+    *,
+    task_id: str,
+    session_id: str = "",
+) -> str:
+    try:
+        return _send_card(
+            remoko_client, card, task_id=task_id, session_id=session_id
+        )
+    except Exception as exc:
+        logger.warning("remoko ask_question failed for %s: %s", task_id, exc)
+        return ""
+
+
+def _complete_or_clear_kanban_claim(
+    conn: sqlite3.Connection,
+    decision: BudgetDecision,
+    claim: str,
+    request_id: str,
+) -> None:
+    from hermes_cli import kanban_db as kb
+
+    now = _now()
+    persisted = request_id or ""
+    with kb.write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE kanban_budget_decisions
+               SET request_id = ?, updated_at = ?
+             WHERE task_id = ?
+               AND request_id = ?
+            """,
+            (persisted, now, decision.task_id, claim),
+        )
+        if cur.rowcount == 1:
+            decision.request_id = persisted or None
+            decision.updated_at = now
+            return
+        live = get_decision(conn, decision.task_id)
+        if live is not None:
+            decision.request_id = live.request_id
+            decision.status = live.status
+            decision.extra_turns = live.extra_turns
+            decision.updated_at = live.updated_at
+
+
+@contextlib.contextmanager
+def _sidecar_lock(subject_id: str) -> Iterator[None]:
+    path = _sidecar_path(subject_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    handle = open(lock_path, "a+b")
+    _SIDECAR_THREAD_LOCK.acquire()
+    try:
+        try:
+            os.chmod(lock_path, 0o600)
+        except OSError:
+            pass
+        if _fcntl is not None:
+            _fcntl.flock(handle.fileno(), _fcntl.LOCK_EX)
+        yield
+    finally:
+        if _fcntl is not None:
+            try:
+                _fcntl.flock(handle.fileno(), _fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
+        _SIDECAR_THREAD_LOCK.release()
+
+
+def _complete_or_clear_sidecar_claim(
+    subject_id: str,
+    decision: BudgetDecision,
+    claim: str,
+    request_id: str,
+) -> None:
+    with _sidecar_lock(subject_id):
+        live = load_sidecar(subject_id)
+        if live is None or live.request_id != claim:
+            if live is not None:
+                decision.request_id = live.request_id
+                decision.status = live.status
+                decision.extra_turns = live.extra_turns
+                decision.updated_at = live.updated_at
+            return
+        live.request_id = request_id or None
+        save_sidecar(live)
+        decision.request_id = live.request_id
+        decision.status = live.status
+        decision.updated_at = live.updated_at
+
+
+def _answered_choice(payload: Any) -> str:
+    if not isinstance(payload, Mapping) or payload.get("status") != "answered":
+        return ""
+    response = payload.get("response")
+    if not isinstance(response, Mapping):
+        response = payload
+    return _normalize_answer(response)
+
+
 def _park_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -718,56 +867,49 @@ def record_kanban_budget_exhausted(
 
     client = remoko_client or default_remoko_client()
     ensure_budget_decisions_table(conn)
-    existing = get_decision(conn, task_id)
     failures_before = _consecutive_failures(conn, task_id)
     now = _now()
     reason = (
         f"{BUDGET_EXHAUST_NEEDLE} ({budget_used}/{budget_max}) — "
         "task could not complete within the allowed iterations"
     )
+    claim = _new_send_claim()
+    send_card: Optional[dict[str, Any]] = None
+    decision: Optional[BudgetDecision] = None
 
-    if existing and existing.status in (
-        STATUS_PENDING,
-        STATUS_PARKED,
-        STATUS_STOPPED,
-    ):
-        if existing.status == STATUS_PENDING and not existing.request_id:
-            card = build_remoko_card(
-                task_id=task_id,
-                extensions_count=existing.extensions_count,
-                budget_used=budget_used,
-                budget_max=budget_max,
-                extra_turns=existing.extra_turns,
-            )
-            try:
-                request_id = _send_card(
-                    client,
-                    card,
+    with kb.write_txn(conn):
+        existing = get_decision(conn, task_id)
+
+        if existing and existing.status in (
+            STATUS_PENDING,
+            STATUS_PARKED,
+            STATUS_STOPPED,
+        ):
+            if existing.status == STATUS_PENDING and _request_is_claimable(
+                existing.request_id
+            ):
+                send_card = build_remoko_card(
                     task_id=task_id,
-                    session_id=session_id,
+                    extensions_count=existing.extensions_count,
+                    budget_used=budget_used,
+                    budget_max=budget_max,
+                    extra_turns=existing.extra_turns,
                 )
-            except Exception as exc:
-                logger.warning("remoko retry on pending burn failed: %s", exc)
-                request_id = ""
-            if request_id:
-                existing.request_id = request_id
-                existing.external_id = existing.external_id or card["external_id"]
-                with kb.write_txn(conn):
-                    _upsert_decision(conn, existing)
-        return existing
-
-    if (
-        existing
-        and existing.status == STATUS_GRANTED
-        and existing.policy == POLICY_EXTEND_ONCE
-    ):
-        existing.status = STATUS_PARKED
-        existing.policy = POLICY_PARK
-        existing.last_budget_burn_at = now
-        existing.external_id = existing.external_id or external_id_for(
-            task_id, existing.extensions_count
-        )
-        with kb.write_txn(conn):
+                existing.request_id = claim
+                existing.external_id = existing.external_id or send_card["external_id"]
+                _upsert_decision(conn, existing)
+            decision = existing
+        elif (
+            existing
+            and existing.status == STATUS_GRANTED
+            and existing.policy == POLICY_EXTEND_ONCE
+        ):
+            existing.status = STATUS_PARKED
+            existing.policy = POLICY_PARK
+            existing.last_budget_burn_at = now
+            existing.external_id = existing.external_id or external_id_for(
+                task_id, existing.extensions_count
+            )
             _park_task(
                 conn,
                 task_id,
@@ -787,60 +929,56 @@ def record_kanban_budget_exhausted(
                     "UPDATE tasks SET consecutive_failures = ? WHERE id = ?",
                     (failures_before, task_id),
                 )
-        return existing
-
-    extensions_count = existing.extensions_count if existing else 0
-    extra_turns = existing.extra_turns if existing else 0
-    created_at = existing.created_at if existing else now
-    card = build_remoko_card(
-        task_id=task_id,
-        extensions_count=extensions_count,
-        budget_used=budget_used,
-        budget_max=budget_max,
-        extra_turns=extra_turns,
-    )
-    decision = BudgetDecision(
-        task_id=task_id,
-        request_id="",
-        external_id=card["external_id"],
-        status=STATUS_PENDING,
-        policy="",
-        extensions_count=extensions_count,
-        extra_turns=extra_turns,
-        last_budget_burn_at=now,
-        created_at=created_at,
-        updated_at=now,
-    )
-    with kb.write_txn(conn):
-        _park_task(
-            conn,
-            task_id,
-            budget_used=budget_used,
-            budget_max=budget_max,
-            reason=reason,
-            payload={
-                "external_id": decision.external_id,
-                "consecutive_failures": failures_before,
-            },
-        )
-        _upsert_decision(conn, decision)
-        if _consecutive_failures(conn, task_id) != failures_before:
-            conn.execute(
-                "UPDATE tasks SET consecutive_failures = ? WHERE id = ?",
-                (failures_before, task_id),
+            decision = existing
+        else:
+            extensions_count = existing.extensions_count if existing else 0
+            extra_turns = existing.extra_turns if existing else 0
+            created_at = existing.created_at if existing else now
+            send_card = build_remoko_card(
+                task_id=task_id,
+                extensions_count=extensions_count,
+                budget_used=budget_used,
+                budget_max=budget_max,
+                extra_turns=extra_turns,
             )
-
-    try:
-        request_id = _send_card(
-            client, card, task_id=task_id, session_id=session_id
-        )
-    except Exception as exc:
-        logger.warning("remoko ask_question failed for %s: %s", task_id, exc)
-        request_id = ""
-    if request_id:
-        decision.request_id = request_id
-        with kb.write_txn(conn):
+            decision = BudgetDecision(
+                task_id=task_id,
+                request_id=claim,
+                external_id=send_card["external_id"],
+                status=STATUS_PENDING,
+                policy="",
+                extensions_count=extensions_count,
+                extra_turns=extra_turns,
+                last_budget_burn_at=now,
+                created_at=created_at,
+                updated_at=now,
+            )
+            _park_task(
+                conn,
+                task_id,
+                budget_used=budget_used,
+                budget_max=budget_max,
+                reason=reason,
+                payload={
+                    "external_id": decision.external_id,
+                    "consecutive_failures": failures_before,
+                },
+            )
             _upsert_decision(conn, decision)
+            if _consecutive_failures(conn, task_id) != failures_before:
+                conn.execute(
+                    "UPDATE tasks SET consecutive_failures = ? WHERE id = ?",
+                    (failures_before, task_id),
+                )
+
+    assert decision is not None
+    if send_card is None:
+        return decision
+
+    request_id = _send_claimed_card(
+        client, send_card, task_id=task_id, session_id=session_id
+    )
+    _complete_or_clear_kanban_claim(conn, decision, claim, request_id)
     return decision
 
 
@@ -853,77 +991,74 @@ def record_sidecar_budget_exhausted(
     session_id: str = "",
 ) -> BudgetDecision:
     client = remoko_client or default_remoko_client()
-    existing = load_sidecar(subject_id)
     now = _now()
-    if existing and existing.status in (
-        STATUS_PENDING,
-        STATUS_PARKED,
-        STATUS_STOPPED,
-    ):
-        if existing.status == STATUS_PENDING and not existing.request_id:
-            card = build_remoko_card(
+    claim = _new_send_claim()
+    send_card: Optional[dict[str, Any]] = None
+    decision: Optional[BudgetDecision] = None
+
+    with _sidecar_lock(subject_id):
+        existing = load_sidecar(subject_id)
+        if existing and existing.status in (
+            STATUS_PENDING,
+            STATUS_PARKED,
+            STATUS_STOPPED,
+        ):
+            if existing.status == STATUS_PENDING and _request_is_claimable(
+                existing.request_id
+            ):
+                send_card = build_remoko_card(
+                    task_id=subject_id,
+                    extensions_count=existing.extensions_count,
+                    budget_used=budget_used,
+                    budget_max=budget_max,
+                    extra_turns=existing.extra_turns,
+                )
+                existing.request_id = claim
+                existing.external_id = existing.external_id or send_card["external_id"]
+                save_sidecar(existing)
+            decision = existing
+        elif (
+            existing
+            and existing.status == STATUS_GRANTED
+            and existing.policy == POLICY_EXTEND_ONCE
+        ):
+            existing.status = STATUS_PARKED
+            existing.policy = POLICY_PARK
+            existing.last_budget_burn_at = now
+            save_sidecar(existing)
+            decision = existing
+        else:
+            extensions_count = existing.extensions_count if existing else 0
+            extra_turns = existing.extra_turns if existing else 0
+            send_card = build_remoko_card(
                 task_id=subject_id,
-                extensions_count=existing.extensions_count,
+                extensions_count=extensions_count,
                 budget_used=budget_used,
                 budget_max=budget_max,
-                extra_turns=existing.extra_turns,
+                extra_turns=extra_turns,
             )
-            try:
-                request_id = _send_card(
-                    client, card, task_id=subject_id, session_id=session_id
-                )
-            except Exception as exc:
-                logger.warning("sidecar remoko retry failed: %s", exc)
-                request_id = ""
-            if request_id:
-                existing.request_id = request_id
-                existing.external_id = existing.external_id or card["external_id"]
-                save_sidecar(existing)
-        return existing
+            decision = BudgetDecision(
+                task_id=subject_id,
+                request_id=claim,
+                external_id=send_card["external_id"],
+                status=STATUS_PENDING,
+                policy="",
+                extensions_count=extensions_count,
+                extra_turns=extra_turns,
+                last_budget_burn_at=now,
+                created_at=existing.created_at if existing else now,
+                store="sidecar",
+            )
+            save_sidecar(decision)
 
-    if (
-        existing
-        and existing.status == STATUS_GRANTED
-        and existing.policy == POLICY_EXTEND_ONCE
-    ):
-        existing.status = STATUS_PARKED
-        existing.policy = POLICY_PARK
-        existing.last_budget_burn_at = now
-        save_sidecar(existing)
-        return existing
+    assert decision is not None
+    if send_card is None:
+        return decision
 
-    extensions_count = existing.extensions_count if existing else 0
-    extra_turns = existing.extra_turns if existing else 0
-    card = build_remoko_card(
-        task_id=subject_id,
-        extensions_count=extensions_count,
-        budget_used=budget_used,
-        budget_max=budget_max,
-        extra_turns=extra_turns,
+    request_id = _send_claimed_card(
+        client, send_card, task_id=subject_id, session_id=session_id
     )
-    decision = BudgetDecision(
-        task_id=subject_id,
-        request_id="",
-        external_id=card["external_id"],
-        status=STATUS_PENDING,
-        policy="",
-        extensions_count=extensions_count,
-        extra_turns=extra_turns,
-        last_budget_burn_at=now,
-        created_at=existing.created_at if existing else now,
-        store="sidecar",
-    )
-    save_sidecar(decision)
-    try:
-        request_id = _send_card(
-            client, card, task_id=subject_id, session_id=session_id
-        )
-    except Exception as exc:
-        logger.warning("sidecar remoko ask_question failed: %s", exc)
-        request_id = ""
-    if request_id:
-        decision.request_id = request_id
-        save_sidecar(decision)
+    _complete_or_clear_sidecar_claim(subject_id, decision, claim, request_id)
     return decision
 
 
@@ -1227,7 +1362,9 @@ def reconcile_budget_keepalive(
     *,
     remoko_client: Optional[RemokoClient] = None,
 ) -> dict[str, Any]:
-    """Retry unsent pending cards. Never auto-resumes a pending/parked/stopped row."""
+    """Retry unsent pending cards and apply answered taps. Never auto-resumes."""
+    from hermes_cli import kanban_db as kb
+
     client = remoko_client or default_remoko_client()
     ensure_budget_decisions_table(conn)
     retried = 0
@@ -1238,7 +1375,9 @@ def reconcile_budget_keepalive(
     ).fetchall()
     for row in rows:
         decision = _row_to_decision(row)
-        if not decision.request_id:
+        if not _has_live_request_id(decision.request_id):
+            if not _request_is_claimable(decision.request_id):
+                continue
             card = build_remoko_card(
                 task_id=decision.task_id,
                 extensions_count=decision.extensions_count,
@@ -1247,27 +1386,28 @@ def reconcile_budget_keepalive(
                 extra_turns=decision.extra_turns,
             )
             card["external_id"] = decision.external_id or card["external_id"]
-            try:
-                request_id = _send_card(client, card, task_id=decision.task_id)
-            except Exception as exc:
-                logger.warning("reconcile remoko send failed for %s: %s", decision.task_id, exc)
-                request_id = ""
+            claim = _new_send_claim()
+            with kb.write_txn(conn):
+                live = get_decision(conn, decision.task_id)
+                if (
+                    live is None
+                    or live.status != STATUS_PENDING
+                    or not _request_is_claimable(live.request_id)
+                ):
+                    continue
+                live.request_id = claim
+                live.external_id = live.external_id or card["external_id"]
+                _upsert_decision(conn, live)
+            request_id = _send_claimed_card(client, card, task_id=decision.task_id)
+            _complete_or_clear_kanban_claim(conn, decision, claim, request_id)
             if request_id:
-                decision.request_id = request_id
-                from hermes_cli import kanban_db as kb
-
-                with kb.write_txn(conn):
-                    _upsert_decision(conn, decision)
                 retried += 1
             continue
         try:
             payload = client.get_response(request_id=decision.request_id)
         except Exception:
             continue
-        if not isinstance(payload, Mapping) or payload.get("status") != "answered":
-            continue
-        response = payload.get("response") if isinstance(payload.get("response"), Mapping) else payload
-        choice = _normalize_answer(response)
+        choice = _answered_choice(payload)
         if not choice:
             continue
         result = consume_budget_decision(
@@ -1276,15 +1416,21 @@ def reconcile_budget_keepalive(
         if result.get("ok"):
             consumed += 1
 
-    sidecar_retried = _reconcile_sidecars(client)
-    return {"retried": retried, "consumed": consumed, "sidecar_retried": sidecar_retried}
+    sidecar_retried, sidecar_consumed = _reconcile_sidecars(client)
+    return {
+        "retried": retried,
+        "consumed": consumed,
+        "sidecar_retried": sidecar_retried,
+        "sidecar_consumed": sidecar_consumed,
+    }
 
 
-def _reconcile_sidecars(client: RemokoClient) -> int:
+def _reconcile_sidecars(client: RemokoClient) -> tuple[int, int]:
     root = sidecar_dir()
     if not root.is_dir():
-        return 0
+        return 0, 0
     retried = 0
+    consumed = 0
     for path in root.glob("*.json"):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1292,9 +1438,24 @@ def _reconcile_sidecars(client: RemokoClient) -> int:
             continue
         if not isinstance(payload, dict) or payload.get("status") != STATUS_PENDING:
             continue
-        if payload.get("request_id"):
-            continue
         subject_id = str(payload.get("task_id") or path.stem)
+        request_id = str(payload.get("request_id") or "") or None
+        if _has_live_request_id(request_id):
+            try:
+                response = client.get_response(request_id=request_id)
+            except Exception:
+                continue
+            choice = _answered_choice(response)
+            if not choice:
+                continue
+            result = consume_sidecar_budget_decision(
+                subject_id, choice, remoko_client=client
+            )
+            if result.get("ok"):
+                consumed += 1
+            continue
+        if not _request_is_claimable(request_id):
+            continue
         card = build_remoko_card(
             task_id=subject_id,
             extensions_count=int(payload.get("extensions_count") or 0),
@@ -1303,14 +1464,21 @@ def _reconcile_sidecars(client: RemokoClient) -> int:
             extra_turns=int(payload.get("extra_turns") or 0),
         )
         card["external_id"] = payload.get("external_id") or card["external_id"]
-        try:
-            request_id = _send_card(client, card, task_id=subject_id)
-        except Exception:
-            request_id = ""
-        if request_id:
-            decision = load_sidecar(subject_id)
-            if decision:
-                decision.request_id = request_id
-                save_sidecar(decision)
-                retried += 1
-    return retried
+        claim = _new_send_claim()
+        with _sidecar_lock(subject_id):
+            live = load_sidecar(subject_id)
+            if (
+                live is None
+                or live.status != STATUS_PENDING
+                or not _request_is_claimable(live.request_id)
+            ):
+                continue
+            live.request_id = claim
+            live.external_id = live.external_id or card["external_id"]
+            save_sidecar(live)
+        sent = _send_claimed_card(client, card, task_id=subject_id)
+        scratch = live if live is not None else BudgetDecision(task_id=subject_id)
+        _complete_or_clear_sidecar_claim(subject_id, scratch, claim, sent)
+        if sent:
+            retried += 1
+    return retried, consumed
