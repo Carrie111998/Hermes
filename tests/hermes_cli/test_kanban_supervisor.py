@@ -1052,3 +1052,129 @@ def test_stale_untrusted_jude_comment_does_not_write_current_head(kanban_home, t
         proof = json.loads(units[child]["proof"])
         assert proof["verdict"] == "pass"
         assert proof["head"] == live
+
+
+def _init_git_head(repo: Path) -> str:
+    import subprocess
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "init"],
+        cwd=repo, check=True, capture_output=True,
+    )
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def test_abbreviated_reviewed_head_fails_closed_even_if_prefix_matches(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    live = _init_git_head(repo)
+    assert len(live) == 40
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root", assignee="default")
+        child = kb.create_task(
+            conn, title="child", assignee="cole", parents=[root],
+            workspace_kind="dir", workspace_path=str(repo),
+        )
+        oid = sup.ensure_objective(conn, root)
+        sup.upsert_unit(conn, objective_id=oid, kind="kanban", ref=child, status="pending")
+        for short in (live[:7], live[:12]):
+            kb.add_comment(
+                conn, child, author="jude",
+                body=f"jude-verdict: pass\nreviewed_head={short}",
+            )
+            sup._maybe_record_jude_proof(conn, child)
+            units = {u["ref"]: u for u in sup.list_units(conn, oid)}
+            proof = json.loads(units[child]["proof"] or "{}") if units[child].get("proof") else {}
+            assert proof.get("verdict") != "pass"
+            assert proof.get("head") != live
+        kb.add_comment(
+            conn, child, author="jude",
+            body=f"jude-verdict: pass\nreviewed_head={live}",
+        )
+        sup._maybe_record_jude_proof(conn, child)
+        units = {u["ref"]: u for u in sup.list_units(conn, oid)}
+        proof = json.loads(units[child]["proof"])
+        assert proof["verdict"] == "pass"
+        assert proof["head"] == live
+        assert sup._unit_satisfies_predicate(conn, {
+            **units[child],
+            "status": "done",
+            "terminal_predicate": "jude_verdict_pass",
+            "proof": units[child]["proof"],
+        })
+
+
+def test_prefixing_reviewed_head_fails_closed_when_live_is_short(kanban_home, monkeypatch):
+    short_live = "deadbee"
+    long_reviewed = short_live + ("c" * (40 - len(short_live)))
+    monkeypatch.setattr(sup, "git_head", lambda _path: short_live)
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root", assignee="default")
+        child = kb.create_task(
+            conn, title="child", assignee="cole", parents=[root],
+            workspace_kind="dir", workspace_path="/tmp/fake-repo",
+        )
+        oid = sup.ensure_objective(conn, root)
+        sup.upsert_unit(conn, objective_id=oid, kind="kanban", ref=child, status="pending")
+        kb.add_comment(
+            conn, child, author="jude",
+            body=f"jude-verdict: pass\nreviewed_head={long_reviewed}",
+        )
+        sup._maybe_record_jude_proof(conn, child)
+        units = {u["ref"]: u for u in sup.list_units(conn, oid)}
+        proof = json.loads(units[child]["proof"] or "{}") if units[child].get("proof") else {}
+        assert proof.get("verdict") != "pass"
+        assert proof.get("head") != long_reviewed
+
+
+def test_existing_jude_pass_invalidated_when_current_head_missing(kanban_home):
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root", assignee="default")
+        child = kb.create_task(
+            conn, title="child", assignee="cole", parents=[root],
+            workspace_kind="dir",
+            workspace_path="/tmp/fake-repo",
+        )
+        oid = sup.ensure_objective(conn, root)
+        conn.execute(
+            "UPDATE kanban_objective_units SET terminal_predicate='jude_verdict_pass', "
+            "status='done', proof=? WHERE kind='kanban' AND ref=?",
+            (json.dumps({"type": "jude_verdict", "verdict": "pass", "head": "aaa", "verified": True}), child),
+        )
+        invalidated = sup.invalidate_stale_reviews(
+            conn, git_head_fn=lambda _path: None,
+        )
+        assert child in invalidated
+        units = {u["ref"]: u for u in sup.list_units(conn, oid)}
+        assert units[child]["status"] == "pending"
+        assert units[child]["next_gate"] == "re-review"
+        assert not sup.objective_is_complete(conn, oid)
+
+
+def test_jude_pass_predicate_fails_closed_without_current_head(kanban_home, monkeypatch):
+    recorded = "a" * 40
+    monkeypatch.setattr(sup, "git_head", lambda _path: None)
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root", assignee="default")
+        child = kb.create_task(
+            conn, title="child", assignee="cole", parents=[root],
+            workspace_kind="dir",
+            workspace_path="/tmp/missing-repo",
+        )
+        oid = sup.ensure_objective(conn, root)
+        proof = {"type": "jude_verdict", "verdict": "pass", "head": recorded, "verified": True}
+        conn.execute(
+            "UPDATE kanban_objective_units SET terminal_predicate='jude_verdict_pass', "
+            "status='done', proof=? WHERE kind='kanban' AND ref=?",
+            (json.dumps(proof), child),
+        )
+        units = {u["ref"]: u for u in sup.list_units(conn, oid)}
+        assert not sup._unit_satisfies_predicate(conn, {
+            **units[child],
+            "status": "done",
+            "terminal_predicate": "jude_verdict_pass",
+            "proof": json.dumps(proof),
+        })
+        assert not sup.objective_is_complete(conn, oid)

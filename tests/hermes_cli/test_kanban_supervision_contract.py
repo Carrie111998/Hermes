@@ -14,7 +14,7 @@ from hermes_cli.kanban_budget_keepalive import (
     RecordingRemokoClient,
     record_kanban_budget_exhausted,
 )
-from tests.hermes_cli.test_kanban_supervisor import FakeRemoko
+from tests.hermes_cli.test_kanban_supervisor import FakeRemoko, _init_git_head
 
 
 @pytest.fixture
@@ -509,8 +509,13 @@ def test_external_blocker_one_remoko_parks(kanban_home):
 
 def test_e2e_objective_done_only_after_all_gates_survives_reopen(kanban_home, monkeypatch):
     remoko = FakeRemoko()
+    live = _init_git_head(kanban_home.parent / "repo")
     with kb.connect() as conn:
         parent, child, oid = _graph(conn)
+        conn.execute(
+            "UPDATE tasks SET workspace_path=? WHERE id IN (?, ?)",
+            (str(kanban_home.parent / "repo"), parent, child),
+        )
         kb.add_notify_sub(
             conn, task_id=parent, platform="webui",
             chat_id="origin-live", delivery_mode="notify+wake",
@@ -533,10 +538,10 @@ def test_e2e_objective_done_only_after_all_gates_survives_reopen(kanban_home, mo
         )
         assert verified["status"] == "failed"
         contract.record_review_verdict(
-            conn, task_id=child, verdict="fail", head="old", blockers=["p1"],
+            conn, task_id=child, verdict="fail", head="0" * 40, blockers=["p1"],
         )
         contract.record_review_verdict(
-            conn, task_id=child, verdict="pass", head="new", current_head="new",
+            conn, task_id=child, verdict="pass", head=live, current_head=live,
         )
         for i in range(5):
             last = contract.record_review_verdict(
@@ -547,9 +552,9 @@ def test_e2e_objective_done_only_after_all_gates_survives_reopen(kanban_home, mo
         remoko.answer(last["request_id"], "Add 5 reviews")
         contract.apply_review_cap_answer(conn, parent, "Add 5 reviews")
         contract.record_review_verdict(
-            conn, task_id=parent, verdict="pass", head="final", current_head="final",
+            conn, task_id=parent, verdict="pass", head=live, current_head=live,
         )
-        digest = _seed_child_proof(conn, oid, child, head="new")
+        digest = _seed_child_proof(conn, oid, child, head=live)
         issued = contract.issue_descendant_grant(
             conn, objective_id=oid, supervisor_task_id=parent,
             descendant_task_id=child, transition="complete",

@@ -805,9 +805,17 @@ def note_kanban_terminal(
 
 
 _TRUSTED_JUDE_AUTHORS = frozenset({"jude", "jude-verdict"})
+_FULL_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _REVIEWED_HEAD_RE = re.compile(
-    r"(?im)^reviewed_head\s*[:=]\s*([0-9a-f]{7,40})\s*$"
+    r"(?im)^reviewed_head\s*[:=]\s*([0-9a-fA-F]{40})\s*$"
 )
+
+
+def _full_git_sha(value: Optional[str]) -> Optional[str]:
+    text = str(value or "").strip().lower()
+    if _FULL_GIT_SHA_RE.fullmatch(text):
+        return text
+    return None
 
 
 def _maybe_record_jude_proof(conn: sqlite3.Connection, task_id: str) -> None:
@@ -815,7 +823,7 @@ def _maybe_record_jude_proof(conn: sqlite3.Connection, task_id: str) -> None:
         "SELECT author, body FROM task_comments WHERE task_id = ? ORDER BY created_at DESC",
         (task_id,),
     ).fetchall()
-    live = _task_git_head(conn, task_id)
+    live = _full_git_sha(_task_git_head(conn, task_id))
     if not live:
         return
     trusted = False
@@ -829,8 +837,8 @@ def _maybe_record_jude_proof(conn: sqlite3.Connection, task_id: str) -> None:
         match = _REVIEWED_HEAD_RE.search(body)
         if match is None:
             continue
-        reviewed = match.group(1)
-        if live.startswith(reviewed) or reviewed.startswith(live):
+        reviewed = _full_git_sha(match.group(1))
+        if reviewed is not None and reviewed == live:
             trusted = True
             break
     if not trusted:
@@ -870,14 +878,13 @@ def git_head(workspace_path: Optional[str]) -> Optional[str]:
         return None
     if result.returncode != 0:
         return None
-    head = (result.stdout or "").strip()
-    return head or None
+    return _full_git_sha((result.stdout or "").strip())
 
 
 def invalidate_stale_reviews(
     conn: sqlite3.Connection, *, git_head_fn: Callable[[Optional[str]], Optional[str]] = git_head
 ) -> list[str]:
-    """A moved git head invalidates a prior jude-verdict: pass."""
+    """A moved or unreadable git head invalidates a prior jude-verdict: pass."""
     if not _table_exists(conn, "kanban_objective_units"):
         return []
     invalidated: list[str] = []
@@ -899,7 +906,7 @@ def invalidate_stale_reviews(
         if not recorded:
             continue
         current = git_head_fn(row["workspace_path"])
-        if current and current != recorded:
+        if not current or current != recorded:
             conn.execute(
                 """
                 UPDATE kanban_objective_units
@@ -1849,10 +1856,9 @@ def _unit_satisfies_predicate(conn: sqlite3.Connection, unit: dict) -> bool:
         if proof.get("blockers") or proof.get("stale"):
             return False
         recorded = (proof or {}).get("head")
-        if recorded:
-            current = _task_git_head(conn, unit["ref"])
-            if current and current != recorded:
-                return False
+        current = _task_git_head(conn, unit["ref"])
+        if not recorded or not current or current != recorded:
+            return False
         return (proof or {}).get("verdict") == "pass" and proof.get("verified") is not False
     if predicate == "task_done_with_proof":
         if unit.get("kind") == "kanban":
