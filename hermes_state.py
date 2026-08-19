@@ -1401,6 +1401,20 @@ CREATE TABLE IF NOT EXISTS session_sidebar_jobs (
     )
 );
 
+-- Parent delete guard. Its four children (terminal/precreate/unbound
+-- resolutions, reconciliation_proofs) are already ON DELETE RESTRICT and
+-- individually delete-guarded; the parent was not, which is how a bulk
+-- DELETE run with foreign_keys=OFF orphaned 97 proofs on 2026-08-09.
+-- Triggers fire regardless of the FK pragma and regardless of whether the
+-- deleting script was ever committed. Legitimate repairs drop, delete and
+-- recreate this trigger inside one transaction -- see
+-- session-bridge/repair_fabricated_sidebar_jobs.py.
+CREATE TRIGGER IF NOT EXISTS trg_session_sidebar_jobs_no_delete
+BEFORE DELETE ON session_sidebar_jobs
+BEGIN
+    SELECT RAISE(ABORT, 'session_sidebar_jobs rows are delete-guarded');
+END;
+
 CREATE TABLE IF NOT EXISTS session_sidebar_reconciliation_proofs (
     proof_digest TEXT PRIMARY KEY CHECK (
         length(proof_digest) = 64
@@ -1518,6 +1532,15 @@ CREATE INDEX IF NOT EXISTS idx_session_sidebar_hydration_lease
 CREATE INDEX IF NOT EXISTS idx_session_sidebar_hydration_completion
     ON session_sidebar_hydration_jobs(completion_digest)
     WHERE completion_digest IS NOT NULL;
+
+-- Parent delete guard. This table has NO children, so PRAGMA
+-- foreign_keys=ON alone would not refuse a bulk delete of it -- the
+-- trigger is the only control that covers this table.
+CREATE TRIGGER IF NOT EXISTS trg_session_sidebar_hydration_jobs_no_delete
+BEFORE DELETE ON session_sidebar_hydration_jobs
+BEGIN
+    SELECT RAISE(ABORT, 'session_sidebar_hydration_jobs rows are delete-guarded');
+END;
 
 CREATE TABLE IF NOT EXISTS session_sidebar_terminal_resolutions (
     job_id TEXT PRIMARY KEY
@@ -1798,6 +1821,18 @@ CREATE TABLE IF NOT EXISTS session_claude_visibility_jobs (
         OR (completion_digest IS NOT NULL AND visible_at IS NOT NULL)
     )
 );
+
+-- Parent delete guard. Children: characterization_events RESTRICT,
+-- visibility_reconciliations/auth_recoveries CASCADE, registration_usage
+-- NO ACTION. No production DELETE site targets this table; jobs are
+-- retired by state transition. The strict trigger-set validator at
+-- _validate_claude_characterization_events_v28 checks the CHILD event
+-- table, not this one, so this trigger does not trip it.
+CREATE TRIGGER IF NOT EXISTS trg_session_claude_visibility_jobs_no_delete
+BEFORE DELETE ON session_claude_visibility_jobs
+BEGIN
+    SELECT RAISE(ABORT, 'session_claude_visibility_jobs rows are delete-guarded');
+END;
 
 CREATE TABLE IF NOT EXISTS session_claude_registration_usage (
     local_day TEXT NOT NULL,

@@ -825,6 +825,15 @@ def test_current_database_quarantines_orphan_characterization_events(tmp_path):
     damaged = sqlite3.connect(db_path)
     try:
         damaged.execute("PRAGMA foreign_keys=OFF")
+        # That older writer predates trg_session_claude_visibility_jobs_no_delete,
+        # which now refuses exactly this DELETE -- that guard is the point, so the
+        # simulation has to step around it to reproduce the damage the quarantine
+        # migration exists to clean up. Dropping it here is confined to this
+        # throwaway fixture DB; the assertions below reopen through SessionDB,
+        # whose _init_schema recreates the guard.
+        damaged.execute(
+            "DROP TRIGGER IF EXISTS trg_session_claude_visibility_jobs_no_delete"
+        )
         damaged.execute(
             "DELETE FROM session_claude_visibility_jobs "
             "WHERE id = 'orphaned-characterization-job'"
