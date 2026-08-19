@@ -55,7 +55,6 @@ import {
 import { upsertOptimisticSession } from '../session/hooks/use-session-actions/utils'
 
 import type { ComposerScope } from './composer/scope'
-import { transcriptBackfillAvailable } from './transcript-backfill'
 
 /**
  * List a tile's session in the sidebar/tab strip on its first send.
@@ -427,11 +426,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
           }
         },
         truncateRowId,
-        sourceText,
-        // Tail-only transcript (#88082): same durable-id-only rule as the
-        // primary chat — a window-relative ordinal would trip the gateway's
-        // 4030 cross-check and refuse every edit in a long session.
-        transcriptBackfillAvailable(storedIdRef.current)
+        sourceText
       ),
     [requestGateway]
   )

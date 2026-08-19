@@ -3,7 +3,6 @@ import { JsonRpcGatewayError } from '@hermes/shared'
 import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 
-import { transcriptBackfillAvailable } from '@/app/chat/transcript-backfill'
 import { transcribeAudio } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { stripAnsi } from '@/lib/ansi'
@@ -852,11 +851,7 @@ export function usePromptActions({
           }
         },
         truncateRowId,
-        sourceText,
-        // Tail-only transcript (#88082): ordinals are window-relative until
-        // the prefix is backfilled, so the durable id must address the cut
-        // alone or the gateway's 4030 cross-check refuses every edit.
-        transcriptBackfillAvailable(selectedStoredSessionIdRef.current)
+        sourceText
       ),
     [activeSessionIdRef, requestGateway, selectedStoredSessionIdRef]
   )
