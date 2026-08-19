@@ -869,10 +869,17 @@ def pipeline_state(tmp_path, monkeypatch):
 
 
 class TestApplicationReadyIdentity:
-    """SUBMIT_REQUEST carries only job_id/materials_path/mode, so all four
-    contract keys were dropped and the HIGH "approve?" page read
+    """The applier's DRY_RUN_COMPLETE carries job_id/api_job_id/screenshots,
+    so all four contract keys were dropped and the HIGH "approve?" page read
     "Dry-run complete for ? . Approve submission? Reply YES or NO."
     (whatsapp_escalator.py:383) -- Diego asked to approve an UNNAMED job.
+
+    All six live `application_ready` events came from SUBMIT_REQUEST, which no
+    longer produces this event at all: it is a command, not an outcome (see
+    TestSubmitRequestIsNotAnApprovalPrompt). DRY_RUN_COMPLETE is the truthful
+    producer, and it has the same broken vocabulary, so the identity repair
+    these tests cover is what makes the lane usable when the first clean dry
+    run lands.
     """
 
     def _ready(self, bus):
@@ -880,13 +887,14 @@ class TestApplicationReadyIdentity:
                     if et == EventType.APPLICATION_READY)
 
     def test_job_key_is_aliased_from_job_id(self, bus, pipeline_state):
-        _mailbox_event(bus, "SUBMIT_REQUEST", {
-            "job_id": "8446590b", "materials_path": "C:/x", "mode": "dry-run"})
+        _mailbox_event(bus, "DRY_RUN_COMPLETE", {
+            "job_id": "8446590b", "status": "review_reached",
+            "review_url": "https://x", "approval_required": True})
         _translate(bus)
         assert self._ready(bus)["job_key"] == "8446590b"
 
     def test_company_and_title_backfilled_from_pipeline_state(self, bus, pipeline_state):
-        _mailbox_event(bus, "SUBMIT_REQUEST", {"job_id": "8446590b"})
+        _mailbox_event(bus, "DRY_RUN_COMPLETE", {"job_id": "8446590b"})
         _translate(bus)
         out = self._ready(bus)
         assert out["company"] == "Deloitte"
@@ -915,7 +923,7 @@ class TestApplicationReadyIdentity:
 
     def test_the_rendered_approval_page_names_the_job(self, bus, pipeline_state):
         """Mirrors whatsapp_escalator.py:383 exactly."""
-        _mailbox_event(bus, "SUBMIT_REQUEST", {"job_id": "8de4877d"})
+        _mailbox_event(bus, "DRY_RUN_COMPLETE", {"job_id": "8de4877d"})
         _translate(bus)
         p = self._ready(bus)
         text = (f"Dry-run complete for {p.get('company', '?')} "
@@ -1140,6 +1148,7 @@ class TestSubmitResultIsTranslated:
     """
 
     def _only(self, bus):
+        _translate(bus)
         events = _recent_domain_events(bus)
         assert len(events) == 1, events
         return events[0]
@@ -1198,6 +1207,7 @@ class TestSubmitResultIsTranslated:
 
     def test_the_bus_job_id_column_is_populated(self, bus):
         _mailbox_event(bus, "SUBMIT_RESULT", self._submitted())
+        _translate(bus)
         row = next(e for e in bus.query()
                    if e.event_type == EventType.APPLICATION_SUBMITTED)
         assert row.job_id == "8de4877d"
