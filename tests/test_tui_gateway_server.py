@@ -8155,6 +8155,55 @@ def test_config_set_reasoning_global_scope_clears_session_override(tmp_path, mon
     assert status["result"]["value"] == "high"
 
 
+def test_config_set_reasoning_honors_configured_default_and_explicit_session(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        "agent:\n"
+        "  reasoning_effort: medium\n"
+        "  reasoning_command_scope: global\n",
+        encoding="utf-8",
+    )
+    agent = types.SimpleNamespace(reasoning_config=None)
+    server._sessions["sid"] = _session(agent=agent)
+
+    plain = server.handle_request(
+        {
+            "id": "1",
+            "method": "config.set",
+            "params": {"session_id": "sid", "key": "reasoning", "value": "high"},
+        }
+    )
+    assert plain["result"]["value"] == "high"
+    assert server._load_cfg()["agent"]["reasoning_effort"] == "high"
+    assert "create_reasoning_override" not in server._sessions["sid"]
+
+    session_only = server.handle_request(
+        {
+            "id": "2",
+            "method": "config.set",
+            "params": {
+                "session_id": "sid",
+                "key": "reasoning",
+                "value": "low",
+                "scope": "session",
+            },
+        }
+    )
+    assert session_only["result"]["value"] == "low"
+    assert server._load_cfg()["agent"]["reasoning_effort"] == "high"
+    assert server._sessions["sid"]["create_reasoning_override"] == {
+        "enabled": True,
+        "effort": "low",
+    }
+
+    status = server.handle_request(
+        {"id": "3", "method": "config.get", "params": {"key": "reasoning"}}
+    )
+    assert status["result"]["command_scope"] == "global"
+
+
 def test_config_set_verbose_updates_session_mode_and_agent(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
     agent = types.SimpleNamespace(verbose_logging=False)

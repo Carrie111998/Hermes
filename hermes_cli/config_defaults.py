@@ -328,6 +328,9 @@ DEFAULT_CONFIG = {
         # matches a key in this dict.
         # Edit directly in config.yaml (no CLI support due to dots in keys).
         "reasoning_overrides": {},
+        # Persistence scope for bare `/reasoning <level>` changes. Explicit
+        # --session / --global flags always override this default.
+        "reasoning_command_scope": "session",
     },
 
     "terminal": {

@@ -12110,7 +12110,6 @@ def _(rid, params: dict) -> dict:
 
             arg = str(value or "").strip().lower()
             scope = str(params.get("scope") or "").strip().lower()
-            global_scope = scope == "global"
             if arg in {"show", "on"}:
                 cfg = _load_cfg_raw()  # write-back round-trip
                 display = (
@@ -12190,6 +12189,14 @@ def _(rid, params: dict) -> dict:
             parsed = parse_reasoning_effort(arg)
             if parsed is None:
                 return _err(rid, 4002, f"unknown reasoning value: {value}")
+            from hermes_constants import resolve_reasoning_command_scope
+
+            global_scope = (
+                resolve_reasoning_command_scope(
+                    _load_cfg(), scope if scope in {"session", "global"} else None
+                )
+                == "global"
+            )
             if global_scope or session is None:
                 _write_config_key("agent.reasoning_effort", arg)
                 if session is not None:

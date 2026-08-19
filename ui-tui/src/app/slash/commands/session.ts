@@ -55,10 +55,8 @@ const reasoningConfigPayload = (arg: string, sid: string) => {
     }
 
     if (REASONING_SESSION_FLAGS.has(flag)) {
-      // Session scope is the default; accept the flag for parity with /model.
-      if (!scope) {
-        scope = 'session'
-      }
+      // Explicit session scope overrides the configured command default.
+      scope = 'session'
 
       continue
     }
@@ -522,7 +520,11 @@ export const sessionCommands: SlashCommand[] = [
           .rpc<ConfigGetValueResponse>('config.get', { key: 'reasoning', session_id: ctx.sid })
           .then(
             ctx.guarded<ConfigGetValueResponse>(
-              r => r.value && ctx.transcript.sys(`reasoning: ${r.value} · display ${r.display || 'hide'}`)
+              r =>
+                r.value &&
+                ctx.transcript.sys(
+                  `reasoning: ${r.value} · display ${r.display || 'hide'} · command default ${r.command_scope || 'session'}`
+                )
             )
           )
       }

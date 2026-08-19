@@ -1156,6 +1156,49 @@ VALID_REASONING_EFFORTS = (
     "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 )
 
+REASONING_COMMAND_SCOPES = ("session", "global")
+
+
+def parse_reasoning_command_args(raw_args: str) -> tuple[str, str | None]:
+    """Parse a reasoning value and optional explicit persistence scope."""
+    import shlex
+
+    text = str(raw_args or "").strip().replace("—", "--").replace("–", "--")
+    if not text:
+        return "", None
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        tokens = text.split()
+
+    explicit_scope = None
+    value_tokens = []
+    for token in tokens:
+        normalized = token.lower()
+        if normalized in {"--session", "--global"}:
+            # Repeated scope flags follow normal CLI convention: last wins.
+            explicit_scope = normalized[2:]
+        else:
+            value_tokens.append(token)
+    return " ".join(value_tokens).strip().lower(), explicit_scope
+
+
+def resolve_reasoning_command_scope(
+    cfg: dict | None,
+    explicit_scope: str | None = None,
+) -> str:
+    """Resolve effort-change persistence, defaulting safely to session scope."""
+    normalized_explicit = str(explicit_scope or "").strip().lower()
+    if normalized_explicit in REASONING_COMMAND_SCOPES:
+        return normalized_explicit
+
+    cfg = cfg if isinstance(cfg, dict) else {}
+    agent_cfg = cfg.get("agent")
+    if not isinstance(agent_cfg, dict):
+        return "session"
+    configured = str(agent_cfg.get("reasoning_command_scope") or "session").strip().lower()
+    return configured if configured in REASONING_COMMAND_SCOPES else "session"
+
 
 def parse_reasoning_effort(effort) -> dict | None:
     """Parse a reasoning effort level into a config dict.

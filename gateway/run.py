@@ -9194,30 +9194,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return resolve_reasoning_config(cfg, model)
 
     @staticmethod
-    def _parse_reasoning_command_args(raw_args: str) -> tuple[str, bool]:
-        """Parse `/reasoning` args into `(value, persist_global)`.
+    def _parse_reasoning_command_args(raw_args: str) -> tuple[str, str | None]:
+        """Parse `/reasoning` args into ``(value, explicit_scope)``."""
+        from hermes_constants import parse_reasoning_command_args
 
-        `/reasoning <level>` is session-scoped by default. `--global` may be
-        supplied in any position to persist the change to config.yaml.
-        """
-        import shlex
-
-        text = str(raw_args or "").strip().replace("—", "--")
-        if not text:
-            return "", False
-        try:
-            tokens = shlex.split(text)
-        except ValueError:
-            tokens = text.split()
-
-        persist_global = False
-        value_tokens = []
-        for token in tokens:
-            if token == "--global":
-                persist_global = True
-            else:
-                value_tokens.append(token)
-        return " ".join(value_tokens).strip().lower(), persist_global
+        return parse_reasoning_command_args(raw_args)
 
     def _resolve_session_reasoning_config(
         self,

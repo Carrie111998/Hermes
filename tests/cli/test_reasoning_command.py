@@ -103,6 +103,46 @@ class TestHandleReasoningCommand(unittest.TestCase):
         self.assertEqual(stub.reasoning_config, {"enabled": True, "effort": "high"})
         self.assertIsNone(stub.agent)
 
+    def test_configured_global_default_persists_effort(self):
+        from cli import CLI_CONFIG
+        from hermes_cli.cli_commands_mixin import CLICommandsMixin
+
+        stub = self._make_cli(reasoning_config={"enabled": True, "effort": "medium"})
+        with patch.dict(
+            CLI_CONFIG.setdefault("agent", {}),
+            {"reasoning_command_scope": "global"},
+        ), patch("cli.save_config_value", return_value=True) as save_config, patch("cli._cprint"):
+            CLICommandsMixin._handle_reasoning_command(stub, "/reasoning high")
+
+        save_config.assert_called_once_with("agent.reasoning_effort", "high")
+
+    def test_explicit_session_overrides_configured_global_default(self):
+        from cli import CLI_CONFIG
+        from hermes_cli.cli_commands_mixin import CLICommandsMixin
+
+        stub = self._make_cli(reasoning_config={"enabled": True, "effort": "medium"})
+        with patch.dict(
+            CLI_CONFIG.setdefault("agent", {}),
+            {"reasoning_command_scope": "global"},
+        ), patch("cli.save_config_value") as save_config, patch("cli._cprint"):
+            CLICommandsMixin._handle_reasoning_command(stub, "/reasoning high --session")
+
+        save_config.assert_not_called()
+        self.assertEqual(stub.reasoning_config, {"enabled": True, "effort": "high"})
+
+    def test_status_reports_configured_command_default(self):
+        from cli import CLI_CONFIG
+        from hermes_cli.cli_commands_mixin import CLICommandsMixin
+
+        stub = self._make_cli(reasoning_config={"enabled": True, "effort": "medium"})
+        with patch.dict(
+            CLI_CONFIG.setdefault("agent", {}),
+            {"reasoning_command_scope": "global"},
+        ), patch("cli._cprint") as cprint:
+            CLICommandsMixin._handle_reasoning_command(stub, "/reasoning")
+
+        assert any("Command default:   global" in call.args[0] for call in cprint.call_args_list)
+
 
 
     def test_new_session_clears_session_reasoning_override(self):
