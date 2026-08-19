@@ -270,6 +270,68 @@ _VALID_ITEM_ID = "msg_abc123"
 _OVERSIZED_CALL_ID = "codex_mcp__hermes-tools__web_search_exec-" + "0" * 43
 
 
+def test_chat_messages_to_responses_input_uses_tool_call_after_reasoning():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": "opaque-reasoning",
+                    "summary": [],
+                }
+            ],
+            "tool_calls": [
+                {
+                    "call_id": "call_1",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"README.md"}',
+                    },
+                }
+            ],
+        }
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    assert items == [
+        {
+            "type": "reasoning",
+            "encrypted_content": "opaque-reasoning",
+            "summary": [],
+        },
+        {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "read_file",
+            "arguments": '{"path":"README.md"}',
+        },
+    ]
+
+
+def test_chat_messages_to_responses_input_uses_nonempty_pure_reasoning_follower():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [
+                {
+                    "type": "reasoning",
+                    "encrypted_content": "opaque-reasoning",
+                    "summary": [],
+                }
+            ],
+        }
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    assert items[-1] == {"role": "assistant", "content": " "}
+
+
 def test_chat_messages_to_responses_input_clamps_oversized_call_id():
     """An oversized call_id must be clamped to <=64 chars on BOTH the
     function_call and its matching function_call_output, to the same surrogate,
