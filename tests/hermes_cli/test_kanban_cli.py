@@ -100,6 +100,31 @@ def test_constraint_cli_sets_supersedes_and_rejects_delegated_producers(
     assert "superseded" in removed.lower()
 
 
+def test_constraint_repair_policy_cli_is_explicit_and_rejects_delegated_child(
+    kanban_home, monkeypatch
+):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="malformed policy", triage=True)
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events(task_id, kind, payload, created_at) "
+                "VALUES (?, 'decomposition_constraint_set', 'not-json', 1)",
+                (tid,),
+            )
+
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+    denied = kc.run_slash(
+        f"constraint repair-policy {tid} --reason 'delegated spoof'"
+    )
+    assert "delegate_task child contexts cannot mutate" in denied
+
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT")
+    repaired = kc.run_slash(
+        f"constraint repair-policy {tid} --reason 'operator inspected history'"
+    )
+    assert "repaired decomposition policy" in repaired.lower()
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")

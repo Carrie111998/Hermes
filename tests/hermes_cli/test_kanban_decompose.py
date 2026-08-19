@@ -361,3 +361,179 @@ def test_crash_reservation_fails_closed_until_bounded_audited_recovery(kanban_ho
             "AND kind = 'decomposition_reservation_recovered'", (tid,),
         ).fetchone()
         assert jsonlib.loads(event["payload"])["reason"] == "operator verified crash"
+
+
+@pytest.mark.parametrize("history_kind", ["malformed", "ambiguous"])
+def test_operator_can_append_cursor_bound_policy_recovery_without_rewriting_history(
+    kanban_home, history_kind
+):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="repair policy", triage=True)
+        with kb.write_txn(conn):
+            if history_kind == "malformed":
+                conn.execute(
+                    "INSERT INTO task_events(task_id, kind, payload, created_at) "
+                    "VALUES (?, 'decomposition_constraint_set', 'not-json', 1)",
+                    (tid,),
+                )
+            else:
+                payload = jsonlib.dumps({
+                    "version": 1,
+                    "constraint": kb.DECOMPOSITION_CONSTRAINT_SAME_LINEAGE,
+                    "reason": "duplicate",
+                })
+                conn.execute(
+                    "INSERT INTO task_events(task_id, kind, payload, created_at) "
+                    "VALUES (?, 'decomposition_constraint_set', ?, 1)",
+                    (tid, payload),
+                )
+                conn.execute(
+                    "INSERT INTO task_events(task_id, kind, payload, created_at) "
+                    "VALUES (?, 'decomposition_constraint_set', ?, 2)",
+                    (tid, payload),
+                )
+        original = conn.execute(
+            "SELECT id, kind, payload FROM task_events WHERE task_id = ? ORDER BY id",
+            (tid,),
+        ).fetchall()
+
+        denied = kb.reserve_decomposition(conn, tid)
+        assert not denied.ok
+        assert "malformed or ambiguous" in denied.reason
+        with pytest.raises(RuntimeError, match="malformed or ambiguous"):
+            kb.supersede_decomposition_constraint(conn, tid, reason="normal removal")
+
+        recovery_id = kb.recover_decomposition_policy(
+            conn, tid, reason="operator inspected corrupt policy history"
+        )
+        after = conn.execute(
+            "SELECT id, kind, payload FROM task_events WHERE task_id = ? ORDER BY id",
+            (tid,),
+        ).fetchall()
+
+        assert [(row["id"], row["kind"], row["payload"]) for row in after[:len(original)]] == [
+            (row["id"], row["kind"], row["payload"]) for row in original
+        ]
+        recovery = after[-1]
+        assert recovery["id"] == recovery_id
+        assert recovery["kind"] == "decomposition_policy_recovered"
+        recovery_payload = jsonlib.loads(recovery["payload"])
+        assert recovery_payload["recovered_through_event_id"] == original[-1]["id"]
+        assert recovery_payload["reason"] == "operator inspected corrupt policy history"
+        assert recovery_payload["provenance"]["prior_state"] == "malformed_or_ambiguous"
+
+        available = kb.reserve_decomposition(conn, tid)
+        assert available.ok
+        kb.release_decomposition_reservation(conn, tid, available.token)
+
+
+@pytest.mark.parametrize(
+    "recovery_payload",
+    [
+        "not-json",
+        jsonlib.dumps({
+            "version": 1,
+            "recovered_through_event_id": 0,
+            "reason": "wrong cursor",
+            "provenance": {"prior_state": "malformed_or_ambiguous"},
+        }),
+    ],
+)
+def test_invalid_policy_recovery_event_is_itself_fail_closed(
+    kanban_home, recovery_payload
+):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="bad recovery", triage=True)
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events(task_id, kind, payload, created_at) "
+                "VALUES (?, 'decomposition_constraint_set', 'not-json', 1)",
+                (tid,),
+            )
+            conn.execute(
+                "INSERT INTO task_events(task_id, kind, payload, created_at) "
+                "VALUES (?, 'decomposition_policy_recovered', ?, 2)",
+                (tid, recovery_payload),
+            )
+
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
+        outcome = decomp.decompose_task(tid)
+    assert not outcome.ok
+    assert "malformed or ambiguous" in outcome.reason
+    call_llm.assert_not_called()
+
+
+def test_policy_recovery_refuses_valid_constraint_and_live_reservation(kanban_home):
+    with kb.connect_closing() as conn:
+        with pytest.raises(ValueError, match="unknown task id"):
+            kb.recover_decomposition_policy(
+                conn, "missing-task", reason="cannot repair missing task"
+            )
+
+        valid_tid = kb.create_task(conn, title="valid guard", triage=True)
+        kb.set_decomposition_constraint(
+            conn, valid_tid,
+            constraint=kb.DECOMPOSITION_CONSTRAINT_SAME_LINEAGE,
+            reason="valid operator policy",
+        )
+        with pytest.raises(RuntimeError, match="valid active SAME-LINEAGE"):
+            kb.recover_decomposition_policy(conn, valid_tid, reason="must not force clear")
+
+        reserved_tid = kb.create_task(conn, title="reserved corrupt policy", triage=True)
+        reservation = kb.reserve_decomposition(conn, reserved_tid)
+        assert reservation.ok
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events(task_id, kind, payload, created_at) "
+                "VALUES (?, 'decomposition_constraint_set', 'not-json', 1)",
+                (reserved_tid,),
+            )
+        with pytest.raises(RuntimeError, match="already reserved"):
+            kb.recover_decomposition_policy(
+                conn, reserved_tid, reason="wait for reservation owner"
+            )
+
+
+def test_fresh_constraint_after_policy_recovery_still_blocks_before_llm(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="repaired then guarded", triage=True)
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events(task_id, kind, payload, created_at) "
+                "VALUES (?, 'decomposition_constraint_set', 'not-json', 1)",
+                (tid,),
+            )
+        kb.recover_decomposition_policy(conn, tid, reason="repair corrupt history")
+        kb.set_decomposition_constraint(
+            conn, tid,
+            constraint=kb.DECOMPOSITION_CONSTRAINT_SAME_LINEAGE,
+            reason="fresh valid guard",
+        )
+
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
+        outcome = decomp.decompose_task(tid)
+    assert not outcome.ok
+    assert "SAME-LINEAGE" in outcome.reason
+    call_llm.assert_not_called()
+
+
+def test_new_malformed_event_after_policy_recovery_fails_closed_again(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="re-corrupted policy", triage=True)
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events(task_id, kind, payload, created_at) "
+                "VALUES (?, 'decomposition_constraint_set', 'not-json', 1)",
+                (tid,),
+            )
+        kb.recover_decomposition_policy(conn, tid, reason="first repair")
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events(task_id, kind, payload, created_at) "
+                "VALUES (?, 'decomposition_constraint_set', 'still-not-json', 2)",
+                (tid,),
+            )
+
+    outcome = decomp.decompose_task(tid)
+    assert not outcome.ok
+    assert "malformed or ambiguous" in outcome.reason

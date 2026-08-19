@@ -137,9 +137,11 @@ DECOMPOSITION_CONSTRAINT_SAME_LINEAGE = "same-lineage/no-decomposition"
 _DECOMPOSITION_EVENT_VERSION = 1
 _DECOMPOSITION_CONSTRAINT_EVENT = "decomposition_constraint_set"
 _DECOMPOSITION_SUPERSEDED_EVENT = "decomposition_constraint_superseded"
+_DECOMPOSITION_POLICY_RECOVERED_EVENT = "decomposition_policy_recovered"
 _DECOMPOSITION_RELEVANT_KINDS = (
     _DECOMPOSITION_CONSTRAINT_EVENT,
     _DECOMPOSITION_SUPERSEDED_EVENT,
+    _DECOMPOSITION_POLICY_RECOVERED_EVENT,
 )
 
 
@@ -7137,13 +7139,14 @@ def _decomposition_policy_state(
     """Return (denied, relevant cursor, reason), failing closed on bad events."""
     rows = conn.execute(
         "SELECT id, kind, payload FROM task_events "
-        "WHERE task_id = ? AND kind IN (?, ?) ORDER BY id",
+        "WHERE task_id = ? AND kind IN (?, ?, ?) ORDER BY id",
         (task_id, *_DECOMPOSITION_RELEVANT_KINDS),
     ).fetchall()
     active: dict[int, dict] = {}
     cursor = 0
     malformed = False
     for row in rows:
+        prior_cursor = cursor
         cursor = int(row["id"])
         try:
             payload = json.loads(row["payload"])
@@ -7153,7 +7156,22 @@ def _decomposition_policy_state(
         if not isinstance(payload, dict) or payload.get("version") != _DECOMPOSITION_EVENT_VERSION:
             malformed = True
             continue
-        if row["kind"] == _DECOMPOSITION_CONSTRAINT_EVENT:
+        if row["kind"] == _DECOMPOSITION_POLICY_RECOVERED_EVENT:
+            provenance = payload.get("provenance")
+            reason = payload.get("reason")
+            if (
+                prior_cursor <= 0
+                or payload.get("recovered_through_event_id") != prior_cursor
+                or not isinstance(reason, str)
+                or not reason.strip()
+                or not isinstance(provenance, dict)
+                or provenance.get("prior_state") != "malformed_or_ambiguous"
+            ):
+                malformed = True
+                continue
+            active.clear()
+            malformed = False
+        elif row["kind"] == _DECOMPOSITION_CONSTRAINT_EVENT:
             if payload.get("constraint") != DECOMPOSITION_CONSTRAINT_SAME_LINEAGE:
                 malformed = True
                 continue
@@ -7254,6 +7272,49 @@ def supersede_decomposition_constraint(
                 "version": _DECOMPOSITION_EVENT_VERSION,
                 "constraint_event_id": int(row["id"]),
                 "reason": reason.strip(),
+            },
+        )
+        return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+
+def recover_decomposition_policy(
+    conn: sqlite3.Connection, task_id: str, *, reason: str
+) -> int:
+    """Append a cursor-bound recovery for malformed/ambiguous policy history."""
+    if not str(reason or "").strip():
+        raise ValueError("policy recovery reason is required")
+    with write_txn(conn):
+        if conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone() is None:
+            raise ValueError("unknown task id")
+        if conn.execute(
+            "SELECT 1 FROM task_decomposition_reservations WHERE task_id = ?",
+            (task_id,),
+        ).fetchone():
+            raise RuntimeError(
+                "decomposition is already reserved; policy was not recovered"
+            )
+        denied, cursor, policy_reason = _decomposition_policy_state(conn, task_id)
+        if not denied or not policy_reason.startswith("malformed or ambiguous"):
+            if policy_reason.startswith("SAME-LINEAGE"):
+                raise RuntimeError(
+                    "valid active SAME-LINEAGE constraint cannot be force-cleared; "
+                    "use constraint supersede"
+                )
+            raise RuntimeError("no malformed or ambiguous policy lock to recover")
+        _append_event(
+            conn,
+            task_id,
+            _DECOMPOSITION_POLICY_RECOVERED_EVENT,
+            {
+                "version": _DECOMPOSITION_EVENT_VERSION,
+                "recovered_through_event_id": cursor,
+                "reason": reason.strip(),
+                "provenance": {
+                    "prior_state": "malformed_or_ambiguous",
+                    "authority_boundary": "non_delegated_operator_process",
+                },
             },
         )
         return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])

@@ -939,6 +939,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Required staleness threshold (60..86400 seconds)",
     )
     p_recover.add_argument("--reason", required=True, help="Required durable operator audit reason")
+    p_repair_policy = constraint_sub.add_parser(
+        "repair-policy",
+        help="Append a cursor-bound recovery for malformed/ambiguous decomposition policy history",
+    )
+    p_repair_policy.add_argument("task_id")
+    p_repair_policy.add_argument(
+        "--reason", required=True, help="Required durable operator audit reason"
+    )
 
     # --- specify --- (triage → todo via auxiliary LLM)
     p_specify = sub.add_parser(
@@ -3191,6 +3199,12 @@ def _cmd_constraint(args: argparse.Namespace) -> int:
                 print(f"kanban: no decomposition reservation for {args.task_id}", file=sys.stderr)
                 return 1
             print(f"Recovered stale decomposition reservation for {args.task_id}.")
+            return 0
+        if action == "repair-policy":
+            kb.recover_decomposition_policy(
+                conn, args.task_id, reason=args.reason
+            )
+            print(f"Repaired decomposition policy for {args.task_id}.")
             return 0
     raise ValueError(f"unknown constraint action {action!r}")
 
