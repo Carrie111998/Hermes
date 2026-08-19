@@ -26,7 +26,8 @@ STAGE2_HOOK = REPO_ROOT / "docker" / "stage2-hook.sh"
 _INITIAL_UID = "10000"
 _TARGET_UID = "1000"
 _ORIGINAL_HOME = "/opt/data"
-_STAGING_HOME = "/tmp/hermes-uid-remap"
+_PREDICTABLE_STAGING = "/tmp/hermes-uid-remap"
+_STAGING_PREFIX = "/tmp/hermes-uid-remap."
 
 
 def _require_sh() -> str:
@@ -344,6 +345,33 @@ def _home_at_uid_change(home_log: list[str]) -> list[str]:
     return homes
 
 
+def _staging_from_usermod(usermod_log: list[str]) -> str:
+    """First remap ``usermod -d`` target — the mktemp staging directory."""
+    remap = _remap_usermod_calls(usermod_log)
+    assert remap, usermod_log
+    first = remap[0]
+    assert first.startswith("-d ") and first.endswith(" hermes"), first
+    return first[len("-d ") : -len(" hermes")]
+
+
+def _assert_unique_private_staging(staging: str) -> None:
+    """Staging must be mktemp-unique, never the predictable path or data home."""
+    assert staging.startswith(_STAGING_PREFIX), staging
+    assert staging != _PREDICTABLE_STAGING, staging
+    assert staging != _ORIGINAL_HOME, staging
+    suffix = staging[len(_STAGING_PREFIX) :]
+    assert suffix, staging
+    assert "/" not in suffix, staging
+
+
+def _assert_remap_sequence(usermod_log: list[str], staging: str) -> None:
+    assert _remap_usermod_calls(usermod_log) == [
+        f"-d {staging} hermes",
+        f"-u {_TARGET_UID} hermes",
+        f"-d {_ORIGINAL_HOME} hermes",
+    ], usermod_log
+
+
 @pytest.fixture
 def stage2_env():
     shell = _require_sh()
@@ -375,14 +403,21 @@ def test_stage2_uid_remap_isolates_opt_data_home_and_repairs_ownership(stage2_en
     )
 
     usermod_log = _read_state(shell, f"{state_dir}/usermod.log").splitlines()
-    assert _remap_usermod_calls(usermod_log) == [
-        f"-d {_STAGING_HOME} hermes",
-        f"-u {_TARGET_UID} hermes",
-        f"-d {_ORIGINAL_HOME} hermes",
-    ], usermod_log
+    staging = _staging_from_usermod(usermod_log)
+    _assert_unique_private_staging(staging)
+    _assert_remap_sequence(usermod_log, staging)
 
     home_log = _read_state(shell, f"{state_dir}/usermod.home.log").splitlines()
-    assert _home_at_uid_change(home_log) == [_STAGING_HOME], home_log
+    assert _home_at_uid_change(home_log) == [staging], home_log
+
+    # Unique scratch is removed after home restore.
+    gone = subprocess.run(
+        [shell, "-c", 'if [ -e "$1" ]; then exit 0; else exit 1; fi', "_", staging],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert gone.returncode != 0, f"staging directory leaked: {staging}"
 
     # Passwd home restored to /opt/data; UID remapped.
     assert _read_state(shell, f"{state_dir}/hermes_home") == _ORIGINAL_HOME
@@ -417,11 +452,9 @@ def test_stage2_uid_remap_restores_home_when_usermod_u_fails(stage2_env) -> None
     assert proc.returncode != 0
 
     usermod_log = _read_state(shell, f"{state_dir}/usermod.log").splitlines()
-    assert _remap_usermod_calls(usermod_log) == [
-        f"-d {_STAGING_HOME} hermes",
-        f"-u {_TARGET_UID} hermes",
-        f"-d {_ORIGINAL_HOME} hermes",
-    ], usermod_log
+    staging = _staging_from_usermod(usermod_log)
+    _assert_unique_private_staging(staging)
+    _assert_remap_sequence(usermod_log, staging)
     assert _read_state(shell, f"{state_dir}/hermes_home") == _ORIGINAL_HOME
     # UID change failed — passwd UID must remain the original build UID.
     assert _read_state(shell, f"{state_dir}/hermes_uid") == _INITIAL_UID
@@ -438,6 +471,102 @@ def test_stage2_uid_remap_target_uid_is_applied(stage2_env) -> None:
     )
     assert proc.returncode == 0, proc.stderr
     assert _read_state(shell, f"{state_dir}/hermes_uid") == _TARGET_UID
+
+
+def test_stage2_uid_remap_ignores_preexisting_predictable_staging_symlink(stage2_env) -> None:
+    """Pre-existing ``/tmp/hermes-uid-remap`` symlink must not become usermod home.
+
+    Worst case: that predictable path already points at the FUSE/data home.
+    Unique mktemp staging must be used instead so UID remap never follows it.
+    """
+    shell, hermes_home, state_dir, bin_dir = stage2_env
+
+    # Plant a sentinel in the data volume, then make the predictable staging
+    # path a symlink to it. Git Bash on Windows copies unless native
+    # winsymlinks are requested; Linux ln -s is unaffected.
+    planted = subprocess.run(
+        [
+            shell,
+            "-c",
+            'printf "poison\n" > "$1/.fuse-sentinel" && '
+            'if [ -L "$2" ]; then rm -f "$2"; else rm -rf "$2"; fi && '
+            'MSYS=winsymlinks:nativestrict ln -sfn "$1" "$2" && test -L "$2"',
+            "_",
+            hermes_home,
+            _PREDICTABLE_STAGING,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert planted.returncode == 0, (
+        f"failed to create poison symlink at {_PREDICTABLE_STAGING} -> {hermes_home}: "
+        f"rc={planted.returncode} out={planted.stdout!r} err={planted.stderr!r}"
+    )
+    try:
+        proc = _run_stage2(
+            shell,
+            hermes_home=hermes_home,
+            state_dir=state_dir,
+            bin_dir=bin_dir,
+            passwd_home=_ORIGINAL_HOME,
+        )
+        assert proc.returncode == 0, (
+            f"stage2 failed\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        )
+
+        usermod_log = _read_state(shell, f"{state_dir}/usermod.log").splitlines()
+        staging = _staging_from_usermod(usermod_log)
+        _assert_unique_private_staging(staging)
+        _assert_remap_sequence(usermod_log, staging)
+        assert staging != hermes_home, staging
+        assert all(
+            line != f"-d {_PREDICTABLE_STAGING} hermes"
+            for line in _remap_usermod_calls(usermod_log)
+        ), usermod_log
+
+        home_log = _read_state(shell, f"{state_dir}/usermod.home.log").splitlines()
+        assert _home_at_uid_change(home_log) == [staging], home_log
+        assert _PREDICTABLE_STAGING not in _home_at_uid_change(home_log)
+        assert hermes_home not in _home_at_uid_change(home_log)
+
+        # Symlink was irrelevant: still a symlink, target sentinel untouched,
+        # unique staging used then removed.
+        link_check = subprocess.run(
+            [
+                shell,
+                "-c",
+                'test -L "$1" && test -f "$2/.fuse-sentinel" && '
+                'grep -qx poison "$2/.fuse-sentinel" && '
+                'if [ -e "$3" ]; then exit 2; fi',
+                "_",
+                _PREDICTABLE_STAGING,
+                hermes_home,
+                staging,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert link_check.returncode == 0, (
+            f"symlink/sentinel/cleanup check failed rc={link_check.returncode} "
+            f"err={link_check.stderr!r} staging={staging}"
+        )
+        assert _read_state(shell, f"{state_dir}/hermes_home") == _ORIGINAL_HOME
+        assert _read_state(shell, f"{state_dir}/hermes_uid") == _TARGET_UID
+    finally:
+        subprocess.run(
+            [
+                shell,
+                "-c",
+                'if [ -L "$1" ]; then rm -f "$1"; else rm -rf "$1"; fi',
+                "_",
+                _PREDICTABLE_STAGING,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
 
 def _docker_available() -> bool:
@@ -545,6 +674,8 @@ exit 0
     assert uid_homes, combined[-4000:]
     assert "/opt/data" not in uid_homes, uid_homes
     assert all(h != "/opt/data" for h in uid_homes), uid_homes
+    assert all(h != "/tmp/hermes-uid-remap" for h in uid_homes), uid_homes
+    assert all(h.startswith("/tmp/hermes-uid-remap.") for h in uid_homes), uid_homes
 
 
 def test_docker_fuse_not_claimed_from_this_harness() -> None:

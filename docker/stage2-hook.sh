@@ -115,8 +115,14 @@ remap_hermes_uid() {
     new_uid="$1"
     original_home=$(getent passwd hermes | cut -d: -f6)
     [ -n "$original_home" ] || original_home="${HERMES_HOME:-/opt/data}"
-    staging="/tmp/hermes-uid-remap"
-    mkdir -p "$staging"
+    # Private, unpredictable scratch. Do not fall back to a fixed
+    # /tmp/hermes-uid-remap path — that name can already be a symlink
+    # into $HERMES_HOME / FUSE mounts (#77072).
+    staging=$(mktemp -d /tmp/hermes-uid-remap.XXXXXX) || {
+        echo "[stage2] ERROR: failed to create private UID-remap staging directory" >&2
+        return 1
+    }
+    chmod 700 "$staging"
     # Point home at an empty staging dir for the UID change so usermod's
     # automatic home-tree chown never enters $HERMES_HOME / FUSE mounts.
     usermod -d "$staging" hermes
@@ -124,6 +130,7 @@ remap_hermes_uid() {
     usermod -u "$new_uid" hermes || usermod_rc=$?
     # Always restore home even if the UID change failed mid-flight.
     usermod -d "$original_home" hermes
+    rm -rf "$staging"
     return "$usermod_rc"
 }
 
