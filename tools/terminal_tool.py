@@ -1491,7 +1491,7 @@ def _safe_getcwd() -> str:
 # cwd looks when it leaks toward a Linux container's ``-w`` flag.
 _HOST_CWD_PREFIXES = ("/Users/", "/home/", "C:\\", "C:/")
 
-_CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox"})
+_CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox", "e2b"})
 
 
 def _is_unusable_container_cwd(cwd: str) -> bool:
@@ -1615,6 +1615,8 @@ def _get_env_config() -> Dict[str, Any]:
         default_cwd = "~"
     elif env_type == "vercel_sandbox":
         default_cwd = _VERCEL_SANDBOX_DEFAULT_CWD
+    elif env_type == "e2b":
+        default_cwd = "/home/user"
     else:
         default_cwd = "/root"
 
@@ -1652,6 +1654,9 @@ def _get_env_config() -> Dict[str, Any]:
         "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
         "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
         "daytona_image": os.getenv("TERMINAL_DAYTONA_IMAGE", default_image),
+        "e2b_template": os.getenv("TERMINAL_E2B_TEMPLATE", ""),
+        "e2b_sandbox_id": os.getenv("TERMINAL_E2B_SANDBOX_ID", ""),
+        "e2b_ttl_seconds": _parse_env_var("TERMINAL_E2B_TTL_SECONDS", "0"),
         "vercel_runtime": os.getenv("TERMINAL_VERCEL_RUNTIME", "").strip(),
         "cwd": cwd,
         "host_cwd": host_cwd,
@@ -1740,6 +1745,8 @@ def _container_config_from_config(config: Dict[str, Any]) -> dict:
         "container_persistent": config.get("container_persistent", True),
         "modal_mode": config.get("modal_mode", "auto"),
         "vercel_runtime": config.get("vercel_runtime", ""),
+        "e2b_sandbox_id": config.get("e2b_sandbox_id", ""),
+        "e2b_ttl_seconds": config.get("e2b_ttl_seconds", 0),
         "docker_volumes": config.get("docker_volumes", []),
         "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
         "docker_forward_env": config.get("docker_forward_env", []),
@@ -1938,10 +1945,22 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             timeout=timeout,
         )
 
+    elif env_type == "e2b":
+        # Lazy import so the e2b SDK is only required when backend is selected.
+        from tools.environments.e2b import E2BEnvironment as _E2BEnvironment
+        return _E2BEnvironment(
+            template=image,
+            cwd=cwd,
+            timeout=timeout,
+            task_id=task_id,
+            sandbox_id=cc.get("e2b_sandbox_id", ""),
+            ttl_seconds=cc.get("e2b_ttl_seconds", 0),
+        )
+
     else:
         raise ValueError(
             f"Unknown environment type: {env_type}. Use 'local', 'docker', "
-            f"'singularity', 'modal', 'daytona', 'vercel_sandbox', or 'ssh'"
+            f"'singularity', 'modal', 'daytona', 'vercel_sandbox', 'e2b', or 'ssh'"
         )
 
 
@@ -2684,6 +2703,8 @@ def terminal_tool(
             image = overrides.get("modal_image") or config["modal_image"]
         elif env_type == "daytona":
             image = overrides.get("daytona_image") or config["daytona_image"]
+        elif env_type == "e2b":
+            image = overrides.get("e2b_template") or config["e2b_template"]
         else:
             image = ""
 
@@ -3797,10 +3818,27 @@ def check_terminal_requirements() -> bool:
             from agent.secret_scope import get_secret
             return get_secret("DAYTONA_API_KEY") is not None
 
+        elif env_type == "e2b":
+            try:
+                from e2b import Sandbox  # noqa: F401 — SDK presence check
+            except ImportError:
+                logger.error(
+                    "E2B backend selected but the e2b SDK is not installed "
+                    "(installs on demand at first terminal use, or: pip install e2b)."
+                )
+                return False
+            # Same source of truth as E2BEnvironment.__init__ and the SDK itself
+            # (os.environ) — a scoped secret the SDK can't see must fail here,
+            # not deep inside sandbox creation.
+            if not os.environ.get("E2B_API_KEY"):
+                logger.error("E2B backend selected but E2B_API_KEY is not set.")
+                return False
+            return True
+
         else:
             logger.error(
                 "Unknown TERMINAL_ENV '%s'. Use one of: local, docker, singularity, "
-                "modal, daytona, vercel_sandbox, ssh.",
+                "modal, daytona, vercel_sandbox, ssh, e2b.",
                 env_type,
             )
             return False
