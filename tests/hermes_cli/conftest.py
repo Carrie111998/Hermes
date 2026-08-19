@@ -116,12 +116,16 @@ def _stub_provider_model_fetch(request, monkeypatch):
     pay all of it -- measured 13-22s per test in
     ``test_authenticated_providers_exhausted_pool.py``.
 
-    That matters beyond slowness. ``--timeout-method=thread`` (pyproject.toml)
-    cannot raise into the main thread, so a test crossing the 30s cap takes the
-    WHOLE pytest process down: no summary line, and the reported failure set is
-    whatever had accumulated when the run died. Because these tests sit right
+    That mattered beyond slowness, and the consequence has since been removed
+    at the source. ``--timeout-method=thread`` (pyproject.toml) cannot raise
+    into the main thread, so a test crossing the 30s cap used to take the WHOLE
+    pytest process down: no summary line, and the reported failure set was
+    whatever had accumulated when the run died. Because these tests sat right
     at the cap, the set varied between invocations -- a standing trap for
     anyone taking a ``tests/hermes_cli`` baseline.
+    ``tests/_nonfatal_timeout.py`` now makes a cap breach fail one test instead
+    of killing the run, so the trap is gone; this stub still matters, because
+    keeping these tests far from the cap is what stops them failing at all.
 
     ``[]`` is the semantically safe default, not merely a fast one: every
     caller already treats an empty result as "live discovery unavailable" and

@@ -6,7 +6,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
 from hermes_cli import active_sessions
+from tests.timeout_budget import scaled
 
 
 def test_resolve_max_concurrent_sessions_values(caplog):
@@ -235,6 +238,24 @@ def test_concurrent_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
             lease.release()
 
 
+# Every deadline in the cross-process test below is an incidental safety net
+# around spawning six interpreters that each import ``hermes_cli.active_sessions``
+# -- none of them is the assertion, which is "exactly one worker gets the last
+# slot". They were hardcoded at 10s, sized for an idle box; in a full
+# ``tests/hermes_cli`` run the box is not idle and the lease holder gave up
+# waiting for its five siblings ("timed out waiting for all workers to attempt
+# acquire"), which is the ONLY reason this test's result moved between runs.
+# Rule 2 of tests/timeout_budget.py: generous base, scaled by
+# HERMES_TEST_TIMEOUT_SCALE.
+COORD_BUDGET_S = scaled(60)
+# Must exceed a worker's whole life: go-file wait + the 2.5s deliberate delay +
+# the results wait. Bounds are ordered inner < outer < pytest-level, because a
+# child bound above the 30s addopts cap is inert on its own -- pytest would fail
+# the test first.
+COMMUNICATE_BUDGET_S = scaled(150)
+
+
+@pytest.mark.timeout(scaled(300))
 def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -257,8 +278,9 @@ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
         "ready_dir = Path(os.environ['READY_DIR'])\n"
         "results_dir = Path(os.environ['RESULTS_DIR'])\n"
         "go_file = Path(os.environ['GO_FILE'])\n"
+        "coord_budget = float(os.environ['COORD_BUDGET_S'])\n"
         "(ready_dir / idx).write_text('ready', encoding='utf-8')\n"
-        "deadline = time.time() + 10\n"
+        "deadline = time.time() + coord_budget\n"
         "while not go_file.exists():\n"
         "    if time.time() > deadline:\n"
         "        raise RuntimeError('timed out waiting for go file')\n"
@@ -276,7 +298,7 @@ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
         "else:\n"
         "    (results_dir / idx).write_text('OK', encoding='utf-8')\n"
         "    print('OK', flush=True)\n"
-        "    deadline = time.time() + 10\n"
+        "    deadline = time.time() + coord_budget\n"
         "    while len(list(results_dir.iterdir())) < worker_count:\n"
         "        if time.time() > deadline:\n"
         "            raise RuntimeError('timed out waiting for all workers to attempt acquire')\n"
@@ -293,6 +315,7 @@ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
             worker_env["READY_DIR"] = str(ready_dir)
             worker_env["RESULTS_DIR"] = str(results_dir)
             worker_env["GO_FILE"] = str(go_file)
+            worker_env["COORD_BUDGET_S"] = str(COORD_BUDGET_S)
             workers.append(
                 subprocess.Popen(
                     [sys.executable, "-c", script],
@@ -306,7 +329,7 @@ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
                 )
             )
 
-        deadline = time.time() + 10
+        deadline = time.time() + COORD_BUDGET_S
         while len(list(ready_dir.iterdir())) < len(workers):
             if time.time() > deadline:
                 raise AssertionError("workers did not become ready")
@@ -315,7 +338,7 @@ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
 
         outputs = []
         for worker in workers:
-            stdout, stderr = worker.communicate(timeout=10)
+            stdout, stderr = worker.communicate(timeout=COMMUNICATE_BUDGET_S)
             assert worker.returncode == 0, stderr
             outputs.append(stdout.strip())
     finally:

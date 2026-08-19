@@ -1,0 +1,299 @@
+# tests/hermes_cli SINGLE-PROCESS baseline -- FROZEN
+# commit:  db0977b4c0   date: 2026-08-18
+# harness: python -m pytest tests/hermes_cli -q -p no:cacheprovider
+#          .venv python 3.12, Windows. pyproject addopts supply
+#          --timeout=30 --timeout-method=thread. 9434 collected every run.
+#
+# STABLE CORE: 248 failures across 61 files. DIFF AGAINST THIS.
+#
+# Evidence: 9 independent full runs. Every one printed a summary line and
+# reported FDGUARD-SUMMARY collected=9434 CLEAN. The core was set-identical
+# (not merely count-identical) in 5 of them: V1, V3, W1, X2, X3.
+#   A   249 failed, 9086 passed, 102 skipped, 12 warnings in 2803.39s (0:46:43)
+#   V1  248 failed, 9087 passed, 102 skipped, 12 warnings in 3139.93s (0:52:19)
+#   V2  249 failed, 9086 passed, 102 skipped, 12 warnings in 2482.19s (0:41:22)
+#   V3  248 failed, 9087 passed, 102 skipped, 12 warnings in 3128.04s (0:52:08)
+#   W1  248 failed, 9087 passed, 102 skipped, 12 warnings in 2795.43s (0:46:35)
+#   W2  249 failed, 9086 passed, 102 skipped, 12 warnings in 2808.31s (0:46:48)
+#   X1  249 failed, 9086 passed, 102 skipped, 12 warnings in 1806.28s (0:30:06)
+#   X2  248 failed, 9087 passed, 102 skipped, 12 warnings in 1713.45s (0:28:33)
+#   X3  248 failed, 9087 passed, 102 skipped, 12 warnings in 2838.29s (0:47:18)
+#
+# The remaining runs were core + exactly ONE rotating timing-sensitive test.
+# All four such tests were identified and fixed; none is part of the core:
+#   - test_cross_process_acquire_claims_only_one_last_slot
+#     FIXED: worker coordination deadlines scaled (COORD_BUDGET_S)
+#   - test_config_set_waits_for_mutation_transaction_and_preserves_keys
+#     FIXED: class-wide spawn budget scaled
+#   - test_direct_save_uses_bounded_lock_with_fixed_timeout
+#     FIXED: holder hold-budget + spawn budget scaled
+#   - test_write_sends_to_child_stdin
+#     FIXED: READY handshake before write (was a race, not a deadline)
+#
+# THIS IS A BASELINE, NOT A REGRESSION LIST. The largest families are platform
+# failures (POSIX-only APIs on Windows), not defects from any recent change:
+#    40  tests/hermes_cli/test_container_boot.py
+#    16  tests/hermes_cli/test_gui_command.py
+#    14  tests/hermes_cli/test_managed_uv.py
+#    14  tests/hermes_cli/test_session_browse.py
+#    13  tests/hermes_cli/test_service_manager.py
+#    12  tests/hermes_cli/test_web_oauth_dispatch.py
+#     9  tests/hermes_cli/test_ensure_hermes_home_uid_34107.py
+#     9  tests/hermes_cli/test_web_ui_build.py
+#
+# Why this file can exist at all: pytest-timeout's `thread` method -- the only
+# one available on Windows -- answered a cap breach with os._exit(1), so a
+# single slow test ended the process with no summary line and a failure set
+# that depended on where it died. tests/_nonfatal_timeout.py makes a breach
+# fail one test instead, which is what makes a frozen list meaningful.
+#
+# Format: one failing test nodeid per line. Regenerate and diff.
+
+tests/hermes_cli/test_auth_commands.py::test_auth_add_codex_oauth_keeps_distinct_pool_accounts
+tests/hermes_cli/test_auth_commands.py::test_auth_add_codex_oauth_persists_pool_entry
+tests/hermes_cli/test_auth_commands.py::test_reset_config_provider_uses_atomic_config_transaction
+tests/hermes_cli/test_auth_nous_provider.py::test_shared_store_write_and_read_roundtrip
+tests/hermes_cli/test_auth_qwen_provider.py::test_save_qwen_cli_tokens_permissions
+tests/hermes_cli/test_banner.py::test_build_welcome_banner_title_is_hyperlinked_to_release
+tests/hermes_cli/test_banner_git_state.py::test_format_banner_version_label_on_upstream_main
+tests/hermes_cli/test_banner_git_state.py::test_format_banner_version_label_with_carried_commits
+tests/hermes_cli/test_banner_git_state.py::test_format_banner_version_label_without_git_state
+tests/hermes_cli/test_bedrock_model_picker.py::TestBedrockRegionRouting::test_eu_region_from_botocore_profile_yields_eu_models
+tests/hermes_cli/test_bedrock_model_picker.py::TestBedrockRegionRouting::test_us_region_from_env_var_yields_us_models
+tests/hermes_cli/test_bedrock_model_picker.py::TestListAuthenticatedProvidersBedrock::test_bedrock_total_models_matches_discovery
+tests/hermes_cli/test_bedrock_model_picker.py::TestListAuthenticatedProvidersBedrock::test_bedrock_uses_live_discovery_not_static_list
+tests/hermes_cli/test_cmd_update.py::TestCmdUpdateBranchFallback::test_update_refreshes_repo_and_tui_node_dependencies
+tests/hermes_cli/test_cmd_update.py::TestNodeRuntimeNpmResolution::test_resolve_rejects_windows_npm_and_rescans_path
+tests/hermes_cli/test_codex_cli_model_picker.py::test_codex_picker_uses_live_codex_catalog
+tests/hermes_cli/test_completion.py::TestGenerateBash::test_valid_bash_syntax
+tests/hermes_cli/test_console_engine.py::test_cron_run_hosted_background_fire_inherits_profile_home
+tests/hermes_cli/test_container_boot.py::test_corrupt_state_file_treated_as_no_prior_state
+tests/hermes_cli/test_container_boot.py::test_default_slot_always_registered_on_empty_home
+tests/hermes_cli/test_container_boot.py::test_default_slot_appears_before_named_profiles
+tests/hermes_cli/test_container_boot.py::test_default_slot_autostarts_when_root_state_running
+tests/hermes_cli/test_container_boot.py::test_default_slot_cleans_up_stale_runtime_files_at_root
+tests/hermes_cli/test_container_boot.py::test_default_slot_does_not_autostart_when_root_state_startup_failed
+tests/hermes_cli/test_container_boot.py::test_default_slot_does_not_autostart_when_root_state_stopped
+tests/hermes_cli/test_container_boot.py::test_default_slot_run_script_omits_profile_flag
+tests/hermes_cli/test_container_boot.py::test_degraded_runtime_state_autostarts
+tests/hermes_cli/test_container_boot.py::test_desired_state_running_autostarts_even_if_runtime_failed
+tests/hermes_cli/test_container_boot.py::test_desired_state_stopped_blocks_legacy_running_runtime
+tests/hermes_cli/test_container_boot.py::test_desired_state_stopped_overrides_draining_runtime
+tests/hermes_cli/test_container_boot.py::test_directory_without_marker_file_is_skipped
+tests/hermes_cli/test_container_boot.py::test_draining_default_root_autostarts
+tests/hermes_cli/test_container_boot.py::test_draining_runtime_state_autostarts
+tests/hermes_cli/test_container_boot.py::test_invalid_profile_name_in_directory_raises
+tests/hermes_cli/test_container_boot.py::test_legacy_gateway_run_cmd_seeds_default_running_state[container_argv0]
+tests/hermes_cli/test_container_boot.py::test_legacy_gateway_run_cmd_seeds_default_running_state[container_argv1]
+tests/hermes_cli/test_container_boot.py::test_legacy_gateway_run_env_no_supervise_does_not_seed_s6_state
+tests/hermes_cli/test_container_boot.py::test_legacy_gateway_run_no_supervise_does_not_seed_s6_state[container_argv0]
+tests/hermes_cli/test_container_boot.py::test_legacy_gateway_run_no_supervise_does_not_seed_s6_state[container_argv1]
+tests/hermes_cli/test_container_boot.py::test_main_ignores_removed_skip_reconcile_env_var
+tests/hermes_cli/test_container_boot.py::test_main_reconciles_in_gateway_container
+tests/hermes_cli/test_container_boot.py::test_missing_profiles_root_still_registers_default_slot
+tests/hermes_cli/test_container_boot.py::test_multiplex_boot_keeps_named_running_profile_registered_down
+tests/hermes_cli/test_container_boot.py::test_profile_without_state_file_is_registered_but_not_started
+tests/hermes_cli/test_container_boot.py::test_profiles_default_subdir_is_skipped_with_warning
+tests/hermes_cli/test_container_boot.py::test_reconcile_log_does_not_rotate_below_threshold
+tests/hermes_cli/test_container_boot.py::test_reconcile_log_is_written
+tests/hermes_cli/test_container_boot.py::test_reconcile_log_rotates_when_size_exceeded
+tests/hermes_cli/test_container_boot.py::test_reconcile_log_rotation_overwrites_existing_dot1
+tests/hermes_cli/test_container_boot.py::test_register_service_cleans_up_stale_tmp_dir
+tests/hermes_cli/test_container_boot.py::test_register_service_overwrites_existing_slot
+tests/hermes_cli/test_container_boot.py::test_register_service_publishes_atomically
+tests/hermes_cli/test_container_boot.py::test_registered_profile_has_finish_script
+tests/hermes_cli/test_container_boot.py::test_running_profile_is_registered_and_autostarted
+tests/hermes_cli/test_container_boot.py::test_stale_runtime_files_are_removed
+tests/hermes_cli/test_container_boot.py::test_starting_state_does_not_autostart
+tests/hermes_cli/test_container_boot.py::test_startup_failed_does_not_autostart
+tests/hermes_cli/test_container_boot.py::test_stopped_profile_is_registered_but_not_started
+tests/hermes_cli/test_copilot_in_model_list.py::test_copilot_picker_uses_live_catalog_when_available
+tests/hermes_cli/test_dashboard_auth_password_login.py::TestPasswordLoginRoute::test_oauth_provider_rejects_password_login_with_404
+tests/hermes_cli/test_dashboard_auth_password_login.py::TestPasswordSessionRefresh::test_expired_access_token_refreshes_via_rt_cookie
+tests/hermes_cli/test_dashboard_auth_password_login.py::TestProviderListFlag::test_oauth_provider_reports_false
+tests/hermes_cli/test_debug.py::TestCaptureLogSnapshot::test_keeps_first_line_when_truncation_on_boundary
+tests/hermes_cli/test_ensure_hermes_home_uid_34107.py::TestChownToHermesUid::test_attributeerror_swallowed_for_windows_compat
+tests/hermes_cli/test_ensure_hermes_home_uid_34107.py::TestChownToHermesUid::test_calls_os_chown_when_both_set
+tests/hermes_cli/test_ensure_hermes_home_uid_34107.py::TestChownToHermesUid::test_eperm_is_silently_swallowed
+tests/hermes_cli/test_ensure_hermes_home_uid_34107.py::TestChownToHermesUid::test_no_op_when_neither_set
+tests/hermes_cli/test_ensure_hermes_home_uid_34107.py::TestChownToHermesUid::test_uses_minus_one_for_missing_field
+tests/hermes_cli/test_ensure_hermes_home_uid_34107.py::TestResolveHermesUidGid::test_invalid_uid_returns_none_for_that_field
+tests/hermes_cli/test_ensure_hermes_home_uid_34107.py::TestResolveHermesUidGid::test_returns_parsed_values_when_both_set
+tests/hermes_cli/test_ensure_hermes_home_uid_34107.py::TestResolveHermesUidGid::test_uid_only_returns_gid_none
+tests/hermes_cli/test_ensure_hermes_home_uid_34107.py::TestResolveHermesUidGid::test_whitespace_padded_values
+tests/hermes_cli/test_env_custom_keys.py::test_catalogued_key_is_not_marked_custom
+tests/hermes_cli/test_env_custom_keys.py::test_custom_key_is_password_masked
+tests/hermes_cli/test_env_custom_keys.py::test_every_row_has_custom_flag
+tests/hermes_cli/test_env_custom_keys.py::test_unknown_env_key_surfaces_as_custom
+tests/hermes_cli/test_env_export_line_lifecycle.py::test_classic_pat_save_via_endpoint_succeeds
+tests/hermes_cli/test_env_export_line_lifecycle.py::test_export_line_with_comment_untouched
+tests/hermes_cli/test_env_export_line_lifecycle.py::test_remove_export_prefixed_token
+tests/hermes_cli/test_env_export_line_lifecycle.py::test_update_export_prefixed_token_does_not_duplicate
+tests/hermes_cli/test_gateway.py::test_install_linux_gateway_from_setup_non_root_never_offers_system
+tests/hermes_cli/test_gateway.py::test_install_linux_gateway_from_setup_system_choice_as_root_installs
+tests/hermes_cli/test_gateway.py::test_install_linux_gateway_from_setup_system_choice_without_root_no_sudo_recipe
+tests/hermes_cli/test_gateway.py::test_reap_unsupervised_orphans_sigterms_then_sigkills_survivor
+tests/hermes_cli/test_gateway.py::test_run_gateway_refuses_root_in_official_docker
+tests/hermes_cli/test_gateway.py::test_run_gateway_root_guard_has_escape_hatch
+tests/hermes_cli/test_gateway.py::test_systemd_install_checks_linger_status
+tests/hermes_cli/test_gateway.py::test_systemd_status_warns_when_linger_disabled
+tests/hermes_cli/test_gateway_linger.py::test_systemd_install_calls_linger_helper
+tests/hermes_cli/test_gateway_s6_dispatch.py::test_block_until_terminated_installs_sigterm_handler_and_blocks
+tests/hermes_cli/test_gateway_wsl.py::TestSupportsSystemdServicesWSL::test_native_linux
+tests/hermes_cli/test_gateway_wsl.py::TestSupportsSystemdServicesWSL::test_wsl_with_systemd
+tests/hermes_cli/test_gui_command.py::test_desktop_build_stamp_skips_build_when_up_to_date
+tests/hermes_cli/test_gui_command.py::test_desktop_force_build_overrides_stamp
+tests/hermes_cli/test_gui_command.py::test_gui_does_not_override_user_electron_mirror
+tests/hermes_cli/test_gui_command.py::test_gui_does_not_retry_after_packaged_executable_exists
+tests/hermes_cli/test_gui_command.py::test_gui_exits_when_npm_missing
+tests/hermes_cli/test_gui_command.py::test_gui_forwards_desktop_environment_overrides
+tests/hermes_cli/test_gui_command.py::test_gui_install_env_prepends_managed_node_on_bare_path
+tests/hermes_cli/test_gui_command.py::test_gui_install_failure_hard_fails_when_electron_dist_exists
+tests/hermes_cli/test_gui_command.py::test_gui_install_failure_hard_fails_when_electron_not_staged
+tests/hermes_cli/test_gui_command.py::test_gui_install_failure_self_heals_electron_and_continues
+tests/hermes_cli/test_gui_command.py::test_gui_installs_packages_and_launches_desktop_app
+tests/hermes_cli/test_gui_command.py::test_gui_linux_falls_back_to_no_sandbox_when_userns_is_restricted
+tests/hermes_cli/test_gui_command.py::test_gui_redownloads_electron_via_mirror_then_repacks
+tests/hermes_cli/test_gui_command.py::test_gui_retries_pack_once_after_purging_build_cache
+tests/hermes_cli/test_gui_command.py::test_gui_retries_pack_under_mirror_even_when_prefetch_blocked
+tests/hermes_cli/test_gui_command.py::test_gui_source_mode_uses_renderer_build_and_electron
+tests/hermes_cli/test_hooks_cli.py::TestHooksDoctor::test_clean_script_runs
+tests/hermes_cli/test_hooks_cli.py::TestHooksDoctor::test_flags_invalid_json
+tests/hermes_cli/test_hooks_cli.py::TestHooksDoctor::test_flags_missing_exec_bit
+tests/hermes_cli/test_hooks_cli.py::TestHooksTest::test_fires_real_subprocess_and_parses_block
+tests/hermes_cli/test_hooks_cli.py::TestHooksTest::test_synthetic_payload_matches_production_shape
+tests/hermes_cli/test_install_cua_driver.py::TestStaleInstallLockClear::test_dead_holder_lock_is_cleared
+tests/hermes_cli/test_install_cua_driver.py::TestStaleInstallLockClear::test_pidless_old_lock_is_cleared
+tests/hermes_cli/test_kanban_reclaim_claim_lock_guard.py::test_genuine_crash_still_reclaims
+tests/hermes_cli/test_kanban_reclaim_claim_lock_guard.py::test_stale_crash_reset_rejected_for_reclaimed_task
+tests/hermes_cli/test_managed_uv.py::TestEnsureUv::test_already_installed_no_bootstrap
+tests/hermes_cli/test_managed_uv.py::TestEnsureUv::test_install_failure_returns_falsy
+tests/hermes_cli/test_managed_uv.py::TestEnsureUv::test_installs_if_missing
+tests/hermes_cli/test_managed_uv.py::TestEnsureUvUpdateBoundary::test_failure_unpacks_without_raising
+tests/hermes_cli/test_managed_uv.py::TestEnsureUvUpdateBoundary::test_success_unpacks_as_legacy_two_tuple
+tests/hermes_cli/test_managed_uv.py::TestEnsureUvUpdateBoundary::test_success_usable_as_single_value
+tests/hermes_cli/test_managed_uv.py::TestEnsureUvWindowsSafe::test_windows_failure_returns_none
+tests/hermes_cli/test_managed_uv.py::TestInstallUvInternals::test_posix_sets_uv_unmanaged_install
+tests/hermes_cli/test_managed_uv.py::TestResolveUv::test_existing_executable
+tests/hermes_cli/test_managed_uv.py::TestResolveUv::test_missing_returns_none
+tests/hermes_cli/test_managed_uv.py::TestResolveUv::test_non_executable_file_returns_none
+tests/hermes_cli/test_managed_uv.py::TestUpdateManagedUv::test_no_uv_returns_none
+tests/hermes_cli/test_managed_uv.py::TestUpdateManagedUv::test_self_update_failure_non_fatal
+tests/hermes_cli/test_managed_uv.py::TestUpdateManagedUv::test_self_update_success
+tests/hermes_cli/test_mcp_dashboard_oauth.py::test_callback_route_supports_server_names_with_slashes
+tests/hermes_cli/test_mcp_dashboard_oauth.py::test_flow_status_does_not_expose_authorization_code
+tests/hermes_cli/test_mcp_dashboard_oauth.py::test_hosted_auth_rejects_overlapping_flow_for_same_server
+tests/hermes_cli/test_mcp_dashboard_oauth.py::test_hosted_auth_start_bounds_pending_flow_registry
+tests/hermes_cli/test_mcp_dashboard_oauth.py::test_hosted_auth_start_returns_public_authorization_url
+tests/hermes_cli/test_mcp_dashboard_oauth.py::test_hosted_callback_bypasses_gated_cookie_auth
+tests/hermes_cli/test_mcp_dashboard_oauth.py::test_hosted_callback_is_public_and_delivers_code
+tests/hermes_cli/test_mcp_dashboard_oauth.py::test_hosted_callback_rejects_wrong_state_before_waking_sdk
+tests/hermes_cli/test_mcp_security.py::test_dashboard_mcp_add_rejects_dangerous_entry
+tests/hermes_cli/test_mcp_security.py::test_profile_mcp_write_skips_dangerous_entry
+tests/hermes_cli/test_model_provider_persistence.py::TestProviderPersistsAfterModelSave::test_update_config_for_provider_uses_atomic_config_transaction
+tests/hermes_cli/test_model_switch_custom_providers.py::test_excluded_providers_empty_is_noop
+tests/hermes_cli/test_model_switch_custom_providers.py::test_excluded_providers_hides_builtin_row
+tests/hermes_cli/test_models.py::TestFetchOpenRouterModels::test_live_fetch_recomputes_free_tags
+tests/hermes_cli/test_models.py::TestFetchOpenRouterModels::test_permissive_when_supported_parameters_missing
+tests/hermes_cli/test_path_completion.py::TestIntegration::test_absolute_path_triggers_completion
+tests/hermes_cli/test_plugin_runtime_disable_gate.py::TestBundledPluginAssetGate::test_bundled_asset_returns_404_when_disabled
+tests/hermes_cli/test_plugin_runtime_disable_gate.py::TestBundledPluginAssetGate::test_bundled_asset_served_when_not_disabled
+tests/hermes_cli/test_plugin_runtime_disable_gate.py::TestBundledPluginAssetGate::test_user_plugin_asset_still_gated
+tests/hermes_cli/test_plugins_cmd.py::TestCursesRadiolist::test_keyboard_interrupt_returns_cancel_value
+tests/hermes_cli/test_plugins_cmd.py::TestResolveSubdirWithin::test_rejects_symlink_escape
+tests/hermes_cli/test_profile_override_import_order.py::test_pre_override_imports_are_only_subcommand_parser_builders
+tests/hermes_cli/test_profiles.py::TestBackfillProfileEnvs::test_copies_default_env_into_envless_profiles
+tests/hermes_cli/test_profiles.py::TestCreateProfile::test_seeds_placeholder_env_file
+tests/hermes_cli/test_profiles.py::TestExportImport::test_export_default_handles_broken_symlinks
+tests/hermes_cli/test_projects_db.py::test_add_remove_folder_and_primary_repoint
+tests/hermes_cli/test_projects_db.py::test_create_get_list
+tests/hermes_cli/test_projects_db.py::test_paths_normalized
+tests/hermes_cli/test_projects_db.py::test_record_and_list_discovered_repos
+tests/hermes_cli/test_projects_db.py::test_record_discovered_repos_replace_drops_stale_rows
+tests/hermes_cli/test_provider_parity.py::test_each_provider_lands_on_the_tab_its_auth_type_dictates
+tests/hermes_cli/test_provider_parity.py::test_every_hermes_model_provider_is_configurable_in_desktop
+tests/hermes_cli/test_provider_parity.py::test_no_provider_appears_on_both_tabs
+tests/hermes_cli/test_relaunch.py::TestBuildRelaunchArgv::test_falls_back_to_python_module
+tests/hermes_cli/test_relaunch.py::TestRelaunch::test_calls_execvp
+tests/hermes_cli/test_relaunch.py::TestRelaunch::test_windows_uses_subprocess_not_execvp
+tests/hermes_cli/test_runtime_provider_resolution.py::test_qwen_oauth_auto_fallthrough_on_auth_failure
+tests/hermes_cli/test_runtime_provider_resolution.py::test_resolve_runtime_provider_qwen_oauth
+tests/hermes_cli/test_service_manager.py::test_s6_log_run_chowns_gateways_parent
+tests/hermes_cli/test_service_manager.py::test_s6_register_creates_service_dir_and_triggers_scan
+tests/hermes_cli/test_service_manager.py::test_s6_register_extra_env_is_quoted
+tests/hermes_cli/test_service_manager.py::test_s6_register_rolls_back_on_svscanctl_failure
+tests/hermes_cli/test_service_manager.py::test_s6_register_staging_dir_is_dotfile_hidden_from_svscan
+tests/hermes_cli/test_service_manager.py::test_s6_register_start_now_false_writes_down_marker
+tests/hermes_cli/test_service_manager.py::test_s6_register_start_now_true_no_down_marker
+tests/hermes_cli/test_service_manager.py::test_s6_register_writes_finish_script
+tests/hermes_cli/test_service_manager.py::test_s6_running_true_when_comm_and_basedir_match
+tests/hermes_cli/test_service_manager.py::test_seed_supervise_skeleton_creates_expected_layout
+tests/hermes_cli/test_service_manager.py::test_seed_supervise_skeleton_handles_log_subservice
+tests/hermes_cli/test_service_manager.py::test_seed_supervise_skeleton_is_idempotent
+tests/hermes_cli/test_service_manager.py::test_seed_supervise_skeleton_skips_when_no_log_subservice
+tests/hermes_cli/test_session_browse.py::TestCursesBrowse::test_backspace_removes_filter_char
+tests/hermes_cli/test_session_browse.py::TestCursesBrowse::test_down_down_enter_selects_third
+tests/hermes_cli/test_session_browse.py::TestCursesBrowse::test_down_then_enter_selects_second
+tests/hermes_cli/test_session_browse.py::TestCursesBrowse::test_enter_selects_first_session
+tests/hermes_cli/test_session_browse.py::TestCursesBrowse::test_escape_cancels
+tests/hermes_cli/test_session_browse.py::TestCursesBrowse::test_escape_clears_filter_first
+tests/hermes_cli/test_session_browse.py::TestCursesBrowse::test_filter_matches_preview
+tests/hermes_cli/test_session_browse.py::TestCursesBrowse::test_filter_matches_source
+tests/hermes_cli/test_session_browse.py::TestCursesBrowse::test_filter_no_match_enter_does_nothing
+tests/hermes_cli/test_session_browse.py::TestCursesBrowse::test_q_cancels
+tests/hermes_cli/test_session_browse.py::TestCursesBrowse::test_q_quits_when_no_filter_active
+tests/hermes_cli/test_session_browse.py::TestCursesBrowse::test_q_types_into_filter_when_filter_active
+tests/hermes_cli/test_session_browse.py::TestCursesBrowse::test_type_to_filter_then_enter
+tests/hermes_cli/test_session_browse.py::TestCursesBrowse::test_up_wraps_to_last
+tests/hermes_cli/test_setup.py::test_setup_gateway_in_container_shows_docker_guidance
+tests/hermes_cli/test_setup.py::test_setup_gateway_skips_service_install_when_systemctl_missing
+tests/hermes_cli/test_setup_hermes_script.py::test_setup_hermes_script_is_valid_shell
+tests/hermes_cli/test_systemd_watchdog_unit.py::test_system_unit_reads_watchdog_from_target_home
+tests/hermes_cli/test_tui_resume_flow.py::test_exit_after_oneshot_bypasses_late_atexit_abort
+tests/hermes_cli/test_tui_resume_flow.py::test_main_oneshot_path_bypasses_late_atexit_abort
+tests/hermes_cli/test_tui_resume_flow.py::test_oneshot_subprocess_exits_without_teardown_abort
+tests/hermes_cli/test_uninstall_node_symlinks.py::test_leaves_unrelated_symlinks_untouched
+tests/hermes_cli/test_uninstall_node_symlinks.py::test_only_some_links_present
+tests/hermes_cli/test_uninstall_node_symlinks.py::test_removes_dangling_symlink_into_hermes_node
+tests/hermes_cli/test_uninstall_node_symlinks.py::test_removes_fhs_symlinks_in_usr_local_bin
+tests/hermes_cli/test_uninstall_node_symlinks.py::test_removes_symlinks_pointing_into_hermes_node
+tests/hermes_cli/test_update_autostash.py::test_non_interactive_discard_throws_changes_away
+tests/hermes_cli/test_update_hangup_protection.py::TestInstallHangupProtection::test_wraps_stdout_and_stderr_with_mirror
+tests/hermes_cli/test_update_post_pull_syntax_guard.py::test_validate_critical_files_syntax_detects_break_in_main_py
+tests/hermes_cli/test_update_post_pull_syntax_guard.py::test_validate_critical_files_syntax_detects_break_in_web_server
+tests/hermes_cli/test_update_post_pull_syntax_guard.py::test_validate_critical_files_syntax_detects_conflict_markers
+tests/hermes_cli/test_update_venv_health.py::test_venv_health_broken_interpreter_is_unhealthy
+tests/hermes_cli/test_update_venv_health.py::test_venv_health_reports_missing_imports
+tests/hermes_cli/test_update_yes_flag.py::TestUpdateYesConfigMigration::test_no_yes_flag_still_prompts_in_tty
+tests/hermes_cli/test_update_yes_flag.py::TestUpdateYesConfigMigration::test_yes_auto_migrates_without_input
+tests/hermes_cli/test_user_providers_model_switch.py::test_current_custom_model_is_surfaced_in_builtin_provider_row
+tests/hermes_cli/test_uv_tool_update.py::TestCmdUpdatePipInstallLayouts::test_pipx_managed_uses_pipx_upgrade
+tests/hermes_cli/test_web_oauth_dispatch.py::test_accounts_offers_every_oauth_provider_from_catalog
+tests/hermes_cli/test_web_oauth_dispatch.py::test_anthropic_pkce_branch_still_works
+tests/hermes_cli/test_web_oauth_dispatch.py::test_codex_dashboard_start_rewords_device_authorization_error
+tests/hermes_cli/test_web_oauth_dispatch.py::test_copilot_acp_now_in_accounts
+tests/hermes_cli/test_web_oauth_dispatch.py::test_env_sourced_oauth_status_is_not_disconnectable
+tests/hermes_cli/test_web_oauth_dispatch.py::test_external_oauth_disconnect_rejected_before_auth_mutation
+tests/hermes_cli/test_web_oauth_dispatch.py::test_minimax_login_does_not_launch_anthropic_flow
+tests/hermes_cli/test_web_oauth_dispatch.py::test_oauth_catalog_marks_external_providers_not_disconnectable
+tests/hermes_cli/test_web_oauth_dispatch.py::test_oauth_provider_status_uses_profile_query
+tests/hermes_cli/test_web_oauth_dispatch.py::test_oauth_start_stores_profile_for_background_completion
+tests/hermes_cli/test_web_oauth_dispatch.py::test_xai_oauth_device_code_start_returns_user_code
+tests/hermes_cli/test_web_oauth_dispatch.py::test_xai_oauth_listed_as_device_code_flow
+tests/hermes_cli/test_web_server_cron_profiles.py::test_dashboard_cron_noop_inference_fields_keep_existing_snapshots
+tests/hermes_cli/test_web_server_cron_profiles.py::test_fire_cron_job_scopes_store_and_runtime_home_together
+tests/hermes_cli/test_web_server_cron_profiles.py::test_update_cron_job_clears_snapshots_for_no_agent
+tests/hermes_cli/test_web_server_cron_profiles.py::test_update_cron_job_refreshes_snapshots_when_unpinning
+tests/hermes_cli/test_web_server_oauth_write.py::test_dashboard_oauth_write_uses_owner_only_permissions
+tests/hermes_cli/test_web_server_skill_editor.py::TestSkillContent::test_get_content_scopes_to_profile
+tests/hermes_cli/test_web_server_skills_profiles.py::TestProfileScopedToolsets::test_toolset_toggle_scopes_to_profile
+tests/hermes_cli/test_web_ui_build.py::TestBuildWebUIRetryAndStaleFallback::test_falls_back_to_stale_dist_when_retry_also_fails
+tests/hermes_cli/test_web_ui_build.py::TestBuildWebUIRetryAndStaleFallback::test_hard_fails_when_no_dist_to_fall_back_to
+tests/hermes_cli/test_web_ui_build.py::TestBuildWebUIRetryAndStaleFallback::test_retries_build_once_on_failure
+tests/hermes_cli/test_web_ui_build.py::TestBuildWebUISkipsWhenFresh::test_desktop_web_install_uses_existing_workspace_root
+tests/hermes_cli/test_web_ui_build.py::TestBuildWebUISkipsWhenFresh::test_npm_install_uses_workspace_web_scope
+tests/hermes_cli/test_web_ui_build.py::TestBuildWebUISkipsWhenFresh::test_runs_npm_when_dist_missing
+tests/hermes_cli/test_web_ui_build.py::TestBuildWebUISkipsWhenFresh::test_termux_web_install_is_workspace_scoped
+tests/hermes_cli/test_web_ui_build.py::TestBuildWebUISkipsWhenFresh::test_web_build_uses_idle_timeout_helper
+tests/hermes_cli/test_web_ui_build.py::TestBuildWebUISkipsWhenFresh::test_web_install_omits_workspace_when_web_has_own_lockfile
+tests/hermes_cli/test_xai_model_flow.py::test_auth_credentials_choice_falls_back_to_numbered_prompt

@@ -36,6 +36,14 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# Per-test timeouts must fail ONE test, not take the whole run down.
+# pytest-timeout's ``thread`` method (pinned in pyproject.toml because
+# signal.SIGALRM is Unix-only) answers a timeout with ``os._exit(1)``: no
+# summary line, and a failure set that depends on where the process died.
+# Re-exporting this hook implementation here registers it for the whole suite.
+# See tests/_nonfatal_timeout.py.
+from tests._nonfatal_timeout import pytest_timeout_set_timer  # noqa: E402,F401
+
 # ``sys.path`` as the RUNNER handed it to us, snapshotted before pytest has
 # imported a single test module. Everything here was put there deliberately by
 # the harness -- PYTHONPATH, the venv, plugin dirs -- so it is the baseline the

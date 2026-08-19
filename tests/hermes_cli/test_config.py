@@ -9,6 +9,8 @@ from unittest.mock import patch
 import pytest
 import yaml
 
+from tests.timeout_budget import scaled
+
 from hermes_cli.config import (
     DEFAULT_CONFIG,
     check_config_version,
@@ -33,6 +35,22 @@ from hermes_cli.config import (
 )
 
 
+# How long a spawned lock HOLDER keeps the lock while the parent does its
+# assertion. This is an incidental safety net, not the assertion (rule 2 of
+# tests/timeout_budget.py). At its old hardcoded 10s, a loaded box could starve
+# the parent long enough for the holder to give up FIRST -- it then released the
+# lock, the parent's save_config succeeded, and the test failed with
+# "DID NOT RAISE <class 'TimeoutError'>" while the holder died with
+# "test release timed out". That is the whole reason
+# test_direct_save_uses_bounded_lock_with_fixed_timeout moved between runs.
+#
+# Read at import; in a "spawn" child the module is re-imported and the
+# environment is inherited, so HERMES_TEST_TIMEOUT_SCALE applies on both sides.
+_HOLD_BUDGET_S = scaled(60)
+#: Bound on a spawned child becoming ready / being reaped. Also incidental.
+_SPAWN_BUDGET_S = scaled(60)
+
+
 def _mutate_config_process(home, key, entered, release=None, ready=None):
     os.environ["HERMES_HOME"] = str(home)
     from hermes_cli.config import mutate_config
@@ -43,7 +61,7 @@ def _mutate_config_process(home, key, entered, release=None, ready=None):
     def update(config):
         config.setdefault("race_test", {})[key] = True
         entered.set()
-        if release is not None and not release.wait(timeout=10):
+        if release is not None and not release.wait(timeout=_HOLD_BUDGET_S):
             raise RuntimeError("test release timed out")
 
     mutate_config(update, strip_defaults=False)
@@ -96,7 +114,7 @@ def _hold_config_file_lock_process(config_path, entered, release):
 
     with _config_file_lock(Path(config_path)):
         entered.set()
-        if not release.wait(timeout=10):
+        if not release.wait(timeout=_HOLD_BUDGET_S):
             raise RuntimeError("test release timed out")
 
 
@@ -1212,6 +1230,19 @@ class TestSaveConfigAtomicity:
             assert raw["agent"]["max_turns"] == 77
 
 
+# Every test in this class spawns real interpreters ("spawn" start method) that
+# import hermes_cli.config, then coordinates with them through Events. All the
+# wait/join bounds are incidental safety nets, not assertions -- the assertions
+# are about lock ORDERING -- so they are scaled per rule 2 of
+# tests/timeout_budget.py. At their old hardcoded 10s/15s the class produced a
+# rotating +/-1 in the tests/hermes_cli failure count: 2026-08-18 saw
+# test_direct_save_uses_bounded_lock_with_fixed_timeout fail one run and
+# test_config_set_waits_for_mutation_transaction_and_preserves_keys fail
+# another, both with a spawned child simply not becoming ready in 10s under
+# full-suite load. The `assert not ...wait(timeout=0.5)` calls are deliberately
+# NOT scaled: those bounds ARE the assertion ("the second writer must not get
+# in"), and lengthening them would only slow the suite.
+@pytest.mark.timeout(scaled(180))
 class TestConfigInterprocessLocking:
     def test_mutate_config_rejects_unpersisted_managed_document_and_releases_lock(
         self, tmp_path, monkeypatch
@@ -1291,15 +1322,15 @@ class TestConfigInterprocessLocking:
                 args=(tmp_path, "second", second_entered, None, second_ready),
             )
             first.start()
-            assert first_entered.wait(timeout=10)
+            assert first_entered.wait(timeout=_SPAWN_BUDGET_S)
             second.start()
             try:
-                assert second_ready.wait(timeout=10)
+                assert second_ready.wait(timeout=_SPAWN_BUDGET_S)
                 assert not second_entered.wait(timeout=0.5)
             finally:
                 release_first.set()
-                first.join(timeout=15)
-                second.join(timeout=15)
+                first.join(timeout=_SPAWN_BUDGET_S)
+                second.join(timeout=_SPAWN_BUDGET_S)
                 if first.is_alive():
                     first.terminate()
                 if second.is_alive():
@@ -1321,7 +1352,7 @@ class TestConfigInterprocessLocking:
                 args=(tmp_path,),
             )
             process.start()
-            process.join(timeout=15)
+            process.join(timeout=_SPAWN_BUDGET_S)
             if process.is_alive():
                 process.terminate()
                 pytest.fail("config lock remained held after a mutator exception")
@@ -1329,6 +1360,10 @@ class TestConfigInterprocessLocking:
             assert process.exitcode == 0
             assert read_raw_config()["race_test"]["recovered"] is True
 
+    # The bound under test is _CONFIG_FILE_LOCK_TIMEOUT_SECONDS=0.1 below, and it
+    # stays hardcoded and small -- it IS the assertion (rule 1). Only the spawn
+    # safety nets around it are scaled; the class-level cap above covers the
+    # pytest side.
     def test_direct_save_uses_bounded_lock_with_fixed_timeout(
         self, tmp_path, monkeypatch
     ):
@@ -1343,7 +1378,7 @@ class TestConfigInterprocessLocking:
                 args=(tmp_path, "holder", holder_entered, release_holder),
             )
             holder.start()
-            assert holder_entered.wait(timeout=10)
+            assert holder_entered.wait(timeout=_SPAWN_BUDGET_S)
             monkeypatch.setattr(
                 config_module,
                 "_CONFIG_FILE_LOCK_TIMEOUT_SECONDS",
@@ -1356,7 +1391,7 @@ class TestConfigInterprocessLocking:
                 assert str(raised.value) == "config_lock_timeout"
             finally:
                 release_holder.set()
-                holder.join(timeout=15)
+                holder.join(timeout=_SPAWN_BUDGET_S)
                 if holder.is_alive():
                     holder.terminate()
 
@@ -1379,15 +1414,15 @@ class TestConfigInterprocessLocking:
                 args=(tmp_path, setter_ready, setter_done),
             )
             holder.start()
-            assert holder_entered.wait(timeout=10)
+            assert holder_entered.wait(timeout=_SPAWN_BUDGET_S)
             setter.start()
             try:
-                assert setter_ready.wait(timeout=10)
+                assert setter_ready.wait(timeout=_SPAWN_BUDGET_S)
                 assert not setter_done.wait(timeout=0.5)
             finally:
                 release_holder.set()
-                holder.join(timeout=15)
-                setter.join(timeout=15)
+                holder.join(timeout=_SPAWN_BUDGET_S)
+                setter.join(timeout=_SPAWN_BUDGET_S)
                 if holder.is_alive():
                     holder.terminate()
                 if setter.is_alive():
@@ -1430,15 +1465,15 @@ class TestConfigInterprocessLocking:
                 args=(tmp_path, action, auth_ready, auth_done),
             )
             holder.start()
-            assert holder_entered.wait(timeout=10)
+            assert holder_entered.wait(timeout=_SPAWN_BUDGET_S)
             auth_writer.start()
             try:
-                assert auth_ready.wait(timeout=10)
+                assert auth_ready.wait(timeout=_SPAWN_BUDGET_S)
                 assert not auth_done.wait(timeout=0.5)
             finally:
                 release_holder.set()
-                holder.join(timeout=15)
-                auth_writer.join(timeout=15)
+                holder.join(timeout=_SPAWN_BUDGET_S)
+                auth_writer.join(timeout=_SPAWN_BUDGET_S)
                 if holder.is_alive():
                     holder.terminate()
                 if auth_writer.is_alive():
@@ -1487,7 +1522,7 @@ class TestConfigInterprocessLocking:
             args=(first_alias, entered, release),
         )
         holder.start()
-        assert entered.wait(timeout=10)
+        assert entered.wait(timeout=_SPAWN_BUDGET_S)
         monkeypatch.setattr(config_module, "_CONFIG_FILE_LOCK_TIMEOUT_SECONDS", 0.1)
         try:
             with pytest.raises(TimeoutError, match="^config_lock_timeout$"):
@@ -1495,7 +1530,7 @@ class TestConfigInterprocessLocking:
                     pass
         finally:
             release.set()
-            holder.join(timeout=15)
+            holder.join(timeout=_SPAWN_BUDGET_S)
             if holder.is_alive():
                 holder.terminate()
 
@@ -1555,15 +1590,15 @@ class TestConfigInterprocessLocking:
                 args=(tmp_path, action, writer_ready, writer_done),
             )
             holder.start()
-            assert holder_entered.wait(timeout=10)
+            assert holder_entered.wait(timeout=_SPAWN_BUDGET_S)
             writer.start()
             try:
-                assert writer_ready.wait(timeout=10)
+                assert writer_ready.wait(timeout=_SPAWN_BUDGET_S)
                 assert not writer_done.wait(timeout=0.5)
             finally:
                 release_holder.set()
-                holder.join(timeout=15)
-                writer.join(timeout=15)
+                holder.join(timeout=_SPAWN_BUDGET_S)
+                writer.join(timeout=_SPAWN_BUDGET_S)
                 if holder.is_alive():
                     holder.terminate()
                 if writer.is_alive():
