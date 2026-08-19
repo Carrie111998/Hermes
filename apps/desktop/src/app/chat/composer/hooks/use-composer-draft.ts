@@ -182,7 +182,7 @@ export function useComposerDraft({
   )
 
   useEffect(() => {
-    if (!inputDisabled) {
+    if (!inputDisabled && focusKey !== null) {
       focusInput()
     }
   }, [focusInput, focusKey, focusRequestId, inputDisabled])
