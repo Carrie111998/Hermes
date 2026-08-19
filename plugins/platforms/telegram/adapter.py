@@ -6677,6 +6677,11 @@ class TelegramAdapter(BasePlatformAdapter):
 
             models = provider.get("models", [])
             state["selected_provider"] = provider_slug
+            try:
+                from hermes_cli.models import picker_runtime_slug
+                state["selected_runtime_slug"] = picker_runtime_slug(provider)
+            except Exception:
+                state["selected_runtime_slug"] = provider_slug
             state["selected_provider_name"] = provider.get("name", provider_slug)
             state["model_list"] = models
             state["model_page"] = 0
@@ -6783,7 +6788,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
 
             model_id = model_list[idx]
-            provider_slug = state.get("selected_provider", "")
+            provider_slug = state.get("selected_runtime_slug") or state.get("selected_provider", "")
             callback = state.get("on_model_selected")
 
             if not callback:
@@ -6832,7 +6837,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
 
             model_id = model_list[idx]
-            provider_slug = state.get("selected_provider", "")
+            provider_slug = state.get("selected_runtime_slug") or state.get("selected_provider", "")
             callback = state.get("on_model_selected")
 
             if not callback:
