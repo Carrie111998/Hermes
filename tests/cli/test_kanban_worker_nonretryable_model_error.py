@@ -241,6 +241,24 @@ def test_main_without_kanban_task_nonretryable_model_error_exits_with_error_code
     assert fake_kanban_db.blocks == []
 
 
+def test_main_with_whitespace_kanban_task_nonretryable_model_error_exits_with_error_code(
+    monkeypatch, fake_kanban_db
+):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "   ")
+    monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+
+    result = _make_result("auth", status_code=403, error="access terminated")
+    monkeypatch.setattr(cli, "HermesCLI", _make_fake_cli_for_main(result))
+    monkeypatch.setattr(cli.atexit, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli, "_finalize_single_query", lambda _cli: None)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(query="hello", quiet=True, toolsets="terminal")
+
+    assert exc_info.value.code == 1
+    assert fake_kanban_db.blocks == []
+
+
 def test_main_with_kanban_task_rate_limit_still_uses_rate_limit_exit_code(
     monkeypatch, fake_kanban_db
 ):
@@ -279,6 +297,7 @@ def test_block_kanban_task_for_model_error_swallows_connection_close_exception(
 
     conn = fake_kanban_db.connect()
     conn.close = lambda: (_ for _ in ()).throw(RuntimeError("close failed"))
+    monkeypatch.setattr(fake_kanban_db, "connect", lambda: conn)
 
     cli._block_kanban_task_for_model_error(fake_cli, _make_result("auth"))
 

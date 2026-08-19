@@ -20536,7 +20536,7 @@ def main(
         # first so the final debug trace isn't lost; SIGALRM deadman guards
         # the flush against any rare blocking-I/O case (the reporter measured
         # flush in <1ms; the alarm is a failsafe, not the common path).
-        if os.environ.get("HERMES_KANBAN_TASK"):
+        if (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
             try:
                 import signal as _sig_mod
                 if hasattr(_sig_mod, "SIGALRM"):
@@ -20772,7 +20772,7 @@ def main(
                         _exit_code = 0
                         if isinstance(result, dict) and result.get("failed"):
                             _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
+                            if (os.environ.get("HERMES_KANBAN_TASK") or "").strip() and result.get(
                                 "failure_reason"
                             ) in ("rate_limit", "billing"):
                                 try:
@@ -20782,7 +20782,7 @@ def main(
                                     _exit_code = _RL_CODE
                                 except Exception:
                                     _exit_code = 1
-                            elif os.environ.get("HERMES_KANBAN_TASK") and _is_nonretryable_model_client_error(result):
+                            elif (os.environ.get("HERMES_KANBAN_TASK") or "").strip() and _is_nonretryable_model_client_error(result):
                                 # A non-retryable model-client error (e.g. 403
                                 # access_terminated_error) means the provider
                                 # has refused the request. Block the card with the
