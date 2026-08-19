@@ -1,103 +1,84 @@
 /**
- * backend-child.ts
+ * Fail-closed lifecycle control for desktop-owned backend children.
  *
- * Windows-aware teardown for the desktop's managed backend child process.
+ * A numeric PID is observation, never destructive authority. This module only
+ * signals a retained ChildProcess-style owner whose lifecycle fields still say
+ * it is live. Persisted or reconstructed `{ pid }` records are intentionally
+ * rejected. If no owner survives, callers must leave residue and abort the
+ * operation rather than rediscovering and killing by PID (#89614).
  *
- * Node's `child.kill()` only signals the direct child. On Windows a backend
- * that spawned its own grandchildren (a `hermes` REPL, a pty terminal
- * session, the gateway) survives a plain SIGTERM and keeps files (e.g. the
- * venv shim) locked. So on Windows we tree-kill via `forceKillProcessTree`.
- *
- * On POSIX the backend IS spawned into its own session/process-group
- * (start_new_session=True), so `child.kill('SIGTERM')` would only reach the
- * backend and orphan its MCP grandchildren (the leak in #serve-orphans). We
- * signal the whole group via `process.kill(-pid, ...)` instead, falling back
- * to the direct child if the group send fails.
- *
- * Extracted into its own dependency-free module (no electron import) so the
- * tree-kill / group-kill branching can be asserted directly with a fake child
- * object and spy kill functions, instead of grepping main.ts source text for
- * the function body.
+ * Tree-wide force-stop belongs in a platform authority created at spawn time:
+ * a retained Windows Job Object handle or a retained POSIX process-group
+ * owner. Until that authority lands, direct-child shutdown plus abort-on-lock
+ * is the safe P1 policy.
  */
-
-export interface StopBackendChildDeps {
-  /** Defaults to the real platform check; injectable for tests. */
-  isWindows?: boolean
-  /** Windows tree-kill implementation (real: taskkill /T /F via execFileSync). */
-  forceKillProcessTree: (pid: number) => void
-  /**
-   * POSIX group-signal implementation. Real: process.kill(-pgid, signal).
-   * Injectable so the negative-pid group send is asserted in tests without a
-   * live process group. Defaults to process.kill.
-   */
-  killGroup?: (pgid: number, signal: string) => void
-}
-
-export interface StopBackendTreesForUpdateDeps {
-  /** Synchronous Windows taskkill /T /F implementation. */
-  forceKillProcessTree: (pid: number) => void
-  /** Clears and stops the desktop's pooled backends. */
-  stopAllPoolBackends: () => void
-}
 
 export interface BackendProcessRoot {
   pid?: number | null
+  exitCode?: null | number
+  signalCode?: null | string
 }
 
 export interface KillableChild extends BackendProcessRoot {
   killed?: boolean
-  kill: (signal: string) => void
+  /** Accepts NodeJS.Signals (e.g. 'SIGTERM', 'SIGKILL') to match ChildProcess.kill. */
+  kill: (signal?: NodeJS.Signals | number | null) => unknown
+}
+
+export interface StopBackendTreesForUpdateDeps {
+  /** Stops pooled backends through their retained ChildProcess owners. */
+  stopAllPoolBackends: () => Promise<void> | void
 }
 
 /**
- * Stop a managed child process, choosing the right strategy for the platform.
- * No-ops silently if `child` is falsy, already killed, or the kill attempt
- * throws (the process may already be gone) -- mirrors the original inline
- * best-effort semantics in main.ts.
+ * True only for a retained owner with a positive PID and explicit live
+ * lifecycle state. Missing lifecycle fields mean there is no authority, not
+ * that a legacy PID should be trusted.
  */
-export function stopBackendChild(child: KillableChild | null | undefined, deps: StopBackendChildDeps) {
-  if (!child || child.killed) {
-    return
+export function isLiveProcessRoot(root: BackendProcessRoot | null | undefined): boolean {
+  return Boolean(
+    root &&
+      Number.isInteger(root.pid) &&
+      (root.pid as number) > 0 &&
+      root.exitCode === null &&
+      root.signalCode === null
+  )
+}
+
+function signalRetainedChild(child: KillableChild | null | undefined, signal: NodeJS.Signals): boolean {
+  if (!child || !isLiveProcessRoot(child) || typeof child.kill !== 'function') {
+    return false
   }
-
-  const isWindows = deps.isWindows ?? process.platform === 'win32'
-  const killGroup = deps.killGroup ?? ((pgid: number, signal: string) => process.kill(pgid, signal))
-
   try {
-    if (isWindows && Number.isInteger(child.pid)) {
-      deps.forceKillProcessTree(child.pid as number)
-    } else if (Number.isInteger(child.pid)) {
-      // POSIX: pgid == pid (start_new_session). Signal the whole group so MCP
-      // grandchildren die too; fall back to the direct child on failure.
-      try {
-        killGroup(-(child.pid as number), 'SIGTERM')
-      } catch {
-        child.kill('SIGTERM')
-      }
-    } else {
-      child.kill('SIGTERM')
-    }
+    return child.kill(signal) !== false
   } catch {
-    // Already gone.
+    return false
   }
 }
 
-/**
- * Stop every backend tree owned by a Windows Desktop update hand-off.
- *
- * Tree-kill the primary root while its PID is still live, then delegate pool
- * teardown to the existing routine that tree-kills each pooled root exactly
- * once before mutating its registry. In particular, do not signal the primary
- * first: if that root exits before taskkill /T runs, Windows can no longer
- * enumerate its MCP grandchildren and they survive with the venv locked.
- */
-export function stopBackendTreesForUpdate(
-  primary: BackendProcessRoot | null | undefined,
-  deps: StopBackendTreesForUpdateDeps
-): void {
-  if (primary && Number.isInteger(primary.pid)) {
-    deps.forceKillProcessTree(primary.pid as number)
+/** Graceful stop through the retained owner only. */
+export function stopBackendChild(child: KillableChild | null | undefined): boolean {
+  if (!child || child.killed) {
+    return false
   }
+  return signalRetainedChild(child, 'SIGTERM')
+}
 
-  deps.stopAllPoolBackends()
+/** Forced direct-child stop through the same retained owner only. */
+export function forceStopBackendChild(child: KillableChild | null | undefined): boolean {
+  return signalRetainedChild(child, 'SIGKILL')
+}
+
+/**
+ * Begin update teardown without ever converting ownership into a PID.
+ * Descendants that survive direct-child shutdown keep the shim locked; the
+ * caller must then abort the update. That residue is deliberate containment
+ * until a retained Job Object/process-group authority owns the full tree.
+ */
+export async function stopBackendTreesForUpdate(
+  primary: KillableChild | null | undefined,
+  deps: StopBackendTreesForUpdateDeps
+): Promise<void> {
+  stopBackendChild(primary)
+  await deps.stopAllPoolBackends()
 }
