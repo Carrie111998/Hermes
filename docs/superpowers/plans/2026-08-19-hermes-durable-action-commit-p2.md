@@ -108,4 +108,3 @@
 - [ ] Review diff, secret scan, compile/import smoke, and worktree cleanliness.
 - [ ] Write the final receipt with exact SHA, test counts, invariants, and no universal exactly-once claim.
 - [ ] Commit only intended P2 scope and stop; do not start P3.
-
