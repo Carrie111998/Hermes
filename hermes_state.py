@@ -346,6 +346,31 @@ CREATE TABLE IF NOT EXISTS mission_checkpoints (
     convergence_reference TEXT
 );
 
+CREATE TABLE IF NOT EXISTS mission_actions (
+    action_id TEXT PRIMARY KEY,
+    mission_id TEXT REFERENCES missions(mission_id),
+    checkpoint_id TEXT,
+    parent_action_id TEXT REFERENCES mission_actions(action_id),
+    action_type TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    input_summary TEXT NOT NULL,
+    status TEXT NOT NULL,
+    replay_class TEXT NOT NULL,
+    freshness_policy TEXT,
+    created_at REAL NOT NULL,
+    authorized_at REAL,
+    started_at REAL,
+    completed_at REAL,
+    updated_at REAL NOT NULL,
+    result_ref TEXT,
+    verification_ref TEXT,
+    error_code TEXT,
+    error_summary TEXT,
+    external_authority_ref TEXT,
+    approval_ref TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -355,6 +380,9 @@ CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(ex
 CREATE INDEX IF NOT EXISTS idx_missions_current_session ON missions(current_session_id);
 CREATE INDEX IF NOT EXISTS idx_mission_sessions_mission ON mission_sessions(mission_id);
 CREATE INDEX IF NOT EXISTS idx_mission_checkpoints_mission ON mission_checkpoints(mission_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_mission_actions_mission ON mission_actions(mission_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_mission_actions_status ON mission_actions(mission_id, status);
+CREATE INDEX IF NOT EXISTS idx_mission_actions_fingerprint ON mission_actions(mission_id, tool_name, input_fingerprint);
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -1316,6 +1344,265 @@ class SessionDB:
         mission = self.get_mission_for_session(session_id)
         if mission["mission_id"] != mission_id:
             raise ValueError("session belongs to another durable mission")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Durable action ledger
+    # ──────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _action_from_row(row):
+        from agent.action_commit import (
+            ActionIntegrityError,
+            ActionRecord,
+            ActionStatus,
+            ReplayClass,
+            validate_action,
+        )
+
+        if row is None:
+            return None
+        try:
+            summary = json.loads(row["input_summary"] or "{}")
+            if not isinstance(summary, dict):
+                raise ValueError("input summary must be an object")
+            action = ActionRecord(
+                action_id=row["action_id"],
+                mission_id=row["mission_id"],
+                checkpoint_id=row["checkpoint_id"],
+                parent_action_id=row["parent_action_id"],
+                action_type=row["action_type"],
+                tool_name=row["tool_name"],
+                input_fingerprint=row["input_fingerprint"],
+                input_summary=summary,
+                status=ActionStatus(row["status"]),
+                replay_class=ReplayClass(row["replay_class"]),
+                freshness_policy=row["freshness_policy"],
+                created_at=row["created_at"],
+                authorized_at=row["authorized_at"],
+                started_at=row["started_at"],
+                completed_at=row["completed_at"],
+                updated_at=row["updated_at"],
+                result_ref=row["result_ref"],
+                verification_ref=row["verification_ref"],
+                error_code=row["error_code"],
+                error_summary=row["error_summary"],
+                external_authority_ref=row["external_authority_ref"],
+                approval_ref=row["approval_ref"],
+            )
+            return validate_action(action)
+        except ActionIntegrityError:
+            raise
+        except Exception as exc:
+            raise ActionIntegrityError("action row is corrupt") from exc
+
+    @staticmethod
+    def _action_values(action):
+        from agent.action_commit import validate_action
+
+        action = validate_action(action)
+        return (
+            action.action_id,
+            action.mission_id,
+            action.checkpoint_id,
+            action.parent_action_id,
+            action.action_type,
+            action.tool_name,
+            action.input_fingerprint,
+            json.dumps(action.input_summary, ensure_ascii=False, sort_keys=True),
+            action.status.value,
+            action.replay_class.value,
+            action.freshness_policy,
+            action.created_at,
+            action.authorized_at,
+            action.started_at,
+            action.completed_at,
+            action.updated_at,
+            action.result_ref,
+            action.verification_ref,
+            action.error_code,
+            action.error_summary,
+            action.external_authority_ref,
+            action.approval_ref,
+        )
+
+    def create_action(
+        self,
+        *,
+        mission_id: str | None,
+        checkpoint_id: str | None,
+        action_type: str,
+        tool_name: str,
+        input_fingerprint: str,
+        replay_class: str,
+        input_summary: dict,
+        parent_action_id: str | None = None,
+        freshness_policy: str | None = None,
+        external_authority_ref: str | None = None,
+        approval_ref: str | None = None,
+        action_id: str | None = None,
+    ):
+        from agent.action_commit import ActionRecord, ActionStatus, ReplayClass, new_action_id, safe_input_summary, validate_action
+
+        now = time.time()
+        action = validate_action(ActionRecord(
+            action_id=action_id or new_action_id(),
+            mission_id=mission_id,
+            checkpoint_id=checkpoint_id,
+            parent_action_id=parent_action_id,
+            action_type=action_type,
+            tool_name=tool_name,
+            input_fingerprint=input_fingerprint,
+            input_summary=safe_input_summary(input_summary),
+            status=ActionStatus.PLANNED,
+            replay_class=ReplayClass(replay_class),
+            freshness_policy=freshness_policy,
+            created_at=now,
+            updated_at=now,
+            external_authority_ref=external_authority_ref,
+            approval_ref=approval_ref,
+        ))
+
+        def _do(conn):
+            if mission_id is not None and conn.execute(
+                "SELECT 1 FROM missions WHERE mission_id = ?", (mission_id,)
+            ).fetchone() is None:
+                raise ValueError(f"mission does not exist: {mission_id}")
+            conn.execute(
+                """INSERT INTO mission_actions
+                   (action_id, mission_id, checkpoint_id, parent_action_id,
+                    action_type, tool_name, input_fingerprint, input_summary,
+                    status, replay_class, freshness_policy, created_at,
+                    authorized_at, started_at, completed_at, updated_at,
+                    result_ref, verification_ref, error_code, error_summary,
+                    external_authority_ref, approval_ref)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                self._action_values(action),
+            )
+
+        self._execute_write(_do)
+        return action
+
+    def get_action(self, action_id: str):
+        row = self._conn.execute(
+            "SELECT * FROM mission_actions WHERE action_id = ?", (action_id,)
+        ).fetchone()
+        return self._action_from_row(row)
+
+    def find_action_by_fingerprint(self, mission_id: str | None, tool_name: str, input_fingerprint: str):
+        row = self._conn.execute(
+            """SELECT * FROM mission_actions
+               WHERE mission_id IS ? AND tool_name = ? AND input_fingerprint = ?
+               ORDER BY created_at DESC LIMIT 1""",
+            (mission_id, tool_name, input_fingerprint),
+        ).fetchone()
+        return self._action_from_row(row)
+
+    def list_pending_actions(self, mission_id: str, checkpoint_id: str | None = None):
+        params = [mission_id]
+        query = """SELECT * FROM mission_actions
+                   WHERE mission_id = ? AND status IN ('RUNNING', 'UNKNOWN_OUTCOME', 'VERIFY_REQUIRED')"""
+        if checkpoint_id is not None:
+            query += " AND checkpoint_id = ?"
+            params.append(checkpoint_id)
+        query += " ORDER BY created_at"
+        return [self._action_from_row(row) for row in self._conn.execute(query, params).fetchall()]
+
+    def _transition_action(self, action_id: str, target, **fields):
+        from agent.action_commit import ActionLedgerError, ActionStatus, validate_transition
+
+        target = ActionStatus(target)
+        now = time.time()
+        updates = {"status": target.value, "updated_at": now, **fields}
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM mission_actions WHERE action_id = ?", (action_id,)
+            ).fetchone()
+            current = self._action_from_row(row)
+            if current is None:
+                raise ValueError(f"action does not exist: {action_id}")
+            validate_transition(current.status, target)
+            assignments = ", ".join(f"{key} = ?" for key in updates)
+            values = [updates[key] for key in updates]
+            values.extend([action_id, current.status.value])
+            changed = conn.execute(
+                f"UPDATE mission_actions SET {assignments} WHERE action_id = ? AND status = ?",
+                values,
+            ).rowcount
+            if changed != 1:
+                raise ActionLedgerError("action transition lost a concurrent race")
+
+        self._execute_write(_do)
+        return self.get_action(action_id)
+
+    def authorize_action(self, action_id: str):
+        return self._transition_action(action_id, "AUTHORIZED", authorized_at=time.time())
+
+    def mark_action_running(self, action_id: str, before_dispatch=None):
+        action = self._transition_action(action_id, "RUNNING", started_at=time.time())
+        if before_dispatch is not None:
+            before_dispatch()
+        return action
+
+    def mark_action_committed(self, action_id: str, *, result_ref: str):
+        if not result_ref or len(str(result_ref).encode("utf-8")) > 512:
+            raise ValueError("bounded result_ref is required")
+        return self._transition_action(
+            action_id, "COMMITTED", completed_at=time.time(), result_ref=str(result_ref)
+        )
+
+    def mark_action_failed(self, action_id: str, *, error_code: str, error_summary: str | None = None):
+        return self._transition_action(
+            action_id,
+            "FAILED",
+            completed_at=time.time(),
+            error_code=str(error_code)[:256],
+            error_summary=(str(error_summary)[:2048] if error_summary else None),
+        )
+
+    def mark_action_unknown_outcome(self, action_id: str, *, error_code: str, error_summary: str | None = None):
+        return self._transition_action(
+            action_id,
+            "UNKNOWN_OUTCOME",
+            error_code=str(error_code)[:256],
+            error_summary=(str(error_summary)[:2048] if error_summary else None),
+        )
+
+    def require_action_verification(self, action_id: str, *, verification_ref: str | None = None):
+        return self._transition_action(
+            action_id,
+            "VERIFY_REQUIRED",
+            verification_ref=(verification_ref or f"verify:{action_id}")[:512],
+        )
+
+    def verify_action_outcome(self, action_id: str, verdict: str, *, result_ref: str | None = None):
+        from agent.action_commit import ActionStatus
+
+        action = self.get_action(action_id)
+        if action is None or action.status is not ActionStatus.VERIFY_REQUIRED:
+            raise ValueError("action is not awaiting verification")
+        if verdict == "VERIFIED_EXISTS":
+            return self.mark_action_committed(action_id, result_ref=result_ref or action.verification_ref or "verified")
+        if verdict == "VERIFIED_ABSENT":
+            return self.mark_action_failed(action_id, error_code="VERIFIED_ABSENT", error_summary="verification proved no side effect occurred")
+        if verdict == "AMBIGUOUS":
+            now = time.time()
+            self._execute_write(lambda conn: conn.execute(
+                "UPDATE mission_actions SET verification_ref = ?, updated_at = ? WHERE action_id = ?",
+                (f"ambiguous:{action_id}", now, action_id),
+            ))
+            return self.get_action(action_id)
+        raise ValueError(f"unsupported verification verdict: {verdict}")
+
+    def reject_action(self, action_id: str, *, error_code: str = "REJECTED", error_summary: str | None = None):
+        return self._transition_action(
+            action_id, "REJECTED", completed_at=time.time(), error_code=error_code[:256],
+            error_summary=(error_summary[:2048] if error_summary else None),
+        )
+
+    def supersede_action(self, action_id: str):
+        return self._transition_action(action_id, "SUPERSEDED", completed_at=time.time())
+
     def end_session(self, session_id: str, end_reason: str) -> None:
         """Mark a session as ended.
 

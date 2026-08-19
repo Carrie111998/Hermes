@@ -1849,11 +1849,25 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             )
 
     from hermes_cli.middleware import run_tool_execution_middleware
+    from agent.action_commit import execute_with_ledger
+
+    def _ledger_dispatch(next_args: dict) -> Any:
+        normalized_args = next_args if isinstance(next_args, dict) else function_args
+        return execute_with_ledger(
+            getattr(agent, "_session_db", None),
+            mission_id=getattr(agent, "mission_id", None),
+            checkpoint_id=getattr(getattr(agent, "_durable_mission_checkpoint", None), "checkpoint_id", None),
+            tool_name=function_name,
+            function_args=normalized_args,
+            execute=lambda: _execute(normalized_args),
+            owner=agent,
+            identity_context={"task_id": effective_task_id or ""},
+        )
 
     return run_tool_execution_middleware(
         function_name,
         function_args,
-        lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
+        _ledger_dispatch,
         original_args=function_args,
         task_id=effective_task_id or "",
         session_id=getattr(agent, "session_id", "") or "",

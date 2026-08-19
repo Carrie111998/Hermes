@@ -178,6 +178,26 @@ def render_mission_projection(checkpoint: MissionCheckpoint) -> str:
     return projection
 
 
+def render_action_projection(actions) -> str:
+    """Render bounded machine-owned execution status for resumed missions."""
+    if not actions:
+        return ""
+    lines = ["[DURABLE ACTION STATE]"]
+    for action in actions:
+        lines.extend([
+            f"ACTION_ID: {action.action_id}",
+            f"ACTION_TOOL: {action.tool_name}",
+            f"ACTION_STATUS: {action.status.value}",
+            f"REPLAY_CLASS: {action.replay_class.value}",
+            f"VERIFICATION_REQUIRED: {'true' if action.status.value in {'RUNNING', 'UNKNOWN_OUTCOME', 'VERIFY_REQUIRED'} else 'false'}",
+        ])
+    lines.append("Action execution status is ledger-owned; conversation memory is non-authoritative.")
+    projection = "\n".join(lines)
+    if len(projection) > _MAX_PROJECTION:
+        raise MissionCheckpointIntegrityError("action projection exceeds bounded size")
+    return projection
+
+
 def restore_mission_for_turn(agent: Any) -> str:
     """Restore required checkpoint or fail before turn/model construction."""
     mission_id = getattr(agent, "mission_id", None)
@@ -194,6 +214,19 @@ def restore_mission_for_turn(agent: Any) -> str:
     if db is None:
         raise MissionCheckpointRequiredError("durable mission requires SessionDB")
     checkpoint = db.load_mission_checkpoint(mission_id)
+    try:
+        pending_actions = list(db.list_pending_actions(mission_id))
+        for action in pending_actions:
+            if action.status.value == "RUNNING":
+                db.mark_action_unknown_outcome(
+                    action.action_id,
+                    error_code="RESUME_AFTER_RUNNING",
+                    error_summary="dispatch may have started before mission restoration",
+                )
+                db.require_action_verification(action.action_id)
+        pending_actions = list(db.list_pending_actions(mission_id))
+    except Exception as exc:
+        raise MissionCheckpointIntegrityError("action ledger recovery failed closed") from exc
     expected_codegraph = getattr(agent, "codegraph_project", None) or getattr(
         agent, "_codegraph_project", None
     )
@@ -206,6 +239,9 @@ def restore_mission_for_turn(agent: Any) -> str:
             "checkpoint CodeGraph project does not match canonical binding"
         )
     projection = render_mission_projection(checkpoint)
+    action_projection = render_action_projection(pending_actions)
+    if action_projection:
+        projection = f"{projection}\n\n{action_projection}"
     agent._durable_mission_checkpoint = checkpoint
     agent._durable_mission_projection = projection
     return projection

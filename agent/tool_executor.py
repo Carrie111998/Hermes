@@ -222,7 +222,18 @@ def _run_agent_tool_execution_middleware(
     def _execute(next_args: dict) -> Any:
         nonlocal observed_args
         observed_args = next_args if isinstance(next_args, dict) else function_args
-        return execute(observed_args)
+        from agent.action_commit import execute_with_ledger
+
+        return execute_with_ledger(
+            getattr(agent, "_session_db", None),
+            mission_id=getattr(agent, "mission_id", None),
+            checkpoint_id=getattr(getattr(agent, "_durable_mission_checkpoint", None), "checkpoint_id", None),
+            tool_name=function_name,
+            function_args=observed_args,
+            execute=lambda: execute(observed_args),
+            owner=agent,
+            identity_context={"task_id": effective_task_id or ""},
+        )
 
     from hermes_cli.middleware import run_tool_execution_middleware
 
@@ -1190,6 +1201,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                     tool_request_middleware_trace=list(middleware_trace),
+                    action_db=getattr(agent, "_session_db", None),
+                    mission_id=getattr(agent, "mission_id", None),
+                    checkpoint_id=getattr(getattr(agent, "_durable_mission_checkpoint", None), "checkpoint_id", None),
+                    action_owner=agent,
+                    identity_context={"task_id": effective_task_id or ""},
                 )
                 _spinner_result = function_result
             except KeyboardInterrupt:
@@ -1232,6 +1248,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                     tool_request_middleware_trace=list(middleware_trace),
+                    action_db=getattr(agent, "_session_db", None),
+                    mission_id=getattr(agent, "mission_id", None),
+                    checkpoint_id=getattr(getattr(agent, "_durable_mission_checkpoint", None), "checkpoint_id", None),
+                    action_owner=agent,
+                    identity_context={"task_id": effective_task_id or ""},
                 )
             except KeyboardInterrupt:
                 _emit_cancelled_terminal_post_tool_call(

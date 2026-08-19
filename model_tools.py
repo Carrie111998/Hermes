@@ -888,6 +888,11 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    action_db: Any = None,
+    mission_id: Optional[str] = None,
+    checkpoint_id: Optional[str] = None,
+    action_owner: Any = None,
+    identity_context: Any = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -992,6 +997,11 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                action_db=action_db,
+                mission_id=mission_id,
+                checkpoint_id=checkpoint_id,
+                action_owner=action_owner,
+                identity_context=identity_context,
             )
 
     _tool_original_args = dict(function_args)
@@ -1111,19 +1121,35 @@ def handle_function_call(
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
-                def _dispatch(next_args: Dict[str, Any]) -> Any:
+                def _raw_dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         enabled_tools=sandbox_enabled,
                     )
             else:
-                def _dispatch(next_args: Dict[str, Any]) -> Any:
+                def _raw_dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         user_task=user_task,
                     )
+            if action_db is not None and mission_id:
+                from agent.action_commit import execute_with_ledger
+
+                def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    return execute_with_ledger(
+                        action_db,
+                        mission_id=mission_id,
+                        checkpoint_id=checkpoint_id,
+                        tool_name=function_name,
+                        function_args=next_args,
+                        execute=lambda: _raw_dispatch(next_args),
+                        owner=action_owner,
+                        identity_context=identity_context or {"task_id": task_id or ""},
+                    )
+            else:
+                _dispatch = _raw_dispatch
             from hermes_cli.middleware import run_tool_execution_middleware
 
             result = run_tool_execution_middleware(
@@ -1195,6 +1221,9 @@ def handle_function_call(
         return result
 
     except Exception as e:
+        from agent.action_commit import ActionLedgerError
+        if isinstance(e, ActionLedgerError):
+            raise
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)
         return json.dumps({"error": _sanitize_tool_error(error_msg)}, ensure_ascii=False)
