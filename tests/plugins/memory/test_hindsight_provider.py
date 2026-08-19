@@ -10,6 +10,7 @@ import os
 import re
 import stat
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from hermes_cli.memory_setup import _CANCELLED
+import plugins.memory.hindsight as hindsight_module
 from plugins.memory.hindsight import (
     HindsightMemoryProvider,
     RECALL_SCHEMA,
@@ -1101,6 +1103,47 @@ class TestSessionEndBufferFlush:
 
         # Still one — no duplicate ingest from either hook.
         assert client.aretain_batch.call_count == 1
+
+    def test_session_end_waits_for_the_flush_to_dispatch(
+        self, provider_with_config
+    ):
+        """Enqueueing is not persistence. Session end is routinely followed
+        straight by process exit, so a flush still sitting in the queue when
+        the hook returns dies with the writer — the loss this hook exists to
+        prevent. on_session_end must not return until the writer drains it."""
+        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+
+        p.sync_turn("turn1-user", "turn1-asst")
+        p._client.aretain_batch.assert_not_called()
+
+        # Occupy the writer so the flush cannot be dispatched immediately;
+        # without the wait, on_session_end returns while this is still running.
+        released = threading.Event()
+        p._retain_queue.put(lambda: released.wait(timeout=5.0))
+        threading.Timer(0.3, released.set).start()
+
+        p.on_session_end([])
+
+        # No queue.join() here — that is the whole point of the assertion.
+        p._client.aretain_batch.assert_called_once()
+        assert "turn1-user" in json.dumps(
+            json.loads(p._client.aretain_batch.call_args.kwargs["items"][0]["content"])
+        )
+
+    def test_session_end_wait_is_bounded(self, provider_with_config, monkeypatch):
+        """A wedged retain must not hang session teardown forever."""
+        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+        p.sync_turn("turn1-user", "turn1-asst")
+
+        monkeypatch.setattr(
+            hindsight_module, "_SESSION_END_FLUSH_TIMEOUT", 0.2
+        )
+        # Never released — the writer stays blocked past the budget.
+        p._retain_queue.put(lambda: time.sleep(30))
+
+        started = time.monotonic()
+        p.on_session_end([])
+        assert time.monotonic() - started < 5.0
 
 
 # ---------------------------------------------------------------------------

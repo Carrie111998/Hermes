@@ -74,6 +74,10 @@ _DEFAULT_LOCAL_URL = "http://localhost:8888"
 _MIN_CLIENT_VERSION = "0.6.1"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
+# seconds — how long on_session_end waits for the buffered-turn flush to reach
+# the writer. Session end runs on a teardown path, so this trades a bounded
+# stall for not losing the buffer to an immediately following process exit.
+_SESSION_END_FLUSH_TIMEOUT = 10.0
 # ``metadata.source`` stamped on retained memories — OPT-IN, empty by default.
 # AGENTS.md forbids shipping third-party attribution tags on-by-default until a
 # generic user-facing opt-in exists, so this stays unset unless the user sets it
@@ -2398,8 +2402,35 @@ class HindsightMemoryProvider(MemoryProvider):
 
         ``messages`` is unused: the buffer already holds this session's turns
         in the retain format, formatted by ``sync_turn``.
+
+        Blocks until the writer picks the flush up. Enqueueing is NOT a
+        durability signal: the paths that end a session without rotating
+        ``session_id`` are frequently followed straight by process exit, and a
+        job still sitting in ``_retain_queue`` dies with the writer — the exact
+        loss this hook exists to prevent.
         """
-        self._flush_buffered_turns(reason="session-end", respect_watermark=True)
+        if not self._flush_buffered_turns(
+            reason="session-end", respect_watermark=True
+        ):
+            return
+        # Poll unfinished_tasks rather than queue.join() so a wedged retain
+        # can't hang the caller forever — same reasoning as
+        # _wait_for_retains_drained. Bounded: a session end that cannot
+        # persist within the budget is logged, not stalled on.
+        deadline = time.monotonic() + _SESSION_END_FLUSH_TIMEOUT
+        while self._retain_queue.unfinished_tasks > 0:
+            if self._shutting_down.is_set():
+                # shutdown() owns the drain from here; it joins the writer.
+                return
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "Hindsight session-end flush did not dispatch within %.1fs "
+                    "(%d pending retain(s))",
+                    _SESSION_END_FLUSH_TIMEOUT,
+                    self._retain_queue.unfinished_tasks,
+                )
+                return
+            time.sleep(0.05)
 
     def on_session_switch(
         self,
