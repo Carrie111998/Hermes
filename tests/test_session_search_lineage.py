@@ -10,6 +10,8 @@ exact-title / current-session exclusion through the same root meaning and
 surfaces B exhaustion as an explicit truncation warning.
 """
 import json
+import threading
+import time
 
 import pytest
 
@@ -763,6 +765,34 @@ def test_lineage_winners_displayable_anchor_ordering_not_live_rank(db):
 # ---------------------------------------------------------------------------
 
 
+def _bulk_positive_chain(db, prefix, n, source="cli"):
+    """Bulk-build a positive compression chain of *n* sessions, fast.
+
+    SessionDB's writer connection is autocommit, so per-row inserts would
+    fsync every row (~40x slower).  One explicit BEGIN/COMMIT keeps the
+    fixture fast enough for the real B=2000-boundary and 10k-chain tests.
+    """
+    base = prefix
+    now = time.time()
+    db._conn.execute("BEGIN")
+    db._conn.executemany(
+        "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+        [(f"{base}-{i}", source, now) for i in range(n)],
+    )
+    for i in range(n - 1):
+        child, parent = f"{base}-{i}", f"{base}-{i + 1}"
+        db._conn.execute(
+            "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
+            (parent, child),
+        )
+        db._conn.execute(
+            "UPDATE sessions SET end_reason = 'compression' WHERE id = ?",
+            (parent,),
+        )
+    db._conn.execute("COMMIT")
+    return [f"{base}-{i}" for i in range(n)]
+
+
 def _seed_bound_chain(db, n=6):
     """A positive compression chain longer than the monkeypatched budget."""
     base = "bhit"
@@ -876,3 +906,103 @@ def test_discover_compression_dedupe_and_exact_title_slot(db):
     # lineage -> excluded, so the title is the only result.
     assert sids == ["t_parent"]
     assert result.get("truncated") is False
+
+
+def test_lineage_winners_default_budget_1999_succeeds(db):
+    # A root resolved on successful lookup 1999 succeeds with the default B.
+    ids = _bulk_positive_chain(db, "b1999", 1999)
+    _message(db, ids[0], "needle 1999")
+
+    result = db.resolve_lineage_winners([_candidate(db, ids[0])], result_limit=5)
+    assert result["winners"][0]["lineage_root_id"] == ids[-1]
+    assert result["stats"]["lineage_work"] == 1999
+    assert result["stats"]["lineage_bound_hit"] is False
+
+
+def test_lineage_winners_default_budget_2000_succeeds(db):
+    # A root resolved on successful lookup 2000 (the boundary) succeeds with
+    # the default B.
+    ids = _bulk_positive_chain(db, "b2000", 2000)
+    _message(db, ids[0], "needle 2000")
+
+    result = db.resolve_lineage_winners([_candidate(db, ids[0])], result_limit=5)
+    assert result["winners"][0]["lineage_root_id"] == ids[-1]
+    assert result["stats"]["lineage_work"] == 2000
+    assert result["stats"]["lineage_bound_hit"] is False
+
+
+def test_lineage_winners_default_budget_2001_truncates(db):
+    # A resolution that would need lookup 2001 stops BEFORE it with the
+    # default B, flags bound-hit, and returns no fabricated winner.
+    ids = _bulk_positive_chain(db, "b2001", 2001)
+    _message(db, ids[0], "needle 2001")
+
+    result = db.resolve_lineage_winners([_candidate(db, ids[0])], result_limit=5)
+    assert result["stats"]["lineage_bound_hit"] is True
+    assert result["winners"] == []
+
+
+def test_lineage_winners_10k_chain_cut_by_default_budget(db):
+    # A real 10k-node acyclic chain is cut by the default B=2000 work budget,
+    # not by any semantic depth cap.
+    ids = _bulk_positive_chain(db, "path10k", 10000)
+    _message(db, ids[0], "needle path")
+
+    result = db.resolve_lineage_winners([_candidate(db, ids[0])], result_limit=5)
+    assert result["stats"]["lineage_bound_hit"] is True
+    assert result["stats"]["lineage_work"] == 2000
+    assert result["winners"] == []
+
+
+def test_lineage_winners_internal_k_stress(db):
+    # Larger internal K (beyond the public K<=10 tool path) is a defensive
+    # DB contract, not the normal product path.
+    for i in range(60):
+        _create(db, f"ik-{i}", source="cli")
+        _message(db, f"ik-{i}", "needle internal k")
+
+    candidates = [_candidate(db, f"ik-{i}") for i in range(60)]
+    result = db.resolve_lineage_winners(candidates, result_limit=60)
+    assert len(result["winners"]) == 60
+    assert result["stats"]["lineage_bound_hit"] is False
+
+
+def test_lineage_winners_lineage_reads_coherent_under_concurrent_writer(
+    db, monkeypatch,
+):
+    # A writer hammering session creation during a winner search cannot tear
+    # the resolver's lineage snapshot: lineage lookups observe one coherent
+    # root set from one logical moment.
+    original = SessionDB._resolve_compression_lineage_on_conn
+
+    def slow(self, conn, session_id, state):
+        time.sleep(0.02)
+        return original(self, conn, session_id, state)
+
+    monkeypatch.setattr(SessionDB, "_resolve_compression_lineage_on_conn", slow)
+    _create(db, "root", source="cli")
+    _message(db, "root", "snap needle")
+    db.end_session("root", "compression")
+    _create(db, "child", source="cli", parent="root")
+    _message(db, "child", "snap needle")
+    _create(db, "other", source="cli")
+    _message(db, "other", "snap needle")
+
+    candidates = [
+        _candidate(db, "root"),
+        _candidate(db, "child"),
+        _candidate(db, "other"),
+    ]
+
+    def writer():
+        for i in range(10):
+            db.create_session(f"cw-{i}", source="cli")
+
+    t = threading.Thread(target=writer)
+    t.start()
+    result = db.resolve_lineage_winners(candidates, result_limit=5)
+    t.join()
+
+    roots = {row["lineage_root_id"] for row in result["winners"]}
+    assert roots == {"root", "other"}
+    assert result["stats"]["lineage_bound_hit"] is False
