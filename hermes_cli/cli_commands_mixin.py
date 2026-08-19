@@ -2933,6 +2933,59 @@ class CLICommandsMixin:
             _cprint("  Usage: /goal gate [list | add <command> | remove <N> | clear]")
             return
 
+        # /goal budget ... — opt-in token budget (prime-agent port). Caps the
+        # input/output tokens consumed during this goal (delta since the goal
+        # started). Syntax: '/goal budget in:<n> out:<n>', '/goal budget off'
+        # to disable, bare '/goal budget' to show the current setting.
+        if lower == "budget" or lower.startswith("budget"):
+            b_arg = arg[len("budget"):].strip()
+            mgr_b = self._get_goal_manager()
+            if mgr_b is None:
+                _cprint(f"  {_DIM}Goals unavailable (no active session).{_RST}")
+                return
+            st = mgr_b.get_state() if hasattr(mgr_b, "get_state") else None
+            if not b_arg or b_arg.lower() == "show":
+                if st and (st.max_input_tokens or st.max_output_tokens):
+                    in_s = f"in≤{st.max_input_tokens}" if st.max_input_tokens else "in: off"
+                    out_s = f"out≤{st.max_output_tokens}" if st.max_output_tokens else "out: off"
+                    _cprint(f"  Token budget: {in_s} / {out_s}")
+                else:
+                    _cprint(f"  {_DIM}Token budget: off (set with /goal budget in:<n> out:<n>).{_RST}")
+                return
+            if b_arg.lower() == "off":
+                mgr_b.clear_budget()
+                _cprint("  ✓ Token budget disabled.")
+                return
+            # Parse 'in:<n>' and/or 'out:<n>'.
+            in_tok = None
+            out_tok = None
+            ok = True
+            for tok in b_arg.split():
+                if tok.lower().startswith("in:"):
+                    try:
+                        in_tok = int(tok.split(":", 1)[1])
+                    except ValueError:
+                        ok = False
+                elif tok.lower().startswith("out:"):
+                    try:
+                        out_tok = int(tok.split(":", 1)[1])
+                    except ValueError:
+                        ok = False
+                else:
+                    ok = False
+            if not ok or (in_tok is None and out_tok is None):
+                _cprint("  Usage: /goal budget in:<n> out:<n>  (or: /goal budget off)")
+                return
+            try:
+                mgr_b.set_budget(max_input_tokens=in_tok, max_output_tokens=out_tok)
+            except Exception as exc:
+                _cprint(f"  /goal budget failed: {exc}")
+                return
+            in_s = f"in≤{in_tok}" if in_tok is not None else ""
+            out_s = f"out≤{out_tok}" if out_tok is not None else ""
+            _cprint(f"  ✓ Token budget set: {in_s} {out_s}".strip())
+            return
+
         # Otherwise treat the arg as the goal text. Inline `field: value`
         # lines (verify:, constraints:, boundaries:, stop when:) are parsed
         # into a completion contract; the remaining prose is the headline.

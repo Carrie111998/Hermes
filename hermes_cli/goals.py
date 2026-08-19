@@ -599,6 +599,18 @@ class GoalState:
     # must ALL pass before the judge may declare the goal done. Empty by
     # default — a goal with no gates behaves exactly as before.
     gates: List[GoalGate] = field(default_factory=list)
+    # Token budget (prime-agent port): optional cap on input/output tokens
+    # consumed *since the goal started*. Enforced alongside the turn budget in
+    # evaluate_after_turn. None means off (backwards-compatible: rows saved
+    # before this field existed load unchanged because from_json defaults
+    # missing keys to None).
+    max_input_tokens: Optional[int] = None
+    max_output_tokens: Optional[int] = None
+    # Snapshot of the session's recorded input/output token totals at the
+    # moment the goal (re)started, so enforcement compares the delta accrued
+    # *during* this goal rather than lifetime totals.
+    input_tokens_base: int = 0
+    output_tokens_base: int = 0
 
     def to_json(self) -> str:
         data = asdict(self)
@@ -636,6 +648,10 @@ class GoalState:
                 for g in (data.get("gates") or [])
                 if isinstance(g, dict) and str(g.get("command") or "").strip()
             ],
+            max_input_tokens=(int(data["max_input_tokens"]) if data.get("max_input_tokens") else None),
+            max_output_tokens=(int(data["max_output_tokens"]) if data.get("max_output_tokens") else None),
+            input_tokens_base=int(data.get("input_tokens_base", 0) or 0),
+            output_tokens_base=int(data.get("output_tokens_base", 0) or 0),
         )
 
     # --- contract helpers -------------------------------------------------
@@ -715,6 +731,38 @@ def _bootstrap_session_db(home: str, done: threading.Event) -> None:
             _DB_CACHE[home] = db
         _DB_BOOTSTRAP_INFLIGHT.pop(home, None)
     done.set()
+
+
+def _current_session_tokens(session_id: str) -> Tuple[int, int]:
+    """Return ``(input_tokens, output_tokens)`` recorded for ``session_id``.
+
+    Reads the existing ``session_model_usage`` table via the cached
+    SessionDB. Returns (0, 0) if unavailable — token budget enforcement
+    degrades to off rather than erroring when usage accounting is absent.
+    Mirrors the read pattern used by ``cli.web_server`` analytics.
+    """
+    db = _get_session_db()
+    if db is None or session_id is None:
+        return (0, 0)
+    try:
+        cur = db._conn.execute(
+            """
+            SELECT COALESCE(SUM(input_tokens), 0) AS in_tok,
+                   COALESCE(SUM(output_tokens), 0) AS out_tok
+              FROM session_model_usage
+             WHERE session_id = ?
+            """,
+            (session_id,),
+        )
+        row = cur.fetchone()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("GoalManager: session_model_usage read failed (%s)", exc)
+        return (0, 0)
+    if not row:
+        return (0, 0)
+    in_tok = int(row[0] or 0)
+    out_tok = int(row[1] or 0)
+    return (in_tok, out_tok)
 
 
 def _get_session_db() -> Optional[Any]:
@@ -1416,7 +1464,15 @@ class GoalManager:
         sub = f", {len(s.subgoals)} subgoal{'s' if len(s.subgoals) != 1 else ''}" if s.subgoals else ""
         con = ", contract" if self.has_contract() else ""
         gat = f", {len(s.gates)} gate{'s' if len(s.gates) != 1 else ''}" if s.gates else ""
-        meta = f"{turns}{sub}{con}{gat}"
+        bud = ""
+        if s.max_input_tokens or s.max_output_tokens:
+            bits = []
+            if s.max_input_tokens:
+                bits.append(f"in≤{s.max_input_tokens}")
+            if s.max_output_tokens:
+                bits.append(f"out≤{s.max_output_tokens}")
+            bud = f", token {'/'.join(bits)}"
+        meta = f"{turns}{sub}{con}{gat}{bud}"
         if s.status == "active":
             if s.waiting_on_session and _session_waiting(s.waiting_on_session):
                 wr = s.waiting_reason or f"session {s.waiting_on_session}"
@@ -1438,10 +1494,11 @@ class GoalManager:
 
     # --- mutation -----------------------------------------------------
 
-    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
+    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None, max_input_tokens: Optional[int] = None, max_output_tokens: Optional[int] = None) -> GoalState:
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
+        in_base, out_base = _current_session_tokens(self.session_id)
         state = GoalState(
             goal=goal,
             status="active",
@@ -1450,6 +1507,10 @@ class GoalManager:
             created_at=time.time(),
             last_turn_at=0.0,
             contract=contract if contract is not None else GoalContract(),
+            max_input_tokens=int(max_input_tokens) if max_input_tokens else None,
+            max_output_tokens=int(max_output_tokens) if max_output_tokens else None,
+            input_tokens_base=in_base,
+            output_tokens_base=out_base,
         )
         self._state = state
         save_goal(self.session_id, state)
@@ -1493,6 +1554,48 @@ class GoalManager:
         self._state.waiting_since = 0.0
         if reset_budget:
             self._state.turns_used = 0
+            # Re-baseline token counters so the budget is measured from the
+            # resume point, not lifetime totals.
+            in_base, out_base = _current_session_tokens(self.session_id)
+            self._state.input_tokens_base = in_base
+            self._state.output_tokens_base = out_base
+        save_goal(self.session_id, self._state)
+        return self._state
+
+    def set_budget(
+        self,
+        *,
+        max_input_tokens: Optional[int] = None,
+        max_output_tokens: Optional[int] = None,
+        reset_baseline: bool = True,
+    ) -> Optional[GoalState]:
+        """Set (or clear, with None) the token budget on the active goal.
+
+        Passing ``None`` for a field leaves that field unchanged; passing an
+        explicit ``0``/``None`` sentinel to clear is handled by the CLI by
+        passing ``None`` for the field to clear. When both are ``None`` the
+        caller wanted no change. Returns the updated state, or None if there
+        is no active goal.
+        """
+        if self._state is None:
+            return None
+        if max_input_tokens is not None:
+            self._state.max_input_tokens = int(max_input_tokens) if max_input_tokens else None
+        if max_output_tokens is not None:
+            self._state.max_output_tokens = int(max_output_tokens) if max_output_tokens else None
+        if reset_baseline:
+            in_base, out_base = _current_session_tokens(self.session_id)
+            self._state.input_tokens_base = in_base
+            self._state.output_tokens_base = out_base
+        save_goal(self.session_id, self._state)
+        return self._state
+
+    def clear_budget(self) -> Optional[GoalState]:
+        """Disable the token budget on the active goal."""
+        if self._state is None:
+            return None
+        self._state.max_input_tokens = None
+        self._state.max_output_tokens = None
         save_goal(self.session_id, self._state)
         return self._state
 
@@ -1886,6 +1989,41 @@ class GoalManager:
         # Count the turn that just finished.
         state.turns_used += 1
         state.last_turn_at = time.time()
+
+        # Token budget (prime-agent port): enforce the optional input/output
+        # token caps the same way the turn budget is enforced. We compare the
+        # delta since the goal (re)started (current totals minus the baseline
+        # captured in set()/resume()), so a cap applies to this goal's spend,
+        # not the session's lifetime. Reading token totals is best-effort;
+        # if accounting is unavailable the check is skipped rather than
+        # erroring. The token budget is opt-in (None = off).
+        if state.max_input_tokens or state.max_output_tokens:
+            cur_in, cur_out = _current_session_tokens(self.session_id)
+            used_in = max(0, cur_in - state.input_tokens_base)
+            used_out = max(0, cur_out - state.output_tokens_base)
+            in_exceeded = state.max_input_tokens and used_in >= state.max_input_tokens
+            out_exceeded = state.max_output_tokens and used_out >= state.max_output_tokens
+            if in_exceeded or out_exceeded:
+                state.status = "paused"
+                parts = []
+                if state.max_input_tokens:
+                    parts.append(f"in {used_in}/{state.max_input_tokens}")
+                if state.max_output_tokens:
+                    parts.append(f"out {used_out}/{state.max_output_tokens}")
+                state.paused_reason = f"token budget exhausted ({'; '.join(parts)})"
+                save_goal(self.session_id, state)
+                return {
+                    "status": "paused",
+                    "should_continue": False,
+                    "continuation_prompt": None,
+                    "verdict": "token_budget_exhausted",
+                    "reason": state.paused_reason,
+                    "message": (
+                        f"⏸ Goal paused — token budget exhausted "
+                        f"({' / '.join(parts)}). "
+                        "Use /goal resume to keep going, or /goal clear to stop."
+                    ),
+                }
 
         # Quality gates run BEFORE the LLM judge: a failing gate is
         # deterministic evidence the goal is not done, so the judge call is
