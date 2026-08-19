@@ -198,14 +198,20 @@ def task_has_live_claim(conn: sqlite3.Connection, task_id: str, *, now: Optional
     return run is not None
 
 
-def build_canonical_evidence(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+def build_canonical_evidence(
+    conn: sqlite3.Connection, task_id: str, *, objective_id: str
+) -> dict[str, Any]:
     proof: dict[str, Any] = {}
     predicate = None
-    unit = conn.execute(
-        "SELECT proof, terminal_predicate FROM kanban_objective_units "
-        "WHERE kind = 'kanban' AND ref = ? ORDER BY last_progress_at DESC LIMIT 1",
-        (task_id,),
-    ).fetchone()
+    oid = str(objective_id or "").strip()
+    unit = None
+    if oid:
+        unit = conn.execute(
+            "SELECT proof, terminal_predicate FROM kanban_objective_units "
+            "WHERE objective_id = ? AND kind = 'kanban' AND ref = ? "
+            "ORDER BY last_progress_at DESC LIMIT 1",
+            (oid, task_id),
+        ).fetchone()
     if unit is not None:
         predicate = unit["terminal_predicate"]
         if unit["proof"]:
@@ -220,6 +226,7 @@ def build_canonical_evidence(conn: sqlite3.Connection, task_id: str) -> dict[str
         proof = {}
     return {
         "task_id": task_id,
+        "objective_id": oid,
         "run_id": int(run["id"]) if run else None,
         "run_outcome": (run["outcome"] if run else None),
         "head": proof.get("head"),
@@ -338,8 +345,10 @@ def issue_descendant_grant(
         return {"ok": False, "error": f"{descendant_task_id} is not in objective {objective_id}"}
     if task_has_live_claim(conn, descendant_task_id):
         return {"ok": False, "error": f"{descendant_task_id} still has a live claim"}
-    packet = build_canonical_evidence(conn, descendant_task_id)
-    if not persisted_proof_present(packet):
+    packet = build_canonical_evidence(
+        conn, descendant_task_id, objective_id=objective_id
+    )
+    if packet.get("objective_id") != objective_id or not persisted_proof_present(packet):
         return {
             "ok": False,
             "error": f"{descendant_task_id} has no persisted exact-run/revision/review proof",
@@ -529,8 +538,10 @@ def reconcile_descendant(
                 "error": "descendant reconcile grant already consumed",
                 "grant_id": grant["id"],
             }
-        packet = build_canonical_evidence(conn, descendant_task_id)
-        if not persisted_proof_present(packet):
+        packet = build_canonical_evidence(
+            conn, descendant_task_id, objective_id=objective_id
+        )
+        if packet.get("objective_id") != objective_id or not persisted_proof_present(packet):
             return {
                 "ok": False,
                 "error": f"{descendant_task_id} has no persisted exact-run/revision/review proof",

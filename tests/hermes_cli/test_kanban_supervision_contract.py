@@ -69,7 +69,7 @@ def _seed_child_proof(
         terminal_predicate="task_done_with_proof",
         proof={"type": "exact_run", "head": head, "verdict": "pass"},
     )
-    packet = contract.build_canonical_evidence(conn, child_id)
+    packet = contract.build_canonical_evidence(conn, child_id, objective_id=oid)
     return contract.canonical_evidence_hash(packet)
 
 
@@ -658,7 +658,7 @@ def test_failed_run_without_canonical_proof_cannot_issue_or_consume_grant(kanban
                 "claim_lock=NULL, claim_expires=NULL WHERE id=?",
                 (child,),
             )
-        packet = contract.build_canonical_evidence(conn, child)
+        packet = contract.build_canonical_evidence(conn, child, objective_id=oid)
         assert packet.get("run_id")
         assert contract.persisted_proof_present(packet) is False
         issued = contract.issue_descendant_grant(
@@ -669,6 +669,102 @@ def test_failed_run_without_canonical_proof_cannot_issue_or_consume_grant(kanban
         )
         assert issued["ok"] is False
         assert kb.get_task(conn, child).status != "done"
+
+
+def _shared_descendant_two_objectives(conn, workspace):
+    """Same descendant in two objectives; A has the newest exact proof, B has none."""
+    parent_a = kb.create_task(conn, title="supervisor-a", assignee="default")
+    parent_b = kb.create_task(conn, title="supervisor-b", assignee="default")
+    child = kb.create_task(
+        conn, title="shared-descendant", assignee="cole",
+        parents=[parent_a, parent_b],
+        workspace_kind="dir", workspace_path=str(workspace),
+    )
+    oid_a = sup.ensure_objective(conn, parent_a)
+    oid_b = sup.ensure_objective(conn, parent_b)
+    sup.upsert_unit(conn, objective_id=oid_b, kind="kanban", ref=child, status="pending")
+    digest_a = _seed_child_proof(conn, oid_a, child, workspace=workspace)
+    return parent_a, parent_b, child, oid_a, oid_b, digest_a
+
+
+def _unit_proof(conn, oid: str, ref: str) -> dict:
+    units = {u["ref"]: u for u in sup.list_units(conn, oid)}
+    raw = (units.get(ref) or {}).get("proof") or "{}"
+    return json.loads(raw) if raw else {}
+
+
+def test_foreign_objective_proof_cannot_issue_grant(kanban_home):
+    workspace = kanban_home.parent / "repo-obj-scope-issue"
+    with kb.connect() as conn:
+        parent_a, parent_b, child, oid_a, oid_b, digest_a = (
+            _shared_descendant_two_objectives(conn, workspace)
+        )
+        issued_b = contract.issue_descendant_grant(
+            conn, objective_id=oid_b, supervisor_task_id=parent_b,
+            descendant_task_id=child, transition="complete",
+            evidence_hash=digest_a, caller_task_id=parent_b,
+        )
+        assert issued_b["ok"] is False
+        assert "no persisted" in str(issued_b.get("error") or "")
+        assert kb.get_task(conn, child).status != "done"
+        assert _unit_proof(conn, oid_b, child).get("verdict") != "pass"
+        assert _unit_proof(conn, oid_a, child).get("verdict") == "pass"
+        issued_a = contract.issue_descendant_grant(
+            conn, objective_id=oid_a, supervisor_task_id=parent_a,
+            descendant_task_id=child, transition="complete",
+            evidence_hash=digest_a, caller_task_id=parent_a,
+        )
+        assert issued_a["ok"] is True
+
+
+def test_foreign_objective_proof_cannot_satisfy_consume_or_read(kanban_home):
+    workspace = kanban_home.parent / "repo-obj-scope-consume"
+    with kb.connect() as conn:
+        _parent_a, parent_b, child, oid_a, oid_b, digest_a = (
+            _shared_descendant_two_objectives(conn, workspace)
+        )
+        packet_a = contract.build_canonical_evidence(conn, child, objective_id=oid_a)
+        packet_b = contract.build_canonical_evidence(conn, child, objective_id=oid_b)
+        empty = contract.build_canonical_evidence(conn, child, objective_id="")
+        assert packet_a.get("objective_id") == oid_a
+        assert contract.persisted_proof_present(packet_a) is True
+        assert packet_b.get("objective_id") == oid_b
+        assert packet_b.get("proof") == {}
+        assert packet_b.get("head") is None
+        assert packet_b.get("verdict") is None
+        assert contract.persisted_proof_present(packet_b) is False
+        assert empty.get("proof") == {}
+        assert contract.persisted_proof_present(empty) is False
+        contract.ensure_contract_tables(conn)
+        now = int(__import__("time").time())
+        with kb.write_txn(conn):
+            conn.execute(
+                """
+                INSERT INTO kanban_reconcile_grants (
+                    id, objective_id, supervisor_task_id, descendant_task_id,
+                    transition, evidence_hash, consumed_at, created_at
+                ) VALUES (?, ?, ?, ?, 'complete', ?, NULL, ?)
+                """,
+                ("rg_cross_obj", oid_b, parent_b, child, digest_a, now),
+            )
+        closed_b = contract.reconcile_descendant(
+            conn, supervisor_task_id=parent_b, descendant_task_id=child,
+            transition="complete", evidence_hash=digest_a,
+            caller_task_id=parent_b, objective_id=oid_b,
+        )
+        assert closed_b["ok"] is False
+        err = str(closed_b.get("error") or "")
+        assert "no persisted" in err or "does not match" in err
+        assert "already consumed" not in err
+        assert "no issued" not in err
+        assert kb.get_task(conn, child).status != "done"
+        planted = conn.execute(
+            "SELECT consumed_at FROM kanban_reconcile_grants WHERE id = ?",
+            ("rg_cross_obj",),
+        ).fetchone()
+        assert planted["consumed_at"] is None
+        assert _unit_proof(conn, oid_b, child).get("verdict") != "pass"
+        assert _unit_proof(conn, oid_a, child).get("verdict") == "pass"
 
 
 def test_missing_head_review_fails_closed(kanban_home):
@@ -740,7 +836,7 @@ def test_stale_proof_after_later_failed_run_cannot_issue_or_consume_grant(kanban
                 "claim_lock=NULL, claim_expires=NULL WHERE id=?",
                 (child,),
             )
-        packet = contract.build_canonical_evidence(conn, child)
+        packet = contract.build_canonical_evidence(conn, child, objective_id=oid)
         assert packet.get("run_id")
         assert packet.get("run_outcome") == "failed"
         assert contract.persisted_proof_present(packet) is False
