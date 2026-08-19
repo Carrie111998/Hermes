@@ -9835,6 +9835,35 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    # Multi-board callers already resolved the authoritative board. Pin that
+    # identity for every nested policy lookup during this tick instead of
+    # allowing helpers to fall back to a stale process-global current board.
+    # Re-entering keeps the existing lock and observer paths single-shot while
+    # preserving compatibility for callers that omit ``board``.
+    if board is not None:
+        try:
+            normalized_board = _normalize_board_slug(board)
+        except ValueError:
+            # Preserve the pre-existing fail-soft dispatch path below. Invalid
+            # board input is handled by kanban_db_path() and its fallback;
+            # adding policy scoping must not turn it into an earlier crash.
+            normalized_board = None
+        if normalized_board and _CURRENT_BOARD_OVERRIDE.get() != normalized_board:
+            with scoped_current_board(normalized_board):
+                return dispatch_once(
+                    conn,
+                    spawn_fn=spawn_fn,
+                    ttl_seconds=ttl_seconds,
+                    dry_run=dry_run,
+                    max_spawn=max_spawn,
+                    max_in_progress=max_in_progress,
+                    failure_limit=failure_limit,
+                    stale_timeout_seconds=stale_timeout_seconds,
+                    board=normalized_board,
+                    default_assignee=default_assignee,
+                    max_in_progress_per_profile=max_in_progress_per_profile,
+                    reconcile_orphans=reconcile_orphans,
+                )
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
