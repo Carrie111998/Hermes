@@ -187,6 +187,11 @@ test('behavior: remote default does not open this-device chat when the source di
     displayName: bot => bot.connectionLabel || bot.name,
     duplicateBot: async () => 'copy',
     haptic: () => undefined,
+    // Paid/free badge helpers referenced inside BotRow.
+    useModelOptions: () => ({ data: undefined }),
+    botCostState: () => 'free',
+    buildPricingByModel: () => ({}),
+    costBadge: () => null,
     previewKind: () => ({ fromBot: false, sender: null }),
     generatedSessionTitle: () => null,
     openBotCanonicalChat: async (...args) => {

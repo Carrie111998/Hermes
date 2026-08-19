@@ -4688,17 +4688,12 @@ function isFreeModel(model, provider, pricingByModel) {
 /** Per-bot cost state: 'paid' | 'free' | 'local' | 'unknown'.
  *  'local' = the user declared the bot runs on their own hardware (bot meta
  *  flag), which overrides every other signal. Unknown = no model configured
- *  anywhere (nothing to charge). A bot whose own model is free but whose
- *  delegation model is paid still counts as paid (subagents run under
- *  delegation). */
+ *  anywhere (nothing to charge). */
 function botCostState(bot, { pricingByModel, defaultModel, local } = {}) {
   if (local) return 'local'
   const model = bot.model || defaultModel || ''
   if (!model) return 'unknown'
   const provider = bot.provider || ''
-  if (bot.delegation_model && !isFreeModel(bot.delegation_model, bot.delegation_provider, pricingByModel)) {
-    return 'paid'
-  }
   return isFreeModel(model, provider, pricingByModel) ? 'free' : 'paid'
 }
 
@@ -4718,29 +4713,8 @@ function buildPricingByModel(modelOptions) {
   return map
 }
 
-const REGION_CURRENCY = {
-  US: '$', GB: '£', IE: '€', DE: '€', FR: '€', ES: '€', IT: '€', NL: '€',
-  AT: '€', BE: '€', FI: '€', PT: '€', GR: '€', PL: 'zł', CZ: 'Kč', SE: 'kr',
-  NO: 'kr', DK: 'kr', CH: 'CHF', CA: 'CA$', AU: 'A$', NZ: 'NZ$', JP: '¥',
-  CN: '¥', KR: '₩', IN: '₹', MX: 'MX$', BR: 'R$', TR: '₺', IL: '₪',
-  SG: 'S$', HK: 'HK$', TW: 'NT$', TH: '฿', ID: 'Rp', MY: 'RM', PH: '₱',
-  VN: '₫', ZA: 'R', RU: '₽'
-}
-
-/** The user's official currency symbol, from the app/OS locale. Falls back
- *  to $ when the locale is unknown or unavailable. */
-function userCurrencySymbol() {
-  try {
-    const locale = (typeof navigator !== 'undefined' && navigator.language) || 'en-US'
-    const region = String(locale.split('-')[1] || 'US').toUpperCase()
-    return REGION_CURRENCY[region] || '$'
-  } catch {
-    return '$'
-  }
-}
-
-/** Small roster badge: the user's currency symbol when the bot's LLM costs
- *  money, 🆓 when provably free or declared locally hosted, nothing when
+/** Small roster badge: a $ when the bot's LLM costs money (provider pricing
+ *  is USD), 🆓 when provably free or declared locally hosted, nothing when
  *  unclassifiable. The title always names the exact model + provider so a
  *  badge is never a mystery. */
 function costBadge(costState, model, provider) {
@@ -4749,12 +4723,13 @@ function costBadge(costState, model, provider) {
       className: 'shrink-0 text-[0.875rem] font-semibold leading-none',
       // Inline color: the app's plugin class pipeline doesn't generate
       // arbitrary `text-[#hex]` utilities, so theme/scan-dependent classes
-      // would fall back to inherited gray. Brand emerald (#10b981) is
-      // stable in both light and dark palettes.
-      style: { color: '#10b981' },
+      // would fall back to inherited gray. Neutral amber (#f59e0b) keeps
+      // green reserved as the 'free' signal and is stable in both light
+      // and dark palettes.
+      style: { color: '#f59e0b' },
       title: `${model} via ${provider || 'unknown provider'} — paid LLM`,
       'aria-label': 'paid LLM',
-      children: userCurrencySymbol()
+      children: '$'
     })
   }
   if (costState === 'local') {

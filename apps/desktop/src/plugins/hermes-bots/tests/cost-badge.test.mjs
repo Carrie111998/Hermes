@@ -48,7 +48,7 @@ function load({ locale = 'en-US' } = {}) {
     .replace(/^import .* from 'react'\s*\n/m, '')
     .replace(/^import .* from 'react\/jsx-runtime'\s*\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
-    .concat('\nglobalThis.__cost = { isFreeModel, botCostState, buildPricingByModel, userCurrencySymbol, saveBotMeta };')
+    .concat('\nglobalThis.__cost = { isFreeModel, botCostState, buildPricingByModel, saveBotMeta };')
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
 
   const register = () => {
@@ -132,14 +132,6 @@ test('unit: an empty model resolves through the launch default', () => {
   )
 })
 
-test('unit: currency symbol follows the user locale, $ as fallback', () => {
-  assert.equal(load({ locale: 'en-US' }).__cost.userCurrencySymbol(), '$')
-  assert.equal(load({ locale: 'en-GB' }).__cost.userCurrencySymbol(), '£')
-  assert.equal(load({ locale: 'de-DE' }).__cost.userCurrencySymbol(), '€')
-  assert.equal(load({ locale: 'ja-JP' }).__cost.userCurrencySymbol(), '¥')
-  assert.equal(load({ locale: 'xx-XX' }).__cost.userCurrencySymbol(), '$')
-})
-
 test('unit: the user-declared locally-hosted flag overrides paid classification', () => {
   const { __cost } = load()
   // Deepseek on nous is paid... unless the user says it runs on their hardware.
@@ -176,7 +168,6 @@ test('regression: roster rows render a paid/free badge wired to the classifier',
   assert.match(pluginSource, /const costState = botCostState\(/)
   assert.match(pluginSource, /costBadge\(costState, bot\.model \|\| defaultModel, bot\.provider\)/)
   assert.match(pluginSource, /'🆓'/)
-  assert.match(pluginSource, /userCurrencySymbol\(\)/)
   assert.match(pluginSource, /local: Boolean\(meta\?\.local\)/)
 })
 
