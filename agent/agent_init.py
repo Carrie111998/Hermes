@@ -2493,13 +2493,19 @@ def init_agent(
         except Exception:
             pass
 
-    # Check legacy custom_providers per-model context_length.
+    # Endpoint-scoped custom_providers fallback. Identity-aware: once the
+    # selected provider is a named ``providers:`` entry, a shared-endpoint
+    # sibling must not lend its per-model window through the converted
+    # compatible view — genuine legacy ``custom_providers`` still apply.
     if _config_context_length is None and _custom_providers:
         try:
-            from hermes_cli.config import get_custom_provider_context_length
-            _cp_ctx_resolved = get_custom_provider_context_length(
+            from hermes_cli.config import get_endpoint_fallback_context_length
+            _cp_ctx_resolved = get_endpoint_fallback_context_length(
                 model=agent.model,
                 base_url=agent.base_url,
+                provider=agent.requested_provider,
+                config=_agent_cfg if isinstance(_agent_cfg, dict) else None,
+                user_providers=agent._user_providers,
                 custom_providers=_custom_providers,
             )
             if _cp_ctx_resolved:

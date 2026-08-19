@@ -2852,7 +2852,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     try:
         from hermes_cli.config import (
             get_compatible_custom_providers,
-            get_custom_provider_context_length,
+            get_endpoint_fallback_context_length,
             get_named_provider_context_length,
             load_config,
         )
@@ -2866,9 +2866,15 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             user_providers=_sm_user_providers,
         )
         if _destination_context_intent is None:
-            _destination_context_intent = get_custom_provider_context_length(
+            # Endpoint fallback stays identity-aware: once the selected provider
+            # is a named ``providers:`` entry, a shared-endpoint sibling must not
+            # lend its per-model window through the converted compatible view.
+            _destination_context_intent = get_endpoint_fallback_context_length(
                 model=agent.model,
                 base_url=agent.base_url,
+                provider=agent.requested_provider,
+                config=_sm_cfg,
+                user_providers=_sm_user_providers,
                 custom_providers=_sm_custom_providers,
             )
     except Exception:

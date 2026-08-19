@@ -177,6 +177,44 @@ def test_switch_model_uses_selected_named_provider_model_metadata(monkeypatch):
     assert agent.context_compressor.context_length == 1_048_576
 
 
+def test_switch_model_endpoint_fallback_no_sibling_named_provider_leak(monkeypatch):
+    """After an exact named-provider miss, ``switch_model`` must NOT borrow a
+    sibling named provider's per-model window via the shared endpoint.
+
+    ``beta`` (selected) declares the model but no ``context_length``; ``alpha``
+    shares the endpoint and declares 1,048,576. Selecting ``beta`` must fall
+    through to the live probe, not inherit ``alpha``'s window through the
+    converted-new-style compatible list (Medium review finding on #89714)."""
+    agent = _make_agent_with_compressor(config_context_length=None)
+    shared_url = "http://da-aihost01:4000/v1"
+    model = "vllm/DeepSeek-V4-Flash-0731"
+    cfg = {
+        "providers": {
+            "alpha": {
+                "base_url": shared_url,
+                "models": {model: {"context_length": 1_048_576}},
+            },
+            "beta": {
+                "base_url": shared_url,
+                "models": {model: {}},
+            },
+        }
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: cfg)
+
+    with patch(
+        "agent.model_metadata.get_model_context_length",
+        return_value=200_000,
+    ) as mock_ctx:
+        agent.switch_model(model, "beta", api_key="sk-test", base_url=shared_url)
+
+    assert agent.requested_provider == "beta"
+    assert agent._config_context_length != 1_048_576
+    assert mock_ctx.call_args.kwargs.get("config_context_length") != 1_048_576
+    assert agent.context_compressor.context_length == 200_000
+
+
 def test_direct_start_model_override_does_not_inherit_profile_context_length():
     """A CLI ``--model`` startup override must not inherit another model's window."""
     cfg = {

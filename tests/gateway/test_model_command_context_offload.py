@@ -329,3 +329,56 @@ def test_gateway_context_authority_uses_named_provider_identity(monkeypatch):
 
     assert context.context_length == 1_048_576
     assert context.context_source == "config"
+
+
+def test_gateway_context_endpoint_fallback_no_sibling_leak(monkeypatch):
+    """After an exact named-provider miss, the endpoint fallback must NOT reach
+    through a converted sibling ``providers:`` entry that shares the base_url.
+
+    ``beta`` is the selected provider and declares the model but no
+    ``context_length``; ``alpha`` shares the endpoint and declares 1,048,576.
+    ``beta`` must not borrow ``alpha``'s window via the compatible endpoint
+    match (Medium review finding on #89714)."""
+    import gateway.run as gateway_run
+
+    model = "vllm/DeepSeek-V4-Flash-0731"
+    base_url = "http://da-aihost01:4000/v1"
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {
+            "model": {"default": model, "provider": "beta"},
+            "providers": {
+                "alpha": {
+                    "base_url": base_url,
+                    "models": {model: {"context_length": 1_048_576}},
+                },
+                "beta": {
+                    "base_url": base_url,
+                    "models": {model: {}},
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda: model)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "custom",
+            "requested_provider": "beta",
+            "base_url": base_url,
+            "api_key": "sk-test",
+        },
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, config_context_length=None, **_kwargs: (
+            config_context_length or 512_000
+        ),
+    )
+
+    context = gateway_run._resolve_gateway_model_context()
+
+    assert context.context_length != 1_048_576
+    assert context.context_length == 512_000
