@@ -90,6 +90,17 @@ def _is_named_loopback_ollama_route(requested_provider: str, base_url: str) -> b
     )
 
 
+def _reject_authenticated_named_local_ollama(base_url: str) -> None:
+    parsed = urlparse(base_url)
+    if parsed.username is None and parsed.password is None:
+        return
+    raise AuthError(
+        "Provider 'ollama' local endpoints cannot use embedded authentication; "
+        "use 'custom:ollama' for authenticated local endpoints.",
+        provider="ollama",
+    )
+
+
 def _config_base_url_trustworthy_for_bare_custom(cfg_base_url: str, cfg_provider: str) -> bool:
     """Decide whether ``model.base_url`` may back bare ``custom`` runtime resolution.
 
@@ -1122,6 +1133,7 @@ def _resolve_named_custom_runtime(
     if explicit_base_url and _is_named_loopback_ollama_route(
         requested_provider, explicit_base_url
     ):
+        _reject_authenticated_named_local_ollama(explicit_base_url)
         base_url = explicit_base_url.strip().rstrip("/")
         return {
             "provider": "custom",
@@ -1190,6 +1202,7 @@ def _resolve_named_custom_runtime(
     # boundary. Keep model and output-token overrides, which are nonsecret.
     # Do not apply this to custom:ollama or remote/LAN Ollama endpoints.
     if _is_named_loopback_ollama_route(requested_provider, base_url):
+        _reject_authenticated_named_local_ollama(base_url)
         result = {
             "provider": "custom",
             "api_mode": custom_provider.get("api_mode")

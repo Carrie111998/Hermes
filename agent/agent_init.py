@@ -472,6 +472,14 @@ def _custom_provider_extra_body_for_agent(
 
 
 def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, Any]]) -> None:
+    from hermes_cli.runtime_provider import _is_named_loopback_ollama_route
+
+    if _is_named_loopback_ollama_route(
+        agent.requested_provider or agent.provider,
+        agent.base_url,
+    ):
+        return
+
     extra_body = _custom_provider_extra_body_for_agent(
         provider=agent.provider,
         model=agent.model,

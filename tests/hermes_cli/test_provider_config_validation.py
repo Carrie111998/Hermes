@@ -87,6 +87,39 @@ class TestNormalizeCustomProviderEntry:
         assert invalid_fields == [("base_url", invalid_endpoint)]
 
 
+    def test_invalid_endpoint_warning_omits_candidate_and_reports_validation_scope(
+        self, caplog
+    ):
+        """Rejected endpoint diagnostics must not persist URL authentication."""
+        candidate = (
+            "http://synthetic-user:synthetic-pass@localhost:notaport/v1"
+            "?marker=synthetic-query"
+        )
+        entry = {
+            "base_url": candidate,
+            "api": "https://valid-api.example/v1",
+        }
+
+        with caplog.at_level(logging.WARNING):
+            normalized = _normalize_custom_provider_entry(
+                entry,
+                provider_key="log-safe-provider",
+            )
+
+        assert normalized is not None
+        assert normalized["base_url"] == "https://valid-api.example/v1"
+        messages = [record.getMessage() for record in caplog.records]
+        assert len(messages) == 1
+        message = messages[0]
+        assert "providers.log-safe-provider" in message
+        assert "base_url" in message
+        assert "scheme, host, or port validation failed" in message
+        assert candidate not in message
+        assert "synthetic-user" not in message
+        assert "synthetic-pass" not in message
+        assert "synthetic-query" not in message
+
+
     def test_endpoint_helper_accepts_normalizer_camelcase_base_url_alias(self):
         """Raw consumers must accept the normalizer's baseUrl compatibility alias."""
         entry = {

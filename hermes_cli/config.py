@@ -1434,11 +1434,11 @@ def _normalize_custom_provider_entry(
             provider_key or "?", ", ".join(sorted(unknown)),
         )
 
-    def _warn_invalid_endpoint(url_key: str, candidate: str) -> None:
+    def _warn_invalid_endpoint(url_key: str, _candidate: str) -> None:
         logger.warning(
-            "providers.%s: '%s' value '%s' is not a valid URL "
-            "(no scheme or host) — skipped",
-            provider_key or "?", url_key, candidate,
+            "providers.%s: '%s' value is not a valid URL "
+            "(scheme, host, or port validation failed) — skipped",
+            provider_key or "?", url_key,
         )
 
     base_url = get_custom_provider_endpoint(

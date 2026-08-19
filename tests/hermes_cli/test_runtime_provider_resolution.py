@@ -164,6 +164,75 @@ def test_named_loopback_ollama_explicit_endpoint_bypasses_pool_credentials(monke
     assert pool_calls == []
 
 
+@pytest.mark.parametrize("endpoint_source", ["configured", "explicit"])
+def test_named_loopback_ollama_rejects_url_userinfo_without_echoing_it(
+    tmp_path, monkeypatch, endpoint_source
+):
+    """The no-auth route must fail closed on embedded URL authentication."""
+    endpoint = "http://synthetic-user:synthetic-pass@127.0.0.1:11434/v1?marker=synthetic-query"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    if endpoint_source == "configured":
+        atomic_yaml_write(
+            tmp_path / "config.yaml",
+            {"providers": {"ollama": {"base_url": endpoint}}},
+            sort_keys=False,
+        )
+
+    kwargs = {"requested": "ollama"}
+    if endpoint_source == "explicit":
+        kwargs["explicit_base_url"] = endpoint
+
+    with pytest.raises(rp.AuthError) as exc_info:
+        rp.resolve_runtime_provider(**kwargs)
+
+    error = exc_info.value
+    message = str(error)
+    assert error.provider == "ollama"
+    assert "custom:ollama" in message
+    assert endpoint not in message
+    assert "synthetic-user" not in message
+    assert "synthetic-pass" not in message
+    assert "synthetic-query" not in message
+
+
+@pytest.mark.parametrize(
+    ("requested_provider", "base_url"),
+    [
+        (
+            "custom:ollama",
+            "http://synthetic-user:synthetic-pass@127.0.0.1:11434/v1?marker=synthetic-query",
+        ),
+        (
+            "ollama",
+            "https://synthetic-user:synthetic-pass@ollama.remote.example/v1?marker=synthetic-query",
+        ),
+    ],
+)
+def test_authenticated_ollama_routes_preserve_url_userinfo(
+    tmp_path, monkeypatch, requested_provider, base_url
+):
+    """Custom-local and named-remote routes retain authenticated URL behavior."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    atomic_yaml_write(
+        tmp_path / "config.yaml",
+        {
+            "providers": {
+                "ollama": {
+                    "base_url": base_url,
+                    "api_key": "synthetic-auth-value",
+                }
+            }
+        },
+        sort_keys=False,
+    )
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *_a, **_kw: None)
+
+    resolved = rp.resolve_runtime_provider(requested=requested_provider)
+
+    assert resolved["base_url"] == base_url
+    assert resolved["api_key"] == "synthetic-auth-value"
+
+
 @pytest.mark.parametrize(
     ("requested_provider", "base_url", "expected"),
     [

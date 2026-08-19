@@ -75,6 +75,66 @@ providers:
     )
 
 
+def _write_ollama_extra_body_config(tmp_path, *, base_url):
+    (tmp_path / "config.yaml").write_text(
+        f"""\
+providers:
+  ollama:
+    base_url: {base_url}
+    extra_body:
+      provider_body_marker: configured
+""",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize(
+    ("base_url", "requested_provider", "keeps_provider_body"),
+    [
+        ("http://127.0.0.1:11434/v1", "ollama", False),
+        ("http://127.0.0.1:11434/v1", "custom:ollama", True),
+        ("https://ollama.remote.example/v1", "ollama", True),
+    ],
+)
+def test_full_constructor_and_rebuild_isolate_named_local_ollama_provider_body(
+    tmp_path, monkeypatch, base_url, requested_provider, keeps_provider_body
+):
+    """Provider config must not cross the exact named-local body boundary."""
+    _write_ollama_extra_body_config(tmp_path, base_url=base_url)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("run_agent.OpenAI", MagicMock(return_value=MagicMock()))
+
+    agent = AIAgent(
+        api_key="synthetic-route-key",
+        base_url=base_url,
+        provider="custom",
+        requested_provider=requested_provider,
+        api_mode="chat_completions",
+        model="synthetic-model",
+        request_overrides={
+            "caller_option": "caller-owned-marker",
+            "extra_body": {"caller_body_marker": "retained"},
+        },
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    expected_extra_body = {"caller_body_marker": "retained"}
+    if keeps_provider_body:
+        expected_extra_body["provider_body_marker"] = "configured"
+    assert agent.request_overrides == {
+        "caller_option": "caller-owned-marker",
+        "extra_body": expected_extra_body,
+    }
+
+    assert agent._replace_primary_openai_client(reason="test-provider-body") is True
+    assert agent.request_overrides == {
+        "caller_option": "caller-owned-marker",
+        "extra_body": expected_extra_body,
+    }
+
+
 def test_full_constructor_and_rebuild_keep_authenticated_loopback_custom_ollama_headers(
     tmp_path, monkeypatch
 ):
