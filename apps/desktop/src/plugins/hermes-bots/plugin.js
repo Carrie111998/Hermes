@@ -7446,13 +7446,32 @@ function CreateRoutineDialog({ bot, open, onClose }) {
   })
 }
 
-/** Which bot the Routines tile should scope to. $selectedBot already tracks
- *  the live gateway profile (see the host.state.profile listener that keeps
- *  it in sync) plus roster clicks, so it is current the instant a bot is
- *  clicked; the raw gateway profile is only a fallback before any selection
- *  has landed. */
+/** Which bot the Routines tile should scope to. $selectedBot is reseeded from
+ *  the live gateway profile on every register() and kept in sync afterward by
+ *  the host.state.profile listener, plus updated on roster clicks — so it is
+ *  current both the instant a bot is clicked and across disable/re-enable
+ *  cycles. The raw gateway profile is only a fallback before any value has
+ *  landed in $selectedBot. */
 function resolveRoutinesBot(selected, gatewayProfile) {
   return (selected || gatewayProfile || 'default').trim() || 'default'
+}
+
+/** Keeps $selectedBot in sync with the live gateway profile. nanostores'
+ *  `.listen()` never replays the current value the way `.subscribe()` does,
+ *  so a disable → profile switch → re-enable sequence would otherwise leave
+ *  $selectedBot pointed at whichever bot was active before the plugin was
+ *  disabled — reseeding here on every register() call closes that gap.
+ *  Returns the unbind function for ctx.onDispose. */
+function bindProfileSync(profileStore) {
+  const current = profileStore.get?.()
+  if (current && typeof current === 'string') {
+    $selectedBot.set(current)
+  }
+  return profileStore.listen(profile => {
+    if (profile && typeof profile === 'string') {
+      $selectedBot.set(profile)
+    }
+  })
 }
 
 function RoutinesPane() {
@@ -9830,11 +9849,7 @@ export default {
     // Capture the unbinds: without them a disable → re-enable cycle stacks a
     // duplicate listener per cycle (same survives-disable class as the face
     // clock before its onDispose hook — these kept firing until app restart).
-    const unbindProfileListener = host.state.profile.listen(profile => {
-      if (profile && typeof profile === 'string') {
-        $selectedBot.set(profile)
-      }
-    })
+    const unbindProfileListener = bindProfileSync(host.state.profile)
     const unbindGatewayListener = host.state.gateway.listen(handleSessionsGatewayTransition)
 
     if (typeof ctx.onDispose === 'function') {
