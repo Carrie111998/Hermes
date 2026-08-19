@@ -46,6 +46,105 @@ _FTS5_SPECIAL_CHARS = '+{}():"^@/#&|~[]<>,;!?$=\\\''
 _FTS5_SPECIAL_RE = re.compile(f"[{re.escape(_FTS5_SPECIAL_CHARS)}]")
 
 
+# ---------------------------------------------------------------------------
+# Compression-lineage resolver (fork #68, reconstructed on current upstream).
+#
+# One logical session-search query resolves each ranked owner candidate to
+# its positive compression-continuation root with a query-local
+# memo/path-compression pass.  Generic parentage is NOT lineage: only a
+# child whose parent exists, whose parent ended by ``'compression'``, that is
+# not a ``tool`` session, and whose branch/delegate markers do not explicitly
+# point at that parent forms a compression edge.  Foreign markers pointing
+# elsewhere do not disqualify the edge.
+#
+# Safety is orthogonal to lineage identity: a traversal-local seen-set proves
+# cycles, and a global per-query work budget bounds indexed row fetches.  A
+# budget-exhausted partial path is operational uncertainty, never semantic
+# evidence, so it is not memoized as unresolved.
+_LINEAGE_WORK_BUDGET = 2000
+_UNRESOLVED = object()
+_BUDGET_EXHAUSTED = object()
+
+_LINEAGE_NODE_SQL = """
+SELECT
+    child.id,
+    child.parent_session_id,
+    child.source,
+    child.model_config,
+    parent.id AS parent_exists,
+    parent.end_reason AS parent_end_reason
+FROM sessions child
+LEFT JOIN sessions parent ON parent.id = child.parent_session_id
+WHERE child.id = ?
+"""
+
+
+def _lineage_markers(
+    model_config: Any,
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """Return ``(config_valid, branched_from, delegate_from)`` for a session.
+
+    Malformed / non-object ``model_config`` is treated as "no proven positive
+    edge" (the conservative direction): the current node becomes its own root
+    rather than traversing an unproven parent.
+    """
+    if model_config in (None, ""):
+        return True, None, None
+    value = model_config
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return False, None, None
+    if not isinstance(value, dict):
+        return False, None, None
+    markers: List[Optional[str]] = []
+    for key in ("_branched_from", "_delegate_from"):
+        marker = value.get(key)
+        if marker is None:
+            markers.append(None)
+        elif isinstance(marker, str) and marker:
+            markers.append(marker)
+        else:
+            return False, None, None
+    return True, markers[0], markers[1]
+
+
+class _LineageResolutionState:
+    """Per-logical-query resolver state for one winner search.
+
+    ``work`` counts exactly one successful uncached lineage-node row fetch;
+    memo hits, absent-row fetches, and local cycle checks consume nothing.
+    ``memo`` maps a lineage node to a resolved root string or ``_UNRESOLVED``.
+    A budget-exhausted partial path is never written to the memo.
+    """
+
+    __slots__ = (
+        "budget",
+        "work",
+        "memo",
+        "memo_hits",
+        "bound_hit",
+        "candidates_inspected",
+        "accepted_roots",
+    )
+
+    def __init__(self, budget: int = _LINEAGE_WORK_BUDGET) -> None:
+        self.budget = max(1, int(budget))
+        self.work = 0
+        self.memo: Dict[str, Any] = {}
+        self.memo_hits = 0
+        self.bound_hit = False
+        self.candidates_inspected = 0
+        self.accepted_roots = 0
+
+    def _memoize_unresolved(self, path: List[str], node: str) -> None:
+        """Mark *path* plus *node* as proven unresolved (zero later lookups)."""
+        for visited in path:
+            self.memo.setdefault(visited, _UNRESOLVED)
+        self.memo.setdefault(node, _UNRESOLVED)
+
+
 class SessionSearchMixin:
     """See module docstring — mixin for SessionDB (Search cluster)."""
 
@@ -2285,6 +2384,167 @@ class SessionSearchMixin:
         with self._read_ctx() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
+
+    def _resolve_compression_lineage_on_conn(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        state: _LineageResolutionState,
+    ) -> Any:
+        """Resolve *session_id* to its compression root on *conn*.
+
+        Returns the resolved root string, ``_UNRESOLVED`` for a proven
+        semantic unresolved outcome (missing row / dangling parent / positive
+        cycle), or ``_BUDGET_EXHAUSTED`` when the global work budget would be
+        exceeded by the next uncached lookup.
+
+        The loop ordering is correctness-significant at the B boundary:
+        memo lookup first, then traversal-local cycle proof, then the budget
+        check (only because another uncached lookup is now required), then the
+        one-node point lookup.
+        """
+        if not session_id:
+            return _UNRESOLVED
+        node = str(session_id)
+        path: List[str] = []
+        seen: set = set()
+
+        while True:
+            cached = state.memo.get(node)
+            if cached is _UNRESOLVED:
+                state.memo_hits += 1
+                for visited in path:
+                    state.memo.setdefault(visited, _UNRESOLVED)
+                return _UNRESOLVED
+            if cached is not None:
+                # Memo hit: path-compress the visited prefix to the known root.
+                state.memo_hits += 1
+                for visited in path:
+                    state.memo.setdefault(visited, cached)
+                return cached
+
+            if node in seen:
+                # Positive cycle proven from the traversal-local seen-set
+                # with no further DB lookup (valid even at work == B).
+                state._memoize_unresolved(path, node)
+                return _UNRESOLVED
+            seen.add(node)
+
+            if state.work >= state.budget:
+                # Another uncached lookup is required and the budget is gone.
+                # This is operational uncertainty, NOT semantic unresolved, so
+                # the partial path is left out of the memo.
+                state.bound_hit = True
+                return _BUDGET_EXHAUSTED
+
+            row = conn.execute(_LINEAGE_NODE_SQL, (node,)).fetchone()
+            if row is None:
+                # The node row itself is missing: zero successful-fetch work
+                # for that absent row; the traversed path is semantically
+                # unresolved.
+                state._memoize_unresolved(path, node)
+                return _UNRESOLVED
+            state.work += 1
+
+            current = str(row["id"])
+            path.append(current)
+            parent_id = row["parent_session_id"]
+            if parent_id is None:
+                root = current
+                break
+            parent_id = str(parent_id)
+
+            if row["parent_exists"] is None:
+                # Dangling parent: malformed lineage, fail closed.
+                state._memoize_unresolved(path, node)
+                return _UNRESOLVED
+
+            config_valid, branched_from, delegate_from = _lineage_markers(
+                row["model_config"]
+            )
+            positive_edge = (
+                config_valid
+                and row["parent_end_reason"] == "compression"
+                and row["source"] != "tool"
+                and branched_from != parent_id
+                and delegate_from != parent_id
+            )
+            if not positive_edge:
+                root = current
+                break
+
+            node = parent_id
+
+        for visited in path:
+            state.memo.setdefault(visited, root)
+        return root
+
+    def resolve_compression_lineage(
+        self,
+        session_id: str,
+        *,
+        work_budget: int = _LINEAGE_WORK_BUDGET,
+    ) -> Optional[str]:
+        """Resolve *session_id* to its positive compression-continuation root.
+
+        Returns the root id, or ``None`` when the outcome is a proven semantic
+        unresolved (missing row / dangling parent / positive cycle) or the work
+        budget is exhausted.  Never falls back to generic parent ancestry; an
+        unresolved session is kept separate instead of broadening exclusion to
+        an unproven ancestor.
+        """
+        if not session_id:
+            return None
+        with self._read_ctx() as conn:
+            started_tx = not conn.in_transaction
+            if started_tx:
+                conn.execute("BEGIN")
+            try:
+                state = _LineageResolutionState(work_budget)
+                outcome = self._resolve_compression_lineage_on_conn(
+                    conn, str(session_id), state
+                )
+            finally:
+                if started_tx and conn.in_transaction:
+                    conn.rollback()
+        if outcome is _UNRESOLVED or outcome is _BUDGET_EXHAUSTED:
+            return None
+        return outcome
+
+    def _current_lineage_ancestors_on_conn(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        state: _LineageResolutionState,
+    ) -> set:
+        """Collect the current session's generic parent chain ids.
+
+        Current-session exclusion must also hide live-context ancestors that
+        are NOT compression lineage: a delegation/branch child is still
+        visible to its parent agent, so the parent's content stays excluded
+        even though the child is a distinct compression root (#68).  Walks
+        ``parent_session_id`` links on the same connection, counts successful
+        row fetches toward the work budget, and stops on a missing row, a
+        cycle, or budget exhaustion.
+        """
+        ancestors: set = set()
+        seen: set = set()
+        node = str(session_id) if session_id else None
+        while node and node not in seen:
+            seen.add(node)
+            if state.work >= state.budget:
+                state.bound_hit = True
+                break
+            row = conn.execute(_LINEAGE_NODE_SQL, (node,)).fetchone()
+            if row is None:
+                break
+            state.work += 1
+            parent = row["parent_session_id"]
+            if parent is None:
+                break
+            node = str(parent)
+            ancestors.add(node)
+        return ancestors
 
     def search_sessions_by_id(
         self,
