@@ -331,7 +331,8 @@ class MailboxTranslator(BaseSubscriber):
         statement that a submission actually happened, and it had no branch at
         all — so the sole `application_submitted` event ever on the bus was a
         synthetic Mission-Control drill. The branch that did exist,
-        SUBMIT_CONFIRM, is Diego's go-ahead: an authorization, not an outcome.
+        SUBMIT_CONFIRM, was Diego's go-ahead — an authorization, not an
+        outcome — and has since been removed, leaving this the one producer.
 
         Success and failure share the message type and differ only in
         `status`, so they must not collapse: APPLICATION_SUBMITTED is a
@@ -558,9 +559,36 @@ class MailboxTranslator(BaseSubscriber):
         elif message_type == "SUBMIT_RESULT":
             results.extend(self._submit_result_emissions(inner))
 
-        elif message_type == "SUBMIT_CONFIRM":
-            results.append((EventType.APPLICATION_SUBMITTED, _copy_fields(
-                inner, ["company", "title", "job_key", "submission_id"]), None))
+        # SUBMIT_CONFIRM deliberately absent (2026-08-19). It is Diego's
+        # AUTHORIZATION, not an outcome: "Dry-run -> Jaum review ->
+        # SUBMIT_CONFIRM -> actual submit" (curator/orchestrator.py:151)
+        # places it strictly BEFORE the applier acts, and protocol.md:49
+        # gives its entire payload as `{job_id, approved: true}`. Mapping it
+        # to APPLICATION_SUBMITTED -- a _SUCCESS_EVENT_TYPE
+        # (events/outcomes.py:89) -- booked the job as a completed success
+        # the instant Diego said yes, and the consequences outlive the
+        # notification: memory_writer.py:186 appends "Application submitted
+        # for <title> at <company>" to the job's GBrain timeline, which is
+        # append-only, and digest_composer.py:371 counts it in the daily
+        # "Applier: N submitted" line. The copied fields were a fiction too
+        # -- none of company/title/job_key/submission_id is in that payload,
+        # so the event landed as `{}`, and a submission_id cannot exist
+        # before the submission does.
+        #
+        # Since SUBMIT_RESULT became the truthful producer of this event
+        # type, keeping the branch made one authorized application emit
+        # APPLICATION_SUBMITTED twice -- once falsely at the go-ahead, once
+        # truthfully at the report.
+        #
+        # Dropped rather than repointed at an "authorization received" type:
+        # Diego AUTHORS this message (SOUL.md:58 "approve X" / "yes"; he
+        # clicks Approve -- profiles/applier/workspace/WORKFLOW.md:73), so
+        # such an event would page him about his own click, and every other
+        # event in this lane tells him something a machine learned. The
+        # message still reaches the bus as `mailbox_message` for audit, with
+        # its own `_summarize` case (mailbox_watcher.py:282), and the
+        # dispatch route that wakes the applier is a separate table
+        # (jobflow_dispatch/contracts.py:55).
 
         elif message_type == "BLOCKED_QUESTION":
             results.append(
