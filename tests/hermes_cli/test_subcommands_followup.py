@@ -79,3 +79,18 @@ def test_skills_reset_help_distinguishes_plain_reset_from_restore(capsys):
     assert "byte-identical" in output
     assert "genuinely differs" in output
     assert "--restore" in output
+
+
+def test_skills_list_modified_help_points_to_restore(capsys):
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    build_skills_parser(sub, cmd_skills=_h("skills"))
+
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["skills", "list-modified", "--help"])
+
+    assert exc.value.code == 0
+    output = " ".join(capsys.readouterr().out.split())
+    assert "hermes skills diff <name>" in output
+    assert "hermes skills reset <name> --restore" in output
+    assert "replace the modified copy" in output

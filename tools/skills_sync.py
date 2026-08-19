@@ -845,8 +845,8 @@ def sync_skills(quiet: bool = False) -> dict:
                         print(
                             f"  ⚠ {skill_name}: bundled version shipped but you "
                             f"already have a local skill by this name — yours "
-                            f"was kept. Run `hermes skills reset --restore "
-                            f"{skill_name}` to replace it with the bundled version."
+                            f"was kept. Run `hermes skills reset {skill_name} "
+                            f"--restore` to replace it with the bundled version."
                         )
                 else:
                     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1164,7 +1164,7 @@ def reset_bundled_skill(name: str, restore: bool = False) -> dict:
                 f"Cleared manifest entry for '{name}', but your local copy differs "
                 f"from the bundled version, so it remains preserved and will not "
                 f"receive upstream updates. Use "
-                f"`hermes skills reset --restore {name}` to revert to the shipped "
+                f"`hermes skills reset {name} --restore` to revert to the shipped "
                 f"version."
             )
 

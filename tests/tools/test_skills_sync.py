@@ -477,7 +477,7 @@ class TestSyncSkills:
 
         captured = capsys.readouterr().out
         assert "new-skill" in captured
-        assert "hermes skills reset --restore new-skill" in captured
+        assert "hermes skills reset new-skill --restore" in captured
 
     def test_user_deleted_skill_not_re_added_and_stale_entries_cleaned(self, tmp_path):
         """In manifest but not on disk = user deleted it; don't re-add. And a
@@ -654,7 +654,10 @@ class TestResetBundledSkill:
 
             assert result["ok"] is True
             assert result["action"] == "manifest_cleared_local_preserved"
-            assert "--restore" in result["message"]
+            assert (
+                "hermes skills reset google-workspace --restore"
+                in result["message"]
+            )
             assert "preserved" in result["message"]
             assert "google-workspace" not in _read_manifest()
             assert "user-edited" in (dest / "SKILL.md").read_text()

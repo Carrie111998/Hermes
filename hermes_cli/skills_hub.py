@@ -1318,9 +1318,11 @@ def do_list_modified(console: Optional[Console] = None,
     for entry in modified:
         c.print(f"  [yellow]~[/] {entry['name']}")
     c.print()
-    c.print("[dim]See changes:   hermes skills diff <name>[/]")
-    c.print("[dim]Resume updates: hermes skills reset <name>          (keep your copy, re-baseline)[/]")
-    c.print("[dim]Revert to stock: hermes skills reset <name> --restore[/]\n")
+    c.print("[dim]Inspect changes: hermes skills diff <name>[/]")
+    c.print(
+        "[dim]Replace your copy and resume stock updates: "
+        "hermes skills reset <name> --restore[/]\n"
+    )
 
 
 def do_diff(name: str, console: Optional[Console] = None) -> None:

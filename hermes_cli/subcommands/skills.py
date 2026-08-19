@@ -221,8 +221,9 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
         description=(
             "Show the bundled skills whose local copy differs from the version last "
             "synced, i.e. the ones `hermes update` reports as user-modified and skips. "
-            "Use `hermes skills diff <name>` to see changes and `hermes skills reset "
-            "<name>` to resume updates."
+            "Use `hermes skills diff <name>` to inspect changes. To replace the modified "
+            "copy with the bundled version and resume stock updates, run "
+            "`hermes skills reset <name> --restore`."
         ),
     )
     skills_list_modified.add_argument(
