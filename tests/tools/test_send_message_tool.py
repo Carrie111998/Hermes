@@ -990,7 +990,7 @@ class TestSendTelegramThreadIdMapping:
 
         # Create a test file
         test_file = tmp_path / "doc.txt"
-        test_file.write_text("test content")
+        test_file.write_text("test content", encoding="utf-8")
 
         asyncio.run(
             _send_telegram(
