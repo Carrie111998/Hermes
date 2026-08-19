@@ -29124,6 +29124,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _stale_finalized = _matcher(_final) is False
                     except Exception:
                         _stale_finalized = False
+                _sc_adapter = getattr(_sc, "adapter", None)
+                if (
+                    _stale_finalized
+                    and getattr(_sc_adapter, "SUPPORTS_MESSAGE_EDITING", True) is False
+                ):
+                    # Non-editable streaming surfaces (WeCom draft + final send)
+                    # have no durable mid-stream preview to reconcile. If they
+                    # set final_content_delivered, the real final send already
+                    # reached the user; treating a payload mismatch as stale
+                    # makes the gateway send the same final answer again.
+                    _stale_finalized = False
                 if _stale_finalized:
                     _content_delivered = False
             # Plugin hooks (e.g. transform_llm_output) may have appended content
