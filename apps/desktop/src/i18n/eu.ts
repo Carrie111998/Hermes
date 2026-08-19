@@ -2116,4 +2116,66 @@ export const eu = defineLocale({
       worktrees: 'Lan-zuhaitzak'
     }
   },
+
+  updates: {
+    stages: {
+      idle: 'Prestatzen…',
+      prepare: 'Prestatzen…',
+      fetch: 'Deskargatzen…',
+      pull: 'Ia prest…',
+      pydeps: 'Amaitzen…',
+      update: 'Hermes eguneratzen…',
+      rebuild: 'Mahaigaineko aplikazioa berreraikitzen…',
+      restart: 'Hermes berrabiarazten…',
+      done: 'Eguneraketa osatuta',
+      manual: 'Eguneratu terminaletik',
+      guiSkew: 'Eguneratu mahaigaineko aplikazioa',
+      error: 'Eguneraketa etenda'
+    },
+    checking: 'Eguneraketen bila…',
+    checkFailedTitle: 'Ezin izan dira eguneraketak egiaztatu',
+    tryAgain: 'Saiatu berriro',
+    notAvailableTitle: 'Ez dago eguneraketarik',
+    unsupportedMessage: 'Hermes-en bertsio honek ezin du bere burua eguneratu aplikaziotik bertatik.',
+    connectionRetry: 'Egiaztatu konexioa eta saiatu berriro.',
+    latestBody: 'Azken bertsioa erabiltzen ari zara.',
+    latestBodyBackend: 'Backend-a azken bertsioan dabil.',
+    allSetTitle: 'Dena prest',
+    availableTitle: 'Eguneraketa berria eskuragarri',
+    availableBody: 'Hermes-en bertsio berri bat instalatzeko prest dago.',
+    availableTitleBackend: 'Backend-aren eguneraketa eskuragarri',
+    availableBodyBackend: 'Konektatutako Hermes backend-aren bertsio berriago bat instalatzeko prest dago.',
+    availableBodyNoChangelog:
+      'Bertsio berriago bat prest dago. Ohar-liburuak ez daude erabilgarri instalazio-mota honetarako.',
+    updateNow: 'Eguneratu orain',
+    maybeLater: 'Geroago agian',
+    moreChanges: count => `+ ${count} aldaketa gehiago sartuta.`,
+    manualTitle: 'Eguneratu terminaletik',
+    manualBody:
+      'Hermes komando-lerrotik instalatu zenuen, beraz eguneraketak ere han exekutatzen dira. Itsatsi hau terminalean:',
+    manualPickedUp: 'Hermes-ek bertsio berria hartuko du hurrengoko abiaraztean.',
+    guiSkewTitle: 'Eguneratu mahaigaineko aplikazioa',
+    guiSkewBody:
+      'Backend-a eguneratu da, baina mahaigaineko aplikazio-pakete hau ez da aldatu. Eguneratu edo berriro instalatu Hermes mahaigaineko aplikazioa (zure AppImage / .deb / .rpm) bat etortzeko.',
+    copy: 'Kopiatu',
+    copied: 'Kopiatuta',
+    done: 'Eginda',
+    applyingBody:
+      'Hermes eguneratzaileak bere leihoan hartzen du kontrola eta Hermes automatikoki irekitzen du amaitu ondoren. Mesedez, ez ireki Hermes zeuk eguneratzen ari den bitartean.',
+    applyingBodyBackend:
+      'Urruneko backend-a eguneraketa aplikatzen ari da eta berrabiaraziko da. Hermes automatikoki konektatzen da berriro itzultzen denean.',
+    applyingClose:
+      'Leiho hau itxiko da eguneraketa exekutatzen den bitartean, eta gero Hermes-ek bere kasa irekitzen du.',
+    errorTitle: 'Eguneraketa ez da amaitu',
+    errorBody: 'Lasai — ez da ezer galdu. Orain saia zaitezke berriro.',
+    notNow: 'Orain ez',
+    applyStatus: {
+      preparing: 'Backend-a eguneratzen…',
+      pulling: 'Backend-a eguneratzen…',
+      restarting: 'Backend-a berrabiarazten eguneraketa kargatzeko…',
+      notAvailable: 'Ez dago eguneraketarik backend honetarako.',
+      failed: 'Backend-aren eguneraketak huts egin du.',
+      noReturn: 'Backend-a ez da berriro martxan jarri. Eguneraketa agian ez da osatu — egiaztatu backend-aren ostalaria.'
+    }
+  },
 })
