@@ -1820,7 +1820,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             if not chunk.choices:
                 if hasattr(chunk, "model") and chunk.model:
                     model_name = chunk.model
-                # Usage comes in the final chunk with empty choices
+                # Usage comes in the final chunk withempty choices
                 if hasattr(chunk, "usage") and chunk.usage:
                     usage_obj = chunk.usage
                 continue
