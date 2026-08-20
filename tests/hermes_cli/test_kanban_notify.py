@@ -43,7 +43,8 @@ def test_notify_sub_delivery_mode_persists_and_last_write_wins(kanban_home):
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="mode sub task", assignee="worker1")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="mode sub task", assignee="worker1")
         # Fresh sub without a mode -> defaults to "notify".
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat1",
@@ -87,14 +88,15 @@ def test_child_task_inherits_parent_delivery_mode(kanban_home):
 
     conn = kb.connect()
     try:
-        parent = kb.create_task(conn, title="root", assignee=None)
+        parent = kb.create_task(conn,
+                        bead_id="worktracker-790", title="root", assignee=None)
         kb.add_notify_sub(
             conn, task_id=parent, platform="telegram", chat_id="chat1",
             thread_id="42", user_id="u1", user_id_alt="alt-u1", notifier_profile="default",
             delivery_mode="notify+wake",
         )
         child = kb.create_task(
-            conn, title="review child", assignee="ccreviewer", parents=[parent],
+            conn, bead_id="worktracker-789", title="review child", assignee="ccreviewer", parents=[parent],
         )
         subs = kb.list_notify_subs(conn, child)
     finally:
@@ -119,7 +121,8 @@ def test_notify_sub_chat_type_persists_and_last_write_wins(kanban_home):
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="chat_type sub", assignee="worker1")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="chat_type sub", assignee="worker1")
         # Fresh sub without chat_type -> defaults to "dm".
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
         subs = kb.list_notify_subs(conn, tid)
@@ -153,7 +156,8 @@ def test_notify_sub_user_id_alt_persists_and_backfills_legacy_rows(kanban_home):
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="alt sub", assignee="worker1")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="alt sub", assignee="worker1")
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat1",
             user_id="open-id",
@@ -182,14 +186,15 @@ def test_child_task_inherits_parent_chat_type(kanban_home):
 
     conn = kb.connect()
     try:
-        parent = kb.create_task(conn, title="root", assignee=None)
+        parent = kb.create_task(conn,
+                        bead_id="worktracker-790", title="root", assignee=None)
         kb.add_notify_sub(
             conn, task_id=parent, platform="telegram", chat_id="chat1",
             user_id="u1", user_id_alt="alt-u1", chat_type="group",
             delivery_mode="notify+wake",
         )
         child = kb.create_task(
-            conn, title="impl child", assignee="coder", parents=[parent],
+            conn, bead_id="worktracker-789", title="impl child", assignee="coder", parents=[parent],
         )
         subs = kb.list_notify_subs(conn, child)
     finally:
@@ -212,8 +217,10 @@ async def test_notifier_notify_plus_wake_sends_and_wakes(kanban_home):
 
     conn = kb.connect()
     try:
-        passive_tid = kb.create_task(conn, title="passive task", assignee="worker1")
-        active_tid = kb.create_task(conn, title="active task", assignee="worker1")
+        passive_tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="passive task", assignee="worker1")
+        active_tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="active task", assignee="worker1")
         kb.add_notify_sub(conn, task_id=passive_tid, platform="telegram", chat_id="chat1")
         kb.add_notify_sub(
             conn, task_id=active_tid, platform="telegram", chat_id="chat1",
@@ -277,7 +284,7 @@ async def test_notifier_plain_notify_never_wakes_even_with_session_id(kanban_hom
     conn = kb.connect()
     try:
         tid = kb.create_task(
-            conn,
+            conn, bead_id="worktracker-789",
             title="legacy passive task",
             assignee="worker1",
             session_id="origin-session-id",
@@ -328,7 +335,8 @@ async def test_notifier_notify_wake_does_not_wake_on_status_event(kanban_home):
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="status-only task", assignee="worker1")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="status-only task", assignee="worker1")
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat1",
             delivery_mode="notify+wake",
@@ -378,7 +386,8 @@ async def test_notifier_wake_forwards_persisted_chat_type_and_user_id(kanban_hom
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="group wake", assignee="worker1")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="group wake", assignee="worker1")
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="grp1",
             user_id="op-42", chat_type="group", delivery_mode="wake",
@@ -433,7 +442,8 @@ async def test_notifier_wake_only_skips_send_and_advances_cursor(kanban_home):
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="wake only task", assignee="worker1")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="wake only task", assignee="worker1")
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="chat1",
             delivery_mode="wake",
@@ -506,7 +516,8 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
     conn = kb.connect()
 
     try:
-        tid = kb.create_task(conn, title=f"test {kind} task", assignee="worker1")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title=f"test {kind} task", assignee="worker1")
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
         kb._append_event(conn, tid, kind=kind)
     finally:
@@ -593,7 +604,8 @@ async def test_notifier_wakes_origin_for_review_and_keeps_subscription(kanban_ho
     from gateway.run import GatewayRunner
 
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="review handoff", assignee="builder")
+        task_id = kb.create_task(conn,
+                        bead_id="worktracker-790", title="review handoff", assignee="builder")
         kb.add_notify_sub(
             conn,
             task_id=task_id,
@@ -815,7 +827,8 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="t", assignee="worker1")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="t", assignee="worker1")
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
     finally:
         conn.close()
@@ -886,7 +899,7 @@ def test_migration_backfills_legacy_gateway_subs_to_notify_wake(kanban_home):
     from hermes_cli.kanban_db import _migrate_add_optional_columns
 
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="legacy sub upgrade")
+        task_id = kb.create_task(conn, title="legacy sub upgrade", bead_id="worktracker-789")
         # Simulate a pre-delivery_mode database: drop the column entirely,
         # then insert legacy-shaped rows (one gateway, one tui).
         conn.execute("ALTER TABLE kanban_notify_subs DROP COLUMN delivery_mode")
@@ -923,7 +936,7 @@ def test_migration_backfill_runs_only_on_first_add(kanban_home):
     from hermes_cli.kanban_db import _migrate_add_optional_columns
 
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="explicit downgrade survives")
+        task_id = kb.create_task(conn, title="explicit downgrade survives", bead_id="worktracker-789")
         kb.add_notify_sub(
             conn,
             task_id=task_id,
@@ -985,11 +998,13 @@ def test_link_tasks_inherits_all_routing_columns(kanban_home):
 
     conn = kb.connect()
     try:
-        parent = kb.create_task(conn, title="root", assignee=None)
+        parent = kb.create_task(conn,
+                        bead_id="worktracker-790", title="root", assignee=None)
         _add_full_parent_sub(kb, conn, parent)
         # Pre-existing child, linked after the fact — exercises
         # _inherit_notify_subs directly (not the create_task parents path).
-        child = kb.create_task(conn, title="existing child", assignee="w1")
+        child = kb.create_task(conn,
+                        bead_id="worktracker-790", title="existing child", assignee="w1")
         kb.link_tasks(conn, parent, child)
         subs = kb.list_notify_subs(conn, child)
     finally:
@@ -1002,10 +1017,11 @@ def test_create_with_parents_inherits_delivery_metadata(kanban_home):
 
     conn = kb.connect()
     try:
-        parent = kb.create_task(conn, title="root", assignee=None)
+        parent = kb.create_task(conn,
+                        bead_id="worktracker-790", title="root", assignee=None)
         _add_full_parent_sub(kb, conn, parent)
         child = kb.create_task(
-            conn, title="graph child", assignee="w1", parents=[parent],
+            conn, bead_id="worktracker-789", title="graph child", assignee="w1", parents=[parent],
         )
         subs = kb.list_notify_subs(conn, child)
     finally:
@@ -1018,7 +1034,8 @@ def test_create_with_parents_inherits_delivery_metadata(kanban_home):
 # ---------------------------------------------------------------------------
 
 def _make_done_task_with_sub(kb, conn, *, title, chat_id):
-    tid = kb.create_task(conn, title=title, assignee="worker1")
+    tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title=title, assignee="worker1")
     kb.add_notify_sub(
         conn, task_id=tid, platform="telegram", chat_id=chat_id,
         notifier_profile="default",

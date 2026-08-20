@@ -77,7 +77,8 @@ def _patch_list_profiles(names: list[str]):
 
 def test_decompose_with_fanout_creates_children(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="ship a feature", triage=True)
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="ship a feature", triage=True)
 
     llm_payload = jsonlib.dumps({
         "fanout": True,
@@ -115,7 +116,8 @@ def test_decompose_with_fanout_creates_children(kanban_home):
 
 def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="route me safely", triage=True)
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="route me safely", triage=True)
 
     llm_payload = jsonlib.dumps({
         "fanout": False,
@@ -147,7 +149,7 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
 
 def test_decompose_returns_false_when_task_not_triage(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="x")  # ready, not triage
+        tid = kb.create_task(conn, title="x", bead_id="worktracker-789")  # ready, not triage
 
     patches = _patch_list_profiles(["orchestrator"])
     for p in patches:

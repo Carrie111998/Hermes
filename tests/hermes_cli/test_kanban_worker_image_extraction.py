@@ -49,7 +49,7 @@ def _add_task_with_body(body: str, *, title: str = "Look at this") -> str:
     conn = kb.connect()
     try:
         task_id = kb.create_task(
-            conn,
+            conn, bead_id="worktracker-789",
             title=title,
             body=body,
             assignee="worker-a",

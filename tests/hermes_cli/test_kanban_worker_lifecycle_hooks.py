@@ -78,7 +78,8 @@ def test_dispatch_spawn_fires_worker_spawned(
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="t", assignee="alice")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="t", assignee="alice")
         result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242)
         assert any(row[0] == tid for row in result.spawned)
     finally:
@@ -100,7 +101,8 @@ def test_crash_reclaim_fires_worker_exited(kanban_home, captured_hooks, monkeypa
     """A dead-PID reclaim fires the exit observer with the exit facts."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="t", assignee="worker")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="t", assignee="worker")
         kb.claim_task(conn, tid)
         kb._set_worker_pid(conn, tid, 98765)
         monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
@@ -126,7 +128,8 @@ def test_stale_claim_reclaim_fires_hook(kanban_home, captured_hooks):
     """A TTL-expired reclaim fires the stale-claim observer post-commit."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="t", assignee="worker")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="t", assignee="worker")
         kb.claim_task(conn, tid)
         conn.execute(
             "UPDATE tasks SET claim_expires = ? WHERE id = ?",
@@ -164,7 +167,8 @@ def test_raising_callbacks_never_break_worker_lifecycle(
     try:
         conn = kb.connect()
         try:
-            tid = kb.create_task(conn, title="t", assignee="alice")
+            tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="t", assignee="alice")
             result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 111)
             assert any(row[0] == tid for row in result.spawned)
 
@@ -201,7 +205,8 @@ def test_no_subscriber_short_circuits_worker_hooks(
     monkeypatch.setattr(lifecycle, "invoke_hook", _spy)
     conn = kb.connect()
     try:
-        kb.create_task(conn, title="t", assignee="alice")
+        kb.create_task(conn,
+                        bead_id="worktracker-790", title="t", assignee="alice")
         kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 222)
     finally:
         conn.close()

@@ -78,7 +78,7 @@ def _completed_subscription(**sub_kwargs):
     conn = kb.connect()
     try:
         tid = kb.create_task(
-            conn,
+            conn, bead_id="worktracker-789",
             title="wake scope",
             assignee="worker",
             session_id="origin-session",

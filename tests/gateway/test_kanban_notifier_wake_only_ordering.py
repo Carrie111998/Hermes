@@ -65,7 +65,7 @@ def _make_completed_task(delivery_mode):
     conn = kb.connect()
     try:
         tid = kb.create_task(
-            conn,
+            conn, bead_id="worktracker-789",
             title="wake ordering task",
             assignee="worker",
             session_id="agent:main:telegram:dm:chat-1",

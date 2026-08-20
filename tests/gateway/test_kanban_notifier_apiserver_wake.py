@@ -76,7 +76,7 @@ def _create_completed_subscription(platform, chat_id, session_id=None):
     conn = kb.connect()
     try:
         tid = kb.create_task(
-            conn, title="notify once", assignee="worker", session_id=session_id,
+            conn, bead_id="worktracker-789", title="notify once", assignee="worker", session_id=session_id,
         )
         kb.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=chat_id)
         kb.complete_task(conn, tid, summary="done once")
@@ -150,7 +150,7 @@ def test_apiserver_subscriptions_have_independent_wake_destinations(
     conn = kb.connect()
     try:
         tid = kb.create_task(
-            conn,
+            conn, bead_id="worktracker-789",
             title="notify both",
             assignee="worker",
             session_id="worker-session",

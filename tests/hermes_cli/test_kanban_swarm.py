@@ -23,6 +23,7 @@ def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path)
             synthesizer_assignee="writer",
             tenant="intel",
             created_by="orchestrator",
+            bead_id="worktracker-790",
         )
 
         root = kb.get_task(conn, created.root_id)
@@ -83,6 +84,7 @@ def test_create_swarm_graph_is_atomic_and_rolls_back_partial_build(
                 ],
                 verifier_assignee="reviewer",
                 synthesizer_assignee="writer",
+            bead_id="worktracker-790",
             )
         assert writer.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
         assert reader.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
@@ -103,6 +105,7 @@ def test_create_swarm_graph_is_atomic_and_rolls_back_partial_build(
                 ],
                 verifier_assignee="reviewer",
                 synthesizer_assignee="writer",
+            bead_id="worktracker-790",
             )
         assert writer.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
         assert reader.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
@@ -122,6 +125,7 @@ def test_create_swarm_graph_is_atomic_and_rolls_back_partial_build(
             workers=[SwarmWorkerSpec(profile="worker-a", title="A", body="A")],
             verifier_assignee="reviewer",
             synthesizer_assignee="writer",
+            bead_id="worktracker-790",
         )
         assert hooks == [("kanban_task_completed", False)]
     finally:
@@ -141,7 +145,8 @@ def test_plain_write_txn_nesting_raises_and_allow_nested_composes(tmp_path):
     try:
         workspace = tmp_path / "scratch-ws"
         workspace.mkdir()
-        tid = kb.create_task(conn, title="ws task", assignee="worker")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="ws task", assignee="worker")
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET workspace_path = ? WHERE id = ?",
@@ -186,6 +191,7 @@ def test_swarm_blackboard_merges_structured_updates(tmp_path):
             workers=[SwarmWorkerSpec(profile="researcher", title="Evidence", body="Find proof")],
             verifier_assignee="reviewer",
             synthesizer_assignee="writer",
+            bead_id="worktracker-790",
         )
 
         post_blackboard_update(
@@ -223,6 +229,7 @@ def test_swarm_verifier_and_synthesis_are_dependency_gated(tmp_path):
             ],
             verifier_assignee="reviewer",
             synthesizer_assignee="writer",
+            bead_id="worktracker-790",
         )
 
         kb.complete_task(

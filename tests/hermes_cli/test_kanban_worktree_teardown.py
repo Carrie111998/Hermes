@@ -156,7 +156,8 @@ def test_tree_dirtied_between_check_and_removal_preserved(
 
 
 def _worktree_task(conn, repo: Path, title: str = "wt-task") -> tuple[str, Path]:
-    tid = kb.create_task(conn, title=title, assignee="worker")
+    tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title=title, assignee="worker")
     wt = _make_worktree(repo, tid)
     with kb.write_txn(conn):
         conn.execute(
@@ -202,7 +203,8 @@ def test_parent_worktree_deferred_until_children_done(
 ) -> None:
     with kb.connect_closing() as conn:
         parent, parent_wt = _worktree_task(conn, repo, title="parent")
-        child = kb.create_task(conn, title="child", assignee="worker")
+        child = kb.create_task(conn,
+                        bead_id="worktracker-790", title="child", assignee="worker")
         kb.link_tasks(conn, parent, child)
 
         with kb.write_txn(conn):

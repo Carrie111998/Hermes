@@ -36,7 +36,8 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def _running_task(conn, title="t"):
     """Create a task and drive it to ``running`` so block_task can act."""
-    tid = kb.create_task(conn, title=title, assignee="worker")
+    tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title=title, assignee="worker")
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
     claimed = kb.claim_task(conn, tid, claimer="worker")
@@ -86,7 +87,8 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
 def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
     """A dependency-parked child becomes ready once its parent completes."""
     with kb.connect_closing() as conn:
-        parent = kb.create_task(conn, title="parent", assignee="worker")
+        parent = kb.create_task(conn,
+                        bead_id="worktracker-790", title="parent", assignee="worker")
         child = _running_task(conn, title="child")
         kb.link_tasks(conn, parent_id=parent, child_id=child)
         kb.block_task(conn, child, reason="wait", kind="dependency")

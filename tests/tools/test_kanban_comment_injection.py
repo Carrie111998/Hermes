@@ -68,7 +68,7 @@ def test_noop_without_worker_env(worker_home, monkeypatch):
 def test_seed_then_inject_new_comment(worker_home, monkeypatch):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="live task")
+        tid = kb.create_task(conn, bead_id="worktracker-789", title="live task")
         kb.add_comment(conn, tid, author="desktop", body="pre-existing note")
     finally:
         conn.close()
@@ -102,7 +102,7 @@ def test_seed_then_inject_new_comment(worker_home, monkeypatch):
 def test_skips_own_authored_comments(worker_home, monkeypatch):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="echo guard")
+        tid = kb.create_task(conn, bead_id="worktracker-789", title="echo guard")
     finally:
         conn.close()
 

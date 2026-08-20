@@ -130,7 +130,8 @@ def main():
     kb.init_db()
     conn = kb.connect()
     for i in range(NUM_TASKS):
-        kb.create_task(conn, title=f"t{i}", assignee="shared",
+        kb.create_task(conn,
+                        bead_id="worktracker-790", title=f"t{i}", assignee="shared",
                        tenant="reclaim-race")
     conn.close()
     print(f"Seeded {NUM_TASKS} tasks. TTL={TTL}s, work_duration={WORK_DURATION_S}s")

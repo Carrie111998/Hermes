@@ -131,7 +131,7 @@ def main():
     tids = []
     for i in range(NUM_TASKS):
         tid = kb.create_task(
-            conn, title=f"task #{i}", assignee="shared",
+            conn, bead_id="worktracker-789", title=f"task #{i}", assignee="shared",
             tenant="concurrency-test",
         )
         tids.append(tid)

@@ -69,7 +69,7 @@ def client(kanban_home):
 
 
 def test_set_and_clear_model_override(conn):
-    tid = kb.create_task(conn, title="t", assignee="worker")
+    tid = kb.create_task(conn, bead_id="worktracker-789", title="t", assignee="worker")
     assert kb.set_model_override(conn, tid, "gpt-5.6-sol", provider="openai")
     t = kb.get_task(conn, tid)
     assert t.model_override == "gpt-5.6-sol"
@@ -83,18 +83,16 @@ def test_set_and_clear_model_override(conn):
 
 
 def test_provider_without_model_rejected(conn):
-    tid = kb.create_task(conn, title="t", assignee="worker")
+    tid = kb.create_task(conn, bead_id="worktracker-789", title="t", assignee="worker")
     with pytest.raises(ValueError):
         kb.set_model_override(conn, tid, None, provider="openrouter")
     with pytest.raises(ValueError):
-        kb.create_task(
-            conn, title="t2", assignee="worker", provider_override="openrouter",
+        kb.create_task(conn, bead_id="worktracker-789", title="t2", assignee="worker", provider_override="openrouter",
         )
 
 
 def test_create_task_with_model_and_provider(conn):
-    tid = kb.create_task(
-        conn, title="t", assignee="worker",
+    tid = kb.create_task(conn, bead_id="worktracker-789", title="t", assignee="worker",
         model_override="qwen-max", provider_override="openrouter",
     )
     t = kb.get_task(conn, tid)
@@ -136,8 +134,7 @@ def _spawn_and_capture(monkeypatch, tmp_path, task):
 
 
 def test_spawn_passes_model_and_provider(monkeypatch, tmp_path, conn):
-    tid = kb.create_task(
-        conn, title="t", assignee="elias",
+    tid = kb.create_task(conn, bead_id="worktracker-789", title="t", assignee="elias",
         model_override="glm-5", provider_override="openrouter",
     )
     task = kb.get_task(conn, tid)
@@ -155,7 +152,7 @@ def test_spawn_passes_model_and_provider(monkeypatch, tmp_path, conn):
 
 
 def _create(client, **kwargs):
-    body = {"title": "task", "assignee": "worker"}
+    body = {"title": "task", "assignee": "worker", "bead_id": "worktracker-789"}
     body.update(kwargs)
     r = client.post("/api/plugins/kanban/tasks", json=body)
     assert r.status_code == 200, r.text
@@ -213,7 +210,7 @@ def test_model_options_endpoint_shape(client, monkeypatch):
 
 
 def test_reasoning_effort_normalizes_and_rejects(conn):
-    tid = kb.create_task(conn, title="t", assignee="worker", reasoning_effort="  HIGH ")
+    tid = kb.create_task(conn, bead_id="worktracker-789", title="t", assignee="worker", reasoning_effort="  HIGH ")
     assert kb.get_task(conn, tid).reasoning_effort == "high"
 
     # "none" is a VALUE (thinking off), not a clear.
@@ -231,8 +228,7 @@ def test_reasoning_effort_normalizes_and_rejects(conn):
 def test_reasoning_effort_survives_clearing_the_model(conn):
     """Depth and model are independent knobs: dropping a model override must
     not silently reset the thinking depth the operator chose."""
-    tid = kb.create_task(
-        conn, title="t", assignee="worker",
+    tid = kb.create_task(conn, bead_id="worktracker-789", title="t", assignee="worker",
         model_override="glm-5", provider_override="openrouter",
         reasoning_effort="ultra",
     )
@@ -245,14 +241,14 @@ def test_reasoning_effort_survives_clearing_the_model(conn):
 
 def test_reasoning_effort_without_a_model_override(conn):
     """A task may run the profile's OWN model at a different depth."""
-    tid = kb.create_task(conn, title="t", assignee="worker", reasoning_effort="low")
+    tid = kb.create_task(conn, bead_id="worktracker-789", title="t", assignee="worker", reasoning_effort="low")
     t = kb.get_task(conn, tid)
     assert t.model_override is None
     assert t.reasoning_effort == "low"
 
 
 def test_spawn_passes_reasoning_without_a_model(monkeypatch, tmp_path, conn):
-    tid = kb.create_task(conn, title="t", assignee="elias", reasoning_effort="high")
+    tid = kb.create_task(conn, bead_id="worktracker-789", title="t", assignee="elias", reasoning_effort="high")
     task = kb.get_task(conn, tid)
     cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
     assert "-m" not in cmd
@@ -261,7 +257,7 @@ def test_spawn_passes_reasoning_without_a_model(monkeypatch, tmp_path, conn):
 
 
 def test_spawn_omits_reasoning_when_unset(monkeypatch, tmp_path, conn):
-    tid = kb.create_task(conn, title="t", assignee="elias")
+    tid = kb.create_task(conn, bead_id="worktracker-789", title="t", assignee="elias")
     task = kb.get_task(conn, tid)
     cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
     assert "--reasoning" not in cmd

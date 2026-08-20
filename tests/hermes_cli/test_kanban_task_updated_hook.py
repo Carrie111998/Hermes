@@ -61,7 +61,8 @@ def test_assign_fires_updated_with_changed_fields(kanban_home, captured_updates)
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="t", assignee="alice")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="t", assignee="alice")
         captured_updates.clear()  # create-time bookkeeping is not under test
         assert kb.assign_task(conn, tid, "bob") is True
     finally:
@@ -88,7 +89,8 @@ def test_raising_callback_does_not_break_assign(kanban_home):
     try:
         conn = kb.connect()
         try:
-            tid = kb.create_task(conn, title="t", assignee="alice")
+            tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="t", assignee="alice")
             assert kb.assign_task(conn, tid, "bob") is True
             assert kb.get_task(conn, tid).assignee == "bob"
         finally:
@@ -110,7 +112,8 @@ def test_no_subscriber_short_circuits_task_updated(kanban_home, monkeypatch):
     monkeypatch.setattr(lifecycle, "invoke_hook", _spy)
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="t", assignee="alice")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="t", assignee="alice")
         assert kb.assign_task(conn, tid, "bob") is True
     finally:
         conn.close()

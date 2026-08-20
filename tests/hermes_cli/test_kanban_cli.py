@@ -46,7 +46,7 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     from hermes_cli import kanban_db as kb
     with kb.connect() as conn:
         kb.create_task(
-            conn, title="acp task", assignee="alice", session_id="acp-x"
+            conn, title="acp task", assignee="alice", session_id="acp-x", bead_id="worktracker-789"
         )
     raw = kc.run_slash("list --json")
     payload = json.loads(raw)
@@ -59,8 +59,8 @@ def test_kanban_list_json_includes_session_id(kanban_home):
 
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     with kb.connect_closing() as conn:
-        parent_id = kb.create_task(conn, title="parent task")
-        child_id = kb.create_task(conn, title="child task")
+        parent_id = kb.create_task(conn, title="parent task", bead_id="worktracker-789")
+        child_id = kb.create_task(conn, title="child task", bead_id="worktracker-789")
         kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
 
     output = kc.run_slash(f"show {child_id}")
@@ -93,7 +93,7 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
     failures: list[str] = []
 
     def worker(board: str, title: str) -> None:
-        args = parser.parse_args(["kanban", "--board", board, "create", title])
+        args = parser.parse_args(["kanban", "--board", board, "create", title, "--bead", "worktracker-789"])
         rc = kc.kanban_command(args)
         if rc != 0:
             failures.append(f"{board}:{rc}")
@@ -135,7 +135,7 @@ def test_run_slash_reclaim_running_task(kanban_home):
     import secrets
     from hermes_cli import kanban_db as kb
 
-    out1 = kc.run_slash("create 'stuck worker task' --assignee broken-model")
+    out1 = kc.run_slash("create 'stuck worker task' --assignee broken-model --bead worktracker-789")
     m = re.search(r"(t_[a-f0-9]+)", out1)
     assert m
     tid = m.group(1)

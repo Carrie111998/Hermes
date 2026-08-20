@@ -124,7 +124,7 @@ def _setup_running_task_with_run(conn, *, title, assignee, worker_pid):
     tasks.claim_lock, tasks.worker_pid; inserts task_runs row with the
     same claim_lock so reclaim_task's preconditions are satisfied.
     """
-    task_id = kb.create_task(conn, title=title, assignee=assignee)
+    task_id = kb.create_task(conn, title=title, assignee=assignee, bead_id="worktracker-456")
     lock = secrets.token_hex(8)
     future = int(time.time()) + 3600
     conn.execute(

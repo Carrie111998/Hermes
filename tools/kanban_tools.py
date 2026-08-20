@@ -1461,6 +1461,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                bead_id=args.get("bead_id") or args.get("bead"),
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -2161,6 +2162,15 @@ KANBAN_CREATE_SCHEMA = {
                     "Opening post: full spec, acceptance criteria, "
                     "links. The assigned worker reads this as part of "
                     "its context."
+                ),
+            },
+            "bead": {
+                "type": "string",
+                "description": (
+                    "Upstream issue-tracker id this task captures, e.g. "
+                    "'worktracker-123' (the card links to it). REQUIRED — "
+                    "creation fails without it. When creating a child task "
+                    "(passing 'parents'), omit to inherit the parent's bead."
                 ),
             },
             "parents": {

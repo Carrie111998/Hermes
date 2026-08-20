@@ -61,6 +61,15 @@ type KanbanMessages = {
   titlePlaceholderTriage: string
   titlePlaceholder: string
   descPlaceholder: string
+  bead: string
+  beadPlaceholder: string
+  beadRequired: string
+  beadHint: string
+  beadMissing: string
+  beadMissingTip: string
+  beadLink: string
+  beadAdd: string
+  beadInvalid: string
   priority: string
   workspace: string
   boardDefaultSuffix: string
@@ -261,6 +270,15 @@ export const en: KanbanMessages = {
   titlePlaceholderTriage: 'Rough idea — a specifier will flesh it out',
   titlePlaceholder: 'Title',
   descPlaceholder: 'Description (optional)',
+  bead: 'Bead id',
+  beadPlaceholder: 'worktracker-123',
+  beadRequired: 'Bead id is required — every card must reference the bead it captures.',
+  beadHint: 'Links this card to its bead.',
+  beadMissing: 'no bead',
+  beadMissingTip: 'This card predates the mandatory bead field — open it to link a bead.',
+  beadLink: 'Linked bead',
+  beadAdd: 'Add bead',
+  beadInvalid: 'Bead id must look like worktracker-<digits>.',
   priority: 'Priority',
   workspace: 'Workspace',
   boardDefaultSuffix: ' · board default',
@@ -463,6 +481,15 @@ const ja: KanbanMessages = {
   titlePlaceholderTriage: '大まかなアイデア — スペシファイアが具体化します',
   titlePlaceholder: 'タイトル',
   descPlaceholder: '説明（任意）',
+  bead: 'ビーズ ID',
+  beadPlaceholder: 'worktracker-123',
+  beadRequired: 'ビーズ ID は必須です — すべてのカードは捕捉するビーズを参照する必要があります。',
+  beadHint: 'このカードをビーズにリンクします。',
+  beadMissing: 'ビーズなし',
+  beadMissingTip: 'このカードは必須ビーズフィールドより前のものです — 開いてリンクしてください。',
+  beadLink: 'リンクされたビーズ',
+  beadAdd: 'ビーズを追加',
+  beadInvalid: 'ビーズ ID は worktracker-<数字> の形でなければなりません。',
   priority: '優先度',
   workspace: 'ワークスペース',
   boardDefaultSuffix: '・ボード既定',
@@ -663,6 +690,15 @@ const zh: KanbanMessages = {
   titlePlaceholderTriage: '大致想法 — 细化代理会补全',
   titlePlaceholder: '标题',
   descPlaceholder: '描述（可选）',
+  bead: 'Bead ID',
+  beadPlaceholder: 'worktracker-123',
+  beadRequired: 'Bead ID 为必填 — 每张卡片必须引用它捕获的 bead。',
+  beadHint: '将此卡片链接到其 bead。',
+  beadMissing: '无 bead',
+  beadMissingTip: '此卡片早于必填 bead 字段 — 打开以链接 bead。',
+  beadLink: '已链接的 bead',
+  beadAdd: '添加 bead',
+  beadInvalid: 'Bead ID 必须形如 worktracker-<数字>。',
   priority: '优先级',
   workspace: '工作区',
   boardDefaultSuffix: '・面板默认',
@@ -861,6 +897,15 @@ const zhHant: KanbanMessages = {
   titlePlaceholderTriage: '大致想法 — 細化代理會補全',
   titlePlaceholder: '標題',
   descPlaceholder: '描述（選填）',
+  bead: 'Bead ID',
+  beadPlaceholder: 'worktracker-123',
+  beadRequired: 'Bead ID 為必填 — 每張卡片必須引用它捕捉的 bead。',
+  beadHint: '將此卡片連結到其 bead。',
+  beadMissing: '無 bead',
+  beadMissingTip: '此卡片早於必填 bead 欄位 — 開啟以連結 bead。',
+  beadLink: '已連結的 bead',
+  beadAdd: '新增 bead',
+  beadInvalid: 'Bead ID 必須形如 worktracker-<數字>。',
   priority: '優先順序',
   workspace: '工作區',
   boardDefaultSuffix: '・面板預設',

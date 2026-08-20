@@ -69,7 +69,7 @@ def captured_updates():
 def _make_task(title="t"):
     conn = kb.connect()
     try:
-        return kb.create_task(conn, title=title, assignee="alice")
+        return kb.create_task(conn, title=title, assignee="alice", bead_id="worktracker-789")
     finally:
         conn.close()
 

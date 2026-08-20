@@ -18,6 +18,7 @@ import {
   DropdownMenuTrigger,
   ErrorState,
   host,
+  Input,
   Loader,
   LogView,
   Textarea,
@@ -45,6 +46,7 @@ import {
   taskKey,
   uploadAttachment
 } from './api'
+import { beadUrl, isBeadId } from './board'
 import { ModelOverrideField, overridePatch } from './model-override'
 import {
   type Diagnostic,
@@ -175,6 +177,77 @@ function MetaRow({ children, label }: { children: ReactNode; label: string }) {
       <span className="text-(--ui-text-quaternary)">{label}</span>
       <span className="min-w-0 truncate text-(--ui-text-secondary)">{children}</span>
     </>
+  )
+}
+
+/** Inline bead reference row: clickable link when set, inline "add" when the
+ *  legacy card predates the mandatory field. Same validation as the backend. */
+function BeadField({ current, onSave }: { current: null | string; onSave: (beadId: string) => void }) {
+  const k = useKanban()
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
+
+  if (!editing) {
+    return current ? (
+      <a
+        className="inline-flex items-center gap-1 font-mono text-(--ui-link)"
+        href={beadUrl(current)}
+        onClick={event => event.stopPropagation()}
+        rel="noreferrer"
+        target="_blank"
+        title={k.beadLink}
+      >
+        <Codicon name="link-external" size="0.7rem" />
+        {current}
+      </a>
+    ) : (
+      <button
+        className="inline-flex items-center gap-1 text-(--ui-text-tertiary) transition-colors hover:text-foreground"
+        onClick={() => {
+          setDraft('')
+          setEditing(true)
+        }}
+        type="button"
+      >
+        <Codicon name="add" size="0.7rem" />
+        {k.beadAdd}
+      </button>
+    )
+  }
+
+  const save = () => {
+    const trimmed = (draft ?? '').trim()
+
+    if (trimmed && isBeadId(trimmed)) {
+      onSave(trimmed)
+      setEditing(false)
+    }
+  }
+
+  return (
+    <span className="inline-flex items-center gap-1">
+      <Input
+        autoFocus
+        className="h-5 w-36 font-mono text-[0.6875rem]"
+        onChange={event => setDraft(event.target.value)}
+        onKeyDown={event => {
+          if (event.key === 'Enter') {
+            save()
+          } else if (event.key === 'Escape') {
+            setEditing(false)
+          }
+        }}
+        value={draft ?? ''}
+      />
+      <button
+        aria-label={k.save}
+        className="text-(--ui-text-tertiary) hover:text-foreground"
+        onClick={save}
+        type="button"
+      >
+        <Codicon name="check" size="0.75rem" />
+      </button>
+    </span>
   )
 }
 
@@ -757,6 +830,12 @@ export function TaskDrawer({
         ) : (
           <div className="flex flex-col gap-4 text-sm">
             <div className="grid grid-cols-[6rem_minmax(0,1fr)] gap-x-3 gap-y-1 text-[0.71rem]">
+              <MetaRow label={k.beadLink}>
+                <BeadField
+                  current={task.bead_id ?? null}
+                  onSave={beadId => void mutate(() => patchTask(task.id, { bead_id: beadId }))()}
+                />
+              </MetaRow>
               <MetaRow label={k.assignee}>
                 <AssigneeMenu
                   current={task.assignee}

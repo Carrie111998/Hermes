@@ -59,7 +59,7 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
     Before #28712's fix, ``recompute_ready`` would silently flip it
     back to ``ready`` on the very next tick."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="needs human review")
+        tid = kb.create_task(conn, title="needs human review", bead_id="worktracker-789")
         kb.claim_task(conn, tid)
         assert kb.block_task(
             conn, tid,
@@ -116,7 +116,7 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
     leaves the task blocked.
     """
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="loop reproducer")
+        tid = kb.create_task(conn, title="loop reproducer", bead_id="worktracker-789")
         kb.claim_task(conn, tid)
         kb.block_task(
             conn, tid,

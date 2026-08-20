@@ -23,7 +23,7 @@ def kanban_home(tmp_path, monkeypatch):
 
 def _create_triage(conn, title="rough idea", body=None, assignee=None):
     return kb.create_task(
-        conn,
+        conn, bead_id="worktracker-789",
         title=title,
         body=body,
         assignee=assignee,

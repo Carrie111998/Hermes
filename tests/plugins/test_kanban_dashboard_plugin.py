@@ -89,7 +89,7 @@ def test_board_empty(client):
 def test_create_task_appears_on_board(client):
     r = client.post(
         "/api/plugins/kanban/tasks",
-        json={
+        json={"bead_id": "worktracker-789", 
             "title": "Research LLM caching",
             "assignee": "researcher",
             "priority": 3,
@@ -143,7 +143,7 @@ def test_scheduled_tasks_have_their_own_column_not_todo(client):
 
     task = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "wait for indexed data", "assignee": "ops"},
+        json={"bead_id": "worktracker-789", "title": "wait for indexed data", "assignee": "ops"},
     ).json()["task"]
 
     conn = kb.connect()
@@ -164,8 +164,8 @@ def test_scheduled_tasks_have_their_own_column_not_todo(client):
 
 
 def test_tenant_filter(client):
-    client.post("/api/plugins/kanban/tasks", json={"title": "A", "tenant": "t1"})
-    client.post("/api/plugins/kanban/tasks", json={"title": "B", "tenant": "t2"})
+    client.post("/api/plugins/kanban/tasks", json={"bead_id": "worktracker-789", "title": "A", "tenant": "t1"})
+    client.post("/api/plugins/kanban/tasks", json={"bead_id": "worktracker-789", "title": "B", "tenant": "t2"})
 
     r = client.get("/api/plugins/kanban/board?tenant=t1")
     counts = {c["name"]: len(c["tasks"]) for c in r.json()["columns"]}
@@ -197,11 +197,11 @@ def test_dashboard_markdown_html_is_sanitized_before_render():
 
 def test_task_detail_includes_links_and_events(client):
     parent = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "parent"},
+        "/api/plugins/kanban/tasks", json={"bead_id": "worktracker-789", "title": "parent"},
     ).json()["task"]
     child = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "child", "parents": [parent["id"]]},
+        json={"bead_id": "worktracker-789", "title": "child", "parents": [parent["id"]]},
     ).json()["task"]
     assert child["status"] == "todo"  # parent not done yet
 
@@ -228,7 +228,7 @@ def test_task_detail_includes_links_and_events(client):
 def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):
     secret = "ghp_" + "D" * 40
     task = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "review me", "assignee": "builder"},
+        "/api/plugins/kanban/tasks", json={"bead_id": "worktracker-789", "title": "review me", "assignee": "builder"},
     ).json()["task"]
 
     response = client.patch(
@@ -280,10 +280,10 @@ def test_reopening_parent_demotes_ready_child(client):
     should not keep showing a stale child as ready after an operator drags
     its parent back out of done for more work.
     """
-    parent = client.post("/api/plugins/kanban/tasks", json={"title": "p"}).json()["task"]
+    parent = client.post("/api/plugins/kanban/tasks", json={"bead_id": "worktracker-789", "title": "p"}).json()["task"]
     child = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "c", "parents": [parent["id"]]},
+        json={"bead_id": "worktracker-789", "title": "c", "parents": [parent["id"]]},
     ).json()["task"]
     assert child["status"] == "todo"
 
@@ -312,17 +312,13 @@ def test_reopening_parent_demotes_ready_child(client):
 
 def test_reopening_parent_retracts_review_and_blocks_approval(client):
     with kb.connect() as conn:
-        parent_id = kb.create_task(conn, title="parent", assignee="planner")
+        parent_id = kb.create_task(conn, bead_id="worktracker-789", title="parent", assignee="planner")
         assert kb.complete_task(conn, parent_id)
-        child_id = kb.create_task(
-            conn,
-            title="child in review",
+        child_id = kb.create_task(conn, bead_id="worktracker-789", title="child in review",
             assignee="reviewer",
             parents=[parent_id],
         )
-        grandchild_id = kb.create_task(
-            conn,
-            title="downstream",
+        grandchild_id = kb.create_task(conn, bead_id="worktracker-789", title="downstream",
             assignee="writer",
             parents=[child_id],
         )
@@ -381,18 +377,14 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
 
 def test_reopening_parent_recursively_retracts_done_and_running_descendants(client):
     with kb.connect() as conn:
-        parent_id = kb.create_task(conn, title="root", assignee="planner")
+        parent_id = kb.create_task(conn, bead_id="worktracker-789", title="root", assignee="planner")
         assert kb.complete_task(conn, parent_id)
-        child_id = kb.create_task(
-            conn,
-            title="accepted child",
+        child_id = kb.create_task(conn, bead_id="worktracker-789", title="accepted child",
             assignee="builder",
             parents=[parent_id],
         )
         assert kb.complete_task(conn, child_id)
-        grandchild_id = kb.create_task(
-            conn,
-            title="running grandchild",
+        grandchild_id = kb.create_task(conn, bead_id="worktracker-789", title="running grandchild",
             assignee="writer",
             parents=[child_id],
         )
@@ -430,7 +422,7 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
 
 def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="active review", assignee="reviewer")
+        task_id = kb.create_task(conn, bead_id="worktracker-789", title="active review", assignee="reviewer")
         implementation = kb.claim_task(conn, task_id)
         assert implementation is not None
         assert kb.request_review(
@@ -462,7 +454,7 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
 # ---------------------------------------------------------------------------
 
 def test_delete_task(client):
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "to-delete"}).json()["task"]
+    t = client.post("/api/plugins/kanban/tasks", json={"bead_id": "worktracker-789", "title": "to-delete"}).json()["task"]
     r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
     assert r.status_code == 200
     assert r.json()["deleted"] is True
@@ -484,7 +476,7 @@ def test_delete_task(client):
 
 
 def test_add_comment(client):
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    t = client.post("/api/plugins/kanban/tasks", json={"bead_id": "worktracker-789", "title": "x"}).json()["task"]
     r = client.post(
         f"/api/plugins/kanban/tasks/{t['id']}/comments",
         json={"body": "how's progress?", "author": "teknium"},
@@ -506,7 +498,7 @@ def test_add_comment(client):
 def test_dispatch_dry_run(client):
     client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "work", "assignee": "researcher"},
+        json={"bead_id": "worktracker-789", "title": "work", "assignee": "researcher"},
     )
     r = client.post("/api/plugins/kanban/dispatch?dry_run=true&max=4")
     assert r.status_code == 200
@@ -597,9 +589,9 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
 
 
 def test_bulk_status_ready(client):
-    a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
-    b = client.post("/api/plugins/kanban/tasks", json={"title": "b"}).json()["task"]
-    c2 = client.post("/api/plugins/kanban/tasks", json={"title": "c"}).json()["task"]
+    a = client.post("/api/plugins/kanban/tasks", json={"bead_id": "worktracker-789", "title": "a"}).json()["task"]
+    b = client.post("/api/plugins/kanban/tasks", json={"bead_id": "worktracker-789", "title": "b"}).json()["task"]
+    c2 = client.post("/api/plugins/kanban/tasks", json={"bead_id": "worktracker-789", "title": "c"}).json()["task"]
     # Parent-less tasks land in "ready" already; push them to blocked first.
     for tid in (a["id"], b["id"], c2["id"]):
         client.patch(
@@ -625,7 +617,7 @@ def test_bulk_review_assignment_preserves_implementer_provenance(client):
     tasks = [
         client.post(
             "/api/plugins/kanban/tasks",
-            json={"title": title, "assignee": "builder"},
+            json={"bead_id": "worktracker-789", "title": title, "assignee": "builder"},
         ).json()["task"]
         for title in ("review a", "review b")
     ]
@@ -656,8 +648,8 @@ def test_bulk_review_assignment_preserves_implementer_provenance(client):
 
 
 def test_bulk_status_done_forwards_completion_summary(client):
-    a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
-    b = client.post("/api/plugins/kanban/tasks", json={"title": "b"}).json()["task"]
+    a = client.post("/api/plugins/kanban/tasks", json={"bead_id": "worktracker-789", "title": "a"}).json()["task"]
+    b = client.post("/api/plugins/kanban/tasks", json={"bead_id": "worktracker-789", "title": "b"}).json()["task"]
 
     r = client.post(
         "/api/plugins/kanban/tasks/bulk",
@@ -687,7 +679,7 @@ def test_bulk_status_done_forwards_completion_summary(client):
 
 def test_bulk_status_running_rejected(client):
     """Bulk updates must match single-task PATCH: direct 'running' is invalid."""
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    t = client.post("/api/plugins/kanban/tasks", json={"bead_id": "worktracker-789", "title": "x"}).json()["task"]
 
     r = client.post(
         "/api/plugins/kanban/tasks/bulk",
@@ -777,7 +769,7 @@ def test_dashboard_cancel_keeps_task_in_old_status(client):
     relies on.
     """
     t = client.post("/api/plugins/kanban/tasks",
-                    json={"title": "x"}).json()["task"]
+                    json={"bead_id": "worktracker-789", "title": "x"}).json()["task"]
     # Tasks land in ``ready`` by default. No PATCH issued — simulating the
     # cancel branch in the bundle.
     assert t["status"] == "ready"
@@ -795,7 +787,7 @@ def test_dashboard_confirm_dispatches_expected_patch_body(client):
     This is the contract the bundle's performMoveTask relies on.
     """
     t = client.post("/api/plugins/kanban/tasks",
-                    json={"title": "x"}).json()["task"]
+                    json={"bead_id": "worktracker-789", "title": "x"}).json()["task"]
     # Bundle's performMoveTask on confirm with a summary produces:
     #   { status, result: summary, summary: summary }
     r = client.patch(
@@ -814,7 +806,7 @@ def test_dashboard_confirm_dispatches_expected_delete(client):
     succeed and remove the task.
     """
     t = client.post("/api/plugins/kanban/tasks",
-                    json={"title": "x"}).json()["task"]
+                    json={"bead_id": "worktracker-789", "title": "x"}).json()["task"]
     r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
     assert r.status_code == 200, r.text
     # 404 on the now-deleted task confirms removal.
@@ -877,8 +869,8 @@ def test_dashboard_dependency_selects_use_value_change_handler():
 
 
 def test_bulk_archive(client):
-    a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
-    b = client.post("/api/plugins/kanban/tasks", json={"title": "b"}).json()["task"]
+    a = client.post("/api/plugins/kanban/tasks", json={"bead_id": "worktracker-789", "title": "a"}).json()["task"]
+    b = client.post("/api/plugins/kanban/tasks", json={"bead_id": "worktracker-789", "title": "b"}).json()["task"]
     r = client.post("/api/plugins/kanban/tasks/bulk",
                     json={"ids": [a["id"], b["id"]], "archive": True})
     assert r.status_code == 200
@@ -892,9 +884,9 @@ def test_bulk_archive(client):
 
 def test_bulk_reassign(client):
     a = client.post("/api/plugins/kanban/tasks",
-                    json={"title": "a", "assignee": "old"}).json()["task"]
+                    json={"bead_id": "worktracker-789", "title": "a", "assignee": "old"}).json()["task"]
     b = client.post("/api/plugins/kanban/tasks",
-                    json={"title": "b", "assignee": "old"}).json()["task"]
+                    json={"bead_id": "worktracker-789", "title": "b", "assignee": "old"}).json()["task"]
     r = client.post("/api/plugins/kanban/tasks/bulk",
                     json={"ids": [a["id"], b["id"]], "assignee": "new"})
     assert r.status_code == 200
@@ -905,7 +897,7 @@ def test_bulk_reassign(client):
 
 def test_bulk_unassign_via_empty_string(client):
     a = client.post("/api/plugins/kanban/tasks",
-                    json={"title": "a", "assignee": "x"}).json()["task"]
+                    json={"bead_id": "worktracker-789", "title": "a", "assignee": "x"}).json()["task"]
     r = client.post("/api/plugins/kanban/tasks/bulk",
                     json={"ids": [a["id"]], "assignee": ""})
     assert r.status_code == 200
@@ -916,8 +908,8 @@ def test_bulk_unassign_via_empty_string(client):
 def test_bulk_partial_failure_doesnt_abort_siblings(client):
     """One bad id in the middle of a batch must not prevent others from
     applying."""
-    a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
-    c2 = client.post("/api/plugins/kanban/tasks", json={"title": "c"}).json()["task"]
+    a = client.post("/api/plugins/kanban/tasks", json={"bead_id": "worktracker-789", "title": "a"}).json()["task"]
+    c2 = client.post("/api/plugins/kanban/tasks", json={"bead_id": "worktracker-789", "title": "c"}).json()["task"]
     r = client.post("/api/plugins/kanban/tasks/bulk",
                     json={"ids": [a["id"], "bogus-id", c2["id"]], "priority": 7})
     assert r.status_code == 200
@@ -974,7 +966,7 @@ def test_config_reads_dashboard_kanban_section(tmp_path, monkeypatch, client):
 
 def test_event_dict_includes_run_id(client):
     """GET /tasks/:id returns events with run_id populated."""
-    r = client.post("/api/plugins/kanban/tasks", json={"title": "e", "assignee": "worker"})
+    r = client.post("/api/plugins/kanban/tasks", json={"bead_id": "worktracker-789", "title": "e", "assignee": "worker"})
     tid = r.json()["task"]["id"]
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
@@ -1077,7 +1069,7 @@ def test_reclaim_endpoint_releases_running_claim(client):
     import secrets
     conn = kb.connect()
     try:
-        t = kb.create_task(conn, title="running", assignee="x")
+        t = kb.create_task(conn, bead_id="worktracker-789", title="running", assignee="x")
         lock = secrets.token_hex(8)
         future = int(time.time()) + 3600
         conn.execute(
@@ -1121,7 +1113,7 @@ def test_reassign_endpoint_switches_profile(client):
     """POST /tasks/<id>/reassign changes the assignee field."""
     conn = kb.connect()
     try:
-        t = kb.create_task(conn, title="task", assignee="orig")
+        t = kb.create_task(conn, bead_id="worktracker-789", title="task", assignee="orig")
     finally:
         conn.close()
 
@@ -1150,8 +1142,8 @@ def test_reassign_endpoint_switches_profile(client):
 def test_diagnostics_endpoint_surfaces_blocked_hallucination(client):
     conn = kb.connect()
     try:
-        parent = kb.create_task(conn, title="parent", assignee="alice")
-        real = kb.create_task(conn, title="real", assignee="x", created_by="alice")
+        parent = kb.create_task(conn, bead_id="worktracker-789", title="parent", assignee="alice")
+        real = kb.create_task(conn, bead_id="worktracker-789", title="real", assignee="x", created_by="alice")
         import pytest as _pytest
         with _pytest.raises(kb.HallucinatedCardsError):
             kb.complete_task(
@@ -1197,7 +1189,7 @@ def test_specify_happy_path(client, monkeypatch):
     # Create a triage task.
     t = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "one-liner", "triage": True},
+        json={"bead_id": "worktracker-789", "title": "one-liner", "triage": True},
     ).json()["task"]
     assert t["status"] == "triage"
 

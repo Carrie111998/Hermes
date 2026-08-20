@@ -22,7 +22,8 @@ def _build_board_db(db_path: Path, tasks: int = 12) -> None:
     kb.init_db(db_path=db_path)
     with kb.connect(db_path=db_path) as conn:
         for i in range(tasks):
-            kb.create_task(conn, title=f"task-{i}")
+            kb.create_task(conn,
+                        bead_id="worktracker-790", title=f"task-{i}")
     conn.close()
     # Force the next connect() to re-run the health guard.
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))

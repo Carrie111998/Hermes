@@ -190,7 +190,8 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 
 def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="delayed recheck", assignee="ops")
+        t = kb.create_task(conn,
+                        bead_id="worktracker-790", title="delayed recheck", assignee="ops")
         assert kb.schedule_task(conn, t, reason="run next week") is True
         task = kb.get_task(conn, t)
         assert task.status == "scheduled"
@@ -217,7 +218,8 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
     import hermes_cli.kanban_db as _kb
 
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="x", assignee="a")
+        t = kb.create_task(conn,
+                        bead_id="worktracker-790", title="x", assignee="a")
         host = _kb._claimer_id().split(":", 1)[0]
         kb.claim_task(conn, t, claimer=f"{host}:worker")
         kb._set_worker_pid(conn, t, 12345)
@@ -277,7 +279,8 @@ def test_rate_limit_exit_requeues_without_counting_failure(
 
     with kb.connect() as conn:
         host = _kb._claimer_id().split(":", 1)[0]
-        tid = kb.create_task(conn, title="rl", assignee="a")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="rl", assignee="a")
 
         # Simulate FAR more quota-wall hits than DEFAULT_FAILURE_LIMIT (2).
         # If any of these counted as a failure the task would be blocked.
@@ -340,7 +343,8 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
     now = 5_000_000
 
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="rl-guard", assignee="a")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="rl-guard", assignee="a")
         # Seed a rate_limited run that just ended + the stamped error.
         kb.claim_task(conn, tid)
         run_id = kb.get_task(conn, tid).current_run_id
@@ -396,7 +400,8 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
     with kb.connect() as conn:
         # Config allows MORE retries than the default. A task blocked
         # with failures below the configured limit must still recover.
-        t = kb.create_task(conn, title="lenient", assignee="a")
+        t = kb.create_task(conn,
+                        bead_id="worktracker-790", title="lenient", assignee="a")
         conn.execute(
             "UPDATE tasks SET status='blocked', consecutive_failures=? "
             "WHERE id=?",
@@ -417,7 +422,8 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
 
         # Config allows FEWER retries than the default. A task at the
         # stricter limit must stay blocked even though it's below default.
-        t2 = kb.create_task(conn, title="strict", assignee="a")
+        t2 = kb.create_task(conn,
+                        bead_id="worktracker-790", title="strict", assignee="a")
         conn.execute(
             "UPDATE tasks SET status='blocked', consecutive_failures=1 "
             "WHERE id=?",
@@ -451,8 +457,9 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
 
 def test_delete_archived_task_removes_related_rows(kanban_home):
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
-        tid = kb.create_task(conn, title="child", parents=[parent], assignee="worker")
+        parent = kb.create_task(conn, title="parent", bead_id="worktracker-789")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="child", parents=[parent], assignee="worker")
         kb.add_comment(conn, tid, "user", "cleanup me")
         kb.claim_task(conn, tid)
         kb.complete_task(conn, tid, result="done")
@@ -475,7 +482,8 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
 
 def test_delete_task_removes_task_and_cascades(kanban_home):
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="to-delete", assignee="alice")
+        t = kb.create_task(conn,
+                        bead_id="worktracker-790", title="to-delete", assignee="alice")
         kb.add_comment(conn, t, "user", "comment")
         kb.add_comment(conn, t, "user", "another")
         assert kb.delete_task(conn, t)
@@ -535,7 +543,7 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
     branch = "wt/custom-task"
     with kb.connect() as conn:
         t = kb.create_task(
-            conn,
+            conn, bead_id="worktracker-789",
             title="ship",
             workspace_kind="worktree",
             workspace_path=str(target),
@@ -579,7 +587,7 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
 def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     """Completion artifacts from scratch workspaces survive workspace cleanup."""
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="render chart")
+        t = kb.create_task(conn, title="render chart", bead_id="worktracker-789")
         task = kb.get_task(conn, t)
         ws = kb.resolve_workspace(task)
         kb.set_workspace_path(conn, t, ws)
@@ -631,9 +639,9 @@ def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_
     child_dir = tmp_path / "persistent-child"
     child_dir.mkdir()
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="scratch parent")
+        parent = kb.create_task(conn, title="scratch parent", bead_id="worktracker-789")
         child = kb.create_task(
-            conn, title="dir child", workspace_kind="dir",
+            conn, bead_id="worktracker-789", title="dir child", workspace_kind="dir",
             workspace_path=str(child_dir),
         )
         kb.link_tasks(conn, parent, child)
@@ -783,7 +791,7 @@ class TestSharedBoardPaths:
         self._set_home(monkeypatch, tmp_path, default_home)
         kb.init_db()
         with kb.connect() as conn:
-            task_id = kb.create_task(conn, title="cross-profile")
+            task_id = kb.create_task(conn, title="cross-profile", bead_id="worktracker-789")
 
         # Worker switches to the profile HERMES_HOME and reads.
         monkeypatch.setenv("HERMES_HOME", str(profile_home))
@@ -946,7 +954,7 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
     )
 
     # DB still usable end-to-end — create + list a task
-    t = kb.create_task(conn, title="post-fallback task")
+    t = kb.create_task(conn, title="post-fallback task", bead_id="worktracker-789")
     tasks = kb.list_tasks(conn)
     assert any(row.id == t for row in tasks)
     conn.close()
@@ -992,7 +1000,7 @@ def test_connect_works_when_wal_is_silently_refused(tmp_path, monkeypatch, caplo
             conn = kb.connect()
 
     assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
-    t = kb.create_task(conn, title="post-silent-fallback task")
+    t = kb.create_task(conn, title="post-silent-fallback task", bead_id="worktracker-789")
     tasks = kb.list_tasks(conn)
     assert any(row.id == t for row in tasks)
     conn.close()
@@ -1019,15 +1027,16 @@ def test_unlink_tasks_triggers_recompute_ready(kanban_home):
     """
     with kb.connect() as conn:
         # A is done.
-        a = kb.create_task(conn, title="parent-done")
+        a = kb.create_task(conn, title="parent-done", bead_id="worktracker-789")
         kb.complete_task(conn, a)
 
         # C is running (not done) — blocks child B.
-        c = kb.create_task(conn, title="parent-running")
+        c = kb.create_task(conn, title="parent-running", bead_id="worktracker-789")
         kb.claim_task(conn, c, claimer="worker:1")
 
         # B depends on both A (done) and C (running) → stays todo.
-        b = kb.create_task(conn, title="child", parents=[a, c])
+        b = kb.create_task(conn,
+                        bead_id="worktracker-790", title="child", parents=[a, c])
         assert kb.get_task(conn, b).status == "todo"
 
         # Remove the blocking dependency C → B.
@@ -1257,9 +1266,11 @@ def test_dispatch_max_in_progress_blocks_review_when_at_limit(
         return 42
 
     with kb.connect() as conn:
-        running = kb.create_task(conn, title="running", assignee="alice")
+        running = kb.create_task(conn,
+                        bead_id="worktracker-790", title="running", assignee="alice")
         kb.claim_task(conn, running)
-        review = kb.create_task(conn, title="review", assignee="bob")
+        review = kb.create_task(conn,
+                        bead_id="worktracker-790", title="review", assignee="bob")
         _set_task_status(conn, review, "review")
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=1)
         review_task = kb.get_task(conn, review)
@@ -1382,7 +1393,7 @@ def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):
     # And once the lock clears, normal access still works.
     monkeypatch.setattr(kb.sqlite3, "connect", real_connect)
     with kb.connect(db_path=db_path) as conn:
-        kb.create_task(conn, title="still here")
+        kb.create_task(conn, title="still here", bead_id="worktracker-789")
         titles = [t.title for t in kb.list_tasks(conn)]
     assert "still here" in titles
 
@@ -1402,8 +1413,8 @@ def test_maybe_emit_scratch_tip_fires_once_per_install(kanban_home, caplog):
     import logging
 
     with kb.connect() as conn:
-        t1 = kb.create_task(conn, title="first scratch")
-        t2 = kb.create_task(conn, title="second scratch")
+        t1 = kb.create_task(conn, title="first scratch", bead_id="worktracker-789")
+        t2 = kb.create_task(conn, title="second scratch", bead_id="worktracker-789")
 
     # Sentinel must not exist yet on a fresh install.
     assert not kb._scratch_tip_shown()

@@ -41,7 +41,8 @@ def test_missing_db_counts_zero_and_creates_nothing(kanban_home):
 def test_optional_filters_narrow_count_without_changing_unfiltered_count(kanban_home):
     conn = kb.connect(board="default")
     try:
-        tid = kb.create_task(conn, title="t", assignee="w")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="t", assignee="w")
         kb.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="session-1")
         kb.add_notify_sub(
             conn,
@@ -110,7 +111,8 @@ def test_count_notify_subs_filters_profile_owners(tmp_path):
     conn = kb.connect(db_path)
     try:
         for profile in ("default", "writer", None):
-            task_id = kb.create_task(conn, title=f"owned by {profile}")
+            task_id = kb.create_task(conn,
+                        bead_id="worktracker-790", title=f"owned by {profile}")
             kb.add_notify_sub(
                 conn,
                 task_id=task_id,

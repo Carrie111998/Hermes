@@ -65,7 +65,8 @@ def test_create_task_inherits_board_project(fresh_home, tmp_path):
     kb.create_board("scoped", name="Scoped", project_id=proj_id)
     conn = kb.connect(board="scoped")
     try:
-        tid = kb.create_task(conn, title="inherit me", board="scoped")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="inherit me", board="scoped")
         assert kb.get_task(conn, tid).project_id == proj_id
     finally:
         conn.close()
@@ -81,7 +82,8 @@ def test_create_task_explicit_project_beats_board(fresh_home, tmp_path):
     kb.create_board("scoped2", name="Scoped2", project_id=board_proj)
     conn = kb.connect(board="scoped2")
     try:
-        tid = kb.create_task(conn, title="explicit", board="scoped2", project_id=task_proj)
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="explicit", board="scoped2", project_id=task_proj)
         assert kb.get_task(conn, tid).project_id == task_proj
     finally:
         conn.close()

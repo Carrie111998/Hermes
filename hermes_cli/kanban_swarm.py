@@ -136,6 +136,7 @@ def create_swarm(
     verifier_title: str = "Verify swarm outputs",
     synthesizer_title: str = "Synthesize swarm outputs",
     tenant: Optional[str] = None,
+    bead_id: Optional[str] = None,
     created_by: str = "swarm-orchestrator",
     workspace_kind: str = "scratch",
     workspace_path: Optional[str] = None,
@@ -158,6 +159,7 @@ def create_swarm(
             verifier_title=verifier_title,
             synthesizer_title=synthesizer_title,
             tenant=tenant,
+            bead_id=bead_id,
             created_by=created_by,
             workspace_kind=workspace_kind,
             workspace_path=workspace_path,
@@ -207,6 +209,7 @@ def _create_swarm_uncommitted(
     verifier_title: str = "Verify swarm outputs",
     synthesizer_title: str = "Synthesize swarm outputs",
     tenant: Optional[str] = None,
+    bead_id: Optional[str] = None,
     created_by: str = "swarm-orchestrator",
     workspace_kind: str = "scratch",
     workspace_path: Optional[str] = None,
@@ -247,6 +250,7 @@ def _create_swarm_uncommitted(
         initial_status="blocked",
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
+        bead_id=bead_id,
     )
 
     # If idempotency returned an existing non-archived root, do not duplicate the
@@ -281,6 +285,7 @@ def _create_swarm_uncommitted(
             workspace_path=workspace_path,
             skills=spec.skills or None,
             max_runtime_seconds=spec.max_runtime_seconds,
+            bead_id=bead_id,
         )
         worker_ids.append(worker_id)
 
@@ -302,6 +307,7 @@ def _create_swarm_uncommitted(
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
         skills=["requesting-code-review"],
+        bead_id=bead_id,
     )
 
     synthesizer_body = (
@@ -321,6 +327,7 @@ def _create_swarm_uncommitted(
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
         skills=["humanizer"],
+        bead_id=bead_id,
     )
 
     created = SwarmCreated(root, worker_ids, verifier, synthesizer)
