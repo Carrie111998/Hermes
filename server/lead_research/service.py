@@ -7,12 +7,14 @@ from urllib.parse import urlparse
 
 from ..db import json_dump, json_load, new_id, now
 from .candidates import CandidateRecord, CandidateRepository
+from .enrichment import FeaturePlanner, satisfied_playbook_fields
 from .identity import IdentityResolver
 from .metrics import CampaignMetricsRecorder, FUNNEL_KEYS, estimate_campaign
 from .models import CampaignConfig, Claim, DiscoveryQuery, ResearchResultData
 from .qualification import EligibilityService
 from .registry import ProviderRegistry, build_registry
 from .scoring import score_lead
+from .sectors import load_sectors
 from .storage import EvidenceRepository
 from .verdicts import SourceCoverage, evaluate_verdict
 
@@ -27,6 +29,7 @@ class LeadResearchService:
         self.db = db
         self.registry = registry or build_registry()
         self.candidates = CandidateRepository(db)
+        self._planner = FeaturePlanner()
 
     def ensure_catalog(self, company_id: str) -> None:
         self.registry.ensure_tenant(self.db, company_id, now())
@@ -353,6 +356,121 @@ class LeadResearchService:
             "sector_ids": config.sector_ids,
         }
 
+    def _enrichment_query(
+        self, query: DiscoveryQuery, config: CampaignConfig
+    ) -> DiscoveryQuery | None:
+        """A second query aimed at what the first pass did not establish.
+
+        The first pass searches the candidate's name against the campaign's own
+        terms. This one searches it against the sector's vocabulary — the words
+        a distributor actually puts on a page ("white goods", "private label",
+        "distributor wanted") — so it reaches different pages rather than
+        re-fetching the same ones at extra cost.
+        """
+        sectors = {sector.sector_id: sector for sector in load_sectors()}
+        product: list[str] = []
+        buyer: list[str] = []
+        for sector_id in config.sector_ids:
+            sector = sectors.get(sector_id)
+            if sector is None:
+                continue
+            product.extend(sector.aliases)
+            product.extend(sector.sourcing_terms)
+            buyer.extend(sector.buyer_types)
+        product = [term for term in dict.fromkeys(product) if term not in query.sector_ids]
+        buyer = [term for term in dict.fromkeys(buyer) if term not in query.buyer_types]
+        if not product and not buyer:
+            # No sector vocabulary means no new search to run. Repeating the
+            # first query would cost the same and return the same pages.
+            return None
+        return query.model_copy(update={
+            "sector_ids": product or query.sector_ids,
+            "buyer_types": buyer or query.buyer_types,
+        })
+
+    def _enrich_candidate(
+        self,
+        config: CampaignConfig,
+        query: DiscoveryQuery,
+        candidate: CandidateRecord,
+        providers: dict,
+        available_source_ids: list[str],
+        bundles: list,
+    ) -> tuple[list, list[str]]:
+        """Re-verify a candidate against the gaps its first pass left open.
+
+        Returns the extra bundles plus the playbook fields still missing after
+        them, so a run can say what it looked for and whether it found it.
+        """
+        fact_fields = {
+            field
+            for _, bundle in bundles
+            for source in bundle.sources
+            for field in source.facts
+        }
+        satisfied = satisfied_playbook_fields(fact_fields)
+        missing = [
+            request.field
+            for request in self._planner.missing_claims(
+                {"claims": {field: True for field in satisfied}}, config.sector_ids
+            )
+        ]
+        if not missing:
+            return [], []
+
+        gap_query = self._enrichment_query(query, config)
+        if gap_query is None:
+            return [], missing
+
+        # Only ask sources whose answer can actually change with the terms.
+        # TED retrieves by winner name and country, so a re-query returns the
+        # same notices and costs a request to learn nothing; a web verifier
+        # searches the terms and reaches different pages. `web_evidence` is
+        # what separates the two, and it is already declared in the catalog.
+        searchable = [
+            source_id for source_id in available_source_ids
+            if "web_evidence" in (self.registry.definitions[source_id].capabilities
+                                  if source_id in self.registry.definitions else [])
+        ]
+        if not searchable:
+            return [], missing
+
+        seen = {
+            source.provenance_url
+            for _, bundle in bundles for source in bundle.sources
+        }
+        extra = []
+        for source_id in searchable:
+            try:
+                bundle = providers[source_id].verify(gap_query, candidate)
+            except Exception:
+                # A failed enrichment must never lose the first pass's evidence.
+                # The candidate keeps whatever it already had.
+                continue
+            if bundle.candidate_source_record_id != candidate.source_record_id:
+                continue
+            fresh = [source for source in bundle.sources if source.provenance_url not in seen]
+            if not fresh:
+                continue
+            seen.update(source.provenance_url for source in fresh)
+            extra.append((source_id, bundle.model_copy(update={"sources": fresh})))
+
+        still_missing = [
+            request.field
+            for request in self._planner.missing_claims(
+                {"claims": {
+                    field: True for field in satisfied_playbook_fields(fact_fields | {
+                        field
+                        for _, bundle in extra
+                        for source in bundle.sources
+                        for field in source.facts
+                    })
+                }},
+                config.sector_ids,
+            )
+        ]
+        return extra, still_missing
+
     def _product_terms(self, company_id: str, config: CampaignConfig) -> list[str]:
         terms = [*config.sector_ids, *config.hs_codes]
         if config.product_ids:
@@ -540,6 +658,10 @@ class LeadResearchService:
         metrics = {key: 0 for key in FUNNEL_KEYS}
         partitions: dict[tuple[str, str], dict] = {}
         processing_error: dict | None = None
+        # Bound before the try so a campaign that fails early still reports
+        # zero enrichment rather than blowing up on the way out.
+        enriched = 0
+        unresolved_gaps: set[str] = set()
         try:
             catalog = {item["source_id"]: item for item in self.catalog(company_id)}
             providers = {
@@ -601,10 +723,12 @@ class LeadResearchService:
                 for candidate in candidates:
                     bundles: list[tuple[str, Any]] = []
                     verification_messages: list[str] = []
+                    available_source_ids: list[str] = []
                     for source_id in config.enabled_source_ids:
                         partition = partitions[(source_id, country)]
                         if not partition["available"]:
                             continue
+                        available_source_ids.append(source_id)
                         try:
                             bundle = providers[source_id].verify(query, candidate)
                             if bundle.candidate_source_record_id != candidate.source_record_id:
@@ -630,6 +754,25 @@ class LeadResearchService:
                             },
                         )
                         continue
+
+                    # A source match says the company exists and is roughly
+                    # right. It does not say whether it is worth contacting, and
+                    # the sector playbook knows what else to look for — so ask
+                    # again, aimed at what is still unknown, before scoring.
+                    if (config.enrichment.research_each_lead
+                            and enriched < config.enrichment.max_companies):
+                        extra, still_missing = self._enrich_candidate(
+                            config, query, candidate, providers, available_source_ids, bundles,
+                        )
+                        if extra:
+                            enriched += 1
+                            bundles.extend(extra)
+                            for source_id, bundle in extra:
+                                partition = partitions[(source_id, country)]
+                                partition["enriched"] = partition.get("enriched", 0) + 1
+                                partition["evidence"] += len(bundle.sources)
+                        if still_missing:
+                            unresolved_gaps.update(still_missing)
 
                     organization_id: str | None = None
                     evaluated_verdict = None
@@ -771,6 +914,12 @@ class LeadResearchService:
                 "campaign_processing_failed", processing_error,
             )
 
+        # Outside FUNNEL_KEYS with excluded_closed and skipped_validated:
+        # enrichment adds evidence to records already counted, it never moves
+        # one through a stage, and that funnel has to stay monotonic.
+        metrics["enriched_companies"] = enriched
+        metrics["unresolved_gaps"] = sorted(unresolved_gaps)
+
         partition_statuses: list[str] = []
         failed_sources: set[str] = set()
         for (source_id, _country), partition in partitions.items():
@@ -801,6 +950,7 @@ class LeadResearchService:
             partition_metrics = {
                 "selected_candidates": partition["selected"],
                 "verified_candidates": partition["verified"],
+                "enriched_candidates": partition.get("enriched", 0),
                 "completed_candidates": partition["completed"],
                 "evidence_records": partition["evidence"],
                 "errors": partition["errors"],

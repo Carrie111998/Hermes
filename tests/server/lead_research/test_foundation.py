@@ -6,10 +6,10 @@ from pydantic import ValidationError
 from server.db import Database, now
 from server.lead_research.enrichment import FeaturePlanner
 from server.lead_research.models import (
-    Claim, LeadCandidate, MarketSignal, ScoringProfile, ScoringWeights,
+    Claim, DatasetDefinition, LeadCandidate, MarketSignal, ScoringProfile, ScoringWeights,
 )
 from server.lead_research.scoring import derive_dimension_scores, score_lead
-from server.lead_research.registry import build_registry
+from server.lead_research.registry import ProviderRegistry, build_registry
 from server.lead_research.service import LeadResearchService
 from server.lead_research.sectors import (
     SECTOR_CSV, SECTOR_MD, load_sectors, render_sector_csv, render_sector_markdown,
@@ -22,6 +22,20 @@ def test_production_catalog_has_no_fixture_adapter():
     assert "fixture-directory" not in {item.source_id for item in registry.list()}
 
 
+# Built here rather than taken from the shipped catalog: the guarantee is about
+# any adapter-less definition, and pinning it to whichever source happens to be
+# uninstalled today makes the test fail when the catalog is curated instead of
+# when the rule breaks.
+CATALOG_ONLY = DatasetDefinition(
+    source_id="declared-only",
+    display_name="Declared Only",
+    publisher="Nobody",
+    access_tier="credentialed_public",
+    entity_levels=["named_company"],
+    adapter_mode="credential_required",
+)
+
+
 def test_catalog_only_provider_cannot_be_enabled_as_a_candidate_verifier(tmp_path):
     db = Database(tmp_path / "catalog.db")
     stamp = now()
@@ -29,17 +43,33 @@ def test_catalog_only_provider_cannot_be_enabled_as_a_candidate_verifier(tmp_pat
         "INSERT INTO companies(id,name,status,data,created_at,updated_at) VALUES(?,?,?,?,?,?)",
         ("company_one", "Company One", "active", "{}", stamp, stamp),
     )
-    service = LeadResearchService(db, registry=build_registry())
+    service = LeadResearchService(db, registry=ProviderRegistry([CATALOG_ONLY]))
     service.ensure_catalog("company_one")
     db.execute(
         "UPDATE dataset_definitions SET enabled=1 WHERE company_id=? AND source_id=?",
-        ("company_one", "un-comtrade"),
+        ("company_one", "declared-only"),
     )
 
-    source = next(item for item in service.catalog("company_one") if item["source_id"] == "un-comtrade")
+    source = next(
+        item for item in service.catalog("company_one") if item["source_id"] == "declared-only"
+    )
 
     assert source["available"] is False
     assert source["unavailable_reason"] == "credential_required"
+
+
+def test_every_shipped_source_can_actually_verify_a_candidate():
+    """A definition with no verifier renders as permanently unavailable.
+
+    That is indistinguishable from a broken integration on the Data Sources
+    page, so the catalog only carries sources that work.
+    """
+    registry = build_registry()
+    missing = [
+        item.source_id for item in registry.list()
+        if not callable(getattr(registry.get(item.source_id), "verify", None))
+    ]
+    assert missing == []
 
 
 def test_generated_sector_artifacts_are_current():
