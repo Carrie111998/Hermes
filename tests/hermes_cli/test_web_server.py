@@ -1274,6 +1274,28 @@ class TestWebServerEndpoints:
         }
 
 
+    def test_update_status_survives_dashboard_restart(self, monkeypatch, tmp_path):
+        """The restarted server must recover the updater's durable result."""
+        import hermes_cli.web_server as web_server
+
+        action_id = "c" * 32
+        (tmp_path / "hermes-update.log").write_text("✓ Code updated!\n")
+        (tmp_path / "update.log").write_text(
+            f"✓ Update complete!\n=== hermes-update completed {action_id} ===\n"
+        )
+        monkeypatch.setattr(web_server, "_ACTION_LOG_DIR", tmp_path)
+        monkeypatch.setattr(web_server, "_ACTION_PROCS", {})
+        monkeypatch.setattr(web_server, "_ACTION_RESULTS", {})
+
+        resp = self.client.get("/api/actions/hermes-update/status?lines=20")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["running"] is False
+        assert data["exit_code"] is None
+        assert f"=== hermes-update completed {action_id} ===" in data["lines"]
+
+
 
 
 
