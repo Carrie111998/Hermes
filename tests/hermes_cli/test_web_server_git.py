@@ -1,9 +1,11 @@
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-from hermes_cli import web_server
+from hermes_cli import web_git, web_server
 
 pytest.importorskip("starlette.testclient")
 from starlette.testclient import TestClient
@@ -29,6 +31,17 @@ def client():
 
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+
+def test_checkout_like_git_commands_allow_repository_hooks_to_finish():
+    probe_timeout = web_git._git_timeout_for(["status", "--short"])
+
+    assert web_git._git_timeout_for(["worktree", "add", "/tmp/tree", "main"]) > probe_timeout
+    assert web_git._git_timeout_for(["switch", "feature"]) > probe_timeout
+    assert web_git._git_timeout_for(["checkout", "feature"]) > probe_timeout
+    assert web_git._git_timeout_for(["commit", "--allow-empty", "-m", "Initial commit"]) > probe_timeout
+    assert web_git._git_timeout_for(["status", "--", "commit"]) == probe_timeout
+    assert web_git._git_timeout_for(["diff", "--", "commit"]) == probe_timeout
 
 
 @pytest.fixture
@@ -94,6 +107,41 @@ def test_worktree_add_initializes_plain_folder(client, tmp_path):
     assert status["branch"]
     # Existing files are not silently committed by repo initialization.
     assert any(file["path"] == "notes.txt" and file["untracked"] for file in status["files"])
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell hook fixture")
+def test_worktree_add_reports_partial_success_after_post_checkout_failure(client, repo):
+    hook = repo / ".git" / "hooks" / "post-checkout"
+    hook.write_text(
+        '#!/bin/sh\nprintf "project setup failed\\n" >&2\nexit 42\n',
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+
+    response = client.post(
+        "/api/git/worktree/add",
+        json={"path": str(repo), "branch": "hook-failure", "name": "hook-failure"},
+    )
+
+    assert response.status_code == 200
+    added = response.json()
+    assert added["setupIncomplete"] is True
+    assert "post-checkout" in added["warning"]
+    assert Path(added["path"]).is_dir()
+
+
+def test_worktree_add_rejects_stale_metadata_for_a_missing_directory(client, repo):
+    stale_path = repo / ".worktrees" / "stale-feature"
+    _git(repo, "worktree", "add", "-b", "stale-feature", str(stale_path))
+    shutil.rmtree(stale_path)
+
+    response = client.post(
+        "/api/git/worktree/add",
+        json={"path": str(repo), "branch": "stale-feature", "name": "stale-feature"},
+    )
+
+    assert response.status_code == 400
+    assert not stale_path.exists()
 
 
 

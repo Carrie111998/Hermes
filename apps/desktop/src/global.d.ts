@@ -307,7 +307,7 @@ declare global {
         worktreeAdd: (
           repoPath: string,
           options?: { name?: string; branch?: string; base?: string; existingBranch?: string }
-        ) => Promise<{ path: string; branch: string; repoRoot: string }>
+        ) => Promise<HermesGitWorktreeAddResult>
         worktreeRemove: (
           repoPath: string,
           worktreePath: string,
@@ -1154,6 +1154,15 @@ export interface HermesGitWorktree {
   isMain: boolean
   detached: boolean
   locked: boolean
+}
+
+export interface HermesGitWorktreeAddResult {
+  path: string
+  branch: string
+  repoRoot: string
+  /** The checkout exists, but a repository post-checkout hook failed or timed out. */
+  setupIncomplete?: boolean
+  warning?: string
 }
 
 // A branch that the "convert a branch into a worktree" picker offers: the local

@@ -22,6 +22,7 @@ from pathlib import Path
 from hermes_cli._subprocess_compat import noninteractive_git_env
 
 _GIT_TIMEOUT = 30
+_GIT_HOOK_TIMEOUT = 15 * 60
 _GH_TIMEOUT = 30
 _MAX_BUFFER = 32 * 1024 * 1024
 _UNTRACKED_LINE_MAX_BYTES = 1024 * 1024
@@ -29,9 +30,47 @@ _UNTRACKED_SCAN_CAP = 500
 _COMMIT_CONTEXT_DIFF_MAX_CHARS = 120_000
 _COMMIT_CONTEXT_UNTRACKED_MAX = 80
 _TRUNK_BRANCHES = ("main", "master")
+_GIT_GLOBAL_OPTIONS_WITH_VALUE = {
+    "-c",
+    "-C",
+    "--config-env",
+    "--git-dir",
+    "--namespace",
+    "--work-tree",
+}
 
 
-def _git(cwd: str, args: list[str], *, timeout: int = _GIT_TIMEOUT) -> tuple[int, str, str]:
+def _git_subcommand(args: list[str]) -> tuple[int, str]:
+    index = 0
+    while index < len(args):
+        arg = str(args[index] or "")
+        if arg == "--":
+            break
+        if arg in _GIT_GLOBAL_OPTIONS_WITH_VALUE:
+            index += 2
+            continue
+        if not arg.startswith("-"):
+            return index, arg
+        index += 1
+    return -1, ""
+
+
+def _git_timeout_for(args: list[str]) -> int:
+    """Return a hook-safe budget for checkout-like mutations."""
+    command_index, command = _git_subcommand(args)
+    adds_worktree = (
+        command == "worktree"
+        and command_index + 1 < len(args)
+        and args[command_index + 1] == "add"
+    )
+    return (
+        _GIT_HOOK_TIMEOUT
+        if adds_worktree or command in {"checkout", "commit", "switch"}
+        else _GIT_TIMEOUT
+    )
+
+
+def _git(cwd: str, args: list[str], *, timeout: int | None = None) -> tuple[int, str, str]:
     """Run ``git`` in ``cwd``. Returns (returncode, stdout, stderr); never raises
     on a non-zero exit (callers decide what an error means).
 
@@ -39,7 +78,12 @@ def _git(cwd: str, args: list[str], *, timeout: int = _GIT_TIMEOUT) -> tuple[int
     calls serve authenticated REST requests from the dashboard/desktop, so a
     credential prompt from ``fetch``/``push``/``pull`` could never be answered
     — it would just hang the request until the timeout. Failing fast surfaces
-    the real auth error in the toast instead."""
+    the real auth error in the toast instead. Checkout-like mutations receive a
+    longer budget because they synchronously run repository hooks.
+    """
+    if timeout is None:
+        timeout = _git_timeout_for(args)
+
     try:
         proc = subprocess.run(
             ["git", *args],
@@ -682,6 +726,51 @@ def _unique_dir(base: str) -> str:
     return candidate
 
 
+_WORKTREE_SETUP_WARNING = (
+    "Worktree created, but its post-checkout setup did not finish. "
+    "Dependency installation or code generation may be incomplete; rerun the "
+    "repository setup command in the worktree."
+)
+
+
+def _worktree_was_created(root: str, target: str, branch: str) -> bool:
+    target_path = Path(target)
+    if not target_path.is_dir():
+        return False
+
+    expected = target_path.resolve()
+    listed = any(
+        not tree["locked"]
+        and tree["branch"] == branch
+        and Path(tree["path"]).resolve() == expected
+        for tree in worktree_list(root)
+    )
+    if not listed:
+        return False
+
+    inside_code, inside, _ = _git(target, ["rev-parse", "--is-inside-work-tree"])
+    branch_code, current_branch, _ = _git(target, ["branch", "--show-current"])
+    return (
+        inside_code == 0
+        and inside.strip() == "true"
+        and branch_code == 0
+        and current_branch.strip() == branch
+    )
+
+
+def _run_worktree_add(root: str, args: list[str], result: dict) -> dict:
+    code, _, err = _git(root, args)
+    if code == 0:
+        return result
+    if _worktree_was_created(root, result["path"], result["branch"]):
+        return {
+            **result,
+            "setupIncomplete": True,
+            "warning": _WORKTREE_SETUP_WARNING,
+        }
+    raise RuntimeError(err.strip() or "git worktree add failed")
+
+
 def _remote_of_ref(cwd: str, name: str) -> str:
     """The remote a ref belongs to ("origin" for "origin/main"), or "" when the
     name is not a remote-tracking ref in this repo. Asks git rather than
@@ -720,10 +809,16 @@ def worktree_add(cwd: str, options: dict) -> dict:
             # user did not fetch recently. On failure (offline, branch gone)
             # the last known ref is still there to branch from.
             _git(root, ["fetch", remote, existing])
-            _git_ok(root, ["worktree", "add", "--track", "-b", existing, target, requested])
-            return {"path": target, "branch": existing, "repoRoot": root}
-        _git_ok(root, ["worktree", "add", target, existing])
-        return {"path": target, "branch": existing, "repoRoot": root}
+            return _run_worktree_add(
+                root,
+                ["worktree", "add", "--track", "-b", existing, target, requested],
+                {"path": target, "branch": existing, "repoRoot": root},
+            )
+        return _run_worktree_add(
+            root,
+            ["worktree", "add", target, existing],
+            {"path": target, "branch": existing, "repoRoot": root},
+        )
 
     slug = _slugify(options.get("name") or f"work-{os.urandom(4).hex()}")
     branch = _sanitize_branch(options.get("branch") or "") or f"hermes/{slug}"
@@ -744,13 +839,13 @@ def worktree_add(cwd: str, options: dict) -> dict:
             # checkout -b new` — so suppress it (parity with the Electron op).
             args.append("--no-track")
         args.append(base)
-    code, _, err = _git(root, args)
-    if code != 0:
-        if "already exists" in (err or "").lower():
-            _git_ok(root, ["worktree", "add", target, branch])
-        else:
-            raise RuntimeError(err.strip() or "git worktree add failed")
-    return {"path": target, "branch": branch, "repoRoot": root}
+    result = {"path": target, "branch": branch, "repoRoot": root}
+    try:
+        return _run_worktree_add(root, args, result)
+    except RuntimeError as exc:
+        if "already exists" in str(exc).lower():
+            return _run_worktree_add(root, ["worktree", "add", target, branch], result)
+        raise
 
 
 def worktree_remove(cwd: str, worktree_path: str, force: bool) -> dict:

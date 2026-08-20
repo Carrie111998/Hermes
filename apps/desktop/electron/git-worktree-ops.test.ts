@@ -9,12 +9,77 @@ import { test } from 'vitest'
 import {
   addWorktree,
   ensureGitRepo,
+  gitTimeoutFor,
   listBaseBranches,
   listBranches,
   parseWorktrees,
   sanitizeBranch,
   switchBranch
 } from './git-worktree-ops'
+
+test('checkout-like git commands allow repository hooks to finish', () => {
+  const probeTimeout = gitTimeoutFor(['status', '--short'])
+
+  assert.ok(gitTimeoutFor(['worktree', 'add', '/tmp/tree', 'main']) > probeTimeout)
+  assert.ok(gitTimeoutFor(['switch', 'feature']) > probeTimeout)
+  assert.ok(gitTimeoutFor(['checkout', 'feature']) > probeTimeout)
+  assert.ok(
+    gitTimeoutFor([
+      '-c',
+      'user.email=hermes@localhost',
+      '-c',
+      'user.name=Hermes',
+      'commit',
+      '--allow-empty',
+      '-m',
+      'Initial commit'
+    ]) > probeTimeout
+  )
+  assert.equal(gitTimeoutFor(['status', '--', 'commit']), probeTimeout)
+  assert.equal(gitTimeoutFor(['diff', '--', 'commit']), probeTimeout)
+})
+
+test.skipIf(process.platform === 'win32')(
+  'addWorktree reports partial success when a post-checkout hook fails after creation',
+  async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-wt-hook-failure-'))
+
+    try {
+      await ensureGitRepo('git', dir)
+      const hook = path.join(dir, '.git', 'hooks', 'post-checkout')
+
+      fs.writeFileSync(hook, '#!/bin/sh\nprintf "project setup failed\\n" >&2\nexit 42\n')
+      fs.chmodSync(hook, 0o755)
+
+      const result = await addWorktree(dir, { branch: 'hook-failure', name: 'hook-failure' }, 'git')
+
+      assert.equal(result.setupIncomplete, true)
+      assert.match(result.warning, /post-checkout/i)
+      assert.equal(
+        execFileSync('git', ['branch', '--show-current'], { cwd: result.path }).toString().trim(),
+        'hook-failure'
+      )
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+)
+
+test('addWorktree does not treat stale metadata for a missing directory as partial success', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-wt-stale-metadata-'))
+  const stalePath = path.join(dir, '.worktrees', 'stale-feature')
+
+  try {
+    await ensureGitRepo('git', dir)
+    execFileSync('git', ['worktree', 'add', '-b', 'stale-feature', stalePath], { cwd: dir })
+    fs.rmSync(stalePath, { recursive: true, force: true })
+
+    await assert.rejects(() => addWorktree(dir, { branch: 'stale-feature', name: 'stale-feature' }, 'git'))
+    assert.equal(fs.existsSync(stalePath), false)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
 
 test('sanitizeBranch: spaces → hyphens, forbidden chars dropped, edges trimmed', () => {
   assert.equal(sanitizeBranch('beach vibes'), 'beach-vibes')

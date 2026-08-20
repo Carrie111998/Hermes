@@ -280,6 +280,29 @@ describe('worktree refresh', () => {
 })
 
 describe('startWorkInRepo remote capability gate (#81724)', () => {
+  it('warns when git created the worktree but repository setup did not finish', async () => {
+    isDesktopFsRemoteMode.mockReturnValue(false)
+    desktopGit.mockReturnValue({
+      worktreeAdd: vi.fn(async () => ({
+        branch: 'feature',
+        path: '/repo/.worktrees/feature',
+        repoRoot: '/repo',
+        setupIncomplete: true,
+        warning: 'Worktree created, but its post-checkout setup did not finish.'
+      }))
+    } as never)
+    notify.mockClear()
+
+    await expect(startWorkInRepo('/repo', { branch: 'feature' })).resolves.toEqual({
+      branch: 'feature',
+      path: '/repo/.worktrees/feature'
+    })
+    expect(notify).toHaveBeenCalledWith({
+      kind: 'warning',
+      message: 'Worktree created, but its post-checkout setup did not finish.'
+    })
+  })
+
   it('names the stale-backend remedy when a remote gateway lacks the worktree route', async () => {
     isDesktopFsRemoteMode.mockReturnValue(true)
     desktopGit.mockReturnValue({

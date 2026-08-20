@@ -8,12 +8,48 @@ import path from 'node:path'
 
 import { resolveRequestedPathForIpc } from './hardening'
 
+const DEFAULT_GIT_TIMEOUT_MS = 30_000
+const HOOK_CAPABLE_GIT_TIMEOUT_MS = 15 * 60_000
+const GIT_GLOBAL_OPTIONS_WITH_VALUE = new Set(['-c', '-C', '--config-env', '--git-dir', '--namespace', '--work-tree'])
+
+function gitSubcommand(args) {
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = String(args[index] || '')
+
+    if (arg === '--') {
+      break
+    }
+
+    if (GIT_GLOBAL_OPTIONS_WITH_VALUE.has(arg)) {
+      index += 1
+    } else if (!arg.startsWith('-')) {
+      return { index, name: arg }
+    }
+  }
+
+  return { index: -1, name: '' }
+}
+
+// Checkout-like mutations synchronously run repository hooks. A single global
+// 30-second budget kills legitimate post-checkout setup (dependency installs,
+// code generation, Git LFS) after the worktree has already been created.
+// Keep probes bounded tightly while giving commands that can run hooks a real
+// interactive-operation budget.
+function gitTimeoutFor(args) {
+  const command = gitSubcommand(args)
+  const addsWorktree = command.name === 'worktree' && args[command.index + 1] === 'add'
+
+  return addsWorktree || command.name === 'checkout' || command.name === 'commit' || command.name === 'switch'
+    ? HOOK_CAPABLE_GIT_TIMEOUT_MS
+    : DEFAULT_GIT_TIMEOUT_MS
+}
+
 function runGit(gitBin, args, cwd): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(
       gitBin,
       args,
-      { cwd, windowsHide: true, timeout: 30_000, maxBuffer: 8 * 1024 * 1024 },
+      { cwd, windowsHide: true, timeout: gitTimeoutFor(args), maxBuffer: 8 * 1024 * 1024 },
       (err, stdout, stderr) => {
         if (err) {
           err.stderr = String(stderr || '')
@@ -242,6 +278,65 @@ function uniqueDir(base) {
   return dir
 }
 
+function canonicalPath(value) {
+  try {
+    return fs.realpathSync(value)
+  } catch {
+    return path.resolve(value)
+  }
+}
+
+async function worktreeWasCreated(gitBin, root, dir, branch) {
+  try {
+    if (!fs.statSync(dir).isDirectory()) {
+      return false
+    }
+  } catch {
+    return false
+  }
+
+  const expectedPath = canonicalPath(dir)
+  const trees = await listWorktrees(root, gitBin)
+  const listed = trees.some(tree => !tree.locked && tree.branch === branch && canonicalPath(tree.path) === expectedPath)
+
+  if (!listed) {
+    return false
+  }
+
+  try {
+    const inside = (await runGit(gitBin, ['-C', dir, 'rev-parse', '--is-inside-work-tree'], root)).trim()
+    const currentBranch = (await runGit(gitBin, ['-C', dir, 'branch', '--show-current'], root)).trim()
+
+    return inside === 'true' && currentBranch === branch
+  } catch {
+    return false
+  }
+}
+
+async function runWorktreeAdd(gitBin, root, args, result) {
+  try {
+    await runGit(gitBin, args, root)
+
+    return result
+  } catch (err) {
+    // `git worktree add` is not atomic with respect to post-checkout hooks: the
+    // checkout and branch can be complete before a hook exits nonzero or the
+    // parent process times out. Reconcile against git's authoritative worktree
+    // list so the renderer does not tell the user creation failed and then
+    // poison a retry with an already-checked-out branch.
+    if (await worktreeWasCreated(gitBin, root, result.path, result.branch)) {
+      return {
+        ...result,
+        setupIncomplete: true,
+        warning:
+          'Worktree created, but its post-checkout setup did not finish. Dependency installation or code generation may be incomplete; rerun the repository setup command in the worktree.'
+      }
+    }
+
+    throw err
+  }
+}
+
 async function addExistingBranchWorktree(gitBin, root, name) {
   const requested = sanitizeBranch(name)
 
@@ -275,14 +370,18 @@ async function addExistingBranchWorktree(gitBin, root, name) {
       // that the repo already has.
     }
 
-    await runGit(gitBin, ['worktree', 'add', '--track', '-b', branch, dir, requested], root)
-
-    return { path: dir, branch, repoRoot: root }
+    return runWorktreeAdd(gitBin, root, ['worktree', 'add', '--track', '-b', branch, dir, requested], {
+      path: dir,
+      branch,
+      repoRoot: root
+    })
   }
 
-  await runGit(gitBin, ['worktree', 'add', dir, branch], root)
-
-  return { path: dir, branch, repoRoot: root }
+  return runWorktreeAdd(gitBin, root, ['worktree', 'add', dir, branch], {
+    path: dir,
+    branch,
+    repoRoot: root
+  })
 }
 
 async function addWorktree(repoPath, options, gitBin) {
@@ -333,18 +432,20 @@ async function addWorktree(repoPath, options, gitBin) {
   }
 
   try {
-    await runGit(gitBin, args, root)
+    return await runWorktreeAdd(gitBin, root, args, { path: dir, branch, repoRoot: root })
   } catch (err) {
     // Branch name may already exist — retry checking out the existing branch
     // into a fresh worktree dir instead of failing the whole flow.
     if (/already exists/i.test(err.stderr || '')) {
-      await runGit(gitBin, ['worktree', 'add', dir, branch], root)
+      return runWorktreeAdd(gitBin, root, ['worktree', 'add', dir, branch], {
+        path: dir,
+        branch,
+        repoRoot: root
+      })
     } else {
       throw err
     }
   }
-
-  return { path: dir, branch, repoRoot: root }
 }
 
 async function removeWorktree(repoPath, worktreePath, options, gitBin) {
@@ -527,6 +628,7 @@ async function listBaseBranches(repoPath, gitBin) {
 export {
   addWorktree,
   ensureGitRepo,
+  gitTimeoutFor,
   listBaseBranches,
   listBranches,
   listWorktrees,

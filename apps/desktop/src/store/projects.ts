@@ -1106,6 +1106,10 @@ export async function startWorkInRepo(
 
   bumpWorktrees()
 
+  if (result.setupIncomplete && result.warning) {
+    notify({ kind: 'warning', message: result.warning })
+  }
+
   return { branch: result.branch, path: result.path }
 }
 
