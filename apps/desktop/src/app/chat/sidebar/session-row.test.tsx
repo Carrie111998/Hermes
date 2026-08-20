@@ -8,6 +8,7 @@ import { createClientSessionState } from '@/lib/chat-runtime'
 import type * as ChatRuntime from '@/lib/chat-runtime'
 import type * as Time from '@/lib/time'
 import type * as ComposerStatusStore from '@/store/composer-status'
+import type * as ProjectsStore from '@/store/projects'
 import type * as SessionStore from '@/store/session'
 import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
 import type * as SessionStatesStore from '@/store/session-states'
@@ -32,7 +33,8 @@ vi.mock('@/i18n', () => ({
           sessionActions: 'Session actions',
           sessionRunning: 'Running',
           waitingForAnswer: 'Waiting for answer'
-        }
+        },
+        projects: { home: 'Home' }
       },
       assistant: {
         thread: {
@@ -112,6 +114,13 @@ vi.mock('@/store/windows', async importOriginal => {
     canOpenSessionWindow: () => false,
     openSessionInNewWindow: vi.fn()
   }
+})
+
+// The card variant reads the projects store to label its workspace header.
+vi.mock('@/store/projects', async importOriginal => {
+  const actual = await importOriginal<typeof ProjectsStore>()
+
+  return { ...actual, $projects: atom({}) }
 })
 
 // SessionActionsMenu open behavior is covered in session-actions-menu.test.tsx
@@ -386,5 +395,49 @@ describe('SidebarSessionRow', () => {
     const avatar = handoffAvatar(container)
     expect(avatar).toBeTruthy()
     expect(tipTrigger(avatar as HTMLElement)).toBeTruthy()
+  })
+
+  // PR #90920 — the shell owns the trailing inset. The one-line row's body
+  // drops its literal `pr-2` (the gap now lives once in rowPadX = 'pl-2 pr-2'),
+  // and the card opts OUT (`pr-0`) because its cluster is inside the body,
+  // ending at the shell's own trailing inset.
+  describe('right-edge ownership (PR #90920)', () => {
+    it('the one-line row body no longer hardcodes pr-2; the shell owns the trailing inset', () => {
+      const { container } = renderRow(makeSession({ title: 'Edge row' }))
+
+      // The main tap target is the first button whose text is the title.
+      const target = Array.from(container.querySelectorAll('button')).find(b => b.textContent?.includes('Edge row'))
+      expect(target).toBeTruthy()
+      // rowPadX supplies the label-to-actions gap: pl-2 pr-2.
+      expect(target?.className).toMatch(/pl-2/)
+      expect(target?.className).toMatch(/pr-2/)
+
+      // The actions column ends inside the shell's own pr-2, not flush.
+      const actions = container.querySelector('[data-row-actions]')
+      expect(actions).toBeTruthy()
+    })
+
+    it('the card body opts out of the trailing gap (pr-0) so the header shares the shell edge', () => {
+      const { container } = render(
+        <SidebarSessionRow
+          card
+          isPinned={false}
+          isSelected={false}
+          onArchive={noop}
+          onDelete={noop}
+          onPin={noop}
+          onResume={noop}
+          onToggleUnread={noop}
+          session={makeSession({ title: 'Card row' })}
+          unread={false}
+        />
+      )
+
+      const target = Array.from(container.querySelectorAll('button')).find(b => b.textContent?.includes('Card row'))
+      expect(target).toBeTruthy()
+      // The card's cluster is INSIDE the body, ending at the shell's trailing
+      // inset — keeping the gap would pull the header in past every line below.
+      expect(target?.className).toMatch(/pr-0/)
+    })
   })
 })
