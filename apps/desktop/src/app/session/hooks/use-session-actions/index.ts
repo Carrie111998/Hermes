@@ -16,6 +16,7 @@ import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue
 import { $gatewaySwitching } from '@/store/gateway-switch'
 import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
+import { $archivedSessions } from '@/store/sidebar-archive'
 import {
   $activeGatewayProfile,
   $gatewaySwapTarget,
@@ -1713,17 +1714,30 @@ export function useSessionActions({
     async (storedSessionId: string) => {
       clearNotifications()
 
-      const removed = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+      // The row may live in the main list OR the archived view's own store
+      // (archived rows are excluded from $sessions by design). Resolve from
+      // both so deleting from the Archived filter evicts the row instead of
+      // leaving a ghost that resumes into a dead id (infinite spinner).
+      const removedFromMain = $sessions
+        .get()
+        .find(session => sessionMatchesStoredId(session, storedSessionId))
+      const removed =
+        removedFromMain ??
+        $archivedSessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
       const wasSelected = selectedStoredSessionId === storedSessionId
       const closingRuntimeId = wasSelected ? activeSessionId : null
       const previousMessages = $messages.get()
       const previousPinned = $pinnedSessionIds.get()
+      const previousArchived = $archivedSessions.get()
       // Pins are keyed on the durable lineage-root id; the stored id may be the
       // live tip after compression. Drop both so the pin can't linger.
       const removedPinId = removed ? sessionPinId(removed) : storedSessionId
       const removedIds = [storedSessionId, removed?.id, removed?._lineage_root_id]
 
       setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
+      $archivedSessions.set(
+        previousArchived.filter(session => !sessionMatchesStoredId(session, storedSessionId))
+      )
       // Evict from the project tree's optimistic layer too (the backend snapshot
       // still lists it until its next refresh), so grouped + flat views drop the
       // row in lockstep. Pin the tombstone against the projects.tree prune while
@@ -1767,9 +1781,12 @@ export function useSessionActions({
           dropSessionState(tiledRuntimeId)
         }
       } catch (err) {
-        if (removed) {
-          setSessions(prev => [removed, ...prev])
+        if (removedFromMain) {
+          setSessions(prev => [removedFromMain, ...prev])
         }
+
+        // Restore the archived-view row too (no-op when it wasn't archived).
+        $archivedSessions.set(previousArchived)
 
         untombstoneSessions(removedIds)
         $pinnedSessionIds.set(previousPinned)
