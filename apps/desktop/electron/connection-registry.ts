@@ -54,7 +54,9 @@ export interface RegistryConnection {
   url?: string
   /** remote/cloud: 'token' | 'oauth'. */
   authMode?: 'oauth' | 'token'
-  /** remote: encrypted token envelope (opaque here; main.ts encrypts/decrypts). */
+  /** remote/ssh: encrypted token envelope (opaque here; main.ts encrypts/
+   * decrypts). For ssh it is the SERVED dashboard token, written back after a
+   * bootstrap so the next start can prove reuse instead of respawning. */
   token?: unknown
   /** remote/cloud: extra gateway headers (Cloudflare Access etc.). Secret
    * envelopes, same shape as `token`; names pre-filtered through
@@ -654,7 +656,17 @@ export function normalizeConnectionInput(input: ConnectionInput, registry: Conne
       throw new Error(`A connection to this SSH host already exists ("${sshDupe.label}").`)
     }
 
-    return { id, kind: 'ssh', label, ...sshFields }
+    const sshEntry: RegistryConnection = { id, kind: 'ssh', label, ...sshFields }
+
+    // ssh entries are always token-auth (Desktop mints the token and writes
+    // back the one the remote dashboard serves), so unlike remote/cloud there
+    // is no auth mode that makes the stored token meaningless. Renaming an ssh
+    // connection must not throw away its reuse credential.
+    if (input.token !== undefined) {
+      sshEntry.token = input.token
+    }
+
+    return sshEntry
   }
 
   if (kind === 'remote' || kind === 'cloud') {
@@ -892,6 +904,14 @@ export function normalizeRegistry(raw: unknown): ConnectionRegistry {
 
       const { mode: _mode, ...sshFields } = ssh
       Object.assign(clean, sshFields)
+
+      // The served dashboard token is what proves reuse of an existing remote
+      // backend. Dropping it here made it write-only: persistSshConnectionToken
+      // wrote it to disk and every read threw it away, so each start reported
+      // "no saved token", killed the previous backend and spawned a new one.
+      if (entry.token !== undefined) {
+        clean.token = entry.token
+      }
     }
 
     connections.push(clean)
