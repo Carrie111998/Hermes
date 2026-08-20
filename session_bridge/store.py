@@ -1009,6 +1009,7 @@ class SessionBridgeStore:
                     """SELECT 1
                        FROM session_claude_visibility_jobs AS job
                        WHERE job.id != ?
+                         AND job.operator_cleared_at IS NULL
                          AND job.state IN (
                              'claude_pending', 'claude_leased',
                              'claude_retry', 'claude_failed'
@@ -1186,7 +1187,7 @@ class SessionBridgeStore:
             grouped = conn.execute(
                 """SELECT state, error_code, COUNT(*) AS count
                      FROM session_claude_visibility_jobs AS job
-                    WHERE NOT EXISTS (
+                    WHERE job.operator_cleared_at IS NULL AND NOT EXISTS (
                         SELECT 1
                         FROM session_claude_visibility_characterization_events AS event
                         WHERE event.job_id = job.id
@@ -1397,7 +1398,7 @@ class SessionBridgeStore:
                 )
                 other_open = conn.execute(
                     """SELECT 1 FROM session_claude_visibility_jobs AS job
-                       WHERE id != ? AND state IN (
+                       WHERE id != ? AND operator_cleared_at IS NULL AND state IN (
                            'claude_pending', 'claude_leased',
                            'claude_retry', 'claude_failed'
                        ) AND NOT EXISTS (
@@ -1637,7 +1638,7 @@ class SessionBridgeStore:
                 )
                 other_open = conn.execute(
                     """SELECT 1 FROM session_claude_visibility_jobs AS job
-                       WHERE id != ? AND state IN (
+                       WHERE id != ? AND operator_cleared_at IS NULL AND state IN (
                            'claude_pending', 'claude_leased',
                            'claude_retry', 'claude_failed'
                        ) AND NOT EXISTS (
@@ -1997,7 +1998,7 @@ class SessionBridgeStore:
                 raise ValueError("exact failed Claude visibility job required")
             other_open = conn.execute(
                 """SELECT 1 FROM session_claude_visibility_jobs AS job
-                   WHERE id != ? AND state IN (
+                   WHERE id != ? AND operator_cleared_at IS NULL AND state IN (
                        'claude_pending', 'claude_leased',
                        'claude_retry', 'claude_failed'
                    ) AND NOT EXISTS (
@@ -2613,7 +2614,7 @@ class SessionBridgeStore:
             operation_time = _finite_number(self._clock(), "clock")
             other_open = conn.execute(
                 """SELECT 1 FROM session_claude_visibility_jobs AS job
-                   WHERE id != ? AND state IN (
+                   WHERE id != ? AND operator_cleared_at IS NULL AND state IN (
                        'claude_pending', 'claude_leased',
                        'claude_retry', 'claude_failed'
                    ) AND NOT EXISTS (
@@ -2819,6 +2820,58 @@ class SessionBridgeStore:
 
         return self.db._execute_write(_write)
 
+    def dismiss_claude_visibility_job(
+        self, *, job_id: str, expected_error_code: str
+    ) -> dict[str, Any]:
+        """Retire one terminally failed job so the gates stop counting it open.
+
+        A claude_failed job fail-closes discovery by design: the state is a
+        member of the coordinator's open set and its error_code is promoted
+        into the fatal set, so run_once skips discovery until an operator
+        adjudicates it. There is no honest state to move such a job to --
+        rows here are delete-guarded, and the only other terminal state,
+        'claude_visible', requires a completion digest and would assert a
+        registration that never happened. So the acknowledgement is recorded
+        as a stamp BESIDE the verdict rather than overwriting it: state,
+        attempts, error_code and error_detail all survive verbatim.
+
+        The paid-attempt ledger in session_claude_registration_usage is never
+        touched. Those rows are the cost record of real spend, and
+        UNIQUE(job_id, attempt_ordinal) is precisely what stops a re-queued
+        job from re-spending ordinals it has already used -- deleting them is
+        what re-arms the livelock this stamp exists to end.
+
+        *expected_error_code* must match the failure on the row, so an
+        operator cannot clear a job whose verdict changed since they looked.
+        """
+
+        normalized_job = _exact_nonempty_text(job_id, "Claude visibility job ID")
+        normalized_code = _exact_nonempty_text(
+            expected_error_code, "Claude visibility error code"
+        )
+
+        def _write(conn):
+            operation_time = _finite_number(self._clock(), "clock")
+            cursor = conn.execute(
+                """UPDATE session_claude_visibility_jobs
+                   SET operator_cleared_at = ?, updated_at = ?
+                   WHERE id = ? AND state = 'claude_failed' AND error_code = ?
+                     AND operator_cleared_at IS NULL""",
+                (operation_time, operation_time, normalized_job, normalized_code),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    "exact terminally failed Claude visibility job required"
+                )
+            return {
+                "status": "dismissed",
+                "job_id": normalized_job,
+                "error_code": normalized_code,
+                "operator_cleared_at": operation_time,
+            }
+
+        return self.db._execute_write(_write)
+
     def claude_visibility_status(self, now: float) -> dict[str, Any]:
         status_time = _finite_number(now, "now")
         local_day = self._claude_visibility_local_day(status_time)
@@ -2835,7 +2888,7 @@ class SessionBridgeStore:
             count_rows = conn.execute(
                 """SELECT state, COUNT(*) AS count
                    FROM session_claude_visibility_jobs AS job
-                   WHERE NOT EXISTS (
+                   WHERE job.operator_cleared_at IS NULL AND NOT EXISTS (
                        SELECT 1
                        FROM session_claude_visibility_characterization_events AS event
                        WHERE event.job_id = job.id
@@ -2848,7 +2901,8 @@ class SessionBridgeStore:
             code_rows = conn.execute(
                 """SELECT state, error_code, COUNT(*) AS count
                    FROM session_claude_visibility_jobs AS job
-                   WHERE error_code IS NOT NULL AND NOT EXISTS (
+                   WHERE error_code IS NOT NULL
+                     AND job.operator_cleared_at IS NULL AND NOT EXISTS (
                        SELECT 1
                        FROM session_claude_visibility_characterization_events AS event
                        WHERE event.job_id = job.id

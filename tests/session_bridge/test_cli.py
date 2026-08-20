@@ -470,6 +470,15 @@ class FakeBackend:
             "active_record_retired": True,
         }
 
+    def dismiss_claude_visibility_job(self, *, job_id: str, expected_error_code: str):
+        self.calls.append(("dismiss_claude_visibility_job", job_id, expected_error_code))
+        return {
+            "status": "dismissed",
+            "job_id": job_id,
+            "error_code": expected_error_code,
+            "operator_cleared_at": 100.0,
+        }
+
     def characterize(self, *, provider: str) -> dict[str, Any]:
         self.calls.append(("characterize", provider))
         return {"passed": True, "report": "characterization/report.json"}
@@ -5426,6 +5435,79 @@ def test_lineage_apply_syncs_completed_characterization_before_store_repair(
     assert events[0][1]["include_active"] is False  # type: ignore[index]
     assert events[0][1]["include_completed"] is True  # type: ignore[index]
     assert events[1][0] == "reconcile"  # type: ignore[index]
+
+
+def test_visibility_dismiss_backend_reports_a_stale_row_as_a_gate_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CAS that matched nothing must not read as a generic config error."""
+
+    class Store:
+        def dismiss_claude_visibility_job(self, *, job_id, expected_error_code):
+            raise ValueError("exact terminally failed Claude visibility job required")
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+
+    with pytest.raises(RolloutGateBlocked) as raised:
+        backend.dismiss_claude_visibility_job(
+            job_id="claude-visibility-job:test",
+            expected_error_code="max_attempts_exhausted",
+        )
+
+    assert raised.value.gate == "visibility_dismiss_identity_mismatch"
+
+
+def test_visibility_dismiss_cli_requires_explicit_confirmation(capsys) -> None:
+    backend = FakeBackend()
+    job_id = "claude-visibility-job:test"
+
+    assert (
+        _run(
+            [
+                "claude-visibility-dismiss",
+                "--job-id",
+                job_id,
+                "--error-code",
+                "max_attempts_exhausted",
+            ],
+            backend,
+        )
+        == 4
+    )
+    assert _json_output(capsys) == {
+        "error": "rollout_gate_blocked",
+        "gate": "visibility_dismiss_confirmation_required",
+    }
+    assert not any(
+        call[0] == "dismiss_claude_visibility_job" for call in backend.calls
+    )
+
+    assert (
+        _run(
+            [
+                "claude-visibility-dismiss",
+                "--confirm-terminal-failure",
+                "--job-id",
+                job_id,
+                "--error-code",
+                "max_attempts_exhausted",
+            ],
+            backend,
+        )
+        == 0
+    )
+    assert _json_output(capsys) == {
+        "status": "dismissed",
+        "job_id": job_id,
+        "error_code": "max_attempts_exhausted",
+        "operator_cleared_at": 100.0,
+    }
+    assert (
+        "dismiss_claude_visibility_job",
+        job_id,
+        "max_attempts_exhausted",
+    ) in backend.calls
 
 
 def test_characterization_abort_cli_requires_explicit_confirmation(capsys) -> None:

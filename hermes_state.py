@@ -1833,6 +1833,20 @@ CREATE TABLE IF NOT EXISTS session_claude_visibility_jobs (
     error_code TEXT,
     error_detail TEXT,
     completion_digest TEXT,
+    -- Operator acknowledgement of a TERMINAL job. Set only on a claude_failed
+    -- row, only by dismiss_claude_visibility_job, and never cleared. A job
+    -- carrying this stamp stops counting as open work everywhere the gates
+    -- look (status counts/codes, the idle-enqueue check, the five
+    -- sole-open-job guards) without lying about how it ended: state,
+    -- attempts, error_code and the session_claude_registration_usage ledger
+    -- all stay exactly as written. It exists because job rows are
+    -- delete-guarded and the only other terminal state is 'claude_visible',
+    -- which would assert a registration that never happened. Deliberately NOT
+    -- a CHECK: _reconcile_columns_from_sql only ADDs the column to databases
+    -- that predate it, so a CHECK here would bind new databases and not
+    -- existing ones. The single writer enforces the rule instead, in its
+    -- guarded UPDATE.
+    operator_cleared_at REAL,
     eligible_at REAL NOT NULL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
