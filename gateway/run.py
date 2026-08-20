@@ -13456,25 +13456,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._handoff_source_profile(row) if move_source_key else None
         )
         destination_guild_id = None
+        parent_source = None
         if move_source_key:
             destination_guild_id = await self._webhook_handoff_destination_guild_id(
                 platform=platform,
                 adapter=adapter,
                 home=home,
             )
+            parent_source = SessionSource(
+                platform=platform,
+                chat_id=home_chat_id,
+                chat_name=home.name,
+                chat_type="group",
+                user_id=str(home.user_id) if home.user_id else None,
+                scope_id=str(home.scope_id) if home.scope_id else None,
+                guild_id=destination_guild_id,
+                profile=handoff_source_profile,
+            )
             self._validate_webhook_handoff_destination_profile(
-                SessionSource(
-                    platform=platform,
-                    chat_id=home_chat_id,
-                    chat_name=home.name,
-                    chat_type="group",
-                    user_id=str(home.user_id) if home.user_id else None,
-                    scope_id=str(home.scope_id) if home.scope_id else None,
-                    guild_id=destination_guild_id,
-                    profile=handoff_source_profile,
-                ),
+                parent_source,
                 handoff_source_profile,
             )
+            # A relay adapter normally learns the logical platform and tenant
+            # discriminators from inbound traffic. After restart its caches are
+            # cold, but /sethome already persisted the trusted parent identity.
+            # Prime from that parent (not the synthetic system user in the new
+            # thread) before thread creation and final delivery.
+            prime_routing_cache = getattr(adapter, "prime_routing_cache", None)
+            if callable(prime_routing_cache):
+                prime_routing_cache(
+                    MessageEvent(
+                        text="[session handoff routing context]",
+                        source=parent_source,
+                        internal=True,
+                    )
+                )
 
         session_title = row.get("title") or handoff_session_id[:8]
 
@@ -13751,13 +13767,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         get_chat_info = getattr(adapter, "get_chat_info", None)
         if not callable(get_chat_info):
             raise RuntimeError(
-                f"cannot verify {platform.value} home profile routing"
+                f"cannot verify {platform.value} home profile routing; "
+                "run /sethome on the desired chat again"
             )
         info = await get_chat_info(str(home.chat_id))
         guild_id = info.get("guild_id") if isinstance(info, dict) else None
         if not guild_id or (isinstance(info, dict) and info.get("error")):
             raise RuntimeError(
-                f"cannot verify {platform.value} home profile routing"
+                f"cannot verify {platform.value} home profile routing; "
+                "run /sethome on the desired chat again"
             )
         return str(guild_id)
 

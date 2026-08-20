@@ -8,6 +8,8 @@ import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.profile_routing import ProfileRoute
+from gateway.relay.adapter import RelayAdapter
+from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
 from gateway.run import GatewayRunner
 from gateway.session import (
     AsyncSessionStore,
@@ -348,6 +350,126 @@ async def test_named_destination_profile_route_is_rejected_before_thread(
     adapter.create_handoff_thread.assert_not_awaited()
     runner._handle_message.assert_not_awaited()
     adapter.send.assert_not_awaited()
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_relay_handoff_reuses_persisted_scope_for_profile_routing(
+    tmp_path,
+):
+    """Relay homes use /sethome provenance without an unsupported info probe."""
+    config = GatewayConfig(
+        sessions_dir=tmp_path / "sessions",
+        multiplex_profiles=True,
+        profile_routes=[
+            ProfileRoute(
+                name="default-guild",
+                platform="discord",
+                guild_id="guild-1",
+                profile="default",
+            )
+        ],
+        platforms={
+            Platform.DISCORD: PlatformConfig(
+                enabled=False,
+                home_channel=HomeChannel(
+                    platform=Platform.DISCORD,
+                    chat_id="parent-1",
+                    name="Relay Discord Home",
+                    user_id="discord-user-7",
+                    scope_id="guild-1",
+                ),
+            ),
+            Platform.RELAY: PlatformConfig(enabled=True),
+        },
+    )
+    with patch("gateway.session.SessionStore._ensure_loaded"):
+        store = SessionStore(sessions_dir=config.sessions_dir, config=config)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    store._db = db
+    store._loaded = True
+
+    source = SessionSource(
+        platform=Platform.WEBHOOK,
+        chat_id="webhook:alerts:relay-profile-route",
+        chat_type="webhook",
+        user_id="webhook:alerts",
+        profile="default",
+    )
+    entry = store.get_or_create_session(source)
+    runner = object.__new__(GatewayRunner)
+    runner.config = config
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._session_db = AsyncSessionDB(db)
+    descriptor = CapabilityDescriptor(
+        contract_version=CONTRACT_VERSION,
+        platform="discord",
+        label="Discord",
+        max_message_length=2000,
+        supports_draft_streaming=False,
+        supports_edit=True,
+        supports_threads=True,
+        markdown_dialect="discord",
+        len_unit="chars",
+        supported_ops=("send", "thread_create"),
+    )
+    sent = []
+
+    class _ColdRelayTransport:
+        _identities = [("discord", "bot-1")]
+
+        async def send_outbound(self, action, *, platform=None):
+            sent.append((action, platform))
+            if action.get("op") == "thread_create":
+                return {"success": True, "thread_id": "thread-42"}
+            return {"success": True, "message_id": "message-1"}
+
+    relay = RelayAdapter(
+        config.platforms[Platform.RELAY],
+        descriptor,
+        _ColdRelayTransport(),
+    )
+    runner.adapters = {Platform.RELAY: relay}
+    runner._evict_cached_agent = MagicMock()
+    runner._release_running_agent_state = MagicMock()
+    runner._handle_message = AsyncMock(
+        return_value="Ready in the relay handoff thread."
+    )
+    row = db.get_session(entry.session_id)
+    row.update(
+        {
+            "handoff_platform": "discord",
+            "source": "webhook",
+            "session_key": entry.session_key,
+        }
+    )
+
+    await runner._process_handoff(row)
+
+    next_reply = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-42",
+        chat_type="thread",
+        user_id="discord-user-7",
+        thread_id="thread-42",
+        scope_id="guild-1",
+        guild_id="guild-1",
+        parent_chat_id="parent-1",
+    )
+    destination_key = runner._session_key_for_source(next_reply)
+    assert store.peek_session_id(entry.session_key) is None
+    assert store.peek_session_id(destination_key) == entry.session_id
+    assert [action["op"] for action, _platform in sent] == [
+        "thread_create",
+        "send",
+    ]
+    for action, logical_platform in sent:
+        assert logical_platform == "discord"
+        assert action["chat_id"] == "parent-1"
+        assert action["metadata"]["scope_id"] == "guild-1"
+        assert action["metadata"]["user_id"] == "discord-user-7"
+    assert sent[1][0]["metadata"]["thread_id"] == "thread-42"
     db.close()
 
 
