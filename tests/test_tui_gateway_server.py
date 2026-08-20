@@ -4411,6 +4411,35 @@ def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_incognito_session_close_does_not_commit_memory(monkeypatch):
+    calls = {"commit": 0}
+
+    agent = types.SimpleNamespace(
+        session_id="incognito-session",
+        incognito=True,
+        commit_memory_session=lambda _history: calls.__setitem__(
+            "commit", calls["commit"] + 1
+        ),
+    )
+    server._sessions["incognito-sid"] = _session(
+        agent=agent, history=[{"role": "user", "content": "private"}]
+    )
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a: None)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "incognito-close",
+                "method": "session.close",
+                "params": {"session_id": "incognito-sid"},
+            }
+        )
+        assert resp["result"]["closed"] is True
+        assert calls["commit"] == 0
+    finally:
+        server._sessions.pop("incognito-sid", None)
+
+
 def test_session_close_releases_resume_lock_before_slow_teardown(monkeypatch):
     """One slow session finalizer must not stall unrelated session.resume RPCs."""
     teardown_started = threading.Event()

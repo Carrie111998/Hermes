@@ -655,7 +655,7 @@ def init_agent(
     # provide no value (no human in the loop, no skill-creation pressure).
     # skip_memory=True already disables the memory-review trigger; this
     # flag is the explicit single-switch off for both review paths.
-    agent.skip_background_review = bool(skip_background_review)
+    agent.skip_background_review = bool(skip_background_review or agent.incognito)
     agent.pass_session_id = pass_session_id
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""

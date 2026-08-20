@@ -91,6 +91,22 @@ def test_skip_background_review_flag_persists() -> None:
     assert agent.skip_background_review is True
 
 
+def test_incognito_forces_skip_background_review() -> None:
+    """Incognito must suppress review forks even without the explicit flag."""
+    agent = AIAgent(
+        model="openai/gpt-4o-mini",
+        provider="openrouter",
+        api_key="sk-dummy",
+        base_url="https://openrouter.ai/api/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        incognito=True,
+        platform="cli",
+    )
+    assert agent.incognito is True
+    assert agent.skip_background_review is True
+
+
 def test_finalize_turn_skips_review_when_flag_set() -> None:
     """finalize_turn must NOT call _spawn_background_review when skip_background_review=True.
 
@@ -101,6 +117,29 @@ def test_finalize_turn_skips_review_when_flag_set() -> None:
     _stub_agent_for_finalize(agent)
     _run_finalize(agent)
     agent._spawn_background_review.assert_not_called()
+
+
+def test_incognito_skips_on_session_end_hook(monkeypatch) -> None:
+    """Incognito must not give plugins a lifecycle callback to persist data."""
+    agent = AIAgent(
+        model="openai/gpt-4o-mini",
+        provider="openrouter",
+        api_key="sk-dummy",
+        base_url="https://openrouter.ai/api/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        incognito=True,
+        platform="cli",
+    )
+    _stub_agent_for_finalize(agent)
+    from hermes_cli import lifecycle
+
+    hook = MagicMock(return_value=[])
+    monkeypatch.setattr(lifecycle, "invoke_hook", hook)
+    _run_finalize(agent)
+    assert not any(
+        call.args and call.args[0] == "on_session_end" for call in hook.call_args_list
+    )
 
 
 def test_finalize_turn_fires_review_when_flag_unset() -> None:

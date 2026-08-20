@@ -1340,22 +1340,23 @@ def _emit_interrupted_session_end(cli, *, reason: str = "keyboard_interrupt") ->
         except Exception:
             pass
 
-    try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_end",
-            session_id=session_id,
-            task_id=getattr(agent, "_current_task_id", "") or "",
-            turn_id=getattr(agent, "_current_turn_id", "") or "",
-            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-            completed=False,
-            interrupted=True,
-            model=getattr(agent, "model", None),
-            platform=getattr(agent, "platform", None) or "cli",
-            reason=reason,
-        )
-    except Exception:
-        pass
+    if not getattr(agent, "incognito", False):
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_end",
+                session_id=session_id,
+                task_id=getattr(agent, "_current_task_id", "") or "",
+                turn_id=getattr(agent, "_current_turn_id", "") or "",
+                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                completed=False,
+                interrupted=True,
+                model=getattr(agent, "model", None),
+                platform=getattr(agent, "platform", None) or "cli",
+                reason=reason,
+            )
+        except Exception:
+            pass
 
 
 def _notify_single_query_session_finalize(cli, *, reason: str = "shutdown") -> None:

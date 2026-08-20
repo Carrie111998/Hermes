@@ -798,7 +798,12 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         except Exception:
             pass
 
-    if not incognito and agent is not None and history and hasattr(agent, "commit_memory_session"):
+    if (
+        agent is not None
+        and not getattr(agent, "incognito", False)
+        and history
+        and hasattr(agent, "commit_memory_session")
+    ):
         try:
             agent.commit_memory_session(history)
         except Exception:
