@@ -97,12 +97,14 @@ export function reorderProfileSessionOrder(
   renderedSortableIds: string[],
   visibleOrder: string[]
 ): Record<string, string[]> {
+  const retained = new Set(retainedIds)
   const rendered = new Set(renderedSortableIds)
 
   if (
     !visibleOrder.length ||
     !renderedSortableIds.length ||
     rendered.size !== renderedSortableIds.length ||
+    renderedSortableIds.some(id => !retained.has(id)) ||
     new Set(visibleOrder).size !== visibleOrder.length ||
     visibleOrder.length !== renderedSortableIds.length ||
     visibleOrder.some(id => !rendered.has(id))

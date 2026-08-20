@@ -98,6 +98,19 @@ describe('reorderProfileSessionOrder', () => {
     expect(reorderProfileSessionOrder(orders, 'alpha', ['a1', 'a2'], ['a1', 'a2'], ['a2', 'b1'])).toBe(orders)
   })
 
+  it.each([
+    ['fully stale', ['stale-a', 'stale-b'], ['stale-b', 'stale-a']],
+    ['partially stale', ['current-a', 'stale-a'], ['stale-a', 'current-a']]
+  ])('fails closed without mutating persistence for a %s rendered snapshot', (_, rendered, payload) => {
+    const orders = { alpha: ['current-b', 'current-a'] }
+    const originalOrder = [...orders.alpha]
+
+    expect(
+      reorderProfileSessionOrder(orders, 'alpha', ['current-a', 'current-a', 'current-b'], rendered, payload)
+    ).toBe(orders)
+    expect(orders.alpha).toEqual(originalOrder)
+  })
+
   it('fails closed when a same-profile payload omits a rendered sortable id', () => {
     const orders = { alpha: ['a1', 'a2', 'a3'] }
 
