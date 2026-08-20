@@ -62,12 +62,14 @@ import {
   $selectedStoredSessionId,
   $sessionResumeRequest,
   $sessions,
+  rememberedSessionProfile,
   sessionMatchesStoredId,
   sessionPinId,
   setAwaitingResponse,
   setBusy,
   setMessages
 } from '@/store/session'
+import { requestForSessionProfile } from '@/store/session-request-router'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '@/store/todos'
 import { armWakeWord, stopClientCapture } from '@/store/wake-word'
 import { isAuxiliaryWindow, isHudWindow } from '@/store/windows'
@@ -279,7 +281,22 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     setMessages
   })
 
-  const { connectionRef, gateway, gatewayRef, requestGateway } = useGatewayRequest()
+  const { connectionRef, gateway, gatewayRef, requestGateway: ambientRequestGateway } = useGatewayRequest()
+
+  // When chrome stays on the launch backend (Bot Mode / all-profiles
+  // navigation), session-owned RPCs still have to hit the session's backend.
+  const requestGateway = useCallback(
+    <T,>(method: string, params?: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal) => {
+      const owner = rememberedSessionProfile(
+        $sessions.get(),
+        selectedStoredSessionIdRef.current,
+        $activeGatewayProfile.get()
+      )
+
+      return requestForSessionProfile<T>(owner, ambientRequestGateway, method, params ?? {}, timeoutMs, signal)
+    },
+    [ambientRequestGateway]
+  )
 
   const { loadMoreMessagingForPlatform, loadMoreSessions, refreshCronJobs, refreshMessagingSessions, refreshSessions } =
     useSessionListActions({ profileScope })
@@ -325,21 +342,21 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     return () => window.removeEventListener('hermes:open-keybinds', onOpenKeybinds)
   }, [navigate])
 
-  // Dev-only: install the demo triggers (credit notices on Ctrl+Shift+C, the
-  // tour UI on Ctrl+Shift+X — each also a ⌘K entry and a window hook). Dynamic
-  // imports inside the DEV guard so the modules are dropped from production
-  // builds.
+  // Dev-only: install the credit-notice demo trigger (Ctrl+Shift+C / ⌘K palette
+  // / window.__creditsDemo). Dynamic import inside the DEV guard so the module
+  // is dropped from production builds.
   useEffect(() => {
     if (!import.meta.env.DEV) {
       return
     }
 
-    const disposers: (() => void)[] = []
+    let dispose: (() => void) | undefined
 
-    void import('./dev/credits-notice-demo').then(m => disposers.push(m.installCreditsNoticeDemo()))
-    void import('./dev/tour-demo').then(m => disposers.push(m.installTourDemo()))
+    void import('./dev/credits-notice-demo').then(m => {
+      dispose = m.installCreditsNoticeDemo()
+    })
 
-    return () => disposers.forEach(dispose => dispose())
+    return () => dispose?.()
   }, [])
 
   // Post-turn rehydrate from stored history (same behavior as DesktopController,
