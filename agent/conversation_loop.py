@@ -1275,21 +1275,21 @@ def _canonicalize_api_tool_calls(api_messages) -> None:
         am["tool_calls"] = new_tcs
 
 
-def refresh_tool_execution_bindings(agent) -> set[str]:
-    """Keep the execution guard aligned with the schemas sent to the model.
+def refresh_tool_execution_bindings(agent, request_tools) -> set[str]:
+    """Keep the execution guard aligned with one request's tool schemas.
 
-    ``agent.tools`` is the request-facing source of truth.  The separately
-    cached ``valid_tool_names`` set is used by the execution guard and can be
-    replaced by late refresh/resume paths.  Reconcile at the response boundary
-    so a schema-visible tool cannot be rejected as nonexistent mid-session.
+    The separately cached ``valid_tool_names`` set is used by the execution
+    guard and can be replaced by late refresh/resume paths. Reconcile at the
+    response boundary from the exact snapshot used to build this request so a
+    schema-visible tool cannot be rejected as nonexistent mid-session, even if
+    ``agent.tools`` changes while the provider is producing its response.
     """
-    tools = getattr(agent, "tools", None)
-    if not isinstance(tools, (list, tuple)):
+    if not isinstance(request_tools, (list, tuple)):
         return set(getattr(agent, "valid_tool_names", set()) or set())
 
     names = {
         name
-        for tool in tools
+        for tool in request_tools
         if isinstance(tool, dict)
         for function in [tool.get("function")]
         if isinstance(function, dict)
@@ -6837,7 +6837,7 @@ def run_conversation(
                 # Validate tool call names - detect model hallucinations. The
                 # schemas attached to this request are authoritative; repair a
                 # stale secondary execution-name set before applying the guard.
-                refresh_tool_execution_bindings(agent)
+                refresh_tool_execution_bindings(agent, tools_for_api)
                 # Repair mismatched tool names before validating
                 for tc in assistant_message.tool_calls:
                     if tc.function.name not in agent.valid_tool_names:
