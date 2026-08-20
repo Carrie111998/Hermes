@@ -485,3 +485,24 @@ def test_carried_forward_pre_provenance_row_gets_hermes_source(tmp_path):
     gemini = {p["key"]: p for p in data["providers"]}["gemini"]
     assert gemini["state"] == "stale"
     assert gemini["source"] == "hermes"
+
+
+def test_production_fetcher_accepts_the_cooperative_budget():
+    """collect()'s deadline is only real if the REAL fetcher takes the budget.
+
+    Every other budget test in this file drives a fake declared as
+    ``def fetch(provider, *, budget_seconds)``. That makes them blind to the
+    thing most likely to break: production passing a callable that does NOT
+    accept ``budget_seconds``. When that happens ``_supports_budget`` returns
+    False, collect() silently falls back to ``fetch_usage(key)``, and the
+    documented 90s bound degrades to a check performed only BETWEEN providers
+    -- while this file stays green. It shipped that way until 2026-08-20.
+
+    So pin the real callable, not a stand-in.
+    """
+    from agent.account_usage import fetch_account_usage
+
+    assert collector_module._supports_budget(fetch_account_usage), (
+        "agent.account_usage.fetch_account_usage must accept budget_seconds, "
+        "otherwise collect()'s deadline_seconds never bounds a provider call"
+    )

@@ -1,4 +1,7 @@
 from datetime import datetime, timezone
+from types import SimpleNamespace
+
+import pytest
 
 from agent.account_usage import (
     AccountUsageSnapshot,
@@ -31,13 +34,14 @@ class _Client:
     def __exit__(self, exc_type, exc, tb):
         return False
 
-    def get(self, url, headers=None):
+    def get(self, url, headers=None, timeout=None):
         return _Response(self._payload)
 
 
 class _RoutingClient:
     def __init__(self, payloads):
         self._payloads = payloads
+        self.timeouts: list = []
 
     def __enter__(self):
         return self
@@ -45,7 +49,8 @@ class _RoutingClient:
     def __exit__(self, exc_type, exc, tb):
         return False
 
-    def get(self, url, headers=None):
+    def get(self, url, headers=None, timeout=None):
+        self.timeouts.append(timeout)
         return _Response(self._payloads[url])
 
 
@@ -259,3 +264,78 @@ def test_fetch_account_usage_openrouter_omits_quota_window_when_key_has_no_limit
     assert snapshot.windows == ()
     assert "Credits balance: $74.50" in snapshot.details
     assert "API key usage: $25.50 total • $1.25 today • $4.50 this week • $18.00 this month" in snapshot.details
+
+
+_OPENROUTER_PAYLOADS = {
+    "https://openrouter.ai/api/v1/credits": {
+        "data": {"total_credits": 300.0, "total_usage": 10.92}
+    },
+    "https://openrouter.ai/api/v1/key": {
+        "data": {
+            "limit": 100.0,
+            "limit_remaining": 70.0,
+            "limit_reset": "monthly",
+            "usage": 12.5,
+        }
+    },
+}
+
+
+def _stub_openrouter(monkeypatch):
+    monkeypatch.setattr(
+        "agent.account_usage.resolve_runtime_provider",
+        lambda requested, explicit_base_url=None, explicit_api_key=None: {
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "sk-test",
+        },
+    )
+    client = _RoutingClient(dict(_OPENROUTER_PAYLOADS))
+    monkeypatch.setattr(
+        "agent.account_usage.httpx.Client", lambda timeout=10.0: client
+    )
+    return client
+
+
+def test_openrouter_budget_covers_both_requests_not_each(monkeypatch):
+    """openrouter is the only fetcher that makes TWO sequential calls.
+
+    A budget applied per-request would let it run to ~2x the deadline the
+    collector handed it, which is the overrun the clamp exists to prevent. The
+    key call must therefore get only what the credits call left over, not a
+    fresh full budget.
+    """
+    client = _stub_openrouter(monkeypatch)
+    # Drive the clock, so the assertion below is a real constraint. With the
+    # wall clock a stubbed credits call costs ~0s, `remaining` comes back as
+    # 4.0, and the test would pass just as happily against code that handed the
+    # key call a fresh full budget -- the exact bug it is meant to catch.
+    ticks = iter([100.0, 101.5])
+    monkeypatch.setattr(
+        "agent.account_usage.time",
+        SimpleNamespace(monotonic=lambda: next(ticks)),
+    )
+
+    snapshot = fetch_account_usage("openrouter", budget_seconds=4.0)
+
+    assert snapshot is not None
+    assert len(client.timeouts) == 2
+    assert client.timeouts[0] is None  # client-level timeout, set at construction
+    # The credits call burned 1.5s of the 4.0s budget, so 2.5s is left -- NOT 4.0.
+    assert client.timeouts[1] == pytest.approx(2.5)
+
+
+def test_openrouter_still_reports_the_quota_window_under_a_budget(monkeypatch):
+    """Regression: the key call must actually SUCCEED under a budget.
+
+    The fetcher swallows any exception from the key call and degrades to
+    ``key_data = {}``, which silently drops the quota window. That made an
+    incompatible call signature look like a provider with no limit -- how the
+    first cut of this change slipped past review.
+    """
+    _stub_openrouter(monkeypatch)
+
+    snapshot = fetch_account_usage("openrouter", budget_seconds=4.0)
+
+    assert snapshot is not None
+    assert snapshot.windows, "quota window vanished -- the key call was swallowed"

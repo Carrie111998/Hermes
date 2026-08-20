@@ -27,7 +27,7 @@ class _FakeClient:
     def __exit__(self, *exc):
         return False
 
-    def get(self, url, headers):
+    def get(self, url, headers, timeout=None):
         self.calls.append({"url": url, "headers": headers})
         return _FakeResponse(self.payload)
 
@@ -573,3 +573,69 @@ def test_redeem_missing_credentials_reports_unavailable(monkeypatch):
 
     assert result.status == "unavailable"
     assert "hermes auth" in result.message
+
+
+class _TimeoutRecordingClient(_FakeClient):
+    """Records the timeout the fetcher asked httpx for."""
+
+    def __init__(self, calls, payload, timeouts, timeout):
+        super().__init__(calls, payload)
+        timeouts.append(timeout)
+
+
+def _record_timeouts(monkeypatch, payload):
+    timeouts: list = []
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _TimeoutRecordingClient([], payload, timeouts, timeout),
+    )
+    return timeouts
+
+
+def test_budget_seconds_clamps_the_http_timeout(monkeypatch, codex_usage_payload):
+    """The budget must reach httpx, not just the signature.
+
+    Accepting ``budget_seconds`` is what flips
+    ``ai_usage.collector._supports_budget`` to True. If the value were then
+    dropped on the floor, the collector would believe it had a bounded call
+    while the request could still run for the fetcher's full 15s default --
+    a worse failure than not accepting it at all, because it reads as fixed.
+    """
+    timeouts = _record_timeouts(monkeypatch, codex_usage_payload)
+
+    account_usage.fetch_account_usage(
+        "openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="live-agent-token",
+        budget_seconds=2.5,
+    )
+
+    assert timeouts == [2.5]
+
+
+def test_budget_seconds_never_widens_the_default(monkeypatch, codex_usage_payload):
+    """A budget larger than the default must not extend the request."""
+    timeouts = _record_timeouts(monkeypatch, codex_usage_payload)
+
+    account_usage.fetch_account_usage(
+        "openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="live-agent-token",
+        budget_seconds=900.0,
+    )
+
+    assert timeouts == [account_usage._DEFAULT_USAGE_TIMEOUT]
+
+
+def test_no_budget_keeps_the_fetcher_default(monkeypatch, codex_usage_payload):
+    """The CLI and /usage paths pass no budget and must be unaffected."""
+    timeouts = _record_timeouts(monkeypatch, codex_usage_payload)
+
+    account_usage.fetch_account_usage(
+        "openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="live-agent-token",
+    )
+
+    assert timeouts == [account_usage._DEFAULT_USAGE_TIMEOUT]
