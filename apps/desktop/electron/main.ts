@@ -998,7 +998,18 @@ function chatWindowSurfaceOptions() {
     // (electron#49443). Chat windows on glass-capable Windows are born
     // transparent so a live Clear→Glass toggle doesn't need a recreate; the
     // opaque themed backgroundColor covers it while glass is off.
-    ...(IS_WINDOWS && GLASS_SUPPORTED ? { transparent: true } : {}),
+    //
+    // However, a `transparent: true` window drops the WS_THICKFRAME style,
+    // which is what Windows requires for snap / snap-assist (Win+Arrow,
+    // edge-drag) — see electron#37888. The window only needs to be
+    // transparent while glass is actually rendering; when translucency is
+    // 0% / `clear` nothing is painted, so the transparency is pure downside
+    // (it strips the frame that makes the window snappable). Gate the flag
+    // on `glassActive` so the window stays opaque and snap-eligible when
+    // glass is off, and transparent only when glass is on.
+    ...(IS_WINDOWS && GLASS_SUPPORTED && glassActive(translucencyState)
+      ? { transparent: true }
+      : {}),
     backgroundMaterial: IS_WINDOWS && GLASS_SUPPORTED ? backgroundMaterialFor(translucencyState) : undefined,
     opacity: windowOpacity(),
     ...windowBackingOptions(translucencyState, getWindowBackgroundColor())
