@@ -500,6 +500,11 @@ def _run_agent(
             #   - skill secret capture → returns gracefully when no callback set
             clarify_callback=_oneshot_clarify_callback,
         )
+        # Oneshot is a single-session local CLI runtime even though it bypasses
+        # cli.py's trusted AIAgent wrapper. Mint the same internal seal here so
+        # lifecycle/plugin attribution may use the launcher's explicit
+        # TERMINAL_CWD/profile fallback. Platform="cli" alone is not authority.
+        setattr(agent, "_classic_cli_runtime", True)
 
         # Belt-and-braces: make sure AIAgent doesn't invoke any streaming
         # display callbacks that would bypass our stdout capture.
