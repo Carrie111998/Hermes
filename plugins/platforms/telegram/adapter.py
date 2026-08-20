@@ -650,6 +650,7 @@ class TelegramAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = 4096
     supports_code_blocks = True  # Telegram MarkdownV2 renders fenced code blocks
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    supports_single_external_attempt = True
     # Bot API 10.1 Rich Messages cap the raw markdown/html text at 32,768
     # UTF-8 characters. Content above this is sent via the legacy chunking path.
     RICH_MESSAGE_MAX_CHARS = 32768
@@ -1675,6 +1676,21 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
     @staticmethod
+    def _is_single_external_attempt(
+        metadata: Optional[Dict[str, Any]],
+    ) -> bool:
+        return isinstance(metadata, dict) and metadata.get("single_external_attempt") is True
+
+    @staticmethod
+    def _single_external_attempt_failure(error: Exception) -> SendResult:
+        return SendResult(
+            success=False,
+            error=_redact_telegram_error_text(error),
+            retryable=False,
+            error_kind=classify_send_error(error),
+        )
+
+    @staticmethod
     def _is_bad_request_error(error: Exception) -> bool:
         name = error.__class__.__name__.lower()
         if name == "badrequest" or name.endswith("badrequest"):
@@ -1742,6 +1758,8 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             return await send_fn(**send_kwargs)
         except Exception as send_err:
+            if self._is_single_external_attempt(metadata):
+                raise
             if not self._should_retry_without_dm_topic_reply_anchor(
                 send_err,
                 metadata,
@@ -5137,7 +5155,13 @@ class TelegramAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
-        """Send a message to a Telegram chat."""
+        """Send a message to a Telegram chat.
+
+        ``metadata["single_external_attempt"]`` disables uncertain internal
+        network and flood-control retries. Definitive format/routing rejection
+        fallbacks remain allowed because the rejected request did not mutate
+        Telegram state.
+        """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
@@ -5148,7 +5172,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
-        
+
+        single_external_attempt = (
+            (metadata or {}).get("single_external_attempt") is True
+        )
+
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
             # sendRichMessage so tables/task lists/etc. render natively. Falls
@@ -5177,6 +5205,13 @@ class TelegramAdapter(BasePlatformAdapter):
             chunks = self.truncate_message(
                 formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
             )
+            if single_external_attempt and len(chunks) > 1:
+                return SendResult(
+                    success=False,
+                    error="message_too_long",
+                    error_kind="too_long",
+                    retryable=False,
+                )
             if len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix. Escape the
                 # MarkdownV2-special parentheses so Telegram doesn't reject the
@@ -5208,6 +5243,7 @@ class TelegramAdapter(BasePlatformAdapter):
             except (ImportError, AttributeError):
                 _TimedOut = None  # type: ignore[assignment,misc]
 
+            max_send_attempts = 3
             for i, chunk in enumerate(chunks):
                 retried_thread_not_found = False
                 metadata_reply_to = self._metadata_reply_to_message_id(metadata)
@@ -5252,7 +5288,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 effective_thread_id = thread_kwargs.get("message_thread_id")
 
                 msg = None
-                for _send_attempt in range(3):
+                for _send_attempt in range(max_send_attempts):
                     try:
                         # Try Markdown first, fall back to plain text if it fails
                         try:
@@ -5376,24 +5412,37 @@ class TelegramAdapter(BasePlatformAdapter):
                             raise
                         if is_pool_timeout:
                             await self._drain_general_connections_after_pool_timeout()
-                        if _send_attempt < 2:
+                        if (
+                            not single_external_attempt
+                            and _send_attempt < max_send_attempts - 1
+                        ):
                             wait = 2 ** _send_attempt
                             safe_send_error = _redact_telegram_error_text(send_err)
-                            logger.warning("[%s] Network error on send (attempt %d/3), retrying in %ds: %s",
-                                           self.name, _send_attempt + 1, wait, safe_send_error)
+                            logger.warning(
+                                "[%s] Network error on send (attempt %d/%d), retrying in %ds: %s",
+                                self.name,
+                                _send_attempt + 1,
+                                max_send_attempts,
+                                wait,
+                                safe_send_error,
+                            )
                             await asyncio.sleep(wait)
                         else:
                             raise
                     except Exception as send_err:
                         retry_after = getattr(send_err, "retry_after", None)
                         if retry_after is not None or "retry after" in str(send_err).lower():
-                            if _send_attempt < 2:
+                            if (
+                                not single_external_attempt
+                                and _send_attempt < max_send_attempts - 1
+                            ):
                                 wait = float(retry_after) if retry_after is not None else 1.0
                                 safe_send_error = _redact_telegram_error_text(send_err)
                                 logger.warning(
-                                    "[%s] Telegram flood control on send (attempt %d/3), retrying in %.1fs: %s",
+                                    "[%s] Telegram flood control on send (attempt %d/%d), retrying in %.1fs: %s",
                                     self.name,
                                     _send_attempt + 1,
+                                    max_send_attempts,
                                     wait,
                                     safe_send_error,
                                 )
@@ -7700,6 +7749,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            if self._is_single_external_attempt(metadata):
+                logger.warning(
+                    "[%s] Failed to send Telegram voice/audio: %s",
+                    self.name,
+                    _redact_telegram_error_text(e),
+                    exc_info=True,
+                )
+                return self._single_external_attempt_failure(e)
             logger.error(
                 "[%s] Failed to send Telegram voice/audio, falling back to base adapter: %s",
                 self.name,
@@ -7828,6 +7885,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     reset_media=_reset_opened_files,
                 )
             except Exception as e:
+                if self._is_single_external_attempt(metadata):
+                    logger.warning(
+                        "[%s] send_media_group failed (chunk %d/%d): %s",
+                        self.name,
+                        chunk_idx + 1,
+                        len(chunks),
+                        _redact_telegram_error_text(e),
+                        exc_info=True,
+                    )
+                    return
                 logger.warning(
                     "[%s] send_media_group failed (chunk %d/%d), falling back to per-image: %s",
                     self.name, chunk_idx + 1, len(chunks), _redact_telegram_error_text(e),
@@ -7889,6 +7956,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            if self._is_single_external_attempt(metadata):
+                logger.warning(
+                    "[%s] Failed to send Telegram local image as photo: %s",
+                    self.name,
+                    _redact_telegram_error_text(e),
+                    exc_info=True,
+                )
+                return self._single_external_attempt_failure(e)
             error_str = str(e)
             # Dimension-related errors are the expected case for valid image
             # files that Telegram just refuses as photos (screenshots, extreme
@@ -7987,6 +8062,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            if self._is_single_external_attempt(metadata):
+                logger.warning(
+                    "[%s] Failed to send document: %s",
+                    self.name, _redact_telegram_error_text(e),
+                )
+                return self._single_external_attempt_failure(e)
             logger.warning(
                 "[%s] Failed to send document: %s",
                 self.name, _redact_telegram_error_text(e),
@@ -8038,6 +8119,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            if self._is_single_external_attempt(metadata):
+                logger.warning(
+                    "[%s] Failed to send video: %s",
+                    self.name, _redact_telegram_error_text(e),
+                )
+                return self._single_external_attempt_failure(e)
             logger.warning(
                 "[%s] Failed to send video: %s",
                 self.name, _redact_telegram_error_text(e),
@@ -8093,6 +8180,14 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            if self._is_single_external_attempt(metadata):
+                logger.warning(
+                    "[%s] URL-based send_photo failed: %s",
+                    self.name,
+                    _redact_telegram_error_text(e),
+                    exc_info=True,
+                )
+                return self._single_external_attempt_failure(e)
             logger.warning(
                 "[%s] URL-based send_photo failed, trying file upload: %s",
                 self.name,
@@ -8184,6 +8279,14 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
+            if self._is_single_external_attempt(metadata):
+                logger.warning(
+                    "[%s] Failed to send Telegram animation: %s",
+                    self.name,
+                    _redact_telegram_error_text(e),
+                    exc_info=True,
+                )
+                return self._single_external_attempt_failure(e)
             logger.error(
                 "[%s] Failed to send Telegram animation, falling back to photo: %s",
                 self.name,
