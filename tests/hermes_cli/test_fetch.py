@@ -88,6 +88,27 @@ def test_render_fetch_slash_args_supports_concise_formats(monkeypatch):
     assert data["version"] == "0.test"
 
 
+def test_render_fetch_slash_args_can_omit_operator_paths():
+    info = _info()
+
+    compact = fetch.render_fetch_slash_args(
+        "compact",
+        info=info,
+        include_paths=False,
+    )
+    data = json.loads(
+        fetch.render_fetch_slash_args("json", info=info, include_paths=False)
+    )
+
+    assert "~/.hermes" not in compact
+    assert "~/hermes-agent" not in compact
+    assert "hermes_home" not in data
+    assert "path" not in data["repo"]
+    # Sanitizing a gateway rendering must not mutate the caller's snapshot.
+    assert info["hermes_home"] == "~/.hermes"
+    assert info["repo"]["path"] == "~/hermes-agent"
+
+
 def test_fetch_is_registered_as_slash_command_and_midrun_bypass():
     cmd = resolve_command("fetch")
 

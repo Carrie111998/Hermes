@@ -747,20 +747,15 @@ class GatewaySlashCommandsMixin:
         return "\n".join(lines)
 
     async def _handle_fetch_command(self, event: MessageEvent) -> str:
-        """Handle /fetch — show fastfetch-style Hermes runtime overview."""
-        from hermes_cli.fetch import collect_fetch_info, render_fetch_info
-        import asyncio
+        """Handle /fetch without blocking the gateway event loop."""
+        from hermes_cli.fetch import collect_fetch_info, render_fetch_slash_args
 
-        # Run the synchronous info collection in a thread to avoid blocking
-        # the gateway's asyncio event loop (git/node subprocesses can take
-        # multiple seconds each).
         info = await asyncio.to_thread(collect_fetch_info)
-        # Gateway context: omit filesystem paths that could reveal operator
-        # layout in shared channels.
-        info.pop("hermes_home", None)
-        if "repo" in info and isinstance(info["repo"], dict):
-            info["repo"].pop("path", None)
-        return render_fetch_info(info, plain=True)
+        return render_fetch_slash_args(
+            event.get_command_args().strip(),
+            info=info,
+            include_paths=False,
+        )
 
     @staticmethod
     def _redact_matrix_session_key(session_key: str) -> str:

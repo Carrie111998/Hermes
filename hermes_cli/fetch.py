@@ -32,6 +32,10 @@ def _run(cmd: list[str], *, cwd: Path | None = None, timeout: float = 2.0) -> st
             check=False,
         )
     except Exception:
+        # Fetch is best-effort: missing tools and timed-out probes degrade the
+        # overview instead of failing the command. Most callers map an empty
+        # result to "unknown"; boolean probes such as git status read it as
+        # clean, so this output is informational rather than authoritative.
         return ""
     return result.stdout.strip() if result.returncode == 0 else ""
 
@@ -306,9 +310,12 @@ def render_fetch_info(
     avatar = _HERMES_AVATAR if no_persona else _PERSONA_AVATAR
     title = "Hermes Agent"
     subtitle = "neutral overview" if no_persona else f"persona-aware · {info['persona']}"
+    profile = str(info["profile"])
+    if info.get("hermes_home"):
+        profile = f"{profile} · {info['hermes_home']}"
     rows = [
         ("Version", f"v{info['version']} · {info['repo']['branch']}@{info['repo']['commit']}{' *' if info['repo']['dirty'] else ''}"),
-        ("Profile", f"{info['profile']} · {info['hermes_home']}"),
+        ("Profile", profile),
         ("Model", f"{info['model']['provider']} / {info['model']['name']}"),
         ("Gateway", info["gateway"]),
         ("Platforms", ", ".join(info["platforms"]) or "none configured"),
@@ -347,7 +354,12 @@ def run_fetch(args: argparse.Namespace) -> int:
     return 0
 
 
-def render_fetch_slash_args(raw_args: str = "") -> str:
+def render_fetch_slash_args(
+    raw_args: str = "",
+    *,
+    info: dict[str, Any] | None = None,
+    include_paths: bool = True,
+) -> str:
     """Render /fetch slash-command output from a small shell-like arg string.
 
     Supported forms intentionally mirror the CLI flags while allowing concise
@@ -385,7 +397,16 @@ def render_fetch_slash_args(raw_args: str = "") -> str:
                 "Usage: /fetch [text|plain|compact|json] [--no-persona]"
             )
 
-    info = collect_fetch_info()
+    if info is None:
+        info = collect_fetch_info()
+    if not include_paths:
+        info = dict(info)
+        info.pop("hermes_home", None)
+        repo = info.get("repo")
+        if isinstance(repo, dict):
+            repo = dict(repo)
+            repo.pop("path", None)
+            info["repo"] = repo
     if fmt == "json":
         return json.dumps(info, indent=2, ensure_ascii=False, sort_keys=True)
     return render_fetch_info(

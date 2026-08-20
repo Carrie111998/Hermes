@@ -9,6 +9,8 @@ duplicate agent.
 """
 
 import asyncio
+import json
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -249,9 +251,72 @@ async def test_fetch_command_idle_session_returns_overview():
     assert session_key not in runner.adapters[Platform.TELEGRAM]._pending_messages
 
 
-# ------------------------------------------------------------------
-# Test 6: /stop during sentinel force-cleans and unlocks session
-# ------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_fetch_gateway_handler_runs_collection_off_event_loop(monkeypatch):
+    """The real /fetch handler keeps collection off the gateway event loop."""
+    from hermes_cli import fetch
+
+    runner = _make_runner()
+    event = _make_event(text="/fetch json")
+    loop_thread_id = threading.get_ident()
+    info = {
+        "generated_at": "2026-06-02T00:00:00+00:00",
+        "version": "0.test",
+        "release_date": "2026.6.2",
+        "repo": {"branch": "main", "commit": "abc123", "dirty": False, "path": "/private/repo"},
+        "profile": "default",
+        "persona": "Atsuko",
+        "hermes_home": "/private/hermes",
+        "model": {"provider": "test", "name": "model"},
+        "gateway": "running",
+        "platforms": ["telegram"],
+        "tools": "1 available",
+        "skills": 0,
+        "cron": {"active": 0, "paused": 0, "total": 0},
+        "memory": "enabled (built-in)",
+        "mcp_servers": 0,
+        "host": {"system": "Linux", "release": "test", "machine": "x86_64", "termux": False},
+        "runtime": {"python": "3.11", "node": "not found", "npm": "not found"},
+        "update": "up to date",
+    }
+    seen_thread = {}
+
+    def collect():
+        seen_thread["id"] = threading.get_ident()
+        return info
+
+    monkeypatch.setattr(fetch, "collect_fetch_info", collect)
+    result = await runner._handle_fetch_command(event)
+    data = json.loads(result)
+
+    assert data["repo"]["branch"] == "main"
+    assert "path" not in data["repo"]
+    assert "hermes_home" not in data
+    assert seen_thread["id"] != loop_thread_id
+
+
+@pytest.mark.asyncio
+async def test_fetch_gateway_handler_preserves_compact_format(monkeypatch):
+    from hermes_cli import fetch
+
+    runner = _make_runner()
+    event = _make_event(text="/fetch compact")
+    monkeypatch.setattr(fetch, "collect_fetch_info", lambda: {
+        "generated_at": "now", "version": "0.test", "release_date": "today",
+        "repo": {"branch": "main", "commit": "abc", "dirty": False, "path": "/private"},
+        "profile": "default", "persona": "Atsuko", "hermes_home": "/private/hermes",
+        "model": {"provider": "test", "name": "model"}, "gateway": "running",
+        "platforms": ["telegram"], "tools": "1 available", "skills": 0,
+        "cron": {"active": 0, "paused": 0, "total": 0}, "memory": "enabled",
+        "mcp_servers": 0, "host": {"system": "Linux", "release": "test", "machine": "x86_64", "termux": False},
+        "runtime": {"python": "3.11", "node": "not found", "npm": "not found"}, "update": "up to date",
+    })
+    result = await runner._handle_fetch_command(event)
+    assert "Hermes Agent" in result
+    assert "Tools" not in result
+    assert "/private" not in result
+
+
 @pytest.mark.asyncio
 async def test_stop_during_sentinel_force_cleans_session():
     """If /stop arrives while the sentinel is set (agent still starting),
