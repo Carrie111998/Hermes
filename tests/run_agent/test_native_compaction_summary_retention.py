@@ -1,134 +1,270 @@
-"""Comprehensive tests for native compaction summary retention, token budgeting, and robustness."""
+"""Tests for native compaction summary retention during pre-checkpoint pruning (#90975).
 
+``prune_pre_checkpoint_items`` previously dropped every pre-checkpoint item
+whose ``role`` was not ``"user"`` — which silently deleted Hermes' own local
+compression summaries (``role="assistant"``) from the wire on every native
+compaction turn. These tests cover the fix's summary retention path, its
+reliance on the canonical ``agent.context_compressor`` provenance check (not
+an ad-hoc heuristic), whole-or-drop truncation, and idempotency.
+"""
+
+from agent.context_compressor import (
+    COMPRESSED_SUMMARY_METADATA_KEY,
+    ContextCompressor,
+    SUMMARY_PREFIX,
+    _MERGED_PRIOR_CONTEXT_HEADER,
+    _MERGED_SUMMARY_DELIMITER,
+    _SUMMARY_END_MARKER,
+)
 from agent.native_compaction import (
-    prune_pre_checkpoint_items,
-    _is_summary_item,
     _extract_item_text,
+    _is_summary_item,
+    prune_pre_checkpoint_items,
 )
 
 
-def test_is_summary_item_robustness():
-    """Validates summary detection across metadata dicts, headers, and flags."""
-    # Top level flags
-    assert _is_summary_item({"_compressed_summary": True}) is True
-    assert _is_summary_item({"_is_compression_summary": True}) is True
-    assert _is_summary_item({"_hermes_compressed_summary": True}) is True
-    assert _is_summary_item({"_my_custom_summary_flag": True}) is True
-
-    # Nested metadata dict
-    assert _is_summary_item({"metadata": {"summary": True}}) is True
-    assert _is_summary_item({"_metadata": {"is_summary": True}}) is True
-    assert _is_summary_item({"metadata": {"_compressed_summary": True}}) is True
-    assert _is_summary_item({"metadata": {"compression_v2": True}}) is True
-
-    # Text headers
-    assert _is_summary_item({"content": "summary of previous conversation: ..."}) is True
-    assert _is_summary_item({"content": "Conversation Summary\nDone"}) is True
-    assert _is_summary_item({"content": "Handoff from a previous context"}) is True
-    assert _is_summary_item({"content": "## Summary of work"}) is True
-
-    # Negative cases
-    assert _is_summary_item({"role": "user", "content": "Just normal prompt"}) is False
-    assert _is_summary_item(None) is False
-    assert _is_summary_item(123) is False
-    assert _is_summary_item({}) is False
+def _standalone_summary_content(body: str = "## Active Task\nstuff") -> str:
+    return f"{SUMMARY_PREFIX}\n{body}\n\n{_SUMMARY_END_MARKER}"
 
 
-def test_extract_item_text_variations():
-    """Validates text extraction across string, multipart list, output_text, and malformed structures."""
-    # String
-    assert _extract_item_text({"content": "Hello world"}) == "Hello world"
-
-    # Multipart list
-    item_list = {
-        "content": [
-            {"type": "input_text", "text": "Part 1"},
-            {"type": "text", "text": "Part 2"},
-            {"type": "other", "output_text": "Part 3"},
-        ]
-    }
-    assert _extract_item_text(item_list) == "Part 1 Part 2 Part 3"
-
-    # output_text fallback
-    assert _extract_item_text({"output_text": "Output fallback"}) == "Output fallback"
-
-    # Malformed / Empty
-    assert _extract_item_text({"content": None}) is None
-    assert _extract_item_text({"content": []}) is None
-    assert _extract_item_text(None) is None
-    assert _extract_item_text("string_item") is None
-
-
-def test_prune_pre_checkpoint_items_retains_summary_and_user_in_order():
-    """Preserves chronological order of user messages and summary messages."""
-    items = [
-        {"role": "user", "content": "User Ask 1"},
-        {"role": "assistant", "content": "Conversation Summary: Step 1 complete", "_compressed_summary": True},
-        {"role": "user", "content": "User Ask 2"},
-        {"role": "assistant", "content": "Normal chatter to prune"},
-        {"type": "compaction", "encrypted_content": "blob_cp"},
-        {"role": "user", "content": "User Ask 3"},
-    ]
-
-    pruned = prune_pre_checkpoint_items(items, retained_user_token_budget=1000)
-
-    # Checkpoint comes first, followed by retained items in original sequence
-    assert pruned[0]["type"] == "compaction"
-    contents = [m.get("content") for m in pruned[1:]]
-    assert contents == [
-        "User Ask 1",
-        "Conversation Summary: Step 1 complete",
-        "User Ask 2",
-        "User Ask 3",
-    ]
-
-
-def test_prune_pre_checkpoint_items_summary_budget_cap_and_truncation():
-    """Enforces token budget limit and truncation for summaries."""
-    long_summary = "Summary line " * 500  # ~6500 chars = ~1625 tokens
-    items = [
-        {"role": "assistant", "content": long_summary, "_compressed_summary": True},
-        {"type": "compaction", "encrypted_content": "blob_cp"},
-        {"role": "user", "content": "Ask"},
-    ]
-
-    # Restrict summary budget to 100 tokens (~400 chars)
-    pruned = prune_pre_checkpoint_items(
-        items,
-        retained_summary_token_budget=100,
+def _merged_summary_content(tail: str = "preserved prior turn") -> str:
+    return (
+        f"{_MERGED_PRIOR_CONTEXT_HEADER}\n{tail}\n\n"
+        f"{_MERGED_SUMMARY_DELIMITER}\n\n"
+        f"{SUMMARY_PREFIX}\nbody\n\n{_SUMMARY_END_MARKER}"
     )
 
-    retained_sum = [m for m in pruned if m.get("_compressed_summary")][0]
-    assert len(retained_sum["content"]) <= 400
-    assert len(retained_sum["content"]) > 0
+
+class TestIsSummaryItemCanonical:
+    """`_is_summary_item` must delegate to the canonical provenance check —
+    exact metadata flag or the canonical prefix classifier — never an
+    ad-hoc heuristic (#90975 blocking review)."""
+
+    def test_truthy_metadata_flag_detected(self):
+        assert _is_summary_item({COMPRESSED_SUMMARY_METADATA_KEY: True}) is True
+
+    def test_standalone_content_detected_without_metadata(self):
+        # The wire sanitizers strip underscore keys, so content-only
+        # detection must still work on the canonical prefix.
+        assert _is_summary_item({"role": "assistant", "content": _standalone_summary_content()}) is True
+
+    def test_merged_content_detected_without_metadata(self):
+        assert _is_summary_item({"role": "assistant", "content": _merged_summary_content()}) is True
+
+    def test_malformed_inputs_are_not_summaries(self):
+        assert _is_summary_item(None) is False
+        assert _is_summary_item(123) is False
+        assert _is_summary_item({}) is False
 
 
-def test_prune_pre_checkpoint_items_enable_summary_retention_toggle():
-    """Disabling summary retention drops pre-checkpoint summaries."""
-    items = [
-        {"role": "assistant", "content": "Conversation Summary: Old", "_compressed_summary": True},
-        {"type": "compaction", "encrypted_content": "blob"},
-        {"role": "user", "content": "New ask"},
-    ]
+class TestIsSummaryItemNegativeWitnesses:
+    """Content that merely resembles a summary must never be promoted to
+    durable retained history — that is authority drift (#90975 blocking
+    review, required item 4)."""
 
-    pruned_disabled = prune_pre_checkpoint_items(items, enable_summary_retention=False)
-    contents = [m.get("content") for m in pruned_disabled]
-    assert "Conversation Summary: Old" not in contents
+    def test_summary_heading_in_ordinary_user_text_is_not_a_summary(self):
+        item = {"role": "user", "content": "## Summary\nplease summarize the PR for me"}
+        assert _is_summary_item(item) is False
+
+    def test_false_valued_metadata_flag_is_not_a_summary(self):
+        item = {"role": "assistant", "content": "hi", COMPRESSED_SUMMARY_METADATA_KEY: False}
+        assert _is_summary_item(item) is False
+
+    def test_arbitrary_underscore_summary_key_is_not_a_summary(self):
+        item = {"role": "assistant", "content": "hi", "_my_custom_summary_flag": True}
+        assert _is_summary_item(item) is False
+
+    def test_non_hermes_assistant_content_is_not_a_summary(self):
+        item = {"role": "assistant", "content": "Conversation Summary: I finished the task."}
+        assert _is_summary_item(item) is False
 
 
-def test_prune_pre_checkpoint_items_malformed_inputs_handled_safely():
-    """Handles None, non-dict elements, empty lists, and invalid items without crashing."""
-    assert prune_pre_checkpoint_items(None) is None
-    assert prune_pre_checkpoint_items([]) == []
+class TestExtractItemTextVariations:
+    def test_string_content(self):
+        assert _extract_item_text({"content": "Hello world"}) == "Hello world"
 
-    items = [
-        None,
-        123,
-        "raw_string",
-        {"role": "user", "content": "Valid user ask"},
-        {"type": "compaction", "encrypted_content": "blob"},
-    ]
-    pruned = prune_pre_checkpoint_items(items)
-    assert len(pruned) == 2
-    assert pruned[0]["type"] == "compaction"
-    assert pruned[1]["content"] == "Valid user ask"
+    def test_multipart_list_content(self):
+        item = {
+            "content": [
+                {"type": "input_text", "text": "Part 1"},
+                {"type": "text", "text": "Part 2"},
+                {"type": "other", "output_text": "Part 3"},
+            ]
+        }
+        assert _extract_item_text(item) == "Part 1 Part 2 Part 3"
+
+    def test_output_text_fallback(self):
+        assert _extract_item_text({"output_text": "Output fallback"}) == "Output fallback"
+
+    def test_malformed_or_empty(self):
+        assert _extract_item_text({"content": None}) is None
+        assert _extract_item_text({"content": []}) is None
+        assert _extract_item_text(None) is None
+        assert _extract_item_text("string_item") is None
+
+
+class TestPrunePreCheckpointItemsRetainsSummaries:
+    def test_retains_summary_and_user_in_original_order(self):
+        summary_content = _standalone_summary_content("Step 1 complete")
+        items = [
+            {"role": "user", "content": "User Ask 1"},
+            {"role": "assistant", "content": summary_content, COMPRESSED_SUMMARY_METADATA_KEY: True},
+            {"role": "user", "content": "User Ask 2"},
+            {"role": "assistant", "content": "Normal chatter to prune"},
+            {"type": "compaction", "encrypted_content": "blob_cp"},
+            {"role": "user", "content": "User Ask 3"},
+        ]
+
+        pruned = prune_pre_checkpoint_items(items, retained_user_token_budget=1000)
+
+        assert pruned[0]["type"] == "compaction"
+        contents = [m.get("content") for m in pruned[1:]]
+        assert contents == [
+            "User Ask 1",
+            summary_content,
+            "User Ask 2",
+            "User Ask 3",
+        ]
+
+    def test_role_agnostic_retention_does_not_touch_user_budget(self):
+        summary_content = _standalone_summary_content("x" * 2000)
+        items = [
+            {"role": "assistant", "content": summary_content, COMPRESSED_SUMMARY_METADATA_KEY: True},
+            {"role": "user", "content": "short ask"},
+            {"type": "compaction", "encrypted_content": "blob_cp"},
+        ]
+
+        pruned = prune_pre_checkpoint_items(
+            items, retained_user_token_budget=10, retained_summary_token_budget=10_000
+        )
+
+        contents = [m.get("content") for m in pruned]
+        assert summary_content in contents
+        assert "short ask" in contents
+
+
+class TestPrunePreCheckpointItemsSummaryBudget:
+    def test_oversized_summary_is_dropped_whole_not_sliced(self):
+        """A summary that cannot fit the remaining budget is dropped
+        entirely rather than character-sliced (#90975 blocking review,
+        required item 3): slicing can corrupt the handoff prefix / end
+        marker that keeps the summary non-active."""
+        long_summary = _standalone_summary_content("Summary line " * 500)
+        items = [
+            {"role": "assistant", "content": long_summary, COMPRESSED_SUMMARY_METADATA_KEY: True},
+            {"type": "compaction", "encrypted_content": "blob_cp"},
+            {"role": "user", "content": "Ask"},
+        ]
+
+        pruned = prune_pre_checkpoint_items(items, retained_summary_token_budget=100)
+
+        assert not any(m.get(COMPRESSED_SUMMARY_METADATA_KEY) for m in pruned)
+
+    def test_summary_that_fits_budget_is_retained_whole(self):
+        summary_content = _standalone_summary_content("short body")
+        items = [
+            {"role": "assistant", "content": summary_content, COMPRESSED_SUMMARY_METADATA_KEY: True},
+            {"type": "compaction", "encrypted_content": "blob_cp"},
+            {"role": "user", "content": "Ask"},
+        ]
+
+        pruned = prune_pre_checkpoint_items(items, retained_summary_token_budget=10_000)
+
+        retained = [m for m in pruned if m.get(COMPRESSED_SUMMARY_METADATA_KEY)]
+        assert len(retained) == 1
+        assert retained[0]["content"] == summary_content
+
+
+class TestPrunePreCheckpointItemsIdempotency:
+    def test_duplicate_summary_text_is_not_retained_twice(self):
+        """A repeated checkpoint sequence can leave the same summary text
+        present at more than one pre-checkpoint position; retention must
+        stay idempotent rather than duplicate it (#90975 blocking review,
+        required item 5)."""
+        summary_content = _standalone_summary_content("same body")
+        items = [
+            {"role": "assistant", "content": summary_content, COMPRESSED_SUMMARY_METADATA_KEY: True},
+            {"role": "user", "content": "mid ask"},
+            {"role": "assistant", "content": summary_content, COMPRESSED_SUMMARY_METADATA_KEY: True},
+            {"type": "compaction", "encrypted_content": "blob_cp"},
+            {"role": "user", "content": "Ask"},
+        ]
+
+        pruned = prune_pre_checkpoint_items(items)
+
+        matches = [m for m in pruned if m.get("content") == summary_content]
+        assert len(matches) == 1
+
+    def test_re_pruning_an_already_pruned_result_is_stable(self):
+        summary_content = _standalone_summary_content("stable body")
+        items = [
+            {"role": "assistant", "content": summary_content, COMPRESSED_SUMMARY_METADATA_KEY: True},
+            {"role": "user", "content": "ask"},
+            {"type": "compaction", "encrypted_content": "blob_cp"},
+        ]
+
+        once = prune_pre_checkpoint_items(items)
+        twice = prune_pre_checkpoint_items(once)
+        assert once == twice
+
+
+class TestPrunePreCheckpointItemsLiveCompressorEmissions:
+    """Exercise the real ``ContextCompressor`` marker renderer instead of a
+    hand-built stand-in, for both standalone and merge-into-tail shapes
+    (#90975 blocking review, required item 5)."""
+
+    def test_standalone_live_marker_is_retained(self):
+        rendered = ContextCompressor._render_micro_marker_content("Live handoff body")
+        assert ContextCompressor.classify_summary_content(rendered) == "standalone"
+
+        items = [
+            {"role": "assistant", "content": rendered, COMPRESSED_SUMMARY_METADATA_KEY: True},
+            {"type": "compaction", "encrypted_content": "blob_cp"},
+            {"role": "user", "content": "Ask"},
+        ]
+        pruned = prune_pre_checkpoint_items(items)
+        assert any(m.get("content") == rendered for m in pruned)
+
+    def test_merged_tail_summary_is_retained_and_classified_merged(self):
+        merged = _merged_summary_content("earlier preserved turn text")
+        assert ContextCompressor.classify_summary_content(merged) == "merged"
+
+        items = [
+            {"role": "assistant", "content": merged, COMPRESSED_SUMMARY_METADATA_KEY: True},
+            {"type": "compaction", "encrypted_content": "blob_cp"},
+            {"role": "user", "content": "Ask"},
+        ]
+        pruned = prune_pre_checkpoint_items(items)
+        assert any(m.get("content") == merged for m in pruned)
+
+
+class TestPrunePreCheckpointItemsEnableSummaryRetentionToggle:
+    def test_disabling_summary_retention_drops_pre_checkpoint_summaries(self):
+        summary_content = _standalone_summary_content("Old")
+        items = [
+            {"role": "assistant", "content": summary_content, COMPRESSED_SUMMARY_METADATA_KEY: True},
+            {"type": "compaction", "encrypted_content": "blob"},
+            {"role": "user", "content": "New ask"},
+        ]
+
+        pruned_disabled = prune_pre_checkpoint_items(items, enable_summary_retention=False)
+        contents = [m.get("content") for m in pruned_disabled]
+        assert summary_content not in contents
+
+
+class TestPrunePreCheckpointItemsMalformedInputs:
+    def test_handles_none_non_dict_and_empty_items_safely(self):
+        assert prune_pre_checkpoint_items(None) is None
+        assert prune_pre_checkpoint_items([]) == []
+
+        items = [
+            None,
+            123,
+            "raw_string",
+            {"role": "user", "content": "Valid user ask"},
+            {"type": "compaction", "encrypted_content": "blob"},
+        ]
+        pruned = prune_pre_checkpoint_items(items)
+        assert len(pruned) == 2
+        assert pruned[0]["type"] == "compaction"
+        assert pruned[1]["content"] == "Valid user ask"

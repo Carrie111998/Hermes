@@ -32,8 +32,11 @@ captured compaction items ride the existing ``codex_reasoning_items``
 sidecar, which already handles persistence (state.db), gateway session
 replay, cross-issuer stamping, and the encrypted-replay kill switch.
 
-This module is dependency-free on purpose so the transport, adapter, and
-conversation loop can share the gate without import cycles.
+This module stays free of transport/adapter dependencies so the transport,
+adapter, and conversation loop can share the gate without import cycles. The
+one exception is ``agent.context_compressor``: it sits below this module in
+the dependency graph (it never imports ``native_compaction``), so importing
+its canonical summary-provenance primitives here introduces no cycle.
 """
 
 from __future__ import annotations
@@ -41,6 +44,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
+
+from agent.context_compressor import is_compaction_summary_message
 
 logger = logging.getLogger(__name__)
 
@@ -198,57 +203,26 @@ def _extract_item_text(item: Any) -> Optional[str]:
     return None
 
 
-def _user_item_text(item: Dict[str, Any]) -> Optional[str]:
-    """Extract the retained-budget text of a user-role input item (backward compatibility wrapper)."""
-    return _extract_item_text(item)
-
-
 def _is_summary_item(item: Any) -> bool:
-    """Robust summary item detection supporting flags, metadata dicts, and content headers."""
-    if not isinstance(item, dict):
-        return False
+    """True when *item* is a canonical Hermes compression-summary message.
 
-    # 1. Top-level summary boolean or string flags
-    if (
-        item.get("_compressed_summary")
-        or item.get("_is_compression_summary")
-        or item.get("_hermes_compressed_summary")
-    ):
-        return True
+    Delegates entirely to
+    ``agent.context_compressor.is_compaction_summary_message`` — the single
+    authoritative provenance check already used by every other summary
+    consumer (memory providers, frontends, the compactor itself). It prefers
+    the exact, truthy ``COMPRESSED_SUMMARY_METADATA_KEY`` marker and falls
+    back to the canonical prefix classifier (``SUMMARY_PREFIX`` /
+    ``LEGACY_SUMMARY_PREFIX`` / historical prefixes, including the
+    merge-into-tail shape) for the case where the underscore-prefixed key
+    was already stripped by a wire sanitizer.
 
-    # 2. Dynamic underscore key scan
-    if any(isinstance(k, str) and k.startswith("_") and "summary" in k.lower() for k in item.keys()):
-        return True
-
-    # 3. Nested metadata inspection (metadata / _metadata)
-    for meta_key in ("metadata", "_metadata"):
-        meta = item.get(meta_key)
-        if isinstance(meta, dict):
-            if meta.get("summary") or meta.get("is_summary") or meta.get("_compressed_summary"):
-                return True
-            if any(
-                isinstance(k, str) and ("summary" in k.lower() or "compression" in k.lower())
-                for k in meta.keys()
-            ):
-                return True
-
-    # 4. Text header inspection
-    text = _extract_item_text(item)
-    if text:
-        text_lower = text.lower()
-        summary_phrases = (
-            "summary of previous conversation",
-            "conversation summary",
-            "handoff from a previous context",
-            "previous conversation summary",
-            "context summary",
-            "[summary]",
-            "## summary",
-        )
-        if any(phrase in text_lower for phrase in summary_phrases):
-            return True
-
-    return False
+    Deliberately NOT a second heuristic: no arbitrary underscore-key scan, no
+    inference from a falsy or unrelated metadata key, and no matching on
+    ad-hoc content headings like ``"## Summary"`` in ordinary text — any of
+    those can promote a normal user/assistant message (or adversarial
+    content) to durable retained history (#90975 review).
+    """
+    return is_compaction_summary_message(item)
 
 
 def prune_pre_checkpoint_items(
@@ -261,15 +235,31 @@ def prune_pre_checkpoint_items(
 
     The server drops every input item that precedes a replayed ``compaction``
     item (live-verified Aug 2026), so sending pre-checkpoint history is dead
-    weight AND silently erases the user's plaintext asks. When a checkpoint
-    is present, rebuild the wire as::
+    weight AND silently erases the user's plaintext asks — including any
+    local-compression summary the agent already produced, which previously
+    vanished here because it carries ``role="assistant"``, not ``"user"``
+    (#90975). When a checkpoint is present, rebuild the wire as::
 
         [checkpoint run] + [retained user & summary messages (newest-first budget)] + [post]
 
     - The NEWEST contiguous run of checkpoints wins.
-    - Retained user messages are kept verbatim within ``retained_user_token_budget``.
-    - Compression summary messages are retained within ``retained_summary_token_budget``.
-    - Original relative chronological order between user messages and summaries is preserved.
+    - Retained user messages are kept verbatim within
+      ``retained_user_token_budget``; the boundary message is head-truncated
+      when it only partially fits (string content only) — goals are usually
+      stated up front, so the head is the valuable end.
+    - Compression summary messages (``_is_summary_item``, the canonical
+      ``agent.context_compressor`` provenance check) are retained whole
+      within ``retained_summary_token_budget``. A summary is never
+      byte/character-sliced: Hermes summaries carry structural framing
+      (handoff prefix, end marker, merge-into-tail delimiters) that a blind
+      slice can corrupt, so one that doesn't fit whole is dropped instead.
+      A summary already retained once (identical text) is never duplicated,
+      so repeated checkpoints stay idempotent.
+    - ``enable_summary_retention`` is a function-level override (used by
+      tests and callers that need the pre-#90975 behavior back); it is not
+      wired to a user-facing config surface.
+    - Original relative chronological order between user messages and
+      summaries is preserved.
     """
     if not isinstance(items, list) or not items:
         return items
@@ -297,13 +287,16 @@ def prune_pre_checkpoint_items(
     retained_reversed: List[Dict[str, Any]] = []
     user_remaining = max(0, int(retained_user_token_budget))
     summary_remaining = max(0, int(retained_summary_token_budget))
+    seen_summary_texts: set = set()
 
     for item in reversed(pre):
         if not isinstance(item, dict):
             continue
 
-        # Skip typed non-message items
-        if "type" in item and item.get("type") not in ("message", "summary", "context_summary"):
+        # Skip typed non-message items (function_call_output etc. never
+        # carry role=user or a summary flag, but stay defensive about
+        # future shapes).
+        if "type" in item and item.get("type") != "message":
             continue
 
         is_summary = enable_summary_retention and _is_summary_item(item)
@@ -316,23 +309,21 @@ def prune_pre_checkpoint_items(
         if not text:
             continue
 
-        cost = _approx_tokens(text)
-
         if is_summary:
-            if summary_remaining <= 0:
+            if summary_remaining <= 0 or text in seen_summary_texts:
                 continue
-            if cost <= summary_remaining:
-                retained_reversed.append(item)
-                summary_remaining -= cost
-            elif isinstance(item.get("content"), str):
-                truncated = dict(item)
-                truncated["content"] = item["content"][: summary_remaining * 4]
-                if truncated["content"].strip():
-                    retained_reversed.append(truncated)
-                summary_remaining = 0
+            cost = _approx_tokens(text)
+            if cost > summary_remaining:
+                # Never byte-slice a summary's structural framing — drop it
+                # whole rather than corrupt the handoff prefix / end marker.
+                continue
+            retained_reversed.append(item)
+            seen_summary_texts.add(text)
+            summary_remaining -= cost
         elif is_user:
             if user_remaining <= 0:
                 continue
+            cost = _approx_tokens(text)
             if cost <= user_remaining:
                 retained_reversed.append(item)
                 user_remaining -= cost
