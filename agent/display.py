@@ -1361,6 +1361,14 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
     # Memory: distinguish "store full" from real errors.
     if tool_name == "memory":
         if isinstance(data, dict):
+            # done=True is the memory tool's terminal graceful-degradation
+            # result (#42405): it already tells the model to stop retrying.
+            # Rendering it as a failure also feeds the same-tool halt counter,
+            # which aborts the turn and eats the user's reply - the exact
+            # outcome #42405 exists to prevent. Keep in lockstep with
+            # agent/tool_guardrails.py:classify_tool_failure.
+            if data.get("done") is True:
+                return False, ""
             if data.get("success") is False and "exceed the limit" in data.get("error", ""):
                 return True, " [full]"
 

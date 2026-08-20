@@ -119,6 +119,31 @@ def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution()
 
 
 
+def test_memory_terminal_degradation_is_not_a_tool_failure():
+    # The memory tool's terminal graceful-degradation result (#42405) carries
+    # done=True and already tells the model to stop retrying. Counting it as a
+    # failure feeds the same-tool halt counter, which aborts the turn and eats
+    # the user-facing reply - the exact outcome #42405 exists to prevent.
+    # Keep in lockstep with agent/display.py:_detect_tool_failure.
+    terminal = json.dumps({
+        "success": False,
+        "done": True,
+        "error": (
+            "Memory consolidation failed 4 times this turn. Stop retrying "
+            "memory calls - leave memory unchanged for now and continue with "
+            "your reply to the user."
+        ),
+    })
+    full = json.dumps({
+        "success": False,
+        "error": "Memory at 3,990/4,000 chars. Adding this entry would exceed the limit.",
+    })
+
+    assert classify_tool_failure("memory", terminal) == (False, "")
+    # A genuine at-capacity error is still a failure.
+    assert classify_tool_failure("memory", full) == (True, " [full]")
+
+
 def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=2)
