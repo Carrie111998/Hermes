@@ -96,6 +96,30 @@ def _is_webhook_silence_response(content: Any) -> bool:
     """
     return is_autonomous_silence_response(content)
 
+# Terminal error placeholders that `agent/conversation_loop.py` puts in a run's
+# `final_response` when the turn ends without producing an answer (truncated
+# output, a stream that kept dropping mid tool-call, an oversized payload...).
+# They explain why the turn stopped; they are not the answer the caller asked
+# for. Every other surface shows them as an error, but a webhook route hands
+# whatever it receives to its delivery target, so the recipient gets the
+# placeholder as if it were the requested output.
+# `test_webhook_delivery_guard.py` fails if any of these drifts out of
+# conversation_loop.py, so this set cannot silently go stale.
+_TERMINAL_ERROR_PLACEHOLDERS = frozenset({
+    "Response truncated due to output length limit",
+    "First response truncated due to output length limit",
+    "Stream repeatedly dropped mid tool-call (network); the tool was not executed",
+    "Incomplete REASONING_SCRATCHPAD after 2 retries",
+    "Codex response remained incomplete after 3 continuation attempts",
+    "Request payload too large (413). Cannot compress further.",
+})
+
+
+def _is_terminal_error_placeholder(content: Any) -> bool:
+    """True when ``content`` is a turn-ended-early placeholder, not an answer."""
+    return isinstance(content, str) and content.strip() in _TERMINAL_ERROR_PLACEHOLDERS
+
+
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
 # (no prefix / multiplexing off → handle as the default profile).
@@ -378,6 +402,35 @@ class WebhookAdapter(BasePlatformAdapter):
         if deliver_type == "log":
             logger.info("[webhook] Response for %s: %s", chat_id, content[:200])
             return SendResult(success=True)
+
+        # Past this point the response reaches a person: a GitHub comment, or
+        # a chat adapter. A run that ended early leaves an error placeholder in
+        # `final_response`, and delivering it unchanged tells that person the
+        # placeholder *is* the answer, with nothing anywhere recording that the
+        # request produced no output. Replace it with a notice that says so and
+        # leave a WARNING behind.
+        #
+        # `gateway/run.py:_sanitize_gateway_final_response` does this for the
+        # chat gateways, and deliberately exempts `webhook` as a programmatic
+        # surface — correct for the route's own HTTP response and for
+        # `deliver: log`, both left untouched above. It does not hold for a
+        # route configured to deliver to a human, which is what this covers.
+        if _is_terminal_error_placeholder(content):
+            route = delivery.get("route") or "?"
+            reason = content.strip()
+            logger.warning(
+                "[webhook] delivery-guard: session=%s route=%s produced no answer "
+                "(agent reported: %s) - delivering a notice instead",
+                chat_id,
+                route,
+                reason,
+            )
+            content = (
+                f"\u26a0\ufe0f No answer was produced for this request "
+                f"(webhook route: {route}).\n"
+                f"The run ended early - the agent reported: {reason}\n"
+                f"Nothing else was generated; re-send the request to retry."
+            )
 
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
@@ -919,6 +972,9 @@ class WebhookAdapter(BasePlatformAdapter):
             "deliver_extra": self._render_delivery_extra(
                 route_config.get("deliver_extra", {}), payload
             ),
+            # Read only by the delivery guard in send(), to name the route in
+            # its warning and its notice.
+            "route": route_name,
         }
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
