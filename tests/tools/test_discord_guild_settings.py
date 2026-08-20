@@ -85,7 +85,10 @@ def test_name_contract():
 
 
 def test_description_max_contract():
-    assert len(edit_guild_request(GUILD_ID, description="x" * 1024)["json"]["description"]) == 1024
+    description = edit_guild_request(GUILD_ID, description="x" * 1024)["json"][
+        "description"
+    ]
+    assert len(description) == 1024
     with pytest.raises(GuildSettingsError, match="exceeds 1024"):
         edit_guild_request(GUILD_ID, description="x" * 1025)
 
