@@ -18,8 +18,8 @@ Both stores are written from two origins:
 This module lets the user gate those writes per-subsystem with a boolean
 ``write_approval``:
 
-  * ``false`` (default) — write freely (the pre-gate behaviour)
-  * ``true``            — require approval: do not commit the write; either
+  * ``false``           — write freely only when the operator explicitly opts out
+  * ``true`` (default)  — require approval: do not commit the write; either
     prompt inline (memory, interactive CLI only) or **stage** it to a pending
     store and surface it for the user to approve or reject out-of-band
 
@@ -75,22 +75,23 @@ def write_approval_enabled(subsystem: str) -> bool:
     """Return whether the approval gate is enabled for ``subsystem``.
 
     Reads ``<subsystem>.write_approval`` from config.yaml. Defaults to
-    ``False`` (gate off — writes flow freely) for any unset / invalid value so
-    existing installs keep their current behaviour until the user opts in.
+    ``True`` (gate on) for unset, invalid, or unreadable configuration. Only an
+    explicit recognized false value may disable the gate.
     """
     if subsystem not in _SUBSYSTEMS:
-        return False
+        return True
     try:
         from hermes_cli.config import load_config, cfg_get
         cfg = load_config()
-        raw = cfg_get(cfg, subsystem, CONFIG_KEY, default=False)
+        raw = cfg_get(cfg, subsystem, CONFIG_KEY, default=True)
     except Exception:
-        return False
+        logger.exception("Could not establish %s write-approval state; failing closed", subsystem)
+        return True
     return _normalize_enabled(raw)
 
 
 def _normalize_enabled(value: Any) -> bool:
-    """Coerce a config value to a bool. Default (unknown) is False (gate off).
+    """Coerce a config value to a bool. Default (unknown) is True (gate on).
 
     Accepts real bools and the usual truthy/falsey strings. YAML 1.1 parses
     bare ``on``/``off``/``yes``/``no`` as bools already, so the string branch
@@ -99,8 +100,12 @@ def _normalize_enabled(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
-        return value.strip().lower() in {"on", "true", "yes", "1", "approve", "enabled"}
-    return False
+        normalized = value.strip().lower()
+        if normalized in {"on", "true", "yes", "1", "approve", "enabled"}:
+            return True
+        if normalized in {"off", "false", "no", "0", "disable", "disabled"}:
+            return False
+    return True
 
 
 def emit_gate_event(subsystem: str, outcome: str, action_id: str, detail: str) -> None:
@@ -127,6 +132,10 @@ def _pending_dir(subsystem: str) -> Path:
     return get_hermes_home() / "pending" / subsystem
 
 
+class PendingWriteError(RuntimeError):
+    """A proposed write could not be durably persisted for approval."""
+
+
 def stage_write(subsystem: str, payload: Dict[str, Any],
                 *, summary: str, origin: str) -> Dict[str, Any]:
     """Persist a pending write and return a short record describing it.
@@ -141,9 +150,9 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
             entry text itself.
         origin: ``foreground`` or ``background_review`` — recorded for audit.
 
-    Returns a dict with ``id`` and metadata. Best-effort: on disk failure it
-    logs and still returns a record (the write is simply lost, which is the
-    safe failure for an approval gate — nothing is silently committed).
+    Returns a dict with ``id`` and metadata only after the pending record is
+    durably persisted. Raises :class:`PendingWriteError` on failure so callers
+    cannot report a nonexistent approval record as successfully staged.
     """
     pid = uuid.uuid4().hex[:8]
     record = {
@@ -155,6 +164,7 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
         "created_at": time.time(),
         "payload": payload,
     }
+    tmp: Optional[Path] = None
     try:
         d = _pending_dir(subsystem)
         d.mkdir(parents=True, exist_ok=True)
@@ -162,8 +172,16 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, path)
-    except Exception as e:  # pragma: no cover - disk failure path
+    except Exception as e:
         logger.error("Failed to stage pending %s write: %s", subsystem, e, exc_info=True)
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+        raise PendingWriteError(
+            f"Could not persist pending {subsystem} write; no write was applied"
+        ) from e
     return record
 
 
@@ -278,7 +296,7 @@ def evaluate_gate(subsystem: str, *, inline_summary: str = "",
             are small; skills never take the inline path).
 
     Decision matrix:
-        gate off (default)                    → allow (writes flow freely)
+        gate explicitly off                  → allow (writes flow freely)
         gate on, memory + interactive CLI     → inline approve/deny prompt
         gate on, memory + gateway/script/bg   → stage
         gate on, skills (any origin)          → stage (too big to review inline)

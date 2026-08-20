@@ -930,9 +930,10 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
     try:
         from tools import write_approval as wa
     except Exception:
-        # If the gate module can't load, fail open (current behaviour) rather
-        # than blocking all memory writes.
-        return None
+        return tool_error(
+            "Memory write refused: the approval gate could not be loaded.",
+            success=False,
+        )
 
     # Build a small inline summary/detail for the foreground approval prompt.
     label = "user profile" if target == "user" else "memory"
@@ -968,11 +969,17 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
         "content": content,
         "old_text": old_text,
     }
-    record = wa.stage_write(
-        wa.MEMORY, payload,
-        summary=f"{summary}: {detail[:120]}",
-        origin=wa.current_origin(),
-    )
+    try:
+        record = wa.stage_write(
+            wa.MEMORY, payload,
+            summary=f"{summary}: {detail[:120]}",
+            origin=wa.current_origin(),
+        )
+    except Exception:
+        return tool_error(
+            "Memory write refused: the pending approval could not be persisted.",
+            success=False,
+        )
     wa.emit_gate_event(wa.MEMORY, "staged", record["id"], summary)
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],
@@ -991,7 +998,10 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
     try:
         from tools import write_approval as wa
     except Exception:
-        return None
+        return tool_error(
+            "Memory batch refused: the approval gate could not be loaded.",
+            success=False,
+        )
 
     label = "user profile" if target == "user" else "memory"
     summary = f"apply {len(operations)} op(s) to {label}"
@@ -1021,11 +1031,17 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
         return tool_error(decision.message, success=False)
 
     payload = {"action": "batch", "target": target, "operations": operations}
-    record = wa.stage_write(
-        wa.MEMORY, payload,
-        summary=f"{summary}: {detail[:120]}",
-        origin=wa.current_origin(),
-    )
+    try:
+        record = wa.stage_write(
+            wa.MEMORY, payload,
+            summary=f"{summary}: {detail[:120]}",
+            origin=wa.current_origin(),
+        )
+    except Exception:
+        return tool_error(
+            "Memory batch refused: the pending approval could not be persisted.",
+            success=False,
+        )
     wa.emit_gate_event(wa.MEMORY, "staged", record["id"], summary)
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],
@@ -1274,7 +1290,6 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
 
 
 

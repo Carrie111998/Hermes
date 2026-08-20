@@ -11,6 +11,15 @@ from tools.memory_tool import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _direct_writes_for_memory_behavior_tests(monkeypatch):
+    """Keep this module focused on memory behavior, not approval staging."""
+    monkeypatch.setattr(
+        "tools.write_approval.write_approval_enabled",
+        lambda _subsystem: False,
+    )
+
+
 def _blocked(content, pattern_id=None):
     """Assert content is refused by the scanner, optionally by a named pattern."""
     result = _scan_memory_content(content)

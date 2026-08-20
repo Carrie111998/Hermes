@@ -27,6 +27,15 @@ from agent.skill_utils import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _direct_writes_for_skill_behavior_tests(monkeypatch):
+    """Keep this module focused on skill behavior, not approval staging."""
+    monkeypatch.setattr(
+        "tools.write_approval.write_approval_enabled",
+        lambda _subsystem: False,
+    )
+
+
 @contextmanager
 def _skill_dir(tmp_path):
     """Patch both SKILLS_DIR and get_all_skills_dirs so _find_skill searches
