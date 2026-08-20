@@ -878,6 +878,12 @@ def _ensure_default_soul_md(home: Path) -> None:
     DEFAULT_SOUL_MD. A SOUL.md the user actually customized is never touched.
     """
     soul_path = home / "SOUL.md"
+    # ``Path.exists()`` follows symlinks. A dangling SOUL.md link therefore
+    # looks missing and the write below would follow it, silently recreating
+    # the removed target (or raise when its parent is gone). Preserve the link
+    # as evidence of a broken identity binding and leave repair to the owner.
+    if soul_path.is_symlink() and not soul_path.exists():
+        return
     if soul_path.exists():
         try:
             existing = soul_path.read_text(encoding="utf-8")

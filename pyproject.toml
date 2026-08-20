@@ -146,6 +146,9 @@ dependencies = [
   # Hence the ``sys_platform == 'win32'`` marker: the dep (and its portalocker
   # / pywin32 tree) ships only where it's actually used.
   "concurrent-log-handler==0.9.29; sys_platform == 'win32'",
+  # Local HA bridge helpers use the websocket-client package (``import websocket``),
+  # which is distinct from the async ``websockets`` dependency above.
+  "websocket-client==1.9.0",
   # First-party lifecycle and shared-metrics runtime. Relay 0.6 is the minimum
   # lossless provider-codec contract. Managed calls pass request/response data
   # through this native module in-process; shared metrics installs no network

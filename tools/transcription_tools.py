@@ -2282,6 +2282,25 @@ def _transcribe_openai(
         logger.info("Model %s not available on OpenAI, using %s", model_name, DEFAULT_STT_MODEL)
         model_name = DEFAULT_STT_MODEL
 
+    spend_reservation = None
+    cancel_spend_reservation = None
+    api_request_started = False
+
+    def _cancel_if_pre_call(reason: str) -> None:
+        if (
+            spend_reservation is None
+            or cancel_spend_reservation is None
+            or api_request_started
+        ):
+            return
+        try:
+            cancel_spend_reservation(spend_reservation["reservation_id"], reason)
+        except Exception as exc:
+            logger.critical(
+                "Could not release unused OpenAI transcription spend reservation: %s",
+                exc,
+            )
+
     try:
         from openai import (
             OpenAI,
@@ -2290,11 +2309,41 @@ def _transcribe_openai(
             APITimeoutError,
             BadRequestError,
         )
+
+        # Cost gating applies only to the native OpenAI path. This function is
+        # also shared by third-party OpenAI-compatible STT providers whose
+        # credentials and pricing are governed separately.
+        duration_seconds = None
+        if provider_label == "openai":
+            from tools.openai_media_spend import (
+                SpendPolicyError,
+                audio_duration_seconds,
+                cancel_reservation as cancel_spend_reservation,
+                gate as spend_gate,
+                transcription_preflight_usd,
+            )
+
+            try:
+                duration_seconds = audio_duration_seconds(file_path)
+                spend_reservation = spend_gate(
+                    "transcription",
+                    model_name,
+                    transcription_preflight_usd(duration_seconds),
+                    {"duration_seconds": round(duration_seconds, 3)},
+                )
+            except SpendPolicyError as exc:
+                return {
+                    "success": False,
+                    "transcript": "",
+                    "error": f"OpenAI spend policy blocked transcription: {exc}",
+                }
+
         client = OpenAI(api_key=api_key, base_url=base_url, timeout=30, max_retries=0)
 
         def _create_transcription(path: str):
+            nonlocal api_request_started
             with open(path, "rb") as audio_file:
-                create_kwargs = {
+                create_kwargs: Dict[str, Any] = {
                     "model": model_name,
                     "file": audio_file,
                     "response_format": "text" if model_name == "whisper-1" else "json",
@@ -2312,6 +2361,7 @@ def _transcribe_openai(
                     # Only send the prompt when set so the no-hook, no-config
                     # request stays byte-identical to today's.
                     create_kwargs["prompt"] = prompt
+                api_request_started = True
                 return client.audio.transcriptions.create(**create_kwargs)
 
         try:
@@ -2328,6 +2378,12 @@ def _transcribe_openai(
                     converted_path, transcode_error = _transcode_audio_for_stt(file_path, work_dir)
                     if transcode_error:
                         return {"success": False, "transcript": "", "error": transcode_error}
+                    if converted_path is None:
+                        return {
+                            "success": False,
+                            "transcript": "",
+                            "error": "audio transcoding returned no output path",
+                        }
                     logger.info(
                         "Retrying %s STT after transcoding %s to m4a (API rejected the original container)",
                         provider_label, Path(file_path).name,
@@ -2335,18 +2391,73 @@ def _transcribe_openai(
                     transcription = _create_transcription(converted_path)
 
             transcript_text = _extract_transcript_text(transcription)
+            result: Dict[str, Any] = {
+                "success": True,
+                "transcript": transcript_text,
+                "provider": provider_label,
+            }
+            if (
+                provider_label == "openai"
+                and duration_seconds is not None
+                and spend_reservation is not None
+            ):
+                from tools.openai_media_spend import (
+                    record as spend_record,
+                    transcription_cost,
+                )
+
+                cost_usd = float(spend_reservation["estimated_call_usd"])
+                is_estimated = True
+                try:
+                    cost_usd, usage, is_estimated = transcription_cost(
+                        transcription,
+                        duration_seconds,
+                    )
+                    spend_record(
+                        "transcription",
+                        model_name,
+                        cost_usd,
+                        input_tokens=usage["input_tokens"],
+                        cached_tokens=usage["cached_tokens"],
+                        output_tokens=usage["output_tokens"],
+                        estimated=is_estimated,
+                        reservation_id=spend_reservation["reservation_id"],
+                        metadata={
+                            "duration_seconds": round(duration_seconds, 3),
+                            "usage_source": (
+                                "duration_estimate" if is_estimated else "openai_response"
+                            ),
+                        },
+                    )
+                except Exception as exc:
+                    # The paid transcription is valid and its conservative
+                    # reservation remains in the ledger. Returning an error
+                    # here would invite a duplicate paid retry.
+                    logger.critical(
+                        "OpenAI transcription succeeded but spend reservation "
+                        "reconciliation failed: %s",
+                        exc,
+                    )
+                result.update(
+                    {
+                        "model": model_name,
+                        "cost_usd": cost_usd,
+                        "cost_estimated": is_estimated,
+                    }
+                )
             logger.info(
                 "Transcribed %s via %s (%s, %d chars)",
                 Path(file_path).name, provider_label, model_name, len(transcript_text),
             )
 
-            return {"success": True, "transcript": transcript_text, "provider": provider_label}
+            return result
         finally:
             close = getattr(client, "close", None)
             if callable(close):
                 close()
 
     except PermissionError:
+        _cancel_if_pre_call("permission_denied_before_request")
         return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
     except APIConnectionError as e:
         return {"success": False, "transcript": "", "error": f"Connection error: {e}"}
@@ -2355,6 +2466,7 @@ def _transcribe_openai(
     except APIError as e:
         return {"success": False, "transcript": "", "error": f"API error: {e}"}
     except Exception as e:
+        _cancel_if_pre_call("exception_before_request")
         logger.error("%s transcription failed: %s", provider_label, e, exc_info=True)
         return {"success": False, "transcript": "", "error": f"Transcription failed: {e}"}
 

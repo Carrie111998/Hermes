@@ -65,6 +65,143 @@ async def test_restart_command_writes_notify_file(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_restart_command_refuses_while_cron_work_is_active(tmp_path, monkeypatch):
+    """In-chat /restart must not interrupt an active cron execution."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, _adapter = make_restart_runner()
+    runner.request_restart = MagicMock(return_value=True)
+    runner._begin_cron_restart_drain = MagicMock(return_value=2)
+
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="42"),
+        message_id="m-cron",
+    )
+
+    result = await runner._handle_restart_command(event)
+
+    assert "Restart odbijen" in result
+    assert "2" in result
+    runner.request_restart.assert_not_called()
+    assert not (tmp_path / ".restart_notify.json").exists()
+    assert not (tmp_path / ".restart_last_processed.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_restart_command_fails_closed_when_cron_gate_errors(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, _adapter = make_restart_runner()
+    runner.request_restart = MagicMock(return_value=True)
+    runner._begin_cron_restart_drain = MagicMock(side_effect=RuntimeError("registry down"))
+
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="42"),
+        message_id="m-cron-error",
+    )
+    result = await runner._handle_restart_command(event)
+
+    assert "Restart odbijen" in result
+    assert "nije moguće sigurno provjeriti" in result
+    runner.request_restart.assert_not_called()
+
+
+def test_atomic_restart_drain_blocks_new_cron_registration():
+    from cron.scheduler import (
+        begin_gateway_restart_drain,
+        cancel_gateway_restart_drain,
+        release_running_job,
+        try_register_running_job,
+    )
+
+    cancel_gateway_restart_drain()
+    try:
+        assert begin_gateway_restart_drain() == 0
+        assert try_register_running_job("race-after-restart-check") is False
+    finally:
+        cancel_gateway_restart_drain()
+        release_running_job("race-after-restart-check")
+
+    assert try_register_running_job("race-after-restart-check") is True
+    release_running_job("race-after-restart-check")
+
+
+def test_restart_drain_blocks_manual_claim_before_durable_mutation(monkeypatch):
+    from cron.scheduler import (
+        begin_gateway_restart_drain,
+        cancel_gateway_restart_drain,
+        release_running_job,
+    )
+    from tools.cronjob_tools import _execute_job_now
+
+    durable_claim = MagicMock(return_value={"id": "manual-during-drain"})
+    monkeypatch.setattr("tools.cronjob_tools.claim_job_for_fire", durable_claim)
+
+    cancel_gateway_restart_drain()
+    try:
+        assert begin_gateway_restart_drain() == 0
+        result = _execute_job_now({"id": "manual-during-drain"})
+        assert result["claimed"] is False
+        durable_claim.assert_not_called()
+    finally:
+        cancel_gateway_restart_drain()
+        release_running_job("manual-during-drain")
+
+
+def test_restart_drain_blocks_external_claim_before_durable_mutation(monkeypatch):
+    from cron.scheduler import (
+        begin_gateway_restart_drain,
+        cancel_gateway_restart_drain,
+        release_running_job,
+    )
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    durable_claim = MagicMock(return_value={"id": "external-during-drain"})
+    monkeypatch.setattr("cron.jobs.claim_job_for_fire", durable_claim)
+    create_execution = MagicMock(return_value={"id": "exec-during-drain"})
+    monkeypatch.setattr("cron.executions.create_execution", create_execution)
+    finish_execution = MagicMock()
+    monkeypatch.setattr("cron.executions.finish_execution", finish_execution)
+
+    cancel_gateway_restart_drain()
+    try:
+        assert begin_gateway_restart_drain() == 0
+        result = InProcessCronScheduler().claim_fire("external-during-drain")
+        assert result is None
+        create_execution.assert_not_called()
+        durable_claim.assert_not_called()
+        finish_execution.assert_not_called()
+    finally:
+        cancel_gateway_restart_drain()
+        release_running_job("external-during-drain")
+
+
+@pytest.mark.asyncio
+async def test_restart_command_rolls_back_cron_gate_when_restart_not_started(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, _adapter = make_restart_runner()
+    runner.request_restart = MagicMock(return_value=False)
+    cancel_gate = MagicMock()
+    runner._cancel_cron_restart_drain = cancel_gate
+
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="42"),
+        message_id="m-restart-race",
+    )
+    await runner._handle_restart_command(event)
+
+    cancel_gate.assert_called_once()
+    assert runner._draining is False
+
+
+@pytest.mark.asyncio
 async def test_restart_command_uses_atomic_json_writes_for_marker_files(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 

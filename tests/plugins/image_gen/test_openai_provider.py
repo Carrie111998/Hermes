@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -32,12 +33,16 @@ def _fake_response(*, b64=None, url=None, revised_prompt=None):
 @pytest.fixture(autouse=True)
 def _tmp_hermes_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENAI_API_ALLOWED_OPERATIONS", "image_generation")
+    monkeypatch.setenv("HERMES_API_SPEND_CALLER", "pytest")
+    monkeypatch.setenv("API_SPEND_LEDGER", str(tmp_path / "api-spend.sqlite"))
+    monkeypatch.setenv("API_SPEND_DAILY_HARD_USD", "100")
     yield tmp_path
 
 
 @pytest.fixture
 def provider(monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_IMAGE_API_KEY", "test-key")
     return openai_plugin.OpenAIImageGenProvider()
 
 
@@ -73,12 +78,17 @@ class TestMetadata:
 
 class TestAvailability:
     def test_no_api_key_unavailable(self, monkeypatch):
-        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_IMAGE_API_KEY", raising=False)
         assert openai_plugin.OpenAIImageGenProvider().is_available() is False
 
     def test_api_key_set_available(self, monkeypatch):
-        monkeypatch.setenv("OPENAI_API_KEY", "test")
+        monkeypatch.setenv("OPENAI_IMAGE_API_KEY", "test")
         assert openai_plugin.OpenAIImageGenProvider().is_available() is True
+
+    def test_general_openai_key_does_not_authorize_image_spend(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_IMAGE_API_KEY", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "general-key")
+        assert openai_plugin.OpenAIImageGenProvider().is_available() is False
 
 
 # ── Model resolution ────────────────────────────────────────────────────────
@@ -139,10 +149,87 @@ class TestGenerate:
         assert result["error_type"] == "invalid_argument"
 
     def test_missing_api_key(self, monkeypatch):
-        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_IMAGE_API_KEY", raising=False)
         result = openai_plugin.OpenAIImageGenProvider().generate("a cat")
         assert result["success"] is False
         assert result["error_type"] == "auth_required"
+
+    def test_spend_policy_blocks_before_openai_client(self, monkeypatch, provider):
+        monkeypatch.setenv("OPENAI_API_ALLOWED_OPERATIONS", "transcription")
+        client_factory = MagicMock()
+        monkeypatch.setattr("openai.OpenAI", client_factory)
+
+        result = provider.generate("a cat")
+
+        assert result["success"] is False
+        assert result["error_type"] == "spend_policy"
+        client_factory.assert_not_called()
+
+    def test_pre_call_client_failure_cancels_reservation(
+        self, monkeypatch, provider, _tmp_hermes_home
+    ):
+        client_factory = MagicMock(side_effect=RuntimeError("client init failed"))
+        monkeypatch.setattr("openai.OpenAI", client_factory)
+
+        result = provider.generate("a cat")
+
+        assert result["success"] is False
+        assert result["error_type"] == "client_error"
+        with sqlite3.connect(_tmp_hermes_home / "api-spend.sqlite") as con:
+            amount, status = con.execute(
+                "SELECT estimated_usd, status FROM api_spend_events"
+            ).fetchone()
+        assert amount == 0
+        assert status == "cancelled"
+
+    def test_started_provider_failure_keeps_conservative_reservation(
+        self, provider, _tmp_hermes_home
+    ):
+        fake_client = MagicMock()
+        fake_client.images.generate.side_effect = RuntimeError("outcome unknown")
+
+        with _patched_openai(fake_client):
+            result = provider.generate("a potentially billed cat")
+
+        assert result["success"] is False
+        fake_client.images.generate.assert_called_once()
+        with sqlite3.connect(_tmp_hermes_home / "api-spend.sqlite") as con:
+            amount, status = con.execute(
+                "SELECT estimated_usd, status FROM api_spend_events"
+            ).fetchone()
+        assert amount > 0
+        assert status == "reserved"
+
+    def test_reconciliation_failure_does_not_invite_duplicate_paid_retry(
+        self, provider, _tmp_hermes_home, caplog
+    ):
+        from tools.openai_media_spend import SpendPolicyError
+
+        fake_client = MagicMock()
+        fake_client.images.generate.return_value = _fake_response(b64=_b64_png())
+
+        with (
+            _patched_openai(fake_client),
+            patch(
+                "tools.openai_media_spend.record",
+                side_effect=SpendPolicyError("ledger reconciliation failed"),
+            ),
+        ):
+            result = provider.generate("a paid cat")
+
+        assert result["success"] is True
+        fake_client.images.generate.assert_called_once()
+        assert any(
+            record.levelname == "CRITICAL"
+            and "reconciliation failed" in record.message
+            for record in caplog.records
+        )
+        with sqlite3.connect(_tmp_hermes_home / "api-spend.sqlite") as con:
+            amount, status = con.execute(
+                "SELECT estimated_usd, status FROM api_spend_events"
+            ).fetchone()
+        assert amount > 0
+        assert status == "reserved"
 
     def test_b64_saves_to_cache(self, provider, tmp_path):
         png_bytes = bytes.fromhex(_PNG_HEX)

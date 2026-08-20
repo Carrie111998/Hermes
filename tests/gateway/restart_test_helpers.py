@@ -124,6 +124,8 @@ def make_restart_runner(
     runner._active_cron_job_count = GatewayRunner._active_cron_job_count.__get__(
         runner, GatewayRunner
     )
+    runner._begin_cron_restart_drain = MagicMock(return_value=0)
+    runner._cancel_cron_restart_drain = MagicMock()
     runner._active_api_run_count = GatewayRunner._active_api_run_count.__get__(
         runner, GatewayRunner
     )

@@ -958,6 +958,10 @@ class GatewayConfig:
     # STT settings
     stt_enabled: bool = True  # Whether to auto-transcribe inbound voice messages
     stt_echo_transcripts: bool = True  # Whether to echo raw STT transcripts back to the user
+    # Outer gateway deadline for the complete configured-provider + local-
+    # fallback chain. Provider SDK timeouts alone do not protect the event loop
+    # when a worker thread or subprocess wedges.
+    stt_gateway_timeout_seconds: float = 45.0
 
     # Session isolation in shared chats
     group_sessions_per_user: bool = True  # Isolate group/channel sessions per participant when user IDs are available
@@ -1117,6 +1121,7 @@ class GatewayConfig:
             "filter_silence_narration": self.filter_silence_narration,
             "stt_enabled": self.stt_enabled,
             "stt_echo_transcripts": self.stt_echo_transcripts,
+            "stt_gateway_timeout_seconds": self.stt_gateway_timeout_seconds,
             "group_sessions_per_user": self.group_sessions_per_user,
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "max_concurrent_sessions": self.max_concurrent_sessions,
@@ -1181,6 +1186,16 @@ class GatewayConfig:
                 if isinstance(data.get("stt"), dict)
                 else None
             )
+        stt_timeout_raw = data.get("stt_gateway_timeout_seconds")
+        if stt_timeout_raw is None and isinstance(data.get("stt"), dict):
+            stt_timeout_raw = data["stt"].get("gateway_timeout_seconds")
+        stt_gateway_timeout_seconds = _coerce_float(stt_timeout_raw, 45.0)
+        if stt_gateway_timeout_seconds <= 0:
+            logger.warning(
+                "Ignoring invalid stt.gateway_timeout_seconds=%r; using 45 seconds",
+                stt_timeout_raw,
+            )
+            stt_gateway_timeout_seconds = 45.0
 
         group_sessions_per_user = data.get("group_sessions_per_user")
         thread_sessions_per_user = data.get("thread_sessions_per_user")
@@ -1263,6 +1278,7 @@ class GatewayConfig:
             ),
             stt_enabled=_coerce_bool(stt_enabled, True),
             stt_echo_transcripts=_coerce_bool(stt_echo_transcripts, True),
+            stt_gateway_timeout_seconds=stt_gateway_timeout_seconds,
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),

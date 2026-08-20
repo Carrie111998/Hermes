@@ -31,6 +31,97 @@ from typing import Any
 # between recovery attempts.
 _EMFILE_BACKOFF_MAX_SECONDS = 15 * 60  # 15 minutes
 
+# External fire admission may be transferred from the webhook thread to a
+# background worker.  While provider code runs, this thread-local marker lets
+# an override that delegates to the base claim path reuse the already-held
+# registration instead of rejecting itself as a duplicate.
+_external_fire_admission = threading.local()
+
+
+def _external_fire_pre_registered(job_id: str) -> bool:
+    return job_id in getattr(_external_fire_admission, "job_ids", ())
+
+
+def _push_external_fire_context(job_id: str) -> set[str]:
+    prior: set[str] = set(getattr(_external_fire_admission, "job_ids", ()))
+    current = set(prior)
+    current.add(job_id)
+    _external_fire_admission.job_ids = current
+    return prior
+
+
+def claim_external_provider_fire(
+    provider: Any, job_id: str
+) -> tuple[str, dict | None]:
+    """Atomically admit, then durably claim, one split-provider fire.
+
+    The returned status is ``claimed``, ``duplicate``, or ``draining``.  A
+    claimed snapshot carries registration ownership into
+    ``fire_external_provider_claimed`` so HTTP acknowledgment cannot race ahead
+    of restart admission.
+    """
+    from cron.scheduler import acquire_running_job_admission, release_running_job
+
+    status = acquire_running_job_admission(job_id)
+    if status != "acquired":
+        return status, None
+    prior = _push_external_fire_context(job_id)
+    try:
+        claimed = provider.claim_fire(job_id)
+    except BaseException:
+        release_running_job(job_id)
+        raise
+    finally:
+        _external_fire_admission.job_ids = prior
+    if not isinstance(claimed, dict):
+        release_running_job(job_id)
+        return "duplicate", None
+    claimed["_external_fire_registered"] = True
+    return "claimed", claimed
+
+
+def fire_external_provider_claimed(
+    provider: Any,
+    claimed_job: dict,
+    *,
+    adapters: Any = None,
+    loop: Any = None,
+) -> bool:
+    """Run a split-provider claim and always release webhook admission."""
+    from cron.scheduler import release_running_job
+
+    registered = bool(claimed_job.pop("_external_fire_registered", False))
+    try:
+        return bool(provider.fire_claimed(claimed_job, adapters=adapters, loop=loop))
+    finally:
+        if registered:
+            release_running_job(str(claimed_job.get("id") or ""))
+
+
+def fire_legacy_provider_guarded(
+    provider: Any,
+    job_id: str,
+    *,
+    adapters: Any = None,
+    loop: Any = None,
+    pre_registered: bool = False,
+) -> bool:
+    """Run an opaque legacy fire with restart admission held until return."""
+    from cron.scheduler import (
+        acquire_running_job_admission,
+        release_running_job,
+    )
+
+    if not pre_registered:
+        if acquire_running_job_admission(job_id) != "acquired":
+            return False
+    prior = _push_external_fire_context(job_id)
+    try:
+        return bool(provider.fire_due(job_id, adapters=adapters, loop=loop))
+    finally:
+        _external_fire_admission.job_ids = prior
+        release_running_job(job_id)
+
 
 def _backoff_wait_seconds(interval: float, consecutive_failures: int) -> float:
     """Exponential tick backoff shared by both ticker loops (#87644).
@@ -181,14 +272,30 @@ class CronScheduler(ABC):
         """
         from cron.executions import create_execution, finish_execution
         from cron.jobs import claim_job_for_fire
+        from cron.scheduler import release_running_job, try_register_running_job
 
-        execution = create_execution(job_id, source=self.name)
+        pre_registered = _external_fire_pre_registered(job_id)
+        owns_registration = False
+        if not pre_registered:
+            if not try_register_running_job(job_id):
+                return None
+            owns_registration = True
+
+        try:
+            execution = create_execution(job_id, source=self.name)
+        except BaseException:
+            if owns_registration:
+                release_running_job(job_id)
+            raise
+
         claim_kwargs = {"return_job": True}
         if force:
             claim_kwargs["force"] = True
         try:
             claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
         except BaseException as exc:
+            if owns_registration:
+                release_running_job(job_id)
             finish_execution(
                 execution["id"],
                 success=False,
@@ -196,6 +303,8 @@ class CronScheduler(ABC):
             )
             raise
         if not isinstance(claimed_job, dict):
+            if owns_registration:
+                release_running_job(job_id)
             finish_execution(
                 execution["id"],
                 success=False,
@@ -203,6 +312,7 @@ class CronScheduler(ABC):
             )
             return None
         claimed_job["execution_id"] = execution["id"]
+        claimed_job["_restart_drain_registered"] = owns_registration
         return claimed_job
 
     def fire_claimed(
@@ -220,15 +330,20 @@ class CronScheduler(ABC):
         — e.g. the dashboard lifespan drain signalling pending webhook
         fires before the event loop shuts down.
         """
-        from cron.scheduler import run_one_job
+        from cron.scheduler import release_running_job, run_one_job
 
-        run_one_job(
-            claimed_job,
-            adapters=adapters,
-            loop=loop,
-            cancel_event=cancel_event,
-        )
-        return True
+        registered = bool(claimed_job.pop("_restart_drain_registered", False))
+        try:
+            run_one_job(
+                claimed_job,
+                adapters=adapters,
+                loop=loop,
+                cancel_event=cancel_event,
+            )
+            return True
+        finally:
+            if registered:
+                release_running_job(claimed_job["id"])
 
     def reconcile(self) -> None:
         """Converge the external registry toward jobs.json (the desired state):
@@ -402,23 +517,31 @@ def fire_overdue_jobs(
             next_run_at,
             overdue_seconds / 60,
         )
+        claimed = None
         try:
-            # Two-phase, webhook-style: claim synchronously (fast store
-            # CAS — losing means an external retry beat us, which is
-            # fine), then run the job off-thread so the caller's loop is
-            # never blocked for the length of an agent run.
-            claimed = provider.claim_fire(job_id)
-            if claimed is None:
+            # Two-phase, webhook-style: admission and durable claim are atomic
+            # with the restart gate; the worker owns release through completion.
+            admission, claimed = claim_external_provider_fire(provider, job_id)
+            if admission != "claimed" or claimed is None:
                 continue
             threading.Thread(
-                target=provider.fire_claimed,
-                args=(claimed,),
+                target=fire_external_provider_claimed,
+                args=(provider, claimed),
                 kwargs={"adapters": adapters, "loop": loop},
                 daemon=True,
                 name=f"cron-misfire-{job_id[:12]}",
             ).start()
             fired += 1
         except Exception as exc:
+            if isinstance(claimed, dict) and claimed.pop(
+                "_external_fire_registered", False
+            ):
+                try:
+                    from cron.scheduler import release_running_job
+
+                    release_running_job(job_id)
+                except Exception:
+                    pass
             logger.warning(
                 "Misfire catch-up failed for job %s: %s: %s",
                 job_id, type(exc).__name__, exc,

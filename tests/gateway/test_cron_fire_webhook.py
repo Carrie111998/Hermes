@@ -55,14 +55,17 @@ class _SpyProvider:
 
 
 @pytest.mark.asyncio
-async def test_valid_fire_reservation_blocks_drain_before_body_and_task(adapter, monkeypatch):
+@pytest.mark.parametrize("provider_kind", ["split", "legacy"])
+async def test_valid_fire_reservation_blocks_drain_before_body_and_task(
+    adapter, monkeypatch, provider_kind
+):
     runner = SimpleNamespace(_draining=False, _external_drain_active=False)
     body_started = asyncio.Event()
     release_body = asyncio.Event()
     fired = threading.Event()
     release_fire = threading.Event()
 
-    class BlockingProvider:
+    class SplitBlockingProvider:
         def claim_fire(self, job_id):
             return {"id": job_id, "execution_id": "exec-1"}
 
@@ -71,6 +74,18 @@ async def test_valid_fire_reservation_blocks_drain_before_body_and_task(adapter,
             release_fire.wait(timeout=2)
             return True
 
+    class LegacyBlockingProvider:
+        def fire_due(self, job_id, *, adapters=None, loop=None):
+            fired.set()
+            release_fire.wait(timeout=2)
+            return True
+
+    provider = (
+        SplitBlockingProvider()
+        if provider_kind == "split"
+        else LegacyBlockingProvider()
+    )
+
     original_json = web.Request.json
 
     async def delayed_json(request):
@@ -78,7 +93,9 @@ async def test_valid_fire_reservation_blocks_drain_before_body_and_task(adapter,
         await release_body.wait()
         return await original_json(request)
 
-    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", BlockingProvider)
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler", lambda: provider
+    )
     monkeypatch.setattr(
         "plugins.cron_providers.chronos.verify.get_fire_verifier",
         lambda: (lambda **kw: {"purpose": "cron_fire"}),
@@ -103,6 +120,13 @@ async def test_valid_fire_reservation_blocks_drain_before_body_and_task(adapter,
             assert response.status == 202
             await asyncio.to_thread(fired.wait, 2)
             assert adapter.active_agent_work_count() == 1
+            from cron.scheduler import (
+                begin_gateway_restart_drain,
+                cancel_gateway_restart_drain,
+            )
+
+            cancel_gateway_restart_drain()
+            assert begin_gateway_restart_drain() == 1
             release_fire.set()
             for _ in range(50):
                 if adapter.active_agent_work_count() == 0:
@@ -110,6 +134,8 @@ async def test_valid_fire_reservation_blocks_drain_before_body_and_task(adapter,
                 await asyncio.sleep(0.01)
 
     assert adapter.active_agent_work_count() == 0
+    assert begin_gateway_restart_drain() == 0
+    cancel_gateway_restart_drain()
 
 
 @pytest.mark.asyncio
@@ -408,3 +434,66 @@ async def test_fire_without_runner_passes_none_adapters(adapter, monkeypatch):
 
     assert seen.get("job_id") == "no-runner"
     assert seen.get("adapters") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_kind", ["split", "legacy"])
+async def test_restart_gate_returns_retryable_without_acknowledging_dropped_fire(
+    adapter, monkeypatch, provider_kind
+):
+    from cron.scheduler import begin_gateway_restart_drain, cancel_gateway_restart_drain
+    from cron.scheduler_provider import CronScheduler
+
+    calls = []
+
+    class SplitProvider(CronScheduler):
+        @property
+        def name(self):
+            return "split"
+
+        def start(self, stop_event, **kwargs):
+            return None
+
+        def claim_fire(  # type: ignore[invalid-method-override]
+            self, job_id
+        ):
+            calls.append(("claim", job_id))
+            return {"id": job_id}
+
+    class LegacyProvider(CronScheduler):
+        @property
+        def name(self):
+            return "legacy"
+
+        def start(self, stop_event, **kwargs):
+            return None
+
+        def fire_due(  # type: ignore[invalid-method-override]
+            self, job_id, *, adapters=None, loop=None
+        ):
+            calls.append(("fire", job_id))
+            return True
+
+    provider = SplitProvider() if provider_kind == "split" else LegacyProvider()
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler", lambda: provider
+    )
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
+    )
+
+    cancel_gateway_restart_drain()
+    try:
+        assert begin_gateway_restart_drain() == 0
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/api/cron/fire",
+                headers={"Authorization": "Bearer good"},
+                json={"job_id": f"blocked-{provider_kind}"},
+            )
+        assert response.status == 503
+        assert calls == []
+    finally:
+        cancel_gateway_restart_drain()

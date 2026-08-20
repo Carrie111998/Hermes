@@ -174,7 +174,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
         return "OpenAI"
 
     def is_available(self) -> bool:
-        if not get_secret("OPENAI_API_KEY"):
+        if not get_secret("OPENAI_IMAGE_API_KEY"):
             return False
         try:
             import openai  # noqa: F401
@@ -204,8 +204,8 @@ class OpenAIImageGenProvider(ImageGenProvider):
             "tag": "gpt-image-2 at low/medium/high quality tiers — text-to-image & image editing",
             "env_vars": [
                 {
-                    "key": "OPENAI_API_KEY",
-                    "prompt": "OpenAI API key",
+                    "key": "OPENAI_IMAGE_API_KEY",
+                    "prompt": "OpenAI image API key",
                     "url": "https://platform.openai.com/api-keys",
                 },
             ],
@@ -236,11 +236,11 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        api_key = get_secret("OPENAI_API_KEY")
+        api_key = get_secret("OPENAI_IMAGE_API_KEY")
         if not api_key:
             return error_response(
                 error=(
-                    "OPENAI_API_KEY not set. Run `hermes tools` → Image "
+                    "OPENAI_IMAGE_API_KEY not set. Run `hermes tools` → Image "
                     "Generation → OpenAI to configure, or `hermes setup` "
                     "to add the key."
                 ),
@@ -272,7 +272,57 @@ class OpenAIImageGenProvider(ImageGenProvider):
         is_edit = bool(sources)
         modality = "image" if is_edit else "text"
 
-        client = openai.OpenAI(api_key=api_key)
+        from tools.openai_media_spend import (
+            SpendPolicyError,
+            cancel_reservation,
+            gate as spend_gate,
+            image_cost,
+            image_preflight_usd,
+            record as spend_record,
+        )
+
+        try:
+            spend_reservation = spend_gate(
+                "image_generation",
+                API_MODEL,
+                image_preflight_usd(meta["quality"], size, len(sources)),
+                {
+                    "quality": meta["quality"],
+                    "size": size,
+                    "source_count": len(sources),
+                },
+            )
+        except SpendPolicyError as exc:
+            return error_response(
+                error=f"OpenAI spend policy blocked image generation: {exc}",
+                error_type="spend_policy",
+                provider="openai",
+                model=tier_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
+
+        def _cancel_pre_call_reservation(reason: str) -> None:
+            try:
+                cancel_reservation(spend_reservation["reservation_id"], reason)
+            except SpendPolicyError as exc:
+                logger.critical(
+                    "Could not release unused OpenAI image spend reservation: %s",
+                    exc,
+                )
+
+        try:
+            client = openai.OpenAI(api_key=api_key)
+        except Exception as exc:
+            _cancel_pre_call_reservation("client_initialization_failed")
+            return error_response(
+                error=f"OpenAI image client initialization failed: {exc}",
+                error_type="client_error",
+                provider="openai",
+                model=tier_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
 
         if is_edit:
             # images.edit() expects file-like objects. Download/read each
@@ -287,6 +337,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
                     bio.name = fname
                     files.append(bio)
             except Exception as exc:
+                _cancel_pre_call_reservation("source_image_load_failed")
                 return error_response(
                     error=f"Could not load source image for editing: {exc}",
                     error_type="io_error",
@@ -338,6 +389,48 @@ class OpenAIImageGenProvider(ImageGenProvider):
                     prompt=prompt,
                     aspect_ratio=aspect,
                 )
+
+        cost_usd = float(spend_reservation["estimated_call_usd"])
+        usage = {"input_tokens": 0, "cached_tokens": 0, "output_tokens": 0}
+        is_cost_estimated = True
+        usage_details: Dict[str, Any] = {"usage_source": "preflight_reservation"}
+        try:
+            cost_usd, usage, is_cost_estimated, usage_details = image_cost(
+                response,
+                meta["quality"],
+                size,
+                len(sources),
+                prompt,
+            )
+            spend_record(
+                "image_generation",
+                API_MODEL,
+                cost_usd,
+                input_tokens=usage["input_tokens"],
+                cached_tokens=usage["cached_tokens"],
+                output_tokens=usage["output_tokens"],
+                estimated=is_cost_estimated,
+                reservation_id=spend_reservation["reservation_id"],
+                metadata={
+                    "tier": tier_id,
+                    "quality": meta["quality"],
+                    "size": size,
+                    "source_count": len(sources),
+                    "modality": modality,
+                    "usage_source": (
+                        "fallback_estimate" if is_cost_estimated else "openai_response"
+                    ),
+                    "usage_details": usage_details,
+                },
+            )
+        except Exception as exc:
+            # The pre-call reservation remains in the ledger, so returning the
+            # already-paid image is safer than surfacing a retryable failure and
+            # potentially charging the user twice.
+            logger.critical(
+                "OpenAI image generated but spend reservation reconciliation failed: %s",
+                exc,
+            )
 
         data = getattr(response, "data", None) or []
         if not data:
@@ -394,7 +487,12 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        extra: Dict[str, Any] = {"size": size, "quality": meta["quality"]}
+        extra: Dict[str, Any] = {
+            "size": size,
+            "quality": meta["quality"],
+            "cost_usd": cost_usd,
+            "cost_estimated": is_cost_estimated,
+        }
         if revised_prompt:
             extra["revised_prompt"] = revised_prompt
 

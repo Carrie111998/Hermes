@@ -1628,6 +1628,34 @@ class GatewaySlashCommandsMixin:
                 return t("gateway.draining", count=count)
             return EphemeralReply(t("gateway.restart.in_progress"))
 
+        # Local operator policy: an in-chat restart must never interrupt cron
+        # work. The scheduler operation is atomic: when it returns zero it has
+        # also blocked every new ticker/manual cron registration until restart.
+        # Any import/state failure is fail-closed rather than interpreted as
+        # "zero active jobs".
+        try:
+            begin_cron_restart_drain = getattr(
+                self, "_begin_cron_restart_drain", None
+            )
+            if not callable(begin_cron_restart_drain):
+                raise RuntimeError("cron restart drain gate is unavailable")
+            active_cron_jobs = begin_cron_restart_drain()
+        except Exception as exc:
+            logger.error("Could not establish cron restart drain gate: %s", exc)
+            return (
+                "⛔ Restart odbijen: stanje cron izvršavanja nije moguće sigurno "
+                "provjeriti."
+            )
+        if active_cron_jobs:
+            return (
+                f"⛔ Restart odbijen: aktivna cron izvršavanja: {active_cron_jobs}. "
+                "Pričekaj završetak pa pokušaj ponovno."
+            )
+
+        # Close the local TOCTOU window while marker files are written. The
+        # scheduler's independent dispatch block above protects cron work.
+        self._draining = True
+
         # Save the requester's routing info so the new gateway process can
         # notify them once it comes back online.
         try:
@@ -1701,12 +1729,21 @@ class GatewaySlashCommandsMixin:
             is_gateway_supervisor_process,
         )
 
-        _under_service = is_gateway_supervisor_process()
-        _in_container = is_container_restart_context()
-        if _under_service or _in_container:
-            self.request_restart(detached=False, via_service=True)
-        else:
-            self.request_restart(detached=True, via_service=False)
+        try:
+            _under_service = is_gateway_supervisor_process()
+            _in_container = is_container_restart_context()
+            if _under_service or _in_container:
+                restart_started = self.request_restart(detached=False, via_service=True)
+            else:
+                restart_started = self.request_restart(detached=True, via_service=False)
+        except Exception:
+            self._draining = False
+            self._cancel_cron_restart_drain()
+            raise
+        if not restart_started:
+            self._draining = False
+            self._cancel_cron_restart_drain()
+            return EphemeralReply(t("gateway.restart.in_progress"))
         if active_agents:
             return t("gateway.draining", count=active_agents)
         return EphemeralReply(t("gateway.restart.restarting"))

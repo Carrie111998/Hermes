@@ -161,6 +161,9 @@ class TestTranscribeOpenAI:
 
     def test_unset_language_omits_argument(self, monkeypatch, tmp_path):
         monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test")
+        monkeypatch.setenv("OPENAI_API_ALLOWED_OPERATIONS", "transcription")
+        monkeypatch.setenv("HERMES_API_SPEND_CALLER", "pytest")
+        monkeypatch.setenv("API_SPEND_LEDGER", str(tmp_path / "spend.sqlite"))
         audio_file = tmp_path / "test.ogg"
         audio_file.write_bytes(b"fake audio")
 
@@ -171,6 +174,7 @@ class TestTranscribeOpenAI:
              patch("tools.transcription_tools._load_stt_config", return_value={
                  "openai": {"language": ""},
              }), \
+             patch("tools.openai_media_spend.audio_duration_seconds", return_value=1.0), \
              patch("openai.OpenAI", return_value=mock_client):
             from tools.transcription_tools import _transcribe_openai
             result = _transcribe_openai(str(audio_file), "whisper-1")
