@@ -343,7 +343,9 @@ _TOOL_STUBS = {
     "read_file": (
         "read_file",
         "path: str, offset: int = 1, limit: int = 2000",
-        '"""Read a file (1-indexed lines). Returns dict with "content" and "total_lines"."""',
+        '"""Read a file (1-indexed lines). Returns dict with "content" and "total_lines". '
+        'Always returns the content, however many times you read the same range: the '
+        'model-facing read deduplication does not apply to these calls."""',
         '{"path": path, "offset": offset, "limit": limit}',
     ),
     "write_file": (
@@ -2082,7 +2084,10 @@ _TOOL_DOC_LINES = [
      "    No LLM summarization. Pages over char_limit (default 15000) are head+tail truncated; full text stored on disk (path in the content footer)."),
     ("read_file",
      "  read_file(path: str, offset: int = 1, limit: int = 2000) -> dict\n"
-     "    Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}"),
+     "    Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}\n"
+     "    Repeated reads of the same range always return the content: the read\n"
+     "    deduplication that stubs your own repeated read_file calls does not\n"
+     "    apply to reads made from inside execute_code."),
     ("write_file",
      "  write_file(path: str, content: str) -> dict\n"
      "    Always overwrites the entire file."),

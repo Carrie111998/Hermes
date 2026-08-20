@@ -718,7 +718,7 @@ file_read_max_chars: 200000
 file_read_max_chars: 30000
 ```
 
-The agent also deduplicates file reads automatically — if the same file region is read twice and the file hasn't changed, a lightweight stub is returned instead of re-sending the content. This resets on context compression so the agent can re-read files after their content is summarized away.
+The agent also deduplicates file reads automatically — if the same file region is read twice and the file hasn't changed, a lightweight stub is returned instead of re-sending the content. This resets on context compression so the agent can re-read files after their content is summarized away. It applies to the agent's own `read_file` calls only — `hermes_tools.read_file()` inside `execute_code` always returns the content, because a sandbox script has no conversation to refer back to.
 
 ## Tool Output Truncation Limits
 
