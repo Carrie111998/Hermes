@@ -529,7 +529,7 @@
       assertPrimaryProfile(profile)
       const tunnel = await ensureNativeTunnel()
       const conn = requireConnection()
-      return buildWsUrl((tunnel && tunnel.url) || conn.url, conn.token)
+      return buildWsUrl((tunnel && tunnel.url) || conn.url, (tunnel && tunnel.token) || conn.token)
     },
     // { ok, rebuilt } per global.d.ts:23. Nothing to "rebuild" for a stateless
     // remote; ok reflects whether a usable stored config is present.

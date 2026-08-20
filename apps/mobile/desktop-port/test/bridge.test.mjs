@@ -13,9 +13,10 @@ import vm from 'node:vm'
 const here = dirname(fileURLToPath(import.meta.url))
 const SHIM_SRC = readFileSync(resolve(here, '../shim/hermes-web-shim.js'), 'utf8')
 
-function loadBridge({ config = null, fetchImpl } = {}) {
+function loadBridge({ config = null, sshConfig = null, fetchImpl, tunnelStatus = null } = {}) {
   const store = new Map()
   if (config) store.set('hermes.remoteGateway', JSON.stringify(config))
+  if (sshConfig) store.set('hermes.iosSsh', JSON.stringify(sshConfig))
 
   const localStorage = {
     getItem: (k) => (store.has(k) ? store.get(k) : null),
@@ -41,6 +42,17 @@ function loadBridge({ config = null, fetchImpl } = {}) {
     },
     matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
     navigator: { userAgent: 'test' },
+  }
+  if (tunnelStatus) {
+    win.Capacitor = {
+      Plugins: {
+        SshTunnel: {
+          status: async () => tunnelStatus,
+          start: async () => tunnelStatus,
+          stop: async () => {}
+        }
+      }
+    }
   }
   win.window = win
 
@@ -163,4 +175,13 @@ test('getGatewayWsUrl and touchBackend reject a foreign profile', async () => {
   await assert.rejects(() => d.getGatewayWsUrl('work'), /single remote gateway/i)
   await assert.rejects(() => d.touchBackend('work'), /single remote gateway/i)
   assert.equal((await d.touchBackend()).ok, true)
+})
+
+test('getGatewayWsUrl prefers the active native tunnel token', async () => {
+  const d = loadBridge({
+    config: { url: 'http://127.0.0.1:39119', token: 'stale-token' },
+    sshConfig: { host: 'pi.local', username: 'guido', hostKey: 'ssh-ed25519 AAAA', port: 22 },
+    tunnelStatus: { running: true, url: 'http://127.0.0.1:48211', token: 'active-token', localPort: 48211 }
+  })
+  assert.equal((await d.getGatewayWsUrl()), 'ws://127.0.0.1:48211/api/ws?token=active-token')
 })
