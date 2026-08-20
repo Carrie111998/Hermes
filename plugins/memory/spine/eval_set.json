@@ -1,6 +1,6 @@
 {
   "_about": "Spine retrieval gate. Two sections. SINGLE-HOP cases pass when any expect_any phrase appears in top-k. MULTI-HOP cases pass only when EVERY expect_all phrase appears AND they arrive from at least min_sources distinct documents -- without that second constraint one large memory containing all the phrases would fake a multi-hop pass. Sections are scored separately: averaging them hides which capability moved. No spine change ships without a before/after run.",
-  "k": 6,
+  "k": 20,
   "cases": [
     {
       "id": "sg-lwix-weighting",

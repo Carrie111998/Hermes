@@ -296,7 +296,7 @@ def handle_recall(args: Dict[str, Any], config: SpineConfig) -> str:
     # agent:claude-code was that one recall should reach both stores. Writes
     # and consolidation stay pinned to a single profile.
     profile = args.get("profile", "*")
-    k = min(args.get("k", 6), 25)
+    k = min(args.get("k", 20), 25)
 
     idx = _get_index(config)
 
@@ -334,7 +334,7 @@ def handle_recall_at(args: Dict[str, Any], config: SpineConfig) -> str:
     query = args["query"]
     as_of = args["as_of"]
     profile = args.get("profile", "agent:main")
-    k = min(args.get("k", 6), 25)
+    k = min(args.get("k", 20), 25)
 
     obs_dir = _os.path.join(_os.path.expanduser(config.canonical_root), "observations")
     results = recall_as_of(obs_dir, query, as_of, profile_filter=profile, k=k)

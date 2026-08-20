@@ -128,6 +128,13 @@ MAX_BYTES_PER_VEC = EMBEDDING_DIM * 4  # 4 bytes per float32
 # search — 90 of 158 rows at the time this was fixed. 'demoted' is the state
 # an observation lands in when it gets pushed back out of MEMORY.md for space;
 # it must stay searchable too, or demotion becomes deletion.
+# Recall window. Measured 2026-08-20: at k=6 the correct memory for a
+# multi-part question was regularly retrieved and ranked, then discarded just
+# below the cutoff -- 7/12 multi-hop cases passed. k=20 passes 9/12 at the same
+# latency (17.6ms vs 17.9ms), because the candidate pool was already being
+# fetched and scored; only the final slice was throwing the results away.
+DEFAULT_K = 20
+
 SEARCHABLE_STATUSES = ("active", "promoted", "demoted")
 _STATUS_PLACEHOLDERS = ",".join("?" * len(SEARCHABLE_STATUSES))
 
@@ -497,7 +504,7 @@ class MemoryIndex:
         return merged
 
     def search_hybrid(
-        self, query: str, query_embedding: Optional[List[float]], profile: str = "agent:main", k: int = 6
+        self, query: str, query_embedding: Optional[List[float]], profile: str = "agent:main", k: int = DEFAULT_K
     ) -> List[Dict[str, Any]]:
         """Hybrid FTS5 + vector search with Reciprocal Rank Fusion and recency weighting.
 
