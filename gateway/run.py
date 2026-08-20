@@ -5975,7 +5975,20 @@ class TurnRunner:
         # path, not baked into the stream.
         if _stream_consumer is not None:
             _final_for_stream = None
-            if isinstance(result, dict) and not result.get("failed"):
+            # Adopt ONLY a genuinely completed final (review B6): interrupt
+            # paths return {interrupted: True, completed: False} with a
+            # DIAGNOSTIC final_response ("Operation interrupted during …")
+            # and no failed key — adopting that would seal the user's
+            # streamed partial answer over with the diagnostic AND make
+            # delivered_final_matches reconcile, suppressing the gateway's
+            # own error-delivery path. Writers of these shapes:
+            # agent/conversation_loop.py interrupt/retry-abort returns.
+            if (
+                isinstance(result, dict)
+                and not result.get("failed")
+                and not result.get("interrupted")
+                and result.get("completed") is not False
+            ):
                 _fr = result.get("final_response")
                 if isinstance(_fr, str) and _fr.strip() and _fr != "(empty)":
                     _final_for_stream = _fr
