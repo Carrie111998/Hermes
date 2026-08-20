@@ -55,6 +55,7 @@ def _register_named(sid: str, name: str | None, owner: SimpleNamespace,
             "agent": ag,
             "owner_agent_session_id": owner.session_id,
             "name": name,
+            "accepting_steer": accept,
         }
     )
     return ag
@@ -172,7 +173,11 @@ class TestControlActionNameResolution:
     def test_stop_by_name_unknown(self):
         owner = _owner_parent()
         out = _call_control("stop", name="ghost")
-        assert "No live subagent named 'ghost'" in out
+        # A totally unknown name fails at the no-subagent_id gate before any
+        # ownership/name-resolution check, so the actionable message is the
+        # generic "requires subagent_id or a name" one.
+        assert "requires subagent_id" in out
+        assert "matching an owned child" in out
 
     def test_list_includes_name_field(self):
         owner = _owner_parent()
