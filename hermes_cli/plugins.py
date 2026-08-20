@@ -3701,8 +3701,8 @@ class PluginManager:
         self._dispose_registrations(registrations)
         self._forget_registrations(registrations)
 
+        stale_events = []
         if not unload_all and hook_names:
-            stale_events = []
             with self._hook_timeout_lock:
                 live_callback_keys = {
                     (hook_name, id(callback))
@@ -3775,6 +3775,7 @@ class PluginManager:
             self._hooks.clear()
             with self._hook_timeout_lock:
                 self._hook_timeout_suppressed_until.clear()
+                stale_events.extend(self._hook_running_callbacks.values())
                 self._hook_running_callbacks.clear()
             self._middleware.clear()
             self._plugin_tool_names.clear()
@@ -3794,6 +3795,9 @@ class PluginManager:
         else:
             for key in target_keys:
                 self._plugins.pop(key, None)
+
+        for event in stale_events:
+            event.set()
 
         return found
 
@@ -5264,6 +5268,17 @@ class PluginManager:
                 running_event=running_event,
             ) -> Any:
                 try:
+                    with self._hook_timeout_lock:
+                        callback_live = any(
+                            registered is callback
+                            for registered in self._hooks.get(hook_name, [])
+                        )
+                        state_is_current = (
+                            callback_live
+                            and self._hook_running_callbacks.get(callback_key) is running_event
+                        )
+                    if not state_is_current:
+                        return None
                     return context.run(self._invoke_hook_callback, callback, kwargs)
                 finally:
                     with self._hook_timeout_lock:

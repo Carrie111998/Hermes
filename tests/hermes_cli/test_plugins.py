@@ -1145,12 +1145,14 @@ class TestPluginHooks:
         mgr = PluginManager()
         callback_key = ("pre_tool_call", 1)
         mgr._hook_timeout_suppressed_until[callback_key] = time.monotonic() + 60
-        mgr._hook_running_callbacks[callback_key] = threading.Event()
+        event = threading.Event()
+        mgr._hook_running_callbacks[callback_key] = event
 
         mgr.unload()
 
         assert mgr._hook_timeout_suppressed_until == {}
         assert mgr._hook_running_callbacks == {}
+        assert event.is_set()
 
     def test_scoped_unload_clears_removed_hook_timeout_state(self):
         mgr = PluginManager()
