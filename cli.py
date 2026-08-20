@@ -1803,7 +1803,7 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True,
 
     repo_root = repo_root or _git_repo_root()
     if not repo_root:
-        print("\033[31m✗ --worktree requires being inside a git repository.\033[0m")
+        _cprint("\033[31m✗ --worktree requires being inside a git repository.\033[0m")
         print("  cd into your project repo first, then run hermes -w")
         return None
 
@@ -1822,7 +1822,7 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True,
 
     wt_path = worktrees_dir / wt_name
     if name and wt_path.exists():
-        print(f"\033[31m✗ Worktree already exists: {wt_path}\033[0m")
+        _cprint(f"\033[31m✗ Worktree already exists: {wt_path}\033[0m")
         print("  Pick a different name, or remove it with: "
               f"git worktree remove {wt_path}")
         return None
@@ -1866,9 +1866,14 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True,
         "-c", "checkout.thresholdForParallelism=100",
     ]
     try:
+        # 120s, not 30: on a multi-agent box the ~10k-file materialization
+        # contends with sibling sessions' checkouts/fetches/Electron dev
+        # builds for the same disk — measured 113s wall at near-zero CPU
+        # under load vs 1.2s idle (Aug 2026). A too-tight timeout kills a
+        # legitimately slow create and wastes the work already done.
         result = subprocess.run(
             ["git", *_wt_add_cfg, "worktree", "add", str(wt_path), "-b", branch_name, base_ref],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, cwd=repo_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, cwd=repo_root,
         )
         if result.returncode != 0:
             # If branching from the resolved remote ref failed for any reason
@@ -1883,11 +1888,11 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True,
                 base_ref, base_label = "HEAD", "HEAD (fallback — remote base failed)"
                 result = subprocess.run(
                     ["git", "worktree", "add", str(wt_path), "-b", branch_name, base_ref],
-                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, cwd=repo_root,
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, cwd=repo_root,
                 )
             if result.returncode != 0:
                 _cleanup_failed_worktree_add(repo_root, wt_path, branch_name)
-                print(f"\033[31m✗ Failed to create worktree: {result.stderr.strip()}\033[0m")
+                _cprint(f"\033[31m✗ Failed to create worktree: {result.stderr.strip()}\033[0m")
                 return None
     except Exception as e:
         # A timed-out/failed `worktree add` is NOT atomic: git leaves the
@@ -1898,7 +1903,7 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True,
         # the error (Aug 2026 incident: 30s timeout during pack-sprawl left
         # exactly this poison).
         _cleanup_failed_worktree_add(repo_root, wt_path, branch_name)
-        print(f"\033[31m✗ Failed to create worktree: {e}\033[0m")
+        _cprint(f"\033[31m✗ Failed to create worktree: {e}\033[0m")
         return None
 
     # Copy files listed in .worktreeinclude (gitignored files the agent needs)
@@ -1993,7 +1998,7 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True,
         "base": base_ref,
     }
 
-    print(f"\033[32m✓ Worktree created:\033[0m {wt_path}")
+    _cprint(f"\033[32m✓ Worktree created:\033[0m {wt_path}")
     print(f"  Branch: {branch_name}")
     print(f"  Base:   {base_label}")
 
@@ -2292,6 +2297,69 @@ def _worktree_commits_all_merged_upstream(
         return False
 
 
+def _worktree_branch_pr_merged(
+    worktree_path: str,
+    timeout: int = 15,
+    cache: Optional[Dict[str, bool]] = None,
+) -> bool:
+    """Return whether the worktree branch's PR is MERGED on GitHub.
+
+    Escape hatch for the case ``git cherry`` cannot catch: a rebase-merge that
+    altered the diff (conflict resolution against a moved base, follow-up
+    commits added during salvage/CI-fix) changes the patch-id, so the local
+    commits are no longer patch-equivalent to anything upstream even though
+    the PR merged. Those trees survive the cherry check forever (Aug 2026:
+    12 of 22 "unpushed" trees on a loaded box had MERGED PRs).
+
+    GitHub's PR state is the authoritative merge signal, so a clean tree
+    whose branch has a MERGED PR is reaped. Verdicts are memoized keyed on
+    ``(branch, head_sha)`` — MERGED is monotonic, so a True verdict is cached
+    permanently; False is never cached (the PR may merge later without new
+    local commits, which would leave the key unchanged).
+
+    Fails SAFE toward False (preserve): no gh binary, offline, rate-limited,
+    detached HEAD, or any parse failure keeps the tree.
+    """
+    import subprocess
+
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=worktree_path,
+        )
+        if head.returncode != 0:
+            return False
+        branch = head.stdout.strip()
+        if not branch or branch == "HEAD":  # detached — no PR to look up
+            return False
+
+        cache_key = None
+        if cache is not None:
+            sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=worktree_path,
+            )
+            if sha.returncode == 0 and sha.stdout.strip():
+                cache_key = f"pr-merged:{branch}:{sha.stdout.strip()}"
+                if cache.get(cache_key) is True:
+                    return True
+
+        result = subprocess.run(
+            ["gh", "pr", "list", "--head", branch, "--state", "merged",
+             "--json", "number", "--limit", "1"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=worktree_path,
+        )
+        if result.returncode != 0:
+            return False
+        prs = json.loads(result.stdout or "[]")
+        merged = isinstance(prs, list) and len(prs) > 0
+        if merged and cache is not None and cache_key is not None:
+            cache[cache_key] = True
+        return merged
+    except Exception:
+        return False
+
+
 def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10):
     """Classify a worktree's git lock as live, dead, or absent.
 
@@ -2385,10 +2453,10 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
             # origin/*, so already-public commits look "unpushed". Be honest
             # about why we're keeping it — the startup pruner deepens the
             # clone in the background and will reap it on a later startup.
-            print(f"\n\033[33m⚠ Shallow clone — cannot verify push state, keeping: {wt_path}\033[0m")
+            _cprint(f"\n\033[33m⚠ Shallow clone — cannot verify push state, keeping: {wt_path}\033[0m")
             print("  The next `hermes -w` session deepens the clone and prunes merged worktrees automatically.")
         else:
-            print(f"\n\033[33m⚠ Worktree has unpushed commits, keeping: {wt_path}\033[0m")
+            _cprint(f"\n\033[33m⚠ Worktree has unpushed commits, keeping: {wt_path}\033[0m")
             print(f"  To clean up manually: git worktree remove --force {wt_path}")
         _active_worktree = None
         return
@@ -2423,7 +2491,7 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
         logger.debug("Failed to delete branch %s: %s", branch, e)
 
     _active_worktree = None
-    print(f"\033[32m✓ Worktree cleaned up: {wt_path}\033[0m")
+    _cprint(f"\033[32m✓ Worktree cleaned up: {wt_path}\033[0m")
 
 
 def _run_state_db_auto_maintenance(session_db) -> None:
@@ -2652,6 +2720,14 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
             merged = _worktree_commits_all_merged_upstream(
                 str(entry), timeout=30, cache=snapshot
             )
+            if not merged:
+                # Rebase-merge escape hatch: conflict resolution or follow-up
+                # commits change the patch-id, so cherry misses them — but
+                # GitHub knows the PR merged. Authoritative and cheap (~0.3s,
+                # memoized on (branch, head_sha) so it's paid once per tree).
+                merged = _worktree_branch_pr_merged(
+                    str(entry), timeout=15, cache=snapshot
+                )
             with cache_lock:
                 merge_cache.update(snapshot)
             if not merged:
@@ -2741,11 +2817,30 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
     if preserved_stale:
         logger.warning(
             "Preserving %d worktree(s) older than 7 days with unmerged work "
-            "(push or remove them to reclaim disk): %s",
+            "(run `hermes worktree prune` to review and reclaim): %s",
             len(preserved_stale), ", ".join(sorted(preserved_stale)),
         )
 
     _prune_orphaned_branches(repo_root)
+
+    # Escalation notice: the startup pass is deliberately conservative, so
+    # installs accumulate preserved trees it can never reclaim. Once the
+    # footprint is clearly a problem (many trees or multi-GB), say so once
+    # per launch and name the attended reclaim command — silence here is how
+    # boxes reach 15GB+ of .worktrees/ without anyone noticing.
+    try:
+        from hermes_cli.worktree_gc import worktrees_summary
+
+        count, size_mb = worktrees_summary(repo_root)
+        if count >= 10 or (size_mb or 0) >= 5120:
+            size_txt = f"{size_mb / 1024:.1f}GB" if size_mb else "unknown size"
+            logger.warning(
+                ".worktrees/ holds %d tree(s) (%s) — run `hermes worktree list` "
+                "to audit and `hermes worktree prune` to reclaim safely.",
+                count, size_txt,
+            )
+    except Exception:
+        pass
 
 
 def _prune_orphaned_branches(repo_root: str) -> None:
@@ -4094,10 +4189,34 @@ _TERMINAL_INPUT_MODE_RESET_SEQ = (
     "\x1b[0m"      # reset text attributes
     "\x1b[?25h"    # ensure cursor visible
 )
-_EXTENDED_ENTER_KEYS_SEQ = "\x1b[>1u\x1b[>4;2m"
+_KITTY_KEYBOARD_PUSH_SEQ = "\x1b[>1u"
+_MODIFY_OTHER_KEYS_SEQ = "\x1b[>4;2m"
+_EXTENDED_ENTER_KEYS_SEQ = _KITTY_KEYBOARD_PUSH_SEQ + _MODIFY_OTHER_KEYS_SEQ
 
 
 _BACKSLASH_LINE_CONTINUATION_RE = re.compile(r"\\[ \t]*$")
+
+
+def _is_ghostty_terminal(env: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether the terminal is Ghostty (either detection path).
+
+    Ghostty must be pushed ONLY modifyOtherKeys, not the Kitty keyboard
+    protocol: its Kitty disambiguate-mode implementation strips the Alt
+    modifier from the Backspace key, so Option+Backspace arrives as bare
+    \\x7f instead of the CSI-u form ``\\x1b[127;3u`` the protocol calls for
+    (upstream Ghostty bug), breaking backward-kill-word (#87630
+    regression).  Ghostty implements modifyOtherKeys correctly (it then
+    emits ``\\x1b[27;3;127~``, which the alias table also maps).
+
+    Matches exactly the two conditions that admit Ghostty through
+    ``_terminal_supports_extended_enter_keys``.
+    """
+    if env is None:
+        env = os.environ
+    return (
+        (env.get("TERM_PROGRAM") or "").strip() == "ghostty"
+        or (env.get("TERM") or "").strip().lower() == "xterm-ghostty"
+    )
 
 
 def _terminal_supports_extended_enter_keys(env: Optional[Mapping[str, str]] = None) -> bool:
@@ -4131,7 +4250,9 @@ def _enable_extended_enter_keys(output=None, env: Optional[Mapping[str, str]] = 
 
     Writes the Kitty keyboard protocol push (CSI >1u, disambiguate mode) AND
     xterm modifyOtherKeys level 2 (CSI >4;2m), mirroring the Ink TUI —
-    terminals honor whichever protocol they implement.  Both are needed:
+    terminals honor whichever protocol they implement (except Ghostty, which
+    gets only modifyOtherKeys; see the Ghostty exception below).  Both are
+    needed:
     kitty-the-terminal removed modifyOtherKeys support entirely (it only
     speaks its own protocol), while tmux/VS Code only accept modifyOtherKeys.
 
@@ -4148,20 +4269,25 @@ def _enable_extended_enter_keys(output=None, env: Optional[Mapping[str, str]] = 
     Ctrl+C, which is handled by prompt_toolkit's ``c-c`` binding (raw mode
     clears ISIG, so the kernel INTR path was never in play for the CLI).
 
+    Ghostty exception: pushes only modifyOtherKeys — see
+    ``_is_ghostty_terminal`` for the full rationale (#87630).
+
     The exit reset sequence pops/resets both modes, so this is safe across
     normal exits, Ctrl+C, and SIGTERM cleanup.
     """
     if not _terminal_supports_extended_enter_keys(env):
         return False
+    # Ghostty exception: only modifyOtherKeys — see _is_ghostty_terminal.
+    seq = _MODIFY_OTHER_KEYS_SEQ if _is_ghostty_terminal(env) else _EXTENDED_ENTER_KEYS_SEQ
     try:
         target = output
         if target is not None and hasattr(target, "write_raw"):
-            target.write_raw(_EXTENDED_ENTER_KEYS_SEQ)
+            target.write_raw(seq)
             target.flush()
             return True
         stream = sys.stdout
         if stream is not None and stream.isatty():
-            stream.write(_EXTENDED_ENTER_KEYS_SEQ)
+            stream.write(seq)
             stream.flush()
             return True
     except Exception:
@@ -4858,6 +4984,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         api_key: str = None,
         base_url: str = None,
         max_turns: int = None,
+        run_budget: float = None,
         verbose: Optional[bool] = None,
         compact: bool = False,
         resume: str = None,
@@ -5125,6 +5252,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self.max_turns = 500
         else:
             self.max_turns = 500
+
+        # Wall-clock run budget: CLI flag wins over config; both optional.
+        # None keeps the feature fully off (AIAgent stays dormant).
+        if run_budget is not None:
+            self.run_budget_seconds = run_budget
+        else:
+            self.run_budget_seconds = CLI_CONFIG["agent"].get("run_budget_seconds")
         
         # Parse and validate toolsets
         self.enabled_toolsets = toolsets
@@ -9204,6 +9338,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         print()
     
 
+    def _handle_whoami_command(self):
+        """Display slash-command access for the local CLI surface."""
+        import getpass
+
+        try:
+            user_name = getpass.getuser() or "?"
+        except Exception:
+            user_name = "?"
+
+        print()
+        print("  You:            cli (local terminal)")
+        print(f"  User:           {user_name}")
+        print("  Tier:           unrestricted")
+        print("  Slash commands: all available")
+        print()
+
     def show_config(self):
         """Display current configuration with kawaii ASCII art."""
         # Get terminal config from environment (which was set from cli-config.yaml)
@@ -9222,10 +9372,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # ``self.api_key`` may be a callable (Azure Foundry Entra ID bearer
         # provider). Never invoke it; just identify the auth surface.
         from agent.azure_identity_adapter import is_token_provider
-        if is_token_provider(self.api_key):
+
+        # Prefer the LIVE agent's credential when one exists: HermesCLI's
+        # constructor seeds self.api_key from OPENAI/OPENROUTER env vars
+        # before provider resolution runs, so on non-OpenAI providers (Nous,
+        # Anthropic, ...) the constructor value is a different vendor's key
+        # than the one actually authenticating requests. /config displaying
+        # an sk-proj-... OpenAI key next to a Nous base URL was the visible
+        # symptom (full-surface CLI QA sweep, Aug 2026).
+        display_key = self.api_key
+        agent = getattr(self, "agent", None)
+        if agent is not None and getattr(agent, "api_key", None):
+            display_key = agent.api_key
+        if is_token_provider(display_key):
             api_key_display = "Microsoft Entra ID"
-        elif isinstance(self.api_key, str) and len(self.api_key) > 12:
-            api_key_display = f"{self.api_key[:8]}...{self.api_key[-4:]}"
+        elif isinstance(display_key, str) and len(display_key) > 12:
+            api_key_display = f"{display_key[:8]}...{display_key[-4:]}"
         else:
             api_key_display = "Not set!"
         
@@ -10369,6 +10531,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "current_provider": current_provider,
             "user_provs": user_provs,
             "custom_provs": custom_provs,
+            "filter": "",
         }
         self._invalidate(min_interval=0.0)
 
@@ -10482,6 +10645,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
             except Exception as exc:
                 logger.warning("CLI one-turn model restore failed: %s", exc)
+
+    @staticmethod
+    def _filter_model_picker_entries(entries: list, query: str) -> list:
+        """Return (original_index, label) pairs for entries matching ``query``.
+
+        Subsequence ("fuzzy") match, case-insensitive: the query characters
+        must appear in order in the label. An empty query matches everything.
+        Crucially the returned pairs carry the ORIGINAL index into ``entries``,
+        so a selection in the filtered view still resolves to exactly one
+        concrete model — filtering only narrows the list, it never introduces
+        an ambiguous or fuzzy *resolution* (the anti-"claude→old-model" rule).
+        """
+        pairs = list(enumerate(entries))
+        q = (query or "").strip().lower()
+        if not q:
+            return pairs
+
+        def _subseq(needle: str, hay: str) -> bool:
+            it = iter(hay)
+            return all(ch in it for ch in needle)
+
+        out = [(i, e) for (i, e) in pairs if _subseq(q, str(e).lower())]
+        return out
 
     @staticmethod
     def _compute_model_picker_viewport(
@@ -10712,24 +10898,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             state["provider_data"] = provider_data
             state["model_list"] = model_list
             state["selected"] = 0
+            state["filter"] = ""
+            state["_filtered_pairs"] = None
             self._invalidate(min_interval=0.0)
             return
         if stage == "model":
             provider_data = state.get("provider_data") or {}
             model_list = state.get("model_list") or []
-            back_idx = len(model_list)
-            cancel_idx = len(model_list) + 1
+            # Map the selected row through the active fuzzy filter so the
+            # index lines up with what the picker is currently showing. The
+            # filtered pair carries the ORIGINAL index into model_list, so the
+            # resolved model is always one concrete, unambiguous entry.
+            filtered_pairs = state.get("_filtered_pairs")
+            if filtered_pairs is None:
+                filtered_pairs = list(enumerate(model_list))
+            visible_labels = [e for (_i, e) in filtered_pairs]
+            back_idx = len(visible_labels)
+            cancel_idx = len(visible_labels) + 1
             if selected == back_idx:
                 state["stage"] = "provider"
+                state["filter"] = ""
+                state["_filtered_pairs"] = None
                 state["selected"] = next((i for i, p in enumerate(state.get("providers") or []) if p.get("slug") == provider_data.get("slug")), 0)
                 self._invalidate(min_interval=0.0)
                 return
             if selected >= cancel_idx:
                 self._close_model_picker()
                 return
-            if selected < len(model_list):
+            if 0 <= selected < len(visible_labels):
                 from hermes_cli.model_switch import switch_model
-                chosen_model = model_list[selected]
+                chosen_model = visible_labels[selected]
                 result = switch_model(
                     raw_input=chosen_model,
                     current_provider=self.provider or "",
@@ -11373,6 +11571,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return False
         elif canonical == "help":
             self.show_help()
+        elif canonical == "whoami":
+            self._handle_whoami_command()
         elif canonical == "profile":
             self._handle_profile_command()
         elif canonical == "tools":
@@ -11474,8 +11674,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             from hermes_state import SessionDB
                             new_title = SessionDB.sanitize_title(raw_title)
                         except ValueError as e:
+                            # sanitize_title rejected the input (e.g. too long).
+                            # Print that one reason and stop — don't fall
+                            # through to the "empty after cleanup" branch and
+                            # print a second, contradictory error (SC-05).
                             _cprint(f"  {e}")
-                            new_title = None
+                            return True
                         if not new_title:
                             _cprint("  Title is empty after cleanup. Please use printable characters.")
                         elif self._session_db.get_session(self.session_id):
@@ -11565,9 +11769,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _undo_n = int(_undo_parts[1])
                 except ValueError:
                     print(f"(._.) Invalid count {_undo_parts[1]!r} — use /undo or /undo N.")
-                    return
+                    return True  # bad arg — command handled, keep the REPL alive
                 if _undo_n < 1:
                     _undo_n = 1
+            # Nothing to undo → say so immediately; don't pop a destructive
+            # confirmation dialog for a guaranteed no-op (SC-06).
+            if not self.conversation_history:
+                print("(._.) No messages to undo.")
+                return True
             _undo_desc = (
                 "This removes the last user/assistant exchange from history."
                 if _undo_n == 1
@@ -12646,10 +12855,27 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """
         from hermes_cli.colors import Colors as _Colors
         from tools.approval import (
+            _YOLO_MODE_FROZEN,
             disable_session_yolo,
             enable_session_yolo,
             is_session_yolo_enabled,
         )
+
+        # Process-level YOLO (--yolo flag / HERMES_YOLO_MODE at startup) is
+        # frozen into tools.approval at import time and cannot be disabled by
+        # the session toggle. Before this guard, /yolo printed "YOLO mode OFF —
+        # dangerous commands will require approval" while every command kept
+        # auto-approving (the frozen flag short-circuits the approval gate
+        # ahead of the session check) — a false safety claim. Say the truth
+        # instead of toggling a bypass that has no effect.
+        if _YOLO_MODE_FROZEN:
+            _cprint(
+                f"  ⚡ YOLO is {_Colors.BOLD}{_Colors.RED}locked ON{_Colors.RESET}"
+                " for this process (started with --yolo / HERMES_YOLO_MODE)."
+                " /yolo cannot disable it — restart without the flag to"
+                " re-enable approvals."
+            )
+            return
 
         session_key = self.session_id or "default"
         # ``getattr`` guard: tests exercise this method unbound against a
@@ -12915,7 +13141,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         self.agent, "context_compressor", None
                     ),
                 )
-                if summary.get("aborted") or summary.get("fallback_used"):
+                if (
+                    summary.get("aborted")
+                    or summary.get("fallback_used")
+                    or summary.get("refused_would_grow")
+                ):
                     icon = "⚠️"
                 else:
                     icon = "🗜️" if summary["noop"] else "✅"
@@ -17801,13 +18031,57 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if state.get("stage") == "provider":
                 max_idx = len(state.get("providers") or [])
             else:
-                max_idx = len(state.get("model_list") or []) + 1
+                # +1 for "← Back" and Cancel over the filtered visible rows.
+                _fp = state.get("_filtered_pairs")
+                _visible = len(_fp) if _fp is not None else len(state.get("model_list") or [])
+                max_idx = _visible + 1
             state["selected"] = min(max_idx, state.get("selected", 0) + 1)
+            event.app.invalidate()
+
+        def _model_picker_typing_active() -> bool:
+            # Type-to-filter is only live on the model stage (concrete list).
+            st = self._model_picker_state
+            return bool(st) and st.get("stage") == "model"
+
+        def _make_model_filter_char_handler(ch: str):
+            def handler(event):
+                st = self._model_picker_state
+                if not st or st.get("stage") != "model":
+                    return
+                st["filter"] = (st.get("filter", "") or "") + ch
+                st["selected"] = 0
+                st["_scroll_offset"] = 0
+                event.app.invalidate()
+            return handler
+
+        # Printable ASCII (space through ~) narrows the model list as you type.
+        import string as _string
+        for _ch in _string.digits + _string.ascii_letters + "-_.:/ ":
+            kb.add(_ch, filter=Condition(_model_picker_typing_active))(
+                _make_model_filter_char_handler(_ch)
+            )
+
+        @kb.add('backspace', filter=Condition(_model_picker_typing_active))
+        def model_picker_filter_backspace(event):
+            st = self._model_picker_state
+            if not st:
+                return
+            cur = st.get("filter", "") or ""
+            st["filter"] = cur[:-1]
+            st["selected"] = 0
+            st["_scroll_offset"] = 0
             event.app.invalidate()
 
         @kb.add('escape', filter=Condition(lambda: bool(self._model_picker_state)), eager=True)
         def model_picker_escape(event):
-            """ESC closes the /model picker."""
+            """ESC clears an active filter first, else closes the picker."""
+            st = self._model_picker_state
+            if st and st.get("stage") == "model" and (st.get("filter") or ""):
+                st["filter"] = ""
+                st["selected"] = 0
+                st["_scroll_offset"] = 0
+                event.app.invalidate()
+                return
             self._close_model_picker()
             event.app.current_buffer.reset()
             event.app.invalidate()
@@ -19104,9 +19378,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 provider_data = state.get("provider_data") or {}
                 model_list = state.get("model_list") or []
                 title = f"⚙ Model Picker — {provider_data.get('name', provider_data.get('slug', 'Provider'))}"
-                choices = list(model_list) + ["← Back", "Cancel"]
-                if model_list:
-                    hint = f"Select a model ({len(model_list)} available)"
+                # Fuzzy filter: narrow the concrete model list by the typed
+                # query. Selection still resolves to a real entry (see the
+                # filtered_pairs index mapping in the selection handler), so
+                # this never introduces an ambiguous model resolution.
+                _query = state.get("filter", "") or ""
+                filtered_pairs = cli_ref._filter_model_picker_entries(model_list, _query)
+                state["_filtered_pairs"] = filtered_pairs
+                model_labels = [e for (_i, e) in filtered_pairs]
+                choices = list(model_labels) + ["← Back", "Cancel"]
+                if _query:
+                    hint = (
+                        f"Filter: {_query}▏  ({len(model_labels)}/{len(model_list)} match "
+                        "— type to narrow, Backspace to clear)"
+                    )
+                elif model_list:
+                    hint = f"Select a model ({len(model_list)} available) — type to filter"
                 else:
                     hint = "No models listed for this provider. Use Back or Cancel."
 
@@ -20174,6 +20461,7 @@ def main(
     api_key: str = None,
     base_url: str = None,
     max_turns: int = None,
+    run_budget: float = None,
     verbose: Optional[bool] = None,
     quiet: bool = False,
     compact: bool = False,
@@ -20370,6 +20658,7 @@ def main(
         api_key=api_key,
         base_url=base_url,
         max_turns=max_turns,
+        run_budget=run_budget,
         verbose=verbose,
         compact=compact,
         resume=resume,
