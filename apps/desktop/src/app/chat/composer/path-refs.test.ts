@@ -53,6 +53,18 @@ describe('pathifyRefs', () => {
     expect(pathifyRefs('cc @teknium1 on this')).toBe('cc @teknium1 on this')
   })
 
+  it('leaves extensionless npm-scoped package tokens alone', () => {
+    expect(pathifyRefs('install @openai/codex')).toBe('install @openai/codex')
+    expect(pathifyRefs('install @openai/codex@0.148.0')).toBe('install @openai/codex@0.148.0')
+    expect(pathifyRefs('min-release-age-exclude=@openai/codex')).toBe('min-release-age-exclude=@openai/codex')
+  })
+
+  it('leaves npm-scoped package tokens before prose punctuation alone', () => {
+    expect(pathifyRefs('install @openai/codex, then retry')).toBe('install @openai/codex, then retry')
+    expect(pathifyRefs('install (@openai/codex)')).toBe('install (@openai/codex)')
+    expect(pathifyRefs('install `@openai/codex`')).toBe('install `@openai/codex`')
+  })
+
   it('leaves simple refs alone', () => {
     expect(pathifyRefs('check @diff and @staged')).toBe('check @diff and @staged')
   })
@@ -93,6 +105,25 @@ describe('chipTypedPathOnSpace', () => {
 
     expect(chipTypedPathOnSpace(event)).toBe(false)
     expect(editor.querySelector('[data-ref-text]')).toBeNull()
+  })
+
+  it('leaves npm-scoped package forms as text', () => {
+    const examples = [
+      'install @openai/codex',
+      'install @openai/codex@0.148.0',
+      'min-release-age-exclude=@openai/codex',
+      'install @openai/codex,',
+      'install (@openai/codex)',
+      'install `@openai/codex`',
+    ]
+
+    for (const text of examples) {
+      const { editor, event } = spaceOn(text)
+
+      expect(chipTypedPathOnSpace(event), text).toBe(false)
+      expect(editor.querySelector('[data-ref-text]'), text).toBeNull()
+      editor.remove()
+    }
   })
 
   it('leaves an already-typed ref alone', () => {

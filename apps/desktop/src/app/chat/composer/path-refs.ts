@@ -22,12 +22,25 @@ import { textBeforeCaret } from './text-utils'
 const BARE_PATH_RE = /(?<![\w@/])@((?!(?:file|folder|url|image|tool|line|terminal|session|git):)[^\s@:]*\/[^\s@:]*)/g
 const TYPED_BARE_PATH_RE = new RegExp(`${BARE_PATH_RE.source}$`)
 
+// An extensionless `@scope/package` token is indistinguishable from a
+// two-segment relative path. Preserve the package-shaped token instead of
+// silently attaching it; file-like paths such as `@src/main.ts` still promote.
+// Explicit `@file:` remains available for an ambiguous extensionless path.
+const EXTENSIONLESS_SCOPED_PACKAGE_RE = /^[a-z0-9][a-z0-9._~-]*\/[a-z0-9][a-z0-9_~-]*$/
+const TRAILING_PROSE_RE = /[`'",.;!?)}\]]+$/
+
+function isExtensionlessScopedPackageToken(path: string) {
+  return EXTENSIONLESS_SCOPED_PACKAGE_RE.test(path.replace(TRAILING_PROSE_RE, ''))
+}
+
 /** Trailing `/` means a directory — that's how the gateway's completion emits
  *  folders, and what Tab-descending leaves behind. */
 export function barePathRef(path: string) {
   const trimmed = path.replace(/\/+$/, '')
 
-  return trimmed ? `@${path.endsWith('/') ? 'folder' : 'file'}:${quoteRefValue(trimmed)}` : null
+  return trimmed && (path.endsWith('/') || !isExtensionlessScopedPackageToken(trimmed))
+    ? `@${path.endsWith('/') ? 'folder' : 'file'}:${quoteRefValue(trimmed)}`
+    : null
 }
 
 /** Rewrite bare `@path` tokens as typed `@file:`/`@folder:` directives, leaving
