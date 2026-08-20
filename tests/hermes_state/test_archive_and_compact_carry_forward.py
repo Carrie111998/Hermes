@@ -162,29 +162,117 @@ class TestCarryForwardIsNotDuplicated:
         # oldest copy: summarized away (compacted=1). newest: superseded (0, 0).
         assert archived == [(0, 1), (0, 0)], archived
 
-    def test_tool_calls_inserted_through_append_match_the_carried_tail(self, db):
-        sid = _seed(db, n=1)
-        tool_calls = [{"id": "call-1", "type": "function"}]
+    def test_carried_forward_with_tool_calls_and_tool_call_id(self, db):
+        """Messages with tool calls and tool results match across compaction."""
+        sid = "s1"
+        db.create_session(sid, source="cli")
+        db.append_message(sid, "user", content="run tool")
+        tool_calls_list = [
+            {
+                "id": "call_123",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path": "test.txt"}'},
+            }
+        ]
         db.append_message(
             sid,
             "assistant",
-            content=None,
-            tool_calls=tool_calls,
-            tool_call_id="call-1",
+            content="calling tool",
+            tool_calls=tool_calls_list,
         )
-        tail = {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": tool_calls,
-            "tool_call_id": "call-1",
-        }
+        db.append_message(
+            sid,
+            "tool",
+            content="file contents here",
+            tool_call_id="call_123",
+            tool_name="read_file",
+        )
+        db.append_message(sid, "assistant", content="final answer with token-z")
 
-        db.archive_and_compact(sid, [{"role": "user", "content": "SUMMARY"}, tail])
+        # Compact keeping the tool interaction and answer
+        compacted = [
+            {"role": "user", "content": "SUMMARY"},
+            {
+                "role": "assistant",
+                "content": "calling tool",
+                "tool_calls": tool_calls_list,
+            },
+            {
+                "role": "tool",
+                "content": "file contents here",
+                "tool_call_id": "call_123",
+                "tool_name": "read_file",
+            },
+            {"role": "assistant", "content": "final answer with token-z"},
+        ]
+        db.archive_and_compact(sid, compacted)
 
-        with db._read_ctx() as conn:
-            rows = conn.execute(
-                "SELECT active, compacted FROM messages "
-                "WHERE session_id = ? AND tool_call_id = ? ORDER BY id",
-                (sid, "call-1"),
-            ).fetchall()
-        assert [(row[0], row[1]) for row in rows] == [(0, 0), (1, 0)]
+        visible = _recall_visible(db, sid)
+        assert len([c for c in visible if "calling tool" in str(c)]) == 1
+        assert len([c for c in visible if "file contents here" in str(c)]) == 1
+        assert len([c for c in visible if "token-z" in str(c)]) == 1
+        assert any("SUMMARY" in str(c) for c in visible)
+        assert any("run tool" in str(c) for c in visible)
+
+    def test_concurrent_tail_with_watermark_appears_once_in_recall(self, db):
+        """Concurrent appends after watermark are cloned; originals become (0, 0)."""
+        sid = _seed(db, n=3)
+        watermark = db.get_active_message_watermark(sid)
+        # Concurrent message arrives after watermark
+        db.append_message(sid, "user", content="concurrent-msg-watermark")
+
+        db.archive_and_compact(
+            sid,
+            [
+                {"role": "user", "content": "SUMMARY"},
+                {"role": "user", "content": "turn-2 unique-token-2"},
+            ],
+            watermark=watermark,
+        )
+
+        visible = _recall_visible(db, sid)
+        # Concurrent message was cloned to active=1, original should be (0,0) -> 1 hit total
+        hits = [c for c in visible if "concurrent-msg-watermark" in c]
+        assert len(hits) == 1, f"concurrent msg visible {len(hits)}x, expected 1"
+        assert len([c for c in visible if "unique-token-2" in c]) == 1
+
+        all_rows = _rows(db, sid)
+        concurrent_rows = [r for r in all_rows if "concurrent-msg-watermark" in r[0]]
+        assert len(concurrent_rows) == 2
+        # Original is (0, 0), clone is (1, 0)
+        assert sorted((a, cp) for _, a, cp in concurrent_rows) == [(0, 0), (1, 0)]
+
+    def test_multimodal_structured_content_matching(self, db):
+        """Multimodal list/dict content encoded via _encode_content matches suffix."""
+        sid = "s1"
+        db.create_session(sid, source="cli")
+        db.append_message(sid, "user", content="regular text")
+        structured_content = [
+            {"type": "text", "text": "look at this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,123"}},
+        ]
+        db.append_message(sid, "user", content=structured_content)
+        db.append_message(sid, "assistant", content="seen image")
+
+        compacted = [
+            {"role": "user", "content": "SUMMARY"},
+            {"role": "user", "content": structured_content},
+            {"role": "assistant", "content": "seen image"},
+        ]
+        db.archive_and_compact(sid, compacted)
+
+        live = db.get_messages(sid)
+        assert live[1]["content"] == structured_content
+        assert live[2]["content"] == "seen image"
+
+        # Verify on disk via include_inactive=True:
+        all_user_rows = [
+            m for m in db.get_messages(sid, include_inactive=True)
+            if m["role"] == "user" and m["content"] == structured_content
+        ]
+        assert len(all_user_rows) == 2
+        # 1 superseded (active=0, compacted=0), 1 live (active=1, compacted=0)
+        assert sorted((int(m["active"]), int(m["compacted"])) for m in all_user_rows) == [
+            (0, 0),
+            (1, 0),
+        ]

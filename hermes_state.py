@@ -29,6 +29,7 @@ import sqlite3
 import sys
 import threading
 import time
+import weakref
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -45,7 +46,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar, Union
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
@@ -1605,8 +1606,24 @@ PERSISTENCE_ERROR_CAUSES = (
     "compression",
     "compression_closed",
     "turn_lease",
+    "corrupt",
     "disk",
     "unknown",
+)
+
+
+# Markers that mean the database FILE itself is structurally damaged.  Kept
+# as plain substrings so sqlite3.DatabaseError, wrapped RPC strings, and
+# logged message text all match the same helper.  NOTE: "database disk image
+# is malformed" contains the word "disk", so this check MUST run before the
+# disk-full/readonly bucket in classify_persistence_error — otherwise real
+# B-tree corruption gets reported to the user as "free some disk space"
+# (the misdiagnosis documented on #77386).
+_DB_CORRUPTION_MARKERS = (
+    "malformed",              # "database disk image is malformed" (SQLITE_CORRUPT)
+    "file is not a database", # SQLITE_NOTADB (also connection-level poisoning)
+    "not a database",
+    "database corruption",
 )
 
 
@@ -1631,6 +1648,10 @@ def classify_persistence_error(exc_or_str) -> str:
     * ``"turn_lease"`` — a presented session-turn-lease holder no longer
       owns the conversation (expired, released, or reclaimed); fail-fast
       fencing, not a storage fault.
+    * ``"corrupt"`` — the database file itself is structurally damaged
+      (``database disk image is malformed`` / SQLITE_NOTADB).  Distinct from
+      ``"disk"``: freeing space cannot help, the user needs the repair path
+      (``hermes doctor`` / automatic schema surgery).
     * ``"disk"``    — disk full / read-only / permission-shaped failures
       (delegates the disk-full patterns to :func:`is_disk_full_error` so the
       two classifiers can never drift apart — e.g. ENOSPC).
@@ -1656,6 +1677,12 @@ def classify_persistence_error(exc_or_str) -> str:
         return "compression_closed"
     if "being compressed" in text or "compression lease" in text:
         return "compression"
+    # Structural corruption BEFORE the lock and disk buckets: "database disk
+    # image is malformed" contains "disk" (and some wrapped corruption
+    # strings mention "locked" recovery attempts), so later buckets would
+    # steal it and misdiagnose damage as space/contention.
+    if any(marker in text for marker in _DB_CORRUPTION_MARKERS):
+        return "corrupt"
     if (
         "locked" in text
         or "busy" in text
@@ -2235,7 +2262,7 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         conn.close()
 
 
-def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
+def repair_state_db_schema(db_path: Union[Path, str], *, backup: bool = True) -> Dict[str, Any]:
     """Repair a state.db whose ``sqlite_master`` schema is malformed or whose
     FTS indexes reject writes.
 
@@ -2846,7 +2873,7 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
 # ── Read-only health/stats probes (hermes doctor, dashboards) ──────────
 
 
-def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
+def collect_state_db_stats(db_path: Union[Path, str]) -> Dict[str, Any]:
     """Best-effort, strictly read-only stats snapshot of a state.db file.
 
     Opens the database with ``mode=ro`` (URI) and a short timeout so it can
@@ -2890,6 +2917,7 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
         "fts_rebuild_progress": None,
     }
 
+    db_path = Path(db_path)
     # WAL sidecar size needs no connection at all.
     try:
         wal_path = Path(str(db_path) + "-wal")
@@ -2987,7 +3015,7 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
     return stats
 
 
-def count_db_holders(db_path: Path) -> Optional[int]:
+def count_db_holders(db_path: Union[Path, str]) -> Optional[int]:
     """Best-effort count of processes holding ``db_path`` open (Linux only).
 
     Scans ``/proc/*/fd`` symlinks for the resolved database path. Returns
@@ -2999,6 +3027,7 @@ def count_db_holders(db_path: Path) -> Optional[int]:
     try:
         if not sys.platform.startswith("linux"):
             return None
+        db_path = Path(db_path)
         target = os.path.realpath(str(db_path))
         holders = 0
         for pid in os.listdir("/proc"):
@@ -3147,6 +3176,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _IMPORT_MAX_TOTAL_MESSAGES = 50_000
     _IMPORT_MAX_SESSION_BYTES = 5 * 1024 * 1024
     _IMPORT_MAX_TOTAL_BYTES = 25 * 1024 * 1024
+    # Demand-started accounting workers retire after an idle window so their
+    # bound targets do not keep abandoned SessionDB instances (and SQLite
+    # descriptors) alive forever. A later enqueue starts a fresh worker.
+    _TOKEN_WRITER_IDLE_SECONDS = 30.0
 
     @staticmethod
     def _store_system_prompt(conn, system_prompt: Optional[str]) -> Optional[str]:
@@ -3188,8 +3221,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception:
             logger.debug("Could not close a SessionDB connection", exc_info=True)
 
-    def __init__(self, db_path: Path = None, read_only: bool = False):
-        self.db_path = db_path or _default_db_path()
+    def __init__(self, db_path: Optional[Union[Path, str]] = None, read_only: bool = False):
+        self.db_path = Path(db_path) if db_path is not None else _default_db_path()
         # Fail hard (before any connection/pragma/mkdir) if a pytest-context
         # process resolved the developer's production state.db — see the
         # live-DB test-isolation guard block near _default_db_path().
@@ -3285,6 +3318,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._token_writer_thread: Optional[threading.Thread] = None
         self._token_writer_stop = False
         self._token_writer_busy = False
+        self._token_atexit_hook: Optional[Callable[[], None]] = None
         initialization_complete = False
         try:
             if read_only:
@@ -4315,6 +4349,43 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception as exc:
             logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
 
+    def __enter__(self) -> "SessionDB":
+        """Enter a scope that closes this handle on the way out.
+
+        Ownership of a SessionDB should be released explicitly.
+        Historically an instance with a started token writer pinned ITSELF
+        (bound-method writer target plus a strong ``atexit`` drain hook), so
+        ``__del__`` never ran for exactly the instances that leaked
+        descriptors (#88033).  The writer now retires after an idle window
+        and the atexit hook holds only a weak reference, so abandoned
+        handles are eventually collectible — but "eventually, after the
+        idle window and a GC cycle" is not a release policy.  Call sites
+        owning a handle are still expected to close it deterministically
+        (see the ownership comments in ``run_agent.py`` and
+        ``tui_gateway/methods_session.py``).
+
+        This makes the correct usage the easy one, so an owning scope can be
+        exception-safe by construction rather than by remembering a
+        ``try/finally``:
+
+            with SessionDB(path) as db:
+                db.append_message(...)
+
+        Purely additive: it changes nothing for callers that already call
+        ``close()`` directly, and ``close()`` stays idempotent, so a scope
+        that closes early still exits cleanly.
+        """
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        """Close the handle, then let any exception propagate.
+
+        Returns False (never suppressing), so ``with`` here only manages the
+        descriptor lifetime and never swallows a caller's error.
+        """
+        self.close()
+        return False
+
     def close(self):
         """Close the database connection.
 
@@ -4326,12 +4397,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         #45383). Read-only connections never request a checkpoint.
         """
         self._stop_token_writer()
-        # The atexit hook holds a strong reference to this instance (bound
-        # method); without unregistering, every closed SessionDB stays
-        # reachable until interpreter exit. Bound methods compare equal by
-        # (instance, function), so this removes exactly our registration;
-        # no-op when the writer never started.
-        atexit.unregister(self._drain_token_queue_at_exit)
+        hook, self._token_atexit_hook = self._token_atexit_hook, None
+        if hook is not None:
+            atexit.unregister(hook)
         # Drain the read-only connection pool.  Setting the closed flag
         # under the lock first means a reader still in flight closes its own
         # connection on release instead of re-populating a pool that has
@@ -4367,17 +4435,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def __del__(self) -> None:
         """Safety net: close the connection if the caller forgot.
 
-        ``atexit.register`` in ``__init__`` pins this instance alive until
-        interpreter exit, which prevents GC from collecting orphaned
-        ``SessionDB`` instances on exception paths.  When callers forget
-        ``.close()``, the sqlite FDs leak until the process exits (EMFILE).
-
-        A ``__del__`` finalizer is the last-resort guard: it fires when the
-        GC collects the object, which *can* happen once ``atexit`` is
-        unregistered (via ``close()``) **or** when the atexit-held
-        reference is the only remaining root and the interpreter is
-        shutting down.  During normal interpreter teardown the order of
-        module cleanup is undefined, so we guard every attribute access.
+        The async accounting worker retires when idle and its atexit hook
+        holds only a weak reference, so neither can pin an otherwise orphaned
+        instance. During interpreter teardown the order of module cleanup is
+        undefined, so every attribute access remains guarded.
 
         Delegates to ``close()`` so the read pool, token writer, and atexit
         hook are all cleaned up — not just the writer connection.
@@ -7195,7 +7256,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     )
                     self._token_writer_thread = thread
                     thread.start()
-                    atexit.register(self._drain_token_queue_at_exit)
+                    if self._token_atexit_hook is None:
+                        self_ref = weakref.ref(self)
+
+                        def _drain_at_exit() -> None:
+                            db = self_ref()
+                            if db is not None:
+                                db._drain_token_queue_at_exit()
+
+                        self._token_atexit_hook = _drain_at_exit
+                        atexit.register(_drain_at_exit)
                 self._token_queue_cond.notify_all()
         if writer_stopped:
             # Writer permanently stopped (close() ran; a stop-flagged but
@@ -7261,9 +7331,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def _token_writer_loop(self) -> None:
         while True:
             with self._token_queue_cond:
+                idle_deadline = time.monotonic() + self._TOKEN_WRITER_IDLE_SECONDS
                 while not self._token_queue and not self._token_writer_stop:
-                    self._token_queue_cond.wait()
+                    remaining = idle_deadline - time.monotonic()
+                    if remaining <= 0:
+                        # Publish retirement under the same lock used by
+                        # queue_token_counts() to decide whether to spawn. An
+                        # enqueue cannot strand a delta behind an exiting worker.
+                        self._token_writer_thread = None
+                        return
+                    self._token_queue_cond.wait(remaining)
                 if not self._token_queue:
+                    self._token_writer_thread = None
                     return  # stop requested and fully drained
                 # busy is set BEFORE the queue is cleared: the lock-free
                 # fast path in flush_token_counts() reads queue-then-busy,
@@ -7689,6 +7768,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         cache_write_tokens: int = 0,
         reasoning_tokens: int = 0,
         estimated_cost_usd: Optional[float] = None,
+        api_call_count: int = 1,
     ) -> None:
         """Record an auxiliary LLM call's usage against *session_id* (issue #23270).
 
@@ -7701,6 +7781,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         the gateway overwrites session counters with absolute main-loop totals,
         so folding aux tokens into the summary row would either be clobbered
         or double-counted. Insights/analytics read the union of both.
+
+        ``api_call_count`` defaults to 1 (one aux LLM call). Background-review
+        forks record an aggregate of N fork API calls in one write with
+        ``task='background_review'`` (issue #87250).
 
         Best-effort by contract: callers must never fail an aux call because
         accounting failed.
@@ -7729,7 +7813,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 actual_cost_usd=None,
                 cost_status=None,
                 cost_source=None,
-                api_call_count=1,
+                api_call_count=(
+                    1 if api_call_count is None else int(api_call_count)
+                ),
                 task=task,
             )
         self._execute_write(_do)
@@ -9709,7 +9795,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             reasoning_details_json = self._reasoning_json_text(reasoning_details)
             codex_items_json = self._reasoning_json_text(codex_reasoning_items)
             codex_message_items_json = self._reasoning_json_text(codex_message_items)
-
             # Accept either `platform_message_id` (new explicit name) or
             # `message_id` (yuanbao's existing convention on message dicts).
             platform_msg_id = (
@@ -9858,52 +9943,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cursor.fetchone() is not None
 
-    def _carry_forward_row_ids(
-        self, conn, session_id: str, compacted_messages: List[Dict[str, Any]]
-    ) -> List[int]:
-        """Row ids of active messages that *compacted_messages* keeps verbatim.
-
-        The compressor emits ``[summary] + [recent tail]`` where the tail is a
-        byte-identical copy of the newest active rows, so those rows are about
-        to be re-inserted rather than replaced.
-
-        Matched as a longest common suffix, not by content alone: an older turn
-        that happens to repeat the tail's text — a re-run command, a re-read
-        file — was genuinely summarized away and has to stay discoverable as
-        ``compacted = 1``. Anchoring to the suffix is what keeps the two cases
-        apart.
-
-        Keys mirror what :meth:`_insert_message_rows` will store, so the
-        comparison is against the encoded form actually on disk.
-        """
-        if not compacted_messages:
-            return []
-
-        active = list(
-            conn.execute(
-                "SELECT id, role, content, tool_call_id, tool_calls FROM messages"
-                " WHERE session_id = ? AND active = 1 ORDER BY id DESC LIMIT ?",
-                (session_id, len(compacted_messages)),
-            )
-        )
-        active.reverse()
-        if not active:
-            return []
-
-        carried: List[int] = []
-        i = len(active) - 1
-        j = len(compacted_messages) - 1
-        while i >= 0 and j >= 0:
-            row = active[i]
-            if (row[1], row[2], row[3], row[4]) != self._message_storage_key(
-                compacted_messages[j]
-            )[:4]:
-                break
-            carried.append(row[0])
-            i -= 1
-            j -= 1
-        return carried
-
     def get_active_message_watermark(self, session_id: str) -> int:
         """MAX(id) of the session's active rows — the compression watermark.
 
@@ -9921,6 +9960,63 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             ).fetchone()
         return int(row[0]) if row else 0
+
+    def _carry_forward_row_ids(
+        self,
+        conn,
+        session_id: str,
+        compacted_messages: List[Dict[str, Any]],
+        watermark: Optional[int] = None,
+    ) -> List[int]:
+        """Return row IDs of the contiguous active tail carried forward verbatim.
+
+        ``compacted_messages`` is typically ``[summary] + [verbatim recent
+        tail]``. Matches the live tail against the end of
+        ``compacted_messages`` as a longest common suffix. Anchoring to the
+        suffix is critical: an older turn that happens to repeat the tail's
+        text (a re-run command, an identical greeting) was genuinely
+        summarized away and must keep ``compacted = 1``.
+
+        Keys mirror what :meth:`_insert_message_rows` will store, so the
+        comparison is against the encoded form actually on disk.
+        """
+        if not compacted_messages:
+            return []
+
+        if watermark is not None:
+            active = list(
+                conn.execute(
+                    "SELECT id, role, content, tool_call_id, tool_calls FROM messages"
+                    " WHERE session_id = ? AND active = 1 AND id <= ? ORDER BY id DESC LIMIT ?",
+                    (session_id, int(watermark), len(compacted_messages)),
+                )
+            )
+        else:
+            active = list(
+                conn.execute(
+                    "SELECT id, role, content, tool_call_id, tool_calls FROM messages"
+                    " WHERE session_id = ? AND active = 1 ORDER BY id DESC LIMIT ?",
+                    (session_id, len(compacted_messages)),
+                )
+            )
+        active.reverse()
+        if not active:
+            return []
+
+        carried: List[int] = []
+        i = len(active) - 1
+        j = len(compacted_messages) - 1
+        while i >= 0 and j >= 0:
+            row = active[i]
+            if (row[1], row[2], row[3], row[4]) != self._message_storage_key(
+                compacted_messages[j]
+            )[:4]:
+                break
+            carried.append(row[0])
+            i -= 1
+            j -= 1
+
+        return carried
 
     def archive_and_compact(
         self,
@@ -10022,30 +10118,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         except (TypeError, ValueError):
                             pass
 
-            # Soft-archive the live turns: active=0 hides them from the live
-            # context load, compacted=1 marks them as "summarized away" (vs
-            # rewind/undo's active=0+compacted=0, which means "user took it
-            # back"). search_messages includes compacted=1 rows by default so
-            # the pre-compaction transcript stays discoverable; live-context
-            # loads (active=1 only) still exclude them.
-            #
-            # The recent tail is NOT summarized away — it is re-inserted below,
-            # verbatim, as fresh active rows. Stamping compacted=1 on its
-            # originals would publish a second copy of still-live content to
-            # recall (search_messages matches active=1 OR compacted=1) and label
-            # live turns "summarized away", once more per compaction. Those
-            # originals are superseded duplicates, so they take the rewind state
-            # instead: still on disk and reachable via include_inactive=True,
-            # hidden from recall. Only turns the summary actually replaced keep
-            # compacted=1.
-            carried = self._carry_forward_row_ids(conn, session_id, compacted_messages)
-            if carried:
-                placeholders = ",".join("?" * len(carried))
+            # Superseded originals (carried-forward tail + concurrent appends):
+            # The compacted payload carries the recent tail forward verbatim as
+            # fresh active rows, and concurrent rows arriving after watermark
+            # are cloned as fresh active rows below. Stamping compacted=1 on
+            # their originals would publish a second copy of still-live content
+            # to recall (search_messages matches active=1 OR compacted=1) and
+            # label live turns "summarized away", once more per compaction.
+            # Those originals are superseded duplicates, so they take the rewind
+            # state instead (active=0, compacted=0): still on disk and
+            # reachable via include_inactive=True, hidden from recall. Only
+            # turns the summary actually replaced keep compacted=1.
+            carried = self._carry_forward_row_ids(
+                conn, session_id, compacted_messages, watermark=watermark
+            )
+            superseded_ids = list(set(carried) | set(tail_ids))
+            if superseded_ids:
+                placeholders = ",".join("?" * len(superseded_ids))
                 conn.execute(
                     "UPDATE messages SET active = 0, compacted = 0 "
                     f"WHERE session_id = ? AND active = 1 AND id IN ({placeholders})",
-                    (session_id, *carried),
+                    (session_id, *superseded_ids),
                 )
+
+            # Soft-archive the live turns that were genuinely summarized away:
+            # active=0 hides them from the live context load, compacted=1 marks
+            # them as "summarized away" (vs rewind/undo's active=0+compacted=0,
+            # which means "user took it back"). search_messages includes
+            # compacted=1 rows by default so the pre-compaction transcript
+            # stays discoverable; live-context loads (active=1 only) exclude them.
             conn.execute(
                 "UPDATE messages SET active = 0, compacted = 1 "
                 "WHERE session_id = ? AND active = 1",
