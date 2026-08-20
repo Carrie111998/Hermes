@@ -56,6 +56,28 @@ def _bound_session_key(key="agent:main:telegram:dm:123"):
 
 
 class TestBackgroundDispatch:
+    def test_restart_drain_blocks_before_durable_claim(self):
+        from cron.scheduler import (
+            begin_gateway_restart_drain,
+            cancel_gateway_restart_drain,
+            release_running_job,
+        )
+
+        job = _job("job-bg-drain")
+        cancel_gateway_restart_drain()
+        try:
+            assert begin_gateway_restart_drain() == 0
+            with _bound_session_key(), patch(
+                "tools.cronjob_tools.claim_job_for_fire"
+            ) as durable_claim:
+                result = _try_dispatch_background_run(job)
+            assert result is not None
+            assert result["claimed"] is False
+            durable_claim.assert_not_called()
+        finally:
+            cancel_gateway_restart_drain()
+            release_running_job(job["id"])
+
     def test_dispatches_and_returns_handle_immediately(self):
         """With a routable session, run claims sync then dispatches async."""
         run_started = threading.Event()

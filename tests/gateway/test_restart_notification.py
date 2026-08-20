@@ -129,6 +129,57 @@ def test_atomic_restart_drain_blocks_new_cron_registration():
     release_running_job("race-after-restart-check")
 
 
+def test_restart_drain_blocks_manual_claim_before_durable_mutation(monkeypatch):
+    from cron.scheduler import (
+        begin_gateway_restart_drain,
+        cancel_gateway_restart_drain,
+        release_running_job,
+    )
+    from tools.cronjob_tools import _execute_job_now
+
+    durable_claim = MagicMock(return_value={"id": "manual-during-drain"})
+    monkeypatch.setattr("tools.cronjob_tools.claim_job_for_fire", durable_claim)
+
+    cancel_gateway_restart_drain()
+    try:
+        assert begin_gateway_restart_drain() == 0
+        result = _execute_job_now({"id": "manual-during-drain"})
+        assert result["claimed"] is False
+        durable_claim.assert_not_called()
+    finally:
+        cancel_gateway_restart_drain()
+        release_running_job("manual-during-drain")
+
+
+def test_restart_drain_blocks_external_claim_before_durable_mutation(monkeypatch):
+    from cron.scheduler import (
+        begin_gateway_restart_drain,
+        cancel_gateway_restart_drain,
+        release_running_job,
+    )
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    durable_claim = MagicMock(return_value={"id": "external-during-drain"})
+    monkeypatch.setattr("cron.jobs.claim_job_for_fire", durable_claim)
+    monkeypatch.setattr(
+        "cron.executions.create_execution",
+        MagicMock(return_value={"id": "exec-during-drain"}),
+    )
+    finish_execution = MagicMock()
+    monkeypatch.setattr("cron.executions.finish_execution", finish_execution)
+
+    cancel_gateway_restart_drain()
+    try:
+        assert begin_gateway_restart_drain() == 0
+        result = InProcessCronScheduler().claim_fire("external-during-drain")
+        assert result is None
+        durable_claim.assert_not_called()
+        finish_execution.assert_called_once()
+    finally:
+        cancel_gateway_restart_drain()
+        release_running_job("external-during-drain")
+
+
 @pytest.mark.asyncio
 async def test_restart_command_rolls_back_cron_gate_when_restart_not_started(
     tmp_path, monkeypatch

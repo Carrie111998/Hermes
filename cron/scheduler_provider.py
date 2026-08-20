@@ -181,14 +181,27 @@ class CronScheduler(ABC):
         """
         from cron.executions import create_execution, finish_execution
         from cron.jobs import claim_job_for_fire
+        from cron.scheduler import release_running_job, try_register_running_job
 
         execution = create_execution(job_id, source=self.name)
+        if not try_register_running_job(job_id):
+            finish_execution(
+                execution["id"],
+                success=False,
+                error=(
+                    "Fire admission blocked: job is already running or the "
+                    "gateway is draining for restart"
+                ),
+            )
+            return None
+
         claim_kwargs = {"return_job": True}
         if force:
             claim_kwargs["force"] = True
         try:
             claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
         except BaseException as exc:
+            release_running_job(job_id)
             finish_execution(
                 execution["id"],
                 success=False,
@@ -196,6 +209,7 @@ class CronScheduler(ABC):
             )
             raise
         if not isinstance(claimed_job, dict):
+            release_running_job(job_id)
             finish_execution(
                 execution["id"],
                 success=False,
@@ -203,6 +217,7 @@ class CronScheduler(ABC):
             )
             return None
         claimed_job["execution_id"] = execution["id"]
+        claimed_job["_restart_drain_registered"] = True
         return claimed_job
 
     def fire_claimed(
@@ -220,15 +235,20 @@ class CronScheduler(ABC):
         — e.g. the dashboard lifespan drain signalling pending webhook
         fires before the event loop shuts down.
         """
-        from cron.scheduler import run_one_job
+        from cron.scheduler import release_running_job, run_one_job
 
-        run_one_job(
-            claimed_job,
-            adapters=adapters,
-            loop=loop,
-            cancel_event=cancel_event,
-        )
-        return True
+        registered = bool(claimed_job.pop("_restart_drain_registered", False))
+        try:
+            run_one_job(
+                claimed_job,
+                adapters=adapters,
+                loop=loop,
+                cancel_event=cancel_event,
+            )
+            return True
+        finally:
+            if registered:
+                release_running_job(claimed_job["id"])
 
     def reconcile(self) -> None:
         """Converge the external registry toward jobs.json (the desired state):
@@ -402,6 +422,7 @@ def fire_overdue_jobs(
             next_run_at,
             overdue_seconds / 60,
         )
+        claimed = None
         try:
             # Two-phase, webhook-style: claim synchronously (fast store
             # CAS — losing means an external retry beat us, which is
@@ -419,6 +440,15 @@ def fire_overdue_jobs(
             ).start()
             fired += 1
         except Exception as exc:
+            if isinstance(claimed, dict) and claimed.pop(
+                "_restart_drain_registered", False
+            ):
+                try:
+                    from cron.scheduler import release_running_job
+
+                    release_running_job(job_id)
+                except Exception:
+                    pass
             logger.warning(
                 "Misfire catch-up failed for job %s: %s: %s",
                 job_id, type(exc).__name__, exc,
