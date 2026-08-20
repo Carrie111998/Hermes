@@ -31,7 +31,11 @@ DAYTONA_CLOUD_API_URL = "https://app.daytona.io/api"
 
 def resolve_daytona_api_url() -> str:
     """Return the endpoint the Daytona SDK resolves from the environment."""
-    return os.getenv("DAYTONA_API_URL", "").strip() or DAYTONA_CLOUD_API_URL
+    return (
+        os.getenv("DAYTONA_API_URL", "").strip()
+        or os.getenv("DAYTONA_SERVER_URL", "").strip()
+        or DAYTONA_CLOUD_API_URL
+    )
 
 
 def is_daytona_cloud_endpoint(api_url: str) -> bool:
