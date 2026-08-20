@@ -148,6 +148,22 @@ _answers: dict[str, str] = {}
 _db = None
 _db_error: str | None = None
 _stdout_lock = threading.Lock()
+
+_GATEWAY_CAPABILITIES = {
+    "mcp-client-access": {
+        "version": {"major": 1, "minor": 0},
+        "endpoints": [
+            "mcp.client.status",
+            "mcp.client.tools",
+            "mcp.client.call",
+        ],
+    }
+}
+
+
+def gateway_capabilities() -> dict[str, dict]:
+    """Return the bounded, service-neutral contract advertised at handshake."""
+    return copy.deepcopy(_GATEWAY_CAPABILITIES)
 _cfg_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
 _prompt_lock = threading.Lock()

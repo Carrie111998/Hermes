@@ -21,6 +21,8 @@ from tools.registry import registry
 
 
 def _config(client_access=None):
+    if isinstance(client_access, dict) and client_access.get("enabled") is True and "tools" in client_access and "operator_read_only" not in client_access:
+        client_access = {**client_access, "operator_read_only": True}
     server = {} if client_access is None else {"client_access": client_access}
     return {"mcp_servers": {"convexopps": server}}
 
@@ -45,6 +47,14 @@ def test_valid_policy_preserves_order_and_deduplicates_first_occurrence():
     assert policy.ordered_tools == ("search_companies", "whoami")
     assert policy.allows("whoami") is True
     assert policy.allows("WhoAmI") is False
+
+
+def test_policy_requires_explicit_operator_read_only_declaration():
+    config = {"mcp_servers": {"convexopps": {"client_access": {"enabled": True, "tools": ["whoami"]}}}}
+    with patch("hermes_cli.config.load_config", return_value=config):
+        policy = load_mcp_client_access_policy("convexopps")
+    assert policy.enabled is True
+    assert policy.ordered_tools == ()
 
 
 @pytest.mark.parametrize("tools", ["whoami", {}, None, 42])
@@ -178,6 +188,11 @@ def _call_patches(registry_name, raw_name="whoami", *, read_only=True, interacti
     config["mcp_servers"]["convexopps"].update(
         {"sampling": {"enabled": False}, "elicitation": {"enabled": False}}
     )
+    entry = registry.get_entry(registry_name)
+    if entry is not None:
+        setattr(entry.handler, "_hermes_mcp_client_server", "convexopps")
+        setattr(entry.handler, "_hermes_mcp_client_raw_tool", raw_name)
+        setattr(entry.handler, "_hermes_mcp_client_read_only_hint", read_only)
     return (
         patch("hermes_cli.config.load_config", return_value=config),
         patch(
@@ -255,6 +270,11 @@ def test_policy_revocation_is_rechecked_immediately_before_dispatch():
         schema={"name": name, "parameters": {}},
         handler=lambda args: called.append(args) or "ok",
     )
+    entry = registry.get_entry(name)
+    assert entry is not None
+    setattr(entry.handler, "_hermes_mcp_client_server", "convexopps")
+    setattr(entry.handler, "_hermes_mcp_client_raw_tool", "whoami")
+    setattr(entry.handler, "_hermes_mcp_client_read_only_hint", True)
     try:
         with (
             patch(
@@ -264,8 +284,7 @@ def test_policy_revocation_is_rechecked_immediately_before_dispatch():
                     MCPClientAccessPolicy(False, ()),
                 ],
             ),
-            patch("tools.mcp_client_access._find_registry_tool", return_value=name),
-            patch("tools.mcp_tool.is_mcp_tool_read_only", return_value=True),
+            patch("tools.mcp_client_access._find_registry_entry", return_value=entry),
             patch("tools.mcp_client_access._is_mcp_client_runtime_noninteractive", return_value=True),
         ):
             with pytest.raises(MCPClientAccessError) as exc:
@@ -274,6 +293,45 @@ def test_policy_revocation_is_rechecked_immediately_before_dispatch():
         registry.deregister(name)
     assert exc.value.code == "MCP_CLIENT_DISABLED"
     assert called == []
+
+
+def test_notification_refresh_cannot_swap_the_authorized_handler_before_dispatch():
+    name = "test_mcp_client_refresh_swap"
+    old_calls = []
+    new_calls = []
+
+    def old_handler(args):
+        old_calls.append(args)
+        return '{"result":"old"}'
+
+    registry.register(name=name, toolset="mcp-convexopps", schema={"name": name, "parameters": {}}, handler=old_handler)
+    patches = _call_patches(name)
+    checks = 0
+
+    def noninteractive(_server):
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            def new_handler(args):
+                new_calls.append(args)
+                return '{"result":"new"}'
+            setattr(new_handler, "_hermes_mcp_client_server", "convexopps")
+            setattr(new_handler, "_hermes_mcp_client_raw_tool", "whoami")
+            setattr(new_handler, "_hermes_mcp_client_read_only_hint", True)
+            registry.register(name=name, toolset="mcp-convexopps", schema={"name": name, "parameters": {}}, handler=new_handler)
+        return True
+
+    try:
+        with patches[0], patches[1], patches[2], patch(
+            "tools.mcp_client_access._is_mcp_client_runtime_noninteractive",
+            side_effect=noninteractive,
+        ):
+            result = call_mcp_client_tool("convexopps", "whoami", {})
+    finally:
+        registry.deregister(name)
+    assert result.result_text == '{"result":"old"}'
+    assert old_calls == [{}]
+    assert new_calls == []
 
 
 def test_concurrent_second_call_is_busy_without_queueing():
@@ -354,6 +412,23 @@ def test_result_strips_backend_session_credential_metadata():
     assert decoded["structuredContent"]["_meta"] == {"schema_version": "5"}
     assert "token_expires_at" not in result.result_text
     assert "refresh_required_before" not in result.result_text
+
+
+def test_structured_error_envelope_is_never_reported_as_ok():
+    name = "test_mcp_client_structured_error"
+    registry.register(
+        name=name,
+        toolset="mcp-convexopps",
+        schema={"name": name, "parameters": {}},
+        handler=lambda args: json.dumps({"error": {"code": "upstream_failed"}}),
+    )
+    try:
+        patches = _call_patches(name)
+        with patches[0], patches[1], patches[2], patches[3]:
+            result = call_mcp_client_tool("convexopps", "whoami", {})
+    finally:
+        registry.deregister(name)
+    assert result.ok is False
 
 
 def test_exception_credentials_are_redacted_and_audit_log_omits_arguments(caplog):

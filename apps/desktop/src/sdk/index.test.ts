@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { host } from '@/sdk'
+import { $hostCapabilities, ingestHostCapabilities, resetHostCapabilities } from '@/store/host-capabilities'
 import { setActiveSessionId, setAwaitingResponse, setBusy } from '@/store/session'
 import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
 
@@ -105,5 +106,24 @@ describe('host.state turn flags', () => {
     expect(host.state.awaitingResponse.get()).toBe(false)
 
     $sessionTiles.set([])
+  })
+})
+
+describe('host.state capabilities', () => {
+  afterEach(resetHostCapabilities)
+
+  it('exposes the validated active-backend capability atom to plugins', () => {
+    ingestHostCapabilities({
+      'mcp-client-access': {
+        endpoints: ['mcp.client.status', 'mcp.client.tools', 'mcp.client.call'],
+        version: { major: 1, minor: 0 }
+      }
+    })
+
+    expect(host.state.capabilities).toBe($hostCapabilities)
+    expect(host.state.capabilities.get()['mcp-client-access']).toEqual({
+      endpoints: ['mcp.client.status', 'mcp.client.tools', 'mcp.client.call'],
+      version: { major: 1, minor: 0 }
+    })
   })
 })

@@ -43,6 +43,7 @@ def _fake_cache_entry():
                 "name": "browser_navigate",
                 "description": "Navigate",
                 "inputSchema": {"type": "object", "properties": {}},
+                "annotations": {"readOnlyHint": True},
             }
         ],
         "utility_tools": [],
@@ -318,6 +319,25 @@ class TestCacheLoadDescriptionScan:
             mcp._register_from_cache_sync("playwright", config, entry)
 
         mock_scan.assert_called_once_with("playwright", "browser_navigate", "Navigate")
+
+    def test_lazy_handler_binds_client_identity_and_read_only_hint(self):
+        from tools.registry import registry
+
+        names = mcp._register_from_cache_sync(
+            "playwright",
+            {"command": "npx", "args": [], "lazy": True},
+            _fake_cache_entry(),
+        )
+        try:
+            assert len(names) == 1
+            entry = registry.get_entry(names[0])
+            assert entry is not None
+            assert getattr(entry.handler, "_hermes_mcp_client_server") == "playwright"
+            assert getattr(entry.handler, "_hermes_mcp_client_raw_tool") == "browser_navigate"
+            assert getattr(entry.handler, "_hermes_mcp_client_read_only_hint") is True
+        finally:
+            for registry_name in names:
+                registry.deregister(registry_name)
 
 
 class TestResolveServerLazy:

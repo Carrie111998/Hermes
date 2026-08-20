@@ -30,6 +30,7 @@ import { setSessionCompacting } from '@/store/compaction'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
 import { $gateway, activeGatewayConnectionId } from '@/store/gateway'
 import { applyGoalStatusText } from '@/store/goals'
+import { hostCapabilityScope, ingestHostCapabilities } from '@/store/host-capabilities'
 import {
   notifyCronChanged,
   notifyPairingChanged,
@@ -431,6 +432,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // Backends with the change watcher broadcast pet/cron/sessions change
         // events; consumers demote their legacy polls to slow backstops.
         setChangeEventsAvailable(Boolean((payload as { change_events?: boolean } | undefined)?.change_events))
+        ingestHostCapabilities(
+          (payload as { capabilities?: unknown } | undefined)?.capabilities,
+          hostCapabilityScope(event.connectionId, event.profile ?? (fromActiveSource() ? $activeGatewayProfile.get() : null))
+        )
 
         return
       } else if (event.type === 'skin.changed') {

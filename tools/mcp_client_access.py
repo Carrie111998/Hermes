@@ -69,6 +69,8 @@ def load_mcp_client_access_policy(server_name: str) -> MCPClientAccessPolicy:
     block = server.get("client_access") if isinstance(server, dict) else None
     if not isinstance(block, dict) or block.get("enabled") is not True:
         return MCPClientAccessPolicy(enabled=False, ordered_tools=())
+    if block.get("operator_read_only") is not True:
+        return MCPClientAccessPolicy(enabled=True, ordered_tools=())
 
     configured_tools = block.get("tools")
     if not isinstance(configured_tools, list):
@@ -200,18 +202,19 @@ def get_mcp_client_status(server_name: str) -> dict:
     }
 
 
-def _find_registry_tool(server_name: str, raw_tool_name: str) -> str | None:
-    from tools.mcp_tool import get_mcp_tool_provenance
+def _find_registry_entry(server_name: str, raw_tool_name: str):
+    """Resolve one immutable handler entry carrying registration-time MCP identity."""
     from tools.registry import registry
 
-    for registry_name in registry.get_all_tool_names():
-        provenance = get_mcp_tool_provenance(registry_name)
+    expected_toolset = f"mcp-{server_name}"
+    for entry in registry.get_all_entries():
+        handler = entry.handler
         if (
-            provenance is not None
-            and provenance.server_name == server_name
-            and provenance.raw_tool_name == raw_tool_name
+            entry.toolset == expected_toolset
+            and getattr(handler, "_hermes_mcp_client_server", None) == server_name
+            and getattr(handler, "_hermes_mcp_client_raw_tool", None) == raw_tool_name
         ):
-            return registry_name
+            return entry
     return None
 
 
@@ -284,13 +287,11 @@ def call_mcp_client_tool(
     if not policy.allows(tool_name):
         raise MCPClientAccessError("MCP_CLIENT_TOOL_DENIED", "MCP tool is not allowlisted")
 
-    registry_name = _find_registry_tool(server_name, tool_name)
-    if registry_name is None:
+    registry_entry = _find_registry_entry(server_name, tool_name)
+    if registry_entry is None:
         raise MCPClientAccessError("MCP_CLIENT_SERVER_UNAVAILABLE", "MCP tool is unavailable")
 
-    from tools.mcp_tool import is_mcp_tool_read_only
-
-    if not is_mcp_tool_read_only(server_name, tool_name):
+    if getattr(registry_entry.handler, "_hermes_mcp_client_read_only_hint", None) is not True:
         raise MCPClientAccessError("MCP_CLIENT_NOT_READ_ONLY", "MCP tool is not marked read-only")
     if not _is_mcp_client_runtime_noninteractive(server_name):
         raise MCPClientAccessError(
@@ -318,23 +319,21 @@ def call_mcp_client_tool(
             raise MCPClientAccessError("MCP_CLIENT_DISABLED", "MCP client access is disabled")
         if not current_policy.allows(tool_name):
             raise MCPClientAccessError("MCP_CLIENT_TOOL_DENIED", "MCP tool is not allowlisted")
-        if not is_mcp_tool_read_only(server_name, tool_name):
+        if getattr(registry_entry.handler, "_hermes_mcp_client_read_only_hint", None) is not True:
             raise MCPClientAccessError("MCP_CLIENT_NOT_READ_ONLY", "MCP tool is not marked read-only")
         if not _is_mcp_client_runtime_noninteractive(server_name):
             raise MCPClientAccessError(
                 "MCP_CLIENT_INTERACTIVE_RUNTIME", "MCP runtime must be reloaded as non-interactive"
             )
 
-        dispatched = registry.dispatch(registry_name, arguments)
+        dispatched = registry.dispatch_entry(registry_entry, arguments)
         if not isinstance(dispatched, str):
             raise MCPClientAccessError(
                 "MCP_CLIENT_RESULT_CONTRACT", "MCP tool returned an unsupported result"
             )
         safe_dispatched, envelope = _strip_session_credential_metadata(dispatched)
         result_text, truncated = _bounded_result_text(safe_dispatched)
-        ok = not (
-            isinstance(envelope, dict) and isinstance(envelope.get("error"), str)
-        )
+        ok = not (isinstance(envelope, dict) and ("error" in envelope or envelope.get("isError") is True))
         duration_ms = max(0, int((time.monotonic() - started) * 1000))
         return MCPClientCallResult(
             request_id=request_id,

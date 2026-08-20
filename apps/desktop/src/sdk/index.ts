@@ -43,6 +43,7 @@ import {
   requestGatewayForProfile,
   retireLocalProfileGateways
 } from '@/store/gateway'
+import { $hostCapabilities, type HostCapabilities } from '@/store/host-capabilities'
 import { notify, notifyError } from '@/store/notifications'
 import {
   $activeGatewayProfile,
@@ -198,6 +199,10 @@ export const host = {
   state: {
     /** Runtime id of the active chat session (null on a fresh draft). */
     activeSessionId: readonlyAtom<null | string>($activeSessionId),
+    /** Versioned contracts advertised by the active backend at gateway.ready.
+     * Missing/malformed descriptors are absent; plugins must check before a
+     * capability-specific request and fail closed when unsupported. */
+    capabilities: readonlyAtom<HostCapabilities>($hostCapabilities),
     /** True from send until the first assistant payload on the focused chat. */
     awaitingResponse: readonlyAtom<boolean>($focusedAwaitingResponse),
     /**

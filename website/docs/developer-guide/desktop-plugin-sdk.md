@@ -40,7 +40,8 @@ plugin, and fail to resolve in a disk plugin). Capability comes in tiers:
 
 - **`host.state.*`** — readonly views over the app's live state (nanostore
   atoms): active session, per-session turn-busy, cwd, gateway socket status,
-  model, profile, viewport. `gateway` is the WebSocket, not turn-busy.
+  model, profile, viewport, and versioned backend capabilities. `gateway` is
+  the WebSocket, not turn-busy.
 - **`host.*` actions** — curated safe verbs: toast, navigate, tail logs,
   restart the gateway, subscribe to the gateway event stream.
 - **`host.request`** — the gateway JSON-RPC door: sessions, config, skills,
@@ -430,6 +431,7 @@ components.
 
 ```ts
 host.state.activeSessionId  // ReadableAtom<string | null>
+host.state.capabilities     // ReadableAtom<Record<string, { version: { major, minor }, endpoints: string[] }>>
 host.state.awaitingResponse // ReadableAtom<boolean>  true until the first assistant payload
 host.state.busy             // ReadableAtom<boolean>  focused chat is working after a send
 host.state.busyBySession    // ReadableAtom<Record<string, boolean>>  runtime id → mid-turn
@@ -441,6 +443,26 @@ host.state.gateway          // ReadableAtom<string>  socket state ('idle' | 'con
 host.state.model            // ReadableAtom<string>
 host.state.profile          // ReadableAtom<string>
 host.state.viewport         // ReadableAtom<{ width, height, narrow }>
+```
+
+`host.state.capabilities` comes from the active backend's `gateway.ready`
+handshake and is validated before plugins see it. Read it before a
+capability-specific RPC. Missing, malformed, or unsupported-major metadata
+means the capability is unavailable; do not probe an endpoint just to discover
+whether it exists. Capability state is isolated by registry source + profile
+and switches with the active gateway. For example, MCP client access v1.0 is:
+
+```ts
+const capability = host.state.capabilities.get()['mcp-client-access']
+
+if (
+  capability?.version.major === 1 &&
+  capability.endpoints.includes('mcp.client.status') &&
+  capability.endpoints.includes('mcp.client.tools') &&
+  capability.endpoints.includes('mcp.client.call')
+) {
+  // The released host advertises the complete v1 contract.
+}
 ```
 
 `host.state.gateway` is the WebSocket connection, not whether a chat turn is
@@ -483,6 +505,9 @@ cron, kanban, …). `host.requestProfile` accepts a descriptor from
 profile without changing the active chat or gateway. The profile-only overload is
 retained only for the sole-local/legacy topology; registry-aware plugins should pass
 the descriptor so two sources exposing the same profile name cannot collide.
+Runtime plugins are trusted local code: `host.request` is not a sandbox or a
+per-plugin authorization boundary. Backend policy still validates every RPC,
+but operators must not install untrusted plugin source.
 
 `host.openWorkspace(id, { render, title?, minWidth?, onClose? })` docks a
 plugin-rendered view into the **main workspace zone** — the same center area

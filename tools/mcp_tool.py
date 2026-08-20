@@ -6799,15 +6799,21 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
 
         _scan_mcp_description(name, mcp_tool.name, mcp_tool.description or "")
         schema = _convert_mcp_schema(name, mcp_tool)
+        handler = _make_tool_handler(name, mcp_tool.name, server.tool_timeout)
+        setattr(handler, "_hermes_mcp_client_server", name)
+        setattr(handler, "_hermes_mcp_client_raw_tool", mcp_tool.name)
+        setattr(
+            handler,
+            "_hermes_mcp_client_read_only_hint",
+            _annotation_read_only_hint(mcp_tool),
+        )
         candidates.append(
             {
                 "registry_name": schema["name"],
                 "raw_tool_name": mcp_tool.name,
                 "origin": f"tool {mcp_tool.name!r}",
                 "schema": schema,
-                "handler": _make_tool_handler(
-                    name, mcp_tool.name, server.tool_timeout
-                ),
+                "handler": handler,
                 "check_fn": check_fn,
             }
         )
@@ -7086,11 +7092,21 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
                 name, registry_name, existing_toolset,
             )
             continue
+        handler = _make_tool_handler(name, raw_name, tool_timeout)
+        raw_annotations = raw.get("annotations")
+        annotations = raw_annotations if isinstance(raw_annotations, dict) else {}
+        setattr(handler, "_hermes_mcp_client_server", name)
+        setattr(handler, "_hermes_mcp_client_raw_tool", raw_name)
+        setattr(
+            handler,
+            "_hermes_mcp_client_read_only_hint",
+            annotations.get("readOnlyHint") is True,
+        )
         registry.register(
             name=registry_name,
             toolset=toolset_name,
             schema=schema,
-            handler=_make_tool_handler(name, raw_name, tool_timeout),
+            handler=handler,
             check_fn=check_fn,
             is_async=False,
             description=schema["description"],

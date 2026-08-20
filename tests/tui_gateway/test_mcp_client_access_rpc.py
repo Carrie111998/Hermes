@@ -25,6 +25,19 @@ def test_mcp_client_methods_are_registered_and_pool_routed(server, method):
     assert method in server._LONG_HANDLERS
 
 
+def test_gateway_capabilities_advertise_versioned_mcp_client_access(server):
+    assert server.gateway_capabilities() == {
+        "mcp-client-access": {
+            "version": {"major": 1, "minor": 0},
+            "endpoints": [
+                "mcp.client.status",
+                "mcp.client.tools",
+                "mcp.client.call",
+            ],
+        }
+    }
+
+
 def test_profile_mismatch_fails_before_service_lookup(server):
     with (
         patch("hermes_cli.profiles.get_active_profile_name", return_value="researcher"),

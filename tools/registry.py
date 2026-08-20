@@ -1141,6 +1141,13 @@ class ToolRegistry:
         entry = self.get_entry(name, scope=scope)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
+        return self.dispatch_entry(entry, args, **kwargs)
+
+    def dispatch_entry(self, entry: ToolEntry, args: dict, **kwargs) -> str | dict:
+        """Execute the exact captured entry instead of re-resolving a mutable name."""
+        if not isinstance(entry, ToolEntry):
+            return tool_error("Unknown tool entry")
+        name = entry.name
         try:
             if entry.is_async:
                 from model_tools import _run_async

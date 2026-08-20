@@ -4,6 +4,7 @@ import { atom } from 'nanostores'
 import type { HermesConnection } from '@/global'
 import { HermesGateway, setApiRequestConnection } from '@/hermes'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
+import { activateHostCapabilities, clearHostCapabilities, hostCapabilityScope } from '@/store/host-capabilities'
 import { markNativeNotifyBaseline } from '@/store/notify-baseline'
 import { setConnection, setGatewayState } from '@/store/session'
 
@@ -182,6 +183,8 @@ function reportGatewayState(profile: string, state: ConnectionState): void {
   // launch/reconnect doesn't alert about state that already existed.
   if (state === 'open') {
     markNativeNotifyBaseline()
+  } else {
+    clearHostCapabilities(profile)
   }
 
   if (normKey(profile) === g.activeKey) {
@@ -210,6 +213,7 @@ function applyActive(profile: string, activationEpoch: number): boolean {
   }
 
   g.activeKey = normKey(profile)
+  activateHostCapabilities(hostCapabilityScope(activeGatewayConnectionId(), profile))
   const gateway = activeGateway()
   g.$gateway.set(gateway)
   setGatewayState(gateway?.connectionState ?? 'closed')

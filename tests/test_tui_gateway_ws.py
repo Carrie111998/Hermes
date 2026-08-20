@@ -127,6 +127,7 @@ def test_ws_starts_mcp_discovery_before_ready(monkeypatch):
 
     calls = []
     events = []
+    ready_frames = []
 
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0)
     monkeypatch.setattr(entry, "ensure_mcp_discovery_started", lambda: calls.append("mcp"))
@@ -138,6 +139,7 @@ def test_ws_starts_mcp_discovery_before_ready(monkeypatch):
         async def send_text(self, line):
             if '"gateway.ready"' in line:
                 events.append(f"ready_after_{len(calls)}")
+                ready_frames.append(json.loads(line))
 
         async def receive_text(self):
             raise ws_mod._WebSocketDisconnect()
@@ -151,6 +153,7 @@ def test_ws_starts_mcp_discovery_before_ready(monkeypatch):
     # should not start MCP discovery before a profile has been bound.
     assert calls == []
     assert events == ["accept", "ready_after_0"]
+    assert ready_frames[0]["params"]["payload"]["capabilities"] == server.gateway_capabilities()
 
 
 def test_ws_transport_serializes_concurrent_sends():

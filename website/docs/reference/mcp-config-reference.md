@@ -41,6 +41,7 @@ mcp_servers:
       prompts: true
     client_access:
       enabled: false
+      operator_read_only: false
       tools: []
 ```
 
@@ -134,10 +135,16 @@ mcp_servers:
       enabled: false
     client_access:
       enabled: true
+      operator_read_only: true
       tools:
         - whoami
         - search_companies
 ```
+
+`operator_read_only` must be exactly `true`: it is the operator's explicit
+declaration that every listed tool has been reviewed as non-mutating. The
+server's `readOnlyHint=true` remains an additional required signal but cannot
+replace this operator-owned declaration.
 
 Tool names are exact, case-sensitive raw MCP names. Blank values, globs,
 malformed lists, and names without exact registration-time provenance fail
@@ -156,6 +163,19 @@ OAuth tokens, authorization headers, token paths, expiry, and OAuth metadata
 remain backend-only. Write-capable tools are outside this contract. A server's
 `readOnlyHint` is defense-in-depth supplied by that server, not proof that the
 server or tool is harmless.
+
+This is a trusted-local plugin surface. Runtime Desktop plugins execute with
+the app's authority and `host.request` is not a plugin sandbox. Do not install
+untrusted plugin code; per-plugin capability isolation is outside this API.
+
+Desktop plugins must preflight the active backend's versioned
+`host.state.capabilities['mcp-client-access']` descriptor before calling these
+RPCs. Contract v1.0 advertises exactly `mcp.client.status`,
+`mcp.client.tools`, and `mcp.client.call` in `gateway.ready`. Missing,
+malformed, or unsupported-major metadata means the host is incompatible and
+must cause zero client-access calls. The descriptor is a compiled host
+contract, not permission: server policy, profile isolation, read-only
+intersection, and non-interactive checks still run on every request.
 
 ## Filtering semantics
 
