@@ -185,10 +185,37 @@ def check_eval(cfg):
     return OK, ", ".join(out) if out else "baseline has no sections to compare"
 
 
+def check_hotcore_coverage(cfg):
+    """Every hot-core block must exist in spine, or trimming it destroys it.
+
+    MEMORY.md has a second writer: Hermes's memory() tool writes straight into
+    the file and never touches spine. 27 blocks were in that state when this
+    check was written. A cleanup that assumed "these are in spine already"
+    would have deleted all of them.
+    """
+    from spine import coverage
+    if not os.path.exists(MEM_MD):
+        return SKIP, "MEMORY.md not found"
+    con = sqlite3.connect(cfg.db)
+    con.execute("PRAGMA query_only = ON")
+    try:
+        total = len(coverage.hotcore_blocks(MEM_MD))
+        uncovered = coverage.uncovered_hotcore(MEM_MD, con)
+    finally:
+        con.close()
+    if not total:
+        return SKIP, "hot core is empty"
+    if uncovered:
+        return FAIL, (f"{len(uncovered)}/{total} hot-core blocks are not retrievable from "
+                      f"spine — run sync_hotcore.py before trimming MEMORY.md")
+    return OK, f"all {total} hot-core blocks retrievable from spine"
+
+
 CHECKS = [
     ("embedder", check_embedder),
     ("vectors", check_vectors),
     ("hotcore", check_hotcore),
+    ("hotcore_coverage", check_hotcore_coverage),
     ("sync", check_sync),
     ("divergence", check_divergence),
     ("consolidation", check_consolidation),
