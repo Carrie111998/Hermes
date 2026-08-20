@@ -550,6 +550,11 @@ class SshConnection {
   _opened: boolean
   _mux: boolean
   _tunnels: Map<string, any>
+  // Every element of this counter is one spawned `ssh` process. On Windows
+  // (no ControlMaster) that is also one authentication against the agent, so
+  // the bootstrap logs it to prove the batched path did not regress into a
+  // per-operation auth storm.
+  _invocations: number
 
   constructor(cfg, opts: any = {}) {
     if (!cfg || !cfg.host) {
@@ -589,6 +594,20 @@ class SshConnection {
     this._execTimeoutMs = opts.execTimeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS
     this._forwardTimeoutMs = opts.forwardTimeoutMs ?? DEFAULT_FORWARD_TIMEOUT_MS
     this._opened = false
+    this._invocations = 0
+  }
+
+  // Count of ssh processes this connection has spawned. Read as a delta around
+  // one bootstrap cycle.
+  get invocations() {
+    return this._invocations
+  }
+
+  // Single funnel for every ssh spawn so the counter cannot drift from reality.
+  _run(args, options: any = {}) {
+    this._invocations += 1
+
+    return runSsh(args, { spawnFn: this._spawnFn, ...options })
   }
 
   // Lifecycle logging — ALWAYS through redaction.
@@ -619,7 +638,20 @@ class SshConnection {
   // Open the connection. Mux: start the persistent ControlMaster (idempotent —
   // a live master is a no-op). No-mux: there is no master; validate auth +
   // reachability with a one-shot `ssh true` so failures classify identically.
-  async open({ signal }: any = {}) {
+  //
+  // `lazy` (no-mux only): skip the `ssh true` reachability probe and let the
+  // FIRST real operation classify auth/reachability instead. Without mux that
+  // probe is a whole extra authentication — on Windows, where every ssh call
+  // re-authenticates through the agent, it doubles the cost of a two-call
+  // bootstrap for no added signal.
+  async open({ lazy, signal }: any = {}) {
+    if (!this._mux && lazy) {
+      this._opened = true
+      this._logLine(`deferred connect (no-mux, lazy) to ${target(this.user, this.host)}:${this.port}`)
+
+      return
+    }
+
     if (await this.isAlive({ signal })) {
       // -O check passing is not proof the master works: a ControlPersist master
       // can survive a failed teardown with wedged channels (observed on macOS
@@ -640,9 +672,8 @@ class SshConnection {
       let result
 
       try {
-        result = await runSsh(buildExecArgs(this, 'exit 0', this._connectTimeoutMs), {
+        result = await this._run(buildExecArgs(this, 'exit 0', this._connectTimeoutMs), {
           timeoutMs: this._connectTimeoutMs,
-          spawnFn: this._spawnFn,
           signal
         })
       } catch (error) {
@@ -692,7 +723,7 @@ class SshConnection {
     let result
 
     try {
-      result = await runSsh(args, { timeoutMs: this._connectTimeoutMs, spawnFn: this._spawnFn, signal })
+      result = await this._run(args, { timeoutMs: this._connectTimeoutMs, signal })
     } catch (error) {
       throw this._fail(error, SSH_ERROR.UNREACHABLE)
     }
@@ -717,7 +748,7 @@ class SshConnection {
       : buildExecArgs(this, 'exit 0', this._connectTimeoutMs)
 
     try {
-      const result: any = await runSsh(args, { timeoutMs: this._connectTimeoutMs, spawnFn: this._spawnFn, signal })
+      const result: any = await this._run(args, { timeoutMs: this._connectTimeoutMs, signal })
 
       return result.code === 0
     } catch (error: any) {
@@ -733,9 +764,8 @@ class SshConnection {
   // cmd.exe); a wedged mux hangs to the timeout.
   async _verifyMuxChannel({ signal }: any = {}) {
     try {
-      const result: any = await runSsh(buildExecArgs(this, 'exit 0', this._connectTimeoutMs), {
+      const result: any = await this._run(buildExecArgs(this, 'exit 0', this._connectTimeoutMs), {
         timeoutMs: this._connectTimeoutMs,
-        spawnFn: this._spawnFn,
         signal
       })
 
@@ -755,9 +785,8 @@ class SshConnection {
   // inert.)
   async _evictStaleMaster() {
     try {
-      await runSsh(buildControlArgs(this, 'exit', [], this._connectTimeoutMs), {
-        timeoutMs: this._connectTimeoutMs,
-        spawnFn: this._spawnFn
+      await this._run(buildControlArgs(this, 'exit', [], this._connectTimeoutMs), {
+        timeoutMs: this._connectTimeoutMs
       })
     } catch {
       void 0
@@ -774,14 +803,17 @@ class SshConnection {
 
   // One-shot remote command over the control connection. Resolves stdout;
   // rejects with a classified error on non-zero exit or timeout.
-  async exec(remoteCommand, { timeoutMs, stdinData }: any = {}) {
+  //
+  // `signal` aborts the spawned ssh: a bootstrap superseded (or an app quit)
+  // mid-exec must not leave the child running to completion.
+  async exec(remoteCommand, { signal, stdinData, timeoutMs }: any = {}) {
     const args = buildExecArgs(this, remoteCommand, this._connectTimeoutMs)
     let result
 
     try {
-      result = await runSsh(args, {
+      result = await this._run(args, {
         timeoutMs: timeoutMs ?? this._execTimeoutMs,
-        spawnFn: this._spawnFn,
+        ...(signal ? { signal } : {}),
         ...(stdinData != null ? { stdinData } : {})
       })
     } catch (error) {
@@ -799,7 +831,7 @@ class SshConnection {
   // No-mux: spawn a persistent `ssh -N -L` child that IS the tunnel; ready when
   // the local port accepts. The child dying = tunnel down (isAlive of the
   // backend catches it upstream).
-  async forward(localPort, remotePort, remoteHost = '127.0.0.1') {
+  async forward(localPort, remotePort, remoteHost = '127.0.0.1', { signal }: any = {}) {
     const spec = forwardSpec(localPort, remotePort, remoteHost)
     this._logLine(`forwarding 127.0.0.1:${localPort} -> ${remoteHost}:${remotePort}`)
 
@@ -815,6 +847,7 @@ class SshConnection {
         target(this.user, this.host)
       ]
 
+      this._invocations += 1
       const child = this._spawnFn('ssh', args, { stdio: ['ignore', 'ignore', 'pipe'] })
       const tunnel = { child, alive: true }
       this._tunnels.set(spec, tunnel)
@@ -827,6 +860,17 @@ class SshConnection {
         readyResolve = resolve
         readyReject = reject
       })
+
+      const onAbort = () => {
+        tunnel.alive = false
+        readyReject(Object.assign(new Error('SSH operation was cancelled.'), { kind: 'superseded' }))
+      }
+
+      signal?.addEventListener('abort', onAbort, { once: true })
+
+      if (signal?.aborted) {
+        onAbort()
+      }
 
       const readyPattern = new RegExp(`Local forwarding listening on .* port ${localPort}\\b`)
       child.stderr?.on('data', d => {
@@ -873,9 +917,14 @@ class SshConnection {
           throw this._fail(stopError, SSH_ERROR.UNKNOWN)
         }
 
+        if (error?.kind === 'superseded') {
+          throw error
+        }
+
         throw this._fail(stderr || error, SSH_ERROR.UNKNOWN)
       } finally {
         clearTimeout(readyTimeout)
+        signal?.removeEventListener('abort', onAbort)
       }
 
       return
@@ -885,7 +934,7 @@ class SshConnection {
     let result
 
     try {
-      result = await runSsh(args, { timeoutMs: this._forwardTimeoutMs, spawnFn: this._spawnFn })
+      result = await this._run(args, { timeoutMs: this._forwardTimeoutMs })
     } catch (error) {
       throw this._fail(error)
     }
@@ -915,7 +964,7 @@ class SshConnection {
     const args = buildControlArgs(this, 'cancel', ['-L', spec], this._connectTimeoutMs)
 
     try {
-      await runSsh(args, { timeoutMs: this._forwardTimeoutMs, spawnFn: this._spawnFn })
+      await this._run(args, { timeoutMs: this._forwardTimeoutMs })
       this._logLine(`cancelled forward 127.0.0.1:${localPort}`)
     } catch (error: any) {
       this._logLine(`cancelForward failed (ignored): ${error.message}`)
@@ -944,7 +993,7 @@ class SshConnection {
     const args = buildControlArgs(this, 'exit', [], this._connectTimeoutMs)
 
     try {
-      const result: any = await runSsh(args, { timeoutMs: this._connectTimeoutMs, spawnFn: this._spawnFn })
+      const result: any = await this._run(args, { timeoutMs: this._connectTimeoutMs })
 
       if (result.code !== 0) {
         throw this._fail(result.stderr)
@@ -972,8 +1021,8 @@ class SshConnection {
 // kernel-assigned port, release. The benign TOCTOU window (release → forward
 // grabs it) is caught upstream and retried with a fresh port.
 
-function pickLocalPort() {
-  return new Promise((resolve, reject) => {
+function pickLocalPort(): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
     const server = net.createServer()
     server.unref()
     server.on('error', reject)

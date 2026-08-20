@@ -9,6 +9,7 @@ import { test } from 'vitest'
 
 import { profileSshOverride } from './connection-config'
 import {
+  buildRemoteProfileInventoryCommand,
   buildSpawnCommand,
   cleanupStale,
   connect,
@@ -87,10 +88,14 @@ function fakeSsh(rules: any[] = []) {
   }
 }
 
+// The remote answer: home, separator, then the listing.
+function inventoryOutput(home: string, listing = '') {
+  return `${home}\n--- hermes-desktop-profiles ---\n${listing}`
+}
+
 test('listRemoteHermesProfiles inventories Mini-style profile dirs without spawning a dashboard', async () => {
   const ssh = fakeSsh([
-    [/HERMES_HOME/, '/Users/zillajr/.hermes\n'],
-    [/ls -1/, 'bob\ndixie\ngoose\nrambo\nbob.rollback-old\n']
+    [/HERMES_HOME/, inventoryOutput('/Users/zillajr/.hermes', 'bob\ndixie\ngoose\nrambo\nbob.rollback-old\n')]
   ])
 
   assert.deepEqual(await listRemoteHermesProfiles(ssh), ['default', 'bob', 'dixie', 'goose', 'rambo'])
@@ -98,10 +103,13 @@ test('listRemoteHermesProfiles inventories Mini-style profile dirs without spawn
     ssh.calls.some(cmd => cmd.includes('serve') || cmd.includes('dashboard')),
     false
   )
+  // One exec: on a no-ControlMaster client each extra call is a whole extra
+  // key authentication, and this runs on every roster poll.
+  assert.equal(ssh.calls.length, 1)
 })
 
 test('listRemoteHermesProfiles rejects a hostile HERMES_HOME', async () => {
-  const ssh = fakeSsh([[/HERMES_HOME/, '/tmp/x; echo pwned\n']])
+  const ssh = fakeSsh([[/HERMES_HOME/, inventoryOutput('/tmp/x; echo pwned', 'bob\n')]])
 
   await assert.rejects(
     () => listRemoteHermesProfiles(ssh),
@@ -111,9 +119,26 @@ test('listRemoteHermesProfiles rejects a hostile HERMES_HOME', async () => {
       return true
     }
   )
-  assert.equal(
-    ssh.calls.some(cmd => cmd.includes('ls -1')),
-    false
+})
+
+test('the inventory command interpolates nothing and stays quoted on the remote', () => {
+  const command = buildRemoteProfileInventoryCommand()
+
+  assert.match(command, /home="\$\{HERMES_HOME:-\$HOME\/\.hermes\}"/)
+  assert.match(command, /ls -1 "\$home\/profiles"/)
+  assert.equal(command.includes('--- hermes-desktop-profiles ---'), true)
+})
+
+test('a remote answer without the separator is a transport error, not an empty roster', async () => {
+  const ssh = fakeSsh([[/HERMES_HOME/, 'bash: HERMES_HOME: command not found\n']])
+
+  await assert.rejects(
+    () => listRemoteHermesProfiles(ssh),
+    (err: any) => {
+      assert.equal(err.kind, 'transient-transport-error')
+
+      return true
+    }
   )
 })
 

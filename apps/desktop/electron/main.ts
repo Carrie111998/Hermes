@@ -225,6 +225,7 @@ import {
 import { selectPoolEvictions } from './pool-eviction'
 import { createPoolStopper } from './pool-stop'
 import { poolTouchKeys } from './pool-touch-scope'
+import { connectBatched, shouldFallBackToLegacy } from './posix-remote-bootstrap'
 import { createKeepAwake } from './power-save'
 import { PreviewReachRegistry } from './preview-reach'
 import {
@@ -9095,6 +9096,15 @@ async function bootstrapSshConnection(profile, sshConfig, reuseToken, source) {
   const resolvedConfig = { ...sshConfig, effectiveConfigFingerprint }
   const fingerprint = sshConfigFingerprint(scope, resolvedConfig)
 
+  // "joined" means a concurrent caller (v1 route + registry roster, or several
+  // windows) landed on the SAME (scope, fingerprint) and shares one bootstrap
+  // instead of dialling a second time.
+  const joined = sshBootstrapCoordinator.pending.get(scope)?.fingerprint === fingerprint
+
+  sshRememberLog(
+    `[ssh] bootstrap ${joined ? 'joined' : 'started'} scope=${JSON.stringify(scope)} source=${String(source || '')}`
+  )
+
   return sshBootstrapCoordinator.start(scope, fingerprint, lease =>
     bootstrapSshConnectionInner(profile, resolvedConfig, reuseToken, source, fingerprint, lease)
   )
@@ -9109,9 +9119,30 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
     await teardownSshConnection(profile)
   }
 
+  // Windows OpenSSH has no ControlMaster, so EVERY ssh invocation is a fresh
+  // key authentication (and, with a vault-backed agent, a user-visible
+  // approval). On that platform the whole remote lifecycle runs as one batched
+  // exec instead of ~15 calls plus a two-call readiness poll.
+  const batched = process.platform === 'win32'
+  const remoteDashboardProfile = resolveRemoteSshDashboardProfile(sshConfig.remoteProfile, profile)
+
+  const connectionLabel =
+    typeof source === 'string' && source.startsWith('registry:')
+      ? source.slice('registry:'.length)
+      : `v1-${String(source || 'settings')}`
+
+  const phases: Record<string, number> = {}
+
+  const recordPhase = (name: string, ms: number) => {
+    phases[name] = (phases[name] || 0) + ms
+  }
+
   let ssh = sshConnections.get(scope)?.ssh
 
-  if (ssh && !(await ssh.isAlive())) {
+  // Without mux there is no master to interrogate: the batched bootstrap exec
+  // that follows IS the liveness test, and its failure path already tears the
+  // scope down. Probing here would just buy one more authentication.
+  if (ssh && !batched && !(await ssh.isAlive())) {
     try {
       await ssh.close()
     } catch {
@@ -9125,6 +9156,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
   const created = !ssh
 
   let removeForceCleanup = () => {}
+  const cycleStartedAt = Date.now()
 
   if (created) {
     ssh = new SshConnection(
@@ -9137,17 +9169,21 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
       }
     )
     removeForceCleanup = lease.onForceCleanup(() => ssh.close())
-    await ssh.open({ signal: lease.signal })
+    const openStartedAt = Date.now()
+    await ssh.open({ lazy: batched, signal: lease.signal })
+    recordPhase('open', Date.now() - openStartedAt)
   }
 
+  const invocationsAtStart = ssh.invocations || 0
   let result
 
-  try {
+  const runLegacyLifecycle = async () => {
     const platform = await detectRemotePlatform(ssh, sshConfig.remoteHermesPath || '')
     const lifecycle = platform.os === 'Windows' ? connectWindowsRemote : remoteLifecycle.connect
-    result = await lifecycle({
+
+    return lifecycle({
       ssh,
-      profile: resolveRemoteSshDashboardProfile(sshConfig.remoteProfile, profile),
+      profile: remoteDashboardProfile,
       remoteHermesPath: sshConfig.remoteHermesPath || '',
       ownershipId: sshOwnershipKey(profile),
       reuseToken: reuseToken || '',
@@ -9160,6 +9196,46 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
       rememberLog: sshRememberLog,
       signal: lease.signal
     })
+  }
+
+  try {
+    if (batched) {
+      try {
+        result = await connectBatched({
+          adoptServedToken: adoptServedDashboardToken,
+          cancelForward: (localPort, remotePort) => ssh.cancelForward(localPort, remotePort),
+          forward: (localPort, remotePort, options) => ssh.forward(localPort, remotePort, '127.0.0.1', options),
+          onPhase: recordPhase,
+          ownershipId: sshOwnershipKey(profile),
+          pickLocalPort,
+          probeReuseProof: sshProbeReuseProof,
+          probeWebSocket: wsUrl => probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket }),
+          profile: remoteDashboardProfile,
+          rememberLog: sshRememberLog,
+          remoteHermesPath: sshConfig.remoteHermesPath || '',
+          reuseToken: reuseToken || '',
+          signal: lease.signal,
+          ssh,
+          waitForHermes: (baseUrl, token) => waitForHermes(baseUrl, token, lease.signal, 'token')
+        })
+      } catch (error: any) {
+        if (!shouldFallBackToLegacy(error)) {
+          throw error
+        }
+
+        // The remote could not run the batched program at all (no python3, a
+        // Windows remote, a mangled response). Take the slow path rather than
+        // failing the connection - and say exactly why, since this is the one
+        // case where the authentication count goes back up.
+        sshRememberLog(
+          `[ssh] batched bootstrap unavailable, falling back to the per-call lifecycle: ${error?.message || error}`
+        )
+        recordPhase('fallback', 0)
+        result = await runLegacyLifecycle()
+      }
+    } else {
+      result = await runLegacyLifecycle()
+    }
   } catch (error: any) {
     if (created) {
       try {
@@ -9221,6 +9297,17 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
   sshRememberLog(
     `[ssh] connection ${result.reused ? 'REUSED' : 'spawned'} dashboard: ` +
       `${result.hermesVersion || 'hermes (version unknown)'} at ${result.hermesPath || '?'}`
+  )
+
+  const phaseTrace = Object.entries(phases)
+    .map(([name, ms]) => `${name}Ms=${ms}`)
+    .join(' ')
+
+  sshRememberLog(
+    `[ssh] ready connection=${connectionLabel} profile=${remoteDashboardProfile || 'default'} ` +
+      `scope=${JSON.stringify(scope)} reused=${Boolean(result.reused)} ` +
+      `sshInvocations=${(ssh.invocations || 0) - invocationsAtStart} totalMs=${Date.now() - cycleStartedAt}` +
+      `${phaseTrace ? ` ${phaseTrace}` : ''}`
   )
 
   const connection = await buildRemoteConnection(
@@ -12756,7 +12843,10 @@ async function probeSshProfileInventory(connection) {
   )
 
   try {
-    await ssh.open()
+    // The listing exec below is itself the reachability check, so on a
+    // no-ControlMaster client we skip the separate `ssh true` handshake rather
+    // than pay a second authentication for the same answer.
+    await ssh.open({ lazy: process.platform === 'win32' })
     const profiles = await remoteLifecycle.listRemoteHermesProfiles(ssh)
 
     if (profiles.length > 0) {

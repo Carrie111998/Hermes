@@ -37,6 +37,7 @@ const LOCKFILE_SCHEMA_VERSION = 2
 const PROTOCOL_VERSION = 1
 const READY_RE = /^HERMES_(?:BACKEND|DASHBOARD)_READY port=(\d+)/m
 const REMOTE_LOCK_DIR = '~/.hermes/desktop-ssh'
+const NEWLINE = '\n'
 const SUPPORTED_REMOTE_OS = new Set(['Linux', 'Darwin'])
 const DEFAULT_READY_TIMEOUT_MS = 45_000
 const READY_POLL_INTERVAL_MS = 750
@@ -261,13 +262,28 @@ async function probeRemoteHermesHome(ssh) {
   }
 }
 
+const REMOTE_INVENTORY_SEPARATOR = '--- hermes-desktop-profiles ---'
+
+// Home resolution + listing in ONE exec. This runs on every roster poll until
+// it succeeds, and a client without ControlMaster (Windows) pays a full key
+// authentication per exec — two calls here is two authentications for one
+// answer. $HERMES_HOME is expanded and quoted by the REMOTE shell, so nothing
+// untrusted is interpolated into the command; the home is still validated
+// locally afterwards and an unsafe one still discards the listing.
+function buildRemoteProfileInventoryCommand() {
+  return (
+    'home="${HERMES_HOME:-$HOME/.hermes}"; ' +
+    `printf '%s${NEWLINE}' "$home"; ` +
+    `printf '%s${NEWLINE}' ${shq(REMOTE_INVENTORY_SEPARATOR)}; ` +
+    'if [ -d "$home/profiles" ]; then ls -1 "$home/profiles"; fi'
+  )
+}
+
 async function listRemoteHermesProfiles(ssh) {
-  const home = assertSafeRemoteHome(await probeRemoteHermesHome(ssh))
-  const dir = expandRemotePath(`${home}/profiles`)
-  let listing = ''
+  let output = ''
 
   try {
-    listing = await ssh.exec(`if [ -d ${dir} ]; then ls -1 ${dir}; fi`)
+    output = await ssh.exec(buildRemoteProfileInventoryCommand())
   } catch (cause) {
     const error: any = new Error('Could not list remote Hermes profiles.')
     error.kind = 'transient-transport-error'
@@ -275,7 +291,23 @@ async function listRemoteHermesProfiles(ssh) {
     throw error
   }
 
-  return parseRemoteProfileListing(listing)
+  const index = String(output || '').indexOf(REMOTE_INVENTORY_SEPARATOR)
+
+  if (index < 0) {
+    const error: any = new Error('Could not resolve the remote Hermes home.')
+    error.kind = 'transient-transport-error'
+    throw error
+  }
+
+  // Throws `unsafe-path` on a hostile HERMES_HOME, before any listing is used.
+  assertSafeRemoteHome(
+    String(output.slice(0, index) || '')
+      .trim()
+      .split(NEWLINE)
+      .pop()
+  )
+
+  return parseRemoteProfileListing(output.slice(index + REMOTE_INVENTORY_SEPARATOR.length))
 }
 
 function assertSafeRemoteHome(home) {
@@ -956,6 +988,7 @@ async function connect(deps) {
 
 export {
   adoptOwnedServedToken,
+  buildRemoteProfileInventoryCommand,
   buildSpawnCommand,
   cleanupStale,
   connect,
