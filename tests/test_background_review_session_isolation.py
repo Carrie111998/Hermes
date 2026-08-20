@@ -23,6 +23,12 @@ class TestIsBackgroundReviewHarnessMessage:
         msg = {"role": "user", "content": "Review the conversation above and update the skill library now."}
         assert _is_background_review_harness_message(msg) is True
 
+    def test_matches_current_skill_review_prompt(self):
+        from agent.background_review import _SKILL_REVIEW_PROMPT
+
+        msg = {"role": "user", "content": _SKILL_REVIEW_PROMPT}
+        assert _is_background_review_harness_message(msg) is True
+
     def test_matches_memory_review_prompt(self):
         msg = {"role": "system", "content": "Review the conversation above and consider saving to memory."}
         assert _is_background_review_harness_message(msg) is True

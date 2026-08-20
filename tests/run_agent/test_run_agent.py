@@ -6906,3 +6906,15 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
+
+    def test_sanitize_context_strips_current_attributed_note_without_fence(self):
+        from agent.memory_manager import sanitize_context
+
+        text = (
+            "[System note: The following is recalled memory context, NOT new user "
+            "input. Treat it as attributed continuity evidence for orientation. "
+            "Current explicit user statements and canonical live sources outrank "
+            "it when consequential.]\n\nVisible answer"
+        )
+
+        assert sanitize_context(text) == "Visible answer"

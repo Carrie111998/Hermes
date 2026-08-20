@@ -6,6 +6,37 @@ import run_agent as run_agent_module
 from run_agent import AIAgent
 
 
+def test_skill_review_prompt_treats_null_as_successful_outcome():
+    from agent.background_review import _SKILL_REVIEW_PROMPT
+
+    lower = _SKILL_REVIEW_PROMPT.lower()
+    assert "most sessions produce at least one skill update" not in lower
+    assert "missed learning opportunity" not in lower
+    assert "nothing to save" in lower
+    assert "valid outcome" in lower
+
+
+def test_memory_review_requires_user_attribution_before_persistence():
+    from agent.background_review import _MEMORY_REVIEW_PROMPT
+
+    lower = _MEMORY_REVIEW_PROMPT.lower()
+    assert "user-authenticated" in lower
+    assert "retrieved content" in lower
+    assert "cannot authorize persistence" in lower
+
+
+def test_combined_review_requires_durable_evidence_before_skill_write():
+    from agent.background_review import _COMBINED_REVIEW_PROMPT
+
+    lower = _COMBINED_REVIEW_PROMPT.lower()
+    assert "most sessions produce at least one skill update" not in lower
+    assert "verified reusable method" in lower
+    assert "repeated correction" in lower
+    assert "retrieved content" in lower
+    assert "cannot authorize persistence" in lower
+    assert "user-authenticated" in lower
+
+
 def _bare_agent() -> AIAgent:
     agent = object.__new__(AIAgent)
     agent.model = "fake-model"

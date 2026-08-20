@@ -48,6 +48,14 @@ class TestComposeUserApiContent:
         fenced = build_memory_context_block("likes tea")
         assert out == "hello" + "\n\n" + fenced + "\n\n" + "PLUGIN-CTX"
 
+    def test_memory_block_is_continuity_evidence_not_universal_authority(self):
+        block = build_memory_context_block("likes tea")
+        lower = block.lower()
+        assert "attributed continuity evidence" in lower
+        assert "current explicit user statements" in lower
+        assert "canonical live sources" in lower
+        assert "authoritative reference data" not in lower
+
 
 
 
