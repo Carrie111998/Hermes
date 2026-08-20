@@ -292,7 +292,7 @@ class TestBuildSkillsSystemPrompt:
             (d / "SKILL.md").write_text("---\ndescription: Search stuff\n---\n")
         result = build_skills_system_prompt()
         # "search" should appear only once per category
-        assert result.count("- search") == 1
+        assert result.count("invocation_name: search") == 1
 
 
     def test_compact_categories_demote_nested_and_miss_cache_separately(
@@ -1011,5 +1011,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 
