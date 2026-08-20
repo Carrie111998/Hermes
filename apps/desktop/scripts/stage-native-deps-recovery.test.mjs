@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import test from 'node:test'
+import { test } from 'vitest'
 
 import {
   GET_WINDOWS_MISSING_ROOT_MARKER,
@@ -12,76 +12,81 @@ import {
   stageGetWindowsWithRecovery
 } from './stage-native-deps-recovery.mjs'
 
-function tempParent(t) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-get-windows-recovery-test-'))
-  t.after(() => fs.rmSync(root, { force: true, recursive: true }))
-  return root
+function tempParent() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-get-windows-recovery-test-'))
 }
 
-test('isolated recovery installs the exact get-windows package outside active node_modules', (t) => {
-  const parent = tempParent(t)
-  let invocation
+test('isolated recovery installs the exact get-windows package outside active node_modules', () => {
+  const parent = tempParent()
+  try {
+    let invocation
 
-  const recovery = recoverGetWindowsPackage({
-    arch: 'x64',
-    npmExecPath: '/fake/npm-cli.js',
-    platform: 'win32',
-    tempParent: parent,
-    run(command, args, options) {
-      invocation = { args, command, options }
-      const packageRoot = path.join(options.cwd, 'node_modules', 'get-windows')
-      fs.mkdirSync(path.join(packageRoot, 'lib'), { recursive: true })
-      fs.writeFileSync(
-        path.join(packageRoot, 'package.json'),
-        JSON.stringify({ name: 'get-windows', version: GET_WINDOWS_RECOVERY_VERSION })
-      )
-      fs.writeFileSync(path.join(packageRoot, 'index.js'), 'export default {}\n')
-      return { status: 0 }
-    }
-  })
+    const recovery = recoverGetWindowsPackage({
+      arch: 'x64',
+      npmExecPath: '/fake/npm-cli.js',
+      platform: 'win32',
+      tempParent: parent,
+      run(command, args, options) {
+        invocation = { args, command, options }
+        const packageRoot = path.join(options.cwd, 'node_modules', 'get-windows')
+        fs.mkdirSync(path.join(packageRoot, 'lib'), { recursive: true })
+        fs.writeFileSync(
+          path.join(packageRoot, 'package.json'),
+          JSON.stringify({ name: 'get-windows', version: GET_WINDOWS_RECOVERY_VERSION })
+        )
+        fs.writeFileSync(path.join(packageRoot, 'index.js'), 'export default {}\n')
+        return { status: 0 }
+      }
+    })
 
-  assert.equal(invocation.command, process.execPath)
-  assert.equal(invocation.args[0], '/fake/npm-cli.js')
-  assert.equal(invocation.args[1], 'install')
-  assert.ok(invocation.args.includes('--workspaces=false'))
-  assert.ok(invocation.args.includes('--include=optional'))
-  assert.equal(invocation.options.cwd, recovery.recoveryRoot)
-  assert.equal(invocation.options.env.npm_config_platform, 'win32')
-  assert.equal(invocation.options.env.npm_config_arch, 'x64')
+    assert.equal(invocation.command, process.execPath)
+    assert.equal(invocation.args[0], '/fake/npm-cli.js')
+    assert.equal(invocation.args[1], 'install')
+    assert.ok(invocation.args.includes('--workspaces=false'))
+    assert.ok(invocation.args.includes('--include=optional'))
+    assert.equal(invocation.options.cwd, recovery.recoveryRoot)
+    assert.equal(invocation.options.env.npm_config_platform, 'win32')
+    assert.equal(invocation.options.env.npm_config_arch, 'x64')
 
-  const manifest = JSON.parse(
-    fs.readFileSync(path.join(recovery.recoveryRoot, 'package.json'), 'utf8')
-  )
-  assert.deepEqual(manifest.dependencies, {
-    'get-windows': GET_WINDOWS_RECOVERY_VERSION
-  })
-  assert.deepEqual(manifest.allowScripts, {
-    [`get-windows@${GET_WINDOWS_RECOVERY_VERSION}`]: true
-  })
-  assert.equal(
-    recovery.packageRoot,
-    path.join(recovery.recoveryRoot, 'node_modules', 'get-windows')
-  )
-  assert.ok(fs.existsSync(recovery.recoveryRoot))
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(recovery.recoveryRoot, 'package.json'), 'utf8')
+    )
+    assert.deepEqual(manifest.dependencies, {
+      'get-windows': GET_WINDOWS_RECOVERY_VERSION
+    })
+    assert.deepEqual(manifest.allowScripts, {
+      [`get-windows@${GET_WINDOWS_RECOVERY_VERSION}`]: true
+    })
+    assert.equal(
+      recovery.packageRoot,
+      path.join(recovery.recoveryRoot, 'node_modules', 'get-windows')
+    )
+    assert.ok(fs.existsSync(recovery.recoveryRoot))
 
-  assert.equal(recovery.cleanup(), true)
-  assert.equal(recovery.cleanup(), true)
-  assert.equal(fs.existsSync(recovery.recoveryRoot), false)
+    assert.equal(recovery.cleanup(), true)
+    assert.equal(recovery.cleanup(), true)
+    assert.equal(fs.existsSync(recovery.recoveryRoot), false)
+  } finally {
+    fs.rmSync(parent, { force: true, recursive: true })
+  }
 })
 
-test('failed isolated install is removed and cannot poison a later update', (t) => {
-  const parent = tempParent(t)
-
-  assert.throws(
-    () =>
-      recoverGetWindowsPackage({
-        npmExecPath: '/fake/npm-cli.js',
-        run: () => ({ status: 1 }),
-        tempParent: parent
-      }),
-    /isolated get-windows recovery install exited with 1/
-  )
-  assert.deepEqual(fs.readdirSync(parent), [])
+test('failed isolated install is removed and cannot poison a later update', () => {
+  const parent = tempParent()
+  try {
+    assert.throws(
+      () =>
+        recoverGetWindowsPackage({
+          npmExecPath: '/fake/npm-cli.js',
+          run: () => ({ status: 1 }),
+          tempParent: parent
+        }),
+      /isolated get-windows recovery install exited with 1/
+    )
+    assert.deepEqual(fs.readdirSync(parent), [])
+  } finally {
+    fs.rmSync(parent, { force: true, recursive: true })
+  }
 })
 
 test('supported native Windows staging retries with the recovered package root', () => {
