@@ -272,6 +272,7 @@ def test_rebound_registry_tool_is_rejected_at_dispatch(agent_env):
     )
     agent.tools = [*agent.tools, {"type": "function", "function": schema}]
     agent.valid_tool_names = {*agent.valid_tool_names, "binding_probe"}
+    agent._tool_snapshot_generation = registry._generation
 
     original_flush = agent._flush_messages_to_session_db
     rebound = False
@@ -295,6 +296,62 @@ def test_rebound_registry_tool_is_rejected_at_dispatch(agent_env):
 
     result = agent.run_conversation(
         "run the binding probe", conversation_history=[], task_id="t"
+    )
+
+    tool_results = [
+        message.get("content", "")
+        for message in result["messages"]
+        if isinstance(message, dict) and message.get("role") == "tool"
+    ]
+    assert calls == []
+    assert any("binding changed" in content for content in tool_results)
+    assert result["final_response"] == "Retried safely."
+
+
+def test_registry_change_between_schema_and_binding_capture_is_rejected(
+    agent_env, monkeypatch
+):
+    """Schema A must not pair with binding B during request assembly."""
+    agent, handler = agent_env
+    from tools.registry import registry
+
+    calls = []
+    schema = {
+        "name": "assembly_binding_probe",
+        "description": "Probe atomic request assembly.",
+        "parameters": {"type": "object", "properties": {}},
+    }
+    registry.register(
+        name="assembly_binding_probe",
+        toolset="test-binding",
+        schema=schema,
+        handler=lambda _args, **_kwargs: calls.append("A") or '{"ok":"A"}',
+    )
+    agent.tools = [*agent.tools, {"type": "function", "function": schema}]
+    agent.valid_tool_names = {*agent.valid_tool_names, "assembly_binding_probe"}
+    agent._tool_snapshot_generation = registry._generation
+
+    original_capture = registry.capture_bindings_with_generation
+    rebound = False
+
+    def _rebind_then_capture(names, *, scope=None):
+        nonlocal rebound
+        if not rebound:
+            rebound = True
+            registry.register(
+                name="assembly_binding_probe",
+                toolset="test-binding",
+                schema=schema,
+                handler=lambda _args, **_kwargs: calls.append("B") or '{"ok":"B"}',
+            )
+        return original_capture(names, scope=scope)
+
+    monkeypatch.setattr(registry, "capture_bindings_with_generation", _rebind_then_capture)
+    handler.response_queue.append(_tc_resp("assembly_binding_probe"))
+    handler.response_queue.append(_text_resp("Retried safely."))
+
+    result = agent.run_conversation(
+        "run the assembly probe", conversation_history=[], task_id="t"
     )
 
     tool_results = [

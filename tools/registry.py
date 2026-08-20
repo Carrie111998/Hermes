@@ -524,9 +524,21 @@ class ToolRegistry:
         scope: Optional[str] = None,
     ) -> Dict[str, Optional[ToolEntry]]:
         """Capture immutable entry identities for one request's tool names."""
+        bindings, _generation = self.capture_bindings_with_generation(
+            names, scope=scope
+        )
+        return bindings
+
+    def capture_bindings_with_generation(
+        self,
+        names,
+        *,
+        scope: Optional[str] = None,
+    ) -> tuple[Dict[str, Optional[ToolEntry]], int]:
+        """Capture entry identities and their registry generation atomically."""
         with self._lock:
             merged = self._merged_tools(scope)
-            return {name: merged.get(name) for name in names}
+            return ({name: merged.get(name) for name in names}, self._generation)
 
     def snapshot_registration(
         self,

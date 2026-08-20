@@ -2417,7 +2417,10 @@ def run_conversation(
         )
         tools_for_api = request_tool_snapshot
         from tools.registry import registry as _tool_registry
-        request_registry_bindings = _tool_registry.capture_bindings(
+        (
+            request_registry_bindings,
+            request_registry_generation,
+        ) = _tool_registry.capture_bindings_with_generation(
             request_tool_names(request_tool_snapshot)
         )
         if agent._use_prompt_caching and agent.provider != "moa":
@@ -6862,7 +6865,7 @@ def run_conversation(
                     agent,
                     request_tool_snapshot,
                     request_tool_snapshot_generation,
-                ):
+                ) or request_registry_generation != request_tool_snapshot_generation:
                     # A name offered by request A is not proof that its live
                     # handler still has A's binding after snapshot B publishes.
                     # Refuse all execution from A and let the next iteration
