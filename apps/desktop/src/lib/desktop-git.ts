@@ -1,3 +1,4 @@
+import { hermesApi } from '@/api/client'
 import type {
   HermesGitBaseBranch,
   HermesGitBranch,
@@ -25,7 +26,7 @@ function desktopApi<T>(path: string, body?: Record<string, unknown>): Promise<T>
     throw new Error('Hermes Desktop bridge is unavailable')
   }
 
-  return desktop.api<T>(
+  return hermesApi<T>(
     body ? { body, method: 'POST', path, profile: desktopFsProfile() } : { path, profile: desktopFsProfile() }
   )
 }

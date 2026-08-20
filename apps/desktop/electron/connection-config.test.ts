@@ -455,6 +455,20 @@ test('apiRequestRegistryConnectionId extracts a genuinely non-local connection i
   assert.equal(apiRequestRegistryConnectionId({ connectionId: '  gw-1  ', path: '/x' }), 'gw-1')
 })
 
+test('registry filesystem requests stay on their gateway and shared-remote profile', () => {
+  const request = {
+    connectionId: 'gateway-proxmox',
+    path: '/api/fs/list?path=%2Fsrv%2Fproject',
+    profile: 'remote-docker'
+  }
+
+  assert.equal(apiRequestRegistryConnectionId(request), 'gateway-proxmox')
+  assert.equal(
+    pathWithProfileScope(request.path, request.profile),
+    '/api/fs/list?path=%2Fsrv%2Fproject&profile=remote-docker'
+  )
+})
+
 test('apiRequestRegistryConnectionId preserves an explicit local registry route', () => {
   assert.equal(apiRequestRegistryConnectionId({ connectionId: 'local', path: '/x' }), 'local')
 })

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { setApiRequestConnection } from '@/api/client'
 import { $connection } from '@/store/session'
 
 import { desktopGit } from './desktop-git'
@@ -33,12 +34,14 @@ const api = vi.fn(async ({ path }: { path: string }) => {
 describe('desktop git facade', () => {
   beforeEach(() => {
     vi.stubGlobal('window', { hermesDesktop: { api, git: localGit } })
+    setApiRequestConnection(null)
     $connection.set(null)
   })
 
   afterEach(() => {
     vi.unstubAllGlobals()
     vi.clearAllMocks()
+    setApiRequestConnection(null)
     $connection.set(null)
   })
 
@@ -75,15 +78,21 @@ describe('desktop git facade', () => {
     expect(repoStatus).not.toHaveBeenCalled()
   })
 
-  it('targets the active profile backend so a remote profile never touches the local repo', async () => {
+  it('targets the active registry connection and profile for remote git requests', async () => {
+    setApiRequestConnection('gateway-proxmox')
     $connection.set({ mode: 'remote', profile: 'remote-docker' } as never)
 
     await desktopGit()?.repoStatus('/srv/work')
     await desktopGit()?.review.stage('/srv/work', 'a.txt')
 
-    expect(api).toHaveBeenCalledWith({ path: '/api/git/status?path=%2Fsrv%2Fwork', profile: 'remote-docker' })
+    expect(api).toHaveBeenCalledWith({
+      connectionId: 'gateway-proxmox',
+      path: '/api/git/status?path=%2Fsrv%2Fwork',
+      profile: 'remote-docker'
+    })
     expect(api).toHaveBeenCalledWith({
       body: { file: 'a.txt', path: '/srv/work' },
+      connectionId: 'gateway-proxmox',
       method: 'POST',
       path: '/api/git/review/stage',
       profile: 'remote-docker'

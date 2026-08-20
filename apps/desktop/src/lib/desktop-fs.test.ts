@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { setApiRequestConnection } from '@/api/client'
 import { $connection } from '@/store/session'
 
 import {
@@ -12,7 +13,8 @@ import {
   readDesktopFileDataUrlLocalFirst,
   readDesktopFileText,
   selectDesktopPaths,
-  setDesktopFsRemotePicker
+  setDesktopFsRemotePicker,
+  writeDesktopFileText
 } from './desktop-fs'
 
 const readDir = vi.fn(async () => ({ entries: [{ name: 'local', path: '/local', isDirectory: true }] }))
@@ -32,6 +34,10 @@ const api = vi.fn(async ({ path }: { path: string }) => {
 
   if (path.startsWith('/api/fs/read-data-url?')) {
     return { dataUrl: 'data:text/plain;base64,cmVtb3Rl' }
+  }
+
+  if (path === '/api/fs/write-text') {
+    return { ok: true, path: '/remote/file.txt' }
   }
 
   if (path.startsWith('/api/fs/git-root?')) {
@@ -65,12 +71,14 @@ function stubBridge() {
 describe('desktop filesystem facade', () => {
   beforeEach(() => {
     stubBridge()
+    setApiRequestConnection(null)
     $connection.set(null)
   })
 
   afterEach(() => {
     vi.unstubAllGlobals()
     vi.clearAllMocks()
+    setApiRequestConnection(null)
     $connection.set(null)
     setDesktopFsRemotePicker(null)
   })
@@ -142,6 +150,33 @@ describe('desktop filesystem facade', () => {
 
     expect(api).toHaveBeenCalledWith({ path: '/api/fs/list?path=%2Fsrv%2Fproject', profile: 'remote-docker' })
     expect(api).toHaveBeenCalledWith({ path: '/api/fs/default-cwd', profile: 'remote-docker' })
+  })
+
+  it('targets the active registry connection for remote filesystem requests', async () => {
+    setApiRequestConnection('gateway-proxmox')
+    $connection.set({ mode: 'remote', profile: 'remote-docker' } as never)
+
+    await readDesktopDir('/srv/project')
+    await desktopDefaultCwd()
+    await writeDesktopFileText('/srv/project/a.txt', 'hello')
+
+    expect(api).toHaveBeenCalledWith({
+      connectionId: 'gateway-proxmox',
+      path: '/api/fs/list?path=%2Fsrv%2Fproject',
+      profile: 'remote-docker'
+    })
+    expect(api).toHaveBeenCalledWith({
+      connectionId: 'gateway-proxmox',
+      path: '/api/fs/default-cwd',
+      profile: 'remote-docker'
+    })
+    expect(api).toHaveBeenCalledWith({
+      body: { content: 'hello', path: '/srv/project/a.txt' },
+      connectionId: 'gateway-proxmox',
+      method: 'POST',
+      path: '/api/fs/write-text',
+      profile: 'remote-docker'
+    })
   })
 
   it('keys SSH filesystem caches by stable host identity instead of the forwarded port', () => {
