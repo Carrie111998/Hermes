@@ -887,100 +887,120 @@ def _(rid, params: dict) -> dict:
             return _err(
                 rid, 4009, "session busy — /interrupt the current turn before /undo"
             )
-        db = _get_db()
-        if db is None:
-            return _db_unavailable_error(rid, code=5008)
-        session_key = session.get("session_key", "")
-        if not session_key:
-            return _err(rid, 4001, "no session key for undo")
-        # Parse the optional count argument (e.g. "/undo 3" → 3).
-        n = 1
-        arg_str = (arg or "").strip()
-        if arg_str:
-            try:
-                n = int(arg_str.split()[0])
-            except (ValueError, IndexError):
-                return _err(rid, 4004, f"undo: invalid count {arg_str!r} — use /undo or /undo N")
-        if n < 1:
+        # Profile-owned session (global-remote desktop profile): the durable
+        # rows live in the profile's own state.db, not the launch profile's —
+        # same routing the prompt.submit truncation write uses. Reading the
+        # launch DB here finds no rows ("no user messages to undo") and a
+        # rewind would silently no-op against the wrong database.
+        with _session_db(session) as db:
+            if db is None:
+                return _db_unavailable_error(rid, code=5008)
+            session_key = session.get("session_key", "")
+            if not session_key:
+                return _err(rid, 4001, "no session key for undo")
+            # Parse the optional count argument (e.g. "/undo 3" → 3).
             n = 1
-        try:
-            recents = db.list_recent_user_messages(session_key, limit=max(n, 10))
-        except Exception as e:
-            return _err(rid, 5008, f"undo: failed to load history: {e}")
-        if not recents:
-            return _err(rid, 4018, "no user messages to undo")
-        # recents[0] is the most-recent user turn; pick the Nth-from-last.
-        # If N exceeds the number of user turns, back up to the oldest.
-        target_idx = min(n - 1, len(recents) - 1)
-        target_id = recents[target_idx]["id"]
-        try:
-            result = db.rewind_to_message(session_key, target_id)
-        except ValueError as e:
-            return _err(rid, 4004, f"undo: {e}")
-        except Exception as e:
-            return _err(rid, 5008, f"undo: {e}")
-        # Reload the active-only transcript into the in-memory session
-        # history so subsequent turns see the truncated view.
-        # repair_alternation: this reload feeds LIVE REPLAY — session["history"]
-        # is the working conversation for subsequent turns, and a rewind that
-        # lands on a durable user;user pair would otherwise re-fire the
-        # pre-request repair on every request from here on.
-        try:
-            active = db.get_messages_as_conversation(
-                session_key, repair_alternation=True, include_row_ids=True
+            arg_str = (arg or "").strip()
+            if arg_str:
+                try:
+                    n = int(arg_str.split()[0])
+                except (ValueError, IndexError):
+                    return _err(rid, 4004, f"undo: invalid count {arg_str!r} — use /undo or /undo N")
+            if n < 1:
+                n = 1
+            try:
+                recents = db.list_recent_user_messages(session_key, limit=max(n, 10))
+            except Exception as e:
+                return _err(rid, 5008, f"undo: failed to load history: {e}")
+            if not recents:
+                return _err(rid, 4018, "no user messages to undo")
+            # recents[0] is the most-recent user turn; pick the Nth-from-last.
+            # If N exceeds the number of user turns, back up to the oldest.
+            target_idx = min(n - 1, len(recents) - 1)
+            target_id = recents[target_idx]["id"]
+            try:
+                result = db.rewind_to_message(session_key, target_id)
+            except ValueError as e:
+                return _err(rid, 4004, f"undo: {e}")
+            except Exception as e:
+                return _err(rid, 5008, f"undo: {e}")
+            # Reload the active-only transcript into the in-memory session
+            # history so subsequent turns see the truncated view.
+            # repair_alternation: this reload feeds LIVE REPLAY — session["history"]
+            # is the working conversation for subsequent turns, and a rewind that
+            # lands on a durable user;user pair would otherwise re-fire the
+            # pre-request repair on every request from here on.
+            try:
+                active = db.get_messages_as_conversation(
+                    session_key, repair_alternation=True, include_row_ids=True
+                )
+            except Exception:
+                # The durable rewind already succeeded; a failed reload must
+                # NOT publish an empty transcript. That would wipe the live
+                # agent's whole context mid-session, and the flush-pointer
+                # reset below (len([]) == 0) would re-append every surviving
+                # message as new rows — resurrecting the turns /undo just
+                # soft-archived. Keep the pre-rewind memory instead: the DB
+                # is the source of truth and the next resume/reload converges
+                # back to it.
+                active = None
+                logger.error(
+                    "undo: rewind succeeded for session %s but history reload "
+                    "failed; keeping pre-rewind in-memory history",
+                    session_key,
+                    exc_info=True,
+                )
+            if active is not None:
+                with session["history_lock"]:
+                    session["history"] = list(active)
+                    session["history_version"] = int(session.get("history_version", 0)) + 1
+            # Notify memory providers — same hook /branch fires, plus the
+            # rewound flag so providers caching per-turn document state
+            # know to invalidate. See #6672 + #21910.
+            agent = session.get("agent")
+            if agent is not None:
+                mm = getattr(agent, "_memory_manager", None)
+                if mm is not None:
+                    try:
+                        mm.on_session_switch(
+                            session_key,
+                            parent_session_id="",
+                            reset=False,
+                            rewound=True,
+                        )
+                    except Exception:
+                        pass
+                if hasattr(agent, "_invalidate_system_prompt"):
+                    try:
+                        agent._invalidate_system_prompt()
+                    except Exception:
+                        pass
+                if hasattr(agent, "_last_flushed_db_idx") and active is not None:
+                    try:
+                        agent._last_flushed_db_idx = len(active)
+                    except Exception:
+                        pass
+            target_msg = result.get("target_message") or {}
+            target_text = target_msg.get("content") or ""
+            if isinstance(target_text, list):
+                parts = [
+                    p.get("text", "") for p in target_text
+                    if isinstance(p, dict) and p.get("type") == "text"
+                ]
+                target_text = "\n".join(t for t in parts if t)
+            if not isinstance(target_text, str):
+                target_text = ""
+            rewound_count = result.get("rewound_count", 0)
+            turns_undone = target_idx + 1
+            turn_word = "turn" if turns_undone == 1 else "turns"
+            notice = (
+                f"↶ Undid {turns_undone} {turn_word} ({rewound_count} message(s)). "
+                "Edit and resubmit, or send a new message."
             )
-        except Exception:
-            active = []
-        with session["history_lock"]:
-            session["history"] = list(active)
-            session["history_version"] = int(session.get("history_version", 0)) + 1
-        # Notify memory providers — same hook /branch fires, plus the
-        # rewound flag so providers caching per-turn document state
-        # know to invalidate. See #6672 + #21910.
-        agent = session.get("agent")
-        if agent is not None:
-            mm = getattr(agent, "_memory_manager", None)
-            if mm is not None:
-                try:
-                    mm.on_session_switch(
-                        session_key,
-                        parent_session_id="",
-                        reset=False,
-                        rewound=True,
-                    )
-                except Exception:
-                    pass
-            if hasattr(agent, "_invalidate_system_prompt"):
-                try:
-                    agent._invalidate_system_prompt()
-                except Exception:
-                    pass
-            if hasattr(agent, "_last_flushed_db_idx"):
-                try:
-                    agent._last_flushed_db_idx = len(active)
-                except Exception:
-                    pass
-        target_msg = result.get("target_message") or {}
-        target_text = target_msg.get("content") or ""
-        if isinstance(target_text, list):
-            parts = [
-                p.get("text", "") for p in target_text
-                if isinstance(p, dict) and p.get("type") == "text"
-            ]
-            target_text = "\n".join(t for t in parts if t)
-        if not isinstance(target_text, str):
-            target_text = ""
-        rewound_count = result.get("rewound_count", 0)
-        turns_undone = target_idx + 1
-        turn_word = "turn" if turns_undone == 1 else "turns"
-        notice = (
-            f"↶ Undid {turns_undone} {turn_word} ({rewound_count} message(s)). "
-            "Edit and resubmit, or send a new message."
-        )
-        return _ok(
-            rid,
-            {"type": "prefill", "message": target_text, "notice": notice},
-        )
+            return _ok(
+                rid,
+                {"type": "prefill", "message": target_text, "notice": notice},
+            )
 
     if name in {"snapshot", "snap"}:
         subcommand = arg.split(maxsplit=1)[0].lower() if arg else ""

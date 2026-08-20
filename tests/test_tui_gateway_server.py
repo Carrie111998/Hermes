@@ -5559,6 +5559,288 @@ def test_prompt_submit_truncates_by_row_id(monkeypatch):
         server._sessions.pop("row-id-trunc-sid", None)
 
 
+def test_prompt_submit_row_id_truncates_profile_owned_history(monkeypatch, tmp_path):
+    """A remote-profile edit must write through the same DB used to resolve it."""
+    from hermes_state import SessionDB
+
+    profile_home = tmp_path / "remote-profile"
+    profile_home.mkdir()
+    session_key = "profile-row-id-session"
+    db = SessionDB(db_path=profile_home / "state.db")
+    try:
+        db.create_session(session_key, source="desktop")
+        db.append_messages_batch(
+            session_key,
+            [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "reply 1"},
+                {"role": "user", "content": "second"},
+                {"role": "assistant", "content": "reply 2"},
+            ],
+        )
+        history = db.get_messages_as_conversation(
+            session_key, include_row_ids=True
+        )
+        target_row_id = history[2]["_row_id"]
+    finally:
+        db.close()
+
+    sess = _session(history=list(history), session_key=session_key)
+    sess["profile_home"] = str(profile_home)
+    server._sessions["profile-row-id-sid"] = sess
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: pytest.fail("must not write through the launch-profile DB"),
+    )
+    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "profile-row-id-sid",
+                    "text": "edited second",
+                    "truncate_before_row_id": target_row_id,
+                    "confirm_truncate": True,
+                },
+            }
+        )
+        assert resp.get("error") is None
+        assert [message["content"] for message in sess["history"]] == [
+            "first",
+            "reply 1",
+        ]
+        verify_db = SessionDB(db_path=profile_home / "state.db")
+        try:
+            persisted = verify_db.get_messages_as_conversation(session_key)
+        finally:
+            verify_db.close()
+        assert [message["content"] for message in persisted] == [
+            "first",
+            "reply 1",
+        ]
+    finally:
+        server._sessions.pop("profile-row-id-sid", None)
+
+
+def test_cli_undo_routes_profile_owned_session_db(monkeypatch, tmp_path):
+    """/undo on a remote-profile session must read/rewind the profile's own
+    state.db — the launch-profile DB has no rows for that session key, so the
+    old `_get_db()` routing failed with "no user messages to undo"."""
+    from hermes_state import SessionDB
+
+    profile_home = tmp_path / "remote-profile"
+    profile_home.mkdir()
+    session_key = "profile-undo-session"
+    db = SessionDB(db_path=profile_home / "state.db")
+    try:
+        db.create_session(session_key, source="desktop")
+        db.append_messages_batch(
+            session_key,
+            [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "reply 1"},
+                {"role": "user", "content": "second"},
+                {"role": "assistant", "content": "reply 2"},
+            ],
+        )
+    finally:
+        db.close()
+
+    sess = _session(history=[], session_key=session_key)
+    sess["profile_home"] = str(profile_home)
+    server._sessions["profile-undo-sid"] = sess
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: pytest.fail("must not read through the launch-profile DB"),
+    )
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "command.dispatch",
+                "params": {
+                    "session_id": "profile-undo-sid",
+                    "name": "undo",
+                    "arg": "",
+                },
+            }
+        )
+        assert resp.get("result"), f"got error: {resp.get('error')}"
+        assert resp["result"]["type"] == "prefill"
+        assert resp["result"]["message"] == "second"
+        verify_db = SessionDB(db_path=profile_home / "state.db")
+        try:
+            persisted = verify_db.get_messages_as_conversation(session_key)
+        finally:
+            verify_db.close()
+        assert [message["content"] for message in persisted] == ["first", "reply 1"]
+    finally:
+        server._sessions.pop("profile-undo-sid", None)
+
+
+def test_prompt_submit_truncate_fails_closed_when_profile_db_unavailable(
+    monkeypatch, tmp_path
+):
+    """Profile-owned session + unopenable profile state.db + confirmed
+    truncate: the turn must be refused (fail closed), NOT silently skipped —
+    otherwise memory truncates while the profile DB keeps the old tail
+    (durable zombie history; the ordinal-mismatch class this PR fixes)."""
+    from hermes_state import SessionDB
+
+    profile_home = tmp_path / "remote-profile"
+    profile_home.mkdir()
+    session_key = "profile-unavailable-session"
+    db = SessionDB(db_path=profile_home / "state.db")
+    try:
+        db.create_session(session_key, source="desktop")
+        db.append_messages_batch(
+            session_key,
+            [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "reply 1"},
+                {"role": "user", "content": "second"},
+                {"role": "assistant", "content": "reply 2"},
+            ],
+        )
+        history = db.get_messages_as_conversation(
+            session_key, include_row_ids=True
+        )
+        target_row_id = history[2]["_row_id"]
+    finally:
+        db.close()
+
+    sess = _session(history=list(history), session_key=session_key)
+    sess["profile_home"] = str(profile_home)
+    server._sessions["profile-unavailable-sid"] = sess
+    def _yield_none(session):
+        yield None
+
+    monkeypatch.setattr(
+        server, "_session_db", server.contextlib.contextmanager(_yield_none)
+    )
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: pytest.fail("must not fall back to the launch-profile DB"),
+    )
+    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "profile-unavailable-sid",
+                    "text": "edited second",
+                    "truncate_before_row_id": target_row_id,
+                    "confirm_truncate": True,
+                },
+            }
+        )
+        assert resp.get("error"), "expected fail-closed refusal"
+        assert resp["error"]["code"] == 5008
+        assert "state.db unavailable" in resp["error"]["message"]
+        # Fail closed = memory untouched, no turn started.
+        assert [m["content"] for m in sess["history"]] == [
+            "first",
+            "reply 1",
+            "second",
+            "reply 2",
+        ]
+        assert sess["running"] is False
+    finally:
+        server._sessions.pop("profile-unavailable-sid", None)
+
+
+def test_cli_undo_keeps_history_when_post_rewind_reload_fails(
+    monkeypatch, tmp_path
+):
+    """/undo: rewind_to_message succeeds but the post-rewind reload raises —
+    live memory must keep the pre-rewind transcript instead of being wiped
+    to an empty list (the flush pointer would then re-append every surviving
+    row, resurrecting the soft-archived turns)."""
+    from hermes_state import SessionDB
+
+    profile_home = tmp_path / "remote-profile"
+    profile_home.mkdir()
+    session_key = "profile-undo-reload-fail-session"
+    db = SessionDB(db_path=profile_home / "state.db")
+    try:
+        db.create_session(session_key, source="desktop")
+        db.append_messages_batch(
+            session_key,
+            [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "reply 1"},
+                {"role": "user", "content": "second"},
+                {"role": "assistant", "content": "reply 2"},
+            ],
+        )
+    finally:
+        db.close()
+
+    sess = _session(history=[], session_key=session_key)
+    sess["profile_home"] = str(profile_home)
+    server._sessions["profile-undo-reload-fail-sid"] = sess
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: pytest.fail("must not read through the launch-profile DB"),
+    )
+
+    real_session_db = server._session_db
+
+    @server.contextlib.contextmanager
+    def _failing_reload_session_db(session):
+        with real_session_db(session) as db:
+            if db is None:
+                yield None
+                return
+            original = db.get_messages_as_conversation
+
+            def _broken(*args, **kwargs):
+                if kwargs.get("include_row_ids"):
+                    raise RuntimeError("simulated reload failure")
+                return original(*args, **kwargs)
+
+            db.get_messages_as_conversation = _broken
+            yield db
+
+    monkeypatch.setattr(server, "_session_db", _failing_reload_session_db)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "command.dispatch",
+                "params": {
+                    "session_id": "profile-undo-reload-fail-sid",
+                    "name": "undo",
+                    "arg": "",
+                },
+            }
+        )
+        assert resp.get("result"), f"got error: {resp.get('error')}"
+        assert resp["result"]["type"] == "prefill"
+        # DB was rewound (durable rewind succeeded)…
+        verify_db = SessionDB(db_path=profile_home / "state.db")
+        try:
+            persisted = verify_db.get_messages_as_conversation(session_key)
+        finally:
+            verify_db.close()
+        assert [message["content"] for message in persisted] == ["first", "reply 1"]
+        # …but live memory keeps the pre-rewind view rather than going empty.
+        assert sess["history"] == []
+    finally:
+        server._sessions.pop("profile-undo-reload-fail-sid", None)
+
+
 def test_prompt_submit_truncates_by_string_row_id(monkeypatch):
     """#82959: String row IDs in history match correctly against integer truncate_before_row_id."""
     replaced = []
