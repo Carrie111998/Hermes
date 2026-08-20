@@ -710,9 +710,8 @@ def test_resolve_capture_mode_auto_and_prefer_client(monkeypatch):
     assert ww.resolve_capture_mode({"capture": "auto"}, force_local=True) == "local"
     monkeypatch.setattr(ww, "_local_input_device_ready", lambda: True)
     assert ww.resolve_capture_mode({"capture": "auto"}) == "local"
-    # A working backend mic wins under auto even for a preferring surface, so
-    # local desktops keep PortAudio + wake_word.input_device selection.
-    assert ww.resolve_capture_mode({"capture": "auto"}, prefer_client=True) == "local"
+    # GUI capture belongs to the renderer even when the backend has a mic.
+    assert ww.resolve_capture_mode({"capture": "auto"}, prefer_client=True) == "client"
     # Explicit client still forces streaming (backend mic exists but is wrong).
     assert ww.resolve_capture_mode({"capture": "client"}, prefer_client=True) == "client"
 

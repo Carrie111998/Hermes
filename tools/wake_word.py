@@ -269,14 +269,12 @@ def resolve_capture_mode(
         return "client"
     if raw == "local":
         return "local"
-    # auto: a working backend input always wins so local desktops keep
-    # PortAudio and the configured ``input_device`` selection. Client capture
-    # is the fallback for a preferring surface (desktop remote) on a backend
-    # with no usable mic — the headless VPS/Cloud case.
-    if _local_input_device_ready():
-        return "local"
+    # A GUI owns its microphone through the renderer, regardless of where the
+    # backend runs. CLI/TUI keep using the backend's PortAudio input.
     if prefer_client:
         return "client"
+    if _local_input_device_ready():
+        return "local"
     # No local mic and no client preference (CLI/TUI): stay local so status
     # reports the real requirement instead of advertising a capture path
     # nothing will feed.

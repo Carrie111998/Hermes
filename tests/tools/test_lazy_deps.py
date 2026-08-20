@@ -75,6 +75,14 @@ class TestSpecSafety:
 
 
 class TestAllowlist:
+    def test_openwakeword_keeps_stock_pin_except_on_intel_macos(self, monkeypatch):
+        monkeypatch.setattr(ld.sys, "platform", "linux")
+        assert "onnxruntime==1.27.0" in ld.feature_specs("wake.openwakeword")
+
+        monkeypatch.setattr(ld.sys, "platform", "darwin")
+        monkeypatch.setattr(ld.platform, "machine", lambda: "x86_64")
+        assert "onnxruntime==1.23.2" in ld.feature_specs("wake.openwakeword")
+
     def test_unknown_feature_raises(self, monkeypatch):
         monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
         with pytest.raises(ld.FeatureUnavailable, match="not in LAZY_DEPS"):

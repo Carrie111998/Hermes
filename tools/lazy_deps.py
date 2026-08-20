@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 import re
 import shutil
 import site
@@ -167,9 +168,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     ),
     "wake.openwakeword": (
         "openwakeword==0.6.0",
-        # 1.27.0 dropped Intel macOS wheels; 1.23.2 remains available for
-        # Darwin x86_64 (the supported OpenWakeWord backend on Intel Macs).
-        "onnxruntime==1.23.2",
+        "onnxruntime==1.27.0",
         "sounddevice==0.5.5",
         "numpy==2.4.3",
     ),
@@ -836,7 +835,17 @@ def feature_specs(feature: str) -> tuple[str, ...]:
     """Return the registered specs for a feature, or raise KeyError."""
     if feature not in LAZY_DEPS:
         raise KeyError(f"Unknown lazy feature: {feature!r}")
-    return LAZY_DEPS[feature]
+    specs = LAZY_DEPS[feature]
+    if (
+        feature == "wake.openwakeword"
+        and sys.platform == "darwin"
+        and platform.machine().lower() in {"x86_64", "amd64"}
+    ):
+        return tuple(
+            "onnxruntime==1.23.2" if spec == "onnxruntime==1.27.0" else spec
+            for spec in specs
+        )
+    return specs
 
 
 def feature_missing(feature: str) -> tuple[str, ...]:
@@ -996,7 +1005,7 @@ def feature_install_command(feature: str, *, venv_pip: bool = False) -> Optional
     """
     if feature not in LAZY_DEPS:
         return None
-    specs = LAZY_DEPS[feature]
+    specs = feature_specs(feature)
     joined = " ".join(repr(s) for s in specs)
     if venv_pip:
         return f"{sys.executable} -m pip install {joined}"
