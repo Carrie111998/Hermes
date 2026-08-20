@@ -43,9 +43,25 @@ from utils import atomic_replace
 logger = logging.getLogger(__name__)
 
 # L2 enforcement (post-turn READONLY gate): refuse suggestion writes
-# from the background-review origin when HERMES_DISABLE_SELF_IMPROVEMENT
-# or HERMES_READ_ONLY_SESSION is activated. Read paths of
-# ``load_suggestions``/``list_pending`` stay unaffected.
+# from the background-review origin when the captured self-improvement
+# Decision is DENY. Read paths of ``load_suggestions``/``list_pending``
+# stay unaffected.
+#
+# Authority contract (P0-1 / Block 2 repair, PR #90883 must-fix):
+#   * The primary DENY/ALLOW decision comes from the captured
+#     ``get_self_improvement_decision()`` ContextVar. The captured
+#     ``Decision`` is the frozen authority; env vars are sampled
+#     ONCE at canonical initialization and never re-read here.
+#   * The legacy ``evaluate(...)`` helper is retained ONLY as a
+#     secondary layer for operation_kind labelling / logging / auditing
+#     (``operation_kind="suggestions_write"`` vs ``skill_*``) and any
+#     background-review-specific semantics. It MUST NOT act as a second
+#     authority for self-improvement and MUST NOT override the captured
+#     Decision based on env state.
+from agent.self_improvement_decision_context import (
+    get_self_improvement_decision,
+)
+from agent.self_improvement_decision_context import DENY_FALLBACK_DECISION
 from agent.self_improvement_policy import (
     BACKGROUND_REVIEW_ORIGIN as _POLICY_BG_REVIEW_ORIGIN,
     evaluate as _policy_evaluate,
@@ -73,7 +89,25 @@ _STATUS_DISMISSED = "dismissed"
 
 
 def _background_review_suggestions_guard(action: str, target: str = "") -> bool:
-    """Return True when a background-review suggestion mutation is denied."""
+    """Return True when a background-review suggestion mutation is denied.
+
+    P0-1 / Block 2 contract (PR #90883 must-fix):
+
+    The primary DENY/ALLOW decision comes from the captured
+    ``get_self_improvement_decision()`` ContextVar. The captured
+    ``Decision`` is the frozen authority bound at canonical
+    initialization; env vars ``HERMES_DISABLE_SELF_IMPROVEMENT`` and
+    ``HERMES_READ_ONLY_SESSION`` are sampled ONCE at canonical init and
+    MUST NOT be re-read here. A captured DENY is preserved even if the
+    process env is later mutated to look permissive.
+
+    The legacy ``evaluate(...)`` helper is retained ONLY as a
+    secondary layer for operation_kind labelling / logging / auditing
+    (``operation_kind="suggestions_write"`` vs ``skill_*``) and any
+    background-review-specific semantics. It MUST NOT act as a second
+    authority for self-improvement: a legacy ALLOW from env-derived
+    inputs cannot override a captured DENY.
+    """
     provenance_failed = False
     try:
         if not is_background_review():
@@ -81,35 +115,69 @@ def _background_review_suggestions_guard(action: str, target: str = "") -> bool:
     except Exception:
         provenance_failed = True
 
+    # Primary authority: the captured self-improvement Decision.
+    captured_decision = get_self_improvement_decision()
+    # ``get_self_improvement_decision`` never returns None; it returns
+    # a Decision-like object (or DENY_FALLBACK_DECISION on unset).
+    if captured_decision is None:
+        captured_decision = DENY_FALLBACK_DECISION
+    if not getattr(captured_decision, "allow", False):
+        # Captured DENY -> deny. Env state is irrelevant from here on.
+        _session_id = os.environ.get("HERMES_SESSION_ID", "") or ""
+        logger.warning(
+            "self_improvement_decision DENY bound at canonical init "
+            "operation_kind=suggestions_write origin=background_review "
+            "session_id=%s action=%s target=%s reason=%s provenance_failed=%s",
+            _session_id,
+            action,
+            target,
+            getattr(captured_decision, "reason", "deny"),
+            provenance_failed,
+        )
+        return True
+
+    # Secondary layer: keep the legacy evaluate for operation_kind
+    # labelling / auditing. Env is passed through as empty strings
+    # because the captured Decision is the only authority; any
+    # env-derived override is rejected by the primary check above.
     try:
-        decision = _policy_evaluate(
-            environment_disabled=os.environ.get("HERMES_DISABLE_SELF_IMPROVEMENT", ""),
-            session_read_only=os.environ.get("HERMES_READ_ONLY_SESSION", ""),
+        _legacy = _policy_evaluate(
+            environment_disabled="",
+            session_read_only="",
             operation_kind="suggestions_write",
             origin=_POLICY_BG_REVIEW_ORIGIN,
             target_path=target or None,
         )
     except Exception:
-        logger.exception(
-            "self_improvement_policy.evaluate raised in suggestions guard; defaulting to deny"
+        # Legacy helper failure is non-authoritative; the captured
+        # Decision already authorised the mutation. Log and continue.
+        logger.debug(
+            "self_improvement_policy.evaluate raised in suggestions guard; "
+            "captured Decision is ALLOW, continuing",
+            exc_info=True,
         )
-        return True
-
-    if decision.result == "ALLOW":
         return False
 
-    _session_id = os.environ.get("HERMES_SESSION_ID", "") or ""
-    logger.warning(
-        "self_improvement_policy deny decision=DENY reason=%r "
-        "operation_kind=suggestions_write origin=background_review "
-        "session_id=%s action=%s target=%s provenance_failed=%s",
-        decision.reason,
-        _session_id,
-        action,
-        target,
-        provenance_failed,
-    )
-    return True
+    # The legacy layer must not contradict the captured ALLOW. If it
+    # does, log and refuse-to-deny so we never silently override the
+    # captured authority. The captured Decision is authoritative.
+    if _legacy.result != "ALLOW":
+        _session_id = os.environ.get("HERMES_SESSION_ID", "") or ""
+        logger.warning(
+            "captured ALLOW but legacy evaluate disagreement "
+            "decision=ALLOW legacy=%s reason=%r "
+            "operation_kind=suggestions_write origin=background_review "
+            "session_id=%s action=%s target=%s provenance_failed=%s",
+            _legacy.result,
+            _legacy.reason,
+            _session_id,
+            action,
+            target,
+            provenance_failed,
+        )
+        return False
+
+    return False
 
 
 def _secure_file(path: Path) -> None:
