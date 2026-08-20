@@ -68,6 +68,43 @@ class TestVerdicts:
         assert "ask-approval" in out
         assert "recursive delete" in out
 
+    @pytest.mark.parametrize(
+        "stored_key",
+        [
+            "delete in root path",
+            next(
+                key
+                for key in A._approval_key_aliases("delete in root path")
+                if key != "delete in root path"
+            ),
+        ],
+        ids=["canonical-key", "legacy-key"],
+    )
+    def test_dangerous_pattern_allowlist_matches_runtime(
+        self, isolated_approvals, stored_key
+    ):
+        command = "rm /tmp/approvals-test-probe"
+        isolated_approvals._permanent_approved.add(stored_key)
+
+        runtime = isolated_approvals.check_dangerous_command(command, "local")
+        verdict = at.evaluate_command(command)
+
+        assert runtime["approved"] is True
+        assert verdict["verdict"] == "allow"
+        assert verdict["exit_code"] == 0
+        assert verdict["rule"] == "delete in root path"
+        assert "permanently approved" in verdict["detail"]
+
+    def test_pattern_allowlist_cannot_bypass_hardline(
+        self, isolated_approvals
+    ):
+        isolated_approvals._permanent_approved.add("delete in root path")
+
+        verdict = at.evaluate_command("rm -rf /")
+
+        assert verdict["verdict"] == "hardline-deny"
+        assert verdict["exit_code"] == 3
+
     def test_user_deny_rule_from_config_honored(self, isolated_approvals, capsys,
                                                 monkeypatch):
         monkeypatch.setattr(
