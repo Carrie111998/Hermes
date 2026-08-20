@@ -6,7 +6,8 @@ reference them without importing hermes_state (which would be a cycle).
 hermes_state re-imports every name here for backward compatibility.
 """
 
-from typing import Any
+import math
+from typing import Any, Optional, Union
 
 from agent.skill_commands import (
     SKILL_EXCERPT_JOINT,
@@ -156,6 +157,26 @@ _LISTABLE_CHILD_SQL = (
 # Unix seconds, so keep derived recency inside the range every Desktop client
 # can render before it reaches its date formatter.
 _JS_DATE_MAX_UNIX_SECONDS = 8_640_000_000_000
+
+
+def _date_representable_timestamp(value: Any) -> Optional[Union[int, float]]:
+    """Return a finite SQLite/ECMAScript-Date-compatible Unix-seconds value.
+
+    Session-list consumers must use this alongside the SQL producer guard:
+    persisted rows may still carry malformed values when a caller receives a
+    hand-built, projected, or legacy row rather than a fresh SQL expression.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if -_JS_DATE_MAX_UNIX_SECONDS <= value <= _JS_DATE_MAX_UNIX_SECONDS else None
+    if not isinstance(value, float):
+        return None
+    if not math.isfinite(value):
+        return None
+    if not -_JS_DATE_MAX_UNIX_SECONDS <= value <= _JS_DATE_MAX_UNIX_SECONDS:
+        return None
+    return value
 
 
 def _sql_date_representable_timestamp(expr: str) -> str:

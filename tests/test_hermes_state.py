@@ -2095,6 +2095,105 @@ class TestListSessionsRich:
 
         assert db.list_sessions_rich()[0]["last_active"] is None
 
+    @pytest.mark.parametrize(
+        ("last_active", "started_at", "last_read_at", "expected"),
+        [
+            (20.0, 10.0, 10.0, True),
+            (10.0, 20.0, 10.0, False),
+            # Preserve zero-as-unset behavior using a safe started_at fallback.
+            (0.0, 20.0, 10.0, True),
+            (None, 20.0, 10.0, True),
+        ],
+    )
+    def test_session_unread_uses_safe_activity_or_started_at_fallback(
+        self, last_active, started_at, last_read_at, expected
+    ):
+        assert SessionDB.session_unread(
+            {
+                "last_active": last_active,
+                "started_at": started_at,
+                "last_read_at": last_read_at,
+            }
+        ) is expected
+
+    @pytest.mark.parametrize(
+        "invalid", [True, False, 10**1000, float("nan"), float("inf"), float("-inf"), "not-a-timestamp"]
+    )
+    def test_session_unread_rejects_nonfinite_and_malformed_values(self, invalid):
+        assert SessionDB.session_unread(
+            {"last_active": invalid, "started_at": invalid, "last_read_at": 0.0}
+        ) is False
+
+    def test_invalid_started_at_cannot_mark_ordinary_session_unread(self, db):
+        db.create_session("ordinary", "cli")
+        with db._lock:
+            db._conn.execute(
+                "UPDATE sessions SET started_at=?, last_read_at=? WHERE id=?",
+                (4.701028517545611e180, 0.0, "ordinary"),
+            )
+            db._conn.commit()
+
+        (row,) = db.list_sessions_rich()
+        assert row["started_at"] is None
+        assert row["last_active"] is None
+        assert row["unread"] is False
+
+    def test_malformed_started_at_cannot_crash_or_mark_session_unread(self, db):
+        db.create_session("malformed", "cli")
+        with db._lock:
+            db._conn.execute(
+                "UPDATE sessions SET started_at=?, last_activity_at=?, last_read_at=? WHERE id=?",
+                ("not-a-timestamp", "not-a-timestamp", 0.0, "malformed"),
+            )
+            db._conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+                ("malformed", "tool", "captured tool result", "not-a-timestamp"),
+            )
+            db._conn.commit()
+
+        (row,) = db.list_sessions_rich()
+        assert row["started_at"] is None
+        assert row["last_active"] is None
+        assert row["unread"] is False
+
+    def test_invalid_recency_cannot_mark_pinned_backfill_unread(self, db):
+        db.create_session("pinned", "cli")
+        db.set_session_pinned("pinned", True)
+        db.create_session("recent", "cli")
+        with db._lock:
+            db._conn.execute(
+                "UPDATE sessions SET started_at=?, last_read_at=? WHERE id=?",
+                (4.701028517545611e180, 0.0, "pinned"),
+            )
+            db._conn.commit()
+
+        rows = db.list_sessions_rich(limit=1, include_pinned=True, order_by_last_active=True)
+        pinned = next(row for row in rows if row["id"] == "pinned")
+        assert pinned["started_at"] is None
+        assert pinned["last_active"] is None
+        assert pinned["unread"] is False
+
+    def test_invalid_recency_cannot_mark_compression_projection_unread(self, db):
+        db.create_session("root", "cli")
+        db.end_session("root", "compression")
+        db.create_session("tip", "cli", parent_session_id="root")
+        with db._lock:
+            db._conn.execute(
+                "UPDATE sessions SET started_at=?, last_read_at=? WHERE id=?",
+                (4.701028517545611e180, 0.0, "root"),
+            )
+            db._conn.execute(
+                "UPDATE sessions SET started_at=? WHERE id=?",
+                (4.701028517545611e180, "tip"),
+            )
+            db._conn.commit()
+
+        (row,) = db.list_sessions_rich(order_by_last_active=True)
+        assert row["id"] == "tip"
+        assert row["started_at"] is None
+        assert row["last_active"] is None
+        assert row["unread"] is False
+
     def test_order_by_last_active_ignores_invalid_timestamp_on_compression_tip(self, db):
         """Lineage recency must use the by-id helper's valid timestamp candidates."""
         root_at = 1_700_000_000.0

@@ -20,6 +20,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { middleClickHandlers } from '@/lib/middle-click'
 import { displayModelName } from '@/lib/model-status-label'
 import { sessionProjectLabel } from '@/lib/session-project-label'
+import { dateRepresentableUnixSeconds } from '@/lib/session-timestamp'
 import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
 import { useStoreSelector } from '@/lib/use-session-slice'
@@ -79,16 +80,6 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
 }
 
 const AGE_KEY = { day: 'ageDay', hour: 'ageHour', minute: 'ageMin' } as const
-const JS_DATE_MAX_UNIX_SECONDS = 8_640_000_000_000
-
-function isDateRepresentableUnixSeconds(value: unknown): value is number {
-  return (
-    typeof value === 'number' &&
-    Number.isFinite(value) &&
-    value >= -JS_DATE_MAX_UNIX_SECONDS &&
-    value <= JS_DATE_MAX_UNIX_SECONDS
-  )
-}
 
 // Hover marquee (card title): measure the actual overflow on pointerenter and
 // arm the CSS animation only when there is some — CSS can't detect overflow on
@@ -165,9 +156,9 @@ function SidebarSessionRowImpl({
 
   // Preserve the existing zero-as-unset contract for last_active while
   // rejecting numeric values a JavaScript Date cannot represent.
-  const timestamp = isDateRepresentableUnixSeconds(session.last_active) && session.last_active !== 0
+  const timestamp = dateRepresentableUnixSeconds(session.last_active) && session.last_active !== 0
     ? session.last_active
-    : isDateRepresentableUnixSeconds(session.started_at)
+    : dateRepresentableUnixSeconds(session.started_at)
       ? session.started_at
       : null
 
