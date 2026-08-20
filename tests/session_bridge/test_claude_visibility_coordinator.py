@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from decimal import Decimal
 
@@ -757,3 +758,40 @@ def test_run_once_blocks_before_claim_on_unknown_persisted_job_state() -> None:
     assert result.error_code == "unknown_job_state"
     assert result.fatal is True
     assert store.claim_calls == 0
+
+
+def test_claim_failure_is_logged_with_its_cause(caplog) -> None:
+    """A raising claim must name itself in the log, not just record claim_failed.
+
+    This handler swallowed every claim exception silently. A real UNIQUE
+    collision in session_claude_registration_usage therefore livelocked the
+    lane for a week: each 60s cycle rolled back, recorded ``claim_failed``,
+    and logged nothing at all, so the cause was invisible from the outside.
+    The sibling handler for the enqueue gates already logs; this asserts the
+    claim handler does too. The public result is deliberately unchanged.
+    """
+
+    class ExplodingStore(FakeStore):
+        def claim_claude_visibility_job(self, *args):
+            raise RuntimeError("UNIQUE constraint failed: secret database path")
+
+    coordinator, _calls = _coordinator([], store=ExplodingStore())
+
+    with caplog.at_level(logging.WARNING, logger="session_bridge.coordinator"):
+        result = coordinator.run_once()
+
+    assert result.status == "degraded"
+    assert result.error_code == "claim_failed"
+    assert result.degraded is True
+    # The cause reaches the operator log, naming its own gate...
+    logged = [
+        record.getMessage()
+        for record in caplog.records
+        if "claude_visibility_discovery_degraded" in record.getMessage()
+    ]
+    assert len(logged) == 1
+    assert "stage=claim" in logged[0]
+    assert "RuntimeError" in logged[0]
+    assert "UNIQUE constraint failed" in logged[0]
+    # ...and still never reaches public output.
+    assert "secret" not in repr(result)

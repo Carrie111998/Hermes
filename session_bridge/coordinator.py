@@ -791,7 +791,8 @@ class ClaudeVisibilityCoordinator:
                 policy.reserved_cost_per_attempt_usd,
                 policy.max_attempts,
             )
-        except Exception:
+        except Exception as exc:
+            self._log_visibility_discovery_degraded("claim", exc)
             return recorded(
                 ClaudeVisibilityRunResult(
                     enabled=True,
