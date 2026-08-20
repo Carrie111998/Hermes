@@ -67,6 +67,10 @@ def test_skip_memory_memory_tool_handler_works_and_provider_skipped(
     import json
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hm"))
+    monkeypatch.setattr(
+        "tools.write_approval.write_approval_enabled",
+        lambda _subsystem: False,
+    )
     agent = _make_agent(monkeypatch, enabled_toolsets=["memory"], skip_memory=True)
 
     # Provider sync/prefetch must remain skipped: skip_memory still gates the

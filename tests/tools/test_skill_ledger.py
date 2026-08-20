@@ -14,6 +14,15 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _direct_skill_writes_for_ledger_tests(monkeypatch):
+    """Exercise ledger mutations directly; approval staging is tested elsewhere."""
+    monkeypatch.setattr(
+        "tools.write_approval.write_approval_enabled",
+        lambda _subsystem: False,
+    )
+
+
 VALID_SKILL_CONTENT = """---
 name: my-skill
 description: test skill
