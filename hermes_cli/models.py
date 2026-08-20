@@ -5283,6 +5283,16 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
             # per the published Go endpoint table, same as GPT on Zen:
             # https://opencode.ai/docs/go/#endpoints
             return "codex_responses"
+        if normalized.startswith("muse-"):
+            # Muse Spark models on Go (muse-spark-1.2, muse-spark-1.2-contributor)
+            # are served via /v1/responses. Verified live: /v1/chat/completions
+            # streams HTTP 200 with empty choices:[] chunks (no delta, no
+            # finish_reason) against muse-spark-1.2-contributor, while
+            # /v1/responses completes with full content and encrypted reasoning.
+            # Without this routing the model falls into the chat_completions
+            # branch below, where the empty stream surfaces as a truncated /
+            # "4 continuation attempts" error in the conversation loop.
+            return "codex_responses"
         if normalized.startswith("minimax-"):
             return "anthropic_messages"
         if normalized.startswith("qwen"):
@@ -5295,6 +5305,11 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
         if normalized.startswith("claude-"):
             return "anthropic_messages"
         if normalized.startswith("gpt-"):
+            return "codex_responses"
+        if normalized.startswith("muse-"):
+            # Muse Spark models on Zen are also served via /v1/responses (the
+            # published Zen endpoint table lists muse-spark* on /v1/responses),
+            # mirroring the Go routing above and the existing GPT handling.
             return "codex_responses"
         if normalized.startswith("qwen"):
             # Qwen models on Zen moved to /v1/messages per the published

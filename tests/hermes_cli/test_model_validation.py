@@ -273,6 +273,31 @@ class TestCopilotNormalization:
         assert opencode_model_api_mode("opencode-go", "gpt-5.6-luna") == "codex_responses"
         assert opencode_model_api_mode("opencode-go", "opencode-go/gpt-5.6-luna") == "codex_responses"
 
+    def test_opencode_go_muse_spark_routes_to_responses(self):
+        # Muse Spark on Go must go through /v1/responses. Verified live
+        # (2026-08-20): streaming /v1/chat/completions for
+        # muse-spark-1.2-contributor returns HTTP 200 with empty choices:[]
+        # chunks — no delta, no finish_reason — while /v1/responses completes
+        # with full content and encrypted reasoning. Without this routing the
+        # empty stream surfaces as a truncated "4 continuation attempts" error.
+        assert opencode_model_api_mode("opencode-go", "muse-spark-1.2") == "codex_responses"
+        assert opencode_model_api_mode("opencode-go", "opencode-go/muse-spark-1.2") == "codex_responses"
+        assert opencode_model_api_mode("opencode-go", "muse-spark-1.2-contributor") == "codex_responses"
+        assert opencode_model_api_mode("opencode-go", "opencode-go/muse-spark-1.2-contributor") == "codex_responses"
+        assert opencode_model_api_mode("opencode-go", "muse-glimmer-30b") == "codex_responses"
+
+    def test_opencode_zen_muse_spark_routes_to_responses(self):
+        # Muse Spark on Zen is served via /v1/responses per the published Zen
+        # endpoint table, mirroring the Go routing and the GPT handling.
+        assert opencode_model_api_mode("opencode-zen", "muse-spark-1.2") == "codex_responses"
+        assert opencode_model_api_mode("opencode-zen", "opencode-zen/muse-spark-1.2") == "codex_responses"
+        assert opencode_model_api_mode("opencode-zen", "muse-spark-1.2-contributor") == "codex_responses"
+        assert opencode_model_api_mode("opencode-zen", "opencode-zen/muse-spark-1.2-contributor") == "codex_responses"
+        # Non-Muse Zen models keep their existing routing.
+        assert opencode_model_api_mode("opencode-zen", "deepseek-v4-flash") == "chat_completions"
+        assert opencode_model_api_mode("opencode-zen", "claude-sonnet-4.6") == "anthropic_messages"
+        assert opencode_model_api_mode("opencode-zen", "qwen3.7-max") == "anthropic_messages"
+
 
 class TestNormalizeOpencodeBaseUrl:
     """Symmetric /v1 normalization for OpenCode Zen / Go base URLs.
