@@ -87,6 +87,7 @@ class _FakeAWatchFactory:
         self.paths: tuple[Path | str, ...] | None = None
         self.stop_event: asyncio.Event | None = None
         self.kwargs: dict[str, object] = {}
+        self.requests = 0
 
     def __call__(
         self,
@@ -113,6 +114,12 @@ class _FakeAWatchFactory:
         self.started.set()
         try:
             while not stop_event.is_set():
+                # Bumped as the consumer asks for the NEXT batch, which it only
+                # does after fully handling the previous one.  So requests ==
+                # baseline + N proves N batches were processed to completion --
+                # unlike queue.empty(), which flips as soon as an item is TAKEN
+                # and leaves the consumer's handling of it still in flight.
+                self.requests += 1
                 item_task = asyncio.create_task(self.queue.get())
                 stop_task = asyncio.create_task(stop_event.wait())
                 try:
@@ -134,6 +141,44 @@ class _FakeAWatchFactory:
                 yield item
         finally:
             self.closed.set()
+
+
+# Deadlock guard for awaits that must not be allowed to hang the suite.  It is
+# never an assertion target: no test asserts anything about how much of it was
+# consumed, so it is sized for the worst host rather than for expected latency.
+_REFRESH_DEADLOCK_GUARD_SECONDS = 30.0
+
+
+class _GatedDebounceSleep:
+    """Replace the watcher's debounce wall-clock wait with a test-driven gate.
+
+    ``_watch_loop`` cancels the pending debounce task on every batch, so a burst
+    coalesces into one scan only if the loop drains every queued batch before the
+    debounce elapses.  Timing that against ``watch_debounce_seconds`` makes the
+    coalescing assertion a race with the scheduler: on a loaded host the debounce
+    expires BETWEEN two already-queued batches and the burst splits into two
+    scans.  Gating it removes the clock -- no debounce can expire until the test
+    opens ``release``, so "all batches consumed" becomes an effect to wait on
+    rather than an interval to bet on.
+
+    Only the debounce duration is intercepted; every other sleep the coordinator
+    performs (catalog scan, reconcile, mirror poll) still reaches ``asyncio.sleep``.
+    """
+
+    def __init__(self, debounce_seconds: float) -> None:
+        self._debounce_seconds = float(debounce_seconds)
+        self.release = asyncio.Event()
+        self.parked = 0
+
+    async def __call__(self, delay: float) -> None:
+        if float(delay) != self._debounce_seconds:
+            await asyncio.sleep(delay)
+            return
+        self.parked += 1
+        try:
+            await self.release.wait()
+        finally:
+            self.parked -= 1
 
 
 async def _wait_until(
@@ -2632,6 +2677,7 @@ async def test_watcher_burst_debounces_to_one_claude_only_scan(
     claude = _LifecycleClaudeAdapter()
     codex = _LifecycleCodexAdapter()
     awatch = _FakeAWatchFactory()
+    debounce = _GatedDebounceSleep(0.03)
     coordinator = SessionBridgeCoordinator(
         config=_watcher_config(catalog_scan_seconds=10.0),
         store=object(),
@@ -2639,6 +2685,7 @@ async def test_watcher_burst_debounces_to_one_claude_only_scan(
         claude_projects_root=tmp_path,
         watch_debounce_seconds=0.03,
         awatch_factory=awatch,
+        sleep=debounce,
     )
 
     await coordinator.start()
@@ -2650,18 +2697,32 @@ async def test_watcher_burst_debounces_to_one_claude_only_scan(
                 and awatch.started.is_set()
             )
         )
+        consumed_before = awatch.requests
         awatch.emit(tmp_path / "one.jsonl")
         awatch.emit(tmp_path / "two.jsonl")
         awatch.emit(tmp_path / "three.jsonl")
 
+        # Settled state for the whole burst: all three batches handled to
+        # completion AND exactly one surviving debounce parked on the gate.
+        # Each batch cancels its predecessor's debounce, so parked dips to 0
+        # mid-burst; this predicate is only true once the loop is idle with the
+        # last debounce armed.  No debounce can have expired yet -- the gate is
+        # still shut -- so the burst provably has not split.
+        await _wait_until(
+            lambda: awatch.requests == consumed_before + 3 and debounce.parked == 1
+        )
+        debounce.release.set()
         await _wait_until(lambda: claude.discover_calls == 2)
-        await asyncio.sleep(0.08)
 
         assert claude.discover_calls == 2
+        # No re-arm: the burst left exactly one debounce, which has now fired.
+        assert debounce.parked == 0
+        assert awatch.requests == consumed_before + 3
         assert codex.inventory_calls == 2
         assert awatch.paths == (tmp_path,)
         assert coordinator.health()["watcher_state"] == "running"
     finally:
+        debounce.release.set()
         await coordinator.stop()
 
 
@@ -6362,22 +6423,35 @@ async def test_refresh_waiting_behind_hung_read_has_its_own_bounded_timeout() ->
 
     first = await coordinator.refresh_session(session_id, timeout=0.01)
     await _wait_until(started.is_set)
-    second = None
+    # The first read is hung in its worker thread and still owns the CODEX scan
+    # lock, so the second refresh can only return by hitting its OWN timeout.
+    hung_reads = tuple(coordinator._provider_tasks)
+    assert len(hung_reads) == 1
+    hung_read = hung_reads[0]
+    assert hung_read.done() is False
+
     try:
+        # _REFRESH_DEADLOCK_GUARD_SECONDS is a deadlock GUARD, not an assertion:
+        # nothing here measures it, and it is sized for the worst host so that a
+        # regression which unbounds the lock wait fails the run instead of
+        # hanging it.  What proves the bound is the EFFECT captured below -- that
+        # this returned while the read was still in flight -- never a stopwatch.
         second = await asyncio.wait_for(
             coordinator.refresh_session(session_id, timeout=0.02),
-            timeout=0.1,
+            timeout=_REFRESH_DEADLOCK_GUARD_SECONDS,
         )
-    except TimeoutError:
-        pass
+        returned_while_read_still_hung = not hung_read.done()
     finally:
         release.set()
-        await asyncio.sleep(0.03)
+        await _wait_until(hung_read.done)
 
     assert first.stale is True
-    assert second is not None
     assert second.stale is True
     assert second.cursor == "codex-cursor-durable"
+    assert returned_while_read_still_hung is True, (
+        "refresh_session only returned once the hung read completed: its wait "
+        "for the provider scan lock is not bounded by its own timeout"
+    )
     assert adapter.read_calls == 1
 
 
