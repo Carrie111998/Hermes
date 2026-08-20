@@ -218,6 +218,26 @@ def show_status(args):
     anthropic_display = redact_key(anthropic_value)
     print(f"  {'Anthropic':<12}  {check_mark(bool(anthropic_value))} {anthropic_display}")
 
+    # TTS readiness (#90610): the provider row above only proves an API key
+    # resolved — the selected provider's SDK must also be importable, or
+    # every voice reply silently degrades to text (the failure is swallowed
+    # by the gateway auto-TTS path). Surface that mismatch here. Only check
+    # when a provider was explicitly configured: the free Edge default is
+    # not part of anyone's setup contract.
+    try:
+        from tools.tts_tool import _load_tts_config, check_tts_requirements
+
+        _tts_provider = (_load_tts_config().get("provider") or "").strip()
+        if _tts_provider and not check_tts_requirements():
+            print(
+                f"  {'TTS':<12}  {check_mark(False)} "
+                f"{_tts_provider} provider not runnable — SDK missing; voice "
+                "replies silently degrade to text"
+            )
+    except Exception:
+        # The status probe must never fail the whole report.
+        pass
+
     # =========================================================================
     # Auth Providers (OAuth)
     # =========================================================================
