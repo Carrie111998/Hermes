@@ -94,6 +94,46 @@ def test_purge_rejects_missing_or_mismatched_snapshot_and_retains_source_rows(
         db.close()
 
 
+def test_purge_flushes_pending_token_accounting_before_final_recheck(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    archive_root = tmp_path / "archive"
+    try:
+        db.create_session("terminal", source="cli")
+        db.append_message("terminal", role="user", content="stored")
+        db.end_session("terminal", "completed")
+        assert db.set_session_archived("terminal", True)
+        store_archived_lineage(db, "terminal", archive_root)
+
+        # Deterministically model a queued delta that the background writer has
+        # not started applying yet. A post-delete apply would recreate the row
+        # as source='unknown' and the snapshot would miss these counters.
+        with db._token_queue_cond:
+            assert db._token_writer_thread is None
+            db._token_queue.append(
+                (
+                    "terminal",
+                    {
+                        "input_tokens": 7,
+                        "model": "late-model",
+                        "billing_provider": "late-provider",
+                        "api_call_count": 1,
+                    },
+                )
+            )
+
+        with pytest.raises(ValueError, match="fingerprint"):
+            purge_archived_lineage(db, "terminal", archive_root)
+
+        row = db.get_session("terminal")
+        assert row is not None
+        assert row["source"] == "cli"
+        assert row["input_tokens"] == 7
+    finally:
+        db.close()
+
+
 def test_purge_rejects_source_mutation_after_store_and_retains_source_rows(
     tmp_path: Path,
 ) -> None:

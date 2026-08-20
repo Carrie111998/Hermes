@@ -1101,6 +1101,8 @@ def purge_archived_lineage(
             snapshot_dir,
         )
 
+    if not db.flush_token_counts():
+        raise RuntimeError("cold purge could not flush pending token accounting")
     return db._execute_write(_purge)
 
 
