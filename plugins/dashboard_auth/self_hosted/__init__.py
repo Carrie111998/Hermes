@@ -83,9 +83,25 @@ import secrets
 import threading
 import time
 import urllib.parse
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
-import httpx
+if TYPE_CHECKING:  # pragma: no cover - annotations only, never imported at runtime
+    import httpx
+
+# ``httpx`` is imported inside the three methods that call it, not here.
+#
+# Bundled ``kind: backend`` plugins are loaded EAGERLY by the plugin manager
+# during ``discover_plugins()``, which ``gateway.config.load_gateway_config()``
+# calls -- so every ``hermes send`` to a real platform paid for this import.
+# ``from __future__ import annotations`` above makes the ``httpx.*``
+# annotations strings, so only the runtime uses need the module; the
+# TYPE_CHECKING import keeps them resolvable for type checkers.
+#
+# ``__getattr__`` at the bottom of this module keeps ``httpx`` reachable as a
+# module attribute for callers and tests that patch through that path.
+#
+# Regression test: tests/hermes_cli/test_plugin_discovery_import_cost.py
+
 
 from hermes_cli.dashboard_auth import (
     DashboardAuthProvider,
@@ -321,6 +337,8 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
     def revoke_session(self, *, refresh_token: str) -> None:
         # Best-effort RFC 7009 revocation if the IDP advertised an endpoint.
         # Must never raise — logout is client-side cookie clearing regardless.
+        import httpx
+
         if not refresh_token:
             return None
         try:
@@ -420,6 +438,8 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         a public client, so the request is byte-identical to the pre-
         confidential-client behaviour in that case.
         """
+        import httpx
+
         headers = {"Accept": "application/json"}
         if extra_headers:
             headers.update(extra_headers)
@@ -504,6 +524,8 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         return f"{self._issuer}/.well-known/openid-configuration"
 
     def _fetch_discovery(self) -> Dict[str, Any]:
+        import httpx
+
         url = self._discovery_url()
         try:
             # follow_redirects=True: many IDPs answer the discovery GET with a
@@ -856,3 +878,21 @@ def register(ctx) -> None:
         # Log only whether a secret is present, never the secret itself.
         bool(client_secret),
     )
+
+
+def __getattr__(name: str):
+    """Resolve ``httpx`` on first attribute access (PEP 562).
+
+    This module used to carry ``import httpx`` at module scope, so
+    ``<this module>.httpx`` was a real attribute. Two kinds of caller depend on
+    that: anything reaching the client through the module path, and the tests,
+    which patch ``"<this module>.httpx.<verb>"``. Both resolve to the same
+    global ``httpx`` module object they always did -- the only change is that
+    importing it is deferred until something actually asks.
+    """
+    if name == "httpx":
+        import httpx
+
+        globals()["httpx"] = httpx
+        return httpx
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

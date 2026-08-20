@@ -22,7 +22,19 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
+# ``requests`` is imported inside the one method that calls it, not here.
+#
+# Bundled ``kind: backend`` plugins are loaded EAGERLY by the plugin manager
+# during ``discover_plugins()``, which ``gateway.config.load_gateway_config()``
+# calls -- so every ``hermes send`` to a real platform paid for this import.
+# Nothing at module scope references ``requests``: the call sites are all
+# inside method bodies, so there is not even an annotation to keep alive.
+#
+# ``__getattr__`` at the bottom of this module keeps ``requests`` reachable as a
+# module attribute for callers and tests that patch through that path.
+#
+# Regression test: tests/hermes_cli/test_plugin_discovery_import_cost.py
+
 
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
@@ -228,6 +240,8 @@ class XAIImageGenProvider(ImageGenProvider):
         a JSON body (the OpenAI SDK's multipart ``images.edit()`` is NOT
         supported by xAI).
         """
+        import requests
+
         creds = resolve_xai_http_credentials()
         api_key = str(creds.get("api_key") or "").strip()
         provider_name = str(creds.get("provider") or "xai").strip() or "xai"
@@ -492,3 +506,21 @@ class XAIImageGenProvider(ImageGenProvider):
 def register(ctx: Any) -> None:
     """Register this provider with the image gen registry."""
     ctx.register_image_gen_provider(XAIImageGenProvider())
+
+
+def __getattr__(name: str):
+    """Resolve ``requests`` on first attribute access (PEP 562).
+
+    This module used to carry ``import requests`` at module scope, so
+    ``<this module>.requests`` was a real attribute. Two kinds of caller depend on
+    that: anything reaching the client through the module path, and the tests,
+    which patch ``"<this module>.requests.<verb>"``. Both resolve to the same
+    global ``requests`` module object they always did -- the only change is that
+    importing it is deferred until something actually asks.
+    """
+    if name == "requests":
+        import requests
+
+        globals()["requests"] = requests
+        return requests
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -36,7 +36,19 @@ import os
 import uuid
 from typing import Any, Dict, Optional
 
-import requests
+# ``requests`` is imported inside the three methods that call it, not here.
+#
+# Bundled ``kind: backend`` plugins are loaded EAGERLY by the plugin manager
+# during ``discover_plugins()``, which ``gateway.config.load_gateway_config()``
+# calls -- so every ``hermes send`` to a real platform paid for this import.
+# Nothing at module scope references ``requests``: the call sites are all
+# inside method bodies, so there is not even an annotation to keep alive.
+#
+# ``__getattr__`` at the bottom of this module keeps ``requests`` reachable as a
+# module attribute for callers and tests that patch through that path.
+#
+# Regression test: tests/hermes_cli/test_plugin_discovery_import_cost.py
+
 
 from agent.browser_provider import BrowserProvider
 
@@ -92,6 +104,8 @@ class BrowserbaseBrowserProvider(BrowserProvider):
     # ------------------------------------------------------------------
 
     def create_session(self, task_id: str) -> Dict[str, object]:
+        import requests
+
         config = self._get_config()
 
         # Optional env-var knobs
@@ -215,6 +229,8 @@ class BrowserbaseBrowserProvider(BrowserProvider):
         }
 
     def close_session(self, session_id: str) -> bool:
+        import requests
+
         try:
             config = self._get_config()
         except ValueError:
@@ -252,6 +268,8 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             return False
 
     def emergency_cleanup(self, session_id: str) -> None:
+        import requests
+
         config = self._get_config_or_none()
         if config is None:
             logger.warning(
@@ -295,3 +313,21 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             ],
             "post_setup": "agent_browser",
         }
+
+
+def __getattr__(name: str):
+    """Resolve ``requests`` on first attribute access (PEP 562).
+
+    This module used to carry ``import requests`` at module scope, so
+    ``<this module>.requests`` was a real attribute. Two kinds of caller depend on
+    that: anything reaching the client through the module path, and the tests,
+    which patch ``"<this module>.requests.<verb>"``. Both resolve to the same
+    global ``requests`` module object they always did -- the only change is that
+    importing it is deferred until something actually asks.
+    """
+    if name == "requests":
+        import requests
+
+        globals()["requests"] = requests
+        return requests
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

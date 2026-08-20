@@ -32,11 +32,31 @@ import logging
 import os
 import threading
 import uuid
-from typing import Any, Dict, Optional
-
-import requests
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from agent.browser_provider import BrowserProvider
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only, never imported at runtime
+    import requests
+
+# ``requests`` is imported inside the three methods that call it, not here.
+#
+# This plugin is a bundled ``kind: backend``, so the plugin manager loads it
+# EAGERLY during ``discover_plugins()`` -- which ``gateway.config.
+# load_gateway_config()`` calls, which every ``hermes send`` to a real platform
+# calls. A module-scope ``import requests`` therefore charged 145 modules
+# (requests + urllib3 + charset_normalizer + idna + certifi + http + ssl) to a
+# Telegram message that never opens a cloud browser.
+#
+# ``from __future__ import annotations`` above makes the ``requests.Response``
+# annotations strings, so only the runtime uses need the module; the
+# TYPE_CHECKING import keeps them resolvable for type checkers.
+#
+# ``__getattr__`` at the bottom of this module keeps ``requests`` reachable as a
+# module attribute for callers and tests that patch through that path.
+#
+# Regression test: tests/hermes_cli/test_plugin_discovery_import_cost.py
+
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +206,8 @@ class BrowserUseBrowserProvider(BrowserProvider):
         }
 
     def create_session(self, task_id: str) -> Dict[str, object]:
+        import requests
+
         config = self._get_config()
         managed_mode = bool(config.get("managed_mode"))
 
@@ -251,6 +273,8 @@ class BrowserUseBrowserProvider(BrowserProvider):
         }
 
     def close_session(self, session_id: str) -> bool:
+        import requests
+
         try:
             config = self._get_config()
         except ValueError:
@@ -282,6 +306,8 @@ class BrowserUseBrowserProvider(BrowserProvider):
             return False
 
     def emergency_cleanup(self, session_id: str) -> None:
+        import requests
+
         config = self._get_config_or_none()
         if config is None:
             logger.warning(
@@ -315,3 +341,21 @@ class BrowserUseBrowserProvider(BrowserProvider):
             ],
             "post_setup": "agent_browser",
         }
+
+
+def __getattr__(name: str):
+    """Resolve ``requests`` on first attribute access (PEP 562).
+
+    This module used to carry ``import requests`` at module scope, so
+    ``<this module>.requests`` was a real attribute. Two kinds of caller depend on
+    that: anything reaching the client through the module path, and the tests,
+    which patch ``"<this module>.requests.<verb>"``. Both resolve to the same
+    global ``requests`` module object they always did -- the only change is that
+    importing it is deferred until something actually asks.
+    """
+    if name == "requests":
+        import requests
+
+        globals()["requests"] = requests
+        return requests
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

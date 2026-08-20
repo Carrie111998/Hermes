@@ -25,9 +25,25 @@ import mimetypes
 import os
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-import httpx
+if TYPE_CHECKING:  # pragma: no cover - annotations only, never imported at runtime
+    import httpx
+
+# ``httpx`` is imported inside the one coroutine that calls it, not here.
+#
+# Bundled ``kind: backend`` plugins are loaded EAGERLY by the plugin manager
+# during ``discover_plugins()``, which ``gateway.config.load_gateway_config()``
+# calls -- so every ``hermes send`` to a real platform paid for this import.
+# ``from __future__ import annotations`` above makes the ``httpx.*``
+# annotations strings, so only the runtime uses need the module; the
+# TYPE_CHECKING import keeps them resolvable for type checkers.
+#
+# ``__getattr__`` at the bottom of this module keeps ``httpx`` reachable as a
+# module attribute for callers and tests that patch through that path.
+#
+# Regression test: tests/hermes_cli/test_plugin_discovery_import_cost.py
+
 
 from agent.video_gen_provider import (
     VideoGenProvider,
@@ -790,6 +806,8 @@ async def _submit_xai_video_payload(
     operation: str,
     resolution: Optional[str] = None,
 ) -> Dict[str, Any]:
+    import httpx
+
     try:
         from tools.xai_http import (
             build_xai_storage_options,
@@ -923,3 +941,21 @@ async def _submit_xai_video_payload(
 def register(ctx) -> None:
     """Plugin entry point — wire ``XAIVideoGenProvider`` into the registry."""
     ctx.register_video_gen_provider(XAIVideoGenProvider())
+
+
+def __getattr__(name: str):
+    """Resolve ``httpx`` on first attribute access (PEP 562).
+
+    This module used to carry ``import httpx`` at module scope, so
+    ``<this module>.httpx`` was a real attribute. Two kinds of caller depend on
+    that: anything reaching the client through the module path, and the tests,
+    which patch ``"<this module>.httpx.<verb>"``. Both resolve to the same
+    global ``httpx`` module object they always did -- the only change is that
+    importing it is deferred until something actually asks.
+    """
+    if name == "httpx":
+        import httpx
+
+        globals()["httpx"] = httpx
+        return httpx
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

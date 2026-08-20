@@ -75,9 +75,33 @@ import logging
 import os
 import secrets
 import urllib.parse
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
-import httpx
+if TYPE_CHECKING:  # pragma: no cover - annotations only, never imported at runtime
+    import httpx
+
+# ``httpx`` is imported inside the two methods that POST to Portal, not here.
+#
+# This plugin is a bundled ``kind: backend``, so the plugin manager loads it
+# EAGERLY during ``discover_plugins()`` -- which ``gateway.config.
+# load_gateway_config()`` calls, which every ``hermes send`` to a real platform
+# calls. A module-scope ``import httpx`` charged 146 modules to that path, and
+# httpx's CLI extra drags rich, click, pygments and attrs in with it.
+#
+# The waste was total, not partial: ``register()`` below returns immediately
+# when no ``dashboard.oauth.client_id`` / HERMES_DASHBOARD_OAUTH_CLIENT_ID is
+# configured, which is every loopback and ``--insecure`` install. Those
+# installs paid 146 modules to register nothing.
+#
+# ``from __future__ import annotations`` above makes the ``httpx.Response``
+# annotations strings, so only the runtime uses need the module; the
+# TYPE_CHECKING import keeps them resolvable for type checkers.
+#
+# ``__getattr__`` at the bottom of this module keeps ``httpx`` reachable as a
+# module attribute for callers and tests that patch through that path.
+#
+# Regression test: tests/hermes_cli/test_plugin_discovery_import_cost.py
+
 
 from hermes_cli.dashboard_auth import (
     DashboardAuthProvider,
@@ -218,6 +242,8 @@ class NousDashboardAuthProvider(DashboardAuthProvider):
         # doesn't re-check state at the token endpoint, so we ignore it here.
         _ = state
 
+        import httpx
+
         try:
             response = httpx.post(
                 self._token_url,
@@ -264,6 +290,8 @@ class NousDashboardAuthProvider(DashboardAuthProvider):
             # No RT to present — treat as a dead session so middleware
             # forces a clean re-login rather than emitting a malformed POST.
             raise RefreshExpiredError("no refresh token present in session")
+
+        import httpx
 
         try:
             response = httpx.post(
@@ -665,3 +693,21 @@ def register(ctx) -> None:
         client_id,
         portal_url,
     )
+
+
+def __getattr__(name: str):
+    """Resolve ``httpx`` on first attribute access (PEP 562).
+
+    This module used to carry ``import httpx`` at module scope, so
+    ``<this module>.httpx`` was a real attribute. Two kinds of caller depend on
+    that: anything reaching the client through the module path, and the tests,
+    which patch ``"<this module>.httpx.<verb>"``. Both resolve to the same
+    global ``httpx`` module object they always did -- the only change is that
+    importing it is deferred until something actually asks.
+    """
+    if name == "httpx":
+        import httpx
+
+        globals()["httpx"] = httpx
+        return httpx
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
