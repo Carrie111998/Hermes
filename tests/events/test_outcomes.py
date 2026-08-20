@@ -393,3 +393,84 @@ def test_watchdog_burst_still_uses_its_transitions_list():
     verdict = evaluate_outcome(_burst([{"after": "healthy", "tier": "critical"}]))
 
     assert verdict.state is OutcomeState.RECOVERED
+# --- monodirectional bad-news types carry their verdict in the TYPE ---------
+# CONTAINER_CRASH_LOOP and DEVFLOW_DEPLOY_FAILED were in none of the four
+# evidence sets and carry no _VALUE_FIELDS key and no `after`, so both fell
+# through to UNKNOWN. Observed live 2026-08-19: a real hindsight-app crash
+# loop (1085 restarts in 24h against a budget of 20) reached the phone headed
+# "UNKNOWN CONTAINER_CRASH_LOOP".
+#
+# These are TYPE-level, unlike the transition rule above: the event only ever
+# exists as bad news (watchdog_sweep.py:854 emits it from a variable named
+# `alarm`; there is no recovery variant -- WATCHDOG_RECOVERED covers that).
+# DEVFLOW_BUILD_FAILED was already classified and DEVFLOW_DEPLOY_FAILED was
+# not, which is an omission rather than a decision.
+
+
+def test_container_crash_loop_is_failed():
+    """The real payload observed live 2026-08-19T03:56:12Z."""
+    verdict = evaluate_outcome(
+        _event(
+            {
+                "watchdog_type": "container_crash_loop",
+                "container": "hindsight-app",
+                "restarts_24h": 1085,
+                "restart_count_now": 893,
+                "threshold": 20,
+                "tray_state": "down",
+                "tray_tier": "important",
+                "tray_detail": "CHURNING (running but crash-looping)",
+            },
+            event_type=EventType.CONTAINER_CRASH_LOOP,
+            priority=Priority.HIGH,
+        )
+    )
+
+    assert verdict.state is OutcomeState.FAILED
+    assert verdict.priority_floor is Priority.HIGH
+
+
+def test_container_crash_loop_is_failed_even_when_the_tray_reads_healthy():
+    """THE TRAP, pinned. Keying this verdict on payload.tray_state is the
+    obvious fix and it is WRONG: laptop-monitor's churn verdict is a one-pass
+    RestartCount delta that self-clears 600s after the last restart, so a
+    container that restarted 264 times in a morning renders tray_state
+    "healthy" and green (observed 2026-08-10T08:15, hindsight-app). A
+    tray_state-driven rule would call a REAL crash loop healthy for exactly
+    the cases this alert exists to catch. The verdict comes from the TYPE.
+    """
+    verdict = evaluate_outcome(
+        _event(
+            {
+                "watchdog_type": "container_crash_loop",
+                "container": "hindsight-app",
+                "restarts_24h": 264,
+                "threshold": 20,
+                "tray_state": "healthy",
+                "tray_detail": "running, RestartCount stable (266)",
+            },
+            event_type=EventType.CONTAINER_CRASH_LOOP,
+            priority=Priority.HIGH,
+        )
+    )
+
+    assert verdict.state is OutcomeState.FAILED
+
+
+def test_devflow_deploy_failed_is_failed_like_its_build_sibling():
+    """DEVFLOW_BUILD_FAILED was classified and DEVFLOW_DEPLOY_FAILED was not.
+    Two siblings, both named 'failed'."""
+    for et in (EventType.DEVFLOW_BUILD_FAILED, EventType.DEVFLOW_DEPLOY_FAILED):
+        verdict = evaluate_outcome(_event({}, event_type=et, priority=Priority.HIGH))
+
+        assert verdict.state is OutcomeState.FAILED, et
+
+
+@pytest.mark.parametrize("event_type", [
+    EventType.CONTAINER_CRASH_LOOP,
+    EventType.DEVFLOW_DEPLOY_FAILED,
+])
+def test_monodirectional_failures_never_wear_the_ambiguous_marker(event_type):
+    verdict = evaluate_outcome(_event({}, event_type=event_type, priority=Priority.HIGH))
+
+    assert marker_for_verdict(verdict, Priority.HIGH) != "🟡"

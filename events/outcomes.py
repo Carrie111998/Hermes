@@ -60,6 +60,25 @@ _FAILURE_EVENT_TYPES = frozenset(
         EventType.NOTIFICATION_FAILED,
         EventType.GATEWAY_STOPPED,
         EventType.AGENT_LOOP_FAULT,
+        # Monodirectional bad news: these types exist ONLY as failures, so
+        # the verdict belongs to the type, not to a payload field.
+        #
+        # CONTAINER_CRASH_LOOP fires from one call site -- watchdog_sweep.py
+        # :854, `for alarm in restart_alarms` -- and has no recovery variant
+        # (WATCHDOG_RECOVERED covers that separately). Deliberately NOT keyed
+        # on payload.tray_state, which is very often "healthy" while the
+        # alert is real: laptop-monitor's churn verdict is a one-pass
+        # RestartCount delta that self-clears 600s after the last restart, so
+        # a container that restarted 264 times in a morning reads green
+        # (formatting.container_crash_loop_body says so at length). A
+        # tray_state rule would call a real crash loop healthy for exactly
+        # the cases the alert exists to catch.
+        #
+        # DEVFLOW_DEPLOY_FAILED sat unclassified while its sibling
+        # DEVFLOW_BUILD_FAILED (above) was classified -- an omission, not a
+        # decision. Both were reaching the phone headed "UNKNOWN".
+        EventType.CONTAINER_CRASH_LOOP,
+        EventType.DEVFLOW_DEPLOY_FAILED,
     }
 )
 
