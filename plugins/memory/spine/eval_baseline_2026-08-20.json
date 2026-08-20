@@ -1,0 +1,1246 @@
+{
+  "profile": "*",
+  "embedder": true,
+  "k": 6,
+  "passed": 24,
+  "by_hop": {
+    "single": {
+      "passed": 17,
+      "total": 17
+    },
+    "multi": {
+      "passed": 7,
+      "total": 12
+    }
+  },
+  "total": 29,
+  "median_search_ms": 8.6,
+  "cases": [
+    {
+      "id": "sg-lwix-weighting",
+      "q": "how is the SG-LWIX watch index weighted",
+      "hop": "single",
+      "passed": true,
+      "matched": [
+        "LWIX",
+        "watch index",
+        "price card",
+        "listings.json"
+      ],
+      "n_sources": 1,
+      "need_sources": 0,
+      "search_ms": 24.6,
+      "embed_ms": 108.6,
+      "n_hits": 6,
+      "n_wiki": 3,
+      "top": [
+        {
+          "src": "obs",
+          "content": "SG watch index (0xsteamboat.me/watches) \u2014 rebuilt 2026-08-04 as a per-reference price-card tool; index demoted"
+        },
+        {
+          "src": "wiki",
+          "content": "Wash Trading Detection: ## Industry Methodology\nPlatforms like CoinGecko and CoinMarketCap utilize proprietary"
+        },
+        {
+          "src": "wiki",
+          "content": "Potential Biz Ideas \u2014 Master File: ## Combined Analysis\n\n### Ideas appearing in both reports (consensus picks)"
+        },
+        {
+          "src": "obs",
+          "content": "Morning brief with watch NOT worn overnight (pattern established Aug 9, 2026): don't fabricate Garmin rows, do"
+        },
+        {
+          "src": "wiki",
+          "content": "Claude Code Loops for Google & Meta Ads \u2014 Ryze AI: ## The 8 Loops\n\n| # | Loop | Platform | Cadence | Gate |\n|-"
+        },
+        {
+          "src": "obs",
+          "content": "Engine Test proxy system (Aug 15 2026): VO2max proxy for Chin's CrossFit engine \u2014 Garmin VO2max is running/cyc"
+        }
+      ]
+    },
+    {
+      "id": "zo-route-rce",
+      "q": "why was the Zo api/zo public route rewritten",
+      "hop": "single",
+      "passed": true,
+      "matched": [
+        "RCE",
+        "unauthenticated",
+        "root",
+        "shell",
+        "traversal"
+      ],
+      "n_sources": 5,
+      "need_sources": 0,
+      "search_ms": 8.8,
+      "embed_ms": 23.2,
+      "n_hits": 6,
+      "n_wiki": 1,
+      "top": [
+        {
+          "src": "obs",
+          "content": "Zo space route /api/zo exposed unauthenticated root RCE to the public internet \u2014 found and fixed 2026-08-04; a"
+        },
+        {
+          "src": "obs",
+          "content": "Talking to Zo: always try the zo MCP toolset first (deterministic, cheap, screened). Only use the /zo/ask REST"
+        },
+        {
+          "src": "wiki",
+          "content": "Zo Agentic Creative Agency \u2014 Architecture Reference: ## Hermes /agency Integration\n\nThe Hermes skills list inc"
+        },
+        {
+          "src": "obs",
+          "content": "[Aug 12, 2026] Hermes<->Zo bridge is LIVE \u2014 Zo build agents call Hermes via `bun hermes.ts` (HERMES_BASE=https"
+        },
+        {
+          "src": "obs",
+          "content": "Before reporting a security/health finding from a probe, run a negative control \u2014 prove the test can fail\n\n202"
+        },
+        {
+          "src": "obs",
+          "content": "Two unfixable-on-container Zo platform bugs reported to Zo security, status pending as of 2026-08-07\n\nTwo plat"
+        }
+      ]
+    },
+    {
+      "id": "embedder-break",
+      "q": "what silently broke spine semantic search for eight days",
+      "hop": "single",
+      "passed": true,
+      "matched": [
+        "get_sentence_embedding_dimension",
+        "embedder",
+        "rename",
+        "MiniLM"
+      ],
+      "n_sources": 2,
+      "need_sources": 0,
+      "search_ms": 9.0,
+      "embed_ms": 17.1,
+      "n_hits": 6,
+      "n_wiki": 1,
+      "top": [
+        {
+          "src": "obs",
+          "content": "Spine memory Observer (plugins/memory/spine/loops.py, on_session_end) does NOT ingest tool-call traces: lines "
+        },
+        {
+          "src": "obs",
+          "content": "Memory Auto-Consolidation cron 029a6b71e2e7 (Sun 04:35 SGT -> #11, agent mode): silent below 85% MEMORY.md cap"
+        },
+        {
+          "src": "obs",
+          "content": "Spine memory Observer does NOT ingest tool-call traces \u2014 it keeps only plain-string content; tool calls are si"
+        },
+        {
+          "src": "obs",
+          "content": "Spine's semantic recall was silently dead ~2026-07-27 to 08-04 from a sentence-transformers method rename \u2014 fi"
+        },
+        {
+          "src": "wiki",
+          "content": "Hermes Spine Memory v2.1.0 \u2014 Comprehensive External Evaluation: ## 2. Spine Evaluation by Dimension\n\n### 2.1 R"
+        },
+        {
+          "src": "obs",
+          "content": "OKF Graph Wiki gist \u2014 independently converges on spine's architecture; four ideas folded into Voltron Phase 3\n"
+        }
+      ]
+    },
+    {
+      "id": "canonical-hermes",
+      "q": "which Hermes installation is canonical, the M1 or the one on Zo",
+      "hop": "single",
+      "passed": true,
+      "matched": [
+        "M1"
+      ],
+      "n_sources": 2,
+      "need_sources": 0,
+      "search_ms": 17.5,
+      "embed_ms": 19.5,
+      "n_hits": 6,
+      "n_wiki": 2,
+      "top": [
+        {
+          "src": "obs",
+          "content": "[Aug 12, 2026] Hermes<->Zo bridge is LIVE \u2014 Zo build agents call Hermes via `bun hermes.ts` (HERMES_BASE=https"
+        },
+        {
+          "src": "wiki",
+          "content": "Hermes /agency \u2014 Zo Creative Agency Bridge: ## Installation\n\nPlace this SKILL.md in your Hermes skills directo"
+        },
+        {
+          "src": "obs",
+          "content": "User relays messages to Zo through Hermes by asking Hermes to send a message to the dedicated Zo topic."
+        },
+        {
+          "src": "obs",
+          "content": "Hermes and Zo are separate systems/agents that communicate through a dedicated relay channel set up by the use"
+        },
+        {
+          "src": "wiki",
+          "content": "Hermes Memory System \u2014 Audit & Refinement: ## Phase 2 \u2014 Multi-Device Refinement (Jul 1)\n\n### Problem\nUser oper"
+        },
+        {
+          "src": "obs",
+          "content": "User is running or configuring a local Hermes Agent installation."
+        }
+      ]
+    },
+    {
+      "id": "system-topic",
+      "q": "which Telegram topic is the ops and system broadcast channel",
+      "hop": "single",
+      "passed": true,
+      "matched": [
+        "topic 11",
+        "system",
+        "HQ_HermesBoat69"
+      ],
+      "n_sources": 6,
+      "need_sources": 0,
+      "search_ms": 8.9,
+      "embed_ms": 18.6,
+      "n_hits": 6,
+      "n_wiki": 4,
+      "top": [
+        {
+          "src": "obs",
+          "content": "What Telegram topic 11 in the HQ_HermesBoat69 supergroup is and does \u2014 the ops/infra broadcast channel\n\nTopic "
+        },
+        {
+          "src": "obs",
+          "content": "Concierge Bot command center: Telegram HQ_HermesBoat69 topic 8680 (-1004389869012:8680) \u2014 route all concierge-"
+        },
+        {
+          "src": "wiki",
+          "content": "Hermes Multi-Agent System \u2014 How It Works: ## Aug 1, 2026 \u2014 Hermes-Zo Relay Channel (added 2026-08-02)\n\nNew ded"
+        },
+        {
+          "src": "wiki",
+          "content": "Crypto Quant System: ## Steambot News Delivery Redirect (Jun 9)\nAll 4 news/market cron jobs were redirected to"
+        },
+        {
+          "src": "wiki",
+          "content": "Market Intel Agent \u2014 Rebuild-From-Scratch Guide: ## 1. What this system is\n\nSeven scheduled intelligence brief"
+        },
+        {
+          "src": "wiki",
+          "content": "HQ_HermesBoat69 \u2014 Telegram Forum Summary: ## What This Is\n\nA Telegram forum group that consolidates 10 formerl"
+        }
+      ]
+    },
+    {
+      "id": "control-direction",
+      "q": "can Zo call into Claude Code or is control one way",
+      "hop": "single",
+      "passed": true,
+      "matched": [
+        "one-way",
+        "never the reverse"
+      ],
+      "n_sources": 3,
+      "need_sources": 0,
+      "search_ms": 8.6,
+      "embed_ms": 22.1,
+      "n_hits": 6,
+      "n_wiki": 1,
+      "top": [
+        {
+          "src": "obs",
+          "content": "Claude Code is the \\\"main brain\\\"; Zo can never initiate, but Hermes CAN drive Claude Code and now does routin"
+        },
+        {
+          "src": "obs",
+          "content": "Current confirmed topology across Hermes, Claude Code, and Zo \u2014 who can reach whom, verified live 2026-08-03\n\n"
+        },
+        {
+          "src": "wiki",
+          "content": "Hermes Multi-Agent System \u2014 How It Works: ## Aug 1, 2026 \u2014 Hermes-Zo Relay Channel (added 2026-08-02)\n\nNew ded"
+        },
+        {
+          "src": "obs",
+          "content": "Talking to Zo: always try the zo MCP toolset first (deterministic, cheap, screened). Only use the /zo/ask REST"
+        },
+        {
+          "src": "obs",
+          "content": "Claude Code is directly connected to 0xsteamboat's Zo Computer via MCP (not Telegram relay) \u2014 setup details an"
+        },
+        {
+          "src": "obs",
+          "content": "Agent corrected Hermes that control between Hermes and Claude Code is one-way: Claude Code \u2192 Hermes, never the"
+        }
+      ]
+    },
+    {
+      "id": "totoapp-rejection",
+      "q": "why did TotoApp get rejected from the App Store",
+      "hop": "single",
+      "passed": true,
+      "matched": [
+        "age rating",
+        "2.3.6",
+        "rejected"
+      ],
+      "n_sources": 1,
+      "need_sources": 0,
+      "search_ms": 7.8,
+      "embed_ms": 13.6,
+      "n_hits": 6,
+      "n_wiki": 2,
+      "top": [
+        {
+          "src": "wiki",
+          "content": "TOTO 6/49 \u2014 Complete Strategy Reference: ## 8. TOTO iOS App\n\n**Status:** Built by Claude in sandbox, compiled "
+        },
+        {
+          "src": "obs",
+          "content": "Toto iOS app: repo chintheman/toto (branch claude/toto-lottery-ios-app-8be0t7), Xcode project ios/TotoApp/Toto"
+        },
+        {
+          "src": "obs",
+          "content": "TotoApp (Toto Buddy) App Store Connect API access \u2014 credentials now in macOS Keychain, current key ID, submiss"
+        },
+        {
+          "src": "obs",
+          "content": "App Store Connect API access: credentials in macOS keychain (account toto-asc) \u2014 no .p8 file on disk. Query `s"
+        },
+        {
+          "src": "obs",
+          "content": "[Aug 15 2026] User assigned Hermes as product/project manager for Toto Buddy (post-launch). North star: real b"
+        },
+        {
+          "src": "wiki",
+          "content": "Daily Digest \u2014 2026-08-01 (Saturday): ## Key Themes\n\n### 1. DM \u2014 DNS Flush Executed, Machine Rebooted, App Sto"
+        }
+      ]
+    },
+    {
+      "id": "workout-log-shape",
+      "q": "how are records structured in workout-log.json",
+      "hop": "single",
+      "passed": true,
+      "matched": [
+        "per exercise",
+        "group by date",
+        "one record"
+      ],
+      "n_sources": 1,
+      "need_sources": 0,
+      "search_ms": 7.4,
+      "embed_ms": 9.4,
+      "n_hits": 6,
+      "n_wiki": 4,
+      "top": [
+        {
+          "src": "wiki",
+          "content": "Agentic Health & Wellness Coach \u2014 Complete System Documentation: ## 11. Workout Logging & Structured Memory\n\n#"
+        },
+        {
+          "src": "obs",
+          "content": "workout-log.json is one record per exercise, not one per session \u2014 any code reading 'the last workout' must gr"
+        },
+        {
+          "src": "wiki",
+          "content": "Agentic Health & Wellness Coach \u2014 v3.0 Implementation Spec: ## schemas/workout-log.schema.json\n---------------"
+        },
+        {
+          "src": "obs",
+          "content": "[Aug 15, 2026] workout-log-tracker.py CLI trap: it is a HAND-ROLLED parser (no argparse) \u2014 `add --help` parses"
+        },
+        {
+          "src": "wiki",
+          "content": "Agentic Health & Wellness Coach \u2014 v3.0 Implementation Spec: ## 9. Data contracts (schemas)\n\nFour JSON files fo"
+        },
+        {
+          "src": "wiki",
+          "content": "Review Engine Skill: ## Data sources (read all, synthesize)\n\n- `workout-log.json` \u2014 sessions, lifts, RPE, knee"
+        }
+      ]
+    },
+    {
+      "id": "groq-limit",
+      "q": "why was Groq removed from the fallback providers",
+      "hop": "single",
+      "passed": true,
+      "matched": [
+        "8K TPM",
+        "8K",
+        "413",
+        "Groq"
+      ],
+      "n_sources": 3,
+      "need_sources": 0,
+      "search_ms": 6.9,
+      "embed_ms": 14.2,
+      "n_hits": 6,
+      "n_wiki": 4,
+      "top": [
+        {
+          "src": "obs",
+          "content": "Groq free tier 8K TPM limit makes it incompatible with agent sessions \u2014 any request >8K tokens returns HTTP 41"
+        },
+        {
+          "src": "wiki",
+          "content": "cq-na-consolidation: ## Consolidation Blueprint (Draft)\n\n**Goal:** Merge Crypto Quant + News Aggregator into a"
+        },
+        {
+          "src": "wiki",
+          "content": "Hermes Agent \u2014 Complete System Reference: ## 2. Model Configuration\n\n### 2.1 Default Model Stack\n\n```yaml\nmode"
+        },
+        {
+          "src": "wiki",
+          "content": "Hermes Agent \u2014 Complete System Reference: ## 13. Config Reference\n\n### `~/.hermes/config.yaml` Key Sections\n\n|"
+        },
+        {
+          "src": "obs",
+          "content": "X/Twitter scanning: Zo X API is PRIMARY for X Multi-Scanner (81b086688939, since Aug 11 2026) \u2014 beats Exa's in"
+        },
+        {
+          "src": "wiki",
+          "content": "cq-na-consolidation: ## Platform Comparison: Both Sources\n\n| Platform | Source 1 (ohneis652) | Source 2 (datas"
+        }
+      ]
+    },
+    {
+      "id": "concierge-field-name",
+      "q": "what is the concierge bot field called instead of Trigger",
+      "hop": "single",
+      "passed": true,
+      "matched": [
+        "Driver"
+      ],
+      "n_sources": 1,
+      "need_sources": 0,
+      "search_ms": 9.5,
+      "embed_ms": 9.1,
+      "n_hits": 6,
+      "n_wiki": 0,
+      "top": [
+        {
+          "src": "obs",
+          "content": "Concierge bot v0.1 running on M1: ~/projects/concierge-bot/bot.py (python-telegram-bot, Anthropic Claude Sonne"
+        },
+        {
+          "src": "obs",
+          "content": "Concierge Bot command center: Telegram HQ_HermesBoat69 topic 8680 (-1004389869012:8680) \u2014 route all concierge-"
+        },
+        {
+          "src": "obs",
+          "content": "Concierge bot command descriptions live in TWO places: (1) Telegram command menu set via setMyCommands Bot API"
+        },
+        {
+          "src": "obs",
+          "content": "Concierge bot: user wants Glenn to use the bot immediately. Bot is public \u2014 Glenn searches @testingsteambot on"
+        },
+        {
+          "src": "obs",
+          "content": "Concierge bot uses claude-sonnet-5 for main model, deepseek-chat for document/URL summarization (sub-agent pat"
+        },
+        {
+          "src": "obs",
+          "content": "Concierge bot multi-tenant architecture: data_layer.py with client profiles at data/clients/{slug}/brief.json,"
+        }
+      ]
+    },
+    {
+      "id": "no-dashes",
+      "q": "what punctuation is banned in copy Chin ships",
+      "hop": "single",
+      "passed": true,
+      "matched": [
+        "em/en",
+        "em dash",
+        "hyphen"
+      ],
+      "n_sources": 1,
+      "need_sources": 0,
+      "search_ms": 8.9,
+      "embed_ms": 10.5,
+      "n_hits": 6,
+      "n_wiki": 2,
+      "top": [
+        {
+          "src": "obs",
+          "content": "The user's name is Chin (Chuang Chin Tuan), also known as 0xsteamboat, based in Singapore"
+        },
+        {
+          "src": "obs",
+          "content": "Hard rule: no em/en dashes in any copy Chin ships. Hyphens only where grammar requires them.\n\n**No em dashes ("
+        },
+        {
+          "src": "obs",
+          "content": "User's personal name is Chin."
+        },
+        {
+          "src": "wiki",
+          "content": "0xsteamboat \u2014 Career Operations Master Reference: ## 6. Quality Gates & Scoring\n\n### 6.1 Anti-Slop Rubric (Man"
+        },
+        {
+          "src": "wiki",
+          "content": "Visual Style Library \u2014 10 Distinct Styles: ## Style 6: Bold Typographic\n\n**Vibe:** Dramatic, minimal, editoria"
+        },
+        {
+          "src": "obs",
+          "content": "User's personal name is Chin."
+        }
+      ]
+    },
+    {
+      "id": "gh-argv-limit",
+      "q": "why did passing a large base64 payload to gh silently fail",
+      "hop": "single",
+      "passed": true,
+      "matched": [
+        "128KB",
+        "128 KB",
+        "argv",
+        "96KB"
+      ],
+      "n_sources": 1,
+      "need_sources": 0,
+      "search_ms": 7.1,
+      "embed_ms": 17.7,
+      "n_hits": 6,
+      "n_wiki": 2,
+      "top": [
+        {
+          "src": "obs",
+          "content": "Shelling out to gh with a file's base64 as an argv silently breaks past ~96KB \u2014 Linux caps ONE argument at 128"
+        },
+        {
+          "src": "obs",
+          "content": "Real triggers + subagent audits catch bugs code review alone misses \u2014 validated repeatedly during the 2026-07-"
+        },
+        {
+          "src": "obs",
+          "content": "Before reporting a security/health finding from a probe, run a negative control \u2014 prove the test can fail\n\n202"
+        },
+        {
+          "src": "obs",
+          "content": "[Aug 14 2026] Labs/0xsteamboat-me concurrent-agent deploy race: user's Claude Code sessions rebuild from STALE"
+        },
+        {
+          "src": "wiki",
+          "content": "\ud83c\udfd7\ufe0f Graphify Integration \u2014 Knowledge Graph for Coding Stack: ## Validation Performed\n\nThe tool was fully valida"
+        },
+        {
+          "src": "wiki",
+          "content": "P1 #6 \u2014 Synchronization Barriers for Parallel Work: ## The Fix: Wait for All Branches, Synthesize, Deliver Onc"
+        }
+      ]
+    },
+    {
+      "id": "telegram-100-prefix",
+      "q": "hermes send fails with a MEDIA tag error, what is actually wrong",
+      "hop": "single",
+      "passed": true,
+      "matched": [
+        "-100",
+        "prefix",
+        "chat id"
+      ],
+      "n_sources": 1,
+      "need_sources": 0,
+      "search_ms": 8.8,
+      "embed_ms": 9.8,
+      "n_hits": 6,
+      "n_wiki": 3,
+      "top": [
+        {
+          "src": "obs",
+          "content": "hermes send Telegram chat ids need the -100 prefix that t.me/c/ links omit, and the MEDIA-tag error message mi"
+        },
+        {
+          "src": "obs",
+          "content": "User relays messages to Zo through Hermes by asking Hermes to send a message to the dedicated Zo topic."
+        },
+        {
+          "src": "wiki",
+          "content": "Hermes Stack Pulse \u2014 v1.0.0: ## Dedup\n\n- Before send: check `~/.hermes/data/shared-links.txt` \u2014 skip any URL a"
+        },
+        {
+          "src": "obs",
+          "content": "openai-whisper installed in Hermes venv (Aug 5, 2026): `~/.hermes/hermes-agent/venv/bin/whisper` (base model \u2248"
+        },
+        {
+          "src": "wiki",
+          "content": "Claude Command Cheat Sheet \u2014 Evaluation for Hermes Stack: ## 11. COLLABORATE & SHARE\n\n| Command | Hermes Equiv"
+        },
+        {
+          "src": "wiki",
+          "content": "Creative Brief: Second Brain Public Launch: ## Delivery\n- Summary .md \u2192 send as MEDIA:/path reference\n- Linked"
+        }
+      ]
+    },
+    {
+      "id": "zo-service-restart",
+      "q": "how do I restart a Zo web service",
+      "hop": "single",
+      "passed": true,
+      "matched": [
+        "supervisorctl"
+      ],
+      "n_sources": 1,
+      "need_sources": 0,
+      "search_ms": 7.6,
+      "embed_ms": 10.6,
+      "n_hits": 6,
+      "n_wiki": 1,
+      "top": [
+        {
+          "src": "obs",
+          "content": "Zo's update_user_service MCP tool is classifier-blocked; restart Zo web services via supervisorctl over bash i"
+        },
+        {
+          "src": "obs",
+          "content": "Zo space route /api/zo exposed unauthenticated root RCE to the public internet \u2014 found and fixed 2026-08-04; a"
+        },
+        {
+          "src": "obs",
+          "content": "User has Hermes and Claude Code connected to the Zo computer service."
+        },
+        {
+          "src": "obs",
+          "content": "[Aug 12, 2026] Hermes<->Zo bridge is LIVE \u2014 Zo build agents call Hermes via `bun hermes.ts` (HERMES_BASE=https"
+        },
+        {
+          "src": "wiki",
+          "content": "Zo Creative Agency \u2014 Complete Merged Stack: ---\nname: zo-creative-agency\ndescription: \"Zo Creative Agency \u2014 Co"
+        },
+        {
+          "src": "obs",
+          "content": "Talking to Zo: always try the zo MCP toolset first (deterministic, cheap, screened). Only use the /zo/ask REST"
+        }
+      ]
+    },
+    {
+      "id": "deploy-source",
+      "q": "which checkout does the 0xsteamboat.me site deploy from",
+      "hop": "single",
+      "passed": true,
+      "matched": [
+        "worktree",
+        "origin/main"
+      ],
+      "n_sources": 2,
+      "need_sources": 0,
+      "search_ms": 7.7,
+      "embed_ms": 20.7,
+      "n_hits": 6,
+      "n_wiki": 1,
+      "top": [
+        {
+          "src": "obs",
+          "content": "0xsteamboat.me deploys from a prod git worktree pinned to origin/main \u2014 never from the dev checkout\n\n**Two che"
+        },
+        {
+          "src": "wiki",
+          "content": "Learn Animated Websites \u2014 Full Context Reference: ## Personal Site Target\n- **Current:** 0xsteamboat.zo.space\n"
+        },
+        {
+          "src": "obs",
+          "content": "[Aug 14 2026] Labs/0xsteamboat-me concurrent-agent deploy race: user's Claude Code sessions rebuild from STALE"
+        },
+        {
+          "src": "obs",
+          "content": "Personal site rebuild as the \\\"Gestalt Sector\\\" assembly scene \u2014 staged at /v2, full dark rebrand agreed, 5 of"
+        },
+        {
+          "src": "obs",
+          "content": "User identifies as 0xsteamboat."
+        },
+        {
+          "src": "obs",
+          "content": "0xsteamboat maintains a personal knowledge base (wiki) in the local path /Users/0xsteamboat/wiki."
+        }
+      ]
+    },
+    {
+      "id": "npm-audit-hazard",
+      "q": "is it safe to run npm audit fix in the hermes agent repo",
+      "hop": "single",
+      "passed": true,
+      "matched": [
+        "cascade",
+        "bad dependency",
+        "every wo",
+        "--force"
+      ],
+      "n_sources": 1,
+      "need_sources": 0,
+      "search_ms": 19.9,
+      "embed_ms": 8.4,
+      "n_hits": 6,
+      "n_wiki": 0,
+      "top": [
+        {
+          "src": "obs",
+          "content": "npm audit fix in ~/.hermes/hermes-agent (even without --force) can cascade a bad dependency resolution across "
+        },
+        {
+          "src": "obs",
+          "content": "Public CLI + playbook tool built from the personal infra security audit, shipped as v0.1.0\n\nBuilt `agent-secur"
+        },
+        {
+          "src": "obs",
+          "content": "User has a personal fork of hermes-agent (github.com/chintheman/hermes-agent) to preserve local fixes across h"
+        },
+        {
+          "src": "obs",
+          "content": "Uses the Hermes agent framework with symlinked skill directories pointing to local repo checkouts."
+        },
+        {
+          "src": "obs",
+          "content": "Always independently verify Hermes's own \\\"done\\\" reports with direct file/config/cron checks before relaying "
+        },
+        {
+          "src": "obs",
+          "content": "Hermes secrets layout (verified Aug 4, 2026): the Hermes env file is the SINGLE source for API keys (FRED_API_"
+        }
+      ]
+    },
+    {
+      "id": "session-id-shapes",
+      "q": "which Claude Code session id can actually be resumed locally",
+      "hop": "single",
+      "passed": true,
+      "matched": [
+        "UUID",
+        "uuid"
+      ],
+      "n_sources": 2,
+      "need_sources": 0,
+      "search_ms": 9.5,
+      "embed_ms": 10.5,
+      "n_hits": 6,
+      "n_wiki": 0,
+      "top": [
+        {
+          "src": "obs",
+          "content": "Claude Code has two session id shapes that look interchangeable and are not \u2014 only the UUID can be resumed loc"
+        },
+        {
+          "src": "obs",
+          "content": "[Aug 6, 2026] Claude Code session-resume: use `claude --resume` (picker) \u2014 NOT `claude --continue` (can grab t"
+        },
+        {
+          "src": "obs",
+          "content": "Claude Code session file is shared/accessible across different terminal windows on the same machine; content i"
+        },
+        {
+          "src": "obs",
+          "content": "Claude Code is the \\\"main brain\\\"; Zo can never initiate, but Hermes CAN drive Claude Code and now does routin"
+        },
+        {
+          "src": "obs",
+          "content": "User manages Claude Code sessions himself when active in them ('everything i need to do with the session i wil"
+        },
+        {
+          "src": "obs",
+          "content": "Claude Code is directly connected to 0xsteamboat's Zo Computer via MCP (not Telegram relay) \u2014 setup details an"
+        }
+      ]
+    },
+    {
+      "id": "mh-zo-safe-publish",
+      "q": "what is the safe way for an agent to publish something to Zo",
+      "hop": "multi",
+      "passed": true,
+      "matched": [
+        "mcp",
+        "rce"
+      ],
+      "n_sources": 3,
+      "need_sources": 2,
+      "search_ms": 8.0,
+      "embed_ms": 11.5,
+      "n_hits": 6,
+      "n_wiki": 2,
+      "top": [
+        {
+          "src": "obs",
+          "content": "Talking to Zo: always try the zo MCP toolset first (deterministic, cheap, screened). Only use the /zo/ask REST"
+        },
+        {
+          "src": "wiki",
+          "content": "Zo Agentic Creative Agency \u2014 Architecture Reference: ## Hermes /agency Integration\n\nThe Hermes skills list inc"
+        },
+        {
+          "src": "obs",
+          "content": "Zo space route /api/zo exposed unauthenticated root RCE to the public internet \u2014 found and fixed 2026-08-04; a"
+        },
+        {
+          "src": "obs",
+          "content": "Claude Code is directly connected to 0xsteamboat's Zo Computer via MCP (not Telegram relay) \u2014 setup details an"
+        },
+        {
+          "src": "obs",
+          "content": "Two unfixable-on-container Zo platform bugs reported to Zo security, status pending as of 2026-08-07\n\nTwo plat"
+        },
+        {
+          "src": "wiki",
+          "content": "Zo Agentic Creative Agency \u2014 Architecture Reference: # Zo Agentic Creative Agency \u2014 Architecture Reference\n\nBu"
+        }
+      ]
+    },
+    {
+      "id": "mh-rebuild-unsafe",
+      "q": "why is it unsafe to rebuild the spine index right now",
+      "hop": "multi",
+      "passed": true,
+      "matched": [
+        "status",
+        "jsonl",
+        "promote"
+      ],
+      "n_sources": 5,
+      "need_sources": 2,
+      "search_ms": 7.4,
+      "embed_ms": 8.2,
+      "n_hits": 6,
+      "n_wiki": 4,
+      "top": [
+        {
+          "src": "obs",
+          "content": "Spine's observation `status` lives ONLY in the SQLite DB. The consolidation loop never writes it back to the c"
+        },
+        {
+          "src": "obs",
+          "content": "Memory Auto-Consolidation cron 029a6b71e2e7 (Sun 04:35 SGT -> #11, agent mode): silent below 85% MEMORY.md cap"
+        },
+        {
+          "src": "wiki",
+          "content": "Hermes Memory System v2.1.0 \u2014 Build Complete: ## 4. What Happens Next\n\n### Immediate (next session)\n- Gateway "
+        },
+        {
+          "src": "wiki",
+          "content": "Hermes Memory System v2 \u2014 The Complete Story: ## Part 2: After \u2014 What Memory Is Now\n\n### The Philosophy: Gbrai"
+        },
+        {
+          "src": "wiki",
+          "content": "Hermes Memory System v2 \u2014 The Complete Story: ## Part 5: The Replication Package\n\n`~/projects/spine-replicatio"
+        },
+        {
+          "src": "wiki",
+          "content": "Voyage Embedder Upgrade \u2014 Evaluation Plan: ## Cron Schedule (Sunday Pipeline)\n\n```\n04:00 \u2014 Spine Memory Consol"
+        }
+      ]
+    },
+    {
+      "id": "mh-blocked-cli",
+      "q": "a shell command is blocked for Claude Code, what should I try before asking Chin",
+      "hop": "multi",
+      "passed": true,
+      "matched": [
+        "hermes",
+        "classifier"
+      ],
+      "n_sources": 6,
+      "need_sources": 2,
+      "search_ms": 8.0,
+      "embed_ms": 20.7,
+      "n_hits": 6,
+      "n_wiki": 3,
+      "top": [
+        {
+          "src": "obs",
+          "content": "When a CLI action is blocked for Claude Code, try routing it through the local Hermes agent before asking the "
+        },
+        {
+          "src": "obs",
+          "content": "Claude Code is the \\\"main brain\\\"; Zo can never initiate, but Hermes CAN drive Claude Code and now does routin"
+        },
+        {
+          "src": "wiki",
+          "content": "Claude Handoff Protocol: ## Path A: Claude.ai Web Chat\n\n**When:** Quick reviews, single-file fixes, asking Cla"
+        },
+        {
+          "src": "obs",
+          "content": "claudem1 FAST PATH (Aug 3, 2026): ~/.hermes/scripts/launch-claude-fast.sh launches Claude Code in ~7s via ONE "
+        },
+        {
+          "src": "wiki",
+          "content": "Claude Handoff Protocol: ## Path B: Claude Code CLI\n\n**When:** Multi-file refactoring. Claude Code can Read fi"
+        },
+        {
+          "src": "wiki",
+          "content": "Claude Handoff Protocol: ## Overview\n**Hermes (DeepSeek, cheap) \u2192 Claude (review/refactor) \u2192 Hermes (integrate"
+        }
+      ]
+    },
+    {
+      "id": "mh-secrets-route",
+      "q": "how do I read a secret when the permission classifier blocks me",
+      "hop": "multi",
+      "passed": true,
+      "matched": [
+        "keychain",
+        "classifier"
+      ],
+      "n_sources": 3,
+      "need_sources": 2,
+      "search_ms": 7.6,
+      "embed_ms": 14.4,
+      "n_hits": 6,
+      "n_wiki": 1,
+      "top": [
+        {
+          "src": "obs",
+          "content": "Claude Code's auto-mode classifier hard-blocks self-granting Bash permissions (e.g. reading secrets/Keychain),"
+        },
+        {
+          "src": "obs",
+          "content": "When a CLI action is blocked for Claude Code, try routing it through the local Hermes agent before asking the "
+        },
+        {
+          "src": "obs",
+          "content": "How this user wants secrets/credentials handled when working with Claude Code \u2014 free-first tooling, fetch-at-u"
+        },
+        {
+          "src": "wiki",
+          "content": "Interior Designer \u2014 Usage Guide: ## What to Say\n\n### Speed controls\n| Say this | Effect |\n|----------|--------"
+        },
+        {
+          "src": "obs",
+          "content": "A secret guard blocks git commits that contain 12-word seed phrases; false positives can be bypassed with --no"
+        },
+        {
+          "src": "obs",
+          "content": "Two unfixable-on-container Zo platform bugs reported to Zo security, status pending as of 2026-08-07\n\nTwo plat"
+        }
+      ]
+    },
+    {
+      "id": "mh-silent-failure",
+      "q": "what keeps breaking silently in this system and what was meant to catch it",
+      "hop": "multi",
+      "passed": false,
+      "matched": [],
+      "n_sources": 0,
+      "need_sources": 2,
+      "search_ms": 7.8,
+      "embed_ms": 8.4,
+      "n_hits": 6,
+      "n_wiki": 3,
+      "top": [
+        {
+          "src": "obs",
+          "content": "Real triggers + subagent audits catch bugs code review alone misses \u2014 validated repeatedly during the 2026-07-"
+        },
+        {
+          "src": "wiki",
+          "content": "Context Digest Taxonomy \u2014 Full Reference: ## Cluster 12: \ud83d\udd01 Recurring Frictions\n\n**What it captures:** The same"
+        },
+        {
+          "src": "wiki",
+          "content": "\ud83e\udd16 AI Agentic Reporter \u2014 Comprehensive Scope: ## 10. Breaking Alert System\n\nA three-gate system for real-time i"
+        },
+        {
+          "src": "wiki",
+          "content": "HQ_HermesBoat69 \u2014 Telegram Forum Topics Map: ## #11 \u2014 System\n\n**What this topic is:** The system alert board. "
+        },
+        {
+          "src": "obs",
+          "content": "Standing protocol from 2026-08-16: Chin sends labs feedback as he uses it, I research and log it, I do not bui"
+        },
+        {
+          "src": "obs",
+          "content": "[F \u2014 Jul 30, 2026] Testing discipline for live/delivered systems: reviewing a prompt/config change is not enou"
+        }
+      ]
+    },
+    {
+      "id": "mh-who-drives-who",
+      "q": "can Hermes start a Claude Code session, and can Zo",
+      "hop": "multi",
+      "passed": true,
+      "matched": [
+        "hermes",
+        "zo",
+        "initiate"
+      ],
+      "n_sources": 6,
+      "need_sources": 2,
+      "search_ms": 9.1,
+      "embed_ms": 13.8,
+      "n_hits": 6,
+      "n_wiki": 0,
+      "top": [
+        {
+          "src": "obs",
+          "content": "User has Hermes and Claude Code connected to the Zo computer service."
+        },
+        {
+          "src": "obs",
+          "content": "Operates across at least two machines/sessions simultaneously: one running Hermes and one running the target C"
+        },
+        {
+          "src": "obs",
+          "content": "User manages Claude Code sessions himself when active in them ('everything i need to do with the session i wil"
+        },
+        {
+          "src": "obs",
+          "content": "Agent corrected Hermes that control between Hermes and Claude Code is one-way: Claude Code \u2192 Hermes, never the"
+        },
+        {
+          "src": "obs",
+          "content": "User handles Claude Code installations themselves \u2014 said 'implement for hermes, i'll handle claude separately'"
+        },
+        {
+          "src": "obs",
+          "content": "Claude Code is the \\\"main brain\\\"; Zo can never initiate, but Hermes CAN drive Claude Code and now does routin"
+        }
+      ]
+    },
+    {
+      "id": "mh-output-rules",
+      "q": "how should I format a reply and what punctuation is off limits",
+      "hop": "multi",
+      "passed": false,
+      "matched": [],
+      "n_sources": 0,
+      "need_sources": 2,
+      "search_ms": 7.8,
+      "embed_ms": 8.9,
+      "n_hits": 6,
+      "n_wiki": 2,
+      "top": [
+        {
+          "src": "wiki",
+          "content": "Hermes Routing Protocol: ## 1.3 Response Format\n\nThe answering profile wraps its reply as:\n\n```"
+        },
+        {
+          "src": "obs",
+          "content": "HARD FORMAT RULE (Jul 20 2026): Morning brief format is LOCKED to the Jul 14 template. User sent a screenshot "
+        },
+        {
+          "src": "obs",
+          "content": "[Aug 3, 2026] When user forwards messages/news/images, READ THEM IN FULL DETAIL before replying \u2014 don't rush t"
+        },
+        {
+          "src": "obs",
+          "content": "Telegram bot formatting: use parse_mode='HTML' for AI-generated text (only < > & need escaping \u2014 far more forg"
+        },
+        {
+          "src": "obs",
+          "content": "Market Intel response format (Jul 28 2026): Lead with direct answer in 1-2 sentences. Blank line. Supporting d"
+        },
+        {
+          "src": "wiki",
+          "content": "Visual Style Library \u2014 10 Distinct Styles: ## Style 6: Bold Typographic\n\n**Vibe:** Dramatic, minimal, editoria"
+        }
+      ]
+    },
+    {
+      "id": "mh-memory-md-care",
+      "q": "why does Hermes MEMORY.md need manual repair and what writes to it",
+      "hop": "multi",
+      "passed": true,
+      "matched": [
+        "two",
+        "consolidation",
+        "promote"
+      ],
+      "n_sources": 3,
+      "need_sources": 2,
+      "search_ms": 9.0,
+      "embed_ms": 8.5,
+      "n_hits": 6,
+      "n_wiki": 1,
+      "top": [
+        {
+          "src": "obs",
+          "content": "Spine's observation `status` lives ONLY in the SQLite DB. The consolidation loop never writes it back to the c"
+        },
+        {
+          "src": "obs",
+          "content": "0xsteamboat is the project lead and owner of the Hermes memory system project."
+        },
+        {
+          "src": "obs",
+          "content": "~/.hermes/memories/MEMORY.md has TWO independent writers (spine's promote pass and the LLM-assisted consolidat"
+        },
+        {
+          "src": "wiki",
+          "content": "Hermes Agent \u2014 Critical Skills (Full Bodies): ## 10. memory-architecture\n\n**Path:** `devops/memory-architectur"
+        },
+        {
+          "src": "obs",
+          "content": "MCP server wrapping Hermes's spine memory, built 2026-08-04 \u2014 gives Claude Code read/write access to the same "
+        },
+        {
+          "src": "obs",
+          "content": "User operates an agent system named \"Hermes\" that uses a MEMORY.md file with always-on behavioral rules."
+        }
+      ]
+    },
+    {
+      "id": "mh-cron-traps",
+      "q": "what goes wrong when creating a Hermes cron and how do I verify it worked",
+      "hop": "multi",
+      "passed": false,
+      "matched": [
+        "30m",
+        "one-shot"
+      ],
+      "n_sources": 1,
+      "need_sources": 2,
+      "search_ms": 9.6,
+      "embed_ms": 8.9,
+      "n_hits": 6,
+      "n_wiki": 2,
+      "top": [
+        {
+          "src": "obs",
+          "content": "Always independently verify Hermes's own \\\"done\\\" reports with direct file/config/cron checks before relaying "
+        },
+        {
+          "src": "obs",
+          "content": "Traps when creating or editing Hermes cron jobs \u2014 \\\"30m\\\" silently makes a one-shot, enabled_toolsets has no C"
+        },
+        {
+          "src": "obs",
+          "content": "[Aug 14, 2026] Prompt-transform verification: verify bulk cron prompt edits by COUNT not presence \u2014 a non-idem"
+        },
+        {
+          "src": "wiki",
+          "content": "Agentic Health & Wellness Coach \u2014 v3.0 Implementation Spec: ## 11. Implementation order (do this, in this orde"
+        },
+        {
+          "src": "wiki",
+          "content": "Agentic Health & Wellness Coach \u2014 v3.0 Implementation Spec: ## 11. Implementation order (do this, in this orde"
+        },
+        {
+          "src": "obs",
+          "content": "When building/refining any Hermes skill with non-trivial deterministic logic, check chintheman/hermes-skill-te"
+        }
+      ]
+    },
+    {
+      "id": "mh-memory-sync-latency",
+      "q": "if I write a Claude Code memory file now, when can Hermes search it",
+      "hop": "multi",
+      "passed": true,
+      "matched": [
+        "sync",
+        "4 hours"
+      ],
+      "n_sources": 1,
+      "need_sources": 1,
+      "search_ms": 9.9,
+      "embed_ms": 9.0,
+      "n_hits": 6,
+      "n_wiki": 0,
+      "top": [
+        {
+          "src": "obs",
+          "content": "User handles Claude Code installations themselves \u2014 said 'implement for hermes, i'll handle claude separately'"
+        },
+        {
+          "src": "obs",
+          "content": "MCP server wrapping Hermes's spine memory, built 2026-08-04 \u2014 gives Claude Code read/write access to the same "
+        },
+        {
+          "src": "obs",
+          "content": "Claude Code's memory files auto-sync into spine as profile agent:claude-code every 4h (cron fd84811c4db6). The"
+        },
+        {
+          "src": "obs",
+          "content": "User has Hermes and Claude Code connected to the Zo computer service."
+        },
+        {
+          "src": "obs",
+          "content": "Agent corrected Hermes that control between Hermes and Claude Code is one-way: Claude Code \u2192 Hermes, never the"
+        },
+        {
+          "src": "obs",
+          "content": "User operates an agent system named \"Hermes\" that uses a MEMORY.md file with always-on behavioral rules."
+        }
+      ]
+    },
+    {
+      "id": "mh-verification-discipline",
+      "q": "before I report that something works, what must I do first",
+      "hop": "multi",
+      "passed": false,
+      "matched": [
+        "verify"
+      ],
+      "n_sources": 2,
+      "need_sources": 2,
+      "search_ms": 8.2,
+      "embed_ms": 14.7,
+      "n_hits": 6,
+      "n_wiki": 2,
+      "top": [
+        {
+          "src": "wiki",
+          "content": "Shared Conventions \u2014 All Profiles: ## Universal Format Rules\n\n1. **Bullet list output** \u2014 All output must use "
+        },
+        {
+          "src": "obs",
+          "content": "Standing protocol from 2026-08-16: Chin sends labs feedback as he uses it, I research and log it, I do not bui"
+        },
+        {
+          "src": "obs",
+          "content": "When user reports a problem/missing feature on a delivered system (e.g. \"i don't see these changes on the page"
+        },
+        {
+          "src": "obs",
+          "content": "Every problem I raise must say immediately whether I am handling it or Chin has to act; never leave ownership "
+        },
+        {
+          "src": "wiki",
+          "content": "Hermes Agent \u2014 Complete System Reference: ## 2. Persona & Operating Principles\n\n### Identity Override (Interio"
+        },
+        {
+          "src": "obs",
+          "content": "User prefers HTML reports in light mode (white background), bigger font (~17px base), with checkboxes for mark"
+        }
+      ]
+    },
+    {
+      "id": "mh-deploy-truth",
+      "q": "how do I confirm a site change is actually live and not just committed",
+      "hop": "multi",
+      "passed": false,
+      "matched": [],
+      "n_sources": 0,
+      "need_sources": 2,
+      "search_ms": 7.9,
+      "embed_ms": 7.1,
+      "n_hits": 6,
+      "n_wiki": 3,
+      "top": [
+        {
+          "src": "wiki",
+          "content": "Verification Protocol: ## Edge Cases\n\n| Case | Classification | Reasoning |\n|:-----|:---------------|:--------"
+        },
+        {
+          "src": "wiki",
+          "content": "zero-to-live-personal-website: ---\ntitle: \"Zero-to-Live Personal Website\"\ntype: concept\ncreated: 2026-06-10\nup"
+        },
+        {
+          "src": "obs",
+          "content": "User instinctively requests independent verification after system changes (Jul 26: 'create sub agents to test "
+        },
+        {
+          "src": "obs",
+          "content": "Values running test suites to confirm no regressions before committing engine changes."
+        },
+        {
+          "src": "wiki",
+          "content": "Verification Protocol: ## \ud83d\udfe1 Light Gate \u2014 Verification Only (No Test)\n\n**Trigger:** Tasks that change state but"
+        },
+        {
+          "src": "obs",
+          "content": "[F \u2014 Jul 30, 2026] Testing discipline for live/delivered systems: reviewing a prompt/config change is not enou"
+        }
+      ]
+    }
+  ]
+}

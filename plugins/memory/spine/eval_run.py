@@ -53,14 +53,36 @@ def run(profile: str = "agent:main") -> Dict[str, Any]:
         hits = idx.search_hybrid(q, qvec or None, profile=profile, k=k)
         t_search = time.perf_counter() - t0
 
-        blob = "\n".join((h.get("content") or "") for h in hits).lower()
-        matched = [p for p in case["expect_any"] if p.lower() in blob]
+        docs = [(h.get("content") or "").lower() for h in hits]
+        blob = "\n".join(docs)
+        hop = case.get("hop", "single")
+
+        if hop == "multi":
+            # Every needle must appear, AND they must arrive from enough distinct
+            # documents. Without the source count, one memory containing all the
+            # phrases would pass a test meant to prove retrieval CONNECTED
+            # separate memories.
+            needles = case["expect_all"]
+            matched = [n for n in needles if n.lower() in blob]
+            sources = {i for i, d in enumerate(docs)
+                       if any(n.lower() in d for n in needles)}
+            passed = (len(matched) == len(needles)
+                      and len(sources) >= case.get("min_sources", 2))
+            n_sources = len(sources)
+        else:
+            matched = [p for p in case["expect_any"] if p.lower() in blob]
+            passed = bool(matched)
+            n_sources = sum(1 for d in docs
+                            if any(p.lower() in d for p in case["expect_any"]))
 
         results.append({
             "id": case["id"],
             "q": q,
-            "passed": bool(matched),
+            "hop": hop,
+            "passed": passed,
             "matched": matched,
+            "n_sources": n_sources,
+            "need_sources": case.get("min_sources", 0) if hop == "multi" else 0,
             "search_ms": round(t_search * 1000, 1),
             "embed_ms": round(t_embed * 1000, 1),
             "n_hits": len(hits),
@@ -74,11 +96,16 @@ def run(profile: str = "agent:main") -> Dict[str, Any]:
 
     idx.close()
     passed = sum(1 for r in results if r["passed"])
+    by_hop = {}
+    for hop in ("single", "multi"):
+        sub = [r for r in results if r["hop"] == hop]
+        by_hop[hop] = {"passed": sum(1 for r in sub if r["passed"]), "total": len(sub)}
     return {
         "profile": profile,
         "embedder": have_embedder,
         "k": k,
         "passed": passed,
+        "by_hop": by_hop,
         "total": len(results),
         "median_search_ms": sorted(r["search_ms"] for r in results)[len(results) // 2],
         "cases": results,
@@ -87,14 +114,25 @@ def run(profile: str = "agent:main") -> Dict[str, Any]:
 
 def show(rep: Dict[str, Any]) -> None:
     print(f"\nprofile={rep['profile']}  embedder={rep['embedder']}  k={rep['k']}")
-    print(f"{'':2} {'case':24} {'result':6} {'ms':>7}  matched")
-    print("-" * 78)
-    for r in rep["cases"]:
-        mark = "PASS" if r["passed"] else "FAIL"
-        got = ", ".join(r["matched"])[:34] or "-"
-        print(f"{'':2} {r['id']:24} {mark:6} {r['search_ms']:>7}  {got}")
-    print("-" * 78)
-    print(f"   {rep['passed']}/{rep['total']} passed   median search {rep['median_search_ms']} ms")
+    for hop in ("single", "multi"):
+        sub = [r for r in rep["cases"] if r["hop"] == hop]
+        if not sub:
+            continue
+        b = rep["by_hop"][hop]
+        print(f"\n{hop.upper()}-HOP  {b['passed']}/{b['total']}")
+        print(f"{'':2} {'case':26} {'result':6} {'ms':>7} {'src':>4}  matched")
+        print("-" * 82)
+        for r in sub:
+            mark = "PASS" if r["passed"] else "FAIL"
+            got = ", ".join(r["matched"])[:30] or "-"
+            src = f"{r['n_sources']}/{r['need_sources']}" if hop == "multi" else str(r["n_sources"])
+            print(f"{'':2} {r['id']:26} {mark:6} {r['search_ms']:>7} {src:>4}  {got}")
+        print("-" * 82)
+    b = rep["by_hop"]
+    print(f"\n   TOTAL {rep['passed']}/{rep['total']}   "
+          f"single {b['single']['passed']}/{b['single']['total']}   "
+          f"multi {b['multi']['passed']}/{b['multi']['total']}   "
+          f"median search {rep['median_search_ms']} ms")
     wiki = sum(r["n_wiki"] for r in rep["cases"])
     print(f"   wiki chunks appearing in results: {wiki}\n")
 
