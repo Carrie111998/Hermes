@@ -179,7 +179,18 @@ test('ActiveNowStrip renders above the roster, is a live region, and is click-ac
   // The key rides as jsx()'s third argument so React keeps chip identity.
   assert.match(source, /botRosterKey\(bot\)\s*\)\s*\}\)\s*\]\s*\}\)\s*\}\s*\/\*\* Assign a bot to a group/s)
   assert.match(source, /jsx\(BotFace,\s*\{[\s\S]*?mood: 'work'/)
-  assert.match(source, /let pinnedChat = botRosterMeta\(bot, allMeta\)\?\.chat/)
-  assert.match(source, /await prepareBotSource\(bot, pinnedChat\)/)
-  assert.match(source, /bot\.preferred_session \|\| bot\.last_session/)
+  // Chips open through the SAME owner-routed path as roster rows — one
+  // implementation, so a chip can never take a shortcut a row does not.
+  assert.match(source, /onOpen: bot => void openRosterBot\(bot\)/)
+
+  // That shared path still activates the bot's own source BEFORE any
+  // canonical-chat RPC, and previews the session the click will land on.
+  const openStart = source.indexOf('async function openRosterBot(')
+  assert.ok(openStart >= 0)
+  const open = source.slice(openStart, openStart + 3000)
+
+  assert.match(open, /const meta = botRosterMeta\(bot, \$botMeta\.get\(\)\)/)
+  assert.match(open, /let pinnedChat = meta\?\.chat/)
+  assert.match(open, /await prepareBotSource\(bot, pinnedChat\)/)
+  assert.match(open, /bot\.preferred_session \|\| bot\.last_session/)
 })
