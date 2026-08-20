@@ -110,6 +110,13 @@ try {
 } catch {}
 const PAIR_ONLY = args.includes('--pair-only');
 const PAIR_JSON = args.includes('--pair-json');
+// Phone-based pairing: instead of scanning a QR code, log in via the
+// WhatsApp 6-digit linking code (requestPairingCode). Set --phone <nomor>
+// or env WHATSAPP_PHONE (format: 62xxxx atau +62xxxx, digits only after
+// optional leading +). When set and no session exists yet, the bridge
+// emits a "pairing_code" event (8 digits) and skips QR entirely.
+const WHATSAPP_PHONE = getArg('phone', process.env.WHATSAPP_PHONE || '').trim();
+let pairingCodeRequested = false;
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const WHATSAPP_DM_POLICY = String(process.env.WHATSAPP_DM_POLICY || 'open').trim().toLowerCase();
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
@@ -407,6 +414,9 @@ async function startSocket() {
     auth: state,
     logger,
     printQRInTerminal: false,
+    // Phone-based pairing skips the QR scan entirely. When a phone number is
+    // supplied, Baileys logs in via the 8-digit linking code instead of QR.
+    ...(WHATSAPP_PHONE ? { printedQr: false } : {}),
     browser: ['Hermes Agent', 'Chrome', '120.0'],
     syncFullHistory: false,
     markOnlineOnConnect: false,
@@ -421,10 +431,45 @@ async function startSocket() {
 
   sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
 
+  // Phone-based login: request the 8-digit pairing code and emit it so the
+  // gateway / --pair-json consumer can surface it. Only request once.
+  if (WHATSAPP_PHONE && !pairingCodeRequested) {
+    pairingCodeRequested = true;
+    (async () => {
+      try {
+        // waVersion check: requestPairingCode needs the socket fully auth-init'd
+        let phone = WHATSAPP_PHONE.replace(/\D/g, '');
+        if (!phone) {
+          console.error('❌ Invalid WHATSAPP_PHONE / --phone value (no digits).');
+          if (PAIR_JSON) emitPairEvent({ event: 'error', error: 'invalid_phone' });
+          return;
+        }
+        if (!phone.startsWith('62') && !phone.startsWith('0') && !phone.startsWith('+')) {
+          // assume Indonesia default country if 10-11 digits, prefix 62
+          if (phone.length >= 10 && phone.length <= 11) phone = '62' + phone.replace(/^0/, '');
+        }
+        // requestPairingCode resolves to the 8-digit code
+        const code = await sock?.requestPairingCode?.(phone);
+        if (code) {
+          console.log(`\n🔗 WhatsApp pairing code for ${phone}: ${code}`);
+          console.log('Enter this code in WhatsApp > Settings > Linked Devices > Link a Device > Enter Code.\n');
+          if (PAIR_JSON) emitPairEvent({ event: 'pairing_code', code, phone });
+        } else if (PAIR_JSON) {
+          emitPairEvent({ event: 'error', error: 'no_pairing_code' });
+        }
+      } catch (e) {
+        console.error('❌ Pairing code request failed:', e?.message || e);
+        if (PAIR_JSON) emitPairEvent({ event: 'error', error: 'pairing_failed', message: e?.message || String(e) });
+      }
+    })();
+  }
+
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    if (qr) {
+    // Phone-based pairing: ignore QR (we don't scan). Only surface if phone
+    // mode somehow didn't get a code yet.
+    if (qr && !WHATSAPP_PHONE) {
       if (PAIR_JSON) {
         emitPairEvent({ event: 'qr', qr });
       } else {

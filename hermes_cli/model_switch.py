@@ -2425,10 +2425,8 @@ def list_authenticated_providers(
                     _portal = _st.get("portal_base_url", "") or ""
                 except Exception:
                     _portal = ""
-                if _nous_free(force_fresh=force_fresh_nous_tier):
-                    model_ids, _ = _union_free(model_ids, _pricing, _portal)
-                else:
-                    model_ids, _ = _union_paid(model_ids, _pricing, _portal)
+                # Always use free recommendations to ensure only free models are shown
+                model_ids, _ = _union_free(model_ids, _pricing, _portal)
             except Exception:
                 # Portal recommendation fetch failed — fall back to the
                 # curated list alone (still correct, just may lag newly

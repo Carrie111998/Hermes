@@ -539,7 +539,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # clear pairing message instead of the watcher
         # silently hammering an unconfigured platform.
         creds_path = self._session_path / "creds.json"
-        if not creds_path.exists():
+        _wa_phone = _wenv("WHATSAPP_PHONE", "").strip()
+        if not creds_path.exists() and not _wa_phone:
             logger.warning(
                 "[%s] WhatsApp is enabled but not paired (no creds.json at %s). "
                 "Pair from the dashboard or run `hermes whatsapp`; remove "
@@ -705,6 +706,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 "WHATSAPP_DEBUG", "WHATSAPP_FORWARD_OWNER_MESSAGES",
                 "WHATSAPP_REPLY_PREFIX", "WHATSAPP_MAX_MESSAGE_LENGTH",
                 "WHATSAPP_CHUNK_DELAY_MS", "WHATSAPP_SEND_TIMEOUT_MS",
+                "WHATSAPP_PHONE",
             ):
                 _v = _wenv(_key)
                 if _v:
