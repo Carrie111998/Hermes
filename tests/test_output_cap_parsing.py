@@ -191,3 +191,50 @@ class TestParseVllmTokenBasedOutputCap:
             cap = available
         assert real_input + cap <= window, f"did not converge: cap={cap}"
 
+
+class TestParseOpenAIParentheticalOutputCap:
+    """OpenAI (and vLLM / llama-cpp-python, which copied the wording) split an
+    over-cap request parenthetically without ever naming max_tokens (#90607).
+
+    Both detectors missed it, the 400 was routed into context compression,
+    and compression re-issued the identical request until "cannot compress
+    further".
+    """
+
+    def test_chat_endpoint_parenthetical_format(self):
+        msg = ("This model's maximum context length is 102400 tokens. "
+               "However, you requested 102401 tokens (36865 in the messages, "
+               "65536 in the completion). Please reduce the length of the "
+               "messages or completion.")
+        # available output = 102400 - 36865 = 65535
+        assert parse_available_output_tokens_from_error(msg) == 65535
+
+    def test_chat_endpoint_parenthetical_is_output_cap(self):
+        msg = ("This model's maximum context length is 102400 tokens. "
+               "However, you requested 102401 tokens (36865 in the messages, "
+               "65536 in the completion). Please reduce the length of the "
+               "messages or completion.")
+        # "reduce the length" must not push this into the compression path:
+        # the messages share (36865) fits, so the completion is the binding
+        # overage.
+        assert is_output_cap_error(msg) is True
+
+    def test_legacy_completions_parenthetical_format(self):
+        msg = ("This model's maximum context length is 4097 tokens, however "
+               "you requested 4771 tokens (771 in your prompt; 4000 for the "
+               "completion). Please reduce your prompt; or completion length.")
+        # available output = 4097 - 771 = 3326
+        assert parse_available_output_tokens_from_error(msg) == 3326
+        assert is_output_cap_error(msg) is True
+
+    def test_parenthetical_with_oversized_input_is_not_output_cap(self):
+        """When the messages share alone exceeds the window, the input is the
+        real overflow — the compression path applies even in the OpenAI
+        parenthetical wording."""
+        msg = ("This model's maximum context length is 102400 tokens. "
+               "However, you requested 102601 tokens (102401 in the messages, "
+               "200 in the completion). Please reduce the length of the "
+               "messages or completion.")
+        assert parse_available_output_tokens_from_error(msg) is None
+        assert is_output_cap_error(msg) is False
+

@@ -1666,6 +1666,25 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
         # This is independent of the input context window.
         "exceeds model" in error_lower
         and "maximum output tokens" in error_lower
+    ) or (
+        # OpenAI's parenthetical split of an over-cap request (chat wording;
+        # vLLM and llama-cpp-python copied it verbatim):
+        #   "This model's maximum context length is 102400 tokens. However, you
+        #    requested 102401 tokens (36865 in the messages, 65536 in the
+        #    completion). Please reduce the length of the messages or completion."
+        # The parenthetical names the completion share, so the output cap can be
+        # the binding constraint — the number check below confirms the input
+        # itself fits (issue #90607).
+        "in the messages" in error_lower
+        and "in the completion" in error_lower
+        and "maximum context length" in error_lower
+    ) or (
+        # Same split, legacy completions wording:
+        #   "... maximum context length is 4097 tokens, however you requested
+        #    4771 tokens (771 in your prompt; 4000 for the completion). ..."
+        "in your prompt" in error_lower
+        and "for the completion" in error_lower
+        and "maximum context length" in error_lower
     )
     if not is_output_cap_error:
         return None
@@ -1769,6 +1788,22 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
         if _available >= 1:
             return _available
 
+    # OpenAI parenthetical split (chat + legacy completions wording, #90607):
+    #   "... maximum context length is N tokens ... (A in the messages, B in
+    #    the completion)"  /  "(A in your prompt; B for the completion)"
+    # When A alone fits inside the window (A < N) the output cap is the
+    # binding constraint; available output = N - A.  When A >= N the input
+    # itself overflows and this stays None so the caller compresses instead.
+    _m_openai_paren = re.search(
+        r'\((\d+)\s+in (?:the messages|your prompt)[;,]\s*(\d+)\s+'
+        r'(?:in|for) the completion\)',
+        error_lower,
+    )
+    if _m_ctx_tok and _m_openai_paren:
+        _available = int(_m_ctx_tok.group(1)) - int(_m_openai_paren.group(1))
+        if _available >= 1:
+            return _available
+
     return None
 
 
@@ -1797,10 +1832,22 @@ def is_output_cap_error(error_msg: str) -> bool:
     """
     error_lower = error_msg.lower()
 
+    # OpenAI's parenthetical split never names max_tokens at all — the
+    # completion share only appears as "(A in the messages, B in the
+    # completion)" / "(A in your prompt; B for the completion)" — so the
+    # parenthetical itself must count as mentioning the output parameter
+    # (#90607).
+    _openai_paren = re.search(
+        r'\(\d+\s+in (?:the messages|your prompt)[;,]\s*\d+\s+'
+        r'(?:in|for) the completion\)',
+        error_lower,
+    )
+
     mentions_output_param = (
         "max_tokens" in error_lower
         or "max_output_tokens" in error_lower
         or "max_completion_tokens" in error_lower
+        or _openai_paren is not None
     )
     if not mentions_output_param:
         return False
@@ -1819,6 +1866,7 @@ def is_output_cap_error(error_msg: str) -> bool:
         or "must be" in error_lower
         or ("exceeds model" in error_lower
             and "maximum output tokens" in error_lower)
+        or _openai_paren is not None                        # OpenAI parenthetical (#90607)
     )
     if not output_cap_signal:
         return False
@@ -1835,7 +1883,24 @@ def is_output_cap_error(error_msg: str) -> bool:
         or "prompt contains" in error_lower
         or "reduce the length" in error_lower
     )
-    return not input_overflow_signal
+    if not input_overflow_signal:
+        return True
+
+    # OpenAI's boilerplate ("Please reduce the length of the messages or
+    # completion") trips "reduce the length" even when the input fits.  When
+    # the parenthetical's input share is strictly below the reported window,
+    # the completion is the binding overage — the output-cap path applies.
+    if _openai_paren:
+        _m_ctx = re.search(r'maximum context length is (\d+)', error_lower)
+        _m_parts = re.search(
+            r'\((\d+)\s+in (?:the messages|your prompt)[;,]\s*(\d+)\s+'
+            r'(?:in|for) the completion\)',
+            error_lower,
+        )
+        if _m_ctx and _m_parts:
+            if int(_m_parts.group(1)) < int(_m_ctx.group(1)):
+                return True
+    return False
 
 
 def _model_id_matches(candidate_id: str, lookup_model: str) -> bool:
