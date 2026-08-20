@@ -947,3 +947,95 @@ class TestCuratorConsolidationDeleteGuard:
             assert allowed["success"] is True, allowed
 
         _reset_background_review_read_marks()
+
+
+# =============================================================================
+# file_path validation must run before the approval gate
+# =============================================================================
+
+
+class TestValidateFilePathAbsolute:
+    """An absolute path can never name a location inside a skill directory."""
+
+    def test_absolute_path_is_rejected(self):
+        error = _validate_file_path("/etc/passwd")
+        assert error is not None
+        assert "Absolute paths are not allowed" in error
+        # The message must point at the tool that can write there, instead of
+        # reading as "use references/ instead" and inviting a doomed retry.
+        assert "terminal tool" in error
+
+    def test_absolute_path_under_an_allowed_name_is_still_rejected(self):
+        # 'references' as the first component would satisfy the subdirectory
+        # rule if the leading slash were ignored.
+        error = _validate_file_path("/references/guide.md")
+        assert error is not None
+        assert "Absolute paths are not allowed" in error
+
+    def test_relative_path_under_an_allowed_subdir_still_passes(self):
+        assert _validate_file_path("references/guide.md") is None
+
+    def test_skill_md_at_the_root_still_passes(self):
+        assert _validate_file_path("SKILL.md") is None
+
+
+class TestWriteFileValidatedBeforeGate:
+    """The gate stages a write and answers success:true.
+
+    A file_path the write could never honour must be refused on the call that
+    made it, not staged into pending/skills under a "staged for review"
+    success and rejected later, out of band.
+    """
+
+    def _staging_gate(self):
+        from tools import write_approval as wa
+        return patch.object(
+            wa, "evaluate_gate",
+            return_value=wa.GateDecision(stage=True, message="staged for review"),
+        )
+
+    def test_absolute_path_is_rejected_and_never_staged(self):
+        from tools import write_approval as wa
+        with self._staging_gate(), patch.object(
+            wa, "stage_write", return_value={"id": "test-pending-1"}
+        ) as mock_stage:
+            result = json.loads(skill_manage(
+                action="write_file",
+                name="some-skill",
+                file_path="/tmp/notes.txt",
+                file_content="hello",
+            ))
+        assert result["success"] is False
+        assert "Absolute paths are not allowed" in result["error"]
+        assert not result.get("staged")
+        mock_stage.assert_not_called()
+
+    def test_traversal_path_is_rejected_and_never_staged(self):
+        from tools import write_approval as wa
+        with self._staging_gate(), patch.object(
+            wa, "stage_write", return_value={"id": "test-pending-1"}
+        ) as mock_stage:
+            result = json.loads(skill_manage(
+                action="write_file",
+                name="some-skill",
+                file_path="references/../../../etc/passwd",
+                file_content="hello",
+            ))
+        assert result["success"] is False
+        assert not result.get("staged")
+        mock_stage.assert_not_called()
+
+    def test_valid_relative_path_still_reaches_the_gate(self):
+        from tools import write_approval as wa
+        with self._staging_gate(), patch.object(
+            wa, "stage_write", return_value={"id": "test-pending-1"}
+        ) as mock_stage:
+            result = json.loads(skill_manage(
+                action="write_file",
+                name="some-skill",
+                file_path="references/guide.md",
+                file_content="ok",
+            ))
+        assert result["success"] is True
+        assert result["staged"] is True
+        mock_stage.assert_called_once()
