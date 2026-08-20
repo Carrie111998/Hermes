@@ -646,6 +646,26 @@ def _(rid, params: dict) -> dict:
             # zombie history on resume, and the edit/regenerate never sticks.
             # Fail closed: refuse the turn and leave memory/DB unchanged.
             with _session_db(session) as db:
+                if db is None and session.get("profile_home"):
+                    # Profile-owned durable session whose own state.db cannot
+                    # be opened. Skipping the write here would truncate memory
+                    # while the profile DB keeps the old tail — the durable
+                    # zombie history this block exists to prevent. Memory-only
+                    # sessions (no profile_home, launch db unavailable) keep
+                    # the legacy skip: with nothing durable to diverge from,
+                    # refusing the turn would break stateless runs outright.
+                    logger.error(
+                        "prompt.submit: profile state.db unavailable for "
+                        "session %s (ordinal=%d); refusing truncation",
+                        sid,
+                        ordinal,
+                    )
+                    return _err(
+                        rid,
+                        5008,
+                        "state.db unavailable: refusing to truncate a "
+                        "profile-owned session that cannot be persisted",
+                    )
                 if db is not None:
                     try:
                         # active_only=True: replace only the live (active=1) rows.

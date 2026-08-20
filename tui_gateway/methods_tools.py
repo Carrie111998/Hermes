@@ -935,10 +935,25 @@ def _(rid, params: dict) -> dict:
                     session_key, repair_alternation=True, include_row_ids=True
                 )
             except Exception:
-                active = []
-            with session["history_lock"]:
-                session["history"] = list(active)
-                session["history_version"] = int(session.get("history_version", 0)) + 1
+                # The durable rewind already succeeded; a failed reload must
+                # NOT publish an empty transcript. That would wipe the live
+                # agent's whole context mid-session, and the flush-pointer
+                # reset below (len([]) == 0) would re-append every surviving
+                # message as new rows — resurrecting the turns /undo just
+                # soft-archived. Keep the pre-rewind memory instead: the DB
+                # is the source of truth and the next resume/reload converges
+                # back to it.
+                active = None
+                logger.error(
+                    "undo: rewind succeeded for session %s but history reload "
+                    "failed; keeping pre-rewind in-memory history",
+                    session_key,
+                    exc_info=True,
+                )
+            if active is not None:
+                with session["history_lock"]:
+                    session["history"] = list(active)
+                    session["history_version"] = int(session.get("history_version", 0)) + 1
             # Notify memory providers — same hook /branch fires, plus the
             # rewound flag so providers caching per-turn document state
             # know to invalidate. See #6672 + #21910.
@@ -960,7 +975,7 @@ def _(rid, params: dict) -> dict:
                         agent._invalidate_system_prompt()
                     except Exception:
                         pass
-                if hasattr(agent, "_last_flushed_db_idx"):
+                if hasattr(agent, "_last_flushed_db_idx") and active is not None:
                     try:
                         agent._last_flushed_db_idx = len(active)
                     except Exception:
