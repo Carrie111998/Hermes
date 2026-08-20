@@ -46,7 +46,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar, Union
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
@@ -2262,7 +2262,7 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         conn.close()
 
 
-def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
+def repair_state_db_schema(db_path: Union[Path, str], *, backup: bool = True) -> Dict[str, Any]:
     """Repair a state.db whose ``sqlite_master`` schema is malformed or whose
     FTS indexes reject writes.
 
@@ -2873,7 +2873,7 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
 # ── Read-only health/stats probes (hermes doctor, dashboards) ──────────
 
 
-def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
+def collect_state_db_stats(db_path: Union[Path, str]) -> Dict[str, Any]:
     """Best-effort, strictly read-only stats snapshot of a state.db file.
 
     Opens the database with ``mode=ro`` (URI) and a short timeout so it can
@@ -2917,6 +2917,7 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
         "fts_rebuild_progress": None,
     }
 
+    db_path = Path(db_path)
     # WAL sidecar size needs no connection at all.
     try:
         wal_path = Path(str(db_path) + "-wal")
@@ -3014,7 +3015,7 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
     return stats
 
 
-def count_db_holders(db_path: Path) -> Optional[int]:
+def count_db_holders(db_path: Union[Path, str]) -> Optional[int]:
     """Best-effort count of processes holding ``db_path`` open (Linux only).
 
     Scans ``/proc/*/fd`` symlinks for the resolved database path. Returns
@@ -3026,6 +3027,7 @@ def count_db_holders(db_path: Path) -> Optional[int]:
     try:
         if not sys.platform.startswith("linux"):
             return None
+        db_path = Path(db_path)
         target = os.path.realpath(str(db_path))
         holders = 0
         for pid in os.listdir("/proc"):
@@ -3219,8 +3221,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception:
             logger.debug("Could not close a SessionDB connection", exc_info=True)
 
-    def __init__(self, db_path: Path = None, read_only: bool = False):
-        self.db_path = db_path or _default_db_path()
+    def __init__(self, db_path: Optional[Union[Path, str]] = None, read_only: bool = False):
+        self.db_path = Path(db_path) if db_path is not None else _default_db_path()
         # Fail hard (before any connection/pragma/mkdir) if a pytest-context
         # process resolved the developer's production state.db — see the
         # live-DB test-isolation guard block near _default_db_path().
