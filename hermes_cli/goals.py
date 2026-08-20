@@ -859,6 +859,28 @@ def _goal_judge_max_tokens() -> int:
         pass
     return DEFAULT_JUDGE_MAX_TOKENS
 
+def _goal_judge_timeout() -> float:
+    """Resolve auxiliary.goal_judge.timeout, falling back to the default.
+
+    ``load_config()`` is cached on the config file's (mtime, size), so calling
+    this once per judge turn is cheap. A non-positive or non-float value falls
+    back to the default rather than crashing the goal loop.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        value = (
+            (cfg.get("auxiliary") or {})
+            .get("goal_judge", {})
+            .get("timeout", DEFAULT_JUDGE_TIMEOUT)
+        )
+        value = float(value)
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return DEFAULT_JUDGE_TIMEOUT
 
 def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, Any]]]:
     """Parse the judge's reply. Fail-open on unusable output.
@@ -1007,7 +1029,7 @@ def judge_goal(
     goal: str,
     last_response: str,
     *,
-    timeout: float = DEFAULT_JUDGE_TIMEOUT,
+    timeout: Optional[float] = None,
     subgoals: Optional[List[str]] = None,
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
@@ -1049,6 +1071,9 @@ def judge_goal(
     ``DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES``) so a permanently broken
     judge doesn't burn the entire turn budget.
     """
+    if timeout is None:
+        timeout = _goal_judge_timeout()
+ 
     if not goal.strip():
         return "skipped", "empty goal", False, None, False
     if not last_response.strip():
