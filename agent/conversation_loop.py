@@ -1813,6 +1813,13 @@ def run_conversation(
         except Exception:
             pass
 
+    _checkpoint_src = persist_user_message if persist_user_message is not None else user_message
+    _apply_checkpoint = getattr(
+        getattr(agent, "_tool_guardrails", None), "apply_user_checkpoint", None
+    )
+    if callable(_apply_checkpoint) and isinstance(_checkpoint_src, str):
+        _apply_checkpoint(_checkpoint_src)
+
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
     # uncompressed result look like a compacted transcript to gateway writers.
@@ -2000,18 +2007,15 @@ def run_conversation(
             break
 
         if getattr(agent, "_delegate_depth", 0) > 0:
-            try:
-                from agent.tool_guardrails import child_session_budget_exhausted
-                _child_cap = child_session_budget_exhausted(agent)
-                if _child_cap is not None:
-                    interrupted = True
-                    _turn_exit_reason = "child_session_budget"
-                    agent._interrupt_requested = True
-                    if not agent.quiet_mode:
-                        agent._safe_print(f"\n{_child_cap.message}")
-                    break
-            except Exception:
-                pass
+            from agent.tool_guardrails import child_session_budget_exhausted
+            _child_cap = child_session_budget_exhausted(agent)
+            if _child_cap is not None:
+                interrupted = True
+                _turn_exit_reason = "child_session_budget"
+                agent._interrupt_requested = True
+                if not agent.quiet_mode:
+                    agent._safe_print(f"\n{_child_cap.message}")
+                break
         
         api_call_count += 1
         agent._api_call_count = api_call_count
@@ -2898,8 +2902,9 @@ def run_conversation(
                 except Exception:
                     pass  # Never let rate guard break the agent loop
 
-            # Codex weekly allowance circuit breaker (#91040). Fail-open on
-            # fetch errors; 0 disables. Prefer fallback over burning the cap.
+            # Codex weekly allowance circuit breaker (#91040). Prefer
+            # x-ratelimit weekly headers; usage API is backup. Do not
+            # fall back onto another openai-codex route.
             if str(getattr(agent, "provider", "") or "") == "openai-codex":
                 try:
                     _caps = getattr(
@@ -2914,48 +2919,58 @@ def run_conversation(
                             cached_codex_usage_snapshot,
                             codex_weekly_used_percent,
                             should_trip_codex_weekly_breaker,
+                            weekly_used_percent_from_headers,
                         )
                         _snap = cached_codex_usage_snapshot(agent)
-                        if should_trip_codex_weekly_breaker(_snap, _weekly_pct):
-                            _used = codex_weekly_used_percent(_snap)
+                        _rl = getattr(agent, "_rate_limit_state", None)
+                        if should_trip_codex_weekly_breaker(
+                            _snap, _weekly_pct, rate_limit_state=_rl
+                        ):
+                            _used = weekly_used_percent_from_headers(_rl)
+                            if _used is None:
+                                _used = codex_weekly_used_percent(_snap)
                             _codex_msg = (
                                 f"Codex weekly usage is at {_used:.0f}% "
                                 f"(circuit breaker {_weekly_pct}%). Stopping "
                                 "further API calls this turn."
                             )
-                            agent._buffer_vprint(f"⏳ {_codex_msg} Trying fallback...")
+                            agent._buffer_vprint(f"⏳ {_codex_msg}")
                             agent._buffer_status(f"⏳ {_codex_msg}")
                             try:
                                 from agent.interrupt_compat import request_hard_interrupt
                                 request_hard_interrupt(agent, _codex_msg)
                             except Exception:
                                 agent._interrupt_requested = True
+                            _fallback_ok = False
                             if agent._try_activate_fallback():
-                                active_system_prompt = _sync_failover_system_message(
-                                    agent, api_messages, active_system_prompt)
-                                retry_count = 0
-                                compression_attempts = 0
-                                _retry.primary_recovery_attempted = False
-                                _retry.restart_with_rebuilt_messages = True
-                                break
-                            agent._flush_status_buffer()
-                            agent._persist_session(messages, conversation_history)
-                            return {
-                                "final_response": (
-                                    f"⏳ {_codex_msg}\n\n"
-                                    "No fallback provider available. "
-                                    "Wait for the weekly reset, redeem a "
-                                    "Codex reset credit, or add a fallback "
-                                    "provider in config.yaml."
-                                ),
-                                "messages": messages,
-                                "api_calls": api_call_count,
-                                "completed": False,
-                                "failed": True,
-                                "error": _codex_msg,
-                            }
+                                if str(getattr(agent, "provider", "") or "") != "openai-codex":
+                                    _fallback_ok = True
+                                    active_system_prompt = _sync_failover_system_message(
+                                        agent, api_messages, active_system_prompt)
+                                    retry_count = 0
+                                    compression_attempts = 0
+                                    _retry.primary_recovery_attempted = False
+                                    _retry.restart_with_rebuilt_messages = True
+                                    break
+                            if not _fallback_ok:
+                                agent._flush_status_buffer()
+                                agent._persist_session(messages, conversation_history)
+                                return {
+                                    "final_response": (
+                                        f"⏳ {_codex_msg}\n\n"
+                                        "No non-Codex fallback provider available. "
+                                        "Wait for the weekly reset, redeem a "
+                                        "Codex reset credit, or add a fallback "
+                                        "provider in config.yaml."
+                                    ),
+                                    "messages": messages,
+                                    "api_calls": api_call_count,
+                                    "completed": False,
+                                    "failed": True,
+                                    "error": _codex_msg,
+                                }
                 except Exception:
-                    pass
+                    agent._interrupt_requested = True
 
             try:
                 agent._reset_stream_delivery_tracking()
@@ -4268,15 +4283,15 @@ def run_conversation(
                     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
 
                     if getattr(agent, "_delegate_depth", 0) > 0:
+                        from agent.tool_guardrails import record_child_session_usage
                         try:
-                            from agent.tool_guardrails import record_child_session_usage
                             record_child_session_usage(
                                 agent,
                                 api_calls=1,
                                 tokens=int(total_tokens or 0),
                             )
                         except Exception:
-                            pass
+                            agent._interrupt_requested = True
 
                     # Log API call details for debugging/observability
                     _cache_pct = ""

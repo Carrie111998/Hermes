@@ -59,17 +59,39 @@ def codex_weekly_used_percent(snapshot: Optional[AccountUsageSnapshot]) -> Optio
     return None
 
 
+def weekly_used_percent_from_headers(rate_limit_state: Any) -> Optional[float]:
+    """Prefer weekly token/request buckets from x-ratelimit-*-1w / -7d headers."""
+    if rate_limit_state is None:
+        return None
+    for attr in ("tokens_week", "requests_week"):
+        bucket = getattr(rate_limit_state, attr, None)
+        if bucket is None:
+            continue
+        limit = int(getattr(bucket, "limit", 0) or 0)
+        if limit <= 0:
+            continue
+        pct = getattr(bucket, "usage_pct", None)
+        if pct is None:
+            continue
+        return float(pct)
+    return None
+
+
 def should_trip_codex_weekly_breaker(
     snapshot: Optional[AccountUsageSnapshot],
     threshold_percent: float,
+    rate_limit_state: Any = None,
 ) -> bool:
-    """Trip when the weekly window is at or above the configured percent.
+    """Trip when weekly headers or the usage-API weekly window hit the percent.
 
-    ``threshold_percent <= 0`` disables the breaker. Missing snapshots fail open.
+    Header buckets win when present. ``threshold_percent <= 0`` disables.
+    Missing both sources does not trip (caller still must not Codex-fallback).
     """
     if threshold_percent is None or float(threshold_percent) <= 0:
         return False
-    used = codex_weekly_used_percent(snapshot)
+    used = weekly_used_percent_from_headers(rate_limit_state)
+    if used is None:
+        used = codex_weekly_used_percent(snapshot)
     if used is None:
         return False
     return used >= float(threshold_percent)

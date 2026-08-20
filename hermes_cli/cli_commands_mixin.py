@@ -506,9 +506,13 @@ class CLICommandsMixin:
             print(f"  Stopping {len(running)} background process(es)...")
             killed = process_registry.kill_all()
             print(f"  ✅ Stopped {killed} process(es).")
-        if n_async and interrupt_all is not None:
+        # Always fan out to the async-delegation registry on /stop, including
+        # when a foreground parent is already hard-interrupted (children may
+        # have been spawned as background=true and miss parent fan-out).
+        if interrupt_all is not None and (n_async or foreground):
             stopped = interrupt_all(reason="/stop")
-            print(f"  ✅ Interrupted {stopped} background delegation(s).")
+            if stopped:
+                print(f"  ✅ Interrupted {stopped} background delegation(s).")
 
     def _handle_agents_command(self):
         """Handle /agents — show background processes and agent status."""

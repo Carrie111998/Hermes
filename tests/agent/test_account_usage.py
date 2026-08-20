@@ -246,3 +246,21 @@ def test_codex_weekly_breaker_trips_at_threshold():
     assert account_usage.should_trip_codex_weekly_breaker(snap, 91) is False
     assert account_usage.should_trip_codex_weekly_breaker(snap, 0) is False
     assert account_usage.should_trip_codex_weekly_breaker(None, 90) is False
+
+
+def test_codex_weekly_breaker_prefers_headers():
+    from agent.rate_limit_tracker import parse_rate_limit_headers
+
+    headers = parse_rate_limit_headers(
+        {
+            "x-ratelimit-limit-tokens-1w": "100",
+            "x-ratelimit-remaining-tokens-1w": "5",
+        }
+    )
+    assert account_usage.weekly_used_percent_from_headers(headers) == pytest.approx(95.0)
+    assert account_usage.should_trip_codex_weekly_breaker(
+        None, 90, rate_limit_state=headers
+    ) is True
+    assert account_usage.should_trip_codex_weekly_breaker(
+        None, 96, rate_limit_state=headers
+    ) is False

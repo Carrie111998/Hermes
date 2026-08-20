@@ -26,10 +26,22 @@ def test_stop_interrupts_foreground_agent(monkeypatch, capsys):
         lambda: 0,
         raising=False,
     )
+    called = {}
+
+    def _interrupt_all(reason="/stop"):
+        called["reason"] = reason
+        return 0
+
+    monkeypatch.setattr(
+        "tools.async_delegation.interrupt_all",
+        _interrupt_all,
+        raising=False,
+    )
     agent = _Agent()
     stub = _Stub(agent=agent, running=True)
     stub._handle_stop_command()
     assert agent.messages == ["/stop"]
+    assert called.get("reason") == "/stop"
     out = capsys.readouterr().out
     assert "Interrupted the running agent" in out
 

@@ -1733,17 +1733,27 @@ tool_loop_guardrails:
   loop_caps:
     max_web_searches: 50       # max web_search calls per turn (0 = unlimited)
     max_subagents: 50          # max subagents spawned per turn (0 = unlimited)
+    max_subagents_per_session: 16
+    max_delegate_batches_per_session: 4
+    max_child_api_calls_per_session: 80
+    max_child_tokens_per_session: 8000000
+    require_delegate_batch_checkpoint: true
+    codex_weekly_break_percent: 90   # 0 = off
 ```
 
 `hard_stop_enabled` defaults to `false` because interactive sessions have a human in the loop. In unattended deployments (gateway, cron, kanban workers) set it to `true` so repeated failures are blocked rather than only warned. See also [Docker / unattended deployments](docker.md).
 
 ### Per-turn runaway-loop caps
 
-Separate from the failure-based thresholds above, `loop_caps` sets hard ceilings on how many `web_search` calls and subagent spawns a single agent loop (turn) may make. The counters reset at the start of every turn, so a legitimate multi-turn session is never starved — but a single turn that spirals into an unbounded search or delegation loop is stopped. These are always on and fire regardless of `hard_stop_enabled`. A single turn issuing dozens of web searches or spawning dozens of subagents is already pathological, so the defaults are low. When a cap is reached, the offending tool call is blocked with an explanatory message and the turn stops cleanly instead of burning the rest of the budget. Set either value to `0` to disable that cap entirely.
+Separate from the failure-based thresholds above, `loop_caps` sets hard ceilings on runaway-prone tools. `max_web_searches` and `max_subagents` reset at the start of every turn. Session-lifetime keys (`max_subagents_per_session`, `max_delegate_batches_per_session`, `max_child_api_calls_per_session`, `max_child_tokens_per_session`) do **not** reset between turns in the same CLI/gateway conversation — sequential review batches share one session. Set a session key to `0` to disable that cap.
 
-A single `delegate_task` batch counts each task toward `max_subagents` (a batch of 3 spends 3), so the cap tracks real subagents spawned rather than `delegate_task` invocations.
+When `require_delegate_batch_checkpoint` is true, a second `delegate_task` spawn in the same session is blocked until the user replies with an explicit yes-style word (`yes`, `continue`, `allow`, and similar). A new user turn by itself does not grant that checkpoint.
 
-This mirrors Claude Code's per-session WebSearch and subagent caps (v2.1.212), which also default to 200 and reset on `/clear`.
+`codex_weekly_break_percent` stops further Codex API calls when weekly rate-limit headers (preferred) or the Codex usage-API weekly window reach that percent. `0` disables the breaker.
+
+A single `delegate_task` batch counts each task toward `max_subagents` and `max_subagents_per_session` (a batch of 3 spends 3), so the cap tracks real subagents spawned rather than `delegate_task` invocations.
+
+Per-turn web-search and subagent caps are always on and fire regardless of `hard_stop_enabled`. When a cap is reached, the offending tool call is blocked with an explanatory message and the turn stops cleanly.
 
 ### Runtime anti-stall guards
 

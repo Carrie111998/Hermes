@@ -195,6 +195,10 @@ _REVIEW_DELEGATE_RE = re.compile(
     r"\b(code\s*review|reviewer|review|nitpick|lgtm)\b",
     re.IGNORECASE,
 )
+_EXPLICIT_CHECKPOINT_RE = re.compile(
+    r"^\s*(y|yes|yeah|ok|okay|continue|proceed|allow|confirm)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -389,6 +393,8 @@ class ToolCallGuardrailController:
         self._session_child_tokens = 0
         self._session_checkpoint_granted = False
         self._session_awaiting_delegate_checkpoint = False
+        self._session_last_delegate_was_review = False
+        self._session_saw_patch_after_review = False
         self._session_lock = threading.Lock()
         self.reset_for_turn()
 
@@ -422,14 +428,20 @@ class ToolCallGuardrailController:
         # single agent loop rather than accumulating across the session.
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
-        # A new user turn after a blocked follow-up batch is the checkpoint.
-        if self._session_delegate_batches > 0 and self._session_awaiting_delegate_checkpoint:
-            self._session_checkpoint_granted = True
-            self._session_awaiting_delegate_checkpoint = False
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
         return self._halt_decision
+
+    def apply_user_checkpoint(self, text: str) -> bool:
+        """Grant one extra delegate batch only on an explicit yes-style reply."""
+        if not self._session_awaiting_delegate_checkpoint:
+            return False
+        if not _explicit_checkpoint_text(text):
+            return False
+        self._session_checkpoint_granted = True
+        self._session_awaiting_delegate_checkpoint = False
+        return True
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
@@ -768,19 +780,21 @@ class ToolCallGuardrailController:
                 and self._session_delegate_batches >= 1
                 and not self._session_checkpoint_granted
             ):
-                kind = (
-                    "review"
-                    if looks_like_review_delegate(args)
-                    else "delegation"
+                is_review = looks_like_review_delegate(args)
+                cycle = is_review and self._session_saw_patch_after_review
+                kind = "review" if is_review else "delegation"
+                cycle_note = (
+                    " Detected a review → patch → review cycle."
+                    if cycle
+                    else ""
                 )
                 decision = ToolGuardrailDecision(
                     action="block",
                     code="loop_delegate_batch_checkpoint",
                     message=(
                         f"Blocked delegate_task: this session already ran a "
-                        f"{kind} batch. A second review/delegation batch "
-                        "needs an explicit user checkpoint (a new user "
-                        "message after this halt). Summarize progress and wait."
+                        f"{kind} batch.{cycle_note} Reply yes / continue / "
+                        "allow before another review or delegation batch."
                     ),
                     tool_name=tool_name,
                     count=self._session_delegate_batches,
@@ -853,6 +867,10 @@ class ToolCallGuardrailController:
             self._session_delegate_batches += 1
             if self._session_checkpoint_granted:
                 self._session_checkpoint_granted = False
+            is_review = looks_like_review_delegate(args)
+            if (not is_review) and self._session_last_delegate_was_review:
+                self._session_saw_patch_after_review = True
+            self._session_last_delegate_was_review = is_review
             self._session_awaiting_delegate_checkpoint = True
             return None
 
@@ -1038,6 +1056,12 @@ def _subagent_spawn_count(args: Mapping[str, Any]) -> int:
     return 1
 
 
+def _explicit_checkpoint_text(text: str | None) -> bool:
+    if not isinstance(text, str) or not text.strip():
+        return False
+    return bool(_EXPLICIT_CHECKPOINT_RE.match(text))
+
+
 def looks_like_review_delegate(args: Mapping[str, Any] | None) -> bool:
     """Heuristic for review→patch→review fan-out (issue #91040)."""
     if not isinstance(args, Mapping):
@@ -1078,17 +1102,33 @@ def session_root_guardrails(agent: Any) -> ToolCallGuardrailController | None:
 
 
 def record_child_session_usage(agent: Any, *, api_calls: int = 0, tokens: int = 0) -> None:
+    if not callable(getattr(agent, "_delegate_parent_ref", None)):
+        return
     controller = session_root_guardrails(agent)
     if controller is None:
-        return
+        raise RuntimeError("child usage caps unavailable")
     controller.record_child_usage(api_calls=api_calls, tokens=tokens)
 
 
 def child_session_budget_exhausted(agent: Any) -> ToolGuardrailDecision | None:
-    controller = session_root_guardrails(agent)
-    if controller is None:
+    if not callable(getattr(agent, "_delegate_parent_ref", None)):
         return None
-    return controller.child_budget_exhausted()
+    unavailable = ToolGuardrailDecision(
+        action="block",
+        code="loop_child_budget_unavailable",
+        message=(
+            "Blocked: this subagent cannot read parent session usage caps. "
+            "Stopping to avoid unbounded child API spend."
+        ),
+        tool_name="delegate_task",
+    )
+    try:
+        controller = session_root_guardrails(agent)
+        if controller is None:
+            return unavailable
+        return controller.child_budget_exhausted()
+    except Exception:
+        return unavailable
 
 
 def _sha256(value: str) -> str:
