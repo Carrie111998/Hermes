@@ -9971,6 +9971,52 @@ function BotsPane() {
   })
 }
 
+/** Desktop-agent send into an existing group room. Resolves current members
+ *  from the live roster + bot-meta (and stored remote seats), then reuses
+ *  sendToGroupChat so headless/UI sends share one engine. Returns false when
+ *  the group is unknown or the payload is empty — never mints a room. */
+function ingestBotGroupSend(payload) {
+  const source = payload && typeof payload === 'object' ? payload : {}
+  const group = String(source.group || '').trim()
+  const text = String(source.text || source.message || '').trim()
+  const thread = String(source.thread || '').trim() || null
+
+  if (!group || !text) {
+    return false
+  }
+
+  const meta = $botMeta.get()
+  const roster = $lastRoster.get()
+  const seated = groupChatMemberBots(group, roster, meta)
+  const members = seated.map(bot => ({
+    name: bot.name,
+    title: (meta[bot.name] && meta[bot.name].title) || bot.title || '',
+    handle: bot.handle,
+    remoteSource: bot.remoteSource,
+    connectionId: bot.connectionId,
+    connectionLabel: bot.connectionLabel
+  }))
+
+  if (!members.length) {
+    for (const [name, botMeta] of Object.entries(meta || {})) {
+      if (botGroups(botMeta).includes(group)) {
+        members.push({ name, title: botMeta.title || '' })
+      }
+    }
+  }
+
+  if (!members.length) {
+    return false
+  }
+
+  return Boolean(sendToGroupChat(group, members, text, thread))
+}
+
+function handleBotGroupSendEvent(event) {
+  const payload = event && event.payload && typeof event.payload === 'object' ? event.payload : event
+  ingestBotGroupSend(payload)
+}
+
 // ── plugin ───────────────────────────────────────────────────────────────────
 
 export default {
@@ -9984,6 +10030,17 @@ export default {
     // before this, the rAF loop + 1Hz document scan ran until app restart.
     if (typeof ctx.onDispose === 'function') {
       ctx.onDispose(stopFaceClock)
+    }
+
+    // Desktop-agent group send: the send_bot_group tool emits bots.group.send
+    // over the desktop_ui bridge. Reuse the existing room engine — do not
+    // mint rooms from a typo'd name.
+    if (typeof host.onEvent === 'function') {
+      const offGroupSend = host.onEvent('bots.group.send', handleBotGroupSendEvent)
+
+      if (typeof ctx.onDispose === 'function' && typeof offGroupSend === 'function') {
+        ctx.onDispose(offGroupSend)
+      }
     }
 
     // @-mention autocomplete: typing "@rese…" in ANY composer offers the

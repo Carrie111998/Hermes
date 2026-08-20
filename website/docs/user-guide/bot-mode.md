@@ -88,6 +88,7 @@ Groups are standalone rows in the same activity-ordered roster as Bot DMs. A Bot
 - Each member keeps its own persistent `Group: <name>` session, so room context survives like any other conversation.
 - **Not every Bot replies to every message.** Speaking is each member's own choice — a Bot replies only when it has something new to add and passes otherwise, and @-mentioning specific members scopes the round to them. Expect the members you addressed (or whoever has something to say) to speak, and the rest to stay quiet.
 - **Rooms can span machines.** The New Group Chat picker seats Bots from any registered connection; each member's turns run on its own machine, in its own `Group: <name>` session there. Cross-machine members carry a device badge (`dixie · Mac Mini`) in the room and in other members' transcripts, and the disambiguated `@name-device` handle works in room mentions — so same-named agents on two machines never blur together.
+- **Desktop agents can post into a room** with the `send_bot_group` tool (same `desktop_ui` surface as `open_preview`). That emit lands on the existing room engine — it is not a second orchestrator, and it does not mint rooms from a typo. There is still no headless CLI/RPC for group send when Desktop is not running; individual Bot Chat / `hermes peer dm` are not a room turn.
 
 ## Bot-to-bot messaging
 
@@ -149,5 +150,6 @@ Because Bots are profiles, everything has a terminal equivalent:
 | A Bot's files, skills, memory | `~/.hermes/profiles/<bot>/` |
 | Routines | `hermes cron list` (jobs named `[bot:<name>] …`) |
 | Create / inspect profiles | `hermes profile create`, `hermes profile list` |
+| Post into a group room | Desktop agent tool `send_bot_group` (desktop sessions only) |
 
 See [Profiles](./profiles.md) for the underlying primitive and [Profile Commands](../reference/profile-commands.md) for the full CLI reference.
