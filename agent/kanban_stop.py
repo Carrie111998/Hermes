@@ -13,6 +13,7 @@ loop continues instead of exiting.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Iterable, Optional
 
@@ -20,6 +21,8 @@ from typing import Any, Iterable, Optional
 _TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
 
 _DEFAULT_MAX_ATTEMPTS = 2
+
+logger = logging.getLogger(__name__)
 
 
 def kanban_stop_nudge_enabled() -> bool:
@@ -66,6 +69,46 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
     return False
 
 
+def dispatcher_worker_run_is_terminal() -> bool:
+    """Return whether this dispatcher-owned worker's exact run has ended.
+
+    The run row is authoritative rather than the attempted tool name: a failed
+    ``kanban_complete`` must not stop the worker, while dependency blocks may
+    move the task back to ``todo`` even though the worker run is terminal.
+    Read failures preserve the existing conversation behavior.
+    """
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    raw_run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    if not task_id or not raw_run_id:
+        return False
+    try:
+        run_id = int(raw_run_id)
+    except ValueError:
+        return False
+
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        if not is_dispatcher_owned_worker_context():
+            return False
+        from hermes_cli import kanban_db as kb
+
+        conn = kb.connect()
+        try:
+            run = kb.get_run(conn, run_id)
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("kanban terminal run-state check failed", exc_info=True)
+        return False
+
+    return bool(
+        run is not None
+        and str(run.task_id) == task_id
+        and str(run.status) != "running"
+    )
+
+
 def build_kanban_stop_nudge(
     *,
     messages: Iterable[dict] | None = None,
@@ -103,6 +146,7 @@ def build_kanban_stop_nudge(
 
 __all__ = [
     "build_kanban_stop_nudge",
+    "dispatcher_worker_run_is_terminal",
     "kanban_stop_nudge_enabled",
     "session_called_kanban_terminal",
 ]
