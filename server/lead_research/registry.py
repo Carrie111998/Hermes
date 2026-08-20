@@ -7,6 +7,7 @@ from ..config import Settings
 from .models import DatasetDefinition
 from .providers.base import CatalogProvider, Provider
 from .providers.bright_data import BrightDataVerifier
+from .providers.corpus import CorpusProvider
 from .providers.ted import TedVerifier
 from .sectors import REFERENCE_DIR
 from .verification import UnavailableCandidateVerifier
@@ -37,6 +38,21 @@ class ProviderRegistry:
 
     def ensure_tenant(self, db, company_id: str, stamp: float) -> None:
         from ..db import json_dump
+        # A source dropped from the catalog leaves a tenant row behind, and
+        # catalog() resolves every row through the registry — so without this
+        # the whole Data Sources page raises KeyError on the stale one. Evidence
+        # and partitions keep their source_id; nothing here touches history.
+        known = set(self.definitions)
+        stale = [
+            row["source_id"] for row in db.all(
+                "SELECT source_id FROM dataset_definitions WHERE company_id=?", (company_id,)
+            ) if row["source_id"] not in known
+        ]
+        for source_id in stale:
+            db.execute(
+                "DELETE FROM dataset_definitions WHERE company_id=? AND source_id=?",
+                (company_id, source_id),
+            )
         for definition in self.list():
             payload = json_dump(definition.model_dump(mode="json"))
             exists = db.one(
@@ -94,9 +110,11 @@ def build_registry(
             supplied[bright_data.source_id] = verifier
     # TED needs no credential, so there is nothing to gate on: it is either in
     # the catalog or it is not. Tenants still opt in per source.
-    ted = next((item for item in definitions if item.source_id == "ted"), None)
-    if ted is not None and ted.source_id not in supplied:
-        verifier = TedVerifier()
-        verifier.definition = ted
-        supplied[ted.source_id] = verifier
+    for source_id, build in (("ted", TedVerifier), ("customer-list-corpus", CorpusProvider)):
+        definition = next((item for item in definitions if item.source_id == source_id), None)
+        if definition is None or source_id in supplied:
+            continue
+        verifier = build()
+        verifier.definition = definition
+        supplied[source_id] = verifier
     return ProviderRegistry(definitions, supplied)

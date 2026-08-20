@@ -160,3 +160,64 @@ def test_ted_is_a_verifier_in_the_registry_without_any_credential():
     assert callable(getattr(provider, "verify", None))
     assert provider.definition.adapter_mode == "live"
     assert provider.health().status == "active"
+
+
+def _company(db, company_id: str) -> None:
+    from server.db import now
+    stamp = now()
+    db.execute(
+        "INSERT INTO companies(id,name,status,data,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+        (company_id, company_id, "active", "{}", stamp, stamp),
+    )
+
+
+def test_enabling_a_source_for_one_tenant_leaves_the_other_alone(tmp_path):
+    """Provider access is sold per customer, so it has to be stored per customer."""
+    from server.db import Database, now
+    from server.lead_research.service import LeadResearchService
+
+    db = Database(tmp_path / "sources.db")
+    _company(db, "company_one")
+    _company(db, "company_two")
+    service = LeadResearchService(db, registry=build_registry())
+    service.ensure_catalog("company_one")
+    service.ensure_catalog("company_two")
+
+    db.execute(
+        "UPDATE dataset_definitions SET installed=1,enabled=1,updated_at=? "
+        "WHERE company_id=? AND source_id=?",
+        (now(), "company_one", "ted"),
+    )
+
+    def state(company_id):
+        return next(i for i in service.catalog(company_id) if i["source_id"] == "ted")
+
+    assert state("company_one")["enabled"] is True
+    assert state("company_one")["available"] is True
+    assert state("company_two")["enabled"] is False
+    assert state("company_two")["available"] is False
+    assert state("company_two")["unavailable_reason"] == "disabled"
+
+
+def test_a_source_dropped_from_the_catalog_does_not_break_an_existing_tenant(tmp_path):
+    """catalog() resolves every tenant row through the registry.
+
+    A row for a source that has since been removed would raise KeyError and take
+    the whole Data Sources page down with it, so seeding prunes them.
+    """
+    from server.db import Database, now
+    from server.lead_research.service import LeadResearchService
+
+    db = Database(tmp_path / "pruned.db")
+    _company(db, "company_one")
+    service = LeadResearchService(db, registry=build_registry())
+    service.ensure_catalog("company_one")
+    db.execute(
+        "INSERT INTO dataset_definitions VALUES(?,?,?,?,?,?,?,?)",
+        ("company_one", "retired-source", 1, 1, "{}", "active", None, now()),
+    )
+
+    source_ids = {item["source_id"] for item in service.catalog("company_one")}
+
+    assert "retired-source" not in source_ids
+    assert source_ids == set(build_registry().definitions)

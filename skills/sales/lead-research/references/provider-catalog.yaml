@@ -1,70 +1,34 @@
-- source_id: un-comtrade
+# Only sources with a working adapter belong here. An entry with no verifier
+# renders on the Data Sources page as permanently unavailable, which reads as a
+# broken product rather than as the honest "not integrated yet" it means.
+# Removed 2026-08-20: un-comtrade and eurostat-comext (market aggregates only —
+# they cannot name a company at any level of adapter effort), auma (lists fairs,
+# not exhibitors), companies-house (needs a key and a GB-only adapter nobody has
+# written), b2match-export (no customer has supplied an export), jetro-jmesse
+# (service discontinued 2026-03-31). Their history is unaffected: evidence,
+# organization links and partitions carry source_id as free text with no foreign
+# key, so removing a definition never orphans a record.
+- source_id: customer-list-corpus
   version: '1'
-  display_name: UN Comtrade
-  publisher: United Nations Statistics Division
+  display_name: Customer list corpus
+  publisher: Customer-supplied company list
   jurisdiction: [global]
-  categories: [trade]
-  homepage: https://comtradeplus.un.org/
-  access_tier: credentialed_public
-  entity_levels: [market]
-  capabilities: [market_signals]
-  countries: []
-  sector_ids: []
-  freshness_days: 120
-  adapter_mode: credential_required
-  default_enabled: false
-  health: active
-  last_verified_at: '2026-07-14'
-- source_id: brightdata-web
-  version: '1'
-  display_name: Bright Data Web Unlocker
-  publisher: Bright Data
-  jurisdiction: [global]
-  categories: [web, verification]
-  homepage: https://brightdata.com/products/web-unlocker
-  access_tier: credentialed_public
+  categories: [matchmaking]
+  homepage: null
+  access_tier: customer_upload
   entity_levels: [named_company]
-  capabilities: [candidate_verification, web_evidence]
+  capabilities: [organizations, candidate_verification]
   countries: []
   sector_ids: []
-  freshness_days: 30
-  adapter_mode: credential_required
+  freshness_days: 365
+  adapter_mode: live
   default_enabled: false
   health: active
-- source_id: eurostat-comext
-  version: '1'
-  display_name: Eurostat Comext
-  publisher: Eurostat
-  jurisdiction: [EU]
-  categories: [trade]
-  homepage: https://ec.europa.eu/eurostat/
-  access_tier: public
-  entity_levels: [market]
-  capabilities: [market_signals]
-  countries: []
-  sector_ids: []
-  freshness_days: 90
-  adapter_mode: manual_import
-  default_enabled: false
-  health: active
-  last_verified_at: '2026-07-14'
-- source_id: companies-house
-  version: '1'
-  display_name: Companies House
-  publisher: UK Companies House
-  jurisdiction: [GB]
-  categories: [registry, filings]
-  homepage: https://developer.company-information.service.gov.uk/
-  access_tier: credentialed_public
-  entity_levels: [named_company]
-  capabilities: [organizations, filings]
-  countries: [GB]
-  sector_ids: []
-  freshness_days: 30
-  adapter_mode: credential_required
-  default_enabled: false
-  health: active
-  last_verified_at: '2026-07-14'
+  last_verified_at: '2026-08-20'
+  license_note: >
+    Corpora loaded with `import-candidates`. Rows that carry a provenance_url
+    are cited as evidence; rows without one supply a name only and need another
+    source to verify them.
 - source_id: ted
   version: '1'
   display_name: Tenders Electronic Daily
@@ -82,76 +46,24 @@
   default_enabled: false
   health: active
   last_verified_at: '2026-08-20'
-- source_id: auma
+  license_note: >
+    Free search API, no credential. Confirms that a company won or bid for an EU
+    public contract; silent everywhere else, so it complements a web verifier
+    rather than replacing one.
+- source_id: brightdata-web
   version: '1'
-  display_name: AUMA Fair Finder
-  publisher: Association of the German Trade Fair Industry
-  jurisdiction: [DE, global]
-  categories: [exhibition]
-  homepage: https://www.auma.de/en/find-your-fair/
-  access_tier: public
-  entity_levels: [event]
-  capabilities: [events]
-  countries: []
-  sector_ids: []
-  freshness_days: 30
-  adapter_mode: manual_import
-  default_enabled: false
-  health: active
-  last_verified_at: '2026-07-14'
-- source_id: b2match-export
-  version: '1'
-  display_name: b2match customer export
-  publisher: b2match / customer event organizer
+  display_name: Bright Data Web Unlocker
+  publisher: Bright Data
   jurisdiction: [global]
-  categories: [matchmaking]
-  homepage: https://support.b2match.com/
-  access_tier: customer_upload
-  entity_levels: [named_company, opportunity, event]
-  capabilities: [organizations, buying_requests, events]
-  countries: []
-  sector_ids: []
-  freshness_days: 30
-  adapter_mode: manual_import
-  default_enabled: false
-  health: active
-  last_verified_at: '2026-07-14'
-- source_id: jetro-jmesse
-  version: retired-2026
-  display_name: JETRO J-messe
-  publisher: JETRO
-  jurisdiction: [JP, global]
-  categories: [exhibition]
-  homepage: https://www.jetro.go.jp/en/database/j-messe/
-  access_tier: retired
-  entity_levels: [event]
-  capabilities: [events]
-  countries: []
-  sector_ids: []
-  freshness_days: 365
-  adapter_mode: catalog_only
-  default_enabled: false
-  health: retired
-  last_verified_at: '2026-07-14'
-  license_note: Service discontinued 2026-03-31; retained for historical provenance.
-- source_id: customer-list-corpus
-  version: '1'
-  display_name: Customer list corpus
-  publisher: Customer-supplied contact export
-  jurisdiction: [global]
-  categories: [matchmaking]
-  homepage: null
-  access_tier: customer_upload
+  categories: [web, verification]
+  homepage: https://brightdata.com/products/web-unlocker
+  access_tier: credentialed_public
   entity_levels: [named_company]
-  capabilities: [organizations]
+  capabilities: [candidate_verification, web_evidence]
   countries: []
   sector_ids: []
-  freshness_days: 365
-  adapter_mode: manual_import
+  freshness_days: 30
+  adapter_mode: credential_required
   default_enabled: false
   health: active
   last_verified_at: '2026-08-20'
-  license_note: >
-    Provenance entry for corpora loaded via `import-candidates`. Candidate rows
-    supply names for a campaign to verify; they are not evidence and this entry
-    carries no verifier, so it stays unavailable by design.
