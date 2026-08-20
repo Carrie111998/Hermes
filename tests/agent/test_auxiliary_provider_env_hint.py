@@ -3,11 +3,12 @@ from unittest.mock import patch
 import pytest
 
 from agent.auxiliary_client import async_call_llm, call_llm
-from hermes_cli.auth import provider_api_key_env_hint
+from hermes_cli.auth import PROVIDER_REGISTRY, provider_api_key_env_hint
 
 
 def test_provider_api_key_env_hint_uses_registry_and_safe_fallback():
     assert provider_api_key_env_hint("minimax-oauth") == "MINIMAX_API_KEY"
+    assert PROVIDER_REGISTRY["minimax-oauth"].api_key_env_vars == ()
     assert provider_api_key_env_hint("alibaba") == "DASHSCOPE_API_KEY"
     assert provider_api_key_env_hint("future-provider") == "FUTURE-PROVIDER_API_KEY"
 
