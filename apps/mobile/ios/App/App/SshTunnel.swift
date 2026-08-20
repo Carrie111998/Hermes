@@ -119,8 +119,8 @@ private func pythonQuote(_ value: String) -> String {
     "'" + value.replacingOccurrences(of: "'", with: "\\'") + "'"
 }
 
-private func remoteHomePath(_ suffix: String) -> String {
-    "\"$HOME/.hermes/desktop-ssh/\(suffix)\""
+private func remoteHermesHomePath(_ suffix: String) -> String {
+    "\"${HERMES_HOME:-$HOME/.hermes}/desktop-ssh/\(suffix)\""
 }
 
 actor SshTunnel {
@@ -241,7 +241,7 @@ actor SshTunnel {
 
     private func startRemoteBackend(using sshClient: SSHClient) async throws -> RemoteBackend {
         let hermesOutput = try await sshClient.executeCommand(
-            "for p in \"$HOME/.local/bin/hermes\" \"$HOME/.hermes/hermes-agent/venv/bin/hermes\"; do [ -x \"$p\" ] && printf '%s' \"$p\" && exit 0; done; command -v hermes"
+            "for p in \"$HOME/.local/bin/hermes\" \"${HERMES_HOME:-$HOME/.hermes}/hermes-agent/venv/bin/hermes\"; do [ -x \"$p\" ] && printf '%s' \"$p\" && exit 0; done; command -v hermes"
         )
         let hermesPath = String(buffer: hermesOutput).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !hermesPath.isEmpty else {
@@ -250,18 +250,17 @@ actor SshTunnel {
 
         let ownershipID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         let nonce = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(16))
-        let tokenPath = "~/.hermes/desktop-ssh/\(ownershipID)/\(nonce).token"
-        let tokenSource = "import os,secrets; p=os.path.expanduser(\(pythonQuote(tokenPath))); os.makedirs(os.path.dirname(p),mode=0o700,exist_ok=True); f=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600); os.write(f,secrets.token_hex(32).encode()); os.close(f)"
+        let tokenSource = "import os,secrets; h=os.environ.get('HERMES_HOME') or os.path.expanduser('~/.hermes'); p=os.path.join(h,'desktop-ssh',\(pythonQuote(ownershipID)),\(pythonQuote("\(nonce).token"))); os.makedirs(os.path.dirname(p),mode=0o700,exist_ok=True); f=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600); os.write(f,secrets.token_hex(32).encode()); os.close(f)"
 
         _ = try await sshClient.executeCommand("python3 -c \(shellQuote(tokenSource)) >/dev/null 2>&1")
-        let tokenOutput = try await sshClient.executeCommand("cat \(remoteHomePath("\(ownershipID)/\(nonce).token"))")
+        let tokenOutput = try await sshClient.executeCommand("cat \(remoteHermesHomePath("\(ownershipID)/\(nonce).token"))")
         let token = String(buffer: tokenOutput).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !token.isEmpty else {
             throw NSError(domain: "SshTunnel", code: 2, userInfo: [NSLocalizedDescriptionKey: "The remote Hermes session token was empty."])
         }
 
-        let launch = "env HERMES_DESKTOP=1 \(shellQuote(hermesPath)) serve --isolated --host 127.0.0.1 --port 0 --ssh-session-token-file \(remoteHomePath("\(ownershipID)/\(nonce).token")) --ssh-owner-nonce \(nonce) </dev/null >> \(remoteHomePath("\(ownershipID)/\(nonce).log")) 2>&1 & echo $!"
-        let command = "mkdir -p \(remoteHomePath("")) && \"$(command -v setsid || echo nohup)\" sh -c \(shellQuote(launch))"
+        let launch = "env HERMES_DESKTOP=1 \(shellQuote(hermesPath)) serve --isolated --host 127.0.0.1 --port 0 --ssh-session-token-file \(remoteHermesHomePath("\(ownershipID)/\(nonce).token")) --ssh-owner-nonce \(nonce) </dev/null >> \(remoteHermesHomePath("\(ownershipID)/\(nonce).log")) 2>&1 & echo $!"
+        let command = "mkdir -p \(remoteHermesHomePath("")) && \"$(command -v setsid || echo nohup)\" sh -c \(shellQuote(launch))"
         let pidOutput = try await sshClient.executeCommand(command)
         guard let pid = Int(String(buffer: pidOutput).trimmingCharacters(in: .whitespacesAndNewlines)) else {
             throw NSError(domain: "SshTunnel", code: 3, userInfo: [NSLocalizedDescriptionKey: "The remote Hermes backend did not return a process ID."])
@@ -270,7 +269,7 @@ actor SshTunnel {
         let deadline = Date().addingTimeInterval(15)
         while Date() < deadline {
             do {
-                let readyOutput = try await sshClient.executeCommand("grep -oE 'HERMES_(BACKEND|DASHBOARD)_READY port=[0-9]+' \(remoteHomePath("\(ownershipID)/\(nonce).log")) 2>/dev/null | tail -n 1 | sed 's/.*port=//'")
+                let readyOutput = try await sshClient.executeCommand("grep -oE 'HERMES_(BACKEND|DASHBOARD)_READY port=[0-9]+' \(remoteHermesHomePath("\(ownershipID)/\(nonce).log")) 2>/dev/null | tail -n 1 | sed 's/.*port=//'")
                 if let port = Int(String(buffer: readyOutput).trimmingCharacters(in: .whitespacesAndNewlines)), port > 0 {
                     return RemoteBackend(port: port, pid: pid, ownershipID: ownershipID, nonce: nonce, token: token)
                 }
@@ -294,8 +293,8 @@ actor SshTunnel {
     }
 
     private func stopRemoteSession(_ identity: RemoteSessionIdentity, pid: Int?, using sshClient: SSHClient) async {
-        let tokenPath = remoteHomePath("\(identity.ownershipID)/\(identity.nonce).token")
-        let logPath = remoteHomePath("\(identity.ownershipID)/\(identity.nonce).log")
+        let tokenPath = remoteHermesHomePath("\(identity.ownershipID)/\(identity.nonce).token")
+        let logPath = remoteHermesHomePath("\(identity.ownershipID)/\(identity.nonce).log")
         let processCheck: String
         if let pid {
             processCheck = "if (tr '\\0' ' ' < /proc/\(pid)/cmdline 2>/dev/null || ps -o command= -p \(pid) 2>/dev/null) | grep -F -- \(shellQuote("hermes serve")) >/dev/null && (tr '\\0' ' ' < /proc/\(pid)/cmdline 2>/dev/null || ps -o command= -p \(pid) 2>/dev/null) | grep -F -- \(shellQuote("--ssh-owner-nonce \(identity.nonce)")) >/dev/null; then kill \(pid) 2>/dev/null || true; fi"
