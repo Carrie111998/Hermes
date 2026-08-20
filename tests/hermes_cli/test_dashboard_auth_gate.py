@@ -15,6 +15,28 @@ from fastapi.testclient import TestClient
 from hermes_cli import web_server
 
 
+@pytest.fixture(autouse=True)
+def _restore_app_state():
+    """Undo this module's writes to the module-level ``web_server.app`` singleton.
+
+    ``app`` is imported once and shared by every dashboard test in the session,
+    so the ``start_server`` tests below -- which set ``app.state.auth_required``
+    and let ``start_server`` bind ``bound_host``/``bound_port`` -- used to leak
+    that state into every file collected after this one. Victims saw
+    ``401``/``400 Invalid Host header`` from an app that was still in the last
+    test's auth posture; the 2026-08-17 sweep triage attributed ~35 failures
+    across 8 files to it.
+
+    Snapshot and restore the whole ``State`` mapping rather than named keys, so
+    a test that stashes a new attribute cannot reintroduce the leak.
+    """
+    snapshot = dict(web_server.app.state._state)
+    yield
+    web_server.app.state._state.clear()
+    web_server.app.state._state.update(snapshot)
+
+
+
 @pytest.fixture
 def client_loopback():
     # Pin the bound-host state for host_header_middleware so requests with
