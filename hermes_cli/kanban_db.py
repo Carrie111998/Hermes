@@ -7734,15 +7734,25 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists():
+        target_resolved = target.resolve(strict=False)
+        target_root = _git_toplevel(target)
         target_common = _git_common_dir(target)
         actual_branch = _git_current_branch(target)
+        target_is_linked = _is_linked_worktree_checkout(target)
         if (
             repo_common is not None
+            and target_root == target_resolved
+            and target_is_linked
             and target_common == repo_common
             and actual_branch == branch_name
         ):
             return
-        if repo_common is None or target_common != repo_common:
+        if (
+            repo_common is None
+            or target_root != target_resolved
+            or not target_is_linked
+            or target_common != repo_common
+        ):
             raise RuntimeError(
                 f"refusing to reuse existing worktree target {target}: "
                 "repository ownership is ambiguous"

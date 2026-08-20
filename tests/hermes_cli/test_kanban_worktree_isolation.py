@@ -178,6 +178,30 @@ def test_existing_task_target_on_wrong_branch_fails_closed(kanban_home, tmp_path
     assert head == "wt/other-task"
 
 
+def test_existing_plain_target_on_matching_anchor_branch_fails_closed(
+    kanban_home, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    canonical = _add_worktree(repo, tmp_path / "canonical", "anchor/main")
+    target = canonical / ".worktrees" / "t_plain"
+    target.mkdir(parents=True)
+
+    # Git commands inherit the surrounding linked checkout, so common-dir,
+    # branch, and linked-checkout checks all appear to match. Exact toplevel
+    # identity is what proves this plain directory is not the worktree root.
+    assert kb._is_linked_worktree_checkout(target)
+    assert kb._git_toplevel(target) == canonical
+    assert kb._git_common_dir(target) == kb._git_common_dir(canonical)
+    assert kb._git_current_branch(target) == "anchor/main"
+    with pytest.raises(RuntimeError, match="repository ownership"):
+        kb._ensure_git_worktree(canonical, target, "anchor/main")
+
+    assert canonical.is_dir()
+    assert (canonical / "README.md").is_file()
+    assert target.is_dir()
+    assert kb._git_toplevel(target) == canonical
+
+
 def test_decompose_worktree_children_get_own_workspace(kanban_home):
     with kb.connect() as conn:
         root = kb.create_task(conn, title="build the feature", triage=True)
