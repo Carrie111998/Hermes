@@ -268,6 +268,26 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
     _prune_durable_records()
 
 
+def _persist_dispatch_or_rollback(
+    delegation_id: str, record: Dict[str, Any]
+) -> None:
+    try:
+        _persist_dispatch(record)
+    except Exception:
+        with _records_lock:
+            if _records.get(delegation_id) is record:
+                _records.pop(delegation_id, None)
+        try:
+            _delete_durable_delegation(delegation_id)
+        except Exception:
+            logger.warning(
+                "Failed to remove partially persisted async delegation %s",
+                delegation_id,
+                exc_info=True,
+            )
+        raise
+
+
 def _delete_durable_delegation(delegation_id: str) -> None:
     with _DB_LOCK, _transaction() as conn:
         conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
@@ -853,7 +873,7 @@ def dispatch_async_delegation(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
+    _persist_dispatch_or_rollback(delegation_id, record)
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
@@ -925,6 +945,7 @@ def _begin_finalization(
         record["interrupt_fn"] = None  # drop the closure; child is done
         record["progress_fn"] = None  # stop stale-monitor sampling
         event_record = dict(record)
+        record["status_finalize_fn"] = None
 
     return event_record, interrupt_fn
 
@@ -1028,6 +1049,7 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    status_finalize_fn: Optional[Callable[[tuple], None]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -1075,6 +1097,7 @@ def dispatch_async_delegation_batch(
         "interrupt_fn": interrupt_fn,
         "is_batch": True,
         "progress_fn": progress_fn,
+        "status_finalize_fn": status_finalize_fn,
         "_progress_token": None,
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
@@ -1096,7 +1119,7 @@ def dispatch_async_delegation_batch(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
+    _persist_dispatch_or_rollback(delegation_id, record)
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
@@ -1154,8 +1177,38 @@ def _finalize_batch(
         return
     event_record, _interrupt_fn = claimed
 
-    _push_batch_completion_event(event_record, combined, status)
-    _finish_finalization(delegation_id, status)
+    try:
+        _push_batch_completion_event(event_record, combined, status)
+    finally:
+        _finalize_status_projection(event_record, combined)
+        _finish_finalization(delegation_id, status)
+
+
+def _finalize_status_projection(
+    event_record: Dict[str, Any], combined: Dict[str, Any]
+) -> None:
+    callback = event_record.get("status_finalize_fn")
+    if not callable(callback):
+        return
+    try:
+        from tools.delegation_status import DetachedStatusPhase
+
+        task_count = len(event_record.get("goals") or ())
+        outcomes = [DetachedStatusPhase.FAILED] * task_count
+        for result in combined.get("results") or ():
+            if not isinstance(result, dict):
+                continue
+            task_index = result.get("task_index")
+            if not isinstance(task_index, int) or not 0 <= task_index < task_count:
+                continue
+            outcomes[task_index] = (
+                DetachedStatusPhase.DONE
+                if result.get("status") in ("completed", "success")
+                else DetachedStatusPhase.FAILED
+            )
+        callback(tuple(outcomes))
+    except Exception:
+        logger.warning("Detached status finalizer failed", exc_info=True)
 
 
 def _push_batch_completion_event(
@@ -1380,32 +1433,33 @@ def _finalize_stalled(delegation_id: str) -> None:
         ),
         "stall_grace_seconds": _STALL_GRACE_SECONDS,
     }
-    if event_record.get("is_batch"):
-        _push_batch_completion_event(
-            event_record,
-            {
-                "results": [],
-                "error": error,
-                "total_duration_seconds": duration,
-                **stall_meta,
-            },
-            "stalled",
-        )
-    else:
-        _push_completion_event(
-            event_record,
-            {
-                "status": "stalled",
-                "summary": None,
-                "error": error,
-                "api_calls": 0,
-                "duration_seconds": duration,
-                "exit_reason": "stalled",
-                **stall_meta,
-            },
-            "stalled",
-        )
-    _finish_finalization(delegation_id, "stalled")
+    batch_result = {
+        "results": [],
+        "error": error,
+        "total_duration_seconds": duration,
+        **stall_meta,
+    }
+    try:
+        if event_record.get("is_batch"):
+            _push_batch_completion_event(event_record, batch_result, "stalled")
+        else:
+            _push_completion_event(
+                event_record,
+                {
+                    "status": "stalled",
+                    "summary": None,
+                    "error": error,
+                    "api_calls": 0,
+                    "duration_seconds": duration,
+                    "exit_reason": "stalled",
+                    **stall_meta,
+                },
+                "stalled",
+            )
+    finally:
+        if event_record.get("is_batch"):
+            _finalize_status_projection(event_record, batch_result)
+        _finish_finalization(delegation_id, "stalled")
 
 
 def _children_activity_from_token(token: Any, now: float) -> Optional[List]:
