@@ -8219,14 +8219,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # it: the caller sees CancelledError, the handler runs to completion.
         await asyncio.shield(task)
 
-    def _queue_retryable_fatal_platform(self, adapter: BasePlatformAdapter) -> bool:
+    def _queue_retryable_fatal_platform(
+        self,
+        adapter: BasePlatformAdapter,
+        *,
+        force: bool = False,
+    ) -> bool:
         """Queue a retryable fatal adapter for background reconnection.
 
         Returns True when the platform was newly queued. Idempotent if already
         queued. Must not await: callers invoke this *before* any disconnect
         await so a wedged close cannot strand the platform (#80598).
+
+        ``force`` is reserved for the all-messaging-disconnected keep-alive
+        policy. It retains the final failed adapter even when that adapter
+        classified its terminal error as non-retryable, so the preserved
+        process still has a platform for the reconnect watcher to rebuild.
         """
-        if not adapter.fatal_error_retryable:
+        if not adapter.fatal_error_retryable and not force:
             return False
         platform_config = self.config.platforms.get(adapter.platform)
         if not platform_config or adapter.platform in self._failed_platforms:
@@ -8252,6 +8262,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # are not permanently stranded (#70344).
         self._ensure_reconnect_watcher_running()
         return True
+
+    @staticmethod
+    def _messaging_platform_exit_on_all_disconnected() -> bool:
+        """Return the all-messaging-disconnected exit policy (default: true)."""
+        try:
+            config = _load_gateway_config()
+            gateway_cfg = config.get("gateway") if isinstance(config, dict) else None
+            if isinstance(gateway_cfg, dict):
+                value = gateway_cfg.get(
+                    "messaging_platform_exit_on_all_disconnected",
+                    True,
+                )
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, str):
+                    normalized = value.strip().lower()
+                    if normalized in {"true", "1", "yes", "on"}:
+                        return True
+                    if normalized in {"false", "0", "no", "off"}:
+                        return False
+        except Exception:
+            logger.debug(
+                "Failed reading all-messaging-disconnected exit policy",
+                exc_info=True,
+            )
+        return True
+
+    def _has_active_local_interactive_work(self) -> bool:
+        """Return whether stopping the gateway would interrupt local/API work."""
+        if self._active_api_run_count() > 0:
+            return True
+
+        # In-process local turns are represented by the running-agent map; use
+        # the cached source to distinguish terminal/TUI work from messaging
+        # turns that belong to the adapter currently going down.
+        for session_key in getattr(self, "_running_agents", {}):
+            source = getattr(self, "_session_sources", {}).get(session_key)
+            if getattr(source, "platform", None) == Platform.LOCAL:
+                return True
+
+        # CLI and TUI surfaces run in separate processes and advertise leases
+        # through the shared registry. Gateway leases use ``gateway:<platform>``
+        # and do not count as local interactive work here.
+        try:
+            from hermes_cli.active_sessions import active_session_registry_snapshot
+
+            return any(
+                not str(entry.get("surface") or "").startswith("gateway:")
+                for entry in active_session_registry_snapshot()
+                if isinstance(entry, dict)
+            )
+        except Exception:
+            logger.debug("Failed reading active local session registry", exc_info=True)
+            return False
 
     async def _handle_adapter_fatal_error_detached(
         self, adapter: BasePlatformAdapter
@@ -8391,6 +8455,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # reconnect watcher always has work; teardown is best-effort after.
         self._queue_retryable_fatal_platform(adapter)
 
+        # A shared gateway must not tear down local terminal/TUI/API work just
+        # because its final messaging adapter is unavailable. The explicit
+        # false override keeps even a headless gateway alive; with the default
+        # true policy, only live local work suppresses the legacy service
+        # restart. Force-queue before disconnect so a wedged close cannot leave
+        # the preserved process with nothing for the reconnect watcher to do.
+        keep_alive_for_policy = False
+        if not self.adapters:
+            exit_when_disconnected = (
+                self._messaging_platform_exit_on_all_disconnected()
+            )
+            keep_alive_for_policy = (
+                not exit_when_disconnected
+                or self._has_active_local_interactive_work()
+            )
+            if keep_alive_for_policy:
+                self._queue_retryable_fatal_platform(adapter, force=True)
+
         if existing is adapter:
             # A half-closed transport can wedge an adapter's native close()
             # indefinitely. Reuse the shutdown-path timeout so this runtime
@@ -8416,12 +8498,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # but that converted a transient outage into a restart loop and
             # killed in-process state every time. The reconnect watcher
             # already handles long-running recovery — let it do its job.
-            logger.warning(
-                "No connected messaging platforms remain, but %d platform(s) "
-                "queued for reconnection — gateway staying alive, watcher will "
-                "retry in background.",
-                len(self._failed_platforms),
-            )
+            if keep_alive_for_policy:
+                logger.warning(
+                    "No connected messaging platforms remain; local/API work or "
+                    "gateway.messaging_platform_exit_on_all_disconnected=false "
+                    "requires the gateway to stay alive. %d platform(s) queued "
+                    "for background reconnection.",
+                    len(self._failed_platforms),
+                )
+            else:
+                logger.warning(
+                    "No connected messaging platforms remain, but %d platform(s) "
+                    "queued for reconnection — gateway staying alive, watcher will "
+                    "retry in background.",
+                    len(self._failed_platforms),
+                )
 
     def _request_clean_exit(self, reason: str) -> None:
         self._exit_cleanly = True

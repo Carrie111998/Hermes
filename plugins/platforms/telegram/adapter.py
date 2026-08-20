@@ -2933,38 +2933,36 @@ class TelegramAdapter(BasePlatformAdapter):
         reconnect, etc.).  The gateway process stays alive but the long-poll
         connection silently dies; without this handler the bot never recovers.
 
-        Strategy: exponential back-off (5s, 10s, 20s, 40s, 60s cap) up to
-        MAX_NETWORK_RETRIES attempts, then mark the adapter retryable-fatal so
-        the supervisor restarts the gateway process.
+        Strategy: ten fast exponential-backoff attempts (5s, 10s, 20s, 40s,
+        then a 60s cap), followed by slow 10-minute background retries for as
+        long as the connectivity outage lasts. A pure network outage never
+        marks the adapter fatal or restarts the gateway process; polling
+        self-heals when the network returns.
         """
         if getattr(self, "_polling_teardown_started", False):
             return
         if self.has_fatal_error:
             return
 
-        MAX_NETWORK_RETRIES = 10
+        FAST_NETWORK_RETRIES = 10
         BASE_DELAY = 5
-        MAX_DELAY = 60
+        FAST_MAX_DELAY = 60
+        SLOW_RETRY_DELAY = 600
 
         self._polling_network_error_count += 1
         self._send_path_degraded = True
         attempt = self._polling_network_error_count
 
-        if attempt > MAX_NETWORK_RETRIES:
-            message = (
-                "Telegram polling could not reconnect after %d network error retries. "
-                "Escalating to gateway recovery." % MAX_NETWORK_RETRIES
-            )
-            logger.error("[%s] %s Last error: %s", self.name, message, _redact_telegram_error_text(error))
-            self._set_fatal_error("telegram_network_error", message, retryable=True)
-            await self._handoff_polling_fatal_error()
-            return
-
-        delay = min(BASE_DELAY * (2 ** (attempt - 1)), MAX_DELAY)
+        if attempt <= FAST_NETWORK_RETRIES:
+            delay = min(BASE_DELAY * (2 ** (attempt - 1)), FAST_MAX_DELAY)
+            retry_phase = f"fast attempt {attempt}/{FAST_NETWORK_RETRIES}"
+        else:
+            delay = SLOW_RETRY_DELAY
+            retry_phase = f"slow background attempt {attempt - FAST_NETWORK_RETRIES}"
         safe_error = _redact_telegram_error_text(error)
         logger.warning(
-            "[%s] Telegram network error (attempt %d/%d), reconnecting in %ds. Error: %s",
-            self.name, attempt, MAX_NETWORK_RETRIES, delay, safe_error,
+            "[%s] Telegram network error (%s), reconnecting in %ds. Error: %s",
+            self.name, retry_phase, delay, safe_error,
         )
         await asyncio.sleep(delay)
 

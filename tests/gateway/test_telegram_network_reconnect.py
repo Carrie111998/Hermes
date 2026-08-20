@@ -100,6 +100,34 @@ async def test_reconnect_self_schedules_on_start_polling_failure():
 
 
 @pytest.mark.asyncio
+async def test_extended_outage_uses_slow_background_retry_without_fatal_escalation():
+    """A multi-hour network outage must not permanently kill Telegram polling."""
+    adapter = _make_adapter()
+    adapter._polling_network_error_count = 10
+    adapter._handoff_polling_fatal_error = AsyncMock()
+
+    mock_updater = MagicMock()
+    mock_updater.running = False
+    mock_updater.start_polling = AsyncMock()
+    mock_app = MagicMock()
+    mock_app.updater = mock_updater
+    adapter._app = mock_app
+
+    delays = []
+
+    async def _capture_sleep(delay):
+        delays.append(delay)
+
+    with patch("asyncio.sleep", side_effect=_capture_sleep):
+        await adapter._handle_polling_network_error(Exception("still blocked"))
+
+    assert delays == [600]
+    mock_updater.start_polling.assert_awaited_once()
+    adapter._handoff_polling_fatal_error.assert_not_awaited()
+    assert not adapter.has_fatal_error
+
+
+@pytest.mark.asyncio
 async def test_retry_exhaustion_queues_reconnect_before_child_disconnect(tmp_path):
     """Fatal teardown must not cancel the gateway's reconnect handoff.
 
@@ -115,14 +143,27 @@ async def test_retry_exhaustion_queues_reconnect_before_child_disconnect(tmp_pat
         sessions_dir=tmp_path / "sessions",
     )
     runner = GatewayRunner(config)
+    # This test only cares whether disconnect() teardown cancels the fatal
+    # handler before it can queue reconnection — not the separate
+    # exit-on-all-disconnected policy decision (covered by
+    # tests/gateway/test_adapter_fatal_shutdown_policy.py). Force the
+    # "stay alive and queue" branch explicitly so a policy-default change
+    # doesn't make this regression test flap.
+    runner._messaging_platform_exit_on_all_disconnected = lambda: False
     adapter = _make_adapter()
-    adapter._polling_network_error_count = 10  # MAX_NETWORK_RETRIES
+    # Network-error retries no longer escalate to fatal (they fall back to
+    # slow indefinite background retry instead — see
+    # test_extended_outage_uses_slow_background_retry_without_fatal_escalation).
+    # The conflict-retry ladder (409 from a stale prior session) still
+    # escalates to fatal after MAX_CONFLICT_RETRIES, so exercise that path
+    # here to keep covering the child-teardown-cancellation regression.
+    adapter._polling_conflict_count = 5  # MAX_CONFLICT_RETRIES
     adapter.set_fatal_error_handler(runner._handle_adapter_fatal_error)
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner.delivery_router.adapters = runner.adapters
 
     recovery_task = asyncio.create_task(
-        adapter._handle_polling_network_error(Exception("still failing"))
+        adapter._handle_polling_conflict(Exception("still failing"))
     )
     adapter._polling_error_task = recovery_task
     result = await asyncio.gather(recovery_task, return_exceptions=True)
