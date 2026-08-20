@@ -189,7 +189,7 @@ class TestStdioPidTracking:
 # Fix 2b: stdio descendant reaping via process group (issue #23799)
 # ---------------------------------------------------------------------------
 #
-# When a stdio MCP wrapper (e.g. ``openclaw mcp serve``) itself spawns a
+# When a stdio MCP wrapper (e.g. ``upstream mcp serve``) itself spawns a
 # helper subprocess (``claude mcp serve``) and then exits, the helper
 # reparents to systemd-user and is invisible to the per-pid orphan reaper.
 # The fix captures the wrapper's pgid at spawn time and reaps via killpg,

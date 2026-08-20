@@ -80,7 +80,7 @@ class TurnResult:
     # wedged (turn-level timeout fired, post-tool watchdog tripped, or
     # token-refresh failure killed the child). The caller should retire
     # the session so the next turn respawns codex from scratch instead
-    # of riding a CPU-spinning or auth-broken process. Mirrors openclaw
+    # of riding a CPU-spinning or auth-broken process. Mirrors upstream
     # beta.8's "retire timed-out app-server clients" fix.
     should_retire: bool = False
 
@@ -88,7 +88,7 @@ class TurnResult:
 # Markers we accept as terminal even when codex never emits turn/completed.
 # Some codex versions stream `<turn_aborted>` as raw text in agentMessage
 # items when an interrupt or upstream error tears the turn down before the
-# normal completion path fires. Mirrors openclaw beta.8 fix.
+# normal completion path fires. Mirrors upstream beta.8 fix.
 _TURN_ABORTED_MARKERS = ("<turn_aborted>", "<turn_aborted/>")
 
 
@@ -202,7 +202,7 @@ def _coerce_turn_input_text(user_input: Any) -> str:
 # subprocess died because its OAuth credentials are no longer valid.
 # Kept conservative: we only redirect users to `codex login` when we're
 # reasonably sure that's the actual failure, otherwise we surface the
-# original error verbatim. Mirrors openclaw beta.8's auth-refresh
+# original error verbatim. Mirrors upstream beta.8's auth-refresh
 # classification.
 _OAUTH_REFRESH_FAILURE_HINTS = (
     "invalid_grant",
@@ -345,7 +345,7 @@ class CodexAppServerSession:
         params: dict[str, Any] = {"cwd": self._cwd}
         result = self._client.request("thread/start", params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
-        # serialized this under either key. Mirrors openclaw beta.8's
+        # serialized this under either key. Mirrors upstream beta.8's
         # tolerance fix so future codex drops/renames don't KeyError us
         # at handshake time.
         thread_obj = result.get("thread") or {}
@@ -482,7 +482,7 @@ class CodexAppServerSession:
         post_tool_quiet_timeout: if codex emits a tool completion and then
         goes quiet for this many seconds without emitting another item or
         `turn/completed`, fast-fail and mark the session for retirement.
-        Mirrors openclaw beta.8's post-tool completion watchdog (#81697)
+        Mirrors upstream beta.8's post-tool completion watchdog (#81697)
         so a wedged codex doesn't burn the full turn deadline.
         """
         # Pre-create the result so startup failures (codex subprocess can't
@@ -1271,7 +1271,7 @@ def _has_turn_aborted_marker(text: str) -> bool:
     Codex emits `<turn_aborted>` (and sometimes `<turn_aborted/>`) as raw
     text inside agentMessage items when an interrupt or upstream error
     tears the turn down before the normal completion path fires. Mirrors
-    openclaw beta.8's terminal-marker fix so we don't burn the full turn
+    upstream beta.8's terminal-marker fix so we don't burn the full turn
     deadline waiting for a turn/completed that never comes.
     """
     if not text:

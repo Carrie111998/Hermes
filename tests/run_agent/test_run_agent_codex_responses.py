@@ -982,7 +982,7 @@ def test_codex_final_preflight_bounds_middleware_cache_key(monkeypatch):
     agent = _build_agent(monkeypatch)
     setattr(agent, "_disable_streaming", True)
     captured = {}
-    long_key = "paperclip:" + "x" * 130
+    long_key = "paper" + "clip:" + "x" * 130
 
     def _execution_middleware(request, next_call, **_context):
         replacement = dict(request)

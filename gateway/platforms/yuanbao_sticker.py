@@ -1,7 +1,7 @@
 """
 Yuanbao sticker (TIMFaceElem) support.
 
-Ported from yuanbao-openclaw-plugin/src/sticker/.
+Ported from the legacy Yuanbao plugin/src/sticker/.
 
 TIMFaceElem wire format:
     {
@@ -390,7 +390,7 @@ def get_sticker_by_id(sticker_id: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# 模糊搜索（对齐 chatbot-web yuanbao-openclaw-plugin/sticker-cache.ts.searchStickers）
+# 模糊搜索（对齐 chatbot-web the legacy Yuanbao plugin/sticker-cache.ts.searchStickers）
 # ---------------------------------------------------------------------------
 
 _PUNCT_RE = re.compile(r"[\s\u3000\-_·.,，。!！?？\"“”'‘’、/\\]+")

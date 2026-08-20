@@ -1123,7 +1123,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # every downstream check (checkpointing, guardrails, plugin
         # pre-tool-call hooks, the display/activity feed, the post-call
         # callback) sees the underlying tool — not the bridge. This is
-        # the OpenClaw lesson: hooks must observe the real tool name.
+        # the upstream lesson: hooks must observe the real tool name.
         #
         # The original tool_call entry on ``tool_call.function`` is left
         # untouched so the conversation transcript and the matching

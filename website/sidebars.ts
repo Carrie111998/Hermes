@@ -487,15 +487,6 @@ const sidebars: SidebarsConfig = {
                 },
                 {
                   type: 'category',
-                  label: 'migration',
-                  key: 'skills-optional-migration',
-                  collapsed: true,
-                  items: [
-                    'user-guide/skills/optional/migration/migration-openclaw-migration',
-                  ],
-                },
-                {
-                  type: 'category',
                   label: 'mlops',
                   key: 'skills-optional-mlops',
                   collapsed: true,
@@ -734,7 +725,6 @@ const sidebars: SidebarsConfig = {
         'guides/agent-email-address',
         'guides/github-pr-review-agent',
         'guides/webhook-github-pr-review',
-        'guides/migrate-from-openclaw',
         'guides/aws-bedrock',
         'guides/google-vertex',
         'guides/azure-foundry',

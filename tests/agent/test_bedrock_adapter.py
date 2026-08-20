@@ -35,7 +35,7 @@ def _mock_botocore_session(*, return_value=None, side_effect=None):
 class TestResolveAwsAuthEnvVar:
     """Test AWS credential environment variable detection.
 
-    Mirrors OpenClaw's resolveAwsSdkEnvVarName() priority order.
+    Mirrors upstream's resolveAwsSdkEnvVarName() priority order.
     """
 
 

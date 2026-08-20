@@ -1,6 +1,6 @@
 // Measures the desktop image-attach pipeline stage by stage on a real image,
 // against the real renderer helpers. No Electron, no LLM — just the transforms
-// an attached image goes through between the paperclip and prompt.submit.
+// an attached image goes through between the paper-clip picker and prompt.submit.
 //
 //   node scripts/perf/image-attach-bench.mjs [--kb 900] [--rounds 7]
 

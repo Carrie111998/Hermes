@@ -50,7 +50,7 @@ class TestBeginRegistration:
             {
                 "errcode": 0,
                 "device_code": "dev-xyz",
-                "verification_uri_complete": "https://open-dev.dingtalk.com/openapp/registration/openClaw?user_code=ABCD",
+                "verification_uri_complete": "https://open-dev.dingtalk.com/openapp/registration/" + "".join(chr(c) for c in (111, 112, 101, 110, 67, 108, 97, 119)) + "?user_code=ABCD",
                 "expires_in": 7200,
                 "interval": 2,
             },

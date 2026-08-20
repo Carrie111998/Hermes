@@ -807,7 +807,7 @@ def run_codex_app_server_turn(
     # If the turn signalled the underlying client is wedged (deadline
     # blown, post-tool watchdog tripped, OAuth refresh died, subprocess
     # exited), retire the session so the next turn respawns codex
-    # rather than riding the broken process. Mirrors openclaw beta.8's
+    # rather than riding the broken process. Mirrors upstream beta.8's
     # "retire timed-out app-server clients" fix.
     if getattr(turn, "should_retire", False):
         logger.warning(
@@ -970,7 +970,7 @@ def run_codex_app_server_turn(
 # backend can return ``null``, ``[]``, a string, or omit the field entirely
 # and we don't care.
 #
-# This mirrors what the OpenClaw TS implementation does for the same backend
+# This mirrors what the upstream TS implementation does for the same backend
 # and is structurally immune to the bug class rather than patched.
 # ---------------------------------------------------------------------------
 

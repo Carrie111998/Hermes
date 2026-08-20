@@ -1,5 +1,5 @@
 """Tests for cli.py::_strip_reasoning_tags — specifically the tool-call
-XML stripping added in openclaw/openclaw#67318 port.
+XML stripping added in third-party reference #67318 port.
 
 The CLI has its own copy of the stripper because it needs to run on the
 final displayed assistant text (after streaming) without depending on the

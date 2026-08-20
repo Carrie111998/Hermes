@@ -8,7 +8,7 @@ yuanbao_tools.py - 元宝平台工具集
   - send_sticker          : 向当前会话或指定 chat_id 发送贴纸（TIMFaceElem）
   - send_dm               : 发送私聊消息（按昵称查找用户并发送）
 
-对齐 chatbot-web/yuanbao-openclaw-plugin 的 sticker-search/sticker-send 行为：
+对齐 chatbot-web/the legacy Yuanbao plugin 的 sticker-search/sticker-send 行为：
 LLM 应先用 search_sticker 找到合适的 sticker_id（或直接传中文 name），再用 send_sticker
 发送。不要在文本中夹杂裸的 Unicode emoji 当作贴纸。
 

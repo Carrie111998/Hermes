@@ -1183,7 +1183,7 @@ class HermesConsoleEngine:
         blocked_top = {
             "acp",
             "chat",
-            "claw",
+
             "completion",
             "dashboard",
             "desktop",

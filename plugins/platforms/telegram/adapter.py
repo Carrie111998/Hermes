@@ -3549,7 +3549,7 @@ class TelegramAdapter(BasePlatformAdapter):
             "Telegram polling could not recover after %d retries (%ds total wait). "
             "The previous gateway session is still held open on Telegram's servers, "
             "or another process is using the same bot token. "
-            "To recover: ensure no other Hermes or OpenClaw instance is running "
+            "To recover: ensure no other Hermes or legacy agent instance is running "
             "with this token, then restart the gateway with 'hermes gateway restart'."
             % (MAX_CONFLICT_RETRIES, sum(10 + i * 10 for i in range(1, MAX_CONFLICT_RETRIES + 1)))
         )
@@ -5906,7 +5906,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Delete a previously sent Telegram message.
 
         Used by the stream consumer's fresh-final cleanup path (ported
-        from openclaw/openclaw#72038) to remove long-lived preview
+        from third-party reference #72038) to remove long-lived preview
         messages after sending the completed reply as a fresh message.
         Telegram's Bot API ``deleteMessage`` works for bot-posted
         messages in the last 48 hours.  Failures are non-fatal — the
@@ -8486,7 +8486,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Return whether skipped unmentioned group messages are stored as context.
 
         When enabled with ``require_mention``, Telegram matches the Yuanbao /
-        OpenClaw-style group UX: observe ordinary group chatter in the session
+        legacy-agent-style group UX: observe ordinary group chatter in the session
         transcript, but only dispatch the agent when the bot is explicitly
         addressed.
         """

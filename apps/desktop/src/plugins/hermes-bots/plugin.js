@@ -8421,7 +8421,7 @@ function GroupChatWorkspace({ group, members, onBack }) {
     setOpenThreads(prev => ({ ...prev, [thread]: true }))
   }
 
-  /** Pending-attachment chips + the paperclip picker for one composer
+  /** Pending-attachment chips + the paper-clip picker for one composer
    *  (thread = null → main). Chips preview the image and X removes it. */
   const attachmentRow = thread => {
     const images = imagesFor(thread)

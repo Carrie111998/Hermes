@@ -56,10 +56,18 @@ jobs:
               continue  # mapped via the contributors directory
             fi
 
-            if ! grep -qF "\"${email}\"" scripts/release.py 2>/dev/null; then
-              AUTHOR=$(git log --author="$email" --format='%an' -1)
-              MISSING="${MISSING}\n  ${email} (${AUTHOR})"
+            if python3 scripts/check_mapping_key.py scripts/release.py LEGACY_AUTHOR_MAP "$email"; then
+              continue
+            else
+              mapping_status=$?
             fi
+            if [ "$mapping_status" -ne 1 ]; then
+              echo "Contributor mapping parser failed closed." >&2
+              exit "$mapping_status"
+            fi
+
+            AUTHOR=$(git log --author="$email" --format='%an' -1)
+            MISSING="${MISSING}\n  ${email} (${AUTHOR})"
           done <<< "$NEW_EMAILS"
 
           if [ -n "$MISSING" ]; then

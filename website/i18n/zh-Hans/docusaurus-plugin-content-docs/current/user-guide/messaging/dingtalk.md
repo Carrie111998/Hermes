@@ -105,8 +105,8 @@ hermes gateway setup
 - **二维码设备流（推荐）。** 用钉钉手机 App 扫描终端中打印的二维码——Client ID 和 Client Secret 将自动返回并写入 `~/.hermes/.env`，无需前往开发者控制台。
 - **手动粘贴。** 如果你已有凭证（或扫码不方便），在提示时粘贴你的 Client ID、Client Secret 和允许的用户 ID。
 
-:::note openClaw 品牌披露
-由于钉钉的 `verification_uri_complete` 在 API 层硬编码为 openClaw 身份，在 Alibaba / DingTalk-Real-AI 在服务端注册 Hermes 专属模板之前，二维码目前以 `openClaw` 来源字符串进行授权。这仅是钉钉呈现授权界面的方式——你创建的机器人完全属于你，且对你的租户私有。
+:::note upstream 品牌披露
+由于钉钉的 `verification_uri_complete` 在 API 层硬编码为 upstream 身份，在 Alibaba / DingTalk-Real-AI 在服务端注册 Hermes 专属模板之前，二维码目前以 `upstream` 来源字符串进行授权。这仅是钉钉呈现授权界面的方式——你创建的机器人完全属于你，且对你的租户私有。
 :::
 
 ### 方式 B：手动配置

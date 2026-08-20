@@ -157,7 +157,7 @@ Options: available in 4 colors.
 |---|---|
 | WhatsApp | Image as a media message, then an interactive message with the product info. No markdown links. |
 | iMessage | Plain text only, no markdown. Never put CDN/image URLs in text. Send two messages per product: (1) image, (2) info. |
-| Telegram (Openclaw) | One single media message per product, no alt text. Inline "View Product" URL button if supported, else the template link; on send failure, fall back to text. |
+| Telegram (upstream) | One single media message per product, no alt text. Inline "View Product" URL button if supported, else the template link; on send failure, fall back to text. |
 | Telegram (Hermes Agent + all other agents) | Do **not** send an image. Send separate messages — never one combined message. |
 
 ## Visualization

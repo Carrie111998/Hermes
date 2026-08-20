@@ -33,14 +33,12 @@ Usage:
     hermes honcho tokens --dialectic N     # Set dialectic result char cap
     hermes honcho identity                 # Show AI peer identity representation
     hermes honcho identity <file>          # Seed AI peer identity from a file (SOUL.md etc.)
-    hermes honcho migrate                  # Step-by-step migration guide: OpenClaw native → Hermes + Honcho
     hermes version             Show version
     hermes update              Update to latest version
     hermes uninstall           Uninstall Hermes Agent
     hermes acp                 Run as an ACP server for editor integration
     hermes sessions browse     Interactive session picker with search
 
-    hermes claw migrate --dry-run  # Preview migration without changes
 """
 
 # IMPORTANT: hermes_bootstrap must be the very first import — it sets up
@@ -481,7 +479,7 @@ from hermes_cli.subcommands.skills import build_skills_parser
 from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
 from hermes_cli.subcommands.mcp import build_mcp_parser
-from hermes_cli.subcommands.claw import build_claw_parser
+
 
 
 def _require_tty(command_name: str) -> None:
@@ -10009,7 +10007,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "desktop",
         "gui",
         "honcho",
-        "claw",
+
         "plugins",
         "security",
         "acp",
@@ -11434,7 +11432,7 @@ def _build_provider_choices() -> list[str]:
 # to parse.
 _BUILTIN_SUBCOMMANDS = frozenset(
     {
-        "acp", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
+        "acp", "approvals", "auth", "backup", "bundles", "checkpoints", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
@@ -12174,12 +12172,6 @@ def cmd_mcp(args):
     from hermes_cli.mcp_config import mcp_command
 
     mcp_command(args)
-
-
-def cmd_claw(args):
-    from hermes_cli.claw import claw_command
-
-    claw_command(args)
 
 
 def _advertise_agent_env() -> None:
@@ -13540,10 +13532,6 @@ def main():
     build_insights_parser(subparsers, cmd_insights=cmd_insights)
     build_monitoring_parser(subparsers, cmd_monitoring=cmd_monitoring)
 
-    # =========================================================================
-    # claw command  (parser built in hermes_cli/subcommands/claw.py)
-    # =========================================================================
-    build_claw_parser(subparsers, cmd_claw=cmd_claw)
 
     # =========================================================================
     # version command  (parser built in hermes_cli/subcommands/version.py)

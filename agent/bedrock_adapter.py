@@ -21,7 +21,7 @@ Architecture follows the same pattern as ``anthropic_adapter.py``:
   - Messages/tools are converted between OpenAI format and Converse format.
   - Responses are normalized back to OpenAI-compatible objects for the agent loop.
 
-Reference: OpenClaw's ``extensions/amazon-bedrock/`` plugin, which implements
+Reference: upstream's ``extensions/amazon-bedrock/`` plugin, which implements
 the same Converse API integration in TypeScript via ``@aws-sdk/client-bedrock``.
 
 Requires: ``boto3`` (optional dependency — only needed when using the Bedrock provider).
@@ -264,7 +264,7 @@ def is_streaming_access_denied_error(exc: BaseException) -> bool:
 # AWS credential detection
 # ---------------------------------------------------------------------------
 
-# Priority order matches OpenClaw's resolveAwsSdkEnvVarName():
+# Priority order matches upstream's resolveAwsSdkEnvVarName():
 #   1. AWS_BEARER_TOKEN_BEDROCK (Bedrock-specific bearer token)
 #   2. AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY (explicit IAM credentials)
 #   3. AWS_PROFILE (named profile → SSO, assume-role, etc.)
@@ -286,7 +286,7 @@ def resolve_aws_auth_env_var(env: Optional[Dict[str, str]] = None) -> Optional[s
     Checks environment variables first, then falls back to boto3's credential
     chain for implicit sources (EC2 IMDS, ECS task role, etc.).
 
-    This mirrors OpenClaw's ``resolveAwsSdkEnvVarName()`` — used to detect
+    This mirrors upstream's ``resolveAwsSdkEnvVarName()`` — used to detect
     whether the user has any AWS credentials configured without actually
     attempting to authenticate.
     """
@@ -330,7 +330,7 @@ def has_aws_credentials(env: Optional[Dict[str, str]] = None) -> bool:
     Lambda execution roles, and other IMDS-based sources that don't set
     environment variables.
 
-    This two-tier approach mirrors the pattern from OpenClaw PR #62673:
+    This two-tier approach mirrors the pattern from third-party reference #62673:
     cloud environments (EC2, ECS, Lambda) provide credentials via instance
     metadata, not environment variables. The env-var check is a fast path
     for local development; the boto3 fallback covers all cloud deployments.
@@ -1223,7 +1223,7 @@ def discover_bedrock_models(
 
     Caches results for 1 hour per region to avoid repeated API calls.
 
-    Mirrors OpenClaw's ``discoverBedrockModels()`` in
+    Mirrors upstream's ``discoverBedrockModels()`` in
     ``extensions/amazon-bedrock/discovery.ts``.
     """
     import time
@@ -1350,7 +1350,7 @@ def _extract_provider_from_arn(arn: str) -> str:
 # ---------------------------------------------------------------------------
 # Error classification — Bedrock-specific exceptions
 # ---------------------------------------------------------------------------
-# Mirrors OpenClaw's classifyFailoverReason() and matchesContextOverflowError()
+# Mirrors upstream's classifyFailoverReason() and matchesContextOverflowError()
 # in extensions/amazon-bedrock/register.sync.runtime.ts.
 
 # Patterns that indicate the input context exceeded the model's token limit.

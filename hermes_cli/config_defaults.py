@@ -2634,7 +2634,7 @@ DEFAULT_CONFIG = {
     # Core Hermes tools (terminal, read_file, write_file, patch,
     # search_files, todo, memory, browser_*, etc.) are NEVER deferred.
     # See tools/tool_search.py for full design notes and the
-    # openclaw-tool-search-report PDF in this PR for the rationale.
+    # upstream-tool-search-report PDF in this PR for the rationale.
     "tools": {
         "tool_search": {
             # Tiered disclosure: any deferrable (MCP/plugin) tool activates

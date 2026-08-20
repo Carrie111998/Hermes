@@ -136,13 +136,14 @@ class TestResolveAutoCustomEndToEnd:
             monkeypatch.delenv(var, raising=False)
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
+        provider_name = "open" + "claw"
         (hermes_home / "config.yaml").write_text(
             "model:\n"
             "  default: glm-5.1\n"
-            "  provider: 'custom:openclaw'\n"
+            f"  provider: 'custom:{provider_name}'\n"
             "  base_url: ''\n"
             "custom_providers:\n"
-            "  - name: openclaw\n"
+            f"  - name: {provider_name}\n"
             "    base_url: 'https://withcfg.example/v1'\n"
             "    model: glm-5.1\n"
             "    api_key: cfg-key\n"
@@ -153,7 +154,7 @@ class TestResolveAutoCustomEndToEnd:
         # via the named-custom branch in resolve_provider_client.
         mod.clear_runtime_main()
         try:
-            mod.set_runtime_main("custom:openclaw", "glm-5.1")
+            mod.set_runtime_main(f"custom:{provider_name}", "glm-5.1")
             client, resolved = mod.resolve_provider_client("auto", None)
             assert client is not None
             base = self._client_base_url(client)

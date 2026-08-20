@@ -10505,7 +10505,7 @@ def _is_connected(config) -> bool:
 
     Looks up via ``hermes_cli.gateway.get_env_value`` at call time (not via
     the plugin's own bound import) so tests that patch ``gateway_mod.get_env_value``
-    — including ``test_setup_openclaw_migration`` — can suppress ambient
+    — including setup migration tests — can suppress ambient
     ``DISCORD_BOT_TOKEN`` env vars. Matches what the legacy
     ``_PLATFORMS["discord"]`` dispatch did before this migration.
     """

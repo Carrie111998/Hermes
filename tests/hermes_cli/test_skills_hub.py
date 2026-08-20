@@ -411,7 +411,7 @@ def test_do_search_json_flag_emits_full_identifiers(capsys):
 
 
 # ---------------------------------------------------------------------------
-# Local-edit protection in do_update (ported from paperclipai/paperclip#10978)
+# Local-edit protection in do_update (ported from third-party reference #10978)
 # ---------------------------------------------------------------------------
 
 

@@ -2,7 +2,7 @@
 yuanbao_media.py — 元宝平台媒体处理模块
 
 提供 COS 上传、文件下载、TIM 媒体消息构建等功能。
-移植自 TypeScript 版 media.ts（yuanbao-openclaw-plugin），
+移植自 TypeScript 版 media.ts（the legacy Yuanbao plugin），
 使用 httpx 替代 cos-nodejs-sdk-v5，避免引入额外 SDK 依赖。
 
 COS 上传流程：

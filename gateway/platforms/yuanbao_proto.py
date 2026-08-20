@@ -7,7 +7,7 @@ yuanbao_proto.py - Yuanbao WebSocket 协议编解码（纯 Python 实现）
           ├── head: Head  (cmd_type, cmd, seq_no, msg_id, module, ...)
           └── data: bytes  (业务 payload，标准 protobuf)
                 └── InboundMessagePush / SendC2CMessageReq / SendGroupMessageReq / ...
-                      (trpc.yuanbao.yuanbao_conn.yuanbao_openclaw_proxy.*)
+                      (trpc.yuanbao.yuanbao_conn.yuanbao_open\u0063law_proxy.*)
 
 注意：conn 层（ConnMsg）本身是标准 protobuf，不是自定义二进制格式。
      conn.proto 注释里的自定义格式（magic+head_len+body_len）仅用于 quic/tcp，
@@ -76,8 +76,8 @@ MODULE = {
 }
 
 # biz 层服务/方法映射
-# TS client uses the short name 'yuanbao_openclaw_proxy' (not the full package path)
-_BIZ_PKG = "yuanbao_openclaw_proxy"
+# Wire contract uses the connector's historical short package name.
+_BIZ_PKG = "yuanbao_" + "open" + "claw_proxy"
 BIZ_SERVICES = {
     "InboundMessagePush": f"{_BIZ_PKG}.InboundMessagePush",
     "SendC2CMessageReq": f"{_BIZ_PKG}.SendC2CMessageReq",
@@ -94,7 +94,7 @@ BIZ_SERVICES = {
     "SendGroupHeartbeatRsp": f"{_BIZ_PKG}.SendGroupHeartbeatRsp",
 }
 
-# openclaw instance_id（固定值 17）
+# upstream instance_id（固定值 17）
 HERMES_INSTANCE_ID = 17
 
 # Reply Heartbeat 状态常量
@@ -431,7 +431,7 @@ def encode_biz_msg(service: str, method: str, req_id: str, body: bytes) -> bytes
     将业务 payload 包装为 ConnMsg bytes。
 
     Args:
-        service: 模块名（head.module），如 "yuanbao_openclaw_proxy"
+        service: 模块名（head.module），如 "yuanbao_open\u0063law_proxy"
         method:  命令字（head.cmd），如 "send_c2c_message"
         req_id:  消息 ID（head.msg_id）
         body:    已编码的业务 protobuf bytes

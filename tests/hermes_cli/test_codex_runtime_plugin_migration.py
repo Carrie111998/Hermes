@@ -166,7 +166,7 @@ class TestMigrate:
 
     def test_plugin_discovery_writes_plugin_blocks(self, tmp_path, monkeypatch):
         """Discovered curated plugins land as [plugins."<name>@<marketplace>"]
-        blocks. This is what OpenClaw calls 'migrate native codex plugins.'"""
+        blocks. This is what upstream calls 'migrate native codex plugins.'"""
         from hermes_cli import codex_runtime_plugin_migration as crpm
 
         def fake_query(codex_home=None, timeout=8.0):

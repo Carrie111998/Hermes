@@ -259,7 +259,7 @@ explains why and what to do differently.
 
 `cua-driver skills status` shows what's installed and which agent
 harnesses it's linked into. Today the autodetect list covers Claude
-Code, Codex, OpenCode, OpenClaw, and Antigravity; **Hermes
+Code, Codex, OpenCode, upstream, and Antigravity; **Hermes
 autodetection is planned as a follow-up in `trycua/cua`** — until
 then, run `cua-driver skills install` once and point your harness at
 the resulting `~/.cua-driver/skills/cua-driver` directory (or symlink

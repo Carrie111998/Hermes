@@ -10,7 +10,7 @@ Ported from [JimLiu/baoyu-skills](https://github.com/JimLiu/baoyu-skills) v1.57.
 
 | Change | Upstream | Hermes |
 |--------|----------|--------|
-| Metadata namespace | `openclaw` | `hermes` |
+| Metadata namespace | `upstream` | `hermes` |
 | Trigger | `/baoyu-article-illustrator` slash command + CLI flags | Natural language skill matching |
 | User config | EXTEND.md (project/user/XDG paths) + first-time-setup | Removed — not part of Hermes infra |
 | User prompts | `AskUserQuestion` (batched, multi-question) | `clarify` tool (one question at a time) |

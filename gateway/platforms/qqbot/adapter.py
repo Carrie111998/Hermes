@@ -516,7 +516,7 @@ class QQAdapter(BasePlatformAdapter):
     async def _listen_loop(self) -> None:
         """Read WebSocket events and reconnect on errors.
 
-        Close code handling follows the OpenClaw qqbot reference implementation:
+        Close code handling follows the upstream qqbot reference implementation:
           4004 → invalid token, refresh and reconnect
           4006/4007/4009 → session invalid, clear session and re-identify
           4008 → rate limited, back off 60s
@@ -1681,7 +1681,7 @@ class QQAdapter(BasePlatformAdapter):
     ) -> Dict[str, Any]:
         """Process inbound attachments (all message types).
 
-        Mirrors OpenClaw's ``processAttachments`` — handles images, voice, and
+        Mirrors upstream's ``processAttachments`` — handles images, voice, and
         other files uniformly.
 
         Returns a dict with:
@@ -2198,7 +2198,7 @@ class QQAdapter(BasePlatformAdapter):
         """
         extra = self.config.extra or {}
 
-        # 1. Plugin-specific STT config (matches OpenClaw's channels.qqbot.stt)
+        # 1. Plugin-specific STT config (matches upstream's channels.qqbot.stt)
         stt_cfg = extra.get("stt")
         if isinstance(stt_cfg, dict) and stt_cfg.get("enabled") is not False:
             base_url = stt_cfg.get("baseUrl") or stt_cfg.get("base_url", "")

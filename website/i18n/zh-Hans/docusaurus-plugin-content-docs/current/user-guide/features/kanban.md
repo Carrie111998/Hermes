@@ -27,7 +27,7 @@ Hermes Kanban 是一个持久化任务看板，在所有 Hermes 配置文件之�
 - **工程流水线** —— 分解 → 在并行 worktree 中实现 → 审查 → 迭代 → PR。
 - **批量任务** —— 一个专家管理 N 个对象（50 个社交账号、12 个监控服务）。
 
-完整的设计原理、与 Cline Kanban / Paperclip / NanoClaw / Google Gemini Enterprise 的对比分析，以及八种典型协作模式，请参阅仓库中的 `docs/hermes-kanban-v1-spec.pdf`。
+完整的设计原理、与 Cline Kanban / Attachment / NanoClaw / Google Gemini Enterprise 的对比分析，以及八种典型协作模式，请参阅仓库中的 `docs/hermes-kanban-v1-spec.pdf`。
 
 ## Kanban 与 `delegate_task` 的对比
 

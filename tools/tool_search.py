@@ -4,7 +4,7 @@ When enabled, MCP and non-core plugin tools are replaced in the model-visible
 tools array by three bridge tools — ``tool_search``, ``tool_describe``,
 ``tool_call`` — and surfaced on demand. Core Hermes tools never defer.
 
-Design constraints this module is built around (see ``openclaw-tool-search-report``
+Design constraints this module is built around (see ``upstream-tool-search-report``
 for the full rationale):
 
 * Core tools defined in ``toolsets._HERMES_CORE_TOOLS`` are *never* deferred.
@@ -24,7 +24,7 @@ for the full rationale):
       reachable; individual tools are discoverable only via ``tool_search``.
 * The catalog is stateless across turns and tools-array assemblies. It is
   rebuilt from the current tool-defs list every time. This is the lesson
-  from OpenClaw's cron regression (openclaw/openclaw#84141): a session-keyed
+  from upstream's cron regression (third-party reference #84141): a session-keyed
   catalog that drifts out of sync with the live tool registry produces
   silent tool dropouts.
 * Bridge tools route through ``model_tools.handle_function_call`` exactly

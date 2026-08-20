@@ -11,7 +11,7 @@ import { describe, expect, it } from "vitest";
 // Clipboard READS (paste paths) have no equivalent legacy fallback and are
 // exempt; they must feature-detect and fail soft instead.
 //
-// Ported from paperclipai/paperclip#10875.
+// Ported from third-party reference #10875.
 
 const SRC_ROOT = join(__dirname, "..");
 

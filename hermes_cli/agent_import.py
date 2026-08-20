@@ -7,12 +7,11 @@ Usage:
     hermes import-agent claude-code --dry-run # preview only, no changes
     hermes import-agent codex --source /path/to/.codex
 
-Follows the OpenClaw migration pattern (``hermes claw migrate`` /
-``optional-skills/migration/openclaw-migration/scripts/openclaw_to_hermes.py``):
+Uses a preview-first import pattern:
 detect → parse → map → apply, with a mandatory preview phase, per-item
 imported/skipped/conflict/error records, and a ``--dry-run`` that writes
 nothing.  The memory-entry merge and allowlist-merge primitives here are
-self-contained ports of the openclaw script's equivalents so this command
+self-contained import helpers so this command
 works even when the optional migration skill is not installed.
 
 Mappings
@@ -51,11 +50,11 @@ from utils import atomic_write_text, atomic_yaml_write
 
 logger = logging.getLogger(__name__)
 
-# Same entry delimiter as the Hermes memory store and the openclaw migration
-# script — memories/MEMORY.md entries are separated by bare "§" lines.
+# Same entry delimiter as the Hermes memory store and the import
+# pipeline — memories/MEMORY.md entries are separated by bare "§" lines.
 ENTRY_DELIMITER = "\n§\n"
 
-# Character budget for merged memory files (matches the openclaw script's
+# Character budget for merged memory files (matches the importer's
 # default memory limit).
 MEMORY_CHAR_LIMIT = 20_000
 
@@ -162,14 +161,14 @@ def dump_yaml_file(path: Path, data: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Memory-entry primitives (ported from openclaw_to_hermes.py)
+# Memory-entry primitives (shared import helpers)
 # ---------------------------------------------------------------------------
 
 def extract_markdown_entries(text: str) -> List[str]:
     """Split a markdown document into individual memory entries.
 
     Headings become context prefixes, bullets and paragraphs become entries.
-    Code blocks and tables are skipped.  Port of the openclaw migration
+    Code blocks and tables are skipped.  Import pipeline
     script's extractor.
     """
     entries: List[str] = []
@@ -277,7 +276,7 @@ def parse_existing_memory_entries(path: Path) -> List[str]:
 def backup_memory_file(path: Path) -> Optional[Path]:
     """Snapshot ``path`` before a destructive rewrite; return the backup path.
 
-    Restores parity with the openclaw migration script this module was ported
+    Restores parity with the upstream migration script this module was ported
     from, which calls ``maybe_backup(destination)`` before rewriting a memory
     store.  Uses the same ``<name>.bak.<unix_ts>`` naming as
     ``MemoryStore._backup_drifted_file``.  Returns None when there is nothing
@@ -967,7 +966,7 @@ def import_agent_command(args) -> None:
 
 
 def print_import_report(report: Dict[str, Any], dry_run: bool) -> None:
-    """Print a formatted per-item import report (claw-migrate style)."""
+    """Print a formatted per-item import report (preview-first)."""
     from hermes_cli.setup import Colors, color, print_header, print_info
 
     summary = report.get("summary", {})

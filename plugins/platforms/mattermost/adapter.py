@@ -57,7 +57,7 @@ def _get_scoped_secret(name, default=None):
 logger = logging.getLogger(__name__)
 
 # Mattermost post size limit (server default is 16383, but 4000 is the
-# practical limit for readable messages — matching OpenClaw's choice).
+# practical limit for readable messages — matching upstream's choice).
 MAX_POST_LENGTH = 4000
 
 # Channel type codes returned by the Mattermost API.
