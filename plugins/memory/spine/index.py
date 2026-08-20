@@ -2,7 +2,7 @@
 
 SQLite database with:
 - FTS5 full-text search on observation content
-- sqlite-vec vector search (384-dim MiniLM embeddings)
+- brute-force vector search over packed float32 blobs (width set by the embedder)
 - dim_meta table to prevent silent mixed-dimension searches
 - Episodes + wiki chunks indexed alongside observations
 """
@@ -27,7 +27,23 @@ except ImportError:  # pragma: no cover — falls back to the pure-Python path
 
 logger = logging.getLogger(__name__)
 
-EMBEDDING_DIM = 384  # MiniLM-L6-v2
+# Vector width. Must match whatever the embedder actually produces: the packed
+# float32 blob format is fixed-width, and _stack() reshapes on this number, so a
+# mismatch does not error -- it silently reinterprets the bytes and returns
+# nonsense similarity scores. Read it from the embedder rather than hardcoding,
+# so swapping models cannot leave a stale 384 behind.
+def _resolve_embedding_dim() -> int:
+    try:
+        from .embedder import get_embedding_dim
+        d = get_embedding_dim()
+        if d:
+            return int(d)
+    except Exception:  # noqa: BLE001 — embedder unavailable; keep the legacy width
+        pass
+    return 384
+
+
+EMBEDDING_DIM = _resolve_embedding_dim()
 
 # Recency scoring constants. NOTE (found 2026-07-30): despite the name and
 # SpineConfig having matching `recency_half_life_hours`/`recency_weight`

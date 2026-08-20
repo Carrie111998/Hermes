@@ -63,6 +63,44 @@ def check_embedder(cfg):
     return OK, f"loads, dim {dim}"
 
 
+def check_vector_width(cfg):
+    """Every stored vector must be the width the live embedder produces.
+
+    Added after a real incident on 2026-08-20: an embedding-model swap was
+    started, the re-embed was killed part way, and the code was left expecting
+    768-dim vectors against a 384-dim store. Search did not error. It returned
+    three confident, entirely wrong results. `check_vectors` passed throughout,
+    because every row still had *a* vector -- just the wrong shape.
+
+    A width mismatch is unrecoverable by retry: it needs a completed re-embed or
+    a revert, so it is reported loudly rather than left to look healthy.
+    """
+    from spine import embedder
+    if not embedder.embedder_available():
+        return SKIP, "embedder unavailable, cannot compare widths"
+    want = embedder.get_embedding_dim()
+    if not want:
+        return SKIP, "embedder reports no dimension"
+    con = sqlite3.connect(cfg.db)
+    con.execute("PRAGMA query_only = ON")
+    try:
+        widths = set()
+        for table in ("observations", "wiki_chunks"):
+            for (blob,) in con.execute(
+                    f"SELECT embedding FROM {table} WHERE embedding IS NOT NULL"):
+                if isinstance(blob, (bytes, memoryview)):
+                    widths.add(len(blob) // 4)
+    finally:
+        con.close()
+    if not widths:
+        return SKIP, "no vectors stored"
+    if widths != {want}:
+        return FAIL, (f"embedder produces {want}-dim vectors but the store holds "
+                      f"{sorted(widths)} — search will return confident nonsense; "
+                      f"finish the re-embed or revert the model")
+    return OK, f"all vectors {want}-dim, matching the live embedder"
+
+
 def check_vectors(cfg):
     con = sqlite3.connect(cfg.db)
     con.execute("PRAGMA query_only = ON")
@@ -214,6 +252,7 @@ def check_hotcore_coverage(cfg):
 CHECKS = [
     ("embedder", check_embedder),
     ("vectors", check_vectors),
+    ("vector_width", check_vector_width),
     ("hotcore", check_hotcore),
     ("hotcore_coverage", check_hotcore_coverage),
     ("sync", check_sync),
