@@ -269,8 +269,11 @@ class TestPostStopInterruptSwallow:
             def __init__(self):
                 self.interrupt_reasons = []
 
-            def interrupt(self, reason=None):
+            def hard_interrupt(self, reason=None):
                 self.interrupt_reasons.append(reason)
+
+            def interrupt(self, reason=None):
+                self.interrupt_reasons.append(("soft", reason))
 
         agent = _RecordingAgent()
         agent._gateway_turn_process_task_id = "session-123"
@@ -306,6 +309,12 @@ class TestPostStopInterruptSwallow:
 
         monkeypatch.setattr(process_registry, "kill_started_since", _record_reap)
 
+        delegated = []
+        monkeypatch.setattr(
+            "tools.async_delegation.interrupt_all",
+            lambda reason=None: delegated.append(reason) or 0,
+        )
+
         await runner._interrupt_and_clear_session(
             session_key,
             source,
@@ -314,6 +323,7 @@ class TestPostStopInterruptSwallow:
         )
 
         assert agent.interrupt_reasons == [_INTERRUPT_REASON_STOP]
+        assert delegated == [_INTERRUPT_REASON_STOP]
         assert released == [session_key]
         assert reaped_event.wait(1)
         assert reaped == [
