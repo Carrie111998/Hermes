@@ -2775,11 +2775,15 @@ def _handle_write_file(args, **kw):
         )
     if "content" not in args:
         # Echo back what WAS sent so the agent can see exactly which field dropped.
+        # Args always contain 'path' here (guarded above), so the sorted list is
+        # never empty and the "(none)" fallback is unreachable; keep it as a
+        # belt-and-braces guard in case the upstream guard is ever relaxed.
         received = ", ".join(sorted(args.keys())) or "(none)"
-        # Detect the .tmp placeholder typo pattern (e.g. "SKILL.md.tmp" or
-        # "PLACEHOLDER_NOT_USED.md") — the agent's first version of a write often
-        # uses a placeholder path while the content is being assembled, and the
-        # content gets dropped when the path is finalized.
+        # Detect the .tmp placeholder typo pattern (e.g. "SKILL.md.tmp") —
+        # the agent's first version of a write often uses a placeholder path
+        # while the content is being assembled, and the content gets dropped
+        # when the path is finalized. We only detect `.tmp` here; broader
+        # placeholder-name heuristics belong in a separate, opt-in check.
         path_str = args.get("path", "")
         tmp_hint = ""
         if path_str.endswith(".tmp"):

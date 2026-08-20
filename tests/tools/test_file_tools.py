@@ -153,19 +153,22 @@ class TestWriteFileHandler:
     def test_missing_content_without_tmp_path_has_no_placeholder_hint(self):
         """Empty content + non-.tmp path should NOT trigger the placeholder hint."""
         result = _handle_write_file({"path": "/some/real.md"})
-        err = result["error"] if isinstance(result, dict) else result
+        err = json.loads(result)["error"]
         assert isinstance(err, str)
         assert "missing required field 'content'" in err
         assert "Received args: path" in err
         # No .tmp hint should appear
         assert "placeholder" not in err.lower()
 
-    def test_missing_content_with_empty_args_lists_none(self):
-        """Empty args dict should report 'Received args: (none)'."""
+    def test_received_args_lists_path(self):
+        """When only `path` is provided, Received args echoes back exactly that."""
         result = _handle_write_file({"path": "/some/real.md"})
-        # Should error on missing content (not missing path)
-        err = result["error"] if isinstance(result, dict) else result
-        assert "Received args:" in err
+        err = json.loads(result)["error"]
+        assert "Received args: path" in err
+        # The `(none)` fallback is unreachable in the current handler flow
+        # (the path guard above guarantees args is non-empty by this point);
+        # verify the live output does not contain it.
+        assert "(none)" not in err
 
 
 class TestPatchHandler:
