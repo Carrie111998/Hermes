@@ -274,7 +274,7 @@ class TestBuildSkillsSystemPrompt:
             (d / "SKILL.md").write_text("---\ndescription: Search stuff\n---\n")
         result = build_skills_system_prompt()
         # "search" should appear only once per category
-        assert result.count("- search") == 1
+        assert result.count("invocation_name: search") == 1
 
     def test_excludes_incompatible_platform_skills(self, monkeypatch, tmp_path):
         """Skills with platforms: [macos] should not appear on Linux."""
@@ -1268,5 +1268,4 @@ class TestOpenAIModelExecutionGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 

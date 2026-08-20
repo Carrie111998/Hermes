@@ -233,6 +233,15 @@ class TestFindAllSkills:
         assert len(skills) == 1
         assert skills[0]["category"] == "mlops"
 
+    def test_exposes_invocation_name_separately_from_category_and_path(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "lah-repo-router", category="software-development")
+            skill = _find_all_skills()[0]
+        assert skill["invocation_name"] == "lah-repo-router"
+        assert skill["name"] == "lah-repo-router"
+        assert skill["category"] == "software-development"
+        assert skill["path"] == "software-development/lah-repo-router/SKILL.md"
+
     def test_description_from_body_when_missing(self, tmp_path):
         """If no description in frontmatter, first non-header line is used."""
         skill_dir = tmp_path / "no-desc"
