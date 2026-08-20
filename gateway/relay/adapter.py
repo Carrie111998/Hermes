@@ -351,6 +351,18 @@ class RelayAdapter(BasePlatformAdapter):
         anchor = md.get("thread_ts") or md.get("thread_id") or ""
         return f"{chat_id}:{anchor}"
 
+    # Cap for the draft/seal coordination dicts, matching the sibling
+    # bounded caches (_auto_thread_by_chat). Entries are per-turn keys;
+    # 512 in-flight-or-recent turns per adapter is far beyond any real
+    # concurrency, and matches the connector's tombstone store size.
+    _DRAFT_STATE_CAP = 512
+
+    @classmethod
+    def _evict_oldest(cls, d: Dict[str, int]) -> None:
+        """FIFO-bound a coordination dict in place (review M1)."""
+        while len(d) > cls._DRAFT_STATE_CAP:
+            d.pop(next(iter(d)), None)
+
     @staticmethod
     def _card_key(
         reply_to: Optional[str], metadata: Optional[Dict[str, Any]]
@@ -442,6 +454,7 @@ class RelayAdapter(BasePlatformAdapter):
         # and no history message would ever be posted.
         if self.draft_stream_is_message:
             self._open_draft_by_chat[chat_key] = draft_id
+            self._evict_oldest(self._open_draft_by_chat)
         try:
             result = await self._transport.send_outbound(
                 {
@@ -480,6 +493,12 @@ class RelayAdapter(BasePlatformAdapter):
         # ack says, this draft_id's stream must never be re-armed by a
         # straggler frame — the connector-side tombstone handles its half.
         self._sealed_draft_by_chat[draft_key] = draft_id
+        # Bounded like the sibling caches (review M1): the key embeds a
+        # per-turn identity, so an unbounded dict grows one entry per turn
+        # for the life of the process. FIFO eviction matches the
+        # straggler window this tombstone exists for (seconds, not days);
+        # the connector holds its own 512-entry tombstone store.
+        self._evict_oldest(self._sealed_draft_by_chat)
         if self._transport is None:
             return SendResult(success=False, error="no transport")
         seal_frame = {
