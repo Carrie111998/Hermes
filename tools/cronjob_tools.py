@@ -352,6 +352,16 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
             # send_message, which passes HERMES_SESSION_USER_ID to
             # gateway.mirror.mirror_to_session. Harmless for DMs/shared sessions.
             "user_id": get_session_env("HERMES_SESSION_USER_ID") or None,
+            # Workspace/server scope (Slack team, Discord guild, Matrix
+            # server). build_session_key embeds it in every Slack session key
+            # (dm/group/thread alike), so a continuable cron seed built
+            # WITHOUT it creates a row no scoped reply ever resolves to —
+            # the seeded key is agent:main:slack:dm:<chat>:<thread> while the
+            # reply keys agent:main:slack:dm:<team>:<chat>:<thread>. Captured
+            # here so the scheduler's seed helpers can reproduce the reply's
+            # exact key. Same session-context var async_delegation already
+            # snapshots; None for platforms without scope.
+            "scope_id": get_session_env("HERMES_SESSION_SCOPE_ID") or None,
         }
     return None
 
@@ -638,6 +648,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "last_run_at": job.get("last_run_at"),
         "last_status": job.get("last_status"),
         "last_delivery_error": job.get("last_delivery_error"),
+        "last_fire_error": job.get("last_fire_error"),
         "enabled": job.get("enabled", True),
         # Derive from enabled so half-paused records never render as paused.
         "state": effective_job_state(job),
