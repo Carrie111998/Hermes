@@ -125,10 +125,13 @@ def test_changed_workspace_resolution_updates_row_and_emits_payload_atomically(
         )
 
         task = kb.get_task(conn, task_id)
-        events = _event(conn, task_id, "workspace_resolved")
+        history = kb.list_events(conn, task_id)
+        events = [event for event in history if event.kind == "workspace_resolved"]
         created_after = _event(conn, task_id, "created")[0]
 
     assert changed is True
+    assert [event.kind for event in history] == ["created", "workspace_resolved"]
+    assert history[0].id < history[1].id
     assert task.workspace_path == str(resolved)
     assert task.branch_name == "wt/resolved"
     assert len(events) == 1
