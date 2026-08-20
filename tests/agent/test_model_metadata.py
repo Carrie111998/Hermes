@@ -371,6 +371,46 @@ class TestDefaultContextLengths:
                     f"{model_id}: expected {expected_ctx}, got {actual}"
                 )
 
+    def test_glm_5_3_resolves_to_1m_not_glm_catchall(self):
+        """GLM-5.3 must resolve to 1M, not the generic ``glm`` 202,752 fallback.
+
+        GLM-5.3 (preview, 2026-08-14) ships with a 1M context window per
+        models.dev catalog metadata (limit.context = 1,048,576; output
+        131,072). Before the dedicated ``glm-5.3`` entry existed, the slug
+        fell through longest-key-first substring matching to the generic
+        ``glm`` catch-all (202,752), silently capping the window at ~202K
+        on endpoints that don't self-report (e.g. the BigModel
+        Anthropic-compatible gateway serving ``glm-5.3``).
+        """
+        from agent.model_metadata import get_model_context_length
+        from unittest.mock import patch as mock_patch
+
+        assert "glm-5.3" in DEFAULT_CONTEXT_LENGTHS
+        assert DEFAULT_CONTEXT_LENGTHS["glm-5.3"] == 1_048_576
+
+        # Longest-first substring matching must resolve the bare slug,
+        # vendor-prefixed OpenRouter forms, and :thinking variants to 1M —
+        # and must NOT touch the legacy ~202K ``glm`` catch-all.
+        with mock_patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             mock_patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+             mock_patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             mock_patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
+             mock_patch("agent.models_dev.lookup_models_dev_context", return_value=None):
+            for model in (
+                "glm-5.3",
+                "zai-org/glm-5.3",
+                "glm-5.3:thinking",
+            ):
+                assert get_model_context_length(model) == 1_048_576, (
+                    f"{model} should resolve to 1M"
+                )
+
+            # Older GLM generations stay on the ~202K catch-all.
+            for model in ("glm-5.1", "glm-4.7"):
+                assert get_model_context_length(model) == 202_752, (
+                    f"{model} should stay on the glm catch-all"
+                )
+
 
 
 
