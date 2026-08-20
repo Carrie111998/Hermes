@@ -426,6 +426,7 @@ if _try_ultrafast_version():
     raise SystemExit(0)
 
 import argparse
+import atexit
 import hashlib
 import json
 import re
@@ -433,6 +434,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -692,6 +694,47 @@ def _apply_profile_override() -> None:
 
 
 _apply_profile_override()
+
+
+def _early_subcommand(argv: list[str]) -> str:
+    """Find the root subcommand without constructing the full argparse tree."""
+    value_options = {
+        "-z", "--oneshot", "--usage-file", "-m", "--model", "--provider",
+        "--reasoning", "-t", "--toolsets", "--resume", "-r", "--in",
+        "--skills", "-s",
+    }
+    optional_value_options = {"--continue", "-c"}
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in value_options:
+            i += 2
+            continue
+        if arg in optional_value_options:
+            i += 2 if i + 1 < len(argv) and not argv[i + 1].startswith("-") else 1
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        return arg
+    return ""
+
+
+# ``prompt-size`` is a read-only diagnostic. Redirect startup-time writes
+# (SOUL bootstrap, logs, caches, state.db) before dotenv/logging initialization,
+# while retaining the resolved profile as the source to inspect.
+if _early_subcommand(sys.argv[1:]) == "prompt-size":
+    from hermes_constants import get_hermes_home as _prompt_size_source_home
+    from hermes_cli.prompt_size import prepare_prompt_inspection_home
+
+    _prompt_size_source = _prompt_size_source_home().resolve()
+    _prompt_size_temp = Path(
+        tempfile.mkdtemp(prefix="hermes-prompt-size-cli-")
+    ).resolve()
+    prepare_prompt_inspection_home(_prompt_size_source, _prompt_size_temp)
+    os.environ["HERMES_PROMPT_SIZE_SOURCE_HOME"] = str(_prompt_size_source)
+    os.environ["HERMES_HOME"] = str(_prompt_size_temp)
+    atexit.register(shutil.rmtree, _prompt_size_temp, ignore_errors=True)
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.

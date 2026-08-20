@@ -1,6 +1,9 @@
 """Tests for the ``hermes prompt-size`` diagnostic (issue #34667)."""
 
 import json
+import os
+import socket
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +15,7 @@ from hermes_cli.prompt_size import (
     _build_inspection_agent,
     _compute_skills_breakdown,
     compute_prompt_breakdown,
+    prepare_prompt_inspection_home,
     render_breakdown,
 )
 
@@ -50,8 +54,84 @@ def test_runs_offline_without_credentials(isolated_home, monkeypatch):
     for var in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "NOUS_API_KEY",
                 "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(var, raising=False)
+    before = sorted(
+        str(path.relative_to(isolated_home))
+        for path in isolated_home.rglob("*")
+    )
+
+    def deny_network(self, address):
+        raise AssertionError(f"network attempted: {address}")
+
+    monkeypatch.setattr(socket.socket, "connect", deny_network)
     data = compute_prompt_breakdown("cli")
     assert data["system_prompt"]["bytes"] > 0
+    after = sorted(
+        str(path.relative_to(isolated_home))
+        for path in isolated_home.rglob("*")
+    )
+    assert after == before
+
+
+def test_cli_prompt_size_leaves_source_home_unchanged(isolated_home):
+    (isolated_home / ".env").write_text(
+        "XAI_API_KEY=synthetic-test-key\n", encoding="utf-8"
+    )
+    before = {
+        str(path.relative_to(isolated_home)): (
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+        )
+        for path in isolated_home.rglob("*")
+    }
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", ""),
+        "LANG": "C.UTF-8",
+        "HERMES_HOME": str(isolated_home),
+        "NO_COLOR": "1",
+    }
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "--reasoning",
+            "high",
+            "prompt-size",
+            "--json",
+        ],
+        cwd=isolated_home.parent,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    json.loads(result.stdout)
+    after = {
+        str(path.relative_to(isolated_home)): (
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+        )
+        for path in isolated_home.rglob("*")
+    }
+    assert after == before
+
+
+def test_prepare_inspection_home_copies_profile_env(tmp_path):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    (source / ".env").write_text(
+        "XAI_API_KEY=synthetic-test-key\n", encoding="utf-8"
+    )
+
+    prepare_prompt_inspection_home(source, target)
+
+    assert (target / ".env").read_bytes() == (source / ".env").read_bytes()
 
 
 

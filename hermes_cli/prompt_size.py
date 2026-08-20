@@ -13,8 +13,13 @@ calls ``build_system_prompt_parts`` / inspects ``agent.tools`` offline.
 
 from __future__ import annotations
 
+import atexit
 import json
+import os
 import re
+import shutil
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,6 +36,58 @@ _NAMES_ONLY_LINE_RE = re.compile(r"^  .+ \[names only\]: (?P<names>.+)$")
 
 # Cap the human-readable "Skills by size" table; ``--json`` always has them all.
 _SKILLS_TABLE_LIMIT = 20
+
+
+def prepare_prompt_inspection_home(source: Path, target: Path) -> None:
+    """Copy/link read inputs needed for prompt inspection into *target*."""
+    source = source.resolve()
+    target = target.resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    for filename in ("config.yaml", "SOUL.md", ".env", ".skills_prompt_snapshot.json"):
+        src = source / filename
+        if src.is_file():
+            shutil.copy2(src, target / filename)
+    for dirname in ("memories", "plugins"):
+        src = source / dirname
+        if src.is_dir():
+            shutil.copytree(src, target / dirname, dirs_exist_ok=True)
+    skills = source / "skills"
+    if skills.is_dir():
+        try:
+            (target / "skills").symlink_to(skills, target_is_directory=True)
+        except OSError:
+            shutil.copytree(skills, target / "skills", dirs_exist_ok=True)
+
+
+@contextmanager
+def _isolated_inspection_home():
+    """Redirect all inspection-time writes to a disposable profile clone."""
+    from hermes_constants import (
+        get_hermes_home,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    preisolated_source = os.environ.get("HERMES_PROMPT_SIZE_SOURCE_HOME")
+    if preisolated_source:
+        yield get_hermes_home().resolve(), Path(preisolated_source).resolve()
+        return
+
+    source = get_hermes_home().resolve()
+    raw_temp = tempfile.mkdtemp(prefix="hermes-prompt-size-")
+    atexit.register(shutil.rmtree, raw_temp, ignore_errors=True)
+    target = Path(raw_temp).resolve()
+    try:
+        prepare_prompt_inspection_home(source, target)
+
+        token = set_hermes_home_override(str(target))
+        try:
+            yield target, source
+        finally:
+            reset_hermes_home_override(token)
+    except Exception:
+        shutil.rmtree(target, ignore_errors=True)
+        raise
 
 
 def _bytes(s: str) -> int:
@@ -72,9 +129,11 @@ def _build_inspection_agent(platform: str) -> Any:
     return AIAgent(
         model=model,
         api_key="inspect-only",
-        base_url="https://openrouter.ai/api/v1",
+        base_url="http://127.0.0.1:1/v1",
+        provider="custom",
         quiet_mode=True,
         save_trajectories=False,
+        skip_background_review=True,
         platform=platform,
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
@@ -232,6 +291,28 @@ def _compute_toolsets_breakdown(tools: List[Any]) -> List[Dict[str, Any]]:
     return out
 
 
+def _compute_tools_breakdown(tools: List[Any]) -> List[Dict[str, Any]]:
+    """Return per-tool schema and description sizes, largest description first."""
+    rows: List[Dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function")
+        if isinstance(fn, dict):
+            description = str(fn.get("description") or "")
+        else:
+            description = str(tool.get("description") or "")
+        rows.append(
+            {
+                "name": _tool_name(tool),
+                "description_chars": len(description),
+                "json_bytes": _bytes(json.dumps(tool, ensure_ascii=False)),
+            }
+        )
+    rows.sort(key=lambda row: (-row["description_chars"], row["name"]))
+    return rows
+
+
 def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     """Return a dict of prompt-size measurements for a fresh session.
 
@@ -239,63 +320,83 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     ``user_profile``, ``tools`` (count + json bytes), ``sections`` (a list of
     (label, chars, bytes) for the three prompt tiers), ``skills_breakdown``
     (per-skill index-line + on-disk SKILL.md bytes, largest-first), and
-    ``toolsets_breakdown`` (per-toolset tool count + schema json bytes,
-    largest-first). The last two answer "what should I disable to cut tokens?".
+    ``toolsets_breakdown`` (per-toolset tool count + schema json bytes), and
+    ``tools_breakdown`` (per-tool description/schema size, largest-first).
+    These answer "what should I disable or shorten to cut tokens?".
     """
     from agent.system_prompt import build_system_prompt, build_system_prompt_parts
 
-    agent = _build_inspection_agent(platform)
+    with _isolated_inspection_home() as (inspection_home, source_home):
+        agent = _build_inspection_agent(platform)
+        try:
+            parts = build_system_prompt_parts(agent)
+            full = build_system_prompt(agent)
 
-    parts = build_system_prompt_parts(agent)
-    full = build_system_prompt(agent)
-
-    stable = parts.get("stable", "")
-    context = parts.get("context", "")
-    volatile = parts.get("volatile", "")
+            stable = parts.get("stable", "")
+            context = parts.get("context", "")
+            volatile = parts.get("volatile", "")
 
     # Skills index — the <available_skills> block (the largest single block
     # when many skills are installed). Lives in the volatile tier (moved from
     # stable so skill edits don't invalidate the cached identity prefix).
-    skills_match = _SKILLS_BLOCK_RE.search(volatile) or _SKILLS_BLOCK_RE.search(stable)
-    skills_index = skills_match.group(0) if skills_match else ""
+            skills_match = _SKILLS_BLOCK_RE.search(volatile) or _SKILLS_BLOCK_RE.search(stable)
+            skills_index = skills_match.group(0) if skills_match else ""
 
     # Memory + user profile live in the volatile tier. We re-derive their
     # blocks directly from the memory store so the numbers are attributable
     # even though they're joined into ``volatile``.
-    memory_block = ""
-    user_block = ""
-    store = getattr(agent, "_memory_store", None)
-    if store is not None:
-        try:
-            if getattr(agent, "_memory_enabled", True):
-                memory_block = store.format_for_system_prompt("memory") or ""
-            if getattr(agent, "_user_profile_enabled", True):
-                user_block = store.format_for_system_prompt("user") or ""
-        except Exception:
-            pass
+            memory_block = ""
+            user_block = ""
+            store = getattr(agent, "_memory_store", None)
+            if store is not None:
+                try:
+                    if getattr(agent, "_memory_enabled", True):
+                        memory_block = store.format_for_system_prompt("memory") or ""
+                    if getattr(agent, "_user_profile_enabled", True):
+                        user_block = store.format_for_system_prompt("user") or ""
+                except Exception:
+                    pass
 
     # Tool-schema JSON — the other half of the fixed per-call payload.
-    tools = getattr(agent, "tools", None) or []
-    tools_json = json.dumps(tools, ensure_ascii=False)
+            tools = getattr(agent, "tools", None) or []
+            tools_json = json.dumps(tools, ensure_ascii=False)
 
-    sections: List[Tuple[str, int, int]] = [
-        ("stable (identity/guidance/skills)", len(stable), _bytes(stable)),
-        ("context (AGENTS.md/cwd files)", len(context), _bytes(context)),
-        ("volatile (memory/profile/timestamp)", len(volatile), _bytes(volatile)),
-    ]
+            sections: List[Tuple[str, int, int]] = [
+                ("stable (identity/guidance/skills)", len(stable), _bytes(stable)),
+                ("context (AGENTS.md/cwd files)", len(context), _bytes(context)),
+                ("volatile (memory/profile/timestamp)", len(volatile), _bytes(volatile)),
+            ]
 
-    return {
-        "platform": platform,
-        "model": getattr(agent, "model", "") or "",
-        "system_prompt": {"chars": len(full), "bytes": _bytes(full)},
-        "skills_index": {"chars": len(skills_index), "bytes": _bytes(skills_index)},
-        "memory": {"chars": len(memory_block), "bytes": _bytes(memory_block)},
-        "user_profile": {"chars": len(user_block), "bytes": _bytes(user_block)},
-        "tools": {"count": len(tools), "json_bytes": _bytes(tools_json)},
-        "sections": sections,
-        "skills_breakdown": _compute_skills_breakdown(skills_index),
-        "toolsets_breakdown": _compute_toolsets_breakdown(tools),
-    }
+            skills_breakdown = _compute_skills_breakdown(skills_index)
+            for row in skills_breakdown:
+                raw_path = row.get("path")
+                if not raw_path:
+                    continue
+                try:
+                    relative = Path(raw_path).relative_to(inspection_home / "skills")
+                except ValueError:
+                    continue
+                source_path = source_home / "skills" / relative
+                if source_path.exists():
+                    row["path"] = str(source_path)
+
+            return {
+                "platform": platform,
+                "model": getattr(agent, "model", "") or "",
+                "system_prompt": {"chars": len(full), "bytes": _bytes(full)},
+                "skills_index": {"chars": len(skills_index), "bytes": _bytes(skills_index)},
+                "memory": {"chars": len(memory_block), "bytes": _bytes(memory_block)},
+                "user_profile": {"chars": len(user_block), "bytes": _bytes(user_block)},
+                "tools": {"count": len(tools), "json_bytes": _bytes(tools_json)},
+                "sections": sections,
+                "skills_breakdown": skills_breakdown,
+                "toolsets_breakdown": _compute_toolsets_breakdown(tools),
+                "tools_breakdown": _compute_tools_breakdown(tools),
+            }
+        finally:
+            close = getattr(agent, "close", None)
+            if callable(close):
+                close()
 
 
 def _fmt_kb(n: int) -> str:
@@ -324,6 +425,20 @@ def render_breakdown(data: Dict[str, Any]) -> str:
     lines.append("")
     tools = data["tools"]
     lines.append(f"  Tool schemas         : {tools['json_bytes']:>8,} B  ({_fmt_kb(tools['json_bytes'])}, {tools['count']} tools)")
+
+    tool_rows = data.get("tools_breakdown") or []
+    if tool_rows:
+        lines.append("")
+        lines.append("  Tool descriptions by size (largest first):")
+        lines.append(f"    {'tool':<28} {'description':>12}  {'schema':>10}")
+        for row in tool_rows[:10]:
+            name = row["name"]
+            if len(name) > 28:
+                name = name[:27] + "…"
+            lines.append(
+                f"    {name:<28} {row['description_chars']:>10,} ch  "
+                f"{row['json_bytes']:>8,} B"
+            )
 
     # Per-toolset schema cost — which toolset's tools cost the most to ship.
     toolsets = data.get("toolsets_breakdown") or []
