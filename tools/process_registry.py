@@ -160,7 +160,7 @@ def _worker_memory_max_bytes() -> int:
             max(_MIN_WORKER_MEMORY_MAX_BYTES, physical_bytes // 2),
         )
         candidates.append(physical_bound)
-    except (OSError, ValueError, TypeError):
+    except (AttributeError, OSError, ValueError, TypeError):
         pass
 
     safe_bound = min(candidates) if candidates else _DEFAULT_WORKER_MEMORY_MAX_BYTES
