@@ -589,8 +589,9 @@ class TestBlockMessageGuidance:
         assert "tmpfs" in msg
         assert "Delete the clone" in msg
 
-    def test_scratch_hint_honors_hermes_home(self, repo, monkeypatch):
-        monkeypatch.setenv("HERMES_HOME", "/custom/hermes-home")
+    def test_scratch_hint_honors_hermes_home(self, repo, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "custom-hermes-home"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         hit, msg = _detect("git rebase origin/main", repo, repo)
         assert hit is True
-        assert "/custom/hermes-home/scratch" in msg
+        assert str(hermes_home / "scratch") in msg
