@@ -737,7 +737,7 @@ def stream_converse_with_callbacks(
     Args:
         event_stream: The boto3 ``converse_stream()`` response containing a
             ``stream`` key with an iterable of events.
-        on_text_delta: Called with each text chunk as it arrives. Only fires
+        on_text_delta: Called witheach text chunk as it arrives. Only fires
             when no tool_use blocks have been seen (same semantics as the
             Anthropic and chat_completions streaming paths).
         on_tool_start: Called with the tool name when a toolUse block begins.
