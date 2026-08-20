@@ -1693,6 +1693,12 @@ def _build_child_agent(
         inherited_disabled = [str(name) for name in raw_parent_disabled]
     else:
         inherited_disabled = []
+    # This hidden child-only capability is granted by construction, not
+    # inherited from the parent's configurable tool scope. A stale/raw config
+    # entry must not silently disable the only authoritative delivery channel.
+    inherited_disabled = [
+        name for name in inherited_disabled if name != "delegation_reply"
+    ]
     if effective_role == "orchestrator":
         # Role grants delegate_task explicitly, matching the unconditional
         # delegation toolset re-add below.
@@ -2028,6 +2034,9 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    # Per-conversation-attempt delivery state. Schema retries clear this list
+    # before the retry turn so rejected and corrected payloads never combine.
+    child._delegate_reply_chunks = []
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Ownership chain for the model-facing control plane (action=list/steer/
     # stop): a parent may only control agents whose weakref chain reaches it.
@@ -2317,7 +2326,7 @@ def _extract_reply_deliverable(child) -> Optional[str]:
         return None
     if not isinstance(chunks, list):
         return None
-    return "\n\n".join(chunks) if chunks else ""
+    return "\n\n".join(chunks) if chunks else None
 
 
 def _trim_summary_with_footer(
@@ -2969,6 +2978,17 @@ def _run_single_child(
             # is stuck on blocking I/O, wait=True would hang forever.
             _timeout_executor.shutdown(wait=False)
 
+        # Resolve the explicit delivery before schema validation. A child can
+        # legitimately emit the schema payload through delegate_tool_reply and
+        # then finish with non-schema cleanup prose; validating final_response
+        # would reject the wrong text and discard the authoritative payload.
+        _reply_deliverable = _extract_reply_deliverable(child)
+        _authoritative_summary = (
+            _reply_deliverable
+            if _reply_deliverable is not None
+            else result.get("final_response") or ""
+        )
+
         # T1-24: structured-output contract validation + ONE bounded retry.
         # Runs only when a schema was attached at dispatch; schema-less
         # delegations take none of these branches and their result entry
@@ -2985,7 +3005,7 @@ def _run_single_child(
                 validate_output,
             )
 
-            _first_text = result.get("final_response") or ""
+            _first_text = _authoritative_summary
             _schema_valid, _schema_errors = validate_output(
                 _first_text, _output_schema
             )
@@ -2999,6 +3019,9 @@ def _run_single_child(
                 # the contract in its context).
                 _schema_retries = 1
                 _retry_result = None
+                # Isolate attempts: a corrected delivery replaces the rejected
+                # attempt rather than being appended to it.
+                child._delegate_reply_chunks = []
                 try:
                     _retry_result = child.run_conversation(
                         user_message=build_retry_message(_schema_errors),
@@ -3012,9 +3035,15 @@ def _run_single_child(
                         _retry_exc,
                     )
                 if isinstance(_retry_result, dict):
-                    _retry_text = _retry_result.get("final_response") or ""
+                    _retry_deliverable = _extract_reply_deliverable(child)
+                    _retry_text = (
+                        _retry_deliverable
+                        if _retry_deliverable is not None
+                        else _retry_result.get("final_response") or ""
+                    )
                     if _retry_text.strip():
                         result["final_response"] = _retry_text
+                        _authoritative_summary = _retry_text
                     try:
                         result["api_calls"] = int(
                             result.get("api_calls", 0) or 0
@@ -3054,17 +3083,9 @@ def _run_single_child(
 
         duration = round(time.monotonic() - child_start, 2)
 
-        # Prefer the explicit deliverable channel: if the child called
-        # delegate_tool_reply, its content (recorded on the agent instance at
-        # execution time, outside the compressible messages[] transcript) is
-        # the authoritative result and replaces final_response. Falls back to
-        # final_response when the child never used the tool (strictly
-        # not-worse-than-status-quo).
-        _reply_deliverable = _extract_reply_deliverable(child)
-        if _reply_deliverable is not None:
-            summary = _reply_deliverable
-        else:
-            summary = result.get("final_response") or ""
+        # The explicit delivery channel, when used, already replaced the
+        # trailing-prose fallback before any optional schema validation.
+        summary = _authoritative_summary
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
