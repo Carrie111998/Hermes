@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import importlib
 import os
+import sys
 
 import pytest
 
@@ -17,15 +17,15 @@ from agent.secret_scope import (  # noqa: E402
 from hermes_cli.auth import resolve_api_key_provider_credentials  # noqa: E402
 from providers import get_provider_profile  # noqa: E402
 
-# Bundled model-provider plugins are loaded by the provider registry, which
-# installs their stable ``plugins.model_providers.<name>`` module aliases.
-# Trigger canonical discovery before importing the production package directly;
-# importing the synthetic alias first only worked when another test happened to
-# have populated it earlier in the same process.
+# Bundled model-provider plugins are loaded by the provider registry under a
+# synthetic module name. Trigger canonical discovery, then consume the exact
+# module objects installed by that loader. Importing the dotted synthetic name
+# through importlib is not a production contract: the loader intentionally does
+# not create an importable ``plugins.model_providers`` parent package.
 PROFILE = get_provider_profile("freemaxxing")
 assert PROFILE is not None
-PLUGIN = importlib.import_module("plugins.model_providers.freemaxxing")
-PROXY = importlib.import_module("plugins.model_providers.freemaxxing.proxy")
+PLUGIN = sys.modules["plugins.model_providers.freemaxxing"]
+PROXY = sys.modules["plugins.model_providers.freemaxxing.proxy"]
 
 
 @pytest.fixture(autouse=True)
