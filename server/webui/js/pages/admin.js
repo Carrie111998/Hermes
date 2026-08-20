@@ -6,7 +6,7 @@ import {
 } from '../ui.js';
 import { call } from '../api.js';
 import { db, emit } from '../state.js';
-import { updateSession } from '../session.js';
+import { getSession, updateSession } from '../session.js';
 import { countryName, recordTitle, providerLabel } from './_page-utils.js';
 
 const ADMIN_TABS = [
@@ -205,11 +205,43 @@ export async function mountLogs(root, ctx) {
     card({ flush: true, body: logsTable(res.items) }));
 }
 
+function selectWorkspace(company, ctx) {
+  updateSession({ company: { id: company.id, name: company.name } });
+  db.company = { ...db.company, id: company.id, name: company.name };
+  emit('company', db.company);
+  ctx.navigate('/admin/data-sources');
+}
+
+// Provider access is per tenant, so the catalog needs the X-Company-ID the
+// shell only sends once a workspace is selected, and the admin nav offers this
+// tab whether or not that ever happened. Asking which tenant beats letting the
+// backend answer "company_id is required for admin requests".
+async function mountSourceWorkspacePicker(root, ctx) {
+  const companies = (await call('admin.companies.list')).items || [];
+  withAdmin(root, ctx, 'Data Sources',
+    'Provider access is granted per customer. Choose whose catalog to manage.', '/admin/data-sources',
+    card({ flush: companies.length > 0, body: companies.length
+      ? dataTable({
+          columns: [
+            { key: 'name', label: 'Customer', render: company => recordTitle(company.name, company.status) },
+            { key: 'actions', label: 'Actions', width: '160px',
+              render: company => button('Manage sources', { size: 'sm', onClick: () => selectWorkspace(company, ctx) }) },
+          ],
+          rows: companies,
+        })
+      : emptyState({ icon: 'database', title: 'No customers exist yet',
+                     hint: 'Create a company first; provider access is stored per tenant.',
+                     action: button('Go to Companies', { onClick: () => ctx.navigate('/admin/companies') }) }) }));
+}
+
 export async function mountDataSources(root, ctx) {
+  if (!getSession()?.company?.id) return mountSourceWorkspacePicker(root, ctx);
   const res = await call('dataSources.catalog');
   const rows = res.items || res;
+  const workspace = getSession()?.company?.name || 'this workspace';
   withAdmin(root, ctx, 'Data Sources',
-    'Provider catalog, access state, health, licensing and tenant evidence lifecycle.', '/admin/data-sources',
+    `Provider catalog, access state, health, licensing and evidence lifecycle for ${workspace}.`,
+    '/admin/data-sources',
     el('div', { class: 'ifz-research-stack' },
       card({ body: el('div', { class: 'ifz-grid cols-3' },
         statCard({ label: 'Cataloged sources', value: String(rows.length), delta: 'global catalog', deltaDir: 'flat' }),
