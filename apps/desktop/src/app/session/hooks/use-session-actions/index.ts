@@ -40,6 +40,7 @@ import {
   $currentProvider,
   $currentReasoningEffort,
   $messages,
+  $messagingSessions,
   $newChatWorkspaceTarget,
   $sessions,
   $yoloActive,
@@ -58,6 +59,7 @@ import {
   setFreshDraftReady,
   setIntroSeed,
   setMessages,
+  setMessagingSessions,
   setNewChatWorkspaceTarget,
   setResumeExhaustedSessionId,
   setResumeFailedSessionId,
@@ -1723,7 +1725,17 @@ export function useSessionActions({
       const removedPinId = removed ? sessionPinId(removed) : storedSessionId
       const removedIds = [storedSessionId, removed?.id, removed?._lineage_root_id]
 
+      // The messaging slice is a separate atom from recents; capture its rows so
+      // a failed delete can roll them back in lockstep with $sessions (#87716).
+      const removedMessagingRows = $messagingSessions
+        .get()
+        .filter(session => sessionMatchesStoredId(session, storedSessionId))
+
       setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
+      // Mirror the optimistic removal on the messaging slice: platform cards
+      // must clear instantly, not on the next refreshMessagingSessions cycle
+      // (which can lag the delete RPC by seconds) (#87716).
+      setMessagingSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
       // Evict from the project tree's optimistic layer too (the backend snapshot
       // still lists it until its next refresh), so grouped + flat views drop the
       // row in lockstep. Pin the tombstone against the projects.tree prune while
@@ -1769,6 +1781,13 @@ export function useSessionActions({
       } catch (err) {
         if (removed) {
           setSessions(prev => [removed, ...prev])
+        }
+
+        if (removedMessagingRows.length) {
+          setMessagingSessions(prev => [
+            ...removedMessagingRows,
+            ...prev.filter(session => !sessionMatchesStoredId(session, storedSessionId))
+          ])
         }
 
         untombstoneSessions(removedIds)
@@ -1827,8 +1846,18 @@ export function useSessionActions({
       const archivedPinId = archived ? sessionPinId(archived) : storedSessionId
       const archivedIds = [storedSessionId, archived?.id, archived?._lineage_root_id]
 
+      // The messaging slice is a separate atom from recents; capture its rows so
+      // a failed archive can roll them back in lockstep with $sessions (#87716).
+      const archivedMessagingRows = $messagingSessions
+        .get()
+        .filter(session => sessionMatchesStoredId(session, storedSessionId))
+
       // Soft-hide: drop from the sidebar immediately, keep the data.
       setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
+      // Mirror the optimistic removal on the messaging slice: platform cards
+      // must clear instantly, not on the next refreshMessagingSessions cycle
+      // (which can lag the archive RPC by seconds) (#87716).
+      setMessagingSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
       tombstoneSessions(archivedIds)
       beginSessionMutation(archivedIds)
       $pinnedSessionIds.set(previousPinned.filter(id => id !== storedSessionId && id !== archivedPinId))
@@ -1856,6 +1885,13 @@ export function useSessionActions({
       } catch (err) {
         if (archived) {
           setSessions(prev => [archived, ...prev.filter(session => !sessionMatchesStoredId(session, storedSessionId))])
+        }
+
+        if (archivedMessagingRows.length) {
+          setMessagingSessions(prev => [
+            ...archivedMessagingRows,
+            ...prev.filter(session => !sessionMatchesStoredId(session, storedSessionId))
+          ])
         }
 
         untombstoneSessions(archivedIds)
