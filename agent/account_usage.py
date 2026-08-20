@@ -7,8 +7,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
 
-import httpx
-
 from agent.anthropic_adapter import _is_oauth_token, resolve_anthropic_token
 from hermes_cli.auth import AuthError, _read_codex_tokens, resolve_codex_runtime_credentials
 from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -17,6 +15,73 @@ if TYPE_CHECKING:
     from typing import TypeGuard
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Lazy httpx
+# ---------------------------------------------------------------------------
+#
+# This module used to carry ``import httpx`` at module scope, which silently
+# undid the identical work already done in ``hermes_cli.auth`` (see the long
+# note there): httpx 0.28.1's ``__init__`` runs ``from ._main import main``,
+# dragging in click, rich and pygments for a CLI nothing here uses.
+#
+# MEASURED on this box 2026-08-20, and this is why it mattered:
+#   ``import httpx``          7.56 s      ``import httpx._client``   4.91 s
+# so the CLI subtree alone was ~2.65 s, and ``import ai_usage.__main__`` spent
+# 3.67 s of its 5.02 s total inside httpx -- 73%, paid at MODULE SCOPE on every
+# single run of the 5-minutely AIUsageCollector task.
+#
+# THE FAILURE THIS CAUSED: that task runs at Priority 7 = BELOW_NORMAL, which is
+# inherited by the child. The same import measured 15.54 s at Normal against
+# 475.12 s at BelowNormal (30.6x) -- longer than the task's own PT6M
+# ExecutionTimeLimit, so it was killed DURING IMPORT, 145 times in 7 days.
+# ``main()`` never ran, no fetch was attempted, and ``collect()``'s 90 s
+# cooperative deadline never got the chance to engage and carry values forward.
+# Deferring the cost past module scope is what lets ``collect()`` start, so a
+# slow run now degrades to carry-forward instead of producing nothing at all.
+#
+# NO ``TYPE_CHECKING`` import here, unlike hermes_cli/auth.py: that module has
+# seven annotation-only ``client: httpx.Client`` parameters that need the name
+# for type checkers. This module has none -- all six uses are runtime calls
+# inside functions that bind ``httpx`` locally -- so a TYPE_CHECKING import
+# would be dead weight and ruff's F401 rejects it.
+#
+# WHY THROUGH THE MODULE GLOBAL rather than a plain function-local import:
+# tests/agent/test_account_usage.py patches through the module attribute
+# (``monkeypatch.setattr(account_usage.httpx, "Client", ...)``, 10 sites). A
+# function-local import would fetch the real httpx and silently ignore that,
+# turning a mocked test into a live network call. ``__getattr__`` below serves
+# the attribute access by importing the real module and caching it here, so
+# those tests patch exactly the object they always did.
+#
+# Regression test: tests/agent/test_account_usage_import_cost.py
+# Mirrors: hermes_cli/auth.py (same pattern, same reason).
+
+
+def _ensure_httpx():
+    """Return the module-global ``httpx``, importing it on first use.
+
+    Reads ``globals()`` rather than importing directly, so a test that has
+    replaced ``agent.account_usage.httpx`` wholesale gets its replacement back.
+    """
+    module = globals().get("httpx")
+    if module is None:
+        import httpx as module
+
+        globals()["httpx"] = module
+    return module
+
+
+def __getattr__(name: str):
+    """Resolve ``agent.account_usage.httpx`` on first attribute access (PEP 562).
+
+    Keeps the module attribute that ``import httpx`` used to provide, without
+    paying for it at import time.
+    """
+    if name == "httpx":
+        return _ensure_httpx()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _utc_now() -> datetime:
@@ -534,6 +599,7 @@ def _fetch_codex_account_usage(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> Optional[AccountUsageSnapshot]:
+    httpx = _ensure_httpx()
     token, resolved_base_url, account_id = _resolve_codex_usage_credentials(base_url, api_key)
     headers = {
         "Authorization": f"Bearer {token}",
@@ -634,6 +700,7 @@ def redeem_codex_reset_credit(
     """
     import uuid
 
+    httpx = _ensure_httpx()
     try:
         token, resolved_base_url, account_id = _resolve_codex_usage_credentials(base_url, api_key)
     except Exception:
@@ -760,6 +827,7 @@ def redeem_codex_reset_credit(
 
 
 def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
+    httpx = _ensure_httpx()
     token = (resolve_anthropic_token() or "").strip()
     if not token:
         return None
@@ -821,6 +889,7 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
 
 
 def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[str]) -> Optional[AccountUsageSnapshot]:
+    httpx = _ensure_httpx()
     runtime = resolve_runtime_provider(
         requested="openrouter",
         explicit_base_url=base_url,
@@ -979,6 +1048,7 @@ def _fetch_kimi_account_usage(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> Optional[AccountUsageSnapshot]:
+    httpx = _ensure_httpx()
     token, resolved_base_url = _resolve_kimi_usage_credentials(base_url, api_key)
     headers = {
         "Authorization": f"Bearer {token}",
@@ -1061,6 +1131,7 @@ def _fetch_deepseek_account_usage(
        "balance_infos": [{"currency":"USD","total_balance":"9.74", ...}]}
     ``total_balance`` (a string) is the outstanding-$ figure the tray shows.
     """
+    httpx = _ensure_httpx()
     token, resolved_base_url = _resolve_deepseek_balance_credentials(base_url, api_key)
     headers = {
         "Authorization": f"Bearer {token}",
