@@ -32,7 +32,7 @@ except ImportError:
 
 # ── Constants ───────────────────────────────────────────────────────────────
 
-DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_MODEL = "9router/cbcn/deepseek-v4-flash"
 MAX_ADDED_LINES = 30
 
 # Secret patterns — if diff contains any, refuse to write and WARN
@@ -116,16 +116,40 @@ def resolve_skill_path(skill_arg: str | None, tasks_data: dict[str, Any]) -> str
         candidate = Path.home() / ".hermes" / "skills" / skill_name / "SKILL.md"
         if candidate.exists():
             return str(candidate)
-        # recursive search: ~/.hermes/skills/**/skill_name/SKILL.md
-        for p in (Path.home() / ".hermes" / "skills").rglob(f"{skill_name}/SKILL.md"):
-            return str(p)
-        # also try case-insensitive glob for common names
-        for p in (Path.home() / ".hermes" / "skills").rglob("SKILL.md"):
-            if p.parent.name.lower() == skill_name.lower():
-                return str(p)
+        # recursive search: ~/.hermes/skills/**/skill_name/SKILL.md (case-sensitive first)
+        skills_base = Path.home() / ".hermes" / "skills"
+        if skills_base.is_dir():
+            # collect exact matches
+            exact = list(skills_base.rglob(f"{skill_name}/SKILL.md"))
+            if exact:
+                if len(exact) > 1:
+                    print(f"[propose] WARN: multiple candidates for skill '{skill_name}':", file=sys.stderr)
+                    for p in sorted(exact):
+                        print(f"  - {p}", file=sys.stderr)
+                    print("  Hint: pass --skill <path> to specify explicitly", file=sys.stderr)
+                return str(sorted(exact)[0])
+            # case-insensitive fallback: rglob all SKILL.md and match parent dir
+            ci_matches: list[Path] = []
+            for p in skills_base.rglob("SKILL.md"):
+                if p.parent.name.lower() == skill_name.lower():
+                    ci_matches.append(p)
+            if ci_matches:
+                if len(ci_matches) > 1:
+                    print(f"[propose] WARN: multiple candidates for skill '{skill_name}' (case-insensitive):", file=sys.stderr)
+                    for p in sorted(ci_matches):
+                        print(f"  - {p}", file=sys.stderr)
+                    print("  Hint: pass --skill <path> to specify explicitly", file=sys.stderr)
+                return str(sorted(ci_matches)[0])
     # fallback: glob for hermes-agent anywhere under skills
-    for p in (Path.home() / ".hermes" / "skills").rglob("hermes-agent/SKILL.md"):
-        return str(p)
+    skills_base = Path.home() / ".hermes" / "skills"
+    if skills_base.is_dir():
+        fallbacks = list(skills_base.rglob("hermes-agent/SKILL.md"))
+        if fallbacks:
+            if len(fallbacks) > 1:
+                print("[propose] WARN: multiple hermes-agent candidates, using first:", file=sys.stderr)
+                for p in sorted(fallbacks):
+                    print(f"  - {p}", file=sys.stderr)
+            return str(sorted(fallbacks)[0])
     return str(Path.home() / ".hermes" / "skills" / "hermes-agent" / "SKILL.md")
 
 

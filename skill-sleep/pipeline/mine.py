@@ -166,7 +166,87 @@ def _has_tool_error(msg: dict) -> bool:
     return False
 
 
+def _extract_skill_names_from_system_prompt(system_prompt: str) -> list[str]:
+    """Extract skill names from system_prompt without logging raw content."""
+    if not system_prompt:
+        return []
+    names: list[str] = []
+    # pattern: skill_view(name='...') or skill_view(name="...")
+    for m in re.finditer(r"skill_view\s*\(\s*name\s*=\s*['\"]([^'\"]+)['\"]", system_prompt):
+        n = m.group(1).strip()
+        if n and n not in names:
+            names.append(n)
+    # also match bare skill identifiers like "hermes-agent" in skills listing
+    # only keep names that look like skill slugs (alphanum + hyphen/underscore)
+    return names
+
+
+def _extract_skill_names_from_messages(messages: list[dict]) -> list[str]:
+    """Extract skill names from messages/tool_calls without logging raw content."""
+    names: list[str] = []
+    for msg in messages or []:
+        # tool_calls: skill_view etc
+        for tc in msg.get("tool_calls") or []:
+            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+            fname = fn.get("name", "") or tc.get("name", "")
+            if fname in ("skill_view", "skill_manage"):
+                try:
+                    args_raw = fn.get("arguments", "") or ""
+                    args = json.loads(args_raw) if isinstance(args_raw, str) and args_raw.strip().startswith("{") else {}
+                    n = str(args.get("name") or "").strip()
+                    if n and n not in names:
+                        names.append(n)
+                except Exception:
+                    pass
+        # tool result content may be JSON with skill name
+        content = msg.get("content") or ""
+        if isinstance(content, str) and '"name"' in content and "skill" in content.lower():
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, dict):
+                    n = str(parsed.get("name") or "").strip()
+                    if n and re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$", n) and n not in names:
+                        # only accept if it looks like a skill name and came from skill tool
+                        tool_name = msg.get("tool_name") or ""
+                        if tool_name in ("skill_view", "skill_manage"):
+                            names.append(n)
+            except Exception:
+                pass
+        # slash command in user message: /skill or /skill_view
+        if msg.get("role") == "user" and isinstance(content, str):
+            m = re.search(r"/skill[\s_]+(\S+)", content, re.IGNORECASE)
+            if m:
+                n = m.group(1).strip().strip(",.;:")
+                if n and n not in names:
+                    names.append(n)
+    return names
+
+
 def _get_skill_name(session: dict) -> str:
+    # 1) explicit skills_used field if present (future hermes export)
+    skills_used = session.get("skills_used")
+    if isinstance(skills_used, list) and skills_used:
+        first = str(skills_used[0]).strip()
+        if first:
+            return first
+    if isinstance(skills_used, str) and skills_used.strip():
+        return skills_used.strip()
+
+    # 2) system_prompt: extract skill_view(name='...') mentions (privacy: never log raw)
+    sp = session.get("system_prompt") or ""
+    if isinstance(sp, str) and sp:
+        sp_skills = _extract_skill_names_from_system_prompt(sp)
+        if sp_skills:
+            return sp_skills[0]
+
+    # 3) messages: skill_view tool calls / tool results / /skill commands
+    msgs = session.get("messages") or []
+    if msgs:
+        msg_skills = _extract_skill_names_from_messages(msgs)
+        if msg_skills:
+            return msg_skills[0]
+
+    # 4) fallback: existing heuristics (title / cwd)
     title = session.get("title") or ""
     cwd = session.get("cwd") or ""
     m = re.search(r"skill[:\s]+(\S+)", title, re.IGNORECASE)
