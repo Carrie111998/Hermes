@@ -465,7 +465,7 @@ def apply_anthropic_cache_control(
             native_anthropic=native_anthropic,
         )
 
-    remaining = 4 - breakpoints_used
+    remaining = max(0, 4 - breakpoints_used)
     if remaining > 0:
         non_sys = [
             i
