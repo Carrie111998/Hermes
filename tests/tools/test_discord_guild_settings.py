@@ -16,11 +16,12 @@ def test_allowed_scalar_edits_full_payload():
         verification_level=4,
         default_message_notifications=1,
         explicit_content_filter=2,
-        nsfw_level=3,
         premium_progress_bar_enabled=True,
+        afk_channel_id=CHANNEL_ID,
         system_channel_id=CHANNEL_ID,
         rules_channel_id=CHANNEL_ID,
         public_updates_channel_id=CHANNEL_ID,
+        safety_alerts_channel_id=CHANNEL_ID,
         afk_timeout=3600,
     )
 
@@ -33,76 +34,65 @@ def test_allowed_scalar_edits_full_payload():
             "verification_level": 4,
             "default_message_notifications": 1,
             "explicit_content_filter": 2,
-            "nsfw_level": 3,
             "premium_progress_bar_enabled": True,
+            "afk_channel_id": CHANNEL_ID,
             "system_channel_id": CHANNEL_ID,
             "rules_channel_id": CHANNEL_ID,
             "public_updates_channel_id": CHANNEL_ID,
+            "safety_alerts_channel_id": CHANNEL_ID,
             "afk_timeout": 3600,
         },
     }
 
 
-def test_minimum_allowed_values_and_nullable_fields():
+def test_nullable_fields_and_falsey_values_are_preserved():
     request = edit_guild_request(
         GUILD_ID,
-        verification_level=0,
+        verification_level=None,
         default_message_notifications=0,
-        explicit_content_filter=0,
-        nsfw_level=0,
+        explicit_content_filter=None,
         premium_progress_bar_enabled=False,
-        afk_timeout=60,
         description=None,
-        system_channel_id=None,
+        afk_channel_id=None,
     )
 
     assert request["json"] == {
-        "verification_level": 0,
+        "verification_level": None,
         "default_message_notifications": 0,
-        "explicit_content_filter": 0,
-        "nsfw_level": 0,
+        "explicit_content_filter": None,
         "premium_progress_bar_enabled": False,
-        "afk_timeout": 60,
         "description": None,
-        "system_channel_id": None,
+        "afk_channel_id": None,
     }
 
 
 @pytest.mark.parametrize(
     "bad_key",
-    ["widget_enabled", "system_channel_flags", "bogus_field"],
+    ["nsfw_level", "widget_enabled", "system_channel_flags", "bogus_field"],
 )
 def test_disallowed_key_rejected(bad_key):
     with pytest.raises(GuildSettingsError, match="unsupported guild setting"):
         edit_guild_request(GUILD_ID, **{bad_key: True})
 
 
-def test_name_max_length_ok():
+def test_name_contract():
+    assert edit_guild_request(GUILD_ID, name="xx")["json"]["name"] == "xx"
     assert edit_guild_request(GUILD_ID, name="x" * 100)["json"]["name"] == "x" * 100
 
-
-def test_name_too_long_rejected():
-    with pytest.raises(GuildSettingsError, match="exceeds 100"):
-        edit_guild_request(GUILD_ID, name="x" * 101)
-
-
-def test_name_must_be_string():
-    with pytest.raises(GuildSettingsError, match="must be a string"):
-        edit_guild_request(GUILD_ID, name=123)
+    for bad in ("x", " x", "x ", "x" * 101, 123):
+        with pytest.raises(GuildSettingsError):
+            edit_guild_request(GUILD_ID, name=bad)
 
 
-def test_description_max_ok():
+def test_description_max_contract():
     assert len(edit_guild_request(GUILD_ID, description="x" * 1024)["json"]["description"]) == 1024
-
-
-def test_description_too_long_rejected():
     with pytest.raises(GuildSettingsError, match="exceeds 1024"):
         edit_guild_request(GUILD_ID, description="x" * 1025)
 
 
 @pytest.mark.parametrize("level", [-1, 5, 100])
 def test_verification_level_out_of_range(level):
-    with pytest.raises(GuildSettingsError, match="between 0 and 4"):
+    with pytest.raises(GuildSettingsError, match="must be one of"):
         edit_guild_request(GUILD_ID, verification_level=level)
 
 
@@ -114,7 +104,13 @@ def test_verification_level_wrong_type(bad):
 
 @pytest.mark.parametrize(
     "field",
-    ["system_channel_id", "rules_channel_id", "public_updates_channel_id"],
+    [
+        "afk_channel_id",
+        "system_channel_id",
+        "rules_channel_id",
+        "public_updates_channel_id",
+        "safety_alerts_channel_id",
+    ],
 )
 @pytest.mark.parametrize(
     "bad",
@@ -125,15 +121,9 @@ def test_channel_id_invalid_rejected(field, bad):
         edit_guild_request(GUILD_ID, **{field: bad})
 
 
-def test_channel_id_none_allowed():
-    assert edit_guild_request(GUILD_ID, system_channel_id=None)["json"] == {
-        "system_channel_id": None
-    }
-
-
 def test_snowflakes_are_canonical_decimal_strings():
     request = edit_guild_request(
-        123456789012345678,
+        "000123456789012345678",
         rules_channel_id=987654321098765432,
         system_channel_id="000987654321098765432",
     )
@@ -149,9 +139,16 @@ def test_invalid_guild_id_rejected(guild_id):
         edit_guild_request(guild_id, name="Hermes")
 
 
-@pytest.mark.parametrize("timeout", [59, 3601, 0, -1])
-def test_afk_timeout_out_of_range(timeout):
-    with pytest.raises(GuildSettingsError, match="between 60 and 3600"):
+@pytest.mark.parametrize("timeout", [60, 300, 900, 1800, 3600])
+def test_afk_timeout_discrete_values_allowed(timeout):
+    assert edit_guild_request(GUILD_ID, afk_timeout=timeout)["json"] == {
+        "afk_timeout": timeout
+    }
+
+
+@pytest.mark.parametrize("timeout", [59, 61, 299, 301, 3601, 0, -1])
+def test_afk_timeout_non_enum_values_rejected(timeout):
+    with pytest.raises(GuildSettingsError, match="60, 300, 900, 1800, 3600"):
         edit_guild_request(GUILD_ID, afk_timeout=timeout)
 
 
