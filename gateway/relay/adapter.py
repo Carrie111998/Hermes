@@ -312,16 +312,86 @@ class RelayAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _draft_key(chat_id: str, metadata: Optional[Dict[str, Any]]) -> str:
-        """Coordination key for one turn's stream: (chat, thread anchor).
+        """Coordination key for one turn's stream.
 
-        Finding #10: every inbound stamps thread_ts = event.thread_ts or ts,
-        so each turn carries its own anchor even in a flat DM — parallel
-        turns in one chat must never share draft/seal state. Falls back to
-        the bare chat when no anchor exists (single-turn semantics).
+        Prefers a PER-TURN identity — the triggering inbound message id
+        (``message_id`` is stamped by the gateway's Slack thread metadata,
+        ``reply_to_message_id`` by the consumer's send path; both carry the
+        same event id) — over the thread anchor. Finding #10 keyed on the
+        thread anchor alone, which is simultaneously too coarse and too
+        fragile (review B2 + flat-DM concern):
+
+          - two parallel turns REPLYING INSIDE ONE THREAD share thread_ts,
+            so turn A's final sealed turn B's stream with A's content;
+          - a flat DM whose metadata carries no anchor at all degraded to
+            the bare chat id, re-creating the original #10 collision.
+
+        The thread anchor remains the fallback for callers that only have
+        placement metadata, and the bare chat is the last resort
+        (single-turn semantics).
         """
         md = metadata or {}
+        turn_id = md.get("message_id") or md.get("reply_to_message_id")
+        if turn_id:
+            return f"{chat_id}:turn:{turn_id}"
         anchor = md.get("thread_ts") or md.get("thread_id") or ""
         return f"{chat_id}:{anchor}"
+
+    @staticmethod
+    def _card_key(
+        reply_to: Optional[str], metadata: Optional[Dict[str, Any]]
+    ) -> str:
+        """Per-turn task-card identity — same precedence as ``_draft_key``.
+
+        ``reply_to`` (the triggering message id from the TurnRunner) wins;
+        metadata message ids cover the flat-DM / resolver lanes; the thread
+        anchor is only a fallback because two turns replying inside one
+        thread share ``thread_ts`` and must not share a card (review B2).
+        One derivation for send AND stop, so the stop always hits the
+        stream the send opened.
+        """
+        md = metadata or {}
+        anchor = (
+            reply_to
+            or md.get("message_id")
+            or md.get("reply_to_message_id")
+            or md.get("thread_ts")
+            or md.get("thread_id")
+            or "root"
+        )
+        return f"turn:{anchor}"
+
+    def _match_open_draft(
+        self, chat_id: str, metadata: Optional[Dict[str, Any]]
+    ) -> Optional[str]:
+        """Resolve which open stream (if any) a turn-final send belongs to.
+
+        Exact key match first. A caller with NO turn identity in its
+        metadata (legacy resolver lanes that only carry placement info)
+        may still absorb the final — but ONLY when the chat has exactly
+        one open stream. With several open streams the send stays a plain
+        send: a duplicate message is recoverable, sealing someone else's
+        stream with the wrong content is not (review B2).
+        """
+        key = self._draft_key(str(chat_id), metadata)
+        if key in self._open_draft_by_chat:
+            return key
+        md = metadata or {}
+        has_turn_identity = bool(
+            md.get("message_id")
+            or md.get("reply_to_message_id")
+            or md.get("thread_ts")
+            or md.get("thread_id")
+        )
+        if has_turn_identity:
+            return None
+        prefix = f"{chat_id}:"
+        candidates = [
+            k for k in self._open_draft_by_chat if k.startswith(prefix)
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
 
     async def send_draft(
         self,
@@ -379,9 +449,12 @@ class RelayAdapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         metadata: Optional[Dict[str, Any]],
+        *,
+        draft_key: Optional[str] = None,
     ) -> SendResult:
         """Convert the turn-final send into the sealing draft frame."""
-        draft_key = self._draft_key(str(chat_id), metadata)
+        if draft_key is None:
+            draft_key = self._draft_key(str(chat_id), metadata)
         draft_id = self._open_draft_by_chat.pop(draft_key)
         # Tombstone BEFORE the transport call (regression fix): whatever the
         # ack says, this draft_id's stream must never be re-armed by a
@@ -468,13 +541,13 @@ class RelayAdapter(BasePlatformAdapter):
             )
         if self._transport is None:
             return SendResult(success=False, error="no transport")
-        # Finding #10: bare reply_to is None in flat DMs — every parallel
-        # turn collided on card key 'turn:root'. Anchor on the same turn
-        # thread identity the draft lane uses.
-        _anchor = reply_to or (metadata or {}).get("thread_ts") or (
-            metadata or {}
-        ).get("thread_id") or "root"
-        card_id = f"turn:{_anchor}"
+        # Finding #10 + review B2: one card per TURN. reply_to (the
+        # triggering message id) is already per-turn; when it is absent
+        # (flat DM, resolver lanes) fall back to the same per-turn
+        # identity the draft lane keys on — metadata message ids first,
+        # thread anchor only after that (two turns replying inside one
+        # thread share thread_ts and must not share a card).
+        card_id = self._card_key(reply_to, metadata)
         merged_meta = dict(metadata or {})
         if reply_to and "thread_ts" not in merged_meta:
             # Slack card streams are thread replies (same rule as draft):
@@ -514,10 +587,9 @@ class RelayAdapter(BasePlatformAdapter):
             )
         if self._transport is None:
             return SendResult(success=False, error="no transport")
-        _anchor = reply_to or (metadata or {}).get("thread_ts") or (
-            metadata or {}
-        ).get("thread_id") or "root"
-        card_id = f"turn:{_anchor}"
+        # Same per-turn key derivation as send (shared helper) so the stop
+        # hits the open stream.
+        card_id = self._card_key(reply_to, metadata)
         result = await self._transport.send_outbound(
             {
                 "op": "task_card_stop",
@@ -1311,12 +1383,13 @@ class RelayAdapter(BasePlatformAdapter):
         # stream must absorb the turn-final here too, or the stream is left
         # unsealed (frozen live indicator) and the final posts as a separate
         # duplicate message.
-        if (
-            not _interim
-            and self._draft_key(str(chat_id), _sfp_metadata) in self._open_draft_by_chat
-        ):
+        if not _interim:
+            _sfp_key = self._match_open_draft(str(chat_id), _sfp_metadata)
+        else:
+            _sfp_key = None
+        if _sfp_key is not None:
             seal = await self._seal_open_draft(
-                chat_id, content, _sfp_metadata
+                chat_id, content, _sfp_metadata, draft_key=_sfp_key
             )
             if seal.success:
                 return seal
@@ -1369,11 +1442,14 @@ class RelayAdapter(BasePlatformAdapter):
         # separate message. An open stream absorbs the turn-final send no
         # matter which egress door it arrives through; the stream IS the
         # message.
-        if (
-            not _interim
-            and self._draft_key(str(chat_id), send_metadata) in self._open_draft_by_chat
-        ):
-            seal = await self._seal_open_draft(chat_id, content, send_metadata)
+        if not _interim:
+            _send_key = self._match_open_draft(str(chat_id), send_metadata)
+        else:
+            _send_key = None
+        if _send_key is not None:
+            seal = await self._seal_open_draft(
+                chat_id, content, send_metadata, draft_key=_send_key
+            )
             if seal.success:
                 return seal
             # Review finding (PR 85796, point 1): a failed seal must NOT

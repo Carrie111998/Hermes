@@ -1854,12 +1854,21 @@ class GatewayStreamConsumer:
             # set in tandem with _draft_id in run().  Disable to be safe.
             self._use_draft_streaming = False
             return False
+        # Carry the per-turn identity on EVERY frame (review B2): the
+        # turn-final send goes out via _metadata_for_send, which stamps
+        # reply_to_message_id — the relay adapter keys draft/seal state on
+        # that identity, so frames must carry the same one or the final
+        # cannot find the open stream (flat DMs have no thread metadata
+        # at all and would otherwise key on the bare chat).
+        _md = dict(self.metadata) if self.metadata else {}
+        if self._initial_reply_to_id:
+            _md.setdefault("reply_to_message_id", self._initial_reply_to_id)
         try:
             result = await self.adapter.send_draft(
                 chat_id=self.chat_id,
                 draft_id=self._draft_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=_md or None,
             )
         except Exception as e:
             logger.debug(
