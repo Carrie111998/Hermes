@@ -113,9 +113,12 @@
         const tunnel = status && status.running ? status : await plugin.start(config)
         if (tunnel && tunnel.running && tunnel.url) {
           const stored = readStoredRaw()
+          const ssh = readStoredSsh()
           writeStored({
             url: tunnel.url,
-            token: tunnel.token || (stored && stored.token) || ''
+            // SSH tokens stay in the native tunnel boundary. Direct remote
+            // gateway tokens retain the existing storage behavior.
+            token: ssh ? '' : tunnel.token || (stored && stored.token) || ''
           })
         }
         return tunnel
@@ -334,7 +337,7 @@
     const stored = readStoredRaw()
     const ssh = readStoredSsh()
     const scopeKey = String(profileScope == null ? '' : profileScope).trim() || null
-    const token = stored ? stored.token : ''
+    const token = ssh ? '' : stored ? stored.token : ''
     return {
       envOverride: false,
       mode: ssh ? 'ssh' : 'remote',
@@ -535,7 +538,8 @@
     // remote; ok reflects whether a usable stored config is present.
     revalidateConnection: async () => {
       const raw = readStoredRaw()
-      return { ok: Boolean(raw && raw.url && raw.token), rebuilt: false }
+      const ssh = readStoredSsh()
+      return { ok: Boolean(raw && raw.url && (ssh || raw.token)), rebuilt: false }
     },
     // Idle-reaper keepalive (global.d.ts:26). No pool here → always ok for the
     // primary profile; a named profile throws (single-profile client).
@@ -1021,6 +1025,7 @@
 
       ;(async () => {
         let tunnel = null
+        let activeTunnelToken = ''
         if (mode === 'ssh') {
           const plugin = nativeSshPlugin()
           if (!plugin) throw new Error('Native SSH is unavailable')
@@ -1055,6 +1060,7 @@
             tunnel = await plugin.start(sshConfig)
           }
           writeStoredSsh(sshConfig)
+          activeTunnelToken = tunnel && tunnel.token ? tunnel.token : ''
 
         }
         return window.hermesDesktop.testConnectionConfig({
@@ -1077,7 +1083,7 @@
           // NO_CONFIG_MESSAGE — silent data loss after a "Verbunden" toast).
           const trimmedToken = String(tokenValue || '').trim()
           const stored = readStoredRaw()
-          const effectiveToken = trimmedToken || (stored ? stored.token : '')
+          const effectiveToken = mode === 'ssh' ? activeTunnelToken : trimmedToken || (stored ? stored.token : '')
           if (mode === 'direct' && !effectiveToken) {
             // Defense in depth: coerceRemote() already throws "Remote
             // gateway session token is required." when neither the field
@@ -1093,7 +1099,7 @@
             if (cancelBtn) cancelBtn.disabled = false
             return
           }
-          writeStored({ url: result.baseUrl, token: effectiveToken })
+          writeStored({ url: result.baseUrl, token: mode === 'ssh' ? '' : effectiveToken })
           setConnectStatus(statusEl, 'Connected. Reloading…', 'ok')
           // Reload = the established apply path (no onConnectionApplied
           // event exists; mirrors applyConnectionConfig's own deferred
