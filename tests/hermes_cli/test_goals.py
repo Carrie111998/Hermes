@@ -96,6 +96,51 @@ class TestJudgeGoal:
         assert verdict == "done"
         assert reason == "achieved"
 
+    def test_judge_honors_configured_timeout(self, tmp_path, monkeypatch):
+        """judge_goal passes auxiliary.goal_judge.timeout through to call_llm."""
+        from hermes_cli import goals
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "auxiliary:\n  goal_judge:\n    timeout: 41\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        observed = {}
+
+        def _fake_call_llm(**kwargs):
+            observed["timeout"] = kwargs.get("timeout")
+            return MagicMock(
+                choices=[MagicMock(message=MagicMock(content='{"done": true, "reason": "x"}'))]
+            )
+
+        with patch("agent.auxiliary_client.call_llm", side_effect=_fake_call_llm):
+            verdict, _reason, _pf, _wd, _tf = goals.judge_goal("goal", "response")
+        assert verdict == "done"
+        assert observed["timeout"] == 41.0
+
+    def test_judge_timeout_falls_back_on_invalid_config(self, tmp_path, monkeypatch):
+        """A non-numeric judge timeout falls back instead of crashing the loop."""
+        from hermes_cli import goals
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "auxiliary:\n  goal_judge:\n    timeout: fast\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        observed = {}
+
+        def _fake_call_llm(**kwargs):
+            observed["timeout"] = kwargs.get("timeout")
+            return MagicMock(
+                choices=[MagicMock(message=MagicMock(content='{"done": true, "reason": "x"}'))]
+            )
+
+        with patch("agent.auxiliary_client.call_llm", side_effect=_fake_call_llm):
+            goals.judge_goal("goal", "response")
+        assert observed["timeout"] == goals.DEFAULT_JUDGE_TIMEOUT
+
 
 # ──────────────────────────────────────────────────────────────────────
 # GoalManager lifecycle + persistence
