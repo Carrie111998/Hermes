@@ -33,6 +33,11 @@ def _(rid, params: dict) -> dict:
         explicit_cwd = False
     resolved_cwd = _completion_cwd(params)
     source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+    from tui_gateway.prompt_dispatch_hooks import normalize_required_prompt_handler
+
+    required_prompt_handler = normalize_required_prompt_handler(
+        params.get("required_prompt_handler")
+    )
     _enable_gateway_prompts()
 
     # ``profile`` (app-global remote mode): a new chat started under a non-launch
@@ -100,6 +105,7 @@ def _(rid, params: dict) -> dict:
             "pending_title": title or None,
             "pending_hidden": is_truthy_value(params.get("hidden", False)),
             "profile_home": str(profile_home) if profile_home is not None else None,
+            "required_prompt_handler": required_prompt_handler,
             "running": False,
             "session_key": key,
             "show_reasoning": _load_show_reasoning(),
@@ -318,6 +324,11 @@ def _(rid, params: dict) -> dict:
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
     defer_history = is_truthy_value(params.get("defer_history", False))
+    from tui_gateway.prompt_dispatch_hooks import normalize_required_prompt_handler
+
+    required_prompt_handler = normalize_required_prompt_handler(
+        params.get("required_prompt_handler")
+    )
     # Desktop hydrates persisted transcripts through the authenticated REST
     # route in parallel. Suppress the duplicate WebSocket transcript only when
     # the caller explicitly requests it; other clients keep upstream behavior.
@@ -416,6 +427,10 @@ def _(rid, params: dict) -> dict:
         )
 
         def _reuse_live_payload(sid: str, session: dict) -> dict:
+            # The handler policy is transport/client-owned rather than durable
+            # conversation state. Reconnects reassert (or clear) it before the
+            # reused session can accept another turn.
+            session["required_prompt_handler"] = required_prompt_handler
             payload = _live_session_payload(
                 sid,
                 session,
@@ -482,6 +497,7 @@ def _(rid, params: dict) -> dict:
                 close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
                 profile_home=profile_home,
                 lazy=True,
+                required_prompt_handler=required_prompt_handler,
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _ok(rid, _reuse_live_payload(*live))
@@ -550,6 +566,7 @@ def _(rid, params: dict) -> dict:
                 profile_home=profile_home,
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
+                required_prompt_handler=required_prompt_handler,
             )
             record["resume_history_ready"] = threading.Event()
             record["resume_hydrating"] = True
@@ -646,6 +663,7 @@ def _(rid, params: dict) -> dict:
                 profile_home=profile_home,
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
+                required_prompt_handler=required_prompt_handler,
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _ok(rid, _reuse_live_payload(*live))
@@ -790,6 +808,7 @@ def _(rid, params: dict) -> dict:
                         cwd=profile_resume_cwd,
                         session_db=db,
                         source=source,
+                        required_prompt_handler=required_prompt_handler,
                     )
                     # Ownership TRANSFER — the registered session's agent now
                     # holds this handle for its whole life, and _init_session
