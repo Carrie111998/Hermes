@@ -402,27 +402,35 @@
   }
 
   async function startSshFromConfig(configuration) {
-    const plugin = nativeSshPlugin()
-    if (!plugin) {
-      throw new Error('The native iOS SSH tunnel is unavailable.')
+    if (nativeTunnelStart) {
+      return nativeTunnelStart
     }
-    const current = await plugin.status()
-    if (current && current.running && current.url) {
-      const stored = readStoredSsh()
-      if (
-        stored &&
-        stored.host === configuration.host &&
-        stored.port === configuration.port &&
-        stored.username === configuration.username &&
-        stored.hostKey === configuration.hostKey
-      ) {
-        return current
+    nativeTunnelStart = (async () => {
+      const plugin = nativeSshPlugin()
+      if (!plugin) {
+        throw new Error('The native iOS SSH tunnel is unavailable.')
       }
-      await plugin.stop()
-    }
-    const tunnel = await plugin.start(configuration)
-    writeStoredSsh(configuration)
-    return tunnel
+      const current = await plugin.status()
+      if (current && current.running && current.url) {
+        const stored = readStoredSsh()
+        if (
+          stored &&
+          stored.host === configuration.host &&
+          stored.port === configuration.port &&
+          stored.username === configuration.username &&
+          stored.hostKey === configuration.hostKey
+        ) {
+          return current
+        }
+        await plugin.stop()
+      }
+      const tunnel = await plugin.start(configuration)
+      writeStoredSsh(configuration)
+      return tunnel
+    })().finally(() => {
+      nativeTunnelStart = null
+    })
+    return nativeTunnelStart
   }
 
   // GET the PUBLIC /api/status (no token needed). Used by probe + the HTTP leg
