@@ -237,7 +237,7 @@ memory:
   user_profile_enabled: true
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
-  write_approval: false     # false = write freely (default) | true = require approval
+  write_approval: true      # true = require approval (default) | false = explicit opt-out
 ```
 
 Setting **both** `memory_enabled` and `user_profile_enabled` to `false` turns the
@@ -356,7 +356,7 @@ Skills use the same on/off gate, but the review UX differs because a
 
 ```yaml
 skills:
-  write_approval: false     # false = write freely (default) | true = require approval
+  write_approval: true      # true = require approval (default) | false = explicit opt-out
 ```
 
 When `write_approval: true`, skill writes (create / edit / patch / write_file /

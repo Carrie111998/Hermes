@@ -1442,7 +1442,10 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
     try:
         from tools import write_approval as wa
     except Exception:
-        return None  # fail open
+        return tool_error(
+            "Skill write refused: the approval gate could not be loaded.",
+            success=False,
+        )
 
     decision = wa.evaluate_gate(wa.SKILLS)
     if decision.allow:
@@ -1464,7 +1467,15 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
         old_string=payload_kwargs.get("old_string") or "",
         new_string=payload_kwargs.get("new_string") or "",
     )
-    record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
+    try:
+        record = wa.stage_write(
+            wa.SKILLS, payload, summary=gist, origin=wa.current_origin()
+        )
+    except Exception:
+        return tool_error(
+            "Skill write refused: the pending approval could not be persisted.",
+            success=False,
+        )
     wa.emit_gate_event(wa.SKILLS, "staged", record["id"], f"{action} {name}")
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],

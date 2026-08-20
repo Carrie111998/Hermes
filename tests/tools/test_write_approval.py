@@ -1,8 +1,8 @@
 """Tests for the memory/skill write-approval gate (tools/write_approval.py)
 and the shared slash-command handlers (hermes_cli/write_approval_commands.py).
 
-Covers the boolean write_approval gate (off by default = write freely; on =
-require approval) for both subsystems, the foreground-vs-background staging
+Covers the boolean write_approval gate (on by default = require approval;
+explicitly off = write freely) for both subsystems, the foreground-vs-background staging
 split, pending store CRUD, and the list/approve/reject/diff/approval
 subcommand dispatch.
 """
@@ -36,16 +36,15 @@ def _set_approval(subsystem, enabled):
 # Config resolution
 # ---------------------------------------------------------------------------
 
-def test_default_gate_is_off(hermes_home):
+def test_default_gate_is_on(hermes_home):
     from tools import write_approval as wa
-    # Default: gate off → writes flow freely.
-    assert wa.write_approval_enabled("memory") is False
-    assert wa.write_approval_enabled("skills") is False
+    assert wa.write_approval_enabled("memory") is True
+    assert wa.write_approval_enabled("skills") is True
 
 
-def test_invalid_subsystem_is_off(hermes_home):
+def test_invalid_subsystem_fails_closed(hermes_home):
     from tools import write_approval as wa
-    assert wa.write_approval_enabled("bogus") is False
+    assert wa.write_approval_enabled("bogus") is True
 
 
 def test_normalize_enabled_coerces_values():
@@ -57,10 +56,11 @@ def test_normalize_enabled_coerces_values():
     assert wa._normalize_enabled("on") is True
     assert wa._normalize_enabled("approve") is True
     assert wa._normalize_enabled("true") is True
-    # Everything else → False (gate off is the safe default).
+    # Recognized false values opt out; unknown values fail closed.
     assert wa._normalize_enabled("off") is False
-    assert wa._normalize_enabled("garbage") is False
-    assert wa._normalize_enabled(None) is False
+    assert wa._normalize_enabled("false") is False
+    assert wa._normalize_enabled("garbage") is True
+    assert wa._normalize_enabled(None) is True
 
 
 # ---------------------------------------------------------------------------
@@ -68,9 +68,9 @@ def test_normalize_enabled_coerces_values():
 # ---------------------------------------------------------------------------
 
 def test_memory_gate_off_allows_write(hermes_home):
-    # Default (gate off) → write straight through, no staging.
     from tools.memory_tool import memory_tool, MemoryStore
     from tools import write_approval as wa
+    _set_approval("memory", False)
     store = MemoryStore(); store.load_from_disk()
     r = json.loads(memory_tool("add", "user", "save me", store=store))
     assert r["success"] is True

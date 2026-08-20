@@ -1861,8 +1861,8 @@ DEFAULT_CONFIG = {
         # Approval gate for memory writes (add/replace/remove), applied to BOTH
         # foreground agent turns and the background self-improvement review fork
         # (the source of unprompted "wrong assumption" saves users reported).
-        #   false (default) — write freely; the gate is off (pre-gate behaviour)
-        #   true            — require approval: foreground writes prompt inline
+        #   false           — write freely only after an explicit opt-out
+        #   true (default)  — require approval: foreground writes prompt inline
         #                     (entries are small enough to review in a chat
         #                     bubble); background-review writes are staged
         #                     instead of committed (a daemon thread cannot block
@@ -1870,7 +1870,7 @@ DEFAULT_CONFIG = {
         #                     /memory pending, /memory approve <id>,
         #                     /memory reject <id>.
         # To disable memory entirely, use memory_enabled: false instead.
-        "write_approval": False,
+        "write_approval": True,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
         # Periodic built-in memory review. External providers with automatic
@@ -2080,15 +2080,15 @@ DEFAULT_CONFIG = {
         # Approval gate for skill_manage (create/edit/patch/write_file/delete/
         # remove_file), applied to BOTH foreground agent turns and the
         # background self-improvement review fork.
-        #   false (default) — write freely; the gate is off (pre-gate behaviour)
-        #   true            — require approval: stage the write for review
+        #   false           — write freely only after an explicit opt-out
+        #   true (default)  — require approval: stage the write for review
         #                     instead of committing (a SKILL.md is too large to
         #                     review inline, so skills always stage rather than
         #                     prompt). List with /skills pending, inspect with
         #                     /skills diff <id> (full diff — CLI/dashboard/file,
         #                     never crammed into a chat bubble), apply with
         #                     /skills approve <id> or drop with /skills reject <id>.
-        "write_approval": False,
+        "write_approval": True,
         # Per-mutation audit ledger (tracker #79686 P3). Every skill mutation
         # — curator, agent, or user — appends one JSONL entry to
         # ~/.hermes/skills/.curator_ledger.jsonl with before/after file

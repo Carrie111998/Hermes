@@ -584,7 +584,7 @@ wanting eyes on the self-improvement loop), turn on the write-approval gate:
 
 ```yaml
 skills:
-  write_approval: false     # false = write freely (default) | true = require approval
+  write_approval: true      # true = require approval (default) | false = explicit opt-out
 ```
 
 When `write_approval: true`, every `skill_manage` write (create / edit /

@@ -726,7 +726,6 @@ class TestConfigSupportFloor:
             "platforms": {"telegram": {"tool_progress": "verbose"}},
             "tool_progress_overrides": {"telegram": "verbose"},
         },
-        "memory": {"write_approval": True},
         "model": {"default": "openai/gpt-5.4", "provider": "openrouter"},
         "model_catalog": {"ttl_hours": 1},
         "plugins": {"enabled": []},
@@ -1096,7 +1095,7 @@ class TestWriteApprovalMigration:
     """Version 28→29 renames memory/skills write_mode → write_approval (bool).
 
     Only an explicit ``approve`` carried gating intent and maps to ``True``;
-    ``on``/``off``/unset map to ``False`` (gate off). The old ``write_mode`` key
+    legacy ``on``/``off`` map to an explicit ``False`` opt-out. The old ``write_mode`` key
     is removed. Only a persisted key is rewritten — never invented.
     """
 
@@ -1110,10 +1109,13 @@ class TestWriteApprovalMigration:
                         "skills:\n  write_mode: approve\n")
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
-            assert raw["memory"]["write_approval"] is True
-            assert raw["skills"]["write_approval"] is True
-            assert "write_mode" not in raw["memory"]
-            assert "write_mode" not in raw["skills"]
+            loaded = load_config()
+            # True is now the schema default, so lean-config persistence strips
+            # the migrated key while preserving the effective gated behavior.
+            assert "write_mode" not in raw.get("memory", {})
+            assert "write_mode" not in raw.get("skills", {})
+            assert loaded["memory"]["write_approval"] is True
+            assert loaded["skills"]["write_approval"] is True
 
     def test_on_and_off_map_to_false(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
@@ -1125,12 +1127,12 @@ class TestWriteApprovalMigration:
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
             loaded = load_config()
-            # write_approval=False equals the schema default, so it is NOT
-            # materialised to disk (lean-config invariant) — the legacy
-            # write_mode key is gone and the effective value resolves to False
-            # via load_config()'s deep-merge.
+            # False now differs from the fail-closed schema default, so the
+            # migration must preserve it as an explicit opt-out.
             assert "write_mode" not in raw.get("memory", {})
             assert "write_mode" not in raw.get("skills", {})
+            assert raw["memory"]["write_approval"] is False
+            assert raw["skills"]["write_approval"] is False
             assert loaded["memory"]["write_approval"] is False
             assert loaded["skills"]["write_approval"] is False
 

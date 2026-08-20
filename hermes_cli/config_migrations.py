@@ -495,8 +495,8 @@ def _migrate_to_25(results: Dict[str, Any], quiet: bool) -> None:
 def _migrate_to_29(results: Dict[str, Any], quiet: bool) -> None:
     # ── Version 28 → 29: rename memory/skills write_mode → write_approval ──
     # The tri-state write_mode (on|off|approve) was replaced by a clear boolean
-    # write_approval (default false = gate off, writes flow freely; true =
-    # require approval). Only an explicit "approve" carried gating intent, so
+    # write_approval (default true = require approval; explicit false =
+    # gate off). Only an explicit legacy "approve" carried gating intent, so
     # it maps to true; everything else (on/off/unset) → false. The old
     # "off = block all writes" mode is dropped — memory_enabled: false disables
     # memory entirely. Only rewrite a key the user actually persisted; never
