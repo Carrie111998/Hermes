@@ -10476,6 +10476,7 @@ async def _async_call_llm_impl(
                 base_url=resolved_base_url,
                 api_key=resolved_api_key,
                 api_mode=resolved_api_mode,
+                main_runtime=main_runtime,
                 is_vision=(task == "vision"),
             )
             if refreshed_client is not None:
@@ -10512,6 +10513,7 @@ async def _async_call_llm_impl(
                 base_url=resolved_base_url,
                 api_key=resolved_api_key,
                 api_mode=resolved_api_mode,
+                main_runtime=main_runtime,
                 is_vision=(task == "vision"),
             )
             if refreshed_client is not None:
