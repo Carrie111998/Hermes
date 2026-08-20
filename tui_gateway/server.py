@@ -5533,6 +5533,26 @@ def _get_usage(agent) -> dict:
             usage["context_max"] = ctx_max
             usage["context_percent"] = max(0, min(100, round(last_prompt / ctx_max * 100)))
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
+    # Generation-speed readouts for the desktop status bar pills. Both rates
+    # come from values recorded at measurement time (per API call in
+    # conversation_loop.py, per turn in _run_prompt_submit's finally), so they
+    # stay constant between events and the usage ticker's ``usage == last``
+    # dedup keeps working. A missing or zero duration omits the key entirely
+    # rather than fabricating a rate.
+    try:
+        last_completion = 0
+        if comp:
+            last_completion = getattr(comp, "last_completion_tokens", 0) or 0
+        last_api_duration = getattr(agent, "_last_api_duration", 0) or 0
+        if last_completion > 0 and last_api_duration > 0:
+            usage["tok_per_call"] = round(last_completion / last_api_duration, 1)
+        turn_output = getattr(agent, "_last_turn_output_tokens", 0) or 0
+        turn_duration = getattr(agent, "_last_turn_duration", 0) or 0
+        if turn_output > 0 and turn_duration > 0:
+            usage["tok_per_turn"] = round(turn_output / turn_duration, 1)
+    except Exception:
+        # A status-bar readout must never break usage reporting.
+        pass
     # Live count of background/async subagents still running (delegate_task
     # batches + background single delegations). Mirrors the classic CLI status
     # bar's ⛓ indicator; sourced from the same async_delegation registry.
@@ -10700,6 +10720,11 @@ def _run_prompt_submit(
     # muted window was structurally indistinguishable from a request that
     # never arrived. No prompt content is logged.
     _turn_started_monotonic = time.monotonic()
+    # WHY: snapshot the cumulative output-token counter at turn start so the
+    # finally block in run() can compute THIS turn's output as a delta. The
+    # counter itself is session-lifetime cumulative and would overstate a
+    # single turn's tokens/sec.
+    _turn_start_output_tokens = int(getattr(agent, "session_output_tokens", 0) or 0)
     logger.info(
         "tui prompt accepted: ui_session=%s session_key=%s agent_session_id=%s "
         "kind=%s chars=%s images=%d",
@@ -11481,6 +11506,22 @@ def _run_prompt_submit(
                 session["last_active"] = time.time()
                 if not turn_error_retained:
                     _clear_inflight_turn(session)
+            # WHY: per-turn tokens/sec for the desktop status bar. Computed once
+            # at turn end (not inside _get_usage) so the value is stable between
+            # turns. A live elapsed-time computation would change on every 1s
+            # usage tick and defeat the ticker's ``usage == last`` dedup.
+            try:
+                _turn_duration = time.monotonic() - _turn_started_monotonic
+                _turn_output = (
+                    int(getattr(agent, "session_output_tokens", 0) or 0)
+                    - _turn_start_output_tokens
+                )
+                if _turn_duration > 0 and _turn_output > 0:
+                    agent._last_turn_duration = _turn_duration
+                    agent._last_turn_output_tokens = _turn_output
+            except Exception:
+                # A status-bar readout must never break turn teardown.
+                pass
             # Closing bookend of the "tui prompt accepted" record above —
             # fires on every path (success, returned error, exception,
             # interrupt), so one accepted prompt always produces exactly one

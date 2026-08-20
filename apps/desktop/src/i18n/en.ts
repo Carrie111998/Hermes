@@ -2795,6 +2795,8 @@ export const en: Translations = {
       toggleBackendVersion: 'Backend version',
       toggleCommandCenter: 'Command Center',
       toggleContextUsage: 'Context meter',
+      toggleTokPerCall: 'Speed: last call',
+      toggleTokPerTurn: 'Speed: last turn',
       toggleRunningTimer: 'Turn timer',
       toggleSessionTimer: 'Session timer',
       toggleTerminal: 'Terminal',

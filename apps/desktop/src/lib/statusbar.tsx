@@ -59,6 +59,27 @@ export function contextBarLabel(usage: UsageStats): string {
   return `[${contextBar(usage.context_percent)}] ${pct}%`
 }
 
+export function tokPerCallLabel(usage: UsageStats): string {
+  // WHY: a missing or zero rate means the backend has not finished an API call
+  // yet, so render nothing and let the pill stay hidden instead of showing a
+  // fabricated 0.0.
+  if (!usage.tok_per_call) {
+    return ''
+  }
+
+  return `${usage.tok_per_call.toFixed(1)} tok/s`
+}
+
+export function tokPerTurnLabel(usage: UsageStats): string {
+  // WHY: same rule as tokPerCallLabel, hide the pill until a turn has
+  // completed and produced a real per-turn rate.
+  if (!usage.tok_per_turn) {
+    return ''
+  }
+
+  return `${usage.tok_per_turn.toFixed(1)} tok/s`
+}
+
 export function LiveDuration({ since }: { since: number | null | undefined }) {
   const [now, setNow] = useState(() => Date.now())
 
