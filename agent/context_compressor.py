@@ -31,6 +31,15 @@ from agent.auxiliary_client import (
     aux_interrupt_protection,
     call_llm,
 )
+from agent.catalog_residual import (
+    LEAN_ANCHOR_HEADING,
+    append_hybrid_handle_index,
+    build_catalog_residual,
+    build_hybrid_handle_index,
+    extract_catalog_items,
+    merge_handles_into_anchor_index,
+    normalize_compression_mode,
+)
 from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.model_metadata import (
@@ -884,7 +893,7 @@ _LEAN_TAIL_DEMOTE_MIN_CHARS = 1_500
 def _lean_recovery_stub(tool_name: str, content_len: int, session_id: str) -> str:
     """One-line replacement for a demoted tail tool result."""
     hint = (
-        f" Recover with session_search(query=..., session_id='{session_id}')"
+        " Recover with session_search(query=..., role_filter='user,assistant,tool')"
         if session_id else ""
     )
     return (
@@ -957,11 +966,13 @@ def _build_recovery_footer(session_id: str, region_len: int) -> str:
     return (
         "\n\n" + _LEAN_RECOVERY_HEADING + "\n"
         f"The {region_len} compacted message(s) remain fully preserved in "
-        "session history. If you need any detail this summary does not carry "
-        "(exact command output, file contents, error text, earlier "
-        "reasoning), recover it with: "
-        f"session_search(query='<keywords>', session_id='{session_id}') — "
-        "do not guess at lost specifics when you can look them up."
+        f"session history for this session ({session_id}). If you need any "
+        "detail this summary does not carry (exact command output, file "
+        "contents, error text, earlier reasoning), recover it with: "
+        "session_search(query='<keywords>', role_filter='user,assistant,tool') "
+        "— discovery form; current-session context is implicit. Do not pass "
+        "session_id (that enters READ and ignores query). Do not guess at "
+        "lost specifics when you can look them up."
     )
 
 
@@ -1000,7 +1011,7 @@ _LOW_SIGNAL_TOOL_RE = re.compile(
 # away — this is the defense for needle-facts (SHAs, ids, error strings) that
 # honest summarization at 10:1 always loses. Doubles as a query-anchor map
 # for session_search recovery.
-_LEAN_ANCHOR_HEADING = "## Anchor Index (mechanically extracted, exact)"
+_LEAN_ANCHOR_HEADING = LEAN_ANCHOR_HEADING
 _LEAN_ANCHOR_BUDGET_CHARS = 7_000
 _ANCHOR_PATTERNS: "list[tuple[str, re.Pattern[str], int]]" = [
     ("PRs/issues", re.compile(r"#\d{3,6}\b"), 120),
@@ -2996,6 +3007,7 @@ class ContextCompressor(ContextEngine):
         proactive_prune_min_reclaim_tokens: int = 4096,
         min_tail_user_messages: int = 1,
         tail_mode: str = "legacy",
+        mode: str = "standard",
     ):
         self.model = model
         self.base_url = base_url
@@ -3006,6 +3018,10 @@ class ContextCompressor(ContextEngine):
         # tail + verbatim-user-message summary section + recovery pointers;
         # "legacy" = 0.20*window tail (shipping behavior).
         self.tail_mode = tail_mode if tail_mode in ("legacy", "lean") else "legacy"
+        # Compaction residual: standard (LLM summary), catalog (extractive
+        # replacement), or hybrid (standard + one unique-handle index).
+        # Orthogonal to tail_mode. Invalid values fall back to standard.
+        self.mode = normalize_compression_mode(mode)
         # Per-model threshold overrides (longest substring match wins).
         # Stored as a plain dict; resolved in _resolve_threshold(), then the
         # small-context floor is applied on top.
@@ -4425,6 +4441,90 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 len(turns_to_summarize),
             )
         return summary
+
+    def _generate_catalog_residual(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+    ) -> str:
+        """Build an extractive catalog residual without calling the aux LLM."""
+        snapshot = self._latest_user_task_snapshot(turns_to_summarize)
+        if snapshot:
+            task_snapshot = snapshot
+        else:
+            # Zero-user provenance: the catalog must carry the same sentinel
+            # the Standard path uses so resume / anti-harvest stay aligned.
+            task_snapshot = _NO_USER_TASK_SENTINEL
+
+        previous = ""
+        if self._previous_summary:
+            previous = _redact_compaction_text(
+                self._strip_summary_prefix(self._previous_summary)
+            )
+
+        body = build_catalog_residual(
+            turns_to_summarize,
+            previous_residual=previous,
+            task_snapshot=task_snapshot,
+        )
+        if not str(body).strip():
+            raise RuntimeError("catalog residual was empty")
+
+        _pruned_names = _collect_ghosted_skill_names(turns_to_summarize)
+        body = _reinject_pruned_skill_markers(body, _pruned_names)
+        body = _redact_compaction_text(body)
+        # Catalog never calls the summarizer. Lean keeps only the
+        # session_search recovery footer — not digests, verbatim quotes,
+        # or the mechanical anchor index.
+        if getattr(self, "tail_mode", "legacy") == "lean":
+            if _LEAN_RECOVERY_HEADING not in body:
+                footer = _build_recovery_footer(
+                    getattr(self, "_session_id", "") or "",
+                    len(turns_to_summarize),
+                )
+                if footer:
+                    body = body.rstrip() + footer
+        self._validate_summary_user_provenance(
+            body, bool(getattr(self, "_summary_has_user_turn", False))
+        )
+        self._previous_summary = body
+        self._clear_compression_failure_cooldown()
+        self._last_summary_error = None
+        self._last_summary_auth_failure = False
+        self._last_summary_network_failure = False
+        return self._with_summary_prefix(body)
+
+    def _append_hybrid_handle_index(
+        self,
+        summary: str,
+        turns_to_summarize: List[Dict[str, Any]],
+        previous_residual: str = "",
+    ) -> str:
+        """Rebuild exactly one unique-handle index after a Standard summary.
+
+        Seeds from ``previous_residual`` (the pre-generation prior compaction
+        residual), not the just-written Standard summary. Lean already carries
+        the mechanical Anchor Index plus other summary aids — strip any
+        echoed Unique handles heading so the extractive index is not doubled.
+        """
+        if getattr(self, "tail_mode", "legacy") == "lean":
+            # Reingest prior Unique handles / Anchor Index before stripping
+            # the public Unique section, then fold first-window handles into
+            # the single lean Anchor Index so they survive the next pass.
+            items = extract_catalog_items(
+                turns_to_summarize,
+                previous_residual=previous_residual,
+            )
+            updated = merge_handles_into_anchor_index(summary, items)
+            updated = append_hybrid_handle_index(updated, "")
+            self._previous_summary = self._strip_summary_prefix(updated)
+            return updated
+        index = build_hybrid_handle_index(
+            turns_to_summarize,
+            previous_residual=previous_residual,
+        )
+        updated = append_hybrid_handle_index(summary, index)
+        self._previous_summary = self._strip_summary_prefix(updated)
+        return updated
 
     @classmethod
     def _bound_summary_input(cls, content: str) -> str:
@@ -7413,8 +7513,24 @@ This compaction should PRIORITISE preserving all information related to the focu
         #
         # Skipped when ``force=True`` (manual /compress) so auth/error
         # handling paths are always exercised on explicit user request.
+        compaction_mode = normalize_compression_mode(getattr(self, "mode", "standard"))
+        telemetry["compaction_mode"] = compaction_mode
+
+        # Snapshot the prior residual BEFORE _generate_summary mutates
+        # ``_previous_summary``. Hybrid reingests unique handles from this
+        # snapshot across repeated compactions.
+        _prior_compaction_residual = ""
+        if self._previous_summary:
+            _prior_compaction_residual = _redact_compaction_text(
+                self._strip_summary_prefix(self._previous_summary)
+            )
+
         feasibility_skip = False
-        if not force and self._ineffective_compression_count >= 1:
+        if (
+            compaction_mode != "catalog"
+            and not force
+            and self._ineffective_compression_count >= 1
+        ):
             # _record_compression_regions already estimated this exact window
             # into the telemetry dict above; reuse it so the log line and
             # telemetry can never disagree. The regions helper no-ops when the
@@ -7441,7 +7557,24 @@ This compaction should PRIORITISE preserving all information related to the focu
                         self.threshold_tokens, self._prellm_skip_count,
                     )
 
-        if feasibility_skip:
+        catalog_construction_failed = False
+        if compaction_mode == "catalog":
+            # Extractive replacement — never call the auxiliary summarizer.
+            # Construction failure is fail-closed: abort and return the
+            # original messages. Do not inject a Standard static narrative,
+            # regardless of abort_on_summary_failure.
+            try:
+                summary = self._generate_catalog_residual(turns_to_summarize)
+            except AuxiliaryExplicitCancellation:
+                self._previous_summary = _previous_summary_before_scan
+                self._summary_has_user_turn = _summary_has_user_turn_before_scan
+                raise
+            except Exception as exc:
+                logger.warning("Catalog residual construction failed: %s", exc)
+                self._last_summary_error = f"catalog residual failed: {exc}"
+                summary = None
+                catalog_construction_failed = True
+        elif feasibility_skip:
             summary = None  # No LLM call; Phase 4 inserts the deterministic fallback
         else:
             # Deriving the auto focus topic scans recent user turns — only pay
@@ -7471,7 +7604,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         #           the middle window.  Records _last_summary_fallback_used /
         #           _last_summary_dropped_count for gateway hygiene to
         #           surface a warning.
-        # Default is False (historical behavior).
+        # Default is False (historical Standard/Hybrid behavior).
+        # Catalog construction failures always abort — never inject the
+        # Standard static fallback (no-invention).
         #
         # EXCEPTION — terminal access/quota AND transient network failures
         # always abort. Missing credentials, 401/402/403 access failures, and
@@ -7482,7 +7617,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         # summary degrades the conversation for zero benefit. Preserve it
         # unchanged until access is restored or connectivity recovers.
         if not summary and not feasibility_skip and (
-            self.abort_on_summary_failure
+            catalog_construction_failed
+            or self.abort_on_summary_failure
             or self._last_summary_auth_failure
             or self._last_summary_network_failure
         ):
@@ -7490,7 +7626,9 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_dropped_count = 0  # nothing actually dropped
             self._last_summary_fallback_used = False
             self._last_compress_aborted = True
-            if self._last_summary_auth_failure:
+            if catalog_construction_failed:
+                telemetry["failure_class"] = "catalog_construction_failed"
+            elif self._last_summary_auth_failure:
                 telemetry["failure_class"] = "summary_auth_failure"
             elif self._last_summary_network_failure:
                 telemetry["failure_class"] = "summary_network_failure"
@@ -7519,6 +7657,13 @@ This compaction should PRIORITISE preserving all information related to the focu
                         "unchanged; the session was NOT rotated. This is "
                         "transient: retry with /compress once connectivity "
                         "recovers, or continue the conversation as-is.",
+                        n_skipped,
+                    )
+                elif catalog_construction_failed:
+                    logger.warning(
+                        "Catalog residual construction failed — aborting "
+                        "compaction without injecting a Standard fallback. "
+                        "%d message(s) preserved unchanged.",
                         n_skipped,
                     )
                 else:
@@ -7581,6 +7726,16 @@ This compaction should PRIORITISE preserving all information related to the focu
                 # A stale error from an earlier real failure must not be
                 # embedded into a deliberate feasibility skip's fallback.
                 reason=None if feasibility_skip else self._last_summary_error,
+            )
+
+        # Hybrid = Standard residual plus one compact unique-handle index.
+        # Seed from the pre-generation prior residual. Lean already has its
+        # extractive Anchor Index — do not emit a second handle index.
+        if compaction_mode == "hybrid" and summary:
+            summary = self._append_hybrid_handle_index(
+                summary,
+                turns_to_summarize,
+                previous_residual=_prior_compaction_residual,
             )
 
         tail_messages: List[Dict[str, Any]] = []

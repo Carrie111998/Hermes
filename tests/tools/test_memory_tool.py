@@ -119,6 +119,12 @@ class TestMemoryStoreAdd:
         assert result["success"] is True
         assert result["target"] == "user"
 
+    def test_add_accepts_explicit_task_progress_memory(self, store):
+        """Explicit user-authored writes stay permissive — no text heuristics."""
+        result = store.add("memory", "Phase 3 done on PR #4242, submitted SHA abcdef123")
+        assert result["success"] is True
+        assert any("Phase 3 done on PR #4242" in entry for entry in store.memory_entries)
+
 
     def test_overflow_returns_consolidation_context(self, store):
         store.add("memory", "x" * 490)
