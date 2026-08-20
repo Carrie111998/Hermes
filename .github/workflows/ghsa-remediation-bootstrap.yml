@@ -114,11 +114,55 @@ jobs:
           target.write_text(text, encoding="utf-8")
           PY
 
-      - name: Regenerate lockfiles
+      - name: Regenerate lockfiles and advance the vulnerable nested Nano ID nodes
         run: |
           npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+          npm update nanoid --package-lock-only --ignore-scripts --no-audit --no-fund --workspaces --include-workspace-root
           npm --prefix website install --package-lock-only --ignore-scripts --no-audit --no-fund
+          npm --prefix website update nanoid --package-lock-only --ignore-scripts --no-audit --no-fund
           uv lock --upgrade-package h2
+
+      - name: Verify exact dependency floors before installation
+        run: |
+          node <<'NODE'
+          const lock = require('./package-lock.json')
+          const root = require('./package.json')
+          const desktop = require('./apps/desktop/package.json')
+          const postcss = root.overrides.postcss
+          if (!postcss || postcss['.'] !== '8.5.23' || postcss.nanoid !== '3.3.18') {
+            throw new Error(`postcss/nanoid override is ${JSON.stringify(postcss)}`)
+          }
+          if (root.overrides['nanoid@^3']) throw new Error('legacy bare nanoid v3 override remains')
+          if (desktop.devDependencies.electron !== '41.10.3') throw new Error('Electron manifest is not 41.10.3')
+          const electron = lock.packages['node_modules/electron'] || lock.packages['apps/desktop/node_modules/electron']
+          if (!electron || electron.version !== '41.10.3') throw new Error(`Electron lock is ${electron?.version}`)
+          const expectedNanoIdPaths = new Set([
+            'node_modules/sanitize-html/node_modules/nanoid',
+            'node_modules/vite/node_modules/nanoid'
+          ])
+          let nanoid3 = 0
+          for (const [path, pkg] of Object.entries(lock.packages)) {
+            if (path.endsWith('/nanoid') && pkg.version?.startsWith('3.')) {
+              nanoid3 += 1
+              if (pkg.version !== '3.3.18') throw new Error(`${path} still resolves nanoid ${pkg.version}`)
+              expectedNanoIdPaths.delete(path)
+            }
+            if (path.endsWith('/extract-zip') && pkg.version === '2.0.1') {
+              throw new Error(`${path} still resolves vulnerable extract-zip 2.0.1`)
+            }
+          }
+          if (nanoid3 === 0) throw new Error('no nanoid v3 resolution was inspected')
+          if (expectedNanoIdPaths.size) {
+            throw new Error(`expected nested Nano ID paths were not inspected: ${[...expectedNanoIdPaths].join(', ')}`)
+          }
+          NODE
+          python3 - <<'PY'
+          import re
+          lock = open('uv.lock', encoding='utf-8').read()
+          match = re.search(r'\[\[package\]\]\nname = "h2"\nversion = "([^"]+)"', lock)
+          if not match or match.group(1) != '4.4.1':
+              raise SystemExit(f"h2 lock is {match.group(1) if match else 'missing'}")
+          PY
 
       - name: Verify clean installs and lock consistency
         run: |
@@ -136,40 +180,9 @@ jobs:
           npm audit --workspace apps/desktop --audit-level=moderate | tee /tmp/npm-audit-desktop.txt
           npm --prefix website audit --audit-level=moderate | tee /tmp/npm-audit-website.txt
 
-      - name: Verify regression contracts and resolved floors
+      - name: Verify desktop regression and diff integrity
         run: |
           node --test apps/desktop/scripts/packaged-app-layout.test.mjs | tee /tmp/packaged-layout-test.txt
-          node <<'NODE'
-          const lock = require('./package-lock.json')
-          const root = require('./package.json')
-          const desktop = require('./apps/desktop/package.json')
-          const postcss = root.overrides.postcss
-          if (!postcss || postcss['.'] !== '8.5.23' || postcss.nanoid !== '3.3.18') {
-            throw new Error(`postcss/nanoid override is ${JSON.stringify(postcss)}`)
-          }
-          if (root.overrides['nanoid@^3']) throw new Error('legacy bare nanoid v3 override remains')
-          if (desktop.devDependencies.electron !== '41.10.3') throw new Error('Electron manifest is not 41.10.3')
-          const electron = lock.packages['node_modules/electron'] || lock.packages['apps/desktop/node_modules/electron']
-          if (!electron || electron.version !== '41.10.3') throw new Error(`Electron lock is ${electron?.version}`)
-          let nanoid3 = 0
-          for (const [path, pkg] of Object.entries(lock.packages)) {
-            if (path.endsWith('/nanoid') && pkg.version?.startsWith('3.')) {
-              nanoid3 += 1
-              if (pkg.version !== '3.3.18') throw new Error(`${path} still resolves nanoid ${pkg.version}`)
-            }
-            if (path.endsWith('/extract-zip') && pkg.version === '2.0.1') {
-              throw new Error(`${path} still resolves vulnerable extract-zip 2.0.1`)
-            }
-          }
-          if (nanoid3 === 0) throw new Error('no nanoid v3 resolution was inspected')
-          NODE
-          python3 - <<'PY'
-          import re
-          lock = open('uv.lock', encoding='utf-8').read()
-          match = re.search(r'\[\[package\]\]\nname = "h2"\nversion = "([^"]+)"', lock)
-          if not match or match.group(1) != '4.4.1':
-              raise SystemExit(f"h2 lock is {match.group(1) if match else 'missing'}")
-          PY
           git diff --check
 
       - name: Build exact-object verification receipt
