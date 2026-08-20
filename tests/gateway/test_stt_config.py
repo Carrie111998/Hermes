@@ -16,6 +16,17 @@ def test_gateway_config_stt_disabled_from_dict_nested():
     assert config.stt_enabled is False
 
 
+def test_gateway_config_stt_timeout_defaults_and_nested_override():
+    assert GatewayConfig.from_dict({}).stt_gateway_timeout_seconds == 45.0
+
+    config = GatewayConfig.from_dict(
+        {"stt": {"gateway_timeout_seconds": 17}}
+    )
+
+    assert config.stt_gateway_timeout_seconds == 17.0
+    assert config.to_dict()["stt_gateway_timeout_seconds"] == 17.0
+
+
 def test_load_gateway_config_bridges_stt_enabled_from_config_yaml(tmp_path, monkeypatch):
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()
@@ -93,5 +104,63 @@ async def test_enrich_message_with_transcription_guards_empty_transcript():
     assert "empty or inaudible" in result
     assert '""' not in result
     assert transcripts == []
+
+
+@pytest.mark.asyncio
+async def test_enrich_message_with_transcription_fails_open_on_gateway_timeout():
+    """A wedged STT worker is bounded to one daemon slot and blocks no turn."""
+    import asyncio
+    import threading
+
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        stt_enabled=True,
+        stt_gateway_timeout_seconds=0.01,
+    )
+    runner._has_setup_skill = lambda: False
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def _wedged_transcription(*_args, **_kwargs):
+        started.set()
+        release.wait(timeout=2)
+        return {"success": False, "transcript": "", "error": "wedged"}
+
+    try:
+        with (
+            patch(
+                "tools.transcription_tools.transcribe_audio",
+                side_effect=_wedged_transcription,
+            ) as transcribe,
+            patch(
+                "tools.transcription_tools.transcribe_audio_local_fallback"
+            ) as fallback,
+        ):
+            result, transcripts = await runner._enrich_message_with_transcription(
+                "caption",
+                ["/tmp/voice.ogg"],
+            )
+            assert started.is_set()
+            assert "could not be transcribed automatically" in result
+            assert transcripts == []
+
+            # The timed-out daemon still owns the sole slot. A second voice
+            # message fails open immediately instead of creating another thread.
+            result2, transcripts2 = await runner._enrich_message_with_transcription(
+                "caption two",
+                ["/tmp/voice-two.ogg"],
+            )
+            assert "could not be transcribed automatically" in result2
+            assert transcripts2 == []
+            assert transcribe.call_count == 1
+
+            release.set()
+            await asyncio.sleep(0.05)
+            fallback.assert_not_called()
+    finally:
+        release.set()
 
 

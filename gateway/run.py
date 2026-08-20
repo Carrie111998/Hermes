@@ -2560,6 +2560,12 @@ from gateway.whatsapp_identity import (
 
 logger = logging.getLogger(__name__)
 
+# A timed-out native/local STT call cannot be force-killed safely in CPython.
+# Isolate it to one daemon worker instead of the shared asyncio executor: a
+# wedged provider then consumes at most one bounded slot, cannot block process
+# exit, and later voice messages fail open instead of accumulating threads.
+_STT_GATEWAY_WORKER_SLOT = threading.BoundedSemaphore(1)
+
 
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
@@ -8364,6 +8370,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return len(get_running_job_ids())
         except Exception:
             return 0
+
+    def _begin_cron_restart_drain(self) -> int:
+        """Fail-closed, atomic cron gate for an in-chat restart request."""
+        from cron.scheduler import begin_gateway_restart_drain
+
+        return begin_gateway_restart_drain()
+
+    def _cancel_cron_restart_drain(self) -> None:
+        """Rollback the cron dispatch gate if restart preparation fails."""
+        from cron.scheduler import cancel_gateway_restart_drain
+
+        cancel_gateway_restart_drain()
 
     def _active_api_run_count(self) -> int:
         """Count API-server work that is outside ``_running_agents``.
@@ -24358,20 +24376,89 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for path in audio_paths:
             try:
                 logger.debug("Transcribing user voice: %s", path)
-                result = await asyncio.to_thread(
-                    transcribe_audio, path, None, "gateway",
+
+                cancel_fallback = threading.Event()
+
+                def _transcribe_with_fallback():
+                    result = transcribe_audio(path, None, "gateway")
+                    if not result.get("success") and not cancel_fallback.is_set():
+                        fallback = transcribe_audio_local_fallback(path)
+                        if fallback.get("success"):
+                            logger.info(
+                                "Configured STT failed for %s; recovered with local STT",
+                                path,
+                            )
+                            return fallback
+                    return result
+
+                async def _run_bounded_transcription(timeout: float):
+                    if not _STT_GATEWAY_WORKER_SLOT.acquire(blocking=False):
+                        return {
+                            "success": False,
+                            "transcript": "",
+                            "error": "gateway transcription worker is still busy",
+                        }
+
+                    loop = asyncio.get_running_loop()
+                    completed = loop.create_future()
+
+                    def _deliver(ok: bool, value) -> None:
+                        if completed.done():
+                            return
+                        if ok:
+                            completed.set_result(value)
+                        else:
+                            completed.set_exception(value)
+
+                    def _worker() -> None:
+                        try:
+                            outcome = (True, _transcribe_with_fallback())
+                        except BaseException as exc:
+                            outcome = (
+                                False,
+                                RuntimeError(
+                                    f"STT worker aborted: {type(exc).__name__}: {exc}"
+                                ),
+                            )
+                        finally:
+                            _STT_GATEWAY_WORKER_SLOT.release()
+                        try:
+                            loop.call_soon_threadsafe(_deliver, *outcome)
+                        except RuntimeError:
+                            # Gateway loop already closed; daemon worker must
+                            # simply exit without retaining process shutdown.
+                            pass
+
+                    threading.Thread(
+                        target=_worker,
+                        name="gateway-stt-worker",
+                        daemon=True,
+                    ).start()
+                    try:
+                        return await asyncio.wait_for(completed, timeout=timeout)
+                    except asyncio.TimeoutError:
+                        cancel_fallback.set()
+                        raise
+
+                timeout_seconds = getattr(
+                    self.config,
+                    "stt_gateway_timeout_seconds",
+                    45.0,
                 )
-                if not result.get("success"):
-                    fallback = await asyncio.to_thread(
-                        transcribe_audio_local_fallback,
+                try:
+                    result = await _run_bounded_transcription(timeout_seconds)
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "Voice transcription exceeded gateway timeout %.1fs for %s; "
+                        "continuing without a transcript",
+                        timeout_seconds,
                         path,
                     )
-                    if fallback.get("success"):
-                        logger.info(
-                            "Configured STT failed for %s; recovered with local STT",
-                            path,
-                        )
-                        result = fallback
+                    result = {
+                        "success": False,
+                        "transcript": "",
+                        "error": f"gateway transcription timeout after {timeout_seconds:.1f}s",
+                    }
                 if result["success"]:
                     transcript = result["transcript"]
                     # Speech-to-text can return success=True with an empty or

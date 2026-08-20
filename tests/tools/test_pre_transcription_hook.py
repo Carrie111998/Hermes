@@ -124,6 +124,9 @@ class TestPromptThreading:
     def test_hook_prompt_and_language_reach_openai(self, monkeypatch, tmp_path):
         audio = _make_audio(tmp_path)
         monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test")
+        monkeypatch.setenv("OPENAI_API_ALLOWED_OPERATIONS", "transcription")
+        monkeypatch.setenv("HERMES_API_SPEND_CALLER", "pytest")
+        monkeypatch.setenv("API_SPEND_LEDGER", str(tmp_path / "spend.sqlite"))
         _fake_hooks(monkeypatch, [{"prompt": PROMPT, "language": "en"}])
 
         mock_client = MagicMock()
@@ -132,6 +135,7 @@ class TestPromptThreading:
         cfg_patch, prov_patch = _dispatch_ctx({"provider": "openai"}, "openai")
         with cfg_patch, prov_patch, \
              patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("tools.openai_media_spend.audio_duration_seconds", return_value=1.0), \
              patch("openai.OpenAI", return_value=mock_client):
             result = transcription_tools.transcribe_audio(audio)
 
@@ -312,6 +316,9 @@ class TestNoHookPath:
         call carries exactly the same kwargs as before this feature."""
         audio = _make_audio(tmp_path)
         monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test")
+        monkeypatch.setenv("OPENAI_API_ALLOWED_OPERATIONS", "transcription")
+        monkeypatch.setenv("HERMES_API_SPEND_CALLER", "pytest")
+        monkeypatch.setenv("API_SPEND_LEDGER", str(tmp_path / "spend.sqlite"))
 
         mock_client = MagicMock()
         mock_client.audio.transcriptions.create.return_value = "hello"
@@ -319,6 +326,7 @@ class TestNoHookPath:
         with patch("tools.transcription_tools._HAS_OPENAI", True), \
              patch("tools.transcription_tools._resolve_stt_language",
                    return_value=None), \
+             patch("tools.openai_media_spend.audio_duration_seconds", return_value=1.0), \
              patch("openai.OpenAI", return_value=mock_client):
             transcription_tools._transcribe_openai(audio, "whisper-1")
 

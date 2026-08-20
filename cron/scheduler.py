@@ -550,6 +550,7 @@ _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_fire_owners: dict[str, dict[object, tuple[Optional[str], Path]]] = {}
 _running_lock = threading.Lock()
+_gateway_restart_dispatch_blocked = False
 
 # Wall-clock (time.time()) instant each in-flight job id was claimed by
 # ``_submit_with_guard``, plus the future that owns its release (a pending
@@ -646,6 +647,29 @@ def get_running_job_ids() -> "frozenset[str]":
         return frozenset(_running_job_ids | _running_fire_owners.keys())
 
 
+def begin_gateway_restart_drain() -> int:
+    """Atomically block new cron dispatch only when no cron work is active.
+
+    Returns the active cron count. A zero return means the persistent dispatch
+    block is installed and remains in force until process restart or an
+    explicit ``cancel_gateway_restart_drain()`` rollback.
+    """
+    global _gateway_restart_dispatch_blocked
+    with _running_lock:
+        active = len(_running_job_ids | _running_fire_owners.keys())
+        if active:
+            return active
+        _gateway_restart_dispatch_blocked = True
+        return 0
+
+
+def cancel_gateway_restart_drain() -> None:
+    """Undo a restart dispatch block when restart preparation fails."""
+    global _gateway_restart_dispatch_blocked
+    with _running_lock:
+        _gateway_restart_dispatch_blocked = False
+
+
 def try_register_running_job(job_id: str) -> bool:
     """Atomically add ``job_id`` to the in-flight running set.
 
@@ -663,6 +687,12 @@ def try_register_running_job(job_id: str) -> bool:
     ``release_running_job`` in a ``finally`` block.
     """
     with _running_lock:
+        if _gateway_restart_dispatch_blocked:
+            logger.info(
+                "Cron job '%s' dispatch skipped while gateway restart is draining",
+                job_id,
+            )
+            return False
         if job_id in _running_job_ids:
             return False
         _running_job_ids.add(job_id)
