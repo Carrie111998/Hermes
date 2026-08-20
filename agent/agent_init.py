@@ -1524,6 +1524,25 @@ def init_agent(
     agent.valid_tool_names = set()
     if agent.tools:
         agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools}
+        try:
+            bindings, binding_generation = (
+                _snapshot_registry.capture_bindings_with_generation(
+                    agent.valid_tool_names
+                )
+            )
+            if binding_generation == agent._tool_snapshot_generation:
+                agent._tool_registry_bindings = bindings
+            else:
+                # Registry mutation overlapped schema construction. Preserve
+                # the schema snapshot but fail closed at dispatch until the
+                # regular refresh path publishes one coherent surface.
+                agent._tool_registry_bindings = {
+                    name: None for name in agent.valid_tool_names
+                }
+        except Exception:
+            agent._tool_registry_bindings = {
+                name: None for name in agent.valid_tool_names
+            }
         tool_names = sorted(agent.valid_tool_names)
         if not agent.quiet_mode:
             print(f"🛠️  Loaded {len(agent.tools)} tools: {', '.join(tool_names)}")
@@ -1534,6 +1553,8 @@ def init_agent(
                 print(f"   ❌ Disabled toolsets: {', '.join(disabled_toolsets)}")
     elif not agent.quiet_mode:
         print("🛠️  No tools loaded (all tools filtered out or unavailable)")
+    if not hasattr(agent, "_tool_registry_bindings"):
+        agent._tool_registry_bindings = {}
 
     # Kanban worker/orchestrator lifecycle guidance is session-static:
     # the dispatcher decides at spawn time whether this process is a kanban

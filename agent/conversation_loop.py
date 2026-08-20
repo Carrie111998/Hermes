@@ -2411,18 +2411,28 @@ def run_conversation(
         # exactly the point the breakpoints were meant to protect. Marking
         # last also keeps breakpoints off messages that the orphan sweep or
         # the thinking-only drop is about to remove or merge away.
-        request_tool_snapshot = agent.tools
-        request_tool_snapshot_generation = getattr(
-            agent, "_tool_snapshot_generation", None
-        )
-        tools_for_api = request_tool_snapshot
-        from tools.registry import registry as _tool_registry
+        from tools.mcp_tool import snapshot_agent_tool_surface
         (
+            request_tool_snapshot,
+            request_tool_snapshot_generation,
             request_registry_bindings,
-            request_registry_generation,
-        ) = _tool_registry.capture_bindings_with_generation(
-            request_tool_names(request_tool_snapshot)
-        )
+        ) = snapshot_agent_tool_surface(agent)
+        tools_for_api = request_tool_snapshot
+        # Tool Search hides deferred schemas behind the bridge, so they are not
+        # part of agent.tools. Capture their current binding identities at the
+        # same request boundary; unwrap dispatch will enforce these identities.
+        try:
+            from agent.tool_executor import _tool_search_scoped_names
+            from tools.registry import registry as _tool_registry
+
+            deferred_names = set(_tool_search_scoped_names(agent))
+            missing_bindings = deferred_names - request_registry_bindings.keys()
+            if missing_bindings:
+                request_registry_bindings.update(
+                    _tool_registry.capture_bindings(missing_bindings)
+                )
+        except Exception:
+            pass
         if agent._use_prompt_caching and agent.provider != "moa":
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
             _initial_cache_plan = build_prompt_cache_plan(
@@ -6865,7 +6875,7 @@ def run_conversation(
                     agent,
                     request_tool_snapshot,
                     request_tool_snapshot_generation,
-                ) or request_registry_generation != request_tool_snapshot_generation:
+                ):
                     # A name offered by request A is not proof that its live
                     # handler still has A's binding after snapshot B publishes.
                     # Refuse all execution from A and let the next iteration

@@ -273,6 +273,9 @@ def test_rebound_registry_tool_is_rejected_at_dispatch(agent_env):
     agent.tools = [*agent.tools, {"type": "function", "function": schema}]
     agent.valid_tool_names = {*agent.valid_tool_names, "binding_probe"}
     agent._tool_snapshot_generation = registry._generation
+    agent._tool_registry_bindings = registry.capture_bindings(
+        agent.valid_tool_names
+    )
 
     original_flush = agent._flush_messages_to_session_db
     rebound = False
@@ -308,17 +311,15 @@ def test_rebound_registry_tool_is_rejected_at_dispatch(agent_env):
     assert result["final_response"] == "Retried safely."
 
 
-def test_registry_change_between_schema_and_binding_capture_is_rejected(
-    agent_env, monkeypatch
-):
-    """Schema A must not pair with binding B during request assembly."""
+def test_unrelated_registry_generation_does_not_block_current_binding(agent_env):
+    """Unrelated registry churn must not poison an unchanged request binding."""
     agent, handler = agent_env
     from tools.registry import registry
 
     calls = []
     schema = {
         "name": "assembly_binding_probe",
-        "description": "Probe atomic request assembly.",
+        "description": "Probe request binding isolation.",
         "parameters": {"type": "object", "properties": {}},
     }
     registry.register(
@@ -330,28 +331,100 @@ def test_registry_change_between_schema_and_binding_capture_is_rejected(
     agent.tools = [*agent.tools, {"type": "function", "function": schema}]
     agent.valid_tool_names = {*agent.valid_tool_names, "assembly_binding_probe"}
     agent._tool_snapshot_generation = registry._generation
-
-    original_capture = registry.capture_bindings_with_generation
-    rebound = False
-
-    def _rebind_then_capture(names, *, scope=None):
-        nonlocal rebound
-        if not rebound:
-            rebound = True
-            registry.register(
-                name="assembly_binding_probe",
-                toolset="test-binding",
-                schema=schema,
-                handler=lambda _args, **_kwargs: calls.append("B") or '{"ok":"B"}',
-            )
-        return original_capture(names, scope=scope)
-
-    monkeypatch.setattr(registry, "capture_bindings_with_generation", _rebind_then_capture)
+    agent._tool_registry_bindings = registry.capture_bindings(
+        agent.valid_tool_names
+    )
+    registry.register(
+        name="unrelated_generation_probe",
+        toolset="test-binding",
+        schema={
+            "name": "unrelated_generation_probe",
+            "description": "Unrelated registry entry.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda _args, **_kwargs: '{"ok":"unrelated"}',
+    )
     handler.response_queue.append(_tc_resp("assembly_binding_probe"))
-    handler.response_queue.append(_text_resp("Retried safely."))
+    handler.response_queue.append(_text_resp("Completed safely."))
 
     result = agent.run_conversation(
         "run the assembly probe", conversation_history=[], task_id="t"
+    )
+
+    tool_results = [
+        message.get("content", "")
+        for message in result["messages"]
+        if isinstance(message, dict) and message.get("role") == "tool"
+    ]
+    assert calls == ["A"]
+    assert not any("binding changed" in content for content in tool_results)
+    assert result["final_response"] == "Completed safely."
+
+
+def test_rebound_deferred_tool_is_rejected_after_tool_search_unwrap(agent_env):
+    """A tool_call bridge response must retain the deferred A binding."""
+    agent, handler = agent_env
+    from tools.registry import registry
+
+    calls = []
+    underlying_name = "mcp_deferred_binding_probe"
+    underlying_schema = {
+        "name": underlying_name,
+        "description": "Deferred binding probe.",
+        "parameters": {"type": "object", "properties": {}},
+    }
+    registry.register(
+        name=underlying_name,
+        toolset="mcp-test-binding",
+        schema=underlying_schema,
+        handler=lambda _args, **_kwargs: calls.append("A") or '{"ok":"A"}',
+    )
+    bridge_schema = {
+        "name": "tool_call",
+        "description": "Invoke one deferred tool.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "arguments": {"type": "object"},
+            },
+            "required": ["name", "arguments"],
+        },
+    }
+    agent.tools = [*agent.tools, {"type": "function", "function": bridge_schema}]
+    agent.valid_tool_names = {*agent.valid_tool_names, "tool_call"}
+    agent._tool_snapshot_generation = registry._generation
+    agent._tool_registry_bindings = registry.capture_bindings(
+        agent.valid_tool_names
+    )
+
+    original_flush = agent._flush_messages_to_session_db
+    rebound = False
+
+    def _rebind_before_dispatch(*args, **kwargs):
+        nonlocal rebound
+        result = original_flush(*args, **kwargs)
+        if not rebound:
+            rebound = True
+            registry.register(
+                name=underlying_name,
+                toolset="mcp-test-binding",
+                schema=underlying_schema,
+                handler=lambda _args, **_kwargs: calls.append("B") or '{"ok":"B"}',
+            )
+        return result
+
+    agent._flush_messages_to_session_db = _rebind_before_dispatch
+    handler.response_queue.append(
+        _tc_resp(
+            "tool_call",
+            json.dumps({"name": underlying_name, "arguments": {}}),
+        )
+    )
+    handler.response_queue.append(_text_resp("Retried safely."))
+
+    result = agent.run_conversation(
+        "run the deferred probe", conversation_history=[], task_id="t"
     )
 
     tool_results = [

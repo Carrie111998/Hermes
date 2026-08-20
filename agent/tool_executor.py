@@ -1326,7 +1326,6 @@ def execute_tool_calls_concurrent(
         try:
             try:
                 def _execute(next_args: dict[str, Any]) -> Any:
-                    _direct_binding = function_name == tool_call.function.name
                     return agent._invoke_tool(
                         function_name,
                         next_args,
@@ -1339,12 +1338,11 @@ def execute_tool_calls_concurrent(
                         tool_request_middleware_trace=list(middleware_trace),
                         expected_registry_entry=(
                             request_registry_bindings.get(function_name)
-                            if _direct_binding and request_registry_bindings is not None
+                            if request_registry_bindings is not None
                             else None
                         ),
                         enforce_registry_entry=(
-                            _direct_binding
-                            and request_registry_bindings is not None
+                            request_registry_bindings is not None
                             and function_name in request_registry_bindings
                         ),
                     )
@@ -2398,13 +2396,11 @@ def execute_tool_calls_sequential(
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                             expected_registry_entry=(
                                 request_registry_bindings.get(function_name)
-                                if function_name == tool_call.function.name
-                                and request_registry_bindings is not None
+                                if request_registry_bindings is not None
                                 else None
                             ),
                             enforce_registry_entry=(
-                                function_name == tool_call.function.name
-                                and request_registry_bindings is not None
+                                request_registry_bindings is not None
                                 and function_name in request_registry_bindings
                             ),
                         )
@@ -2491,13 +2487,11 @@ def execute_tool_calls_sequential(
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                             expected_registry_entry=(
                                 request_registry_bindings.get(function_name)
-                                if function_name == tool_call.function.name
-                                and request_registry_bindings is not None
+                                if request_registry_bindings is not None
                                 else None
                             ),
                             enforce_registry_entry=(
-                                function_name == tool_call.function.name
-                                and request_registry_bindings is not None
+                                request_registry_bindings is not None
                                 and function_name in request_registry_bindings
                             ),
                         )
