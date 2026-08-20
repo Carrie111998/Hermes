@@ -187,6 +187,10 @@ class TestFindAllSkills:
             _make_skill(tmp_path, "axolotl", category="mlops")
 
             # .git internals are not skills.
+            skills = _find_all_skills()
+
+        assert {s["name"] for s in skills} == {"skill-a", "skill-b", "axolotl"}
+        assert [s["category"] for s in skills if s["name"] == "axolotl"] == ["mlops"]
 
     def test_exposes_invocation_name_separately_from_category_and_path(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
@@ -249,8 +253,7 @@ class TestFindAllSkills:
 
             skills = _find_all_skills()
 
-        assert {s["name"] for s in skills} == {"skill-a", "skill-b", "axolotl"}
-        assert [s["category"] for s in skills if s["name"] == "axolotl"] == ["mlops"]
+        assert {s["name"] for s in skills} == {"real-skill"}
 
 
     def test_description_falls_back_to_body_and_is_truncated(self, tmp_path):
