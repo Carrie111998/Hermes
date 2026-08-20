@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
@@ -71,6 +72,44 @@ def _ensure_httpx():
 
         globals()["httpx"] = module
     return module
+
+
+# ---------------------------------------------------------------------------
+# Cooperative budget
+#
+# ``ai_usage.collector.collect()`` documents a ``deadline_seconds`` bound (90s
+# by default) and hands each provider the time it has left -- but only when the
+# fetcher it was given declares ``budget_seconds`` (see
+# ``ai_usage.collector._supports_budget``). Until 2026-08-20 this function did
+# not, so ``_supports_budget`` returned False and the deadline was evaluated
+# only BETWEEN providers: a single hung request could overrun it by any amount.
+# The collector's own tests missed it because their fakes DO accept the budget.
+#
+# Accepting the parameter is not enough on its own -- that would flip
+# ``_supports_budget`` to True while the bound stayed fictional. So the budget
+# is clamped onto the per-request httpx timeout of every fetcher below.
+_DEFAULT_USAGE_TIMEOUT = 15.0
+_OPENROUTER_USAGE_TIMEOUT = 10.0
+
+# Floor for a clamped timeout. collect() skips a provider outright once the
+# budget is gone, so a value this small only shows up when a caller passes a
+# near-zero budget by hand; it keeps httpx from receiving 0 or a negative.
+_MIN_USAGE_TIMEOUT = 0.1
+
+
+def _budgeted_timeout(default: float, budget_seconds: Optional[float]) -> float:
+    """Clamp a per-request timeout down to the caller's remaining budget.
+
+    ``None`` means "no budget in force" -- the fetcher's own default stands,
+    which is what the CLI and /usage paths get.
+    """
+    if budget_seconds is None:
+        return default
+    try:
+        budget = float(budget_seconds)
+    except (TypeError, ValueError):
+        return default
+    return max(_MIN_USAGE_TIMEOUT, min(default, budget))
 
 
 def __getattr__(name: str):
@@ -598,6 +637,8 @@ def _codex_window_label(window: dict, fallback_label: str) -> str:
 def _fetch_codex_account_usage(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    *,
+    timeout: float = _DEFAULT_USAGE_TIMEOUT,
 ) -> Optional[AccountUsageSnapshot]:
     httpx = _ensure_httpx()
     token, resolved_base_url, account_id = _resolve_codex_usage_credentials(base_url, api_key)
@@ -608,7 +649,7 @@ def _fetch_codex_account_usage(
     }
     if account_id:
         headers["ChatGPT-Account-Id"] = account_id
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=timeout) as client:
         response = client.get(_resolve_codex_usage_url(resolved_base_url), headers=headers)
         response.raise_for_status()
     payload = response.json() or {}
@@ -826,7 +867,9 @@ def redeem_codex_reset_credit(
     )
 
 
-def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
+def _fetch_anthropic_account_usage(
+    *, timeout: float = _DEFAULT_USAGE_TIMEOUT
+) -> Optional[AccountUsageSnapshot]:
     httpx = _ensure_httpx()
     token = (resolve_anthropic_token() or "").strip()
     if not token:
@@ -845,7 +888,7 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
         "anthropic-beta": "oauth-2025-04-20",
         "User-Agent": "claude-code/2.1.0",
     }
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=timeout) as client:
         response = client.get("https://api.anthropic.com/api/oauth/usage", headers=headers)
         response.raise_for_status()
     payload = response.json() or {}
@@ -888,7 +931,12 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
     )
 
 
-def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[str]) -> Optional[AccountUsageSnapshot]:
+def _fetch_openrouter_account_usage(
+    base_url: Optional[str],
+    api_key: Optional[str],
+    *,
+    timeout: float = _OPENROUTER_USAGE_TIMEOUT,
+) -> Optional[AccountUsageSnapshot]:
     httpx = _ensure_httpx()
     runtime = resolve_runtime_provider(
         requested="openrouter",
@@ -905,12 +953,20 @@ def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[s
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
     }
-    with httpx.Client(timeout=10.0) as client:
+    started = time.monotonic()
+    with httpx.Client(timeout=timeout) as client:
         credits_resp = client.get(credits_url, headers=headers)
         credits_resp.raise_for_status()
         credits = (credits_resp.json() or {}).get("data") or {}
         try:
-            key_resp = client.get(key_url, headers=headers)
+            # The budget covers BOTH calls, so the key call only gets what the
+            # credits call left. Overrunning here is the failure this clamp
+            # exists to prevent; the balance is already in hand, and key_data
+            # is optional -- an empty one just omits the quota window below.
+            remaining = timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                raise TimeoutError("usage budget spent on the credits call")
+            key_resp = client.get(key_url, headers=headers, timeout=remaining)
             key_resp.raise_for_status()
             key_data = (key_resp.json() or {}).get("data") or {}
         except Exception:
@@ -1047,6 +1103,8 @@ def _kimi_plan(payload: dict) -> Optional[str]:
 def _fetch_kimi_account_usage(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    *,
+    timeout: float = _DEFAULT_USAGE_TIMEOUT,
 ) -> Optional[AccountUsageSnapshot]:
     httpx = _ensure_httpx()
     token, resolved_base_url = _resolve_kimi_usage_credentials(base_url, api_key)
@@ -1055,7 +1113,7 @@ def _fetch_kimi_account_usage(
         "Accept": "application/json",
         "User-Agent": "kimi-code",
     }
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=timeout) as client:
         response = client.get(_kimi_usage_url(resolved_base_url), headers=headers)
         response.raise_for_status()
     payload = response.json() or {}
@@ -1123,6 +1181,8 @@ def _resolve_deepseek_balance_credentials(
 def _fetch_deepseek_account_usage(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    *,
+    timeout: float = _DEFAULT_USAGE_TIMEOUT,
 ) -> Optional[AccountUsageSnapshot]:
     """DeepSeek pay-as-you-go balance from GET /user/balance.
 
@@ -1138,7 +1198,7 @@ def _fetch_deepseek_account_usage(
         "Accept": "application/json",
         "User-Agent": "hermes-usage-collector",
     }
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=timeout) as client:
         response = client.get(_deepseek_balance_url(resolved_base_url), headers=headers)
         response.raise_for_status()
     payload = response.json() or {}
@@ -1173,21 +1233,44 @@ def fetch_account_usage(
     *,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    budget_seconds: Optional[float] = None,
 ) -> Optional[AccountUsageSnapshot]:
+    """Fetch one provider's account usage.
+
+    ``budget_seconds`` is the cooperative budget from
+    ``ai_usage.collector.collect()``: the wall-clock this call may spend before
+    the collector's own deadline expires. Declaring it is what makes
+    ``collector._supports_budget`` return True, so the collector passes the
+    remaining time instead of falling back to an unbounded call -- and the
+    value is clamped onto the HTTP timeout below so the bound is real rather
+    than merely declared. ``None`` (the CLI and /usage paths) keeps each
+    fetcher's own default.
+    """
     normalized = str(provider or "").strip().lower()
     if normalized in {"", "auto", "custom"}:
         return None
+    timeout = _budgeted_timeout(_DEFAULT_USAGE_TIMEOUT, budget_seconds)
     try:
         if normalized == "openai-codex":
-            return _fetch_codex_account_usage(base_url=base_url, api_key=api_key)
+            return _fetch_codex_account_usage(
+                base_url=base_url, api_key=api_key, timeout=timeout
+            )
         if normalized == "kimi":
-            return _fetch_kimi_account_usage(base_url=base_url, api_key=api_key)
+            return _fetch_kimi_account_usage(
+                base_url=base_url, api_key=api_key, timeout=timeout
+            )
         if normalized == "deepseek":
-            return _fetch_deepseek_account_usage(base_url=base_url, api_key=api_key)
+            return _fetch_deepseek_account_usage(
+                base_url=base_url, api_key=api_key, timeout=timeout
+            )
         if normalized == "anthropic":
-            return _fetch_anthropic_account_usage()
+            return _fetch_anthropic_account_usage(timeout=timeout)
         if normalized == "openrouter":
-            return _fetch_openrouter_account_usage(base_url, api_key)
+            return _fetch_openrouter_account_usage(
+                base_url,
+                api_key,
+                timeout=_budgeted_timeout(_OPENROUTER_USAGE_TIMEOUT, budget_seconds),
+            )
     except Exception:
         return None
     return None
