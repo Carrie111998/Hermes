@@ -4948,10 +4948,19 @@ class AIAgent:
         """
         return _sanitize_uniquify_tool_call_ids(tool_calls)
 
-    def _repair_tool_call(self, tool_name: str) -> str | None:
+    def _repair_tool_call(
+        self,
+        tool_name: str,
+        *,
+        valid_tool_names=None,
+    ) -> str | None:
         """Forwarder — see ``agent.agent_runtime_helpers.repair_tool_call``."""
         from agent.agent_runtime_helpers import repair_tool_call
-        return repair_tool_call(self, tool_name)
+        return repair_tool_call(
+            self,
+            tool_name,
+            valid_tool_names=valid_tool_names,
+        )
 
     def _invalidate_system_prompt(self):
         """Forwarder — see ``agent.system_prompt.invalidate_system_prompt``."""

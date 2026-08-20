@@ -3292,7 +3292,12 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
 
 
 
-def repair_tool_call(agent, tool_name: str) -> str | None:
+def repair_tool_call(
+    agent,
+    tool_name: str,
+    *,
+    valid_tool_names=None,
+) -> str | None:
     """Attempt to repair a mismatched tool name before aborting.
 
     Models sometimes emit variants of a tool name that differ only
@@ -3311,7 +3316,8 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
     See #14784 for the original reports (TodoTool_tool, Patch_tool,
     BrowserClick_tool were all returning "Unknown tool" before).
 
-    Returns the repaired name if found in valid_tool_names, else None.
+    Returns the repaired name if found in the supplied request-local names (or
+    the agent's live names when omitted), else None.
     """
     import re
     from difflib import get_close_matches
@@ -3353,12 +3359,18 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
                 return s[: -len(suffix)].rstrip("_-")
         return None
 
+    names = (
+        set(valid_tool_names)
+        if valid_tool_names is not None
+        else set(getattr(agent, "valid_tool_names", set()) or set())
+    )
+
     # Cheap fast-paths first — these cover the common case.
     lowered = tool_name.lower()
-    if lowered in agent.valid_tool_names:
+    if lowered in names:
         return lowered
     normalized = _norm(tool_name)
-    if normalized in agent.valid_tool_names:
+    if normalized in names:
         return normalized
 
     # Build the full candidate set for class-like emissions.
@@ -3375,11 +3387,11 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
         cands |= extra
 
     for c in cands:
-        if c and c in agent.valid_tool_names:
+        if c and c in names:
             return c
 
     # Fuzzy match as last resort.
-    matches = get_close_matches(lowered, agent.valid_tool_names, n=1, cutoff=0.7)
+    matches = get_close_matches(lowered, names, n=1, cutoff=0.7)
     if matches:
         return matches[0]
 
