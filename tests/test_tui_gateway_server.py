@@ -17818,6 +17818,80 @@ def test_get_usage_clamps_post_compression_sentinel():
 
 
 # ---------------------------------------------------------------------------
+# Tokens-per-second readouts (tok/s pills)
+# ---------------------------------------------------------------------------
+
+def test_get_usage_emits_tok_per_call():
+    """When the compressor reports completion tokens and the agent has a
+    recorded API duration, _get_usage emits tok_per_call = completion/duration."""
+    agent = types.SimpleNamespace(
+        model="test-model",
+        session_total_tokens=100_000,
+        _last_api_duration=2.0,
+        context_compressor=types.SimpleNamespace(
+            last_prompt_tokens=60_000,
+            context_length=120_000,
+            last_completion_tokens=80,
+            compression_count=2,
+        ),
+    )
+    usage = server._get_usage(agent)
+    assert usage["tok_per_call"] == 40.0  # 80 tokens / 2.0s
+
+
+def test_get_usage_omits_tok_per_call_when_duration_missing():
+    """With no recorded API duration, tok_per_call must be omitted, not
+    fabricated as 0 or a division error."""
+    agent = types.SimpleNamespace(
+        model="test-model",
+        session_total_tokens=100_000,
+        context_compressor=types.SimpleNamespace(
+            last_prompt_tokens=100_000,
+            context_length=120_000,
+            last_completion_tokens=80,
+            compression_count=2,
+        ),
+    )
+    usage = server._get_usage(agent)
+    assert "tok_per_call" not in usage
+
+
+def test_get_usage_emits_tok_per_turn():
+    """When a turn's output tokens and duration are recorded, _get_usage emits
+    tok/s per turn."""
+    agent = types.SimpleNamespace(
+        model="test-model",
+        session_total_tokens=100_000,
+        _last_turn_output_tokens=500,
+        _last_turn_duration=10.0,
+        context_compressor=types.SimpleNamespace(
+            last_prompt_tokens=100_000,
+            context_length=120_000,
+            compression_count=2,
+        ),
+    )
+    usage = server._get_usage(agent)
+    assert usage["tok_per_turn"] == 50.0  # 500 tokens / 10s
+
+
+def test_get_usage_omits_tok_readouts_on_zero():
+    """Zero rates (no call/turn yet) leave tok/s keys absent entirely."""
+    agent = types.SimpleNamespace(
+        model="test-model",
+        session_total_tokens=100_000,
+        context_compressor=types.SimpleNamespace(
+            last_prompt_tokens=0,
+            context_length=120_000,
+            last_completion_tokens=0,
+            compression_count=0,
+        ),
+    )
+    usage = server._get_usage(agent)
+    assert "tok_per_call" not in usage
+    assert "tok_per_turn" not in usage
+
+
+# ---------------------------------------------------------------------------
 # Streaming TTS — per-turn pipeline + barge-in
 # ---------------------------------------------------------------------------
 
