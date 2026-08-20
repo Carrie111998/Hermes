@@ -715,6 +715,14 @@ class TestConfigHelpers:
 # ---------------------------------------------------------------------------
 
 class TestDispatcher:
+    def test_top_level_wrapper_preserves_dispatcher_status(self, monkeypatch):
+        from hermes_cli import mcp_config
+        from hermes_cli.main import cmd_mcp
+
+        monkeypatch.setattr(mcp_config, "mcp_command", lambda args: 1)
+
+        assert cmd_mcp(_make_args()) == 1
+
     def test_no_action_shows_list(self, tmp_path, capsys):
         from hermes_cli.mcp_config import mcp_command
 
