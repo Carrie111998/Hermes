@@ -92,7 +92,9 @@ def _resolve_install_target(root: Path) -> tuple[list[str], dict | None]:
     """
     uv_bin = _er._find_uv_binary()
     if uv_bin:
-        env = {**os.environ, "VIRTUAL_ENV": str(root / "venv")}
+        from hermes_constants import project_venv_dir
+
+        env = {**os.environ, "VIRTUAL_ENV": str(project_venv_dir(root) or root / "venv")}
         if _is_termux_env(env):
             env.pop("PYTHONPATH", None)
             env.pop("PYTHONHOME", None)
@@ -102,13 +104,14 @@ def _resolve_install_target(root: Path) -> tuple[list[str], dict | None]:
 
 def _venv_scripts_dir(root: Path) -> Path | None:
     """Project venv Scripts/bin dir, when present. stdlib-only."""
-    venv_dir = root / "venv"
-    if not venv_dir.is_dir():
-        return None
-    # hermes_constants is stdlib-only, so the canonical layout helper is safe
+    # hermes_constants is stdlib-only, so the canonical layout helpers are safe
     # to use from this corrupted-venv repair path (#76105: never open-code
     # the Scripts/bin split).
-    from hermes_constants import venv_bin_dir
+    from hermes_constants import project_venv_dir, venv_bin_dir
+
+    venv_dir = project_venv_dir(root)
+    if venv_dir is None:
+        return None
 
     scripts = venv_bin_dir(venv_dir, windows=_is_windows())
     return scripts if scripts.is_dir() else None
@@ -183,10 +186,15 @@ def _run_install_cmd(cmd: list[str], *, env: dict | None, root: Path) -> None:
     moved = _quarantine_running_hermes_exe(scripts_dir) if scripts_dir else []
     try:
         subprocess.run(cmd, cwd=root, check=True, env=env)
-    except BaseException:
+    finally:
+        # Restore runs on success AND failure: a SUCCESSFUL install can still
+        # skip the entry-points step entirely (uv audits an already-satisfied
+        # editable install as a no-op and rewrites nothing), which would leave
+        # the quarantined shims renamed aside and `hermes` gone from PATH
+        # (#75584). _restore_quarantined_exes only renames back when the
+        # installer did NOT write a fresh shim, so this is safe in both cases.
         if scripts_dir is not None:
             _restore_quarantined_exes(moved)
-        raise
 
 
 def _load_installable_optional_extras(root: Path, group: str) -> list[str]:

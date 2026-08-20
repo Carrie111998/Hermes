@@ -155,6 +155,10 @@ class _SQLiteSnapshotError(RuntimeError):
     pass
 
 
+class _SQLiteBackupTimeout(RuntimeError):
+    """Raised when a SQLite snapshot remains busy past its deadline."""
+
+
 @contextmanager
 def _backup_operation_lock(hermes_home: Path, timeout_seconds: float = 0.25):
     """Acquire one cross-process backup slot for full and quick snapshots."""
@@ -347,7 +351,12 @@ def _should_skip_backup_file(abs_path: Path, rel_path: Path, out_path: Path) -> 
 # SQLite safe copy
 # ---------------------------------------------------------------------------
 
-def _safe_copy_db(src: Path, dst: Path) -> bool:
+def _safe_copy_db(
+    src: Path,
+    dst: Path,
+    *,
+    timeout_seconds: float = 10.0,
+) -> bool:
     """Copy a SQLite database safely using the backup() API.
 
     Handles WAL mode — produces a consistent snapshot even while
@@ -357,12 +366,42 @@ def _safe_copy_db(src: Path, dst: Path) -> bool:
     conn = None
     backup_conn = None
     try:
-        conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+        # Disable sqlite3's implicit busy wait so backup() progress callbacks
+        # control the full locked-source deadline instead of adding the
+        # connection's default timeout before each callback.
+        conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=0.0)
         backup_conn = sqlite3.connect(str(dst))
-        conn.backup(backup_conn)
+        busy_deadline = time.monotonic() + max(0.0, timeout_seconds)
+
+        def _check_backup_progress(status: int, _remaining: int, _total: int) -> None:
+            nonlocal busy_deadline
+            now = time.monotonic()
+            if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                if now >= busy_deadline:
+                    raise _SQLiteBackupTimeout(
+                        f"database remained locked for {timeout_seconds:g} seconds"
+                    )
+            else:
+                busy_deadline = now + max(0.0, timeout_seconds)
+
+        conn.backup(
+            backup_conn,
+            pages=256,
+            progress=_check_backup_progress,
+            sleep=0.1,
+        )
         return True
     except Exception as exc:
         logger.warning("SQLite safe copy failed for %s: %s", src, exc)
+        # Windows will not remove the partial destination while SQLite still
+        # has it open. Close it before fail-closed cleanup; the finally block
+        # still owns the source and any close failure.
+        if backup_conn is not None:
+            try:
+                backup_conn.close()
+            except Exception:
+                pass
+            backup_conn = None
         try:
             dst.unlink(missing_ok=True)
         except OSError:
@@ -606,22 +645,30 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
     """Write a full backup while the cross-process backup slot is held."""
 
     # Determine output path
-    if args.output:
-        out_path = Path(args.output).expanduser().resolve()
-        # If user gave a directory, put the zip inside it
-        if out_path.is_dir():
+    out_path = None
+    try:
+        if args.output:
+            out_path = Path(args.output).expanduser().resolve()
+            # If user gave a directory, put the zip inside it
+            if out_path.is_dir():
+                stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+                out_path = out_path / f"hermes-backup-{stamp}.zip"
+        else:
             stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
-            out_path = out_path / f"hermes-backup-{stamp}.zip"
-    else:
-        stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
-        out_path = Path.home() / f"hermes-backup-{stamp}.zip"
+            out_path = Path.home() / f"hermes-backup-{stamp}.zip"
 
-    # Ensure the suffix is .zip
-    if out_path.suffix.lower() != ".zip":
-        out_path = out_path.with_suffix(out_path.suffix + ".zip")
+        # Ensure the suffix is .zip
+        if out_path.suffix.lower() != ".zip":
+            out_path = out_path.with_suffix(out_path.suffix + ".zip")
 
-    # Ensure parent directory exists
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+        # Ensure parent directory exists
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        # A bad/unwritable output path (permission denied, unreadable parent,
+        # etc.) should give a clean one-line error, not a raw traceback
+        # (round-3 QA SUB-01). is_dir() and mkdir() both hit the filesystem.
+        print(f"Error: cannot write backup to {args.output or out_path}: {exc}")
+        raise SystemExit(1) from exc
 
     # Collect files
     scan_started = time.monotonic()
