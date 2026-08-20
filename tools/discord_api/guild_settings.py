@@ -1,8 +1,8 @@
 """Discord REST v10 guild-settings request builder (approved scalars only).
 
 This module is deliberately transport-free. It validates the scalar guild
-settings Hermes exposes and returns a request descriptor for the model-callable
-consumer in :mod:`tools.discord_guild_settings_tool`.
+settings Hermes exposes and returns a request descriptor for the existing
+``discord_admin`` consumer.
 """
 
 from __future__ import annotations
@@ -11,8 +11,7 @@ import re
 from typing import Any, Callable, Dict, Final
 
 __all__ = [
-    "AFK_TIMEOUT_MAX",
-    "AFK_TIMEOUT_MIN",
+    "AFK_TIMEOUT_VALUES",
     "DESCRIPTION_MAX",
     "EDITABLE_GUILD_SETTINGS",
     "GuildSettingsError",
@@ -20,18 +19,13 @@ __all__ = [
     "edit_guild_request",
 ]
 
+NAME_MIN: Final = 2
 NAME_MAX: Final = 100
 DESCRIPTION_MAX: Final = 1024
-VERIFICATION_LEVEL_MIN: Final = 0
-VERIFICATION_LEVEL_MAX: Final = 4
-DEFAULT_MESSAGE_NOTIFICATIONS_MIN: Final = 0
-DEFAULT_MESSAGE_NOTIFICATIONS_MAX: Final = 1
-EXPLICIT_CONTENT_FILTER_MIN: Final = 0
-EXPLICIT_CONTENT_FILTER_MAX: Final = 2
-NSFW_LEVEL_MIN: Final = 0
-NSFW_LEVEL_MAX: Final = 3
-AFK_TIMEOUT_MIN: Final = 60
-AFK_TIMEOUT_MAX: Final = 3600
+VERIFICATION_LEVEL_VALUES: Final = frozenset(range(5))
+DEFAULT_MESSAGE_NOTIFICATION_VALUES: Final = frozenset(range(2))
+EXPLICIT_CONTENT_FILTER_VALUES: Final = frozenset(range(3))
+AFK_TIMEOUT_VALUES: Final = frozenset({60, 300, 900, 1800, 3600})
 
 _SNOWFLAKE_MAX: Final = (1 << 64) - 1
 _SNOWFLAKE_RE: Final = re.compile(r"^[0-9]{1,64}$")
@@ -64,6 +58,18 @@ def _validate_snowflake(value: Any, field: str) -> str:
     return str(parsed)
 
 
+def _validate_name(value: Any) -> str:
+    if not isinstance(value, str):
+        raise GuildSettingsError("'name' must be a string")
+    if value != value.strip():
+        raise GuildSettingsError("'name' cannot have leading or trailing whitespace")
+    if not NAME_MIN <= len(value) <= NAME_MAX:
+        raise GuildSettingsError(
+            f"'name' must be between {NAME_MIN} and {NAME_MAX} characters"
+        )
+    return value
+
+
 def _validate_str(
     value: Any,
     field: str,
@@ -80,11 +86,20 @@ def _validate_str(
     return value
 
 
-def _validate_int_range(value: Any, field: str, lo: int, hi: int) -> int:
+def _validate_int_enum(
+    value: Any,
+    field: str,
+    allowed: frozenset[int],
+    *,
+    allow_none: bool = False,
+) -> int | None:
+    if value is None and allow_none:
+        return None
     if isinstance(value, bool) or not isinstance(value, int):
         raise GuildSettingsError(f"{field!r} must be an integer")
-    if not lo <= value <= hi:
-        raise GuildSettingsError(f"{field!r} must be between {lo} and {hi}")
+    if value not in allowed:
+        allowed_text = ", ".join(str(item) for item in sorted(allowed))
+        raise GuildSettingsError(f"{field!r} must be one of: {allowed_text}")
     return value
 
 
@@ -101,40 +116,38 @@ def _validate_optional_snowflake(value: Any, field: str) -> str | None:
 
 
 _FIELD_VALIDATORS: Dict[str, Callable[[Any], Any]] = {
-    "name": lambda value: _validate_str(value, "name", NAME_MAX),
+    "name": _validate_name,
     "description": lambda value: _validate_str(
         value,
         "description",
         DESCRIPTION_MAX,
         allow_none=True,
     ),
-    "verification_level": lambda value: _validate_int_range(
+    "verification_level": lambda value: _validate_int_enum(
         value,
         "verification_level",
-        VERIFICATION_LEVEL_MIN,
-        VERIFICATION_LEVEL_MAX,
+        VERIFICATION_LEVEL_VALUES,
+        allow_none=True,
     ),
-    "default_message_notifications": lambda value: _validate_int_range(
+    "default_message_notifications": lambda value: _validate_int_enum(
         value,
         "default_message_notifications",
-        DEFAULT_MESSAGE_NOTIFICATIONS_MIN,
-        DEFAULT_MESSAGE_NOTIFICATIONS_MAX,
+        DEFAULT_MESSAGE_NOTIFICATION_VALUES,
+        allow_none=True,
     ),
-    "explicit_content_filter": lambda value: _validate_int_range(
+    "explicit_content_filter": lambda value: _validate_int_enum(
         value,
         "explicit_content_filter",
-        EXPLICIT_CONTENT_FILTER_MIN,
-        EXPLICIT_CONTENT_FILTER_MAX,
-    ),
-    "nsfw_level": lambda value: _validate_int_range(
-        value,
-        "nsfw_level",
-        NSFW_LEVEL_MIN,
-        NSFW_LEVEL_MAX,
+        EXPLICIT_CONTENT_FILTER_VALUES,
+        allow_none=True,
     ),
     "premium_progress_bar_enabled": lambda value: _validate_bool(
         value,
         "premium_progress_bar_enabled",
+    ),
+    "afk_channel_id": lambda value: _validate_optional_snowflake(
+        value,
+        "afk_channel_id",
     ),
     "system_channel_id": lambda value: _validate_optional_snowflake(
         value,
@@ -148,11 +161,14 @@ _FIELD_VALIDATORS: Dict[str, Callable[[Any], Any]] = {
         value,
         "public_updates_channel_id",
     ),
-    "afk_timeout": lambda value: _validate_int_range(
+    "safety_alerts_channel_id": lambda value: _validate_optional_snowflake(
+        value,
+        "safety_alerts_channel_id",
+    ),
+    "afk_timeout": lambda value: _validate_int_enum(
         value,
         "afk_timeout",
-        AFK_TIMEOUT_MIN,
-        AFK_TIMEOUT_MAX,
+        AFK_TIMEOUT_VALUES,
     ),
 }
 
