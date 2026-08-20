@@ -2186,7 +2186,7 @@ DEFAULT_CONFIG = {
 
     # Discord platform settings (gateway mode)
     "discord": {
-        "voice_enabled": True,          # Set false for a text-only Discord surface
+        "voice_channels_enabled": True,  # Set false to disable Discord VC participation
         "require_mention": True,       # Require @mention to respond in server channels
         "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)

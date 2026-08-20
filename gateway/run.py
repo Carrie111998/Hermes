@@ -17179,12 +17179,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _denied is not None:
                 return _denied
 
-        # Voice availability belongs to the source profile. Enforce it before
-        # observers and command hooks so neither can handle or rewrite /voice.
-        if canonical == "voice" and not self._discord_voice_enabled_for_source(
-            source
+        # Voice channel availability belongs to the source profile. Enforce VC
+        # actions before observers and hooks. Voice message STT and TTS modes
+        # remain available when Discord VC participation is disabled.
+        if canonical == "voice" and not self._discord_voice_channel_action_allowed(
+            source, event.get_command_args()
         ):
-            return "Discord voice is disabled."
+            return "Discord voice channels are disabled."
 
         # pre_command observer hook (#64204): fires for every recognized
         # slash command BEFORE core handling, mirroring the CLI fire-site in

@@ -1158,8 +1158,11 @@ class DiscordAdapter(BasePlatformAdapter):
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
         # Preserve compatibility when the key is absent, but fail closed for
-        # malformed values instead of silently enabling voice.
-        self._voice_enabled: bool = self.config.extra.get("voice_enabled", True) is True
+        # malformed values instead of silently enabling voice channel access.
+        # Voice messages and TTS remain available independently.
+        self._voice_channels_enabled: bool = (
+            self.config.extra.get("voice_channels_enabled", True) is True
+        )
         # In-memory cache of the bot's last message ID per channel, used by
         # history backfill to skip the full scan on hot paths.  Falls back to
         # scanning channel.history() on cache miss (cold start / restart).
@@ -5944,24 +5947,24 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_reload_skills(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/reload-skills")
 
-        if self._voice_enabled:
-            @tree.command(name="voice", description="Toggle voice reply mode")
-            @discord.app_commands.describe(mode="Voice mode: join, channel, leave, on, tts, off, or status")
-            @discord.app_commands.choices(mode=[
-                # `join` and `channel` both route to _handle_voice_channel_join in
-                # gateway/run.py — expose both in the slash UI so autocomplete
-                # matches what the docs advertise and what the runner accepts when
-                # the command is typed as plain text.
+        voice_mode_choices = [
+            discord.app_commands.Choice(name="on — voice reply to voice messages", value="on"),
+            discord.app_commands.Choice(name="tts — voice reply to all messages", value="tts"),
+            discord.app_commands.Choice(name="off — text replies only", value="off"),
+            discord.app_commands.Choice(name="status — show current mode", value="status"),
+        ]
+        if self._voice_channels_enabled:
+            voice_mode_choices[:0] = [
                 discord.app_commands.Choice(name="join — join your voice channel", value="join"),
                 discord.app_commands.Choice(name="channel — join your voice channel (alias)", value="channel"),
                 discord.app_commands.Choice(name="leave — leave voice channel", value="leave"),
-                discord.app_commands.Choice(name="on — voice reply to voice messages", value="on"),
-                discord.app_commands.Choice(name="tts — voice reply to all messages", value="tts"),
-                discord.app_commands.Choice(name="off — text only", value="off"),
-                discord.app_commands.Choice(name="status — show current mode", value="status"),
-            ])
-            async def slash_voice(interaction: discord.Interaction, mode: str = ""):
-                await self._run_simple_slash(interaction, f"/voice {mode}".strip())
+            ]
+
+        @tree.command(name="voice", description="Control voice messages and voice channels")
+        @discord.app_commands.describe(mode="Voice message or channel mode")
+        @discord.app_commands.choices(mode=voice_mode_choices)
+        async def slash_voice(interaction: discord.Interaction, mode: str = ""):
+            await self._run_simple_slash(interaction, f"/voice {mode}".strip())
 
         @tree.command(name="update", description="Update Hermes Agent to the latest version")
         async def slash_update(interaction: discord.Interaction):
@@ -6064,8 +6067,6 @@ class DiscordAdapter(BasePlatformAdapter):
                     continue
                 # Discord command names: lowercase, hyphens OK, max 32 chars.
                 discord_name = cmd_def.name.lower()[:32]
-                if not self._voice_enabled and discord_name == "voice":
-                    continue
                 if discord_name in already_registered:
                     continue
                 if len(already_registered) >= slot_cap:
@@ -6101,8 +6102,6 @@ class DiscordAdapter(BasePlatformAdapter):
 
             for plugin_name, plugin_desc, plugin_args_hint in _iter_plugin_command_entries():
                 discord_name = plugin_name.lower()[:32]
-                if not self._voice_enabled and discord_name == "voice":
-                    continue
                 if discord_name in already_registered:
                     continue
                 if len(already_registered) >= slot_cap:
@@ -10360,10 +10359,12 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             if isinstance(candidate_extra, dict):
                 platform_extra_cfg = candidate_extra
     seeded_extra = {}
-    if "voice_enabled" in discord_cfg:
-        seeded_extra["voice_enabled"] = discord_cfg["voice_enabled"]
-    elif "voice_enabled" in platform_extra_cfg:
-        seeded_extra["voice_enabled"] = platform_extra_cfg["voice_enabled"]
+    if "voice_channels_enabled" in discord_cfg:
+        seeded_extra["voice_channels_enabled"] = discord_cfg["voice_channels_enabled"]
+    elif "voice_channels_enabled" in platform_extra_cfg:
+        seeded_extra["voice_channels_enabled"] = platform_extra_cfg[
+            "voice_channels_enabled"
+        ]
     # Authorization gate keys are ALWAYS seeded into PlatformConfig.extra so
     # every adapter carries its own profile's allow/deny lists (issue #72348).
     # The os.environ writes below remain first-writer-wins for legacy env-only

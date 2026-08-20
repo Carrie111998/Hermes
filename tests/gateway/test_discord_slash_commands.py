@@ -203,76 +203,53 @@ async def test_auto_registers_plugin_commands_for_discord(adapter):
     )
 
 
-def test_voice_disabled_omits_native_discord_slash(adapter):
-    adapter._voice_enabled = False
+def test_voice_channels_disabled_keeps_voice_message_slash(adapter):
+    adapter._voice_channels_enabled = False
 
     with patch("hermes_cli.commands.COMMAND_REGISTRY", []):
         adapter._register_slash_commands()
 
-    assert "voice" not in adapter._client.tree.commands
-
-
-def test_voice_enabled_by_default_registers_native_discord_slash(adapter):
-    with patch("hermes_cli.commands.COMMAND_REGISTRY", []):
-        adapter._register_slash_commands()
-
-    assert adapter._voice_enabled is True
     assert "voice" in adapter._client.tree.commands
 
 
-def test_voice_disabled_cannot_be_readded_from_command_registry(adapter):
-    adapter._voice_enabled = False
+def test_voice_channels_enabled_by_default_registers_native_discord_slash(adapter):
+    with patch("hermes_cli.commands.COMMAND_REGISTRY", []):
+        adapter._register_slash_commands()
 
-    adapter._register_slash_commands()
+    assert adapter._voice_channels_enabled is True
+    assert "voice" in adapter._client.tree.commands
 
-    assert "voice" not in adapter._client.tree.commands
 
-
-def test_voice_enabled_yaml_flag_is_seeded_into_adapter_config():
-    assert _apply_yaml_config({}, {"voice_enabled": False}) == {
-        "voice_enabled": False
+def test_voice_channels_enabled_yaml_flag_is_seeded_into_adapter_config():
+    assert _apply_yaml_config({}, {"voice_channels_enabled": False}) == {
+        "voice_channels_enabled": False
     }
 
 
 @pytest.mark.parametrize(
     ("yaml_cfg", "discord_cfg"),
     [
-        ({}, {"voice_enabled": None}),
-        ({"platforms": {"discord": {"extra": {"voice_enabled": None}}}}, {}),
+        ({}, {"voice_channels_enabled": None}),
+        ({"platforms": {"discord": {"extra": {"voice_channels_enabled": None}}}}, {}),
     ],
 )
-def test_voice_enabled_explicit_null_is_preserved_for_fail_closed_validation(
+def test_voice_channels_enabled_explicit_null_is_preserved_for_fail_closed_validation(
     yaml_cfg, discord_cfg
 ):
-    assert _apply_yaml_config(yaml_cfg, discord_cfg) == {"voice_enabled": None}
+    assert _apply_yaml_config(yaml_cfg, discord_cfg) == {"voice_channels_enabled": None}
 
 
 @pytest.mark.parametrize("raw_value", ["false", "true", 0, None, {}])
-def test_voice_enabled_malformed_values_fail_closed(raw_value):
+def test_voice_channels_enabled_malformed_values_fail_closed(raw_value):
     config = PlatformConfig(
         enabled=True,
         token="***",
-        extra={"voice_enabled": raw_value},
+        extra={"voice_channels_enabled": raw_value},
     )
 
     configured_adapter = DiscordAdapter(config)
 
-    assert configured_adapter._voice_enabled is False
-
-
-def test_voice_disabled_omits_plugin_command_named_voice(adapter):
-    adapter._voice_enabled = False
-
-    with (
-        patch("hermes_cli.commands.COMMAND_REGISTRY", []),
-        patch(
-            "hermes_cli.commands._iter_plugin_command_entries",
-            return_value=iter([("voice", "Plugin voice", "")]),
-        ),
-    ):
-        adapter._register_slash_commands()
-
-    assert "voice" not in adapter._client.tree.commands
+    assert configured_adapter._voice_channels_enabled is False
 
 
 @pytest.mark.asyncio
