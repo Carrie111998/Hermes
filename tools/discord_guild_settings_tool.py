@@ -52,31 +52,31 @@ _SETTINGS_SCHEMA: dict[str, Any] = {
         "premium_progress_bar_enabled": {"type": "boolean"},
         "afk_channel_id": {
             "anyOf": [
-                {"type": "string", "pattern": "^[0-9]{1,64}$"},
+                {"type": "string", "pattern": "^[1-9][0-9]{0,19}$"},
                 {"type": "null"},
             ]
         },
         "system_channel_id": {
             "anyOf": [
-                {"type": "string", "pattern": "^[0-9]{1,64}$"},
+                {"type": "string", "pattern": "^[1-9][0-9]{0,19}$"},
                 {"type": "null"},
             ]
         },
         "rules_channel_id": {
             "anyOf": [
-                {"type": "string", "pattern": "^[0-9]{1,64}$"},
+                {"type": "string", "pattern": "^[1-9][0-9]{0,19}$"},
                 {"type": "null"},
             ]
         },
         "public_updates_channel_id": {
             "anyOf": [
-                {"type": "string", "pattern": "^[0-9]{1,64}$"},
+                {"type": "string", "pattern": "^[1-9][0-9]{0,19}$"},
                 {"type": "null"},
             ]
         },
         "safety_alerts_channel_id": {
             "anyOf": [
-                {"type": "string", "pattern": "^[0-9]{1,64}$"},
+                {"type": "string", "pattern": "^[1-9][0-9]{0,19}$"},
                 {"type": "null"},
             ]
         },
