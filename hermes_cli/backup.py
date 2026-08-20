@@ -1422,11 +1422,11 @@ def _create_quick_snapshot_locked(
                 dst = staging_dir / sub_rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 try:
-                    # Route SQLite DBs through the WAL-safe backup() path so a
-                    # board DB with an open WAL (the gateway may hold it at
-                    # snapshot time) is captured consistently.
+                    # Route SQLite DBs through the WAL-safe backup() path and
+                    # verify the offline destination so a corrupt source
+                    # cannot become a seemingly valid recovery artifact.
                     if sub.suffix == ".db":
-                        if not _safe_copy_db(sub, dst):
+                        if not copy_db_and_verify(sub, dst):
                             failed_dbs.append(sub_rel)
                             print(
                                 f"  ⚠ Snapshot: SQLite safe copy FAILED for {sub_rel} "
@@ -1458,7 +1458,7 @@ def _create_quick_snapshot_locked(
 
         try:
             if src.suffix == ".db":
-                if not _safe_copy_db(src, dst):
+                if not copy_db_and_verify(src, dst):
                     failed_dbs.append(rel)
                     print(
                         f"  ⚠ Snapshot: SQLite safe copy FAILED for {rel} "

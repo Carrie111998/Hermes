@@ -1128,7 +1128,62 @@ class TestQuickSnapshot:
         conn.close()
         return home
 
+    def test_corrupt_state_db_is_not_published_as_snapshot(
+        self, hermes_home, capsys
+    ):
+        """A corrupt source must not become a seemingly valid recovery artifact."""
+        db_path = hermes_home / "state.db"
+        index_name = "idx_sessions_data"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(f"CREATE INDEX {index_name} ON sessions(data)")
+        conn.commit()
+        original_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+            (index_name,),
+        ).fetchone()[0]
 
+        # Build a stale B-tree: rebuild the index under WHERE 0, then restore
+        # the original schema definition so integrity_check detects the mismatch.
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute(
+            "UPDATE sqlite_master SET sql=? WHERE type='index' AND name=?",
+            (original_sql + " WHERE 0", index_name),
+        )
+        schema_version = conn.execute("PRAGMA schema_version").fetchone()[0]
+        conn.execute(f"PRAGMA schema_version={schema_version + 1}")
+        conn.execute("PRAGMA writable_schema=OFF")
+        conn.commit()
+        conn.close()
+
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(f"REINDEX {index_name}")
+        conn.commit()
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute(
+            "UPDATE sqlite_master SET sql=? WHERE type='index' AND name=?",
+            (original_sql, index_name),
+        )
+        schema_version = conn.execute("PRAGMA schema_version").fetchone()[0]
+        conn.execute(f"PRAGMA schema_version={schema_version + 1}")
+        conn.execute("PRAGMA writable_schema=OFF")
+        conn.commit()
+        conn.close()
+
+        from hermes_cli.backup import create_quick_snapshot
+
+        snapshot_id = create_quick_snapshot(hermes_home=hermes_home)
+        output = capsys.readouterr().out
+
+        assert snapshot_id is not None
+        manifest = json.loads(
+            (hermes_home / "state-snapshots" / snapshot_id / "manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert "state.db" in manifest["failed_dbs"]
+        assert "state.db" not in manifest["files"]
+        assert "SQLite safe copy FAILED" in output or "CRITICAL" in output
+        assert not (hermes_home / "state-snapshots" / snapshot_id / "state.db").exists()
 
     def test_state_db_safely_copied(self, hermes_home):
         from hermes_cli.backup import create_quick_snapshot
