@@ -314,6 +314,7 @@ async def test_success_binds_claim_and_requests_exact_session_once():
     adapter = _make_adapter({})
     store, db = _wire_lifecycle_runner(adapter)
     event, marker = _make_event(adapter)
+    event._agent_run_failed = False
 
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
     # A duplicate lifecycle callback in the same process must be a no-op.
@@ -349,6 +350,7 @@ async def test_existing_matching_bound_request_is_idempotent():
         },
     )
     event, _ = _make_event(adapter)
+    event._agent_run_failed = False
 
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
@@ -486,6 +488,23 @@ async def test_agent_failure_marker_overrides_delivery_success():
 
 
 @pytest.mark.asyncio
+async def test_success_without_agent_completion_marker_finalizes():
+    """A pre-agent early return cannot create an empty handoff thread."""
+    adapter = _make_adapter({})
+    store, db = _wire_lifecycle_runner(adapter)
+    event, _ = _make_event(adapter)
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    store.remove_session_route_and_end.assert_awaited_once_with(
+        "key:webhook:alerts:delivery-1",
+        "session-exact",
+        "webhook_handoff_failed",
+    )
+    db.request_handoff_once.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_request_failure_removes_source_and_finalizes():
     adapter = _make_adapter({})
     store, db = _wire_lifecycle_runner(
@@ -493,6 +512,7 @@ async def test_request_failure_removes_source_and_finalizes():
         request_error=RuntimeError("database unavailable"),
     )
     event, _ = _make_event(adapter)
+    event._agent_run_failed = False
 
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
@@ -508,6 +528,7 @@ async def test_cancellation_during_shielded_request_leaves_pending_for_watcher()
     adapter = _make_adapter({})
     store, db = _wire_lifecycle_runner(adapter)
     event, _ = _make_event(adapter)
+    event._agent_run_failed = False
     request_started = asyncio.Event()
     release_request = asyncio.Event()
     durable = {"state": None}

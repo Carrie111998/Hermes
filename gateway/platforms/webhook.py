@@ -1168,7 +1168,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self._active_handoff_sessions.discard(event.source.chat_id)
 
         agent_run_failure_marker = getattr(event, "_agent_run_failed", None)
-        agent_run_failed = bool(agent_run_failure_marker)
+        agent_run_succeeded = agent_run_failure_marker is False
         # Base derives ProcessingOutcome from text-delivery accounting. A
         # successful agent turn whose truthy response contains only media can
         # therefore arrive as FAILURE because attachment sends do not call
@@ -1177,10 +1177,10 @@ class WebhookAdapter(BasePlatformAdapter):
         # failure, and cancellation is never promoted to success.
         media_only_agent_success = (
             outcome is ProcessingOutcome.FAILURE
-            and agent_run_failure_marker is False
+            and agent_run_succeeded
         )
         if (
-            outcome is ProcessingOutcome.SUCCESS and not agent_run_failed
+            outcome is ProcessingOutcome.SUCCESS and agent_run_succeeded
         ) or media_only_agent_success:
             # AsyncSessionDB writes run off-loop and cannot be cancelled once
             # SQLite has started them. Keep this task alive through a caller
