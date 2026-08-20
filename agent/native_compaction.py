@@ -177,7 +177,8 @@ def _user_item_text(item: Dict[str, Any]) -> Optional[str]:
         text = "".join(
             part.get("text", "")
             for part in content
-            if isinstance(part, dict) and part.get("type") == "input_text"
+            if isinstance(part, dict)
+            and (part.get("type") in ("input_text", "text") or isinstance(part.get("text"), str))
         )
         return text if text.strip() or content else None
     return None
