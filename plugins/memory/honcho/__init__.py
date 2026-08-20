@@ -80,6 +80,19 @@ _MEMORY_DIRECTIVE = (
 )
 
 
+#: Values ``injection.explicitObservations`` accepts. "strip" drops the raw
+#: timestamped wall and injects only the distilled deductions and patterns;
+#: "keep" injects the representation as the backend rendered it.
+#:
+#: The choice is load-bearing rather than cosmetic. A requirement the user
+#: stated outright lives in the explicit layer; whether the deriver also rolled
+#: it up into a deduction is not guaranteed. Under "strip" such a requirement
+#: reaches the agent only if some pattern happens to cite it, which renders it
+#: as evidence for an inference rather than as an instruction.
+EXPLICIT_OBSERVATION_MODES = ("strip", "keep")
+DEFAULT_EXPLICIT_OBSERVATIONS = "strip"
+
+
 def _strip_explicit_observations(text: str) -> str:
     """Drop the raw explicit-observations wall, keeping the distilled sections."""
     return _EXPLICIT_OBSERVATIONS_SECTION.sub("", text).strip()
@@ -286,6 +299,10 @@ class HonchoMemoryProvider(MemoryProvider):
         # which is the historical behaviour — see _format_first_turn_context.
         self._session_start_components: Optional[frozenset] = None
 
+        # How much of the peer representation to render. See
+        # EXPLICIT_OBSERVATION_MODES; the default preserves the strip.
+        self._explicit_observations: str = DEFAULT_EXPLICIT_OBSERVATIONS
+
         # B5: Cost-awareness turn counting and cadence
         self._turn_count = 0
         self._injection_frequency = "every-turn"  # or "first-turn"
@@ -404,6 +421,7 @@ class HonchoMemoryProvider(MemoryProvider):
                     self._reasoning_level_cap = cfg.reasoning_level_cap
                 self._injection_log_path = self._resolve_injection_log_path(raw)
                 self._session_start_components = self._resolve_session_start(raw)
+                self._explicit_observations = self._resolve_explicit_observations(raw)
             except Exception as e:
                 logger.debug("Honcho cost-awareness config parse error: %s", e)
 
@@ -661,9 +679,11 @@ class HonchoMemoryProvider(MemoryProvider):
                 # able to see in a log, not an absence to be inferred later.
                 suppressed.append(f"{name} ({len(value)}B)")
                 continue
-            if name == "peerRepresentation":
-                # Experiment: raw timestamped explicit observations drown out
-                # the distilled deductions, so inject only the latter.
+            if name == "peerRepresentation" and self._explicit_observations == "strip":
+                # The raw timestamped explicit observations can drown out the
+                # distilled deductions. Stripping them costs any requirement the
+                # deriver did not also roll up, so it is a configured choice
+                # rather than a fixed one — see EXPLICIT_OBSERVATION_MODES.
                 value = _strip_explicit_observations(value)
                 if not value:
                     continue
@@ -754,6 +774,30 @@ class HonchoMemoryProvider(MemoryProvider):
         if not isinstance(listed, (list, tuple)):
             return None
         return frozenset(str(x) for x in listed)
+
+    @staticmethod
+    def _resolve_explicit_observations(raw: dict) -> str:
+        """``injection.explicitObservations``, or the default if unset.
+
+        An unrecognised value falls back to the default rather than raising: a
+        typo here must not cost the whole injection, and the log line makes the
+        fallback visible instead of silent.
+        """
+        injection = raw.get("injection")
+        if not isinstance(injection, dict):
+            return DEFAULT_EXPLICIT_OBSERVATIONS
+        value = injection.get("explicitObservations")
+        if value is None:
+            return DEFAULT_EXPLICIT_OBSERVATIONS
+        mode = str(value).strip().lower()
+        if mode not in EXPLICIT_OBSERVATION_MODES:
+            logger.warning(
+                "Honcho injection.explicitObservations=%r is not one of %s; "
+                "using %r",
+                value, list(EXPLICIT_OBSERVATION_MODES), DEFAULT_EXPLICIT_OBSERVATIONS,
+            )
+            return DEFAULT_EXPLICIT_OBSERVATIONS
+        return mode
 
     @staticmethod
     def _resolve_injection_log_path(raw: dict) -> Optional[str]:
