@@ -1639,6 +1639,15 @@ def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     return str(resolved)
 
 
+def _normalize_allow_silent(value: Optional[bool]) -> Optional[bool]:
+    """Normalize and validate a cron job's silence-suppression contract."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    raise ValueError("allow_silent must be a boolean")
+
+
 def _resolve_default_model_snapshot() -> Optional[str]:
     """Resolve the global default model the same way the cron ticker does.
 
@@ -1797,6 +1806,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    allow_silent: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1854,6 +1864,10 @@ def create_job(
         monitor_url: Optional http(s) URL used as the monitor source instead
                 of a script — fetched with a bounded GET each tick. Same
                 hash-suppression semantics as ``monitor_script``.
+        allow_silent: When False, this job is always-deliver: the scheduler does
+                not tell the agent to use the cron silence marker, and a final
+                marker response is delivered instead of suppressed. Defaults to
+                True for backwards compatibility.
 
     Returns:
         The created job dict
@@ -1893,6 +1907,8 @@ def create_job(
 
     # Monitor-mode validation: exactly one source, and monitor mode only
     # makes sense when there IS an agent to suppress/wake.
+    normalized_allow_silent = _normalize_allow_silent(allow_silent)
+
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface these as clear ValueErrors at create time so bad configs never
     # reach the scheduler (shared with update_job, see
@@ -1995,6 +2011,10 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    # Only persist allow_silent when explicitly set. Missing means the legacy
+    # behavior: cron jobs may suppress delivery with the silence marker.
+    if normalized_allow_silent is not None:
+        job["allow_silent"] = normalized_allow_silent
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2102,6 +2122,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates[_mon_field] = _mv or None
 
             previous_inference_axes = _normalized_inference_axes(job)
+            if "allow_silent" in updates:
+                updates["allow_silent"] = _normalize_allow_silent(updates["allow_silent"])
+
             updated = _apply_skill_fields({**job, **updates})
 
             # Re-check execution-mode invariants on the MERGED record when
