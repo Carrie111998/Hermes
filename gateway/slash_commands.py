@@ -3241,8 +3241,28 @@ class GatewaySlashCommandsMixin:
 
         return t("gateway.set_home.success", name=chat_name, chat_id=chat_id)
 
+    def _discord_voice_enabled_for_source(self, source) -> bool:
+        """Return whether this source resolves to an enabled Discord adapter."""
+        if source.platform != Platform.DISCORD:
+            return True
+        adapter_resolver = getattr(self, "_adapter_for_source", None)
+        if not callable(adapter_resolver):
+            return False
+        try:
+            source_adapter = adapter_resolver(source)
+        except Exception:
+            logger.warning(
+                "Discord voice adapter resolution failed; denying /voice",
+                exc_info=True,
+            )
+            return False
+        return getattr(source_adapter, "_voice_enabled", False) is True
+
     async def _handle_voice_command(self, event: MessageEvent) -> str:
         """Handle /voice [on|off|tts|channel|leave|status] command."""
+        if not self._discord_voice_enabled_for_source(event.source):
+            return "Discord voice is disabled."
+
         args = event.get_command_args().strip().lower()
         chat_id = event.source.chat_id
         platform = event.source.platform
