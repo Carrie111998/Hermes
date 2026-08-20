@@ -114,7 +114,7 @@ describe('chipTypedPathOnSpace', () => {
       'min-release-age-exclude=@openai/codex',
       'install @openai/codex,',
       'install (@openai/codex)',
-      'install `@openai/codex`',
+      'install `@openai/codex`'
     ]
 
     for (const text of examples) {
