@@ -148,12 +148,14 @@ function Harness({
   navigate = vi.fn(),
   onReady,
   requestGateway,
+  runtimeIdByStoredSessionId = new Map<string, string>(),
   selectedStoredSessionId = null
 }: {
   activeSessionId?: null | string
   navigate?: ReturnType<typeof vi.fn>
   onReady: (handle: HarnessHandle) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  runtimeIdByStoredSessionId?: Map<string, string>
   selectedStoredSessionId?: null | string
 }) {
   const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
@@ -169,7 +171,7 @@ function Harness({
     navigate: navigate as never,
     requestGateway,
     resetViewSync: vi.fn(),
-    runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),
+    runtimeIdByStoredSessionIdRef: ref(runtimeIdByStoredSessionId),
     selectedStoredSessionId,
     selectedStoredSessionIdRef: ref(selectedStoredSessionId),
     sessionStateByRuntimeIdRef: ref(new Map<string, ClientSessionState>()),
