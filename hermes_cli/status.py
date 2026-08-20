@@ -44,6 +44,30 @@ def redact_key(key: str) -> str:
     return mask_secret(key, empty=color("(not set)", Colors.DIM))
 
 
+def _check_tts_sdk_available(provider: str, api_key: str) -> bool:
+    """Check if a TTS provider's SDK is importable.
+    
+    Returns True when both the API key is present AND the SDK can be imported.
+    This prevents `hermes status` from showing ✓ for providers that cannot
+    actually run due to missing optional dependencies.
+    
+    Issue #90610: selecting a provider whose SDK is missing fails silently;
+    `hermes status` shows ✓ but auto-TTS degrades to text with no user error.
+    """
+    if not api_key:
+        return False
+    
+    if provider == "elevenlabs":
+        try:
+            import elevenlabs  # noqa: F401
+            return True
+        except ImportError:
+            return False
+    
+    # Add other optional TTS SDKs here as needed
+    return True
+
+
 def _format_iso_timestamp(value) -> str:
     """Format ISO timestamps for status output, converting to local timezone."""
     if not value or not isinstance(value, str):
@@ -210,6 +234,11 @@ def show_status(args):
             continue
         value = _resolve_env(env_ref)
         has_key = bool(value)
+        
+        # ElevenLabs: check SDK availability alongside key presence
+        if name == "ElevenLabs" and has_key:
+            has_key = _check_tts_sdk_available("elevenlabs", value)
+        
         display = redact_key(value)
         print(f"  {name:<12}  {check_mark(has_key)} {display}")
 
