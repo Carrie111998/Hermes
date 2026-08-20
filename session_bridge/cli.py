@@ -63,6 +63,11 @@ from .coordinator import (
     ClaudeVisibilityRunResult,
     SessionBridgeCoordinator,
 )
+from .listener_watchdog import (
+    DEAF_LISTENER_REASON,
+    ListenerWatchdog,
+    make_deaf_listener_handler,
+)
 from .mcp_server import create_app, resolve_bearer_token, resolve_marker_key
 from .mirror_float import (
     ClaudeMirrorFloatWorker,
@@ -940,6 +945,7 @@ class ProductionBackend:
     def serve(self) -> None:
         visibility_stop: threading.Event | None = None
         visibility_thread: threading.Thread | None = None
+        listener_watchdog: ListenerWatchdog | None = None
         try:
             if self.config.mirrors.automatic_creation:
                 try:
@@ -983,12 +989,27 @@ class ProductionBackend:
                 visibility_thread.start()
             import uvicorn
 
-            uvicorn.run(
-                app,
+            # uvicorn.run() builds exactly this and throws the Server away. We
+            # keep it so the listener watchdog has something to ask for a
+            # shutdown when it decides the accept chain is gone -- see
+            # session_bridge.listener_watchdog for why an exit is the fix.
+            server = uvicorn.Server(
+                uvicorn.Config(
+                    app,
+                    host=self.config.service.host,
+                    port=self.config.service.port,
+                    log_level="info",
+                )
+            )
+            listener_watchdog = ListenerWatchdog(
                 host=self.config.service.host,
                 port=self.config.service.port,
-                log_level="info",
+                on_deaf=make_deaf_listener_handler(
+                    lambda: setattr(server, "should_exit", True)
+                ),
             )
+            listener_watchdog.start()
+            server.run()
         except RolloutGateBlocked:
             raise
         except ConfigurationFailure:
@@ -1000,10 +1021,18 @@ class ProductionBackend:
                 raise ConfigurationFailure("service_authorization_failed") from exc
             raise ProviderDegraded("service_start_failed") from exc
         finally:
+            if listener_watchdog is not None:
+                listener_watchdog.stop()
             if visibility_stop is not None:
                 visibility_stop.set()
             if visibility_thread is not None:
                 visibility_thread.join(timeout=5.0)
+        # Raised outside the try so it keeps its own reason: the `except
+        # RuntimeError` arm above would otherwise relabel it
+        # service_start_failed. Either way it lands on EXIT_DEGRADED (3), which
+        # is what the supervisor acts on.
+        if listener_watchdog is not None and listener_watchdog.fired:
+            raise ProviderDegraded(DEAF_LISTENER_REASON)
 
     def scan(
         self, *, provider: str, all_history: bool, newest_first: bool

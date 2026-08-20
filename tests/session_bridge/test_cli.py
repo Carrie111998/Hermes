@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
 import os
 from dataclasses import dataclass, field, replace
@@ -6583,6 +6584,72 @@ def test_sidebar_hydration_claim_runtime_does_not_start_a_provider_client(
     assert backend._codex_client is None
 
 
+class _RecordedServeTransport:
+    """What serve() built instead of actually binding a port."""
+
+    def __init__(self) -> None:
+        self.config_kwargs: dict[str, object] = {}
+        self.ran = False
+        self.should_exit = False
+        self.watchdogs: list[_FakeListenerWatchdog] = []
+
+
+class _FakeListenerWatchdog:
+    def __init__(self, *, host: str, port: int, on_deaf: object) -> None:
+        self.host = host
+        self.port = port
+        self.on_deaf = on_deaf
+        self.started = False
+        self.stopped = False
+        self.fired = False
+
+    def start(self) -> object:
+        self.started = True
+        return self
+
+    def stop(self, **_kwargs: object) -> None:
+        self.stopped = True
+
+
+def _stub_serve_transport(
+    monkeypatch: pytest.MonkeyPatch, *, fires: bool = False
+) -> _RecordedServeTransport:
+    """Keep serve() off a real socket.
+
+    serve() no longer calls uvicorn.run(); it builds Config+Server so the
+    listener watchdog has a shutdown handle. A test that only stubbed
+    uvicorn.run would therefore bind the real service port -- 7484 on this
+    box, where the live bridge is listening.
+    """
+    import uvicorn
+
+    record = _RecordedServeTransport()
+
+    class _FakeConfig:
+        def __init__(self, app: object, **kwargs: object) -> None:
+            record.config_kwargs = {"app": app, **kwargs}
+
+    class _FakeServer:
+        def __init__(self, config: object) -> None:
+            self.config = config
+            self.should_exit = False
+
+        def run(self) -> None:
+            record.ran = True
+            record.should_exit = self.should_exit
+
+    def _build_watchdog(**kwargs: object) -> _FakeListenerWatchdog:
+        watchdog = _FakeListenerWatchdog(**kwargs)  # type: ignore[arg-type]
+        watchdog.fired = fires
+        record.watchdogs.append(watchdog)
+        return watchdog
+
+    monkeypatch.setattr(uvicorn, "Config", _FakeConfig)
+    monkeypatch.setattr(uvicorn, "Server", _FakeServer)
+    monkeypatch.setattr("session_bridge.cli.ListenerWatchdog", _build_watchdog)
+    return record
+
+
 def test_production_serve_does_not_start_local_sidebar_recovery_worker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6657,7 +6724,7 @@ def test_production_serve_does_not_start_local_sidebar_recovery_worker(
         build_visibility_backend,
     )
     monkeypatch.setattr("session_bridge.cli.threading.Thread", FakeThread)
-    monkeypatch.setattr("uvicorn.run", lambda *_args, **_kwargs: None)
+    _stub_serve_transport(monkeypatch)
 
     backend.serve()
 
@@ -6681,6 +6748,172 @@ def test_production_serve_does_not_start_local_sidebar_recovery_worker(
         thread.target is not cli_module._run_continuous_sidebar_recovery_worker
         for thread in started
     )
+
+
+def _serve_backend(monkeypatch: pytest.MonkeyPatch, **config_kwargs) -> ProductionBackend:
+    """A ProductionBackend whose serve() has every dependency stubbed but the transport."""
+    config = BridgeConfig(**config_kwargs) if config_kwargs else BridgeConfig()
+    backend = ProductionBackend(config, db_path=Path("C:/hermetic/session-bridge.db"))
+    monkeypatch.setattr(
+        backend,
+        "_apply_sidebar_create_reservation_cutover",
+        lambda **_kwargs: {},
+    )
+    monkeypatch.setattr(backend, "_provider_runtime", lambda **_kwargs: object())
+    monkeypatch.setattr(backend, "_require_catalog", lambda: object())
+    monkeypatch.setattr(backend, "_require_store", lambda: object())
+    monkeypatch.setattr("session_bridge.cli.resolve_bearer_token", lambda: "token")
+    monkeypatch.setattr("session_bridge.cli.create_app", lambda **_kwargs: object())
+    return backend
+
+
+def test_production_serve_watches_the_port_it_actually_serves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A watchdog pointed at the wrong port would restart the service forever."""
+    record = _stub_serve_transport(monkeypatch)
+    backend = _serve_backend(
+        monkeypatch, service=ServiceConfig(host="127.0.0.1", port=7484)
+    )
+
+    backend.serve()
+
+    assert record.ran is True
+    assert record.config_kwargs["host"] == "127.0.0.1"
+    assert record.config_kwargs["port"] == 7484
+    assert len(record.watchdogs) == 1
+    watchdog = record.watchdogs[0]
+    assert (watchdog.host, watchdog.port) == (
+        record.config_kwargs["host"],
+        record.config_kwargs["port"],
+    )
+    assert watchdog.started is True
+    assert watchdog.stopped is True
+
+
+def test_production_serve_stops_the_watchdog_even_when_serving_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = _stub_serve_transport(monkeypatch)
+    backend = _serve_backend(monkeypatch)
+
+    import uvicorn
+
+    class _ExplodingServer:
+        def __init__(self, config: object) -> None:
+            self.should_exit = False
+
+        def run(self) -> None:
+            raise OSError("bind failed")
+
+    monkeypatch.setattr(uvicorn, "Server", _ExplodingServer)
+
+    with pytest.raises(ConfigurationFailure):
+        backend.serve()
+
+    assert record.watchdogs[0].stopped is True
+
+
+def test_production_serve_reports_a_deaf_listener_as_its_own_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Not service_start_failed: the service started fine and then went deaf."""
+    _stub_serve_transport(monkeypatch, fires=True)
+    backend = _serve_backend(monkeypatch)
+
+    with pytest.raises(ProviderDegraded) as excinfo:
+        backend.serve()
+
+    assert str(excinfo.value) == "service_listener_deaf"
+
+
+def test_production_serve_returns_cleanly_when_the_watchdog_never_fired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_serve_transport(monkeypatch, fires=False)
+    backend = _serve_backend(monkeypatch)
+
+    assert backend.serve() is None
+
+
+def test_a_deaf_listener_exits_degraded_not_one(
+    monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """Exit 1 is reserved for an uncaught BaseException; the supervisor keys on this."""
+
+    class DeafBackend(FakeBackend):
+        def serve(self) -> None:
+            raise ProviderDegraded("service_listener_deaf")
+
+    assert _run(["serve"], DeafBackend(), automatic_creation=True) == 3
+
+
+def test_deaf_handler_asks_for_shutdown_then_insists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from session_bridge.listener_watchdog import make_deaf_listener_handler
+
+    requested: list[bool] = []
+    exited: list[int] = []
+    timers: list[tuple[float, object]] = []
+
+    class _FakeTimer:
+        def __init__(self, interval: float, function) -> None:
+            self.interval = interval
+            self.function = function
+            self.daemon = False
+            timers.append((interval, function))
+
+        def start(self) -> None:
+            return None
+
+    handler = make_deaf_listener_handler(
+        lambda: requested.append(True),
+        grace=20.0,
+        hard_exit=exited.append,
+        timer_factory=_FakeTimer,
+        stream=io.StringIO(),
+    )
+    handler(3)
+
+    assert requested == [True]
+    assert exited == [], "the polite shutdown must get its grace period first"
+    assert len(timers) == 1
+    interval, function = timers[0]
+    assert interval == 20.0
+    function()
+    assert exited == [3]
+
+
+def test_deaf_handler_still_insists_when_the_polite_path_raises() -> None:
+    from session_bridge.listener_watchdog import make_deaf_listener_handler
+
+    exited: list[int] = []
+    timers: list[object] = []
+
+    class _FakeTimer:
+        def __init__(self, interval: float, function) -> None:
+            self.function = function
+            self.daemon = False
+            timers.append(function)
+
+        def start(self) -> None:
+            return None
+
+    def _explode() -> None:
+        raise RuntimeError("uvicorn is wedged")
+
+    handler = make_deaf_listener_handler(
+        _explode,
+        hard_exit=exited.append,
+        timer_factory=_FakeTimer,
+        stream=io.StringIO(),
+    )
+    handler(3)
+
+    assert len(timers) == 1
+    timers[0]()
+    assert exited == [3]
 
 
 def test_scan_defaults_to_catalog_only_all_history_newest_first(capsys):
