@@ -3514,12 +3514,57 @@ _PUBLIC_PLATFORM_ENTRY_KEYS = frozenset({
     "updated_at",
 })
 
+# Known platform lifecycle states (gateway/run.py's platform_state=...
+# call sites). A value outside this set is either stale/from a future
+# adapter revision or a malformed/hijacked field -- normalized to
+# "unknown" rather than forwarded verbatim.
+_KNOWN_PLATFORM_STATES = frozenset({
+    "connected", "connecting", "disabled", "disconnected",
+    "fatal", "paused", "retrying", "running",
+})
+
+# error_code is short, adapter-defined, and expected to grow over time
+# (new adapters add new codes) -- an exact enum would be too brittle, so
+# this validates SHAPE (short, lowercase snake_case) rather than
+# membership. A value that doesn't match is free text (an embedded URL,
+# traceback, or other malformed content) and is dropped, not forwarded.
+_SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+# Timestamp fields (retrying_since, updated_at) are written as
+# ``_utc_now_iso()`` output elsewhere in this codebase -- a plain
+# ISO-8601-shaped string. Reject anything else (an object, a URL, an
+# oversized string) rather than forward it unchecked.
+_ISO_TIMESTAMP_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$"
+)
+
 
 def _public_platform_entry(value: Any) -> Any:
-    """Project a platform entry down to the public-safe field allowlist."""
+    """Project a platform entry down to the public-safe field allowlist,
+    validating the SHAPE of every retained value -- not just its key
+    name -- before it reaches the unauthenticated response (review of
+    #90750, P2). A malformed or unexpectedly-typed value in an
+    allowlisted field is dropped rather than forwarded: this endpoint
+    has no way to distinguish "legitimate new adapter data" from
+    "hijacked/corrupted retained field" at the value level, so the safe
+    default is to omit rather than guess.
+    """
     if not isinstance(value, dict):
-        return value
-    return {k: v for k, v in value.items() if k in _PUBLIC_PLATFORM_ENTRY_KEYS}
+        return {}
+    projected: dict = {}
+    state = value.get("state")
+    if "state" in value:
+        projected["state"] = state if state in _KNOWN_PLATFORM_STATES else "unknown"
+    error_code = value.get("error_code")
+    if isinstance(error_code, str) and _SAFE_ERROR_CODE_RE.match(error_code):
+        projected["error_code"] = error_code
+    if isinstance(value.get("needs_attention"), bool):
+        projected["needs_attention"] = value["needs_attention"]
+    for ts_key in ("retrying_since", "updated_at"):
+        ts = value.get(ts_key)
+        if isinstance(ts, str) and _ISO_TIMESTAMP_RE.match(ts):
+            projected[ts_key] = ts
+    return projected
 
 
 def _merge_profile_gateway_platforms(

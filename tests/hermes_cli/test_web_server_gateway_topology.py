@@ -700,3 +700,101 @@ class TestPublicStatusFieldProjection:
 
         resp = self.client.get("/api/status")
         assert resp.json()["gateway_exit_reason"] is None
+
+
+# ---------------------------------------------------------------------------
+# Value-shape validation on retained fields (review of #90750, P2)
+# ---------------------------------------------------------------------------
+
+class TestPublicPlatformEntryValueValidation:
+    """Regression for review of #90750: an allowlisted field NAME alone
+    was not enough -- a malformed or hijacked VALUE in state, error_code,
+    needs_attention, retrying_since, or updated_at previously still
+    reached the public response unchanged. _public_platform_entry() must
+    validate shape, not just key membership."""
+
+    def test_non_dict_platform_entry_projects_to_empty(self):
+        from hermes_cli.web_server import _public_platform_entry
+
+        assert _public_platform_entry("not a dict") == {}
+        assert _public_platform_entry(None) == {}
+        assert _public_platform_entry(["also", "not", "a", "dict"]) == {}
+
+    def test_unknown_state_value_normalizes_to_unknown(self):
+        from hermes_cli.web_server import _public_platform_entry
+
+        entry = _public_platform_entry({
+            "state": "https://attacker.example/exfil?data=leaked",
+        })
+        assert entry["state"] == "unknown"
+
+    def test_known_state_values_pass_through(self):
+        from hermes_cli.web_server import _public_platform_entry
+
+        for state in (
+            "connected", "connecting", "disabled", "disconnected",
+            "fatal", "paused", "retrying", "running",
+        ):
+            assert _public_platform_entry({"state": state})["state"] == state
+
+    def test_free_text_error_code_is_dropped_not_forwarded(self):
+        """The exact residual bypass the review identified: error_code
+        is an allowlisted FIELD NAME, but a value that's actually free
+        text (a URL, an embedded traceback line, oversized content)
+        must not be forwarded just because the key name is safe."""
+        from hermes_cli.web_server import _public_platform_entry
+
+        entry = _public_platform_entry({
+            "error_code": "see https://internal.example/logs/abc123 for detail",
+        })
+        assert "error_code" not in entry
+
+    def test_short_snake_case_error_code_passes_through(self):
+        from hermes_cli.web_server import _public_platform_entry
+
+        entry = _public_platform_entry({"error_code": "duplicate_credential"})
+        assert entry["error_code"] == "duplicate_credential"
+
+    def test_non_bool_needs_attention_is_dropped(self):
+        from hermes_cli.web_server import _public_platform_entry
+
+        for bad_value in ("true", 1, "yes", None, ["x"]):
+            entry = _public_platform_entry({"needs_attention": bad_value})
+            assert "needs_attention" not in entry, f"failed for {bad_value!r}"
+
+    def test_real_bool_needs_attention_passes_through(self):
+        from hermes_cli.web_server import _public_platform_entry
+
+        assert _public_platform_entry({"needs_attention": True})["needs_attention"] is True
+        assert _public_platform_entry({"needs_attention": False})["needs_attention"] is False
+
+    def test_malformed_timestamp_is_dropped(self):
+        from hermes_cli.web_server import _public_platform_entry
+
+        for bad_ts in (
+            "not a timestamp",
+            "javascript:alert(1)",
+            "2026-01-01",  # date only, not the ISO-8601 datetime shape actually written
+            12345,
+            {"nested": "object"},
+        ):
+            for key in ("retrying_since", "updated_at"):
+                entry = _public_platform_entry({key: bad_ts})
+                assert key not in entry, f"failed for {key}={bad_ts!r}"
+
+    def test_valid_iso_timestamp_passes_through(self):
+        from hermes_cli.web_server import _public_platform_entry
+
+        entry = _public_platform_entry({
+            "retrying_since": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:01.123456+00:00",
+        })
+        assert entry["retrying_since"] == "2026-01-01T00:00:00Z"
+        assert entry["updated_at"] == "2026-01-01T00:00:01.123456+00:00"
+
+    def test_absent_fields_stay_absent_not_defaulted(self):
+        """A field the adapter never wrote must not appear with a
+        synthetic default -- absence should stay absence."""
+        from hermes_cli.web_server import _public_platform_entry
+
+        assert _public_platform_entry({"state": "connected"}) == {"state": "connected"}
