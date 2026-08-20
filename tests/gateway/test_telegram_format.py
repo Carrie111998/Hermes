@@ -284,6 +284,15 @@ class TestFormatMessageSpoiler:
 
 class TestFormatMessageBlockquote:
 
+    def test_expandable_blockquote_preserves_nested_bold(self, adapter):
+        text = "**> **Action Plan** followed by **Health Skill** details||"
+        result = adapter.format_message(text)
+        assert result == "**> *Action Plan* followed by *Health Skill* details||"
+
+    def test_bold_before_greater_than_remains_bold(self, adapter):
+        result = adapter.format_message("**5 > 3**")
+        assert result == "*5 \\> 3*"
+
 
     def test_blockquote_multiline(self, adapter):
         text = "> Line one\n> Line two"
@@ -352,6 +361,13 @@ class TestStripMdv2:
 
     def test_plain_text_unchanged(self):
         assert _strip_mdv2("plain text") == "plain text"
+
+    def test_removes_regular_blockquote_prefix(self):
+        assert _strip_mdv2("> quoted text") == "quoted text"
+
+    def test_removes_expandable_blockquote_markers(self):
+        text = "**> *Action Plan* followed by *Health Skill* details||"
+        assert _strip_mdv2(text) == "Action Plan followed by Health Skill details"
 
 
 # =========================================================================

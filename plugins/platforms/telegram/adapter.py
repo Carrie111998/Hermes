@@ -481,6 +481,9 @@ def _strip_mdv2(text: str) -> str:
     """
     # Remove escape backslashes before special characters
     cleaned = re.sub(r'\\([_*\[\]()~`>#\+\-=|{}.!\\])', r'\1', text)
+    # Remove regular and expandable blockquote prefixes before the generic
+    # bold pass can consume the leading ** from an expandable quote marker.
+    cleaned = re.sub(r'^(?:\*\*)?>{1,3}\s?', '', cleaned, flags=re.MULTILINE)
     # Remove standard markdown bold (**text** → text) BEFORE MarkdownV2 bold
     cleaned = re.sub(r'\*\*([^*]+)\*\*', r'\1', cleaned)
     # Remove MarkdownV2 bold markers that format_message converted from **bold**
@@ -492,6 +495,8 @@ def _strip_mdv2(text: str) -> str:
     cleaned = re.sub(r'~([^~]+)~', r'\1', cleaned)
     # Remove MarkdownV2 spoiler markers (||text|| → text)
     cleaned = re.sub(r'\|\|([^|]+)\|\|', r'\1', cleaned)
+    # Expandable blockquotes use a lone || at the end of their final line.
+    cleaned = re.sub(r'\|\|$', '', cleaned, flags=re.MULTILINE)
     return cleaned
 
 
@@ -8386,9 +8391,10 @@ class TelegramAdapter(BasePlatformAdapter):
             r'^#{1,6}\s+(.+)$', _convert_header, text, flags=re.MULTILINE
         )
 
-        # 5) Convert bold: **text** → *text* (MarkdownV2 bold)
+        # 5) Convert bold: **text** → *text* (MarkdownV2 bold). Do not
+        #    consume the ** in Telegram's expandable blockquote opener (**>).
         text = re.sub(
-            r'\*\*(.+?)\*\*',
+            r'\*\*(?!>)(.+?)\*\*',
             lambda m: _ph(f'*{_escape_mdv2(m.group(1))}*'),
             text,
         )
