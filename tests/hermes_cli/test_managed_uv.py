@@ -615,6 +615,44 @@ class TestInstallUvInternals:
             call_env = mock_posix.call_args[0][0]
             assert call_env["UV_UNMANAGED_INSTALL"] == str(tmp_path / "bin")
 
+    def test_posix_installer_url_is_version_pinned(self, tmp_path):
+        """#90650: an unpinned astral.sh URL installs the latest uv, whose
+        changed exclude-newer handling marks the pristine lockfile stale and
+        knocks installs off the hash-verified tier. The installer URL must
+        carry the pinned version."""
+        import hermes_cli.managed_uv as muv
+
+        calls = []
+        with patch(
+            "hermes_cli.managed_uv.subprocess.run",
+            side_effect=lambda *a, **k: calls.append(a),
+        ):
+            muv._install_uv_posix({})
+        curl_args = next(a for a in calls if a and a[0] and a[0][0] == "curl")
+        url = curl_args[0][2]
+        assert url == (
+            f"https://astral.sh/uv/{muv.PINNED_UV_INSTALL_VERSION}/install.sh"
+        )
+        # The unversioned form is the exact regression this pins away from.
+        assert url != "https://astral.sh/uv/install.sh"
+
+    def test_windows_installer_cmd_is_version_pinned(self):
+        import hermes_cli.managed_uv as muv
+
+        commands = []
+        with patch(
+            "hermes_cli.managed_uv.subprocess.run",
+            side_effect=lambda *a, **k: commands.append(a),
+        ):
+            muv._install_uv_windows({})
+        # argv: ["powershell", "-ExecutionPolicy", "Bypass", "-c", cmd]
+        cmd = commands[0][0][4]
+        assert (
+            f"https://astral.sh/uv/{muv.PINNED_UV_INSTALL_VERSION}/install.ps1"
+            in cmd
+        )
+        assert "irm https://astral.sh/uv/install.ps1 | iex" not in cmd
+
 
 class TestRuntimeRequestMinorLine:
     """The repair must request the CPython minor line, not the exact patch.

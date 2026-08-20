@@ -29,6 +29,11 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Pinned to match CI's uv (see scripts/install.sh for the full rationale —
+# newer uv marks the pristine lockfile stale and knocks installs off the
+# hash-verified tier, #90650).
+UV_PINNED_VERSION="0.9.28"
+
 # Prevent uv from discovering config files (uv.toml, pyproject.toml) from the
 # wrong user's home directory when running under sudo -u <user>.  See #21269.
 export UV_NO_CONFIG=1
@@ -89,7 +94,7 @@ else
         # failures (sh exits 0 on empty stdin under no pipefail).
         _uv_log="$(mktemp 2>/dev/null || echo "/tmp/hermes-uv-install.$$.log")"
         _uv_installer="$(mktemp 2>/dev/null || echo "/tmp/hermes-uv-installer.$$.sh")"
-        if ! curl -LsSf https://astral.sh/uv/install.sh -o "$_uv_installer" 2>"$_uv_log"; then
+        if ! curl -LsSf "https://astral.sh/uv/${UV_PINNED_VERSION}/install.sh" -o "$_uv_installer" 2>"$_uv_log"; then
             echo -e "${RED}✗${NC} Failed to download uv installer."
             sed 's/^/    /' "$_uv_log" >&2
             echo -e "${CYAN}→${NC} Install manually: https://docs.astral.sh/uv/"

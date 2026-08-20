@@ -311,6 +311,14 @@ UV_SELF_UPDATE_INTERVAL_SECONDS = 7 * 24 * 3600
 # blackholed connection (no default timeout in uv's downloader path).
 UV_SELF_UPDATE_TIMEOUT_SECONDS = 60
 
+# Version pinned for the bootstrap installer URLs. CI generates and verifies
+# uv.lock with this exact version; newer uv changed how pyproject's global
+# exclude-newer is handled ("removal of global exclude newer"), which makes
+# --locked report a pristine checkout's lockfile as stale — silently knocking
+# installs off the hash-verified tier onto an unverified PyPI resolve
+# (#90650). Keep in sync with scripts/install.sh and .github/workflows/*.
+PINNED_UV_INSTALL_VERSION = "0.9.28"
+
 
 def update_managed_uv(
     *,
@@ -1337,12 +1345,13 @@ def _install_uv(target: Path) -> None:
 
 def _install_uv_posix(env: dict[str, str]) -> None:
     """Download + sh the POSIX installer (two-stage to avoid curl|sh pitfalls)."""
+    url = f"https://astral.sh/uv/{PINNED_UV_INSTALL_VERSION}/install.sh"
     with tempfile.NamedTemporaryFile(suffix=".sh", delete=False) as f:
         installer_path = f.name
 
     try:
         subprocess.run(
-            ["curl", "-LsSf", "https://astral.sh/uv/install.sh", "-o", installer_path],
+            ["curl", "-LsSf", url, "-o", installer_path],
             check=True,
             capture_output=True,
         )
@@ -1361,7 +1370,9 @@ def _install_uv_posix(env: dict[str, str]) -> None:
 
 def _install_uv_windows(env: dict[str, str]) -> None:
     """Invoke the PowerShell installer."""
-    cmd = "irm https://astral.sh/uv/install.ps1 | iex"
+    cmd = (
+        f"irm https://astral.sh/uv/{PINNED_UV_INSTALL_VERSION}/install.ps1 | iex"
+    )
     subprocess.run(
         ["powershell", "-ExecutionPolicy", "Bypass", "-c", cmd],
         env=env,

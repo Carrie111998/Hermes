@@ -58,6 +58,13 @@ else
 fi
 PYTHON_VERSION="3.11"
 NODE_VERSION="26"
+# Pinned uv: CI generates and verifies uv.lock with this exact version, and
+# newer uv releases changed how pyproject's global exclude-newer is handled
+# ("removal of global exclude newer"), which makes --locked report the
+# pristine checkout's lockfile as stale. An unpinned installer therefore
+# silently knocks every fresh install off the hash-verified Tier 0 and onto
+# an unverified PyPI resolve (#90650). Keep in sync with .github/workflows/*.
+UV_VERSION="0.9.28"
 
 # FHS-style root install layout (set by resolve_install_layout when applicable):
 #   code at /usr/local/lib/hermes-agent, command at /usr/local/bin/hermes,
@@ -581,8 +588,8 @@ install_uv() {
     local _uv_install_log _uv_installer
     _uv_install_log="$(mktemp 2>/dev/null || echo "/tmp/hermes-uv-install.$$.log")"
     _uv_installer="$(mktemp 2>/dev/null || echo "/tmp/hermes-uv-installer.$$.sh")"
-    if ! curl -LsSf https://astral.sh/uv/install.sh -o "$_uv_installer" 2>"$_uv_install_log"; then
-        log_error "Failed to download uv installer from https://astral.sh/uv/install.sh"
+    if ! curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" -o "$_uv_installer" 2>"$_uv_install_log"; then
+        log_error "Failed to download uv installer from https://astral.sh/uv/${UV_VERSION}/install.sh"
         log_info "curl output:"
         sed 's/^/    /' "$_uv_install_log" >&2
         log_info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
