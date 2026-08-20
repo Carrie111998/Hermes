@@ -3430,7 +3430,7 @@ def _venv_launcher_ancestors(pids: list[int]) -> list[int]:
         # Log it: without this, an update that trips the venv-holder guard
         # (silently) never shows *why* — the gateway launcher got hidden by
         # the very fallback this fix was meant to remove.
-        logger.debug("ancestor gating unavailable (%s); skipping whole ancestry", exc)
+        logger.warning("ancestor gating unavailable (%s); skipping whole ancestry", exc)
         try:
             for anc in psutil.Process().parents():
                 skip.add(int(anc.pid))
