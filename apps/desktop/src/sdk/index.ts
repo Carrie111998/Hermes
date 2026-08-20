@@ -26,6 +26,7 @@ import { getLogs, getStatus } from '@/hermes'
 import { $gateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
+import { openPreview } from '@/store/preview'
 import { $activeSessionId, $currentCwd, $currentModel, $gatewayState } from '@/store/session'
 import { runGatewayRestart } from '@/store/system-actions'
 
@@ -94,6 +95,17 @@ export const host = {
 
   /** Restart the backend gateway (progress surfaces in the core statusbar). */
   restartGateway: async () => runGatewayRestart(),
+
+  /** Open a URL in the desktop preview pane (the right-rail tab the chat
+   *  preview uses — same UX as a tool-result / file-browser preview). Use
+   *  this when a plugin wants to surface a server UI, dev tool, or web
+   *  page to the user without leaving the app. Mirrors `openPreview(target,
+   *  'manual')` from `@/store/preview`; the URL becomes a fresh tab and
+   *  the right rail focuses it. */
+  preview: (url: string) => {
+    if (typeof url !== 'string' || !url.trim()) return
+    openPreview({ kind: 'url', label: url, source: 'plugin', url }, 'manual')
+  },
 
   /** One-shot system status snapshot (platforms, versions, …). */
   status: async () => getStatus(),
