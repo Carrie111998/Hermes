@@ -1207,6 +1207,7 @@ def handle_function_call(
     disabled_toolsets: Optional[List[str]] = None,
     expected_registry_entry=None,
     enforce_registry_entry: bool = False,
+    request_registry_bindings=None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1236,6 +1237,9 @@ def handle_function_call(
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
+    if request_registry_bindings is not None:
+        expected_registry_entry = request_registry_bindings.get(function_name)
+        enforce_registry_entry = True
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
 
     # ── Tool Search bridge dispatch ──────────────────────────────────
@@ -1346,6 +1350,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                request_registry_bindings=request_registry_bindings,
             )
 
     _tool_original_args = dict(function_args)

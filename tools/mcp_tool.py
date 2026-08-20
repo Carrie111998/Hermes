@@ -7748,6 +7748,15 @@ def refresh_agent_mcp_tools(
     # Computed OUTSIDE the lock (get_tool_definitions can be slow); the diff and
     # publish below happen together in ONE critical section so two concurrent
     # callers can't torn-publish or compute overlapping ``added`` sets.
+    binding_defs = list(
+        get_tool_definitions(
+            enabled_toolsets=enabled,
+            disabled_toolsets=disabled,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        or []
+    )
     new_defs = list(
         get_tool_definitions(
             enabled_toolsets=enabled,
@@ -7768,7 +7777,7 @@ def refresh_agent_mcp_tools(
     # this rebuild actually appended (matching agent_init's dedup-aware add).
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
     staged_bindings, binding_generation = registry.capture_bindings_with_generation(
-        new_names
+        {tool["function"]["name"] for tool in binding_defs}
     )
     if binding_generation != snapshot_generation:
         # Registry mutation overlapped this rebuild. Publishing either the
@@ -7789,9 +7798,10 @@ def refresh_agent_mcp_tools(
         if snapshot_generation < published_gen:
             # A newer snapshot already won; our set is stale — drop it.
             return set()
+        current_tools = getattr(agent, "tools", None) or []
         current = {
             t["function"]["name"]
-            for t in (getattr(agent, "tools", None) or [])
+            for t in current_tools
         }
         current_bindings = getattr(agent, "_tool_registry_bindings", {}) or {}
         bindings_unchanged = (
@@ -7801,7 +7811,11 @@ def refresh_agent_mcp_tools(
                 for name, entry in staged_bindings.items()
             )
         )
-        if new_names == current and bindings_unchanged:
+        if (
+            new_names == current
+            and bindings_unchanged
+            and new_defs == current_tools
+        ):
             # No change → leave the live snapshot untouched (no churn), but
             # record the generation so an in-flight older caller can't clobber.
             agent._tool_snapshot_generation = max(published_gen, snapshot_generation)

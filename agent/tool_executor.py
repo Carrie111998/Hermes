@@ -1343,8 +1343,8 @@ def execute_tool_calls_concurrent(
                         ),
                         enforce_registry_entry=(
                             request_registry_bindings is not None
-                            and function_name in request_registry_bindings
                         ),
+                        request_registry_bindings=request_registry_bindings,
                     )
 
                 managed = _run_agent_tool_execution_middleware(
@@ -2401,8 +2401,8 @@ def execute_tool_calls_sequential(
                             ),
                             enforce_registry_entry=(
                                 request_registry_bindings is not None
-                                and function_name in request_registry_bindings
                             ),
+                            request_registry_bindings=request_registry_bindings,
                         )
 
                 (
@@ -2492,8 +2492,8 @@ def execute_tool_calls_sequential(
                             ),
                             enforce_registry_entry=(
                                 request_registry_bindings is not None
-                                and function_name in request_registry_bindings
                             ),
+                            request_registry_bindings=request_registry_bindings,
                         )
 
                 (

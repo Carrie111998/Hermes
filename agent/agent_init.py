@@ -1514,12 +1514,18 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
+    binding_tool_defs = _ra().get_tool_definitions(
+        enabled_toolsets=enabled_toolsets,
+        disabled_toolsets=disabled_toolsets,
+        quiet_mode=True,
+        skip_tool_search_assembly=True,
+    ) or []
     agent.tools = _ra().get_tool_definitions(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
     )
-    
+
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
     if agent.tools:
@@ -1527,7 +1533,10 @@ def init_agent(
         try:
             bindings, binding_generation = (
                 _snapshot_registry.capture_bindings_with_generation(
-                    agent.valid_tool_names
+                    {
+                        tool["function"]["name"]
+                        for tool in binding_tool_defs
+                    }
                 )
             )
             if binding_generation == agent._tool_snapshot_generation:
@@ -1537,7 +1546,7 @@ def init_agent(
                 # the schema snapshot but fail closed at dispatch until the
                 # regular refresh path publishes one coherent surface.
                 agent._tool_registry_bindings = {
-                    name: None for name in agent.valid_tool_names
+                    name: None for name in bindings
                 }
         except Exception:
             agent._tool_registry_bindings = {

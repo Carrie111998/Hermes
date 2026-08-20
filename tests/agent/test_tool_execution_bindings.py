@@ -70,9 +70,7 @@ def test_inflight_response_detects_real_refresh_without_poisoning_live_snapshot(
     published_generation = agent._tool_snapshot_generation
 
     assert request_tool_names(request_tools) == {"terminal", "read_file"}
-    assert request_tool_bindings_are_stale(
-        agent, request_tools, request_generation
-    )
+    assert request_tool_bindings_are_stale(agent, request_tools)
     assert {tool["function"]["name"] for tool in agent.tools} == {
         "terminal",
         "newly_refreshed_tool",
@@ -85,6 +83,18 @@ def test_inflight_response_detects_real_refresh_without_poisoning_live_snapshot(
         tool["function"]["name"] for tool in agent.tools
     }
     assert agent._tool_snapshot_generation == published_generation
+
+
+def test_generation_only_refresh_does_not_stale_an_identical_request_surface():
+    from agent.conversation_loop import request_tool_bindings_are_stale
+
+    request_tools = [_tool("terminal")]
+    agent = SimpleNamespace(
+        tools=request_tools,
+        _tool_snapshot_generation=2,
+    )
+
+    assert not request_tool_bindings_are_stale(agent, request_tools)
 
 
 def test_registry_dispatch_rejects_rebound_entry_without_calling_either_handler():
@@ -121,3 +131,63 @@ def test_registry_dispatch_rejects_rebound_entry_without_calling_either_handler(
 
     assert calls == []
     assert "stale_tool_binding" in result
+
+
+def test_refresh_publishes_deferred_bindings_with_the_live_surface(monkeypatch):
+    from tools.mcp_tool import (
+        refresh_agent_mcp_tools,
+        snapshot_agent_tool_surface,
+    )
+    from tools.registry import registry
+
+    calls = []
+    schema = {
+        "name": "deferred_binding_probe",
+        "description": "Deferred binding identity probe.",
+        "parameters": {"type": "object", "properties": {}},
+    }
+    registry.register(
+        name="deferred_binding_probe",
+        toolset="deferred-test",
+        schema=schema,
+        handler=lambda _args, **_kwargs: calls.append("A") or "A",
+    )
+    live_tools = [_tool("terminal")]
+    agent = SimpleNamespace(
+        tools=[],
+        valid_tool_names=set(),
+        _tool_snapshot_generation=0,
+        _tool_registry_bindings={},
+        enabled_toolsets=None,
+        disabled_toolsets=None,
+    )
+    monkeypatch.setattr(
+        "model_tools.get_tool_definitions",
+        lambda **kwargs: (
+            [*live_tools, {"type": "function", "function": schema}]
+            if kwargs.get("skip_tool_search_assembly")
+            else list(live_tools)
+        ),
+    )
+
+    assert refresh_agent_mcp_tools(agent) == {"terminal"}
+    _, published_generation, bindings = snapshot_agent_tool_surface(agent)
+    expected = bindings["deferred_binding_probe"]
+    assert expected is registry.get_entry("deferred_binding_probe")
+
+    registry.register(
+        name="deferred_binding_probe",
+        toolset="deferred-test",
+        schema=schema,
+        handler=lambda _args, **_kwargs: calls.append("B") or "B",
+    )
+    result = registry.dispatch(
+        "deferred_binding_probe",
+        {},
+        expected_entry=expected,
+        enforce_expected_entry=True,
+    )
+
+    assert calls == []
+    assert "stale_tool_binding" in result
+    assert agent._tool_snapshot_generation == published_generation

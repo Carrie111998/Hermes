@@ -8288,7 +8288,8 @@ class AIAgent:
                      tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None,
                      skip_tool_execution_middleware: bool = False,
                      expected_registry_entry=None,
-                     enforce_registry_entry: bool = False) -> str:
+                     enforce_registry_entry: bool = False,
+                     request_registry_bindings=None) -> str:
         """Forwarder — see ``agent.agent_runtime_helpers.invoke_tool``."""
         from agent.agent_runtime_helpers import invoke_tool
         return invoke_tool(
@@ -8304,6 +8305,7 @@ class AIAgent:
             skip_tool_execution_middleware,
             expected_registry_entry,
             enforce_registry_entry,
+            request_registry_bindings,
         )
 
     @staticmethod

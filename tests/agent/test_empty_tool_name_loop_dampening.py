@@ -41,11 +41,16 @@ class _MockHandler(BaseHTTPRequestHandler):
     # Set by the fixture before each request cycle.
     captured_requests: list = []
     response_queue: list = []
+    before_response = None
 
     def do_POST(self):  # noqa: N802 (http.server API)
         length = int(self.headers.get("Content-Length", 0))
         req = json.loads(self.rfile.read(length).decode())
         type(self).captured_requests.append(req)
+        callback = type(self).before_response
+        if callback is not None:
+            type(self).before_response = None
+            callback()
         is_stream = req.get("stream") is True
         if type(self).response_queue:
             resp = type(self).response_queue.pop(0)
@@ -124,6 +129,7 @@ def agent_env():
     """Spin up the mock provider + an isolated HERMES_HOME, yield (agent, helpers)."""
     _MockHandler.captured_requests = []
     _MockHandler.response_queue = []
+    _MockHandler.before_response = None
     srv = HTTPServer(("127.0.0.1", 0), _MockHandler)
     port = srv.server_address[1]
     t = threading.Thread(target=srv.serve_forever, daemon=True)
@@ -309,6 +315,90 @@ def test_rebound_registry_tool_is_rejected_at_dispatch(agent_env):
     assert calls == []
     assert any("binding changed" in content for content in tool_results)
     assert result["final_response"] == "Retried safely."
+
+
+def test_inflight_response_uses_request_policy_without_rolling_back_live_refresh(
+    agent_env, monkeypatch
+):
+    """Response A is request-valid while the globally published surface stays B."""
+    agent, handler = agent_env
+    from tools import mcp_tool
+    from tools.registry import registry
+
+    calls = []
+    request_schema = {
+        "name": "inflight_binding_probe",
+        "description": "Probe request-local response validation.",
+        "parameters": {"type": "object", "properties": {}},
+    }
+    registry.register(
+        name="inflight_binding_probe",
+        toolset="test-binding",
+        schema=request_schema,
+        handler=lambda _args, **_kwargs: calls.append("A") or '{"ok":"A"}',
+    )
+    request_tools = [{"type": "function", "function": request_schema}]
+    agent.tools = request_tools
+    agent.valid_tool_names = {"inflight_binding_probe"}
+    agent._tool_snapshot_generation = registry._generation
+    agent._tool_registry_bindings = registry.capture_bindings(
+        agent.valid_tool_names
+    )
+
+    live_schema = {
+        "name": "refreshed_binding_probe",
+        "description": "Probe the live refreshed surface.",
+        "parameters": {"type": "object", "properties": {}},
+    }
+    registry.register(
+        name="refreshed_binding_probe",
+        toolset="test-binding",
+        schema=live_schema,
+        handler=lambda _args, **_kwargs: calls.append("B") or '{"ok":"B"}',
+    )
+    live_tools = [{"type": "function", "function": live_schema}]
+    monkeypatch.setattr(
+        "model_tools.get_tool_definitions", lambda **_kwargs: list(live_tools)
+    )
+
+    published_generation = None
+
+    def _publish_live_surface():
+        nonlocal published_generation
+        assert mcp_tool.refresh_agent_mcp_tools(agent) == {
+            "refreshed_binding_probe"
+        }
+        published_generation = agent._tool_snapshot_generation
+
+    handler.before_response = _publish_live_surface
+    handler.response_queue.append(_tc_resp("inflight_binding_probe"))
+    handler.response_queue.append(_text_resp("Retried against the live surface."))
+
+    result = agent.run_conversation(
+        "run the request-scoped probe", conversation_history=[], task_id="t"
+    )
+
+    tool_results = [
+        message.get("content", "")
+        for message in result["messages"]
+        if isinstance(message, dict) and message.get("role") == "tool"
+    ]
+    assert calls == []
+    assert any("binding changed" in content for content in tool_results)
+    assert all("does not exist" not in content for content in tool_results)
+    assert agent.tools == live_tools
+    assert agent.valid_tool_names == {"refreshed_binding_probe"}
+    assert agent._tool_snapshot_generation == published_generation
+    assert agent._tool_registry_bindings["refreshed_binding_probe"] is (
+        registry.get_entry("refreshed_binding_probe")
+    )
+
+    published_tools = agent.tools
+    assert mcp_tool.refresh_agent_mcp_tools(agent) == set()
+    assert agent.tools is published_tools
+    assert agent.valid_tool_names == {
+        tool["function"]["name"] for tool in agent.tools
+    }
 
 
 def test_unrelated_registry_generation_does_not_block_current_binding(agent_env):
