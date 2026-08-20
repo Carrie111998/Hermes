@@ -272,6 +272,11 @@ class TestCopilotNormalization:
         # GPT models on Go are Responses-only (Go endpoint table).
         assert opencode_model_api_mode("opencode-go", "gpt-5.6-luna") == "codex_responses"
         assert opencode_model_api_mode("opencode-go", "opencode-go/gpt-5.6-luna") == "codex_responses"
+        # Muse models on Go are Responses-only (same as GPT).
+        assert opencode_model_api_mode("opencode-go", "muse-spark-1.2") == "codex_responses"
+        assert opencode_model_api_mode("opencode-go", "muse-spark-1.2-contributor") == "codex_responses"
+        assert opencode_model_api_mode("opencode-go", "opencode-go/muse-spark-1.2") == "codex_responses"
+        assert opencode_model_api_mode("opencode-go", "opencode-go/muse-spark-1.2-contributor") == "codex_responses"
 
 
 class TestNormalizeOpencodeBaseUrl:

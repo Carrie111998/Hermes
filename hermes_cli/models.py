@@ -5283,6 +5283,10 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
             # per the published Go endpoint table, same as GPT on Zen:
             # https://opencode.ai/docs/go/#endpoints
             return "codex_responses"
+        if normalized.startswith("muse-"):
+            # Muse Spark models on Go use /v1/responses (same as GPT).
+            # Includes muse-spark-1.2 and muse-spark-1.2-contributor.
+            return "codex_responses"
         if normalized.startswith("minimax-"):
             return "anthropic_messages"
         if normalized.startswith("qwen"):
