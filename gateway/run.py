@@ -30671,6 +30671,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             profile_homes = _multiplex_profile_homes(runner.config)
             if profile_homes:
                 cron_start_kwargs["profile_homes"] = profile_homes
+                # Secondary-profile cron jobs must deliver through THAT
+                # profile's live adapters, not the default profile's — on
+                # platforms that scope user ids per app (QQ/WeCom openids)
+                # sending with the wrong bot's token fails outright. Pass the
+                # per-profile adapter map so the ticker can route delivery.
+                cron_start_kwargs["profile_adapters"] = getattr(
+                    runner, "_profile_adapters", {}
+                ) or {}
                 logger.info(
                     "Cron scheduler will tick %d profile(s) under multiplex: %s",
                     len(profile_homes),

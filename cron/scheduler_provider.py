@@ -511,6 +511,7 @@ class InProcessCronScheduler(CronScheduler):
         interval=60,
         can_dispatch=None,
         profile_homes=None,
+        profile_adapters=None,
     ):
         import logging
         from cron.scheduler import tick as cron_tick
@@ -538,6 +539,7 @@ class InProcessCronScheduler(CronScheduler):
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
+                profile_adapters=profile_adapters,
             )
             return
 
@@ -609,6 +611,7 @@ class InProcessCronScheduler(CronScheduler):
         loop=None,
         interval=60,
         can_dispatch=None,
+        profile_adapters=None,
     ):
         """Tick every served profile's cron store when multiplex_profiles is on.
 
@@ -662,12 +665,33 @@ class InProcessCronScheduler(CronScheduler):
                 else:
                     for entry in profile_homes:
                         home = entry[1] if isinstance(entry, tuple) else entry
+                        profile_name = entry[0] if isinstance(entry, tuple) else None
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
+                                # Route delivery through the OWNING profile's
+                                # live adapters. Platforms that scope user ids
+                                # per app (QQ/WeCom openids) reject a recipient
+                                # that belongs to a different bot, so a
+                                # secondary profile must never be delivered
+                                # through the default profile's adapters.
+                                #
+                                # Fail closed when a secondary profile has no
+                                # registry entry (its adapter failed to connect
+                                # or has not registered yet): deliver with no
+                                # adapters rather than over the wrong bot,
+                                # matching the inbound path's fail-closed
+                                # resolution for unregistered secondary
+                                # profiles.
+                                tick_adapters = adapters
+                                if profile_adapters is not None and profile_name:
+                                    if profile_name in profile_adapters:
+                                        tick_adapters = profile_adapters[profile_name]
+                                    elif profile_name != "default":
+                                        tick_adapters = {}
                                 cron_tick(
                                     verbose=False,
-                                    adapters=adapters,
+                                    adapters=tick_adapters,
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,
