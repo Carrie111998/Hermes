@@ -527,6 +527,80 @@ def _strip_markdown_to_plain_text(text: str) -> str:
     return plain
 
 
+# ---------------------------------------------------------------------------
+# Feishu post-md preprocessor (2026-08-20, 借鉴 OpenClaw send.js 的思路)
+#
+# 飞书 post 类型消息里 md 标签的渲染限制:
+#   - 不支持 H1/H2/H3 (显示异常)
+#   - 不支持 GFM 表格语法 (| col | col |) — 表格直接不渲染或显示源码
+#   - 表格前后需要 <br> 间距避免贴一起
+# 这是发送链路兜底: 即便上游 LLM (me) 又写出 markdown 表格/标题,
+# post 路径里的 md 标签也会被预处理成飞书能渲染的等价形态.
+# 业务侧原则仍然是"源头消除" — 我自己不应该再写表格 (2026-08-17 Ben 拍板).
+# ---------------------------------------------------------------------------
+
+_H1_RE = re.compile(r"^# (.+)$", re.MULTILINE)
+_H2_TO_H6_RE = re.compile(r"^(#{2,6}) (.+)$", re.MULTILINE)
+_TABLE_LINE_RE = re.compile(r"^\|.*\|$", re.MULTILINE)
+
+
+def _optimize_markdown_style_for_feishu(text: str) -> str:
+    """OpenClaw send.js #optimizeMarkdownStyle 等价: 降级标题, 表格前后加 <br>.
+
+    飞书 post md 标签不支持 H1/H2/H3, 全部降为飞书支持的形态.
+    """
+    if not text:
+        return text
+    # H1 → H4 (飞书支持 H4 显示)
+    text = _H1_RE.sub(r"#### \1", text)
+    # H2-H6 → H5 (统一降级)
+    text = _H2_TO_H6_RE.sub(r"##### \2", text)
+    return text
+
+
+def _convert_markdown_tables_for_feishu(text: str) -> str:
+    """OpenClaw send.js #convertMarkdownTablesForFeishu 等价: 表格前后加 <br> 间距.
+
+    飞书 post md 标签不识别 GFM 表格语法 (`| col | col |` + `|---|---|` 分隔行),
+    强制走 text 又会显示竖线源码. 当前我们**接受**表格在飞书里显示为源码的视觉,
+    因为业务侧已经承诺源头不写表格 (2026-07-24 Ben 拍板 + 2026-08-17 强化);
+    此函数只确保万一上游漏写, 表格块有足够的视觉间距, 不会被前后段落挤糊.
+    """
+    if not text or not _TABLE_LINE_RE.search(text):
+        return text
+    # 表格前后各加 <br> + 空行, 让飞书 md 渲染器至少视觉上分块
+    lines = text.split("\n")
+    out = []
+    in_table = False
+    for line in lines:
+        is_table = bool(re.match(r"^\s*\|.*\|\s*$", line))
+        if is_table and not in_table:
+            # 进入表格块: 前一行加 <br> + 空行间距
+            if out and out[-1].strip() != "":
+                out.append("")
+            out.append("<br>")
+            out.append("")
+            in_table = True
+        elif not is_table and in_table:
+            # 离开表格块: 加 <br> + 空行间距
+            out.append("")
+            out.append("<br>")
+            in_table = False
+        out.append(line)
+    # 末尾如果还在表格块里 (没正常收尾), 也补 <br>
+    if in_table:
+        out.append("")
+        out.append("<br>")
+    return "\n".join(out)
+
+
+def _prepare_markdown_for_feishu_post(text: str) -> str:
+    """组合预处理: 标题降级 + 表格间距."""
+    text = _optimize_markdown_style_for_feishu(text)
+    text = _convert_markdown_tables_for_feishu(text)
+    return text
+
+
 def _coerce_int(value: Any, default: Optional[int] = None, min_value: int = 0) -> Optional[int]:
     """Coerce value to int with optional default and minimum constraint."""
     try:
@@ -4005,14 +4079,22 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
-        # Feishu post-type 'md' elements do not render markdown tables; sending
-        # table content as post causes the message to appear blank on the client.
-        # Force plain text for anything that looks like a markdown table.
-        if _MARKDOWN_TABLE_RE.search(content):
-            text_payload = {"text": content}
-            return "text", json.dumps(text_payload, ensure_ascii=False)
-        if _MARKDOWN_HINT_RE.search(content):
-            return "post", _build_markdown_post_payload(content)
+        # 2026-08-20 改造 (借鉴 OpenClaw send.js 思路 + Ben 提供的源码诊断):
+        #
+        # 之前逻辑:
+        #   if 表格: 强制 text (飞书 text 不解析 markdown, 显示源码竖线)
+        #   if markdown 提示: post + _build_markdown_post_payload
+        #   else: text
+        #
+        # 改造后:
+        #   if 含 markdown 提示 (表格/标题/列表/代码/粗体等): post + 预处理
+        #   else: text
+        #
+        # 表格现在走 post + _prepare_markdown_for_feishu_post (标题降级 + 表格 <br>),
+        # 不再被强制降级到 text 显示源码. 表格本身在飞书 md 标签里仍不渲染成表,
+        # 但会保留 <br> 间距, 业务侧原则是源头不写表格 (2026-07-24 Ben 拍板).
+        if _MARKDOWN_HINT_RE.search(content) or _MARKDOWN_TABLE_RE.search(content):
+            return "post", _build_markdown_post_payload(_prepare_markdown_for_feishu_post(content))
         text_payload = {"text": content}
         return "text", json.dumps(text_payload, ensure_ascii=False)
 
