@@ -73,6 +73,54 @@ image_gen:
 to the global tool-worker limit, so image providers receive bounded parallel
 requests without allowing an image batch to bypass the agent's concurrency cap.
 
+### Codex images with a named credential provider
+
+The `openai-codex` image backend normally reads Hermes-managed ChatGPT/Codex
+OAuth credentials (`~/.hermes/auth.json`, provisioned with
+`hermes auth add openai-codex`). It can instead reuse an existing named
+provider, including one backed by
+[`key_cmd`](/integrations/providers#command-minted-credentials-key_cmd):
+
+```yaml
+providers:
+  codex-passive:
+    api: https://chatgpt.com/backend-api/codex
+    transport: codex_responses
+    key_cmd: "my-auth-helper print-token"
+    extra_headers:
+      ChatGPT-Account-ID: "your-account-id"
+
+image_gen:
+  provider: openai-codex
+  openai-codex:
+    auth_provider: codex-passive
+```
+
+Setting `image_gen.openai-codex.auth_provider` points image generation at that
+named `providers:` entry. The image request uses the entry's base URL and
+extra headers, and authenticates with the entry's credential: a
+command-minted token from `key_cmd`, or a static `api_key` inline in config /
+`key_env` naming an environment variable. Command-minted tokens run through
+the same expiry-aware cache and secret-safe error handling as normal
+inference, so a gateway token is minted once and reused until shortly before
+it expires. When `auth_provider` is omitted, the existing
+`hermes auth add openai-codex` flow is unchanged.
+
+Precedence: `auth_provider` wins over Hermes-managed Codex OAuth whenever it
+is set — the two paths never mix. Within the named provider entry,
+`key_cmd` beats a static `api_key` / `key_env` on the same entry, exactly as
+documented for inference providers.
+
+Two guardrails are worth knowing about:
+
+- `extra_headers` is for route and account metadata. `Authorization`, `Accept`,
+  and `Content-Type` are owned by the request and are ignored (in any casing)
+  if the provider declares them, so config can never shadow the freshly
+  resolved bearer token.
+- A named provider that is missing, disabled (`enabled: false`), or has no
+  credential is an error — Hermes does **not** quietly fall back to
+  Hermes-managed Codex OAuth or to any other provider.
+
 ### OpenRouter: the full Image API catalog
 
 With `image_gen.provider: openrouter`, the model picker lists OpenRouter's
