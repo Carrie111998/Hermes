@@ -819,6 +819,7 @@ def build_turn_context(
     # work; nothing has touched it yet this turn, so it measures the gap since
     # the previous turn finished. The cheap gap pre-check gates the (more
     # expensive) token estimate, mirroring ``_should_run_preflight_estimate``.
+    _idle_compacted = False
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
     if agent.compression_enabled and _idle_after > 0 and messages:
         _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
@@ -878,6 +879,18 @@ def build_turn_context(
                 # must leave the turn's flush baseline and user-message index
                 # untouched.
                 if messages is not _idle_input:
+                    # One successful boundary is enough for this turn.  The
+                    # compressor has no provider-reported usage for the new
+                    # transcript yet, so an immediately-following threshold
+                    # preflight would judge the same state from the rough
+                    # estimator and can rewrite it a second time.  Besides
+                    # wasting the compaction, an in-place second pass archives
+                    # and re-inserts the whole surviving transcript, producing
+                    # duplicate active completion rows when the pass preserves
+                    # the protected tail.  Let the next real provider request
+                    # adjudicate the idle boundary before another automatic
+                    # turn-start compaction is allowed.
+                    _idle_compacted = True
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history
                     )
@@ -900,6 +913,7 @@ def build_turn_context(
     if (
         agent.compression_enabled
         and not _review_fork_first_request_pending(agent)
+        and not _idle_compacted
         and _should_run_preflight_estimate(
             messages,
             agent.context_compressor.protect_first_n,
