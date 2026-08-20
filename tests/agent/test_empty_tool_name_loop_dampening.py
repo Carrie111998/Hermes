@@ -361,13 +361,19 @@ def test_unrelated_registry_generation_does_not_block_current_binding(agent_env)
     assert "stale_tool_binding" not in result
 
 
-def test_rebound_deferred_tool_is_rejected_after_tool_search_unwrap(agent_env):
+def test_rebound_deferred_tool_is_rejected_after_tool_search_unwrap(
+    agent_env, monkeypatch
+):
     """A tool_call bridge response must retain the deferred A binding."""
     agent, handler = agent_env
     from tools.registry import registry
 
     calls = []
     underlying_name = "mcp_deferred_binding_probe"
+    monkeypatch.setattr(
+        "agent.tool_executor._tool_search_scoped_names",
+        lambda _agent: frozenset({underlying_name}),
+    )
     underlying_schema = {
         "name": underlying_name,
         "description": "Deferred binding probe.",
