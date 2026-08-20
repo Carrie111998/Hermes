@@ -915,9 +915,16 @@ def _authenticated_review_pass_receipt(
         if str(payload.get("verdict") or "").strip().lower() != "pass":
             continue
         reviewed = _full_git_sha(payload.get("head"))
-        current = _full_git_sha(payload.get("current_head")) or live_head
-        if reviewed is None or reviewed != live_head or current != live_head:
+        current = _full_git_sha(payload.get("current_head"))
+        generation = payload.get("generation")
+        reviewed_generation = payload.get("reviewed_generation", generation)
+        if reviewed is None or current is None:
             continue
+        if reviewed != live_head or current != live_head or current != reviewed:
+            continue
+        if generation is not None and reviewed_generation is not None:
+            if generation != reviewed_generation:
+                continue
         return payload
     return None
 

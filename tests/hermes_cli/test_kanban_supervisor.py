@@ -1460,3 +1460,83 @@ def test_stale_and_foreign_review_receipts_do_not_mint_proof(kanban_home, tmp_pa
         proof = json.loads(units[child]["proof"] or "{}") if units[child].get("proof") else {}
         assert proof.get("verified") is not True
         assert proof.get("verdict") != "pass"
+
+
+def test_missing_current_head_receipt_fails_closed(kanban_home, tmp_path):
+    live = _init_git_head(tmp_path / "repo-missing-current")
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root", assignee="default")
+        child = kb.create_task(
+            conn, title="child", assignee="cole", parents=[root],
+            workspace_kind="dir",
+            workspace_path=str(tmp_path / "repo-missing-current"),
+        )
+        oid = sup.ensure_objective(conn, root)
+        sup.upsert_unit(conn, objective_id=oid, kind="kanban", ref=child, status="pending")
+        sup._record_supervisor_event(
+            conn, event_key="review_verdict:missing-current",
+            kind="review_verdict", task_id=child,
+            payload={
+                "verdict": "pass", "head": live,
+                "blockers": [], "stale": False, "verified": True,
+            },
+        )
+        sup._maybe_record_jude_proof(conn, child)
+        units = {u["ref"]: u for u in sup.list_units(conn, oid)}
+        proof = json.loads(units[child]["proof"] or "{}") if units[child].get("proof") else {}
+        assert proof.get("verdict") != "pass"
+        assert proof.get("head") != live
+
+
+def test_stale_or_foreign_current_head_receipt_fails_closed(kanban_home, tmp_path):
+    live = _init_git_head(tmp_path / "repo-foreign-current")
+    other = "b" * 40
+    assert other != live
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root", assignee="default")
+        child = kb.create_task(
+            conn, title="child", assignee="cole", parents=[root],
+            workspace_kind="dir",
+            workspace_path=str(tmp_path / "repo-foreign-current"),
+        )
+        oid = sup.ensure_objective(conn, root)
+        sup.upsert_unit(conn, objective_id=oid, kind="kanban", ref=child, status="pending")
+        sup._record_supervisor_event(
+            conn, event_key="review_verdict:stale-current",
+            kind="review_verdict", task_id=child,
+            payload={
+                "verdict": "pass", "head": live, "current_head": other,
+                "blockers": [], "stale": False, "verified": True,
+            },
+        )
+        sup._maybe_record_jude_proof(conn, child)
+        units = {u["ref"]: u for u in sup.list_units(conn, oid)}
+        proof = json.loads(units[child]["proof"] or "{}") if units[child].get("proof") else {}
+        assert proof.get("verdict") != "pass"
+        sup._record_supervisor_event(
+            conn, event_key="review_verdict:generation-mismatch",
+            kind="review_verdict", task_id=child,
+            payload={
+                "verdict": "pass", "head": live, "current_head": live,
+                "generation": 1, "reviewed_generation": 2,
+                "blockers": [], "stale": False, "verified": True,
+            },
+        )
+        sup._maybe_record_jude_proof(conn, child)
+        units = {u["ref"]: u for u in sup.list_units(conn, oid)}
+        proof = json.loads(units[child]["proof"] or "{}") if units[child].get("proof") else {}
+        assert proof.get("verdict") != "pass"
+        sup._record_supervisor_event(
+            conn, event_key="review_verdict:bound",
+            kind="review_verdict", task_id=child,
+            payload={
+                "verdict": "pass", "head": live, "current_head": live,
+                "generation": 3, "reviewed_generation": 3,
+                "blockers": [], "stale": False, "verified": True,
+            },
+        )
+        sup._maybe_record_jude_proof(conn, child)
+        units = {u["ref"]: u for u in sup.list_units(conn, oid)}
+        proof = json.loads(units[child]["proof"])
+        assert proof.get("verdict") == "pass"
+        assert proof.get("head") == live

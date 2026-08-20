@@ -1614,3 +1614,41 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+def test_inherit_notify_subs_rejects_mixed_independent_origins(kanban_home):
+    with kb.connect() as conn:
+        first = kb.create_task(conn, title="obj-a", assignee="default")
+        second = kb.create_task(conn, title="obj-b", assignee="default")
+        kb.add_notify_sub(
+            conn, task_id=first, platform="webui",
+            chat_id="origin-a", delivery_mode="notify+wake",
+        )
+        kb.add_notify_sub(
+            conn, task_id=second, platform="webui",
+            chat_id="origin-b", delivery_mode="notify+wake",
+        )
+        child = kb.create_task(
+            conn, title="shared", assignee="cole", parents=[first, second],
+        )
+        chats = {s["chat_id"] for s in kb.list_notify_subs(conn, child)}
+        assert "origin-a" not in chats
+        assert "origin-b" not in chats
+
+
+def test_inherit_notify_subs_fails_closed_on_lookup_exception(kanban_home, monkeypatch):
+    import hermes_cli.kanban_supervisor as sup
+
+    def _boom(_conn, _task_id):
+        raise RuntimeError("canonical root lookup failed")
+
+    monkeypatch.setattr(sup, "canonical_root_task_id", _boom)
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root", assignee="default")
+        kb.add_notify_sub(
+            conn, task_id=root, platform="webui",
+            chat_id="origin-live", delivery_mode="notify+wake",
+        )
+        child = kb.create_task(conn, title="child", assignee="cole", parents=[root])
+        chats = {s["chat_id"] for s in kb.list_notify_subs(conn, child)}
+        assert "origin-live" not in chats

@@ -3739,6 +3739,7 @@ def _inherit_notify_subs(
         _log.debug(
             "canonical origin inherit failed for %s", child_id, exc_info=True
         )
+        return
     row = conn.execute(
         "SELECT COALESCE(MAX(id), 0) AS cursor FROM task_events WHERE task_id = ?",
         (child_id,),
