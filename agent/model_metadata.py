@@ -508,6 +508,11 @@ DEFAULT_CONTEXT_LENGTHS = {
     # ensures "glm-5.2" resolves to 1M while older variants still hit the
     # generic 202K fallback.
     "glm-5.2": 1_048_576,
+    # GLM-5.3 ships a 1M context window, same as 5.2 (models.dev:
+    # zai-coding-plan glm-5.3 context=1M, output=128K; verified 2026-08).
+    # Without this entry "glm-5.3" falls through to the generic "glm" 202K
+    # fallback and context gets compressed ~5x too early.
+    "glm-5.3": 1_048_576,
     "glm": 202752,
     # xAI Grok — xAI /v1/models does not return context_length metadata,
     # so these hardcoded fallbacks prevent Hermes from probing-down to
