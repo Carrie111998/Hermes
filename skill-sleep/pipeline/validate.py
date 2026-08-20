@@ -20,7 +20,7 @@ except ImportError:
 
 # ── Constants ───────────────────────────────────────────────────────────────
 
-DEFAULT_MODEL = "9router/cbcn/deepseek-v4-flash"
+DEFAULT_MODEL = "gpt-4o-mini"
 DEFAULT_THRESHOLD = 70
 DEFAULT_MIN_PASS_RATE = 0.6
 DEFAULT_TIMEOUT = 300

@@ -10,7 +10,7 @@
 ```
 skill-sleep run
   ├─ [1] MINE      扫近期会话（hermes sessions export --redact），提取 friction 信号 → tasks.json
-  ├─ [2] PROPOSE   优化器（omp + cbcn/deepseek-v4-flash）读 task cards + 当前 SKILL.md → candidate.diff（含 rejected buffer 上下文）
+  ├─ [2] PROPOSE   优化器（omp + gpt-4o-mini，默认模型可 --model 覆写）读 task cards + 当前 SKILL.md → candidate.diff（含 rejected buffer 上下文）
   ├─ [3] VALIDATE  LLM judge 逐 task 评分，阈值 + 通过率双 gate（默认 70 分 / 60%）→ validation.json
   └─ [4] REVIEW    PASS → staging/<skill>-<ts>/ 待人类审查 → skill_manage patch 采纳
                    FAIL → rejected/<skill>-<ts>/ + rejected.jsonl 进下一轮 prompt
@@ -22,7 +22,7 @@ skill-sleep run
 # 1. 准备环境（项目自带 .venv）
 source .venv/bin/activate
 
-# 2. 配置密钥（cbcn/deepseek-v4-flash 走 NineRouter，仅检查是否设置，不读取值、不落盘）
+# 2. 配置密钥（模型需在 omp 中可用；默认 gpt-4o-mini，可 --model 覆写）
 export NINEROUTER_KEY=...
 
 # 3. 单阶段手动运行（带 [stage] 前缀日志）
@@ -64,7 +64,7 @@ python3 pipeline/review.py reject --staging-dir staging/<skill>-<ts> --reason ".
 
 ## 配置与阈值
 
-- `PROPOSE`: `DEFAULT_MODEL=9router/cbcn/deepseek-v4-flash`，diff 有界（≤30 行新增，文本学习率）
+- `PROPOSE`: `DEFAULT_MODEL=gpt-4o-mini`，diff 有界（≤30 行新增，文本学习率）
 - `VALIDATE`: `threshold=70`，`min_pass_rate=0.6`，`gate_type=llm_judge`
 - 隐私：`hermes sessions export --redact`，task card 脱敏后再送优化器；muse spark 有数据分享条款
 
