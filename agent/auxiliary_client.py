@@ -489,7 +489,7 @@ _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
 _AUTH_JSON_PATH = get_hermes_home() / "auth.json"
 
-# Codex OAuth endpoint used when a caller explicitly requests
+# Codex OAuthendpoint used when a caller explicitly requests
 # provider="openai-codex".  There is deliberately no hardcoded default
 # model: the set of models OpenAI accepts on this endpoint for
 # ChatGPT-account auth is an undocumented, shifting allow-list, and
@@ -515,7 +515,7 @@ def _codex_cloudflare_headers(access_token: str) -> Dict[str, str]:
     ``auth.rs``) out of the OAuth JWT's ``chatgpt_account_id`` claim.
 
     Malformed tokens are tolerated — we drop the account-ID header rather than
-    raise, so a bad token still surfaces as an auth error (401) instead of a
+    raise, so a bad token still surfaces as an autherror (401) instead of a
     crash at client construction.
     """
     headers = {
@@ -1005,7 +1005,7 @@ class _AnthropicCompletionsAdapter:
         tools = kwargs.get("tools")
         tool_choice = kwargs.get("tool_choice")
         # ZAI's Anthropic-compatible endpoint rejects max_tokens on vision
-        # models (glm-4v-flash etc.) with error code 1210.  When the caller
+        # models (glm-4v-flash etc.) witherror code 1210.  When the caller
         # signals this by setting _skip_zai_max_tokens in kwargs, omit it.
         _skip_mt = kwargs.pop("_skip_zai_max_tokens", False)
         if _skip_mt:
@@ -1806,7 +1806,7 @@ def clear_runtime_main() -> None:
 def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """Resolve the active custom/main endpoint the same way the main CLI does.
 
-    This covers both env-driven OPENAI_BASE_URL setups and config-saved custom
+    This covers bothenv-driven OPENAI_BASE_URL setups and config-saved custom
     endpoints where the base URL lives in config.yaml instead of the live
     environment.
     """
@@ -3253,7 +3253,7 @@ def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Option
 # (Chat Completions vs Responses API for Codex).
 #
 # All auxiliary consumer code should go through this or the public helpers
-# below — never look up auth env vars ad-hoc.
+# below — never look up authenv vars ad-hoc.
 
 
 def _to_async_client(sync_client, model: str, is_vision: bool = False):
@@ -3365,7 +3365,7 @@ def resolve_provider_client(
             the caller needs direct access to responses.stream() (e.g.,
             the main agent loop).
         explicit_base_url: Optional direct OpenAI-compatible endpoint.
-        explicit_api_key: Optional API key paired with explicit_base_url.
+        explicit_api_key: Optional API key paired withexplicit_base_url.
         api_mode: API mode override.  One of "chat_completions",
             "codex_responses", or None (auto-detect).  When set to
             "codex_responses", the client is wrapped in
@@ -4703,7 +4703,7 @@ def _resolve_task_provider_model(
 
     # Convenience aliases for direct API-key endpoints that aren't first-class
     # providers (e.g. ``provider: openai`` → custom + api.openai.com/v1).
-    # Applied to both explicit args and config-derived values. When the user
+    # Applied to bothexplicit args and config-derived values. When the user
     # has already supplied a base_url we keep their endpoint but still rewrite
     # the provider to ``custom`` so resolution doesn't hit the
     # PROVIDER_REGISTRY-only path (which has no ``openai`` entry).
@@ -4962,7 +4962,7 @@ def _build_call_kwargs(
         # an explicit cap only risks truncating a summary or 400-ing on providers
         # that reject the parameter outright (e.g. GitHub Copilot / newer OpenAI
         # GPT-5 models require max_completion_tokens, not max_tokens; ZAI vision
-        # models reject it entirely with error 1210). Omitting it sidesteps all of
+        # models reject it entirely witherror 1210). Omitting it sidesteps all of
         # those wire-format quirks at once.
         #
         # The one exception is the Anthropic Messages wire (MiniMax and any
@@ -5335,7 +5335,7 @@ def call_llm(
                 and not client_is_nous):
             if _refresh_provider_credentials(resolved_provider):
                 logger.info(
-                    "Auxiliary %s: refreshed %s credentials after auth error, retrying",
+                    "Auxiliary %s: refreshed %s credentials after autherror, retrying",
                     task or "call", resolved_provider,
                 )
                 return _retry_same_provider_sync(
@@ -5809,7 +5809,7 @@ async def async_call_llm(
                 and not client_is_nous):
             if _refresh_provider_credentials(resolved_provider):
                 logger.info(
-                    "Auxiliary %s (async): refreshed %s credentials after auth error, retrying",
+                    "Auxiliary %s (async): refreshed %s credentials after autherror, retrying",
                     task or "call", resolved_provider,
                 )
                 return await _retry_same_provider_async(
