@@ -506,3 +506,71 @@ def test_production_fetcher_accepts_the_cooperative_budget():
         "agent.account_usage.fetch_account_usage must accept budget_seconds, "
         "otherwise collect()'s deadline_seconds never bounds a provider call"
     )
+
+
+def test_deadline_defaults_to_the_historical_constant_when_unpublished(monkeypatch):
+    """A hand-run `python -m ai_usage`, or an older wrapper, must not change."""
+    monkeypatch.delenv(collector_module.DEADLINE_EPOCH_ENV, raising=False)
+
+    assert collector_module._derive_deadline_seconds() == 90.0
+
+
+def test_deadline_subtracts_the_import_prefix_from_the_task_limit(monkeypatch):
+    """The budget must be measured against the TASK's clock, not collect()'s.
+
+    collect()'s deadline used to be a flat 90s from its own entry. The scheduler
+    limits the whole run (PT6M from the moment it starts the wrapper), and on
+    this box interpreter startup plus imports is where nearly all of that goes.
+    A budget blind to that prefix is respected in full while the task is killed
+    anyway -- and a kill produces NOTHING: no snapshot, no diagnostics, just a
+    stale ai-tokens.json.
+
+    So the wrapper publishes the absolute instant the run must finish by, and
+    the remaining time is computed HERE, after the imports have been paid.
+    """
+    # Wrapper said "be done by t=1000". Imports ran long; it is now t=960.
+    monkeypatch.setenv(collector_module.DEADLINE_EPOCH_ENV, "1000")
+
+    derived = collector_module._derive_deadline_seconds(now_epoch=lambda: 960.0)
+
+    assert derived == 40.0
+
+
+def test_deadline_never_exceeds_the_historical_constant(monkeypatch):
+    """Strictly a tightening mechanism -- it may shrink the budget, never grow it.
+
+    With a fast import the remaining time is most of PT6M. Handing collect()
+    340s would be a behaviour change nobody asked for, and a garbage-large env
+    value must not buy an unbounded run.
+    """
+    monkeypatch.setenv(collector_module.DEADLINE_EPOCH_ENV, "99999999999")
+
+    assert collector_module._derive_deadline_seconds(now_epoch=lambda: 0.0) == 90.0
+
+
+def test_deadline_floors_at_zero_when_the_prefix_ate_everything(monkeypatch):
+    """Past the instant, collect() must carry forward rather than go negative."""
+    monkeypatch.setenv(collector_module.DEADLINE_EPOCH_ENV, "1000")
+
+    assert collector_module._derive_deadline_seconds(now_epoch=lambda: 1500.0) == 0.0
+
+
+def test_deadline_ignores_a_malformed_published_value(monkeypatch):
+    """Never let a typo in the wrapper turn into an unbounded or negative run."""
+    for junk in ("", "   ", "not-a-number", "nan", "inf", "-inf"):
+        monkeypatch.setenv(collector_module.DEADLINE_EPOCH_ENV, junk)
+        assert collector_module._derive_deadline_seconds(now_epoch=lambda: 0.0) == 90.0
+
+
+def test_collect_uses_the_derived_deadline_when_none_is_passed(tmp_path, monkeypatch):
+    """The wiring, not just the helper: collect() must actually consult it."""
+    db = tmp_path / "state.db"
+    _seed_db(str(db))
+    monkeypatch.setenv(collector_module.DEADLINE_EPOCH_ENV, "1000")
+    monkeypatch.setattr(collector_module.time, "time", lambda: 987.5)
+
+    data = collect(
+        db_path=str(db), prev=None, fetch_usage=lambda _provider, **_kw: None, now=NOW,
+    )
+
+    assert data["diagnostics"]["deadline_seconds"] == 12.5
