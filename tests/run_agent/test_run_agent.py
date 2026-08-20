@@ -910,8 +910,44 @@ class TestBuildSystemPrompt:
     def test_memory_guidance_when_memory_tool_loaded(self, agent_with_memory_tool):
         from agent.prompt_builder import MEMORY_GUIDANCE
 
+        agent_with_memory_tool._memory_enabled = True
         prompt = agent_with_memory_tool._build_system_prompt()
         assert MEMORY_GUIDANCE in prompt
+
+    def test_no_memory_guidance_when_both_builtin_stores_disabled(
+        self, agent_with_memory_tool
+    ):
+        """Guidance must follow the stores, not just the tool's presence.
+
+        With both built-in stores off, ``agent_init`` never builds a
+        ``MemoryStore``, so every memory call returns "Memory is not
+        available" — telling the model to save facts there is a dead
+        instruction paid for on every API call.
+        """
+        from agent.prompt_builder import MEMORY_GUIDANCE, USER_PROFILE_GUIDANCE
+
+        agent_with_memory_tool._memory_enabled = False
+        agent_with_memory_tool._user_profile_enabled = False
+        prompt = agent_with_memory_tool._build_system_prompt()
+        assert MEMORY_GUIDANCE not in prompt
+        assert USER_PROFILE_GUIDANCE not in prompt
+
+    def test_profile_guidance_when_only_user_profile_enabled(
+        self, agent_with_memory_tool
+    ):
+        """USER.md alone gets the narrower profile-only guidance.
+
+        The full MEMORY_GUIDANCE block instructs the model to save notes to a
+        MEMORY.md store that does not exist in this configuration, so the
+        profile-specific block is injected instead.
+        """
+        from agent.prompt_builder import MEMORY_GUIDANCE, USER_PROFILE_GUIDANCE
+
+        agent_with_memory_tool._memory_enabled = False
+        agent_with_memory_tool._user_profile_enabled = True
+        prompt = agent_with_memory_tool._build_system_prompt()
+        assert MEMORY_GUIDANCE not in prompt
+        assert USER_PROFILE_GUIDANCE in prompt
 
 
 
@@ -1090,6 +1126,72 @@ class TestToolUseEnforcementConfig:
             a.client = MagicMock()
             prompt = a._build_system_prompt()
             assert TOOL_USE_ENFORCEMENT_GUIDANCE not in prompt
+
+
+class TestExecutionGuidanceConfig:
+    """End-to-end tests for the agent.execution_guidance config option —
+    from config.yaml through agent_init to the built system prompt."""
+
+    def _make_agent(self, model="deepseek/deepseek-v4-pro", execution_guidance=None):
+        agent_cfg = {"tool_use_enforcement": False}
+        if execution_guidance is not None:
+            agent_cfg["execution_guidance"] = execution_guidance
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("terminal", "web_search"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"agent": agent_cfg},
+            ), patch(
+                "hermes_cli.config.load_config_readonly",
+                return_value={"agent": agent_cfg},
+            ),
+        ):
+            a = AIAgent(
+                model=model,
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            a.client = MagicMock()
+            return a
+
+    def test_deepseek_gets_guidance_by_default(self):
+        from agent.prompt_builder import OPENAI_MODEL_EXECUTION_GUIDANCE
+        agent = self._make_agent(model="deepseek/deepseek-v4-pro")
+        assert OPENAI_MODEL_EXECUTION_GUIDANCE in agent._build_system_prompt()
+
+    def test_gpt_still_gets_guidance(self):
+        from agent.prompt_builder import OPENAI_MODEL_EXECUTION_GUIDANCE
+        agent = self._make_agent(model="openai/gpt-4.1")
+        assert OPENAI_MODEL_EXECUTION_GUIDANCE in agent._build_system_prompt()
+
+    def test_config_false_suppresses(self):
+        from agent.prompt_builder import OPENAI_MODEL_EXECUTION_GUIDANCE
+        agent = self._make_agent(
+            model="deepseek/deepseek-v4-pro", execution_guidance=False
+        )
+        assert OPENAI_MODEL_EXECUTION_GUIDANCE not in agent._build_system_prompt()
+
+    def test_config_list_matches(self):
+        from agent.prompt_builder import OPENAI_MODEL_EXECUTION_GUIDANCE
+        agent = self._make_agent(
+            model="moonshotai/kimi-k3", execution_guidance=["kimi"]
+        )
+        assert OPENAI_MODEL_EXECUTION_GUIDANCE in agent._build_system_prompt()
+
+    def test_config_list_non_match_suppresses(self):
+        from agent.prompt_builder import OPENAI_MODEL_EXECUTION_GUIDANCE
+        agent = self._make_agent(
+            model="openai/gpt-4.1", execution_guidance=["kimi"]
+        )
+        assert OPENAI_MODEL_EXECUTION_GUIDANCE not in agent._build_system_prompt()
 
 
 class TestTaskCompletionGuidance:
@@ -2321,6 +2423,7 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("read_preview", {}),
         ("read_window_below", {}),
         ("setup_mcp", {"server": "linear", "action": "install"}),
+        ("tour", {"action": "stop"}),
         ("delegate_task", {"goal": "Check the child path"}),
     )
 
