@@ -215,3 +215,36 @@ def test_plugin_yaml_wins_over_plugin_yml_setup_metadata(tmp_path, monkeypatch):
 
     assert installed == [["yaml-dependency>=1,<2"]]
     assert next(desc for name, desc, _ in providers if name == "precedenceprovider") == "YAML description"
+def test_cmd_status_memory_tool_gate_disabled(capsys, monkeypatch):
+    """When both memory stores are disabled, Memory status reports memory tool as disabled."""
+    _cfg = {"memory": {"memory_enabled": False, "user_profile_enabled": False}}
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: _cfg)
+    # check_memory_requirements() reads the readonly loader, not load_config.
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly", lambda: _cfg, raising=False
+    )
+    monkeypatch.setattr(memory_setup, "_get_available_providers", lambda: [])
+
+    memory_setup.cmd_status(SimpleNamespace())
+
+    captured = capsys.readouterr().out
+    assert "Memory tool:        disabled ✗" in captured
+    assert "Memory injection:   disabled ✗" in captured
+    assert "User profile:       disabled ✗" in captured
+
+
+def test_cmd_status_memory_tool_gate_enabled(capsys, monkeypatch):
+    """When at least one memory store is enabled, Memory status reports memory tool as enabled."""
+    _cfg = {"memory": {"memory_enabled": True, "user_profile_enabled": False}}
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: _cfg)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly", lambda: _cfg, raising=False
+    )
+    monkeypatch.setattr(memory_setup, "_get_available_providers", lambda: [])
+
+    memory_setup.cmd_status(SimpleNamespace())
+
+    captured = capsys.readouterr().out
+    assert "Memory tool:        enabled ✓" in captured
+    assert "Memory injection:   enabled ✓" in captured
+    assert "User profile:       disabled ✗" in captured
