@@ -225,6 +225,9 @@ _DEFAULT_TEXT_BATCH_MAX_MESSAGES = 8
 _DEFAULT_TEXT_BATCH_MAX_CHARS = 4000
 _DEFAULT_MEDIA_BATCH_DELAY_SECONDS = 0.8
 _DEFAULT_DEDUP_CACHE_SIZE = 2048
+# Default max message age in seconds. Messages with create_time older than
+# this are dropped to avoid processing stale/replayed events after restart.
+_DEFAULT_MAX_MESSAGE_AGE_SECONDS = 300  # 5 minutes
 _DEFAULT_WEBHOOK_HOST = "127.0.0.1"
 _DEFAULT_WEBHOOK_PORT = 8765
 _DEFAULT_WEBHOOK_PATH = "/feishu/webhook"
@@ -1650,6 +1653,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 str(extra.get("webhook_path") or os.getenv("FEISHU_WEBHOOK_PATH", _DEFAULT_WEBHOOK_PATH)).strip()
                 or _DEFAULT_WEBHOOK_PATH
             ),
+            max_message_age_seconds=max(
+                0,
+                env_int("FEISHU_MAX_MESSAGE_AGE_SECONDS", _DEFAULT_MAX_MESSAGE_AGE_SECONDS),
+            ),
             ws_reconnect_nonce=_coerce_required_int(extra.get("ws_reconnect_nonce"), default=30, min_value=0),
             ws_reconnect_interval=_coerce_required_int(extra.get("ws_reconnect_interval"), default=120, min_value=1),
             ws_ping_interval=_coerce_int(extra.get("ws_ping_interval"), default=None, min_value=1),
@@ -2610,6 +2617,20 @@ class FeishuAdapter(BasePlatformAdapter):
             return
 
         message_id = getattr(message, "message_id", None)
+
+        # --- Timestamp staleness check ---
+        create_time_ms = getattr(message, "create_time", None)
+        if create_time_ms:
+            max_age = self._max_message_age_seconds
+            if max_age > 0:
+                msg_age = time.time() - (int(create_time_ms) / 1000)
+                if msg_age > max_age:
+                    logger.warning(
+                        "[Feishu] Dropping stale message: id=%s age=%.1fs max=%ds",
+                        message_id, msg_age, max_age,
+                    )
+                    return
+
         if not message_id or self._is_duplicate(message_id):
             logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
             return
