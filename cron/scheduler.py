@@ -509,7 +509,8 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import (
-    advance_next_runs,
+    _advance_next_runs_for_builtin_scheduler,
+    advance_next_runs as _legacy_advance_next_runs,
     bind_fire_claim_execution,
     claim_dispatch,
     claim_job_for_fire,
@@ -523,6 +524,23 @@ from cron.jobs import (
     save_job_output,
     use_cron_store,
 )
+
+# Keep the historical module-level name available to integrations that patch
+# the scheduler's batch-advance hook.  Production ticks use the capability-
+# issuing helper above; this alias preserves the existing import surface while
+# the old integer-returning API remains owned by ``cron.jobs``.
+advance_next_runs = _legacy_advance_next_runs
+_DEFAULT_ADVANCE_NEXT_RUNS = advance_next_runs
+
+
+def _advance_due_jobs_for_tick(job_ids) -> dict[str, Any]:
+    """Issue builtin claim capabilities, honoring the legacy hook when patched."""
+    if advance_next_runs is not _DEFAULT_ADVANCE_NEXT_RUNS:
+        advance_next_runs(job_ids)
+        return {}
+    return _advance_next_runs_for_builtin_scheduler(job_ids)
+
+
 from cron.executions import (
     bind_execution_claim,
     create_execution,
@@ -7441,7 +7459,9 @@ def tick(
         # cron-kind jobs both compute the same next occurrence; interval jobs
         # re-anchor from their own "now" at claim time (harmless for
         # at-most-once — mark_job_run re-anchors at completion regardless).
-        advance_next_runs([job["id"] for job in due_jobs])
+        builtin_claim_tokens = _advance_due_jobs_for_tick(
+            [job["id"] for job in due_jobs]
+        )
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
@@ -7490,6 +7510,9 @@ def tick(
             }
             if getattr(claim_job_for_fire, "__module__", "cron.jobs") == "cron.jobs":
                 claim_kwargs["_scheduler_admission"] = _BUILTIN_SCHEDULER_ADMISSION
+                scheduler_claim_token = builtin_claim_tokens.get(job["id"])
+                if scheduler_claim_token is not None:
+                    claim_kwargs["_scheduler_claim_token"] = scheduler_claim_token
             claimed = claim_job_for_fire(job["id"], **claim_kwargs)
             if not claimed:
                 finish_execution(

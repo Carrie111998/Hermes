@@ -136,6 +136,25 @@ class _CronStorePaths:
     output_dir: Path
 
 
+@dataclass
+class _BuiltinSchedulerClaimToken:
+    """Opaque due-snapshot capability issued by the builtin scheduler.
+
+    The token is created only by ``_advance_next_runs_for_builtin_scheduler``
+    while the jobs lock is held.  A caller-controlled timestamp is never
+    enough to admit ``SCHEDULED_ON_TIME``: the atomic claim also requires this
+    token's capability identity and the exact recurrence that the advance
+    just persisted.  ``consumed`` prevents a stale worker in this process from
+    reusing one token after the first claim.
+    """
+
+    job_id: str
+    prior_next_run_at: Optional[str]
+    advanced_next_run_at: str
+    capability: object
+    consumed: bool = False
+
+
 _cron_store_override: ContextVar[Optional[_CronStorePaths]] = ContextVar(
     "cron_store_override",
     default=None,
@@ -2766,26 +2785,65 @@ def advance_next_runs(job_ids) -> int:
     rather than advancing a prefix — acceptable given the sub-10ms window,
     and identical to the per-job form once the batch completes.
     """
-    ids = set(job_ids)
+    ids = {str(job_id) for job_id in job_ids if job_id}
     if not ids:
         return 0
     with _jobs_lock():
-        jobs = load_jobs()
-        now = _hermes_now().isoformat()
-        advanced = 0
-        for job in jobs:
-            if job["id"] not in ids:
-                continue
-            kind = job.get("schedule", {}).get("kind")
-            if kind not in {"cron", "interval"}:
-                continue
-            new_next = compute_next_run(job["schedule"], now)
-            if new_next and new_next != job.get("next_run_at"):
-                job["next_run_at"] = new_next
-                advanced += 1
-        if advanced:
-            save_jobs(jobs)
+        advanced, _ = _advance_next_runs_locked(ids)
         return advanced
+
+
+def _advance_next_runs_locked(
+    ids: set[str],
+) -> tuple[int, dict[str, _BuiltinSchedulerClaimToken]]:
+    """Advance a due set and return builtin claim capabilities.
+
+    The caller must hold ``_jobs_lock``.  Keeping token issuance in this same
+    critical section makes the ``prior -> advanced`` pair a single durable
+    observation: a later atomic claim can reject a worker whose snapshot no
+    longer matches the recurrence that this advance actually persisted.
+    """
+    jobs = load_jobs()
+    now = _hermes_now().isoformat()
+    advanced = 0
+    tokens: dict[str, _BuiltinSchedulerClaimToken] = {}
+    for job in jobs:
+        job_id = str(job.get("id") or "")
+        if job_id not in ids:
+            continue
+        kind = job.get("schedule", {}).get("kind")
+        if kind not in {"cron", "interval"}:
+            continue
+        prior_next_run_at = job.get("next_run_at")
+        new_next = compute_next_run(job["schedule"], now)
+        if new_next and new_next != prior_next_run_at:
+            job["next_run_at"] = new_next
+            advanced += 1
+            tokens[job_id] = _BuiltinSchedulerClaimToken(
+                job_id=job_id,
+                prior_next_run_at=(
+                    str(prior_next_run_at)
+                    if prior_next_run_at is not None
+                    else None
+                ),
+                advanced_next_run_at=str(new_next),
+                capability=_BUILTIN_SCHEDULER_ADMISSION,
+            )
+    if advanced:
+        save_jobs(jobs)
+    return advanced, tokens
+
+
+def _advance_next_runs_for_builtin_scheduler(
+    job_ids,
+) -> dict[str, _BuiltinSchedulerClaimToken]:
+    """Advance builtin due jobs and return private, one-use claim tokens."""
+    ids = {str(job_id) for job_id in job_ids if job_id}
+    if not ids:
+        return {}
+    with _jobs_lock():
+        _, tokens = _advance_next_runs_locked(ids)
+        return tokens
 
 
 def advance_next_run(job_id: str) -> bool:
@@ -2832,6 +2890,7 @@ def claim_job_for_fire(
     execution_id: Optional[str] = None,
     return_job: bool = False,
     _scheduler_admission: Any = None,
+    _scheduler_claim_token: Any = None,
 ) -> Union[bool, Dict[str, Any]]:
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
@@ -2845,6 +2904,7 @@ def claim_job_for_fire(
             execution_id=execution_id,
             return_job=return_job,
             _scheduler_admission=_scheduler_admission,
+            _scheduler_claim_token=_scheduler_claim_token,
         )
 
 
@@ -2858,6 +2918,7 @@ def _claim_job_for_fire_locked(
     execution_id: Optional[str] = None,
     return_job: bool = False,
     _scheduler_admission: Any = None,
+    _scheduler_claim_token: Any = None,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
@@ -2923,6 +2984,15 @@ def _claim_job_for_fire_locked(
             trigger_marker = job.get("trigger_marker")
             authoritative_intended_fire_at = job.get("next_run_at")
             if force or trigger_marker:
+                # A concurrently persisted operator trigger is authoritative
+                # even when this worker carries a stale builtin snapshot.  Do
+                # not require the builtin token for this branch: the trigger
+                # itself is the durable override and must win atomically.
+                if (
+                    isinstance(_scheduler_claim_token, _BuiltinSchedulerClaimToken)
+                    and _scheduler_claim_token.capability is _BUILTIN_SCHEDULER_ADMISSION
+                ):
+                    _scheduler_claim_token.consumed = True
                 claimed_kind = OPERATOR_TRIGGERED
                 claim_intended_fire_at = None
             elif _scheduler_admission is _AUTHENTICATED_PROVIDER_ADMISSION:
@@ -2933,7 +3003,28 @@ def _claim_job_for_fire_locked(
                     provider=True,
                 )
             elif _scheduler_admission is _BUILTIN_SCHEDULER_ADMISSION:
-                claim_intended_fire_at = authoritative_intended_fire_at
+                token = _scheduler_claim_token
+                if token is not None:
+                    # The token is the only path that may carry the due
+                    # snapshot across the pre-worker recurrence advance.  A
+                    # different current recurrence, a different job, a
+                    # forged capability, or a reused token fails closed.
+                    if not (
+                        isinstance(token, _BuiltinSchedulerClaimToken)
+                        and token.capability is _BUILTIN_SCHEDULER_ADMISSION
+                        and not token.consumed
+                        and token.job_id == str(job.get("id") or "")
+                        and token.advanced_next_run_at
+                        == str(authoritative_intended_fire_at or "")
+                    ):
+                        return False
+                    token.consumed = True
+                    claim_intended_fire_at = token.prior_next_run_at
+                else:
+                    # One-shots and direct builtin tests do not pass through
+                    # the recurrence-advance helper.  They remain
+                    # store-authoritative; the caller's timestamp is ignored.
+                    claim_intended_fire_at = authoritative_intended_fire_at
                 claimed_kind = classify_scheduled_fire(
                     claim_intended_fire_at,
                     now=now,
