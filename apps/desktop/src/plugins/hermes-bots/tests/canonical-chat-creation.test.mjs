@@ -25,7 +25,31 @@ function loadCanonicalCreation({ openSession, request }) {
   return { ...context.__canonical, saved }
 }
 
-test('regression: navigation retries after the kickoff persists a new canonical chat', async () => {
+test('regression: creation materializes and titles the lazy row before opening it', async () => {
+  const events = []
+  const runtime = loadCanonicalCreation({
+    openSession: async id => events.push(`open:${id}`),
+    request: async (method, params) => {
+      events.push(method)
+      if (method === 'session.create') return { stored_session_id: 'stored-1', session_id: 'runtime-1' }
+      if (method === 'session.title') {
+        assert.deepEqual(params, { session_id: 'runtime-1', title: 'Bot Chat' })
+      }
+      return {}
+    }
+  })
+
+  assert.equal(await runtime.createCanonicalChat('ops'), 'stored-1')
+  assert.deepEqual(events, [
+    'session.list',
+    'session.create',
+    'session.title',
+    'open:stored-1',
+    'prompt.submit'
+  ])
+})
+
+test('compatibility: navigation retries after kickoff when eager title persistence is unavailable', async () => {
   const events = []
   let attempts = 0
   const runtime = loadCanonicalCreation({
@@ -36,6 +60,7 @@ test('regression: navigation retries after the kickoff persists a new canonical 
     },
     request: async method => {
       if (method === 'session.create') return { stored_session_id: 'stored-1', session_id: 'runtime-1' }
+      if (method === 'session.title') throw new Error('unknown method')
       if (method === 'prompt.submit') events.push('kickoff:persisted')
       return {}
     }
