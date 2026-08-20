@@ -237,21 +237,32 @@ def prune_pre_checkpoint_items(
     retained_reversed: List[Dict[str, Any]] = []
     remaining = max(0, int(retained_user_token_budget))
     for item in reversed(pre):
-        if not isinstance(item, dict) or item.get("role") != "user":
+        if not isinstance(item, dict):
+            continue
+        is_user = item.get("role") == "user"
+        is_summary = bool(
+            item.get("_compressed_summary")
+            or item.get("_is_compression_summary")
+            or item.get("_hermes_compressed_summary")
+            or "Summary of previous conversation" in str(item.get("content", ""))
+            or "Conversation Summary" in str(item.get("content", ""))
+        )
+        if not is_user and not is_summary:
             continue
         # Skip typed items (function_call_output etc. never carry role=user,
         # but stay defensive about future shapes).
         if "type" in item and item.get("type") != "message":
             continue
-        if remaining <= 0:
+        if remaining <= 0 and not is_summary:
             break
-        text = _user_item_text(item)
-        if text is None:
+        text = _user_item_text(item) if is_user else str(item.get("content") or "")
+        if not text:
             continue
         cost = _approx_tokens(text)
-        if cost <= remaining:
+        if cost <= remaining or is_summary:
             retained_reversed.append(item)
-            remaining -= cost
+            if not is_summary:
+                remaining -= cost
         elif isinstance(item.get("content"), str):
             # Head-truncate the boundary message: goals are usually stated
             # up front, so the head is the valuable end.
