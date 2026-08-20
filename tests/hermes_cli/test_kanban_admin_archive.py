@@ -439,6 +439,42 @@ def board(tmp_path, monkeypatch):
     return db_path
 
 
+@pytest.fixture(autouse=True)
+def _guard_db_connect(tmp_path, monkeypatch):
+    """Fail-closed per-test guard over ``kb.connect``.
+
+    Refuses to open ANY connection whose resolved DB path lies outside
+    this test's ``tmp_path``, *before* :func:`kb.connect` can create the
+    file/sidecars. This is deliberately stricter than
+    ``tests/conftest.py``'s production-root deny-list: it refuses by the
+    test's own temporary root without needing to know the real home root
+    ahead of time, so a stray path pointing anywhere outside the current
+    test's temporary tree is refused on every platform.
+    """
+    original = kb.connect
+    root = Path(tmp_path).resolve()
+
+    def guarded(db_path=None, *, board=None):
+        if db_path is None:
+            # No explicit path -> kb.connect would resolve via env/board
+            # defaults. Under the guard that resolution is never allowed to
+            # run, because the resolved target is unknowable ahead of time.
+            pytest.fail(
+                "FAIL-CLOSED: kb.connect called without an explicit db_path "
+                "(default/board-path resolution is not permitted under the "
+                "archive guard)"
+            )
+        resolved = Path(db_path).resolve()
+        if not resolved.is_relative_to(root):
+            pytest.fail(
+                f"FAIL-CLOSED: refused kb.connect to DB path outside this "
+                f"test's tmp_path: {resolved}"
+            )
+        return original(db_path=db_path, board=board)
+
+    monkeypatch.setattr(kb, "connect", guarded)
+
+
 def assert_result_keys(result, keys):
     missing = set(keys) - set(result.keys())
     assert not missing, f"result missing keys: {sorted(missing)}"
@@ -560,6 +596,21 @@ class TestFixtureSelfChecks:
                     "VALUES ('t_x', 'note', NULL, 0)"
                 )
             assert conn2.write_count == 1
+
+    def test_guard_refuses_db_path_outside_tmp_path(self, board, tmp_path):
+        # A resolved DB path outside THIS test's tmp_path must be refused
+        # by the fail-closed guard before sqlite3 can create anything.
+        outside = tmp_path.parent / "guard-escape"
+        db_target = outside / "escaped.db"
+        outside.mkdir(parents=True, exist_ok=True)
+        assert not db_target.is_relative_to(Path(tmp_path).resolve())
+        for suffix in ("", "-wal", "-shm"):
+            assert not Path(str(db_target) + suffix).exists()
+        with pytest.raises(pytest.fail.Exception):
+            kb.connect(db_path=db_target)
+        # The refused call created no DB, WAL, or SHM file.
+        for suffix in ("", "-wal", "-shm"):
+            assert not Path(str(db_target) + suffix).exists()
 
     @pytest.mark.parametrize("builder_name", ["h1", "h2", "n1", "i1", "dm", "ap"])
     def test_graph_builder_topology_by_direct_sql(self, board, builder_name):
@@ -969,6 +1020,13 @@ class TestAdminArchiveGraph:
     def test_dry(self, board, tmp_path):
         db = make_conn(board)
         built = build_h1(db)
+        # Establish a stable read transaction and read mark BEFORE the
+        # before-snapshot, so ordinary SQLite read-lock bookkeeping in the
+        # WAL/SHM cannot perturb the byte comparison of a write-free (dry)
+        # planner. Without the mark, the kernel's first read would itself
+        # create a WAL/SHM read mark between the two snapshots.
+        db.execute("BEGIN")
+        db.execute("SELECT COUNT(*) FROM tasks")
         files = []
         for suffix in ("", "-wal", "-shm"):
             candidate = Path(str(board) + suffix)
@@ -1107,11 +1165,15 @@ class TestAdminArchiveGraph:
         assert len(_events_by_kind(db, a, "admin_archived")) == 1
         assert len(_events_by_kind(db, b, "admin_archived")) == 1
         assert len(new_events) >= 2
-        # Archive audit comment carries the exact root body.
+        # Archive audit comment carries the exact root body. _comments_of
+        # orders by id ascending, so "[0]" is the pre-archive note and the
+        # audit comment is the NEWEST row ("[-1]").
         comments_a = _comments_of(db, a)
-        assert comments_a[0]["author"] == ACTOR
+        assert len(comments_a) == 2  # the pre-archive note + exactly one audit
+        assert comments_a[0]["body"] == "note before archive"  # prior row intact
+        assert comments_a[-1]["author"] == ACTOR
         group = result["archive_group_id"]
-        assert comments_a[0]["body"] == (
+        assert comments_a[-1]["body"] == (
             f"Admin-archived graph {group} (2 tasks): {REASON}"
         )
         assert _statuses(db)[a] == "archived"
@@ -1410,6 +1472,11 @@ class TestAdminUnarchive:
         # only observes the unarchive calls under test.
         r1 = assert_success(*_call(_archive, db, [a]))
         r2 = assert_success(*_call(_archive, db, [b]))
+        # Direct setup transition: b keeps its latest admin_archived event
+        # but is brought back to the NON-archived "ready" status, preserving
+        # the latest-admin-event-but-currently-nonarchived refusal case used
+        # below as the all-or-nothing mixed target.
+        set_status(db, b, "ready")
         rx = assert_success(*_call(_archive, db, [x]))
         kb.archive_task(db, m)  # ordinary archive, not admin
         assert _statuses(db)[m] == "archived"
