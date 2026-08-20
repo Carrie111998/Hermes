@@ -5,6 +5,7 @@ These tests prove the rejection happens BEFORE any file I/O, leaves the
 existing goal state untouched, and enqueues no kickoff event — while plain
 inline goals and inline contract parsing still work on the gateway.
 """
+
 import pytest
 from unittest.mock import patch
 
@@ -20,7 +21,7 @@ class _FakeSessionEntry:
 
 
 class _FakeSessionStore:
-    def get_or_create_session(self, source):
+    def get_or_create_session(self, source, **_kwargs):
         return _FakeSessionEntry()
 
     def _generate_session_key(self, source):
@@ -106,7 +107,9 @@ async def test_goal_file_rejection_does_no_file_io(hermes_home, tmp_path):
 
     def _fail_if_secret(self, *args, **kwargs):
         if self == secret:
-            raise AssertionError("gateway read a backend file -- security boundary broken")
+            raise AssertionError(
+                "gateway read a backend file -- security boundary broken"
+            )
         return original_read_text(self, *args, **kwargs)
 
     with pytest.MonkeyPatch.context() as mp:
@@ -147,7 +150,9 @@ async def test_goal_file_rejection_enqueues_no_kickoff(hermes_home, tmp_path):
     secret.write_text("leak", encoding="utf-8")
 
     with patch.object(
-        runner, "_enqueue_fifo", side_effect=AssertionError("must not enqueue on --file rejection")
+        runner,
+        "_enqueue_fifo",
+        side_effect=AssertionError("must not enqueue on --file rejection"),
     ) as mock_enqueue:
         response = await GatewayRunner._handle_goal_command(
             runner, _make_event(f"/goal --file {secret}")
