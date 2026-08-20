@@ -3694,6 +3694,27 @@ def _defer_update_for_self_lock(loaded: list[str]) -> None:
     _m()._write_update_incomplete_marker()
 
 
+def _cmdline_runs_hermes_subcommand(cmdline: str, subcommand: str) -> bool:
+    """True when *cmdline* launches the hermes entrypoint with *subcommand*.
+
+    Token-based so a cmdline that merely *contains* the word (``npm run
+    serve``, ``my-dashboard-monitor.exe``) is not mislabeled — the same
+    class of misclassification #90778 fixed, one step down (review
+    feedback on #90791). Covers both launch shapes: the console-script
+    entrypoint (``.../bin/hermes serve``, ``...\\Scripts\\hermes.exe
+    serve``) and the module forms (``-m hermes_cli serve``,
+    ``-m hermes_cli.main serve``).
+    """
+    tokens = cmdline.lower().split()
+    for i, tok in enumerate(tokens[:-1]):
+        if tokens[i + 1] != subcommand:
+            continue
+        base = tok.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        if base in {"hermes", "hermes.exe"} or tok in {"hermes_cli", "hermes_cli.main"}:
+            return True
+    return False
+
+
 def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> str:
     """Explain which venv processes block the update and how to clear them."""
     lines = [
@@ -3701,17 +3722,16 @@ def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> 
     ]
     for pid, name, cmdline in matches[:6]:
         hint = ""
-        low = cmdline.lower()
-        if "serve" in low:
+        if _cmdline_runs_hermes_subcommand(cmdline, "serve"):
             # `hermes serve` is the headless backend the Electron app
             # spawns — closing the desktop app clears it.
             hint = "  ← Hermes Desktop backend (close the desktop app)"
-        elif "dashboard" in low:
+        elif _cmdline_runs_hermes_subcommand(cmdline, "dashboard"):
             # `hermes dashboard` is the STANDALONE browser UI a user starts
             # themselves (port 9119) — not the desktop app. Point at the
             # command that actually clears this holder (#90778).
             hint = "  ← standalone dashboard (stop with: hermes dashboard --stop)"
-        elif "gateway" in low:
+        elif _cmdline_runs_hermes_subcommand(cmdline, "gateway"):
             hint = "  ← gateway"
         lines.append(f"  PID {pid}  {name}  {cmdline[:120]}{hint}")
     if len(matches) > 6:
