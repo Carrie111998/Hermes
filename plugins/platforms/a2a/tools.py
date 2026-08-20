@@ -180,14 +180,24 @@ def _send_task(
             "message": protocol.text_message(protocol.ROLE_USER, safe_message, context_id=ctx),
         },
     }
+    safe_metadata = None
     if metadata is not None:
-        rpc_body["params"]["metadata"] = security.redact_outbound_data(metadata)
+        safe_metadata = security.redact_outbound_data(metadata)
+        rpc_body["params"]["metadata"] = safe_metadata
 
     tenant = _interface_tenant(card, peer)
     if tenant:
         rpc_body["params"]["tenant"] = tenant
 
-    security.audit("outbound", agent_label, rpc_body["id"], safe_message)
+    audit_summary = safe_message
+    if safe_metadata is not None:
+        metadata_summary = json.dumps(
+            safe_metadata, ensure_ascii=False, separators=(",", ":")
+        )
+        if len(metadata_summary) > 240:
+            metadata_summary = metadata_summary[:240] + "…"
+        audit_summary = f"metadata={metadata_summary}\nmessage={safe_message}"
+    security.audit("outbound", agent_label, rpc_body["id"], audit_summary)
     protocol.persist_message(ctx, "user", safe_message, rpc_body["id"])
     protocol.metrics.outbound_total += 1
 

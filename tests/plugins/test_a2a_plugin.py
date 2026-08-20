@@ -205,6 +205,35 @@ class TestOutboundRedaction:
         }
         assert value["nested"][0] == "sk-abcdefghij1234567890XYZ"
 
+    def test_outbound_data_masks_sensitive_fields_and_keys(self):
+        secret_key = "sk-abcdefghij1234567890XYZ"
+        value = {
+            "api_key": "opaque-value",
+            "nested": {"authorization": "Basic dXNlcjpwYXNz"},
+            secret_key: "value",
+            "token_budget": 100,
+        }
+
+        assert security.redact_outbound_data(value) == {
+            "api_key": "[redacted]",
+            "nested": {"authorization": "[redacted]"},
+            "sk-[redacted]": "value",
+            "token_budget": 100,
+        }
+
+    def test_outbound_data_fails_closed_on_cycles_and_excessive_depth(self):
+        cyclic = []
+        cyclic.append(cyclic)
+        assert security.redact_outbound_data(cyclic) == ["[redacted-cycle]"]
+
+        nested = "leaf"
+        for _ in range(security._MAX_OUTBOUND_DATA_DEPTH + 2):
+            nested = [nested]
+        result = security.redact_outbound_data(nested)
+        while isinstance(result, list):
+            result = result[0]
+        assert result == "[redacted-depth-limit]"
+
 
 class TestAudit:
     def test_audit_writes_jsonl(self, monkeypatch, tmp_path):
@@ -524,7 +553,9 @@ class TestClientTools:
         assert "sk-abcdefghij" not in part["text"]
         assert "metadata" not in params
 
-    def test_call_sends_redacted_metadata_at_params_level(self, monkeypatch):
+    def test_call_sends_and_audits_redacted_metadata_at_params_level(
+        self, monkeypatch
+    ):
         monkeypatch.setattr(
             tools,
             "_load_config",
@@ -543,9 +574,20 @@ class TestClientTools:
             )
 
         monkeypatch.setattr(tools, "_http_post_json", fake_post)
+        audited = {}
+        monkeypatch.setattr(
+            security,
+            "audit",
+            lambda direction, peer, task_id, summary: audited.update(
+                direction=direction, summary=summary
+            ),
+        )
         metadata = {
             "agentPreset": "code",
-            "options": {"note": "token ghp_0123456789abcdefghij0123"},
+            "options": {
+                "note": "token ghp_0123456789abcdefghij0123",
+                "api_key": "opaque-value",
+            },
         }
         out = tools.a2a_call(
             {"agent": "r", "message": "review", "metadata": metadata}
@@ -555,10 +597,18 @@ class TestClientTools:
         params = captured["body"]["params"]
         assert params["metadata"] == {
             "agentPreset": "code",
-            "options": {"note": "token ghp_[redacted]"},
+            "options": {
+                "note": "token ghp_[redacted]",
+                "api_key": "[redacted]",
+            },
         }
         assert "metadata" not in params["message"]
         assert metadata["options"]["note"].startswith("token ghp_0123")
+        assert audited["direction"] == "outbound"
+        assert audited["summary"].startswith("metadata=")
+        assert '"agentPreset":"code"' in audited["summary"]
+        assert "opaque-value" not in audited["summary"]
+        assert "ghp_0123456789" not in audited["summary"]
 
     def test_call_rejects_non_object_metadata(self):
         out = tools.a2a_call(
@@ -630,7 +680,7 @@ class TestClientTools:
         params = received["body"]["params"]
         assert params["metadata"] == {
             "agentPreset": "code",
-            "credentials": ["sk-[redacted]"],
+            "credentials": "[redacted]",
         }
         assert "metadata" not in params["message"]
 
