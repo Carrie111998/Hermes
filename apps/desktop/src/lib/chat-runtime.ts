@@ -422,6 +422,68 @@ export function messageCreatedAt(message: Pick<ChatMessage, 'timestamp'>, nowMs 
     : new Date(nowMs)
 }
 
+/**
+ * Per-rendered-message tool-call id uniqueness — the last boundary before the
+ * assistant-ui runtime, which keys each part as `toolCallId-${part.toolCallId}`
+ * and THROWS on a duplicate ("Duplicate key toolCallId-… in useResources"),
+ * taking the whole workspace pane down with it.
+ *
+ * Some providers (Kimi's anthropic_messages mode) number tool_use blocks per
+ * API response (`terminal_0`, `read_file_0`, …), restarting at 0 on every call
+ * of the tool loop, so the same id recurs across hundreds of stored rows. That
+ * is valid on the wire and must NOT be rewritten on the backend request path
+ * (prompt-cache prefix stability) — but the moment two same-id parts land in
+ * ONE rendered message, the runtime crashes. Hydration dedupes globally
+ * (`withUniqueToolCallIds`), yet paths that merge or append after hydration
+ * (background-sync graft, transcript backfill, live upsert, and the tool-only
+ * coalesce above) can still converge duplicates into a single bubble. Enforcing
+ * uniqueness here, per message, covers every path that reaches the runtime.
+ *
+ * Render-only and allocation-free on the happy path: a message whose part ids
+ * are already unique gets its original array back, preserving reference
+ * identity for the repository's WeakMap cache.
+ */
+function dedupeToolCallIdsForRender(parts: ChatMessagePart[]): ChatMessagePart[] {
+  const seen = new Set<string>()
+  let changed = false
+
+  const next = parts.map((part, index) => {
+    if (part.type !== 'tool-call') {
+      return part
+    }
+
+    const id = part.toolCallId || `render-tool-${index}`
+
+    if (!seen.has(id)) {
+      seen.add(id)
+
+      if (part.toolCallId) {
+        return part
+      }
+
+      changed = true
+
+      return { ...part, toolCallId: id } as ChatMessagePart
+    }
+
+    changed = true
+
+    // The index makes the rename unique against the original ids; the loop
+    // guards against colliding with a real id that happens to look renamed.
+    let uniqueId = `${id}~${index}`
+
+    while (seen.has(uniqueId)) {
+      uniqueId = `${uniqueId}~`
+    }
+
+    seen.add(uniqueId)
+
+    return { ...part, toolCallId: uniqueId } as ChatMessagePart
+  })
+
+  return changed ? next : parts
+}
+
 export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
   const role =
     message.role === 'user' || message.role === 'assistant' || message.role === 'system' ? message.role : 'assistant'
@@ -466,7 +528,7 @@ export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
   return {
     id: message.id,
     role,
-    content: message.parts as Extract<ThreadMessage, { role: 'assistant' }>['content'],
+    content: dedupeToolCallIdsForRender(message.parts) as Extract<ThreadMessage, { role: 'assistant' }>['content'],
     createdAt,
     status: message.error
       ? { type: 'incomplete', reason: 'error', error: message.error }
