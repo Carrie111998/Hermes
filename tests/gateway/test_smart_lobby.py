@@ -215,6 +215,27 @@ async def test_lobby_falls_back_to_normal_processing_on_low_confidence():
 
 
 @pytest.mark.asyncio
+async def test_selected_profile_missing_adapter_fails_closed_without_lobby_execution():
+    from gateway.smart_lobby import SmartLobbyDecision
+
+    source_adapter = FakeAdapter()
+    runner = Harness()
+    runner.config = SimpleNamespace(smart_lobby=_raw_config())
+    runner.adapters = {Platform.DISCORD: source_adapter}
+    runner._profile_adapters = {}
+    runner.source_adapter = source_adapter
+    runner._classify_smart_lobby = AsyncMock(
+        return_value=SmartLobbyDecision(profile="work", confidence=0.9, title="Investigate CI")
+    )
+
+    consumed = await runner._maybe_route_smart_lobby(_event())
+
+    assert consumed is True
+    source_adapter.send.assert_awaited_once()
+    assert "not executed in the lobby" in source_adapter.send.await_args.args[1]
+
+
+@pytest.mark.asyncio
 async def test_lobby_falls_back_when_target_thread_cannot_be_created(tmp_path):
     from gateway.smart_lobby import SmartLobbyDecision, SmartLobbyStore
 

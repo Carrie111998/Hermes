@@ -395,20 +395,38 @@ class GatewaySmartLobbyMixin:
         candidate = config.candidates.get(decision.profile)
         if candidate is None:
             return False
+        source_adapter = getattr(self, "_adapter_for_source")(source)
         target_adapter = self._smart_lobby_target_adapter(decision.profile)
         if target_adapter is None:
             logger.warning(
                 "Smart lobby target adapter unavailable: profile=%s platform=discord",
                 decision.profile,
             )
-            return False
+            if source_adapter is not None:
+                try:
+                    await source_adapter.send(
+                        source.chat_id,
+                        f"`{decision.profile}` owns this request, but its Discord bot is "
+                        "unavailable. The request was not executed in the lobby.",
+                    )
+                except Exception:
+                    logger.debug("Smart lobby unavailable-target notice failed", exc_info=True)
+            return True
         create_thread = getattr(target_adapter, "create_handoff_thread", None)
         build_source = getattr(target_adapter, "build_source", None)
         handle_message = getattr(target_adapter, "handle_message", None)
         if not callable(create_thread) or not callable(build_source) or not callable(handle_message):
-            return False
+            if source_adapter is not None:
+                try:
+                    await source_adapter.send(
+                        source.chat_id,
+                        f"`{decision.profile}` owns this request, but its Discord adapter "
+                        "cannot create a routed thread. The request was not executed in the lobby.",
+                    )
+                except Exception:
+                    logger.debug("Smart lobby incapable-target notice failed", exc_info=True)
+            return True
 
-        source_adapter = getattr(self, "_adapter_for_source")(source)
         target_auth = getattr(target_adapter, "_is_sender_authorized", None)
         with _target_profile_runtime_scope(decision.profile):
             authorized = (

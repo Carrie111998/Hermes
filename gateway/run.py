@@ -15978,6 +15978,23 @@ class GatewayRunner(
         "moa": "Agent is running — wait or /stop first, then run /moa.",
     }
 
+    async def _dispatch_plugin_slash_command(
+        self, event: MessageEvent, command: str, source,
+    ):
+        """Authorize and execute one plugin-registered slash command."""
+        denied = self._check_slash_access(source, command)
+        if denied is not None:
+            return denied
+        from hermes_cli.plugins import get_plugin_command_handler
+
+        handler = get_plugin_command_handler(command.replace("_", "-"))
+        if handler is None:
+            return None
+        result = handler(event.get_command_args().strip())
+        if inspect.isawaitable(result):
+            result = await result
+        return str(result) if result else None
+
     async def _dispatch_busy_slash_command(
         self, event: MessageEvent, cmd_def, quick_key: str, source,
     ):
@@ -16814,6 +16831,14 @@ class GatewayRunner(
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
+
+            if _evt_cmd and _cmd_def_inner is None:
+                from hermes_cli.commands import is_gateway_known_command
+
+                if is_gateway_known_command(_evt_cmd):
+                    return await self._dispatch_plugin_slash_command(
+                        event, _evt_cmd, source
+                    )
 
             # /status and /context are intentionally pre-gate so users
             # always see session state.
