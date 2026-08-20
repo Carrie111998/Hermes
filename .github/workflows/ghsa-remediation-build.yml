@@ -1,4 +1,4 @@
-name: Build exact dependency remediation head
+name: Materialize verified dependency remediation
 
 on:
   push:
@@ -9,15 +9,15 @@ permissions:
   contents: write
 
 concurrency:
-  group: ghsa-remediation-build
+  group: ghsa-remediation-materialize
   cancel-in-progress: false
 
 jobs:
-  build-and-publish:
+  materialize:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
-      - name: Checkout remediation branch
+      - name: Checkout exact trigger head
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
@@ -56,6 +56,7 @@ jobs:
 
           ELECTRON = "41.10.4"
           NANOID = "3.3.18"
+          POSTCSS = "8.5.23"
 
           def load(path: str):
               return json.loads(Path(path).read_text(encoding="utf-8"))
@@ -67,11 +68,17 @@ jobs:
               )
 
           root = load("package.json")
-          root["overrides"]["nanoid@^3"] = NANOID
-          for key in list(root["allowScripts"]):
+          overrides = root["overrides"]
+          overrides.pop("nanoid@^3", None)
+          overrides["postcss"] = {".": POSTCSS, "nanoid": NANOID}
+          if overrides.get("nanoid@^6") != "6.0.0":
+              raise SystemExit("Nano ID v6 isolation changed before remediation")
+
+          allow_scripts = root["allowScripts"]
+          for key in list(allow_scripts):
               if key.startswith("electron@"):
-                  root["allowScripts"].pop(key)
-          root["allowScripts"][f"electron@{ELECTRON}"] = True
+                  allow_scripts.pop(key)
+          allow_scripts[f"electron@{ELECTRON}"] = True
           write("package.json", root)
 
           website = load("website/package.json")
@@ -136,16 +143,16 @@ jobs:
           npm --prefix website install --package-lock-only --ignore-scripts --no-audit --no-fund
           uv lock --upgrade-package h2
 
-      - name: Install exact Node graphs
+      - name: Install exact dependency graphs
         run: |
           set -euo pipefail
           npm ci --no-audit --no-fund
           npm --prefix website ci --no-audit --no-fund
+          uv lock --check
 
       - name: Verify resolved security floors
         run: |
           set -euo pipefail
-          uv lock --check
           node <<'NODE'
           const root = require('./package.json')
           const desktop = require('./apps/desktop/package.json')
@@ -153,28 +160,41 @@ jobs:
           const website = require('./website/package.json')
           const websiteLock = require('./website/package-lock.json')
 
-          if (root.overrides['nanoid@^3'] !== '3.3.18') throw new Error('root Nano ID override drifted')
+          const postcss = root.overrides.postcss
+          if (root.overrides['nanoid@^3'] !== undefined) throw new Error('flat Nano ID v3 override remains')
+          if (postcss?.['.'] !== '8.5.23' || postcss?.nanoid !== '3.3.18') {
+            throw new Error(`PostCSS/Nano ID override is ${JSON.stringify(postcss)}`)
+          }
+          if (root.overrides['nanoid@^6'] !== '6.0.0') throw new Error('Nano ID v6 isolation drifted')
           if (website.overrides.nanoid !== '3.3.18') throw new Error('website Nano ID override drifted')
           if (desktop.devDependencies.electron !== '41.10.4') throw new Error('desktop Electron dependency drifted')
           if (desktop.build.electronVersion !== '41.10.4') throw new Error('electron-builder runtime drifted')
-          if (!root.allowScripts['electron@41.10.4']) throw new Error('Electron lifecycle allowlist drifted')
+          if (root.allowScripts['electron@40.10.2'] !== undefined) throw new Error('old Electron lifecycle grant remains')
+          if (root.allowScripts['electron@41.10.4'] !== true) throw new Error('new Electron lifecycle grant missing')
 
           const electron = lock.packages['node_modules/electron'] || lock.packages['apps/desktop/node_modules/electron']
           if (!electron || electron.version !== '41.10.4') throw new Error(`Electron lock resolved ${electron?.version}`)
 
+          let rootNanoid3 = 0
           for (const [path, pkg] of Object.entries(lock.packages)) {
-            if (path.endsWith('/nanoid') && pkg.version?.startsWith('3.') && pkg.version !== '3.3.18') {
-              throw new Error(`${path} resolves Nano ID ${pkg.version}`)
+            if (path.endsWith('/nanoid') && pkg.version?.startsWith('3.')) {
+              rootNanoid3 += 1
+              if (pkg.version !== '3.3.18') throw new Error(`${path} resolves Nano ID ${pkg.version}`)
             }
             if (path.endsWith('/extract-zip') && pkg.version === '2.0.1') {
               throw new Error(`${path} still resolves extract-zip 2.0.1`)
             }
           }
+          if (rootNanoid3 === 0) throw new Error('no root Nano ID v3 resolution was inspected')
+
+          let websiteNanoid3 = 0
           for (const [path, pkg] of Object.entries(websiteLock.packages)) {
-            if (path.endsWith('/nanoid') && pkg.version?.startsWith('3.') && pkg.version !== '3.3.18') {
-              throw new Error(`website ${path} resolves Nano ID ${pkg.version}`)
+            if (path.endsWith('/nanoid') && pkg.version?.startsWith('3.')) {
+              websiteNanoid3 += 1
+              if (pkg.version !== '3.3.18') throw new Error(`website ${path} resolves Nano ID ${pkg.version}`)
             }
           }
+          if (websiteNanoid3 === 0) throw new Error('no website Nano ID v3 resolution was inspected')
           NODE
           python3 - <<'PY'
           import tomllib
@@ -203,6 +223,8 @@ jobs:
           npm run check:lint --workspace apps/desktop
           npm run test:desktop:platforms --workspace apps/desktop
           npm run build --workspace apps/desktop
+          npm run builder --workspace apps/desktop -- --linux --x64 --dir --publish never
+          HERMES_DESKTOP_SKIP_BUILD=1 npm run test:desktop:all --workspace apps/desktop
           git diff --check
 
       - name: Commit and publish exact verified head
@@ -214,10 +236,13 @@ jobs:
             apps/desktop/package.json apps/desktop/scripts/test-desktop.mjs \
             apps/desktop/scripts/packaged-app-layout.mjs \
             apps/desktop/scripts/packaged-app-layout.test.mjs uv.lock
+          git diff --cached --check
           git commit -m "fix(deps): refresh security-sensitive pins" \
             -m "Restack the dependency remediation on exact upstream main, regenerate the Node and Python lock graphs, and keep the Linux packaged-app validator architecture-aware." \
-            -m "Co-authored-by: schmitzi8 <281458983+schmitzi8@users.noreply.github.com>"
-          git push --force-with-lease origin HEAD:security/ghsa-remediation-c47f0b4
+            -m "Co-authored-by: schmitzi8 <281458983+schmitzi8@users.noreply.github.com>" \
+            -m "Co-authored-by: orcaspainting-dev <264355715+orcaspainting-dev@users.noreply.github.com>"
+          git push --force-with-lease=refs/heads/security/ghsa-remediation-c47f0b4:${GITHUB_SHA} \
+            origin HEAD:security/ghsa-remediation-c47f0b4
 
       - name: Exact-head receipt
         run: |
@@ -229,5 +254,5 @@ jobs:
             echo "- Node: \`$(node --version)\`"
             echo "- npm: \`$(npm --version)\`"
             echo "- uv: \`$(uv --version)\`"
-            echo "- clean audits and affected build/test gates: passed"
+            echo "- clean audits, builds, desktop tests, and packaged Linux validation: passed"
           } >> "$GITHUB_STEP_SUMMARY"
