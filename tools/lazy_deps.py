@@ -167,7 +167,9 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     ),
     "wake.openwakeword": (
         "openwakeword==0.6.0",
-        "onnxruntime==1.27.0",
+        # 1.27.0 dropped Intel macOS wheels; 1.23.2 remains available for
+        # Darwin x86_64 (the supported OpenWakeWord backend on Intel Macs).
+        "onnxruntime==1.23.2",
         "sounddevice==0.5.5",
         "numpy==2.4.3",
     ),
