@@ -194,6 +194,17 @@ class TestOutboundRedaction:
         text = "The answer is 42 and the build passed."
         assert security.redact_outbound(text) == text
 
+    def test_nested_outbound_data_is_redacted_without_changing_shape(self):
+        value = {
+            "preset": "code",
+            "nested": ["sk-abcdefghij1234567890XYZ", 42, True, None],
+        }
+        assert security.redact_outbound_data(value) == {
+            "preset": "code",
+            "nested": ["sk-[redacted]", 42, True, None],
+        }
+        assert value["nested"][0] == "sk-abcdefghij1234567890XYZ"
+
 
 class TestAudit:
     def test_audit_writes_jsonl(self, monkeypatch, tmp_path):
@@ -511,6 +522,117 @@ class TestClientTools:
         assert part["mediaType"] == "text/plain"
         # Outbound redaction applied before sending.
         assert "sk-abcdefghij" not in part["text"]
+        assert "metadata" not in params
+
+    def test_call_sends_redacted_metadata_at_params_level(self, monkeypatch):
+        monkeypatch.setattr(
+            tools,
+            "_load_config",
+            lambda: {"a2a_agents": {"r": {"url": "http://localhost:9999"}}},
+        )
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+        captured = {}
+
+        def fake_post(url, body, headers, timeout):
+            captured["body"] = body
+            return protocol.jsonrpc_result(
+                body["id"],
+                protocol.build_task(
+                    "t", "c1", protocol.STATE_COMPLETED, "done"
+                ),
+            )
+
+        monkeypatch.setattr(tools, "_http_post_json", fake_post)
+        metadata = {
+            "agentPreset": "code",
+            "options": {"note": "token ghp_0123456789abcdefghij0123"},
+        }
+        out = tools.a2a_call(
+            {"agent": "r", "message": "review", "metadata": metadata}
+        )
+
+        assert "done" in out
+        params = captured["body"]["params"]
+        assert params["metadata"] == {
+            "agentPreset": "code",
+            "options": {"note": "token ghp_[redacted]"},
+        }
+        assert "metadata" not in params["message"]
+        assert metadata["options"]["note"].startswith("token ghp_0123")
+
+    def test_call_rejects_non_object_metadata(self):
+        out = tools.a2a_call(
+            {"agent": "r", "message": "review", "metadata": ["code"]}
+        )
+        assert out == "Error: 'metadata' must be a JSON object."
+
+    def test_call_metadata_round_trips_over_http(self):
+        received = {}
+
+        class _Peer(BaseHTTPRequestHandler):
+            def log_message(self, *args):  # noqa: A002
+                pass
+
+            def do_GET(self):
+                card = protocol.build_agent_card(
+                    name="test-peer",
+                    url=f"http://127.0.0.1:{self.server.server_port}/",
+                    description="test",
+                )
+                payload = json.dumps(card).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length).decode())
+                received["body"] = body
+                payload = json.dumps(
+                    protocol.jsonrpc_result(
+                        body["id"],
+                        protocol.build_task(
+                            "task-1",
+                            body["params"]["message"]["contextId"],
+                            protocol.STATE_COMPLETED,
+                            "ok",
+                        ),
+                    )
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        server = HTTPServer(("127.0.0.1", 0), _Peer)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            out = tools.a2a_call(
+                {
+                    "agent": f"http://127.0.0.1:{server.server_port}",
+                    "message": "review",
+                    "metadata": {
+                        "agentPreset": "code",
+                        "credentials": ["sk-abcdefghij1234567890XYZ"],
+                    },
+                }
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        assert "ok" in out
+        params = received["body"]["params"]
+        assert params["metadata"] == {
+            "agentPreset": "code",
+            "credentials": ["sk-[redacted]"],
+        }
+        assert "metadata" not in params["message"]
 
     def test_call_reports_input_required(self, monkeypatch):
         monkeypatch.setattr(tools, "_load_config",

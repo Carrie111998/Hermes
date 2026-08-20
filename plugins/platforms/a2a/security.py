@@ -32,7 +32,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -247,6 +247,21 @@ def redact_outbound(text: str) -> str:
     for pat, repl in _REDACTION_PATTERNS:
         out = pat.sub(repl, out)
     return out
+
+
+def redact_outbound_data(value: Any) -> Any:
+    """Recursively scrub strings in JSON-compatible outbound data.
+
+    Container shapes and scalar types are preserved so protocol metadata can
+    pass through unchanged apart from credential-shaped string values.
+    """
+    if isinstance(value, str):
+        return redact_outbound(value)
+    if isinstance(value, list):
+        return [redact_outbound_data(item) for item in value]
+    if isinstance(value, dict):
+        return {key: redact_outbound_data(item) for key, item in value.items()}
+    return value
 
 
 # --------------------------------------------------------------------------
