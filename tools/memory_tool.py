@@ -1083,7 +1083,7 @@ def memory_tool(
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
 
     # Accept new_text as an alias for content (single-op path). See docstring.
-    if content is None and new_text is not None:
+    if not content and new_text is not None:
         content = new_text
 
     # Some strict providers fill optional schema fields with JSON null rather
