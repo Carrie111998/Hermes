@@ -1,0 +1,376 @@
+"""
+skill-sleep — Stage 1: MINE
+
+Scan recent Hermes sessions for friction signals (user corrections, tool errors,
+retry patterns) and output structured task cards for the optimizer.
+
+Uses `hermes sessions export --after <time> --format jsonl --redact` — stable
+CLI API, not raw SQLite. Always runs with --redact for transcript safety.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+# Allow `python3 pipeline/mine.py` direct execution and `python3 -m pipeline.mine`
+try:
+    from lib.task_card import TaskCard  # type: ignore
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from lib.task_card import TaskCard  # type: ignore
+
+# ── Friction signal keywords ────────────────────────────────────────────────
+
+CORRECTION_PATTERNS: list[re.Pattern] = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"不对",
+        r"不是[这的]",
+        r"错了",
+        r"错[了误]",
+        r"重[来做新]",
+        r"重新",
+        r"改[一下正]",
+        r"修复",
+        r"wrong",
+        r"incorrect",
+        r"not what",
+        r"try again",
+        r"redo",
+        r"fix[\s:]",
+        r"that['\u2019]s not",
+        r"that['\u2019]s wrong",
+        r"don['\u2019]t do that",
+        r"stop[\s,\.!]",
+        r"never mind",
+        r"算了",
+        r"当我没说",
+        r"忽略",
+        r"\bno\b",
+    ]
+]
+
+TOOL_ERROR_PATTERNS: list[re.Pattern] = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"exit_code.*[1-9]",
+        r"\b error \b",
+        r"traceback",
+        r"exception",
+        r"\bfail",
+        r"timeout",
+        r"not found",
+        r"permission denied",
+        r"connection refused",
+        r"exit status",
+        r"non-zero",
+    ]
+]
+
+# ── Session export ──────────────────────────────────────────────────────────
+
+
+def export_sessions(
+    after: str,
+    *,
+    redact: bool = True,
+    timeout: int = 60,
+) -> list[dict]:
+    """Export sessions via `hermes sessions export` and parse JSONL."""
+    cmd = [
+        "hermes",
+        "sessions",
+        "export",
+        "--after",
+        after,
+        "--format",
+        "jsonl",
+    ]
+    if redact:
+        cmd.append("--redact")
+    cmd.append("-")
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ, "HERMES_NO_COLOR": "1"},
+        )
+    except FileNotFoundError:
+        print("ERROR: 'hermes' CLI not found in PATH", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print(f"WARN: hermes export timed out after {timeout}s", file=sys.stderr)
+        return []
+
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        print(f"WARN: hermes export exited {proc.returncode}: {stderr}", file=sys.stderr)
+        return []
+
+    sessions: list[dict] = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            sessions.append(json.loads(line))
+        except json.JSONDecodeError as e:
+            print(f"WARN: skipping malformed JSONL line: {e}", file=sys.stderr)
+            continue
+    return sessions
+
+
+# ── Friction detection ──────────────────────────────────────────────────────
+
+
+def _is_correction(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    # search full text; for long messages limit to first 300 chars to reduce FP
+    haystack = lowered if len(text) < 500 else lowered[:300]
+    for pat in CORRECTION_PATTERNS:
+        if pat.search(haystack):
+            return True
+    return False
+
+
+def _has_tool_error(msg: dict) -> bool:
+    content = (msg.get("content") or "")
+    effect = (msg.get("effect_disposition") or "")
+    combined = f"{content} {effect}".lower()
+    # explicit exit_code check
+    raw = (msg.get("content") or "")
+    if isinstance(raw, str):
+        # JSON tool result may contain exit_code field
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict) and int(parsed.get("exit_code", 0)) != 0:
+                return True
+        except Exception:
+            pass
+    for pat in TOOL_ERROR_PATTERNS:
+        if pat.search(combined):
+            return True
+    return False
+
+
+def _get_skill_name(session: dict) -> str:
+    title = session.get("title") or ""
+    cwd = session.get("cwd") or ""
+    m = re.search(r"skill[:\s]+(\S+)", title, re.IGNORECASE)
+    if m:
+        return m.group(1).strip().strip(",.;:")
+    if cwd:
+        return Path(cwd).name
+    return "default"
+
+
+def _extract_tool_calls(messages: list[dict]) -> list[dict]:
+    calls: list[dict] = []
+    for msg in messages:
+        tcs = msg.get("tool_calls")
+        if not tcs:
+            continue
+        for tc in tcs:
+            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+            calls.append(
+                {
+                    "name": fn.get("name", "?"),
+                    "arguments": (fn.get("arguments", "") or "")[:200],
+                }
+            )
+    return calls
+
+
+def detect_friction(session: dict) -> list[TaskCard]:
+    """Scan a single session for friction episodes (0 or 1 card)."""
+    messages: list[dict] = session.get("messages") or []
+    if not messages:
+        return []
+
+    skill_name = _get_skill_name(session)
+    session_id = str(session.get("id") or "?")
+    started_at = session.get("started_at") or session.get("timestamp") or 0
+    try:
+        timestamp = float(started_at)
+    except Exception:
+        timestamp = 0.0
+
+    evidence: list[str] = []
+    tool_calls = _extract_tool_calls(messages)
+
+    last_user_head = ""
+    retry_count = 0
+    last_tool_name = ""
+
+    for msg in messages:
+        role = msg.get("role", "")
+        content = (msg.get("content") or "").strip()
+
+        if role == "user":
+            if _is_correction(content):
+                evidence.append(f"user_correction: {content[:120]}")
+            # retry: same head repeated
+            head = content[:60]
+            if last_user_head and head and head == last_user_head:
+                retry_count += 1
+                if retry_count >= 1:
+                    evidence.append(f"retry_{retry_count + 1}: same request repeated")
+            else:
+                retry_count = 0
+            last_user_head = head
+
+        elif role == "tool":
+            tool_name = (msg.get("tool_name") or "").strip()
+            if _has_tool_error(msg):
+                snippet = (msg.get("content") or "")[:120].replace("\n", " ")
+                evidence.append(f"tool_error: {tool_name or '?'} — {snippet}")
+            if tool_name and tool_name == last_tool_name and _has_tool_error(msg):
+                evidence.append(f"tool_retry: {tool_name} errored multiple times")
+            if tool_name:
+                last_tool_name = tool_name
+
+        elif role == "assistant":
+            low = content.lower()
+            if content and any(
+                kw in low for kw in ["i couldn't", "i'm sorry", "something went wrong", "failed to"]
+            ):
+                # count as error signal
+                if "error" in low or "couldn't" in low or "sorry" in low:
+                    evidence.append(f"assistant_error: {content[:120]}")
+
+    if not evidence:
+        return []
+
+    first_user_msg = ""
+    for m in messages:
+        if m.get("role") == "user" and (m.get("content") or "").strip():
+            first_user_msg = (m.get("content") or "")[:500]
+            break
+
+    return [
+        TaskCard(
+            skill_name=skill_name,
+            session_id=session_id,
+            user_request=first_user_msg,
+            friction_evidence=evidence,
+            tool_calls=tool_calls,
+            timestamp=timestamp,
+        )
+    ]
+
+
+# ── Deduplication ───────────────────────────────────────────────────────────
+
+
+def deduplicate(cards: list[TaskCard]) -> list[TaskCard]:
+    """Keep best card per skill + friction-type."""
+    buckets: dict[str, list[TaskCard]] = {}
+    for card in cards:
+        ev_type = card.friction_evidence[0].split(":")[0] if card.friction_evidence else "unknown"
+        key = f"{card.skill_name}::{ev_type}"
+        buckets.setdefault(key, []).append(card)
+
+    result: list[TaskCard] = []
+    for group in buckets.values():
+        group.sort(key=lambda c: len(c.friction_evidence), reverse=True)
+        result.append(group[0])
+    return result
+
+
+# ── Output ──────────────────────────────────────────────────────────────────
+
+
+def write_task_cards(
+    cards: list[TaskCard],
+    output_dir: str,
+    *,
+    total_sessions_scanned: int = 0,
+) -> str:
+    path = Path(output_dir) / "tasks.json"
+    data = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "total_sessions_scanned": total_sessions_scanned,
+        "total_cards": len(cards),
+        "tasks": [c.to_dict() for c in cards],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    return str(path)
+
+
+# ── CLI ─────────────────────────────────────────────────────────────────────
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="skill-sleep MINE: extract friction signals from Hermes sessions")
+    p.add_argument("--after", default="7d", help='Time window: "7d", "24h", or ISO datetime (default: 7d)')
+    p.add_argument("--output-dir", default=".", help="Output directory for tasks.json")
+    p.add_argument("--no-redact", action="store_true", help="Disable transcript redaction (not recommended)")
+    p.add_argument("--timeout", type=int, default=60, help="Timeout for hermes export (default: 60s)")
+    return p
+
+
+def resolve_after(arg: str) -> str:
+    """Normalize --after to a value hermes understands."""
+    arg = arg.strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}", arg):
+        return arg
+    m = re.match(r"^(\d+)([dhms])$", arg)
+    if not m:
+        return "7d"
+    value = int(m.group(1))
+    unit = m.group(2)
+    now = datetime.now(timezone.utc)
+    if unit == "d":
+        # hermes accepts bare durations; keep as-is for d is simplest, but
+        # return ISO date for consistency with prior behavior
+        return (now - timedelta(days=value)).strftime("%Y-%m-%d")
+    if unit == "h":
+        return (now - timedelta(hours=value)).isoformat()
+    if unit == "m":
+        return (now - timedelta(minutes=value)).isoformat()
+    if unit == "s":
+        return (now - timedelta(seconds=value)).isoformat()
+    return "7d"
+
+
+if __name__ == "__main__":
+    parser = build_parser()
+    args = parser.parse_args()
+    after = resolve_after(args.after)
+
+    print(f"[mine] Scanning sessions since {after} ...")
+
+    sessions = export_sessions(after, redact=not args.no_redact, timeout=args.timeout)
+
+    user_sessions = [s for s in sessions if not str(s.get("id", "")).startswith("cron_")]
+    skipped = len(sessions) - len(user_sessions)
+    print(f"[mine] Got {len(sessions)} sessions ({skipped} cron/automation skipped)")
+
+    all_cards: list[TaskCard] = []
+    for sess in user_sessions:
+        all_cards.extend(detect_friction(sess))
+
+    print(f"[mine] Raw friction episodes: {len(all_cards)}")
+
+    deduped = deduplicate(all_cards)
+    print(f"[mine] After dedup: {len(deduped)} task cards")
+
+    for card in deduped:
+        print(f"  {card}")
+
+    output_path = write_task_cards(deduped, args.output_dir, total_sessions_scanned=len(user_sessions))
+    print(f"[mine] Wrote {output_path}")
