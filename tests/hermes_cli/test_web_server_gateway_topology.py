@@ -535,3 +535,168 @@ class TestStatusEndpointTopology:
             monkeypatch.setattr(
                 web_server.app.state, "auth_required", False, raising=False
             )
+
+
+# ---------------------------------------------------------------------------
+# Public projection allowlist (issue #90700)
+# ---------------------------------------------------------------------------
+
+class TestPublicStatusFieldProjection:
+    """Regression for issue #90700: /api/status is unauthenticated (NAS
+    liveness probing, SPA pre-login bootstrap). Free-text diagnostic
+    fields -- error_message on a platform entry, and the top-level
+    gateway_exit_reason -- must never reach that public payload; both
+    routinely embed endpoint URLs, response bodies, or exception detail
+    from adapter failures."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_client(self, monkeypatch, _isolate_hermes_home):
+        try:
+            from starlette.testclient import TestClient
+        except ImportError:
+            pytest.skip("fastapi/starlette not installed")
+
+        import hermes_state
+        from hermes_constants import get_hermes_home
+        from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+        monkeypatch.setattr(
+            hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db"
+        )
+        self.client = TestClient(app)
+        self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+
+    def test_error_message_never_reaches_the_public_payload(self, monkeypatch):
+        """The exact reported leak: a platform entry's free-text
+        error_message (here containing an embedded URL, matching the
+        issue's own described failure shape) must not survive the
+        public projection, on either a running or startup_failed
+        gateway."""
+        monkeypatch.setattr(web_server, "get_running_pid_cached", lambda: 123)
+        monkeypatch.setattr(
+            web_server,
+            "read_runtime_status",
+            lambda path=None: {
+                "gateway_state": "startup_failed",
+                "exit_reason": "startup_failed",
+                "platforms": {
+                    "telegram": {
+                        "state": "fatal",
+                        "error_code": "duplicate_credential",
+                        "error_message": (
+                            "POST https://api.telegram.org/bot123456:ABCsecret/"
+                            "getMe failed: 409 Conflict — terminated by other "
+                            "getUpdates request"
+                        ),
+                        "writer_pid": 123,
+                        "writer_start_time": 456,
+                    }
+                },
+            },
+        )
+        monkeypatch.setattr(
+            web_server, "_load_configured_gateway_platforms", lambda: {"telegram"}
+        )
+
+        resp = self.client.get("/api/status")
+
+        assert resp.status_code == 200
+        entry = resp.json()["gateway_platforms"]["telegram"]
+        assert entry["state"] == "fatal"
+        assert entry["error_code"] == "duplicate_credential"
+        assert "error_message" not in entry
+        body_text = resp.text
+        assert "api.telegram.org" not in body_text
+        assert "123456:ABCsecret" not in body_text
+
+    def test_only_the_documented_field_allowlist_survives(self, monkeypatch):
+        """Direct allowlist check: every field write_runtime_status()
+        actually writes to a platform entry is accounted for -- the
+        safe ones pass, error_message and writer identity don't, and an
+        unknown future field (simulating an adapter-specific addition
+        no reviewer has vetted for the public path) is dropped too."""
+        monkeypatch.setattr(web_server, "get_running_pid_cached", lambda: 123)
+        monkeypatch.setattr(
+            web_server,
+            "read_runtime_status",
+            lambda path=None: {
+                "gateway_state": "running",
+                "platforms": {
+                    "telegram": {
+                        "state": "connected",
+                        "error_code": "some_code",
+                        "error_message": "sensitive detail",
+                        "needs_attention": True,
+                        "retrying_since": "2026-01-01T00:00:00Z",
+                        "updated_at": "2026-01-01T00:00:01Z",
+                        "writer_pid": 123,
+                        "writer_start_time": 456,
+                        "some_future_adapter_field": "unreviewed",
+                    }
+                },
+            },
+        )
+        monkeypatch.setattr(
+            web_server, "_load_configured_gateway_platforms", lambda: {"telegram"}
+        )
+
+        resp = self.client.get("/api/status")
+        entry = resp.json()["gateway_platforms"]["telegram"]
+
+        assert entry == {
+            "state": "connected",
+            "error_code": "some_code",
+            "needs_attention": True,
+            "retrying_since": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:01Z",
+        }
+
+    def test_gateway_exit_reason_is_reduced_to_a_coarse_category(self, monkeypatch):
+        """gateway_exit_reason must never reach the public payload
+        verbatim -- reduced to the same bounded category
+        classify_exit_reason() already produces for the authenticated
+        monitoring path."""
+        monkeypatch.setattr(web_server, "get_running_pid_cached", lambda: 123)
+        monkeypatch.setattr(
+            web_server,
+            "read_runtime_status",
+            lambda path=None: {
+                "gateway_state": "stopped",
+                "exit_reason": (
+                    "Traceback (most recent call last): ... "
+                    "ConnectionError: could not connect to internal-db-host:5432 "
+                    "user=admin password=hunter2"
+                ),
+                "platforms": {},
+            },
+        )
+        monkeypatch.setattr(web_server, "_load_configured_gateway_platforms", lambda: set())
+
+        resp = self.client.get("/api/status")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert isinstance(data["gateway_exit_reason"], str)
+        assert len(data["gateway_exit_reason"]) < 40, (
+            "must be a short, bounded category, not free text"
+        )
+        raw_leak_markers = ("hunter2", "internal-db-host", "Traceback")
+        for marker in raw_leak_markers:
+            assert marker not in resp.text
+
+    def test_none_exit_reason_stays_none(self, monkeypatch):
+        """Sanity: a genuinely absent exit reason (the common, healthy
+        case) must not be coerced into some non-null placeholder."""
+        monkeypatch.setattr(web_server, "get_running_pid_cached", lambda: 123)
+        monkeypatch.setattr(
+            web_server,
+            "read_runtime_status",
+            lambda path=None: {
+                "gateway_state": "running",
+                "platforms": {},
+            },
+        )
+        monkeypatch.setattr(web_server, "_load_configured_gateway_platforms", lambda: set())
+
+        resp = self.client.get("/api/status")
+        assert resp.json()["gateway_exit_reason"] is None
