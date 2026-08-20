@@ -5188,14 +5188,14 @@ class PluginManager:
                         "fail-closed" if hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS else "fail-open",
                     )
                     if hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS:
-                        results.append({"action": "block", "message": f"BLOCKED: plugin hook '{callback_name}' is unavailable"})
+                        results.append({"action": "block", "message": "pre_tool_call plugin callback timed out or is still running"})
                     continue
                 if suppressed_until is not None:
                     self._hook_timeout_suppressed_until.pop(callback_key, None)
                 self._hook_running_callbacks.add(callback_key)
             context = contextvars.copy_context()
 
-            def bounded_callback() -> Any:
+            def bounded_callback(callback=cb, callback_key=callback_key, context=context) -> Any:
                 try:
                     return context.run(self._invoke_hook_callback, cb, kwargs)
                 finally:
@@ -5213,7 +5213,7 @@ class PluginManager:
                             time.monotonic() + self._hook_timeout_suppression_seconds
                         )
                     if hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS:
-                        results.append({"action": "block", "message": f"BLOCKED: plugin hook '{callback_name}' timed out"})
+                        results.append({"action": "block", "message": "pre_tool_call plugin callback timed out or is still running"})
                     continue
                 ret = bounded_result.value
                 if ret is not None:

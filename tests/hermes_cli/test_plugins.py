@@ -5,6 +5,7 @@ import json
 import sys
 import time
 import threading
+from contextvars import ContextVar
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -871,6 +872,7 @@ class TestPluginHooks:
         mgr = PluginManager()
         mgr._hook_timeout_seconds = 0.02
         calls = []
+        release = threading.Event()
 
         def before(**kwargs):
             calls.append("before")
@@ -878,7 +880,7 @@ class TestPluginHooks:
 
         def slow(**kwargs):
             calls.append("slow-start")
-            time.sleep(0.25)
+            release.wait(30)
             calls.append("slow-end")
             return "slow-result"
 
@@ -900,10 +902,13 @@ class TestPluginHooks:
             )
         elapsed = time.perf_counter() - start
 
-        assert elapsed < 0.20
-        assert results == ["before-result", "after-result"]
-        assert calls[:3] == ["before", "slow-start", "after"]
-        assert any("timed out" in r.getMessage() for r in caplog.records)
+        try:
+            assert elapsed < 0.20
+            assert results == ["before-result", "after-result"]
+            assert calls[:3] == ["before", "slow-start", "after"]
+            assert any("timed out" in r.getMessage() for r in caplog.records)
+        finally:
+            release.set()
 
     def test_distinct_hung_callbacks_do_not_starve_healthy_hooks(self, caplog):
         """Each timed-out callback has isolated capacity."""
@@ -911,11 +916,12 @@ class TestPluginHooks:
         mgr._hook_timeout_seconds = 0.02
         mgr._hook_timeout_suppression_seconds = 30.0
         calls = []
+        release = threading.Event()
 
         def slow(index):
             def callback(**kwargs):
                 calls.append((index, "start"))
-                time.sleep(0.30)
+                release.wait(30)
                 calls.append((index, "end"))
             return callback
 
@@ -931,42 +937,71 @@ class TestPluginHooks:
             results = mgr.invoke_hook("pre_llm_call", session_id="s1")
             elapsed = time.perf_counter() - started
 
-        assert elapsed < 0.20
-        assert results == ["healthy-result"]
-        assert calls.count(("healthy", "run")) == 1
-        assert all(calls.count((index, "start")) == 1 for index in range(4))
-        assert any("timed out" in record.getMessage() for record in caplog.records)
+        try:
+            assert elapsed < 0.20
+            assert results == ["healthy-result"]
+            assert calls.count(("healthy", "run")) == 1
+            assert all(calls.count((index, "start")) == 1 for index in range(4))
+            assert any("timed out" in record.getMessage() for record in caplog.records)
+        finally:
+            release.set()
 
     @pytest.mark.parametrize("hook_name", ["on_session_start", "on_session_end"])
     def test_session_hooks_are_bounded(self, hook_name, caplog):
         mgr = PluginManager()
         mgr._hook_timeout_seconds = 0.02
+        release = threading.Event()
 
         def slow(**kwargs):
-            time.sleep(0.30)
+            release.wait(30)
         mgr._hooks[hook_name] = [slow]
 
-        with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
-            started = time.perf_counter()
-            assert mgr.invoke_hook(hook_name, session_id="s1") == []
-            elapsed = time.perf_counter() - started
-        assert elapsed < 0.20
-        assert any(hook_name in record.getMessage() for record in caplog.records)
+        try:
+            with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+                started = time.perf_counter()
+                assert mgr.invoke_hook(hook_name, session_id="s1") == []
+                elapsed = time.perf_counter() - started
+            assert elapsed < 0.20
+            assert any(hook_name in record.getMessage() for record in caplog.records)
+        finally:
+            release.set()
 
     def test_pre_tool_call_timeout_and_suppression_block(self, monkeypatch):
         mgr = PluginManager()
         mgr._hook_timeout_seconds = 0.02
+        release = threading.Event()
 
         def slow(**kwargs):
-            time.sleep(0.30)
+            release.wait(30)
 
         mgr._hooks["pre_tool_call"] = [slow]
         monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: mgr)
 
-        first = get_pre_tool_call_block_message("terminal", {})
-        second = get_pre_tool_call_block_message("terminal", {})
-        assert first and "timed out" in first
-        assert second and "timed out" in second
+        try:
+            first = get_pre_tool_call_block_message("terminal", {})
+            second = get_pre_tool_call_block_message("terminal", {})
+            assert first and "timed out" in first
+            assert second and "timed out" in second
+        finally:
+            release.set()
+
+    def test_bounded_hook_uses_shared_adapter_and_caller_context(self):
+        mgr = PluginManager()
+        marker = ContextVar("plugin-test-marker", default="missing")
+        marker.set("caller-context")
+
+        def narrow(session_id, telemetry_schema_version):
+            return marker.get(), session_id, telemetry_schema_version
+
+        mgr._hooks["pre_llm_call"] = [narrow]
+        with patch("hermes_cli.plugins.run_bounded_sync", wraps=plugins.run_bounded_sync) as bounded:
+            assert mgr.invoke_hook("pre_llm_call", session_id="session-1", extra="ignored") == [
+                ("caller-context", "session-1", "hermes.observer.v1")
+            ]
+
+        bounded.assert_called_once()
+        assert bounded.call_args.args[1] == mgr._hook_timeout_seconds
+        assert bounded.call_args.kwargs["label"].startswith("plugin-hook:pre_llm_call:narrow")
 
     def test_hook_exception_still_allows_later_return_values(self, caplog):
         """Bounded dispatch keeps the prior fail-open exception behavior."""
