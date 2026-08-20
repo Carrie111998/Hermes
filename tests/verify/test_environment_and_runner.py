@@ -540,6 +540,72 @@ class TestPythonIsolation:
         assert "redirect" in result.phases[0].output_tail.lower()
         assert external.read_text(encoding="utf-8") == "unchanged"
 
+    @pytest.mark.linux_only
+    def test_same_path_lock_replacement_cannot_enter_concurrent_lifecycle(self, tmp_path):
+        root = tmp_path / "project"
+        root.mkdir()
+        metadata = root / ".hermes"
+        metadata.mkdir()
+        repository = Path(__file__).resolve().parents[2]
+        entered = tmp_path / "holder-entered"
+        release = tmp_path / "release-holder"
+        contender_entered = tmp_path / "contender-entered"
+        worker = (
+            "import sys, time\n"
+            "from pathlib import Path\n"
+            "from agent.verify import runner\n"
+            "root = Path(sys.argv[1])\n"
+            "entered = Path(sys.argv[2])\n"
+            "release = Path(sys.argv[3])\n"
+            "with runner._project_python_lock(root.resolve(), 5):\n"
+            "    entered.write_text('yes', encoding='utf-8')\n"
+            "    while not release.exists():\n"
+            "        time.sleep(0.02)\n"
+        )
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(repository)
+        holder = subprocess.Popen(
+            [sys.executable, "-c", worker, str(root), str(entered), str(release)],
+            cwd=repository,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not entered.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert entered.exists(), holder.communicate(timeout=1)[0] if holder.poll() is not None else ""
+
+            (metadata / "verify.lock").unlink()
+            (metadata / "verify.lock").write_text("replacement\n", encoding="utf-8")
+
+            contender = (
+                "import sys\n"
+                "from pathlib import Path\n"
+                "from agent.verify import runner\n"
+                "root = Path(sys.argv[1])\n"
+                "marker = Path(sys.argv[2])\n"
+                "with runner._project_python_lock(root.resolve(), 0.2):\n"
+                "    marker.write_text('entered', encoding='utf-8')\n"
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", contender, str(root), str(contender_entered)],
+                cwd=repository,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            output, _ = process.communicate(timeout=5)
+
+            assert process.returncode != 0, output
+            assert not contender_entered.exists()
+        finally:
+            release.write_text("release", encoding="utf-8")
+            holder.wait(timeout=5)
+
     def test_metadata_parent_replacement_during_lock_open_fails_without_external_lock(
         self, tmp_path, monkeypatch
     ):

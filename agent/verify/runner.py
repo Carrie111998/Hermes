@@ -14,9 +14,12 @@ bootstrap and later phases cannot install into Hermes' caller environment.
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import os
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -168,6 +171,54 @@ def _open_lock_file(metadata: Path, metadata_descriptor: int | None) -> Any:
     return os.fdopen(descriptor, "r+b", buffering=0)
 
 
+def _lock_identity_for_root(root: Path) -> str:
+    """Return a stable OS-lock identity for the current project root path.
+
+    Threat model: the project root path is the caller-selected project boundary;
+    an adversary with the same UID may mutate children such as ``.hermes`` and
+    ``verify.lock`` while verification runs.  The identity therefore avoids any
+    mutable child path and binds to the canonical root path plus the root
+    directory's current device/inode when the platform exposes them.  Replacing
+    the project root itself is outside this lock's guarantee and remains a
+    caller/worktree ownership violation.
+    """
+    root_stat = os.stat(root)
+    material = f"{os.path.normcase(str(root.resolve()))}\0{root_stat.st_dev}\0{root_stat.st_ino}"
+    return hashlib.sha256(material.encode("utf-8", errors="surrogateescape")).hexdigest()
+
+
+def _try_abstract_socket_lock(root: Path, timeout: float) -> socket.socket | None:
+    """Acquire a Linux abstract-namespace process lock for ``root`` if available.
+
+    POSIX file locks are inode locks, so replacing ``.hermes/verify.lock`` at the
+    same pathname can split contenders across two lock inodes.  Linux abstract
+    Unix sockets are process-owned kernel objects, not filesystem entries; a
+    same-path lock-file replacement cannot create a second holder for the same
+    project identity.  Non-Linux platforms keep the file-lock fallback below and
+    intentionally do not claim this stronger same-user mutation protection.
+    """
+    if not sys.platform.startswith("linux") or not hasattr(socket, "AF_UNIX"):
+        return None
+    address = "\0hermes-verify-" + _lock_identity_for_root(root)[:48]
+    deadline = time.monotonic() + timeout
+    while True:
+        lock_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        lock_socket.set_inheritable(False)
+        try:
+            lock_socket.bind(address)
+            lock_socket.listen(1)
+            return lock_socket
+        except OSError as exc:
+            lock_socket.close()
+            if exc.errno != errno.EADDRINUSE:
+                raise
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"timed out waiting for Python verification process lock for {root}"
+                ) from exc
+            time.sleep(0.05)
+
+
 def _thread_lock_for(root: Path) -> threading.Lock:
     key = os.path.normcase(str(root))
     with _THREAD_LOCKS_GUARD:
@@ -220,7 +271,9 @@ def _project_python_lock(root: Path, timeout: float):
     file = None
     metadata_descriptor = None
     locked = False
+    process_lock = None
     try:
+        process_lock = _try_abstract_socket_lock(root, timeout)
         metadata = _prepare_metadata_root(root)
         lock_path = metadata / _VERIFY_LOCK_NAME
         metadata_descriptor = _open_metadata_directory(metadata)
@@ -250,6 +303,8 @@ def _project_python_lock(root: Path, timeout: float):
             file.close()
         if metadata_descriptor is not None:
             os.close(metadata_descriptor)
+        if process_lock is not None:
+            process_lock.close()
         thread_lock.release()
 
 
