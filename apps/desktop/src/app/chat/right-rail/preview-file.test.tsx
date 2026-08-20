@@ -1,9 +1,9 @@
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { LocalFilePreview, MarkdownPreview, anchorNearLine, changedLineSpans, lineForCrossViewPrefix, normalizeForCrossView, selectionTextWithMath } from './preview-file'
-
 import type { PreviewTarget } from '@/store/preview'
+
+import { anchorNearLine, changedLineSpans, lineForCrossViewPrefix, LocalFilePreview, MarkdownPreview, normalizeForCrossView, selectionTextWithMath } from './preview-file'
 
 // Behavior tests for the .md file preview renderer: input markdown goes
 // through normalizeFilePreviewMath -> Streamdown (+ KaTeX math plugin) and must
@@ -300,6 +300,7 @@ describe('selectionTextWithMath', () => {
     const root = document.createElement('div')
     root.innerHTML = html
     document.body.appendChild(root)
+
     return root
   }
 
@@ -310,6 +311,7 @@ describe('selectionTextWithMath', () => {
     const selection = document.getSelection()
     selection?.removeAllRanges()
     selection?.addRange(range)
+
     return range
   }
 

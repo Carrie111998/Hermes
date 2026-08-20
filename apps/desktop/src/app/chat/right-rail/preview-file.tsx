@@ -568,6 +568,7 @@ export function changedLineSpans(oldText: string, newText: string): ChangedLineS
   for (let i = start; i <= end; i += 1) {
     if (!newLines[i - 1].trim()) {
       blanks += 1
+
       continue
     }
 
@@ -649,7 +650,9 @@ export function anchorNearLine(lines: string[], line: number): CrossViewAnchor {
 
   for (let radius = 0; radius <= 12; radius += 1) {
     for (const candidate of radius === 0 ? [line] : [line + radius, line - radius]) {
-      if (candidate < 1 || candidate > total) continue
+      if (candidate < 1 || candidate > total) {
+        continue
+      }
 
       const normalized = normalizeForCrossView(lines[candidate - 1])
 
@@ -670,7 +673,7 @@ export function anchorNearLine(lines: string[], line: number): CrossViewAnchor {
 export function lineForCrossViewPrefix(lines: string[], prefix: string): number | null {
   const target = normalizeForCrossView(prefix).slice(0, 40)
 
-  if (target.length < 8) return null
+  if (target.length < 8) {return null}
 
   for (let index = 0; index < lines.length; index += 1) {
     const normalized = normalizeForCrossView(lines[index])
@@ -688,7 +691,7 @@ export function lineForCrossViewPrefix(lines: string[], prefix: string): number 
 export function previewBlockForPrefix(scroller: HTMLElement, prefix: string): HTMLElement | null {
   const target = normalizeAnchorText(prefix).slice(0, 40)
 
-  if (target.length < 8) return null
+  if (target.length < 8) {return null}
 
   const blocks = Array.from(scroller.querySelectorAll<HTMLElement>(ANCHOR_SELECTOR))
 
@@ -747,7 +750,7 @@ function katexAncestorOf(node: Node): Element | null {
   let cur: Node | null = node
 
   while (cur) {
-    if (cur instanceof Element && cur.classList.contains('katex')) return cur
+    if (cur instanceof Element && cur.classList.contains('katex')) {return cur}
     cur = cur.parentNode
   }
 
@@ -760,7 +763,7 @@ function blockAncestorOf(node: Node): Element | null {
   let cur: Node | null = node.parentNode
 
   while (cur) {
-    if (cur instanceof Element && BLOCK_TAGS.has(cur.tagName)) return cur
+    if (cur instanceof Element && BLOCK_TAGS.has(cur.tagName)) {return cur}
     cur = cur.parentNode
   }
 
@@ -778,8 +781,9 @@ function rangeTextWithMath(range: Range): string {
   let lastEndedWithSpace = true
 
   const append = (chunk: string) => {
-    if (!chunk) return
-    if (out && !lastEndedWithSpace && !/^\s/.test(chunk)) out += ' '
+    if (!chunk) {return}
+
+    if (out && !lastEndedWithSpace && !/^\s/.test(chunk)) {out += ' '}
     out += chunk
     lastEndedWithSpace = /\s$/.test(chunk)
   }
@@ -789,9 +793,11 @@ function rangeTextWithMath(range: Range): string {
     let from = 0
     let to = data.length
 
-    if (node === range.startContainer) from = range.startOffset
-    if (node === range.endContainer) to = range.endOffset
-    if (to <= from) return
+    if (node === range.startContainer) {from = range.startOffset}
+
+    if (node === range.endContainer) {to = range.endOffset}
+
+    if (to <= from) {return}
 
     const block = blockAncestorOf(node)
 
@@ -804,7 +810,7 @@ function rangeTextWithMath(range: Range): string {
   }
 
   const emitKatex = (katex: Element) => {
-    if (emitted.has(katex)) return
+    if (emitted.has(katex)) {return}
     emitted.add(katex)
 
     const latex = katex.querySelector('annotation')?.textContent?.trim()
@@ -834,13 +840,14 @@ function rangeTextWithMath(range: Range): string {
   let node: Node | null
 
   while ((node = walker.nextNode())) {
-    if (!range.intersectsNode(node)) continue
+    if (!range.intersectsNode(node)) {continue}
 
     const textNode = node as Text
     const katex = katexAncestorOf(textNode)
 
     if (katex) {
       emitKatex(katex)
+
       continue
     }
 
@@ -1076,7 +1083,7 @@ export function SourceView({
   // below the viewport top. Rows are fixed-height (SOURCE_LINE_PX), so this is
   // exact. Fires on prop change; double rAF so layout has settled.
   useEffect(() => {
-    if (!scrollToLine || scrollToLine < 1) return
+    if (!scrollToLine || scrollToLine < 1) {return}
 
     const target = Math.max(0, (scrollToLine - 3) * SOURCE_LINE_PX)
     let f1 = 0
@@ -1172,6 +1179,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
   const [saveError, setSaveError] = useState<null | string>(null)
   const [conflict, setConflict] = useState(false)
   const [selfReload, setSelfReload] = useState(0)
+
   // Where to jump when the user clicks "jump to change": ALL changed regions
   // (the jump button cycles through them, then back to the original reading
   // position) plus a click counter so each click re-fires the scroll, plus
@@ -1190,6 +1198,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
     original: CrossViewAnchor | null
     originalScrollTop: number
   } | null>(null)
+
   // Line-exact scroll request consumed by SourceView (fires on nonce bump even
   // when the line is unchanged). Serves both "jump to change" (source view)
   // and rendered->source position sync.
@@ -1254,6 +1263,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
 
   const blockedByTarget = !isImage && !isPdf && !forcePreview && (target.binary || target.large)
 
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     let active = true
 
@@ -1305,6 +1315,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
 
           if (previous !== undefined && previous !== result.text) {
             const newLines = result.text.split('\n')
+
             const spans = changedLineSpans(previous, result.text)
               .filter(span => span.line !== null)
               .map(span => ({
@@ -1323,6 +1334,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
             // Where the user is right now becomes the "restore" target after
             // the last change in the cycle.
             const currentScroller = scrollerRef.current
+
             const original =
               modeRef.current === 'rendered'
                 ? (currentScroller ? captureScrollAnchor(currentScroller) : null)
@@ -1437,10 +1449,12 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
   // above the viewport no longer shift what the user was reading. Runs after
   // the new content paints (two rAFs); falls back to the old pixel scrollTop
   // when the anchored text is gone entirely (heavy rewrite around the user).
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
-    if (state.loading) return
+    if (state.loading) {return}
     const anchor = scrollAnchorRef.current
-    if (!anchor) return
+
+    if (!anchor) {return}
     scrollAnchorRef.current = null
 
     let f1 = 0
@@ -1448,7 +1462,8 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
     f1 = requestAnimationFrame(() => {
       f2 = requestAnimationFrame(() => {
         const scroller = scrollerRef.current
-        if (!scroller) return
+
+        if (!scroller) {return}
 
         const restored = restoreScrollAnchor(scroller, anchor)
 
@@ -1475,11 +1490,11 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
   const capturePreviewAnchor = useCallback((): CrossViewAnchor | null => {
     const scroller = scrollerRef.current
 
-    if (!scroller || !scroller.scrollHeight) return null
+    if (!scroller || !scroller.scrollHeight) {return null}
 
     const captured = captureScrollAnchor(scroller)
 
-    if (!captured) return null
+    if (!captured) {return null}
 
     return { fraction: captured.scrollTop / Math.max(1, scroller.scrollHeight - scroller.clientHeight), prefix: captured.prefix }
   }, [])
@@ -1494,7 +1509,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
     const inner = outer?.querySelector<HTMLElement>('[data-source-scroller]') ?? outer
     const text = state.text
 
-    if (!inner || !text) return null
+    if (!inner || !text) {return null}
 
     const lines = text.split('\n')
     const topLine = Math.floor(inner.scrollTop / SOURCE_LINE_PX) + 1
@@ -1504,10 +1519,11 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
   }, [state.text])
 
   /** Apply a pending anchor to whichever view just became visible. */
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     const anchor = pendingViewAnchorRef.current
 
-    if (!anchor || state.loading || !state.text) return
+    if (!anchor || state.loading || !state.text) {return}
     pendingViewAnchorRef.current = null
 
     let f1 = 0
@@ -1516,7 +1532,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
       f2 = requestAnimationFrame(() => {
         const scroller = scrollerRef.current
 
-        if (!scroller) return
+        if (!scroller) {return}
 
         if (modeRef.current === 'rendered') {
           const block = anchor.prefix ? previewBlockForPrefix(scroller, anchor.prefix) : null
@@ -1554,7 +1570,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
     }
     // Fires when the user picks a view (userMode) or content settles; reads
     // the live mode from modeRef. modeRef is a ref - always current.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, [userMode, state.loading, state.text])
 
   // Editing is only offered for whole, readable text — never images, binaries,
@@ -1902,7 +1918,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
                         if (modeRef.current === 'rendered') {
                           const scroller = scrollerRef.current
 
-                          if (!scroller) return
+                          if (!scroller) {return}
 
                           const block = change.anchor.prefix ? previewBlockForPrefix(scroller, change.anchor.prefix) : null
 
