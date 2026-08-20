@@ -121,7 +121,12 @@ import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import { formatDesktopLogLine } from './desktop-log-line'
-import { resolveDesktopRemoteRoute } from './desktop-remote-route'
+import {
+  effectiveDialDigest,
+  registryTargetForRoute,
+  resolveDesktopRemoteRoute,
+  sshPayloadFieldsMatch
+} from './desktop-remote-route'
 import {
   buildPosixCleanupScript,
   buildWindowsCleanupScript,
@@ -9001,7 +9006,10 @@ async function reachablePreviewUrl(rawUrl: string): Promise<string> {
   }
 }
 
-function effectiveSshConfigFingerprint(sshConfig) {
+// `ssh -G` resolves ~/.ssh/config for a target WITHOUT connecting: no network,
+// no key, no agent prompt. It is the only way to tell whether two differently
+// spelled targets are the same machine.
+function sshEffectiveConfigDump(sshConfig) {
   const ssh =
     process.platform === 'win32'
       ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'OpenSSH', 'ssh.exe')
@@ -9018,9 +9026,67 @@ function effectiveSshConfigFingerprint(sshConfig) {
   }
 
   args.push('--', sshConfig.user ? `${sshConfig.user}@${sshConfig.host}` : sshConfig.host)
-  const output = execFileSync(ssh, args, { encoding: 'utf8', timeout: 10_000, windowsHide: true })
 
-  return crypto.createHash('sha256').update(output).digest('hex')
+  return execFileSync(ssh, args, { encoding: 'utf8', timeout: 10_000, windowsHide: true })
+}
+
+function effectiveSshConfigFingerprint(sshConfig) {
+  return crypto.createHash('sha256').update(sshEffectiveConfigDump(sshConfig)).digest('hex')
+}
+
+// A leftover v1 global SSH block can SPELL the same gateway differently from
+// the registry entry the roster dials - an ~/.ssh/config alias on one side, the
+// resolved host/user on the other. resolveDesktopRemoteRoute() compares the
+// STORED fields, so it cannot see through the alias, and the two spellings mint
+// two ssh scopes, two ownership ids, and two identical
+// `hermes serve --isolated` backends for one profile (#observed on Windows:
+// 78 authentications and two remote backends per cold start).
+//
+// `ssh -G` resolves both sides to their effective dial. Identical dial AND
+// identical remote Hermes path/profile means one gateway, so the legacy route
+// delegates to the registry pool instead of opening its own. Anything less -
+// a different port, user, key, jump host, remote path or remote profile - keeps
+// the historical behaviour. Deliberately limited to the GLOBAL v1 route and the
+// registry PRIMARY: a per-profile override is a deliberate choice by the user,
+// and two registry entries are never merged into each other.
+function registryPrimarySharingSshRoute(route, registry) {
+  if (route?.kind !== 'ssh' || route.connectionId || route.source !== 'settings') {
+    return null
+  }
+
+  const primary = registry.connections.find(connection => connection.id === registry.primary)
+
+  if (!primary || primary.kind !== 'ssh') {
+    return null
+  }
+
+  const entry = normalizeSshConfig({
+    mode: 'ssh',
+    host: primary.host,
+    user: primary.user,
+    port: primary.port,
+    keyPath: primary.keyPath,
+    remoteHermesPath: primary.remoteHermesPath,
+    remoteProfile: primary.remoteProfile
+  })
+
+  if (!entry || !sshPayloadFieldsMatch(entry, route.ssh)) {
+    return null
+  }
+
+  try {
+    if (effectiveDialDigest(sshEffectiveConfigDump(route.ssh)) !== effectiveDialDigest(sshEffectiveConfigDump(entry))) {
+      return null
+    }
+  } catch (error: any) {
+    // No ssh binary, an unreadable ~/.ssh/config, a malformed target: we cannot
+    // prove they are the same gateway, so we do not claim it.
+    sshRememberLog(`[ssh] could not compare effective SSH dials (${error?.message || error}); keeping the v1 route`)
+
+    return null
+  }
+
+  return primary.id
 }
 
 async function bootstrapSshConnection(profile, sshConfig, reuseToken, source) {
@@ -9212,8 +9278,9 @@ function persistSshConnectionToken(profile, source, token) {
 //   3. global remote (connection.json `mode: 'remote'`)
 // A null/empty profile resolves the env/global remote, so legacy callers and
 // the connection test (which pass no profile) are unchanged.
-async function resolveRemoteBackend(profile) {
+async function resolveRemoteBackend(profile: any): Promise<any> {
   const config = readDesktopConnectionConfig()
+  const registry = readDesktopConnectionsRegistry()
 
   const route = resolveDesktopRemoteRoute({
     config,
@@ -9222,11 +9289,44 @@ async function resolveRemoteBackend(profile) {
       url: process.env.HERMES_DESKTOP_REMOTE_URL
     },
     profile,
-    registry: readDesktopConnectionsRegistry()
+    registry
   })
 
   if (!route) {
     return null
+  }
+
+  // A v1 route that resolves to exactly one registry entry is the SAME gateway
+  // the v2 roster dials. Bootstrapping it here under the legacy global ssh
+  // scope minted a second ownership id, so one connection ended up with two
+  // remote `hermes serve --isolated` backends for one profile. Delegate to the
+  // registry pool so both entry points join a single bootstrap.
+  let registryTarget = registryTargetForRoute(route, profile)
+  let delegationBasis = 'stored identity'
+
+  if (!registryTarget) {
+    const sharedPrimaryId = registryPrimarySharingSshRoute(route, registry)
+
+    if (sharedPrimaryId) {
+      registryTarget = registryTargetForRoute({ ...route, connectionId: sharedPrimaryId }, profile)
+      delegationBasis = 'effective ssh dial'
+    }
+  }
+
+  if (registryTarget) {
+    sshRememberLog(
+      `[ssh] route delegated connection=${registryTarget.connectionId} profile=${registryTarget.profile} ` +
+        `source=${route.source} kind=${route.kind} basis="${delegationBasis}"`
+    )
+
+    return ensureRegistryBackend(registryTarget.connectionId, registryTarget.profile)
+  }
+
+  if (route.kind === 'ssh') {
+    sshRememberLog(
+      `[ssh] route not delegated (no registry entry proves the same gateway) source=${route.source} ` +
+        `scope=${JSON.stringify(sshScopeKey(route.source === 'profile' ? profile : null))}`
+    )
   }
 
   let connection
@@ -9786,7 +9886,7 @@ async function ensureBackend(profile) {
 // a genuinely-local child when the v1 mode says remote; non-local connections
 // pool under the composite key from backendScopeKey() and reuse the same pool
 // entry lifecycle (LRU, idle reaper, touch) as per-profile local backends.
-async function ensureRegistryBackend(connectionId, profile) {
+async function ensureRegistryBackend(connectionId: any, profile: any): Promise<any> {
   const registry = readDesktopConnectionsRegistry()
   const id = String(connectionId || '').trim() || registry.primary
   const source = registry.connections.find(c => c.id === id)
