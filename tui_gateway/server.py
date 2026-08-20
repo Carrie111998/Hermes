@@ -3028,6 +3028,9 @@ def _fallback_session_info(session: dict) -> dict:
         "model": _resolve_model(),
         "skills": {},
         "tools": {},
+        # Lazy sessions are still served by this backend. The desktop treats a
+        # missing contract as 0 and otherwise falsely reports it as outdated.
+        "desktop_contract": DESKTOP_BACKEND_CONTRACT,
     }
 
 
