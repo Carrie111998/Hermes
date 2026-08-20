@@ -30,7 +30,7 @@ function loadOpenPath({ openSession, request }) {
   }
   const exportLine = [
     '',
-    'globalThis.__open = { openBotCanonicalChat };',
+    'globalThis.__open = { openBotCanonicalChat, createCanonicalChat };',
     ''
   ].join('\n')
   const section = source.slice(start, end).concat(exportLine)
@@ -165,4 +165,79 @@ test('click-spam: openSession timeout does not remint or overwrite the pin', asy
   assert.deepEqual(opened, ['bot-profile-chat', 'bot-profile-chat'])
   assert.equal(creates, 0, 'timeout must not session.create into the launch store')
   assert.deepEqual(runtime.saved, [], 'timeout must not overwrite the bot-profile pin')
+})
+
+test('same-named bots on different connections never reuse the other source pin', async () => {
+  const opened = []
+  const created = []
+  const runtime = loadOpenPath({
+    openSession: async id => {
+      opened.push(id)
+    },
+    request: async method => {
+      if (method === 'profiles.list') {
+        return { profiles: [{ name: 'ops', preferred_session: null }] }
+      }
+      if (method === 'session.create') {
+        created.push(method)
+        return { stored_session_id: `mint-${created.length}`, session_id: `rt-${created.length}` }
+      }
+      return {}
+    }
+  })
+
+  const sourceA = { name: 'ops', connectionId: 'conn-a' }
+  const sourceB = { name: 'ops', connectionId: 'conn-b' }
+
+  const firstA = await runtime.openBotCanonicalChat('ops', 'pin-a', null, sourceA)
+  const firstB = await runtime.openBotCanonicalChat('ops', null, null, sourceB)
+  const againA = await runtime.openBotCanonicalChat('ops', null, null, sourceA)
+
+  assert.equal(firstA, 'pin-a')
+  assert.notEqual(firstB, 'pin-a', 'source B must not open source A pin')
+  assert.equal(againA, 'pin-a', 'returning to source A must reuse its own pin')
+  assert.equal(opened.includes('pin-a'), true)
+  assert.equal(created.length, 1, 'only the null-pin source mints')
+  assert.deepEqual(
+    runtime.saved.filter(entry => entry.patch?.chat === 'pin-a'),
+    [],
+    'source B must not save source A pin'
+  )
+})
+
+test('overlapping creates for same-named bots on different sources do not share inflight', async () => {
+  let createStarted = 0
+  let releaseFirst
+  const firstGate = new Promise(resolve => {
+    releaseFirst = resolve
+  })
+  const runtime = loadOpenPath({
+    openSession: async () => undefined,
+    request: async method => {
+      if (method === 'session.create') {
+        createStarted += 1
+        const n = createStarted
+        if (n === 1) await firstGate
+        return { stored_session_id: `mint-${n}`, session_id: `rt-${n}` }
+      }
+      return {}
+    }
+  })
+
+  const sourceA = { name: 'ops', connectionId: 'conn-a' }
+  const sourceB = { name: 'ops', connectionId: 'conn-b' }
+  const pendingA = runtime.createCanonicalChat('ops', sourceA)
+  for (let i = 0; i < 20 && createStarted < 1; i += 1) {
+    await Promise.resolve()
+  }
+  assert.equal(createStarted, 1, 'source A create should start first')
+  const pendingB = runtime.createCanonicalChat('ops', sourceB)
+  for (let i = 0; i < 20 && createStarted < 2; i += 1) {
+    await Promise.resolve()
+  }
+  assert.equal(createStarted, 2, 'same name on different sources must not share one inflight create')
+  releaseFirst()
+
+  assert.equal(await pendingA, 'mint-1')
+  assert.equal(await pendingB, 'mint-2')
 })

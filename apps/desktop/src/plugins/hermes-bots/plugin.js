@@ -3388,18 +3388,27 @@ function showsHandle(name, meta, bot) {
 //   - recovery: if the pinned id vanishes from the DB (compaction rewrote
 //     the lineage), re-pin the newest session carrying the canonical title.
 
-// In-flight creations, keyed by bot name — double-clicking a row must not
-// mint two canonical chats.
+// In-flight creations, keyed by source-qualified identity — double-clicking
+// a row must not mint two canonical chats, and same-named bots on different
+// connections must not share one inflight create.
 const canonicalCreations = new Map()
 
 /** Upper bound for per-profile session.list scans (hide sweep, canonical-chat
  *  adoption, stored-session lookups). */
 const PROFILE_SESSION_LIST_LIMIT = 200
-// Last successful canonical pin per bot. Extra clicks often still snapshot
-// meta.chat as null (React has not re-rendered) or as a launch-store id
-// that profiles.list cannot see in the bot profile store (#90458).
+// Last successful canonical pin per source-qualified bot. Extra clicks often
+// still snapshot meta.chat as null (React has not re-rendered) or as a
+// launch-store id that profiles.list cannot see in the bot profile store
+// (#90458). Keyed like botRosterKey: names alone are not identity.
 const lastCanonicalPins = new Map()
 let botOpenGeneration = 0
+
+function canonicalChatKey(name, bot) {
+  if (bot && typeof bot === 'object') {
+    return `${bot.connectionId || 'legacy'}::${bot.name || name || 'default'}`
+  }
+  return `legacy::${name || 'default'}`
+}
 
 function isMissingCanonicalChat(error) {
   const msg = String(error?.message || error || '')
@@ -3469,8 +3478,9 @@ async function findExistingCanonicalChat(name) {
  *  with the bot introducing itself). Pins the stored id in bot meta and
  *  returns it. Adopts an existing "Bot Chat" row instead of creating when
  *  the profile already has one (see findExistingCanonicalChat). */
-function createCanonicalChat(name) {
-  const inflight = canonicalCreations.get(name)
+function createCanonicalChat(name, bot) {
+  const key = canonicalChatKey(name, bot)
+  const inflight = canonicalCreations.get(key)
 
   if (inflight) {
     return inflight
@@ -3480,6 +3490,7 @@ function createCanonicalChat(name) {
     const existing = await findExistingCanonicalChat(name)
 
     if (existing?.id) {
+      lastCanonicalPins.set(key, existing.id)
       saveBotMeta(name, { chat: existing.id })
 
       if (typeof host.openSession === 'function') {
@@ -3505,7 +3516,7 @@ function createCanonicalChat(name) {
     const runtime = res?.session_id
 
     if (sid) {
-      lastCanonicalPins.set(name, sid)
+      lastCanonicalPins.set(key, sid)
       saveBotMeta(name, { chat: sid })
     }
 
@@ -3539,9 +3550,9 @@ function createCanonicalChat(name) {
     }
 
     return sid || null
-  })().finally(() => canonicalCreations.delete(name))
+  })().finally(() => canonicalCreations.delete(key))
 
-  canonicalCreations.set(name, run)
+  canonicalCreations.set(key, run)
 
   return run
 }
@@ -3569,9 +3580,10 @@ function isCanonicalBotChatHistory(history) {
   return rootTitle === 'Bot Chat' || (!rootTitle && title === 'Bot Chat')
 }
 
-async function openBotCanonicalChat(name, pinned, history) {
+async function openBotCanonicalChat(name, pinned, history, bot) {
+  const key = canonicalChatKey(name, bot)
   if (!pinned) {
-    pinned = lastCanonicalPins.get(name) || null
+    pinned = lastCanonicalPins.get(key) || null
   }
 
   if (!pinned) {
@@ -3581,11 +3593,11 @@ async function openBotCanonicalChat(name, pinned, history) {
     const adoptId = isCanonicalBotChatHistory(history) ? history.id : null
     if (adoptId && typeof host.openSession === 'function') {
       await openStoredBotChat(name, adoptId, history)
-      lastCanonicalPins.set(name, adoptId)
+      lastCanonicalPins.set(key, adoptId)
       saveBotMeta(name, { chat: adoptId })
       return adoptId
     }
-    return createCanonicalChat(name)
+    return createCanonicalChat(name, bot)
   }
 
   // Precise verification. An older gateway ignores the unknown param and
@@ -3612,14 +3624,14 @@ async function openBotCanonicalChat(name, pinned, history) {
     // until proven guilty — try it as-is. A rejected open is still ambiguous:
     // it can be the same reconnect/hydration outage that broke this lookup, so
     // preserve the forever-chat pin and surface Retry instead of forking it.
-    lastCanonicalPins.set(name, pinned)
+    lastCanonicalPins.set(key, pinned)
     return openStoredBotChat(name, pinned, history)
   }
 
   if (preferred && isCanonicalBotChatHistory(preferred)) {
     try {
       await openStoredBotChat(name, preferred.resolved_id || preferred.id, preferred)
-      lastCanonicalPins.set(name, pinned)
+      lastCanonicalPins.set(key, pinned)
       return pinned
     } catch (error) {
       // The precise lookup JUST confirmed this session exists, so a failed
@@ -3652,13 +3664,13 @@ async function openBotCanonicalChat(name, pinned, history) {
 
     if (messageCount > 0) {
       await openStoredBotChat(name, preferred.resolved_id || preferred.id, preferred)
-      lastCanonicalPins.set(name, pinned)
+      lastCanonicalPins.set(key, pinned)
       return pinned
     }
 
-    lastCanonicalPins.delete(name)
+    lastCanonicalPins.delete(key)
     await saveBotMeta(name, { chat: null })
-    return createCanonicalChat(name)
+    return createCanonicalChat(name, bot)
   }
 
   // preferred_session=null is "not in this profile store", not "gone".
@@ -3667,7 +3679,7 @@ async function openBotCanonicalChat(name, pinned, history) {
   // (#90458). Try the existing pin before reminting or overwriting it.
   try {
     await openStoredBotChat(name, pinned, history)
-    lastCanonicalPins.set(name, pinned)
+    lastCanonicalPins.set(key, pinned)
     return pinned
   } catch (error) {
     if (!isMissingCanonicalChat(error)) {
@@ -3678,7 +3690,7 @@ async function openBotCanonicalChat(name, pinned, history) {
   // Extra clicks still pass the dead pin (React has not re-rendered).
   // A prior remint already lives in lastCanonicalPins — reuse it instead
   // of minting another launch-store kickoff.
-  const remembered = lastCanonicalPins.get(name)
+  const remembered = lastCanonicalPins.get(key)
   if (remembered && remembered !== pinned) {
     try {
       await openStoredBotChat(name, remembered, history)
@@ -3695,13 +3707,13 @@ async function openBotCanonicalChat(name, pinned, history) {
   const recoveryId = isCanonicalBotChatHistory(history) ? history.id : null
   if (recoveryId && typeof host.openSession === 'function') {
     await openStoredBotChat(name, recoveryId, history)
-    lastCanonicalPins.set(name, recoveryId)
+    lastCanonicalPins.set(key, recoveryId)
     saveBotMeta(name, { chat: recoveryId })
     return recoveryId
   }
-  lastCanonicalPins.delete(name)
+  lastCanonicalPins.delete(key)
   saveBotMeta(name, { chat: null })
-  return createCanonicalChat(name)
+  return createCanonicalChat(name, bot)
 }
 
 async function prepareBotSource(bot, pinnedChat) {
@@ -5400,7 +5412,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
     }
 
     try {
-      const id = await openBotCanonicalChat(bot.name, pinnedChat, previewSession)
+      const id = await openBotCanonicalChat(bot.name, pinnedChat, previewSession, bot)
 
       if (generation === botOpenGeneration && id) {
         return
@@ -10347,7 +10359,8 @@ function BotsPane() {
               const id = await openBotCanonicalChat(
                 bot.name,
                 pinnedChat,
-                bot.preferred_session || bot.last_session
+                bot.preferred_session || bot.last_session,
+                bot
               )
 
               if (generation === botOpenGeneration && id) {
