@@ -16593,28 +16593,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         6. Run agent conversation
         7. Return response
         """
-        # Bind the per-message AgentProfile into the ContextVar so every
-        # downstream path-getter (SOUL.md, memory dir, skills dir, sessions
-        # dir) honors the routed agent.  Falls back to "main" when the
-        # adapter didn't stamp an agent_id (legacy code path).  Uses
-        # ``getattr`` for the registry so tests that build a stripped-down
-        # GatewayRunner without going through ``__init__`` still work.
-        from agent.profile import _current_agent_profile as _hermes_agent_cv
-        _hermes_agent_id = getattr(event.source, "agent_id", None) or "main"
-        _hermes_registry = getattr(self, "_agent_registry", None) or {}
-        _hermes_profile = _hermes_registry.get(_hermes_agent_id) or _hermes_registry.get("main")
-        _hermes_profile_token = _hermes_agent_cv.set(_hermes_profile) if _hermes_profile else None
-        try:
-            return await self._handle_message_inner(event)
-        finally:
-            if _hermes_profile_token is not None:
-                _hermes_agent_cv.reset(_hermes_profile_token)
-
-    async def _handle_message_inner(self, event: MessageEvent) -> Optional[str]:
-        # Body of the legacy _handle_message — wrapped by _handle_message
-        # above so the AgentProfile ContextVar is bound for the duration
-        # of the call.  The "update" command and the rest of the
-        # _known_commands set live here.
         source = event.source
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
@@ -16637,7 +16615,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Most adapters resolve profile routes in build_source(), before they
         # hand us the event. A few internal/voice paths construct SessionSource
         # directly, so resolve those here as the shared fail-closed ingress gate
-        # before authorization, hooks, or session side effects.
+        # before authorization, hooks, or session side effects — including the
+        # AgentProfile ContextVar binding just below, which a rejected route
+        # has no business acquiring.
         if (
             getattr(getattr(self, "config", None), "multiplex_profiles", False)
             and not getattr(source, "profile", None)
@@ -16659,6 +16639,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "targets an unserved profile"
             )
             return None
+
+        # Bind the per-message AgentProfile into the ContextVar so every
+        # downstream path-getter (SOUL.md, memory dir, skills dir, sessions
+        # dir) honors the routed agent.  Falls back to "main" when the
+        # adapter didn't stamp an agent_id (legacy code path).  Uses
+        # ``getattr`` for the registry so tests that build a stripped-down
+        # GatewayRunner without going through ``__init__`` still work.
+        from agent.profile import _current_agent_profile as _hermes_agent_cv
+        _hermes_agent_id = getattr(event.source, "agent_id", None) or "main"
+        _hermes_registry = getattr(self, "_agent_registry", None) or {}
+        _hermes_profile = _hermes_registry.get(_hermes_agent_id) or _hermes_registry.get("main")
+        _hermes_profile_token = _hermes_agent_cv.set(_hermes_profile) if _hermes_profile else None
+        try:
+            return await self._handle_message_inner(event)
+        finally:
+            if _hermes_profile_token is not None:
+                _hermes_agent_cv.reset(_hermes_profile_token)
+
+    async def _handle_message_inner(self, event: MessageEvent) -> Optional[str]:
+        # Body of the legacy _handle_message — wrapped by _handle_message
+        # above so the AgentProfile ContextVar is bound for the duration
+        # of the call, and so the cross-session leak guard + profile-route
+        # rejection gate run before that binding (and before any other
+        # side effects). The "update" command and the rest of the
+        # _known_commands set live here.
+        source = event.source
 
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
