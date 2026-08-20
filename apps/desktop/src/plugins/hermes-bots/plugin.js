@@ -3675,6 +3675,21 @@ async function openBotCanonicalChat(name, pinned, history) {
     }
   }
 
+  // Extra clicks still pass the dead pin (React has not re-rendered).
+  // A prior remint already lives in lastCanonicalPins — reuse it instead
+  // of minting another launch-store kickoff.
+  const remembered = lastCanonicalPins.get(name)
+  if (remembered && remembered !== pinned) {
+    try {
+      await openStoredBotChat(name, remembered, history)
+      return remembered
+    } catch (error) {
+      if (!isMissingCanonicalChat(error)) {
+        throw error
+      }
+    }
+  }
+
   // Proven missing from the opener too: re-anchor on a previewed Bot Chat
   // when there is one. Ordinary latest chats are never adopted.
   const recoveryId = isCanonicalBotChatHistory(history) ? history.id : null

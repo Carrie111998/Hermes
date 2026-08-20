@@ -94,3 +94,75 @@ test('click-spam: a just-minted chat is reused when the next click still has no 
     { name: 'ops', patch: { chat: 'launch-kickoff-1' } }
   ])
 })
+
+test('click-spam: openSession not-found remints once', async () => {
+  // preferred_session=null + opener "not found" is the only proven-missing
+  // path. Extra clicks still pass the dead pin (React has not re-rendered);
+  // lastCanonicalPins must stop a second launch-store kickoff.
+  const opened = []
+  let creates = 0
+  const runtime = loadOpenPath({
+    openSession: async id => {
+      if (id === 'dead-pin') throw new Error('session not found')
+      opened.push(id)
+    },
+    request: async method => {
+      if (method === 'profiles.list') {
+        return { profiles: [{ name: 'ops', preferred_session: null }] }
+      }
+      if (method === 'session.create') {
+        creates += 1
+        return { stored_session_id: `remint-${creates}`, session_id: `rt-${creates}` }
+      }
+      return {}
+    }
+  })
+
+  const first = await runtime.openBotCanonicalChat('ops', 'dead-pin', null)
+  const second = await runtime.openBotCanonicalChat('ops', 'dead-pin', null)
+
+  assert.equal(first, 'remint-1')
+  assert.equal(second, 'remint-1')
+  assert.equal(creates, 1, 'a proven-missing pin remints once, not on every extra click')
+  assert.deepEqual(opened, ['remint-1', 'remint-1'])
+  assert.deepEqual(runtime.saved, [
+    { name: 'ops', patch: { chat: null } },
+    { name: 'ops', patch: { chat: 'remint-1' } }
+  ])
+})
+
+test('click-spam: openSession timeout does not remint or overwrite the pin', async () => {
+  // Hydration/timeout is not proof the pin is gone. Pass the same pin on
+  // every click so this cannot accidentally pass via lastCanonicalPins.
+  const opened = []
+  let creates = 0
+  const runtime = loadOpenPath({
+    openSession: async id => {
+      opened.push(id)
+      throw new Error("Timed out loading ops's session history.")
+    },
+    request: async method => {
+      if (method === 'profiles.list') {
+        return { profiles: [{ name: 'ops', preferred_session: null }] }
+      }
+      if (method === 'session.create') {
+        creates += 1
+        return { stored_session_id: `timeout-kickoff-${creates}`, session_id: `rt-${creates}` }
+      }
+      return {}
+    }
+  })
+
+  await assert.rejects(
+    runtime.openBotCanonicalChat('ops', 'bot-profile-chat', null),
+    /Timed out loading/
+  )
+  await assert.rejects(
+    runtime.openBotCanonicalChat('ops', 'bot-profile-chat', null),
+    /Timed out loading/
+  )
+
+  assert.deepEqual(opened, ['bot-profile-chat', 'bot-profile-chat'])
+  assert.equal(creates, 0, 'timeout must not session.create into the launch store')
+  assert.deepEqual(runtime.saved, [], 'timeout must not overwrite the bot-profile pin')
+})
