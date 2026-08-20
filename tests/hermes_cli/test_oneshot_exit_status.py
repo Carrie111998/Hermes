@@ -68,7 +68,7 @@ def test_max_iteration_fallback_with_response_matches_cron_success_contract(
 
     assert oneshot.run_oneshot("do the work", usage_file=str(usage_path)) == 0
     assert capsys.readouterr().out == "Summary produced at the iteration limit.\n"
-    report = json.loads(usage_path.read_text())
+    report = json.loads(usage_path.read_text(encoding="utf-8"))
     assert report["completed"] is False
     assert report["exit_code"] == 0
     assert report["successful"] is True
@@ -99,7 +99,7 @@ def test_billing_failure_exit_matches_usage_report(monkeypatch, tmp_path):
         )
         == 2
     )
-    report = json.loads(usage_path.read_text())
+    report = json.loads(usage_path.read_text(encoding="utf-8"))
     assert report["exit_code"] == 2
     assert report["successful"] is False
     assert report["failed"] is True
@@ -127,7 +127,7 @@ def test_partial_result_preserves_raw_failed_but_reports_unsuccessful(
     )
 
     assert oneshot.run_oneshot("do the work", usage_file=str(usage_path)) == 2
-    report = json.loads(usage_path.read_text())
+    report = json.loads(usage_path.read_text(encoding="utf-8"))
     assert report["exit_code"] == 2
     assert report["successful"] is False
     assert report["failed"] is False
