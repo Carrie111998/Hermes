@@ -3792,9 +3792,18 @@ def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> 
     for pid, name, cmdline in matches[:6]:
         hint = ""
         low = cmdline.lower()
-        if "serve" in low or "dashboard" in low:
+        # Distinguish the two venv-holding server modes: ``hermes serve`` is
+        # the headless backend the Electron desktop app spawns (close the
+        # app); ``hermes dashboard`` is the standalone browser UI a user
+        # starts on port 9119 and stops with ``hermes dashboard --stop``.
+        # Matching the full ``hermes_cli.main <subcommand>`` token (not a
+        # bare substring) avoids mislabeling unrelated cmdlines that merely
+        # contain the word (e.g. ``hermes_cli.main serve`` vs ``npm serve``).
+        if "hermes_cli.main serve" in low:
             hint = "  ← Hermes Desktop backend (close the desktop app)"
-        elif "gateway" in low:
+        elif "hermes_cli.main dashboard" in low:
+            hint = "  ← hermes dashboard (run `hermes dashboard --stop` to close it)"
+        elif "hermes_cli.main gateway" in low:
             hint = "  ← gateway"
         lines.append(f"  PID {pid}  {name}  {cmdline[:120]}{hint}")
     if len(matches) > 6:
@@ -3810,6 +3819,8 @@ def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> 
         "  Close the Hermes desktop app / other Hermes terminals, then re-run:"
     )
     lines.append("    hermes update")
+    lines.append("  If a `hermes dashboard` is listed, stop it first with:")
+    lines.append("    hermes dashboard --stop")
     lines.append("  (or use `hermes update --force-venv` to proceed anyway at your own risk)")
     return "\n".join(lines)
 
