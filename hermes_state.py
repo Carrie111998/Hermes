@@ -3005,6 +3005,17 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
             stats["fts_rebuild_pending"] = False
         else:
             stats["fts_rebuild_pending"] = (progress or 0) < high_water
+
+        # Best-effort read of the user's sessions.auto_prune setting so the
+        # oversized-DB advisory can avoid suggesting what is already enabled.
+        try:
+            from hermes_cli.config import read_user_config_raw
+            _cfg_raw = read_user_config_raw(Path(str(db_path)).parent / "config.yaml")
+            _sess_cfg = _cfg_raw.get("sessions") or {}
+            if isinstance(_sess_cfg, dict) and "auto_prune" in _sess_cfg:
+                stats["auto_prune_enabled"] = bool(_sess_cfg.get("auto_prune"))
+        except Exception:
+            pass
     finally:
         try:
             conn.close()

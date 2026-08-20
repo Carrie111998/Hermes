@@ -470,6 +470,11 @@ def _render_state_db_stats(stats: dict, holders=None) -> list:
             "consider enabling sessions.auto_prune in config.yaml "
             "to bound growth"
         )
+        # auto_prune is on by default since v38; only push the config
+        # suggestion when it is actually disabled (a stale suggestion for an
+        # already-enabled setting surfaces every run and erodes trust).
+        if stats.get("auto_prune_enabled") is not False:
+            detail = "sessions.auto_prune is enabled; run 'hermes sessions prune --older-than 90' to reclaim space now"
         legacy_trigram = (
             fts is not None
             and fts.get("messages_fts_trigram")
@@ -1417,6 +1422,10 @@ def run_doctor(args):
                 # is exclusively ``vendor/model`` slugs (Qwen/Qwen3.5-…,
                 # meta-llama/Llama-3-…, anthropic/claude-opus-4-7, …).
                 "deepinfra",
+                # CommandCode is an aggregator-style gateway whose catalog
+                # is vendor/model slugs (deepseek/…, Qwen/…, zai-org/…,
+                # MiniMaxAI/…, nvidia/…, xiaomi/…, stepfun/…).
+                "command-code",
             }
             provider_accepts_vendor_slug = (
                 provider_policy_id in providers_accepting_vendor_slugs
