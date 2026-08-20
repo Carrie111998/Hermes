@@ -77,6 +77,7 @@ def test_token_cache_does_not_leak_across_multiplex_profile_contexts(
 
     result_a = _resolve_under_profile(profile_a)
     cached_result_a = _resolve_under_profile(profile_a)
+    aliased_result_a = _resolve_under_profile(profile_a / ".." / "profile-a")
     result_b = _resolve_under_profile(profile_b)
 
     assert result_a == (
@@ -84,6 +85,7 @@ def test_token_cache_does_not_leak_across_multiplex_profile_contexts(
         "https://profile-a.example.invalid",
     )
     assert cached_result_a == result_a
+    assert aliased_result_a == result_a
     assert result_b == (
         "token-for-profile-b",
         "https://profile-b.example.invalid",

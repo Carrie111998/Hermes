@@ -33,7 +33,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
-from hermes_constants import get_hermes_home
+from hermes_constants import hermes_home_key
 
 DEFAULT_PORTAL_BASE_URL = "https://portal.nousresearch.com"
 
@@ -231,7 +231,7 @@ def invalidate_cached_token() -> None:
     (e.g. the CLI's scope step-up flow) call this instead of poking
     the private ``_token_cache`` global directly.
     """
-    cache_key = str(get_hermes_home())
+    cache_key = hermes_home_key()
     with _token_cache_lock:
         _token_cache.pop(cache_key, None)
 
@@ -263,7 +263,7 @@ def _resolve_token_and_base(*, use_cache: bool = True) -> tuple[str, str]:
     """
     import time as _time
 
-    cache_key = str(get_hermes_home())
+    cache_key = hermes_home_key()
     if use_cache:
         with _token_cache_lock:
             cached = _token_cache.get(cache_key)
