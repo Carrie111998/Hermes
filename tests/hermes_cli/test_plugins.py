@@ -984,8 +984,10 @@ class TestPluginHooks:
         mgr = PluginManager()
         mgr._hook_timeout_seconds = 0.02
         release = threading.Event()
+        started = []
 
         def slow(**kwargs):
+            started.append(True)
             release.wait(30)
 
         mgr._hooks["pre_tool_call"] = [slow]
@@ -996,6 +998,7 @@ class TestPluginHooks:
             second = get_pre_tool_call_block_message("terminal", {})
             assert first and "timed out" in first
             assert second and "timed out" in second
+            assert started == [True]
         finally:
             release.set()
 
