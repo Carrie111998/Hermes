@@ -56,11 +56,12 @@ class _FakeRunner:
         return self.session_store._generate_session_key(source)
 
 
-def _make_store(tmp_path) -> SessionStore:
+def _make_store(tmp_path, *, multiplex_profiles: bool = False) -> SessionStore:
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()
     config = GatewayConfig(
-        platforms={Platform.WEBHOOK: PlatformConfig(enabled=True)}
+        platforms={Platform.WEBHOOK: PlatformConfig(enabled=True)},
+        multiplex_profiles=multiplex_profiles,
     )
     store = SessionStore(sessions_dir=sessions_dir, config=config)
     assert store._db is not None, "test requires a real SessionDB"
@@ -74,6 +75,7 @@ def _make_event(
     *,
     conversation_id: str | None = None,
     persistent: bool = False,
+    profile: str | None = None,
 ) -> MessageEvent:
     session_chat_id = f"webhook:alerts:{conversation_id or delivery_id}"
     source = adapter.build_source(
@@ -83,6 +85,7 @@ def _make_event(
         user_id="webhook:alerts",
         user_name="alerts",
     )
+    source.profile = profile
     return MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
@@ -232,5 +235,50 @@ async def test_persistent_webhook_turns_reuse_open_session(tmp_path):
     row = store._db.get_session(session_ids[0])
     assert row["ended_at"] is None
     assert row["end_reason"] is None
+    store._db.close()
+
+
+@pytest.mark.asyncio
+async def test_persistent_webhook_sessions_are_profile_namespaced(tmp_path):
+    """Equal route and rendered key cannot cross a multiplexed profile boundary."""
+    store = _make_store(tmp_path, multiplex_profiles=True)
+    runner = _FakeRunner(store)
+    adapter = _make_adapter(
+        {
+            "alerts": {
+                "secret": _INSECURE_NO_AUTH,
+                "session_key": "{conversation_id}",
+                "prompt": "{message}",
+                "deliver": "log",
+            }
+        }
+    )
+    adapter.gateway_runner = runner
+    session_ids = []
+
+    async def _message_handler(event: MessageEvent):
+        session_ids.append(store.get_or_create_session(event.source).session_id)
+        return ""
+
+    adapter._message_handler = _message_handler
+    for delivery_id, profile in (
+        ("research-turn-001", "research"),
+        ("research-turn-002", "research"),
+        ("support-turn-001", "support"),
+    ):
+        await adapter.handle_message(
+            _make_event(
+                adapter,
+                delivery_id,
+                delivery_id,
+                conversation_id="conversation-9",
+                persistent=True,
+                profile=profile,
+            )
+        )
+        await _drain_background_tasks(adapter)
+
+    assert session_ids[0] == session_ids[1]
+    assert session_ids[2] != session_ids[0]
     store._db.close()
 
