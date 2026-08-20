@@ -2813,14 +2813,16 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 # ---------------------------------------------------------------------------
 # Ephemeral session tool-write guard
 # ---------------------------------------------------------------------------
-# Maps tool name -> frozenset of BLOCKED action values. Only write-side actions
-# are listed; every other action on these tools (and every other tool) stays
-# available. This read/write split is deliberate: an ephemeral chat that cannot
-# read memory or view skills is a degraded assistant, not a private one.
+# Maps tool name -> frozenset of BLOCKED action values, or ``None`` meaning
+# the ENTIRE tool is write-side (for name-per-operation tool families with no
+# "action" parameter). Only write-side entries are listed; every other action
+# on these tools (and every other tool) stays available. This read/write
+# split is deliberate: an ephemeral chat that cannot read memory or view
+# skills is a degraded assistant, not a private one.
 #
-# Tools without an "action" parameter are not listed here — they either don't
-# write durable user state, or (session_search) only read it.
-_EPHEMERAL_BLOCKED_TOOL_ACTIONS: Dict[str, frozenset] = {
+# Action-less tools absent from this table either don't write durable user
+# state, or (session_search) only read it.
+_EPHEMERAL_BLOCKED_TOOL_ACTIONS: Dict[str, Optional[frozenset]] = {
     "memory": frozenset({"add", "replace", "remove"}),
     "skill_manage": frozenset({
         "create", "edit", "patch", "delete", "write_file", "remove_file",
@@ -2831,7 +2833,26 @@ _EPHEMERAL_BLOCKED_TOOL_ACTIONS: Dict[str, frozenset] = {
     # the temporary chat would land in a durable transcript. "list" stays
     # available.
     "cronjob": frozenset({"create", "update", "remove", "pause", "resume", "run"}),
+    # Kanban is name-per-operation. The write side creates durable work items
+    # in kanban.db — tasks, comments, attachments, links — cron-class
+    # orchestration state that outlives the chat and carries
+    # conversation-derived text. kanban_show / kanban_list /
+    # kanban_attachments stay available. The worker-side tools
+    # (complete/block/heartbeat) are env-gated to kanban worker runs a
+    # temporary chat never is, but are listed so the classification is
+    # complete rather than relying on that gate.
+    "kanban_create": None,
+    "kanban_comment": None,
+    "kanban_attach": None,
+    "kanban_attach_url": None,
+    "kanban_link": None,
+    "kanban_unblock": None,
+    "kanban_complete": None,
+    "kanban_block": None,
+    "kanban_heartbeat": None,
 }
+
+_EPHEMERAL_UNLISTED = object()
 
 
 def check_ephemeral_tool_block(
@@ -2842,9 +2863,19 @@ def check_ephemeral_tool_block(
 
     Read-side actions return ``None`` so they execute normally.
     """
-    blocked_actions = _EPHEMERAL_BLOCKED_TOOL_ACTIONS.get(function_name)
-    if not blocked_actions:
+    blocked_actions = _EPHEMERAL_BLOCKED_TOOL_ACTIONS.get(
+        function_name, _EPHEMERAL_UNLISTED
+    )
+    if blocked_actions is _EPHEMERAL_UNLISTED:
         return None
+    if blocked_actions is None:
+        # The whole tool is a write.
+        return (
+            f"'{function_name}' is blocked in this temporary chat. "
+            "Temporary chats leave no trace: nothing is saved to the session "
+            "store, memory, skills, or task boards. Read-side tools still "
+            "work. Start a normal chat (/new) if you want to save this."
+        )
 
     action = function_args.get("action")
     # `memory` accepts a batch `operations` list as well as a bare action.

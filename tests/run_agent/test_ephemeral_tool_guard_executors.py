@@ -53,7 +53,9 @@ def _make_agent(*, ephemeral: bool):
         patch(
             "run_agent.get_tool_definitions",
             return_value=_make_tool_defs(
-                "web_search", "memory", "cronjob", "skill_manage"
+                "web_search", "memory", "cronjob", "skill_manage",
+                "kanban_create", "kanban_comment", "kanban_attach_url",
+                "kanban_show", "kanban_list", "kanban_attachments",
             ),
         ),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -146,6 +148,11 @@ def test_single_memory_write_blocked_on_sequential_router():
         ("cronjob", {"action": "update", "job_id": "j1", "schedule": "1h"}),
         ("cronjob", {"action": "remove", "job_id": "j1"}),
         ("cronjob", {"action": "run", "job_id": "j1", "prompt": "temp-chat text"}),
+        # Whole-tool (name-per-operation) writes: kanban work items are
+        # cron-class durable orchestration state.
+        ("kanban_create", {"title": "probe task", "description": "temp text"}),
+        ("kanban_comment", {"task_id": "t1", "text": "temp text"}),
+        ("kanban_attach_url", {"task_id": "t1", "url": "https://x"}),
         ("skill_manage", {"action": "create", "name": "probe-skill"}),
         ("skill_manage", {"action": "delete", "name": "probe-skill"}),
     ],
@@ -174,7 +181,17 @@ def test_single_registry_write_blocked_on_sequential_router(tool_name, args):
 # non-ephemeral agent dispatches writes normally. Together these pin that the
 # middleware check blocks exactly the write actions and nothing else.
 # ---------------------------------------------------------------------------
-def test_read_side_action_still_dispatches_in_ephemeral_chat():
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        ("cronjob", {"action": "list"}),
+        # Kanban read-side siblings of the blocked write tools.
+        ("kanban_show", {"task_id": "t1"}),
+        ("kanban_list", {}),
+        ("kanban_attachments", {"task_id": "t1"}),
+    ],
+)
+def test_read_side_action_still_dispatches_in_ephemeral_chat(tool_name, args):
     agent = _make_agent(ephemeral=True)
     dispatched = []
 
@@ -183,10 +200,10 @@ def test_read_side_action_still_dispatches_in_ephemeral_chat():
         return json.dumps({"success": True, "jobs": []})
 
     with patch("run_agent.handle_function_call", side_effect=recorder):
-        messages = _run(agent, [_mock_tool_call("cronjob", {"action": "list"}, "c1")])
+        messages = _run(agent, [_mock_tool_call(tool_name, args, "c1")])
 
     content = _result_content(messages, "c1")
-    assert dispatched == ["cronjob"]
+    assert dispatched == [tool_name]
     assert BLOCK_MARKER not in content
 
 
@@ -541,6 +558,117 @@ def test_publish_compression_child_refuses_registered_ids(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Session-keyed durable stores OUTSIDE the sessions/messages tables. Found by
+# enumerating every writer that bypasses invoke_tool, invoke_hook, and the
+# registry-guarded sessions inserts: the async-delegation dispatch row
+# (task_json carries the goal text), the gateway delivery-obligation ledger
+# (full response text), and the goal/heartbeat state_meta rows (goal text,
+# heartbeat prompt). Each is gated at its writer; each still works in-memory
+# for the life of the chat.
+# ---------------------------------------------------------------------------
+def test_async_delegation_dispatch_row_skipped_for_temporary_origin():
+    from hermes_state import mark_session_ephemeral, unmark_session_ephemeral
+    from tools import async_delegation as ad
+
+    sid = "temp-async-origin-sid"
+    mark_session_ephemeral(sid)
+    try:
+        ad._persist_dispatch(
+            {
+                "delegation_id": "temp-deleg-probe",
+                "origin_session_id": sid,
+                "dispatched_at": 1.0,
+                "goal": "PROBE goal text",
+            }
+        )
+        with ad._DB_LOCK, ad._transaction() as conn:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM async_delegations WHERE delegation_id=?",
+                ("temp-deleg-probe",),
+            ).fetchone()[0]
+        assert n == 0, "temporary-origin delegation persisted its dispatch row"
+    finally:
+        unmark_session_ephemeral(sid)
+
+    ad._persist_dispatch(
+        {
+            "delegation_id": "normal-deleg-probe",
+            "origin_session_id": "normal-async-origin",
+            "dispatched_at": 1.0,
+            "goal": "normal goal",
+        }
+    )
+    try:
+        with ad._DB_LOCK, ad._transaction() as conn:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM async_delegations WHERE delegation_id=?",
+                ("normal-deleg-probe",),
+            ).fetchone()[0]
+        assert n == 1, "normal delegation must still persist for restart recovery"
+    finally:
+        ad._delete_durable_delegation("normal-deleg-probe")
+
+
+def test_delivery_ledger_helper_reads_the_entry_flag():
+    from types import SimpleNamespace
+
+    from gateway.platforms.base import BasePlatformAdapter
+
+    entry = SimpleNamespace(ephemeral=True)
+    store = SimpleNamespace(_entries={"k": entry})
+    probe = SimpleNamespace(_session_store=store)
+    assert BasePlatformAdapter._session_is_temporary(probe, "k") is True
+    entry.ephemeral = False
+    assert BasePlatformAdapter._session_is_temporary(probe, "k") is False
+    assert BasePlatformAdapter._session_is_temporary(probe, "missing") is False
+    assert (
+        BasePlatformAdapter._session_is_temporary(
+            SimpleNamespace(_session_store=None), "k"
+        )
+        is False
+    )
+
+
+def test_delivery_ledger_recording_is_wired_to_the_temporary_check():
+    """Wiring pin: the guard function existing is not the guard firing."""
+    from pathlib import Path
+
+    src = Path("gateway/platforms/base.py").read_text(encoding="utf-8")
+    i = src.index("record_obligation,\n")
+    window = src[max(0, i - 2500) : i]
+    assert "_session_is_temporary" in window, (
+        "the delivery-obligation ledger records final-response text without "
+        "consulting _session_is_temporary — a temporary chat's replies would "
+        "persist in state.db"
+    )
+
+
+def test_goal_and_heartbeat_state_meta_skipped_for_temporary_sessions():
+    from hermes_cli.goals import GoalState, load_goal, save_goal
+    from hermes_cli.heartbeat import (
+        HeartbeatState,
+        load_heartbeat,
+        save_heartbeat,
+    )
+    from hermes_state import mark_session_ephemeral, unmark_session_ephemeral
+
+    sid = "temp-goal-heartbeat-sid"
+    mark_session_ephemeral(sid)
+    try:
+        save_goal(sid, GoalState(goal="PROBE goal text"))
+        assert load_goal(sid) is None, "temporary chat's goal text persisted"
+        save_heartbeat(sid, HeartbeatState(prompt="PROBE prompt", interval_seconds=60))
+        assert load_heartbeat(sid) is None, "temporary chat's heartbeat prompt persisted"
+    finally:
+        unmark_session_ephemeral(sid)
+
+    normal = "normal-goal-heartbeat-sid"
+    save_goal(normal, GoalState(goal="normal goal"))
+    loaded = load_goal(normal)
+    assert loaded is not None and loaded.goal == "normal goal"
+
+
+# ---------------------------------------------------------------------------
 # Background self-improvement review: the fork's entire output is durable
 # state (MEMORY.md, the skill library) distilled from the conversation, so it
 # must never spawn for a temporary chat. Its own _persist_disabled is the
@@ -637,7 +765,14 @@ def test_mcp_transport_exposure_disjoint_from_ephemeral_guarded_tools():
     from agent.agent_runtime_helpers import _EPHEMERAL_BLOCKED_TOOL_ACTIONS
     from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
 
-    overlap = set(EXPOSED_TOOLS) & set(_EPHEMERAL_BLOCKED_TOOL_ACTIONS)
+    # The transport serves EXTERNAL codex-runtime sessions — it is not a
+    # dispatch surface a temporary chat can reach. Kanban tools are exposed
+    # there on purpose (codex-runtime kanban workers report through them),
+    # so their overlap with the guard table is justified. Any OTHER guarded
+    # tool appearing here still fails: memory/skill/cron exposure would be a
+    # new decision needing its own ephemeral story.
+    justified = {name for name in _EPHEMERAL_BLOCKED_TOOL_ACTIONS if name.startswith("kanban_")}
+    overlap = set(EXPOSED_TOOLS) & set(_EPHEMERAL_BLOCKED_TOOL_ACTIONS) - justified
     assert not overlap, (
         f"{sorted(overlap)} exposed via the hermes-tools MCP transport, which "
         "dispatches via handle_function_call and bypasses the ephemeral "

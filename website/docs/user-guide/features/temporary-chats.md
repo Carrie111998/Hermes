@@ -53,6 +53,11 @@ temporary can never silently downgrade to a saved one.
 - **No resumability.** `/resume` has nothing to find.
 - **Minimal logs.** The agent's operational log records that a turn happened,
   but the message preview is redacted.
+- **No side-table records.** Background-delegation dispatch rows, the
+  gateway's crash-redelivery ledger (which stores full reply text for
+  normal chats), and per-session `/goal` and `/heartbeat` state are all
+  skipped — goals, heartbeats, and background delegations still work for
+  the life of the chat, they just can't survive it.
 
 ## What is blocked
 
@@ -66,6 +71,9 @@ side door is refused at the tool level, with an explanation:
   Triggering an existing job (`run`) is also blocked, because the run
   executes as a normal saved session and would carry this conversation's
   text into its transcript.
+- **Kanban work items** — creating tasks, comments, attachments, or links:
+  durable orchestration state that outlives the chat. Viewing the board
+  (`kanban_show`, `kanban_list`, `kanban_attachments`) still works.
 - **External memory-provider writes** — provider tools that store to
   services like Hindsight, Supermemory, Mem0, OpenViking, RetainDB,
   ByteRover, or Honcho are refused. Providers that don't declare which of

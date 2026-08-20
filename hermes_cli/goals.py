@@ -718,6 +718,18 @@ def save_goal(session_id: str, state: GoalState) -> None:
     """Persist a goal to SessionDB. No-op if DB unavailable."""
     if not session_id:
         return
+    # Temporary chat: the state_meta row holds the goal text (and subgoals,
+    # verdicts, reasons) keyed by session id — conversation-derived content
+    # in a table the sessions-row registry refusal does not cover. The goal
+    # still works for the life of the process from GoalManager's in-memory
+    # state; it just cannot outlive the chat, which is the contract.
+    try:
+        from hermes_state import is_session_ephemeral
+
+        if is_session_ephemeral(session_id):
+            return
+    except Exception:
+        pass
     db = _get_session_db()
     if db is None:
         return

@@ -198,6 +198,23 @@ def _transaction() -> Iterator[sqlite3.Connection]:
 
 
 def _persist_dispatch(record: Dict[str, Any]) -> None:
+    # Temporary-chat origin: the durable row exists only for restart recovery
+    # and cross-process delivery, and it carries task_json — the goal/context
+    # text distilled from the conversation — plus session lineage. The live
+    # delegation runs entirely from the in-memory _records dict, so skipping
+    # the row costs only restart survival, which a temporary chat does not
+    # have either. Every later writer here is an UPDATE keyed by
+    # delegation_id and no-ops when the row does not exist.
+    try:
+        from hermes_state import is_session_ephemeral
+
+        if any(
+            is_session_ephemeral(str(record.get(key) or ""))
+            for key in ("origin_session_id", "parent_session_id", "session_key")
+        ):
+            return
+    except Exception:
+        pass
     now = time.time()
     try:
         from gateway.status import get_process_start_time

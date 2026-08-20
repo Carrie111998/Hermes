@@ -182,6 +182,17 @@ def load_heartbeat(session_id: str) -> Optional[HeartbeatState]:
 def save_heartbeat(session_id: str, state: HeartbeatState) -> None:
     if not session_id:
         return
+    # Temporary chat: the state_meta row carries the heartbeat PROMPT keyed
+    # by session id — user text in a table the sessions-row registry refusal
+    # does not cover. The heartbeat still runs in-process for the life of
+    # the chat; it just cannot survive it.
+    try:
+        from hermes_state import is_session_ephemeral
+
+        if is_session_ephemeral(session_id):
+            return
+    except Exception:
+        pass
     db = _get_session_db()
     if db is None:
         return

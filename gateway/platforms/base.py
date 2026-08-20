@@ -3645,6 +3645,24 @@ class BasePlatformAdapter(ABC):
         """
         self._session_store = session_store
     
+    def _session_is_temporary(self, session_key: str) -> bool:
+        """True when this session_key belongs to a temporary (/temp) chat.
+
+        Entry-backed rather than registry-backed so the answer survives
+        gateway restarts — the entry persists the flag precisely so a live
+        temporary chat can never silently downgrade. Fails open to False
+        when the store or entry is unavailable, matching
+        ``GatewayRunner._session_is_ephemeral``.
+        """
+        store = getattr(self, "_session_store", None)
+        if store is None:
+            return False
+        try:
+            entry = store._entries.get(session_key)
+        except Exception:
+            return False
+        return bool(getattr(entry, "ephemeral", False)) if entry else False
+
     def _history_media_paths_for_session(self, session_key: str) -> Optional[set]:
         """Return media paths already delivered in prior turns of this session.
 
@@ -6396,9 +6414,16 @@ class BasePlatformAdapter(ABC):
                     # output (#58818). Best-effort at every step — ledger
                     # trouble must never block or delay the actual send.
                     # Slash-command and ephemeral replies are cheap to
-                    # regenerate and are not recorded.
+                    # regenerate and are not recorded. Temporary (/temp)
+                    # chats are not recorded either: the ledger row holds the
+                    # response's FULL TEXT in state.db, and crash-redelivery
+                    # is exactly the durability a temporary chat renounces —
+                    # a reply lost to a crash there dies with the rest of the
+                    # conversation.
                     _obligation_id = None
-                    if not is_ephemeral_response and not str(
+                    if not is_ephemeral_response and not self._session_is_temporary(
+                        session_key
+                    ) and not str(
                         event.text or ""
                     ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
                         try:
