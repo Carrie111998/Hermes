@@ -3702,8 +3702,15 @@ def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> 
     for pid, name, cmdline in matches[:6]:
         hint = ""
         low = cmdline.lower()
-        if "serve" in low or "dashboard" in low:
+        if "serve" in low:
+            # `hermes serve` is the headless backend the Electron app
+            # spawns — closing the desktop app clears it.
             hint = "  ← Hermes Desktop backend (close the desktop app)"
+        elif "dashboard" in low:
+            # `hermes dashboard` is the STANDALONE browser UI a user starts
+            # themselves (port 9119) — not the desktop app. Point at the
+            # command that actually clears this holder (#90778).
+            hint = "  ← standalone dashboard (stop with: hermes dashboard --stop)"
         elif "gateway" in low:
             hint = "  ← gateway"
         lines.append(f"  PID {pid}  {name}  {cmdline[:120]}{hint}")
@@ -3717,7 +3724,8 @@ def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> 
         "  dependency update would fail partway and leave a broken install."
     )
     lines.append(
-        "  Close the Hermes desktop app / other Hermes terminals, then re-run:"
+        "  Close the Hermes desktop app / stop the dashboard"
+        " (`hermes dashboard --stop`) / close other Hermes terminals, then re-run:"
     )
     lines.append("    hermes update")
     lines.append("  (or use `hermes update --force-venv` to proceed anyway at your own risk)")
