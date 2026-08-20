@@ -221,6 +221,14 @@ def _write_marker(hermes_root: Path, bundle_manifest: Optional[dict]) -> bool:
         return False
 
 
+def _boot(msg: str) -> None:
+    """One-shot boot-visible line. Stdout is the cont-init channel
+    (container_boot.main() prints its reconcile lines the same way);
+    module-level INFO lines are invisible under the container logging
+    config, so the support-visible story must not ride on logging."""
+    print(f"[cloud-import] {msg}")
+
+
 def maybe_run() -> bool:
     """Run the first-boot migration import when the gates open.
 
@@ -233,10 +241,11 @@ def maybe_run() -> bool:
 
     hermes_root = _safe_hermes_root()
     if hermes_root is None:
+        _boot("cannot prepare hermes root; skipping")
         return False
 
     if has_import_marker(hermes_root):
-        logger.info("cloud_import: marker present, skipping (already imported)")
+        _boot("marker present, skipping (already imported)")
         return False
 
     if not home_is_fresh(hermes_root):
@@ -244,20 +253,21 @@ def maybe_run() -> bool:
         # instance was used before the bundle URL was injected. Importing
         # now would overwrite live state, so we do not. This state needs a
         # support look, not an automatic second pass.
-        logger.warning(
-            "cloud_import: home has session state but no import marker; "
+        _boot(
+            "home has session state but no import marker; "
             "refusing to import over a live instance"
         )
         return False
 
-    logger.info("cloud_import: first boot, fetching migration bundle")
+    _boot("first boot, fetching migration bundle")
     bundle = _fetch_bundle(url, hermes_root)
     if bundle is None:
+        _boot("bundle fetch failed; booting without migration")
         return True  # attempted; transport failure is logged
 
     ok, reason = _schema_is_compatible(bundle)
     if not ok:
-        logger.warning("cloud_import: refusing bundle: %s", reason)
+        _boot(f"refusing bundle: {reason}")
         bundle.unlink(missing_ok=True)
         return True
 
@@ -272,14 +282,9 @@ def maybe_run() -> bool:
     success = _apply_bundle(bundle, hermes_root)
     if success:
         marker_ok = _write_marker(hermes_root, schema_note)
-        logger.info(
-            "cloud_import: import complete marker=%s", "ok" if marker_ok else "failed"
-        )
+        _boot(f"import complete; marker={'written' if marker_ok else 'write failed'}")
     else:
-        logger.warning(
-            "cloud_import: import failed; leaving no marker so a future "
-            "provision can retry with a fresh bundle"
-        )
+        _boot("import failed; no marker written (a fresh bundle can retry)")
 
     bundle.unlink(missing_ok=True)
     return True
