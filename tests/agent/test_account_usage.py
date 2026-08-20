@@ -264,3 +264,10 @@ def test_codex_weekly_breaker_prefers_headers():
     assert account_usage.should_trip_codex_weekly_breaker(
         None, 96, rate_limit_state=headers
     ) is False
+
+
+def test_weekly_breaker_refuses_codex_to_codex_fallback():
+    assert account_usage.allow_non_codex_weekly_fallback("openai") is True
+    assert account_usage.allow_non_codex_weekly_fallback("openai-codex") is False
+    assert account_usage.allow_non_codex_weekly_fallback("OpenAI-Codex") is False
+    assert account_usage.allow_non_codex_weekly_fallback(None) is True

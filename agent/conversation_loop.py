@@ -2943,7 +2943,10 @@ def run_conversation(
                                 agent._interrupt_requested = True
                             _fallback_ok = False
                             if agent._try_activate_fallback():
-                                if str(getattr(agent, "provider", "") or "") != "openai-codex":
+                                from agent.account_usage import allow_non_codex_weekly_fallback
+                                if allow_non_codex_weekly_fallback(
+                                    getattr(agent, "provider", "")
+                                ):
                                     _fallback_ok = True
                                     active_system_prompt = _sync_failover_system_message(
                                         agent, api_messages, active_system_prompt)

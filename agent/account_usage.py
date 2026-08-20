@@ -97,6 +97,11 @@ def should_trip_codex_weekly_breaker(
     return used >= float(threshold_percent)
 
 
+def allow_non_codex_weekly_fallback(provider: str | None) -> bool:
+    """Weekly breaker may continue only on a non-Codex fallback provider."""
+    return str(provider or "").strip().lower() != "openai-codex"
+
+
 def _title_case_slug(value: Optional[str]) -> Optional[str]:
     cleaned = str(value or "").strip()
     if not cleaned:
