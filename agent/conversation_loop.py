@@ -1275,6 +1275,38 @@ def _canonicalize_api_tool_calls(api_messages) -> None:
         am["tool_calls"] = new_tcs
 
 
+def refresh_tool_execution_bindings(agent) -> set[str]:
+    """Keep the execution guard aligned with the schemas sent to the model.
+
+    ``agent.tools`` is the request-facing source of truth.  The separately
+    cached ``valid_tool_names`` set is used by the execution guard and can be
+    replaced by late refresh/resume paths.  Reconcile at the response boundary
+    so a schema-visible tool cannot be rejected as nonexistent mid-session.
+    """
+    tools = getattr(agent, "tools", None)
+    if not isinstance(tools, (list, tuple)):
+        return set(getattr(agent, "valid_tool_names", set()) or set())
+
+    names = {
+        name
+        for tool in tools
+        if isinstance(tool, dict)
+        for function in [tool.get("function")]
+        if isinstance(function, dict)
+        for name in [function.get("name")]
+        if isinstance(name, str) and name
+    }
+    current = set(getattr(agent, "valid_tool_names", set()) or set())
+    if names != current:
+        logger.warning(
+            "Repaired stale tool execution bindings (schemas=%d bindings=%d)",
+            len(names),
+            len(current),
+        )
+        agent.valid_tool_names = names
+    return names
+
+
 def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
     """Error-result content for a tool call whose name isn't a real tool.
 
@@ -6802,7 +6834,10 @@ def run_conversation(
                 # call/result pair per id. See _uniquify_tool_call_ids.
                 agent._uniquify_tool_call_ids(assistant_message.tool_calls)
 
-                # Validate tool call names - detect model hallucinations
+                # Validate tool call names - detect model hallucinations. The
+                # schemas attached to this request are authoritative; repair a
+                # stale secondary execution-name set before applying the guard.
+                refresh_tool_execution_bindings(agent)
                 # Repair mismatched tool names before validating
                 for tc in assistant_message.tool_calls:
                     if tc.function.name not in agent.valid_tool_names:
