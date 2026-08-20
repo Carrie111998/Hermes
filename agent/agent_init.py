@@ -2284,6 +2284,18 @@ def init_agent(
         0, int(_compression_cfg.get("idle_compact_after_seconds", 0))
     )
 
+    # Opt-in deferred preflight compaction: when enabled, an over-threshold
+    # preflight does not compact synchronously before the inbound message.
+    # Instead a compaction is armed and fires only after the session has been
+    # inactive for `defer_preflight_after_seconds`. See config_defaults.py for
+    # the full semantics; consumed by build_turn_context().
+    compression_defer_preflight = bool(
+        _compression_cfg.get("defer_preflight", False)
+    )
+    compression_defer_preflight_after_seconds = max(
+        0, int(_compression_cfg.get("defer_preflight_after_seconds", 900))
+    )
+
     # Read optional explicit context_length override for the auxiliary
     # compression model. Custom endpoints often cannot report this via
     # /models, so the startup feasibility check needs the config hint.
@@ -2740,6 +2752,10 @@ def init_agent(
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
     agent.codex_responses_native_compaction = codex_responses_native_compaction
     agent.codex_responses_compact_threshold = codex_responses_compact_threshold
+    agent.compression_defer_preflight = compression_defer_preflight
+    agent.compression_defer_preflight_after_seconds = (
+        compression_defer_preflight_after_seconds
+    )
     agent.max_compression_attempts = compression_max_attempts
     agent.compression_idle_compact_after_seconds = (
         compression_idle_compact_after_seconds

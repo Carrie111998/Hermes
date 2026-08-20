@@ -933,6 +933,36 @@ DEFAULT_CONFIG = {
                                       # failure-cooldown / anti-thrash / per-session
                                       # lock guards as every automatic compaction.
                                       # Example: 1800 = compact after 30 min idle.
+        "defer_preflight": False,     # Opt-in (default False = current exact
+                                      # behaviour): when True, an over-threshold
+                                      # preflight does NOT run its synchronous
+                                      # compaction pass before the inbound message
+                                      # is handled. Instead the message is
+                                      # processed to completion, a compaction is
+                                      # armed, and it only fires once the session
+                                      # has been inactive for at least
+                                      # `defer_preflight_after_seconds` — so an
+                                      # urgent message is never blocked by the
+                                      # summarization stall (see #54465, #40416)
+                                      # while idle/one-shot sessions still
+                                      # converge. Backstop: the existing 85%
+                                      # gateway session-hygiene ceiling and the
+                                      # provider context-overflow reactive
+                                      # compaction stay in force regardless, so a
+                                      # busy over-threshold session can never grow
+                                      # unbounded to the provider limit.
+        "defer_preflight_after_seconds": 900,  # Inactivity window (seconds) for
+                                      # the deferred preflight compaction armed by
+                                      # `defer_preflight` above. Only consulted
+                                      # when `defer_preflight` is True; ignored
+                                      # otherwise (any value). A new message
+                                      # within the window re-arms the timer as
+                                      # the conversation continues — compaction
+                                      # only fires after this many seconds with
+                                      # no activity. 0 compacts immediately after
+                                      # the turn completes instead of waiting.
+                                      # Example: 1800 = compact after 30 min of
+                                      # continuous inactivity.
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).

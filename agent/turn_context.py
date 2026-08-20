@@ -399,6 +399,33 @@ def _should_idle_compact(
     return tokens > floor_tokens
 
 
+def _should_defer_preflight(
+    *,
+    enabled: bool,
+    defer_enabled: bool,
+    defer_after_seconds: int,
+    idle_gap_seconds: float,
+    would_compress: bool,
+) -> bool:
+    """Decide whether an over-threshold preflight compaction should be deferred.
+
+    Opt-in (``defer_enabled`` must be True and ``defer_after_seconds > 0``).
+    When the session is over threshold (``would_compress``) but has been active
+    within the last ``defer_after_seconds`` (``idle_gap_seconds`` smaller than
+    the window), the blocking preflight pass is skipped: the message proceeds
+    immediately and compaction is deferred to a later turn. Once the window has
+    elapsed with no activity, deferral ends and normal preflight compaction
+    resumes (the session converges).
+
+    Pure predicate so the policy is unit-testable without a live agent.
+    """
+    if not enabled or not defer_enabled or defer_after_seconds <= 0:
+        return False
+    if not would_compress:
+        return False
+    return idle_gap_seconds < defer_after_seconds
+
+
 @dataclass
 class TurnContext:
     """Values produced by the turn prologue and consumed by the turn loop."""
@@ -956,6 +983,43 @@ def build_turn_context(
             )
         else:
             _should_compress_now = _compressor.should_compress(_preflight_tokens)
+
+            # ── Deferred preflight (opt-in; compression.defer_preflight) ──
+            # When enabled, an over-threshold session does NOT compact
+            # synchronously before the inbound message. Instead the message is
+            # processed immediately (never blocked by the summarization stall,
+            # see #54465 / #40416) and compaction is deferred: it fires only
+            # once the session has been inactive for at least
+            # `defer_preflight_after_seconds`. A new message within the window
+            # re-arms the clock, so an actively-worked session is never
+            # disturbed and idle/one-shot sessions converge — a session that is
+            # never reopened pays nothing, a session resumed after the window
+            # compacts once at that next turn.
+            _defer_after = getattr(
+                agent, "compression_defer_preflight_after_seconds", 0
+            ) or 0
+            if _should_defer_preflight(
+                enabled=agent.compression_enabled,
+                defer_enabled=getattr(
+                    agent, "compression_defer_preflight", False
+                ),
+                defer_after_seconds=_defer_after,
+                idle_gap_seconds=time.time() - getattr(
+                    agent, "_last_activity_ts", time.time()
+                ),
+                would_compress=_should_compress_now,
+            ):
+                # Within the inactivity window: skip the blocking preflight
+                # pass and let the message through; the next turn re-arms.
+                logger.info(
+                    "Deferring preflight compaction: ~%s tokens >= %s "
+                    "threshold, session active within %ss window (session %s)",
+                    f"{_preflight_tokens:,}",
+                    f"{_compressor.threshold_tokens:,}",
+                    _defer_after,
+                    agent.session_id or "none",
+                )
+                _should_compress_now = False
             if not _should_compress_now:
                 # Context is over threshold but compression is blocked
                 # (summary-LLM cooldown or anti-thrashing). Ask should_compress_info

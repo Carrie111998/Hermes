@@ -640,6 +640,23 @@ compression:
   # summarization on a short idle thread. Example: 1800 = compact after 30 min idle.
   idle_compact_after_seconds: 0
 
+  # Deferred preflight (default: false). When TRUE, an over-threshold session
+  # does NOT compact synchronously before your message is handled — the
+  # inbound message is processed immediately (never blocked by the
+  # summarization stall) and compaction is deferred until the session has been
+  # inactive for `defer_preflight_after_seconds`. A message arriving within
+  # the window re-arms the clock, so an actively-worked session is never
+  # disturbed; a session resumed after the window compacts once at that next
+  # turn. A session never reopened pays nothing. Default false keeps the
+  # historical blocking preflight behaviour. The existing 85% session-hygiene
+  # ceiling and provider context-overflow handling stay in force regardless.
+  defer_preflight: false
+
+  # Inactivity window (seconds) for the deferred preflight compaction above.
+  # Only consulted when `defer_preflight` is true; ignored otherwise.
+  # 900 = 15 minutes. 0 compacts right after the turn instead of waiting.
+  defer_preflight_after_seconds: 900
+
   # Proactive tool-result prune (default: 0 = disabled). Opt-in token trigger
   # for a deterministic, no-LLM prune of OLD tool-result payloads, run
   # independently of `threshold` above. On large-window models (512K/1M) the
