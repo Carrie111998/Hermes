@@ -78,6 +78,14 @@ _MAX_TRACE_STATE = 256
 # Langfuse backend that is unbounded, hanging turn finalization past the
 # cron inactivity watchdog and discarding the turn's real output (#87468).
 _FLUSH_TIMEOUT_SECONDS = 30.0
+# Single-flight guard for _flush_bounded: under a sustained backend outage
+# every finalizing turn would otherwise spawn its own stuck flush thread
+# (N turns → N daemon threads, only draining when the backend recovers).
+# While one bounded flush is still pending, later turns skip spawning —
+# their queued spans ride the pending flush (the SDK exporter is a shared
+# queue, so the in-flight flush drains them once the backend answers) or
+# the next healthy flush.
+_FLUSH_IN_FLIGHT = threading.Event()
 _LANGFUSE_CLIENT = None
 # Guards _LANGFUSE_CLIENT initialization against the TOCTOU race: two
 # concurrent first callers both pass the ``is not None`` guard, both
@@ -1093,6 +1101,12 @@ def _flush_bounded(client: Any, timeout: Optional[float] = None) -> None:
     """
     if timeout is None:
         timeout = _FLUSH_TIMEOUT_SECONDS
+    if _FLUSH_IN_FLIGHT.is_set():
+        _debug(
+            "langfuse flush already in progress; coalescing (skip spawn)"
+        )
+        return
+    _FLUSH_IN_FLIGHT.set()
     done = threading.Event()
 
     def _run() -> None:
@@ -1102,11 +1116,17 @@ def _flush_bounded(client: Any, timeout: Optional[float] = None) -> None:
             pass
         finally:
             done.set()
+            _FLUSH_IN_FLIGHT.clear()
 
     worker = threading.Thread(
         target=_run, daemon=True, name="langfuse-flush-bounded"
     )
-    worker.start()
+    try:
+        worker.start()
+    except Exception:
+        # Never strand the single-flight guard if the thread never ran.
+        _FLUSH_IN_FLIGHT.clear()
+        raise
     if not done.wait(timeout):
         _debug(
             f"langfuse flush still running after {timeout}s; proceeding "

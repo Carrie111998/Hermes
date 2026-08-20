@@ -533,6 +533,84 @@ class TestTurnTraceIsolation:
         # Must not raise.
         self._run_turn(mod, session="sess-explode", turn_n=1, finalize=True)
 
+    def test_flush_bounded_coalesces_while_pending(self):
+        """Under a sustained backend outage, N finalizing turns must not
+        spawn N stuck flush threads — while one bounded flush is pending,
+        later calls coalesce (skip the spawn) instead."""
+        import threading
+        import time
+
+        mod = self._fresh_plugin()
+        mod._FLUSH_IN_FLIGHT.clear()
+
+        flush_started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        class _BlockingClient:
+            def flush(self):
+                calls.append(1)
+                flush_started.set()
+                release.wait(10)
+
+        client = _BlockingClient()
+        mod._flush_bounded(client, timeout=0.05)
+        assert flush_started.wait(5), "first flush never started"
+
+        # First flush is still pending: the second call must coalesce.
+        mod._flush_bounded(client, timeout=0.05)
+        time.sleep(0.1)
+        assert len(calls) == 1, (
+            f"coalesced flush spawned another flush thread ({len(calls)} calls) — "
+            "a pending bounded flush must cap concurrency at one"
+        )
+
+        release.set()
+        assert mod._FLUSH_IN_FLIGHT.wait(5) or not mod._FLUSH_IN_FLIGHT.is_set()
+
+    def test_flush_bounded_guard_released_after_completion(self):
+        """Once the in-flight flush finishes, the guard is released so the
+        next turn's flush spawns normally."""
+        import time
+
+        mod = self._fresh_plugin()
+        mod._FLUSH_IN_FLIGHT.clear()
+
+        calls = []
+
+        class _OkClient:
+            def flush(self):
+                calls.append(1)
+
+        mod._flush_bounded(_OkClient(), timeout=5)
+        time.sleep(0.1)
+        assert not mod._FLUSH_IN_FLIGHT.is_set(), (
+            "guard still set after a completed flush — later turns would "
+            "never flush again"
+        )
+
+        mod._flush_bounded(_OkClient(), timeout=5)
+        time.sleep(0.1)
+        assert len(calls) == 2
+
+    def test_flush_bounded_guard_released_on_exception(self):
+        """A flushing error must also release the single-flight guard —
+        otherwise one exporter exception would permanently disable flush."""
+        import time
+
+        mod = self._fresh_plugin()
+        mod._FLUSH_IN_FLIGHT.clear()
+
+        class _ExplodingClient:
+            def flush(self):
+                raise RuntimeError("exporter exploded")
+
+        mod._flush_bounded(_ExplodingClient(), timeout=5)
+        time.sleep(0.1)
+        assert not mod._FLUSH_IN_FLIGHT.is_set(), (
+            "guard stuck set after a flush exception — flush permanently disabled"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Placeholder-credential guard (#23823).
