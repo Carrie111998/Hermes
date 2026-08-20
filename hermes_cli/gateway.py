@@ -3036,10 +3036,10 @@ def _hermes_home_for_target_user(target_home_dir: str) -> str:
     # Keep explicit custom paths lexical. Resolving a non-existent custom path
     # can rewrite it through host-specific path mappings, which would bake a
     # different HERMES_HOME into the generated service unit.
-    current_default = Path.home() / ".hermes"
-    target_default = Path(target_home_dir) / ".hermes"
+    current_default = Path.home() / ".ares"
+    target_default = Path(target_home_dir) / ".ares"
 
-    # Default ~/.hermes → remap to target user's default
+    # Default ~/.ares → remap to target user's default
     if current_hermes == current_default:
         return str(target_default)
 

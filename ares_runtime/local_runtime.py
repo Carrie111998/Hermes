@@ -1044,8 +1044,8 @@ def _parser() -> argparse.ArgumentParser:
     setup.add_argument(
         "--seed-from",
         type=Path,
-        default=Path.home() / ".hermes",
-        help="copy settings and credentials from this Hermes home only when ~/.ares does not yet exist",
+        default=Path.home() / ".ares",
+        help="copy settings and credentials from this Ares home only when ~/.ares does not yet exist",
     )
     setup.add_argument("--no-desktop", action="store_true", help="Do not build or install Desktop")
     setup.add_argument("--no-gateway", action="store_true", help="Do not install or start the Ares gateway service")
