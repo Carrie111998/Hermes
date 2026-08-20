@@ -2363,6 +2363,30 @@ def _transcribe_openai(
 # ---------------------------------------------------------------------------
 
 
+def _resolve_mistral_context_bias() -> list:
+    """Resolve the Voxtral vocabulary bias: ``stt.mistral.context_bias`` then
+    ``stt.context_bias``. Each entry is one token — the API rejects any item
+    holding a space or a comma."""
+    stt_config = _load_stt_config()
+    for source in (_get_stt_section(stt_config, "mistral"), stt_config):
+        raw = source.get("context_bias")
+        if isinstance(raw, (list, tuple)):
+            terms = [str(term).strip() for term in raw if str(term).strip()]
+            if terms:
+                return terms
+    return []
+
+
+def _is_context_bias_rejection(err: Exception) -> bool:
+    """Whether *err* is the server refusing the vocabulary rather than failing.
+
+    A 400 on a request that only differs from a working one by its vocabulary
+    is the vocabulary's fault; 5xx, timeouts and auth errors are not.
+    """
+    message = str(err).lower()
+    return "context_bias" in message or "context bias" in message or "status 400" in message
+
+
 def _transcribe_mistral(
     file_path: str,
     model_name: str,
@@ -2379,6 +2403,14 @@ def _transcribe_mistral(
     if not api_key:
         return {"success": False, "transcript": "", "error": "MISTRAL_API_KEY not set"}
 
+    if prompt:
+        # Voxtral has no ``prompt`` parameter — the SDK signature is strict and
+        # would raise TypeError. ``context_bias`` below is the live equivalent.
+        logger.debug(
+            "STT provider 'mistral' does not support transcription prompts — "
+            "proceeding without the prompt."
+        )
+
     try:
         try:
             from tools.lazy_deps import ensure as _lazy_ensure
@@ -2387,29 +2419,47 @@ def _transcribe_mistral(
             pass
         from mistralai.client import Mistral
 
-        with Mistral(api_key=api_key) as client:
-            with open(file_path, "rb") as audio_file:
-                complete_kwargs: Dict[str, Any] = {
-                    "model": model_name,
-                    "file": {"content": audio_file, "file_name": Path(file_path).name},
-                }
-                # Language: hook override > stt.mistral.language >
-                # stt.language > env > auto.
-                language = language or _resolve_stt_language("mistral")
-                if language:
-                    complete_kwargs["language"] = language
-                if prompt:
-                    # Only send the prompt when set so the no-hook, no-config
-                    # request stays byte-identical to today's.
-                    complete_kwargs["prompt"] = prompt
-                result = client.audio.transcriptions.complete(**complete_kwargs)
+        # Language: hook override > stt.mistral.language > stt.language > env > auto.
+        language = language or _resolve_stt_language("mistral")
+        context_bias = _resolve_mistral_context_bias()
 
-            transcript_text = _extract_transcript_text(result)
-            logger.info(
-                "Transcribed %s via Mistral API (%s, %d chars)",
-                Path(file_path).name, model_name, len(transcript_text),
+        def _complete(bias):
+            """One request. Reopens the file — a retry can't reuse a read handle."""
+            with Mistral(api_key=api_key) as client:
+                with open(file_path, "rb") as audio_file:
+                    complete_kwargs: Dict[str, Any] = {
+                        "model": model_name,
+                        "file": {"content": audio_file, "file_name": Path(file_path).name},
+                    }
+                    if language:
+                        complete_kwargs["language"] = language
+                    if bias:
+                        complete_kwargs["context_bias"] = bias
+                    return client.audio.transcriptions.complete(**complete_kwargs)
+
+        try:
+            result = _complete(context_bias)
+        except Exception as bias_err:
+            # A vocabulary the server refuses (bad shape, too many terms) must
+            # never cost the transcription: retry once without it. Anything
+            # that isn't the vocabulary's fault falls through untouched.
+            if not (context_bias and _is_context_bias_rejection(bias_err)):
+                raise
+            logger.warning(
+                "Mistral rejected the transcription vocabulary (%d terms) — "
+                "retrying without it: %s", len(context_bias), bias_err,
             )
-            return {"success": True, "transcript": transcript_text, "provider": "mistral"}
+            context_bias = []
+            result = _complete([])
+
+        transcript_text = _extract_transcript_text(result)
+        logger.info(
+            "Transcribed %s via Mistral API (%s, %d chars, language=%s, vocabulary=%s)",
+            Path(file_path).name, model_name, len(transcript_text),
+            language or "auto",
+            ("%d terms" % len(context_bias)) if context_bias else "none",
+        )
+        return {"success": True, "transcript": transcript_text, "provider": "mistral"}
 
     except PermissionError:
         return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
