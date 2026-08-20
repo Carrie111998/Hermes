@@ -331,7 +331,7 @@ def cmd_sessions(args, sessions_parser=None):
         read_only = action == "cold-archive" and bool(
             getattr(args, "dry_run", False)
         )
-        db = SessionDB(read_only=read_only)
+        db = SessionDB(read_only=True) if read_only else SessionDB()
     except Exception as e:
         print(f"Error: Could not open session database: {e}")
         return 1
