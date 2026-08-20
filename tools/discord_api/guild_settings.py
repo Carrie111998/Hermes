@@ -1,8 +1,8 @@
 """Discord REST v10 guild-settings request builder (approved scalars only).
 
 This module is deliberately transport-free. It validates the scalar guild
-settings Hermes exposes and returns a request descriptor for the existing
-``discord_admin`` consumer.
+settings Hermes exposes and returns a request descriptor for the request-owned
+``discord_guild_settings`` consumer.
 """
 
 from __future__ import annotations
