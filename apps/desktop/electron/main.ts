@@ -350,6 +350,7 @@ import { installWindowsSystemCaTrust } from './windows-system-ca'
 import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
+import { openWslExternalUrl } from './wsl-open-url'
 import { resolvePickerDefaultPath } from './wsl-path-bridge'
 
 const USER_DATA_OVERRIDE = process.env.HERMES_DESKTOP_USER_DATA_DIR
@@ -1575,21 +1576,15 @@ function openExternalUrl(rawUrl) {
   const url = parsed.toString()
 
   if (IS_WSL) {
-    rememberLog(`[link] opening via WSL→Windows: ${url}`)
-
-    const proc = spawn('cmd.exe', ['/c', 'start', '""', url], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true
+    return openWslExternalUrl(url, {
+      spawn,
+      fallback: openedUrl => {
+        void shell.openExternal(openedUrl).catch(error => {
+          rememberLog(`[link] xdg-open failed: ${error.message}`)
+        })
+      },
+      log: rememberLog
     })
-
-    proc.on('error', error => {
-      rememberLog(`[link] cmd.exe start failed: ${error.message}; falling back to xdg-open`)
-      shell.openExternal(url).catch(fallback => rememberLog(`[link] xdg-open failed: ${fallback.message}`))
-    })
-    proc.unref()
-
-    return true
   }
 
   shell.openExternal(url).catch(error => rememberLog(`[link] openExternal failed: ${error.message}`))
