@@ -1264,6 +1264,64 @@ class TestAuxiliaryPoolAwareness:
         assert stale_client.chat.completions.create.call_count == 1
         assert fresh_client.chat.completions.create.call_count == 1
 
+    def test_call_llm_reuses_refreshed_nous_client_for_same_auto_task(self):
+        class _Auth401(Exception):
+            status_code = 401
+
+        stale_client = MagicMock()
+        stale_client.base_url = "https://inference-api.nousresearch.com/v1"
+        stale_client.chat.completions.create.side_effect = _Auth401("stale nous key")
+
+        fresh_client = MagicMock()
+        fresh_client.base_url = "https://inference-api.nousresearch.com/v1"
+        fresh_client.chat.completions.create.return_value = {"ok": True}
+
+        import agent.auxiliary_client as aux
+
+        aux.shutdown_cached_clients()
+        try:
+            with (
+                patch(
+                    "agent.auxiliary_client._resolve_task_provider_model",
+                    return_value=("auto", "nous-model", None, None, None),
+                ),
+                patch(
+                    "agent.auxiliary_client.resolve_provider_client",
+                    return_value=(stale_client, "nous-model"),
+                ) as mock_resolve,
+                patch(
+                    "agent.auxiliary_client._create_openai_client",
+                    return_value=fresh_client,
+                ),
+                patch(
+                    "agent.auxiliary_client._resolve_nous_runtime_api",
+                    return_value=(
+                        "fresh-agent-key",
+                        "https://inference-api.nousresearch.com/v1",
+                    ),
+                ),
+                patch(
+                    "agent.auxiliary_client._validate_llm_response",
+                    side_effect=lambda resp, _task, **_kw: resp,
+                ),
+            ):
+                first = call_llm(
+                    task="goal_judge",
+                    messages=[{"role": "user", "content": "first"}],
+                )
+                second = call_llm(
+                    task="goal_judge",
+                    messages=[{"role": "user", "content": "second"}],
+                )
+        finally:
+            aux.shutdown_cached_clients()
+
+        assert first == {"ok": True}
+        assert second == {"ok": True}
+        assert stale_client.chat.completions.create.call_count == 1
+        assert fresh_client.chat.completions.create.call_count == 2
+        assert mock_resolve.call_count == 1
+
 
 
 
