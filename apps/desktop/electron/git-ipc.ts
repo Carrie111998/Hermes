@@ -5,7 +5,6 @@
 // plugin installs.
 import { ipcMain } from 'electron'
 
-import { scanGitRepos } from './git-repo-scan'
 import {
   branchCreate,
   branchDelete,
@@ -20,6 +19,7 @@ import {
   tagCreate,
   tagDelete
 } from './git-ref-ops'
+import { scanGitRepos } from './git-repo-scan'
 import {
   fileDiffVsHead,
   repoStatus,
@@ -110,12 +110,8 @@ export function registerGitIpc({ resolveGitBinary, resolveGhBinary }: GitIpcDeps
   ipcMain.handle('hermes:git:stashDrop', async (_event, repoPath, index) =>
     stashDrop(repoPath, index, resolveGitBinary())
   )
-  ipcMain.handle('hermes:git:fetch', async (_event, repoPath, remote) =>
-    gitFetch(repoPath, remote, resolveGitBinary())
-  )
-  ipcMain.handle('hermes:git:pull', async (_event, repoPath, rebase) =>
-    gitPull(repoPath, rebase, resolveGitBinary())
-  )
+  ipcMain.handle('hermes:git:fetch', async (_event, repoPath, remote) => gitFetch(repoPath, remote, resolveGitBinary()))
+  ipcMain.handle('hermes:git:pull', async (_event, repoPath, rebase) => gitPull(repoPath, rebase, resolveGitBinary()))
 
   // Codex-style review pane: list changed files for a scope, fetch one file's
   // unified diff, and stage / unstage / revert. Reads return empty on failure;

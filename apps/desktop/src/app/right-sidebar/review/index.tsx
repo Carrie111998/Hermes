@@ -92,13 +92,16 @@ export function ReviewPane() {
     }
 
     setWorktreesLoading(true)
-    desktopGit()!.worktreeList(cwd).then(wts => {
-      setWorktrees(wts.map(wt => ({ path: wt.path, branch: wt.branch ?? '' })))
-      setWorktreesLoading(false)
-    }).catch(() => {
-      setWorktrees([])
-      setWorktreesLoading(false)
-    })
+    desktopGit()!
+      .worktreeList(cwd)
+      .then(wts => {
+        setWorktrees(wts.map(wt => ({ path: wt.path, branch: wt.branch ?? '' })))
+        setWorktreesLoading(false)
+      })
+      .catch(() => {
+        setWorktrees([])
+        setWorktreesLoading(false)
+      })
   }, [scopeCwd, currentCwd])
 
   const selectedFile = files.find(file => file.path === selectedPath)
@@ -113,14 +116,20 @@ export function ReviewPane() {
   // Repo switcher options
   const repoOptions = worktrees.map(wt => ({
     value: wt.path,
-    label: `${wt.branch} (${wt.path.split(/[\\/]+/).filter(Boolean).pop()})`
+    label: `${wt.branch} (${wt.path
+      .split(/[\\/]+/)
+      .filter(Boolean)
+      .pop()})`
   }))
 
   const isScoped = Boolean(scopeCwd)
 
   const currentRepoLabel = isScoped
     ? repoOptions.find(o => o.value === scopeCwd)?.label || scopeCwd
-    : currentCwd?.split(/[\\/]+/).filter(Boolean).pop() || 'Session'
+    : currentCwd
+        ?.split(/[\\/]+/)
+        .filter(Boolean)
+        .pop() || 'Session'
 
   return (
     <aside
@@ -151,7 +160,10 @@ export function ReviewPane() {
           />
           <div className="ml-2 mr-1 flex min-w-0 flex-1">
             <Tip label="Switch repository / worktree">
-              <Select onValueChange={path => path ? openReview(path) : openReview(null)} value={isScoped ? scopeCwd || '' : currentCwd || ''}>
+              <Select
+                onValueChange={path => (path ? openReview(path) : openReview(null))}
+                value={isScoped ? scopeCwd || '' : currentCwd || ''}
+              >
                 <SelectTrigger className="w-full min-w-[160px] max-w-[280px]">
                   <SelectValue placeholder={currentRepoLabel} />
                 </SelectTrigger>
@@ -159,7 +171,11 @@ export function ReviewPane() {
                   <SelectItem value="">
                     <span className="flex items-center gap-2">
                       <Codicon className="text-(--ui-text-tertiary)" name="sync" size="0.8rem" />
-                      Session: {currentCwd?.split(/[\\/]+/).filter(Boolean).pop() || 'default'}
+                      Session:{' '}
+                      {currentCwd
+                        ?.split(/[\\/]+/)
+                        .filter(Boolean)
+                        .pop() || 'default'}
                     </span>
                   </SelectItem>
                   {repoOptions.map(option => (

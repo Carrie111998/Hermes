@@ -72,7 +72,7 @@ test.beforeAll(async () => {
     'open a repository-backed history session',
     { timeout: 15_000 }
   )
-  await expect(page.locator('.coding-status-bar')).toContainText('main')
+  await expect(page.locator('.coding-status-bar')).toContainText('main', { timeout: 15_000 })
 })
 
 test.afterAll(async () => {

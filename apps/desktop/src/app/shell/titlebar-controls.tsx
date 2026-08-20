@@ -23,8 +23,8 @@ import {
   togglePanesFlipped,
   toggleSidebarOpen
 } from '@/store/layout'
-import { $unreadSessionCount } from '@/store/session-dot-state'
 import { $reviewOpen, revealReview } from '@/store/review'
+import { $unreadSessionCount } from '@/store/session-dot-state'
 
 import { appViewForPath, isOverlayView } from '../routes'
 

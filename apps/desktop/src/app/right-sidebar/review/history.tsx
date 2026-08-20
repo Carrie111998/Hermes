@@ -85,13 +85,15 @@ export function ReviewHistory() {
                 refFilter === 'all'
                   ? scmBranches.filter(b => b.sha === commit.sha).map(b => b.name)
                   : refFilter === 'local'
-                  ? scmBranches.filter(b => !b.isRemote && b.sha === commit.sha).map(b => b.name)
-                  : remoteNames.includes(refFilter)
-                    ? scmBranches.filter(b => b.sha === commit.sha && b.name.startsWith(refFilter + '/')).map(b => b.name)
-                    : []
+                    ? scmBranches.filter(b => !b.isRemote && b.sha === commit.sha).map(b => b.name)
+                    : remoteNames.includes(refFilter)
+                      ? scmBranches
+                          .filter(b => b.sha === commit.sha && b.name.startsWith(refFilter + '/'))
+                          .map(b => b.name)
+                      : []
 
               const matchingTags = scmTags.filter(t => t.sha === commit.sha).map(t => t.name)
-              
+
               return (
                 <button
                   aria-current={selected ? 'true' : undefined}
@@ -116,20 +118,24 @@ export function ReviewHistory() {
                     </time>
                   </span>
                   {/* ref markers: branch pills (accent) and tag pills (neutral) */}
-                  {matchingBranches.length > 0 || matchingTags.length > 0 && (
-                    <span className="flex min-w-0 items-center gap-1 pt-1 text-[0.55rem]">
-                      {matchingBranches.map(name => (
-                        <span className="shrink-0 rounded-full border border-(--ui-accent)/40 px-1 py-1 text-[0.55rem] leading-none text-(--ui-accent)" key={name}>
-                          {name}
-                        </span>
-                      ))}
-                      {matchingTags.length > 0 && (
-                        <span className="shrink-0 rounded-full border border-(--ui-stroke-secondary) px-1 py-1 text-[0.55rem] leading-none text-(--ui-text-secondary)">
-                          {matchingTags.join(' ')}
-                        </span>
-                      )}
-                    </span>
-                  )}
+                  {matchingBranches.length > 0 ||
+                    (matchingTags.length > 0 && (
+                      <span className="flex min-w-0 items-center gap-1 pt-1 text-[0.55rem]">
+                        {matchingBranches.map(name => (
+                          <span
+                            className="shrink-0 rounded-full border border-(--ui-accent)/40 px-1 py-1 text-[0.55rem] leading-none text-(--ui-accent)"
+                            key={name}
+                          >
+                            {name}
+                          </span>
+                        ))}
+                        {matchingTags.length > 0 && (
+                          <span className="shrink-0 rounded-full border border-(--ui-stroke-secondary) px-1 py-1 text-[0.55rem] leading-none text-(--ui-text-secondary)">
+                            {matchingTags.join(' ')}
+                          </span>
+                        )}
+                      </span>
+                    ))}
                 </button>
               )
             })}
