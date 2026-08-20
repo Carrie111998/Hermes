@@ -18,7 +18,7 @@ drives it and stops promptly.
 """
 import threading
 import time
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 def _wait_until(predicate, timeout=10.0, interval=0.005):
@@ -584,6 +584,69 @@ class TestGuardJobCredentialExfil:
         with pytest.raises(RuntimeError) as exc:
             _guard_job_credential_exfil(job)
         assert "blocked for safety" in str(exc.value)
+
+
+# ── Restart drain: legacy single-phase external fires ─────────────────────────
+
+
+def test_legacy_fire_guard_blocks_provider_before_execution_after_drain():
+    from cron.scheduler import begin_gateway_restart_drain, cancel_gateway_restart_drain
+    from cron.scheduler_provider import CronScheduler, fire_legacy_provider_guarded
+
+    calls = []
+
+    class Legacy(CronScheduler):
+        @property
+        def name(self):
+            return "legacy"
+
+        def start(self, stop_event, **kwargs):
+            return None
+
+        def fire_due(  # type: ignore[invalid-method-override]
+            self, job_id, *, adapters=None, loop=None
+        ):
+            calls.append(job_id)
+            return True
+
+    cancel_gateway_restart_drain()
+    try:
+        assert begin_gateway_restart_drain() == 0
+        assert fire_legacy_provider_guarded(Legacy(), "blocked-legacy") is False
+        assert calls == []
+    finally:
+        cancel_gateway_restart_drain()
+
+
+def test_legacy_fire_guard_allows_super_fire_due_without_double_registration(monkeypatch):
+    from cron.scheduler_provider import CronScheduler, fire_legacy_provider_guarded
+
+    class Legacy(CronScheduler):
+        @property
+        def name(self):
+            return "legacy"
+
+        def start(self, stop_event, **kwargs):
+            return None
+
+        def fire_due(  # type: ignore[invalid-method-override]
+            self, job_id, *, adapters=None, loop=None
+        ):
+            return super().fire_due(job_id, adapters=adapters, loop=loop)
+
+    monkeypatch.setattr(
+        "cron.executions.create_execution",
+        lambda *args, **kwargs: {"id": "legacy-execution"},
+    )
+    monkeypatch.setattr("cron.executions.finish_execution", lambda *args, **kwargs: None)
+    claim = MagicMock(return_value={"id": "legacy-super"})
+    monkeypatch.setattr("cron.jobs.claim_job_for_fire", claim)
+    run = MagicMock(return_value=None)
+    monkeypatch.setattr("cron.scheduler.run_one_job", run)
+
+    assert fire_legacy_provider_guarded(Legacy(), "legacy-super") is True
+    claim.assert_called_once_with("legacy-super", return_job=True)
+    run.assert_called_once()
 
 
 # ── Multiplex profiles: cron per secondary profile (issue #69377) ─────────

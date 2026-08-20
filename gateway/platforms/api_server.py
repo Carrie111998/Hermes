@@ -5982,6 +5982,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "missing job_id"}, status=400)
 
             from cron.scheduler_provider import (
+                fire_legacy_provider_guarded,
                 provider_supports_split_fire,
                 resolve_cron_scheduler,
             )
@@ -6013,7 +6014,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 # split claim path would silently bypass that override.
                 task = asyncio.create_task(
                     asyncio.to_thread(
-                        provider.fire_due,
+                        fire_legacy_provider_guarded,
+                        provider,
                         job_id,
                         adapters=adapters,
                         loop=loop,

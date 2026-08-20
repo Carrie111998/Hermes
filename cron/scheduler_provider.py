@@ -31,6 +31,45 @@ from typing import Any
 # between recovery attempts.
 _EMFILE_BACKOFF_MAX_SECONDS = 15 * 60  # 15 minutes
 
+# Legacy single-phase providers execute ``fire_due`` as one opaque call.  The
+# webhook wraps that call with a pre-admission registration; this thread-local
+# marker lets a legacy override that delegates to ``super().fire_due()`` reuse
+# the same registration instead of being rejected as its own duplicate.
+_legacy_fire_admission = threading.local()
+
+
+def _legacy_fire_pre_registered(job_id: str) -> bool:
+    return job_id in getattr(_legacy_fire_admission, "job_ids", ())
+
+
+def fire_legacy_provider_guarded(
+    provider: Any,
+    job_id: str,
+    *,
+    adapters: Any = None,
+    loop: Any = None,
+) -> bool:
+    """Run an opaque legacy provider fire behind the restart-drain gate.
+
+    Registration happens in the same worker thread immediately before provider
+    code.  A restart drain that wins first blocks the provider entirely; a fire
+    that wins first is visible to ``begin_gateway_restart_drain`` until the
+    provider returns.
+    """
+    from cron.scheduler import release_running_job, try_register_running_job
+
+    if not try_register_running_job(job_id):
+        return False
+    prior: set[str] = set(getattr(_legacy_fire_admission, "job_ids", ()))
+    current: set[str] = set(prior)
+    current.add(job_id)
+    _legacy_fire_admission.job_ids = current
+    try:
+        return bool(provider.fire_due(job_id, adapters=adapters, loop=loop))
+    finally:
+        _legacy_fire_admission.job_ids = prior
+        release_running_job(job_id)
+
 
 def _backoff_wait_seconds(interval: float, consecutive_failures: int) -> float:
     """Exponential tick backoff shared by both ticker loops (#87644).
@@ -183,17 +222,19 @@ class CronScheduler(ABC):
         from cron.jobs import claim_job_for_fire
         from cron.scheduler import release_running_job, try_register_running_job
 
-        execution = create_execution(job_id, source=self.name)
-        if not try_register_running_job(job_id):
-            finish_execution(
-                execution["id"],
-                success=False,
-                error=(
-                    "Fire admission blocked: job is already running or the "
-                    "gateway is draining for restart"
-                ),
-            )
-            return None
+        pre_registered = _legacy_fire_pre_registered(job_id)
+        owns_registration = False
+        if not pre_registered:
+            if not try_register_running_job(job_id):
+                return None
+            owns_registration = True
+
+        try:
+            execution = create_execution(job_id, source=self.name)
+        except BaseException:
+            if owns_registration:
+                release_running_job(job_id)
+            raise
 
         claim_kwargs = {"return_job": True}
         if force:
@@ -201,7 +242,8 @@ class CronScheduler(ABC):
         try:
             claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
         except BaseException as exc:
-            release_running_job(job_id)
+            if owns_registration:
+                release_running_job(job_id)
             finish_execution(
                 execution["id"],
                 success=False,
@@ -209,7 +251,8 @@ class CronScheduler(ABC):
             )
             raise
         if not isinstance(claimed_job, dict):
-            release_running_job(job_id)
+            if owns_registration:
+                release_running_job(job_id)
             finish_execution(
                 execution["id"],
                 success=False,
@@ -217,7 +260,7 @@ class CronScheduler(ABC):
             )
             return None
         claimed_job["execution_id"] = execution["id"]
-        claimed_job["_restart_drain_registered"] = True
+        claimed_job["_restart_drain_registered"] = owns_registration
         return claimed_job
 
     def fire_claimed(
