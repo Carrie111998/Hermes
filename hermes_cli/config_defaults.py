@@ -1432,6 +1432,10 @@ DEFAULT_CONFIG = {
         # applies where tool_progress is already enabled. Per-platform override
         # via display.platforms.<platform>.tool_progress_grouping.
         "tool_progress_grouping": "accumulate",
+        # Render command-like gateway tool progress in fenced code blocks on
+        # Markdown-capable platforms. Disable globally or per platform for a
+        # compact plain-text progress line. The default preserves prior output.
+        "tool_progress_code_blocks": True,
         # Optional custom phrases for generic long-running status messages.
         # Built-in defaults live in gateway/assets/status_phrases.yaml. Users
         # can set `path`/`paths` to HERMES_HOME-relative YAML files/directories

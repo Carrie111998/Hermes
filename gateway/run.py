@@ -4374,8 +4374,18 @@ class TurnRunner:
             _progress_adapter = self._runner._adapter_for_source(ctx.source)
         except Exception:
             _progress_adapter = None
+        try:
+            _code_blocks_enabled = ctx.resolve_display_setting(
+                ctx.user_config,
+                _platform_config_key(ctx.source.platform),
+                "tool_progress_code_blocks",
+                True,
+            )
+        except Exception:
+            _code_blocks_enabled = True
         if (
-            getattr(_progress_adapter, "supports_code_blocks", False)
+            _code_blocks_enabled
+            and getattr(_progress_adapter, "supports_code_blocks", False)
             and tool_name == "terminal"
             and isinstance(args, dict)
             and isinstance(args.get("command"), str)

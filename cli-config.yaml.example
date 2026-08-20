@@ -1525,6 +1525,12 @@ display:
   # Toggle at runtime with /verbose in the CLI
   tool_progress: all
 
+  # Render command-like gateway tool progress (currently terminal commands) as
+  # fenced code blocks on Markdown-capable platforms. Disable globally or under
+  # display.platforms.<platform> for compact plain-text progress lines.
+  # Example: display.platforms.telegram.tool_progress_code_blocks: false
+  tool_progress_code_blocks: true
+
   # Per-platform defaults can be quieter than the global setting. Telegram
   # tunes for mobile: tool_progress and busy_ack_detail default off (no
   # per-tool breadcrumb stream, no "iteration 21/60" debug detail in busy

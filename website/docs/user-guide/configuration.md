@@ -1823,6 +1823,7 @@ display:
   timestamps: false       # When true, prefixes user and assistant labels with timestamps in the CLI / TUI transcript
   timestamp_format: "%H:%M"  # strftime format for those timestamps (e.g. "%b-%d %H:%M" for month-day)
   tool_preview_length: 0  # Max chars for tool call previews (0 = no limit, show full paths/commands)
+  tool_progress_code_blocks: true # Gateway: fenced blocks for command-like tool progress on Markdown platforms
   turn_summary: true      # CLI only: print a one-line post-turn accounting footer after each interactive turn
   spinner_token_flow: true # CLI only: append live cumulative turn tokens to the spinner timer
   runtime_footer:         # Gateway: append a runtime-context footer to final replies
@@ -1977,6 +1978,16 @@ display:
 ```
 
 Platforms without an override fall back to the global `tool_progress` value. Valid platform keys: `telegram`, `discord`, `slack`, `signal`, `whatsapp`, `matrix`, `mattermost`, `email`, `sms`, `homeassistant`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`. The legacy `display.tool_progress_overrides` key still loads for backward compatibility but is deprecated and migrated into `display.platforms` on first load.
+
+Markdown-capable gateways render command-like tool progress (currently terminal commands) in fenced code blocks by default. Set `display.tool_progress_code_blocks: false` globally, or override `display.platforms.<platform>.tool_progress_code_blocks: false`, to keep the same progress information as compact plain text. For example:
+
+```yaml
+display:
+  platforms:
+    telegram:
+      tool_progress: all
+      tool_progress_code_blocks: false
+```
 
 Signal is listed as a valid platform key because the setting can be saved per platform, but the current Signal adapter cannot edit sent messages and does not render tool-progress bubbles. Keep Signal `tool_progress` set to `off`; use the CLI or an editing-capable messaging platform if you need to watch each tool call live.
 
