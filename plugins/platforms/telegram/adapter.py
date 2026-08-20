@@ -1008,14 +1008,18 @@ class TelegramAdapter(BasePlatformAdapter):
         if chat_type == "private":
             chat_type = "dm"
         elif chat_type == "supergroup":
-            chat_type = "forum" if getattr(message, "message_thread_id", None) is not None else "group"
+            chat_type = "forum" if getattr(message, "message_thread_id", None) else "group"
         return SessionSource(
             platform=Platform.TELEGRAM,
             chat_id=chat_id,
             chat_type=chat_type,
             user_id=user_id,
             user_name=str(getattr(user, "username", "") or getattr(user, "first_name", "") or "").strip() or None,
-            thread_id=(str(getattr(message, "message_thread_id")) if getattr(message, "message_thread_id", None) is not None else None),
+            thread_id=(
+                str(getattr(message, "message_thread_id"))
+                if getattr(message, "message_thread_id", None)
+                else None
+            ),
         )
 
     def _source_from_message_for_auth(self, message: Message):
@@ -6748,27 +6752,32 @@ class TelegramAdapter(BasePlatformAdapter):
                 for result in results or []:
                     if not isinstance(result, dict) or result.get("action") != "handled":
                         continue
-                    answer = result.get("answer")
-                    await query.answer(text=str(answer) if answer else None)
                     edit = result.get("edit")
-                    if edit:
-                        rows = edit.get("buttons")
-                        markup = None
-                        if rows:
-                            markup = InlineKeyboardMarkup([
-                                [
-                                    InlineKeyboardButton(
-                                        str(button["label"]),
-                                        callback_data=str(button["data"]),
-                                    )
-                                    for button in row
-                                ]
-                                for row in rows
-                            ])
-                        await query.edit_message_text(
-                            text=str(edit.get("text", "")),
-                            reply_markup=markup,
-                        )
+                    # Acknowledge before applying the edit so Telegram's
+                    # loading spinner is cleared even if edit construction
+                    # or the Telegram edit request fails.
+                    answer = result.get("answer")
+                    try:
+                        await query.answer(text=str(answer) if answer else None)
+                    finally:
+                        if edit:
+                            rows = edit.get("buttons")
+                            markup = None
+                            if rows:
+                                markup = InlineKeyboardMarkup([
+                                    [
+                                        InlineKeyboardButton(
+                                            str(button["label"]),
+                                            callback_data=str(button["data"]),
+                                        )
+                                        for button in row
+                                    ]
+                                    for row in rows
+                                ])
+                            await query.edit_message_text(
+                                text=str(edit.get("text", "")),
+                                reply_markup=markup,
+                            )
                     return
             except Exception:
                 logger.debug("[%s] plugin callback dispatch failed", self.name, exc_info=True)

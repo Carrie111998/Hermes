@@ -14536,7 +14536,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return []
             if not self._is_user_authorized(source):
                 return []
-            return invoke_hook("gateway_platform_event", **event)
+            # ``gateway_platform_event`` hooks return a list of action
+            # envelopes. Normalize a legacy/single observer return so one
+            # malformed plugin cannot make the adapter iterate a dict/string.
+            results = invoke_hook("gateway_platform_event", **event)
+            if results is None:
+                return []
+            if isinstance(results, list):
+                return results
+            if isinstance(results, tuple):
+                return list(results)
+            return [results]
         except Exception:
             # Observer failures must never break the adapter's update loop.
             logger.debug("gateway_platform_event hook dispatch failed", exc_info=True)
