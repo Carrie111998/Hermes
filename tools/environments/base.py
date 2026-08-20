@@ -68,6 +68,9 @@ def _windows_output_encoding() -> "str | None":
     return None if normalized == "utf-8" else normalized
 
 
+_AUTO_OUTPUT_ENCODING = object()
+
+
 class _IncrementalOutputDecoder:
     """Decode UTF-8 shell output with a per-line Windows ANSI fallback.
 
@@ -84,10 +87,10 @@ class _IncrementalOutputDecoder:
 
     _PROBE_LIMIT = 4096
 
-    def __init__(self, fallback_encoding: "str | None" = None):
+    def __init__(self, fallback_encoding=_AUTO_OUTPUT_ENCODING):
         self._fallback_encoding = (
             _windows_output_encoding()
-            if fallback_encoding is None
+            if fallback_encoding is _AUTO_OUTPUT_ENCODING
             else fallback_encoding
         )
         if self._fallback_encoding:
@@ -103,7 +106,9 @@ class _IncrementalOutputDecoder:
         try:
             return raw.decode("utf-8", errors="strict")
         except UnicodeDecodeError:
-            return raw.decode(self._fallback_encoding or "utf-8", errors="replace")
+            if b"\x00" not in raw and self._fallback_encoding:
+                return raw.decode(self._fallback_encoding, errors="replace")
+            return raw.decode("utf-8", errors="replace")
 
     def _flush_long_buffer(self) -> str:
         raw = bytes(self._buffer)
@@ -137,12 +142,14 @@ class _IncrementalOutputDecoder:
         output: list[str] = []
 
         while True:
-            try:
-                newline = self._buffer.index(0x0A)
-            except ValueError:
+            boundary = next(
+                (i for i, byte in enumerate(self._buffer) if byte in (0x0A, 0x0D)),
+                None,
+            )
+            if boundary is None:
                 break
-            record = bytes(self._buffer[: newline + 1])
-            del self._buffer[: newline + 1]
+            record = bytes(self._buffer[: boundary + 1])
+            del self._buffer[: boundary + 1]
             output.append(self._decode_record(record))
 
         # An ASCII-only tail is safe to stream without waiting for a newline.
@@ -957,6 +964,10 @@ class BaseEnvironment(ABC):
         """
         return shlex.quote(path)
 
+    def _output_fallback_encoding(self) -> "str | None":
+        """Return a trustworthy fallback codec for this backend's output."""
+        return None
+
     def _wrap_command(self, command: str, cwd: str) -> str:
         """Build the full bash script that sources snapshot, cd's, runs command,
         re-dumps env vars, and emits CWD markers."""
@@ -1164,7 +1175,9 @@ class BaseEnvironment(ABC):
         # Windows children through in the host ANSI code page.  Decode raw
         # chunks with a shared line-aware decoder so both forms survive and
         # multibyte sequences remain intact across read boundaries.
-        decoder = _IncrementalOutputDecoder()
+        decoder = _IncrementalOutputDecoder(
+            fallback_encoding=self._output_fallback_encoding()
+        )
 
         def _drain_iterable(stream):
             # Fallback path: ``stream`` is not backed by a real OS file

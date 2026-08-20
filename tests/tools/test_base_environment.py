@@ -90,6 +90,27 @@ class TestIncrementalOutputDecoder:
 
         assert decoder.decode(b"ready> ") == "ready> "
 
+    def test_emits_localized_output_at_a_carriage_return(self):
+        decoder = _IncrementalOutputDecoder(fallback_encoding="cp936")
+
+        assert decoder.decode("处理中\r".encode("cp936")) == "处理中\r"
+
+    def test_nul_record_keeps_utf8_replacement_behavior(self):
+        decoder = _IncrementalOutputDecoder(fallback_encoding="cp1252")
+
+        assert decoder.decode(b"\x00\xff\n") == "\x00\ufffd\n"
+
+    def test_explicit_none_disables_host_fallback(self, monkeypatch):
+        from tools.environments import base
+
+        monkeypatch.setattr(base, "_windows_output_encoding", lambda: "cp936")
+        decoder = _IncrementalOutputDecoder(fallback_encoding=None)
+
+        assert "\ufffd" in decoder.decode("本地程序\n".encode("cp936"))
+
+    def test_base_environment_does_not_guess_remote_output_encoding(self):
+        assert _TestableEnv()._output_fallback_encoding() is None
+
     def test_wait_for_process_preserves_native_windows_bytes(self, monkeypatch):
         from tools.environments import base
 
@@ -106,7 +127,9 @@ class TestIncrementalOutputDecoder:
             stderr=subprocess.STDOUT,
         )
 
-        result = _TestableEnv()._wait_for_process(proc, timeout=10)
+        env = _TestableEnv()
+        env._output_fallback_encoding = lambda: "cp936"
+        result = env._wait_for_process(proc, timeout=10)
 
         assert result["returncode"] == 0
         assert result["output"] == expected
