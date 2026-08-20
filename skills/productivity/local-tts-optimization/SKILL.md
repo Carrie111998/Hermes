@@ -4,7 +4,7 @@ description: Use when tuning local TTS latency/stability (MLX Qwen3-TTS).
 version: 1.0.0
 author: Hermes Agent
 license: MIT
-platforms: [macos, linux]
+platforms: [macos]
 metadata:
   hermes:
     tags: [TTS, MLX, Apple Silicon, voice, performance]
