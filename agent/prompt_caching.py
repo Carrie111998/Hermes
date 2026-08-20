@@ -406,6 +406,7 @@ def build_prompt_cache_plan(
         return PromptCachePlan(messages=planned_messages, tools=planned_tools)
 
     marker = _build_marker(cache_ttl)
+    sys_used = 0
     if (
         messages
         and isinstance(messages[0], dict)
@@ -413,7 +414,7 @@ def build_prompt_cache_plan(
     ):
         # Tool-cache layout: only the static prefix carries a system-side
         # marker; the volatile suffix's budget is spent on the tools array.
-        _apply_system_cache_markers(
+        sys_used = _apply_system_cache_markers(
             messages[0],
             marker,
             static_system_prefix,
@@ -422,11 +423,14 @@ def build_prompt_cache_plan(
             fallback_to_whole=False,
         )
     planned_tools[-1]["cache_control"] = dict(marker)
-    for endpoint in _completed_transaction_endpoint_indexes(
-        messages,
-        native_anthropic=True,
-    )[-2:]:
-        _apply_cache_marker(messages[endpoint], marker, native_anthropic=True)
+    remaining_msg_budget = max(0, 4 - (sys_used + 1))
+    if remaining_msg_budget > 0:
+        endpoints = _completed_transaction_endpoint_indexes(
+            messages,
+            native_anthropic=True,
+        )
+        for endpoint in endpoints[-remaining_msg_budget:]:
+            _apply_cache_marker(messages[endpoint], marker, native_anthropic=True)
 
     return PromptCachePlan(messages=messages, tools=planned_tools)
 
