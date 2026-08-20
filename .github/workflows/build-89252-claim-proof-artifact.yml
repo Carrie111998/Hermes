@@ -1,0 +1,84 @@
+name: Build #89252 claimant-proof artifact
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-89252-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build-verified-source:
+    if: >-
+      github.event.pull_request.head.repo.full_name == 'andrexibiza/hermes-agent' &&
+      github.event.pull_request.head.ref == 'fix/88715-canonical-multiplex-identity'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact PR head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Execute the branch-stored claimant transformation
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from textwrap import dedent
+
+          workflow = Path('.github/workflows/complete-89252-claim-proof.yml')
+          text = workflow.read_text(encoding='utf-8')
+          start_marker = "          python3 - <<'PY'\n"
+          end_marker = "\n          PY\n"
+          start = text.index(start_marker) + len(start_marker)
+          end = text.index(end_marker, start)
+          code = dedent(text[start:end])
+          exec(compile(code, str(workflow) + ':embedded-transform', 'exec'), {})
+          PY
+          rm .github/workflows/complete-89252-claim-proof.yml
+          git diff --check
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+
+      - name: Format and verify claimant-generation witnesses
+        run: |
+          set -euo pipefail
+          uv run ruff check --fix gateway/routing_identity.py tests/gateway/test_routing_identity.py tests/gateway/test_transport_claim_generation.py
+          uv run ruff format gateway/routing_identity.py tests/gateway/test_routing_identity.py tests/gateway/test_transport_claim_generation.py
+          python -m py_compile gateway/routing_identity.py
+          uv run pytest -q tests/gateway/test_routing_identity.py tests/gateway/test_transport_claim_generation.py
+          git diff --check
+
+      - name: Write exact-object receipt
+        env:
+          SOURCE_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p /tmp/claim-proof
+          {
+            echo "source_head=${SOURCE_HEAD}"
+            echo "routing_identity_sha256=$(sha256sum gateway/routing_identity.py | cut -d' ' -f1)"
+            echo "routing_tests_sha256=$(sha256sum tests/gateway/test_routing_identity.py | cut -d' ' -f1)"
+            echo "claim_tests_sha256=$(sha256sum tests/gateway/test_transport_claim_generation.py | cut -d' ' -f1)"
+            echo "focused_tests=passed"
+          } > /tmp/claim-proof/verification.txt
+
+      - name: Upload verified source objects
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr-89252-claimant-proof-source
+          path: |
+            gateway/routing_identity.py
+            tests/gateway/test_routing_identity.py
+            tests/gateway/test_transport_claim_generation.py
+            /tmp/claim-proof/verification.txt
+          retention-days: 1
+          if-no-files-found: error
