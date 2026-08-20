@@ -442,7 +442,52 @@ Create a new agent run. Returns a `run_id` that can be used to subscribe to prog
 }
 ```
 
-Runs accept a simple `input` string and optional `session_id`, `instructions`, `conversation_history`, or `previous_response_id`. When `session_id` is provided, Hermes surfaces it in the run status so external UIs can correlate runs with their own conversation IDs.
+Runs accept a simple `input` string and optional `session_id`, `instructions`,
+`conversation_history`, `previous_response_id`, or `store`. When `session_id`
+is provided, Hermes surfaces it in the run status so external UIs can correlate
+runs with their own conversation IDs.
+
+`store` defaults to `true`. Set it to `false` when the caller owns the durable
+transcript and sends the required `conversation_history` on each turn:
+
+```json
+{
+  "input": "Continue the caller-managed task",
+  "session_id": "external-conversation-42",
+  "conversation_history": [
+    {"role": "user", "content": "Inspect the project"},
+    {"role": "assistant", "content": "I found three modules."}
+  ],
+  "store": false
+}
+```
+
+For that run, Hermes does not open or write the local `state.db` SessionDB,
+read a persisted session `/model` override, write an optional session JSON
+snapshot or request-debug dump, or persist delegated child transcripts. The
+`session_id` is a caller correlation/runtime-scope value, not a request to
+resume local session state. Use `X-Hermes-Session-Key` when an external memory
+provider needs a stable scope across transcript/session rotations. Model
+selection therefore comes from the current request, its configured route, or
+the global default. `session_search` has no local SessionDB to query and
+reports the store as unavailable.
+
+`previous_response_id` must name an existing Responses API record; a run id is
+not a continuation token. If the record is absent (including after a restart
+when the response store was not durable), Hermes returns `404` instead of
+silently starting a new conversation. Caller-managed integrations should
+resend explicit `conversation_history` to make restart recovery independent of
+Hermes storage.
+
+The `store` flag controls Hermes-managed **session/request artifacts**, not all
+agent side effects. External memory providers still prefetch and sync turns;
+configured plugin/context-engine lifecycle hooks and automatic memory/skill
+review still run; and enabled tools (including memory, skill, file, terminal,
+MCP, and delegated tools) may write to their own backends. Restrict those
+surfaces separately through provider, plugin, toolset, approval, and sandbox
+configuration when a run must have a narrower side-effect boundary. Run status
+and SSE event buffers remain process-local regardless of `store` and disappear
+after restart.
 
 ### GET /v1/runs/\{run_id\}
 
