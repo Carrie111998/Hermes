@@ -7,7 +7,8 @@ import { group, split } from '@/components/pane-shell/tree/model'
 import { $layoutTree, noteActiveTreeGroup } from '@/components/pane-shell/tree/store'
 import { SidebarProvider } from '@/components/ui/sidebar'
 import { registry } from '@/contrib/registry'
-import { $selectedStoredSessionId } from '@/store/session'
+import { $selectedStoredSessionId, $sessions } from '@/store/session'
+import { makeSessionInfo } from '@/test/session-info'
 
 import { ROUTES_AREA, SIDEBAR_NAV_AREA } from '../../routes'
 
@@ -48,6 +49,13 @@ const expectOnlyCurrent = (button: HTMLElement | null) => {
   expect(activeButtons()).toEqual(button ? [button] : [])
 }
 
+const expectOnlySelectedSession = (title: string | null) => {
+  const sessionRows = ['Tile one', 'Tile two'].map(label => screen.getByText(label).closest('.group.row-hover'))
+  const selectedRows = sessionRows.filter(row => row?.className.includes('bg-(--ui-row-active-background)'))
+
+  expect(selectedRows).toEqual(title ? [screen.getByText(title).closest('.group.row-hover')] : [])
+}
+
 describe('ChatSidebar contributed navigation', () => {
   let dispose: () => void
 
@@ -59,6 +67,10 @@ describe('ChatSidebar contributed navigation', () => {
       { area: SIDEBAR_NAV_AREA, id: 'reports-nav', data: { codicon: 'graph', label: 'Reports', path: '/reports' } }
     ])
     $selectedStoredSessionId.set('tile-one')
+    $sessions.set([
+      makeSessionInfo({ id: 'tile-one', last_active: 2, profile: 'default', started_at: 1, title: 'Tile one' }),
+      makeSessionInfo({ id: 'tile-two', last_active: 2, profile: 'default', started_at: 1, title: 'Tile two' })
+    ])
     $layoutTree.set(
       split('row', [
         group(['workspace'], { active: 'workspace', id: 'workspace-group' }),
@@ -73,7 +85,9 @@ describe('ChatSidebar contributed navigation', () => {
     cleanup()
     dispose()
     $selectedStoredSessionId.set(null)
+    $sessions.set([])
     $layoutTree.set(null)
+    noteActiveTreeGroup(null)
   })
 
   it('tracks the visible surface across routes tiles and null identities', () => {
@@ -83,19 +97,23 @@ describe('ChatSidebar contributed navigation', () => {
     const reports = screen.getByRole('button', { name: 'Reports' })
 
     expectOnlyCurrent(kanban)
+    expectOnlySelectedSession(null)
     expect(reports.getAttribute('aria-current')).toBeNull()
     expect(reports.getAttribute('data-active')).not.toBe('true')
 
     act(() => noteActiveTreeGroup('tile-one-group'))
     expectOnlyCurrent(null)
+    expectOnlySelectedSession('Tile one')
     expect(kanban.getAttribute('aria-current')).toBeNull()
     expect(kanban.getAttribute('data-active')).not.toBe('true')
 
     act(() => noteActiveTreeGroup('tile-two-group'))
     expectOnlyCurrent(null)
+    expectOnlySelectedSession('Tile two')
 
     act(() => noteActiveTreeGroup('workspace-group'))
     expectOnlyCurrent(kanban)
+    expectOnlySelectedSession(null)
 
     act(() => $selectedStoredSessionId.set(null))
     expectOnlyCurrent(kanban)

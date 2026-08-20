@@ -476,7 +476,7 @@ export function ChatSidebar({
     }
   }, [])
 
-  const activeSidebarSessionId = currentView === 'chat' ? focusedSessionId : null
+  const activeSidebarSessionId = visibleView === 'chat' ? focusedSessionId : null
 
   const dndSensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
