@@ -149,6 +149,38 @@ def _tui_embedded_pane_clarifier(hint: str) -> str:
     return hint + _TUI_EMBEDDED_PANE_CLARIFIER
 
 
+def _cron_trim_signal(agent: Any) -> bool:
+    """Decide whether the skill index should be trimmed for a cron session.
+
+    Returns True ONLY when BOTH hold:
+      1. This is positively a cron session (``agent.platform == "cron"``).
+         The platform is set explicitly by the scheduler when it builds the
+         AIAgent (cron/scheduler.py passes platform="cron"), so we never
+         infer cron-ness from toolset membership — that heuristic was brittle
+         in both directions (a cron job with one extra toolset kept the full
+         ~176K index and still 403'd; a human chat sharing the same toolset
+         set silently lost skill discovery).
+      2. The opt-in allowlist ``skills.cron_whitelist`` is configured. Trimming
+         is a deliberate, documented opt-in — without it we keep the full index
+         (human-chat-equivalent behaviour) so no feature is silently dropped.
+
+    Reading config here is cheap: ``load_config_readonly`` is a cached fast-path
+    (signature on file mtime/size, no deepcopy). It runs once per system-prompt
+    build on the cron path only — human chat never calls this, so the hot path
+    is untouched.
+    """
+    if getattr(agent, "platform", None) != "cron":
+        return False
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        _skills_cfg = (load_config_readonly() or {}).get("skills", {}) or {}
+        _whitelist = _skills_cfg.get("cron_whitelist")
+        return bool(_whitelist) and isinstance(_whitelist, (list, tuple)) and len(_whitelist) > 0
+    except Exception:
+        return False
+
+
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers.
 
@@ -322,6 +354,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
+            cron_trim=_cron_trim_signal(agent),
         )
     else:
         skills_prompt = ""

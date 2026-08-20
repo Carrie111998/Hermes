@@ -1666,6 +1666,7 @@ def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
+    cron_trim: "bool | None" = None,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -1897,44 +1898,46 @@ def build_skills_system_prompt(
     # then hit a 403 context-limit error on the very first request and the
     # cron job never completes.
     #
-    # Fix: if skills.cron_enabled_toolsets is configured (e.g.
-    # ["terminal","web","file"]) and the current agent's available_toolsets
-    # match it exactly, we are in a cron context. In that case we render ONLY
-    # the whitelisted skills (skills.cron_whitelist) as `name: [category-tag]`
-    # (~3–5K tokens) instead of the full sub-description index.
+    # Fix: the caller (system_prompt.build_system_prompt_parts) passes
+    # ``cron_trim=True`` ONLY when it has positively identified a cron
+    # session (agent.platform == "cron" AND the opt-in skills.cron_whitelist
+    # is configured). We do NOT infer cron-ness from toolset equality:
+    #   * a cron job with even one extra toolset (memory, skills, an MCP
+    #     server) would otherwise keep the full index and still 403;
+    #   * a human chat configured with the same toolset set as the cron
+    #     allowlist would silently lose skill discovery.
+    # Passing an explicit signal keeps both cases predictable.
     #
-    # Human chat is unaffected: it uses a different toolset set, so the full
-    # sub-description index (needed for skill discovery) is preserved. The
-    # scheduler and agent lifecycle are NOT touched.
-    try:
-        _cron_cfg = (load_config_readonly() or {}).get("skills", {}) or {}
-        _cron_toolsets = _cron_cfg.get("cron_enabled_toolsets")
-        if _cron_toolsets and isinstance(_cron_toolsets, (list, tuple)):
-            _cron_toolsets_set = set(_cron_toolsets)
-            _avail_set = set(available_toolsets or set())
-            if _avail_set == _cron_toolsets_set:
-                _whitelist = set(_cron_cfg.get("cron_whitelist") or [])
-                _whitelisted_only = _cron_cfg.get("cron_whitelist_only", True)
-                if _whitelisted_only and _whitelist:
-                    _trimmed: dict[str, list[tuple[str, str]]] = {}
-                    for _cat, _skills in skills_by_category.items():
-                        for _name, _desc in _skills:
-                            if _name in _whitelist:
-                                _trimmed.setdefault(_cat, []).append(
-                                    (_name, f"[{_cat.split('/')[0]}]")
-                                )
-                    skills_by_category = _trimmed
-                elif not _whitelist:
-                    # No whitelist provided — fall back to names-only (tag per category)
-                    _trimmed = {}
-                    for _cat, _skills in skills_by_category.items():
-                        for _name, _desc in _skills:
+    # When cron_trim is set, we render ONLY the whitelisted skills
+    # (skills.cron_whitelist) as `name: [category-tag]` (~3–5K tokens)
+    # instead of the full sub-description index. Human chat (cron_trim is
+    # None) keeps the full index for discovery. The scheduler/agent
+    # lifecycle are NOT touched.
+    if cron_trim:
+        try:
+            _cron_cfg = (load_config_readonly() or {}).get("skills", {}) or {}
+            _whitelist = set(_cron_cfg.get("cron_whitelist") or [])
+            _whitelisted_only = _cron_cfg.get("cron_whitelist_only", True)
+            if _whitelisted_only and _whitelist:
+                _trimmed: dict[str, list[tuple[str, str]]] = {}
+                for _cat, _skills in skills_by_category.items():
+                    for _name, _desc in _skills:
+                        if _name in _whitelist:
                             _trimmed.setdefault(_cat, []).append(
                                 (_name, f"[{_cat.split('/')[0]}]")
                             )
-                    skills_by_category = _trimmed
-    except Exception as _e:
-        logger.debug("cron skill-index trim skipped: %s", _e)
+                skills_by_category = _trimmed
+            elif not _whitelist:
+                # No whitelist provided — fall back to names-only (tag per category)
+                _trimmed = {}
+                for _cat, _skills in skills_by_category.items():
+                    for _name, _desc in _skills:
+                        _trimmed.setdefault(_cat, []).append(
+                            (_name, f"[{_cat.split('/')[0]}]")
+                        )
+                skills_by_category = _trimmed
+        except Exception as _e:
+            logger.debug("cron skill-index trim skipped: %s", _e)
 
     if not skills_by_category:
         result = ""

@@ -1857,6 +1857,25 @@ DEFAULT_CONFIG = {
         "inline_shell": False,
         # Timeout (seconds) for each !`cmd` snippet when inline_shell is on.
         "inline_shell_timeout": 10,
+        # ── Cron skill-index trim (opt-in) ──────────────────────────────
+        # When a large skill library is installed, the full skill-sub-description
+        # index (~176K tokens for ~2890 skills) is rendered into EVERY agent's
+        # system prompt — including cron jobs. Small/free models (e.g.
+        # tencent/hy3:free, ~128–262K context) then 403 on the first request and
+        # the cron job never completes. Trim it for cron sessions to keep them
+        # under the model's context limit.
+        #
+        # This is OFF unless you set cron_whitelist to a non-empty list. When on,
+        # cron agents (agent.platform == "cron") get ONLY the whitelisted skills
+        # rendered as `name: [category]` (~3–5K tokens) instead of the full
+        # index. Human chat is never affected — it always gets the full index
+        # for skill discovery.
+        #
+        #   cron_whitelist:      [skill names] rendered (trims the rest to tags)
+        #   cron_whitelist_only: True  (default) — when False, the full index is
+        #                        kept; whitelist only narrows which get descriptions
+        "cron_whitelist": [],
+        "cron_whitelist_only": True,
         # Run the keyword/pattern security scanner on skills the agent
         # writes via skill_manage (create/edit/patch).  Off by default
         # because the agent can already execute the same code paths via
