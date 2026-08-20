@@ -943,8 +943,12 @@ function applyWindowTranslucency(win, changed = { backing: true, material: true,
   }
 
   try {
-    // Backing swap + material are scoped to registered chat windows (see
-    // translucencyBackedWindows above).
+    // Backing swap, material, and opacity are all scoped to registered chat
+    // windows (see translucencyBackedWindows above) — the HUD / pet overlay /
+    // quick entry / wake indicator are `transparent: true` windows that own
+    // their backgrounds, and `setOpacity` fades the whole window (not just a
+    // themed backing), so an unregistered window is just as wrong a target
+    // for it as it is for setBackgroundColor/setVibrancy.
     if (translucencyBackedWindows.has(win)) {
       if (changed.backing && typeof win.setBackgroundColor === 'function') {
         win.setBackgroundColor(glassActive(translucencyState) ? '#00000000' : getWindowBackgroundColor())
@@ -963,10 +967,10 @@ function applyWindowTranslucency(win, changed = { backing: true, material: true,
           win.setBackgroundMaterial(backgroundMaterialFor(translucencyState))
         }
       }
-    }
 
-    if (changed.opacity && typeof win.setOpacity === 'function') {
-      win.setOpacity(windowOpacity())
+      if (changed.opacity && typeof win.setOpacity === 'function') {
+        win.setOpacity(windowOpacity())
+      }
     }
   } catch (error) {
     rememberLog(`[translucency] apply failed: ${error.message}`)

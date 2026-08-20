@@ -8,6 +8,10 @@
  * across the upgrade that curved the middle of the lever.
  */
 
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -680,5 +684,62 @@ describe('resolving the book for the painted appearance', () => {
 
     expect(resolveTranslucency(book, 'light', false).mode).toBe('clear')
     expect(resolveTranslucency(book, 'dark', false).mode).toBe('clear')
+  })
+})
+
+// applyWindowTranslucency has no module.exports (it lives in main.ts, which has
+// none at all), so this pins its shape via the repo's source-assertion pattern
+// (see hardening.test.ts).
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+function readMain() {
+  return fs.readFileSync(path.join(__dirname, 'main.ts'), 'utf8').replace(/\r\n/g, '\n')
+}
+
+describe('applyWindowTranslucency scopes every native call to registered chat windows', () => {
+  // The HUD, pet overlay, quick entry, and wake indicator are `transparent:
+  // true` windows that own their own background — they never register in
+  // translucencyBackedWindows (see the constant's own comment in main.ts) and
+  // are deliberately excluded from setBackgroundColor/setVibrancy/
+  // setBackgroundMaterial for exactly that reason. setOpacity fades the whole
+  // window, not just a themed backing, so an unregistered window is just as
+  // wrong a target for it: applying it turns a HUD band or a floating pet
+  // sprite translucent along with the desktop showing through, every time the
+  // user drags the intensity/fade slider. The bug shipped with setOpacity as a
+  // sibling of the registration gate instead of nested inside it, so it ran
+  // unconditionally over BrowserWindow.getAllWindows() regardless of
+  // registration.
+  it('nests the setOpacity call inside the translucencyBackedWindows.has(win) gate', () => {
+    const source = readMain()
+    const fnStart = source.indexOf('function applyWindowTranslucency(')
+    expect(fnStart, 'applyWindowTranslucency must exist in main.ts').not.toBe(-1)
+    const fnEnd = source.indexOf('\nfunction ', fnStart + 1)
+    const body = source.slice(fnStart, fnEnd === -1 ? undefined : fnEnd)
+
+    const gateIndex = body.indexOf('if (translucencyBackedWindows.has(win))')
+    expect(gateIndex, 'the chat-window registration gate must exist').not.toBe(-1)
+
+    const opacityIndex = body.indexOf("win.setOpacity(windowOpacity())")
+    expect(opacityIndex, 'the native setOpacity call must still exist').not.toBe(-1)
+    expect(opacityIndex, 'setOpacity must appear after the registration gate opens').toBeGreaterThan(gateIndex)
+
+    // Brace-depth between the gate opening and the opacity check's OWN `if`
+    // (not the setOpacity call itself, which would count the opacity `if`'s
+    // own opening brace and read as "nested" regardless of the gate). If
+    // depth is still positive here, the gate's block has not closed yet, so
+    // the opacity check sits inside it. A depth of 0 (or negative) means the
+    // gate already closed — the opacity check is a sibling, unconditional
+    // over every open window.
+    const opacityIfIndex = body.indexOf('if (changed.opacity')
+    expect(opacityIfIndex, 'the opacity change-guard must still exist').not.toBe(-1)
+    let depth = 0
+    for (const ch of body.slice(gateIndex, opacityIfIndex)) {
+      if (ch === '{') depth += 1
+      if (ch === '}') depth -= 1
+    }
+    expect(
+      depth,
+      'the opacity change-guard must be nested inside the translucencyBackedWindows.has(win) block, not a sibling of it'
+    ).toBeGreaterThan(0)
   })
 })
