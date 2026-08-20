@@ -257,9 +257,26 @@ class CandidateRepository:
             raise
         return CandidateImportReport(dataset_id, version, len(candidates), digest)
 
-    def select(self, *, countries: list[str], product_terms: list[str], limit: int) -> list[CandidateRecord]:
+    def select(
+        self,
+        *,
+        countries: list[str],
+        product_terms: list[str],
+        limit: int,
+        exclude: set[tuple[str, str]] | None = None,
+    ) -> list[CandidateRecord]:
+        """Pick candidates to verify.
+
+        ``exclude`` holds (normalized_name, country) identities the caller has
+        already settled — validated recently, or closed. It is passed in rather
+        than queried here because this corpus is shared across tenants and has
+        no company_id: whose work is already done is a tenant question. The
+        filter runs before ``limit`` so a run still gets a full batch of
+        unsettled candidates instead of a page mostly spent on skips.
+        """
         if limit < 1:
             return []
+        skip = exclude or set()
         normalized_countries = {str(value).strip().upper() for value in countries if str(value).strip()}
         invalid_countries = normalized_countries - ISO_ALPHA_2
         if invalid_countries:
@@ -284,6 +301,8 @@ class CandidateRepository:
                 *[normalize_name(value) for value in data.get("categories", [])],
             ])
             if terms and not all(term in searchable for term in terms):
+                continue
+            if (row["normalized_name"], (row["country"] or "").upper()) in skip:
                 continue
             results.append(CandidateRecord(
                 dataset_id=row["dataset_id"], version=row["version"], source_record_id=row["source_record_id"],

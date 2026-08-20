@@ -82,6 +82,35 @@ def _is_official(provenance_url: str, candidate_domain: str | None) -> bool:
     )
 
 
+# Phrases that mean the business itself has stopped, not that a page, branch or
+# job posting closed. Every one is multi-word on purpose: bare "closed" appears
+# on ordinary pages ("closed on Sundays", "closed a funding round") and a false
+# positive here removes a live company from every future run.
+CLOSURE_PHRASES = (
+    "permanently closed",
+    "closed permanently",
+    "no longer in business",
+    "no longer operating",
+    "no longer trading",
+    "out of business",
+    "ceased operations",
+    "ceased trading",
+    "ceased its operations",
+    "went out of business",
+    "in liquidation",
+    "under liquidation",
+    "has been dissolved",
+    "was dissolved",
+    "company is dissolved",
+    "declared bankruptcy",
+    "filed for bankruptcy",
+)
+
+
+def _closure_signal(normalized: str) -> bool:
+    return any(phrase in normalized for phrase in CLOSURE_PHRASES)
+
+
 def _fact_matches(
     text: str,
     candidate: CandidateRecord,
@@ -120,6 +149,10 @@ def _fact_matches(
         facts["product_term"] = matched_products
     if classification == "official" and candidate.domain:
         facts["domain"] = [candidate.domain]
+    # Gated on identity: a closure phrase about some other company in the same
+    # snippet must never retire this candidate.
+    if identity_matched and _closure_signal(normalized):
+        facts["lifecycle_status"] = ["closed"]
     return facts
 
 

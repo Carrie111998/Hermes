@@ -31,6 +31,76 @@ class LeadResearchService:
     def ensure_catalog(self, company_id: str) -> None:
         self.registry.ensure_tenant(self.db, company_id, now())
 
+    # A claim field carrying "closed" retires a company for good; the corpus it
+    # came from is immutable and shared, so the state has to live tenant-side.
+    LIFECYCLE_FIELD = "lifecycle_status"
+    # What a company must already have proven for a rerun to leave it alone.
+    # Contacts are deliberately not required yet: nothing populates them for
+    # corpus candidates, so requiring one would skip nothing and mean nothing.
+    SETTLED_FIELDS = ("country", "buyer_role")
+
+    def _freshness_days(self, source_ids: list[str]) -> int:
+        windows = [
+            self.registry.definitions[source_id].freshness_days
+            for source_id in source_ids
+            if source_id in self.registry.definitions
+        ]
+        return min([window for window in windows if window] or [30])
+
+    def _settled_identities(
+        self, company_id: str, freshness_days: int
+    ) -> tuple[set[tuple[str, str]], int, int]:
+        """Identities a rerun should not spend requests on.
+
+        Returns the skip set plus how many were closed and how many were merely
+        already validated, so a run can say which it was instead of silently
+        shrinking its own funnel.
+        """
+        organizations = self.db.all(
+            "SELECT id,normalized_name,country FROM organizations WHERE company_id=?",
+            (company_id,),
+        )
+        if not organizations:
+            return set(), 0, 0
+        cutoff = now() - freshness_days * 86400
+        lifecycle: dict[str, tuple[float, Any]] = {}
+        fresh: dict[str, set[str]] = defaultdict(set)
+        for row in self.db.all(
+            "SELECT organization_id,field,value,verified_at FROM feature_claims "
+            "WHERE company_id=?",
+            (company_id,),
+        ):
+            organization_id = row["organization_id"]
+            if row["field"] == self.LIFECYCLE_FIELD:
+                # Latest wins, so a later "operating" claim reopens a company
+                # that was wrongly retired. Closure must not be a one-way door.
+                stamp = row["verified_at"] or 0.0
+                if organization_id not in lifecycle or stamp >= lifecycle[organization_id][0]:
+                    lifecycle[organization_id] = (stamp, json_load(row["value"], None))
+            elif row["field"] in self.SETTLED_FIELDS and (row["verified_at"] or 0.0) >= cutoff:
+                fresh[organization_id].add(row["field"])
+
+        skip: set[tuple[str, str]] = set()
+        closed = validated = 0
+        required = set(self.SETTLED_FIELDS)
+        for organization in organizations:
+            identity = (
+                organization["normalized_name"],
+                (organization["country"] or "").upper(),
+            )
+            state = lifecycle.get(organization["id"])
+            value = state[1] if state else None
+            if isinstance(value, list):
+                value = value[0] if value else None
+            if value == "closed":
+                skip.add(identity)
+                closed += 1
+                continue
+            if required <= fresh.get(organization["id"], set()):
+                skip.add(identity)
+                validated += 1
+        return skip, closed, validated
+
     def catalog(self, company_id: str) -> list[dict]:
         self.ensure_catalog(company_id)
         rows = self.db.all(
@@ -500,11 +570,19 @@ class LeadResearchService:
                     )
 
             product_terms = self._product_terms(company_id, config)
+            settled, closed_count, validated_count = self._settled_identities(
+                company_id, self._freshness_days(config.enabled_source_ids)
+            )
+            # Outside FUNNEL_KEYS on purpose: the funnel is monotonic and these
+            # describe work never started, not a stage that lost records.
+            metrics["excluded_closed"] = closed_count
+            metrics["skipped_validated"] = validated_count
             for country in config.target_countries:
                 candidates = self.candidates.select(
                     countries=[country],
                     product_terms=product_terms,
                     limit=config.max_qualified_leads_per_country * 3,
+                    exclude=settled,
                 )
                 metrics["raw_records"] += len(candidates)
                 metrics["named_candidates"] += len(candidates)

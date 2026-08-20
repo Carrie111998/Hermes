@@ -234,3 +234,32 @@ def test_bare_domain_is_rejected_without_writes(db):
 
     assert db.one("SELECT COUNT(*) AS n FROM candidate_datasets")["n"] == 0
     assert db.one("SELECT COUNT(*) AS n FROM candidate_records")["n"] == 0
+
+
+def test_selection_skips_settled_identities_and_still_fills_the_limit(db, candidate_csv):
+    """A rerun must spend its batch on unsettled companies, not on skips.
+
+    Excluding after the limit would return a page mostly consumed by already
+    validated companies, which is the re-verification cost this exists to stop.
+    """
+    repo = CandidateRepository(db)
+    repo.import_file("kitchen-appliances", "2026-08", "candidates.csv", candidate_csv)
+
+    both = repo.select(countries=["DE", "FR"], product_terms=[], limit=2)
+    assert {record.country for record in both} == {"DE", "FR"}
+
+    remaining = repo.select(
+        countries=["DE", "FR"],
+        product_terms=[],
+        limit=1,
+        exclude={("atlas kitchens gmbh", "DE")},
+    )
+    assert [record.country for record in remaining] == ["FR"]
+
+
+def test_selection_without_exclusions_is_unchanged(db, candidate_csv):
+    repo = CandidateRepository(db)
+    repo.import_file("kitchen-appliances", "2026-08", "candidates.csv", candidate_csv)
+
+    assert len(repo.select(countries=[], product_terms=[], limit=10, exclude=set())) == 2
+    assert len(repo.select(countries=[], product_terms=[], limit=10)) == 2

@@ -9,7 +9,7 @@ import pytest
 from server.config import Settings
 from server.lead_research.candidates import CandidateRecord
 from server.lead_research.models import DiscoveryQuery
-from server.lead_research.providers.bright_data import BrightDataVerifier
+from server.lead_research.providers.bright_data import BrightDataVerifier, _fact_matches
 from server.lead_research.registry import build_registry
 
 
@@ -259,3 +259,36 @@ def test_explicit_candidate_alias_establishes_result_identity(candidate, query):
     assert bundle.sources[0].facts["buyer_role"] == ["distributor"]
     assert bundle.sources[0].facts["product_term"] == ["heat pumps"]
     assert bundle.independent_source_count == 1
+
+
+# A closed company must be retired, but a false positive removes a live company
+# from every future run, so the signal is narrow and identity-gated.
+@pytest.mark.parametrize("text", [
+    "Acme Handel GmbH is permanently closed",
+    "Acme Handel GmbH has ceased operations",
+    "Acme Handel GmbH went out of business last year",
+    "Acme Handel GmbH is in liquidation",
+    "Acme Handel GmbH filed for bankruptcy",
+])
+def test_closure_phrases_retire_the_candidate(candidate, text):
+    facts = _fact_matches(text, candidate, [], [], "independent")
+    assert facts.get("lifecycle_status") == ["closed"]
+
+
+@pytest.mark.parametrize("text", [
+    "Acme Handel GmbH is closed on Sundays",
+    "Acme Handel GmbH closed a funding round",
+    "Acme Handel GmbH closed its Berlin branch",
+    "Acme Handel GmbH announced a closed beta",
+])
+def test_ordinary_uses_of_closed_do_not_retire_a_company(candidate, text):
+    """"Closed" alone is common prose; only business-ending phrases count."""
+    assert "lifecycle_status" not in _fact_matches(text, candidate, [], [], "independent")
+
+
+def test_closure_of_another_company_does_not_retire_this_one(candidate):
+    """An official page may mention some other firm's collapse."""
+    facts = _fact_matches(
+        "Unrelated Trading Ltd has ceased operations", candidate, [], [], "official"
+    )
+    assert "lifecycle_status" not in facts
