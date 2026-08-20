@@ -293,6 +293,7 @@ class TestResolveDeliveryTarget:
             "platform": "telegram",
             "chat_id": "ops-room",
             "thread_id": None,
+            "agent_id": None,
         }
 
 
