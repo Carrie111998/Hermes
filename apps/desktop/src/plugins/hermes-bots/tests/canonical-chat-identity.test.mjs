@@ -7,7 +7,7 @@ const source = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
 
 // ── canonical open-path harness (slice: createCanonicalChat + openBotCanonicalChat)
 function loadOpenPath({ openSession, request }) {
-  const start = source.indexOf('const canonicalCreations = new Map()')
+  const start = source.indexOf('function botRosterKey(bot)')
   const end = source.indexOf('function displayName(', start)
   const saved = []
   const requests = []

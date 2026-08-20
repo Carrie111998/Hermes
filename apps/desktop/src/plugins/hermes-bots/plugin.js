@@ -3404,15 +3404,19 @@ const lastCanonicalPins = new Map()
 let botOpenGeneration = 0
 
 function canonicalChatKey(name, bot) {
-  if (bot && typeof bot === 'object') {
-    return `${bot.connectionId || 'legacy'}::${bot.name || name || 'default'}`
-  }
-  return `legacy::${name || 'default'}`
+  const row = bot && typeof bot === 'object' ? bot : null
+  return botRosterKey({
+    connectionId: row?.connectionId,
+    name: row?.name || name
+  })
 }
 
 function isMissingCanonicalChat(error) {
   const msg = String(error?.message || error || '')
-  return /not found|vanished|unknown session|no such session|does not exist|session not found/i.test(msg)
+  // Session-scoped only. Bare "not found" / "does not exist" match RPC and
+  // filesystem failures. "session not found" is a reconnect/cross-profile
+  // false positive on bot-pane opens (isSessionGoneError).
+  return /unknown session|no such session|session vanished/i.test(msg)
 }
 
 async function openStoredBotChat(name, storedId, summary) {
@@ -6974,7 +6978,10 @@ function CreateAgentDialog({ open, onClose, roster }) {
       // the first thing the user sees, and the pin exists from minute one.
       try {
         // Creates, pins, opens, and kicks off the intro in one flow.
-        const sid = await createCanonicalChat(slug)
+        const sid = await createCanonicalChat(slug, {
+          name: slug,
+          connectionId: String(host.state?.connectionId?.get?.() || host.activeConnectionId?.() || '').trim() || undefined
+        })
 
         if (!sid && typeof host.newChat === 'function') {
           host.newChat(slug)

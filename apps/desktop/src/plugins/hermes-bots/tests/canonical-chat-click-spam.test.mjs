@@ -12,7 +12,7 @@ import vm from 'node:vm'
 const source = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
 
 function loadOpenPath({ openSession, request }) {
-  const start = source.indexOf('const canonicalCreations = new Map()')
+  const start = source.indexOf('function botRosterKey(bot)')
   const end = source.indexOf('function displayName(', start)
   const saved = []
   const requests = []
@@ -30,7 +30,7 @@ function loadOpenPath({ openSession, request }) {
   }
   const exportLine = [
     '',
-    'globalThis.__open = { openBotCanonicalChat, createCanonicalChat };',
+    'globalThis.__open = { openBotCanonicalChat, createCanonicalChat, canonicalChatKey, botRosterKey };',
     ''
   ].join('\n')
   const section = source.slice(start, end).concat(exportLine)
@@ -95,7 +95,7 @@ test('click-spam: a just-minted chat is reused when the next click still has no 
   ])
 })
 
-test('click-spam: openSession not-found remints once', async () => {
+test('click-spam: openSession vanished remints once', async () => {
   // preferred_session=null + opener "not found" is the only proven-missing
   // path. Extra clicks still pass the dead pin (React has not re-rendered);
   // lastCanonicalPins must stop a second launch-store kickoff.
@@ -103,7 +103,7 @@ test('click-spam: openSession not-found remints once', async () => {
   let creates = 0
   const runtime = loadOpenPath({
     openSession: async id => {
-      if (id === 'dead-pin') throw new Error('session not found')
+      if (id === 'dead-pin') throw new Error('session vanished')
       opened.push(id)
     },
     request: async method => {
@@ -240,4 +240,99 @@ test('overlapping creates for same-named bots on different sources do not share 
 
   assert.equal(await pendingA, 'mint-1')
   assert.equal(await pendingB, 'mint-2')
+})
+
+test('click-spam: Method not found / profile not found do not remint', async () => {
+  for (const message of ['Method not found', 'profile not found']) {
+    let creates = 0
+    const runtime = loadOpenPath({
+      openSession: async () => {
+        throw new Error(message)
+      },
+      request: async method => {
+        if (method === 'profiles.list') {
+          return { profiles: [{ name: 'ops', preferred_session: null }] }
+        }
+        if (method === 'session.create') {
+          creates += 1
+          return { stored_session_id: `bad-${creates}`, session_id: `rt-${creates}` }
+        }
+        return {}
+      }
+    })
+
+    await assert.rejects(
+      runtime.openBotCanonicalChat('ops', 'bot-profile-chat', null),
+      new RegExp(message.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    )
+    assert.equal(creates, 0, `${message} must not be treated as a missing session`)
+    assert.deepEqual(runtime.saved, [])
+  }
+})
+
+test('click-spam: reconnect-shaped session not found does not remint', async () => {
+  let creates = 0
+  const runtime = loadOpenPath({
+    openSession: async () => {
+      throw new Error('session not found')
+    },
+    request: async method => {
+      if (method === 'profiles.list') {
+        return { profiles: [{ name: 'ops', preferred_session: null }] }
+      }
+      if (method === 'session.create') {
+        creates += 1
+        return { stored_session_id: `reconnect-${creates}`, session_id: `rt-${creates}` }
+      }
+      return {}
+    }
+  })
+
+  await assert.rejects(
+    runtime.openBotCanonicalChat('ops', 'bot-profile-chat', null),
+    /session not found/
+  )
+  assert.equal(creates, 0, 'session not found is a reconnect false positive, not proven missing')
+  assert.deepEqual(runtime.saved, [])
+})
+
+test('canonicalChatKey delegates to botRosterKey', () => {
+  const runtime = loadOpenPath({
+    openSession: async () => undefined,
+    request: async () => ({})
+  })
+  const bot = { name: 'ops', connectionId: 'gw-1' }
+  assert.equal(runtime.canonicalChatKey('ops', bot), runtime.botRosterKey(bot))
+  assert.equal(runtime.canonicalChatKey('ops'), runtime.botRosterKey({ name: 'ops' }))
+})
+
+test('production open handlers pass the roster bot into openBotCanonicalChat', () => {
+  assert.match(
+    source,
+    /openBotCanonicalChat\(\s*bot\.name,\s*pinnedChat,\s*previewSession,\s*bot\s*\)/
+  )
+  assert.match(
+    source,
+    /openBotCanonicalChat\(\s*bot\.name,\s*pinnedChat,\s*bot\.preferred_session \|\| bot\.last_session,\s*bot\s*\)/
+  )
+  assert.match(source, /createCanonicalChat\(slug, \{/)
+})
+
+test('create then null-snapshot click shares the source-qualified pin', async () => {
+  let creates = 0
+  const runtime = loadOpenPath({
+    openSession: async () => undefined,
+    request: async method => {
+      if (method === 'session.create') {
+        creates += 1
+        return { stored_session_id: `birth-${creates}`, session_id: `rt-${creates}` }
+      }
+      return {}
+    }
+  })
+  const bot = { name: 'ops', connectionId: 'gw-1' }
+
+  assert.equal(await runtime.createCanonicalChat('ops', bot), 'birth-1')
+  assert.equal(await runtime.openBotCanonicalChat('ops', null, null, bot), 'birth-1')
+  assert.equal(creates, 1)
 })
