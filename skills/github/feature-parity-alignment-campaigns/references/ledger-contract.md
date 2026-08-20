@@ -1,88 +1,181 @@
 # Feature Parity campaign ledger contract
 
-The ledger is the source of truth for capability identity, product disposition,
-publication ownership, consumer wiring, and release evidence. Narrative EPIC
-tables and packet implementation maps are projections of this file; they do not
-override it.
+A campaign has two different authorities:
 
-## Root fields
+1. `contracts.json` is the append-only semantic registry. It authorizes ordered
+   capability identity and product disposition.
+2. `<platform>.json` is the mutable delivery ledger. It records current code,
+   publication, wiring, and release evidence for one registered revision.
+
+A ledger cannot authorize a semantic change by recomputing its own digest.
+
+## Contract registry
+
+The repository registry lives at
+`docs/architecture/feature-parity/contracts.json`.
+
+```json
+{
+  "schema_version": 1,
+  "contracts": {
+    "example-feature-parity": [
+      {
+        "revision": 1,
+        "repository": "example/project",
+        "tracker": 123,
+        "contract_sha256": "<sha256>",
+        "previous_contract_sha256": null,
+        "authority": {
+          "kind": "issue",
+          "number": 123,
+          "url": "https://github.com/example/project/issues/123"
+        }
+      }
+    ]
+  }
+}
+```
+
+Revisions are contiguous and append-only. Revision 1 has a null predecessor;
+each later revision points to the prior digest and includes a non-empty `reason`.
+Repository and tracker identity do not change across revisions.
+
+The digest covers the ordered list of each row's `id`, `name`, `product_state`,
+and `source_anchor`.
+
+## Ledger root
 
 ```json
 {
   "schema_version": 1,
   "campaign": {
-    "id": "discord-feature-parity",
-    "tracker": 79564,
+    "id": "example-feature-parity",
+    "repository": "example/project",
+    "tracker": 123,
+    "contract_revision": 1,
     "expected_capability_ids": ["M1", "M2"],
-    "forbidden_growth_paths": ["plugins/platforms/discord/adapter.py"],
-    "contract_sha256": "<sha256 of canonical rows>"
+    "forbidden_growth_paths": ["plugins/platforms/example/adapter.py"],
+    "contract_sha256": "<registered sha256>"
   },
   "snapshot": {
-    "upstream_sha": "<40-hex commit>",
-    "captured_at": "<UTC timestamp ending in Z>"
+    "upstream_sha": "<lowercase 40-hex commit>",
+    "captured_at": "<RFC 3339 UTC timestamp ending in Z>"
   },
   "capabilities": []
 }
 ```
 
-The digest is calculated over the ordered list of each row's `id`, `name`, and
-`product_state`. A renamed or repurposed row therefore fails validation rather
-than silently changing the campaign's meaning.
+`expected_capability_ids` is required, non-empty, unique, and ordered. The
+capability list must match it exactly.
 
 ## Capability row
 
-Required fields:
+Every row requires:
 
-- `id`, `name`, and `source_anchor`;
-- `product_state`: `accepted`, `existing`, `pair_gap`, `conditional`,
-  `deferred`, or `rejected`;
-- `delivery_state`: `gap`, `candidate_blocked`, `candidate_unwired`,
-  `candidate_open`, `on_main_unverified`, `released`, or `superseded`;
+- `id`, `name`, `source_anchor`, `product_state`, and `delivery_state`;
 - `implementation_paths`, `test_paths`, `consumers`, `publications`, and
-  `artifact_evidence`.
+  `artifact_evidence`, even when empty;
+- `decision` for `pair_gap`, `conditional`, `deferred`, or `rejected` product
+  states.
 
-Conditional/deferred/rejected/pair-gap rows also require `decision`.
-Candidate delivery states require one authoritative publication. A candidate is
-`unwired` until the real caller/effect path is named and tested.
+Paths are canonical repository-relative POSIX paths. Consumer identifiers use
+`<path>:<symbol>`.
 
-## State semantics
+## Product states
 
-`candidate_blocked` means code exists behind a still-unresolved product,
-dependency, collision, or authority gate.
+- `accepted` — approved campaign scope.
+- `existing` — behavior already exists but still requires evidence and
+  publication truth.
+- `pair_gap` — paired product or authority decision remains unresolved.
+- `conditional` — implementation is gated by an explicit condition.
+- `deferred` — no production, test, or consumer paths may accumulate.
+- `rejected` — no production, test, or consumer paths may accumulate.
 
-`candidate_unwired` means a module or request builder exists, but no accepted
-runtime consumer proves the user-visible capability.
+Decision-gated states cannot advance to `candidate_open`,
+`on_main_unverified`, or `released`.
 
-`candidate_open` means one current PR contains implementation, tests, and
-consumer wiring.
+## Delivery states
 
-`on_main_unverified` means the exact merged commit exists but terminal release
-evidence is incomplete.
+- `gap` — no active authority; requires `gap_reason` or a product `decision`.
+- `candidate_blocked` — one open authoritative PR plus a non-empty `blocker`.
+- `candidate_unwired` — implementation and tests exist, no consumer exists, and
+  `wiring_gap` explains the missing runtime path.
+- `candidate_open` — one open authoritative PR with exact `head_sha`,
+  implementation paths, tests, and runtime consumers.
+- `on_main_unverified` — authoritative PR is merged and exact merged SHA is
+  recorded, but terminal evidence remains incomplete.
+- `released` — exact merged SHA and all terminal evidence are complete.
+- `superseded` — no active authority; requires `superseded_by`.
 
-`released` requires:
-
-- exact merged commit SHA;
-- head-bound CI receipt;
-- live-system receipt when the campaign requires one;
-- two independent exact-head approvals.
-
-The following are deliberately invalid delivery states:
-`implemented_in_packet`, `implemented_locally`, `package_green`, `patch_ready`,
-and `branch_exists`.
+Artifact-only pseudo-states such as `patch_ready`, `branch_exists`, and
+`implemented_in_packet` are invalid.
 
 ## Publication authority
 
-Each active row has exactly one publication with `role: authoritative`.
-Related work is `dependency`; obsolete work is `superseded`. One authoritative
-PR may not own two rows. This forces a visible decision when high-velocity work
-collides instead of allowing two branches to claim the same class.
+An active row has exactly one authoritative publication, and it must be a pull
+request in `campaign.repository`.
 
-## CI invocation
-
-```bash
-python scripts/ci/validate_feature_parity_ledger.py \
-  docs/architecture/feature-parity/<platform>.json
+```json
+{
+  "kind": "pull_request",
+  "number": 456,
+  "role": "authoritative",
+  "state": "open",
+  "author": "contributor",
+  "url": "https://github.com/example/project/pull/456",
+  "head_sha": "<required for candidate_open>"
+}
 ```
 
-Campaign-specific conformance tests should import the same validator and assert
-semantic invariants that are unique to the approved specification.
+For `on_main_unverified` and `released`, state is `merged` and
+`merge_commit_sha` equals `merged.commit_sha`.
+
+## Terminal release evidence
+
+```json
+{
+  "merged": {
+    "repository": "example/project",
+    "commit_sha": "<lowercase 40-hex commit>"
+  },
+  "release_evidence": {
+    "ci": {
+      "url": "https://github.com/example/project/actions/runs/123",
+      "commit_sha": "<same merged commit>"
+    },
+    "live_receipt": {
+      "path": "receipts/example.json",
+      "sha256": "<lowercase 64-hex file digest>",
+      "commit_sha": "<same merged commit>"
+    },
+    "reviews": [
+      {
+        "reviewer": "reviewer-one",
+        "url": "https://github.com/example/project/pull/456#pullrequestreview-1",
+        "commit_sha": "<same merged commit>"
+      },
+      {
+        "reviewer": "reviewer-two",
+        "url": "https://github.com/example/project/pull/456#pullrequestreview-2",
+        "commit_sha": "<same merged commit>"
+      }
+    ]
+  }
+}
+```
+
+Reviewers are distinct and neither may be the authoritative PR author.
+Repository validation confirms that the live receipt exists within the
+repository and matches its declared SHA-256.
+
+## Repository validation
+
+Run the validator without positional ledgers to discover every JSON ledger in
+`docs/architecture/feature-parity/` except `contracts.json`:
+
+```text
+python scripts/ci/validate_feature_parity_ledger.py --repository-root .
+```
+
+Repository validation additionally rejects duplicate campaign IDs, tracker
+issues, and authoritative pull-request ownership across ledgers.

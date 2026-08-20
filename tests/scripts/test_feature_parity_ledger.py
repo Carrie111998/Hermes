@@ -1,187 +1,99 @@
-"""Behavioral tests for the executable Feature Parity campaign ledger contract."""
+"""Core contract and publication-authority tests for Feature Parity ledgers."""
 
 from __future__ import annotations
 
-import json
-import sys
 from pathlib import Path
+import sys
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-SCRIPTS_CI = REPO_ROOT / "scripts" / "ci"
-sys.path.insert(0, str(SCRIPTS_CI))
+import pytest
 
-from validate_feature_parity_ledger import (  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from feature_parity_ledger_test_support import (  # noqa: E402
+    _errors,
+    _ledger,
+    _registry,
+    _row,
     canonical_contract_digest,
-    validate_ledger,
+
 )
-
-
-def _row(
-    capability_id: str,
-    *,
-    name: str | None = None,
-    product_state: str = "accepted",
-    delivery_state: str = "candidate_open",
-    pr: int | None = None,
-) -> dict:
-    row = {
-        "id": capability_id,
-        "name": name or f"Capability {capability_id}",
-        "source_anchor": f"spec#{capability_id}",
-        "product_state": product_state,
-        "delivery_state": delivery_state,
-        "implementation_paths": [
-            f"plugins/platforms/example/{capability_id.lower()}.py"
-        ],
-        "test_paths": [f"tests/example/test_{capability_id.lower()}.py"],
-        "consumers": [f"plugins/platforms/example/runtime.py:{capability_id}"],
-        "publications": [],
-        "artifact_evidence": [],
-    }
-    if pr is not None:
-        row["publications"] = [
-            {
-                "kind": "pull_request",
-                "number": pr,
-                "role": "authoritative",
-            }
-        ]
-    if product_state in {"pair_gap", "conditional", "deferred", "rejected"}:
-        row["decision"] = "Explicit product decision."
-    if product_state == "rejected":
-        row["implementation_paths"] = []
-        row["test_paths"] = []
-        row["consumers"] = []
-        row["delivery_state"] = "gap"
-    return row
-
-
-def _ledger(*rows: dict) -> dict:
-    capabilities = list(rows)
-    return {
-        "schema_version": 1,
-        "campaign": {
-            "id": "example-parity",
-            "tracker": 123,
-            "expected_capability_ids": [row["id"] for row in capabilities],
-            "forbidden_growth_paths": ["plugins/platforms/example/adapter.py"],
-            "contract_sha256": canonical_contract_digest(capabilities),
-        },
-        "snapshot": {
-            "upstream_sha": "a" * 40,
-            "captured_at": "2026-08-19T21:45:14Z",
-        },
-        "capabilities": capabilities,
-    }
-
 
 def test_valid_candidate_contract_passes() -> None:
     document = _ledger(_row("M1", pr=1001), _row("T1", pr=1002))
-    assert validate_ledger(document) == []
+    assert _errors(document, _registry(document)) == []
 
 
 def test_packet_green_is_evidence_not_delivery_state() -> None:
     document = _ledger(_row("M1", pr=1001))
     document["capabilities"][0]["delivery_state"] = "implemented_in_packet"
-    assert any(
-        "confuses artifact evidence with delivery" in error
-        for error in validate_ledger(document)
-    )
+    assert any("confuses artifact evidence with delivery" in error for error in _errors(document))
 
 
-def test_contract_digest_makes_row_remapping_visible() -> None:
-    document = _ledger(
-        _row("W1", name="Native webhooks", product_state="rejected")
-    )
-    document["capabilities"][0]["name"] = "Multi-profile routing"
-    assert any("contract_sha256" in error for error in validate_ledger(document))
+def test_external_registry_prevents_self_authorized_row_remap() -> None:
+    document = _ledger(_row("W1", name="Native webhooks", product_state="rejected"))
+    registry = _registry(document)
+    document["capabilities"][0]["name"] = "Multiplex routing"
+    document["campaign"]["contract_sha256"] = canonical_contract_digest(document["capabilities"])
+    assert any("external registry" in error for error in _errors(document, registry))
 
 
-def test_expected_ids_are_exact_and_ordered() -> None:
-    document = _ledger(_row("M1", pr=1001), _row("M2", pr=1002))
+def test_contract_digest_includes_source_anchor() -> None:
+    document = _ledger(_row("M1"))
+    document["capabilities"][0]["source_anchor"] = "A different spec"
+    assert any("contract_sha256" in error for error in _errors(document))
+
+
+def test_expected_ids_are_required_non_empty_exact_and_ordered() -> None:
+    document = _ledger(_row("M1"), _row("M2", pr=1002))
+    document["campaign"]["expected_capability_ids"] = []
+    errors = _errors(document)
+    assert any("must not be empty" in error for error in errors)
+    assert any("do not exactly match" in error for error in errors)
+
+
+def test_expected_id_order_drift_is_rejected_even_with_new_digest() -> None:
+    document = _ledger(_row("M1"), _row("M2", pr=1002))
     document["capabilities"].reverse()
-    document["campaign"]["contract_sha256"] = canonical_contract_digest(
-        document["capabilities"]
-    )
-    assert any(
-        "capability ids do not exactly match" in error
-        for error in validate_ledger(document)
-    )
+    document["campaign"]["contract_sha256"] = canonical_contract_digest(document["capabilities"])
+    assert any("order differs" in error for error in _errors(document))
+
+
+def test_duplicate_capability_ids_are_rejected() -> None:
+    document = _ledger(_row("M1", pr=1001), _row("M1", pr=1002))
+    assert any("duplicate capability ids" in error for error in _errors(document))
+
+
+def test_malformed_capability_is_reported_without_digest_crash() -> None:
+    document = _ledger(_row("M1"))
+    document["capabilities"].append("not-an-object")
+    errors = _errors(document)
+    assert any("capabilities[1] must be an object" in error for error in errors)
+
+
+def test_required_row_lists_cannot_be_omitted() -> None:
+    document = _ledger(_row("M1"))
+    del document["capabilities"][0]["artifact_evidence"]
+    assert any("artifact_evidence is required" in error for error in _errors(document))
+
+
+def test_authoritative_publication_must_be_a_pull_request() -> None:
+    document = _ledger(_row("M1"))
+    publication = document["capabilities"][0]["publications"][0]
+    publication.update({"kind": "issue", "url": "https://github.com/example/project/issues/1001"})
+    assert any("must be a pull request" in error for error in _errors(document))
+
+
+def test_candidate_authority_must_be_open() -> None:
+    document = _ledger(_row("M1"))
+    document["capabilities"][0]["publications"][0]["state"] = "closed"
+    assert any("must be open for candidate delivery" in error for error in _errors(document))
+
+
+def test_candidate_open_requires_exact_head_sha() -> None:
+    document = _ledger(_row("M1"))
+    del document["capabilities"][0]["publications"][0]["head_sha"]
+    assert any("head_sha" in error for error in _errors(document))
 
 
 def test_one_authoritative_pr_cannot_own_two_capabilities() -> None:
     document = _ledger(_row("M1", pr=1001), _row("M2", pr=1001))
-    assert any(
-        "claimed by multiple capabilities" in error
-        for error in validate_ledger(document)
-    )
-
-
-def test_candidate_open_requires_runtime_consumer() -> None:
-    document = _ledger(_row("M1", pr=1001))
-    document["capabilities"][0]["consumers"] = []
-    assert any(
-        "requires runtime consumers" in error for error in validate_ledger(document)
-    )
-
-
-def test_candidate_state_requires_exactly_one_authoritative_publication() -> None:
-    document = _ledger(_row("M1"))
-    assert any(
-        "requires exactly one authoritative publication" in error
-        for error in validate_ledger(document)
-    )
-
-
-def test_rejected_capability_cannot_sneak_in_production_code() -> None:
-    document = _ledger(_row("W1", product_state="rejected"))
-    document["capabilities"][0]["implementation_paths"] = [
-        "tools/example/webhooks.py"
-    ]
-    assert any(
-        "rejected but declares implementation_paths" in error
-        for error in validate_ledger(document)
-    )
-
-
-def test_god_file_growth_is_rejected() -> None:
-    document = _ledger(_row("M1", pr=1001))
-    document["capabilities"][0]["implementation_paths"] = [
-        "plugins/platforms/example/adapter.py"
-    ]
-    assert any("grows forbidden surface" in error for error in validate_ledger(document))
-
-
-def test_released_requires_terminal_evidence() -> None:
-    row = _row("M1", pr=1001, delivery_state="released")
-    row["merged"] = {"commit_sha": "b" * 40}
-    document = _ledger(row)
-    assert any(
-        "release_evidence is required" in error
-        for error in validate_ledger(document)
-    )
-
-
-def test_released_with_head_bound_evidence_passes() -> None:
-    row = _row("M1", pr=1001, delivery_state="released")
-    row["merged"] = {"commit_sha": "b" * 40}
-    row["release_evidence"] = {
-        "ci_url": "https://github.com/example/repo/actions/runs/1",
-        "live_receipt": "receipts/example-live.json",
-        "review_a": "approval at bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "review_b": "approval at bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    }
-    document = _ledger(row)
-    assert validate_ledger(document) == []
-
-
-def test_cli_reports_all_errors(tmp_path, capsys) -> None:
-    from validate_feature_parity_ledger import main
-
-    document = _ledger(_row("M1"))
-    path = tmp_path / "ledger.json"
-    path.write_text(json.dumps(document), encoding="utf-8")
-    assert main([str(path)]) == 1
-    stderr = capsys.readouterr().err
-    assert "INVALID" in stderr
-    assert "authoritative publication" in stderr
+    assert any("claimed by multiple capabilities" in error for error in _errors(document))

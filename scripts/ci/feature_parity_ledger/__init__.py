@@ -1,24 +1,16 @@
-#!/usr/bin/env python3
-"""Validate Feature Parity & Alignment campaign ledgers."""
+"""Executable Feature Parity campaign ledger contract."""
 
-from __future__ import annotations
-
-import sys
-from pathlib import Path
-
-_PACKAGE_ROOT = Path(__file__).resolve().parent
-if str(_PACKAGE_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PACKAGE_ROOT))
-
-from feature_parity_ledger import (  # noqa: E402
+from .cli import main
+from .core import (
     LedgerValidationError,
     canonical_contract_digest,
     canonical_contract_payload,
+)
+from .ledger import validate_ledger
+from .registry import validate_contract_registry
+from .repository import (
     discover_ledgers,
     load_json_document,
-    main,
-    validate_contract_registry,
-    validate_ledger,
     validate_path,
     validate_repository,
 )
@@ -35,6 +27,3 @@ __all__ = [
     "validate_path",
     "validate_repository",
 ]
-
-if __name__ == "__main__":
-    raise SystemExit(main())
