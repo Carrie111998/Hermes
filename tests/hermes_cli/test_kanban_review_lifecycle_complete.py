@@ -760,6 +760,46 @@ def test_rework_context_foregrounds_latest_review_instruction(conn) -> None:
     assert "The Body below is the original task, not a replacement" in context
 
 
+def test_rework_context_keeps_instruction_foregrounded_after_crash(
+    conn, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    task_id = kb.create_task(
+        conn,
+        title="retry the correction",
+        body="Original task description.",
+        assignee="builder",
+    )
+    implementation = kb.claim_task(conn, task_id)
+    assert implementation is not None
+    assert kb.request_review(
+        conn,
+        task_id,
+        summary="ready for review",
+        reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
+    assert review is not None
+    assert kb.request_changes(
+        conn,
+        task_id,
+        reason="Fix the exact boundary.",
+        expected_run_id=review.current_run_id,
+    ) == (True, "builder")
+
+    retry = kb.claim_task(conn, task_id)
+    assert retry is not None
+    kb._set_worker_pid(conn, task_id, 98765)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    assert kb.detect_crashed_workers(conn) == [task_id]
+    assert kb.claim_task(conn, task_id) is not None
+
+    context = kb.build_worker_context(conn, task_id)
+    assert context.index("## Current review instruction") < context.index("## Body")
+    assert "Fix the exact boundary." in context
+
+
 def test_review_transitions_preserve_consecutive_failures(conn) -> None:
     """M2 regression: review transitions neither reset nor increment the
     circuit-breaker counter.

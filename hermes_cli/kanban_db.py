@@ -11126,19 +11126,26 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # current instruction. Keep this block ahead of the original task body and
     # outside the bounded attempt history so it cannot be buried or omitted.
     all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
-    latest_prior = all_prior[-1] if all_prior else None
+    latest_review_transition = next(
+        (
+            run
+            for run in reversed(all_prior)
+            if run.outcome in {"review_requested", "changes_requested"}
+        ),
+        None,
+    )
     if (
-        latest_prior is not None
-        and latest_prior.outcome == "changes_requested"
-        and latest_prior.summary
-        and latest_prior.summary.strip()
+        latest_review_transition is not None
+        and latest_review_transition.outcome == "changes_requested"
+        and latest_review_transition.summary
+        and latest_review_transition.summary.strip()
     ):
         lines.append("## Current review instruction")
         lines.append(
             "Address this correction before requesting review again. The Body "
             "below is the original task, not a replacement for this instruction."
         )
-        lines.append(_cap(latest_prior.summary))
+        lines.append(_cap(latest_review_transition.summary))
         lines.append("")
 
     if task.body and task.body.strip():
