@@ -3,6 +3,7 @@
 import http.server
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -25,6 +26,29 @@ from agent.verify.recipes import Recipe, detect_recipe
 from agent.verify.runner import run_verify
 
 
+def _shell_command(*arguments: str) -> str:
+    """Quote an argv for the shell used by subprocess on this platform."""
+    if os.name == "nt":
+        return subprocess.list2cmdline(arguments)
+    return shlex.join(arguments)
+
+
+def _python_command(code: str, *, isolated: bool = False) -> str:
+    arguments = ["python"]
+    if isolated:
+        arguments.append("-I")
+    arguments.extend(("-c", code))
+    return _shell_command(*arguments)
+
+
+def _symlink_or_skip(link: Path, target: Path, *, target_is_directory: bool = False) -> None:
+    """Create a redirect fixture, skipping only when the host denies symlinks."""
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError as exc:
+        pytest.skip(f"symlink capability unavailable on this host: {exc}")
+
+
 class TestManifest:
     def test_roundtrip(self, tmp_path):
         recipe = Recipe(
@@ -39,7 +63,7 @@ class TestManifest:
         )
         path = save_manifest(tmp_path, recipe)
         assert path == manifest_path(tmp_path)
-        payload = json.loads(path.read_text())
+        payload = json.loads(path.read_text(encoding="utf-8"))
         assert payload["version"] == 1
         assert "updatedAt" in payload
         assert load_manifest(tmp_path) == recipe
@@ -169,10 +193,10 @@ class TestPythonIsolation:
         root = tmp_path / "project with spaces"
         root.mkdir()
         monkeypatch.setenv("PYTHONHOME", "/foreign/python/home")
-        probe = (
-            "python -c \"import os,sys; "
+        probe = _python_command(
+            "import os,sys; "
             "print('|'.join((sys.prefix, os.environ['VIRTUAL_ENV'], "
-            "os.environ['PATH'].split(os.pathsep)[0], str(os.environ.get('PYTHONHOME')))))\""
+            "os.environ['PATH'].split(os.pathsep)[0], str(os.environ.get('PYTHONHOME')))))"
         )
         recipe = Recipe(
             name="Python project",
@@ -209,7 +233,7 @@ class TestPythonIsolation:
         recipe = Recipe(
             name="Python project",
             kind="python",
-            start=f'python -u -c "{probe}"',
+            start=_shell_command("python", "-u", "-c", probe),
             port=port,
         )
 
@@ -230,11 +254,12 @@ class TestPythonIsolation:
         self, tmp_path, monkeypatch
     ):
         monkeypatch.setenv("VERIFY_CALLER_MARKER", "preserved")
-        recipe = Recipe(
-            name="Go project",
-            kind="go",
-            test=['printf "%s\\n" "$VERIFY_CALLER_MARKER"'],
+        command = _shell_command(
+            sys.executable,
+            "-c",
+            "import os; print(os.environ['VERIFY_CALLER_MARKER'])",
         )
+        recipe = Recipe(name="Go project", kind="go", test=[command])
 
         result = run_verify(tmp_path, recipe, skip_start=True)
 
@@ -243,7 +268,7 @@ class TestPythonIsolation:
         assert not (tmp_path / ".hermes" / "verify-venv").exists()
 
     def test_existing_project_virtual_environment_is_reused(self, tmp_path, monkeypatch):
-        recipe = Recipe(name="Python project", kind="python", test=["python -c \"pass\""])
+        recipe = Recipe(name="Python project", kind="python", test=[_python_command("pass")])
         assert run_verify(tmp_path, recipe, skip_start=True).ok
 
         def fail_if_recreated(*args, **kwargs):
@@ -294,7 +319,9 @@ class TestPythonIsolation:
         recipe = Recipe(
             name="Python project",
             kind="python",
-            bootstrap=[f'python -c "from pathlib import Path; Path(r\'{marker}\').touch()"'],
+            bootstrap=[
+                _python_command(f"from pathlib import Path; Path({str(marker)!r}).touch()")
+            ],
         )
 
         result = run_verify(tmp_path, recipe, skip_start=True)
@@ -333,23 +360,25 @@ class TestPythonIsolation:
         assert "PYTHONHOME" not in environment
 
     def test_detected_uv_recipe_uses_one_project_environment(self, tmp_path, monkeypatch):
-        (tmp_path / "pyproject.toml").write_text("[project]\nname='fixture'\nversion='0'\n")
+        (tmp_path / "pyproject.toml").write_text(
+            "[project]\nname='fixture'\nversion='0'\n", encoding="utf-8"
+        )
         (tmp_path / "uv.lock").write_text("version = 1\n", encoding="utf-8")
-        tools = tmp_path / "tools"
-        tools.mkdir()
-        uv = tools / "uv"
-        uv.write_text(
-            "#!/bin/sh\nprintf '%s' \"$UV_PROJECT_ENVIRONMENT\" > uv-environment.txt\n",
+        bootstrap_probe = tmp_path / "capture_uv_environment.py"
+        bootstrap_probe.write_text(
+            "import os\n"
+            "from pathlib import Path\n"
+            "Path('uv-environment.txt').write_text("
+            "os.environ['UV_PROJECT_ENVIRONMENT'], encoding='utf-8')\n",
             encoding="utf-8",
         )
-        uv.chmod(0o755)
-        monkeypatch.setenv("PATH", f"{tools}{os.pathsep}{os.environ['PATH']}")
         recipe = detect_recipe(tmp_path)
         assert recipe is not None
         assert recipe.bootstrap == ["uv sync"]
-        probe = (
-            "python -c \"import os,sys; "
-            "print(sys.prefix + '|' + os.environ['UV_PROJECT_ENVIRONMENT'])\""
+        recipe.bootstrap = [_shell_command("python", str(bootstrap_probe))]
+        probe = _python_command(
+            "import os,sys; "
+            "print(sys.prefix + '|' + os.environ['UV_PROJECT_ENVIRONMENT'])"
         )
         recipe.build = [probe]
         recipe.test = [probe]
@@ -358,7 +387,7 @@ class TestPythonIsolation:
 
         expected = str((tmp_path / ".hermes" / "verify-venv").resolve())
         assert result.ok
-        assert (tmp_path / "uv-environment.txt").read_text() == expected
+        assert (tmp_path / "uv-environment.txt").read_text(encoding="utf-8") == expected
         for phase in result.phases[1:]:
             assert phase.output_tail.strip() == f"{expected}|{expected}"
 
@@ -371,19 +400,21 @@ class TestPythonIsolation:
         external = tmp_path / "caller-environment"
         if redirect == "metadata":
             external.mkdir()
-            (root / ".hermes").symlink_to(external, target_is_directory=True)
+            _symlink_or_skip(root / ".hermes", external, target_is_directory=True)
         else:
             (root / ".hermes").mkdir()
             venv.EnvBuilder(with_pip=True).create(external)
-            (root / ".hermes" / "verify-venv").symlink_to(
-                external, target_is_directory=True
+            _symlink_or_skip(
+                root / ".hermes" / "verify-venv",
+                external,
+                target_is_directory=True,
             )
         marker = external / "caller-marker"
         marker.write_text("unchanged", encoding="utf-8")
 
         result = run_verify(
             root,
-            Recipe(name="Python project", kind="python", test=["python -c \"pass\""]),
+            Recipe(name="Python project", kind="python", test=[_python_command("pass")]),
             skip_start=True,
         )
 
@@ -406,7 +437,7 @@ class TestPythonIsolation:
         )
 
     def test_invalid_cache_is_deleted_before_clean_recreation(self, tmp_path):
-        recipe = Recipe(name="Python project", kind="python", test=["python -c \"pass\""])
+        recipe = Recipe(name="Python project", kind="python", test=[_python_command("pass")])
         assert run_verify(tmp_path, recipe, skip_start=True).ok
         cache = tmp_path / ".hermes" / "verify-venv"
         python = runner._python_for_venv(cache)
@@ -463,11 +494,12 @@ class TestPythonIsolation:
         recipe = Recipe(name="Python project", kind="python")
         assert run_verify(tmp_path, recipe, skip_start=True).ok
         repository = Path(__file__).resolve().parents[2]
+        slow_command = _python_command("import time; time.sleep(0.7)")
         worker = (
             "import json,sys; from pathlib import Path; "
             "from agent.verify.recipes import Recipe; from agent.verify.runner import run_verify; "
             "r=run_verify(Path(sys.argv[1]), Recipe(name='p',kind='python',"
-            "test=[\"python -c 'import time; time.sleep(0.7)'\"]), skip_start=True); "
+            f"test=[{slow_command!r}]), skip_start=True); "
             "print(json.dumps(r.to_dict())); raise SystemExit(0 if r.ok else 1)"
         )
         environment = os.environ.copy()
@@ -495,11 +527,11 @@ class TestPythonIsolation:
         metadata.mkdir()
         external = tmp_path / "external-lock"
         external.write_text("unchanged", encoding="utf-8")
-        (metadata / "verify.lock").symlink_to(external)
+        _symlink_or_skip(metadata / "verify.lock", external)
 
         result = run_verify(
             tmp_path,
-            Recipe(name="Python project", kind="python", test=["python -c \"pass\""]),
+            Recipe(name="Python project", kind="python", test=[_python_command("pass")]),
             skip_start=True,
         )
 
@@ -524,7 +556,15 @@ class TestPythonIsolation:
         try:
             result = run_verify(
                 tmp_path,
-                Recipe(name="Python project", kind="python", test=[f"touch {marker}"]),
+                Recipe(
+                    name="Python project",
+                    kind="python",
+                    test=[
+                        _python_command(
+                            f"from pathlib import Path; Path({str(marker)!r}).touch()"
+                        )
+                    ],
+                ),
                 phase_timeout=0.1,
                 skip_start=True,
             )
@@ -545,7 +585,7 @@ class TestPythonIsolation:
 
         result = run_verify(
             tmp_path,
-            Recipe(name="Python project", kind="python", test=["python -c \"pass\""]),
+            Recipe(name="Python project", kind="python", test=[_python_command("pass")]),
             skip_start=True,
         )
 

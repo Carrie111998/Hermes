@@ -63,6 +63,7 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes webhook` | Manage dynamic webhook subscriptions for event-driven activation. |
 | `hermes hooks` | Inspect, approve, or remove shell-script hooks declared in `config.yaml`. |
 | `hermes doctor` | Diagnose config and dependency issues. |
+| `hermes verify` | Detect a project's build/test/start recipe and verify it in the project checkout. |
 | `hermes security audit` | On-demand supply-chain audit (OSV.dev) for the venv, plugin requirements, and pinned MCP servers. |
 | `hermes approvals` | Approval-prompt tools — mine approval history into allowlist proposals. |
 | `hermes dump` | Copy-pasteable setup summary for support/debugging. |
@@ -100,6 +101,34 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes --version` | Show version information. |
 | `hermes update` | Pull latest code and reinstall dependencies. `--check` previews without installing; `--backup` takes a pre-pull `HERMES_HOME` snapshot. |
 | `hermes uninstall` | Remove Hermes from the system. |
+
+## `hermes verify`
+
+`hermes verify` detects or loads a project recipe, then runs its bootstrap,
+build, test, optional start, readiness, and teardown phases in the project
+checkout.
+
+For Python, Django, FastAPI, and Flask recipes, Hermes creates and retains a
+project-owned virtual environment at `.hermes/verify-venv`. Every phase,
+including package-manager bootstrap and the started application, receives that
+environment through `VIRTUAL_ENV`, `UV_PROJECT_ENVIRONMENT`, and the leading
+`PATH` entry. This prevents project dependencies from modifying the Python
+environment that runs Hermes. Non-Python recipes keep their existing process
+environment behavior.
+
+Hermes also retains `.hermes/verify.lock`, a project-scoped lock file that
+serializes the complete Python verification lifecycle across threads and
+processes. The operating-system lock is released automatically when a verifier
+exits or crashes; the file itself remains for reuse. Both `verify-venv` and
+`verify.lock` are generated project cache state. You may delete them when no
+verification is running; the next Python verification recreates them. Hermes
+repairs an invalid cached environment from a clean directory while preserving
+neighboring metadata such as `.hermes/environment.json`.
+
+For safety, `.hermes`, `.hermes/verify-venv`, and `.hermes/verify.lock` must be
+ordinary project-local paths, not symlinks or Windows reparse points. Verification
+fails before running a project command when those paths are redirected or the
+isolated environment cannot be created and validated.
 
 ## `hermes chat`
 
