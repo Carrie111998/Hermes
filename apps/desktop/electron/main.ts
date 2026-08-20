@@ -117,6 +117,7 @@ import {
   updateEligibility,
   upsertConnection
 } from './connection-registry'
+import { activeRegistrySshScope } from './active-ssh-route'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
@@ -8921,6 +8922,13 @@ async function teardownSshConnection(profile) {
 function activeSshTerminalTarget() {
   const profile = primaryProfileKey()
   const config = readDesktopConnectionConfig()
+  const registryScope = activeRegistrySshScope(readDesktopConnectionsRegistry(), profile)
+
+  if (registryScope) {
+    const state = sshConnections.get(registryScope)
+
+    return state && state.ssh ? { ssh: state.ssh, scope: registryScope } : 'pending'
+  }
 
   if (profileSshOverride(config, profile)) {
     const scope = sshScopeKey(profile)
@@ -8939,7 +8947,6 @@ function activeSshTerminalTarget() {
 
   if (config.mode === 'ssh') {
     const state = sshConnections.get('')
-
     return state && state.ssh ? { ssh: state.ssh, scope: '' } : 'pending'
   }
 
