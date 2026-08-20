@@ -32,15 +32,19 @@ def _(rid, params: dict) -> dict:
     except Exception:
         explicit_cwd = False
     resolved_cwd = _completion_cwd(params)
+    authoritative_cwd = os.path.abspath(os.path.expanduser(raw_cwd)) if explicit_cwd else ""
     source = _resolve_session_source(str(params.get("source") or "").strip() or None)
     _enable_gateway_prompts()
 
     # ``profile`` (app-global remote mode): a new chat started under a non-launch
     # profile must build its agent + persist against THAT profile's home/state.db,
     # not the dashboard's launch profile. Stored on the session so _start_agent_build
-    # and each turn re-bind HERMES_HOME. None/own profile → launch (unchanged).
+    # and each turn re-bind HERMES_HOME. Omitted/invalid profile stays
+    # unattributed; an explicit launch profile remains authoritative.
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
+    profile_name = _requested_profile_name(profile)
+    replace_sid = str(params.get("replace_session_id") or "").strip()
 
     # The desktop composer owns its model/effort/fast as plain UI state and ships
     # it on every session.create. Honor each as a PER-SESSION override (built into
@@ -90,7 +94,10 @@ def _(rid, params: dict) -> dict:
             "history_lock": threading.Lock(),
             "history_version": 0,
             "image_counter": 0,
-            "cwd": resolved_cwd,
+            # Sparse authority: detached/omitted workspace remains empty.
+            "cwd": authoritative_cwd,
+            # Compatibility fallback for completion/execution only.
+            "execution_cwd": resolved_cwd,
             "inflight_turn": None,
             "last_active": now,
             "model_override": session_model_override,
@@ -100,6 +107,7 @@ def _(rid, params: dict) -> dict:
             "pending_title": title or None,
             "pending_hidden": is_truthy_value(params.get("hidden", False)),
             "profile_home": str(profile_home) if profile_home is not None else None,
+            "profile_name": profile_name,
             "running": False,
             "session_key": key,
             "show_reasoning": _load_show_reasoning(),
@@ -110,6 +118,19 @@ def _(rid, params: dict) -> dict:
             "transport": current_transport() or _stdio_transport,
         }
         _register_session_cwd(_sessions[sid])
+        successor_session = _sessions[sid]
+
+    replaced_session = None
+    if replace_sid:
+        with _session_resume_lock:
+            replaced_session = _pop_session_by_id(replace_sid)
+    if replaced_session is not None:
+        _teardown_popped_session(
+            replaced_session,
+            end_reason="new_session",
+            new_session_id=key,
+            new_session=successor_session,
+        )
 
     # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop
     # launch (and every "New agent" / draft) opens a session here just to paint
@@ -154,7 +175,7 @@ def _(rid, params: dict) -> dict:
                 "project": _project_info_for_cwd(_sessions[sid]["cwd"]),
                 "lazy": True,
                 "desktop_contract": DESKTOP_BACKEND_CONTRACT,
-                "profile_name": _response_profile_name(profile),
+                "profile_name": profile_name,
             },
         },
     )
@@ -487,6 +508,7 @@ def _(rid, params: dict) -> dict:
                 source=source,
                 close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
                 profile_home=profile_home,
+                profile_name=_response_profile_name(profile),
                 lazy=True,
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
@@ -650,6 +672,7 @@ def _(rid, params: dict) -> dict:
                 close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
                 display_history_prefix=prefix,
                 profile_home=profile_home,
+                profile_name=_response_profile_name(profile),
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
             )
@@ -723,7 +746,10 @@ def _(rid, params: dict) -> dict:
             )
             history = sanitize_replay_history(raw_history)
             messages = [] if omit_messages else _history_to_messages(display_history)
-            tokens = _set_session_context(target)
+            tokens = _set_session_context(
+                target,
+                profile_name=_response_profile_name(profile),
+            )
             try:
                 # Pass the profile's db so the agent persists turns to the right
                 # state.db; home override is active here so config/skills/model
@@ -796,6 +822,10 @@ def _(rid, params: dict) -> dict:
                         cwd=profile_resume_cwd,
                         session_db=db,
                         source=source,
+                        profile_home=(
+                            str(profile_home) if profile_home is not None else None
+                        ),
+                        profile_name=_response_profile_name(profile),
                     )
                     # Ownership TRANSFER — the registered session's agent now
                     # holds this handle for its whole life, and _init_session
@@ -3067,7 +3097,10 @@ def _(rid, params: dict) -> dict:
             else None
         )
         try:
-            tokens = _set_session_context(new_key)
+            tokens = _set_session_context(
+                new_key,
+                profile_name=str(session.get("profile_name") or "") or None,
+            )
             try:
                 agent = _make_agent(
                     new_sid,
@@ -3088,6 +3121,7 @@ def _(rid, params: dict) -> dict:
                 session_db=branch_db,
                 source=source,
                 profile_home=parent_home,
+                profile_name=str(session.get("profile_name") or "") or None,
             )
             # Ownership TRANSFER — the branched session's agent holds this
             # handle for its whole life and closes it on teardown. Drop is

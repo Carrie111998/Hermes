@@ -536,10 +536,12 @@ class ComputeHost:
             session["transport"] = self._transport
             if frame.get("cols") is not None:
                 session["cols"] = int(frame.get("cols") or 80)
-            if frame.get("cwd"):
-                session["cwd"] = str(frame.get("cwd"))
-            if frame.get("profile_home"):
-                session["profile_home"] = str(frame.get("profile_home"))
+            if "cwd" in frame:
+                session["cwd"] = str(frame.get("cwd") or "")
+            if "profile_home" in frame:
+                session["profile_home"] = str(frame.get("profile_home") or "") or None
+            if "profile_name" in frame:
+                session["profile_name"] = str(frame.get("profile_name") or "")
             if isinstance(frame.get("attached_images"), list):
                 session["attached_images"] = list(frame.get("attached_images") or [])
             return session
@@ -601,9 +603,11 @@ class ComputeHost:
                     agent,
                     list(history),
                     cols=int(frame.get("cols") or 80),
-                    cwd=str(frame.get("cwd") or "") or None,
+                    cwd=str(frame["cwd"]) if "cwd" in frame else None,
                     session_db=session_db,
                     source=frame.get("source"),
+                    profile_home=profile_home or None,
+                    profile_name=str(frame.get("profile_name") or "") or None,
                 )
             finally:
                 reset_transport(token)
@@ -623,7 +627,7 @@ class ComputeHost:
                 "running": False,
                 "attached_images": [],
                 "image_counter": 0,
-                "cwd": str(frame.get("cwd") or os.getcwd()),
+                "cwd": str(frame.get("cwd") or ""),
                 "cols": int(frame.get("cols") or 80),
                 "slash_worker": None,
                 "show_reasoning": server._load_show_reasoning(),
@@ -631,12 +635,19 @@ class ComputeHost:
                 "edit_snapshots": {},
                 "tool_started_at": {},
                 "model_override": frame.get("model_override"),
+                "profile_home": profile_home or None,
+                "profile_name": str(frame.get("profile_name") or ""),
                 "source": server._sanitize_client_source(frame.get("source")),
                 "transport": self._transport,
             }
         session = server._sessions[sid]
         session["transport"] = self._transport
-        session["profile_home"] = profile_home or session.get("profile_home")
+        if "cwd" in frame:
+            session["cwd"] = str(frame.get("cwd") or "")
+        if "profile_home" in frame:
+            session["profile_home"] = profile_home or None
+        if "profile_name" in frame:
+            session["profile_name"] = str(frame.get("profile_name") or "")
         if isinstance(frame.get("attached_images"), list):
             session["attached_images"] = list(frame.get("attached_images") or [])
         if frame.get("model_override") is not None:

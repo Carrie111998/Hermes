@@ -3059,7 +3059,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
 
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
-        from hermes_cli.middleware import apply_tool_request_middleware
+        from hermes_cli.middleware import (
+            apply_tool_request_middleware,
+            is_classic_cli_runtime,
+        )
 
         if not skip_tool_request_middleware:
             _tool_request_mw = apply_tool_request_middleware(
@@ -3070,6 +3073,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 tool_call_id=tool_call_id or "",
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                classic_cli=is_classic_cli_runtime(agent),
             )
             function_args = _tool_request_mw.payload
             _tool_middleware_trace = _tool_request_mw.trace
@@ -3301,7 +3305,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if skip_tool_execution_middleware:
         return _execute(function_args)
 
-    from hermes_cli.middleware import run_tool_execution_middleware
+    from hermes_cli.middleware import (
+        is_classic_cli_runtime,
+        run_tool_execution_middleware,
+    )
 
     return run_tool_execution_middleware(
         function_name,
@@ -3313,6 +3320,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         tool_call_id=tool_call_id or "",
         turn_id=getattr(agent, "_current_turn_id", "") or "",
         api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+        classic_cli=is_classic_cli_runtime(agent),
     )
 
 

@@ -172,6 +172,156 @@ def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
         server._sessions.pop(sid, None)
 
 
+def test_session_context_carries_bound_profile():
+    from gateway.session_context import get_session_env
+
+    sid = "profile-sid"
+    session_key = "profile-key"
+    server._sessions[sid] = {
+        "session_key": session_key,
+        "cwd": "",
+        "profile_name": "reviewer",
+    }
+
+    tokens = server._set_session_context(session_key)
+    try:
+        assert get_session_env("HERMES_SESSION_PROFILE") == "reviewer"
+    finally:
+        server._clear_session_context(tokens)
+        server._sessions.pop(sid, None)
+
+
+@pytest.mark.parametrize("create_params", [{}, {"cwd": ""}])
+def test_detached_session_create_keeps_authoritative_cwd_empty_with_hostile_fallbacks(
+    monkeypatch, tmp_path, create_params
+):
+    """Execution fallbacks must never become detached-session attribution."""
+    from agent.turn_context import _plugin_hook_cwd
+
+    configured = tmp_path / "configured"
+    terminal = tmp_path / "terminal"
+    launch = tmp_path / "launch"
+    for path in (configured, terminal, launch):
+        path.mkdir()
+    monkeypatch.setattr(server, "_profile_configured_cwd", lambda _home: str(configured))
+    monkeypatch.setattr(server, "_launch_configured_cwd", lambda: str(configured))
+    monkeypatch.setenv("TERMINAL_CWD", str(terminal))
+    monkeypatch.chdir(launch)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+
+    response = server._methods["session.create"](
+        "detached", {"cols": 80, "source": "desktop", **create_params}
+    )
+    sid = response["result"]["session_id"]
+    session = server._sessions[sid]
+    try:
+        assert session["cwd"] == ""
+        assert response["result"]["info"]["cwd"] == ""
+        assert server._session_cwd(session) == ""
+        assert _plugin_hook_cwd(session["session_key"]) == ""
+        # Completion/execution may still use the configured fallback.
+        assert server._completion_cwd({"session_id": sid}) == str(configured)
+    finally:
+        from tools.terminal_tool import clear_session_cwd
+
+        clear_session_cwd(session["session_key"])
+        server._sessions.pop(sid, None)
+
+
+def test_init_session_preserves_explicit_empty_cwd_with_hostile_fallback(monkeypatch, tmp_path):
+    from agent.turn_context import _plugin_hook_cwd
+    from tools.terminal_tool import clear_session_cwd
+
+    sid = "compute-empty-cwd"
+    key = "durable-compute-empty-cwd"
+    hostile = tmp_path / "hostile-process-fallback"
+    hostile.mkdir()
+    persisted = []
+    session_db = types.SimpleNamespace(
+        get_session=lambda _key: {"cwd": str(hostile / "stale-db-workspace")},
+        update_session_cwd=lambda db_key, db_cwd: persisted.append((db_key, db_cwd)),
+    )
+    monkeypatch.setattr(server, "_completion_cwd", lambda params=None: str(hostile))
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *_args: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *_args: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+
+    server._init_session(
+        sid,
+        key,
+        types.SimpleNamespace(),
+        [],
+        cwd="",
+        session_db=session_db,
+        source="desktop",
+    )
+
+    try:
+        assert server._sessions[sid]["cwd"] == ""
+        assert server._session_cwd(server._sessions[sid]) == ""
+        assert _plugin_hook_cwd(key) == ""
+        assert persisted == [(key, "")]
+    finally:
+        clear_session_cwd(key)
+        server._sessions.pop(sid, None)
+
+
+def test_detached_session_create_does_not_invent_process_profile(monkeypatch):
+    from gateway.session_context import get_session_env
+
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name",
+        lambda: "hostile-process-profile",
+    )
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+
+    response = server._methods["session.create"](
+        "detached-profile", {"cols": 80, "source": "cli"}
+    )
+    sid = response["result"]["session_id"]
+    session = server._sessions[sid]
+    try:
+        assert session["profile_name"] == ""
+        assert response["result"]["info"]["profile_name"] == ""
+        tokens = server._set_session_context(session["session_key"])
+        try:
+            assert get_session_env("HERMES_SESSION_PROFILE") == ""
+        finally:
+            server._clear_session_context(tokens)
+    finally:
+        from tools.terminal_tool import clear_session_cwd
+
+        clear_session_cwd(session["session_key"])
+        server._sessions.pop(sid, None)
+
+
+def test_detached_session_finalize_envelope_keeps_cwd_empty(monkeypatch, tmp_path):
+    calls = []
+    hostile = tmp_path / "hostile"
+    hostile.mkdir()
+    monkeypatch.setenv("TERMINAL_CWD", str(hostile))
+    monkeypatch.chdir(hostile)
+    monkeypatch.setattr(server, "_launch_configured_cwd", lambda: str(hostile))
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "_notify_session_boundary",
+        lambda event, session_id, source, **kwargs: calls.append(kwargs),
+    )
+    session = _session(
+        agent=types.SimpleNamespace(session_id="detached-key", model="x", platform="tui"),
+        cwd="",
+        explicit_cwd=False,
+        source="desktop",
+    )
+
+    server._finalize_session(session, end_reason="shutdown")
+
+    assert calls[-1]["cwd"] == ""
+
+
 def test_handoff_fail_marks_only_inflight_rows(monkeypatch):
     class DbContext:
         def __init__(self, db):
@@ -2951,7 +3101,7 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch, omit_messag
 
     monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
-    monkeypatch.setattr(server, "_set_session_context", lambda target: [])
+    monkeypatch.setattr(server, "_set_session_context", lambda target, **_kwargs: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
     monkeypatch.setattr(
         server,
@@ -3542,7 +3692,7 @@ def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
 
     monkeypatch.setattr(server, "_get_db", lambda: db)
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
-    monkeypatch.setattr(server, "_set_session_context", lambda target: [])
+    monkeypatch.setattr(server, "_set_session_context", lambda target, **_kwargs: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
     monkeypatch.setattr(server, "_make_agent", fake_make_agent)
     monkeypatch.setattr(
@@ -3603,7 +3753,7 @@ def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
 
     monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
-    monkeypatch.setattr(server, "_set_session_context", lambda target: [])
+    monkeypatch.setattr(server, "_set_session_context", lambda target, **_kwargs: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
     monkeypatch.setattr(server, "_make_agent", fake_make_agent)
     monkeypatch.setattr(server, "_session_info", lambda agent, *a: {"model": agent.model, "provider": agent.provider})
@@ -3695,7 +3845,7 @@ def test_session_resume_profile_uses_profile_db_cwd(monkeypatch, tmp_path):
     monkeypatch.setattr("hermes_state.SessionDB", lambda db_path=None: profile_db)
     monkeypatch.setattr(server, "_get_db", lambda: launch_db)
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
-    monkeypatch.setattr(server, "_set_session_context", lambda target: [])
+    monkeypatch.setattr(server, "_set_session_context", lambda target, **_kwargs: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
     monkeypatch.setattr(server, "_make_agent", fake_make_agent)
     monkeypatch.setattr(server, "_SlashWorker", FakeWorker)
@@ -4332,6 +4482,73 @@ def test_background_agent_kwargs_preserves_empty_fallback_chain(monkeypatch):
     assert kwargs["fallback_model"] == []
 
 
+@pytest.mark.parametrize(
+    ("method_name", "extra_params"),
+    [
+        ("prompt.background", {"text": "inspect"}),
+        ("preview.restart", {"url": "http://localhost:3000"}),
+    ],
+)
+def test_ephemeral_prompt_producers_bind_parent_profile(
+    monkeypatch, tmp_path, method_name, extra_params
+):
+    sid = f"profile-{method_name}"
+    captured = {}
+    server._sessions[sid] = {
+        "agent": types.SimpleNamespace(),
+        "session_key": "durable-parent",
+        "history": [],
+        "history_lock": __import__("threading").Lock(),
+        "cwd": str(tmp_path),
+        "profile_name": "reviewer",
+    }
+
+    def _capture_context(*args, **kwargs):
+        captured["args"] = args
+        captured.update(kwargs)
+        return []
+
+    class _ImmediateThread:
+        def __init__(self, *, target, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(server, "_set_session_context", _capture_context)
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(
+        server,
+        "threading",
+        types.SimpleNamespace(Thread=_ImmediateThread, Lock=__import__("threading").Lock),
+    )
+    monkeypatch.setattr(server, "_background_agent_kwargs", lambda *_args: {})
+    monkeypatch.setattr(server, "_ephemeral_preview_agent_kwargs", lambda *_args: {})
+
+    class _EphemeralAgent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_conversation(self, **_kwargs):
+            return {"final_response": "ok"}
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "run_agent",
+        types.SimpleNamespace(AIAgent=_EphemeralAgent),
+    )
+    try:
+        response = server._methods[method_name](
+            "request",
+            {"session_id": sid, **extra_params},
+        )
+        assert "result" in response, response
+        assert captured["cwd"] == str(tmp_path)
+        assert captured["profile_name"] == "reviewer"
+    finally:
+        server._sessions.pop(sid, None)
+
+
 def test_startup_runtime_resolves_short_alias_without_network(monkeypatch):
     monkeypatch.setenv("HERMES_MODEL", "sonnet")
     monkeypatch.delenv("HERMES_TUI_PROVIDER", raising=False)
@@ -4397,7 +4614,9 @@ def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
     monkeypatch.setattr(
         server,
         "_notify_session_boundary",
-        lambda event, session_id, *_args: calls["hooks"].append((event, session_id)),
+        lambda event, session_id, *_args, **_kwargs: calls["hooks"].append(
+            (event, session_id)
+        ),
     )
 
     try:
@@ -4409,6 +4628,141 @@ def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
         assert ("on_session_finalize", "session-key") in calls["hooks"]
     finally:
         server._sessions.pop("sid", None)
+
+
+def test_finalize_session_carries_actual_reason_workspace_and_profile(
+    monkeypatch, tmp_path
+):
+    calls = []
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    agent = types.SimpleNamespace(session_id="session-key", model="x", platform="tui")
+    session = _session(
+        agent=agent,
+        cwd=str(workspace),
+        profile_name="reviewer",
+    )
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "_notify_session_boundary",
+        lambda event, session_id, source, **kwargs: calls.append(
+            (event, session_id, source, kwargs)
+        ),
+    )
+
+    server._finalize_session(session, end_reason="ws_orphan_reap")
+
+    finalize = calls[-1]
+    assert finalize[0] == "on_session_finalize"
+    assert finalize[1] == "session-key"
+    assert finalize[3]["old_session_id"] == "session-key"
+    assert finalize[3]["reason"] == "ws_orphan_reap"
+    assert finalize[3]["cwd"] == str(workspace)
+    assert finalize[3]["profile_name"] == "reviewer"
+
+
+def test_notify_session_boundary_forwards_explicit_profile(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.finalize_session",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    server._notify_session_boundary(
+        "on_session_finalize",
+        "profile-session",
+        "tui",
+        reason="shutdown",
+        old_session_id="profile-session",
+        cwd="/workspace",
+        profile_name="reviewer",
+    )
+
+    assert calls == [
+        {
+            "session_id": "profile-session",
+            "platform": "tui",
+            "reason": "shutdown",
+            "old_session_id": "profile-session",
+            "new_session_id": None,
+            "cwd": "/workspace",
+            "profile_name": "reviewer",
+        }
+    ]
+
+
+def test_session_create_replaces_old_session_with_truthful_boundary(monkeypatch, tmp_path):
+    calls = []
+    old_cwd = tmp_path / "old"
+    new_cwd = tmp_path / "new"
+    successor_home = tmp_path / "profiles" / "successor"
+    old_cwd.mkdir()
+    new_cwd.mkdir()
+    successor_home.mkdir(parents=True)
+    old = _session(
+        agent=types.SimpleNamespace(session_id="durable-old", model="x", platform="tui"),
+        cwd=str(old_cwd),
+        profile_name="reviewer",
+    )
+    server._sessions["ui-old"] = old
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "_profile_home",
+        lambda name: successor_home if name == "successor" else None,
+    )
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "_notify_session_boundary",
+        lambda event, session_id, source, **kwargs: calls.append(
+            (event, session_id, source, kwargs)
+        ),
+    )
+
+    response = server._methods["session.create"](
+        "replace",
+        {
+            "cols": 80,
+            "cwd": str(new_cwd),
+            "profile": "successor",
+            "replace_session_id": "ui-old",
+        },
+    )
+    new_ui_id = response["result"]["session_id"]
+    durable_new = response["result"]["stored_session_id"]
+    try:
+        assert "ui-old" not in server._sessions
+        assert new_ui_id in server._sessions
+        assert calls == [
+            (
+                "on_session_finalize",
+                "durable-old",
+                "tui",
+                {
+                    "old_session_id": "durable-old",
+                    "new_session_id": durable_new,
+                    "reason": "new_session",
+                    "cwd": str(old_cwd),
+                    "profile_name": "reviewer",
+                },
+            ),
+            (
+                "on_session_reset",
+                durable_new,
+                "tui",
+                {
+                    "old_session_id": "durable-old",
+                    "new_session_id": durable_new,
+                    "reason": "new_session",
+                    "cwd": str(new_cwd),
+                    "profile_name": "successor",
+                },
+            ),
+        ]
+    finally:
+        server._sessions.pop(new_ui_id, None)
 
 
 def test_session_close_releases_resume_lock_before_slow_teardown(monkeypatch):
@@ -4835,7 +5189,7 @@ def test_ws_orphan_reap_disabled_when_grace_zero(monkeypatch):
     assert fired["timer"] is False
 
 
-def test_init_session_fires_reset_hook(monkeypatch):
+def test_init_session_does_not_counterfeit_reset_hook(monkeypatch):
     hooks = []
 
     class _FakeWorker:
@@ -4868,7 +5222,7 @@ def test_init_session_fires_reset_hook(monkeypatch):
             history=[],
             cols=80,
         )
-        assert ("on_session_reset", "session-key") in hooks
+        assert hooks == []
     finally:
         server._sessions.pop(sid, None)
 
@@ -13687,6 +14041,7 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
         "running": False,
         "cols": 80,
         "profile_home": str(profile_home),
+        "profile_name": "mlperf",
         "source": "tui",
         "agent": FakeAgent(),
         "created_at": 1.0,
@@ -13703,7 +14058,13 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
         return FakeAgent()
 
     monkeypatch.setattr(server, "_make_agent", _fake_make_agent)
-    monkeypatch.setattr(server, "_set_session_context", lambda *a, **k: {})
+
+    def _capture_context(*args, **kwargs):
+        seen["context_args"] = args
+        seen["context_profile"] = kwargs.get("profile_name")
+        return {}
+
+    monkeypatch.setattr(server, "_set_session_context", _capture_context)
     monkeypatch.setattr(server, "_clear_session_context", lambda *a, **k: None)
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
     monkeypatch.setattr(server, "_session_cwd", lambda s: str(tmp_path))
@@ -13723,6 +14084,7 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
         # The branch row is self-describing: stamped with the parent's owning
         # profile, not left NULL for aggregators to mis-tag as "default".
         assert seen.get("profile_name") == "mlperf"
+        assert seen.get("context_profile") == "mlperf"
         assert seen.get("title") == (seen["created"], "forked")
         assert len(seen["msgs"]) == 1
         assert seen.get("launch") is None
@@ -17096,7 +17458,7 @@ def test_start_agent_build_passes_session_model_override(
         captured.update(kwargs)
         return types.SimpleNamespace(model="claude-sonnet-4.6")
 
-    monkeypatch.setattr(server, "_set_session_context", lambda target: [])
+    monkeypatch.setattr(server, "_set_session_context", lambda target, **_kwargs: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
     monkeypatch.setattr(server, "_make_agent", fake_make_agent)
     monkeypatch.setattr(server, "_SlashWorker", FakeWorker)

@@ -117,6 +117,38 @@ def apply_llm_request_middleware(
     )
 
 
+def _with_bound_profile(context: Dict[str, Any]) -> Dict[str, Any]:
+    classic_cli = bool(context.pop("classic_cli", False))
+    if context.get("profile_name"):
+        return context
+    try:
+        from gateway.session_context import get_session_env
+
+        context["profile_name"] = get_session_env(
+            "HERMES_SESSION_PROFILE", ""
+        )
+    except Exception:
+        context["profile_name"] = ""
+    if not context["profile_name"] and classic_cli:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            context["profile_name"] = get_active_profile_name()
+        except Exception:
+            context["profile_name"] = "default"
+    return context
+
+
+def is_classic_cli_runtime(agent: Any) -> bool:
+    """Return the constructor-minted classic single-session CLI authority bit.
+
+    ``agent.platform`` is descriptive and can originate in a multiplexed
+    session request. It must never authorize process-global cwd/profile
+    fallbacks.
+    """
+    return bool(getattr(agent, "_classic_cli_runtime", False))
+
+
 def apply_tool_request_middleware(
     tool_name: str,
     args: Dict[str, Any],
@@ -130,6 +162,8 @@ def apply_tool_request_middleware(
     original_args = _safe_copy(args)
     current_args = _safe_copy(original_args)
     trace: List[Dict[str, Any]] = []
+
+    context = _with_bound_profile(context)
 
     session_id = str(context.get("session_id") or "")
     skip_relay = bool(context.pop("skip_relay", False))
@@ -210,6 +244,7 @@ def run_tool_execution_middleware(
     **context: Any,
 ) -> Any:
     """Run tool execution through registered tool execution middleware."""
+    context = _with_bound_profile(context)
     callbacks = _get_middleware_callbacks(TOOL_EXECUTION_MIDDLEWARE)
     if not callbacks:
         return next_call(args)

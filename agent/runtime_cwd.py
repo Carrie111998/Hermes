@@ -57,6 +57,20 @@ def _session_cwd_override() -> str:
     return str(value).strip()
 
 
+def authoritative_session_cwd() -> str:
+    """Return the explicitly bound session cwd, or empty when unproven.
+
+    Lifecycle/plugin attribution must not use ``TERMINAL_CWD`` or the process
+    cwd in a multiplexed host. Those are valid compatibility fallbacks for
+    ordinary path resolution, but they cannot prove which session owns a write.
+    """
+    override = _session_cwd_override()
+    if not override:
+        return ""
+    path = Path(override).expanduser()
+    return str(path) if path.is_dir() else ""
+
+
 def resolve_agent_cwd() -> Path:
     override = _session_cwd_override()
     if override:

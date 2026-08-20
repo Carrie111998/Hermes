@@ -11,6 +11,7 @@ import {
   hydrateLiveSessionInflight,
   liveSessionInflightMessages,
   scheduleResumeScrollToBottom,
+  sessionCreateParams,
   signalFreshSessionBoundary,
   writeActiveSessionFile
 } from '../app/useSessionLifecycle.js'
@@ -26,6 +27,21 @@ describe('fresh session boundary', () => {
     expect(signalFreshSessionBoundary('old-session', 'new-session')).toBe(false)
     expect(onFreshSessionStarted).toHaveBeenCalledOnce()
     expect(onFreshSessionStarted).toHaveBeenCalledWith('new-session')
+  })
+})
+
+describe('session create replacement contract', () => {
+  it('replaces only the visible session for ordinary new-session creation', () => {
+    expect(sessionCreateParams(120, 'ui-old', false)).toEqual({
+      cols: 120,
+      replace_session_id: 'ui-old'
+    })
+    expect(sessionCreateParams(120, 'ui-old', true)).toEqual({ cols: 120 })
+    expect(sessionCreateParams(120, null, false)).toEqual({ cols: 120 })
+  })
+
+  it('does not invent a cwd for a detached producer', () => {
+    expect(sessionCreateParams(120, null, false)).not.toHaveProperty('cwd')
   })
 })
 
