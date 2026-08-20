@@ -1401,6 +1401,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
         intercepted_events = []
         writer_token = {"value": None}
+        superseded = {"value": False}
 
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
             stream_kwargs = _sanitize_consumer_codex_request(
@@ -1422,9 +1423,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             logger.warning(
                 "Codex streaming attempt superseded by a newer stream; "
                 "stopping consumption to preserve the single-writer "
-                "invariant (model=%s).",
+                "invariant (model=%s). Not retrying this turn.",
                 api_kwargs.get("model", "unknown"),
             )
+            superseded["value"] = True
+            agent._interrupt_requested = True
             return False
 
         def _finalize_codex_stream() -> Any:
@@ -1493,7 +1496,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             raise
 
         def _interrupt_or_superseded() -> bool:
-            return bool(agent._interrupt_requested)
+            return bool(agent._interrupt_requested) or bool(superseded["value"])
 
         try:
             try:
@@ -1515,6 +1518,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     interrupt_check=_interrupt_or_superseded,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+                if superseded["value"]:
+                    raise InterruptedError(
+                        "Codex streaming attempt superseded; not retrying"
+                    ) from exc
                 if attempt < max_stream_retries:
                     logger.debug(
                         "Codex Responses stream transport failed mid-iteration "
@@ -1530,6 +1537,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 )
                 raise
             except RuntimeError:
+                if superseded["value"]:
+                    raise InterruptedError(
+                        "Codex streaming attempt superseded; not retrying"
+                    )
                 if event_stream.final_response is not None:
                     return event_stream.final_response
                 raise
@@ -1540,6 +1551,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     stream_opened=writer_token["value"] is not None,
                 )
                 raise
+
+            if superseded["value"]:
+                raise InterruptedError(
+                    "Codex streaming attempt superseded; not retrying"
+                )
 
             # A terminal response has already been assembled at this point
             # (``final`` is built), so a transport error while draining the

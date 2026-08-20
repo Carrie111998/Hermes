@@ -716,6 +716,16 @@ DEFAULT_CONFIG = {
         "loop_caps": {
             "max_web_searches": 50,   # max web_search calls per turn (0 = unlimited)
             "max_subagents": 50,      # max subagents spawned per turn (0 = unlimited)
+            # Session-lifetime caps (do not reset between turns). Sequential
+            # review batches in one CLI/gateway task share one session; the
+            # per-turn cap alone cannot stop a multi-hour review→patch→review
+            # fan-out. 0 = unlimited.
+            "max_subagents_per_session": 16,
+            "max_delegate_batches_per_session": 4,
+            "max_child_api_calls_per_session": 80,
+            "max_child_tokens_per_session": 8000000,
+            "require_delegate_batch_checkpoint": True,
+            "codex_weekly_break_percent": 90,
         },
     },
 

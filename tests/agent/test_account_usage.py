@@ -227,3 +227,22 @@ def test_redeem_missing_credentials_reports_unavailable(monkeypatch):
 
     assert result.status == "unavailable"
     assert "hermes auth" in result.message
+
+
+def test_codex_weekly_breaker_trips_at_threshold():
+    from datetime import datetime, timezone
+
+    snap = account_usage.AccountUsageSnapshot(
+        provider="openai-codex",
+        source="usage_api",
+        fetched_at=datetime.now(timezone.utc),
+        windows=(
+            account_usage.AccountUsageWindow(label="Session", used_percent=10),
+            account_usage.AccountUsageWindow(label="Weekly", used_percent=90),
+        ),
+    )
+    assert account_usage.codex_weekly_used_percent(snap) == 90
+    assert account_usage.should_trip_codex_weekly_breaker(snap, 90) is True
+    assert account_usage.should_trip_codex_weekly_breaker(snap, 91) is False
+    assert account_usage.should_trip_codex_weekly_breaker(snap, 0) is False
+    assert account_usage.should_trip_codex_weekly_breaker(None, 90) is False
