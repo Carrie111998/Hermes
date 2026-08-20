@@ -116,6 +116,14 @@ class TestIncrementalOutputDecoder:
         assert output.count("\ufffd") == 2
         assert "\u00ff" not in output
 
+    def test_bounded_flush_keeps_one_encoding_for_the_record(self):
+        decoder = _IncrementalOutputDecoder(fallback_encoding="cp1252")
+        first = b"\xff" + b"a" * (decoder._PROBE_LIMIT - 1)
+
+        output = decoder.decode(first) + decoder.decode(b"\xc3\xa9\n", final=True)
+
+        assert output == first.decode("cp1252") + "\u00c3\u00a9\n"
+
     def test_explicit_none_disables_host_fallback(self, monkeypatch):
         from tools.environments import base
 

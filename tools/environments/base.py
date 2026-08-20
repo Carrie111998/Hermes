@@ -102,41 +102,47 @@ class _IncrementalOutputDecoder:
         self._utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._buffer = bytearray()
         self._record_had_nul = False
+        self._record_encoding = None
 
     def _decode_record(self, raw: bytes) -> str:
+        if self._record_had_nul or b"\x00" in raw:
+            return raw.decode("utf-8", errors="replace")
+        if self._record_encoding:
+            return raw.decode(self._record_encoding, errors="replace")
         try:
             return raw.decode("utf-8", errors="strict")
         except UnicodeDecodeError:
-            if not self._record_had_nul and b"\x00" not in raw and self._fallback_encoding:
+            if self._fallback_encoding:
                 return raw.decode(self._fallback_encoding, errors="replace")
             return raw.decode("utf-8", errors="replace")
 
     def _flush_long_buffer(self) -> str:
         raw = bytes(self._buffer)
         self._record_had_nul = self._record_had_nul or b"\x00" in raw
-        try:
-            text = raw.decode("utf-8", errors="strict")
-        except UnicodeDecodeError as exc:
-            if self._record_had_nul:
+        if self._record_had_nul:
+            self._record_encoding = "utf-8"
+        elif not self._record_encoding:
+            try:
+                text = raw.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as exc:
+                if exc.end == len(raw) and exc.reason == "unexpected end of data" and exc.start:
+                    try:
+                        raw[: exc.start].decode("utf-8", errors="strict")
+                    except UnicodeDecodeError:
+                        pass
+                    else:
+                        self._record_encoding = "utf-8"
+                if not self._record_encoding:
+                    self._record_encoding = self._fallback_encoding
+            else:
+                self._record_encoding = "utf-8"
                 self._buffer.clear()
-                return raw.decode("utf-8", errors="replace")
-            if exc.end == len(raw) and exc.reason == "unexpected end of data" and exc.start:
-                prefix = raw[: exc.start]
-                try:
-                    text = prefix.decode("utf-8", errors="strict")
-                except UnicodeDecodeError:
-                    pass
-                else:
-                    self._buffer = bytearray(raw[exc.start :])
-                    return text
+                return text
 
-            decoder = codecs.getincrementaldecoder(self._fallback_encoding)(errors="replace")
-            text = decoder.decode(raw, final=False)
-            pending, _ = decoder.getstate()
-            self._buffer = bytearray(pending)
-            return text
-
-        self._buffer.clear()
+        decoder = codecs.getincrementaldecoder(self._record_encoding)(errors="replace")
+        text = decoder.decode(raw, final=False)
+        pending, _ = decoder.getstate()
+        self._buffer = bytearray(pending)
         return text
 
     def decode(self, data: bytes, final: bool = False) -> str:
@@ -157,6 +163,7 @@ class _IncrementalOutputDecoder:
             del self._buffer[: boundary + 1]
             output.append(self._decode_record(record))
             self._record_had_nul = False
+            self._record_encoding = None
 
         # An ASCII-only tail is safe to stream without waiting for a newline.
         ascii_end = 0
@@ -176,6 +183,7 @@ class _IncrementalOutputDecoder:
                 output.append(self._decode_record(bytes(self._buffer)))
                 self._buffer.clear()
             self._record_had_nul = False
+            self._record_encoding = None
 
         return "".join(output)
 
