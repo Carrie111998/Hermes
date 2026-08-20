@@ -50,7 +50,11 @@ from agent.acp_agent_registry import (
     normalize_agent_name,
     resolve_agent_launch,
 )
-from agent.file_safety import get_read_block_error, get_write_denied_error
+from agent.file_safety import (
+    get_read_block_error,
+    get_write_denied_error,
+    is_write_approval_required,
+)
 from agent.redact import redact_sensitive_text
 from tools.environments.local import hermes_subprocess_env
 
@@ -479,6 +483,63 @@ class _ACPChatNamespace:
         self.completions = _ACPChatCompletions(client)
 
 
+
+# Probe verdicts cached per binary path so repeated prompts against a
+# CLI that supports --acp pay the ~50ms --help cost exactly once per
+# process. Only definitive verdicts (True/False) are cached; an
+# inconclusive probe (binary missing, --help crashed or timed out) is
+# not cached so a CLI installed mid-session is picked up.
+_ACP_PROBE_CACHE: dict[str, bool] = {}
+
+
+def _acp_supported(command: str, args: list[str]) -> bool | None:
+    """Tri-state probe: does ``command`` accept the ACP args we'd pass?
+
+    Only agents launched with a literal ``--acp`` flag are probed. Every
+    other adapter in the registry speaks ACP through a dedicated binary
+    (``claude-agent-acp``, ``codex-acp``) or its own subcommand/flag
+    (``cursor-agent acp``, ``gemini --experimental-acp``); those have no
+    ``--acp`` to advertise and are skipped, so this never gates a plugin
+    agent on a flag it was never going to pass.
+
+    For the ones that do: spawning a CLI that doesn't recognize ``--acp``
+    exits with code 1 and ``error: unknown option '--acp'`` on stderr,
+    after which the parent ACP loop waits the full
+    ``child_timeout_seconds`` (default 600s) for stdout that never
+    arrives. Ported from the Copilot-specific client (upstream #87308,
+    hardened in #87309) when the protocol moved into this module.
+
+    Returns:
+      - ``True``  — help text advertises ``--acp``, or the agent doesn't
+        use the flag at all; safe to spawn.
+      - ``False`` — help ran cleanly but ``--acp`` is absent; spawning
+        would hang, so the caller should fast-fail with a clear error.
+      - ``None``  — inconclusive (binary missing, --help failed or timed
+        out). The caller must fall through to the normal spawn path,
+        which surfaces the established "Could not start ... ACP command"
+        error with its install hint.
+    """
+    if "--acp" not in args:
+        return True
+    cached = _ACP_PROBE_CACHE.get(command)
+    if cached is not None:
+        return cached
+    try:
+        probe = subprocess.run(
+            [command, "--help"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if probe.returncode != 0:
+        # --help itself failed; can't tell anything about --acp.
+        return None
+    # Match ``--acp`` as a flag in the help text; tolerate spacing and
+    # variants like ``[--acp]``.
+    verdict = bool(re.search(r"(?:^|[\s\[])--acp(?:[\s=\],]|$)", probe.stdout, re.MULTILINE))
+    _ACP_PROBE_CACHE[command] = verdict
+    return verdict
+
 class ACPClient:
     """Minimal OpenAI-client-compatible facade for an ACP agent."""
 
@@ -616,6 +677,22 @@ class ACPClient:
 
     def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
         display = self.agent_display_name
+        # Fast-fail a CLI that doesn't speak the transport we're about to
+        # hand it. Without this, such a CLI exits immediately and the loop
+        # below waits ``child_timeout_seconds`` (default 600s) for stdout
+        # that never arrives. ``None`` (inconclusive) falls through to the
+        # spawn, which raises the established "Could not start" error.
+        if _acp_supported(self._acp_command, self._acp_args) is False:
+            preview = " ".join(self._acp_args[:3]) if self._acp_args else "(none)"
+            raise RuntimeError(
+                f"ACP transport not supported by '{self._acp_command}': "
+                f"`{preview}` is rejected as an unknown option. This usually "
+                f"means the CLI is an older release, or a different tool than "
+                f"expected. " + agent_install_hint(self.agent_name)
+                + f" You can also override the pair with "
+                f"HERMES_ACP_{self.agent_name.upper()}_COMMAND / "
+                f"HERMES_ACP_{self.agent_name.upper()}_ARGS."
+            )
         try:
             # Hide the console the CLI child would otherwise flash on Windows
             # (#56747). Hide-only — stdio pipes stay intact for the ACP wire.
@@ -908,6 +985,14 @@ class ACPClient:
                 denied = get_write_denied_error(str(path))
                 if denied:
                     raise PermissionError(denied)
+                # Approval-gated paths (e.g. ~/.ssh/config) are not hard-denied
+                # for interactive tools, but the ACP bridge has no human channel
+                # to confirm the write — fail closed here.
+                if is_write_approval_required(str(path)):
+                    raise PermissionError(
+                        f"Write denied: '{path}' requires interactive approval "
+                        "and cannot be written through the ACP file bridge."
+                    )
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(str(params.get("content") or ""), encoding="utf-8")
                 response = {
