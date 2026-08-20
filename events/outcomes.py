@@ -108,6 +108,14 @@ _DEGRADED_EVENT_TYPES = frozenset(
         EventType.CRON_STALE,
         EventType.RESOURCE_PRESSURE,
         EventType.WATCHDOG_SELF_DEGRADED,
+        # BOOT_SUMMARY exists only when the boot had trouble --
+        # laptop-start.ps1 Get-BootSummaryPayload returns $null unless
+        # state=='failed' OR a step failed OR there is an error-severity
+        # anomaly. So DEGRADED is its FLOOR, not its verdict; the
+        # failed-step rule below escalates it to FAILED. Membership here
+        # rather than a bare payload rule means a boot that alerted for
+        # anomalies alone still reads as trouble.
+        EventType.BOOT_SUMMARY,
     }
 )
 
@@ -357,6 +365,27 @@ def evaluate_outcome(event: Event) -> OutcomeVerdict:
             failed.append(_evidence("transition_failed", "payload.after", payload.get("after")))
         elif _after in _DEGRADED_VALUES:
             degraded.append(_evidence("transition_degraded", "payload.after", payload.get("after")))
+
+    # BOOT_SUMMARY severity comes from the FAILED STEP COUNT, never from
+    # `state`. `state` reports whether the boot SEQUENCE completed, not
+    # whether it was healthy: the real 2026-08-19 event carries
+    # state=="done" alongside 66 error anomalies, and the producer would not
+    # have emitted at all had the boot been clean. Reading "done" as success
+    # -- the obvious move, and the one first proposed when this was
+    # triaged -- would paint that boot green. state=='failed' is honoured
+    # too, since the producer's own gate treats it as sufficient.
+    if event.event_type is EventType.BOOT_SUMMARY:
+        _failed_steps = payload.get("failed")
+        if isinstance(_failed_steps, bool):
+            _failed_steps = None
+        if isinstance(_failed_steps, (int, float)) and _failed_steps > 0:
+            failed.append(
+                _evidence("boot_steps_failed", "payload.failed", _failed_steps)
+            )
+        elif _normalized(payload.get("state", "")) == "failed":
+            failed.append(
+                _evidence("boot_state_failed", "payload.state", payload.get("state"))
+            )
 
     if event.event_type is EventType.CRON_COMPLETED:
         output_summary = str(payload.get("output_summary", ""))[:400]

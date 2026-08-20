@@ -606,3 +606,70 @@ def test_rate_limit_outcomes_never_wear_the_ambiguous_marker(outcome):
     verdict = evaluate_outcome(_rate_limited(outcome))
 
     assert marker_for_verdict(verdict, Priority.HIGH) != "🟡"
+# --- boot_summary: the event IS the trouble (2026-08-20) --------------------
+# laptop-start.ps1 Get-BootSummaryPayload gates the emit:
+#   if (state -ne 'failed' -and failedSteps.Count -eq 0 -and errAnoms.Count -eq 0)
+#       { return $null }
+# so this event EXISTS only when the boot had trouble -- it is monodirectional
+# at the type level, and DEGRADED is its floor.
+#
+# `state` is NOT the severity signal and must not be read as one: it reports
+# whether the boot SEQUENCE completed, not whether it was healthy. The real
+# 2026-08-19 event carries state="done" alongside 66 error anomalies. Treating
+# state=="done" as success -- the obvious reading, and the one first proposed
+# here -- would render that boot green. Severity comes from the FAILED COUNT.
+
+
+def _boot(state, failed, anomalies=0, skipped=0):
+    return _event(
+        {"boot_id": "20260819-044507", "state": state, "total": 25,
+         "done": 25 - failed, "failed": failed, "skipped": skipped,
+         "failures": ["[critical] step: detail"] * failed,
+         "anomalies": ["kind: detail"] * anomalies},
+        event_type=EventType.BOOT_SUMMARY,
+        priority=Priority.HIGH,
+    )
+
+
+def test_boot_summary_with_a_failed_step_is_failed():
+    """Real 2026-08-10 and 2026-08-11 events: state=failed, failed=1."""
+    verdict = evaluate_outcome(_boot("failed", failed=1))
+
+    assert verdict.state is OutcomeState.FAILED
+
+
+def test_boot_summary_with_only_anomalies_is_degraded_not_failed():
+    """Real 2026-08-19 event: state="done", failed=0, 66 error anomalies. The
+    boot sequence finished; error-severity anomalies are why it alerted at
+    all. Degraded, not a hard failure."""
+    verdict = evaluate_outcome(_boot("done", failed=0, anomalies=66, skipped=1))
+
+    assert verdict.state is OutcomeState.DEGRADED
+
+
+def test_boot_summary_done_is_never_success():
+    """THE TRAP. state="done" means the sequence completed, NOT that the boot
+    was clean -- the producer would not have emitted at all if it were. A
+    _SUCCESS_VALUES reading of "done" would paint a 66-anomaly boot green.
+    """
+    for anomalies in (1, 2, 66):
+        verdict = evaluate_outcome(_boot("done", failed=0, anomalies=anomalies))
+
+        assert verdict.state is not OutcomeState.SUCCEEDED
+        assert verdict.state is not OutcomeState.RECOVERED
+        assert marker_for_verdict(verdict, Priority.HIGH) != "🟢"
+
+
+def test_boot_summary_failed_count_beats_a_done_state():
+    """Failure wins: a boot whose sequence says "done" but which lost a step
+    is FAILED, not DEGRADED."""
+    verdict = evaluate_outcome(_boot("done", failed=2, anomalies=3))
+
+    assert verdict.state is OutcomeState.FAILED
+
+
+def test_boot_summary_never_wears_the_ambiguous_marker():
+    for state, failed in (("failed", 1), ("done", 0)):
+        verdict = evaluate_outcome(_boot(state, failed=failed, anomalies=1))
+
+        assert marker_for_verdict(verdict, Priority.HIGH) != "🟡"
