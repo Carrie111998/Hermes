@@ -69,7 +69,6 @@ from __future__ import annotations
 
 import logging
 import os
-import platform
 import re
 import shutil
 import site
@@ -835,17 +834,7 @@ def feature_specs(feature: str) -> tuple[str, ...]:
     """Return the registered specs for a feature, or raise KeyError."""
     if feature not in LAZY_DEPS:
         raise KeyError(f"Unknown lazy feature: {feature!r}")
-    specs = LAZY_DEPS[feature]
-    if (
-        feature == "wake.openwakeword"
-        and sys.platform == "darwin"
-        and platform.machine().lower() in {"x86_64", "amd64"}
-    ):
-        return tuple(
-            "onnxruntime==1.23.2" if spec == "onnxruntime==1.27.0" else spec
-            for spec in specs
-        )
-    return specs
+    return LAZY_DEPS[feature]
 
 
 def feature_missing(feature: str) -> tuple[str, ...]:
@@ -1005,7 +994,7 @@ def feature_install_command(feature: str, *, venv_pip: bool = False) -> Optional
     """
     if feature not in LAZY_DEPS:
         return None
-    specs = feature_specs(feature)
+    specs = LAZY_DEPS[feature]
     joined = " ".join(repr(s) for s in specs)
     if venv_pip:
         return f"{sys.executable} -m pip install {joined}"

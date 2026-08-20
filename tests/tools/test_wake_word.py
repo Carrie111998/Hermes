@@ -705,7 +705,7 @@ def test_resolve_capture_mode_auto_and_prefer_client(monkeypatch):
     # auto without prefer_client stays local (CLI/TUI/status semantics)
     assert ww.resolve_capture_mode({"capture": "auto"}) == "local"
     assert ww.resolve_capture_mode({"capture": "auto"}, prefer_client=True) == "client"
-    assert ww.resolve_capture_mode({"capture": "local"}, prefer_client=True) == "local"
+    assert ww.resolve_capture_mode({"capture": "local"}, prefer_client=True) == "client"
     assert ww.resolve_capture_mode({"capture": "client"}) == "client"
     assert ww.resolve_capture_mode({"capture": "auto"}, force_local=True) == "local"
     monkeypatch.setattr(ww, "_local_input_device_ready", lambda: True)
