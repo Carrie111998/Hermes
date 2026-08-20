@@ -801,6 +801,20 @@ class TestPluginHooks:
         assert plugins._HOOK_TIMEOUT_FAIL_CLOSED_HOOKS == {"pre_tool_call"}
         assert plugins._HOOK_CALLER_THREAD_HOOKS == {"subagent_stop"}
 
+    def test_hook_timeout_config_uses_positive_values_only(self, monkeypatch):
+        configs = iter(
+            [
+                {"plugins": {"hook_timeout_seconds": 1.5}},
+                {"plugins": {"hook_timeout_seconds": 0}},
+                {"plugins": {"hook_timeout_seconds": "invalid"}},
+            ]
+        )
+        monkeypatch.setattr(plugins, "load_config_readonly", lambda: next(configs))
+
+        assert plugins._get_hook_timeout_seconds() == 1.5
+        assert plugins._get_hook_timeout_seconds() == plugins._DEFAULT_HOOK_TIMEOUT_SECONDS
+        assert plugins._get_hook_timeout_seconds() == plugins._DEFAULT_HOOK_TIMEOUT_SECONDS
+
     """Tests for lifecycle hook registration and invocation."""
 
 
@@ -1003,6 +1017,35 @@ class TestPluginHooks:
         assert bounded.call_args.args[1] == mgr._hook_timeout_seconds
         assert bounded.call_args.kwargs["label"].startswith("plugin-hook:pre_llm_call:narrow")
 
+    def test_bounded_callback_closes_over_registered_callback(self, monkeypatch):
+        mgr = PluginManager()
+        calls = []
+        deferred = []
+
+        def first(**kwargs):
+            calls.append("first")
+            return "first-result"
+
+        def second(**kwargs):
+            calls.append("second")
+            return "second-result"
+
+        mgr._hooks["pre_llm_call"] = [first, second]
+
+        def delayed_runner(callback, timeout, **kwargs):
+            deferred.append(callback)
+            if len(deferred) == 1:
+                return types.SimpleNamespace(timed_out=True, value=None)
+            return types.SimpleNamespace(timed_out=False, value=callback())
+
+        monkeypatch.setattr(plugins, "run_bounded_sync", delayed_runner)
+
+        assert mgr.invoke_hook("pre_llm_call", session_id="session-1") == [
+            "second-result"
+        ]
+        deferred[0]()
+        assert calls == ["second", "first"]
+
     def test_hook_exception_still_allows_later_return_values(self, caplog):
         """Bounded dispatch keeps the prior fail-open exception behavior."""
         mgr = PluginManager()
@@ -1031,6 +1074,17 @@ class TestPluginHooks:
 
         assert results == ["before-result", "after-result"]
         assert any("raised: boom" in r.getMessage() for r in caplog.records)
+
+    def test_unload_clears_hook_timeout_state(self):
+        mgr = PluginManager()
+        callback_key = ("pre_tool_call", 1)
+        mgr._hook_timeout_suppressed_until[callback_key] = time.monotonic() + 60
+        mgr._hook_running_callbacks.add(callback_key)
+
+        mgr.unload()
+
+        assert mgr._hook_timeout_suppressed_until == {}
+        assert mgr._hook_running_callbacks == set()
 
     def test_non_hot_hook_stays_on_caller_thread(self):
         """Lifecycle hooks preserve caller-thread semantics outside hot paths."""

@@ -2218,10 +2218,10 @@ class TestConcurrentToolExecution:
 
         manager = PluginManager()
         manager._hook_timeout_seconds = 0.02
+        release = threading.Event()
 
         def slow_pre_tool_call(**kwargs):
-            import time
-            time.sleep(0.30)
+            release.wait(30)
 
         manager._hooks["pre_tool_call"] = [slow_pre_tool_call]
         monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
@@ -2238,11 +2238,14 @@ class TestConcurrentToolExecution:
             side_effect=AssertionError("checkpoint should not run")
         )
 
-        with patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")):
-            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+        try:
+            with patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")):
+                agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
-        agent._checkpoint_mgr.ensure_checkpoint.assert_not_called()
-        assert json.loads(messages[0]["content"])["error"]
+            agent._checkpoint_mgr.ensure_checkpoint.assert_not_called()
+            assert json.loads(messages[0]["content"])["error"]
+        finally:
+            release.set()
 
     @pytest.mark.parametrize("concurrent", [False, True])
     def test_tool_execution_middleware_replacement_emits_one_terminal_hook(

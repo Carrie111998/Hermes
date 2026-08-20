@@ -3751,6 +3751,9 @@ class PluginManager:
             self._ownership_ledger.clear()
             self._plugins.clear()
             self._hooks.clear()
+            with self._hook_timeout_lock:
+                self._hook_timeout_suppressed_until.clear()
+                self._hook_running_callbacks.clear()
             self._middleware.clear()
             self._plugin_tool_names.clear()
             self._plugin_platform_names.clear()
@@ -5197,7 +5200,7 @@ class PluginManager:
 
             def bounded_callback(callback=cb, callback_key=callback_key, context=context) -> Any:
                 try:
-                    return context.run(self._invoke_hook_callback, cb, kwargs)
+                    return context.run(self._invoke_hook_callback, callback, kwargs)
                 finally:
                     with self._hook_timeout_lock:
                         self._hook_running_callbacks.discard(callback_key)

@@ -16,6 +16,7 @@ instead of rebuilding).  Covers:
 from __future__ import annotations
 
 import logging
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -147,17 +148,20 @@ class TestLegitimateFreshBuild:
     def test_slow_session_start_hook_does_not_delay_first_turn(self, monkeypatch):
         manager = PluginManager()
         manager._hook_timeout_seconds = 0.02
+        release = threading.Event()
 
         def slow_session_start(**kwargs):
-            import time
-            time.sleep(0.30)
+            release.wait(30)
 
         manager._hooks["on_session_start"] = [slow_session_start]
         monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
         db = MagicMock()
         agent = _make_agent(session_db=db)
 
-        _restore_or_build_system_prompt(agent, None, [])
+        try:
+            _restore_or_build_system_prompt(agent, None, [])
+        finally:
+            release.set()
 
         assert agent._cached_system_prompt == "BUILT_PROMPT"
         db.update_system_prompt.assert_called_once_with(agent.session_id, "BUILT_PROMPT")
