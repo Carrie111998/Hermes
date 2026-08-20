@@ -17,7 +17,7 @@ import stat
 import subprocess
 import threading
 import time
-from typing import Any, Protocol, cast
+from typing import Any, NamedTuple, Protocol, cast
 
 from agent.transports.codex_app_server import CodexAppServerClient
 from hermes_constants import (
@@ -355,24 +355,46 @@ def _bounded_run(
     return result
 
 
-def _claude_visibility_preflight(
+class _ClaudeVisibilityPreflight(NamedTuple):
+    """Startup state, plus a fixed code naming the gate that refused it.
+
+    ``failure_code`` is None exactly when ``startup`` is not, and is always a
+    member of ``CLAUDE_VISIBILITY_PREFLIGHT_FAILURE_CODES``. It is diagnostic
+    only: ``main`` deliberately collapses ProviderDegraded to
+    ``{"error": "provider_degraded"}``, so these codes reach the service log
+    and never public output.
+    """
+
+    startup: dict[str, str] | None
+    failure_code: str | None
+
+
+def _claude_visibility_preflight_detail(
     command: Sequence[str],
     *,
     runner: Callable[..., subprocess.CompletedProcess[str]] = _bounded_run,
     global_config_path: Path | str | None = None,
     user_settings_path: Path | str | None = None,
-) -> dict[str, str] | None:
-    """Read pinned version, auth, and startup state without starting a session."""
+) -> _ClaudeVisibilityPreflight:
+    """Read pinned version, auth, and startup state without starting a session.
+
+    Each refusal names its own gate. Ten distinct reasons previously shared one
+    bare ``None``, so a failure in production said only that *something* in
+    startup was wrong -- reconstructing which one needed a hand-written probe.
+    """
+
+    def _refused(code: str) -> _ClaudeVisibilityPreflight:
+        return _ClaudeVisibilityPreflight(None, code)
 
     # Transcript discovery is fixed to ~/.claude/projects. An alternate config
     # root would make the startup state and transcript roots disagree.
     if "CLAUDE_CONFIG_DIR" in os.environ:
-        return None
+        return _refused("claude_visibility_preflight_failed_config_dir_override")
     if any(
         os.environ.get(name) in _CLAUDE_FORCED_ONBOARDING
         for name in _CLAUDE_FORCED_ONBOARDING_ENVIRONMENTS
     ):
-        return None
+        return _refused("claude_visibility_preflight_failed_forced_onboarding")
 
     child_env = os.environ.copy()
     child_env["DISABLE_UPDATES"] = "1"
@@ -398,31 +420,35 @@ def _claude_visibility_preflight(
             env=child_env,
         )
     except (OSError, subprocess.SubprocessError):
-        return None
+        return _refused("claude_visibility_preflight_failed_command_error")
     auth_output = authentication.stdout
     if type(auth_output) is not str:
-        return None
+        return _refused("claude_visibility_preflight_failed_auth_output_invalid")
     try:
         auth_output_bytes = len(auth_output.encode("utf-8"))
     except UnicodeEncodeError:
-        return None
+        return _refused("claude_visibility_preflight_failed_auth_output_invalid")
     version_text = version.stdout.strip() if version.returncode == 0 else ""
-    if (
-        version_text not in _CLAUDE_VISIBILITY_VERSION_OUTPUTS
-        or authentication.returncode != 0
-        or auth_output_bytes > _MAX_CLAUDE_AUTH_STATUS_BYTES
-    ):
-        return None
+    # Split from one combined condition purely to name the gate; the order is
+    # preserved, so exactly the same inputs are refused as before.
+    if version_text not in _CLAUDE_VISIBILITY_VERSION_OUTPUTS:
+        return _refused("claude_visibility_preflight_failed_version_unpinned")
+    if authentication.returncode != 0:
+        return _refused("claude_visibility_preflight_failed_auth_unavailable")
+    if auth_output_bytes > _MAX_CLAUDE_AUTH_STATUS_BYTES:
+        return _refused("claude_visibility_preflight_failed_auth_output_too_large")
     auth_status = _strict_json_object(auth_output)
-    if auth_status is None or auth_status.get("loggedIn") is not True:
-        return None
+    if auth_status is None:
+        return _refused("claude_visibility_preflight_failed_auth_output_invalid")
+    if auth_status.get("loggedIn") is not True:
+        return _refused("claude_visibility_preflight_failed_not_logged_in")
     selected_config = (
         Path(global_config_path)
         if global_config_path is not None
         else _resolve_default_claude_global_config_path()
     )
     if not _read_claude_completed_onboarding(selected_config):
-        return None
+        return _refused("claude_visibility_preflight_failed_onboarding_incomplete")
     selected_settings = (
         Path(user_settings_path)
         if user_settings_path is not None
@@ -430,12 +456,38 @@ def _claude_visibility_preflight(
     )
     theme = _read_claude_startup_theme(selected_settings)
     if theme is None:
-        return None
-    return {
-        "version": _CLAUDE_VISIBILITY_PINNED_VERSION,
-        "authentication": "available",
-        "theme": theme,
-    }
+        return _refused("claude_visibility_preflight_failed_theme_unavailable")
+    return _ClaudeVisibilityPreflight(
+        {
+            "version": _CLAUDE_VISIBILITY_PINNED_VERSION,
+            "authentication": "available",
+            "theme": theme,
+        },
+        None,
+    )
+
+
+def _claude_visibility_preflight(
+    command: Sequence[str],
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = _bounded_run,
+    global_config_path: Path | str | None = None,
+    user_settings_path: Path | str | None = None,
+) -> dict[str, str] | None:
+    """Startup state only, or None when any gate refused.
+
+    The original ``dict | None`` contract, kept because the refusal *reason*
+    is irrelevant to a caller that only needs to know whether startup is
+    usable. Production raise sites use ``_claude_visibility_preflight_detail``
+    so the gate reaches the log.
+    """
+
+    return _claude_visibility_preflight_detail(
+        command,
+        runner=runner,
+        global_config_path=global_config_path,
+        user_settings_path=user_settings_path,
+    ).startup
 
 
 def _resolve_default_claude_global_config_path() -> Path:
@@ -2462,9 +2514,10 @@ class ProductionBackend:
         startup: Mapping[str, Any] | None = None
         if not active_path.exists():
             claude_command = resolve_cli_executable("claude")
-            startup = _claude_visibility_preflight(claude_command)
-            if startup is None:
-                raise ProviderDegraded("claude_visibility_preflight_failed")
+            preflight = _claude_visibility_preflight_detail(claude_command)
+            if preflight.startup is None:
+                raise ProviderDegraded(cast(str, preflight.failure_code))
+            startup = preflight.startup
         marker_secret = resolve_marker_key()
         store = self._require_store()
         _sync_claude_characterization_records(
@@ -2572,9 +2625,10 @@ class ProductionBackend:
         local_recovery = local_visible_recovery or local_exact_reconciliation
         if not local_recovery and startup is None:
             claude_command = resolve_cli_executable("claude")
-            startup = _claude_visibility_preflight(claude_command)
-            if startup is None:
-                raise ProviderDegraded("claude_visibility_preflight_failed")
+            preflight = _claude_visibility_preflight_detail(claude_command)
+            if preflight.startup is None:
+                raise ProviderDegraded(cast(str, preflight.failure_code))
+            startup = preflight.startup
         registrar: Any = None
         if local_exact_reconciliation:
             source = ClaudeSourceAdapter(
@@ -2789,9 +2843,10 @@ class ProductionBackend:
             raise
         except Exception as exc:
             raise ProviderDegraded("claude_visibility_runtime_unavailable") from exc
-        startup = _claude_visibility_preflight(claude_command)
-        if startup is None:
-            raise ProviderDegraded("claude_visibility_preflight_failed")
+        preflight = _claude_visibility_preflight_detail(claude_command)
+        if preflight.startup is None:
+            raise ProviderDegraded(cast(str, preflight.failure_code))
+        startup = preflight.startup
         startup_identity = (tuple(claude_command), startup["theme"])
         if (
             self._claude_visibility_coordinator is not None

@@ -3407,3 +3407,232 @@ def test_cleanup_rejects_forged_capability_and_leaves_exact_artifacts(
             marker_secret=SECRET,
             now=lambda: 11.0,
         )
+
+
+# ---------------------------------------------------------------------------
+# Per-gate preflight failure codes.
+#
+# _claude_visibility_preflight has many independent reasons to refuse and used
+# to collapse all of them into a bare ``None``, so the only thing that reached
+# the log was one undifferentiated ProviderDegraded(
+# "claude_visibility_preflight_failed"). Telling "CLI missing" from "wrong
+# version" from "not logged in" required a bespoke probe. These tests pin a
+# fixed, declared code per gate.
+# ---------------------------------------------------------------------------
+
+
+def _preflight_state(tmp_path: Path, *, theme: str | None = "light") -> tuple[Path, Path]:
+    global_config = tmp_path / ".claude.json"
+    global_config.write_text('{"hasCompletedOnboarding":true}', encoding="utf-8")
+    user_settings = tmp_path / "settings.json"
+    user_settings.write_text(
+        "{}" if theme is None else json.dumps({"theme": theme}), encoding="utf-8"
+    )
+    return global_config, user_settings
+
+
+def _preflight_runner(
+    *,
+    version_output: str = "2.1.216",
+    version_returncode: int = 0,
+    auth_output: str = '{"loggedIn":true}',
+    auth_returncode: int = 0,
+):
+    def runner(argv: list[str], **_kwargs: Any) -> Any:
+        if argv[-1] == "--version":
+            stdout, returncode = version_output, version_returncode
+        else:
+            stdout, returncode = auth_output, auth_returncode
+        return type(
+            "Result", (), {"returncode": returncode, "stdout": stdout, "stderr": ""}
+        )()
+
+    return runner
+
+
+def _detail(tmp_path: Path, *, theme: str | None = "light", **runner_kwargs: Any):
+    from session_bridge.cli import _claude_visibility_preflight_detail
+
+    global_config, user_settings = _preflight_state(tmp_path, theme=theme)
+    return _claude_visibility_preflight_detail(
+        ("claude",),
+        runner=_preflight_runner(**runner_kwargs),
+        global_config_path=global_config,
+        user_settings_path=user_settings,
+    )
+
+
+def test_preflight_detail_reports_no_failure_code_on_success(tmp_path: Path) -> None:
+    detail = _detail(tmp_path)
+
+    assert detail.failure_code is None
+    assert detail.startup == {
+        "version": "2.1.216",
+        "authentication": "available",
+        "theme": "light",
+    }
+
+
+def test_preflight_detail_names_auth_unavailable_when_command_exits_nonzero(
+    tmp_path: Path,
+) -> None:
+    """The live 2026-08-19 failure: version fine, `claude auth status` exits 1."""
+    detail = _detail(
+        tmp_path,
+        auth_returncode=1,
+        auth_output='{"loggedIn":false,"authMethod":"none"}',
+    )
+
+    assert detail.startup is None
+    assert detail.failure_code == "claude_visibility_preflight_failed_auth_unavailable"
+
+
+def test_preflight_detail_names_not_logged_in_when_auth_succeeds_but_denies(
+    tmp_path: Path,
+) -> None:
+    detail = _detail(tmp_path, auth_output='{"loggedIn":false}')
+
+    assert detail.startup is None
+    assert detail.failure_code == "claude_visibility_preflight_failed_not_logged_in"
+
+
+def test_preflight_detail_names_version_unpinned(tmp_path: Path) -> None:
+    detail = _detail(tmp_path, version_output="2.1.999")
+
+    assert detail.startup is None
+    assert detail.failure_code == "claude_visibility_preflight_failed_version_unpinned"
+
+
+def test_preflight_detail_names_theme_unavailable(tmp_path: Path) -> None:
+    detail = _detail(tmp_path, theme=None)
+
+    assert detail.startup is None
+    assert detail.failure_code == "claude_visibility_preflight_failed_theme_unavailable"
+
+
+def test_preflight_detail_names_onboarding_incomplete(tmp_path: Path) -> None:
+    from session_bridge.cli import _claude_visibility_preflight_detail
+
+    global_config = tmp_path / ".claude.json"
+    global_config.write_text('{"hasCompletedOnboarding":false}', encoding="utf-8")
+    user_settings = tmp_path / "settings.json"
+    user_settings.write_text('{"theme":"light"}', encoding="utf-8")
+
+    detail = _claude_visibility_preflight_detail(
+        ("claude",),
+        runner=_preflight_runner(),
+        global_config_path=global_config,
+        user_settings_path=user_settings,
+    )
+
+    assert detail.startup is None
+    assert (
+        detail.failure_code == "claude_visibility_preflight_failed_onboarding_incomplete"
+    )
+
+
+def test_preflight_detail_names_config_dir_override_before_running_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from session_bridge.cli import _claude_visibility_preflight_detail
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+
+    def runner(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("no command may run once the config dir is overridden")
+
+    detail = _claude_visibility_preflight_detail(("claude",), runner=runner)
+
+    assert detail.startup is None
+    assert detail.failure_code == "claude_visibility_preflight_failed_config_dir_override"
+
+
+@pytest.mark.parametrize(
+    "variable", ["CLAUDE_CODE_POWERUP_ONBOARDING", "CLAUDE_CODE_TEAM_ONBOARDING"]
+)
+def test_preflight_detail_names_forced_onboarding_before_running_commands(
+    variable: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from session_bridge.cli import _claude_visibility_preflight_detail
+
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv(variable, "banner")
+
+    def runner(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("no command may run under forced onboarding")
+
+    detail = _claude_visibility_preflight_detail(("claude",), runner=runner)
+
+    assert detail.startup is None
+    assert detail.failure_code == "claude_visibility_preflight_failed_forced_onboarding"
+
+
+def test_preflight_detail_names_command_error(tmp_path: Path) -> None:
+    from session_bridge.cli import _claude_visibility_preflight_detail
+
+    global_config, user_settings = _preflight_state(tmp_path)
+
+    def runner(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("claude is not installed")
+
+    detail = _claude_visibility_preflight_detail(
+        ("claude",),
+        runner=runner,
+        global_config_path=global_config,
+        user_settings_path=user_settings,
+    )
+
+    assert detail.startup is None
+    assert detail.failure_code == "claude_visibility_preflight_failed_command_error"
+
+
+def test_preflight_detail_names_auth_output_too_large(tmp_path: Path) -> None:
+    padded = json.dumps({"loggedIn": True, "pad": "x" * 20_000})
+    detail = _detail(tmp_path, auth_output=padded)
+
+    assert detail.startup is None
+    assert detail.failure_code == "claude_visibility_preflight_failed_auth_output_too_large"
+
+
+def test_preflight_detail_names_auth_output_invalid(tmp_path: Path) -> None:
+    detail = _detail(tmp_path, auth_output="not json at all")
+
+    assert detail.startup is None
+    assert detail.failure_code == "claude_visibility_preflight_failed_auth_output_invalid"
+
+
+def test_every_preflight_failure_code_is_declared(tmp_path: Path) -> None:
+    """No gate may invent a code outside the declared contract."""
+    from session_bridge.claude_visibility_codes import (
+        CLAUDE_VISIBILITY_PREFLIGHT_FAILURE_CODES,
+    )
+
+    observed = {
+        _detail(tmp_path, auth_returncode=1).failure_code,
+        _detail(tmp_path, auth_output='{"loggedIn":false}').failure_code,
+        _detail(tmp_path, version_output="2.1.999").failure_code,
+        _detail(tmp_path, theme=None).failure_code,
+        _detail(tmp_path, auth_output="not json").failure_code,
+    }
+
+    assert None not in observed
+    assert observed <= CLAUDE_VISIBILITY_PREFLIGHT_FAILURE_CODES
+    assert all(
+        code.startswith("claude_visibility_preflight_failed")
+        for code in CLAUDE_VISIBILITY_PREFLIGHT_FAILURE_CODES
+    )
+
+
+def test_preflight_wrapper_still_returns_none_on_failure(tmp_path: Path) -> None:
+    """The existing callers/tests keep the plain dict|None contract."""
+    global_config, user_settings = _preflight_state(tmp_path)
+
+    assert (
+        _claude_visibility_preflight(
+            ("claude",),
+            runner=_preflight_runner(auth_returncode=1),
+            global_config_path=global_config,
+            user_settings_path=user_settings,
+        )
+        is None
+    )

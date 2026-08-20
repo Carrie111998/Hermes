@@ -30,6 +30,23 @@ CLAUDE_VISIBILITY_FATAL_CODES = frozenset({
 CLAUDE_VISIBILITY_ERROR_CODES = (
     CLAUDE_VISIBILITY_RETRY_CODES | CLAUDE_VISIBILITY_FATAL_CODES
 )
+# Why the startup preflight refused, one fixed code per gate. These never reach
+# public CLI output -- `main` collapses ProviderDegraded to {"error":
+# "provider_degraded"} on purpose -- they exist so the SERVICE LOG names the
+# gate. Before this, ten independent refusals shared one message and telling
+# "wrong version" from "not logged in" needed a bespoke probe.
+CLAUDE_VISIBILITY_PREFLIGHT_FAILURE_CODES = frozenset({
+    "claude_visibility_preflight_failed_config_dir_override",
+    "claude_visibility_preflight_failed_forced_onboarding",
+    "claude_visibility_preflight_failed_command_error",
+    "claude_visibility_preflight_failed_version_unpinned",
+    "claude_visibility_preflight_failed_auth_unavailable",
+    "claude_visibility_preflight_failed_auth_output_invalid",
+    "claude_visibility_preflight_failed_auth_output_too_large",
+    "claude_visibility_preflight_failed_not_logged_in",
+    "claude_visibility_preflight_failed_onboarding_incomplete",
+    "claude_visibility_preflight_failed_theme_unavailable",
+})
 CLAUDE_VISIBILITY_PUBLIC_RESULT_ERROR_CODES = CLAUDE_VISIBILITY_ERROR_CODES | frozenset({
     "claim_failed",
     "enqueue_failed",

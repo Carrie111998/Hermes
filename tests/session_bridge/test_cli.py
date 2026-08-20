@@ -4635,12 +4635,16 @@ def test_claude_visibility_preflight_blocks_before_any_runtime_side_effect(
         events.append("resolve_executable")
         return ("claude",)
 
-    def preflight(command: tuple[str, ...]) -> None:
+    def preflight(command: tuple[str, ...]) -> Any:
         events.append(("preflight", command))
-        return None
+        return cli_module._ClaudeVisibilityPreflight(
+            None, "claude_visibility_preflight_failed_not_logged_in"
+        )
 
     monkeypatch.setattr("session_bridge.cli.resolve_cli_executable", resolve_executable)
-    monkeypatch.setattr("session_bridge.cli._claude_visibility_preflight", preflight)
+    monkeypatch.setattr(
+        "session_bridge.cli._claude_visibility_preflight_detail", preflight
+    )
     monkeypatch.setattr(
         "session_bridge.cli.resolve_marker_key",
         lambda: (_ for _ in ()).throw(AssertionError("marker resolution")),
@@ -4701,13 +4705,16 @@ def test_claude_visibility_runtime_passes_only_preflight_theme_to_registrar(
         events.append("resolve_executable")
         return ("claude",)
 
-    def preflight(command: tuple[str, ...]) -> dict[str, str]:
+    def preflight(command: tuple[str, ...]) -> Any:
         events.append(("preflight", command))
-        return {
-            "version": "2.1.216",
-            "authentication": "available",
-            "theme": "light",
-        }
+        return cli_module._ClaudeVisibilityPreflight(
+            {
+                "version": "2.1.216",
+                "authentication": "available",
+                "theme": "light",
+            },
+            None,
+        )
 
     def marker_key() -> bytes:
         events.append("marker")
@@ -4731,7 +4738,9 @@ def test_claude_visibility_runtime_passes_only_preflight_theme_to_registrar(
         return coordinator
 
     monkeypatch.setattr("session_bridge.cli.resolve_cli_executable", resolve_executable)
-    monkeypatch.setattr("session_bridge.cli._claude_visibility_preflight", preflight)
+    monkeypatch.setattr(
+        "session_bridge.cli._claude_visibility_preflight_detail", preflight
+    )
     monkeypatch.setattr("session_bridge.cli.resolve_marker_key", marker_key)
     monkeypatch.setattr("session_bridge.cli.ClaudeSourceAdapter", source_factory)
     monkeypatch.setattr("session_bridge.cli.ClaudeNativeRegistrar", registrar_factory)
@@ -4862,11 +4871,15 @@ def test_characterization_preflight_blocks_before_store_or_registrar(
         "session_bridge.cli.resolve_cli_executable", lambda _name: ("claude",)
     )
 
-    def preflight(command: tuple[str, ...]) -> None:
+    def preflight(command: tuple[str, ...]) -> Any:
         events.append(("preflight", command))
-        return None
+        return cli_module._ClaudeVisibilityPreflight(
+            None, "claude_visibility_preflight_failed_not_logged_in"
+        )
 
-    monkeypatch.setattr("session_bridge.cli._claude_visibility_preflight", preflight)
+    monkeypatch.setattr(
+        "session_bridge.cli._claude_visibility_preflight_detail", preflight
+    )
     monkeypatch.setattr(
         "session_bridge.cli.resolve_marker_key",
         lambda: (_ for _ in ()).throw(AssertionError("marker resolution")),
@@ -5013,8 +5026,10 @@ def test_characterization_status_fatal_blocks_before_native_or_low_level_work(
         "session_bridge.cli.resolve_cli_executable", lambda _name: ("claude",)
     )
     monkeypatch.setattr(
-        "session_bridge.cli._claude_visibility_preflight",
-        lambda _command: {"theme": "light"},
+        "session_bridge.cli._claude_visibility_preflight_detail",
+        lambda _command: cli_module._ClaudeVisibilityPreflight(
+            {"theme": "light"}, None
+        ),
     )
     monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
     monkeypatch.setattr(backend, "_require_store", lambda: Store())
@@ -7497,3 +7512,72 @@ def test_invalid_unsafe_configuration_returns_two_without_echo(capsys):
     assert json.loads(rendered) == {"error": "configuration_error"}
     assert "do-not-print" not in rendered
     assert backend.calls == []
+
+
+# ---------------------------------------------------------------------------
+# The preflight gate that refused must reach the exception message, which is
+# what _run_continuous_visibility_worker logs. Public CLI output is unaffected:
+# main() still collapses ProviderDegraded to {"error": "provider_degraded"}.
+# ---------------------------------------------------------------------------
+
+
+def _refusing_preflight(code: str):
+    from session_bridge.cli import _ClaudeVisibilityPreflight
+
+    def preflight(*_args: object, **_kwargs: object) -> object:
+        return _ClaudeVisibilityPreflight(None, code)
+
+    return preflight
+
+
+def test_claude_visibility_runtime_raises_the_specific_preflight_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = BridgeConfig()
+    backend = ProductionBackend(
+        replace(
+            config, claude_visibility=replace(config.claude_visibility, enabled=True)
+        )
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable", lambda _name: ("claude",)
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli._claude_visibility_preflight_detail",
+        _refusing_preflight("claude_visibility_preflight_failed_auth_unavailable"),
+    )
+
+    with pytest.raises(
+        ProviderDegraded, match="claude_visibility_preflight_failed_auth_unavailable"
+    ):
+        backend.claude_visibility_run_once()
+
+
+def test_claude_visibility_preflight_gate_codes_stay_out_of_public_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A diagnostic code must never widen the public error contract."""
+    from session_bridge.cli import EXIT_DEGRADED, main
+
+    code = "claude_visibility_preflight_failed_not_logged_in"
+
+    class _RaisingBackend:
+        def claude_visibility_run_once(self) -> Mapping[str, Any]:
+            raise ProviderDegraded(code)
+
+        def close(self) -> None:
+            return None
+
+    exit_code = main(
+        ["claude-visibility-run-once"],
+        config_loader=BridgeConfig,
+        backend_factory=lambda _config: _RaisingBackend(),
+    )
+    captured = capsys.readouterr().out
+
+    assert exit_code == EXIT_DEGRADED
+    assert json.loads(captured.strip().splitlines()[-1]) == {
+        "error": "provider_degraded"
+    }
+    assert "not_logged_in" not in captured
+    assert code not in captured
