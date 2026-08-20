@@ -2765,12 +2765,28 @@ def _handle_write_file(args, **kw):
             "both 'path' and 'content' set."
         )
     if "content" not in args:
+        # Echo back what WAS sent so the agent can see exactly which field dropped.
+        received = ", ".join(sorted(args.keys())) or "(none)"
+        # Detect the .tmp placeholder typo pattern (e.g. "SKILL.md.tmp" or
+        # "PLACEHOLDER_NOT_USED.md") — the agent's first version of a write often
+        # uses a placeholder path while the content is being assembled, and the
+        # content gets dropped when the path is finalized.
+        path_str = args.get("path", "")
+        tmp_hint = ""
+        if path_str.endswith(".tmp"):
+            tmp_hint = (
+                " The path ends in '.tmp' — this is usually a placeholder path "
+                "where the real target filename was never substituted in. Try "
+                "again with the target path (drop the `.tmp` suffix) and include "
+                "the full `content` argument."
+            )
         return tool_error(
-            "write_file: missing required field 'content'. The tool call included a "
-            "path but no content argument — this is almost always a dropped-arg bug "
-            "under context pressure. Re-emit the tool call with the full content "
-            "payload, or use execute_code with hermes_tools.write_file() for very "
-            "large files."
+            f"write_file: missing required field 'content'. Received args: "
+            f"{received}. The tool call included a path but no content argument "
+            "— this is almost always a dropped-arg bug under context pressure. "
+            "Re-emit the tool call with the full content payload, or use "
+            "execute_code with hermes_tools.write_file() for very large files."
+            f"{tmp_hint}"
         )
     if not isinstance(args["content"], str):
         return tool_error(

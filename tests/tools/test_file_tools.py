@@ -12,6 +12,7 @@ import pytest
 
 from tools.file_tools import (
     PATCH_SCHEMA,
+    _handle_write_file,
 )
 
 
@@ -128,6 +129,35 @@ class TestWriteFileHandler:
         result = json.loads(_handle_write_file({"path": "/tmp/x.txt", "content": {"nested": "dict"}}))
         assert "error" in result
         assert "string" in result["error"].lower() or "content" in result["error"].lower()
+
+
+    def test_missing_content_with_tmp_path_suggests_retry(self):
+        """Empty content + .tmp path should suggest the placeholder hint."""
+        result = _handle_write_file({"path": "/some/PLACEHOLDER.md.tmp"})
+        err = result["error"] if isinstance(result, dict) else result
+        assert isinstance(err, str)
+        assert "missing required field 'content'" in err
+        assert "Received args: path" in err
+        # The .tmp placeholder hint should be appended
+        assert ".tmp" in err
+        assert "placeholder" in err.lower()
+
+    def test_missing_content_without_tmp_path_has_no_placeholder_hint(self):
+        """Empty content + non-.tmp path should NOT trigger the placeholder hint."""
+        result = _handle_write_file({"path": "/some/real.md"})
+        err = result["error"] if isinstance(result, dict) else result
+        assert isinstance(err, str)
+        assert "missing required field 'content'" in err
+        assert "Received args: path" in err
+        # No .tmp hint should appear
+        assert "placeholder" not in err.lower()
+
+    def test_missing_content_with_empty_args_lists_none(self):
+        """Empty args dict should report 'Received args: (none)'."""
+        result = _handle_write_file({"path": "/some/real.md"})
+        # Should error on missing content (not missing path)
+        err = result["error"] if isinstance(result, dict) else result
+        assert "Received args:" in err
 
 
 class TestPatchHandler:
