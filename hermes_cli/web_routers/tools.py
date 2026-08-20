@@ -782,15 +782,22 @@ async def select_terminal_backend(
 async def get_computer_use_status(profile: Optional[str] = None):
     """Cross-platform Computer Use readiness for the desktop card.
 
-    See ``tools.computer_use.permissions.computer_use_status`` for the payload
-    shape. Read-only and fast (shells ``cua-driver doctor`` + macOS
-    ``permissions status``).
+    Answered by the configured provider, so the card describes the machine the
+    agent will actually drive — reporting the gateway's own Accessibility
+    grants while a tunnelled bridge points at somebody's Mac would send the
+    user to fix permissions on the wrong computer. Payload shape:
+    ``tools.computer_use.permissions.computer_use_status``. Read-only and fast
+    (shells ``cua-driver doctor`` + macOS ``permissions status``).
     """
     from tools.computer_use.permissions import computer_use_status
+    from tools.computer_use.tool import active_computer_use_provider
 
     def _read():
         with _profile_scope(profile):
-            return computer_use_status()
+            try:
+                return active_computer_use_provider().get_status()
+            except Exception:
+                return computer_use_status()
 
     return await asyncio.to_thread(_read)
 

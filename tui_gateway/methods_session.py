@@ -41,6 +41,11 @@ def _(rid, params: dict) -> dict:
     # and each turn re-bind HERMES_HOME. None/own profile → launch (unchanged).
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
+    bound_transport = current_transport() or _stdio_transport
+    bound_principal, bridge_profile = _transport_desktop_bridge_identity(
+        bound_transport,
+        requested_profile=profile,
+    )
 
     # The desktop composer owns its model/effort/fast as plain UI state and ships
     # it on every session.create. Honor each as a PER-SESSION override (built into
@@ -100,6 +105,8 @@ def _(rid, params: dict) -> dict:
             "pending_title": title or None,
             "pending_hidden": is_truthy_value(params.get("hidden", False)),
             "profile_home": str(profile_home) if profile_home is not None else None,
+            "profile": bridge_profile,
+            "authenticated_principal": bound_principal,
             "running": False,
             "session_key": key,
             "show_reasoning": _load_show_reasoning(),
@@ -107,7 +114,7 @@ def _(rid, params: dict) -> dict:
             "slash_worker": None,
             "tool_progress_mode": _load_tool_progress_mode(),
             "tool_started_at": {},
-            "transport": current_transport() or _stdio_transport,
+            "transport": bound_transport,
         }
         _register_session_cwd(_sessions[sid])
 
@@ -323,6 +330,12 @@ def _(rid, params: dict) -> dict:
     # local profile's state.db. None/own profile → the launch profile (unchanged).
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
+    bound_transport = current_transport() or _stdio_transport
+    bound_principal, bridge_profile = _transport_desktop_bridge_identity(
+        bound_transport,
+        requested_profile=profile,
+    )
+    bridge_caller_token = None
     defer_history = is_truthy_value(params.get("defer_history", False))
     # Desktop hydrates persisted transcripts through the authenticated REST
     # route in parallel. Suppress the duplicate WebSocket transcript only when
@@ -427,7 +440,7 @@ def _(rid, params: dict) -> dict:
                 session,
                 cols=cols,
                 touch=True,
-                transport=current_transport() or _stdio_transport,
+                transport=bound_transport,
                 omit_messages=omit_messages,
             )
             payload["resumed"] = target
@@ -487,6 +500,9 @@ def _(rid, params: dict) -> dict:
                 source=source,
                 close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
                 profile_home=profile_home,
+                profile=bridge_profile,
+                authenticated_principal=bound_principal,
+                transport=bound_transport,
                 lazy=True,
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
@@ -554,6 +570,9 @@ def _(rid, params: dict) -> dict:
                 source=source,
                 close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
                 profile_home=profile_home,
+                profile=bridge_profile,
+                authenticated_principal=bound_principal,
+                transport=bound_transport,
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
             )
@@ -650,6 +669,9 @@ def _(rid, params: dict) -> dict:
                 close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
                 display_history_prefix=prefix,
                 profile_home=profile_home,
+                profile=bridge_profile,
+                authenticated_principal=bound_principal,
+                transport=bound_transport,
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
             )
@@ -698,6 +720,13 @@ def _(rid, params: dict) -> dict:
             set_secret_scope(build_profile_secret_scope(Path(str(profile_home))))
             if profile_home is not None
             else None
+        )
+        bridge_caller_token = _set_desktop_bridge_caller_for_session(
+            {
+                "authenticated_principal": bound_principal,
+                "profile": bridge_profile,
+                "transport": bound_transport,
+            }
         )
         try:
             db.reopen_session(target)
@@ -796,6 +825,9 @@ def _(rid, params: dict) -> dict:
                         cwd=profile_resume_cwd,
                         session_db=db,
                         source=source,
+                        profile=bridge_profile,
+                        authenticated_principal=bound_principal,
+                        transport=bound_transport,
                     )
                     # Ownership TRANSFER — the registered session's agent now
                     # holds this handle for its whole life, and _init_session
@@ -855,6 +887,7 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 5000, f"resume failed: {e}")
             session = _sessions.get(sid) or {}
     finally:
+        _reset_desktop_bridge_caller(bridge_caller_token)
         # Every return that does NOT reach the transfer above abandons this
         # handle — session-not-found, both "resume failed" paths, the live-session
         # fast path (the hot one: reconnects re-resume live chats through it), the
@@ -3066,6 +3099,7 @@ def _(rid, params: dict) -> dict:
             if parent_home
             else None
         )
+        bridge_caller_token = _set_desktop_bridge_caller_for_session(session)
         try:
             tokens = _set_session_context(new_key)
             try:
@@ -3078,6 +3112,7 @@ def _(rid, params: dict) -> dict:
                 )
             finally:
                 _clear_session_context(tokens)
+                _reset_desktop_bridge_caller(bridge_caller_token)
             _init_session(
                 new_sid,
                 new_key,
@@ -3088,6 +3123,11 @@ def _(rid, params: dict) -> dict:
                 session_db=branch_db,
                 source=source,
                 profile_home=parent_home,
+                # A branch inherits the parent's verified identity: same user,
+                # same window, same Desktop on the other end.
+                profile=_normalized_desktop_bridge_profile(session.get("profile")),
+                authenticated_principal=_session_authenticated_principal(session),
+                transport=current_transport() or session.get("transport"),
             )
             # Ownership TRANSFER — the branched session's agent holds this
             # handle for its whole life and closes it on teardown. Drop is

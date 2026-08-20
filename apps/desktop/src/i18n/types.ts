@@ -695,6 +695,8 @@ export interface Translations {
       cloudConnectedTo: (name: string) => string
       cloudAgentProvisioning: string
       cloudStatusLabel: (status: string) => string
+      remoteComputerUseBridgeTitle: string
+      remoteComputerUseBridgeDesc: string
       remoteUrlTitle: string
       remoteUrlDesc: string
       probing: string

@@ -15961,8 +15961,55 @@ def _ws_auth_mode() -> str:
     return "loopback"
 
 
+#: Identity for an ungated loopback WS peer, which presents no signed-in user.
+_LOOPBACK_WS_PROVIDER = "dashboard-token"
+_LOOPBACK_WS_PRINCIPAL = "local-session"
+
+
+@dataclass(frozen=True)
+class _WsAuthContext:
+    """Outcome of a WS-upgrade auth check, plus who authenticated.
+
+    ``provider``/``principal`` are the identity the credential itself carried —
+    never anything the peer asserted in a frame. Most routes only need the
+    accept/reject verdict; the Computer Use bridge needs the identity, because
+    "whose desktop is on the other end of this socket" is the whole access
+    control story there.
+    """
+
+    reason: Optional[str]
+    credential: str
+    provider: str = ""
+    principal: str = ""
+
+    @property
+    def identity(self) -> Optional[tuple[str, str]]:
+        """``(provider, principal)`` when authenticated and named, else None."""
+        if self.reason is not None or not self.provider or not self.principal:
+            return None
+
+        return self.provider, self.principal
+
+
+def _ws_auth_accepted(credential: str, info: Dict[str, Any]) -> _WsAuthContext:
+    """Accepted context carrying the identity the credential store returned."""
+    return _WsAuthContext(
+        None,
+        credential,
+        str((info or {}).get("provider") or ""),
+        str((info or {}).get("user_id") or ""),
+    )
+
+
 def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
-    """Validate WS-upgrade auth; return ``(reason, credential)``.
+    """``(reason, credential)`` view of :func:`_ws_auth_context`."""
+    context = _ws_auth_context(ws)
+
+    return context.reason, context.credential
+
+
+def _ws_auth_context(ws: "WebSocket") -> _WsAuthContext:
+    """Validate WS-upgrade auth.
 
     ``reason`` is None when the credential is accepted, else a short
     machine-parseable token explaining the rejection (``no_credential``,
@@ -16010,8 +16057,7 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
         internal = ws.query_params.get("internal", "")
         if internal:
             try:
-                consume_internal_credential(internal)
-                return None, "internal"
+                return _ws_auth_accepted("internal", consume_internal_credential(internal))
             except TicketInvalid as exc:
                 audit_log(
                     AuditEvent.WS_TICKET_REJECTED,
@@ -16019,15 +16065,14 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                     ip=(ws.client.host if ws.client else ""),
                     path=ws.url.path,
                 )
-                return "internal_invalid", "internal"
+                return _WsAuthContext("internal_invalid", "internal")
 
         ticket = ws.query_params.get("ticket", "")
         if not ticket:
-            return "no_credential", "none"
+            return _WsAuthContext("no_credential", "none")
 
         try:
-            consume_ticket(ticket)
-            return None, "ticket"
+            return _ws_auth_accepted("ticket", consume_ticket(ticket))
         except TicketInvalid as exc:
             audit_log(
                 AuditEvent.WS_TICKET_REJECTED,
@@ -16035,14 +16080,17 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                 ip=(ws.client.host if ws.client else ""),
                 path=ws.url.path,
             )
-            return "ticket_invalid", "ticket"
+            return _WsAuthContext("ticket_invalid", "ticket")
 
     token = ws.query_params.get("token", "")
     if not token:
-        return "no_credential", "none"
+        return _WsAuthContext("no_credential", "none")
     if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
-        return None, "token"
-    return "token_mismatch", "token"
+        # Ungated loopback: nobody signed in, so the only identity available is
+        # "whoever can reach this port", which the bind + origin checks already
+        # bound to this machine.
+        return _WsAuthContext(None, "token", _LOOPBACK_WS_PROVIDER, _LOOPBACK_WS_PRINCIPAL)
+    return _WsAuthContext("token_mismatch", "token")
 
 
 def _ws_auth_ok(ws: "WebSocket") -> bool:
@@ -17148,6 +17196,96 @@ async def gateway_ws(ws: WebSocket) -> None:
     from tui_gateway.ws import handle_ws
 
     await handle_ws(ws)
+
+
+def _dashboard_launch_profile() -> str:
+    """The profile this server process itself was started under."""
+    from hermes_cli.profiles import get_active_profile_name
+
+    return get_active_profile_name() or "default"
+
+
+def _desktop_bridge_profile_scope(ws: "WebSocket") -> str:
+    """Normalize and syntactically validate the requested routing scope."""
+    requested = str(ws.query_params.get("profile", "") or "").strip()
+
+    if not requested or requested.lower() == "current":
+        return _dashboard_launch_profile()
+
+    from hermes_cli import profiles as profiles_mod
+
+    normalized = profiles_mod.normalize_profile_name(requested)
+    profiles_mod.validate_profile_name(normalized)
+
+    return normalized
+
+
+def _desktop_bridge_profile_is_authorized(auth: _WsAuthContext, profile: str) -> bool:
+    """Whether this credential may register a bridge for *profile*.
+
+    A signed-in browser ticket says who the user is, not which profiles they
+    administer, so it gets the launch profile and nothing else. The loopback
+    token and the internal credential are already whole-machine authority —
+    holding either means you could edit config.yaml anyway — so they may name
+    any profile the process serves under multiplexing.
+    """
+    if auth.credential in {"token", "internal"}:
+        return True
+
+    if auth.credential != "ticket":
+        return False
+
+    from hermes_cli import profiles as profiles_mod
+
+    return profiles_mod.normalize_profile_name(
+        profile
+    ) == profiles_mod.normalize_profile_name(_dashboard_launch_profile())
+
+
+@app.websocket("/api/tools/computer-use/desktop-bridge/ws")
+async def computer_use_desktop_bridge_ws(ws: WebSocket) -> None:
+    """Authenticated reverse channel from Hermes Desktop to this backend.
+
+    Desktop uses this to proxy the backend's normal `computer_use` tool calls to
+    a local loopback bridge on the user's machine, without requiring the backend
+    to dial the user's laptop or a manual SSH reverse tunnel.
+
+    The socket is filed under the identity its own credential carried, and an
+    agent turn only reaches it by matching that identity. A shared gateway
+    therefore cannot hand one person's keyboard to another person's session,
+    which is the failure this route has to be built around: every other WS here
+    moves data, this one moves clicks.
+    """
+    auth = _ws_auth_context(ws)
+    identity = auth.identity
+
+    if identity is None:
+        # Rejected, or authenticated but anonymous — the credential proved
+        # reachability, not who is holding it, and there is no key to file the
+        # socket under.
+        await ws.close(code=4401)
+        return
+
+    if not _ws_request_is_allowed(ws):
+        await ws.close(code=4403)
+        return
+
+    try:
+        profile = _desktop_bridge_profile_scope(ws)
+        _resolve_profile_dir(profile)
+    except Exception:
+        await ws.close(code=4400)
+        return
+
+    if not _desktop_bridge_profile_is_authorized(auth, profile):
+        await ws.close(code=4403)
+        return
+
+    from tools.computer_use.desktop_bridge import handle_desktop_bridge_ws
+
+    provider, principal = identity
+
+    await handle_desktop_bridge_ws(ws, provider=provider, principal=principal, profile=profile)
 
 
 # ---------------------------------------------------------------------------

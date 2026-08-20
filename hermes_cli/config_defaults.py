@@ -3416,12 +3416,24 @@ DEFAULT_CONFIG = {
     "computer_use": {
         # Which machine's keyboard and mouse computer_use drives.
         #   local (default) — cua-driver on whatever host runs the gateway.
+        #   http-bridge     — a desktop running `hermes computer-use bridge`,
+        #                     reached at bridge_url below (tunnel it).
         # A plugin can register others (a container pool, a leased cloud
         # sandbox) via ctx.register_computer_use_provider(); name one here to
         # activate it. Never inferred: an unrecognized name is an error, not a
         # quiet fall back to driving the host's own desktop.
         # Replaces the HERMES_COMPUTER_USE_BACKEND env var.
+        #
+        # Hermes Desktop's own bridge is NOT named here. It belongs to the
+        # connection rather than to this backend, so it is resolved per session
+        # from the socket the app opened — see the Computer Use docs.
         "provider": "local",
+        # Where the http-bridge provider dials, normally the local end of an
+        # SSH/VPN tunnel to the desktop running the bridge. The bearer token is
+        # a secret and lives in .env as HERMES_COMPUTER_USE_BRIDGE_TOKEN.
+        "bridge_url": "",
+        # Per-request timeout for http-bridge status and actions.
+        "bridge_timeout_seconds": 30,
         # cua-driver ships with anonymous usage telemetry (PostHog) ENABLED
         # by default upstream. Hermes disables it for our users unless they
         # explicitly opt in here. When false (default), Hermes sets
@@ -4227,6 +4239,15 @@ OPTIONAL_ENV_VARS = {
         "url": "https://console.mistral.ai/",
         "password": True,
         "category": "tool",
+    },
+    "HERMES_COMPUTER_USE_BRIDGE_TOKEN": {
+        "description": "Bearer token shared by `hermes computer-use bridge` and the backend that drives it",
+        "prompt": "Computer Use bridge token",
+        "url": None,
+        "tools": ["computer_use"],
+        "password": True,
+        "category": "tool",
+        "advanced": True,
     },
     "PORCUPINE_ACCESS_KEY": {
         "description": "Picovoice access key for the Porcupine 'Hey Hermes' wake word engine (optional; openWakeWord is the free default)",
