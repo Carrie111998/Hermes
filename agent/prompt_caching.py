@@ -466,14 +466,15 @@ def apply_anthropic_cache_control(
         )
 
     remaining = 4 - breakpoints_used
-    non_sys = [
-        i
-        for i in range(len(messages))
-        if messages[i].get("role") != "system"
-        and _can_carry_marker(messages[i], native_anthropic=native_anthropic)
-    ]
-    for idx in non_sys[-remaining:]:
-        messages[idx] = copy.deepcopy(messages[idx])
-        _apply_cache_marker(messages[idx], marker, native_anthropic=native_anthropic)
+    if remaining > 0:
+        non_sys = [
+            i
+            for i in range(len(messages))
+            if messages[i].get("role") != "system"
+            and _can_carry_marker(messages[i], native_anthropic=native_anthropic)
+        ]
+        for idx in non_sys[-remaining:]:
+            messages[idx] = copy.deepcopy(messages[idx])
+            _apply_cache_marker(messages[idx], marker, native_anthropic=native_anthropic)
 
     return messages
