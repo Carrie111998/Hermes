@@ -19,7 +19,7 @@ jobs:
       github.event.pull_request.head.ref == 'security/ghsa-remediation-c47f0b4'
     name: Regenerate and verify dependency remediation
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - name: Checkout exact PR head
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -28,13 +28,13 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
-      - name: Reset worktree to exact upstream base
+      - name: Reset worktree to exact upstream main
         run: |
           set -euo pipefail
           git remote add upstream https://github.com/NousResearch/hermes-agent.git
           git fetch --no-tags upstream main
-          git reset --hard "${{ github.event.pull_request.base.sha }}"
-          test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.base.sha }}"
+          git reset --hard upstream/main
+          git rev-parse HEAD | tee /tmp/upstream-base-sha.txt
 
       - name: Set up Node 26
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -60,8 +60,9 @@ jobs:
           import json
           from pathlib import Path
 
-          ELECTRON = '41.10.3'
+          ELECTRON = '41.10.4'
           NANOID = '3.3.18'
+          POSTCSS = '8.5.23'
 
           def load(path: str):
               return json.loads(Path(path).read_text(encoding='utf-8'))
@@ -73,7 +74,12 @@ jobs:
               )
 
           root = load('package.json')
-          root['overrides']['nanoid@^3'] = NANOID
+          overrides = root['overrides']
+          overrides.pop('nanoid@^3', None)
+          overrides['postcss'] = {'.': POSTCSS, 'nanoid': NANOID}
+          if overrides.get('nanoid@^6') != '6.0.0':
+              raise SystemExit('Nano ID v6 authority changed before remediation')
+
           for key in list(root['allowScripts']):
               if key.startswith('electron@'):
                   root['allowScripts'].pop(key)
@@ -139,21 +145,44 @@ jobs:
         run: |
           set -euo pipefail
           npm install --package-lock-only --ignore-scripts --no-audit --no-fund
-          npm update nanoid --package-lock-only --ignore-scripts --no-audit --no-fund --workspaces --include-workspace-root
           npm --prefix website install --package-lock-only --ignore-scripts --no-audit --no-fund
-          npm --prefix website update nanoid --package-lock-only --ignore-scripts --no-audit --no-fund
           uv lock --upgrade-package h2
 
-      - name: Install exact Node graphs
+          # npm 12 can retain already-satisfying transitive entries after an
+          # override changes. Rewrite only the two exact Nano ID v3 lock
+          # records, then make npm validate the complete lock graph again.
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path('package-lock.json')
+          lock = json.loads(path.read_text(encoding='utf-8'))
+          touched = []
+          for package_path, package in lock['packages'].items():
+              version = package.get('version', '')
+              if package_path.endswith('/nanoid') and version.startswith('3.'):
+                  package['version'] = '3.3.18'
+                  package['resolved'] = 'https://registry.npmjs.org/nanoid/-/nanoid-3.3.18.tgz'
+                  package['integrity'] = 'sha512-DTg4MJbGMWkfi6VZFdNt2/caMbQy4Ou+Op/hJQvGEWcnVfoA1QA+xzRKAzw9jD6+GVOOeYr/mIcuDSdug6F6+w=='
+                  touched.append(package_path)
+          if not touched:
+              raise SystemExit('No Nano ID v3 lock entries were found')
+          path.write_text(json.dumps(lock, indent=2) + '\n', encoding='utf-8')
+          print('updated Nano ID v3 lock entries:', ', '.join(touched))
+          PY
+
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+
+      - name: Install exact dependency graphs
         run: |
           set -o pipefail
           npm ci --no-audit --no-fund | tee /tmp/npm-ci-root.txt
           npm --prefix website ci --no-audit --no-fund | tee /tmp/npm-ci-website.txt
+          uv lock --check | tee /tmp/uv-lock-check.txt
 
       - name: Verify resolved security floors
         run: |
-          set -o pipefail
-          uv lock --check | tee /tmp/uv-lock-check.txt
+          set -euo pipefail
           node <<'NODE'
           const root = require('./package.json')
           const desktop = require('./apps/desktop/package.json')
@@ -161,35 +190,41 @@ jobs:
           const website = require('./website/package.json')
           const websiteLock = require('./website/package-lock.json')
 
-          if (root.overrides['nanoid@^3'] !== '3.3.18') throw new Error('root Nano ID override drifted')
+          const postcss = root.overrides.postcss
+          if (root.overrides['nanoid@^3'] !== undefined) throw new Error('flat Nano ID v3 override remains')
+          if (postcss?.['.'] !== '8.5.23' || postcss?.nanoid !== '3.3.18') {
+            throw new Error(`PostCSS/Nano ID override drifted: ${JSON.stringify(postcss)}`)
+          }
+          if (root.overrides['nanoid@^6'] !== '6.0.0') throw new Error('Nano ID v6 authority drifted')
           if (website.overrides.nanoid !== '3.3.18') throw new Error('website Nano ID override drifted')
-          if (desktop.devDependencies.electron !== '41.10.3') throw new Error('desktop Electron dependency drifted')
-          if (desktop.build.electronVersion !== '41.10.3') throw new Error('electron-builder runtime drifted')
-          if (!root.allowScripts['electron@41.10.3']) throw new Error('Electron lifecycle allowlist drifted')
+          if (desktop.devDependencies.electron !== '41.10.4') throw new Error('desktop Electron dependency drifted')
+          if (desktop.build.electronVersion !== '41.10.4') throw new Error('electron-builder runtime drifted')
+          if (root.allowScripts['electron@40.10.2'] !== undefined) throw new Error('old Electron lifecycle grant remains')
+          if (root.allowScripts['electron@41.10.4'] !== true) throw new Error('new Electron lifecycle grant missing')
 
           const electron = lock.packages['node_modules/electron'] || lock.packages['apps/desktop/node_modules/electron']
-          if (!electron || electron.version !== '41.10.3') throw new Error(`Electron lock resolved ${electron?.version}`)
+          if (!electron || electron.version !== '41.10.4') throw new Error(`Electron lock resolved ${electron?.version}`)
 
           let rootNanoid3 = 0
-          for (const [path, pkg] of Object.entries(lock.packages)) {
-            if (path.endsWith('/nanoid') && pkg.version?.startsWith('3.')) {
+          for (const [packagePath, pkg] of Object.entries(lock.packages)) {
+            if (packagePath.endsWith('/nanoid') && pkg.version?.startsWith('3.')) {
               rootNanoid3 += 1
-              if (pkg.version !== '3.3.18') throw new Error(`${path} resolves Nano ID ${pkg.version}`)
+              if (pkg.version !== '3.3.18') throw new Error(`${packagePath} resolves Nano ID ${pkg.version}`)
             }
-            if (path.endsWith('/extract-zip') && pkg.version === '2.0.1') {
-              throw new Error(`${path} still resolves extract-zip 2.0.1`)
+            if (packagePath.endsWith('/extract-zip') && pkg.version === '2.0.1') {
+              throw new Error(`${packagePath} still resolves extract-zip 2.0.1`)
             }
           }
-          if (rootNanoid3 === 0) throw new Error('no root Nano ID v3 resolution inspected')
+          if (rootNanoid3 === 0) throw new Error('no root Nano ID v3 lock resolution was inspected')
 
           let websiteNanoid3 = 0
-          for (const [path, pkg] of Object.entries(websiteLock.packages)) {
-            if (path.endsWith('/nanoid') && pkg.version?.startsWith('3.')) {
+          for (const [packagePath, pkg] of Object.entries(websiteLock.packages)) {
+            if (packagePath.endsWith('/nanoid') && pkg.version?.startsWith('3.')) {
               websiteNanoid3 += 1
-              if (pkg.version !== '3.3.18') throw new Error(`website ${path} resolves Nano ID ${pkg.version}`)
+              if (pkg.version !== '3.3.18') throw new Error(`website ${packagePath} resolves Nano ID ${pkg.version}`)
             }
           }
-          if (websiteNanoid3 === 0) throw new Error('no website Nano ID v3 resolution inspected')
+          if (websiteNanoid3 === 0) throw new Error('no website Nano ID v3 lock resolution was inspected')
           NODE
           python3 - <<'PY'
           import tomllib
@@ -218,6 +253,8 @@ jobs:
           npm run check:lint --workspace apps/desktop | tee /tmp/desktop-lint.txt
           npm run test:desktop:platforms --workspace apps/desktop | tee /tmp/desktop-platform-tests.txt
           npm run build --workspace apps/desktop | tee /tmp/desktop-build.txt
+          npm run builder --workspace apps/desktop -- --linux --x64 --dir --publish never | tee /tmp/desktop-package.txt
+          HERMES_DESKTOP_SKIP_BUILD=1 npm run test:desktop:all --workspace apps/desktop | tee /tmp/desktop-package-verify.txt
           git diff --check
 
       - name: Build exact-object verification receipt
@@ -225,18 +262,19 @@ jobs:
           mkdir -p /tmp/ghsa-remediation
           {
             echo "source_head=${{ github.event.pull_request.head.sha }}"
-            echo "upstream_base=${{ github.event.pull_request.base.sha }}"
+            echo "upstream_base=$(cat /tmp/upstream-base-sha.txt)"
             echo "node=$(node --version)"
             echo "npm=$(npm --version)"
             echo "uv=$(uv --version)"
             echo "verified_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "all_dependency_and_affected_repository_gates=passed"
           } > /tmp/ghsa-remediation/verification.txt
-          cp /tmp/uv-lock-check.txt /tmp/npm-ci-root.txt /tmp/npm-ci-website.txt \
+          cp /tmp/upstream-base-sha.txt /tmp/uv-lock-check.txt /tmp/npm-ci-root.txt /tmp/npm-ci-website.txt \
             /tmp/npm-audit-root.txt /tmp/npm-audit-web.txt /tmp/npm-audit-tui.txt \
             /tmp/npm-audit-desktop.txt /tmp/npm-audit-website.txt \
             /tmp/web-build.txt /tmp/tui-check.txt /tmp/desktop-lint.txt \
             /tmp/desktop-platform-tests.txt /tmp/desktop-build.txt \
+            /tmp/desktop-package.txt /tmp/desktop-package-verify.txt \
             /tmp/ghsa-remediation/
 
       - name: Upload verified remediation files
