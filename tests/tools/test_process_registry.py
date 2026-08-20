@@ -381,7 +381,10 @@ def test_reader_loop_flushes_truncated_multibyte_tail_at_eof(registry, monkeypat
 
 
 def test_reader_loop_still_replaces_genuinely_invalid_bytes(registry, monkeypatch):
-    """Truly invalid bytes keep the errors="replace" behavior."""
+    """Truly invalid bytes keep the errors="replace" behavior without a fallback."""
+    from tools.environments import base
+
+    monkeypatch.setattr(base, "_windows_output_encoding", lambda: None)
     session = _run_reader(registry, monkeypatch, [b"ok\xffdone\n"])
     assert session.output_buffer == "ok\ufffddone\n"
 
