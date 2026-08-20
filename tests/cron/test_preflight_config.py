@@ -223,6 +223,64 @@ class TestHealthyJobUnaffected:
             assert not stored.get("preflight_alerted")
 
 
+class TestToolsetResolutionBlocks:
+    def test_resolution_failure_is_blocked_before_agent_construction(self, tmp_path):
+        job = _job()
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            with patch(
+                "hermes_cli.tools_config._get_platform_tools",
+                side_effect=RuntimeError("broken tool config"),
+            ):
+                success, output, _response, error, agent_constructed = _run_job_patched(
+                    job, tmp_path
+                )
+
+        assert agent_constructed is False
+        assert success is False
+        assert error is not None and "[blocked_config]" in error
+        assert "toolset resolution failed" in f"{error} {output}"
+
+    def test_resolution_failure_stays_blocked_when_preflight_opted_out(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "cron:\n  preflight: false\n", encoding="utf-8"
+        )
+        job = _job()
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            with patch(
+                "hermes_cli.tools_config._get_platform_tools",
+                side_effect=RuntimeError("broken tool config"),
+            ):
+                success, output, _response, error, agent_constructed = _run_job_patched(
+                    job, tmp_path
+                )
+
+            assert agent_constructed is False
+            assert success is False
+            assert error is not None and "[blocked_config]" in error
+            assert "toolset resolution failed" in f"{error} {output}"
+
+            stored = [j for j in cron_jobs.load_jobs() if j["id"] == job["id"]][0]
+            assert stored.get("preflight_alerted")
+
+            success, *_rest, agent_constructed = _run_job_patched(stored, tmp_path)
+            assert success is True
+            assert agent_constructed is True
+            recovered = [j for j in cron_jobs.load_jobs() if j["id"] == job["id"]][0]
+            assert not recovered.get("preflight_alerted")
+
+            with patch(
+                "hermes_cli.tools_config._get_platform_tools",
+                side_effect=RuntimeError("broken tool config again"),
+            ):
+                _success, _output, _response, second_error, _constructed = _run_job_patched(
+                    recovered, tmp_path
+                )
+            assert second_error is not None and "[blocked_config]" in second_error
+            assert "[blocked_config:silent]" not in second_error
+
+
 class TestOptOut:
     def test_preflight_false_restores_old_behavior(self, tmp_path):
         """cron.preflight: false → job proceeds to resolution and fails the

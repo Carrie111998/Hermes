@@ -422,7 +422,11 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
     return result
 
 
-def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
+class CronToolsetResolutionError(RuntimeError):
+    """Raised when an unattended job's effective toolsets cannot be resolved."""
+
+
+def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str]:
     """Resolve the toolset list for a cron job.
 
     Precedence:
@@ -433,26 +437,29 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     2. Per-platform ``hermes tools`` config for the ``cron`` platform.
        Mirrors gateway behavior (``_get_platform_tools(cfg, platform_key)``)
        so users can gate cron toolsets globally without recreating every job.
-    3. ``None`` on any lookup failure — AIAgent loads the full default set
-       (legacy behavior before this change, preserved as the safety net).
+    3. Fail closed on lookup errors. Returning ``None`` would make AIAgent load
+       the full default set, silently widening an unattended job's authority.
 
     _DEFAULT_OFF_TOOLSETS ({moa, homeassistant, rl}) are removed by
     ``_get_platform_tools`` for unconfigured platforms, so fresh installs
     get cron WITHOUT ``moa`` by default (issue reported by Norbert —
     surprise $4.63 run).
     """
-    per_job = job.get("enabled_toolsets")
-    if per_job:
-        return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
     try:
+        per_job = job.get("enabled_toolsets")
+        if per_job:
+            return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
         return sorted(_get_platform_tools(cfg or {}, "cron"))
     except Exception as exc:
-        logger.warning(
-            "Cron toolset resolution failed, falling back to full default toolset: %s",
+        logger.error(
+            "Cron toolset resolution failed; refusing to widen to the full "
+            "default toolset: %s",
             exc,
         )
-        return None
+        raise CronToolsetResolutionError(
+            f"cron toolset resolution failed: {exc}"
+        ) from exc
 
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
@@ -4612,7 +4619,20 @@ def _preflight_check_skills(job: dict) -> Optional[str]:
     return None
 
 
-def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
+def _preflight_check_toolsets(job: dict, cfg: dict) -> Optional[str]:
+    try:
+        _resolve_cron_enabled_toolsets(job, cfg)
+    except CronToolsetResolutionError as exc:
+        return str(exc)
+    return None
+
+
+def _preflight_job_config(
+    job: dict,
+    cfg: dict,
+    *,
+    toolsets_resolved: bool = False,
+) -> Optional[str]:
     """Pre-dispatch configuration validation (T1-26).
 
     Returns a human-readable reason when the job's configuration cannot
@@ -4628,11 +4648,14 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
     fail-loud-on-hidden-tools direction in #27948; alert dedup follows the
     alert-once pattern from the dead-pin auto-pause (#73506).
     """
-    for name, check in (
+    checks = [
         ("provider_key", lambda: _preflight_check_provider_key(job, cfg)),
         ("skills", lambda: _preflight_check_skills(job)),
         ("delivery", lambda: _preflight_check_delivery(job)),
-    ):
+    ]
+    if not toolsets_resolved:
+        checks.append(("toolsets", lambda: _preflight_check_toolsets(job, cfg)))
+    for name, check in checks:
         try:
             reason = check()
         except Exception:
@@ -5452,18 +5475,19 @@ def run_job(
         # Runs after the wake-gate/prompt build so silent script ticks stay
         # silent. Opt-out: `cron.preflight: false` in config.yaml.
         # ---------------------------------------------------------------
-        _pf_reason = None
+        _resolved_cron_toolsets = None
         try:
-            if _cron_preflight_enabled(_cfg):
-                _pf_reason = _preflight_job_config(job, _cfg)
-                if not _pf_reason and job.get("preflight_alerted"):
-                    # Configuration validates again — clear the alert-once
-                    # marker so a FUTURE config break re-alerts.
-                    try:
-                        from cron.jobs import clear_preflight_alerted
-                        clear_preflight_alerted(job_id)
-                    except Exception:
-                        pass
+            _resolved_cron_toolsets = _resolve_cron_enabled_toolsets(job, _cfg)
+            _toolset_resolution_reason = None
+        except CronToolsetResolutionError as exc:
+            _toolset_resolution_reason = str(exc)
+
+        _pf_reason = _toolset_resolution_reason
+        try:
+            if not _pf_reason and _cron_preflight_enabled(_cfg):
+                _pf_reason = _preflight_job_config(
+                    job, _cfg, toolsets_resolved=True
+                )
         except Exception:
             # The validator must never take down a runnable job — fail open.
             logger.debug(
@@ -5471,6 +5495,15 @@ def run_job(
                 job_id, exc_info=True,
             )
             _pf_reason = None
+
+        if not _pf_reason and job.get("preflight_alerted"):
+            # Mandatory toolset resolution and any enabled preflight checks are
+            # healthy again — clear alert-once state so a future outage alerts.
+            try:
+                from cron.jobs import clear_preflight_alerted
+                clear_preflight_alerted(job_id)
+            except Exception:
+                pass
 
         if _pf_reason:
             logger.warning(
@@ -5761,7 +5794,7 @@ def run_job(
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
-            enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
+            enabled_toolsets=_resolved_cron_toolsets,
             disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from

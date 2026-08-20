@@ -14,6 +14,7 @@ from cron.scheduler import (
     _build_job_prompt,
     _deliver_result,
     _merge_mcp_into_per_job_toolsets,
+    _preflight_job_config,
     _resolve_cron_enabled_toolsets,
     _resolve_delivery_target,
     _resolve_origin,
@@ -117,6 +118,45 @@ class TestPerJobToolsetMcpMerge:
         # _get_platform_tools args: (cfg, "cron")
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
+
+    def test_resolver_failure_raises_typed_error_instead_of_loading_defaults(self):
+        import cron.scheduler as scheduler
+
+        job = {"enabled_toolsets": None}
+        with patch(
+            "hermes_cli.tools_config._get_platform_tools",
+            side_effect=RuntimeError("broken tool config"),
+        ):
+            with pytest.raises(scheduler.CronToolsetResolutionError, match="broken tool config"):
+                _resolve_cron_enabled_toolsets(job, self.CFG)
+
+    def test_per_job_mcp_resolution_failure_raises_typed_error(self):
+        import cron.scheduler as scheduler
+
+        job = {"enabled_toolsets": ["web"]}
+        with patch(
+            "hermes_cli.tools_config.enabled_mcp_server_names",
+            side_effect=RuntimeError("broken MCP config"),
+        ):
+            with pytest.raises(scheduler.CronToolsetResolutionError, match="broken MCP config"):
+                _resolve_cron_enabled_toolsets(job, self.CFG)
+
+    def test_preflight_turns_toolset_resolution_error_into_block_reason(self):
+        job = {"enabled_toolsets": None}
+        with (
+            patch("cron.scheduler._preflight_check_provider_key", return_value=None),
+            patch("cron.scheduler._preflight_check_skills", return_value=None),
+            patch("cron.scheduler._preflight_check_delivery", return_value=None),
+            patch(
+                "hermes_cli.tools_config._get_platform_tools",
+                side_effect=RuntimeError("broken tool config"),
+            ),
+        ):
+            reason = _preflight_job_config(job, self.CFG)
+
+        assert reason is not None
+        assert "toolset resolution failed" in reason
+        assert "broken tool config" in reason
 
 
 class TestResolveOrigin:
