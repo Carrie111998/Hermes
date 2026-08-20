@@ -800,6 +800,50 @@ class TestHandleSessionsCommand:
 
 
     @pytest.mark.asyncio
+    async def test_sessions_search_lane_scoped_pool_survives_busy_platform(self, tmp_path):
+        """`/sessions search` must lane-scope the FTS5 candidate pool in SQL.
+
+        On a busy platform the caller's own lane sessions starve out of the
+        global 200-row pre-filter pool when fresher foreign matches dominate —
+        a Python post-filter cannot recover rows that were never fetched. The
+        lane-scoped pool keeps the caller's hits present among the displayed
+        results. 210 foreign sessions (each with a matching title AND message)
+        crowd the lane out of both the 200-row content pool and the 200-row
+        title pool; the lane-scoped SQL filter restores the 11 lane hits."""
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=tmp_path / "state.db")
+        event = _make_event(text="/sessions search Work")
+        lane_key = _session_key_for_event(event)
+        for i in range(11):
+            sid = f"lane_work_{i}"
+            db.create_session(
+                sid, "telegram", session_key=lane_key,
+                user_id="12345", chat_id="67890",
+            )
+            db.set_session_title(sid, f"Lane Work {i}")
+            db.append_message(
+                sid, "user", f"Work on lane task {i}", timestamp=1000.0 + i
+            )
+        for i in range(210):
+            sid = f"foreign_{i}"
+            db.create_session(
+                sid, "telegram",
+                session_key=f"agent:main:telegram:dm:foreign-{i}",
+                user_id=f"foreign-user-{i}", chat_id=f"foreign-{i}",
+            )
+            db.set_session_title(sid, f"Foreign Work {i}")
+            db.append_message(sid, "user", "Work", timestamp=2000.0 + i)
+
+        runner = _make_runner(session_db=db, event=event)
+        result = await runner._handle_sessions_command(event)
+
+        # All 10 displayed slots are the caller's own lane hits; the fresher
+        # foreign matches must not crowd them out of the fetched pool.
+        assert result.count("Lane Work") == 10
+        assert "Foreign Work" not in result
+        db.close()
+
+    @pytest.mark.asyncio
     async def test_resume_persisted_fallback_fails_closed_on_user_id_alt(self, tmp_path):
         """egilewski/CodeRabbit probe: Signal/Feishu key the session participant
         on ``user_id_alt or user_id`` (build_session_key), but the sessions table

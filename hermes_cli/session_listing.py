@@ -137,6 +137,7 @@ def search_session_listing(
     limit: int = 10,
     exclude_session_id: str | None = None,
     exclude_sources: tuple[str, ...] = ("tool", "subagent", "cron"),
+    session_key: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """Full-text search over session messages with the canonical row shape.
 
@@ -159,6 +160,10 @@ def search_session_listing(
        ``started_at`` (Created), chain-total tokens, last_active — plus a
        ``root_preview_cache`` of the root ancestor's first user message.
 
+    ``session_key`` lane-scopes the candidate pool in SQL for gateway
+    callers (CLI passes None), so a busy platform's foreign traffic cannot
+    starve the caller's own lane out of the pre-filter fetch window.
+
     Returns ``(table_rows, root_preview_cache)`` ready for
     ``render_sessions_table``. ``table_rows`` is empty when nothing
     matched.
@@ -167,6 +172,7 @@ def search_session_listing(
         query=query,
         role_filter=["user", "assistant"],
         exclude_sources=list(exclude_sources),
+        session_key=session_key,
         limit=min(max(limit * 4, 40), 200),
     )
     seen: dict[str, dict[str, Any]] = {}
@@ -186,6 +192,7 @@ def search_session_listing(
         limit=200,
         search_query=query,
         order_by_last_active=True,
+        session_key=session_key,
     )
     for r in title_rows:
         sid = r["id"]

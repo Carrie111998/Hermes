@@ -5008,6 +5008,7 @@ class GatewaySlashCommandsMixin:
                     # results out of the first 50 global hits.
                     limit=200,
                     exclude_session_id=current_entry.session_id,
+                    session_key=None if cross_origin else session_key,
                 )
             except Exception as exc:
                 logger.debug("Gateway /sessions search failed: %s", exc)
