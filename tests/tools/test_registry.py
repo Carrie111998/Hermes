@@ -329,6 +329,39 @@ class TestCheckFnExceptionHandling:
         assert "works" in available
         assert any(u["name"] == "crashes" for u in unavailable)
 
+    def test_unavailable_toolset_can_report_specific_reason(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="browser_cdp",
+            toolset="browser-cdp",
+            schema=_make_schema("browser_cdp"),
+            handler=_dummy_handler,
+            check_fn=lambda: (False, "CDP endpoint not configured"),
+        )
+
+        available, unavailable = reg.check_tool_availability()
+
+        assert "browser-cdp" not in available
+        assert any(
+            u["name"] == "browser-cdp"
+            and u.get("reason") == "CDP endpoint not configured"
+            for u in unavailable
+        )
+
+    def test_reason_only_attached_when_check_provides_it(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="plain",
+            toolset="plain-ts",
+            schema=_make_schema("plain"),
+            handler=_dummy_handler,
+            check_fn=lambda: False,
+        )
+
+        _available, unavailable = reg.check_tool_availability()
+        item = next(u for u in unavailable if u["name"] == "plain-ts")
+        assert "reason" not in item
+
 
 class TestBuiltinDiscovery:
     def test_discovers_all_real_self_registering_builtin_tool_modules(self):

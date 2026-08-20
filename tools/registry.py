@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from hermes_constants import hermes_home_key
 
@@ -272,7 +272,7 @@ _CHECK_FN_TTL_SECONDS = 30.0
 # so a genuinely-down backend is reflected within a couple of turns.
 _CHECK_FN_FAILURE_GRACE_SECONDS = 60.0
 _CHECK_FN_CACHE_MAX = 512
-_check_fn_cache: Dict[tuple[Callable, Optional[str]], tuple[float, bool]] = {}
+_check_fn_cache: Dict[tuple[Callable, Optional[str]], tuple[float, bool, Optional[str]]] = {}
 # Monotonic timestamp of the most recent True result per check_fn.
 _check_fn_last_good: Dict[tuple[Callable, Optional[str]], float] = {}
 _check_fn_cache_lock = threading.Lock()
@@ -284,7 +284,7 @@ def _prune_check_fn_caches(now: float) -> None:
 
     Caller must hold ``_check_fn_cache_lock``.
     """
-    for key, (timestamp, _) in list(_check_fn_cache.items()):
+    for key, (timestamp, _value, _reason) in list(_check_fn_cache.items()):
         if now - timestamp >= _CHECK_FN_TTL_SECONDS:
             _check_fn_cache.pop(key, None)
     for key, timestamp in list(_check_fn_last_good.items()):
@@ -321,10 +321,29 @@ def check_fn_cache_scope() -> Optional[str]:
         return CHECK_FN_CACHE_BYPASS
 
 
-def _check_fn_cached(fn: Callable) -> bool:
-    """Return bool(fn()), TTL-cached across calls.
+def _normalize_check_result(value: Any) -> tuple[bool, Optional[str]]:
+    """Normalize a check_fn return value to ``(available, reason)``.
 
-    Exceptions are swallowed as False. A transient False/exception within
+    Checks historically returned plain booleans. Some toolsets need to
+    distinguish unavailable states (missing system dependency vs. missing
+    user configuration), so checks may also return ``(False, "reason")``.
+    """
+    if isinstance(value, tuple):
+        available = bool(value[0]) if value else False
+        reason = str(value[1]) if not available and len(value) > 1 and value[1] else None
+        return available, reason
+    if isinstance(value, dict) and "available" in value:
+        available = bool(value.get("available"))
+        detail = value.get("reason") or value.get("message")
+        reason = str(detail) if not available and detail else None
+        return available, reason
+    return bool(value), None
+
+
+def _check_fn_cached(fn: Callable) -> tuple[bool, Optional[str]]:
+    """Return normalized ``fn()`` result as ``(available, reason)``, TTL-cached.
+
+    Exceptions are swallowed as (False, None). A transient False/exception within
     ``_CHECK_FN_FAILURE_GRACE_SECONDS`` of the last True is suppressed (the
     last-good True is returned and the failure is NOT cached, so the next call
     re-probes) to keep flaky external checks (Docker daemon busy, socket
@@ -334,7 +353,7 @@ def _check_fn_cached(fn: Callable) -> bool:
     scope = check_fn_cache_scope()
     if scope == CHECK_FN_CACHE_BYPASS:
         try:
-            return bool(fn())
+            return _normalize_check_result(fn())
         except Exception:
             logger.warning(
                 "check_fn %s raised while profile cache scope was unresolved; "
@@ -342,29 +361,29 @@ def _check_fn_cached(fn: Callable) -> bool:
                 getattr(fn, "__qualname__", fn),
                 exc_info=True,
             )
-            return False
+            return False, None
     cache_key = (fn, scope)
     with _check_fn_cache_lock:
         _prune_check_fn_caches(now)
         cached = _check_fn_cache.get(cache_key)
         if cached is not None:
-            ts, value = cached
+            ts, value, reason = cached
             if now - ts < _CHECK_FN_TTL_SECONDS:
-                return value
+                return value, reason
 
     raised = False
     try:
-        value = bool(fn())
+        value, reason = _normalize_check_result(fn())
     except Exception:
-        value = False
+        value, reason = False, None
         raised = True
 
     with _check_fn_cache_lock:
         _prune_check_fn_caches(now)
         if value:
             _check_fn_last_good[cache_key] = now
-            _check_fn_cache[cache_key] = (now, True)
-            return True
+            _check_fn_cache[cache_key] = (now, True, None)
+            return True, None
 
         last_good = _check_fn_last_good.get(cache_key)
         if last_good is not None and now - last_good < _CHECK_FN_FAILURE_GRACE_SECONDS:
@@ -378,7 +397,7 @@ def _check_fn_cached(fn: Callable) -> bool:
                 "raised" if raised else "returned False",
                 _CHECK_FN_FAILURE_GRACE_SECONDS,
             )
-            return True
+            return True, None
 
         # No recent success (or grace expired) — honor the failure. Log it so
         # silent tool loss in quiet mode (subagents) is diagnosable.
@@ -387,8 +406,8 @@ def _check_fn_cached(fn: Callable) -> bool:
             getattr(fn, "__qualname__", fn),
             "raised" if raised else "returned False",
         )
-        _check_fn_cache[cache_key] = (now, False)
-        return False
+        _check_fn_cache[cache_key] = (now, False, reason)
+        return False, reason
 
 
 def invalidate_check_fn_cache() -> None:
@@ -417,7 +436,7 @@ def get_cached_check_fn_result(fn: Callable) -> Optional[bool]:
         cached = _check_fn_cache.get((fn, scope))
         if cached is None:
             return None
-        ts, value = cached
+        ts, value, _reason = cached
         if now - ts < _CHECK_FN_TTL_SECONDS:
             return value
         return None
@@ -495,17 +514,34 @@ class ToolRegistry:
         Mixed toolsets (e.g. ``terminal`` plus desktop-only ``read_terminal``)
         must not be gated solely by the first registered ``check_fn``.
         """
+        return self._toolset_availability_detail(toolset, entries)[0]
+
+    def _toolset_availability_detail(
+        self,
+        toolset: str,
+        entries: List[ToolEntry],
+    ) -> tuple[bool, Optional[str]]:
+        """Return ``(exposed, reason)`` for a toolset.
+
+        Reason is the last check-failure detail (e.g. ``"CDP endpoint not
+        configured"``) so doctor can distinguish a missing user configuration
+        from a plain system-dependency failure.
+        """
         check_results: Dict[Callable, bool] = {}
+        last_reason: Optional[str] = None
         for entry in entries:
             if entry.toolset != toolset:
                 continue
             if not entry.check_fn:
-                return True
+                return True, None
             if entry.check_fn not in check_results:
-                check_results[entry.check_fn] = _check_fn_cached(entry.check_fn)
+                available, reason = _check_fn_cached(entry.check_fn)
+                check_results[entry.check_fn] = available
+                if reason:
+                    last_reason = reason
             if check_results[entry.check_fn]:
-                return True
-        return False
+                return True, None
+        return False, last_reason
 
     def get_entry(
         self,
@@ -1038,7 +1074,7 @@ class ToolRegistry:
                 continue
             if entry.check_fn:
                 if entry.check_fn not in check_results:
-                    check_results[entry.check_fn] = _check_fn_cached(entry.check_fn)
+                    check_results[entry.check_fn] = _check_fn_cached(entry.check_fn)[0]
                 if not check_results[entry.check_fn]:
                     if not quiet:
                         logger.debug("Tool %s unavailable (check failed)", name)
@@ -1248,14 +1284,18 @@ class ToolRegistry:
         entries, _ = self._snapshot_state()
         for ts in sorted({entry.toolset for entry in entries}):
             ts_entries = [entry for entry in entries if entry.toolset == ts]
-            if self._toolset_has_exposable_tools(ts, entries):
+            is_available, reason = self._toolset_availability_detail(ts, entries)
+            if is_available:
                 available.append(ts)
             else:
-                unavailable.append({
+                item = {
                     "name": ts,
                     "env_vars": ts_entries[0].requires_env if ts_entries else [],
                     "tools": [entry.name for entry in ts_entries],
-                })
+                }
+                if reason:
+                    item["reason"] = reason
+                unavailable.append(item)
         return available, unavailable
 
 

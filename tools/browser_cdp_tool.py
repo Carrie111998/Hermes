@@ -634,7 +634,7 @@ BROWSER_CDP_SCHEMA: Dict[str, Any] = {
 }
 
 
-def _browser_cdp_check() -> bool:
+def _browser_cdp_check() -> bool | tuple[bool, str]:
     """Availability check for browser_cdp.
 
     The tool is only offered when the Python side can actually reach a CDP
@@ -658,13 +658,15 @@ def _browser_cdp_check() -> bool:
         )
     except ImportError as exc:  # pragma: no cover — defensive
         logger.debug("browser_cdp check: browser_tool import failed: %s", exc)
-        return False
+        return False, "browser_tool import failed"
     if not check_browser_requirements():
-        return False
+        return False, "browser system dependency not met"
     # Raw (no-I/O) gate: check_fns run during tool-schema assembly at every
     # startup; resolving the endpoint over HTTP here would block launch when
     # the configured endpoint is stale/unreachable.
-    return bool(_get_cdp_override_raw())
+    if not _get_cdp_override_raw():
+        return False, "CDP endpoint not configured"
+    return True
 
 
 registry.register(

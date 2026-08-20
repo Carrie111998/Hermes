@@ -417,4 +417,21 @@ def test_check_fn_false_when_browser_requirements_fail(monkeypatch):
     monkeypatch.setattr(
         bt, "_get_cdp_override_raw", lambda: "ws://localhost:9222/devtools/browser/x"
     )
-    assert browser_cdp_tool._browser_cdp_check() is False
+    assert browser_cdp_tool._browser_cdp_check() == (
+        False,
+        "browser system dependency not met",
+    )
+
+
+def test_check_fn_false_when_no_cdp_url_reports_reason(monkeypatch):
+    """Missing CDP endpoint must report a specific reason, not a bare False,
+    so doctor can distinguish missing user configuration from a system
+    dependency failure."""
+    import tools.browser_tool as bt
+
+    monkeypatch.setattr(bt, "check_browser_requirements", lambda: True)
+    monkeypatch.setattr(bt, "_get_cdp_override_raw", lambda: "")
+    assert browser_cdp_tool._browser_cdp_check() == (
+        False,
+        "CDP endpoint not configured",
+    )
