@@ -72,6 +72,49 @@ def test_does_not_fire_when_results_differ():
         assert notice is None
 
 
+def test_explicit_unchanged_result_continues_streak_across_result_jitter():
+    c = ToolCallGuardrailController()
+    args = {"path": "README.md"}
+    unchanged = (
+        '{"status":"unchanged","dedup":true,'
+        '"content_returned":false,"message":"already returned"}'
+    )
+
+    assert c.observe_identical_call("read_file", args, "full contents") is None
+    assert c.observe_identical_call("read_file", args, unchanged) is None
+    notice = c.observe_identical_call("read_file", args, unchanged)
+
+    assert notice is not None
+    assert "3rd" in notice
+    assert "same underlying result" in notice
+
+
+def test_changed_result_after_unchanged_stub_restarts_streak():
+    c = ToolCallGuardrailController()
+    args = {"path": "README.md"}
+    unchanged = (
+        '{"status":"unchanged","dedup":true,'
+        '"content_returned":false,"message":"already returned"}'
+    )
+
+    assert c.observe_identical_call("read_file", args, "version one") is None
+    assert c.observe_identical_call("read_file", args, unchanged) is None
+    assert c.observe_identical_call("read_file", args, "version two") is None
+    assert c.observe_identical_call("read_file", args, "version two") is None
+    assert c.observe_identical_call("read_file", args, "version two") is not None
+
+
+def test_lookalike_unchanged_payload_does_not_inherit_prior_streak():
+    c = ToolCallGuardrailController()
+    args = {"path": "README.md"}
+    lookalike = '{"status":"unchanged","content_returned":false}'
+
+    assert c.observe_identical_call("read_file", args, "full contents") is None
+    assert c.observe_identical_call("read_file", args, lookalike) is None
+    assert c.observe_identical_call("read_file", args, lookalike) is None
+    assert c.observe_identical_call("read_file", args, lookalike) is not None
+
+
 def test_streak_resets_when_a_different_call_intervenes():
     c = ToolCallGuardrailController()
     assert _observe_n(c, 2)[-1] is None

@@ -516,33 +516,36 @@ class ToolCallGuardrailController:
     ) -> str | None:
         """Track consecutive identical calls; return a loop-breaker notice or None.
 
-        Fires the compact notice when the SAME tool is called with identical
-        canonical arguments AND returns an identical result for the
+        Fires the compact notice when the SAME tool is called with equivalent
+        canonical arguments AND returns the same underlying result for the
         ``STALL_GUARD_IDENTICAL_CALL_THRESHOLD``-th (and every subsequent)
         consecutive time within the turn. Purely observational — never blocks
         the call. Allowlisted pollers (``is_stall_guard_repeatable``) are
-        exempt, and any intervening different call or changed result resets
-        the streak. Callers append the returned notice to the tool RESULT at
-        construction time, which is cache-safe: tool results are append-only
-        and never mutate already-sent context.
+        exempt. A changed result resets the streak unless the tool explicitly
+        marks it as an unchanged dedup envelope. Callers append the returned
+        notice to the tool RESULT at construction time, which is cache-safe:
+        tool results are append-only and never mutate already-sent context.
         """
         if is_stall_guard_repeatable(tool_name):
             # Don't let a poller streak carry over into the next tool either.
             self._identical_streak_sig = None
+            self._identical_streak_result_hash = ""
             self._identical_streak_count = 0
             return None
 
         signature = _stall_guard_signature(tool_name, args)
         result_hash = _result_hash(result)
-        if (
-            self._identical_streak_sig == signature
-            and self._identical_streak_result_hash == result_hash
+        explicit_unchanged = _is_explicit_unchanged_result(result)
+        same_signature = self._identical_streak_sig == signature
+        if same_signature and (
+            self._identical_streak_result_hash == result_hash
+            or explicit_unchanged
         ):
             self._identical_streak_count += 1
         else:
             self._identical_streak_sig = signature
-            self._identical_streak_result_hash = result_hash
             self._identical_streak_count = 1
+        self._identical_streak_result_hash = result_hash
 
         count = self._identical_streak_count
         if count < STALL_GUARD_IDENTICAL_CALL_THRESHOLD:
@@ -550,7 +553,7 @@ class ToolCallGuardrailController:
         ordinal = f"{count}{'th' if 11 <= count % 100 <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(count % 10, 'th')}"
         return (
             f"[hermes note: this is the {ordinal} consecutive identical call to "
-            f"{tool_name} with identical arguments returning the same result. "
+            f"{tool_name} with equivalent arguments returning the same underlying result. "
             "Do not repeat it — change arguments, use a different tool, or "
             "proceed with what you have.]"
         )
@@ -686,6 +689,19 @@ def _result_hash(result: str | None) -> str:
     else:
         canonical = result or ""
     return _sha256(canonical)
+
+
+def _is_explicit_unchanged_result(result: str | None) -> bool:
+    """Whether a tool explicitly says its underlying content did not change."""
+    if not isinstance(result, str):
+        return False
+    parsed = safe_json_loads(result)
+    return bool(
+        isinstance(parsed, dict)
+        and parsed.get("status") == "unchanged"
+        and parsed.get("dedup") is True
+        and parsed.get("content_returned") is False
+    )
 
 
 def _as_bool(value: Any, default: bool) -> bool:
