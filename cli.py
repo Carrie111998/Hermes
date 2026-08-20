@@ -13174,23 +13174,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return False
 
         model = row.get("model") or getattr(self, "model", None) or "unknown"
+        message_count = row.get("message_count")
         msg_count = int(
-            row.get("message_count")
-            or len(getattr(self, "conversation_history", []) or [])
+            message_count
+            if message_count is not None
+            else len(getattr(self, "conversation_history", []) or [])
         )
 
+        row_format = "  {label:<27}{value}"
         print("  📊 Persisted Session Token Usage")
         print(f"  {'─' * 40}")
-        print(f"  Model:                     {model}")
-        print(f"  Input tokens:              {input_tokens:>10,}")
-        print(f"  Output tokens:             {output_tokens:>10,}")
+        print(row_format.format(label="Model:", value=model))
+        print(row_format.format(label="Input tokens:", value=f"{input_tokens:>10,}"))
+        print(row_format.format(label="Output tokens:", value=f"{output_tokens:>10,}"))
         if reasoning_tokens:
-            print(f"  ↳ Reasoning (subset):      {reasoning_tokens:>10,}")
-        print(f"  Total tokens:              {total:>10,}")
-        print(f"  API calls:                 {calls:>10,}")
+            print(
+                row_format.format(
+                    label="↳ Reasoning (subset):",
+                    value=f"{reasoning_tokens:>10,}",
+                )
+            )
+        print(row_format.format(label="Total tokens:", value=f"{total:>10,}"))
+        print(row_format.format(label="API calls:", value=f"{calls:>10,}"))
         print(f"  {'─' * 40}")
-        print(f"  Messages:         {msg_count}")
-        print("  Note:             persisted DB snapshot; live context details unavailable")
+        print(row_format.format(label="Messages:", value=f"{msg_count:>10,}"))
+        print(
+            row_format.format(
+                label="Note:",
+                value="persisted DB snapshot; live context details unavailable",
+            )
+        )
         return True
 
     def _show_insights(self, command: str = "/insights"):

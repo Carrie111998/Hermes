@@ -308,6 +308,43 @@ class TestCLIUsageReport:
         assert "Cost source:" not in output
         assert "Total cost:" not in output
 
+        lines = output.splitlines()
+        model_line = next(line for line in lines if line.strip().startswith("Model:"))
+        api_line = next(line for line in lines if line.strip().startswith("API calls:"))
+        message_line = next(line for line in lines if line.strip().startswith("Messages:"))
+        note_line = next(line for line in lines if line.strip().startswith("Note:"))
+
+        assert model_line.index("gpt-5.5") == note_line.index("persisted DB snapshot")
+        assert api_line.rindex("3") == message_line.rindex("6")
+
+    def test_show_usage_without_live_agent_preserves_zero_message_count(self, capsys):
+        cli_obj = _make_cli()
+        cli_obj.session_id = "zero-message-session"
+        cli_obj._session_db = SimpleNamespace(
+            get_session=lambda session_id: {
+                "id": session_id,
+                "model": "gpt-5.5",
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "reasoning_tokens": 0,
+                "api_call_count": 1,
+                "message_count": 0,
+            }
+        )
+        cli_obj._print_nous_credits_block = lambda: False
+
+        # _make_cli() deliberately leaves one in-memory message. Persisted zero
+        # must remain authoritative rather than falling back to this history.
+        assert len(cli_obj.conversation_history) == 1
+
+        cli_obj._show_usage()
+        output = capsys.readouterr().out
+
+        message_line = next(
+            line for line in output.splitlines() if line.strip().startswith("Messages:")
+        )
+        assert message_line.split() == ["Messages:", "0"]
+
     def test_show_usage_without_live_agent_keeps_no_agent_message_when_no_snapshot(self, capsys):
         cli_obj = _make_cli()
         cli_obj.session_id = "empty-session"
@@ -326,6 +363,28 @@ class TestCLIUsageReport:
 
         assert "No active agent -- send a message first" in output
         assert "Persisted Session Token Usage" not in output
+
+    def test_show_usage_without_live_agent_logs_db_read_failure(self, capsys):
+        cli_obj = _make_cli()
+        cli_obj.session_id = "broken-session"
+
+        class BrokenSessionDB:
+            def get_session(self, session_id):
+                raise RuntimeError("boom")
+
+        cli_obj._session_db = BrokenSessionDB()
+        cli_obj._print_nous_credits_block = lambda: False
+
+        with patch.object(cli_mod.logger, "debug") as debug_log:
+            cli_obj._show_usage()
+
+        output = capsys.readouterr().out
+        assert "No active agent -- send a message first" in output
+        debug_log.assert_any_call(
+            "Failed to load persisted usage for session %s",
+            "broken-session",
+            exc_info=True,
+        )
 
     def test_show_usage_without_live_agent_preserves_credits_cta(self, capsys):
         cli_obj = _make_cli()
