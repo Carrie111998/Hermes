@@ -114,11 +114,11 @@ jobs:
           "
           fi
 
-          # --- subprocess with encoded/obfuscated command argument ---
+          # --- subprocess withencoded/obfuscated command argument ---
           PROC_HITS=$(echo "$DIFF" | grep -n '^\+' | grep -E 'subprocess\.(Popen|call|run)\s*\(' | grep -iE 'base64|\\x[0-9a-f]{2}|chr\(' | head -10 || true)
           if [ -n "$PROC_HITS" ]; then
             FINDINGS="${FINDINGS}
-          ### 🚨 CRITICAL: subprocess with encoded/obfuscated command
+          ### 🚨 CRITICAL: subprocess withencoded/obfuscated command
           Subprocess calls whose command strings are base64- or hex-encoded are a strong indicator of payload execution.
 
           **Matches:**
@@ -167,7 +167,7 @@ jobs:
           $(cat /tmp/findings.md)
 
           ---
-          *Scanner only fires on high-signal indicators: .pth files, base64+exec/eval combos, subprocess with encoded commands, or install-hook files. Low-signal warnings were removed intentionally — if you're seeing this comment, the finding is worth inspecting.*"
+          *Scanner only fires on high-signal indicators: .pth files, base64+exec/eval combos, subprocess withencoded commands, or install-hook files. Low-signal warnings were removed intentionally — if you're seeing this comment, the finding is worth inspecting.*"
 
           gh pr comment "${{ github.event.pull_request.number }}" --body "$BODY" || echo "::warning::Could not post PR comment (expected for fork PRs — GITHUB_TOKEN is read-only)"
 
