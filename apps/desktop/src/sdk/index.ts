@@ -77,20 +77,19 @@ import {
   $gatewayState,
   $messages,
   $selectedStoredSessionId,
-  $sessions,
-  getSessionOwnerHints,
-  rememberedSessionProfile,
   requestSessionResume,
-  sessionMatchesStoredId,
   setResumeExhaustedSessionId,
   setSessionOwnerHint
 } from '@/store/session'
 import {
   $focusedRuntimeId,
+  $focusedSessionOwner,
+  $focusedSessionProfile,
   $focusedSessionState,
   $focusedStoredSessionId,
   $sessionStates,
-  $sessionTiles
+  $sessionTiles,
+  type FocusedSessionOwner
 } from '@/store/session-states'
 import { runGatewayRestart } from '@/store/system-actions'
 import type { PaginatedSessions, UsageStats } from '@/types/hermes'
@@ -125,69 +124,10 @@ const $focusedAwaitingResponse = focusedTurnFlag(
   PRIMARY_SESSION_VIEW.$awaitingResponse
 )
 
-export interface PluginFocusedSessionOwner {
-  connectionId: string
-  profile: string
-}
-
-/**
- * Connection-qualified owner of the FOCUSED chat. The gateway-routing atom
- * (`$activeGatewayProfile`) answers "which backend is the live socket homed
- * on" — but tab/tile focus moves without swapping the socket, and a cold
- * start can restore a route into a session the booting gateway doesn't own.
- * Any per-bot readout must follow the chat the user is LOOKING AT, so this
- * resolves the focused stored session to a unique immutable owner hint or a
- * unique connection-qualified aggregated row. Ambiguous or unresolved focused
- * ids fail closed with null; only a draft/no focused id uses the active gateway
- * owner. `focusedSessionProfile` remains the profile-only compatibility ladder.
- */
-const $focusedSessionOwner = computed(
-  [$focusedStoredSessionId, $sessions, $activeGatewayProfile, $connection],
-  (focused, sessions, activeProfile, connection): PluginFocusedSessionOwner | null => {
-    const activeConnectionId = String(connection?.connectionId || (connection?.mode === 'local' ? 'local' : '')).trim()
-
-    const fallback = {
-      connectionId: activeConnectionId,
-      profile: normalizeProfileKey(activeProfile)
-    }
-
-    if (!focused) {
-      return fallback
-    }
-
-    const hints = getSessionOwnerHints(focused)
-
-    if (hints.length === 1) {
-      return {
-        connectionId: hints[0].connectionId,
-        profile: normalizeProfileKey(hints[0].profile)
-      }
-    }
-
-    if (hints.length > 1) {
-      return null
-    }
-
-    const owners = new Map<string, PluginFocusedSessionOwner>()
-
-    for (const row of sessions.filter(session => sessionMatchesStoredId(session, focused))) {
-      const connectionId = String(row.connection_id || '').trim()
-      const profile = normalizeProfileKey(row.profile)
-
-      if (connectionId) {
-        owners.set(`${connectionId}::${profile}`, { connectionId, profile })
-      }
-    }
-
-    return owners.size === 1 ? [...owners.values()][0] : null
-  }
-)
-
-const $focusedSessionProfile = computed(
-  [$focusedSessionOwner, $focusedStoredSessionId, $sessions, $activeGatewayProfile],
-  (owner, focused, sessions, activeProfile) =>
-    owner?.profile || rememberedSessionProfile(sessions, focused, activeProfile)
-)
+// Owner resolution of the FOCUSED chat — lives in the session-states store
+// (the profile-grouped sidebar follows the same atoms) and is re-exposed on
+// host.state.
+export type PluginFocusedSessionOwner = FocusedSessionOwner
 
 export interface PluginProfileRoute {
   connectionId: string
