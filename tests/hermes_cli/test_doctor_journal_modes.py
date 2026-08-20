@@ -281,9 +281,13 @@ class TestLiveConnectionSafety:
 
 class TestUnreadableReason:
     def test_missing_file_keeps_the_os_error_text(self, tmp_path):
-        reason = doctor._unreadable_reason(tmp_path / "gone.db")
+        missing = tmp_path / "gone.db"
+        with pytest.raises(FileNotFoundError) as exc_info:
+            missing.stat()
 
-        assert "No such file or directory" in reason
+        reason = doctor._unreadable_reason(missing)
+
+        assert reason == str(exc_info.value)
 
     @pytest.mark.skipif(os.name == "nt", reason="chmod is a no-op on Windows")
     @pytest.mark.skipif(
