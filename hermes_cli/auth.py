@@ -2374,8 +2374,18 @@ def _migrate_stale_nous_portal_url(providers: Dict[str, Any]) -> None:
 # (NOUS_INFERENCE_BASE_URL) bypass validation — that's the documented
 # dev/staging escape hatch and the env source is already trusted (the
 # user set it themselves).
+#
+# Loopback hosts mirror _NOUS_PORTAL_ALLOWED_HOSTS' local-dev treatment:
+# a locally running Nous Portal stack (nous-account-service on
+# 127.0.0.1) hands out its own local inference endpoint, and a bearer
+# sent to the operator's own machine has no exfiltration surface — the
+# same reasoning that made the portal allowlist accept localhost. https
+# stays required for everything off-loopback (loopback_http carve-out
+# in the validator below).
 _ALLOWED_NOUS_INFERENCE_HOSTS: FrozenSet[str] = frozenset({
     "inference-api.nousresearch.com",
+    "localhost",
+    "127.0.0.1",
 })
 
 
@@ -2383,10 +2393,14 @@ def _validate_nous_inference_url_from_network(url: Optional[str]) -> Optional[st
     """Validate a Portal-returned inference URL against the host allowlist.
 
     Returns ``url`` (normalised by stripping trailing slashes) if it's a
-    well-formed ``https://<allowlisted-host>/...`` URL. Returns ``None``
-    if the URL is missing, malformed, non-https, or points at an
-    unexpected host — letting the caller fall back to the configured
-    default rather than persist or forward a poisoned value.
+    well-formed ``https://<allowlisted-host>/...`` URL — or an
+    ``http://`` one whose host is loopback, mirroring the Portal
+    allowlist's ``loopback_http`` carve-out (a local Portal stack hands
+    out its own local inference endpoint, and a bearer to the operator's
+    own machine has no exfiltration surface). Returns ``None`` if the
+    URL is missing, malformed, or points at an unexpected host or
+    scheme — letting the caller fall back to the configured default
+    rather than persist or forward a poisoned value.
 
     Defense-in-depth: a compromised refresh response from the Portal API
     (MITM, malicious response injection) could otherwise redirect every
@@ -2410,9 +2424,13 @@ def _validate_nous_inference_url_from_network(url: Optional[str]) -> Optional[st
         parsed = urlparse(cleaned)
     except Exception:
         return None
-    if parsed.scheme != "https":
+    if parsed.scheme != "https" and not (
+        parsed.scheme == "http"
+        and parsed.hostname in {"localhost", "127.0.0.1"}
+    ):
         logger.warning(
-            "nous: refusing non-https inference URL scheme %r from Portal response",
+            "nous: refusing non-https inference URL scheme %r from Portal response "
+            "(http is only trusted for loopback hosts)",
             parsed.scheme,
         )
         return None
