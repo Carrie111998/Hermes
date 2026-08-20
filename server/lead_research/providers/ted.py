@@ -120,13 +120,16 @@ def _title(value) -> str:
 
 # Legal-form and filing noise. Stripped from both sides before comparing, so
 # "BEGA, s.r.o." still matches "BEGA" without the suffix padding the score.
-LEGAL_TOKENS = frozenset("""
+# Passed through normalize_name so the list can be written the way these words
+# are actually spelled. It half-folds diacritics — SPÓŁKA becomes "społka", not
+# "spolka" — and hand-guessing that is how "spółka" silently stopped matching.
+LEGAL_TOKENS = frozenset(normalize_name(token) for token in """
 sp spol spolka spółka spolecnost společnost sro akciova akcyjna komandytowa
 ograniczona ograniczoną odpowiedzialnoscia odpowiedzialnością doo dooel
 gmbh mbh kg ohg ag eg ug ltd limited plc llc lllp inc incorporated corp
 corporation company cie cia sarl sas sasu sa srl spa sl slu sau sociedad
 limitada anonima anonyme bv nv ab asa aps oyj kft zrt nyrt ead ood eood
-sh shpk tic ltd's
+sh shpk tic
 """.split())
 
 TOKEN = re.compile(r"[^0-9a-z\u00c0-\u024f]+")
@@ -168,7 +171,14 @@ def _identity_match(candidate: CandidateRecord, names: list[str]) -> str | None:
         winner_normalized = normalize_name(name)
         for identity in identities:
             core = _core_tokens(identity)
-            if core and core <= winner_core and len(core) >= len(winner_core) * 0.5:
+            if not core or not core <= winner_core:
+                continue
+            # A one-word candidate has to *be* the winner, not merely appear in
+            # it. Half-coverage is fine for `Leroy Merlin` but waves through the
+            # generic ones: `SPS` is not `Maurer SPS GmbH`, and `Distrib` is not
+            # `POM DISTRIB`. Both were real corpus rows and both were wrong.
+            required = len(winner_core) if len(core) == 1 else len(winner_core) * 0.5
+            if len(core) >= required:
                 return name
             # Nothing distinctive survived stripping (initialisms, single short
             # words). Only an exact name is trustworthy at that point.

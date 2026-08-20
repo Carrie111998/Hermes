@@ -67,8 +67,30 @@ def test_shared_word_is_not_an_identity_match():
 def test_legal_form_suffix_does_not_block_a_real_match():
     assert _identity_match(candidate("Leroy Merlin"), ["LEROY MERLIN, S.L."]) == "LEROY MERLIN, S.L."
     assert _identity_match(
+        candidate("Leroy Merlin"), ["LEROY MERLIN FRANCE SAS"]
+    ) == "LEROY MERLIN FRANCE SAS"
+    # normalize_name half-folds diacritics, so the stopword list has to be
+    # normalized too or SPÓŁKA quietly stops being a legal form.
+    assert _identity_match(
         candidate("PFF"), ["PFF SPÓŁKA Z OGRANICZONĄ ODPOWIEDZIALNOŚCIĄ"]
-    ) is not None
+    ) == "PFF SPÓŁKA Z OGRANICZONĄ ODPOWIEDZIALNOŚCIĄ"
+
+
+# Every one of these came back from a real scan of the corpus against live TED,
+# and every one is a different company than the candidate.
+@pytest.mark.parametrize("name,winner", [
+    ("SPS", "Maurer SPS GmbH"),
+    ("Distrib", "POM DISTRIB"),
+    ("DUKAT", "CADXPERT P. GURGA M. DUKAT SPÓŁKA KOMANDYTOWA"),
+    ("Kyndryl", "Kyndryl Luxembourg S.à r.l."),
+])
+def test_a_one_word_candidate_must_be_the_winner_not_appear_inside_it(name, winner):
+    assert _identity_match(candidate(name), [winner]) is None
+
+
+def test_a_one_word_candidate_still_matches_its_own_notice():
+    assert _identity_match(candidate("PROXISERVE"), ["PROXISERVE"]) == "PROXISERVE"
+    assert _identity_match(candidate("BEGA, s.r.o."), ["BEGA, s.r.o."]) == "BEGA, s.r.o."
 
 
 def test_unrelated_winners_produce_no_evidence(query):
