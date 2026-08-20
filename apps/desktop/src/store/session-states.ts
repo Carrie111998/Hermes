@@ -33,6 +33,7 @@ import { stableArray } from '@/lib/stable-array'
 import { readJson, writeJson } from '@/lib/storage'
 import type { SessionInfo } from '@/types/hermes'
 
+import { $pinnedSessionIds } from '@/store/layout'
 import { $activeGatewayProfile, normalizeProfileKey } from './profile'
 import { clearAllProviderWaits, clearSessionProviderWait } from './provider-wait'
 import {
@@ -44,6 +45,7 @@ import {
   lineageAliases,
   markSessionRead,
   sessionMatchesStoredId,
+  sessionPinId,
   setActiveSessionStoredIdRotation,
   setSessions
 } from './session'
@@ -371,6 +373,84 @@ export function clearAllSessionStates() {
   sessionScopeByRuntimeId.clear()
   $stalledSessionIds.set([])
   $sessionStates.set({})
+}
+
+/**
+ * After a gateway disconnect/reconnect, re-hydrate lightweight placeholder states
+ * for pinned sessions that no longer have runtime state entries.
+ *
+ * When the backend detaches sessions from a stale WebSocket (`detached_sessions`
+ * in agent.log), those sessions' runtime ids become invalid. The frontend's
+ * session list ($sessions) and pins ($pinnedSessionIds) survive because they're
+ * re-fetched from the backend, but $sessionStates only gets populated by live
+ * gateway events — so pinned/idle sessions end up with no state. Clicking them
+ * in the sidebar navigates to a session whose runtime has no transcript.
+ *
+ * This creates minimal idle states for pinned sessions that lack one, so the UI
+ * shows them as valid conversations rather than blank/empty chat views.
+ * The placeholder will be replaced by a real state on the first gateway event
+ * for that session.
+ */
+export function restorePinnedSessionStates(rows: readonly SessionInfo[]): void {
+  const current = $sessionStates.get()
+  const pinned = $pinnedSessionIds.get()
+  const pinnedIds = new Set(pinned)
+
+  // Collect runtime ids that already have a state for any stored session
+  const activeStoredIds = new Set<string>()
+  for (const state of Object.values(current)) {
+    if (state.storedSessionId) {
+      activeStoredIds.add(state.storedSessionId)
+    }
+  }
+
+  const entries: [string, ClientSessionState][] = []
+
+  for (const row of rows) {
+    const pinId = sessionPinId(row)
+
+    if (!pinnedIds.has(pinId)) {
+      continue
+    }
+
+    // Already has state — skip
+    if (current[row.id] || activeStoredIds.has(row.id) || (row._lineage_root_id && activeStoredIds.has(row._lineage_root_id))) {
+      continue
+    }
+
+    entries.push([
+      row.id,
+      {
+        storedSessionId: row.id,
+        messages: [],
+        branch: '',
+        cwd: '',
+        model: '',
+        provider: '',
+        reasoningEffort: '',
+        serviceTier: '',
+        fast: false,
+        yolo: false,
+        personality: '',
+        busy: false,
+        awaitingResponse: false,
+        streamId: null,
+        sawAssistantPayload: false,
+        adoptedRunningTurn: false,
+        pendingBranchGroup: null,
+        interrupted: false,
+        interimBoundaryPending: false,
+        needsInput: false,
+        turnStartedAt: null,
+        turnLive: false,
+        usage: null
+      }
+    ])
+  }
+
+  if (entries.length > 0) {
+    $sessionStates.set({ ...current, ...Object.fromEntries(entries) })
+  }
 }
 
 // Derived per-session status sets — pure projections of `$sessionStates` (which
