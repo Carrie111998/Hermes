@@ -73,7 +73,9 @@ def _attempt_track(path_str: str, task_id: str, session_id: str) -> None:
     """Best-effort auto-track. Never raises."""
     try:
         p = Path(path_str).expanduser()
-        if not p.exists():
+        # Reject host paths before any stat so unreadable locations
+        # outside HERMES_HOME never reach Path.exists() (#82661).
+        if not dg.is_safe_path(p) or not p.exists():
             return
         category = dg.guess_category(p)
         if category is None:

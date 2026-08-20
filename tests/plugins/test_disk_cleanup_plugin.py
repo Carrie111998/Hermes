@@ -356,6 +356,27 @@ class TestPostToolCallHook:
         tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
         assert not tracked_file.exists() or tracked_file.read_text().strip() == "[]"
 
+    def test_unsafe_path_skipped_before_exists(self, _isolate_env, monkeypatch):
+        """Candidates outside HERMES_HOME must not be stat'd (#82661)."""
+        pi = _load_plugin_init()
+        probed = []
+        real_exists = Path.exists
+
+        def tracing_exists(self):
+            probed.append(str(self))
+            return real_exists(self)
+
+        monkeypatch.setattr(Path, "exists", tracing_exists)
+        pi._on_post_tool_call(
+            tool_name="terminal",
+            args={"command": "ls /etc/passwd"},
+            result="root:x:0:0",
+            task_id="t6", session_id="s6",
+        )
+        assert not any(str(p) == "/etc/passwd" or str(p).endswith("/passwd") for p in probed)
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        assert not tracked_file.exists() or tracked_file.read_text().strip() == "[]"
+
 
 class TestOnSessionEndHook:
     def test_runs_quick_when_test_files_tracked(self, _isolate_env):
