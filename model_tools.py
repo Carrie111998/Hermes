@@ -1205,6 +1205,8 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    expected_registry_entry=None,
+    enforce_registry_entry: bool = False,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1500,6 +1502,8 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
+                        expected_entry=expected_registry_entry,
+                        enforce_expected_entry=enforce_registry_entry,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
@@ -1508,6 +1512,8 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
+                        expected_entry=expected_registry_entry,
+                        enforce_expected_entry=enforce_registry_entry,
                     )
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)

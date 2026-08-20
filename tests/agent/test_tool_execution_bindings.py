@@ -85,3 +85,39 @@ def test_inflight_response_detects_real_refresh_without_poisoning_live_snapshot(
         tool["function"]["name"] for tool in agent.tools
     }
     assert agent._tool_snapshot_generation == published_generation
+
+
+def test_registry_dispatch_rejects_rebound_entry_without_calling_either_handler():
+    from tools.registry import registry
+
+    calls = []
+    schema = {
+        "name": "binding_identity_probe",
+        "description": "Probe binding identity.",
+        "parameters": {"type": "object", "properties": {}},
+    }
+    registry.register(
+        name="binding_identity_probe",
+        toolset="test-binding",
+        schema=schema,
+        handler=lambda _args, **_kwargs: calls.append("A") or "A",
+    )
+    expected = registry.capture_bindings({"binding_identity_probe"})[
+        "binding_identity_probe"
+    ]
+    registry.register(
+        name="binding_identity_probe",
+        toolset="test-binding",
+        schema=schema,
+        handler=lambda _args, **_kwargs: calls.append("B") or "B",
+    )
+
+    result = registry.dispatch(
+        "binding_identity_probe",
+        {},
+        expected_entry=expected,
+        enforce_expected_entry=True,
+    )
+
+    assert calls == []
+    assert "stale_tool_binding" in result

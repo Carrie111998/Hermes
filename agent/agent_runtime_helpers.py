@@ -3040,7 +3040,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                  pre_tool_block_checked: bool = False,
                  skip_tool_request_middleware: bool = False,
                  tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
-                 skip_tool_execution_middleware: bool = False) -> str:
+                 skip_tool_execution_middleware: bool = False,
+                 expected_registry_entry=None,
+                 enforce_registry_entry: bool = False) -> str:
     """Invoke a single tool and return the result string. No display logic.
 
     Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
@@ -3263,6 +3265,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
+                expected_registry_entry=expected_registry_entry,
+                enforce_registry_entry=enforce_registry_entry,
             )
             if skip_tool_execution_middleware:
                 dispatch_kwargs["skip_tool_execution_middleware"] = True

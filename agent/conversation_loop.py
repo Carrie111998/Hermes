@@ -2416,6 +2416,10 @@ def run_conversation(
             agent, "_tool_snapshot_generation", None
         )
         tools_for_api = request_tool_snapshot
+        from tools.registry import registry as _tool_registry
+        request_registry_bindings = _tool_registry.capture_bindings(
+            request_tool_names(request_tool_snapshot)
+        )
         if agent._use_prompt_caching and agent.provider != "moa":
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
             _initial_cache_plan = build_prompt_cache_plan(
@@ -7273,7 +7277,13 @@ def run_conversation(
                     except Exception:
                         pass
 
-                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                agent._execute_tool_calls(
+                    assistant_message,
+                    messages,
+                    effective_task_id,
+                    api_call_count,
+                    request_registry_bindings,
+                )
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send

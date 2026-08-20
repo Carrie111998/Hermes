@@ -252,3 +252,57 @@ def test_invalid_tool_exhaustion_closes_tool_tail(agent_env):
     assert msgs[-1].get("role") == "assistant"
     assert "invalid tool call" in (msgs[-1].get("content") or "").lower()
 
+
+def test_rebound_registry_tool_is_rejected_at_dispatch(agent_env):
+    """Response A must never execute handler B after a late re-registration."""
+    agent, handler = agent_env
+    from tools.registry import registry
+
+    calls = []
+    schema = {
+        "name": "binding_probe",
+        "description": "Probe request-local binding ownership.",
+        "parameters": {"type": "object", "properties": {}},
+    }
+    registry.register(
+        name="binding_probe",
+        toolset="test-binding",
+        schema=schema,
+        handler=lambda _args, **_kwargs: calls.append("A") or '{"ok":"A"}',
+    )
+    agent.tools = [*agent.tools, {"type": "function", "function": schema}]
+    agent.valid_tool_names = {*agent.valid_tool_names, "binding_probe"}
+
+    original_flush = agent._flush_messages_to_session_db
+    rebound = False
+
+    def _rebind_before_dispatch(*args, **kwargs):
+        nonlocal rebound
+        result = original_flush(*args, **kwargs)
+        if not rebound:
+            rebound = True
+            registry.register(
+                name="binding_probe",
+                toolset="test-binding",
+                schema=schema,
+                handler=lambda _args, **_kwargs: calls.append("B") or '{"ok":"B"}',
+            )
+        return result
+
+    agent._flush_messages_to_session_db = _rebind_before_dispatch
+    handler.response_queue.append(_tc_resp("binding_probe"))
+    handler.response_queue.append(_text_resp("Retried safely."))
+
+    result = agent.run_conversation(
+        "run the binding probe", conversation_history=[], task_id="t"
+    )
+
+    tool_results = [
+        message.get("content", "")
+        for message in result["messages"]
+        if isinstance(message, dict) and message.get("role") == "tool"
+    ]
+    assert calls == []
+    assert any("binding changed" in content for content in tool_results)
+    assert result["final_response"] == "Retried safely."
+
