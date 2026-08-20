@@ -1,6 +1,6 @@
 ---
 name: hydrafetch
-description: Fetch web pages as clean Markdown or typed JSON through a hosted API, including JS-rendered and bot-protected sites.
+description: Fetch web pages as clean Markdown or schema-shaped JSON.
 version: 1.0.0
 author: Akash Rajpurohit
 license: MIT
