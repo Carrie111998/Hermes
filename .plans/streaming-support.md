@@ -155,7 +155,7 @@ def _run_streaming_chat_completion(self, api_kwargs: dict):
                         if tc_delta.function.arguments:
                             accumulated_tool_calls[idx]["arguments"] += tc_delta.function.arguments
         
-        # Build fake response compatible with existing code
+        # Build fake response compatible withexisting code
         tool_calls = []
         for idx in sorted(accumulated_tool_calls):
             tc = accumulated_tool_calls[idx]
@@ -667,7 +667,7 @@ The 1.5s edit interval is conservative enough for all platforms. If we get
 ## Rollout Plan
 
 1. **Phase 1** (core): Merge to main. Streaming disabled by default.
-   Zero impact on existing behavior. Can be tested with env var.
+   Zero impact on existing behavior. Can be tested withenv var.
 
 2. **Phase 2** (gateway): Merge to main. Test on Telegram manually.
    Enable per-platform: `streaming.telegram: true` in config.
