@@ -10,8 +10,9 @@ guard (``check_all_command_guards``) applies them:
     3. sudo-stdin guard (unconditional),
     4. user ``approvals.deny`` rules (fire before yolo/off),
     5. yolo / ``approvals.mode: off`` bypass,
-    6. permanent ``command_allowlist``,
-    7. dangerous-pattern detection → would ask for approval.
+    6. permanent ``command_allowlist`` command-text patterns,
+    7. dangerous-pattern detection,
+    8. permanent approval for the detected pattern key → allow, otherwise ask.
 
 Because the same functions run — including ``_command_detection_variants``'s
 normalization/de-obfuscation path — an obfuscated command (``r\\m -rf /``)
@@ -130,9 +131,18 @@ def evaluate_command(command: str, env_type: str = "local") -> dict:
                    "(permanently approved)",
         )
 
-    # 7. Dangerous-pattern detection → would prompt.
+    # 7. Dangerous-pattern detection.  The runtime passes the detected key
+    # through _run_approval_gate(), whose first decision is whether that key
+    # has already been approved.  Mirror that short-circuit before reporting
+    # that an interactive prompt would occur.
     is_dangerous, pattern_key, description = approval.detect_dangerous_command(command)
     if is_dangerous:
+        if approval.is_approved("", pattern_key):
+            return result(
+                "allow", rule=pattern_key,
+                detail="detected dangerous-pattern key is present in "
+                       "command_allowlist (permanently approved)",
+            )
         return result(
             "ask-approval", rule=description,
             detail="matches a dangerous-command pattern; the runtime would "
