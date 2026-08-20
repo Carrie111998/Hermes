@@ -89,3 +89,13 @@ def test_token_cache_does_not_leak_across_multiplex_profile_contexts(
         "https://profile-b.example.invalid",
     ), "profile B must not receive profile A's cached billing credentials"
     assert resolved_profiles == ["profile-a", "profile-b"]
+
+    reset_token = hermes_constants.set_hermes_home_override(str(profile_a))
+    try:
+        billing.invalidate_cached_token()
+    finally:
+        hermes_constants.reset_hermes_home_override(reset_token)
+
+    assert _resolve_under_profile(profile_b) == result_b
+    assert _resolve_under_profile(profile_a) == result_a
+    assert resolved_profiles == ["profile-a", "profile-b", "profile-a"]
