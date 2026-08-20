@@ -94,6 +94,12 @@ _FAILURE_EVENT_TYPES = frozenset(
         # (schema.py:207) -- there is no secret-un-found event.
         EventType.SECRET_DETECTED,
         EventType.CREDENTIAL_LOSS,
+        # The conformance canary fires when drift IS found and has no
+        # drift-resolved variant -- contrast CODE_DRIFT, which does have one
+        # (status=="resolved") and therefore stays payload-driven. Its sibling
+        # AGENT_LOOP_FAULT, introduced in the same schema comment block, was
+        # already here; this was the same omission as DEVFLOW_DEPLOY_FAILED.
+        EventType.BACKEND_CONTRACT_DRIFT,
     }
 )
 
@@ -144,9 +150,25 @@ _FAILED_VALUES = frozenset(
         "timeout",
         "down",
         "unhealthy",
+        # MODEL_RATE_LIMITED outcomes meaning no model is left to call. Both
+        # are FAILED; formatting.py words them apart only because the REMEDY
+        # differs (chain_exhausted = every configured alternative is also
+        # down; no_fallback = none was ever configured).
+        #
+        # VALUE-level on purpose. MODEL_RATE_LIMITED must NOT join
+        # _FAILURE_EVENT_TYPES: it is bidirectional and already partly
+        # classified -- outcome=="recovered" resolves to RECOVERED via
+        # _RECOVERED_VALUES (5 of 44 real events), and `failed` wins over
+        # recovery in the precedence order below, so a type-level rule would
+        # render those genuine recoveries as red failures.
+        "chain_exhausted",
+        "no_fallback",
     }
 )
-_DEGRADED_VALUES = frozenset({"degraded", "partial", "impaired"})
+# "diverted" is the successful mitigation: the fallback model took the call,
+# so the system is running-but-worse rather than broken. Calling it FAILED
+# would cry wolf on the very path that saved the request.
+_DEGRADED_VALUES = frozenset({"degraded", "partial", "impaired", "diverted"})
 _PENDING_VALUES = frozenset(
     {"pending", "awaiting_approval", "awaiting_decision", "blocked"}
 )

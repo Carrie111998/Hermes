@@ -540,3 +540,69 @@ def test_security_posture_losses_never_wear_the_ambiguous_marker(event_type):
     verdict = evaluate_outcome(_event({}, event_type=event_type))
 
     assert marker_for_verdict(verdict, Priority.CRITICAL) == "🔴"
+# --- backend drift + rate-limit outcomes (2026-08-20) -----------------------
+# The last two alert-class UNKNOWNs worth fixing, and they need DIFFERENT
+# fixes -- which is the point. The empty-payload sweep flags both the same
+# way; only replaying real payloads shows that one is a monodirectional TYPE
+# and the other is a bidirectional type with unrecognized VALUES.
+
+
+def test_backend_contract_drift_is_failed():
+    """Monodirectional, like its sibling AGENT_LOOP_FAULT (same schema comment
+    block, already classified). The canary fires when drift IS found; there is
+    no drift-resolved variant -- contrast CODE_DRIFT, which has one."""
+    verdict = evaluate_outcome(
+        _event(
+            {"detector": "backend_conformance_canary", "backend": "codex",
+             "signature": "output=None"},
+            event_type=EventType.BACKEND_CONTRACT_DRIFT,
+        )
+    )
+
+    assert verdict.state is OutcomeState.FAILED
+
+
+def _rate_limited(outcome, reason="quota_window"):
+    return _event(
+        {"provider": "deepseek", "model": "deepseek-v4-pro", "reason": reason,
+         "outcome": outcome, "detector": "runtime", "diverted_calls": 1},
+        event_type=EventType.MODEL_RATE_LIMITED,
+        priority=Priority.HIGH,
+    )
+
+
+@pytest.mark.parametrize("outcome", ["chain_exhausted", "no_fallback"])
+def test_rate_limit_outcomes_with_no_model_left_are_failed(outcome):
+    """Both mean no model is available. formatting.py already words them apart
+    because the REMEDY differs (every alternative also down vs none ever
+    configured), but the verdict is the same."""
+    verdict = evaluate_outcome(_rate_limited(outcome))
+
+    assert verdict.state is OutcomeState.FAILED
+
+
+def test_rate_limit_diverted_is_degraded_not_failed():
+    """The fallback WORKED -- running on a second-choice model is worse, not
+    broken. Calling it FAILED would cry wolf on the successful mitigation."""
+    verdict = evaluate_outcome(_rate_limited("diverted", reason="rate_limit"))
+
+    assert verdict.state is OutcomeState.DEGRADED
+
+
+def test_rate_limit_recovered_survives_the_new_failure_values():
+    """THE REGRESSION GUARD, and the reason MODEL_RATE_LIMITED must NOT be
+    added to _FAILURE_EVENT_TYPES. 5 of 44 real events carry outcome=
+    "recovered" and already classified as RECOVERED before this change; a
+    type-level rule would have turned them red, because `failed` wins over
+    recovery in the precedence order.
+    """
+    verdict = evaluate_outcome(_rate_limited("recovered", reason="recovered"))
+
+    assert verdict.state is OutcomeState.RECOVERED
+
+
+@pytest.mark.parametrize("outcome", ["chain_exhausted", "no_fallback", "diverted"])
+def test_rate_limit_outcomes_never_wear_the_ambiguous_marker(outcome):
+    verdict = evaluate_outcome(_rate_limited(outcome))
+
+    assert marker_for_verdict(verdict, Priority.HIGH) != "🟡"
