@@ -36,11 +36,47 @@ _EXPLICIT_OBSERVATIONS_SECTION = re.compile(
     r"^## Explicit Observations\s*\n.*?(?=^## |\Z)", re.MULTILINE | re.DOTALL
 )
 
-_MEMORY_DEDUCTION_GUIDANCE = (
-    "## Adhere to memory guidance\n"
-    "IMPORTANT: If the implicit conclusions section concluded that the user has "
-    "some kind of general preference, you should try to follow that preference "
-    "in your interactions with them if you can."
+#: Opens the injected block. Names the peer the memory is about and binds it to
+#: the person the agent is serving right now, so a third-person representation
+#: ("mei wants ...") is not read as notes about somebody else.
+_MEMORY_SUBJECT_HEADER_NAMED = (
+    "## Who this memory is about\n"
+    "You are working with `{peer}` in this session. Everything below was learned "
+    "about `{peer}` in earlier sessions with them. It describes the user whose "
+    "task you are working on right now — not a third party, and not some other "
+    "project's requirements."
+)
+
+#: Same, for when the peer id cannot be resolved. Naming the wrong person would
+#: be worse than naming nobody, so the fallback asserts the binding without one.
+_MEMORY_SUBJECT_HEADER = (
+    "## Who this memory is about\n"
+    "Everything below was learned about the user you are working with in this "
+    "session, during earlier sessions with them. It describes the user whose "
+    "task you are working on right now — not a third party, and not some other "
+    "project's requirements."
+)
+
+#: Closes the injected block. Placed last so it is the most recent thing the
+#: model reads before it starts work, and phrased to answer the three ways the
+#: block gets discarded: as another project's business, as background rather
+#: than instruction, and as outranked by the agent's own style defaults.
+_MEMORY_DIRECTIVE = (
+    "## Applying this memory\n"
+    "The preferences and instructions above are standing requirements from the "
+    "user you are working with now. They hold until that user changes them.\n"
+    "They are not scoped to the project, language, or repository they were "
+    "stated in. Apply them to the task in front of you now, even when that task "
+    "is in an unrelated domain, codebase, or language: a requirement about how "
+    "to write code or how to report back describes how this user wants you to "
+    "work, not merely what they wanted on the day they said it.\n"
+    "Where a requirement names an exact marker, wording, or format, reproduce it "
+    "literally instead of paraphrasing it or applying it in spirit.\n"
+    "Where a requirement conflicts with your own defaults — brevity, matching "
+    "the surrounding code style, keeping the diff minimal — the user's "
+    "requirement wins.\n"
+    "Before you report the work finished, re-read these requirements and check "
+    "that what you produced satisfies each one that applies to it."
 )
 
 
@@ -644,9 +680,19 @@ class HonchoMemoryProvider(MemoryProvider):
 
         if not parts:
             return ""
-        if any(p.startswith("## User Representation") for p in parts):
-            parts.append(_MEMORY_DEDUCTION_GUIDANCE)
-        return "\n\n".join(parts)
+        return "\n\n".join([self._subject_header()] + parts)
+
+    def _subject_header(self) -> str:
+        """The identity-binding preamble, naming the peer when it can be resolved."""
+        peer = ""
+        try:
+            if self._manager and self._session_key:
+                peer = self._manager.subject_peer_id(self._session_key)
+        except Exception as e:  # a header is never worth failing an injection over
+            logger.debug("Honcho subject peer resolution failed: %s", e)
+        if not peer:
+            return _MEMORY_SUBJECT_HEADER
+        return _MEMORY_SUBJECT_HEADER_NAMED.format(peer=peer)
 
     def system_prompt_block(self) -> str:
         """Return system prompt text, adapted by recall_mode.
@@ -922,7 +968,20 @@ class HonchoMemoryProvider(MemoryProvider):
         result = "\n\n".join(parts)
 
         # ----- Port #3265: token budget enforcement -----
+        # Budget the body, then append the directive, so the directive is not
+        # the first thing a truncation drops — it is the shortest part of the
+        # payload and the only part that says what to do with the rest.
         result = self._truncate_to_budget(result)
+
+        # The directive earns its place only when something preference-bearing
+        # arrived. A card-only or summary-only injection states no requirements,
+        # so telling the model to obey them would point at nothing.
+        carries_preferences = (
+            "## User Representation" in base_context
+            or bool(dialectic_result and dialectic_result.strip())
+        )
+        if carries_preferences:
+            result = f"{result}\n\n{_MEMORY_DIRECTIVE}"
 
         return self._log_injection("injected", result)
 
