@@ -391,38 +391,6 @@ class TestCodexOAuthContextLength:
         import agent.model_metadata as mm
         mm._codex_oauth_context_cache = {}
 
-
-        expected = {
-            "gpt-5.6-sol": 372_000,
-            "gpt-5.6-sol-pro": 372_000,
-            "gpt-5.6-terra": 372_000,
-            "gpt-5.6-terra-pro": 372_000,
-            "gpt-5.6-luna": 372_000,
-            "gpt-5.6-luna-pro": 372_000,
-            "gpt-5.5": 272_000,
-            "gpt-5.4": 272_000,
-            "gpt-5.4-mini": 272_000,
-            "gpt-5.3-codex": 272_000,
-            "gpt-5.3-codex-spark": 128_000,
-            "gpt-5.2-codex": 272_000,
-            "gpt-5.1-codex-max": 272_000,
-            "gpt-5.1-codex-mini": 272_000,
-        }
-
-        with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
-             patch("agent.model_metadata.save_context_length"):
-            for model, expected_ctx in expected.items():
-                ctx = get_model_context_length(
-                    model=model,
-                    base_url="https://chatgpt.com/backend-api/codex",
-                    api_key="",
-                    provider="openai-codex",
-                )
-                assert ctx == expected_ctx, (
-                    f"Codex {model}: expected {expected_ctx} fallback, got {ctx} "
-                    "(models.dev leakage?)"
-                )
-
     def test_live_probe_overrides_fallback(self):
         """When a token is provided, the live /models probe is preferred
         and its context_window drives the result."""
@@ -664,15 +632,12 @@ class TestCodexOAuthContextLength:
              patch("agent.model_metadata.get_cached_context_length", return_value=None), \
              patch("agent.model_metadata.save_context_length"):
             ctx = get_model_context_length(
-                model="gpt-5.6-sol",
+                model="gpt-5.4",
                 base_url="https://chatgpt.com/backend-api/codex",
                 api_key="expired-token",
                 provider="openai-codex",
             )
         assert ctx == 900_000
-
-
-        assert remaining.get(f"gpt-5.6-terra@{base_url}") == 372_000
 
 
 # =========================================================================

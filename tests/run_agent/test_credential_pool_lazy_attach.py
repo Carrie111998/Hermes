@@ -63,6 +63,7 @@ def test_recovery_lazy_attaches_matching_pool_when_agent_pool_missing():
             "message": "The usage limit has been reached",
         },
         api_key_hint="token-current",
+        failure_reason="rate_limit",
     )
     agent._swap_credential.assert_called_once_with(second)
 
@@ -136,6 +137,7 @@ def test_recovery_lazy_attaches_matching_pool_when_agent_pool_missing_and_source
             "message": "The usage limit has been reached",
         },
         api_key_hint="token-current",
+        failure_reason="rate_limit",
     )
     agent._swap_credential.assert_called_once_with(second)
 

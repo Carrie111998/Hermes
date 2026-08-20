@@ -583,7 +583,18 @@ def _fetch_codex_account_usage(
         headers["ChatGPT-Account-Id"] = account_id
     with httpx.Client(timeout=15.0) as client:
         response = client.get(_resolve_codex_usage_url(resolved_base_url), headers=headers)
-        response.raise_for_status()
+        body = getattr(response, "text", "")
+        try:
+            response.raise_for_status()
+        except Exception:
+            return AccountUsageSnapshot(
+                provider="openai-codex",
+                source="usage_api",
+                fetched_at=_utc_now(),
+                unavailable_reason=_codex_usage_unavailable_reason(
+                    response.status_code, body
+                ),
+            )
     payload = response.json() or {}
     rate_limit = payload.get("rate_limit") or {}
     windows: list[AccountUsageWindow] = []
