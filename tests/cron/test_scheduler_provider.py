@@ -640,3 +640,340 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
 
 
+def test_multiplex_ticker_delivers_secondary_origin_via_its_live_adapter(
+    tmp_path, monkeypatch
+):
+    """A Rob-origin Telegram job resolves Rob's live adapter, not default's."""
+    import asyncio
+    from concurrent.futures import Future
+
+    import cron.scheduler as scheduler
+    import gateway.delivery as delivery
+    from cron.scheduler_provider import InProcessCronScheduler
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from hermes_constants import get_hermes_home
+
+    class Adapter:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, chat_id, content, metadata=None):
+            self.sent.append((chat_id, content, metadata))
+            return {"success": True}
+
+    class RunningLoop:
+        def is_running(self):
+            return True
+
+    def run_immediately(coro, loop, **kwargs):
+        future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+
+    luma_home = tmp_path / "luma"
+    rob_home = tmp_path / "rob"
+    for home in (luma_home, rob_home):
+        (home / "cron").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(luma_home))
+
+    luma_adapter = Adapter()
+    rob_adapter = Adapter()
+    luma_adapters = {Platform.TELEGRAM: luma_adapter}
+    rob_adapters = {Platform.TELEGRAM: rob_adapter}
+    gateway_config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True)}
+    )
+    resolved = []
+    real_resolve = delivery.resolve_delivery_transport
+
+    def tracking_resolve(platform, config, adapters):
+        transport = real_resolve(platform, config, adapters)
+        resolved.append((get_hermes_home(), adapters, transport.adapter if transport else None))
+        return transport
+
+    stop = threading.Event()
+    tick_adapters = []
+
+    def tick_secondary_delivery(*args, **kwargs):
+        current_home = get_hermes_home()
+        tick_adapters.append((current_home, kwargs["adapters"]))
+        if current_home == rob_home:
+            assert scheduler._deliver_result(
+                {
+                    "id": "rob-telegram-origin",
+                    "name": "Rob reminder",
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "424242"},
+                },
+                "Rob's scheduled result",
+                adapters=kwargs["adapters"],
+                loop=RunningLoop(),
+            ) is None
+            stop.set()
+        return 0
+
+    monkeypatch.setattr(scheduler, "load_config", lambda: {"cron": {"wrap_response": False}})
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: gateway_config)
+    monkeypatch.setattr(delivery, "resolve_delivery_transport", tracking_resolve)
+    monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", run_immediately)
+    monkeypatch.setattr("cron.scheduler.tick", tick_secondary_delivery)
+    monkeypatch.setattr("cron.jobs.record_ticker_heartbeat", lambda **kwargs: None)
+
+    InProcessCronScheduler().start(
+        stop,
+        interval=0,
+        adapters=luma_adapters,
+        profile_adapters={"rob": rob_adapters},
+        profile_homes=[("default", luma_home), ("rob", rob_home)],
+    )
+
+    assert tick_adapters[0] == (luma_home, luma_adapters)
+    assert tick_adapters[1][0] == rob_home
+    assert tick_adapters[1][1].get(Platform.TELEGRAM) is rob_adapter
+    assert any(
+        home == rob_home and adapter is rob_adapter
+        for home, adapters, adapter in resolved
+    )
+    assert [message[0] for message in rob_adapter.sent] == ["424242"]
+    assert luma_adapter.sent == []
+
+
+def test_multiplex_ticker_never_borrows_default_adapters_for_missing_secondary(
+    tmp_path, monkeypatch
+):
+    """A secondary without live adapters falls back to its own standalone path."""
+    from cron.scheduler_provider import InProcessCronScheduler
+    from gateway.config import Platform
+    from hermes_constants import get_hermes_home
+
+    luma_home = tmp_path / "luma"
+    rob_home = tmp_path / "rob"
+    for home in (luma_home, rob_home):
+        (home / "cron").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(luma_home))
+
+    luma_adapters = {Platform.TELEGRAM: object()}
+    calls = []
+    stop = threading.Event()
+
+    def capture_adapters(*args, **kwargs):
+        calls.append((get_hermes_home(), kwargs["adapters"]))
+        if get_hermes_home() == rob_home:
+            stop.set()
+        return 0
+
+    monkeypatch.setattr("cron.scheduler.tick", capture_adapters)
+    monkeypatch.setattr("cron.jobs.record_ticker_heartbeat", lambda **kwargs: None)
+
+    InProcessCronScheduler().start(
+        stop,
+        interval=0,
+        adapters=luma_adapters,
+        profile_adapters={},
+        profile_homes=[("default", luma_home), ("rob", rob_home)],
+    )
+
+    assert calls[0] == (luma_home, luma_adapters)
+    assert calls[1][0] == rob_home
+    assert calls[1][1].get(Platform.TELEGRAM) is None
+
+
+def test_multiplex_secondary_tick_uses_only_own_adapters_and_shared_relay(
+    tmp_path, monkeypatch
+):
+    """Secondary delivery keeps live profile adapters and the primary Relay only."""
+    import gateway.delivery as delivery
+    from cron.scheduler_provider import InProcessCronScheduler
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from hermes_constants import get_hermes_home
+
+    class Relay:
+        def fronts_platform(self, platform):
+            return platform is Platform.DISCORD
+
+    luma_home = tmp_path / "luma"
+    rob_home = tmp_path / "rob"
+    for home in (luma_home, rob_home):
+        (home / "cron").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(luma_home))
+
+    luma_telegram = object()
+    luma_discord = object()
+    shared_relay = Relay()
+    rob_telegram = object()
+    luma_adapters = {
+        Platform.TELEGRAM: luma_telegram,
+        Platform.DISCORD: luma_discord,
+        Platform.RELAY: shared_relay,
+    }
+    rob_adapters = {Platform.TELEGRAM: rob_telegram}
+    calls = []
+    stop = threading.Event()
+
+    def capture_adapters(*args, **kwargs):
+        calls.append((get_hermes_home(), kwargs["adapters"]))
+        if get_hermes_home() == rob_home:
+            stop.set()
+        return 0
+
+    monkeypatch.setattr("cron.scheduler.tick", capture_adapters)
+    monkeypatch.setattr("cron.jobs.record_ticker_heartbeat", lambda **kwargs: None)
+
+    InProcessCronScheduler().start(
+        stop,
+        interval=0,
+        adapters=luma_adapters,
+        profile_adapters={"rob": rob_adapters},
+        profile_homes=[("default", luma_home), ("rob", rob_home)],
+    )
+
+    assert calls[0] == (luma_home, luma_adapters)
+    secondary_adapters = calls[1][1]
+    assert secondary_adapters.get(Platform.TELEGRAM) is rob_telegram
+    assert secondary_adapters.get(Platform.DISCORD) is None
+    assert secondary_adapters.get(Platform.RELAY) is shared_relay
+    assert set(secondary_adapters) == {Platform.TELEGRAM, Platform.RELAY}
+
+    replacement = object()
+    rob_adapters[Platform.TELEGRAM] = replacement
+    assert secondary_adapters.get(Platform.TELEGRAM) is replacement
+
+    relay_config = GatewayConfig(
+        platforms={Platform.RELAY: PlatformConfig(enabled=True)}
+    )
+    transport = delivery.resolve_delivery_transport(
+        Platform.DISCORD, relay_config, secondary_adapters
+    )
+    assert transport is not None
+    assert transport.adapter is shared_relay
+    assert transport.is_relay
+
+
+def test_multiplex_ticker_keeps_primary_adapters_for_default_and_path_entries(
+    tmp_path, monkeypatch
+):
+    """Default and legacy path-only multiplex entries retain primary adapters."""
+    from cron.scheduler_provider import InProcessCronScheduler
+    from gateway.config import Platform
+    from hermes_constants import get_hermes_home
+
+    default_home = tmp_path / "default"
+    path_only_home = tmp_path / "path-only"
+    for home in (default_home, path_only_home):
+        (home / "cron").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+
+    primary_adapters = {Platform.TELEGRAM: object()}
+    calls = []
+    stop = threading.Event()
+
+    def capture_adapters(*args, **kwargs):
+        calls.append((get_hermes_home(), kwargs["adapters"]))
+        if len(calls) == 2:
+            stop.set()
+        return 0
+
+    monkeypatch.setattr("cron.scheduler.tick", capture_adapters)
+    monkeypatch.setattr("cron.jobs.record_ticker_heartbeat", lambda **kwargs: None)
+
+    InProcessCronScheduler().start(
+        stop,
+        interval=0,
+        adapters=primary_adapters,
+        profile_homes=[("default", default_home), path_only_home],
+    )
+
+    assert calls == [
+        (default_home, primary_adapters),
+        (path_only_home, primary_adapters),
+    ]
+
+
+def test_multiplex_secondary_standalone_delivery_keeps_owner_secret_scope(
+    tmp_path, monkeypatch
+):
+    """Both normal and failure delivery use Rob's token, never Luma's."""
+    import cron.scheduler as scheduler
+    from agent import secret_scope
+    from cron.scheduler_provider import _SecondaryCronAdapterView
+    from gateway.config import Platform
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    luma_home = tmp_path / "luma"
+    rob_home = tmp_path / "rob"
+    for home in (luma_home, rob_home):
+        (home / "cron").mkdir(parents=True)
+    (rob_home / ".env").write_text("TELEGRAM_BOT_TOKEN=rob-token\n")
+    monkeypatch.setenv("HERMES_HOME", str(luma_home))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "luma-token")
+
+    selected_tokens = []
+
+    async def capture_standalone_send(platform, pconfig, *args, **kwargs):
+        assert platform is Platform.TELEGRAM
+        selected_tokens.append(pconfig.token)
+        return {"success": True}
+
+    run_results = iter(
+        [
+            (True, "normal output", "normal delivery", None),
+            RuntimeError("simulated run failure"),
+        ]
+    )
+
+    def fake_run_job(*args, **kwargs):
+        result = next(run_results)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def job(job_id):
+        return {
+            "id": job_id,
+            "name": job_id,
+            "execution_id": f"{job_id}-execution",
+            "deliver": "telegram:424242",
+        }
+
+    def mark_running(execution_id):
+        if execution_id == "early-failure-execution":
+            raise RuntimeError("execution ledger unavailable")
+
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda *args, **kwargs: True)
+    monkeypatch.setattr(scheduler, "mark_execution_running", mark_running)
+    monkeypatch.setattr(scheduler, "run_job", fake_run_job)
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *args, **kwargs: "output")
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *args, **kwargs: True)
+    monkeypatch.setattr(scheduler, "finish_execution", lambda *args, **kwargs: None)
+    monkeypatch.setattr(scheduler, "load_config", lambda: {"cron": {"wrap_response": False}})
+    monkeypatch.setattr(
+        "tools.send_message_tool._send_to_platform", capture_standalone_send
+    )
+
+    previous_multiplex = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    home_token = set_hermes_home_override(str(rob_home))
+    secondary_adapters = _SecondaryCronAdapterView(
+        None, {Platform.TELEGRAM: object()}
+    )
+    try:
+        assert scheduler._run_one_job_body(
+            job("normal"), adapters=secondary_adapters
+        )
+        assert not scheduler._run_one_job_body(
+            job("failure"), adapters=secondary_adapters
+        )
+        # This fails before the normal run scope is installed. The outer
+        # failure path must still resolve delivery under Rob's secret scope,
+        # rather than raising UnboundLocalError for its delivery helper.
+        assert not scheduler._run_one_job_body(
+            job("early-failure"), adapters=secondary_adapters
+        )
+    finally:
+        reset_hermes_home_override(home_token)
+        secret_scope.set_multiplex_active(previous_multiplex)
+
+    assert selected_tokens == ["rob-token", "rob-token", "rob-token"]

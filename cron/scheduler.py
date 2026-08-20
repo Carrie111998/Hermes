@@ -7119,6 +7119,22 @@ def _run_one_job_body(
             fire_claim_lost.set()
         return True
 
+    def _deliver_under_profile_secret_scope(content: str) -> Optional[str]:
+        """Resolve delivery config and standalone credentials per profile."""
+        from agent.secret_scope import (
+            build_profile_secret_scope,
+            reset_secret_scope,
+            set_secret_scope,
+        )
+
+        delivery_scope_token = set_secret_scope(
+            build_profile_secret_scope(_get_hermes_home())
+        )
+        try:
+            return _deliver_result(job, content, adapters=adapters, loop=loop)
+        finally:
+            reset_secret_scope(delivery_scope_token)
+
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
@@ -7374,11 +7390,8 @@ def _run_one_job_body(
                         if not owns_delivery:
                             raise _FireClaimLostDuringSideEffect
                         delivery_attempted = True
-                        delivery_error = _deliver_result(
-                            job,
-                            deliver_content,
-                            adapters=adapters,
-                            loop=loop,
+                        delivery_error = _deliver_under_profile_secret_scope(
+                            deliver_content
                         )
                 except Exception as de:
                     if isinstance(de, _FireClaimLostDuringSideEffect):
@@ -7532,8 +7545,7 @@ def _run_one_job_body(
             else:
                 try:
                     delivery_attempted = True
-                    delivery_error = _deliver_result(
-                        job,
+                    delivery_error = _deliver_under_profile_secret_scope(
                         # Composed exactly like the normal failure delivery above.
                         # mark_job_run below records THIS run in failure_streak
                         # whichever layer failed, so a job that fails before the
@@ -7541,9 +7553,7 @@ def _run_one_job_body(
                         # about: its alerts only ever leave through here, and the
                         # nudge only ever left through there (#88655).
                         _summarize_cron_failure_for_delivery(job, _err_text)
-                        + _failure_streak_nudge(job),
-                        adapters=adapters,
-                        loop=loop,
+                        + _failure_streak_nudge(job)
                     )
                 except Exception as delivery_exc:
                     delivery_error = str(delivery_exc)

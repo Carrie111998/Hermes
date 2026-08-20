@@ -22,6 +22,7 @@ from __future__ import annotations
 import inspect
 import threading
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import Any
 
 # Cap for the exponential tick backoff applied while consecutive ticks fail
@@ -30,6 +31,42 @@ from typing import Any
 # here so a still-alive-but-exhausted gateway never sleeps longer than this
 # between recovery attempts.
 _EMFILE_BACKOFF_MAX_SECONDS = 15 * 60  # 15 minutes
+
+
+class _SecondaryCronAdapterView(Mapping):
+    """Live secondary adapters plus the primary-owned Relay transport only."""
+
+    def __init__(self, secondary_adapters, primary_adapters):
+        from gateway.config import Platform
+
+        self._secondary_adapters = (
+            secondary_adapters if secondary_adapters is not None else {}
+        )
+        self._primary_adapters = (
+            primary_adapters if primary_adapters is not None else {}
+        )
+        self._relay_platform = Platform.RELAY
+
+    def __getitem__(self, platform):
+        if platform == self._relay_platform:
+            return self._primary_adapters[platform]
+        return self._secondary_adapters[platform]
+
+    def __iter__(self):
+        if self._relay_platform in self._primary_adapters:
+            yield self._relay_platform
+        yield from (
+            platform
+            for platform in self._secondary_adapters
+            if platform != self._relay_platform
+        )
+
+    def __len__(self):
+        return (
+            len(self._secondary_adapters)
+            - int(self._relay_platform in self._secondary_adapters)
+            + int(self._relay_platform in self._primary_adapters)
+        )
 
 
 def _backoff_wait_seconds(interval: float, consecutive_failures: int) -> float:
@@ -532,6 +569,7 @@ class InProcessCronScheduler(CronScheduler):
         interval=60,
         can_dispatch=None,
         profile_homes=None,
+        profile_adapters=None,
     ):
         import logging
         from cron.scheduler import tick as cron_tick
@@ -556,6 +594,7 @@ class InProcessCronScheduler(CronScheduler):
                 stop_event,
                 profile_homes=profile_homes,
                 adapters=adapters,
+                profile_adapters=profile_adapters,
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
@@ -627,6 +666,7 @@ class InProcessCronScheduler(CronScheduler):
         *,
         profile_homes,
         adapters=None,
+        profile_adapters=None,
         loop=None,
         interval=60,
         can_dispatch=None,
@@ -682,13 +722,22 @@ class InProcessCronScheduler(CronScheduler):
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
                     for entry in profile_homes:
+                        profile_name = entry[0] if isinstance(entry, tuple) else None
                         home = entry[1] if isinstance(entry, tuple) else entry
+                        tick_adapters = (
+                            adapters
+                            if profile_name in (None, "default")
+                            else _SecondaryCronAdapterView(
+                                (profile_adapters or {}).get(profile_name),
+                                adapters,
+                            )
+                        )
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
                                 cron_tick(
                                     verbose=False,
-                                    adapters=adapters,
+                                    adapters=tick_adapters,
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,
