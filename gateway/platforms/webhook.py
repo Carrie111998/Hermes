@@ -929,9 +929,13 @@ class WebhookAdapter(BasePlatformAdapter):
             session_key = self._render_prompt(session_key_tpl, payload, event_type, route_name).strip()
             if "{" in session_key:
                 session_key = ""
-        session_chat_id = f"webhook:{route_name}:{session_key or delivery_id}"
-
         is_persistent_session = bool(session_key)
+        session_identity = (
+            f"session:{session_key}"
+            if is_persistent_session
+            else f"delivery:{delivery_id}"
+        )
+        session_chat_id = f"webhook:{route_name}:{session_identity}"
         delivery_info_key = delivery_id if is_persistent_session else session_chat_id
 
         # Store delivery info for send(). Persistent conversations keep this

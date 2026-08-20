@@ -257,7 +257,7 @@ class TestCrossPlatformDelivery:
             assert resp.status == 202
 
         # The adapter should have stored delivery info
-        chat_id = "webhook:alerts:alert-001"
+        chat_id = "webhook:alerts:delivery:alert-001"
         assert chat_id in adapter._delivery_info
 
         # Now call send() as if the agent has finished
@@ -338,14 +338,51 @@ class TestCrossPlatformDelivery:
             await _drain_background_tasks(adapter)
 
         assert seen_chat_ids == [
-            "webhook:support:tenant-7:account-3:conversation-9",
-            "webhook:support:tenant-7:account-3:conversation-9",
+            "webhook:support:session:tenant-7:account-3:conversation-9",
+            "webhook:support:session:tenant-7:account-3:conversation-9",
         ]
         assert "delivery-1" in adapter._delivery_info
         assert "delivery-2" in adapter._delivery_info
         assert mock_tg_adapter.send.await_args_list == [
             call("chat-a", "reply-delivery-1", metadata=None),
             call("chat-b", "reply-delivery-2", metadata=None),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_persistent_key_and_fallback_delivery_use_disjoint_session_ids(self):
+        """A fallback delivery ID cannot close or reuse a persistent conversation."""
+        routes = {
+            "support": {
+                "secret": _INSECURE_NO_AUTH,
+                "session_key": "{conversation_id}",
+                "prompt": "{message}",
+                "deliver": "log",
+            }
+        }
+        adapter = _make_adapter(routes)
+        adapter.handle_message = AsyncMock()
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            persistent = await cli.post(
+                "/webhooks/support",
+                json={"conversation_id": "abc", "message": "persistent turn"},
+                headers={"X-GitHub-Delivery": "persistent-delivery"},
+            )
+            fallback = await cli.post(
+                "/webhooks/support",
+                json={"message": "fallback turn"},
+                headers={"X-GitHub-Delivery": "abc"},
+            )
+            assert persistent.status == fallback.status == 202
+            await _drain_background_tasks(adapter)
+
+        seen_chat_ids = [
+            call.args[0].source.chat_id for call in adapter.handle_message.await_args_list
+        ]
+        assert seen_chat_ids == [
+            "webhook:support:session:abc",
+            "webhook:support:delivery:abc",
         ]
 
 
@@ -386,7 +423,7 @@ class TestGitHubCommentDelivery:
             )
             assert resp.status == 202
 
-        chat_id = "webhook:pr-bot:gh-comment-001"
+        chat_id = "webhook:pr-bot:delivery:gh-comment-001"
         assert chat_id in adapter._delivery_info
 
         # Verify deliver_extra was rendered with payload data
