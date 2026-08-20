@@ -1,8 +1,9 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
 
+import { defineLocale } from './define-locale'
 import type { Translations } from './types'
 
-export const zh: Translations = {
+export const zh: Translations = defineLocale({
   common: {
     apply: '应用',
     back: '返回',
@@ -3496,4 +3497,4 @@ export const zh: Translations = {
       toggle: open => `${open ? '显示' : '隐藏'}侧边栏`
     }
   }
-}
+})

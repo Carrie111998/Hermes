@@ -5,7 +5,7 @@
 // partial locales should use `defineLocale()` so missing desktop-only strings
 // fall back to English while new keys remain type-checked.
 
-export type Locale = 'en' | 'zh' | 'zh-hant' | 'ja' | 'ar'
+export type Locale = 'en' | 'zh' | 'zh-hant' | 'ja' | 'ar' | 'es'
 
 export type ToolTitleKey =
   | 'browser_click'
@@ -330,6 +330,10 @@ export interface Translations {
       disable: string
       failed: string
       empty: string
+      unavailable: string
+      couldNotResolveFolder: string
+      couldNotOpenFolder: string
+      backendHomeMissing: string
       kinds: { bundled: string; disk: string; runtime: string }
       agent: {
         title: string
@@ -791,6 +795,310 @@ export interface Translations {
       appliesTo: string
       editsProfile: (profile: string) => string
     }
+    memory: {
+      connect: string
+      connectViaOauth: string
+      reconnect: string
+      apiKeySet: string
+      oauthSet: string
+      waitingConsent: string
+      cancel: string
+      couldNotStart: string
+      startFailed: string
+      timedOut: string
+      connectionFailed: string
+      leaveBlankToKeep: string
+      set: string
+      about: (label: string) => string
+      saved: (label: string) => string
+      configUpdated: string
+      saveSettingsFailed: (label: string) => string
+      fullConfigTitle: (label: string) => string
+      fullConfigDesc: (label: string, profile: string) => string
+      configReference: (label: string) => string
+      saveChanges: string
+      loadFailed: string
+      retry: string
+      loading: string
+      settingsFor: (label: string) => string
+      setPill: (label: string) => string
+      notSetPill: (label: string) => string
+      fullConfig: string
+      saveFieldFailed: (label: string) => string
+    }
+    customEndpoints: {
+      title: string
+      emptyTitle: string
+      emptyDesc: string
+      active: string
+      use: string
+      deleteEndpoint: string
+      deleteConfirm: (name: string) => string
+      editEndpoint: string
+      addEndpoint: string
+      newEndpoint: string
+      name: string
+      providerId: string
+      endpointUrl: string
+      defaultModel: string
+      context: string
+      apiKey: string
+      useForNewChats: string
+      discoverModels: string
+      test: string
+      save: string
+      saved: string
+      apiKeySet: string
+      optional: string
+      leaveBlankToKeep: string
+      loadFailed: string
+      saveFailed: string
+      validationFailed: string
+      validationFailedTitle: string
+      reachable: string
+      reachableFound: (count: number) => string
+      activationFailed: string
+      deleteFailed: string
+    }
+    computerUse: {
+      platformNoteLinux: string
+      platformNoteWindows: string
+      granted: string
+      notGranted: string
+      unknown: string
+      readStatusFailed: string
+      requestPermissionsFailed: string
+      approveTitle: string
+      approveMessage: string
+      checking: string
+      unsupported: (platform: string) => string
+      installDriver: string
+      installDriverThenGrant: string
+      grantsAttach: string
+      recheck: string
+      accessibility: string
+      accessibilityHint: string
+      screenRecording: string
+      screenRecordingHint: string
+      driverHealth: string
+      ready: string
+      notReady: string
+      readyMessage: string
+      waitingApproval: string
+      grantPermissions: string
+    }
+    uninstall: {
+      dangerZone: string
+      checking: string
+      confirmTitle: string
+      confirmDesc: (consequence: string) => string
+      appPath: (path: string) => string
+      uninstalling: string
+      yesUninstall: string
+      cancel: string
+      title: string
+      intro: string
+      guiTitle: string
+      guiDesc: string
+      guiConsequence: string
+      liteTitle: string
+      liteDesc: string
+      liteConsequence: string
+      fullTitle: string
+      fullDesc: string
+      fullConsequence: string
+      couldNotStart: string
+    }
+    billingPlans: {
+      checkingChange: string
+      cannotMakeHere: string
+      cannotScheduleHere: string
+      alreadyOn: (name: string) => string
+      changeTo: (name: string, date: string) => string
+      monthlyCreditsChange: (delta: string) => string
+      tryAgain: string
+      scheduling: string
+      confirmDowngrade: string
+      cancel: string
+      currentPlan: string
+      scheduled: string
+      downgrade: string
+      backToBilling: string
+      plans: string
+      noPlansAvailable: string
+    }
+    /** Billing overview copy (sections, summary cards, rows, notices). */
+    billing: {
+      billing: string
+      plan: string
+      paymentAndCredits: string
+      usage: string
+      invoices: string
+      balance: string
+      autoRefill: string
+      enabled: string
+      off: string
+      openPortal: string
+      addCard: string
+      choose: string
+      adjustPlan: string
+      changePlan: string
+      viewPlans: string
+      differentCard: string
+      planValue: (tier: string, price: string) => string
+      addPaymentMethod: string
+      update: string
+      manage: string
+      reconcile: string
+      buy: string
+      undo: string
+      undoing: string
+      free: string
+      perMonth: (price: string) => string
+      creditsPerMonth: (credits: string) => string
+      connectTitle: string
+      connectMessage: string
+      noCardTitle: string
+      noCardMessage: string
+      paymentMethod: string
+      paymentMethodDesc: string
+      buyCreditsNow: string
+      buyCreditsDesc: string
+      refillWhenLow: string
+      refillManageDesc: string
+      refillTurnOn: string
+      refillCharges: (card: string) => string
+      refillChargesConfigured: (reloadTo: string, threshold: string) => string
+      refillKeepTopped: string
+      subscriptionUnavailable: string
+      noSubscription: string
+      planCancelsOn: (date: string) => string
+      planChangesTo: (tier: string, date: string) => string
+      planRenews: (date: string) => string
+      subCredits: string
+      subCreditsRemaining: string
+      subResets: (date: string) => string
+      subLeft: (remaining: string, monthly: string) => string
+      subOver: (remaining: string, monthly: string, over: string) => string
+      topupCredits: string
+      topupNoExpire: string
+      monthlyCap: string
+      monthlyCapUsed: string
+      monthlyCapUsedOf: (spent: string, limit: string) => string
+      capDefault: string
+      capCustom: string
+      usageFallback: (label: string) => string
+      processingSettlement: string
+      addedRefreshing: (amount: string) => string
+      openPortalLabel: string
+      retry: string
+      customCreditAmount: string
+      billingPreviewFixture: string
+      preview: string
+      live: string
+      provenanceAutoRefill: string
+      provenanceCustomerDefault: string
+      provenanceSubPin: string
+    }
+    /** Billing refusal banners (resolveRefusal title + message per refusal kind). */
+    billingErrors: {
+      consentRequiredTitle: string
+      consentRequiredMessage: string
+      insufficientScopeTitle: string
+      insufficientScopeMessage: string
+      revokedByAdmin: string
+      revokedByUser: string
+      revokedTitle: string
+      revokedMessage: (who: string) => string
+      sessionRevokedTitle: string
+      sessionRevokedMessage: string
+      spendingOffTitle: string
+      spendingOffMessage: string
+      roleRequiredTitle: string
+      roleRequiredMessage: string
+      idempotencyConflictTitle: string
+      idempotencyConflictMessage: string
+      noPaymentMethodTitle: string
+      noPaymentMethodMessage: string
+      orgAccessDeniedTitle: string
+      orgAccessDeniedMessage: string
+      monthlyCapReachedTitle: string
+      monthlyCapReachedMessage: string
+      monthlyCapReachedHeadroom: (remaining: string) => string
+      rateLimitedTitle: string
+      rateLimitedMessage: (mins: string) => string
+      stripeUnavailableTitle: string
+      stripeUnavailableMessage: (mins: string) => string
+      upgradeCapTitle: string
+      upgradeCapMessage: string
+      endpointUnavailableTitle: string
+      endpointUnavailableMessage: string
+      timeoutTitle: string
+      timeoutMessage: string
+      transportTitle: string
+      transportMessage: string
+      genericFailedTitle: string
+      genericFailedMessage: string
+      retryInMinutes: (mins: string) => string
+    }
+    /** Charge (top-up buy) flow outcomes. */
+    billingCharge: {
+      creditsAdded: string
+      amountAdded: (amount: string) => string
+      failedTitle: string
+      unconfirmedTitle: string
+      unconfirmedMessage: (refusal: string) => string
+      couldNotCheckTitle: string
+      couldNotCheckMessage: string
+      noChargeIdMessage: string
+      noChargeIdTitle: string
+      timedOutTitle: string
+      timedOutMessage: string
+      bankVerification: string
+      cardExpired: string
+      cardDeclined: string
+      genericFailed: (reason: string) => string
+    }
+    /** Remote Spending step-up verification messages. */
+    billingStepUp: {
+      notApprovedTitle: string
+      notApprovedMessage: string
+      completeTitle: string
+      completeMessage: string
+    }
+    /** Auto-refill row (in-app edit form). */
+    billingAutoReload: {
+      thresholdLabel: string
+      thresholdAria: string
+      reloadToLabel: string
+      reloadToAria: string
+      updated: string
+      turnedOff: string
+      confirmTurnOff: string
+      turnOff: string
+      cancel: string
+      disable: string
+      saving: string
+      save: string
+      manage: string
+    }
+    /** Auto-refill amount validation errors. */
+    billingAmounts: {
+      thresholdLabel: string
+      reloadToLabel: string
+      mustBeGreater: string
+      enterAmount: (label: string) => string
+      greaterThanZero: (label: string) => string
+      minimum: (label: string, amount: string) => string
+      maximum: (label: string, amount: string) => string
+    }
+    /** Billing api refusal fallback. */
+    billingApi: {
+      requestFailed: string
+    }
+    /** Optional per-locale provider taglines (keyed by provider name) that
+     *  override the English defaults in settings/constants PROVIDER_GROUPS. */
+    providerDescriptions?: Record<string, string>
     mcp: {
       loading: string
       failedLoad: string
