@@ -44,6 +44,30 @@ def _multiplex_active() -> bool:
         return False
 
 
+class _LocalCapabilityEnvVars(tuple):
+    """Expose the process-local bearer only in a single-profile runtime.
+
+    ``hermes_cli.auth`` snapshots plugin provider metadata into its generic
+    API-key registry.  Freemaxxing's bearer is different from an upstream
+    credential: it is a process-local capability for an authenticated loopback
+    listener.  The generic resolver still needs to carry it to the OpenAI
+    client in classic mode, but it must become invisible as soon as multiplex
+    mode is active so one profile can never inherit another process-global
+    capability.
+
+    A tuple subclass preserves the registry's ordinary sequence contract while
+    making iteration scope-aware at the exact secret-resolution boundary.
+    """
+
+    def __new__(cls):
+        return super().__new__(cls, ("FREEMAXXING_API_KEY",))
+
+    def __iter__(self):
+        if _multiplex_active():
+            return iter(())
+        return super().__iter__()
+
+
 def _assert_single_profile_runtime() -> None:
     if _multiplex_active():
         raise RuntimeError(
@@ -255,6 +279,25 @@ def _register() -> None:
             fallback_models=(_ROUTER_MODEL,),
         )
     )
+
+    # ``hermes_cli.auth`` may already be importing while provider discovery
+    # reaches this plugin.  Its registry objects exist before the auto-extension
+    # loop, so install the runtime composition bridge here.  This closes the
+    # import-order hole where the profile is discoverable but the generic
+    # resolver snapshots no usable local capability.
+    from hermes_cli.auth import PROVIDER_REGISTRY, ProviderConfig
+
+    runtime_config = ProviderConfig(
+        id="freemaxxing",
+        name="Freemaxxing",
+        auth_type="api_key",
+        inference_base_url=base_url,
+        api_key_env_vars=_LocalCapabilityEnvVars(),
+    )
+    PROVIDER_REGISTRY["freemaxxing"] = runtime_config
+    PROVIDER_REGISTRY["fm"] = runtime_config
+    PROVIDER_REGISTRY["freemaxxing-auto"] = runtime_config
+
     logger.info(
         "freemaxxing: provider registered at %s; upstream pool remains lazy",
         base_url,
