@@ -2502,21 +2502,26 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         return agent._try_activate_fallback(reason)
 
     # Skip entries that resolve to the same backend that just failed —
-    # falling back to it loops the failure. Identity semantics (which axes
-    # distinguish two backends, shim aliases, first-class credential
-    # surfaces, multi-endpoint pools) are owned by agent.backend_identity —
-    # see #22548, #70893, #62984. Do not re-implement comparisons here.
+# falling back to it loops the failure. Identity semantics (which axes
+# distinguish two backends, shim aliases, first-class credential
+# surfaces, multi-endpoint pools) are owned by agent.backend_identity —
+# see #22548, #70893, #62984. Do not re-implement comparisons here.
     from agent.backend_identity import BackendIdentity, should_skip_candidate
+    from hermes_cli.fallback_config import resolve_entry_api_key
+
+    fb_api_key_hint = resolve_entry_api_key(fb)
 
     current_ident = BackendIdentity.build(
         provider=getattr(agent, "provider", ""),
         model=getattr(agent, "model", ""),
         base_url=str(getattr(agent, "base_url", "") or ""),
+        credential=getattr(agent, "api_key", ""),
     )
     fb_ident = BackendIdentity.build(
         provider=fb_provider,
         model=fb_model,
         base_url=(fb.get("base_url") or ""),
+        credential=fb_api_key_hint,
     )
     if should_skip_candidate(fb_ident, current_ident):
         logger.warning(

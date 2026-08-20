@@ -83,6 +83,9 @@ def _norm_model(value: Optional[str]) -> str:
 def _norm_base_url(value: Optional[str]) -> str:
     return (value or "").strip().rstrip("/").lower()
 
+def _norm_credential(value: Optional[str]) -> str:
+    return (value or "").strip()
+
 
 @dataclass(frozen=True)
 class BackendIdentity:
@@ -96,6 +99,7 @@ class BackendIdentity:
     provider: str = ""
     model: str = ""
     base_url: str = ""
+    credential: str = ""
 
     @classmethod
     def build(
@@ -103,11 +107,13 @@ class BackendIdentity:
         provider: Optional[str] = None,
         model: Optional[str] = None,
         base_url: Optional[str] = None,
+        credential: Optional[str] = None,
     ) -> "BackendIdentity":
         return cls(
             provider=_norm_provider(provider),
             model=_norm_model(model),
             base_url=_norm_base_url(base_url),
+            credential=_norm_credential(credential),
         )
 
 
@@ -139,6 +145,8 @@ def same_credential_surface(a: BackendIdentity, b: BackendIdentity) -> bool:
     never proves a shared credential; it is only used as a weak signal
     when a provider label is missing entirely.
     """
+    if a.credential and b.credential:
+        return a.credential == b.credential
     if a.provider and b.provider:
         # Same label = same configured credential. Different labels =
         # different credential config (first-class registry providers
@@ -166,6 +174,8 @@ def same_deployment(a: BackendIdentity, b: BackendIdentity) -> bool:
     explicit URLs is two deployments — a pool).  A side with an unknown URL
     inherits the provider default and cannot prove difference.
     """
+    if a.credential and b.credential and a.credential != b.credential:
+        return False
     if not (a.provider and b.provider and a.provider == b.provider):
         # Same-host different-label shims: same URL + same model IS the same
         # deployment even when the alias labels differ (#22548) — unless both

@@ -79,6 +79,13 @@ class TestSameDeployment:
             assert not should_skip_candidate(a, b, FailureScope.MODEL)
 
 
+    def test_different_credential_same_provider_model_base_url_is_different_deployment(self):
+        """Different credentials on same provider/model/base_url -> different deployment."""
+        failed = BackendIdentity.build(provider="custom", model="m", base_url="http://host/v1", credential="key1")
+        candidate = BackendIdentity.build(provider="custom", model="m", base_url="http://host/v1", credential="key2")
+        assert not same_deployment(candidate, failed)
+        assert not should_skip_candidate(candidate, failed, FailureScope.MODEL)
+
 class TestSameCredentialSurface:
     def test_same_provider_label_shares_credential(self):
         """Auth/payment failure on a provider kills every model on it —
@@ -104,6 +111,13 @@ class TestSameCredentialSurface:
         assert not same_credential_surface(a, b)
 
 
+
+    def test_different_credential_same_provider_model_base_url_different_credential_surface(self):
+        """Different credentials -> different credential surface."""
+        a = BackendIdentity.build(provider="custom", model="m", base_url="http://host/v1", credential="key1")
+        b = BackendIdentity.build(provider="custom", model="m", base_url="http://host/v1", credential="key2")
+        assert not same_credential_surface(a, b)
+        assert not should_skip_candidate(a, b, FailureScope.CREDENTIAL)
 
 class TestSameEndpoint:
     def test_same_explicit_url_is_same_endpoint(self):
