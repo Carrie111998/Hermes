@@ -7,7 +7,7 @@ fails here instead of silently misrouting in production.
 
 import pytest
 
-from events.outcomes import OutcomeState
+from events.outcomes import OutcomeState, marker_for_verdict
 from events.routing_policy import (
     ACTION_REQUIRED,
     AGENTS_MEMORY,
@@ -855,3 +855,83 @@ def test_agent_note_never_escalates_via_the_whatsapp_adapter():
             priority=priority,
         )
         assert classify_tier(event) is None
+# --- critical-tier outages render red (2026-08-19) --------------------------
+# 160ed2d477 made a transition-to-unhealthy verdict FAILED, but the header
+# still wore 🟠: marker_for_verdict reserves 🔴 for Priority.CRITICAL and
+# probe transitions arrive at HIGH. Diego asked for critical-tier outages to
+# read red, which means flooring the PRIORITY, not special-casing the marker.
+#
+# The safety property is that this must NOT change escalation. The policy
+# entry pins wa=WA_URGENT explicitly, and _derive_wa returns an explicit pin
+# unchanged, so wa_tier stays "urgent" and quiet hours still queue it. If a
+# future edit drops that pin, CRITICAL would derive a different tier and a
+# 3am disk-space blip would break through — test_critical_tier_outage_does_
+# not_become_a_quiet_hours_breakthrough is what catches that.
+
+
+def _probe(after, tier="critical", before="healthy", priority=Priority.HIGH):
+    return Event.create(
+        event_type=EventType.WATCHDOG_PROBE_TRANSITION,
+        source="watchdog",
+        payload={
+            "watchdog_type": "watchdog_probe_transition",
+            "probe": "Hermes API Server :8642",
+            "tier": tier,
+            "category": "hermes",
+            "before": before,
+            "after": after,
+            "detail": "",
+        },
+        priority=priority,
+    )
+
+
+def test_critical_tier_outage_is_floored_to_critical():
+    route = classify(_probe("down"))
+
+    assert route.verdict.state is OutcomeState.FAILED
+    assert route.priority is Priority.CRITICAL
+
+
+def test_critical_tier_outage_renders_red():
+    route = classify(_probe("down"))
+
+    assert marker_for_verdict(route.verdict, route.priority) == "🔴"
+
+
+def test_critical_tier_outage_does_not_become_a_quiet_hours_breakthrough():
+    """The whole point of flooring priority was the DOT. Escalation must not
+    move: WA_URGENT is queued during quiet hours, WA_IMMEDIATE is not."""
+    route = classify(_probe("down"))
+
+    assert route.wa_tier == WA_URGENT
+
+
+def test_non_critical_tier_outage_is_not_floored():
+    """An 'important' or 'optional' probe going down is still a failure, but
+    it is not a red-alert outage -- 159 of the 301 real probe transitions on
+    this box are tier=important, so over-flooring would repaint most of them."""
+    for tier in ("important", "optional"):
+        route = classify(_probe("down", tier=tier))
+
+        assert route.verdict.state is OutcomeState.FAILED
+        assert route.priority is Priority.HIGH
+        assert marker_for_verdict(route.verdict, route.priority) == "🟠"
+
+
+def test_critical_tier_recovery_is_not_floored():
+    """Only the FAILED direction is an outage. A recovery must not inherit
+    the red-alert priority just because the probe is critical-tier."""
+    route = classify(_probe("healthy", before="down"))
+
+    assert route.verdict.state is OutcomeState.RECOVERED
+    assert route.priority is not Priority.CRITICAL
+    assert marker_for_verdict(route.verdict, route.priority) == "🟢"
+
+
+def test_critical_tier_degraded_is_not_floored():
+    """DEGRADED is a partial outage, not a red alert."""
+    route = classify(_probe("degraded"))
+
+    assert route.verdict.state is OutcomeState.DEGRADED
+    assert route.priority is not Priority.CRITICAL

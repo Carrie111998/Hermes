@@ -634,6 +634,27 @@ def classify(
     priority = _clamp(event.priority, _class_floor(attention))
     priority = _clamp(priority, verdict.priority_floor)
     priority = _clamp(priority, spec.priority_floor)
+    # A CRITICAL-tier probe that has actually FAILED is a red alert: 160ed2d477
+    # made it verdict FAILED, but marker_for_verdict reserves the red dot for
+    # Priority.CRITICAL and these arrive at HIGH, so a :8642 outage still wore
+    # the same amber as a routine warning. Raise the PRIORITY rather than
+    # special-casing the marker, so the dot follows from the verdict contract.
+    #
+    # ESCALATION IS DELIBERATELY UNCHANGED. The policy entry pins wa=WA_URGENT
+    # and _derive_wa returns an explicit pin untouched, so wa_tier stays
+    # "urgent" and quiet hours still QUEUE this rather than breaking through.
+    # If a future edit drops that pin, CRITICAL would derive a different tier
+    # and a 3am blip would wake the operator; the routing test named
+    # ...does_not_become_a_quiet_hours_breakthrough exists to catch exactly that.
+    #
+    # Scoped three ways on purpose: FAILED only (a recovery must not inherit a
+    # red-alert priority), DEGRADED excluded (a partial outage is not a red
+    # alert), and tier == "critical" only -- 159 of the 301 real probe
+    # transitions on this box are tier=important, so flooring on any tier would
+    # repaint most of the feed red and cost the dot its meaning.
+    _tier = event.payload.get("tier") if isinstance(event.payload, dict) else None
+    if verdict.state is OutcomeState.FAILED and str(_tier or "").strip().lower() == "critical":
+        priority = _clamp(priority, Priority.CRITICAL)
     priority = _cap(priority, _class_cap(attention))
     # Per-type ceiling last, so it beats every floor above it — including the
     # verdict floor, which a payload key such as status:"failed" can raise.
