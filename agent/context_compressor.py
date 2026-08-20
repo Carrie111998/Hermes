@@ -313,7 +313,7 @@ def _content_has_images(content: Any) -> bool:
 
 
 def _strip_images_from_content(content: Any) -> Any:
-    """Return a copy of ``content`` with every image part replaced by a
+    """Return a copy of ``content`` withevery image part replaced by a
     short text placeholder.
 
     - String content is returned unchanged.
@@ -1238,7 +1238,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         """Generate a structured summary of conversation turns.
 
         Uses a structured template (Goal, Progress, Decisions, Resolved/Pending
-        Questions, Files, Remaining Work) with explicit preamble telling the
+        Questions, Files, Remaining Work) withexplicit preamble telling the
         summarizer not to answer questions.  When a previous summary exists,
         generates an iterative update instead of summarizing from scratch.
 
