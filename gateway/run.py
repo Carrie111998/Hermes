@@ -215,6 +215,116 @@ def check_reply_for_pending_ref(reply_to_text: Optional[str]) -> ReplyRefCheck:
     )
 
 
+# ---------------------------------------------------------------------------
+# oauth_reauth quote-reply short-circuit
+#
+# A NARROWER, ADDITIVE special case on top of check_reply_for_pending_ref()
+# (never forked/duplicated — reused as-is above). Every OTHER subsystem
+# (upstream_fix, upstream_pr_fix, anything future) keeps routing through the
+# normal agent turn exactly as before; this block only ever fires for
+# subsystem == "oauth_reauth", and only after the general ref-tag check has
+# already confirmed a live pending record exists. See
+# _handle_message_with_agent's call site for where this bypasses agent
+# dispatch entirely.
+# ---------------------------------------------------------------------------
+
+_OAUTH_REAUTH_SUBSYSTEM = "oauth_reauth"
+
+# Google's redirect URL is "http://localhost:1/?state=...&code=XXXX&scope=...";
+# the user may paste that whole URL, or just the bare code. Match either:
+# a "code=" query param (stop at the next "&" or end of string) OR, when no
+# such param is present, treat the entire trimmed input as the bare code.
+_OAUTH_CODE_QUERY_PARAM_RE = re.compile(r"[?&]code=([^&\s]+)")
+
+
+def extract_oauth_code_from_reply(text: Optional[str]) -> Optional[str]:
+    """Pull a Google OAuth authorization code out of a user's reply text.
+
+    Handles both shapes a real person will actually paste:
+      * the full redirect URL, e.g. "http://localhost:1/?state=xyz&code=4/0A...&scope=..."
+      * just the bare code, e.g. "4/0AVGzR1..."
+
+    Returns ``None`` for empty/whitespace-only input. Never raises — this is
+    a pure function driven entirely by regex/string ops so it stays cheaply
+    unit-testable in isolation from the gateway.
+    """
+    if not text:
+        return None
+    candidate = text.strip()
+    if not candidate:
+        return None
+
+    match = _OAUTH_CODE_QUERY_PARAM_RE.search(candidate)
+    if match:
+        code = match.group(1).strip()
+        return code or None
+
+    # No "code=" param found. If this looks like a URL at all (has a
+    # scheme), there's no code to extract — don't fall through to treating
+    # the whole URL as a "bare code" (that would silently hand setup.py a
+    # garbage value instead of a clear error).
+    if "://" in candidate:
+        return None
+
+    # Otherwise treat the whole trimmed input as the bare code. Guard against
+    # someone pasting something containing whitespace (e.g. accidentally
+    # including surrounding text) — a real OAuth code never contains spaces.
+    if any(ch.isspace() for ch in candidate):
+        return None
+    return candidate
+
+
+# Same name/location scripts/hermes-oauth-expiry-check.py's job maintains —
+# see that script's module docstring for the full Part 2/Part 3 coupling
+# note. Both sides read/write the SAME file so a successful re-auth here
+# resets that job's one-time heads-up/expired flags for a clean new cycle,
+# without either side importing the other as a module.
+_OAUTH_REAUTH_NOTIFY_STATE_FILE_NAME = "oauth_reauth_notify_state.json"
+
+
+def _reset_oauth_reauth_notify_state(hermes_home: Path, identity: str) -> None:
+    """Clear ``identity``'s one-time sent-flags in the shared notify-state
+    file after a successful re-auth, so the daily expiry-check job's next
+    run starts a fresh cycle. Mirrors
+    scripts/hermes-oauth-expiry-check.py's ``reset_identity_cycle`` /
+    ``_blank_identity_state`` — kept as a small independent copy here
+    (rather than importing that script as a module) because it is a script,
+    not a package, and gateway/run.py should not grow a filesystem-path
+    dependency on scripts/ layout. If this shape ever changes, update both.
+    """
+    state_path = hermes_home / "cron" / _OAUTH_REAUTH_NOTIFY_STATE_FILE_NAME
+    state: Dict[str, Any] = {}
+    try:
+        if state_path.is_file():
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning(
+            "oauth_reauth: could not read notify-state file %s before reset; "
+            "starting from empty state",
+            state_path, exc_info=True,
+        )
+        state = {}
+
+    state[identity] = {
+        "last_known_recorded_at": None,
+        "heads_up_sent_at": None,
+        "expired_sent_at": None,
+    }
+
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = state_path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(tmp_path, state_path)
+    except Exception:
+        logger.warning(
+            "oauth_reauth: failed to write reset notify-state for identity=%s "
+            "(non-fatal — the daily job will just re-derive the cycle from "
+            "the sidecar timestamp next run)",
+            identity, exc_info=True,
+        )
+
+
 _HYGIENE_COOLDOWN_LADDER_MULTIPLIERS = (1, 3, 9)
 # Absolute ceiling on an escalated hygiene cooldown, mirroring
 # _RECONNECT_BACKOFF_CAP above: with an operator-raised base the multiplier
@@ -18768,6 +18878,133 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    async def _handle_oauth_reauth_reply(self, event, source, ref_check: "ReplyRefCheck") -> None:
+        """Deterministically handle a quote-reply to a pending oauth_reauth
+        reminder — NO agent turn, ever.
+
+        Called only from ``_handle_message_with_agent``'s short-circuit,
+        after ``check_reply_for_pending_ref`` has already confirmed
+        ``ref_check.subsystem == "oauth_reauth"`` and a live pending record
+        exists for ``ref_check.pending_id``. This method owns everything
+        else: extracting the code, running the token exchange, and sending a
+        direct confirmation/error reply — the caller's job ends at ``return``
+        right after awaiting this.
+        """
+        pending_id = ref_check.pending_id
+        try:
+            from tools import write_approval as wa
+        except Exception:
+            logger.exception(
+                "oauth_reauth: could not import tools.write_approval for pending_id=%s",
+                pending_id,
+            )
+            return
+
+        record = wa.get_pending(_OAUTH_REAUTH_SUBSYSTEM, pending_id)
+        if not record:
+            # Vanishingly unlikely (check_reply_for_pending_ref just
+            # confirmed it existed a moment ago), but handle it rather than
+            # crash on a race with another reply/discard.
+            logger.warning(
+                "oauth_reauth: pending record %s disappeared between ref-check "
+                "and handling", pending_id,
+            )
+            await self._deliver_platform_notice(
+                source,
+                "That re-auth request isn't pending anymore (already handled "
+                "or expired) — nothing to do.",
+            )
+            return
+
+        identity = (record.get("payload") or {}).get("identity")
+        if not identity:
+            logger.error(
+                "oauth_reauth: pending record %s has no identity in its payload",
+                pending_id,
+            )
+            await self._deliver_platform_notice(
+                source,
+                "Something's wrong with this re-auth request's saved details "
+                "— please wait for tomorrow's reminder to get a fresh one.",
+            )
+            return
+
+        # Extract from the ACTUAL NEW reply text (event.text), never the
+        # quoted/original text (event.reply_to_text is the OLD reminder
+        # message being replied to).
+        code = extract_oauth_code_from_reply(getattr(event, "text", None))
+        if not code:
+            logger.info(
+                "oauth_reauth: could not extract a code from reply for "
+                "identity=%s pending_id=%s", identity, pending_id,
+            )
+            await self._deliver_platform_notice(
+                source,
+                "I couldn't find a Google authorization code in that reply. "
+                "Paste either the full redirect URL (the page after signing "
+                "in) or just the code itself, then reply to the reminder "
+                "message again.",
+            )
+            return
+
+        try:
+            hermes_home = Path(get_hermes_home())
+            setup_py = (
+                hermes_home / "skills" / "productivity" / "google-workspace"
+                / "scripts" / "setup.py"
+            )
+            import subprocess
+
+            proc = subprocess.run(
+                [sys.executable, str(setup_py), "--identity", identity, "--auth-code", code],
+                capture_output=True, text=True, timeout=30,
+            )
+        except Exception as exc:
+            logger.exception(
+                "oauth_reauth: setup.py --auth-code subprocess failed for "
+                "identity=%s pending_id=%s", identity, pending_id,
+            )
+            await self._deliver_platform_notice(
+                source,
+                "Something went wrong running the token exchange "
+                f"({type(exc).__name__}). Try again with a fresh code, or "
+                "wait for tomorrow's reminder.",
+            )
+            return
+
+        output = f"{proc.stdout or ''}{proc.stderr or ''}"
+        if proc.returncode != 0:
+            logger.error(
+                "oauth_reauth: token exchange FAILED for identity=%s "
+                "pending_id=%s (exit=%s): %s",
+                identity, pending_id, proc.returncode, output.strip(),
+            )
+            await self._deliver_platform_notice(
+                source,
+                "That code didn't work (it may have expired, or already "
+                "been used). Please try again with a fresh code from a new "
+                "sign-in, or wait for tomorrow's reminder to get a new link.",
+            )
+            # Do NOT discard the pending record — leave it for retry.
+            return
+
+        logger.info(
+            "oauth_reauth: token exchange SUCCEEDED for identity=%s pending_id=%s",
+            identity, pending_id,
+        )
+        wa.discard_pending(_OAUTH_REAUTH_SUBSYSTEM, pending_id)
+        try:
+            _reset_oauth_reauth_notify_state(hermes_home, identity)
+        except Exception:
+            logger.warning(
+                "oauth_reauth: notify-state reset failed for identity=%s "
+                "(non-fatal)", identity, exc_info=True,
+            )
+        await self._deliver_platform_notice(
+            source,
+            "✅ All set — your Google account is reconnected. Thanks!",
+        )
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -18780,6 +19017,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _platform_name, source.user_name or source.user_id or "unknown",
             source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
         )
+
+        # oauth_reauth no-agent short-circuit — as early as feasible, before
+        # ANY session/agent-dispatch machinery runs. This is a NARROW,
+        # ADDITIVE special case: check_reply_for_pending_ref() is reused
+        # unchanged (not forked), and every other subsystem
+        # (upstream_fix, upstream_pr_fix, ...) falls through untouched to
+        # the normal agent-turn path below, exactly as before. Only a
+        # quote-reply whose quoted text carries a LIVE
+        # "[ref:oauth_reauth:<id>]" tag is handled here, deterministically,
+        # with no LLM/agent turn at all.
+        if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
+            _oauth_ref_check = check_reply_for_pending_ref(event.reply_to_text)
+            if (
+                _oauth_ref_check.tag_found
+                and _oauth_ref_check.pending_exists
+                and _oauth_ref_check.subsystem == _OAUTH_REAUTH_SUBSYSTEM
+            ):
+                await self._handle_oauth_reauth_reply(event, source, _oauth_ref_check)
+                return
 
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's

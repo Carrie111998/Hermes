@@ -56,18 +56,65 @@ HERMES_HOME = get_hermes_home()
 # --identity is a required argparse argument with no default.
 TOKEN_PATH, CLIENT_SECRET_PATH, SCOPES = get_google_credentials("jid")
 PENDING_AUTH_PATH = TOKEN_PATH.parent / "google_oauth_pending.json"
+# Sidecar written only on a successful --auth-code token EXCHANGE (a real
+# full re-auth), never on a routine access-token refresh. TOKEN_PATH's own
+# mtime is NOT a reliable re-auth signal — google-auth rewrites the token
+# file on every refresh() call too (see check_auth()/check_auth_live()
+# above), so a script that inferred "last re-auth" from TOKEN_PATH.stat()
+# would be fooled by ordinary background refreshes. This sidecar is the
+# only reliable anchor for estimating Google's ~7-day Testing-mode refresh
+# token expiry window (see the hermes-oauth-expiry-check cron job).
+# Re-pointed alongside TOKEN_PATH for every identity in _resolve_identity()
+# below — this is purely path-derived from whatever identity was resolved,
+# so it works for any identity in _google_identities.py's registry without
+# any code change here.
+REAUTH_SIDECAR_PATH = TOKEN_PATH.parent / "google_token_reauth_at.json"
+# Set by _resolve_identity() below; used only to label the sidecar payload
+# with the identity it belongs to (defense-in-depth — the sidecar's own
+# directory already scopes it, this is just for a human/script reading the
+# file directly to confirm whose record it is without cross-referencing
+# paths).
+CURRENT_IDENTITY: str | None = "jid"
 
 
 def _resolve_identity(identity: str | None) -> None:
-    """Re-point TOKEN_PATH/CLIENT_SECRET_PATH/SCOPES/PENDING_AUTH_PATH at the
-    given identity. FAIL-CLOSED: raises for a missing/unregistered identity.
+    """Re-point TOKEN_PATH/CLIENT_SECRET_PATH/SCOPES/PENDING_AUTH_PATH/
+    REAUTH_SIDECAR_PATH at the given identity. FAIL-CLOSED: raises for a
+    missing/unregistered identity.
     """
     global TOKEN_PATH, CLIENT_SECRET_PATH, SCOPES, PENDING_AUTH_PATH
+    global REAUTH_SIDECAR_PATH, CURRENT_IDENTITY
     TOKEN_PATH, CLIENT_SECRET_PATH, SCOPES = get_google_credentials(identity)
     PENDING_AUTH_PATH = TOKEN_PATH.parent / "google_oauth_pending.json"
+    REAUTH_SIDECAR_PATH = TOKEN_PATH.parent / "google_token_reauth_at.json"
+    CURRENT_IDENTITY = identity
     TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
     try:
         TOKEN_PATH.parent.chmod(0o700)
+    except OSError:
+        pass
+
+
+def _record_reauth_timestamp() -> None:
+    """Write/overwrite the re-auth sidecar for the currently-resolved identity.
+
+    Called only from the successful-exchange path in exchange_auth_code(),
+    i.e. only when a *full* re-auth actually happened (a fresh --auth-url +
+    --auth-code round trip), never on a token refresh. This is the only
+    place that writes REAUTH_SIDECAR_PATH — keep it that way, or the "only
+    a real re-auth advances this" guarantee breaks.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    payload = {
+        "identity": CURRENT_IDENTITY,
+        "recorded_at": now.isoformat(),
+        "recorded_at_epoch": now.timestamp(),
+    }
+    REAUTH_SIDECAR_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    try:
+        REAUTH_SIDECAR_PATH.chmod(0o600)
     except OSError:
         pass
 
@@ -469,6 +516,15 @@ def exchange_auth_code(code: str):
     except OSError:
         pass
     PENDING_AUTH_PATH.unlink(missing_ok=True)
+    # Record the real re-auth timestamp NOW, only on a successful token
+    # exchange (see REAUTH_SIDECAR_PATH's docstring above) — this is the
+    # anchor the daily hermes-oauth-expiry-check job estimates the 7-day
+    # window from. Best-effort: a sidecar write failure must never make an
+    # otherwise-successful re-auth look like it failed to the caller.
+    try:
+        _record_reauth_timestamp()
+    except Exception as e:
+        print(f"WARNING: Could not record re-auth timestamp sidecar: {e}")
     print(f"OK: Authenticated. Token saved to {TOKEN_PATH}")
 
 
