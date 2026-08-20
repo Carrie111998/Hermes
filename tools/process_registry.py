@@ -152,15 +152,19 @@ def _worker_memory_max_bytes() -> int:
         pass
 
     try:
-        physical_bytes = int(os.sysconf("SC_PHYS_PAGES")) * int(
-            os.sysconf("SC_PAGE_SIZE")
-        )
+        if hasattr(os, "sysconf"):
+            physical_bytes = int(os.sysconf("SC_PHYS_PAGES")) * int(
+                os.sysconf("SC_PAGE_SIZE")
+            )
+        else:
+            import psutil
+            physical_bytes = int(psutil.virtual_memory().total)
         physical_bound = min(
             _WORKER_MEMORY_MAX_CAP_BYTES,
             max(_MIN_WORKER_MEMORY_MAX_BYTES, physical_bytes // 2),
         )
         candidates.append(physical_bound)
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, AttributeError, ImportError):
         pass
 
     safe_bound = min(candidates) if candidates else _DEFAULT_WORKER_MEMORY_MAX_BYTES
