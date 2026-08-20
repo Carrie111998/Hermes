@@ -59,6 +59,7 @@ class TurnContext:
     plugin_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
+    context_metrics: Any = None
 
 
 def build_turn_context(
@@ -347,13 +348,35 @@ def build_turn_context(
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
 
-    durable_projection = getattr(agent, "_durable_mission_projection", "")
-    if durable_projection:
-        plugin_user_context = (
-            f"{plugin_user_context}\n\n{durable_projection}"
-            if plugin_user_context
-            else durable_projection
-        )
+    # Durable model context is a derived, bounded view. The compiler runs
+    # after restore/action recovery and before conversation_loop assembles API
+    # messages, so every interactive surface shares this boundary.
+    from agent.context_compiler import ContextCompiler
+    checkpoint = getattr(agent, "_durable_mission_checkpoint", None)
+    pending_actions = []
+    if checkpoint is not None and getattr(agent, "_session_db", None) is not None:
+        pending_actions = list(agent._session_db.list_pending_actions(checkpoint.mission_id))
+    context_window = getattr(getattr(agent, "context_compressor", None), "context_length", None)
+    context_window = context_window or getattr(agent, "_config_context_length", None) or 32000
+    reserved_headroom = max(1024, int(context_window * 0.20), int(getattr(agent, "max_tokens", 0) or 0))
+    compiled = ContextCompiler(
+        token_budget=int(context_window),
+        reserved_headroom=reserved_headroom,
+    ).compile(
+        checkpoint=checkpoint,
+        actions=pending_actions,
+        messages=messages,
+        additional_context=plugin_user_context,
+        model_context_window=int(context_window),
+        compression_count=int(getattr(agent, "_compression_count", 0) or 0),
+    )
+    messages = compiled.messages
+    plugin_user_context = compiled.machine_context
+    current_turn_user_idx = next(
+        (idx for idx in range(len(messages) - 1, -1, -1) if messages[idx].get("role") == "user"),
+        max(0, len(messages) - 1),
+    )
+    agent._context_compiler_metrics = compiled.metrics
 
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}
@@ -400,4 +423,5 @@ def build_turn_context(
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
+        context_metrics=compiled.metrics,
     )
