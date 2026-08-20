@@ -1,4 +1,4 @@
-"""Tests for Anthropic prompt caching breakpoint bounds and idempotency (#90971)."""
+"""Tests for Anthropic prompt caching idempotency and breakpoint bounds (#90971)."""
 
 import copy
 
@@ -10,7 +10,7 @@ from agent.prompt_caching import (
 )
 
 
-class TestPromptCachingSliceOverflow:
+class TestPromptCachingIdempotency:
     def test_apply_anthropic_cache_control_empty_messages(self):
         """Empty messages list is a safe no-op."""
         assert apply_anthropic_cache_control([]) == []
@@ -30,10 +30,13 @@ class TestPromptCachingSliceOverflow:
 
     def test_apply_anthropic_cache_control_is_idempotent(self):
         """Calling apply_anthropic_cache_control repeatedly on its own output
-        (no intervening strip_anthropic_cache_control) must never accumulate
-        markers past 4. Before the idempotency fix, a second call on
-        already-marked messages pushed the total to 5, reproducing the
-        `cache_control can only be specified up to 4 times` HTTP 400 (#90971).
+        (no intervening strip_anthropic_cache_control) must converge to the
+        exact same marker placement, not merely stay under budget: a test
+        that only checks `<= 4` would still pass if a later round moved the
+        breakpoints somewhere else, or dropped every marker. Before the
+        idempotency fix, a second call on already-marked messages pushed the
+        total to 5, reproducing the `cache_control can only be specified up
+        to 4 times` HTTP 400 (#90971).
         """
         messages = [{"role": "system", "content": "STATIC_PREFIX rest of the prompt"}]
         for i in range(8):
@@ -44,9 +47,8 @@ class TestPromptCachingSliceOverflow:
         round2 = apply_anthropic_cache_control(round1, static_system_prefix="STATIC_PREFIX")
         round3 = apply_anthropic_cache_control(round2, static_system_prefix="STATIC_PREFIX")
 
+        assert round1 == round2 == round3
         assert _count_cache_markers(round1, []) <= 4
-        assert _count_cache_markers(round2, []) <= 4
-        assert _count_cache_markers(round3, []) <= 4
 
     def test_apply_anthropic_cache_control_does_not_mutate_caller_messages(self):
         """A caller's live message list must never be mutated in place, even
