@@ -1,34 +1,32 @@
-name: GHSA remediation artifact
+name: Materialize verified GHSA remediation
 
 on:
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened]
+  push:
+    branches:
+      - security/ghsa-remediation-c47f0b4
+  workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: ghsa-remediation-artifact-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: ghsa-remediation-materialize
+  cancel-in-progress: false
 
 jobs:
-  remediate:
+  materialize:
     if: >-
-      github.event.pull_request.head.repo.full_name == 'andrexibiza/hermes-agent' &&
-      github.event.pull_request.head.ref == 'security/ghsa-remediation-c47f0b4'
-    name: Regenerate and verify dependency remediation
+      github.repository == 'andrexibiza/hermes-agent' &&
+      github.ref == 'refs/heads/security/ghsa-remediation-c47f0b4'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - name: Checkout exact PR head
+      - name: Checkout exact trigger head
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
-      - name: Reset worktree to exact upstream main
+      - name: Reset to exact upstream main
         run: |
           set -euo pipefail
           git remote add upstream https://github.com/NousResearch/hermes-agent.git
@@ -54,8 +52,9 @@ jobs:
             pyproject.toml
             uv.lock
 
-      - name: Apply manifest and packaged-layout corrections
+      - name: Apply dependency and packaged-layout corrections
         run: |
+          set -euo pipefail
           python3 - <<'PY'
           import json
           from pathlib import Path
@@ -80,10 +79,11 @@ jobs:
           if overrides.get('nanoid@^6') != '6.0.0':
               raise SystemExit('Nano ID v6 authority changed before remediation')
 
-          for key in list(root['allowScripts']):
+          allow_scripts = root['allowScripts']
+          for key in list(allow_scripts):
               if key.startswith('electron@'):
-                  root['allowScripts'].pop(key)
-          root['allowScripts'][f'electron@{ELECTRON}'] = True
+                  allow_scripts.pop(key)
+          allow_scripts[f'electron@{ELECTRON}'] = True
           write('package.json', root)
 
           website = load('website/package.json')
@@ -148,9 +148,6 @@ jobs:
           npm --prefix website install --package-lock-only --ignore-scripts --no-audit --no-fund
           uv lock --upgrade-package h2
 
-          # npm 12 can retain already-satisfying transitive entries after an
-          # override changes. Rewrite only the two exact Nano ID v3 lock
-          # records, then make npm validate the complete lock graph again.
           python3 - <<'PY'
           import json
           from pathlib import Path
@@ -173,16 +170,13 @@ jobs:
 
           npm install --package-lock-only --ignore-scripts --no-audit --no-fund
 
-      - name: Install exact dependency graphs
-        run: |
-          set -o pipefail
-          npm ci --no-audit --no-fund | tee /tmp/npm-ci-root.txt
-          npm --prefix website ci --no-audit --no-fund | tee /tmp/npm-ci-website.txt
-          uv lock --check | tee /tmp/uv-lock-check.txt
-
-      - name: Verify resolved security floors
+      - name: Install and verify exact dependency graphs
         run: |
           set -euo pipefail
+          npm ci --no-audit --no-fund
+          npm --prefix website ci --no-audit --no-fund
+          uv lock --check
+
           node <<'NODE'
           const root = require('./package.json')
           const desktop = require('./apps/desktop/package.json')
@@ -226,6 +220,7 @@ jobs:
           }
           if (websiteNanoid3 === 0) throw new Error('no website Nano ID v3 lock resolution was inspected')
           NODE
+
           python3 - <<'PY'
           import tomllib
           from pathlib import Path
@@ -236,64 +231,44 @@ jobs:
               raise SystemExit(f'h2 lock resolved {versions!r}, expected 4.4.1')
           PY
 
-      - name: Verify dependency audits
+      - name: Run dependency audits and affected gates
         run: |
-          set -o pipefail
-          npm audit --workspaces=false --audit-level=moderate | tee /tmp/npm-audit-root.txt
-          npm audit --workspace web --audit-level=moderate | tee /tmp/npm-audit-web.txt
-          npm audit --workspace ui-tui --audit-level=moderate | tee /tmp/npm-audit-tui.txt
-          npm audit --workspace apps/desktop --audit-level=moderate | tee /tmp/npm-audit-desktop.txt
-          npm --prefix website audit --audit-level=moderate | tee /tmp/npm-audit-website.txt
-
-      - name: Run affected repository gates
-        run: |
-          set -o pipefail
-          npm run build --workspace web | tee /tmp/web-build.txt
-          npm run check --workspace ui-tui | tee /tmp/tui-check.txt
-          npm run check:lint --workspace apps/desktop | tee /tmp/desktop-lint.txt
-          npm run test:desktop:platforms --workspace apps/desktop | tee /tmp/desktop-platform-tests.txt
-          npm run build --workspace apps/desktop | tee /tmp/desktop-build.txt
-          npm run builder --workspace apps/desktop -- --linux --x64 --dir --publish never | tee /tmp/desktop-package.txt
-          HERMES_DESKTOP_SKIP_BUILD=1 npm run test:desktop:all --workspace apps/desktop | tee /tmp/desktop-package-verify.txt
+          set -euo pipefail
+          npm audit --workspaces=false --audit-level=moderate
+          npm audit --workspace web --audit-level=moderate
+          npm audit --workspace ui-tui --audit-level=moderate
+          npm audit --workspace apps/desktop --audit-level=moderate
+          npm --prefix website audit --audit-level=moderate
+          npm run build --workspace web
+          npm run check --workspace ui-tui
+          npm run check:lint --workspace apps/desktop
+          npm run test:desktop:platforms --workspace apps/desktop
+          npm run build --workspace apps/desktop
+          npm run builder --workspace apps/desktop -- --linux --x64 --dir --publish never
+          HERMES_DESKTOP_SKIP_BUILD=1 npm run test:desktop:all --workspace apps/desktop
           git diff --check
 
-      - name: Build exact-object verification receipt
+      - name: Commit and publish verified repository tree
         run: |
-          mkdir -p /tmp/ghsa-remediation
-          {
-            echo "source_head=${{ github.event.pull_request.head.sha }}"
-            echo "upstream_base=$(cat /tmp/upstream-base-sha.txt)"
-            echo "node=$(node --version)"
-            echo "npm=$(npm --version)"
-            echo "uv=$(uv --version)"
-            echo "verified_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "all_dependency_and_affected_repository_gates=passed"
-          } > /tmp/ghsa-remediation/verification.txt
-          cp /tmp/upstream-base-sha.txt /tmp/uv-lock-check.txt /tmp/npm-ci-root.txt /tmp/npm-ci-website.txt \
-            /tmp/npm-audit-root.txt /tmp/npm-audit-web.txt /tmp/npm-audit-tui.txt \
-            /tmp/npm-audit-desktop.txt /tmp/npm-audit-website.txt \
-            /tmp/web-build.txt /tmp/tui-check.txt /tmp/desktop-lint.txt \
-            /tmp/desktop-platform-tests.txt /tmp/desktop-build.txt \
-            /tmp/desktop-package.txt /tmp/desktop-package-verify.txt \
-            /tmp/ghsa-remediation/
-
-      - name: Upload verified remediation files
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: ghsa-remediation-files
-          path: |
-            .npmrc
-            package.json
-            package-lock.json
-            website/package.json
-            website/package-lock.json
-            apps/desktop/package.json
-            apps/desktop/scripts/test-desktop.mjs
-            apps/desktop/scripts/packaged-app-layout.mjs
-            apps/desktop/scripts/packaged-app-layout.test.mjs
+          set -euo pipefail
+          git config user.name 'Axl Ibiza'
+          git config user.email 'andrexibiza@gmail.com'
+          git add \
+            .npmrc \
+            package.json \
+            package-lock.json \
+            website/package.json \
+            website/package-lock.json \
+            apps/desktop/package.json \
+            apps/desktop/scripts/test-desktop.mjs \
+            apps/desktop/scripts/packaged-app-layout.mjs \
+            apps/desktop/scripts/packaged-app-layout.test.mjs \
             uv.lock
-            /tmp/ghsa-remediation
-          retention-days: 1
-          include-hidden-files: true
-          if-no-files-found: error
+          git diff --cached --check
+          git diff --cached --quiet && { echo 'No remediation changes were staged'; exit 1; }
+          git commit -m 'fix(deps): refresh security-sensitive dependency pins' \
+            -m 'Restack on exact upstream main, refresh the affected Node, Electron, and Python lock graphs, and keep Linux packaged-app validation architecture-aware.' \
+            -m 'Co-authored-by: schmitzi8 <281458983+schmitzi8@users.noreply.github.com>' \
+            -m 'Co-authored-by: orcaspainting-dev <264355715+orcaspainting-dev@users.noreply.github.com>'
+          git push --force-with-lease=refs/heads/security/ghsa-remediation-c47f0b4:${GITHUB_SHA} \
+            origin HEAD:security/ghsa-remediation-c47f0b4
