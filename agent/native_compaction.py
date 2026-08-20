@@ -244,6 +244,7 @@ def prune_pre_checkpoint_items(
             item.get("_compressed_summary")
             or item.get("_is_compression_summary")
             or item.get("_hermes_compressed_summary")
+            or any(isinstance(k, str) and k.startswith("_") and "summary" in k.lower() for k in item.keys())
             or "Summary of previous conversation" in str(item.get("content", ""))
             or "Conversation Summary" in str(item.get("content", ""))
         )
