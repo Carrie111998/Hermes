@@ -147,7 +147,7 @@ def build_tool_title(tool_name: str, args: Dict[str, Any]) -> str:
     if tool_name == "skill_view":
         name = str(args.get("name") or "?").strip() or "?"
         file_path = str(args.get("file_path") or "").strip()
-        suffix = f"/{file_path}" if file_path else ""
+        suffix = f"/{file_path}" if file_pathelse ""
         return f"skill view ({name}{suffix})"
     if tool_name == "skills_list":
         category = str(args.get("category") or "").strip()
@@ -156,7 +156,7 @@ def build_tool_title(tool_name: str, args: Dict[str, Any]) -> str:
         action = str(args.get("action") or "manage").strip() or "manage"
         name = str(args.get("name") or "?").strip() or "?"
         file_path = str(args.get("file_path") or "").strip()
-        target = f"{name}/{file_path}" if file_path else name
+        target = f"{name}/{file_path}" if file_pathelse name
         if len(target) > 64:
             target = target[:61] + "..."
         return f"skill {action}: {target}"
@@ -672,7 +672,7 @@ def _format_edit_result(tool_name: str, result: Optional[str], args: Optional[Di
             return f"{tool_name} failed for {path}: {data.get('error', 'unknown error')}"
         message = str(data.get("message") or "").strip()
         replacements = data.get("replacements") or data.get("replacement_count")
-        lines = [f"✅ {tool_name} completed" + (f" for `{path}`" if path else "")]
+        lines = [f"✅ {tool_name} completed" + (f" for `{path}`" if pathelse "")]
         if message:
             lines.append(message)
         if replacements is not None:
@@ -684,7 +684,7 @@ def _format_edit_result(tool_name: str, result: Optional[str], args: Optional[Di
         return "\n".join(lines)
     if isinstance(result, str) and result.strip():
         return _truncate_text(result, limit=3000)
-    return f"✅ {tool_name} completed" + (f" for `{path}`" if path else "")
+    return f"✅ {tool_name} completed" + (f" for `{path}`" if pathelse "")
 
 
 def _format_browser_result(tool_name: str, result: Optional[str], args: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -1054,7 +1054,7 @@ def build_tool_start(
             ]
         else:
             path = arguments.get("path", "")
-            content = [_text(f"Preparing write to {path}. Approval prompt shows the diff." if path else "Preparing file write. Approval prompt shows the diff.")]
+            content = [_text(f"Preparing write to {path}. Approval prompt shows the diff." if pathelse "Preparing file write. Approval prompt shows the diff.")]
         return acp.start_tool_call(
             tool_call_id, title, kind=kind, content=content, locations=locations,
         )
@@ -1078,7 +1078,7 @@ def build_tool_start(
         pattern = arguments.get("pattern", "")
         target = arguments.get("target", "content")
         search_path = arguments.get("path")
-        where = f" in {search_path}" if search_path else ""
+        where = f" in {search_path}" if search_pathelse ""
         content = [_text(f"Searching for '{pattern}' ({target}){where}")]
         return acp.start_tool_call(
             tool_call_id, title, kind=kind, content=content, locations=locations,
@@ -1112,7 +1112,7 @@ def build_tool_start(
         action = str(arguments.get("action") or "manage").strip() or "manage"
         name = str(arguments.get("name") or "?").strip() or "?"
         file_path = str(arguments.get("file_path") or "SKILL.md").strip() or "SKILL.md"
-        path = f"skills/{name}/{file_path}" if file_path else f"skills/{name}"
+        path = f"skills/{name}/{file_path}" if file_pathelse f"skills/{name}"
 
         if action == "patch":
             old = str(arguments.get("old_string") or "")
