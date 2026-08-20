@@ -294,12 +294,13 @@
     assertPrimaryProfile(profile)
     const tunnel = await ensureNativeTunnel()
     const conn = requireConnection()
+    const ssh = readStoredSsh()
     const baseUrl = (tunnel && tunnel.url) || conn.url
     const sessionToken = (tunnel && tunnel.token) || conn.token
     return {
       baseUrl,
       isFullscreen: false,
-      mode: 'remote',
+      mode: ssh ? 'ssh' : 'remote',
       authMode: sessionToken ? 'token' : 'none',
       nativeOverlayWidth: 0,
       source: 'settings',
@@ -310,7 +311,12 @@
       // Primary profile: this client is bound to one remote gateway, so the
       // connection descriptor is never scoped to a named profile. Keeps
       // desktopFsProfile()/request routing on 'default'.
-      profile: null
+      profile: null,
+      sshHost: ssh ? ssh.host : '',
+      sshUser: ssh ? ssh.username : '',
+      sshPort: ssh ? ssh.port : null,
+      sshKeyPath: '',
+      sshRemoteHermesPath: ''
     }
   }
 
@@ -326,17 +332,25 @@
   // when nothing is stored (UI convenience only — never a connection fallback).
   function sanitizeConfig(profileScope) {
     const stored = readStoredRaw()
+    const ssh = readStoredSsh()
     const scopeKey = String(profileScope == null ? '' : profileScope).trim() || null
     const token = stored ? stored.token : ''
     return {
       envOverride: false,
-      mode: 'remote',
+      mode: ssh ? 'ssh' : 'remote',
       profile: scopeKey,
       remoteAuthMode: 'token',
       remoteOauthConnected: false,
       remoteTokenPreview: tokenPreview(token),
       remoteTokenSet: Boolean(token),
-      remoteUrl: stored && stored.url ? stored.url : DEFAULT_GATEWAY_URL
+      remoteUrl: stored && stored.url ? stored.url : DEFAULT_GATEWAY_URL,
+      sshHost: ssh ? ssh.host : '',
+      sshUser: ssh ? ssh.username : '',
+      sshPort: ssh ? ssh.port : null,
+      // iOS keeps the actual key in Keychain. This compatibility field is
+      // deliberately blank; the renderer must never receive private material.
+      sshKeyPath: '',
+      sshRemoteHermesPath: ''
     }
   }
 
@@ -358,6 +372,51 @@
     const incoming = typeof payload.remoteToken === 'string' ? payload.remoteToken.trim() : ''
     const token = incoming || (stored ? stored.token : '')
     return { url, token }
+  }
+
+  function coerceSsh(payload) {
+    if (!payload || payload.mode !== 'ssh') {
+      throw new Error('This connection is not configured for SSH.')
+    }
+    const stored = readStoredSsh()
+    const host = String(payload.sshHost || (stored && stored.host) || '').trim()
+    const username = String(payload.sshUser || (stored && stored.username) || '').trim()
+    const hostKey = stored ? stored.hostKey : ''
+    const port = Number(payload.sshPort || (stored && stored.port) || 22) || 22
+    if (!host || !username || !hostKey) {
+      throw new Error('SSH host, username and pinned host key are required.')
+    }
+    return {
+      account: stored ? stored.account : 'default',
+      host,
+      port,
+      username,
+      hostKey
+    }
+  }
+
+  async function startSshFromConfig(configuration) {
+    const plugin = nativeSshPlugin()
+    if (!plugin) {
+      throw new Error('The native iOS SSH tunnel is unavailable.')
+    }
+    const current = await plugin.status()
+    if (current && current.running && current.url) {
+      const stored = readStoredSsh()
+      if (
+        stored &&
+        stored.host === configuration.host &&
+        stored.port === configuration.port &&
+        stored.username === configuration.username &&
+        stored.hostKey === configuration.hostKey
+      ) {
+        return current
+      }
+      await plugin.stop()
+    }
+    const tunnel = await plugin.start(configuration)
+    writeStoredSsh(configuration)
+    return tunnel
   }
 
   // GET the PUBLIC /api/status (no token needed). Used by probe + the HTTP leg
@@ -488,16 +547,24 @@
     // ── Gateway settings (gateway-settings.tsx + boot-failure-overlay.tsx) ──
     getConnectionConfig: async profile => sanitizeConfig(profile),
     saveConnectionConfig: async payload => {
-      const block = coerceRemote(payload)
-      writeStored(block)
+      if (payload && payload.mode === 'ssh') {
+        writeStoredSsh(coerceSsh(payload))
+      } else {
+        const block = coerceRemote(payload)
+        writeStored(block)
+      }
       return sanitizeConfig(payload && payload.profile)
     },
     applyConnectionConfig: async payload => {
-      const block = coerceRemote(payload)
-      writeStored(block)
       const plugin = nativeSshPlugin()
       if (plugin) {
         await plugin.stop()
+      }
+      if (payload && payload.mode === 'ssh') {
+        writeStoredSsh(coerceSsh(payload))
+      } else {
+        const block = coerceRemote(payload)
+        writeStored(block)
       }
       const next = sanitizeConfig(payload && payload.profile)
       // Reconnect == a full renderer reload: the vendor's applyConnectionConfig
@@ -515,7 +582,22 @@
       return next
     },
     testConnectionConfig: async payload => {
-      const { url, token } = coerceRemote(payload)
+      let url
+      let token
+      let ssh = null
+      if (payload && payload.mode === 'ssh') {
+        ssh = coerceSsh(payload)
+        const tunnel = await startSshFromConfig(ssh)
+        url = tunnel && tunnel.url
+        token = tunnel && tunnel.token
+        if (!url) {
+          throw new Error('The native iOS SSH tunnel did not provide a local URL.')
+        }
+      } else {
+        const remote = coerceRemote(payload)
+        url = remote.url
+        token = remote.token
+      }
       // 1. HTTP reachability + version via the public /api/status.
       const status = await fetchStatus(url, token)
       // 2. Live WS leg — the actual token/transport check (status is public).
@@ -526,6 +608,16 @@
             ws.reason +
             ' The HTTP check can pass while the WebSocket is blocked by a proxy, firewall, or the gateway auth/origin guard.'
         )
+      }
+      if (ssh) {
+        return {
+          ok: true,
+          reachable: true,
+          host: ssh.host,
+          remotePlatform: 'iOS SSH tunnel',
+          baseUrl: url,
+          version: (status && status.version) || null
+        }
       }
       return { ok: true, baseUrl: url, version: (status && status.version) || null }
     },

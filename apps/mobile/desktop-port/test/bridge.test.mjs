@@ -150,6 +150,11 @@ test('getConnection is scoped to the primary profile', async () => {
   assert.equal(conn.mode, 'remote')
   assert.equal(conn.authMode, 'token')
   assert.equal(conn.profile, null)
+  assert.equal(conn.sshHost, '')
+  assert.equal(conn.sshUser, '')
+  assert.equal(conn.sshPort, null)
+  assert.equal(conn.sshKeyPath, '')
+  assert.equal(conn.sshRemoteHermesPath, '')
   await assert.rejects(() => d.getConnection('work'), /single remote gateway/i)
 })
 
