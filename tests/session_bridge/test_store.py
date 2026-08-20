@@ -852,6 +852,7 @@ _CLAUDE_VISIBILITY_JOB_COLUMNS = [
     "error_code",
     "error_detail",
     "completion_digest",
+    "operator_cleared_at",
     "eligible_at",
     "created_at",
     "updated_at",
@@ -13806,6 +13807,151 @@ def test_claude_visibility_status_reports_unknown_state_as_sanitized_fatal(
             "count": 1,
         }
     ]
+
+
+def _fail_claude_visibility_job(
+    db: SessionDB,
+    job_id: str,
+    *,
+    attempts: int = 7,
+    error_code: str = "max_attempts_exhausted",
+) -> None:
+    """Put one job in the terminal state the exhaustion path writes."""
+
+    with db._lock:
+        assert db._conn is not None
+        db._conn.execute(
+            """UPDATE session_claude_visibility_jobs
+               SET state = 'claude_failed', attempts = ?, error_code = ?,
+                   error_detail = 'maximum paid launch attempts exhausted'
+               WHERE id = ?""",
+            (attempts, error_code, job_id),
+        )
+        db._conn.commit()
+
+
+def test_operator_dismissal_reopens_the_enqueue_gate(db: SessionDB) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    stuck = _claude_visibility_identity("stuck")
+    _enqueue_claude_visibility_job(store, *stuck)
+    _fail_claude_visibility_job(db, stuck[1].job_id)
+
+    blocked = store.enqueue_claude_visibility_batch_if_idle(
+        [_claude_visibility_identity("before")], _CLAUDE_MARKER_SECRET
+    )
+
+    store.dismiss_claude_visibility_job(
+        job_id=stuck[1].job_id, expected_error_code="max_attempts_exhausted"
+    )
+    reopened = store.enqueue_claude_visibility_batch_if_idle(
+        [_claude_visibility_identity("after")], _CLAUDE_MARKER_SECRET
+    )
+
+    # The terminal job trips the FATAL arm, which precedes the open_work
+    # check -- so this is the exact refusal the operator has to clear.
+    assert blocked == {
+        "status": "fatal",
+        "inserted": 0,
+        "duplicates": 0,
+        "fatal_reasons": ["max_attempts_exhausted"],
+    }
+    assert reopened == {"status": "inserted", "inserted": 1, "duplicates": 0}
+
+
+def test_operator_dismissal_clears_the_status_open_and_fatal_signals(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    stuck = _claude_visibility_identity("stuck")
+    _enqueue_claude_visibility_job(store, *stuck)
+    _fail_claude_visibility_job(db, stuck[1].job_id)
+
+    before = store.claude_visibility_status(100.0)
+    store.dismiss_claude_visibility_job(
+        job_id=stuck[1].job_id, expected_error_code="max_attempts_exhausted"
+    )
+    after = store.claude_visibility_status(100.0)
+
+    assert before["counts"]["claude_failed"] == 1
+    assert before["failed_codes"] == {"max_attempts_exhausted": 1}
+    assert after["counts"]["claude_failed"] == 0
+    assert after["failed_codes"] == {}
+
+
+def test_operator_dismissal_never_touches_the_registration_usage_ledger(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    stuck = _claude_visibility_identity("stuck")
+    _enqueue_claude_visibility_job(store, *stuck)
+    _fail_claude_visibility_job(db, stuck[1].job_id)
+    with db._lock:
+        assert db._conn is not None
+        db._conn.executemany(
+            """INSERT INTO session_claude_registration_usage
+               (local_day, job_id, attempt_ordinal, reserved_estimated_cost_usd,
+                reserved_at)
+               VALUES (?, ?, ?, '0.020000', 100.0)""",
+            [("2026-08-13", stuck[1].job_id, ordinal) for ordinal in range(1, 8)],
+        )
+        db._conn.commit()
+
+    store.dismiss_claude_visibility_job(
+        job_id=stuck[1].job_id, expected_error_code="max_attempts_exhausted"
+    )
+
+    ledger = _rows(
+        db,
+        """SELECT attempt_ordinal FROM session_claude_registration_usage
+           WHERE job_id = ? ORDER BY attempt_ordinal""",
+        (stuck[1].job_id,),
+    )
+    assert [row["attempt_ordinal"] for row in ledger] == [1, 2, 3, 4, 5, 6, 7]
+    assert _rows(db, "SELECT state FROM session_claude_visibility_jobs")[0][
+        "state"
+    ] == "claude_failed"
+
+
+def test_operator_dismissal_refuses_a_job_that_is_still_live(db: SessionDB) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    pending = _claude_visibility_identity("pending")
+    _enqueue_claude_visibility_job(store, *pending)
+
+    with pytest.raises(ValueError, match="terminally failed"):
+        store.dismiss_claude_visibility_job(
+            job_id=pending[1].job_id, expected_error_code="max_attempts_exhausted"
+        )
+
+    assert store.claude_visibility_status(100.0)["counts"]["claude_pending"] == 1
+
+
+def test_operator_dismissal_refuses_a_mismatched_error_code(db: SessionDB) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    stuck = _claude_visibility_identity("stuck")
+    _enqueue_claude_visibility_job(store, *stuck)
+    _fail_claude_visibility_job(db, stuck[1].job_id, error_code="uuid_conflict")
+
+    with pytest.raises(ValueError, match="terminally failed"):
+        store.dismiss_claude_visibility_job(
+            job_id=stuck[1].job_id, expected_error_code="max_attempts_exhausted"
+        )
+
+    assert store.claude_visibility_status(100.0)["failed_codes"] == {"uuid_conflict": 1}
+
+
+def test_operator_dismissal_refuses_a_second_time(db: SessionDB) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    stuck = _claude_visibility_identity("stuck")
+    _enqueue_claude_visibility_job(store, *stuck)
+    _fail_claude_visibility_job(db, stuck[1].job_id)
+    store.dismiss_claude_visibility_job(
+        job_id=stuck[1].job_id, expected_error_code="max_attempts_exhausted"
+    )
+
+    with pytest.raises(ValueError, match="terminally failed"):
+        store.dismiss_claude_visibility_job(
+            job_id=stuck[1].job_id, expected_error_code="max_attempts_exhausted"
+        )
 
 
 def test_atomic_idle_batch_rolls_back_all_rows_when_second_insert_fails(

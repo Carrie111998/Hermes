@@ -854,6 +854,9 @@ class _Backend(Protocol):
     def abort_claude_visibility_characterization(
         self, *, expected_job_id: str, expected_reserved_claude_uuid: str
     ) -> Mapping[str, Any]: ...
+    def dismiss_claude_visibility_job(
+        self, *, job_id: str, expected_error_code: str
+    ) -> Mapping[str, Any]: ...
     def characterize(self, *, provider: str) -> Mapping[str, Any]: ...
     def characterization_status(self) -> str: ...
     def backfill_candidates(self, *, days: int) -> list[dict[str, Any]]: ...
@@ -2278,6 +2281,29 @@ class ProductionBackend:
         return _public_claude_run(
             result, continuous=self.config.claude_visibility.continuous
         )
+
+    def dismiss_claude_visibility_job(
+        self, *, job_id: str, expected_error_code: str
+    ) -> Mapping[str, Any]:
+        """Acknowledge one terminally failed job so discovery can resume.
+
+        A claude_failed job holds the discovery gate shut on purpose: it is
+        open work AND its code is fatal, so the lane keeps cycling and
+        enqueues nothing until a human adjudicates the failure. This is the
+        adjudication. It stamps the row as operator-cleared; it does not
+        rewrite the verdict and it does not touch the paid-attempt ledger.
+        """
+
+        store = self._require_store()
+        try:
+            return store.dismiss_claude_visibility_job(
+                job_id=job_id, expected_error_code=expected_error_code
+            )
+        except ValueError as exc:
+            # The guarded UPDATE matched no row: wrong id, a state that is not
+            # claude_failed, a different error_code, or already cleared. Say
+            # so as a gate refusal rather than a generic configuration error.
+            raise RolloutGateBlocked("visibility_dismiss_identity_mismatch") from exc
 
     def abort_claude_visibility_characterization(
         self, *, expected_job_id: str, expected_reserved_claude_uuid: str
@@ -3804,6 +3830,22 @@ def build_parser() -> argparse.ArgumentParser:
     abort_claude_characterization.add_argument("--job-id", required=True)
     abort_claude_characterization.add_argument("--reserved-claude-uuid", required=True)
 
+    dismiss_claude_visibility = commands.add_parser(
+        "claude-visibility-dismiss",
+        help="acknowledge one terminally failed job so discovery can resume",
+    )
+    dismiss_claude_visibility.add_argument("--job-id", required=True)
+    dismiss_claude_visibility.add_argument(
+        "--error-code",
+        required=True,
+        help="the failure recorded on the row, restated to prove intent",
+    )
+    dismiss_claude_visibility.add_argument(
+        "--confirm-terminal-failure",
+        action="store_true",
+        help="confirm the job is not worth another paid attempt",
+    )
+
     characterize = commands.add_parser(
         "characterize", help="run the disposable live provider gate"
     )
@@ -4114,6 +4156,18 @@ def _main_unscoped(
                 )
             )
             _emit(payload)
+            return EXIT_OK
+        if args.command == "claude-visibility-dismiss":
+            if not args.confirm_terminal_failure:
+                raise RolloutGateBlocked("visibility_dismiss_confirmation_required")
+            _emit(
+                dict(
+                    backend.dismiss_claude_visibility_job(
+                        job_id=args.job_id,
+                        expected_error_code=args.error_code,
+                    )
+                )
+            )
             return EXIT_OK
         if args.command == "characterize-claude-visibility":
             if args.cleanup_token is None:
