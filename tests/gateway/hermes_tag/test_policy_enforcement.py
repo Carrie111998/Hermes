@@ -709,19 +709,31 @@ def test_completion_rejects_fabricated_budget_linkage(
 
 
 def test_missing_signing_authority_restores_consumed_approval(
-    ledger, bound_principal, scope
+    ledger, bound_principal, scope, external_identity, surface
 ):
-    kernel = HermesTagKernel(
+    config = HermesTagConfig.from_mapping({"enabled": True})
+    rules = (PolicyRule("allow", DecisionOutcome.ALLOW, reason="allow"),)
+    issuer = HermesTagKernel(
         ledger,
-        HermesTagConfig.from_mapping({"enabled": True}),
-        rules=(PolicyRule("allow", DecisionOutcome.ALLOW, reason="allow"),),
+        config,
+        rules=rules,
+        lease_authority=LeaseAuthority(b"g" * 32),
     )
+    kernel = HermesTagKernel(ledger, config, rules=rules)
     intent, _ = _intent(
         kernel.capabilities, scope, capability="process.spawn", action="spawn"
     )
-    grant = kernel.grant_approval(
+    admission = issuer.admit_turn(external_identity, surface).admission
+    grant_authority = issuer.authorize_approval_grant(
+        admission,
         principal_id=bound_principal.principal_id,
-        approver_id=bound_principal.principal_id,
+        intent_digest=intent.digest,
+        scope_digest=scope.digest,
+    )
+    grant = issuer.grant_approval(
+        admission,
+        grant_authority,
+        principal_id=bound_principal.principal_id,
         intent_digest=intent.digest,
         scope_digest=scope.digest,
     )
@@ -738,7 +750,7 @@ def test_missing_signing_authority_restores_consumed_approval(
 
 
 def test_lease_issuance_failure_releases_budget_and_restores_approval(
-    ledger, bound_principal, scope, monkeypatch
+    ledger, bound_principal, scope, external_identity, surface, monkeypatch
 ):
     authority = LeaseAuthority(b"q" * 32)
     kernel = HermesTagKernel(
@@ -752,9 +764,17 @@ def test_lease_issuance_failure_releases_budget_and_restores_approval(
     intent, _ = _intent(
         kernel.capabilities, scope, capability="process.spawn", action="spawn"
     )
-    grant = kernel.grant_approval(
+    admission = kernel.admit_turn(external_identity, surface).admission
+    grant_authority = kernel.authorize_approval_grant(
+        admission,
         principal_id=bound_principal.principal_id,
-        approver_id=bound_principal.principal_id,
+        intent_digest=intent.digest,
+        scope_digest=scope.digest,
+    )
+    grant = kernel.grant_approval(
+        admission,
+        grant_authority,
+        principal_id=bound_principal.principal_id,
         intent_digest=intent.digest,
         scope_digest=scope.digest,
     )
