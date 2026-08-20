@@ -252,6 +252,130 @@ class TestPrunePreCheckpointItemsEnableSummaryRetentionToggle:
         assert summary_content not in contents
 
 
+def _checkpoint_message(item_id: str = "rs_cp1", blob: str = "cp_blob_1"):
+    """An assistant message carrying a replayable native-compaction checkpoint."""
+    return {
+        "role": "assistant",
+        "content": "",
+        "codex_reasoning_items": [
+            {"type": "compaction", "encrypted_content": blob, "id": item_id},
+        ],
+    }
+
+
+class TestChatMessagesToResponsesInputSummaryCarrierLoss:
+    """Adapter-level witnesses for the second blocking review (#90976):
+    ``prune_pre_checkpoint_items`` only ever saw whatever ``_is_summary_item``
+    could recover from an already-converted Responses ``item`` — but two
+    real merge-into-tail carrier shapes lose or shadow the summary content
+    during ``_chat_messages_to_responses_input`` itself, *before* pruning
+    ever runs:
+
+    * a tool-result carrier becomes a typed ``function_call_output`` (no
+      ``content``/``role`` survive the conversion at all), and
+    * an assistant carrier with a stale ``codex_message_items`` sidecar
+      replays the pre-merge exact message item instead of the rewritten
+      (summary-bearing) ``content``.
+
+    These feed real chat messages, shaped exactly the way
+    ``ContextCompressor.compress()`` merge-into-tail produces them (same
+    ``COMPRESSED_SUMMARY_METADATA_KEY`` stamp, same merge delimiters/end
+    marker), through the real ``_chat_messages_to_responses_input`` with a
+    replayed checkpoint — not a hand-built Responses item passed straight
+    to the pruner.
+    """
+
+    def test_tool_result_merge_carrier_summary_survives_the_adapter(self):
+        from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+        merged = _merged_summary_content("preserved tool context")
+        messages = [
+            {"role": "user", "content": "please do the thing"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "do_thing", "arguments": "{}"},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": merged,
+                COMPRESSED_SUMMARY_METADATA_KEY: True,
+            },
+            _checkpoint_message(),
+            {"role": "user", "content": "next ask after checkpoint"},
+        ]
+
+        items = _chat_messages_to_responses_input(
+            messages, native_compaction_eligible=True,
+        )
+
+        # The summary survives, exactly once, as a plain message item —
+        # never as a `function_call_output` (which the pruner cannot see,
+        # and which would orphan the dropped `function_call` it used to
+        # pair with).
+        assert not any(
+            isinstance(it, dict) and it.get("type") == "function_call_output"
+            for it in items
+        )
+        matches = [
+            it for it in items
+            if isinstance(it, dict) and _extract_item_text(it) == merged
+        ]
+        assert len(matches) == 1
+        assert matches[0].get("type") != "function_call_output"
+
+        # And the newest checkpoint still leads the wire.
+        assert items[0].get("type") == "compaction"
+
+    def test_assistant_merge_carrier_with_stale_replay_summary_survives(self):
+        from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+        merged = _merged_summary_content("preserved assistant context")
+        messages = [
+            {"role": "user", "content": "question"},
+            {
+                "role": "assistant",
+                # Rewritten by the compressor merge — this is what must
+                # reach the wire.
+                "content": merged,
+                COMPRESSED_SUMMARY_METADATA_KEY: True,
+                # Stale sidecar captured BEFORE the merge rewrote the
+                # content above. The exact-replay path prefers this over
+                # `content` for prefix-cache continuity, which is exactly
+                # what shadows the summary (#90976).
+                "codex_message_items": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_stale_1",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "stale pre-merge answer"}],
+                }],
+            },
+            _checkpoint_message(),
+            {"role": "user", "content": "next ask"},
+        ]
+
+        items = _chat_messages_to_responses_input(
+            messages, native_compaction_eligible=True,
+        )
+
+        assert not any(
+            isinstance(it, dict) and _extract_item_text(it) == "stale pre-merge answer"
+            for it in items
+        )
+        matches = [
+            it for it in items
+            if isinstance(it, dict) and _extract_item_text(it) == merged
+        ]
+        assert len(matches) == 1
+        assert items[0].get("type") == "compaction"
+
+
 class TestPrunePreCheckpointItemsMalformedInputs:
     def test_handles_none_non_dict_and_empty_items_safely(self):
         assert prune_pre_checkpoint_items(None) is None

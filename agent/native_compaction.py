@@ -203,6 +203,35 @@ def _extract_item_text(item: Any) -> Optional[str]:
     return None
 
 
+def _extract_message_text(msg: Any) -> Optional[str]:
+    """Best-effort text view of a raw chat message's ``content`` field.
+
+    Chat-message content (pre-Responses-conversion) is plain text or a list
+    of ``{"type": "text", "text": ...}`` parts — a different shape from a
+    converted Responses item. Used to read a canonical summary carrier's
+    up-to-date content directly from its source, bypassing whatever lossy
+    shape the Responses conversion produced for it (#90976).
+    """
+    if not isinstance(msg, dict):
+        return None
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content if content.strip() else None
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                if part.strip():
+                    parts.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text)
+        joined = "\n".join(parts)
+        return joined if joined.strip() else None
+    return None
+
+
 def _is_summary_item(item: Any) -> bool:
     """True when *item* is a canonical Hermes compression-summary message.
 
@@ -230,6 +259,7 @@ def prune_pre_checkpoint_items(
     retained_user_token_budget: int = RETAINED_USER_MESSAGE_TOKEN_BUDGET,
     retained_summary_token_budget: int = RETAINED_SUMMARY_TOKEN_BUDGET,
     enable_summary_retention: bool = True,
+    item_sources: Optional[List[Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Restructure Responses input around the newest compaction checkpoint.
 
@@ -260,6 +290,20 @@ def prune_pre_checkpoint_items(
       wired to a user-facing config surface.
     - Original relative chronological order between user messages and
       summaries is preserved.
+    - ``item_sources`` (optional, parallel to ``items``) is the raw chat
+      message each Responses item was converted from. By the time a summary
+      reaches this function as a converted ``item`` it can already be lossy:
+      a merge-into-tail tool-result carrier becomes a typed
+      ``function_call_output`` (no ``content``/``role`` survives the
+      conversion at all), and a merge-into-tail assistant carrier can be
+      shadowed by a stale exact ``codex_message_items`` replay captured
+      before the merge rewrote its content. When a source is provided and is
+      itself a canonical summary carrier (``is_compaction_summary_message``),
+      its content is read directly from the source — never from the
+      converted item — and it is retained as a synthesized
+      ``role="assistant"`` message regardless of what shape the original
+      item took. Without ``item_sources`` (default), retention only sees
+      what survived conversion, matching pre-#90976 behavior (#90976).
     """
     if not isinstance(items, list) or not items:
         return items
@@ -284,13 +328,39 @@ def prune_pre_checkpoint_items(
     checkpoint_run = items[first_cp : last_cp + 1]
     post = items[last_cp + 1 :]
 
+    if isinstance(item_sources, list) and len(item_sources) == len(items):
+        pre_sources: List[Any] = item_sources[:first_cp]
+    else:
+        pre_sources = [None] * len(pre)
+
     retained_reversed: List[Dict[str, Any]] = []
     user_remaining = max(0, int(retained_user_token_budget))
     summary_remaining = max(0, int(retained_summary_token_budget))
     seen_summary_texts: set = set()
 
-    for item in reversed(pre):
+    for item, source in zip(reversed(pre), reversed(pre_sources)):
         if not isinstance(item, dict):
+            continue
+
+        # Canonical source-based summary detection: reads the ORIGINAL chat
+        # message's own content, so it sees past a lossy conversion (a
+        # typed `function_call_output` wrapper, or a stale exact-replay
+        # message) that erased the summary from `item` itself (#90976).
+        # This is never a heuristic promotion of arbitrary item content —
+        # it only fires when the source message itself is a canonical,
+        # provenance-tagged summary carrier.
+        if enable_summary_retention and isinstance(source, dict) and _is_summary_item(source):
+            text = _extract_message_text(source)
+            if not text or summary_remaining <= 0 or text in seen_summary_texts:
+                continue
+            cost = _approx_tokens(text)
+            if cost > summary_remaining:
+                # Never byte-slice a summary's structural framing — drop it
+                # whole rather than corrupt the handoff prefix / end marker.
+                continue
+            retained_reversed.append({"role": "assistant", "content": text})
+            seen_summary_texts.add(text)
+            summary_remaining -= cost
             continue
 
         # Skip typed non-message items (function_call_output etc. never
