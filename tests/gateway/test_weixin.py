@@ -72,6 +72,30 @@ class TestWeixinFormatting:
         assert " ".join(formatted.split()) == " ".join(content.split())
 
 
+    @pytest.mark.parametrize(
+        ("marker", "continuation_indent"),
+        [
+            ("- ", "  "),
+            ("10. ", "    "),
+        ],
+    )
+    def test_format_message_hanging_indents_wrapped_list_items(
+        self, marker, continuation_indent
+    ):
+        adapter = _make_adapter()
+        content = marker + " ".join(
+            f"knowledge-base-detail-{index}" for index in range(18)
+        )
+
+        formatted = adapter.format_message(content)
+        lines = formatted.splitlines()
+
+        assert len(lines) > 1
+        assert lines[0].startswith(marker)
+        assert all(line.startswith(continuation_indent) for line in lines[1:])
+        assert all(len(line) <= weixin.WEIXIN_COPY_LINE_WIDTH for line in lines)
+
+
 class TestWeixinChunking:
 
 

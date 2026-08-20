@@ -180,6 +180,9 @@ TYPING_STOP = 2
 _HEADER_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _TABLE_RULE_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
 _FENCE_RE = re.compile(r"^```([^\n`]*)\s*$")
+_LIST_PREFIX_RE = re.compile(
+    r"^(?P<prefix>\s*(?:[-+*•]|\d+[.)]|[（(]\d+[）)])\s+(?:\[[ xX]\]\s+)?)"
+)
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 
 
@@ -751,9 +754,14 @@ def _wrap_copy_friendly_lines_for_weixin(content: str) -> str:
             wrapped.append(line)
             continue
 
+        list_prefix = _LIST_PREFIX_RE.match(line)
+        continuation_indent = (
+            " " * len(list_prefix.group("prefix")) if list_prefix else ""
+        )
         wrapped_lines = textwrap.wrap(
             line,
             width=WEIXIN_COPY_LINE_WIDTH,
+            subsequent_indent=continuation_indent,
             break_long_words=False,
             break_on_hyphens=False,
             replace_whitespace=False,
