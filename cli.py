@@ -53,8 +53,8 @@ os.environ["HERMES_QUIET"] = "1"  # Our own modules
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
 from hermes_cli.cli_commands_mixin import CLICommandsMixin
+import hermes_cli.skill_command_helpers as _skill_command_helpers
 from hermes_cli.skill_command_helpers import (
-    _ensure_skill_commands,
     _get_plugin_cmd_handler_names,
     _looks_like_slash_command,
     _parse_skills_argument,
@@ -64,6 +64,20 @@ from hermes_cli.skill_command_helpers import (
     get_skill_bundles,
     get_skill_commands,
 )
+
+# Patch-surface seam: callers have historically monkeypatched
+# ``cli._skill_commands``. Keep that original namespace authoritative for
+# CLI-local dispatch while the registry storage remains in the extracted
+# helper module.
+_skill_commands = _skill_command_helpers._skill_commands
+_skill_bundles = _skill_command_helpers._skill_bundles
+
+
+def _ensure_skill_commands() -> dict:
+    global _skill_commands
+    _skill_command_helpers._skill_commands = _skill_commands
+    _skill_commands = _skill_command_helpers._ensure_skill_commands()
+    return _skill_commands
 from hermes_cli.status_bar_mixin import StatusBarMixin
 from hermes_cli.cli_billing_mixin import CLIBillingMixin
 from agent.interrupt_compat import request_hard_interrupt
@@ -11051,7 +11065,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, StatusBar
             # needing to restart the session.
             import hermes_cli.skill_command_helpers as _skill_helpers
 
-            _skill_helpers._skill_commands = get_skill_commands()
+            global _skill_commands
+            _skill_commands = get_skill_commands()
+            _skill_helpers._skill_commands = _skill_commands
             added = result.get("added", [])      # [{"name", "description"}, ...]
             removed = result.get("removed", [])  # [{"name", "description"}, ...]
             total = result.get("total", 0)
