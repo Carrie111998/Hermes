@@ -742,6 +742,173 @@ class TestRequestShape:
         assert len(message) < len(body)
 
 
+# ── Real key_cmd path ───────────────────────────────────────────────────────
+
+
+class TestKeyCmdRealPath:
+    """Drive the REAL command-token source (subprocess) through the plugin.
+
+    The upstream/mocked tests prove the plugin asks for the right builder and
+    reuses it; these prove the command actually runs, environment expansion
+    works, and the minted token is what lands in the auth record and on the
+    wire.
+    """
+
+    def test_key_cmd_real_subprocess_mints_and_env_expands(self, monkeypatch, tmp_path):
+        counter = tmp_path / "counter"
+        monkeypatch.setenv("CODEX_IMG_TEST_TOKEN", "minted-secret-token-123")
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda requested: {
+                "name": "codex-passive",
+                "base_url": "https://gw.example/codex",
+                # Real subprocess: appends a marker, then prints the
+                # env-expanded token. If env expansion regressed, the token
+                # would come back as the literal variable name.
+                "key_cmd": (
+                    f"printf 'x' >> {counter} && "
+                    "printf '%s' \"$CODEX_IMG_TEST_TOKEN\""
+                ),
+            },
+        )
+
+        first = codex_plugin._resolve_named_provider_auth("codex-passive")
+        second = codex_plugin._resolve_named_provider_auth("codex-passive")
+
+        assert first == second == codex_plugin._CodexImageAuth(
+            "minted-secret-token-123",
+            "https://gw.example/codex",
+            {},
+        )
+        # The no-TTL bearer is cached for a bounded window: the helper ran
+        # exactly once across both resolutions.
+        assert counter.read_text() == "x"
+
+    def test_generate_uses_real_key_cmd_token(self, provider, monkeypatch):
+        """generate() mints via the actual subprocess and sends that token."""
+        monkeypatch.setenv("CODEX_IMG_TEST_TOKEN", "minted-secret-token-123")
+        monkeypatch.setattr(
+            codex_plugin,
+            "_load_image_gen_config",
+            lambda: {"openai-codex": {"auth_provider": "codex-passive"}},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda requested: {
+                "name": "codex-passive",
+                "base_url": "https://gw.example/codex",
+                "key_cmd": "printf '%s' \"$CODEX_IMG_TEST_TOKEN\"",
+            },
+        )
+        captured = {}
+
+        def _collect(token, **kwargs):
+            captured["token"] = token
+            return {"b64": _b64_png(), "source": "final"}
+
+        monkeypatch.setattr(codex_plugin, "_collect_image_b64", _collect)
+
+        result = provider.generate("a cat")
+
+        assert result["success"] is True
+        assert captured["token"] == "minted-secret-token-123"
+
+
+# ── No secret leakage ───────────────────────────────────────────────────────
+
+
+class TestNoSecretLeak:
+    def test_minted_token_and_key_cmd_never_reach_logs(
+        self, monkeypatch, caplog, tmp_path
+    ):
+        """DEBUG logs may name the provider, never the credential material."""
+        import logging
+
+        caplog.set_level(logging.DEBUG)
+        monkeypatch.setenv("CODEX_IMG_TEST_TOKEN", "minted-secret-token-123")
+        secret_cmd = (
+            f"printf 'x' >> {tmp_path / 'codex-leak-ctr'} && "
+            "printf '%s' \"$CODEX_IMG_TEST_TOKEN\""
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda requested: {
+                "name": "codex-passive",
+                "base_url": "https://gw.example/codex",
+                "key_cmd": secret_cmd,
+                "extra_headers": {
+                    "Authorization": "Bearer should-never-reach-wire",
+                },
+            },
+        )
+
+        codex_plugin._resolve_named_provider_auth("codex-passive")
+
+        blob = caplog.text
+        assert "minted-secret-token-123" not in blob
+        assert "should-never-reach-wire" not in blob
+        # key_cmd can legitimately embed a secret (--client-secret=…), so the
+        # command string itself must never be echoed back into a log record.
+        assert secret_cmd not in blob
+
+    def test_static_secret_never_reaches_logs(self, monkeypatch, caplog):
+        import logging
+
+        caplog.set_level(logging.DEBUG)
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda requested: {
+                "name": "codex-passive",
+                "base_url": "https://gw.example/codex",
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda **kwargs: {
+                "provider": "custom",
+                "api_key": "static-secret-456",
+                "base_url": "https://gw.example/codex",
+            },
+        )
+
+        auth = codex_plugin._resolve_named_provider_auth("codex-passive")
+
+        assert auth.token == "static-secret-456"
+        assert "static-secret-456" not in caplog.text
+
+    def test_failed_key_cmd_error_does_not_leak_command_or_output(
+        self, provider, monkeypatch, caplog
+    ):
+        """A broken auth helper must not leak its output or command string."""
+        import logging
+
+        caplog.set_level(logging.DEBUG)
+        secret_cmd = (
+            "printf 'stdout-SENTINEL'; printf 'stderr-SENTINEL' >&2; exit 1"
+        )
+        monkeypatch.setattr(
+            codex_plugin,
+            "_load_image_gen_config",
+            lambda: {"openai-codex": {"auth_provider": "codex-passive"}},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda requested: {
+                "name": "codex-passive",
+                "base_url": "https://gw.example/codex",
+                "key_cmd": secret_cmd,
+            },
+        )
+
+        result = provider.generate("a cat")
+
+        assert result["success"] is False
+        assert result["error_type"] == "auth_required"
+        assert "SENTINEL" not in result["error"]
+        assert secret_cmd not in result["error"]
+        assert "SENTINEL" not in caplog.text
+
+
 # ── Plugin entry point ──────────────────────────────────────────────────────
 
 
