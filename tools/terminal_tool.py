@@ -2645,16 +2645,30 @@ def terminal_tool(
         # Note: force parameter is internal only, not exposed to model API
     """
     try:
-        if not isinstance(command, str):
+        if not isinstance(command, str) or not command.strip():
+            received = type(command).__name__ if not isinstance(command, str) else "empty string"
             logger.warning(
                 "Rejected invalid terminal command value: %s",
-                type(command).__name__,
+                received,
             )
             return json.dumps({
                 "output": "",
                 "exit_code": -1,
-                "error": f"Invalid command: expected string, got {type(command).__name__}",
+                "error": (
+                    "SCHEMA_ERROR: terminal requires a non-empty string field named "
+                    f"'command'; got {received}. Do not repeat terminal "
+                    "with empty arguments. Retry once with "
+                    "{'command': '<shell command>'} or use a non-terminal tool."
+                ),
                 "status": "error",
+                "error_code": "terminal_command_required",
+                "retryable": False,
+                "repair_hint": {
+                    "required_field": "command",
+                    "required_type": "string",
+                    "example": {"command": "pwd"},
+                    "max_retries": 1,
+                },
             }, ensure_ascii=False)
 
         # Get configuration
