@@ -13,7 +13,8 @@ Deploy the JZKK720/hermes-agent fork with Ollama, PostgreSQL, and WeChat persona
 ### Pull the default model
 
 ```bash
-ollama pull gemma4:e4b-it-q8_0
+ollama pull nemotron-3.5-lightning:30b-a3b
+ollama pull qwen3.8:27b          # vision model for image analysis
 ```
 
 To use a different model, follow the [Change the model](#change-the-model) section after install.
@@ -217,7 +218,7 @@ Ensure Ollama is running on the host and the model is pulled:
 
 ```bash
 ollama list
-ollama pull gemma4:e4b-it-q8_0
+ollama pull nemotron-3.5-lightning:30b-a3b
 ```
 
 Check `data/config.yaml` has `provider: "custom"` (not `"ollama"`).

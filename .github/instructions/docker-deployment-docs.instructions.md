@@ -6,6 +6,7 @@ applyTo:
   - "docker-compose.upstream.yml"
   - "INSTALL.md"
   - "docker/*.sh"
+  - "docker/*.ps1"
   - "docker/*.yaml"
 ---
 

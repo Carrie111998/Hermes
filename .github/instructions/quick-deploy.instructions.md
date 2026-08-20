@@ -18,22 +18,45 @@ from local source and is only for testing fork code changes.
 
 ## One-liner (fresh machine)
 
+### Linux / macOS / WSL / Git Bash
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/JZKK720/hermes-agent/main/docker/deploy.sh | bash
 ```
 
+### Windows PowerShell (native, no clone)
+
+```powershell
+irm https://raw.githubusercontent.com/JZKK720/hermes-agent/main/docker/deploy-noclone.ps1 | iex
+```
+
+Downloads only `docker-compose.upstream.yml` and `docker/hermes-config.yaml`
+(no `git clone`). Creates `data/.env` from the remote template, then pulls and
+recreates the stack from the fork's GHCR image. Override the install directory
+with `-InstallDir C:\hermes` (passed via `iex` by wrapping in a scriptblock).
+
+### Windows PowerShell (native, full clone)
+
+```powershell
+irm https://raw.githubusercontent.com/JZKK720/hermes-agent/main/docker/deploy.ps1 | iex
+```
+
 Prerequisites on the target machine:
-- Docker + Docker Compose v2
+- Docker + Docker Compose v2 (Docker Desktop on Windows)
 - Ollama running on host port 11434 with a model pulled:
   ```bash
-  ollama pull gemma4:e4b-it-q8_0
+  ollama pull nemotron-3.5-lightning:30b-a3b
+  ollama pull qwen3.8:27b          # vision model for image analysis
   ```
 
 ## What the deploy script does
 
+Both `deploy.sh` (bash) and `deploy.ps1` (PowerShell) perform the same steps:
+
 1. Clones `JZKK720/hermes-agent` (skipped if already cloned)
 2. Creates `data/` and seeds `data/.env` from `docker/hermes-env.example`
-3. Runs `docker compose -f docker-compose.upstream.yml up -d --pull always --force-recreate --remove-orphans`
+3. Pins the weixin `base_url` in `data/config.yaml` (if present, prevents stale-session errors)
+4. Runs `docker compose -f docker-compose.upstream.yml up -d --pull always --force-recreate --remove-orphans`
 
 ## Post-install: connect WeChat
 

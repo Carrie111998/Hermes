@@ -10,7 +10,7 @@
 # Prerequisites:
 #   - Docker + Docker Compose v2 (https://docs.docker.com/get-docker/)
 #   - Ollama running on host port 11434 with the target model pulled:
-#       ollama pull gemma4:e4b-it-q8_0
+#       ollama pull nemotron-3.5-lightning:30b-a3b
 #
 # What this script does:
 #   1. Clones JZKK720/hermes-agent (skipped if already cloned)
@@ -44,7 +44,7 @@ if curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
     ok "Ollama is running on :11434"
 else
     warn "Ollama not detected on :11434 — containers will start but model calls will fail."
-    warn "Start Ollama and run: ollama pull gemma4:e4b-it-q8_0"
+    warn "Start Ollama and run: ollama pull nemotron-3.5-lightning:30b-a3b"
 fi
 
 # ── Clone (if not already inside the repo) ───────────────────────────────────
@@ -113,5 +113,6 @@ echo -e "  ${CYAN}View logs${NC}           : docker compose -f docker-compose.up
 echo -e "  ${CYAN}Stop all${NC}            : docker compose -f docker-compose.upstream.yml down"
 echo ""
 warn "Config lives in data/config.yaml — edit the model name or settings there."
-warn "Default model: gemma4:e4b-it-q8_0 — change it in data/config.yaml"
+warn "Default model: nemotron-3.5-lightning:30b-a3b — change it in data/config.yaml"
+warn "Vision model: qwen3.8:27b (for image analysis) — pull it with: ollama pull qwen3.8:27b"
 warn "Ollama is reached at http://host.docker.internal:11434 — make sure it is running on the host."
