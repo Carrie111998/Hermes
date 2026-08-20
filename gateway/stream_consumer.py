@@ -920,6 +920,32 @@ class GatewayStreamConsumer:
                                 if _final_payload and _final_payload != _visible:
                                     self._accumulated = item[1]
                                     self._stream_ledger = item[1]
+                            elif _streamed_something and self._turn_split_delivery:
+                                # Split delivery + authoritative final (review
+                                # r2, finding 3): wholesale adoption would
+                                # repeat sealed heads inside the tail (#78541),
+                                # but REFUSING entirely re-creates the #11
+                                # duplicate one level up — a post-split footer
+                                # never enters the ledger, delivered_final_
+                                # matches reports a mismatch, and the gateway
+                                # resends the ENTIRE body+footer. When the
+                                # authoritative final strictly prefix-extends
+                                # the split ledger, the missing suffix is the
+                                # only undelivered content: append it to the
+                                # live tail and the ledger, so the finalize
+                                # carries it and the recorded payload
+                                # reconciles. Non-prefix rewrites keep the
+                                # full-resend fallback (can't patch a rewrite).
+                                _final_raw = item[1]
+                                _ledger = self._stream_ledger
+                                if (
+                                    _ledger
+                                    and _final_raw.startswith(_ledger)
+                                    and len(_final_raw) > len(_ledger)
+                                ):
+                                    _suffix = _final_raw[len(_ledger):]
+                                    self._accumulated += _suffix
+                                    self._stream_ledger = _final_raw
                             continue
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
                             commentary_text = item[1]
