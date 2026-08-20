@@ -359,6 +359,60 @@ async def test_existing_matching_bound_request_is_idempotent():
 
 
 @pytest.mark.asyncio
+async def test_media_only_success_requests_handoff_despite_delivery_failure_outcome():
+    """The runner's explicit success stamp overrides Base's text-only accounting."""
+    adapter = _make_adapter({})
+    store, db = _wire_lifecycle_runner(adapter)
+    event, marker = _make_event(adapter)
+    event._agent_run_failed = False
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+    state_key = adapter._handoff_delivery_state_key(marker)
+    accepted_state = adapter._handoff_delivery_state_value(
+        marker, "discord", session_id=None
+    )
+    bound_state = adapter._handoff_delivery_state_value(
+        marker, "discord", session_id="session-exact"
+    )
+    db.compare_and_set_meta.assert_awaited_once_with(
+        state_key,
+        accepted_state,
+        bound_state,
+    )
+    db.request_handoff_once.assert_awaited_once_with("session-exact", "discord")
+    store.remove_session_route_and_end.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_media_only_success_requests_handoff_through_real_adapter_lifecycle():
+    """Attachment extraction must not turn a successful run into a finalization."""
+    adapter = _make_adapter({})
+    store, db = _wire_lifecycle_runner(adapter)
+    event, _ = _make_event(adapter)
+    adapter._active_handoff_sessions.add(event.source.chat_id)
+
+    async def _media_only_handler(current_event):
+        current_event._agent_run_failed = False
+        return "![generated result](https://example.com/result.png)"
+
+    adapter._message_handler = _media_only_handler
+    await adapter.handle_message(event)
+
+    for _ in range(100):
+        if not adapter._background_tasks:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("webhook background lifecycle did not finish")
+    await asyncio.sleep(0)
+
+    db.request_handoff_once.assert_awaited_once_with("session-exact", "discord")
+    store.remove_session_route_and_end.assert_not_awaited()
+    assert event.source.chat_id not in adapter._active_handoff_sessions
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("outcome", "reason"),
     [
@@ -375,6 +429,40 @@ async def test_failure_or_cancellation_removes_source_and_finalizes(outcome, rea
 
     store.remove_session_route_and_end.assert_awaited_once_with(
         "key:webhook:alerts:delivery-1", "session-exact", reason
+    )
+    db.request_handoff_once.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failure_with_explicit_agent_failure_still_finalizes():
+    adapter = _make_adapter({})
+    store, db = _wire_lifecycle_runner(adapter)
+    event, _ = _make_event(adapter)
+    event._agent_run_failed = True
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+    store.remove_session_route_and_end.assert_awaited_once_with(
+        "key:webhook:alerts:delivery-1",
+        "session-exact",
+        "webhook_handoff_failed",
+    )
+    db.request_handoff_once.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_with_explicit_agent_success_still_finalizes():
+    adapter = _make_adapter({})
+    store, db = _wire_lifecycle_runner(adapter)
+    event, _ = _make_event(adapter)
+    event._agent_run_failed = False
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
+
+    store.remove_session_route_and_end.assert_awaited_once_with(
+        "key:webhook:alerts:delivery-1",
+        "session-exact",
+        "webhook_handoff_cancelled",
     )
     db.request_handoff_once.assert_not_awaited()
 

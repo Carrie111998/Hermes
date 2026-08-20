@@ -348,7 +348,11 @@ platforms:
           handoff_to: discord
 ```
 
-The destination comes only from trusted local route configuration; payload fields cannot choose or interpolate it. Configure the Discord home channel first with `/sethome`. Handoff mode is exclusive: it does not also post the legacy webhook response to `deliver` or the parent channel, and `deliver_only: true` is rejected. A repeated delivery ID reuses the durable handoff marker and does not create another session or thread. In a multiplexed gateway, handoff routes currently belong to the default profile; a named `profile` on a handoff route is rejected instead of silently reading another profile's session store or home channel. The configured Discord home must also resolve to the default profile: a matching named `gateway.profile_routes` rule fails the handoff visibly before a thread is created.
+The destination comes only from trusted local route configuration; payload fields cannot choose or interpolate it. Configure the Discord home channel first with `/sethome`. Handoff mode is exclusive: it does not also post the legacy webhook response to `deliver` or the parent channel, and `deliver_only: true` is rejected. A repeated stable delivery ID is matched against a durable handoff tombstone and does not create another session or thread. In a multiplexed gateway, handoff routes currently belong to the default profile; a named `profile` on a handoff route is rejected instead of silently reading another profile's session store or home channel. The configured Discord home must also resolve to the default profile: a matching named `gateway.profile_routes` rule fails the handoff visibly before a thread is created.
+
+Reliable retry deduplication requires the sender to reuse a stable `X-GitHub-Delivery`, `svix-id`, or `X-Request-ID` value. Without one of these headers, the generated timestamp fallback is unique to each request and cannot correlate retries.
+
+Agent-backed webhook POSTs return `202 Accepted` after the work is accepted, before the run or handoff finishes. Later handoff failures are recorded in gateway logs and durable session/handoff state; they cannot be returned in the original POST response.
 
 Routes without `handoff_to` retain the normal delivery behavior described above.
 
@@ -411,7 +415,7 @@ hermes webhook subscribe antenna-matches \
 | Status | Meaning |
 |--------|---------|
 | `200 OK` | Delivered successfully. Body: `{"status": "delivered", "route": "...", "target": "...", "delivery_id": "..."}` |
-| `200 OK` (status=duplicate) | Duplicate `X-GitHub-Delivery` ID within the idempotency TTL (1 hour). Not re-delivered. |
+| `200 OK` (status=duplicate) | Duplicate stable delivery ID found in the one-hour in-memory cache. Not re-delivered. |
 | `401 Unauthorized` | HMAC signature invalid or missing. |
 | `400 Bad Request` | Malformed JSON body. |
 | `404 Not Found` | Unknown route name. |
@@ -424,7 +428,7 @@ hermes webhook subscribe antenna-matches \
 - `deliver_only: true` requires `deliver` to be a real target. `deliver: log` (or omitting `deliver`) is rejected at startup — the adapter refuses to start if it finds a misconfigured route.
 - The `skills` field is ignored in direct delivery mode (no agent runs, so there's nothing to inject skills into).
 - Template rendering uses the same `{dot.notation}` syntax as agent mode, including the `{__raw__}` token.
-- Idempotency uses the same `X-GitHub-Delivery` / `X-Request-ID` header — retries with the same ID return `status=duplicate` and do NOT re-deliver.
+- Reliable retry deduplication requires the sender to reuse a stable `X-GitHub-Delivery`, `svix-id`, or `X-Request-ID` value. Direct-delivery routes use the one-hour in-memory cache; the timestamp fallback cannot correlate retries.
 
 ---
 
@@ -560,7 +564,9 @@ Requests exceeding the limit receive a `429 Too Many Requests` response.
 
 ### Idempotency
 
-Delivery IDs (from `X-GitHub-Delivery`, `X-Request-ID`, or a timestamp fallback) are cached for **1 hour**. Duplicate deliveries (e.g. webhook retries) are silently skipped with a `200` response, preventing duplicate agent runs.
+Routes without `handoff_to` keep delivery IDs in a **one-hour in-memory cache**. A matching retry is skipped with a `200` response, but this legacy cache does not survive a gateway restart.
+
+Handoff routes additionally persist a **durable handoff tombstone**, so the same delivery cannot create another handoff or destination thread after a restart. Reliable deduplication requires the sender to reuse a stable `X-GitHub-Delivery`, `svix-id`, or `X-Request-ID` value. When none is present, Hermes generates a timestamp fallback for that request; it cannot correlate later retries.
 
 ### Body size limits
 
@@ -619,8 +625,8 @@ This is the same trust model that applies to everything the agent reads: web pag
 
 ### Duplicate responses
 
-- The idempotency cache should prevent this — check that the webhook source is sending a delivery ID header (`X-GitHub-Delivery` or `X-Request-ID`)
-- Delivery IDs are cached for 1 hour
+- Check that the sender reuses the same stable `X-GitHub-Delivery`, `svix-id`, or `X-Request-ID` value on every retry. A missing header uses a timestamp fallback that cannot correlate retries.
+- Routes without `handoff_to` deduplicate only through the one-hour in-memory cache, which resets when the gateway restarts. Handoff routes use a durable tombstone; check gateway logs and session/handoff state if a duplicate thread still appears.
 
 ### `gh` CLI errors (GitHub comment delivery)
 

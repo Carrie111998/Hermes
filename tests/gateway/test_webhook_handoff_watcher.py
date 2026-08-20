@@ -45,9 +45,6 @@ def _discord_config(
                     user_id=home_user_id,
                     scope_id=home_scope_id,
                 ),
-                extra={
-                    "thread_sessions_per_user": thread_sessions_per_user,
-                },
             )
         },
     )
@@ -191,12 +188,13 @@ async def test_webhook_handoff_moves_exact_session_and_next_reply_reuses_it(tmp_
 
 @pytest.mark.asyncio
 async def test_thread_per_user_handoff_keys_to_authenticated_home_user(tmp_path):
-    """The handoff and the home user's next Discord reply resolve identically."""
+    """The production global setting keys handoff and next reply identically."""
     config = _discord_config(
         tmp_path,
         thread_sessions_per_user=True,
         home_user_id="discord-user-7",
     )
+    assert "thread_sessions_per_user" not in config.platforms[Platform.DISCORD].extra
     with patch("gateway.session.SessionStore._ensure_loaded"):
         store = SessionStore(sessions_dir=config.sessions_dir, config=config)
     db = SessionDB(db_path=tmp_path / "state.db")
@@ -539,6 +537,10 @@ async def test_interactive_handoff_keeps_legacy_discord_destination_shape(tmp_pa
         thread_sessions_per_user=True,
         home_user_id="discord-home-user",
     )
+    # Interactive handoffs historically read the platform extra. Set it only
+    # in this direct CLI/TUI regression instead of masking webhook tests in the
+    # shared production-shape fixture.
+    config.platforms[Platform.DISCORD].extra["thread_sessions_per_user"] = True
     with patch("gateway.session.SessionStore._ensure_loaded"):
         store = SessionStore(sessions_dir=config.sessions_dir, config=config)
     db = SessionDB(db_path=tmp_path / "state.db")
@@ -743,6 +745,120 @@ async def test_post_move_cancellation_cleans_destination(tmp_path, monkeypatch):
     assert durable["ended_at"] is not None
     assert durable["end_reason"] == "webhook_handoff_failed"
     assert durable["handoff_state"] == "failed"
+    adapter.send.assert_not_awaited()
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_claim_cancellation_reconciles_running_webhook_handoff(
+    tmp_path, monkeypatch
+):
+    """Cancellation cannot strand a committed claim outside the pending scan."""
+    config = _discord_config(tmp_path)
+    with patch("gateway.session.SessionStore._ensure_loaded"):
+        store = SessionStore(sessions_dir=config.sessions_dir, config=config)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    store._db = db
+    store._loaded = True
+
+    source = SessionSource(
+        platform=Platform.WEBHOOK,
+        chat_id="webhook:route:cancel-during-claim",
+        chat_type="webhook",
+        user_id="webhook:route",
+    )
+    entry = store.get_or_create_session(source)
+    assert db.request_handoff_once(entry.session_id, "discord") is True
+    runner, adapter = _runner_with_store(config, store, db)
+    runner._running = True
+    claim_started = asyncio.Event()
+    release_claim = asyncio.Event()
+
+    async def _claim_after_release(session_id):
+        claim_started.set()
+        await release_claim.wait()
+        return db.claim_handoff(session_id)
+
+    runner._session_db.claim_handoff = AsyncMock(side_effect=_claim_after_release)
+
+    async def _no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr("gateway.run.asyncio.sleep", _no_sleep)
+    watcher_task = asyncio.create_task(
+        GatewayRunner._handoff_watcher(runner, interval=0)
+    )
+    await claim_started.wait()
+    watcher_task.cancel()
+    release_claim.set()
+    with pytest.raises(asyncio.CancelledError):
+        await watcher_task
+
+    assert store.lookup_by_session_key(entry.session_key) is None
+    durable = db.get_session(entry.session_id)
+    assert durable["handoff_state"] == "failed"
+    assert durable["handoff_error"] == "handoff claim was cancelled"
+    assert durable["ended_at"] is not None
+    assert durable["end_reason"] == "webhook_handoff_failed"
+    adapter.create_handoff_thread.assert_not_awaited()
+    runner._handle_message.assert_not_awaited()
+    adapter.send.assert_not_awaited()
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_synthetic_agent_failure_cleans_moved_destination(
+    tmp_path, monkeypatch
+):
+    """A normalized agent error response cannot complete a webhook handoff."""
+    config = _discord_config(tmp_path)
+    with patch("gateway.session.SessionStore._ensure_loaded"):
+        store = SessionStore(sessions_dir=config.sessions_dir, config=config)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    store._db = db
+    store._loaded = True
+
+    source = SessionSource(
+        platform=Platform.WEBHOOK,
+        chat_id="webhook:route:synthetic-agent-failed",
+        chat_type="webhook",
+        user_id="webhook:route",
+    )
+    entry = store.get_or_create_session(source)
+    assert db.request_handoff_once(entry.session_id, "discord") is True
+    runner, adapter = _runner_with_store(config, store, db)
+
+    async def _failed_synthetic_turn(event):
+        event._agent_run_failed = True
+        return "Sorry, I encountered an unexpected error."
+
+    runner._handle_message = AsyncMock(side_effect=_failed_synthetic_turn)
+    states = iter([True, False])
+
+    class _Running:
+        def __bool__(self):
+            try:
+                return next(states)
+            except StopIteration:
+                return False
+
+    runner._running = _Running()
+
+    async def _no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr("gateway.run.asyncio.sleep", _no_sleep)
+    await GatewayRunner._handoff_watcher(runner, interval=0)
+
+    destination_source = runner._handle_message.await_args.args[0].source
+    destination_key = runner._session_key_for_source(destination_source)
+    assert store.lookup_by_session_key(entry.session_key) is None
+    assert store.lookup_by_session_key(destination_key) is None
+    durable = db.get_session(entry.session_id)
+    assert durable["handoff_state"] == "failed"
+    assert durable["handoff_error"] == "synthetic destination agent run failed"
+    assert durable["ended_at"] is not None
+    assert durable["end_reason"] == "webhook_handoff_failed"
     adapter.send.assert_not_awaited()
     db.close()
 

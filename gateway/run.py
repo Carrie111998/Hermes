@@ -13291,10 +13291,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_id = row.get("id")
                     if not session_id:
                         continue
-                    if not await self._session_db.claim_handoff(session_id):
+                    is_webhook_handoff = self._is_webhook_handoff_row(row)
+                    if is_webhook_handoff:
+                        # AsyncSessionDB offloads the claim to a worker thread,
+                        # so cancelling this watcher does not cancel a SQLite
+                        # UPDATE already in flight. Reconcile the result before
+                        # propagating cancellation: a committed running claim
+                        # must be finalized rather than becoming invisible to
+                        # the pending-only watcher after restart.
+                        claim_task = asyncio.create_task(
+                            self._session_db.claim_handoff(session_id)
+                        )
+                        try:
+                            claimed = await asyncio.shield(claim_task)
+                        except asyncio.CancelledError:
+                            claimed = await claim_task
+                            if claimed:
+                                try:
+                                    cleanup_task = asyncio.create_task(
+                                        self._finalize_failed_webhook_handoff(
+                                            row,
+                                            "handoff claim was cancelled",
+                                        )
+                                    )
+                                    try:
+                                        await asyncio.shield(cleanup_task)
+                                    except asyncio.CancelledError:
+                                        await cleanup_task
+                                except Exception as cleanup_exc:
+                                    logger.error(
+                                        "Cancelled webhook handoff claim cleanup "
+                                        "failed for %s: %s",
+                                        session_id,
+                                        cleanup_exc,
+                                        exc_info=True,
+                                    )
+                            raise
+                    else:
+                        # Preserve the established interactive claim behavior.
+                        claimed = await self._session_db.claim_handoff(session_id)
+                    if not claimed:
                         # Another tick or another gateway already claimed it.
                         continue
-                    is_webhook_handoff = self._is_webhook_handoff_row(row)
                     try:
                         await self._process_handoff(row)
                         if is_webhook_handoff:
@@ -13543,9 +13581,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         platform_cfg = self.config.platforms.get(platform)
         extra = platform_cfg.extra if platform_cfg else {}
-        thread_sessions_per_user = bool(
-            extra.get("thread_sessions_per_user", False)
-        )
+        if move_source_key:
+            # Routed webhook sources must use the same global key settings as
+            # normal inbound gateway events. Interactive CLI/TUI handoffs keep
+            # their established platform-extra destination shape below.
+            group_sessions_per_user = getattr(
+                self.config, "group_sessions_per_user", True
+            )
+            thread_sessions_per_user = getattr(
+                self.config, "thread_sessions_per_user", False
+            )
+        else:
+            group_sessions_per_user = extra.get(
+                "group_sessions_per_user", True
+            )
+            thread_sessions_per_user = extra.get(
+                "thread_sessions_per_user", False
+            )
 
         if new_thread_id and not is_telegram_private_chat:
             dest_chat_type = "thread"
@@ -13611,8 +13663,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # next real user message in the thread shares this same session.
         session_key = build_session_key(
             dest_source,
-            group_sessions_per_user=extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
+            group_sessions_per_user=group_sessions_per_user,
+            thread_sessions_per_user=thread_sessions_per_user,
             profile=(
                 dest_source.profile
                 if move_source_key
@@ -13693,6 +13745,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # lose synchronous error visibility; calling _handle_message inline
         # keeps the success/failure path observable for the watcher.
         response_text = await self._handle_message(synthetic_event)
+        if move_source_key and getattr(
+            synthetic_event, "_agent_run_failed", False
+        ):
+            raise RuntimeError("synthetic destination agent run failed")
         if not response_text:
             # Streaming may have already delivered the response inline.
             # Either way, agent ran without raising — count as success.
