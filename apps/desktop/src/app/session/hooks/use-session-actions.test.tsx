@@ -52,6 +52,7 @@ import {
   setTurnStartedAt
 } from '@/store/session'
 import { $sessionTiles } from '@/store/session-states'
+import { $archivedSessions } from '@/store/sidebar-archive'
 
 import sessionResumeActiveTurn from '../../../../../../tests/fixtures/session-resume-active-turn.json'
 import { deferred } from '../../../test/deferred'
@@ -2586,12 +2587,14 @@ describe('archive/delete of a messaging-platform row (issue #87716)', () => {
   beforeEach(() => {
     setSessions([])
     setMessagingSessions([])
+    $archivedSessions.set([])
   })
 
   afterEach(() => {
     cleanup()
     setSessions([])
     setMessagingSessions([])
+    $archivedSessions.set([])
     vi.mocked(deleteSession).mockReset()
     vi.mocked(setSessionArchived).mockReset()
   })
@@ -2700,6 +2703,29 @@ describe('archive/delete of a messaging-platform row (issue #87716)', () => {
     })
 
     expect(idsIn($sessions.get())).toEqual([row.id])
+    expect(idsIn($messagingSessions.get())).toEqual([])
+  })
+
+  it('rolls a failed delete of an archived row back into the archived view only', async () => {
+    // The third slice. `restoreSidebarSession` routes between the two LIVE
+    // slices and knows nothing about the archived store, which is restored
+    // from its own `previousArchived` snapshot instead. Running both would put
+    // the row back in recents as well, so the row would appear twice until the
+    // next refresh and then vanish from the Archived filter it was deleted
+    // from. Pin that the archived case restores in exactly one place.
+    const row = storedSession({ id: 'stored-archived-1', source: 'desktop', title: 'Archived thread' })
+
+    $archivedSessions.set([row])
+    vi.mocked(deleteSession).mockRejectedValue(new Error('gateway unreachable'))
+
+    const actions = await mountSidebarActions()
+
+    await act(async () => {
+      await actions.removeSession(row.id)
+    })
+
+    expect(idsIn($archivedSessions.get())).toEqual([row.id])
+    expect(idsIn($sessions.get())).toEqual([])
     expect(idsIn($messagingSessions.get())).toEqual([])
   })
 })
