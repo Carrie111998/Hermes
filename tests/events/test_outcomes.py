@@ -292,3 +292,104 @@ def test_no_work_yields_to_failure_evidence():
         _event({"agent": "critic", "reason": "no_work", "status": "error"})
     )
     assert verdict.state is OutcomeState.FAILED
+# --- transition-to-unhealthy is a FAILURE (2026-08-19) ----------------------
+# outcomes.py taught the classifier to read `payload.after` for exactly ONE
+# value: WATCHDOG_PROBE_TRANSITION + after == "healthy" -> RECOVERED. The
+# mirror never existed, so a critical probe going healthy -> down produced no
+# evidence at all and fell through to UNKNOWN -> yellow. Observed live
+# 2026-08-19: a real ":8642 down" alert reached the phone headed
+# "UNKNOWN SYSTEM HEALTH ALERT". Same fall-through the burst tests above
+# already fixed for recoveries; these pin the failure direction, and pin it
+# for EVERY event type rather than one more per-type branch.
+
+
+def _transition(after, before="healthy", event_type=EventType.WATCHDOG_PROBE_TRANSITION,
+                priority=Priority.HIGH):
+    return _event(
+        {
+            "watchdog_type": "watchdog_probe_transition",
+            "probe": "Hermes API Server :8642",
+            "tier": "critical",
+            "category": "hermes",
+            "before": before,
+            "after": after,
+            "detail": "",
+        },
+        event_type=event_type,
+        priority=priority,
+    )
+
+
+def test_probe_transition_to_down_is_failed():
+    """The exact payload observed live on 2026-08-19 at 02:10:50Z."""
+    verdict = evaluate_outcome(_transition("down"))
+
+    assert verdict.state is OutcomeState.FAILED
+    assert any(item.path == "payload.after" for item in verdict.evidence)
+
+
+def test_probe_transition_to_healthy_is_still_recovered():
+    """Regression guard: the failure rule must not shadow the recovery rule."""
+    verdict = evaluate_outcome(_transition("healthy", before="down"))
+
+    assert verdict.state is OutcomeState.RECOVERED
+    # Either recovery rule may claim it: the generic healthy_transition
+    # (line 204) fires first when `before` is unhealthy, the probe-specific
+    # probe_recovered otherwise. The STATE is the contract, not which rule won.
+    assert any(
+        item.code in ("probe_recovered", "healthy_transition")
+        for item in verdict.evidence
+    )
+
+
+def test_probe_transition_to_down_floors_priority_high():
+    """FAILED carries priority_floor HIGH; UNKNOWN carried None, so a
+    low-priority producer could not be floored up before this."""
+    verdict = evaluate_outcome(_transition("down", priority=Priority.LOW))
+
+    assert verdict.priority_floor is Priority.HIGH
+
+
+@pytest.mark.parametrize("priority,marker", [
+    (Priority.CRITICAL, "🔴"),
+    (Priority.HIGH, "🟠"),
+])
+def test_probe_transition_to_down_marker_is_not_ambiguous(priority, marker):
+    """Never 🟡 again — that is the marker for genuinely unclassifiable."""
+    verdict = evaluate_outcome(_transition("down"))
+
+    assert marker_for_verdict(verdict, priority) == marker
+
+
+def test_transition_to_unhealthy_is_generic_not_watchdog_only():
+    """The rule is keyed on payload.after for ALL event types, not pinned to
+    WATCHDOG_PROBE_TRANSITION -- that per-type pinning is what left the gap."""
+    verdict = evaluate_outcome(
+        _transition("down", event_type=EventType.GATEWAY_HEALTH)
+    )
+
+    assert verdict.state is OutcomeState.FAILED
+
+
+def test_transition_to_degraded_is_degraded_not_failed():
+    """_UNHEALTHY_VALUES contains "degraded", so keying the failure rule on
+    that set would over-escalate a partial outage to a hard failure. The
+    rule classifies `after` through the same value sets `status` uses."""
+    verdict = evaluate_outcome(_transition("degraded"))
+
+    assert verdict.state is OutcomeState.DEGRADED
+
+
+def test_transition_to_unknown_stays_unknown():
+    """"unknown" means the probe was SKIPPED, not that it failed -- the same
+    reading watchdog_burst_body already applies to its transitions list."""
+    verdict = evaluate_outcome(_transition("unknown"))
+
+    assert verdict.state is OutcomeState.UNKNOWN
+
+
+def test_watchdog_burst_still_uses_its_transitions_list():
+    """A burst has no top-level `after`, so the new rule must not disturb it."""
+    verdict = evaluate_outcome(_burst([{"after": "healthy", "tier": "critical"}]))
+
+    assert verdict.state is OutcomeState.RECOVERED

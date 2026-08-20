@@ -277,6 +277,31 @@ def evaluate_outcome(event: Event) -> OutcomeVerdict:
         elif normalized in _SUCCESS_VALUES:
             succeeded.append(_evidence("explicit_success", path, value))
 
+    # A transition whose CURRENT state is unhealthy is a FAILURE -- for every
+    # event type, not one more per-type branch. This file already read
+    # `payload.after`, but only for the single value "healthy" on
+    # WATCHDOG_PROBE_TRANSITION (_is_recovery_transition). The mirror image
+    # never existed, so a probe going healthy -> down produced no evidence at
+    # all and fell through to UNKNOWN. Observed live 2026-08-19: a real
+    # critical ":8642 down" alert reached the phone headed "UNKNOWN SYSTEM
+    # HEALTH ALERT" -- the same fall-through already fixed for burst
+    # recoveries, in the direction that actually matters.
+    #
+    # Classified through the same value sets `status` uses, NOT through
+    # _UNHEALTHY_VALUES: that set contains "degraded", so keying on it would
+    # over-escalate a partial outage into a hard failure. "unknown" is in
+    # neither set and stays UNKNOWN, which is correct -- it means the probe
+    # was SKIPPED, the reading watchdog_burst_body already applies.
+    #
+    # `status` is deliberately not consulted here; _VALUE_FIELDS above
+    # already covers it, and re-reading it would double-count the evidence.
+    if "after" in payload:
+        _after = _normalized(payload.get("after"))
+        if _after in _FAILED_VALUES:
+            failed.append(_evidence("transition_failed", "payload.after", payload.get("after")))
+        elif _after in _DEGRADED_VALUES:
+            degraded.append(_evidence("transition_degraded", "payload.after", payload.get("after")))
+
     if event.event_type is EventType.CRON_COMPLETED:
         output_summary = str(payload.get("output_summary", ""))[:400]
         if _CRON_FAILURE_RE.search(output_summary):
