@@ -32,6 +32,48 @@ def _hdr(xff: str = "") -> dict:
     return {"X-Forwarded-For": xff} if xff else {}
 
 
+class _DupHeaders:
+    """Minimal header object that preserves duplicate X-Forwarded-For fields.
+
+    Mimics ``http.client.HTTPMessage`` / ``email.message.Message`` wire order:
+    ``get("X-Forwarded-For")`` returns only the first occurrence (the old
+    buggy path), while ``get_all("X-Forwarded-For")`` returns all values in
+    wire order.  Also exposes ``_headers`` and ``items()`` for the fallback
+    branches in ``security._get_xff_values``.
+    """
+
+    def __init__(self, values: list[str]):
+        self._values = list(values)
+
+    def get_all(self, name, default=None):  # noqa: D401
+        if name.lower() == "x-forwarded-for":
+            return list(self._values) if self._values else default
+        return default
+
+    def get(self, name, default=None):
+        if name.lower() == "x-forwarded-for" and self._values:
+            return self._values[0]
+        return default
+
+    @property
+    def _headers(self):  # type: ignore[no-redef]
+        return [("X-Forwarded-For", v) for v in self._values]
+
+    def items(self):
+        return [("X-Forwarded-For", v) for v in self._values]
+
+
+def _email_dup_headers(values: list[str]):
+    """Build a real ``email.message.Message`` with duplicate XFF fields."""
+    from email.message import Message
+    from email.policy import default
+
+    msg = Message(policy=default)
+    for v in values:
+        msg["X-Forwarded-For"] = v
+    return msg
+
+
 # --------------------------------------------------------------------------
 # resolve_client_identity invariants
 # --------------------------------------------------------------------------
@@ -165,6 +207,58 @@ class TestResolveClientIdentity:
         ip_a = security.resolve_client_identity(_hdr("203.0.113.9"), "10.0.0.1")
         ip_b = security.resolve_client_identity(_hdr("198.51.100.7"), "10.0.0.1")
         assert ip_a == ip_b == "10.0.0.1"  # unchanged behavior — the documented risk
+
+    def test_duplicate_xff_fields_wire_order_canonicalized(self, monkeypatch):
+        """P1 follow-up (#80779): duplicate X-Forwarded-For fields must be
+        canonicalized in wire order, not truncated to the first occurrence.
+
+        Attacker injects ``X-Forwarded-For: 10.0.0.1`` (allow-listed) as the
+        first field; the trusted proxy appends ``X-Forwarded-For:
+        203.0.113.9`` (real client) as a second field.  ``headers.get()``
+        returns only the first field, so the old code resolved to the
+        attacker value.  After canonicalizing all field values the walk
+        yields the real client.
+        """
+        monkeypatch.setenv("A2A_TRUSTED_PROXIES", "10.0.0.1,203.0.113.1")
+        dup = _DupHeaders(["10.0.0.1", "203.0.113.9"])
+        # socket peer is the trusted proxy that appended the second field
+        result = security.resolve_client_identity(dup, "203.0.113.1")
+        assert result == "203.0.113.9"
+        assert result != "10.0.0.1"
+
+    def test_duplicate_xff_fields_via_email_message_canonicalized(self, monkeypatch):
+        """Same bypass, but through a real stdlib Message with duplicate fields.
+
+        ``email.message.Message`` preserves duplicates in ``_headers`` and
+        ``get_all``; ``get`` returns the first.  The fix must not rely solely
+        on ``get``.
+        """
+        monkeypatch.setenv("A2A_TRUSTED_PROXIES", "10.0.0.1")
+        msg = _email_dup_headers(["10.0.0.1", "203.0.113.9"])
+        # Socket peer is the trusted proxy; attacker allow-listed leftmost must not win.
+        assert security.resolve_client_identity(msg, "10.0.0.1") == "203.0.113.9"
+        # Also verify that a single combined field still works (no duplicate).
+        from email.message import Message
+        from email.policy import default
+
+        single = Message(policy=default)
+        single["X-Forwarded-For"] = "10.0.0.1, 203.0.113.9"
+        assert security.resolve_client_identity(single, "10.0.0.1") == "203.0.113.9"
+
+    def test_duplicate_xff_fields_with_three_fields_wire_order(self, monkeypatch):
+        """Wire order is preserved across >2 duplicate fields and mixed commas."""
+        monkeypatch.setenv("A2A_TRUSTED_PROXIES", "10.0.0.1,10.0.0.2")
+        # Attacker field 1, proxy1 field 2 with comma, proxy2 is socket peer
+        dup = _DupHeaders(["10.0.0.1", "203.0.113.9, 10.0.0.1"])
+        # hops wire order: [10.0.0.1, 203.0.113.9, 10.0.0.1]
+        # walk from right: 10.0.0.1 trusted -> skip, 203.0.113.9 not trusted -> real client
+        assert security.resolve_client_identity(dup, "10.0.0.2") == "203.0.113.9"
+
+    def test_duplicate_xff_fields_untrusted_peer_still_ignored(self, monkeypatch):
+        """Even with duplicate fields, an untrusted socket peer must not trust XFF."""
+        monkeypatch.setenv("A2A_TRUSTED_PROXIES", "10.0.0.1")
+        dup = _DupHeaders(["10.0.0.1", "203.0.113.9"])
+        assert security.resolve_client_identity(dup, "198.51.100.7") == "198.51.100.7"
 
 
 class TestGetTrustedProxiesConfig:

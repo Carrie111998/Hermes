@@ -238,6 +238,155 @@ def _is_valid_ip(value: str) -> bool:
         return False
 
 
+def _get_xff_values(headers) -> list[str]:
+    """Return all X-Forwarded-For field values in wire order.
+
+    HTTP allows multiple header fields with the same name (RFC 7230 §3.2.2);
+    they are semantically equivalent to a single field with comma-joined
+    values.  ``headers.get("X-Forwarded-For")`` returns only the first
+    occurrence, so ``X-Forwarded-For: 10.0.0.1`` (attacker) + ``X-Forwarded-For:
+    203.0.113.9`` (proxy-appended) would resolve to the attacker value.
+    This helper canonicalizes **all** field occurrences in wire order by
+    trying ``get_all``/``getlist``-style APIs, raw ``_headers``/``items()``,
+    and case-insensitive fallbacks so every header object type (stdlib
+    ``http.client.HTTPMessage``, ``email.message.Message``, Starlette/Werkzeug-
+    style, plain ``dict``) is handled.  The caller then joins/splits the
+    values to build the hop list.  Duplicate fields are not rejected outright
+    — they are canonicalized per RFC — so the right-to-left validated walk
+    still yields the proxy-appended real client, not the attacker value.
+    """
+    if headers is None:
+        return []
+    # 1. ``get_all`` / ``getlist``-style (stdlib Message, Starlette, Werkzeug)
+    for attr in ("get_all", "getlist", "get_list", "getList"):
+        meth = getattr(headers, attr, None)
+        if callable(meth):
+            for key in ("X-Forwarded-For", "x-forwarded-for"):
+                try:
+                    vals = meth(key)
+                except TypeError:
+                    try:
+                        vals = meth(key, None)
+                    except Exception:
+                        continue
+                except Exception:
+                    continue
+                if vals is None:
+                    continue
+                if isinstance(vals, (list, tuple)):
+                    cleaned: list[str] = []
+                    for v in vals:
+                        if v is None:
+                            continue
+                        try:
+                            cleaned.append(str(v))
+                        except Exception:
+                            continue
+                    if cleaned:
+                        return cleaned
+                    # empty list means header present but no values — treat as empty
+                    if isinstance(vals, list) and len(vals) == 0:
+                        return []
+                    continue
+                if isinstance(vals, str):
+                    return [vals]
+                try:
+                    return [str(vals)]
+                except Exception:
+                    continue
+    # 2. Raw ``_headers`` list (stdlib Message internals, preserves wire order)
+    try:
+        raw = getattr(headers, "_headers", None)
+        if isinstance(raw, list):
+            vals: list[str] = []
+            for k, v in raw:
+                if isinstance(k, str) and k.lower() == "x-forwarded-for":
+                    try:
+                        vals.append(str(v))
+                    except Exception:
+                        continue
+            if vals:
+                return vals
+    except Exception:
+        pass
+    # 3. ``get`` with case-insensitive fallbacks (dict-like, http.client)
+    try:
+        get_meth = getattr(headers, "get", None)
+        if callable(get_meth):
+            for key in ("X-Forwarded-For", "x-forwarded-for", "X-FORWARDED-FOR"):
+                try:
+                    # ``dict.get`` takes default; some custom gets may not
+                    try:
+                        val = get_meth(key, None)
+                    except TypeError:
+                        val = get_meth(key)
+                except Exception:
+                    continue
+                if val is not None:
+                    if isinstance(val, (list, tuple)):
+                        return [str(v) for v in val if v is not None]
+                    if isinstance(val, str):
+                        return [val]
+                    try:
+                        return [str(val)]
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    # 4. ``items()`` iteration (Message with duplicates, Starlette Headers)
+    try:
+        items = getattr(headers, "items", None)
+        if callable(items):
+            try:
+                pairs = items()
+            except Exception:
+                pairs = None
+            if pairs:
+                vals: list[str] = []
+                for k, v in pairs:
+                    if isinstance(k, str) and k.lower() == "x-forwarded-for":
+                        try:
+                            vals.append(str(v))
+                        except Exception:
+                            continue
+                if vals:
+                    return vals
+    except Exception:
+        pass
+    # 5. Dict with case-insensitive key scan
+    try:
+        if isinstance(headers, dict):
+            for k, v in headers.items():
+                if isinstance(k, str) and k.lower() == "x-forwarded-for":
+                    if isinstance(v, (list, tuple)):
+                        return [str(x) for x in v if x is not None]
+                    if isinstance(v, str):
+                        return [v]
+                    try:
+                        return [str(v)]
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    # 6. List/tuple of (k, v) pairs (WSGI raw headers)
+    try:
+        if isinstance(headers, (list, tuple)):
+            vals: list[str] = []
+            for item in headers:
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    k, v = item
+                    if isinstance(k, str) and k.lower() == "x-forwarded-for":
+                        try:
+                            vals.append(str(v))
+                        except Exception:
+                            continue
+            if vals:
+                return vals
+    except Exception:
+        pass
+    return []
+
+
 def resolve_client_identity(headers, client_ip: str = "") -> str:
     """Resolve the real client IP for identity, honoring trusted proxies only.
 
@@ -257,21 +406,37 @@ def resolve_client_identity(headers, client_ip: str = "") -> str:
     the spoofed value). If the header is absent, the socket peer is used so
     a misconfigured proxy does not collapse to an empty identity.
 
-    ``headers`` is a mapping with a ``get`` method (e.g. ``http.client`` /
-    ``BaseHTTPRequestHandler`` headers).
+    Duplicate ``X-Forwarded-For`` fields are canonicalized in wire order
+    per RFC 7230 §3.2.2 (all field values joined with ``,`` before splitting
+    into hops).  A caller that injects ``X-Forwarded-For: <allowed>`` and a
+    proxy that appends ``X-Forwarded-For: <real client>`` as a second field
+    therefore yields hops ``[<allowed>, <real client>]``; the right-to-left
+    walk returns ``<real client>``, not the attacker-chosen ``<allowed>``.
+    This prevents ``headers.get("X-Forwarded-For")`` from picking only the
+    first occurrence (#80779 P1).
+
+    ``headers`` is a mapping with a ``get``/``get_all`` method (e.g.
+    ``http.client`` / ``BaseHTTPRequestHandler`` headers, Starlette Headers,
+    or a plain ``dict``).
     """
     proxies = get_trusted_proxies()
     if proxies and _peer_in_proxies(client_ip, proxies):
-        forwarded = (headers.get("X-Forwarded-For", "") or "").strip() if headers else ""
-        if forwarded:
-            # Walk validated hops right-to-left: the socket peer is trusted
-            # (checked above), so the rightmost hop it appended is trusted;
-            # move left only through hops that are themselves trusted proxies.
-            # The first non-trusted hop is the real client. A caller-supplied
-            # allowed address at the left is never reached (#80534 P1). If
-            # every hop is a trusted proxy, take the leftmost (the whole
-            # chain is proxies).
-            hops = [hop.strip() for hop in forwarded.split(",") if hop.strip()]
+        xff_values = _get_xff_values(headers)
+        if xff_values:
+            # Canonicalize all field values in wire order (RFC 7230 §3.2.2):
+            # each field value may itself contain comma-separated hops.
+            hops: list[str] = []
+            for field_val in xff_values:
+                if not field_val:
+                    continue
+                try:
+                    s = str(field_val)
+                except Exception:
+                    continue
+                for hop in s.split(","):
+                    hop = hop.strip()
+                    if hop:
+                        hops.append(hop)
             if hops:
                 for hop in reversed(hops):
                     if _peer_in_proxies(hop, proxies):
