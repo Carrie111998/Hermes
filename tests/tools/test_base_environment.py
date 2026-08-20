@@ -100,6 +100,22 @@ class TestIncrementalOutputDecoder:
 
         assert decoder.decode(b"\x00\xff\n") == "\x00\ufffd\n"
 
+    def test_nul_guard_survives_split_chunks(self):
+        decoder = _IncrementalOutputDecoder(fallback_encoding="cp1252")
+
+        output = decoder.decode(b"\x00") + decoder.decode(b"\xff\n", final=True)
+
+        assert output == "\x00\ufffd\n"
+
+    def test_nul_guard_survives_a_bounded_buffer_flush(self):
+        decoder = _IncrementalOutputDecoder(fallback_encoding="cp1252")
+        first = b"\xff\x00" + b"a" * decoder._PROBE_LIMIT
+
+        output = decoder.decode(first) + decoder.decode(b"\xff\n", final=True)
+
+        assert output.count("\ufffd") == 2
+        assert "\u00ff" not in output
+
     def test_explicit_none_disables_host_fallback(self, monkeypatch):
         from tools.environments import base
 

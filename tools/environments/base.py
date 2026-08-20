@@ -101,20 +101,25 @@ class _IncrementalOutputDecoder:
             self._fallback_encoding = None if normalized == "utf-8" else normalized
         self._utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._buffer = bytearray()
+        self._record_had_nul = False
 
     def _decode_record(self, raw: bytes) -> str:
         try:
             return raw.decode("utf-8", errors="strict")
         except UnicodeDecodeError:
-            if b"\x00" not in raw and self._fallback_encoding:
+            if not self._record_had_nul and b"\x00" not in raw and self._fallback_encoding:
                 return raw.decode(self._fallback_encoding, errors="replace")
             return raw.decode("utf-8", errors="replace")
 
     def _flush_long_buffer(self) -> str:
         raw = bytes(self._buffer)
+        self._record_had_nul = self._record_had_nul or b"\x00" in raw
         try:
             text = raw.decode("utf-8", errors="strict")
         except UnicodeDecodeError as exc:
+            if self._record_had_nul:
+                self._buffer.clear()
+                return raw.decode("utf-8", errors="replace")
             if exc.end == len(raw) and exc.reason == "unexpected end of data" and exc.start:
                 prefix = raw[: exc.start]
                 try:
@@ -151,21 +156,26 @@ class _IncrementalOutputDecoder:
             record = bytes(self._buffer[: boundary + 1])
             del self._buffer[: boundary + 1]
             output.append(self._decode_record(record))
+            self._record_had_nul = False
 
         # An ASCII-only tail is safe to stream without waiting for a newline.
         ascii_end = 0
         while ascii_end < len(self._buffer) and self._buffer[ascii_end] < 0x80:
             ascii_end += 1
         if ascii_end:
-            output.append(bytes(self._buffer[:ascii_end]).decode("ascii"))
+            ascii_raw = bytes(self._buffer[:ascii_end])
+            self._record_had_nul = self._record_had_nul or b"\x00" in ascii_raw
+            output.append(ascii_raw.decode("ascii"))
             del self._buffer[:ascii_end]
 
         if len(self._buffer) >= self._PROBE_LIMIT:
             output.append(self._flush_long_buffer())
 
-        if final and self._buffer:
-            output.append(self._decode_record(bytes(self._buffer)))
-            self._buffer.clear()
+        if final:
+            if self._buffer:
+                output.append(self._decode_record(bytes(self._buffer)))
+                self._buffer.clear()
+            self._record_had_nul = False
 
         return "".join(output)
 
