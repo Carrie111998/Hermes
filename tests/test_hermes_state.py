@@ -2232,6 +2232,40 @@ class TestAutoMaintenanceStaleOpenClose:
         assert db.get_session("old") is None
         assert result["pruned"] >= 1
 
+    def test_brand_new_null_activity_survives(self, db):
+        """A fresh OPEN row with last_activity_at NULL must NOT be closed.
+
+        New rows are inserted with last_activity_at = NULL (_insert_session_row
+        doesn't set it); the first _touch_activity heartbeat lands after the
+        agent starts. Idle is the freshest of last_activity_at and
+        started_at (COALESCE), so a brand-new row is treated as its creation
+        time and survives the stale-OPEN close.
+        """
+        db.create_session(session_id="fresh", source="cli")
+
+        result = db.maybe_auto_prune_and_vacuum(retention_days=90)
+
+        row = db.get_session("fresh")
+        assert row is not None
+        assert row["ended_at"] is None  # closed? would be a false positive
+
+    def test_old_null_activity_still_closed(self, db):
+        """A truly dead row (NULL activity, started long ago) is still closed."""
+        db.create_session(session_id="dead", source="cli")
+        # backdate started_at beyond the stale cutoff — mimics a hard-kill
+        # orphan whose process died before any activity touch landed
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (time.time() - 30 * 86400, "dead"),
+        )
+        db._conn.commit()
+
+        db.maybe_auto_prune_and_vacuum(retention_days=90)
+
+        row = db.get_session("dead")
+        assert row is not None  # closed, not deleted
+        assert row["ended_at"] is not None
+
 
 # =========================================================================
 # FTS5 indexing of tool_calls / tool_name (#16751)

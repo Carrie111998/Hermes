@@ -8781,18 +8781,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # OOM, crash, container restart) BEFORE the ended-only prune:
             # _prune_filter_where hard-codes ended_at IS NOT NULL, so the
             # built-in retention machinery never sees these rows and they
-            # accumulate forever. Safe: only rows with no activity for
-            # STALE_OPEN_CLOSE_DAYS (7), so live sessions and the rotating
-            # gateway signal session are untouched. Rows are CLOSED, never
-            # deleted — messages stay searchable and the ended-only prune
-            # below can then reclaim them via retention.
+            # accumulate forever. Safe: only rows idle for
+            # STALE_OPEN_CLOSE_DAYS (7), where idle = the freshest of
+            # last_activity_at and started_at (COALESCE), so live sessions,
+            # the rotating gateway signal session, and brand-new rows whose
+            # first activity touch hasn't landed yet are untouched. Rows are
+            # CLOSED, never deleted — messages stay searchable and the
+            # ended-only prune below can then reclaim them via retention.
             try:
                 _stale_cutoff = time.time() - 7 * 86400
                 def _close_stale_open(conn):
                     return conn.execute(
                         "UPDATE sessions SET ended_at=?, end_reason='idle_auto_close' "
                         "WHERE ended_at IS NULL "
-                        "AND (last_activity_at IS NULL OR last_activity_at < ?)",
+                        "AND COALESCE(last_activity_at, started_at) < ?",
                         (time.time(), _stale_cutoff),
                     ).rowcount
                 _stale_closed = self._execute_write(_close_stale_open)
