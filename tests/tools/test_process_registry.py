@@ -2142,6 +2142,26 @@ class TestSystemdCgroupIsolation:
 
         assert pr._worker_memory_max_bytes() == pr._DEFAULT_WORKER_MEMORY_MAX_BYTES
 
+    def test_worker_memory_limit_falls_back_when_sysconf_missing(
+        self, monkeypatch
+    ):
+        """#90570: on Windows os.sysconf doesn't exist at all, so the
+        attribute lookup itself raises AttributeError — the "sysconf
+        unavailable" shape. The fail-soft contract must hold for that form
+        too: fall back to the default bound, never raise."""
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(
+            pr.Path,
+            "read_text",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("no cgroup")),
+        )
+        # Simulate the absent attribute (Windows) rather than a raising
+        # callable — monkeypatch.delattr on the module restores after.
+        monkeypatch.delattr(pr.os, "sysconf", raising=False)
+
+        assert pr._worker_memory_max_bytes() == pr._DEFAULT_WORKER_MEMORY_MAX_BYTES
+
     def test_kill_recovered_detached_already_exited_stops_persisted_scope(
         self, registry, monkeypatch
     ):

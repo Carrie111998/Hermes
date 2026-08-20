@@ -160,7 +160,10 @@ def _worker_memory_max_bytes() -> int:
             max(_MIN_WORKER_MEMORY_MAX_BYTES, physical_bytes // 2),
         )
         candidates.append(physical_bound)
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, AttributeError):
+        # AttributeError is the Windows/absent-sysconf shape: os.sysconf
+        # itself doesn't exist there, and "sysconf unavailable" is exactly
+        # the fail-soft case this handler exists for (#90570).
         pass
 
     safe_bound = min(candidates) if candidates else _DEFAULT_WORKER_MEMORY_MAX_BYTES
