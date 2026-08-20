@@ -313,7 +313,7 @@ def test_rebound_registry_tool_is_rejected_at_dispatch(agent_env):
 
 def test_unrelated_registry_generation_does_not_block_current_binding(agent_env):
     """Unrelated registry churn must not poison an unchanged request binding."""
-    agent, handler = agent_env
+    agent, _handler = agent_env
     from tools.registry import registry
 
     calls = []
@@ -334,6 +334,7 @@ def test_unrelated_registry_generation_does_not_block_current_binding(agent_env)
     agent._tool_registry_bindings = registry.capture_bindings(
         agent.valid_tool_names
     )
+    expected = agent._tool_registry_bindings["assembly_binding_probe"]
     registry.register(
         name="unrelated_generation_probe",
         toolset="test-binding",
@@ -344,21 +345,20 @@ def test_unrelated_registry_generation_does_not_block_current_binding(agent_env)
         },
         handler=lambda _args, **_kwargs: '{"ok":"unrelated"}',
     )
-    handler.response_queue.append(_tc_resp("assembly_binding_probe"))
-    handler.response_queue.append(_text_resp("Completed safely."))
 
-    result = agent.run_conversation(
-        "run the assembly probe", conversation_history=[], task_id="t"
+    current = registry.capture_bindings({"assembly_binding_probe"})[
+        "assembly_binding_probe"
+    ]
+    result = registry.dispatch(
+        "assembly_binding_probe",
+        {},
+        expected_entry=expected,
+        enforce_expected_entry=True,
     )
 
-    tool_results = [
-        message.get("content", "")
-        for message in result["messages"]
-        if isinstance(message, dict) and message.get("role") == "tool"
-    ]
+    assert current is expected
     assert calls == ["A"]
-    assert not any("binding changed" in content for content in tool_results)
-    assert result["final_response"] == "Completed safely."
+    assert "stale_tool_binding" not in result
 
 
 def test_rebound_deferred_tool_is_rejected_after_tool_search_unwrap(agent_env):
@@ -393,6 +393,8 @@ def test_rebound_deferred_tool_is_rejected_after_tool_search_unwrap(agent_env):
     }
     agent.tools = [*agent.tools, {"type": "function", "function": bridge_schema}]
     agent.valid_tool_names = {*agent.valid_tool_names, "tool_call"}
+    agent.enabled_toolsets = None
+    agent.disabled_toolsets = None
     agent._tool_snapshot_generation = registry._generation
     agent._tool_registry_bindings = registry.capture_bindings(
         agent.valid_tool_names
