@@ -583,6 +583,56 @@ function Start-DesktopRelaunch {
     return $spawned
 }
 
+# How long a step's pipes get to reach EOF AFTER the step process itself has
+# exited (#90455). This is not a step timeout -- the step is already gone by
+# the time the clock starts, and everything it wrote is sitting in the pipe
+# buffer ready to read, so the grace only has to cover the final drain.
+#
+# It exists because pipe EOF is not the child's to give. Windows hands the
+# write end of a redirected pipe to the child as an INHERITABLE handle, so
+# every descendant that is spawned without its own redirection gets a
+# duplicate -- and the read side does not see EOF until the last of them
+# closes it. `hermes update` deliberately runs its build steps with stdout
+# inherited (hermes_cli/main.py, the tee-stderr runner), so the tree under a
+# step is arbitrarily deep and not something this script can enumerate. When
+# one of those descendants is a resident gateway, the pipe stays open for the
+# life of the gateway, i.e. forever.
+#
+# Overridable so the pipe-drain self-test does not have to sit out the real
+# grace; not documented as a user knob.
+$script:StepDrainGraceSeconds = 20
+if ($env:HERMES_UPDATE_PIPE_DRAIN_SECONDS) {
+    $parsedGrace = 0
+    if ([int]::TryParse($env:HERMES_UPDATE_PIPE_DRAIN_SECONDS, [ref]$parsedGrace) -and $parsedGrace -ge 0) {
+        $script:StepDrainGraceSeconds = $parsedGrace
+    }
+}
+
+function Step-PipeDrain($Reader, [ref]$Task, $Buffer, $Sink) {
+    # Advance one redirected pipe by whatever has already arrived, without
+    # ever blocking. Returns $true once the pipe has reached EOF (or its read
+    # faulted), $false while more may still come.
+    #
+    # The chunked ReadAsync loop is the point: ReadToEndAsync().Result cannot
+    # hand back a partial read, so abandoning it loses the whole step's output.
+    # Draining into a StringBuilder means an abandoned pipe still yields every
+    # byte that arrived before we gave up.
+    if ($null -eq $Task.Value) { return $true }
+    if (-not $Task.Value.IsCompleted) { return $false }
+    $count = 0
+    try {
+        $count = $Task.Value.Result
+    } catch {
+        # Faulted/cancelled read: treat as EOF rather than retrying forever.
+        $Task.Value = $null
+        return $true
+    }
+    if ($count -le 0) { $Task.Value = $null; return $true }
+    [void]$Sink.Append($Buffer, 0, $count)
+    $Task.Value = $Reader.ReadAsync($Buffer, 0, $Buffer.Length)
+    return $false
+}
+
 function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
     # The window does not stream child output, so no line-pump: both pipes
     # drain asynchronously (no deadlock however chatty the child) while a small
@@ -590,6 +640,15 @@ function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
     # stretches (pip installs) -- the old EndOfStream pump blocked on quiet
     # children and froze it. Full output still lands in the hand-off log
     # afterwards, where `hermes debug share` picks it up.
+    #
+    # The drain is bounded once the step exits (#90455). Waiting for pipe EOF
+    # is waiting on the step's whole surviving descendant tree, and this
+    # function sits upstream of every terminal obligation the hand-off has --
+    # .hermes-update-result.json, clearing .hermes-update-in-progress,
+    # relaunching the Desktop. One resident grandchild holding an inherited
+    # handle used to strand all three and leave the Desktop on "Updating
+    # Hermes" until the user killed something by hand. Losing the tail of a
+    # log is the strictly better failure.
     # System.Diagnostics.Process directly: Start-Process's .ExitCode is
     # unreliably $null under PS 5.1 even with the Handle-touch workaround.
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -611,15 +670,40 @@ function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
     $psi.EnvironmentVariables["PYTHONUTF8"] = "1"
     $psi.CreateNoWindow = $true
     $proc = [System.Diagnostics.Process]::Start($psi)
-    $outTask = $proc.StandardOutput.ReadToEndAsync()
-    $errTask = $proc.StandardError.ReadToEndAsync()
-    while (-not $proc.HasExited) {
+    $outSink = New-Object System.Text.StringBuilder
+    $errSink = New-Object System.Text.StringBuilder
+    $outBuffer = New-Object char[] 16384
+    $errBuffer = New-Object char[] 16384
+    $outTask = $proc.StandardOutput.ReadAsync($outBuffer, 0, $outBuffer.Length)
+    $errTask = $proc.StandardError.ReadAsync($errBuffer, 0, $errBuffer.Length)
+    $abandonAt = $null
+    $abandoned = $false
+    while ($true) {
+        $outDone = Step-PipeDrain $proc.StandardOutput ([ref]$outTask) $outBuffer $outSink
+        $errDone = Step-PipeDrain $proc.StandardError ([ref]$errTask) $errBuffer $errSink
+        if ($proc.HasExited) {
+            if ($outDone -and $errDone) { break }
+            # Clock starts at the step's exit, not at its start: a slow step is
+            # not a stuck one, and only a pipe outliving its process is.
+            if ($null -eq $abandonAt) {
+                $abandonAt = (Get-Date).AddSeconds($script:StepDrainGraceSeconds)
+            } elseif ((Get-Date) -ge $abandonAt) {
+                $abandoned = $true
+                break
+            }
+        }
         Start-Sleep -Milliseconds 150
         if ($script:Ui) { [System.Windows.Forms.Application]::DoEvents() }
     }
-    $proc.WaitForExit()
-    $outText = $outTask.Result
-    $errText = $errTask.Result
+    # Bounded overload deliberately: the argument-less overload also waits on
+    # redirected streams, which is the very wait we just bounded. HasExited is
+    # already true here, so this call only settles ExitCode.
+    [void]$proc.WaitForExit(5000)
+    if ($abandoned) {
+        Write-HandoffLog ("{0}!| pipe drain abandoned after {1}s: '{0}' exited but a surviving descendant still holds its stdout/stderr handles. Continuing the hand-off with the output captured so far (#90455)." -f $Tag, $script:StepDrainGraceSeconds)
+    }
+    $outText = $outSink.ToString()
+    $errText = $errSink.ToString()
     foreach ($ln in ($outText -split "`r?`n")) {
         if ($ln.Trim()) { Write-HandoffLog ("{0}| {1}" -f $Tag, $ln) }
     }
