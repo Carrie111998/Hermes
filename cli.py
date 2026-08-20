@@ -5137,7 +5137,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # live registry aliases (registered during discover_mcp_tools),
             # but discovery hasn't run yet at this point, so exclude them.
             mcp_names = set((CLI_CONFIG.get("mcp_servers") or {}).keys())
-            invalid = [t for t in toolsets if not validate_toolset(t) and t not in mcp_names]
+            # Plugin toolsets (e.g. google_health) register only when
+            # discover_plugins() runs, which happens after this check —
+            # exclude names previously tracked by `hermes tools`.
+            known_plugin_names = {
+                ts
+                for ts_list in (CLI_CONFIG.get("known_plugin_toolsets") or {}).values()
+                for ts in (ts_list or [])
+            }
+            invalid = [
+                t for t in toolsets
+                if not validate_toolset(t)
+                and t not in mcp_names
+                and t not in known_plugin_names
+            ]
             if invalid:
                 self._console_print(f"[bold red]Warning: Unknown toolsets: {', '.join(invalid)}[/]")
         
