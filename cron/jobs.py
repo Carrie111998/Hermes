@@ -769,14 +769,16 @@ def _compute_grace_seconds(schedule: dict) -> int:
     return MIN_GRACE
 
 
-def _cron_has_elapsed_occurrence_today(schedule: dict, now: datetime) -> bool:
-    """Return whether a cron expression has reached a fire time today.
+def _cron_should_catch_up_now(
+    schedule: dict, now: datetime, stale_next_run: datetime
+) -> bool:
+    """Return whether catch-up should run a stale cron occurrence now.
 
     Restart catch-up should not replay a stale prior-day occurrence before the
-    job's first scheduled time on the current local day (#77406).  A job that
-    does have an elapsed occurrence today remains eligible, including an
-    expression with multiple daily fires.  Bias toward the existing catch-up
-    behavior if the expression cannot be inspected.
+    job's next scheduled time on the current local day (#77406).  If there is
+    no fire today, the stale occurrence was genuinely missed and remains
+    eligible.  Bias toward the existing catch-up behavior if the expression
+    cannot be inspected.
     """
     if schedule.get("kind") != "cron" or not _ensure_croniter():
         return True
@@ -787,11 +789,8 @@ def _cron_has_elapsed_occurrence_today(schedule: dict, now: datetime) -> bool:
     if not expr:
         return True
     try:
-        # croniter.get_prev() is strict about its base.  Nudge forward by one
-        # microsecond so a tick exactly on a fire boundary counts that boundary
-        # as elapsed rather than looking back to the previous day.
-        previous = croniter_fn(expr, now + timedelta(microseconds=1)).get_prev(datetime)
-        return _ensure_aware(previous).date() == now.date()
+        next_occurrence = _ensure_aware(croniter_fn(expr, stale_next_run).get_next(datetime))
+        return not (next_occurrence.date() == now.date() and next_occurrence > now)
     except Exception:
         return True
 
@@ -2441,7 +2440,9 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     # today's first fire must not consume that future run.
                     new_next = compute_next_run(schedule, now.isoformat())
                     if new_next:
-                        catch_up_now = _cron_has_elapsed_occurrence_today(schedule, now)
+                        catch_up_now = _cron_should_catch_up_now(
+                            schedule, now, next_run_dt
+                        )
                         logger.info(
                             "Job '%s' missed its scheduled time (%s, grace=%ds). "
                             "%s; next run provisionally set to: %s%s",

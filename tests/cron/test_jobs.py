@@ -560,6 +560,47 @@ class TestGetDueJobs:
         assert weekday_1930["next_run_at"] == "2026-08-03T19:30:00+00:00"
 
 
+    def test_restart_catch_up_runs_sparse_cron_after_missed_occurrence(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A missed weekly/monthly occurrence is catch-up eligible without a run today."""
+        now = datetime(2026, 8, 4, 10, 57, tzinfo=timezone.utc)  # Tuesday
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs(
+            [
+                {
+                    "id": "weekly-monday",
+                    "name": "weekly-monday",
+                    "prompt": "run",
+                    "schedule": {"kind": "cron", "expr": "0 9 * * 1"},
+                    "next_run_at": "2026-08-03T09:00:00+00:00",
+                    "enabled": True,
+                    "state": "scheduled",
+                },
+                {
+                    "id": "monthly-first",
+                    "name": "monthly-first",
+                    "prompt": "run",
+                    "schedule": {"kind": "cron", "expr": "30 8 1 * *"},
+                    "next_run_at": "2026-08-01T08:30:00+00:00",
+                    "enabled": True,
+                    "state": "scheduled",
+                },
+            ]
+        )
+
+        due_ids = {job["id"] for job in get_due_jobs()}
+
+        assert due_ids == {"weekly-monday", "monthly-first"}
+        weekly = get_job("weekly-monday")
+        monthly = get_job("monthly-first")
+        assert weekly is not None
+        assert monthly is not None
+        assert weekly["next_run_at"] == "2026-08-10T09:00:00+00:00"
+        assert monthly["next_run_at"] == "2026-09-01T08:30:00+00:00"
+
+
     def test_idless_job_does_not_crash_or_block_sibling_jobs(self, tmp_cron_dir):
         """A job missing its 'id' key must not crash the tick or freeze siblings.
 
