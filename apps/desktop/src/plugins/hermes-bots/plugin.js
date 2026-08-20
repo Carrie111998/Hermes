@@ -204,8 +204,8 @@ const $sessionsGatewayGeneration = atom(0)
 /** Group-chat rooms: { [group]: { log: [{from:{kind,name},text,at}], watermarks:{[member]:idx}, epoch, running } }.
  *  Log + watermarks persist via plugin storage; epoch/running are runtime-only. */
 const $groupChats = atom({})
-/** Group whose room view is open in the Bots pane (secondary navigation,
- *  same pattern as $botSessionsWorkspace). */
+/** Selected group chat. Modern hosts render it in the main workspace; older
+ *  hosts fall back to the Bots pane. */
 const $groupChatWorkspace = atom(null)
 /** Groups whose latest room activity mentions @user — the needs-you badge. */
 const $groupNeedsYou = atom({})
@@ -9367,6 +9367,10 @@ function GroupChatWorkspace({ group, members, onBack }) {
  *  disband (or the room view's own Back) can retire the tab it opened. */
 const groupChatMainTabs = new Map()
 
+function shouldRenderGroupChatInPane(group) {
+  return Boolean(group && !groupChatMainTabs.has(group))
+}
+
 function closeGroupChatMainTab(group) {
   const close = groupChatMainTabs.get(group)
 
@@ -9403,7 +9407,6 @@ function GroupChatMainView({ group }) {
  *  view on desktops whose SDK predates the main-area door. */
 function openGroupChat(group) {
   $groupNeedsYou.set({ ...$groupNeedsYou.get(), [group]: false })
-  $groupChatWorkspace.set(group)
 
   if (typeof host.openWorkspace === 'function') {
     try {
@@ -9421,6 +9424,7 @@ function openGroupChat(group) {
       })
 
       groupChatMainTabs.set(group, close)
+      $groupChatWorkspace.set(group)
 
       return
     } catch {
@@ -9428,8 +9432,7 @@ function openGroupChat(group) {
     }
   }
 
-  // The selected-group atom was set before trying the main-window door, so
-  // older desktops naturally render the in-panel room as the fallback.
+  $groupChatWorkspace.set(group)
 }
 
 /** One group chat as ONE roster row — the Discord shape: stacked member
@@ -9656,7 +9659,7 @@ function BotsPane() {
 
   const groupChatMembers = groupChatName ? groupChatMemberBots(groupChatName, roster, allMeta) : []
 
-  if (groupChatName && groupChatMembers.length) {
+  if (shouldRenderGroupChatInPane(groupChatName) && groupChatMembers.length) {
     return jsx(GroupChatWorkspace, { group: groupChatName, members: groupChatMembers })
   }
 

@@ -104,7 +104,7 @@ function load(turnScript, { busyUntilResumeCall } = {}) {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, disbandGroupChat, updateGroupChat, openGroupChat, closeGroupChatMainTab, $groupChats, $groupNeedsYou, $groupChatWorkspace, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, disbandGroupChat, updateGroupChat, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, $groupChats, $groupNeedsYou, $groupChatWorkspace, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -355,7 +355,7 @@ test('source contract: workspace + main-window door + prompt rules are wired', (
   assert.match(pluginSource, /\[Group chat: "\$\{groupName\}"\]/)
 })
 
-test('group selection follows main-window open and close', () => {
+test('modern hosts render a selected group only in the main workspace', () => {
   const gc = load(() => '(pass)')
   let onClose
 
@@ -366,9 +366,27 @@ test('group selection follows main-window open and close', () => {
 
   gc.openGroupChat('Core')
   assert.equal(gc.$groupChatWorkspace.get(), 'Core')
+  assert.equal(gc.shouldRenderGroupChatInPane('Core'), false)
 
   onClose()
   assert.equal(gc.$groupChatWorkspace.get(), null)
+})
+
+test('older and failed workspace hosts keep the in-pane group fallback', () => {
+  const older = load(() => '(pass)')
+
+  older.openGroupChat('Core')
+  assert.equal(older.$groupChatWorkspace.get(), 'Core')
+  assert.equal(older.shouldRenderGroupChatInPane('Core'), true)
+
+  const failed = load(() => '(pass)')
+  failed.host.openWorkspace = () => {
+    throw new Error('workspace unavailable')
+  }
+
+  failed.openGroupChat('Ops')
+  assert.equal(failed.$groupChatWorkspace.get(), 'Ops')
+  assert.equal(failed.shouldRenderGroupChatInPane('Ops'), true)
 })
 
 test('closing an older selected group does not clear the newer selection', () => {
