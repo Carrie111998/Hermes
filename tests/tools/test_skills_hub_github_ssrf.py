@@ -120,3 +120,28 @@ class TestGetRepoTreeUsesGuardedFetch:
         assert result is not None
         assert calls["n"] == 2
         raw_get.assert_not_called()
+
+
+class TestSkillsShRootListingUsesGuardedFetch:
+    def test_root_listing_fallback_uses_github_guard(self):
+        from tools.skills_hub import SkillsShSource
+
+        source = SkillsShSource(auth=MagicMock())
+        source.github._list_skills_in_repo = MagicMock(return_value=[])
+        source.github._find_skill_in_repo_tree = MagicMock(return_value=None)
+        source.github._github_get = MagicMock(
+            return_value=_resp(
+                200,
+                json_data=[{"name": "community", "type": "dir"}],
+            )
+        )
+        source.github.inspect = MagicMock(return_value=None)
+
+        with patch("tools.skills_hub.httpx.get") as raw_get:
+            result = source._discover_identifier("owner/repo/missing-skill")
+
+        assert result is None
+        source.github._github_get.assert_called_once_with(
+            "https://api.github.com/repos/owner/repo/contents/"
+        )
+        raw_get.assert_not_called()

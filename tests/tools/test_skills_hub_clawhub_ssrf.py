@@ -41,4 +41,6 @@ def test_guarded_http_get_blocks_private_redirect_before_safe_http_get():
     ):
         assert _guarded_http_get(public_url) is None
 
-    mock_safe_get.assert_called_once_with(public_url, timeout=20)
+    mock_safe_get.assert_called_once_with(
+        public_url, timeout=20, headers=None, params=None
+    )
