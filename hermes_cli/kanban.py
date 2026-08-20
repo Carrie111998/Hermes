@@ -988,7 +988,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     # --- gc ---
     p_gc = sub.add_parser(
-        "gc", help="Garbage-collect archived-task workspaces, old events, and old logs",
+        "gc", help="Garbage-collect completed/archived workspaces, old events, and old logs",
     )
     p_gc.add_argument("--event-retention-days", type=int, default=30,
                       help="Delete task_events older than N days for terminal tasks (default: 30)")
@@ -3214,7 +3214,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:
-    """Remove scratch workspaces of archived tasks, prune old events, and
+    """Remove completed/archived task workspaces, prune old events, and
     delete old worker logs."""
     import shutil
     scratch_root = kb.workspaces_root()
@@ -3222,7 +3222,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         rows = conn.execute(
             "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
-            "WHERE status = 'archived'"
+            "WHERE status IN ('done', 'archived')"
         ).fetchall()
     for row in rows:
         if row["workspace_kind"] == "worktree":

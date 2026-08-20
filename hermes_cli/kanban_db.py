@@ -5393,6 +5393,26 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    # A reviewer claim transitions ``review -> running``, so the task row no
+    # longer says ``review`` by the time the reviewer approves it. Preserve
+    # the source phase from the claim event for the retention decision below.
+    current_run = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    current_run_id = current_run["current_run_id"] if current_run else None
+    latest_claim = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'claimed' "
+        "AND run_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id, current_run_id),
+    ).fetchone() if current_run_id is not None else None
+    review_delivery = False
+    if latest_claim and latest_claim["payload"]:
+        try:
+            claimed_payload = json.loads(latest_claim["payload"])
+            if isinstance(claimed_payload, dict):
+                review_delivery = claimed_payload.get("source_status") == "review"
+        except (TypeError, ValueError):
+            pass
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -5527,6 +5547,14 @@ def complete_task(
         completed_payload: dict = {
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
+            # A review approval is a delivery boundary, not just another
+            # successful worker exit.  Keep this provenance on the event so
+            # deferred parent cleanup and explicit GC can make the same
+            # retention decision after this call returns.
+            "source_status": (
+                "review" if (prior_status == "review" or review_delivery)
+                else prior_status
+            ),
         }
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
@@ -5578,7 +5606,15 @@ def complete_task(
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
-    _cleanup_workspace(conn, task_id)
+    # A source-changing task that is approved from the review lane is still
+    # useful evidence for the person inspecting the delivered PR.  Preserve
+    # that task-owned worktree until an explicit archive/GC action. Scratch
+    # workspaces and ordinary completions retain their existing lifecycle.
+    _cleanup_workspace(
+        conn,
+        task_id,
+        retain_completed_worktree=(prior_status == "review" or review_delivery),
+    )
     _done_task = get_task(conn, task_id)
     if fire_lifecycle_hook:
         _fire_kanban_lifecycle_hook(
@@ -5875,14 +5911,21 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return is_managed
 
 
-def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
+def _cleanup_workspace(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    retain_completed_worktree: bool = False,
+) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
     Called from :func:`complete_task` after the DB transaction commits.
     Best-effort — any error is swallowed so cleanup never blocks task completion.
     ``scratch`` workspaces are removed; ``worktree`` workspaces are removed only
     when provably free of work (clean tree, every commit reachable from a
-    remote-tracking ref); ``dir`` workspaces are intentionally preserved.
+    remote-tracking ref), unless this is a review-approved completion, where
+    the worktree is retained for inspection until explicit cleanup;
+    ``dir`` workspaces are intentionally preserved.
     """
     try:
         row = conn.execute(
@@ -5921,6 +5964,14 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # worktree so a lingering worker never has its cwd deleted out
             # from under it. Both steps stay best-effort.
             _cleanup_worker_tmux(conn, task_id)
+            if retain_completed_worktree:
+                _log.info(
+                    "Preserving review-delivered worktree for task %s: %s",
+                    task_id,
+                    path,
+                )
+                _try_cleanup_parent_workspaces(conn, task_id)
+                return
             _cleanup_worktree_workspace(task_id, path, row["branch_name"])
             _try_cleanup_parent_workspaces(conn, task_id)
             return
@@ -5958,7 +6009,10 @@ def _cleanup_worktree_workspace(
 ) -> None:
     """Remove a finished task's linked git worktree when it holds no work.
 
-    Mirrors the safety judgment of the CLI startup pruner
+    Only removes the canonical task-owned checkout at
+    ``<repo>/.worktrees/<task-id>``. Explicit custom worktree targets and
+    existing user worktrees are never owned by Kanban. It then mirrors the
+    safety judgment of the CLI startup pruner
     (``cli._prune_stale_worktrees``): removal requires a clean working tree
     AND every commit reachable from a remote-tracking ref. Any doubt — dirty
     files, unpushed commits, unresolvable repo, failing git — preserves the
@@ -5979,6 +6033,14 @@ def _cleanup_worktree_workspace(
         repo_root = common.parent
         if wp.resolve(strict=False) == repo_root.resolve(strict=False):
             return  # never remove the main checkout
+        expected = (repo_root / ".worktrees" / task_id).resolve(strict=False)
+        if wp.resolve(strict=False) != expected:
+            _log.info(
+                "Preserving non-canonical worktree for task %s at %s "
+                "(expected %s)",
+                task_id, wp, expected,
+            )
+            return
         if _worktree_is_dirty(str(wp)) or _worktree_has_unpushed_commits(str(wp)):
             _log.info(
                 "Preserving worktree for task %s: dirty or unpushed work at %s",
@@ -6031,7 +6093,7 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
         ).fetchall()
         for (parent_id,) in parents:
             row = conn.execute(
-                "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?",
+                "SELECT status, workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?",
                 (parent_id,),
             ).fetchone()
             if (
@@ -6050,6 +6112,35 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             ).fetchone()
             if active:
                 continue  # still has active children
+            # Review-approved source work is deliberately retained until an
+            # explicit archive/GC action, including when the last child later
+            # completes and revisits this deferred-parent path.
+            # Explicit archive is the authoritative cleanup decision. It may
+            # have been deferred while children were active, but a later child
+            # completion must finish that cleanup rather than let historical
+            # review provenance retain the archived worktree forever.
+            if row["status"] == "archived":
+                pass
+            elif row["workspace_kind"] == "worktree":
+                latest_completion = conn.execute(
+                    "SELECT payload FROM task_events "
+                    "WHERE task_id = ? AND kind = 'completed' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (parent_id,),
+                ).fetchone()
+                try:
+                    latest_payload = (
+                        json.loads(latest_completion["payload"])
+                        if latest_completion and latest_completion["payload"]
+                        else {}
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    latest_payload = {}
+                if (
+                    isinstance(latest_payload, dict)
+                    and latest_payload.get("source_status") == "review"
+                ):
+                    continue
             # All children done — safe to clean up parent workspace
             if row["workspace_kind"] == "worktree":
                 _cleanup_worktree_workspace(

@@ -1,21 +1,19 @@
-"""Tests for worktree workspace teardown at task completion/archive.
+"""Tests for worktree workspace retention and teardown at task completion/archive.
 
-Covers the ownership gap where kanban ``worktree`` workspaces were never
-reaped by anything: ``_cleanup_workspace`` preserved them by design, the CLI
-startup pruner explicitly skips ``t_*`` worktrees ("dispatcher-driven
-lifecycle"), and ``kanban gc`` only swept scratch. A completed or archived
-task's linked worktree is now removed when — and only when — it provably
-holds no work: clean working tree and every commit reachable from a
-remote-tracking ref. Any doubt preserves the worktree.
+Review-delivered source work remains inspectable after completion; archive or
+explicit GC removes it only when it is provably disposable. Scratch cleanup
+and all dirty/unpushed/user-tree safety guards remain intact.
 """
 
 from __future__ import annotations
 
+import argparse
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from hermes_cli import kanban as kanban_cli
 from hermes_cli import kanban_db as kb
 
 
@@ -115,6 +113,14 @@ def test_custom_branch_survives_worktree_removal(repo: Path) -> None:
     assert _branch_exists(repo, "feature/custom")
 
 
+def test_custom_existing_worktree_is_not_task_owned(repo: Path) -> None:
+    target = repo / "user-worktree"
+    kb._ensure_git_worktree(repo, target, "feature/user-worktree")
+    kb._cleanup_worktree_workspace("t_ownercase", str(target), "feature/user-worktree")
+    assert target.is_dir()
+    assert _branch_exists(repo, "feature/user-worktree")
+
+
 def test_main_checkout_never_removed(repo: Path) -> None:
     kb._cleanup_worktree_workspace("t_eeee5555", str(repo))
     assert repo.is_dir()
@@ -178,6 +184,174 @@ def test_complete_task_reaps_clean_worktree(kanban_home: Path, repo: Path) -> No
     assert not _branch_exists(repo, f"wt/{tid}")
 
 
+def test_review_delivered_completion_retains_clean_worktree_until_archive(
+    kanban_home: Path, repo: Path
+) -> None:
+    with kb.connect_closing() as conn:
+        tid, wt = _worktree_task(conn, repo)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        implementation = kb.claim_task(conn, tid, claimer="worker")
+        assert implementation is not None
+        assert kb.request_review(
+            conn, tid, summary="PR delivered", reviewer="reviewer",
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, tid, claimer="reviewer")
+        assert review is not None
+        assert kb.complete_task(
+            conn, tid, summary="Approved", expected_run_id=review.current_run_id
+        )
+        assert wt.is_dir(), "review delivery must leave source work inspectable"
+        assert _branch_exists(repo, f"wt/{tid}"), (
+            "review delivery must retain the local task branch until archive"
+        )
+        assert kb.archive_task(conn, tid)
+    assert not wt.exists(), "archive is an explicit cleanup action"
+
+
+def test_review_delivered_worktree_gc_is_explicit_cleanup(
+    kanban_home: Path, repo: Path
+) -> None:
+    with kb.connect_closing() as conn:
+        tid, wt = _worktree_task(conn, repo)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        assert kb.complete_task(conn, tid, summary="Approved")
+        assert wt.is_dir()
+    # GC's backstop covers retained done tasks from the review-only path.
+    assert kanban_cli._cmd_gc(
+        argparse.Namespace(event_retention_days=30, log_retention_days=30)
+    ) == 0
+    assert not wt.exists()
+
+
+def test_corrupt_review_claim_payload_keeps_completion_cleanup_safe(
+    kanban_home: Path, repo: Path
+) -> None:
+    """A non-object claimed payload is non-review provenance, not an error."""
+    with kb.connect_closing() as conn:
+        tid, wt = _worktree_task(conn, repo)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        implementation = kb.claim_task(conn, tid, claimer="worker")
+        assert implementation is not None
+        assert kb.request_review(
+            conn, tid, summary="PR delivered", reviewer="reviewer",
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, tid, claimer="reviewer")
+        assert review is not None
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET payload='[]' "
+                "WHERE task_id=? AND kind='claimed' AND run_id=?",
+                (tid, review.current_run_id),
+            )
+        assert kb.complete_task(
+            conn, tid, summary="Approved", expected_run_id=review.current_run_id
+        )
+        assert kb.get_task(conn, tid).status == "done"
+    assert not wt.exists(), "corrupt provenance must retain ordinary cleanup"
+    assert not _branch_exists(repo, f"wt/{tid}")
+
+
+def test_review_delivered_gc_preserves_dirty_worktree(
+    kanban_home: Path, repo: Path
+) -> None:
+    with kb.connect_closing() as conn:
+        tid, wt = _worktree_task(conn, repo)
+        (wt / "wip.txt").write_text("review evidence\n", encoding="utf-8")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
+        assert kb.complete_task(conn, tid, summary="Approved")
+        assert wt.is_dir()
+    assert kanban_cli._cmd_gc(
+        argparse.Namespace(event_retention_days=30, log_retention_days=30)
+    ) == 0
+    assert wt.is_dir(), "GC must preserve dirty review-delivered work"
+    assert (wt / "wip.txt").read_text(encoding="utf-8") == "review evidence\n"
+
+
+def test_reopened_review_then_ordinary_completion_does_not_retain_worktree(
+    kanban_home: Path, repo: Path
+) -> None:
+    with kb.connect_closing() as conn:
+        tid, wt = _worktree_task(conn, repo)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        implementation = kb.claim_task(conn, tid, claimer="worker")
+        assert implementation is not None
+        assert kb.request_review(
+            conn, tid, summary="needs changes", reviewer="reviewer",
+            expected_run_id=implementation.current_run_id,
+        )
+        assert kb.reopen_review_task(conn, tid)
+        rerun = kb.claim_task(conn, tid, claimer="worker")
+        assert rerun is not None
+        assert kb.complete_task(
+            conn, tid, summary="fixed", expected_run_id=rerun.current_run_id
+        )
+    assert not wt.exists(), "ordinary completion after reopen must clean up"
+
+
+def test_reopened_review_deferred_parent_uses_latest_completion(
+    kanban_home: Path, repo: Path
+) -> None:
+    with kb.connect_closing() as conn:
+        parent, parent_wt = _worktree_task(conn, repo, title="review parent")
+        child = kb.create_task(conn, title="child", assignee="worker")
+        kb.link_tasks(conn, parent, child)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
+        implementation = kb.claim_task(conn, parent, claimer="worker")
+        assert implementation is not None
+        assert kb.request_review(
+            conn, parent, summary="needs changes", reviewer="reviewer",
+            expected_run_id=implementation.current_run_id,
+        )
+        assert kb.reopen_review_task(conn, parent)
+        rerun = kb.claim_task(conn, parent, claimer="worker")
+        assert rerun is not None
+        assert kb.complete_task(
+            conn, parent, summary="fixed", expected_run_id=rerun.current_run_id
+        )
+        assert parent_wt.is_dir(), "active child should defer parent cleanup"
+
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        assert kb.claim_task(conn, child, claimer="worker") is not None
+        assert kb.complete_task(conn, child, summary="child done")
+    assert not parent_wt.exists(), "deferred cleanup must use latest provenance"
+
+
+def test_scratch_completion_and_abandoned_archive_still_clean_up(
+    kanban_home: Path,
+) -> None:
+    with kb.connect_closing() as conn:
+        completed = kb.create_task(conn, title="scratch", assignee="worker")
+        completed_path = kanban_home / "kanban" / "workspaces" / completed
+        completed_path.mkdir(parents=True)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_path=? WHERE id=?",
+                (str(completed_path), completed),
+            )
+        assert kb.complete_task(conn, completed, summary="done")
+        assert not completed_path.exists()
+
+        abandoned = kb.create_task(conn, title="abandoned", assignee="worker")
+        abandoned_path = kanban_home / "kanban" / "workspaces" / abandoned
+        abandoned_path.mkdir(parents=True)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_path=? WHERE id=?",
+                (str(abandoned_path), abandoned),
+            )
+        assert kb.archive_task(conn, abandoned)
+        assert not abandoned_path.exists()
+
+
 def test_complete_task_preserves_dirty_worktree(kanban_home: Path, repo: Path) -> None:
     with kb.connect_closing() as conn:
         tid, wt = _worktree_task(conn, repo)
@@ -218,3 +392,21 @@ def test_parent_worktree_deferred_until_children_done(
         assert kb.complete_task(conn, child, summary="child done")
     # last child terminal -> deferred parent worktree reaped
     assert not parent_wt.exists()
+
+
+def test_archived_parent_cleanup_wins_after_active_child_finishes(
+    kanban_home: Path, repo: Path
+) -> None:
+    with kb.connect_closing() as conn:
+        parent, parent_wt = _worktree_task(conn, repo, title="archived parent")
+        child = kb.create_task(conn, title="child", assignee="worker")
+        kb.link_tasks(conn, parent, child)
+
+        assert kb.archive_task(conn, parent)
+        assert parent_wt.is_dir(), "active child should defer physical removal"
+
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        assert kb.claim_task(conn, child, claimer="worker") is not None
+        assert kb.complete_task(conn, child, summary="child done")
+    assert not parent_wt.exists(), "archive must remain authoritative after deferral"
