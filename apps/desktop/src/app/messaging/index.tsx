@@ -843,7 +843,9 @@ const PLATFORM_INTRO: Record<string, string> = {
   api_server:
     'Expose Hermes as an OpenAI-compatible API. Set an auth key, then point Open WebUI / LobeChat / etc. at the host:port.',
   webhook:
-    'Run an HTTP server that other tools (GitHub, GitLab, custom apps) can POST to. Use the secret to verify signatures.'
+    'Run an HTTP server that other tools (GitHub, GitLab, custom apps) can POST to. Use the secret to verify signatures.',
+  zulip:
+    'Create a Zulip bot in Settings → Bots, then paste the site URL, bot email, and API key.'
 }
 
 const introCopy = (platform: MessagingPlatformInfo, m: Translations['messaging']) =>
