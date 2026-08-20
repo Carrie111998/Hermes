@@ -811,6 +811,13 @@ def hud_surface_note(valid_tool_names: "set[str] | None" = None) -> str:
     Each sentence is gated on the tool it names — naming a tool outside this
     agent's schema invites a hallucinated call — and the note as a whole is
     withheld without the one it rests on.
+
+    The one thing the note cannot know is whether computer_use reaches the
+    window at all: on a remote gateway it drives the backend host's desktop
+    while the HUD floats over the user's. That is resolved when the agent asks
+    — read_window_below returns an `agent_host` — so the prior defers to it
+    rather than carrying a locality bit that would be stale by the time anyone
+    read it back.
     """
     names = valid_tool_names or set()
     if "read_window_below" not in names:
@@ -831,7 +838,9 @@ def hud_surface_note(valid_tool_names: "set[str] | None" = None) -> str:
         sentences.append(
             "Prefer carrying the work out in that same app — computer_use "
             "takes its name in `app` — over pulling the task into a surface "
-            "of your own."
+            "of your own, unless read_window_below reports an `agent_host`, "
+            "which means computer_use drives a different machine than the one "
+            "the window is on."
         )
         if "browser_navigate" in names:
             sentences.append(
