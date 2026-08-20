@@ -5,7 +5,11 @@ from unittest.mock import Mock
 
 import pytest
 
-from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
+from gateway.session_context import (
+    clear_session_vars,
+    reset_session_vars,
+    set_session_vars,
+)
 from tools import discord_guild_settings_tool as consumer
 
 CURRENT_GUILD = "123456789012345678"
@@ -16,8 +20,16 @@ CHANNEL_ID = "987654321098765432"
 @pytest.fixture(autouse=True)
 def _isolated_consumer(monkeypatch):
     reset_session_vars()
-    monkeypatch.setattr(consumer._discord, "_get_bot_token", lambda: "active-profile-token")
-    monkeypatch.setattr(consumer._discord, "_load_allowed_actions_config", lambda: None)
+    monkeypatch.setattr(
+        consumer._discord,
+        "_get_bot_token",
+        lambda: "active-profile-token",
+    )
+    monkeypatch.setattr(
+        consumer._discord,
+        "_load_allowed_actions_config",
+        lambda: None,
+    )
     yield
     reset_session_vars()
 
@@ -164,7 +176,11 @@ def test_consumer_rejects_invalid_or_empty_patch_before_transport(
 def test_consumer_respects_shared_server_action_allowlist(monkeypatch):
     request = Mock()
     monkeypatch.setattr(consumer._discord, "_discord_request", request)
-    monkeypatch.setattr(consumer._discord, "_load_allowed_actions_config", lambda: ["list_roles"])
+    monkeypatch.setattr(
+        consumer._discord,
+        "_load_allowed_actions_config",
+        lambda: ["list_roles"],
+    )
     tokens = _bind_discord_request()
     try:
         result = consumer.edit_current_guild_settings({"name": "Hermes HQ"})
@@ -183,7 +199,16 @@ def test_schema_exposes_only_owned_settings_and_no_target_id():
     settings = parameters["properties"]["settings"]
     assert settings["additionalProperties"] is False
     assert "nsfw_level" not in settings["properties"]
-    assert settings["properties"]["afk_timeout"]["enum"] == [60, 300, 900, 1800, 3600]
+    assert settings["properties"]["afk_timeout"]["enum"] == [
+        60,
+        300,
+        900,
+        1800,
+        3600,
+    ]
+    assert settings["properties"]["system_channel_id"]["anyOf"][0]["pattern"] == (
+        "^[1-9][0-9]{0,19}$"
+    )
 
 
 def test_sequential_request_owners_do_not_share_guild_authority(monkeypatch):
