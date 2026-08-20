@@ -61,8 +61,21 @@ class TestEnsureHermesHome:
             ensure_hermes_home()
             assert soul_path.read_text(encoding="utf-8") == DEFAULT_SOUL_MD
 
+    @pytest.mark.require_symlinks
+    def test_dangling_soul_symlink_is_not_reconstructed(self, tmp_path):
+        """Startup must not create the missing target of a broken SOUL.md link."""
+        from hermes_cli.config import _ensure_default_soul_md
 
+        missing_target = tmp_path / "removed-canary-source" / "SOUL.md"
+        missing_target.parent.mkdir()
+        soul_path = tmp_path / "SOUL.md"
+        soul_path.symlink_to(missing_target)
 
+        _ensure_default_soul_md(tmp_path)
+
+        assert soul_path.is_symlink()
+        assert os.readlink(soul_path) == str(missing_target)
+        assert not missing_target.exists()
 
 
 class TestLoadConfigDefaults:
