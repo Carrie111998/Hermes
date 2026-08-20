@@ -40,13 +40,7 @@ describe('resolveManualSessionOrderIds', () => {
 
 describe('reorderSubset', () => {
   it('reorders only the named subset while preserving every other slot', () => {
-    expect(reorderSubset(['a1', 'b1', 'a2', 'b2', 'a3'], ['a3', 'a1', 'a2'])).toEqual([
-      'a3',
-      'b1',
-      'a1',
-      'b2',
-      'a2'
-    ])
+    expect(reorderSubset(['a1', 'b1', 'a2', 'b2', 'a3'], ['a3', 'a1', 'a2'])).toEqual(['a3', 'b1', 'a1', 'b2', 'a2'])
   })
 
   it('fails closed for duplicate or foreign ids', () => {
@@ -59,12 +53,7 @@ describe('reorderSubset', () => {
 
 describe('reconcileRetainingUnseenIds', () => {
   it('never deletes persisted slots hidden by a filter', () => {
-    expect(reconcileRetainingUnseenIds(['a1', 'a2'], ['a1', 'b1', 'a2', 'b2'])).toEqual([
-      'a1',
-      'b1',
-      'a2',
-      'b2'
-    ])
+    expect(reconcileRetainingUnseenIds(['a1', 'a2'], ['a1', 'b1', 'a2', 'b2'])).toEqual(['a1', 'b1', 'a2', 'b2'])
   })
 
   it('keeps an unseen paged tail and appends it only once when the page loads', () => {
@@ -95,7 +84,9 @@ describe('reorderProfileSessionOrder', () => {
       beta: ['shared', 'beta-2']
     }
 
-    expect(reorderProfileSessionOrder(orders, 'beta', ['shared', 'beta-2'], ['shared', 'beta-2'], ['beta-2', 'shared'])).toEqual({
+    expect(
+      reorderProfileSessionOrder(orders, 'beta', ['shared', 'beta-2'], ['shared', 'beta-2'], ['beta-2', 'shared'])
+    ).toEqual({
       alpha: ['shared', 'alpha-2'],
       beta: ['beta-2', 'shared']
     })
@@ -106,8 +97,6 @@ describe('reorderProfileSessionOrder', () => {
 
     expect(reorderProfileSessionOrder(orders, 'alpha', ['a1', 'a2'], ['a1', 'a2'], ['a2', 'b1'])).toBe(orders)
   })
-
-
 
   it('fails closed when a same-profile payload omits a rendered sortable id', () => {
     const orders = { alpha: ['a1', 'a2', 'a3'] }
@@ -145,12 +134,7 @@ describe('reorderProfileSessionOrder', () => {
     const persisted = { alpha: ['a1', 'a2', 'a3', 'a4'] }
     const dragged = reorderProfileSessionOrder(persisted, 'alpha', ['a1', 'a2'], ['a1', 'a2'], ['a2', 'a1'])
 
-    expect(reconcileRetainingUnseenIds(['a1', 'a2', 'a3', 'a4'], dragged.alpha)).toEqual([
-      'a2',
-      'a1',
-      'a3',
-      'a4'
-    ])
+    expect(reconcileRetainingUnseenIds(['a1', 'a2', 'a3', 'a4'], dragged.alpha)).toEqual(['a2', 'a1', 'a3', 'a4'])
   })
 })
 

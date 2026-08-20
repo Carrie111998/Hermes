@@ -46,7 +46,11 @@ vi.mock('./session-row', () => ({
     reorderable?: boolean
     session: SessionInfo
   }) => (
-    <div data-branch-stem={branchStem ?? ''} data-reorderable={String(Boolean(reorderable))} data-testid={`session-row-${session.id}`}>
+    <div
+      data-branch-stem={branchStem ?? ''}
+      data-reorderable={String(Boolean(reorderable))}
+      data-testid={`session-row-${session.id}`}
+    >
       {branchStem ?? ''}
       {session.id}
     </div>
@@ -240,14 +244,18 @@ describe('SidebarSessionsSection all-profile manual ordering', () => {
 
     expect(globalThis.document.querySelectorAll('[data-reorderable="true"]')).toHaveLength(4)
     expect(
-      [...(globalThis.document.querySelector('[data-testid="profile-group-alpha"]')?.querySelectorAll('[data-testid^="session-row-"]') ?? [])].map(
-        row => row.textContent
-      )
+      [
+        ...(globalThis.document
+          .querySelector('[data-testid="profile-group-alpha"]')
+          ?.querySelectorAll('[data-testid^="session-row-"]') ?? [])
+      ].map(row => row.textContent)
     ).toEqual(['alpha-2', 'alpha-1'])
     expect(
-      [...(globalThis.document.querySelector('[data-testid="profile-group-beta"]')?.querySelectorAll('[data-testid^="session-row-"]') ?? [])].map(
-        row => row.textContent
-      )
+      [
+        ...(globalThis.document
+          .querySelector('[data-testid="profile-group-beta"]')
+          ?.querySelectorAll('[data-testid^="session-row-"]') ?? [])
+      ].map(row => row.textContent)
     ).toEqual(['beta-1', 'beta-2'])
     expect(globalThis.document.body.textContent).toContain('To pick up a draggable item, press the space bar')
   })
@@ -280,15 +288,15 @@ describe('SidebarSessionsSection all-profile manual ordering', () => {
     const rows = [...globalThis.document.querySelectorAll('[data-testid^="session-row-"]')]
 
     expect(rows.map(row => row.textContent)).toEqual(['other', 'parent', '└─ child'])
-    expect(globalThis.document.querySelector('[data-testid="session-row-parent"]')?.getAttribute('data-reorderable')).toBe(
-      'true'
-    )
-    expect(globalThis.document.querySelector('[data-testid="session-row-child"]')?.getAttribute('data-reorderable')).toBe(
-      'false'
-    )
-    expect(globalThis.document.querySelector('[data-testid="session-row-child"]')?.getAttribute('data-branch-stem')).toBe(
-      '└─ '
-    )
+    expect(
+      globalThis.document.querySelector('[data-testid="session-row-parent"]')?.getAttribute('data-reorderable')
+    ).toBe('true')
+    expect(
+      globalThis.document.querySelector('[data-testid="session-row-child"]')?.getAttribute('data-reorderable')
+    ).toBe('false')
+    expect(
+      globalThis.document.querySelector('[data-testid="session-row-child"]')?.getAttribute('data-branch-stem')
+    ).toBe('└─ ')
   })
 
   it('keeps grouped rows static when Manual mode is not active', () => {

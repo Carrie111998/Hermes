@@ -509,7 +509,11 @@ export function SidebarSessionsSection({
 
     inner =
       sessionsDraggable && onReorderSessions ? (
-        <ReorderableList ids={sortableRowIds} onReorder={next => onReorderSessions(next, sortableRowIds)} sensors={dndSensors}>
+        <ReorderableList
+          ids={sortableRowIds}
+          onReorder={next => onReorderSessions(next, sortableRowIds)}
+          sensors={dndSensors}
+        >
           {virtual}
         </ReorderableList>
       ) : (
@@ -517,7 +521,11 @@ export function SidebarSessionsSection({
       )
   } else if (sessionsDraggable && onReorderSessions) {
     inner = (
-      <ReorderableList ids={sortableRowIds} onReorder={next => onReorderSessions(next, sortableRowIds)} sensors={dndSensors}>
+      <ReorderableList
+        ids={sortableRowIds}
+        onReorder={next => onReorderSessions(next, sortableRowIds)}
+        sensors={dndSensors}
+      >
         {flatRows.map(row => renderListRow(row, true, dividerAction))}
       </ReorderableList>
     )
