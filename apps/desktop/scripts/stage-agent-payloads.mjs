@@ -367,6 +367,36 @@ function stageManagedRuntimes(target, outDir, pythonExe) {
     ], { cwd: REPO_ROOT })
   }
 
+  // Stage browser runtimes (camoufox, chromium, chromium-headless-shell)
+  // so a bundled install can browse without a ~650MB+170MB lazy download
+  // on first use. These are optional in the pin table — the sweep above
+  // skips them — so we ask for them by name, same as git on Windows.
+  //
+  // Non-fatal: win32-arm64 has no upstream chromium/camoufox build (the
+  // pin table marks it missing), and the provisioner exits 1 when any
+  // tool fails. A missing browser on one arch must not fail the whole
+  // payload build — the runtime falls back to lazy-install or system
+  // browser on that target.
+  const browserTools = ["camoufox", "chromium", "chromium-headless-shell"]
+  const browserArgs = [
+    "-m",
+    "installation.provisioner",
+    "--runtime-dir",
+    outDir,
+    "--target",
+    targetKey,
+    "--archive-cache",
+    path.join(REPO_ROOT, "apps", "desktop", "build", "pin-archives"),
+  ]
+  for (const tool of browserTools) {
+    browserArgs.push("--only", tool)
+  }
+  try {
+    run(pythonExe, browserArgs, { cwd: REPO_ROOT })
+  } catch (e) {
+    console.warn(`[stage-agent-payloads] browser runtime staging had failures (non-fatal): ${e.message}`)
+  }
+
   assertPayloadArch(target, outDir)
 }
 
