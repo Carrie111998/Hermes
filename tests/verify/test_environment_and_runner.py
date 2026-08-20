@@ -540,6 +540,40 @@ class TestPythonIsolation:
         assert "redirect" in result.phases[0].output_tail.lower()
         assert external.read_text(encoding="utf-8") == "unchanged"
 
+    def test_metadata_parent_replacement_during_lock_open_fails_without_external_lock(
+        self, tmp_path, monkeypatch
+    ):
+        root = tmp_path / "project"
+        root.mkdir()
+        metadata = root / ".hermes"
+        external = tmp_path / "external-metadata"
+        external.mkdir()
+        real_open = runner.os.open
+        swapped = False
+
+        def replace_parent_before_lock_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal swapped
+            if not swapped and dir_fd is None and metadata.is_dir() and not metadata.is_symlink():
+                opened_path = Path(path)
+                if opened_path in {metadata, metadata / "verify.lock"}:
+                    swapped = True
+                    metadata.rmdir()
+                    _symlink_or_skip(metadata, external, target_is_directory=True)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(runner.os, "open", replace_parent_before_lock_open)
+
+        result = run_verify(
+            root,
+            Recipe(name="Python project", kind="python", test=[_python_command("pass")]),
+            skip_start=True,
+        )
+
+        assert swapped
+        assert not result.ok
+        assert result.phases[0].phase == "isolation"
+        assert not (external / "verify.lock").exists()
+
     def test_lock_timeout_fails_before_project_commands(self, tmp_path):
         entered = threading.Event()
         release = threading.Event()

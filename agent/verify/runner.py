@@ -108,6 +108,66 @@ def _prepare_metadata_root(root: Path) -> Path:
     return metadata
 
 
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    """Return whether two stat results identify the same filesystem object."""
+    if hasattr(left, "st_ino") and hasattr(right, "st_ino"):
+        return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+    return False
+
+
+def _open_metadata_directory(metadata: Path) -> int | None:
+    """Open ``metadata`` itself when Python exposes handle-anchored directory ops.
+
+    POSIX ``openat``/``dir_fd`` support lets us validate the metadata directory
+    and create the lock file relative to that exact directory object.  This
+    closes the parent-replacement gap left by path validation followed by a
+    pathname ``open('.hermes/verify.lock')``.  On platforms without these
+    primitives (notably native Windows in the stdlib) callers keep the existing
+    path-based checks rather than claiming POSIX-strength anchoring.
+    """
+    if os.name == "nt" or not os.supports_dir_fd:
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(metadata, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise OSError(f"verification metadata root is not a directory: {metadata}")
+        current = os.lstat(metadata)
+        if not _same_file_identity(opened, current):
+            raise OSError(f"verification metadata root changed during open: {metadata}")
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _verify_metadata_directory(metadata: Path, descriptor: int | None) -> None:
+    """Fail closed if ``metadata`` no longer names ``descriptor``."""
+    _reject_redirect(metadata)
+    if descriptor is None:
+        return
+    opened = os.fstat(descriptor)
+    current = os.lstat(metadata)
+    if not _same_file_identity(opened, current):
+        raise OSError(f"verification metadata root changed during use: {metadata}")
+
+
+def _open_lock_file(metadata: Path, metadata_descriptor: int | None) -> Any:
+    flags = os.O_RDWR | os.O_CREAT
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    if metadata_descriptor is not None:
+        descriptor = os.open(_VERIFY_LOCK_NAME, flags, 0o600, dir_fd=metadata_descriptor)
+    else:
+        lock_path = metadata / _VERIFY_LOCK_NAME
+        _reject_redirect(lock_path)
+        descriptor = os.open(lock_path, flags, 0o600)
+    return os.fdopen(descriptor, "r+b", buffering=0)
+
+
 def _thread_lock_for(root: Path) -> threading.Lock:
     key = os.path.normcase(str(root))
     with _THREAD_LOCKS_GUARD:
@@ -158,19 +218,19 @@ def _project_python_lock(root: Path, timeout: float):
     if not thread_lock.acquire(timeout=timeout):
         raise TimeoutError(f"timed out waiting for Python verification lock for {root}")
     file = None
+    metadata_descriptor = None
     locked = False
     try:
         metadata = _prepare_metadata_root(root)
         lock_path = metadata / _VERIFY_LOCK_NAME
-        _reject_redirect(lock_path)
-        flags = os.O_RDWR | os.O_CREAT
-        flags |= getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(lock_path, flags, 0o600)
-        file = os.fdopen(descriptor, "r+b", buffering=0)
+        metadata_descriptor = _open_metadata_directory(metadata)
+        _verify_metadata_directory(metadata, metadata_descriptor)
+        file = _open_lock_file(metadata, metadata_descriptor)
         if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
             raise OSError(f"verification lock is not a regular file: {lock_path}")
-        _reject_redirect(lock_path)
+        _verify_metadata_directory(metadata, metadata_descriptor)
+        if metadata_descriptor is None:
+            _reject_redirect(lock_path)
         deadline = time.monotonic() + timeout
         while not _try_lock_file(file):
             if time.monotonic() >= deadline:
@@ -179,14 +239,17 @@ def _project_python_lock(root: Path, timeout: float):
                 )
             time.sleep(0.05)
         locked = True
-        _reject_redirect(metadata)
-        _reject_redirect(lock_path)
+        _verify_metadata_directory(metadata, metadata_descriptor)
+        if metadata_descriptor is None:
+            _reject_redirect(lock_path)
         yield
     finally:
         if locked and file is not None:
             _unlock_file(file)
         if file is not None:
             file.close()
+        if metadata_descriptor is not None:
+            os.close(metadata_descriptor)
         thread_lock.release()
 
 
