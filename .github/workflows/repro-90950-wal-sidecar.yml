@@ -29,10 +29,16 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Build SQLite 3.53.1 and 3.53.4 from official amalgamations
+        env:
+          HERMES_EVENT_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/sqlite-build artifacts/bin artifacts/db
-          printf 'source_head=%s\n' "$GITHUB_SHA" > artifacts/trigger.txt
+          actual_head="$(git rev-parse HEAD)"
+          test "$actual_head" = "$HERMES_EVENT_HEAD"
+          printf 'source_head=%s\nevent_head=%s\nworkflow_sha=%s\n' \
+            "$actual_head" "$HERMES_EVENT_HEAD" "$GITHUB_SHA" \
+            > artifacts/trigger.txt
           python3 - <<'PY' > /tmp/sqlite-build/expected.json
           import json
           print(json.dumps({
@@ -111,6 +117,8 @@ jobs:
           done
 
       - name: Classify receipts without assigning causality
+        env:
+          HERMES_EVENT_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           python3 scripts/summarize_state_db_wal_sidecar.py \
@@ -124,6 +132,17 @@ jobs:
           import subprocess
           from pathlib import Path
 
+          source_head = subprocess.run(
+              ['git', 'rev-parse', 'HEAD'],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout.strip()
+          event_head = os.environ['HERMES_EVENT_HEAD']
+          if source_head != event_head:
+              raise SystemExit(
+                  f'checked-out source {source_head} does not match event head {event_head}'
+              )
           stat = subprocess.run(
               ['stat', '-f', '-c', '%T', '.'],
               check=True,
@@ -132,7 +151,9 @@ jobs:
           ).stdout.strip()
           receipt = {
               'schema': 'hermes.state-db-wal-sidecar-environment.v1',
-              'source_head': os.environ.get('GITHUB_SHA'),
+              'source_head': source_head,
+              'event_head': event_head,
+              'workflow_sha': os.environ.get('GITHUB_SHA'),
               'runner_os': platform.platform(),
               'kernel': platform.release(),
               'filesystem_type': stat,
