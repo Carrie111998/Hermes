@@ -153,6 +153,12 @@ def windows_batch_command(
     characters are rejected because ``cmd.exe`` cannot transport them without
     reparsing.
 
+    This function mutates the caller-provided environment mapping in place.
+    Callers must pass a disposable copy and then give that same mapping to
+    :class:`subprocess.Popen`. The generated placeholder variables are
+    intentionally inherited by the batch child (and its descendants): cmd.exe
+    expands them exactly once to transport argv without reparsing its values.
+
     Async callers should use :func:`windows_batch_proxy_command`: asyncio's
     exec API converts argv with native quoting rules that are not cmd.exe's
     rules, while the tiny native-Python proxy can pass this raw string directly
@@ -569,9 +575,9 @@ def kill_process_tree(proc: Any) -> None:
 def _legacy_kill_process_tree(proc: "subprocess.Popen") -> None:
     """Pre-#85125 local tree-kill — fallback when agent.deadline is unavailable.
 
-    Kept verbatim so ``kill_process_tree`` can honor its swallow-everything
-    contract even when the delegation path itself fails (partial install,
-    import cycle during teardown).
+    Retained so ``kill_process_tree`` can honor its swallow-everything contract
+    even when delegation fails (partial install or import cycle during teardown).
+    Windows terminates the tree before the root so descendants remain discoverable.
     """
     if IS_WINDOWS:
         # Ask Windows to terminate the tree while the root PID is still alive.

@@ -51,6 +51,7 @@ import asyncio
 import logging
 import os
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
@@ -75,6 +76,7 @@ from agent.lsp.protocol import (
     make_response,
     read_message,
 )
+
 logger = logging.getLogger("agent.lsp.client")
 
 # Timeouts (seconds) — mirror OpenCode's constants, scaled to seconds.
@@ -83,7 +85,9 @@ DIAGNOSTICS_DOCUMENT_WAIT = 5.0
 DIAGNOSTICS_FULL_WAIT = 10.0
 DIAGNOSTICS_REQUEST_TIMEOUT = 3.0
 PUSH_DEBOUNCE = 0.15
-SHUTDOWN_GRACE = 1.0  # seconds between SIGTERM and SIGKILL
+# Maximum wait after the protocol-level ``shutdown`` + ``exit`` exchange,
+# POSIX ``terminate()``, and whole-tree termination before giving up on reaping.
+PROCESS_EXIT_GRACE_SECONDS = 1.0
 
 # Retry policy for transient ContentModified errors.
 MAX_CONTENT_MODIFIED_RETRIES = 3
@@ -328,24 +332,20 @@ class LSPClient:
             # gateway's child set, it captures the LSP PID, records the
             # inherited pgid, and killpg() then kills the TUI parent itself.
             # See tui_gateway_crash.log "killpg → SIGTERM received" stacks.
-            spawn_kwargs = {
-                "stdin": asyncio.subprocess.PIPE,
-                "stdout": asyncio.subprocess.PIPE,
-                "stderr": asyncio.subprocess.PIPE,
-                "env": env,
-                "cwd": self._cwd,
-                "start_new_session": True,
-                "creationflags": creationflags,
-            }
-            if use_windows_shell:
-                proxy_command = self._win_batch_proxy_command(cmd)
-                self._proc = await asyncio.create_subprocess_exec(
-                    proxy_command[0], *proxy_command[1:], **spawn_kwargs
-                )
-            else:
-                self._proc = await asyncio.create_subprocess_exec(
-                    cmd[0], *cmd[1:], **spawn_kwargs
-                )
+            spawn_command = (
+                self._win_batch_proxy_command(cmd) if use_windows_shell else cmd
+            )
+            self._proc = await asyncio.create_subprocess_exec(
+                spawn_command[0],
+                *spawn_command[1:],
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd=self._cwd,
+                start_new_session=True,
+                creationflags=creationflags,
+            )
         except FileNotFoundError as e:
             raise LSPProtocolError(
                 f"LSP server binary not found: {cmd[0]} ({e})"
@@ -482,8 +482,10 @@ class LSPClient:
     async def shutdown(self) -> None:
         """Best-effort graceful shutdown.
 
-        Sends ``shutdown`` + ``exit``, then SIGTERMs/SIGKILLs the
-        process if it doesn't exit cleanly.  Idempotent.
+        Sends ``shutdown`` + ``exit`` and gives the server one bounded chance
+        to exit cleanly. If it remains alive, shared process-tree cleanup snapshots
+        descendants before signaling the root on every platform. Every wait is
+        bounded. Idempotent.
         """
         if self._stopping:
             return
@@ -530,19 +532,66 @@ class LSPClient:
             if proc is None:
                 return
             if proc.returncode is None:
-                try:
-                    # A server that received shutdown+exit gets one bounded
-                    # chance to leave cleanly before whole-tree termination.
-                    await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
-                except asyncio.TimeoutError:
-                    # The shared compat helper delegates to agent.deadline's
-                    # portable tree-kill and retains its legacy fail-open
-                    # fallback for partial-install/teardown environments.
-                    await asyncio.to_thread(kill_process_tree, proc)
+                # Only shutdown() has sent the protocol shutdown+exit pair.
+                # Startup/transport failures must retire immediately rather
+                # than delaying the reader task behind a clean-exit grace wait.
+                needs_tree_kill = not self._stopping
+                if not needs_tree_kill:
                     try:
-                        await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
-                    except (asyncio.TimeoutError, ProcessLookupError):
-                        pass
+                        await asyncio.wait_for(
+                            proc.wait(), timeout=PROCESS_EXIT_GRACE_SECONDS
+                        )
+                    except asyncio.TimeoutError:
+                        # Do not terminate only the root on POSIX.  A server
+                        # may exit on SIGTERM while descendants keep running;
+                        # once reparented, a later parent walk cannot recover
+                        # ownership.  Enter the whole-tree helper first on
+                        # every platform so descendants are snapshotted before
+                        # any signal reaches the root.
+                        needs_tree_kill = True
+                if needs_tree_kill:
+                    # Use a dedicated daemon thread rather than the shared
+                    # asyncio executor.  Once ``start()`` returns this cleanup
+                    # cannot be cancelled out of an executor queue, and the
+                    # tree helper retains ownership of descendant discovery
+                    # even if reader retirement reaches its time budget.  In
+                    # particular, never kill only the proxy on timeout: doing
+                    # so can orphan cmd.exe and the language server before the
+                    # helper snapshots the tree.
+                    def _own_process_tree_cleanup() -> None:
+                        try:
+                            kill_process_tree(proc)
+                        except Exception:  # noqa: BLE001
+                            logger.debug(
+                                "[%s] process-tree cleanup failed",
+                                self.server_id,
+                                exc_info=True,
+                            )
+
+                    cleanup_thread = threading.Thread(
+                        target=_own_process_tree_cleanup,
+                        name=f"lsp-tree-kill-{getattr(proc, 'pid', 'unknown')}",
+                        daemon=True,
+                    )
+                    cleanup_thread.start()
+                    cleanup_deadline = (
+                        asyncio.get_running_loop().time()
+                        + PROCESS_EXIT_GRACE_SECONDS
+                    )
+                    while cleanup_thread.is_alive():
+                        remaining = (
+                            cleanup_deadline - asyncio.get_running_loop().time()
+                        )
+                        if remaining <= 0:
+                            break
+                        await asyncio.sleep(min(remaining, 0.01))
+                    if not cleanup_thread.is_alive():
+                        try:
+                            await asyncio.wait_for(
+                                proc.wait(), timeout=PROCESS_EXIT_GRACE_SECONDS
+                            )
+                        except (asyncio.TimeoutError, ProcessLookupError):
+                            pass
             # asyncio's proactor subprocess transport keeps its pipe handles and
             # a pending-connection callback alive even after the process exits.
             # Close it while the loop is still running so GC never calls __del__
