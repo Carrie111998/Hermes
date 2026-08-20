@@ -768,6 +768,14 @@ def get_container_exec_info() -> Optional[dict]:
 from hermes_constants import get_hermes_home, get_process_hermes_home  # noqa: F811,E402,F401
 from utils import atomic_replace, fast_safe_load
 
+# ``${VAR}`` expansion lives in its own dependency-free module so that
+# ``hermes send`` can bridge config.yaml into the environment without importing
+# this one (126 modules). Re-imported under the historical private name -- every
+# existing ``from hermes_cli.config import _expand_env_vars`` keeps working and
+# keeps getting the same function object.
+from hermes_cli._env_expand import expand_env_vars as _expand_env_vars  # noqa: E402
+
+
 def get_config_path() -> Path:
     """Get the main config file path."""
     return get_hermes_home() / "config.yaml"
@@ -6808,26 +6816,6 @@ def _strip_dotted_keys(cfg: dict, dotted_keys: set) -> Tuple[dict, set]:
             del node[parts[-1]]
             stripped.add(dotted)
     return cfg, stripped
-
-
-def _expand_env_vars(obj):
-    """Recursively expand ``${VAR}`` references in config values.
-
-    Only string values are processed; dict keys, numbers, booleans, and
-    None are left untouched.  Unresolved references (variable not in
-    ``os.environ``) are kept verbatim so callers can detect them.
-    """
-    if isinstance(obj, str):
-        return re.sub(
-            r"\${([^}]+)}",
-            lambda m: os.environ.get(m.group(1), m.group(0)),
-            obj,
-        )
-    if isinstance(obj, dict):
-        return {k: _expand_env_vars(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_expand_env_vars(item) for item in obj]
-    return obj
 
 
 def _env_ref_snapshot(obj, snapshot=None):

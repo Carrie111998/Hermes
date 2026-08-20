@@ -6,14 +6,23 @@ Built on gateway startup, refreshed periodically (every 5 min), and saved to
 action="list" and for resolving human-friendly channel names to numeric IDs.
 """
 
-import asyncio
 import json
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from hermes_cli.config import get_hermes_home
-from utils import atomic_json_write
+# Deliberately cheap module-scope imports. ``hermes send --list`` imports this
+# module and calls only ``load_directory()`` / ``format_directory_for_display()``
+# -- the read side, which needs neither an event loop nor a writer.
+#
+# * ``get_hermes_home`` comes from ``hermes_constants``, which is where it is
+#   canonically defined; ``hermes_cli.config`` merely re-exports it (see the
+#   re-export near the "Config paths" banner there) and costs 126 modules to
+#   this module's 11 for the identical function object.
+# * ``asyncio`` (89 modules) and ``utils.atomic_json_write`` (57, mostly PyYAML)
+#   are used only by the async build/refresh path, so they are imported inside
+#   the two functions that need them.
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +124,8 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
 
     Returns the directory dict and writes it to DIRECTORY_PATH.
     """
+    import asyncio
+
     from gateway.config import Platform
 
     platforms: Dict[str, List[Dict[str, str]]] = {}
@@ -172,6 +183,8 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     }
 
     try:
+        from utils import atomic_json_write
+
         atomic_json_write(DIRECTORY_PATH, directory)
     except Exception as e:
         logger.warning("Channel directory: failed to write: %s", e)
@@ -224,6 +237,8 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
     discovered from session history (IMs aren't useful to enumerate
     proactively).
     """
+    import asyncio
+
     team_clients = getattr(adapter, "_team_clients", None) or {}
     if not team_clients:
         return await asyncio.to_thread(_build_from_sessions, "slack")

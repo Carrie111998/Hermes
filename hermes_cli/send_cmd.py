@@ -233,8 +233,10 @@ def _load_hermes_env() -> None:
     except Exception:
         load_dotenv = None  # type: ignore[assignment]
 
+    # ``hermes_constants`` (11 modules), not ``hermes_cli.config`` (126) -- the
+    # latter only re-exports this very function. Same object, same semantics.
     try:
-        from hermes_cli.config import get_hermes_home
+        from hermes_constants import get_hermes_home
         home = get_hermes_home()
     except Exception:
         return
@@ -270,9 +272,11 @@ def _load_hermes_env() -> None:
     except Exception:
         return
 
+    # Same function ``hermes_cli.config`` exposes as ``_expand_env_vars``, taken
+    # from the dependency-free module it now lives in.
     try:
-        from hermes_cli.config import _expand_env_vars
-        raw = _expand_env_vars(raw)
+        from hermes_cli._env_expand import expand_env_vars
+        raw = expand_env_vars(raw)
     except Exception:
         pass
 

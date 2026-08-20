@@ -381,3 +381,149 @@ def test_send_still_writes_agent_log(tmp_path, fast):
         f"Files present: {sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob('*') if p.is_file())}"
     )
     assert log.stat().st_size > 0, "agent.log was created but is empty"
+
+
+# ---------------------------------------------------------------------------
+# The DELIVERY path: `send --list`
+# ---------------------------------------------------------------------------
+#
+# `send --help` measures the CLI scaffolding above send. It stops before
+# `cmd_send` runs, so it says nothing about what send costs to actually *do*
+# something. `send --list` is the cheapest argv that exercises the real path:
+# `send_cmd._load_hermes_env()` (dotenv + the config.yaml -> env bridge) and
+# `gateway.channel_directory` (read side). Measured on PRECISION 2026-08-19,
+# with the fast path already in place:
+#
+#     python -X importtime -m hermes_cli.main send --list  ->  378 modules
+#
+# 246 of those 378 were send's OWN dependency tree -- everything `--list`
+# imported that `--help` did not. Three causes, all now fixed:
+#
+#   * `gateway/__init__.py` eagerly re-exported from .config / .session /
+#     .delivery, so `import gateway.channel_directory` paid 294 modules
+#     (requests, urllib3, agent.context_engine) for a module that is one.
+#     Now PEP 562 `__getattr__`.
+#   * `gateway/channel_directory.py` imported `get_hermes_home` from
+#     `hermes_cli.config` (126 modules) rather than `hermes_constants` (11),
+#     which is where it is actually defined -- plus `asyncio` and
+#     `utils.atomic_json_write` at module scope for the write-side only.
+#   * `send_cmd._load_hermes_env()` imported `hermes_cli.config` twice, for
+#     that same re-exported `get_hermes_home` and for `_expand_env_vars` --
+#     eight lines of `re` that now live in `hermes_cli/_env_expand.py`.
+#
+# Post-fix: 171 modules, a 39-module delta over `send --help`.
+#
+# WHY THE ASSERTION IS RELATIVE. It bounds `--list` minus `--help`, not the
+# absolute count. The absolute number is a function of how much of main.py's
+# bootstrap runs before the fast path fires, which is a separate design
+# decision with its own tradeoffs (logging, force_ipv4) and is guarded above.
+# The delta isolates the thing this section owns: send's own delivery tree.
+LIST_BASELINE_DELTA = 246
+MAX_LIST_DELTA = 80
+
+# Prefixes that must not appear in the `--list` DELTA. Each was in the 246 and
+# is provably unnecessary to read `~/.hermes/channel_directory.json`. Checked
+# against the delta rather than the whole import set so this stays a statement
+# about the delivery path and not about main.py's bootstrap.
+LIST_DELTA_FORBIDDEN_PREFIXES = (
+    "gateway.config",        # -> agent.secret_scope; enum + loader, not needed to read
+    "gateway.session",       # -> agent.turn_context
+    "gateway.delivery",
+    "gateway.dead_targets",
+    "agent.secret_scope",
+    "agent.turn_context",
+    "agent.context_engine",
+    "requests",              # 17 modules, + urllib3/idna/charset_normalizer/certifi
+    "urllib3",
+    "asyncio",               # build/refresh side only -- 31 modules on the read path
+    "hermes_cli.config",     # 126 modules for get_hermes_home + _expand_env_vars
+)
+
+
+def _delta_offenders(delta: set[str]) -> list[str]:
+    hits = set()
+    for mod in delta:
+        for prefix in LIST_DELTA_FORBIDDEN_PREFIXES:
+            if mod == prefix or mod.startswith(prefix + "."):
+                hits.add(mod)
+    return sorted(hits)
+
+
+@pytest.mark.timeout(900)
+def test_send_list_delivery_path_stays_cheap():
+    """`send --list` must not re-grow send's own dependency tree."""
+    help_proc, help_modules = _run_importtime(["send", "--help"])
+    list_proc, list_modules = _run_importtime(["send", "--list"])
+
+    assert list_proc.returncode == 0, (
+        f"`send --list` exited {list_proc.returncode}.\n"
+        f"stdout:\n{list_proc.stdout}\nstderr tail:\n{list_proc.stderr[-3000:]}"
+    )
+    # Behaviour first: this has to be the real directory read, not a stub that
+    # got cheap by doing nothing.
+    assert list_proc.stdout.strip(), (
+        "`send --list` printed nothing; it must render the channel directory "
+        "(or the 'no platforms configured' guidance) via "
+        "gateway.channel_directory."
+    )
+    assert help_modules and list_modules, (
+        "no importtime report parsed -- the measurement itself failed.\n"
+        f"stderr tail:\n{list_proc.stderr[-3000:]}"
+    )
+
+    delta = set(list_modules) - set(help_modules)
+
+    offenders = _delta_offenders(delta)
+    assert not offenders, (
+        f"`hermes send --list` imported {len(offenders)} module(s) the "
+        f"delivery path cannot need: {offenders}\n"
+        "Read the block above this test: get_hermes_home comes from "
+        "hermes_constants, ${VAR} expansion from hermes_cli._env_expand, and "
+        "gateway/__init__.py must stay lazy so importing "
+        "gateway.channel_directory does not drag in gateway.config/session/"
+        "delivery."
+    )
+
+    assert len(delta) < MAX_LIST_DELTA, (
+        f"`hermes send --list` imported {len(delta)} modules that "
+        f"`send --help` did not (ceiling {MAX_LIST_DELTA}, pre-fix baseline "
+        f"{LIST_BASELINE_DELTA}). That delta IS send's delivery-path "
+        f"dependency tree.\nNew since --help: {sorted(delta)}"
+    )
+
+
+@pytest.mark.timeout(900)
+def test_expand_env_vars_reexport_is_the_same_object():
+    """`hermes_cli.config._expand_env_vars` must stay the extracted function.
+
+    The delivery path stopped importing `hermes_cli.config` by taking `${VAR}`
+    expansion from `hermes_cli._env_expand` instead. Six other call sites --
+    cli.py, cron/jobs.py, cron/scheduler.py, gateway/run.py,
+    hermes_cli/managed_scope.py, tests/hermes_cli/test_config_env_expansion.py
+    -- still reach it through `hermes_cli.config`. If someone re-adds a local
+    definition there, those two spellings silently diverge.
+
+    Run in a subprocess for the same reason as everything else in this file:
+    importing `hermes_cli.config` in-process would pollute `sys.modules` for
+    sibling tests.
+    """
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from hermes_cli.config import _expand_env_vars\n"
+            "from hermes_cli._env_expand import expand_env_vars\n"
+            "assert _expand_env_vars is expand_env_vars, 'diverged'\n"
+            "print('same')",
+        ],
+        cwd=str(REPO_ROOT),
+        env=_child_env(),
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert proc.returncode == 0 and "same" in proc.stdout, (
+        "hermes_cli.config._expand_env_vars is no longer the function in "
+        "hermes_cli/_env_expand.py.\n"
+        f"stdout:\n{proc.stdout}\nstderr tail:\n{proc.stderr[-2000:]}"
+    )
