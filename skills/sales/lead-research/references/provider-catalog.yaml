@@ -74,14 +74,14 @@
   homepage: https://ted.europa.eu/
   access_tier: public
   entity_levels: [named_company, opportunity]
-  capabilities: [procurement, organizations]
+  capabilities: [procurement, organizations, candidate_verification]
   countries: []
   sector_ids: []
   freshness_days: 7
-  adapter_mode: manual_import
+  adapter_mode: live
   default_enabled: false
   health: active
-  last_verified_at: '2026-07-14'
+  last_verified_at: '2026-08-20'
 - source_id: auma
   version: '1'
   display_name: AUMA Fair Finder
@@ -134,3 +134,24 @@
   health: retired
   last_verified_at: '2026-07-14'
   license_note: Service discontinued 2026-03-31; retained for historical provenance.
+- source_id: customer-list-corpus
+  version: '1'
+  display_name: Customer list corpus
+  publisher: Customer-supplied contact export
+  jurisdiction: [global]
+  categories: [matchmaking]
+  homepage: null
+  access_tier: customer_upload
+  entity_levels: [named_company]
+  capabilities: [organizations]
+  countries: []
+  sector_ids: []
+  freshness_days: 365
+  adapter_mode: manual_import
+  default_enabled: false
+  health: active
+  last_verified_at: '2026-08-20'
+  license_note: >
+    Provenance entry for corpora loaded via `import-candidates`. Candidate rows
+    supply names for a campaign to verify; they are not evidence and this entry
+    carries no verifier, so it stays unavailable by design.

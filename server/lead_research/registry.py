@@ -7,6 +7,7 @@ from ..config import Settings
 from .models import DatasetDefinition
 from .providers.base import CatalogProvider, Provider
 from .providers.bright_data import BrightDataVerifier
+from .providers.ted import TedVerifier
 from .sectors import REFERENCE_DIR
 from .verification import UnavailableCandidateVerifier
 
@@ -37,16 +38,26 @@ class ProviderRegistry:
     def ensure_tenant(self, db, company_id: str, stamp: float) -> None:
         from ..db import json_dump
         for definition in self.list():
+            payload = json_dump(definition.model_dump(mode="json"))
             exists = db.one(
                 "SELECT source_id FROM dataset_definitions WHERE company_id=? AND source_id=?",
                 (company_id, definition.source_id),
             )
             if exists:
+                # The definition is catalog-owned and the row caches a copy, so
+                # a catalog edit — a new adapter_mode, a retirement — would
+                # otherwise never reach a tenant that had already been seeded.
+                # installed/enabled are the tenant's and are left alone.
+                db.execute(
+                    "UPDATE dataset_definitions SET definition=?,health=? "
+                    "WHERE company_id=? AND source_id=?",
+                    (payload, definition.health, company_id, definition.source_id),
+                )
                 continue
             db.execute(
                 "INSERT INTO dataset_definitions VALUES(?,?,?,?,?,?,?,?)",
                 (company_id, definition.source_id, 1, int(definition.default_enabled),
-                 json_dump(definition.model_dump(mode="json")), definition.health, None, stamp),
+                 payload, definition.health, None, stamp),
             )
 
 
@@ -81,4 +92,11 @@ def build_registry(
             )
             verifier.definition = bright_data
             supplied[bright_data.source_id] = verifier
+    # TED needs no credential, so there is nothing to gate on: it is either in
+    # the catalog or it is not. Tenants still opt in per source.
+    ted = next((item for item in definitions if item.source_id == "ted"), None)
+    if ted is not None and ted.source_id not in supplied:
+        verifier = TedVerifier()
+        verifier.definition = ted
+        supplied[ted.source_id] = verifier
     return ProviderRegistry(definitions, supplied)
