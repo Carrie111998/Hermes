@@ -107,6 +107,13 @@ def test_main_import_applies_user_env_over_shell_values(
     # collection time still hold the first, so their
     # ``monkeypatch.setattr('hermes_cli.main....')`` calls land on a module
     # nobody reads and the real code path runs unstubbed.
+    #
+    # Measured victims, this file paired with the 9 files that both bind from
+    # ``hermes_cli.main`` at module scope and patch it by string:
+    # 25 failed -> 18 failed, 0 newly failing. The 7 that clear are the npm
+    # stub escapes -- test_web_ui_build (5) and test_update_yes_flag (2) --
+    # which fail as ``live-system guard: blocked ...npm.cmd`` precisely because
+    # the stub landed on the other incarnation and the real npm was invoked.
     sys.modules.pop("hermes_cli.main", None)
     importlib.import_module("hermes_cli.main")
 
