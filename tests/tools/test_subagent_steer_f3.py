@@ -269,3 +269,100 @@ class TestSteerBroadcast:
         counts = dt.steer_broadcast("  ", resolve_agent=resolve)
         assert counts["sessions"] == 0
         assert counts["subagents"] == 0
+
+
+# ──────────────────────────────────────────────────────────────────────
+# dispatch regression — delegate_task(action="steer_peer"|"broadcast")
+# ──────────────────────────────────────────────────────────────────────
+# These go through the delegate_task(action=...) ROUTER, not the helper
+# functions directly. They guard the one-line _CONTROL_ACTIONS fix: before
+# it, steer_peer/broadcast were NOT in _CONTROL_ACTIONS, so the router fell
+# through to the "Unknown action" branch even though the schema advertised
+# them and _handle_control_action implemented them. If the router regresses,
+# these fail with the tool_error ("Unknown action ...") rather than reaching
+# the steer logic.
+
+
+def _dispatch_parent(**kw) -> SimpleNamespace:
+    """A parent_agent stub sufficient for the control-plane dispatch."""
+    defaults = {
+        "session_id": "owner-session",
+        "valid_tool_names": ["delegate_task"],
+        "enabled_toolsets": ["delegation"],
+        "disabled_toolsets": [],
+        "_delegate_depth": 0,
+        "model": "fake-model",
+        "provider": "fake",
+        "api_key": "k",
+        "base_url": None,
+    }
+    defaults.update(kw)
+    return SimpleNamespace(**defaults)
+
+
+class TestDelegateTaskDispatchSteerPeer:
+    def _run(self, **kw):
+        return dt.delegate_task(
+            goal=None,
+            context=None,
+            tasks=None,
+            max_iterations=None,
+            role="leaf",
+            background=False,
+            output_schema=None,
+            parent_agent=_dispatch_parent(),
+            **kw,
+        )
+
+    def test_steer_peer_routes_to_peer_steer(self):
+        """delegate_task(action='steer_peer') must reach the steer_peer branch
+        (not 'Unknown action') and queue text on the resolved peer."""
+        peer = FakeAgent("peer")
+        resolve = _resolver({"peer-sid": peer})
+        with patch.object(dt, "_peer_session_resolver", return_value=resolve), patch.object(
+            dt, "_capture_gateway_steer_authority",
+            return_value=(object(), object()),
+        ):
+            out = self._run(
+                action="steer_peer", subagent_id="peer-sid", message="turn left"
+            )
+        assert '"status": "queued"' in out, out
+        assert peer.steer_calls == ["turn left"]
+
+    def test_steer_peer_missing_text_rejected(self):
+        with patch.object(
+            dt, "_peer_session_resolver", return_value=_resolver({})
+        ), patch.object(
+            dt, "_capture_gateway_steer_authority", return_value=(object(), object())
+        ):
+            out = self._run(action="steer_peer", subagent_id="peer-sid", message="   ")
+        assert "requires a non-empty" in out, out
+
+
+class TestDelegateTaskDispatchBroadcast:
+    def _run(self, **kw):
+        return dt.delegate_task(
+            goal=None,
+            context=None,
+            tasks=None,
+            max_iterations=None,
+            role="background",
+            background=False,
+            output_schema=None,
+            parent_agent=_dispatch_parent(),
+            **kw,
+        )
+
+    def test_broadcast_routes_to_broadcast(self):
+        """delegate_task(action='broadcast') must reach the broadcast branch
+        (not 'unknown action') and fan out to peers."""
+        peer_a = FakeAgent("a")
+        resolve = _resolver({"a": peer_a})
+        with patch.object(
+            dt, "_peer_session_resolver", return_value=resolve
+        ), patch.object(
+            dt, "_capture_gateway_steer_authority", return_value=(object(), object())
+        ):
+            out = self._run(action="broadcast", message="freeze")
+        assert '"action": "broadcast"' in out, out
+        assert peer_a.steer_calls == ["freeze"]

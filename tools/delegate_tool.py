@@ -629,7 +629,7 @@ def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) ->
 
 # Model-facing control actions accepted by delegate_task(action=...).
 # "spawn" (or omitted) keeps the historical spawn semantics.
-_CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
+_CONTROL_ACTIONS = frozenset({"list", "steer", "stop", "steer_peer", "broadcast"})
 
 
 def _resolve_session_lineage(session_id: Optional[str], parent_agent: Any) -> str:
@@ -745,6 +745,89 @@ def _handle_control_action(
             )
         return json.dumps(payload, ensure_ascii=False)
 
+    # steer_peer / broadcast operate on PEER sessions (and the delegation
+    # registry) rather than an owned child, so they must run BEFORE the
+    # owned-subagent resolution gate below. They mirror the gateway RPC
+    # methods (session.steer_peer / session.steer_broadcast) and reuse
+    # AIAgent.steer, so the message-role invariant holds (no new user turn).
+    # The peer resolver is injected by the gateway layer; outside a live
+    # session there is no session->agent map, so steer_peer fails closed.
+    if action == "steer_peer":
+        text = (message or "").strip()
+        if not text:
+            return tool_error(
+                "action='steer_peer' requires a non-empty 'message'."
+            )
+        # Resolve the invoking session's live-agent authority so the peer
+        # steer reuses the gateway's exact steer triple (same as subagent
+        # steering). The resolver itself is injected by the gateway layer.
+        owner_session_id = getattr(parent_agent, "session_id", None) or None
+        owner_transport, owner_session_record = _capture_gateway_steer_authority(
+            owner_session_id
+        )
+        resolve_agent = _peer_session_resolver()
+        if not callable(resolve_agent):
+            return tool_error(
+                "action='steer_peer' is unavailable outside a live gateway "
+                "session (no session→agent resolver)."
+            )
+        target = (subagent_id or "").strip()
+        if not target:
+            return tool_error(
+                "action='steer_peer' requires a target session_id (the peer "
+                "session to steer)."
+            )
+        if steer_session(
+            target,
+            text,
+            resolve_agent=resolve_agent,
+            owner_session_id=owner_session_id,
+            owner_transport=owner_transport,
+            owner_session_record=owner_session_record,
+        ):
+            return json.dumps(
+                {
+                    "action": "steer_peer",
+                    "session_id": target,
+                    "status": "queued",
+                    "text": text,
+                },
+                ensure_ascii=False,
+            )
+        return tool_error(
+            f"Could not steer peer session '{target}' — unknown, not alive, or "
+            "authority unavailable."
+        )
+
+    if action == "broadcast":
+        text = (message or "").strip()
+        if not text:
+            return tool_error(
+                "action='broadcast' requires a non-empty 'message'."
+            )
+        owner_session_id = getattr(parent_agent, "session_id", None) or None
+        owner_transport, owner_session_record = _capture_gateway_steer_authority(
+            owner_session_id
+        )
+        resolve_agent = _peer_session_resolver()
+        counts = steer_broadcast(
+            text,
+            resolve_agent=resolve_agent,
+            exclude_session_id=owner_session_id,
+            owner_session_id=owner_session_id,
+            owner_transport=owner_transport,
+            owner_session_record=owner_session_record,
+        )
+        return json.dumps(
+            {
+                "action": "broadcast",
+                "counts": counts,
+                "status": "broadcast",
+                "text": text,
+            },
+            ensure_ascii=False,
+        )
+
     # steer / stop need a resolvable, owned target. Resolve by name when no
     # explicit subagent_id is given (prime-agent peer/child steer port).
     sid = (subagent_id or "").strip()
@@ -824,83 +907,6 @@ def _handle_control_action(
             "already finished). Its result arrives as a normal completion "
             "message; re-delegate a follow-up task if more work is needed."
         )
-
-    if action == "steer_peer":
-        text = (message or "").strip()
-        if not text:
-            return tool_error(
-                "action='steer_peer' requires a non-empty 'message'."
-            )
-        # Resolve the invoking session's live-agent authority so the peer
-        # steer reuses the gateway's exact steer triple (same as subagent
-        # steering). The resolver itself is injected by the gateway layer.
-        owner_session_id = getattr(parent_agent, "session_id", None) or None
-        owner_transport, owner_session_record = _capture_gateway_steer_authority(
-            owner_session_id
-        )
-        resolve_agent = _peer_session_resolver()
-        if not callable(resolve_agent):
-            return tool_error(
-                "action='steer_peer' is unavailable outside a live gateway "
-                "session (no session→agent resolver)."
-            )
-        target = (subagent_id or "").strip()
-        if not target:
-            return tool_error(
-                "action='steer_peer' requires a target session_id (the peer "
-                "session to steer)."
-            )
-        if steer_session(
-            target,
-            text,
-            resolve_agent=resolve_agent,
-            owner_session_id=owner_session_id,
-            owner_transport=owner_transport,
-            owner_session_record=owner_session_record,
-        ):
-            return json.dumps(
-                {
-                    "action": "steer_peer",
-                    "session_id": target,
-                    "status": "queued",
-                    "text": text,
-                },
-                ensure_ascii=False,
-            )
-        return tool_error(
-            f"Could not steer peer session '{target}' — unknown, not alive, or "
-            "authority unavailable."
-        )
-
-    if action == "broadcast":
-        text = (message or "").strip()
-        if not text:
-            return tool_error(
-                "action='broadcast' requires a non-empty 'message'."
-            )
-        owner_session_id = getattr(parent_agent, "session_id", None) or None
-        owner_transport, owner_session_record = _capture_gateway_steer_authority(
-            owner_session_id
-        )
-        resolve_agent = _peer_session_resolver()
-        counts = steer_broadcast(
-            text,
-            resolve_agent=resolve_agent,
-            exclude_session_id=owner_session_id,
-            owner_session_id=owner_session_id,
-            owner_transport=owner_transport,
-            owner_session_record=owner_session_record,
-        )
-        return json.dumps(
-            {
-                "action": "broadcast",
-                "counts": counts,
-                "status": "broadcast",
-                "text": text,
-            },
-            ensure_ascii=False,
-        )
-
     return tool_error(
         f"Unknown action '{action}'. Use spawn, list, steer, stop, steer_peer, "
         "or broadcast."
