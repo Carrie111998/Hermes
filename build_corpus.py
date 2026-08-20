@@ -103,7 +103,10 @@ def main(source: Path, out: Path) -> None:
                 ).hexdigest()[:24],
                 "company_name": name,
                 "country": code,
-                "categories": "kitchen-appliances",
+                # The canonical sector id from sectors.py. It has to be this
+                # exact string: campaign selection substring-matches it, and
+                # FeaturePlanner looks up its playbook by the same key.
+                "categories": "household-appliances",
             }
 
     with out.open("w", encoding="utf-8", newline="") as handle:

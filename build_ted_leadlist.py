@@ -165,7 +165,7 @@ def main(out: Path) -> None:
                             "company_name": winner,
                             "country": country,
                             "domain": f"https://{_domain(site)}" if _domain(site) else "",
-                            "categories": "kitchen-appliances",
+                            "categories": "household-appliances",
                             "buyer_types": "public procurement supplier",
                             "provenance_url": "https://ted.europa.eu/en/notice/-/detail/{}".format(
                                 notice.get("publication-number")

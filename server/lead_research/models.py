@@ -263,7 +263,12 @@ class ScoringProfile(ApiModel):
 
 class EnrichmentProfile(ApiModel):
     profile_id: str = "local-balanced"
+    # Two different mechanisms, deliberately not one flag. `enabled` is the
+    # local-model fallback and needs a model profile. `research_each_lead` is
+    # a second, gap-targeted pass over the sources already configured: it costs
+    # requests, not tokens, and needs no model at all.
     enabled: bool = False
+    research_each_lead: bool = False
     model_profile: str | None = None
     trigger: Literal["missing_required", "below_completeness", "manual"] = "missing_required"
     completeness_target: int = Field(default=80, ge=0, le=100)

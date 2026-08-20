@@ -17,6 +17,34 @@ class FeatureRequest:
     priority: int
 
 
+# Playbooks name what a sector needs; verifiers emit what a page or a notice
+# actually said. The two vocabularies were written apart and never met, which is
+# why FeaturePlanner has been importable but unused. This is the bridge, and it
+# is deliberately explicit: a guessed mapping would silently mark a gap filled.
+PLAYBOOK_SATISFIED_BY = {
+    "identity_scale": ("company_name", "domain", "employee_count", "store_count", "revenue"),
+    "market_coverage": ("country", "locations", "countries_served", "market_coverage"),
+    "product_fit": ("product_term", "product_fit", "hs_code", "brands_carried", "sector_ids"),
+    "buying_intent": ("buying_intent", "procurement_intent", "tender", "buyer_role"),
+    "procurement_intent": ("procurement_intent", "tender", "buyer_role"),
+    "store_count": ("store_count",),
+    "relevant_import_value": ("relevant_import_value",),
+    "brands_carried": ("brands_carried",),
+    "certifications": ("certifications",),
+    "facilities": ("facilities",),
+    "private_label_fit": ("private_label_fit",),
+}
+
+
+def satisfied_playbook_fields(fact_fields) -> set[str]:
+    """Playbook fields already covered by the claim fields collected so far."""
+    present = set(fact_fields)
+    return {
+        field for field, accepted in PLAYBOOK_SATISFIED_BY.items()
+        if present.intersection(accepted)
+    }
+
+
 class FeaturePlanner:
     def __init__(self, path: Path = REFERENCE_DIR / "feature-playbooks.yaml"):
         self.playbooks = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
