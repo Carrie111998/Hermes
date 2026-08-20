@@ -5981,7 +5981,13 @@ class APIServerAdapter(BasePlatformAdapter):
             if not job_id:
                 return web.json_response({"error": "missing job_id"}, status=400)
 
+            from cron.scheduler import (
+                acquire_running_job_admission,
+                release_running_job,
+            )
             from cron.scheduler_provider import (
+                claim_external_provider_fire,
+                fire_external_provider_claimed,
                 fire_legacy_provider_guarded,
                 provider_supports_split_fire,
                 resolve_cron_scheduler,
@@ -6008,19 +6014,36 @@ class APIServerAdapter(BasePlatformAdapter):
             adapters = getattr(runner, "adapters", None) or None
 
             if not provider_supports_split_fire(provider):
-                # Legacy single-phase provider: it overrides the documented
-                # ``fire_due`` hook (custom claim/re-arm/telemetry) but
-                # inherits the base ``claim_fire`` — driving it through the
-                # split claim path would silently bypass that override.
-                task = asyncio.create_task(
-                    asyncio.to_thread(
-                        fire_legacy_provider_guarded,
-                        provider,
-                        job_id,
-                        adapters=adapters,
-                        loop=loop,
+                # Legacy single-phase provider: reserve restart admission before
+                # acknowledging the external scheduler, then transfer ownership
+                # to the worker for the full opaque fire_due call.
+                admission = acquire_running_job_admission(job_id)
+                if admission == "draining":
+                    return web.json_response(
+                        {"status": "draining", "job_id": job_id}, status=503
                     )
-                )
+                if admission == "duplicate":
+                    return web.json_response(
+                        {"status": "duplicate", "job_id": job_id}, status=200
+                    )
+                try:
+                    task = asyncio.create_task(
+                        asyncio.to_thread(
+                            fire_legacy_provider_guarded,
+                            provider,
+                            job_id,
+                            adapters=adapters,
+                            loop=loop,
+                            pre_registered=True,
+                        )
+                    )
+                except Exception as exc:
+                    release_running_job(job_id)
+                    logger.error("legacy cron fire dispatch failed for %s: %s", job_id, exc)
+                    return web.json_response(
+                        {"error": "cron fire dispatch failed", "job_id": job_id},
+                        status=503,
+                    )
                 reservation["detached"] = True
                 task.add_done_callback(
                     lambda _task: _release_pending_api_work(self, reservation)
@@ -6035,29 +6058,46 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
 
             # Persist the attempt and exact store owner before acknowledging NAS.
-            # A failure here is retryable and the reservation remains attached.
+            # Admission status distinguishes a retryable restart drain from a
+            # true duplicate so no blocked fire is mislabeled as delivered.
             try:
-                claimed_job = await asyncio.to_thread(provider.claim_fire, job_id)
+                admission, claimed_job = await asyncio.to_thread(
+                    claim_external_provider_fire, provider, job_id
+                )
             except Exception as exc:
                 logger.error("cron fire admission failed for %s: %s", job_id, exc)
                 return web.json_response(
                     {"error": "cron fire admission failed", "job_id": job_id},
                     status=503,
                 )
-            if claimed_job is None:
+            if admission == "draining":
+                return web.json_response(
+                    {"status": "draining", "job_id": job_id}, status=503
+                )
+            if admission == "duplicate" or claimed_job is None:
                 return web.json_response(
                     {"status": "duplicate", "job_id": job_id},
                     status=200,
                 )
 
-            task = asyncio.create_task(
-                asyncio.to_thread(
-                    provider.fire_claimed,
-                    claimed_job,
-                    adapters=adapters,
-                    loop=loop,
+            try:
+                task = asyncio.create_task(
+                    asyncio.to_thread(
+                        fire_external_provider_claimed,
+                        provider,
+                        claimed_job,
+                        adapters=adapters,
+                        loop=loop,
+                    )
                 )
-            )
+            except Exception as exc:
+                if claimed_job.pop("_external_fire_registered", False):
+                    release_running_job(job_id)
+                logger.error("cron fire dispatch failed for %s: %s", job_id, exc)
+                return web.json_response(
+                    {"error": "cron fire dispatch failed", "job_id": job_id},
+                    status=503,
+                )
             reservation["detached"] = True
             task.add_done_callback(
                 lambda _task: _release_pending_api_work(self, reservation)

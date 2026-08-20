@@ -670,12 +670,38 @@ def cancel_gateway_restart_drain() -> None:
         _gateway_restart_dispatch_blocked = False
 
 
+def acquire_running_job_admission(job_id: str) -> str:
+    """Atomically classify and reserve one in-process cron execution.
+
+    Returns ``"acquired"``, ``"duplicate"``, or ``"draining"``.  Callers
+    that acknowledge external schedulers use the distinction so restart-blocked
+    fires remain retryable instead of being mislabeled as delivered duplicates.
+    Every ``"acquired"`` result must be paired with ``release_running_job``.
+    """
+    with _running_lock:
+        if _gateway_restart_dispatch_blocked:
+            logger.info(
+                "Cron job '%s' dispatch skipped while gateway restart is draining",
+                job_id,
+            )
+            return "draining"
+        if job_id in _running_job_ids:
+            return "duplicate"
+        _running_job_ids.add(job_id)
+        _running_since[job_id] = time.time()
+        _running_futures[job_id] = _FUTURE_PENDING
+        return "acquired"
+
+
 def try_register_running_job(job_id: str) -> bool:
     """Atomically add ``job_id`` to the in-flight running set.
 
-    Returns False (without registering) when the job is already mid-run —
-    the caller must skip the fire. This is the single dedupe owner shared by
-    the ticker's ``_submit_with_guard`` and manual runs
+    Returns False (without registering) when the job is already mid-run or the
+    gateway restart gate is active.  Callers that must distinguish those cases
+    should use ``acquire_running_job_admission``.
+
+    This is the single dedupe owner shared by the ticker's
+    ``_submit_with_guard`` and manual runs
     (``tools/cronjob_tools``): the fire claim alone cannot prevent a
     double-fire because its TTL (300s) is routinely outlived by real jobs,
     after which a manual ``cronjob(action='run')`` would claim successfully
@@ -686,24 +712,7 @@ def try_register_running_job(job_id: str) -> bool:
     Callers MUST pair a successful registration with
     ``release_running_job`` in a ``finally`` block.
     """
-    with _running_lock:
-        if _gateway_restart_dispatch_blocked:
-            logger.info(
-                "Cron job '%s' dispatch skipped while gateway restart is draining",
-                job_id,
-            )
-            return False
-        if job_id in _running_job_ids:
-            return False
-        _running_job_ids.add(job_id)
-        # Claim timestamp + pending-future sentinel are recorded in the SAME
-        # critical section as the add, so there is never a window where an
-        # id is in-flight without an age the stale sweep can bound it by
-        # (t_3778a491).  The sentinel is replaced by the real owning future
-        # once ``pool.submit`` returns.
-        _running_since[job_id] = time.time()
-        _running_futures[job_id] = _FUTURE_PENDING
-        return True
+    return acquire_running_job_admission(job_id) == "acquired"
 
 
 def release_running_job(job_id: str) -> None:
