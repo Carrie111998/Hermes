@@ -474,3 +474,69 @@ def test_monodirectional_failures_never_wear_the_ambiguous_marker(event_type):
     verdict = evaluate_outcome(_event({}, event_type=event_type, priority=Priority.HIGH))
 
     assert marker_for_verdict(verdict, Priority.HIGH) != "🟡"
+# --- security-posture losses are failures too (2026-08-20) ------------------
+# SECRET_DETECTED and CREDENTIAL_LOSS were the last two monodirectional
+# bad-news types left UNKNOWN. Both are ACT-class with wa=immediate -- they
+# break quiet hours to wake a human -- yet the header could not say whether
+# they were good or bad.
+#
+# Type-level is safe here because neither has a recovery variant, which
+# MATTERS: `failed` wins over `recovery` in the precedence order, so making a
+# bidirectional type a member would render its recoveries as red failures.
+# Confirmed for CREDENTIAL_LOSS at BOTH producers -- watchdog_sweep emits only
+# the healthy -> down/error edge (_CREDENTIAL_LOSS_BAD_STATES, plus a
+# before=="healthy" guard), and devflow_pr_build_poller._check_auth_transition
+# says outright "Recovery is logged, not emitted". SECRET_DETECTED is "a
+# secret being *found*" (schema.py:207).
+
+
+@pytest.mark.parametrize("event_type", [
+    EventType.SECRET_DETECTED,
+    EventType.CREDENTIAL_LOSS,
+])
+def test_security_posture_losses_are_failed(event_type):
+    verdict = evaluate_outcome(_event({}, event_type=event_type))
+
+    assert verdict.state is OutcomeState.FAILED
+    assert verdict.priority_floor is Priority.HIGH
+
+
+def test_credential_loss_is_failed_on_the_dead_token_shape_too():
+    """The watchdog shape carries after="down", which the transition rule in
+    160ed2d477 already caught. The devflow poller's dead-GitHub-token shape
+    does not, and fell through to UNKNOWN until the type carried the verdict.
+    """
+    verdict = evaluate_outcome(
+        _event(
+            {"watchdog_type": "credential_loss", "probe": "GitHub token",
+             "after": "dead", "detail": "401 Bad credentials"},
+            event_type=EventType.CREDENTIAL_LOSS,
+        )
+    )
+
+    assert verdict.state is OutcomeState.FAILED
+
+
+def test_credential_loss_real_watchdog_payload_is_failed():
+    """The real 2026 payload: Hermes OAuth token validity, healthy -> down."""
+    verdict = evaluate_outcome(
+        _event(
+            {"watchdog_type": "credential_loss",
+             "probe": "Hermes OAuth token validity", "tier": "critical",
+             "category": "hermes", "before": "healthy", "after": "down",
+             "detail": "no active provider resolvable (profile store)"},
+            event_type=EventType.CREDENTIAL_LOSS,
+        )
+    )
+
+    assert verdict.state is OutcomeState.FAILED
+
+
+@pytest.mark.parametrize("event_type", [
+    EventType.SECRET_DETECTED,
+    EventType.CREDENTIAL_LOSS,
+])
+def test_security_posture_losses_never_wear_the_ambiguous_marker(event_type):
+    verdict = evaluate_outcome(_event({}, event_type=event_type))
+
+    assert marker_for_verdict(verdict, Priority.CRITICAL) == "🔴"

@@ -79,6 +79,21 @@ _FAILURE_EVENT_TYPES = frozenset(
         # decision. Both were reaching the phone headed "UNKNOWN".
         EventType.CONTAINER_CRASH_LOOP,
         EventType.DEVFLOW_DEPLOY_FAILED,
+        # Security-posture losses, same monodirectional argument. Both are
+        # ACT-class with wa=immediate -- they break quiet hours to wake a
+        # human -- yet the header could not say whether they were good or bad.
+        #
+        # Type-level membership is only SAFE for a type with no recovery
+        # variant, because `failed` wins over `recovery` in the precedence
+        # order below: a bidirectional member would render its own recoveries
+        # as red failures. Both were checked at every producer.
+        # CREDENTIAL_LOSS: watchdog_sweep emits only the healthy -> down/error
+        # edge (_CREDENTIAL_LOSS_BAD_STATES + a before=="healthy" guard), and
+        # devflow_pr_build_poller._check_auth_transition states "Recovery is
+        # logged, not emitted". SECRET_DETECTED is "a secret being *found*"
+        # (schema.py:207) -- there is no secret-un-found event.
+        EventType.SECRET_DETECTED,
+        EventType.CREDENTIAL_LOSS,
     }
 )
 
