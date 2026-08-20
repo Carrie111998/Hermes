@@ -1295,3 +1295,52 @@ def test_nous_device_code_login_timeout_raises_actionable_message(monkeypatch):
     assert "CAPTCHA" in msg
     assert "hermes portal" in msg
     assert "https://portal.nousresearch.com/login" in msg
+
+
+def test_effective_device_poll_interval_non_numeric_falls_back():
+    """The server-directed interval is only presence-checked, never
+    type-checked — a non-numeric payload must fall back to the RFC 8628
+    default cadence instead of raising ValueError mid-login."""
+    import hermes_cli.auth as auth_mod
+
+    assert auth_mod._effective_device_poll_interval("junk") == 5
+    assert auth_mod._effective_device_poll_interval("5.5") == 5
+    assert auth_mod._effective_device_poll_interval(None) == 5
+    # Numeric values keep the existing floor/cap behavior.
+    assert auth_mod._effective_device_poll_interval(12) == 12
+    assert auth_mod._effective_device_poll_interval(1) == 5
+    assert auth_mod._effective_device_poll_interval(120) == 30
+
+
+def test_poll_for_token_survives_junk_interval_payload(monkeypatch):
+    """End-to-end guard: a junk `interval` in the device-authorization
+    response must not crash the poller — it polls at the 5s default."""
+    import httpx
+    from typing import cast
+
+    import hermes_cli.auth as auth_mod
+
+    sleeps = _record_sleeps(monkeypatch, auth_mod)
+
+    class _PendingThenApproved:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, url, data=None):
+            request = httpx.Request("POST", url)
+            self.calls += 1
+            if self.calls == 1:
+                return httpx.Response(400, json={"error": "authorization_pending"}, request=request)
+            return httpx.Response(200, json={"access_token": "tok"}, request=request)
+
+    payload = auth_mod._poll_for_token(
+        client=cast(httpx.Client, _PendingThenApproved()),
+        portal_base_url="https://portal.nousresearch.com",
+        client_id="hermes-cli",
+        device_code="device",
+        expires_in=300,
+        poll_interval="not-a-number",
+    )
+
+    assert payload == {"access_token": "tok"}
+    assert sleeps == [5]

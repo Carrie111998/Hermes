@@ -5268,10 +5268,19 @@ def _nous_device_auth_timeout_message(portal_base_url: str) -> str:
     )
 
 
-def _effective_device_poll_interval(poll_interval: int) -> int:
+def _effective_device_poll_interval(poll_interval) -> int:
     """RFC 8628 §3.3 poll cadence: honor the server-directed interval,
-    floored at 5s (the portal rate-limits faster polling) and capped at 30s."""
-    return min(30, max(DEVICE_AUTH_POLL_MIN_INTERVAL_SECONDS, int(poll_interval)))
+    floored at 5s (the portal rate-limits faster polling) and capped at 30s.
+
+    The interval comes from the device-authorization response and is only
+    checked for presence, not type — a non-numeric payload must never crash
+    the login flow, so fall back to the RFC 8628 default cadence (5s).
+    """
+    try:
+        interval = int(poll_interval)
+    except (ValueError, TypeError):
+        interval = DEVICE_AUTH_POLL_MIN_INTERVAL_SECONDS
+    return min(30, max(DEVICE_AUTH_POLL_MIN_INTERVAL_SECONDS, interval))
 
 
 def _poll_for_token(
