@@ -48,17 +48,27 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # assertion message can quote the real number rather than a moving target.
 BASELINE_MODULES = 444
 
-# Generous ceiling: the observed post-fix cost is ~120 modules, and the bare
-# interpreter floor on this box is ~70 (13 sys.path entries, 8 sys.meta_path
-# finders including four _EditableFinder instances). Anything at or above this
-# means an upstream module-scope import crept back in.
-MAX_SEND_HELP_MODULES = 200
+# Ceiling for the send path. The fast path deliberately pays main.py's full early
+# bootstrap -- .env, the config.yaml redact/force_ipv4 bridge, and setup_logging --
+# so `send` keeps the same logging and network semantics as the slow path. What it
+# skips is model_setup_flows and the ~38 build_*_parser subcommand modules.
+# Set with headroom over the observed cost; at or above this means one of those
+# crept back in.
+MAX_SEND_HELP_MODULES = 330
+
+# Modules the fast path MUST still import. Skipping setup_logging would cost
+# `send` its agent.log records; skipping the bridge that precedes it would ignore
+# security.redact_secrets and network.force_ipv4 from config.yaml. An earlier
+# revision did exactly that, so this is a regression guard with real history.
+REQUIRED_PREFIXES = (
+    "hermes_logging",   # setup_logging() -> agent.log + errors.log
+    "agent.redact",     # imported by hermes_logging; snapshots HERMES_REDACT_SECRETS
+)
 
 # Module roots that ``hermes send`` provably cannot need to print its own
 # --help. Each was observed in the 444-module baseline. Matching is on the
 # dotted prefix, so "agent.lsp" also catches "agent.lsp.client".
 FORBIDDEN_PREFIXES = (
-    "hermes_logging",             # starts a QueueListener THREAD at import time
     "agent.lsp",                  # language-server client stack
     "agent.secret_sources",       # bitwarden / 1password providers
     "hermes_cli.kanban",
@@ -125,6 +135,15 @@ def _run_importtime(argv: list[str]) -> tuple[subprocess.CompletedProcess, list[
     return proc, modules
 
 
+def _missing_required(modules: list[str]) -> list[str]:
+    """REQUIRED_PREFIXES with no matching import in ``modules``."""
+    gone = []
+    for prefix in REQUIRED_PREFIXES:
+        if not any(m == prefix or m.startswith(prefix + ".") for m in modules):
+            gone.append(prefix)
+    return gone
+
+
 def _offenders(modules: list[str]) -> list[str]:
     hits = set()
     for mod in modules:
@@ -154,6 +173,16 @@ def test_send_help_does_not_import_the_whole_cli():
     # ``hermes_cli`` at a different tree, which would make this pass against
     # code that is not the code under test.
     assert modules, f"no importtime report parsed.\nstderr:\n{proc.stderr[-3000:]}"
+
+    missing = _missing_required(modules)
+    assert not missing, (
+        f"`hermes send --help` did NOT import {missing}. The fast path must fire "
+        "AFTER main.py's early bootstrap so `send` keeps setup_logging (agent.log) "
+        "and the config.yaml bridge that sets HERMES_REDACT_SECRETS and "
+        "network.force_ipv4. Moving the call site earlier saves modules but "
+        "silently drops logging and IPv4 forcing -- that regression already "
+        "happened once."
+    )
 
     offenders = _offenders(modules)
     assert not offenders, (
@@ -298,3 +327,57 @@ def test_fast_send_can_be_disabled_by_env():
         f"HERMES_NO_FAST_SEND=1 still only imported {len(modules)} modules; "
         "the escape hatch is not actually restoring the full-parser path."
     )
+
+
+@pytest.mark.timeout(900)
+@pytest.mark.parametrize("fast", [True, False], ids=["fast-path", "slow-path"])
+def test_send_still_writes_agent_log(tmp_path, fast):
+    """A fast-path ``send`` must still produce ``agent.log`` records.
+
+    This is the behavioural half of REQUIRED_PREFIXES: importing
+    ``hermes_logging`` proves the module loaded, not that ``setup_logging()``
+    ran and wired a file handler. The first cut of the fast path fired before
+    ``setup_logging()`` and silently cost ``send`` its logging entirely.
+
+    ``--to notaplatform`` fails at target resolution, before any adapter or
+    network call, so this exercises the error-logging path without sending
+    anything. The child env is also scrubbed of credentials and HERMES_HOME is
+    redirected at ``tmp_path``, so a real delivery is impossible even if the
+    platform name were valid.
+    """
+    env = _child_env()
+    env["HERMES_HOME"] = str(tmp_path)
+    if fast:
+        env.pop("HERMES_NO_FAST_SEND", None)
+    else:
+        env["HERMES_NO_FAST_SEND"] = "1"
+    # Belt and braces: no inherited credential can turn this into a real send.
+    for key in list(env):
+        upper = key.upper()
+        if any(m in upper for m in ("TOKEN", "SECRET", "PASSWORD", "API_KEY", "HOME_CHANNEL")):
+            if upper != "HERMES_HOME":
+                env.pop(key, None)
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "send", "--to", "notaplatform", "probe"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+
+    # Delivery-level failure, not a crash and not a usage error.
+    assert proc.returncode == 1, (
+        f"expected exit 1 for an unknown platform, got {proc.returncode}.\n"
+        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
+    assert "notaplatform" in proc.stderr, proc.stderr
+
+    log = tmp_path / "logs" / "agent.log"
+    assert log.exists(), (
+        f"no agent.log under {tmp_path}. The fast path must run AFTER "
+        "main.py's setup_logging() call, or `hermes send` loses file logging. "
+        f"Files present: {sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob('*') if p.is_file())}"
+    )
+    assert log.stat().st_size > 0, "agent.log was created but is empty"

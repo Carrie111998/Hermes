@@ -32,10 +32,21 @@ The trigger is deliberately **narrow**: ``sys.argv[1]`` must be exactly
 ``send``. Any leading top-level flag (``hermes -m gpt5 send ...``) falls through
 to the full parser, which understands those flags. This is the conservative
 direction: over-triggering would change argument parsing behaviour, whereas
-under-triggering merely costs the old startup time. ``--profile``/``-p`` is
-*not* a problem despite preceding the subcommand, because
-``_apply_profile_override()`` strips it from ``sys.argv`` before this runs --
-which is also why ``main.py`` must call us only *after* that.
+under-triggering merely costs the old startup time.
+
+**What this deliberately does NOT skip.** ``main.py`` calls us only after its
+full early bootstrap: the ``--profile``/``-p`` strip and HERMES_HOME resolution,
+``load_hermes_dotenv()``, the config.yaml bridge that sets HERMES_REDACT_SECRETS
+before ``hermes_logging`` imports ``agent.redact``, ``setup_logging()``, and the
+``network.force_ipv4`` toggle. A fast-path ``send`` therefore keeps the same
+profile, env, redaction policy, ``agent.log`` records, and IPv4 preference as
+the slow path. Only ``model_setup_flows`` and the ~38 ``build_*_parser``
+subcommand modules -- everything ``send`` cannot reach -- are skipped.
+
+An earlier revision fired much earlier, before ``setup_logging()``, to save a
+further 154 modules. That cost ``send`` its agent.log records *and* silently
+skipped ``force_ipv4``, which would break delivery on a box that needs it.
+Cheaper was not correct.
 
 ``HERMES_NO_FAST_SEND=1`` disables the fast path entirely, restoring the
 original full-parser route without a rollback.

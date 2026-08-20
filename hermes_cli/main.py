@@ -687,24 +687,6 @@ def _apply_profile_override() -> None:
 _RAW_ARGV_BEFORE_PROFILE_STRIP = list(sys.argv)
 _apply_profile_override()
 
-# ``hermes send`` fast path. Must sit exactly here: AFTER
-# ``_apply_profile_override()`` (which strips ``--profile``/``-p`` from argv and
-# sets HERMES_HOME, both of which ``send`` needs) and BEFORE the config /
-# env_loader / ``setup_logging()`` block below, which is what we are trying not
-# to pay for. ``send_cmd`` bridges ~/.hermes/.env + config.yaml via its own
-# ``_load_hermes_env()``, so it does not depend on that block.
-#
-# NOTE: skipping ``setup_logging()`` means a fast-path ``send`` does not write
-# to agent.log. That is deliberate -- the QueueListener thread and its import
-# chain cost 154 modules -- and errors still reach stderr via logging's
-# lastResort handler. Set HERMES_NO_FAST_SEND=1 to restore the logged path.
-try:
-    from hermes_cli._fast_send import try_fast_send as _try_fast_send
-except Exception:
-    _try_fast_send = None  # never let the fast path break the CLI
-if _try_fast_send is not None and _try_fast_send():
-    raise SystemExit(0)
-
 # Earliest-possible gateway spawn record. `_apply_profile_override()` above is
 # what makes this point viable at all: it resolves HERMES_HOME, so the log's
 # location is finally knowable — and it is still ~50s ahead of `run_gateway()`,
@@ -798,6 +780,32 @@ if _FORCE_IPV4_EARLY:
         _apply_ipv4(force=True)
     except Exception:
         pass  # best-effort — don't crash if hermes_constants not importable yet
+
+# ``hermes send`` fast path.
+#
+# Placement is the whole design. It sits AFTER the entire early bootstrap above
+# -- ``_apply_profile_override()`` (strips ``--profile``/``-p``, resolves
+# HERMES_HOME), ``load_hermes_dotenv()``, the config.yaml bridge that sets
+# HERMES_REDACT_SECRETS *before* hermes_logging imports agent.redact,
+# ``setup_logging()``, and the force_ipv4 toggle -- so a fast-path ``send``
+# inherits byte-identical bootstrap semantics from the slow path: same profile,
+# same env, same redaction policy, same agent.log, same IPv4 preference.
+#
+# An earlier revision fired this immediately after ``_apply_profile_override()``
+# to also skip setup_logging's 154 modules. That was wrong twice over: it dropped
+# ``send``'s agent.log records, and -- less obviously -- it skipped
+# ``network.force_ipv4``, so a box that needs forced IPv4 would have had its
+# sends fail against platform REST endpoints. Do not move this call back up.
+#
+# What it still skips is the expensive part that is genuinely send-irrelevant:
+# ``model_setup_flows`` and the ~38 ``build_*_parser`` subcommand modules and
+# their transitive dependencies, none of which ``send`` can reach.
+try:
+    from hermes_cli._fast_send import try_fast_send as _try_fast_send
+except Exception:
+    _try_fast_send = None  # never let the fast path break the CLI
+if _try_fast_send is not None and _try_fast_send():
+    raise SystemExit(0)
 
 import logging
 import threading
