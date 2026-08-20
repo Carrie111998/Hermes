@@ -62,7 +62,7 @@ import {
   useQuery,
   useValue
 } from '@hermes/plugin-sdk'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const { McpTab, ToolsetConfigPanel } = sdk
@@ -120,13 +120,17 @@ function setActivityToasts(enabled) {
 }
 
 /** Detect new inbound activity from a fresh roster: last_active moved past
- *  the watermark for a bot whose chat isn't on screen -> unread + toast. */
+ *  the watermark for a bot whose chat isn't on screen -> unread + toast.
+ *  Watermarks follow botActivitySession (canonical Bot Chat included) —
+ *  last_session alone never sees the hidden Bot Chat, so DMs delivered
+ *  there would neither badge nor toast. */
 function trackInboundActivity(roster) {
   const seeding = !watermarksSeeded
   watermarksSeeded = true
 
   for (const bot of roster) {
-    const ts = bot.last_session?.last_active || 0
+    const activity = botActivitySession(bot)
+    const ts = activity?.last_active || 0
     const prev = rosterWatermarks.get(bot.name) || 0
     rosterWatermarks.set(bot.name, Math.max(prev, ts))
 
@@ -153,7 +157,7 @@ function trackInboundActivity(roster) {
     if ($activityToasts.get()) {
       const meta = $botMeta.get()[bot.name]
       const label = displayName(bot, meta)
-      const preview = (bot.last_session?.preview || '').trim()
+      const preview = (activity?.preview || '').trim()
       const inbound = /^Message from/i.test(preview)
 
       host.notify({
@@ -181,24 +185,122 @@ const $lastJobs = atom([])
  *  (the bot you're actually chatting with) and roster clicks. */
 const $selectedBot = atom('default')
 
-/** Optional secondary navigation inside the Bots pane. Primary row clicks still
- * open the bot's canonical chat; this state opens its stored-session browser. */
-const $botSessionsWorkspace = atom(null)
-const $botSelectedSessions = atom({})
-const $sessionsGatewayGeneration = atom(0)
+/** Owner profile of the chat the user is LOOKING AT. Newer desktops expose
+ *  `host.state.focusedSessionProfile` (the focused session row's stamped
+ *  owner, gateway profile for drafts); older builds fall back to the gateway
+ *  profile atom — the socket's home — which is the previous behavior. The
+ *  distinction matters because tab/tile focus moves WITHOUT swapping the
+ *  gateway socket: with only the socket atom, opening another bot's chat in
+ *  a tab left the roster highlight (and the Cronjobs tile) on whichever bot
+ *  the socket happened to be homed on. */
+const $focusedBotProfile = host.state.focusedSessionProfile || host.state.profile
+
+/** Optional secondary navigation inside the Bots pane (group-chat rooms). */
 
 /** Group-chat rooms: { [group]: { log: [{from:{kind,name},text,at}], watermarks:{[member]:idx}, epoch, running } }.
  *  Log + watermarks persist via plugin storage; epoch/running are runtime-only. */
 const $groupChats = atom({})
-/** Group whose room view is open in the Bots pane (secondary navigation,
- *  same pattern as $botSessionsWorkspace). */
+/** Group whose room view is open in the Bots pane (secondary navigation
+ *  inside the pane; a normal row click returns to the roster). */
 const $groupChatWorkspace = atom(null)
 /** Groups whose latest room activity mentions @user — the needs-you badge. */
 const $groupNeedsYou = atom({})
+// Pending prompts (clarify questions AND command approvals) raised inside
+// hidden group-member sessions, keyed `${group}::${memberKey}` (#90694).
+// Members run in invisible plumbing sessions, so a member's blocking prompt
+// used to park server-side with no surface to answer it — the user saw
+// "is thinking…" until the prompt timeout. The turn poll mirrors each
+// member's `pending_clarify` / `pending_approval` resume fields in here;
+// the room renders answer cards from it.
+const $groupClarify = atom({})
+
+// ── group activity feed ─────────────────────────────────────────────────────
+// Runtime-only, bounded per-room record of turn events that feeds the
+// collapsible Activity view. Never persisted — it is presentation state like
+// running/epoch, and the room transcript (log) stays the only durable record.
+// Every event is tagged with the room epoch it belongs to, so the view shows
+// only the CURRENT run: a newer send bumps the epoch (old-run events drop
+// away), and a rename re-keys the room (the feed starts clean under the new
+// name — stale events under the old key simply have no room to attach to).
+const GROUP_ACTIVITY_LIMIT = 50
+const $groupActivity = atom({})
+
+function recordGroupActivity(group, event) {
+  const room = $groupChats.get()[group]
+
+  if (!room) {
+    return null
+  }
+
+  const current = $groupActivity.get()[group] || { events: [] }
+  const entry = { at: Date.now(), epoch: room.epoch || 0, ...event }
+  const events = [...current.events, entry].slice(-GROUP_ACTIVITY_LIMIT)
+  $groupActivity.set({ ...$groupActivity.get(), [group]: { ...current, events } })
+
+  return entry
+}
+
+/** Events for the room's CURRENT run — superseded runs (epoch moved on)
+ *  are dropped from view instead of describing work that already ended. */
+function currentGroupActivity(group) {
+  const epoch = ($groupChats.get()[group] || {}).epoch || 0
+  return ($groupActivity.get()[group] || {}).events?.filter(event => (event.epoch || 0) === epoch) || []
+}
+
+/** Human label for one activity event, used by the collapsed summary and
+ *  the expanded rows. */
+function groupActivityLabel(event) {
+  const kind = event?.kind
+  const base = GROUP_ACTIVITY_LABELS[kind] || kind || 'did something'
+
+  if (kind === 'cancelled' || kind === 'settled') {
+    return base
+  }
+
+  const who = event?.member === 'You' ? 'You' : groupSpeakerLabel(event?.member || 'A bot')
+
+  return `${who} ${base}`
+}
+
+const GROUP_ACTIVITY_LABELS = {
+  queued: 'sent a message',
+  working: 'is working…',
+  replied: 'replied',
+  passed: 'passed',
+  'timed-out': 'took too long',
+  failed: 'hit an error',
+  cancelled: 'turn interrupted by a newer message',
+  settled: 'turn settled',
+  delivered: 'delivered a late reply'
+}
+
+const GROUP_ACTIVITY_GLYPHS = {
+  queued: 'comment',
+  working: 'sync',
+  replied: 'check',
+  passed: 'circle-outline',
+  'timed-out': 'clock',
+  failed: 'error',
+  cancelled: 'close',
+  settled: 'check-all',
+  delivered: 'mail-read'
+}
+
+/** Text tone for an activity row: quiet for pass/cancel/settle, accent for
+ *  work and real replies, destructive for failures and timeouts. */
+function groupActivityTone(kind) {
+  if (kind === 'failed' || kind === 'timed-out') {
+    return 'text-destructive'
+  }
+
+  if (kind === 'working' || kind === 'replied' || kind === 'delivered') {
+    return 'text-(--ui-accent,#4f9cf9)'
+  }
+
+  return 'text-(--ui-text-tertiary)'
+}
 
 function handleSessionsGatewayTransition() {
-  $sessionsGatewayGeneration.set($sessionsGatewayGeneration.get() + 1)
-  $botSelectedSessions.set({})
   // A gateway swap invalidates any in-flight room drive: bump every room's
   // epoch so running loops bail at their next member boundary.
   const rooms = { ...$groupChats.get() }
@@ -214,9 +316,24 @@ function handleSessionsGatewayTransition() {
  *  { [botName]: { shape, color, title } } */
 const $botMeta = atom({})
 
+/** Freshness fence for the server-meta overlay: the last moment each bot's
+ *  local meta was written (stamped again once the server write settles).
+ *  mergeServerMeta refuses to overlay a roster snapshot FETCHED BEFORE this
+ *  moment — such a snapshot still carries the pre-write ui_meta, and
+ *  spreading it over local meta resurrects state the user just changed
+ *  (disbanded groups reappearing as empty roster rows, renames reverting,
+ *  unpins undoing). Runtime-only by design: on a fresh window there are no
+ *  in-flight local writes for a stale snapshot to clobber. */
+const botMetaWriteAt = new Map()
+
+function noteBotMetaWrite(name) {
+  botMetaWriteAt.set(name, Date.now())
+}
+
 async function saveBotMeta(name, patch) {
   const prevMeta = $botMeta.get()[name] || {}
   const next = { ...$botMeta.get(), [name]: { ...prevMeta, ...patch } }
+  noteBotMetaWrite(name)
   $botMeta.set(next)
 
   // Local plugin storage: instant, and the fallback for older gateways.
@@ -280,6 +397,10 @@ async function saveBotMeta(name, patch) {
     } catch {
       /* older/unavailable gateway — the local fallback remains saved */
     }
+    // Re-stamp now that the server write settled: a roster snapshot fetched
+    // while profiles.configure was still in flight predates the new ui_meta
+    // just as surely as one fetched before the local write.
+    noteBotMetaWrite(name)
   }
 
   return { serverPersisted: serverOutcome === 'persisted', serverOutcome }
@@ -339,17 +460,50 @@ function fallbackSelectionAfterHide(name) {
  *  setter is a no-op on already-hidden rows) and feature-detected: older
  *  gateways lack session.set_hidden and simply keep the rows visible. */
 function hideOwnedBotSessions() {
-  const canonical = Object.values($botMeta.get())
-    .map(m => m && m.chat)
-    .filter(Boolean)
+  const canonical = Object.entries($botMeta.get())
+    .map(([name, meta]) => ({ name, id: meta && meta.chat }))
+    .filter(entry => Boolean(entry.id))
   const rooms = Object.values($groupChats.get())
     .flatMap(room => Object.values(room?.sessions || {}))
     .filter(sid => Boolean(sid) && sid !== true)
-  const ids = [...new Set([...canonical, ...rooms])]
 
-  const known = Promise.all(
-    ids.map(sid =>
-      Promise.resolve(host.request('session.set_hidden', { session_id: sid, hidden: true })).catch(() => undefined)
+  // A stale local/server pointer must not be trusted merely because it looks
+  // like a session id. Resolve every canonical pointer through the backend and
+  // require the canonical Bot Chat title before the hide write. This is
+  // deliberately fail-closed: an unavailable/old gateway may leave an old
+  // Bot Chat visible, but it must never hide an unrelated user conversation.
+  const verifiedCanonical = Promise.resolve()
+    .then(() =>
+      host.request('profiles.list', {
+        include_sessions: true,
+        preferred_session_ids: Object.fromEntries(canonical.map(entry => [entry.name, entry.id]))
+      })
+    )
+    .then(res => {
+      const profiles = Array.isArray(res?.profiles) ? res.profiles : []
+      const valid = []
+
+      for (const entry of canonical) {
+        const profile = profiles.find(item => item?.name === entry.name)
+        const preferred = profile?.preferred_session
+        const ids = [preferred?.id, preferred?.resolved_id, preferred?.session_id, preferred?.session_key]
+          .filter(Boolean)
+          .map(String)
+
+        if (String(preferred?.title || '').trim() === 'Bot Chat' && ids.includes(String(entry.id))) {
+          valid.push(entry.id)
+        }
+      }
+
+      return valid
+    })
+    .catch(() => [])
+
+  const known = verifiedCanonical.then(validCanonical =>
+    Promise.all(
+      [...new Set([...validCanonical, ...rooms])].map(sid =>
+        Promise.resolve(host.request('session.set_hidden', { session_id: sid, hidden: true })).catch(() => undefined)
+      )
     )
   )
 
@@ -568,8 +722,16 @@ function pullServerAvatars(roster) {
  *  pet icon) are PRESERVED — the server copy never includes them, so a
  *  naive replace would wipe a just-saved image avatar on the next roster
  *  paint. When server bot metadata exists, an omitted chat is authoritative
- *  deletion; local still fills all gaps for older gateways with no metadata. */
-function mergeServerMeta(roster) {
+ *  deletion; local still fills all gaps for older gateways with no metadata.
+ *
+ *  `fetchedAt` (the snapshot's issue time) fences the overlay: a bot whose
+ *  local meta was written AFTER the snapshot was fetched is skipped — that
+ *  snapshot's ui_meta predates the write, and spreading it back over local
+ *  meta resurrects state the user just changed (a disbanded group's
+ *  membership reappearing as an empty roster row, a rename reverting, an
+ *  unpin undoing). The next roster fetch post-dates the write and overlays
+ *  normally, so server truth still gets the last word. */
+function mergeServerMeta(roster, fetchedAt = 0) {
   const local = $botMeta.get()
   let changed = false
   const next = { ...local }
@@ -577,6 +739,9 @@ function mergeServerMeta(roster) {
   for (const bot of roster) {
     const server = bot.ui_meta?.['hermes-bots']
     if (server && typeof server === 'object') {
+      if (fetchedAt && fetchedAt < (botMetaWriteAt.get(bot.name) || 0)) {
+        continue
+      }
       const mine = next[bot.name] || {}
       const merged = { ...mine, ...server }
 
@@ -842,17 +1007,21 @@ function defaultShapeFor(name) {
 //   'blobatar'                — the face follows the bot's NAME (renaming the
 //                               bot re-rolls the face, live in the dialog)
 //   'blobatar:<seed>'         — seed locked (the 🔒 lock / 🎲 randomize picks)
-//   'blobatar:<seed>:<kind>'  — plus one of the six silhouettes pinned
+//   'blobatar:<seed>:<kind>'  — plus one of the ten silhouettes pinned
 //   'blobatar::<kind>'        — silhouette pinned, seed still follows the name
 // Bot names are slugs (NAME_RE) and generated seeds are base36, so ':' never
 // appears inside a segment. Colors come from the library's own name-derived
 // palette (contrast-guaranteed) — the classic color swatches don't apply.
 
-const BLOB_KINDS = ['round', 'organic', 'boxy', 'nub', 'cloud', 'sun']
+const BLOB_KINDS = ['round', 'organic', 'boxy', 'capsule', 'nub', 'cloud', 'droplet', 'hexagon', 'sun', 'triangle']
 
 // Trait positions at the center of each silhouette band. Band thresholds are
-// frozen per blobatar major (0.28 / 0.58 / 0.72 / 0.84 / 0.93).
-const BLOB_KIND_TRAIT = { round: 0.14, organic: 0.43, boxy: 0.65, nub: 0.78, cloud: 0.885, sun: 0.965 }
+// frozen per blobatar major (gen2: 0.22 / 0.48 / 0.60 / 0.70 / 0.79 / 0.86 /
+// 0.915 / 0.95 / 0.98).
+const BLOB_KIND_TRAIT = {
+  round: 0.11, organic: 0.35, boxy: 0.54, capsule: 0.65, nub: 0.745,
+  cloud: 0.825, droplet: 0.8875, hexagon: 0.9325, sun: 0.965, triangle: 0.99
+}
 
 function isBlobShape(shape) {
   return shape === 'blobatar' || (typeof shape === 'string' && shape.startsWith('blobatar:'))
@@ -1929,20 +2098,35 @@ function pickImageFromDevice() {
   })
 }
 
-// ── group-chat attachments: pick + downscale images the room's members see ──
+// ── group-chat attachments: pick/paste/drop files the room's members see ────
 
-/** File objects → [{ name, data }] (data URLs), oversized files skipped with
- *  a toast. Shared by the picker button and the composer's paste handler. */
-async function filesToGroupImages(files) {
+/** Classify a picked file for the group-attachment pipeline. */
+function groupAttachmentKind(file) {
+  if (/^image\//.test(file.type || '')) {
+    return 'image'
+  }
+
+  if (file.type === 'application/pdf' || /\.pdf$/i.test(file.name || '')) {
+    return 'pdf'
+  }
+
+  return 'file'
+}
+
+/** File objects → [{ name, data, kind }] (data URLs), oversized files skipped
+ *  with a toast. Images are downscaled; PDFs and other files ride as raw data
+ *  URLs for the gateway's pdf.attach / file.attach staging. Shared by the
+ *  picker button, the composer paste handler, and room drag & drop. */
+async function filesToGroupAttachments(files) {
   const picked = []
 
   for (const file of [...(files || [])]) {
-    if (!file || !/^image\//.test(file.type || '')) {
+    if (!file) {
       continue
     }
 
     if (file.size > 15_000_000) {
-      host.notify({ kind: 'error', message: `${file.name || 'image'}: too large (max 15MB).` })
+      host.notify({ kind: 'error', message: `${file.name || 'attachment'}: too large (max 15MB).` })
       continue
     }
 
@@ -1953,23 +2137,29 @@ async function filesToGroupImages(files) {
       reader.readAsDataURL(file)
     })
 
-    if (data) {
-      picked.push({ name: file.name || 'pasted image', data: await normalizeGroupAttachment(data) })
+    if (!data) {
+      continue
     }
+
+    const kind = groupAttachmentKind(file)
+    picked.push({
+      name: file.name || (kind === 'image' ? 'pasted image' : 'attachment'),
+      data: kind === 'image' ? await normalizeGroupAttachment(data) : data,
+      kind
+    })
   }
 
   return picked
 }
 
-/** Multi-file variant of pickImageFromDevice for the group composer. Resolves
- *  to [{ name, data }] (data URLs); oversized files are skipped with a toast. */
-function pickGroupImages() {
+/** Multi-file picker for the group composer — any file type; kind decides
+ *  the staging RPC. Resolves to [{ name, data, kind }]. */
+function pickGroupAttachments() {
   return new Promise(resolve => {
     const input = document.createElement('input')
     input.type = 'file'
-    input.accept = 'image/png,image/jpeg,image/webp,image/gif'
     input.multiple = true
-    input.onchange = () => resolve(filesToGroupImages(input.files))
+    input.onchange = () => resolve(filesToGroupAttachments(input.files))
     input.click()
   })
 }
@@ -2600,6 +2790,11 @@ function useRoster() {
   return useQuery({
     queryKey: [...ROSTER_KEY, activeConnectionId],
     queryFn: async () => {
+      // Stamp the ISSUE time on the snapshot: mergeServerMeta compares it
+      // against each bot's last local meta write, and a fetch issued before
+      // a write can only carry pre-write ui_meta. (Issue time is the
+      // conservative bound — the server answered no earlier than this.)
+      const issuedAt = Date.now()
       // Rich rows (last_session, ui_meta, has_avatar) come from the ACTIVE
       // gateway's profiles.list — unchanged single-source behavior.
       const pins = preferredSessionIds($botMeta.get())
@@ -2620,13 +2815,13 @@ function useRoster() {
       if (typeof host.agents === 'function') {
         try {
           const union = await host.agents()
-          return mergeMultiSourceRoster(local, union, activeConnectionId, $lastRoster.get())
+          return { ...mergeMultiSourceRoster(local, union, activeConnectionId, $lastRoster.get()), fetchedAt: issuedAt }
         } catch {
           /* older build or roster failure — single-source list stands */
         }
       }
 
-      return local
+      return { ...(local && typeof local === 'object' ? local : {}), fetchedAt: issuedAt }
     },
     refetchInterval: 5000,
     staleTime: 5000,
@@ -2811,6 +3006,53 @@ function botHandle(name, bot) {
   return (name || '').trim().toLowerCase() === 'default' ? 'hermes' : name
 }
 
+/** Taggable @-forms derived from a bot's friendly names — the core profile
+ *  display name (`hermes profile rename`) and the Bot Mode title. Free text
+ *  reduces to the mention charset two ways: slugified ("Research Buddy" →
+ *  research-buddy, the form autocomplete inserts) and collapsed
+ *  (researchbuddy). Reserved tokens are dropped so a bot renamed "Hermes"
+ *  can never hijack the primary profile's @hermes alias. */
+function mentionNameForms(value) {
+  const name = String(value || '').trim().toLowerCase()
+
+  if (!name) {
+    return []
+  }
+
+  const slug = name.replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '')
+  const collapsed = name.replace(/[^a-z0-9_-]+/g, '')
+
+  return [...new Set([slug, collapsed])].filter(
+    form => /^[a-z0-9][a-z0-9_-]*$/.test(form) && !['all', 'everyone', 'user', 'default', 'hermes'].includes(form)
+  )
+}
+
+/** Every friendly (renameable) name a roster row carries: the Bot Mode title
+ *  (server-synced via ui_meta, locally stored, or persisted on a durable
+ *  group descriptor) and the core profile display_name — in displayName's
+ *  precedence order. Remote rows never borrow local meta (two `default`s
+ *  must not share a title). */
+function botFriendlyNames(bot) {
+  const localTitle = !bot?.remoteSource && typeof $botMeta !== 'undefined' ? $botMeta.get()?.[bot?.name]?.title : null
+
+  return [bot?.ui_meta?.['hermes-bots']?.title, localTitle, bot?.title, bot?.display_name]
+}
+
+/** The tag autocomplete inserts for a bot: the renamed (friendly) slug when
+ *  the user gave the bot a real name, otherwise the profile @handle. The
+ *  resolvers accept both, so older muscle memory keeps working. */
+function botMentionTag(bot) {
+  for (const friendly of botFriendlyNames(bot)) {
+    const forms = mentionNameForms(friendly)
+
+    if (forms.length) {
+      return forms[0]
+    }
+  }
+
+  return botHandle(bot?.name, bot)
+}
+
 function isActiveRosterBot(bot, active) {
   const activeName = String(active?.name || 'default').trim() || 'default'
   const activeId = String(active?.connectionId || '').trim()
@@ -2847,6 +3089,15 @@ function resolveRosterMentions(text, roster, active = {}) {
 
     if (bot.handle) {
       forms.add(String(bot.handle).toLowerCase())
+    }
+
+    // Renamed bots are taggable by their friendly names too — the core
+    // profile display_name and the Bot Mode title (issue: renaming a bot
+    // didn't change what you @-tag it with).
+    for (const friendly of botFriendlyNames(bot)) {
+      for (const form of mentionNameForms(friendly)) {
+        forms.add(form)
+      }
     }
 
     for (const form of forms) {
@@ -3140,6 +3391,10 @@ function showsHandle(name, meta, bot) {
 // In-flight creations, keyed by bot name — double-clicking a row must not
 // mint two canonical chats.
 const canonicalCreations = new Map()
+
+/** Upper bound for per-profile session.list scans (hide sweep, canonical-chat
+ *  adoption, stored-session lookups). */
+const PROFILE_SESSION_LIST_LIMIT = 200
 let botOpenGeneration = 0
 
 async function openStoredBotChat(name, storedId, summary) {
@@ -3151,20 +3406,60 @@ async function openStoredBotChat(name, storedId, summary) {
     typeof summary?.message_count === 'number' && Number.isFinite(summary.message_count)
   const expectHistory = hasAuthoritativeCount ? summary.message_count > 0 : true
 
+  // A profile backend that just woke up can lose the hydration-timeout race
+  // even though the session is fine (hermes-agent#89617) — clicking Retry
+  // succeeds because the backend is warm by then. retryHydrationTimeoutOnce
+  // asks the SDK layer to retry that same wait internally, BEFORE it arms the
+  // core stranded-session overlay: a plugin-side retry can't do this because
+  // only host.openSession sees the resume-exhausted latch that overlay reads.
   await host.openSession(storedId, {
     profile: name,
     intent: 'main',
     awaitHydration: true,
-    expectHistory
+    expectHistory,
+    keepAllProfilesScope: true,
+    retryHydrationTimeoutOnce: true
   })
 
   return storedId
 }
 
+/** Adopt-before-mint: the profile may already own a canonical Bot Chat that
+ *  the pin lost track of (pin cleared during an outage, ui_meta rolled back,
+ *  a fork squatting the title). The core UNIQUE title index guarantees at
+ *  most ONE session titled "Bot Chat" per profile db — Profile → Named
+ *  Session is an exact registry, so consult it exactly: `title` asks the
+ *  gateway for an indexed WHERE title = ? lookup (window-free; a busy
+ *  profile can push the forever-chat past any recency window, which would
+ *  re-open the fork loop with a higher trigger threshold). Minting while a
+ *  "Bot Chat" row exists is always wrong twice over: it forks the
+ *  forever-chat AND the new row can never take the (already held) canonical
+ *  title, so the next identity check misreads it and forks again — the
+ *  infinite-fork loop. An older gateway ignores the unknown `title` param
+ *  and returns the plain windowed listing instead — the pre-exact-lookup
+ *  behavior — so the local scan below stays as the compatibility rung.
+ *  include_hidden is required (canonical chats are always hidden); a gateway
+ *  without it simply finds nothing and we fall through to mint. */
+async function findExistingCanonicalChat(name) {
+  try {
+    const res = await host.request('session.list', {
+      profile: name,
+      title: 'Bot Chat',
+      limit: PROFILE_SESSION_LIST_LIMIT,
+      include_hidden: true
+    })
+    const rows = res?.sessions ?? []
+    return rows.find(row => isCanonicalBotChatHistory(row)) || null
+  } catch {
+    return null
+  }
+}
+
 /** Create the bot's ONE forever chat: a real session opened with a kickoff
  *  message (the gateway prunes zero-message sessions, so the chat is born
  *  with the bot introducing itself). Pins the stored id in bot meta and
- *  returns it. */
+ *  returns it. Adopts an existing "Bot Chat" row instead of creating when
+ *  the profile already has one (see findExistingCanonicalChat). */
 function createCanonicalChat(name) {
   const inflight = canonicalCreations.get(name)
 
@@ -3173,6 +3468,21 @@ function createCanonicalChat(name) {
   }
 
   const run = (async () => {
+    const existing = await findExistingCanonicalChat(name)
+
+    if (existing?.id) {
+      saveBotMeta(name, { chat: existing.id })
+
+      if (typeof host.openSession === 'function') {
+        // The exact-lookup gateway reports the compression-lineage tip as
+        // resolved_id; the pin stays the durable row id (same split the
+        // preferred_session path uses).
+        await openStoredBotChat(name, existing.resolved_id || existing.id, existing)
+      }
+
+      return existing.id
+    }
+
     const res = await host.request('session.create', {
       profile: name,
       title: 'Bot Chat',
@@ -3195,7 +3505,7 @@ function createCanonicalChat(name) {
 
     if (sid && typeof host.openSession === 'function') {
       try {
-        await host.openSession(sid, { profile: name, intent: 'main' })
+        await host.openSession(sid, { profile: name, intent: 'main', keepAllProfilesScope: true })
         opened = true
       } catch {
         // The stored row may not exist until the kickoff persists it. Retry
@@ -3210,7 +3520,7 @@ function createCanonicalChat(name) {
         await host.request('prompt.submit', { session_id: runtime, text: 'Hey, tell me about yourself!' })
 
         if (!opened && sid && typeof host.openSession === 'function') {
-          await host.openSession(sid, { profile: name, intent: 'main' })
+          await host.openSession(sid, { profile: name, intent: 'main', keepAllProfilesScope: true })
         }
       } catch {
         // The chat already exists. Keep the pin so the next click
@@ -3230,19 +3540,28 @@ function createCanonicalChat(name) {
  *
  *  Identity rules (hermes-agent#88200 — the row must open the session its
  *  preview describes):
- *  - grandfather: no pin + existing history adopts the previewed session
+ *  - grandfather: no pin + an existing Bot Chat adopts the previewed session
  *    (`history`, the roster's last_session for this bot) instead of minting
- *    a new empty chat;
+ *    a new empty chat. Ordinary user conversations are never adopted;
+ *    `last_session` is only a recency hint, not an ownership proof;
  *  - a live pin is verified through the backend's precise preferred_session
  *    resolver (hidden rows still resolve; compression lineages resolve to
  *    the live tip) — never inferred from a paginated, hidden-excluding
  *    session.list window, which misjudged real hidden pins as gone;
  *  - transient lookup failures keep the pin: try the stored id as-is, and
  *    only a rejected open enters recovery. */
+function isCanonicalBotChatHistory(history) {
+  const rootTitle = String(history?.root_title || '').trim()
+  const title = String(history?.title || '').trim()
+  return rootTitle === 'Bot Chat' || (!rootTitle && title === 'Bot Chat')
+}
+
 async function openBotCanonicalChat(name, pinned, history) {
   if (!pinned) {
-    // Grandfather: adopt the conversation the row already previews.
-    const adoptId = history?.id
+    // Grandfather only an actual Bot Chat. `last_session` is merely the most
+    // recent row for the profile; adopting it blindly can claim an unrelated
+    // user conversation and the hide sweep would then hide that conversation.
+    const adoptId = isCanonicalBotChatHistory(history) ? history.id : null
     if (adoptId && typeof host.openSession === 'function') {
       await openStoredBotChat(name, adoptId, history)
       saveBotMeta(name, { chat: adoptId })
@@ -3278,7 +3597,7 @@ async function openBotCanonicalChat(name, pinned, history) {
     return openStoredBotChat(name, pinned, history)
   }
 
-  if (preferred) {
+  if (preferred && isCanonicalBotChatHistory(preferred)) {
     try {
       await openStoredBotChat(name, preferred.resolved_id || preferred.id, preferred)
       return pinned
@@ -3291,9 +3610,40 @@ async function openBotCanonicalChat(name, pinned, history) {
     }
   }
 
+  if (preferred) {
+    // The stored pointer resolved to a real session, but not to Bot Mode's
+    // titled plumbing session. Two legitimate ways to get here, and neither
+    // means "mint a new chat":
+    //  - the pin IS the forever-chat but its title drifted (grandfathered
+    //    pre-convention chats; the LLM auto-titler renaming an untitled row
+    //    after a silent unique-title conflict dropped "Bot Chat"). A pinned
+    //    session carrying real history is the user's conversation — forking
+    //    away from it silently loses their thread, the exact bug this whole
+    //    resolver exists to prevent. The pin is the durable intent: keep it
+    //    and open it, even when some other (likely forked) row holds the
+    //    "Bot Chat" title. The hide sweep only matches plumbing titles, so
+    //    an adopted odd-titled chat is never swept out of the user's
+    //    ordinary session list.
+    //  - the pin resolves to an EMPTY non-plumbing session (a stray draft):
+    //    genuinely corrupted metadata. Clear it — createCanonicalChat then
+    //    adopts the profile's existing "Bot Chat" row if one exists before
+    //    ever creating a new one.
+    const messageCount = Number(preferred.message_count) || 0
+
+    if (messageCount > 0) {
+      await openStoredBotChat(name, preferred.resolved_id || preferred.id, preferred)
+      return pinned
+    }
+
+    await saveBotMeta(name, { chat: null })
+    return createCanonicalChat(name)
+  }
+
   // Definitively gone (db reset, or the lineage was rewritten past
   // recovery): re-anchor on the previewed session when there is one.
-  const recoveryId = history?.id
+  // A previewed row is safe to re-anchor only when it is Bot Mode plumbing.
+  // Otherwise a stale pin must not steal the profile's ordinary latest chat.
+  const recoveryId = isCanonicalBotChatHistory(history) ? history.id : null
   if (recoveryId && typeof host.openSession === 'function') {
     await openStoredBotChat(name, recoveryId, history)
     saveBotMeta(name, { chat: recoveryId })
@@ -3467,12 +3817,25 @@ function groupChatNames(metaByName, rooms) {
   const names = new Set(knownGroups(metaByName))
 
   for (const [name, room] of Object.entries(rooms || {})) {
+    if (room?.tombstone) {
+      continue
+    }
+
     if ((Array.isArray(room?.members) && room.members.length) || (Array.isArray(room?.log) && room.log.length)) {
       names.add(name)
     }
   }
 
   return [...names]
+}
+
+/** Names of REAL rooms in the atom — disband tombstones excluded. Feeds the
+ *  create/rename collision sets so a just-disbanded name is immediately
+ *  reusable even while an in-flight drive's tombstone still holds its key. */
+function liveGroupChatNames() {
+  return Object.entries($groupChats.get())
+    .filter(([, room]) => !room?.tombstone)
+    .map(([name]) => name)
 }
 
 /** Millisecond timestamp of a room's newest log entry (0 for a silent room) —
@@ -3512,15 +3875,24 @@ function groupChatMemberBots(group, roster, metaByName) {
  *  source's row may become remote after a connection switch, so retaining it
  *  here is what keeps the same room intact across machines. */
 function durableGroupChatMembers(bots) {
-  return (bots || []).map(bot => ({
-    name: bot.name,
-    handle: bot.handle || bot.name,
-    connectionId: bot.connectionId,
-    connectionKind: bot.connectionKind,
-    connectionLabel: bot.connectionLabel,
-    remoteSource: true,
-    sourceScoped: true
-  }))
+  return (bots || []).map(bot => {
+    // Keep the friendly identity on the stored descriptor: after a
+    // connection switch the live roster row may be gone, and renamed-tag
+    // mentions must still resolve against the persisted member.
+    const title = String(botRosterMeta(bot, $botMeta.get())?.title || bot.ui_meta?.['hermes-bots']?.title || bot.title || '').trim()
+
+    return {
+      name: bot.name,
+      handle: bot.handle || bot.name,
+      ...(title ? { title } : {}),
+      ...(bot.display_name ? { display_name: bot.display_name } : {}),
+      connectionId: bot.connectionId,
+      connectionKind: bot.connectionKind,
+      connectionLabel: bot.connectionLabel,
+      remoteSource: true,
+      sourceScoped: true
+    }
+  })
 }
 
 /** Existing group names, alphabetical — feeds the Manage-groups dialog. */
@@ -3588,6 +3960,15 @@ function parseGroupChatMentions(text, members) {
         ? [title.toLowerCase(), title.toLowerCase().replace(/[\s_-]+/g, ''), title.split(/\s+/)[0].toLowerCase()]
         : [])
     ])
+
+    // Renamed members answer to their friendly names too (profile
+    // display_name and Bot Mode title), in slugged and collapsed forms —
+    // the same tags the roster autocomplete inserts.
+    for (const friendly of botFriendlyNames(member)) {
+      for (const form of mentionNameForms(friendly)) {
+        forms.add(form)
+      }
+    }
 
     for (const form of forms) {
       if (form) {
@@ -3675,10 +4056,15 @@ function groupSpeakerLabel(name) {
 /** Room-log line as a member sees it: `Name (user): …` / `Name: …` /
  *  `Name (you): …`. */
 function formatGroupChatLine(entry, viewerName) {
-  // Attachments are staged into each member's session as real images; the
-  // transcript line names them so the delta text and the pixels line up.
+  // Attachments are staged into each member's session as real payloads; the
+  // transcript line names them so the delta text and the bytes line up.
   const attached = Array.isArray(entry.images) && entry.images.length
-    ? ` ${entry.images.map(img => `[attached image: ${img.name || 'image'}]`).join(' ')}`
+    ? ` ${entry.images
+        .map(img => {
+          const label = img.kind === 'pdf' ? 'attached PDF' : img.kind === 'file' ? 'attached file' : 'attached image'
+          return `[${label}: ${img.name || 'image'}]`
+        })
+        .join(' ')}`
     : ''
 
   if (entry.from.kind === 'user') {
@@ -3753,6 +4139,14 @@ function updateGroupChat(group, mutate) {
     const durable = {}
 
     for (const [name, room] of Object.entries(all)) {
+      // Disband tombstones are runtime-only coordination state (they hold the
+      // epoch bump for an in-flight drive). Persisting one would resurrect
+      // the room as an empty record on the next load AND keep its name
+      // "taken" for same-name recreates.
+      if (room.tombstone) {
+        continue
+      }
+
       durable[name] = {
         log: room.log,
         watermarks: room.watermarks,
@@ -3764,6 +4158,8 @@ function updateGroupChat(group, mutate) {
         // Source-qualified member descriptors keep the room whole when the
         // active connection changes and today's local members become remote.
         members: Array.isArray(room.members) ? room.members : [],
+        // Immutable room identity: the member-session title for new rooms.
+        roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
         // Room picture (small data URL, same normalization as bot avatars).
         image: room.image || null
       }
@@ -3781,7 +4177,7 @@ function updateGroupChat(group, mutate) {
  *  membership list (the metadata syncs cross-machine via ui_meta), drop the
  *  room log from the atom + plugin storage, and close the room view if it's
  *  open. Other group memberships and the members' per-group gateway sessions
- *  ("Group: <name>") are intentionally KEPT. */
+ *  ("Group: <roomId>", or legacy "Group: <name>") are intentionally KEPT. */
 async function disbandGroupChat(group, members) {
   // Invalidate any in-flight round-robin FIRST: bump the epoch so a running
   // drive bails at its next member boundary instead of appending to a room
@@ -3791,9 +4187,12 @@ async function disbandGroupChat(group, members) {
 
   delete all[group]
   // Keep a runtime-only tombstone while a drive may still be mid-turn; it
-  // carries no log and is never persisted, so it can't rehydrate.
+  // carries no log and is flagged so persistence and name-dedup skip it —
+  // updateGroupChat writes the WHOLE atom map, so an unflagged tombstone
+  // would be persisted by the next unrelated room write and its name would
+  // count as taken, suffixing a same-name recreate to "<name> 2" forever.
   if (prior.running) {
-    all[group] = { log: [], watermarks: {}, sessions: {}, epoch: (prior.epoch || 0) + 1, running: false }
+    all[group] = { log: [], watermarks: {}, sessions: {}, epoch: (prior.epoch || 0) + 1, running: false, tombstone: true }
   }
 
   $groupChats.set(all)
@@ -3809,6 +4208,7 @@ async function disbandGroupChat(group, members) {
 
   delete needs[group]
   $groupNeedsYou.set(needs)
+  clearGroupClarify(group)
 
   // Persist the room map WITHOUT the disbanded room so it can't come back
   // on the next window load.
@@ -3822,6 +4222,7 @@ async function disbandGroupChat(group, members) {
           watermarks: room.watermarks,
           sessions: room.sessions || {},
           members: Array.isArray(room.members) ? room.members : [],
+          roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
           image: room.image || null
         }
       }
@@ -3843,6 +4244,13 @@ async function disbandGroupChat(group, members) {
     const meta = $botMeta.get()[member.name] || {}
     await saveBotMeta(member.name, groupMembershipPatch(meta, group, false))
   }
+
+  // Converge on server truth: the cached roster still carries the pre-disband
+  // ui_meta (the write-fence in mergeServerMeta keeps it from resurrecting
+  // the membership, but a fresh snapshot is what makes every surface agree).
+  if (typeof queryClient !== 'undefined' && queryClient?.invalidateQueries) {
+    queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
+  }
 }
 
 /** Set or clear a group chat's room picture (small data URL, normalized by
@@ -3857,9 +4265,11 @@ function setGroupChatImage(group, image) {
 /** Rename a group chat. The group's NAME is its identity everywhere — the
  *  room-map key, each local member's ui_meta membership list, and derived
  *  state — so a rename re-keys all of them. Member gateway sessions are kept
- *  as-is: stored sids keep resuming, so no history is lost (only a member
- *  whose sid is later lost falls back to a fresh "Group: <new name>" title
- *  lookup). Returns the new name, or null when the target name is taken. */
+ *  as-is: stored sids keep resuming, so no history is lost. The room's
+ *  immutable roomId (the member-session title) is preserved across the
+ *  rename, so even a member whose sid is later lost falls back to the same
+ *  "Group: <roomId>" title lookup instead of a fresh "Group: <new name>".
+ *  Returns the new name, or null when the target name is taken. */
 async function renameGroupChat(oldName, newName, members) {
   const next = String(newName || '').trim().slice(0, 64)
 
@@ -3868,8 +4278,9 @@ async function renameGroupChat(oldName, newName, members) {
   }
 
   // Renames are explicit user intent: reject a collision honestly instead of
-  // silently suffixing like creation does.
-  const taken = new Set(Object.keys($groupChats.get()))
+  // silently suffixing like creation does. Disband tombstones don't hold
+  // their name — the room is gone, only its epoch survives briefly.
+  const taken = new Set(liveGroupChatNames())
 
   for (const meta of Object.values($botMeta.get() || {})) {
     for (const existing of botGroups(meta)) {
@@ -3905,6 +4316,10 @@ async function renameGroupChat(oldName, newName, members) {
     $groupNeedsYou.set(needs)
   }
 
+  // Mirrored clarify cards key by group name; drop the old room's — the
+  // next poll re-mirrors any still-blocking question under the new name.
+  clearGroupClarify(oldName)
+
   // Local memberships: swap the name inside each member's canonical groups
   // list (syncs cross-machine via ui_meta). Remote members' seating lives in
   // the room record we just moved.
@@ -3932,6 +4347,12 @@ async function renameGroupChat(oldName, newName, members) {
     openGroupChat(next)
   }
 
+  // Same convergence as disband: drop the pre-rename roster snapshot so the
+  // old name can't linger anywhere the fence doesn't cover.
+  if (typeof queryClient !== 'undefined' && queryClient?.invalidateQueries) {
+    queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
+  }
+
   return next
 }
 
@@ -3957,6 +4378,33 @@ function appendGroupChatEntry(group, from, text, thread, images) {
   return entry
 }
 
+/** Fresh room identity for a group. Independent of the editable display
+ *  name: a disbanded-and-recreated group mints a new roomId even when the
+ *  display name is identical, so member sessions never resume by title. */
+function mintGroupRoomId() {
+  return `r${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+}
+
+/** Unique display name for a NEW group. Collisions get a " 2", " 3", …
+ *  suffix; the BASE is truncated (never the joined string), so a 64-char
+ *  base keeps its suffix instead of colliding with the original. */
+function uniqueGroupChatName(base, taken) {
+  if (!taken.has(base)) {
+    return base
+  }
+
+  for (let n = 2; n < 100; n++) {
+    const suffix = ` ${n}`
+    const candidate = base.slice(0, 64 - suffix.length) + suffix
+
+    if (!taken.has(candidate)) {
+      return candidate
+    }
+  }
+
+  throw new Error('No free name for the group.')
+}
+
 /** Ensure the member's per-group session exists and return a LIVE runtime
  *  session id for it. Gateway-native: session.create mints the session
  *  (lazy until its first message), session.resume by stored id — or by
@@ -3964,8 +4412,11 @@ function appendGroupChatEntry(group, from, text, thread, images) {
  *  it after restarts. Cross-connection members route to their OWN source
  *  via requestForBot; the window's gateway never switches. */
 async function ensureGroupChatSession(group, member) {
-  const title = `Group: ${group}`
   const room = $groupChats.get()[group] || {}
+  // New rooms title member sessions by their immutable roomId so a
+  // same-name recreate never resumes the old room's sessions by title;
+  // legacy rooms without a roomId fall back to the display name.
+  const title = `Group: ${room.roomId || group}`
   const key = groupMemberKey(member)
   const known = room.sessions && room.sessions[key]
 
@@ -4017,6 +4468,145 @@ const GROUP_TURN_POLL_MS = 2000
 // reached the room (db's Aug 2026 report).
 const GROUP_TURN_HARD_CAP_MS = 20 * 60000
 
+/** Mirror a member's pending prompt — clarify question OR command approval —
+ *  from its resume snapshot into the room store, keyed
+ *  `${group}::${memberKey}` (#90694). Returns true while a prompt is
+ *  blocking, so the turn poll can extend its deadline — a waiting prompt
+ *  must not be eaten by the group-turn timeout. Feature-detected: older
+ *  backends without `pending_clarify`/`pending_approval` in the resume
+ *  payload always sync to "no prompt". Clarify wins when both are somehow
+ *  present (approvals resolve inside tool batches; clarify is the outer
+ *  blocker). */
+function syncGroupClarify(group, member, state) {
+  const key = `${group}::${groupMemberKey(member)}`
+  const clarify = state && typeof state.pending_clarify === 'object' ? state.pending_clarify : null
+  const approval = state && typeof state.pending_approval === 'object' ? state.pending_approval : null
+  const pending = clarify || approval
+  const requestId = pending?.request_id || null
+  const all = $groupClarify.get()
+  const current = all[key]
+
+  if (!requestId) {
+    if (current) {
+      const next = { ...all }
+      delete next[key]
+      $groupClarify.set(next)
+    }
+
+    return false
+  }
+
+  // Same request already mirrored — keep the object identity so the card
+  // doesn't lose its draft to a re-render.
+  if (current?.requestId === requestId) {
+    return true
+  }
+
+  const base = {
+    requestId,
+    group,
+    member: member.name,
+    memberKey: groupMemberKey(member),
+    // approval.respond keys on the session, not just the request — carry the
+    // runtime id the snapshot came from.
+    sessionId: state?.session_id || null,
+    at: Date.now()
+  }
+
+  $groupClarify.set({
+    ...all,
+    [key]: clarify
+      ? {
+          ...base,
+          kind: 'clarify',
+          question: typeof clarify.question === 'string' ? clarify.question : '',
+          choices: Array.isArray(clarify.choices) ? clarify.choices.filter(c => typeof c === 'string' && c) : [],
+          multiSelect: Boolean(clarify.multi_select),
+          // Batch clarifies carry `questions`; the room card answers them
+          // one wire call per question, mirroring the 1:1 batch contract.
+          questions: Array.isArray(clarify.questions) ? clarify.questions : null
+        }
+      : {
+          ...base,
+          kind: 'approval',
+          question: typeof approval.description === 'string' ? approval.description : '',
+          command: typeof approval.command === 'string' ? approval.command : '',
+          // The server precomputes the choice set from allow_permanent
+          // (once/session/always/deny); fall back to the minimal pair.
+          choices: Array.isArray(approval.choices) && approval.choices.length
+            ? approval.choices.filter(c => typeof c === 'string' && c)
+            : ['once', 'deny'],
+          multiSelect: false,
+          questions: null
+        }
+  })
+  // A blocked member is a question for the human — badge the room.
+  $groupNeedsYou.set({ ...$groupNeedsYou.get(), [group]: true })
+
+  return true
+}
+
+/** Drop every mirrored clarify belonging to `group` (disband/rename). */
+function clearGroupClarify(group) {
+  const all = $groupClarify.get()
+  const next = {}
+  let changed = false
+
+  for (const [key, value] of Object.entries(all)) {
+    if (value?.group === group) {
+      changed = true
+    } else {
+      next[key] = value
+    }
+  }
+
+  if (changed) {
+    $groupClarify.set(next)
+  }
+}
+
+/** Answer a member's pending prompt from the room. Routes to the member's
+ *  OWN source (requestForBot), so cross-connection members work.
+ *  - clarify: `clarify.respond`; batch questions send one respond per
+ *    question, sequentially — the LAST lock resolves the blocked tool
+ *    server-side (same contract as the 1:1 batch card). allow_expired
+ *    server-side makes racing the timeout harmless.
+ *  - approval: `approval.respond` with the choice (once/session/always/deny),
+ *    keyed by session + request_id — the same wire the 1:1 approval card
+ *    and native notifications use. */
+async function answerGroupClarify(entry, member, answers) {
+  if (entry.kind === 'approval') {
+    await requestForBot(member, 'approval.respond', {
+      session_id: entry.sessionId || undefined,
+      request_id: entry.requestId,
+      choice: typeof answers === 'string' && answers ? answers : 'deny'
+    })
+  } else if (entry.questions && entry.questions.length) {
+    for (const question of entry.questions) {
+      const qid = question?.qid ?? question?.id
+      await requestForBot(member, 'clarify.respond', {
+        request_id: entry.requestId,
+        question_id: qid,
+        answer: answers?.[qid] ?? ''
+      })
+    }
+  } else {
+    await requestForBot(member, 'clarify.respond', {
+      request_id: entry.requestId,
+      answer: typeof answers === 'string' ? answers : ''
+    })
+  }
+
+  const all = $groupClarify.get()
+  const key = `${entry.group}::${entry.memberKey}`
+
+  if (all[key]?.requestId === entry.requestId) {
+    const next = { ...all }
+    delete next[key]
+    $groupClarify.set(next)
+  }
+}
+
 /** One member turn, gateway-native: submit the room delta as a prompt into
  *  the member's per-group session, then poll the session until a NEW
  *  assistant message lands (or timeout → pass). While the session visibly
@@ -4030,6 +4620,8 @@ async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
   if (!runtime) {
     return null
   }
+
+  recordGroupActivity(group, { kind: 'working', member: member.name, thread })
 
   // Baseline: how many messages exist before our submit.
   let before = 0
@@ -4045,28 +4637,55 @@ async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
   }
 
   // Stage this delta's attachments into the member's session so the model
-  // receives the actual pixels with the prompt (the same image.attach_bytes
-  // path the 1:1 chat uses — it also works cross-connection, where the
-  // member's gateway can't see this machine's files). A failed attach
-  // degrades that member to text-only; the transcript line still names the
-  // image so the member knows something was shared.
+  // receives the actual payload with the prompt — the same attach RPCs the
+  // 1:1 chat uses (they also work cross-connection, where the member's
+  // gateway can't see this machine's files). Images queue as vision tiles,
+  // PDFs render per-page via pdf.attach, and other files materialize in the
+  // session workspace (their @file: refs are appended to the prompt so the
+  // member's file tools can read them). A failed attach degrades that
+  // member to text-only; the transcript line still names the attachment so
+  // the member knows something was shared.
+  const fileRefs = []
+
   for (const img of Array.isArray(images) ? images : []) {
     if (!img || typeof img.data !== 'string' || !img.data) {
       continue
     }
 
     try {
-      await requestForBot(member, 'image.attach_bytes', {
-        session_id: runtime,
-        content_base64: img.data,
-        filename: img.name || 'attachment.png'
-      })
+      if (img.kind === 'pdf') {
+        await requestForBot(member, 'pdf.attach', {
+          session_id: runtime,
+          content_base64: img.data,
+          filename: img.name || 'attachment.pdf'
+        })
+      } else if (img.kind === 'file') {
+        const res = await requestForBot(member, 'file.attach', {
+          session_id: runtime,
+          data_url: img.data,
+          name: img.name || 'attachment'
+        })
+
+        if (res?.ref_text) {
+          fileRefs.push(`${img.name || 'attachment'} → ${res.ref_text}`)
+        }
+      } else {
+        await requestForBot(member, 'image.attach_bytes', {
+          session_id: runtime,
+          content_base64: img.data,
+          filename: img.name || 'attachment.png'
+        })
+      }
     } catch {
       /* text-only fallback for this member */
     }
   }
 
-  await requestForBot(member, 'prompt.submit', { session_id: runtime, text: prompt })
+  const turnText = fileRefs.length
+    ? `${prompt}\n\nAttached files staged in your session workspace:\n${fileRefs.join('\n')}`
+    : prompt
+
+  await requestForBot(member, 'prompt.submit', { session_id: runtime, text: turnText })
 
   const started = Date.now()
   let deadline = started + GROUP_TURN_TIMEOUT_MS
@@ -4087,7 +4706,11 @@ async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
 
     const messages = Array.isArray(state?.messages) ? state.messages : []
     const busy = Boolean(state?.inflight || state?.running)
-    const done = !busy
+    // A clarify blocking inside the member's session is a question for the
+    // HUMAN (#90694) — mirror it into the room store so a card renders, and
+    // hold the turn open: the member isn't stalling, it's waiting on us.
+    const awaitingUser = syncGroupClarify(group, member, state)
+    const done = !busy && !awaitingUser
 
     if (messages.length > before && done) {
       for (let i = messages.length - 1; i >= 0; i--) {
@@ -4099,23 +4722,37 @@ async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
             : Array.isArray(msg.content)
               ? msg.content.map(p => (typeof p === 'string' ? p : p?.text || '')).join('')
               : msg?.text || ''
+          const replyText = String(text).trim()
 
-          return String(text).trim()
+          recordGroupActivity(group, {
+            kind: isGroupPassText(replyText) ? 'passed' : 'replied',
+            member: member.name,
+            thread
+          })
+
+          return replyText
         }
       }
+
+      recordGroupActivity(group, { kind: 'passed', member: member.name, thread })
 
       return null
     }
 
-    // Still visibly working: extend the deadline (never past the hard cap).
-    if (busy) {
+    // Still visibly working — or waiting on the user's answer to a clarify:
+    // extend the deadline (never past the hard cap). A pending question must
+    // outlive the base turn timeout or it dies unanswered at 3 minutes.
+    if (busy || awaitingUser) {
       deadline = Math.min(started + GROUP_TURN_HARD_CAP_MS, Math.max(deadline, Date.now() + GROUP_TURN_TIMEOUT_MS))
     }
   }
 
-  // Timeout — reads as a pass, but remember the baseline + thread
+  // Timeout — clear any still-mirrored question card (the server-side
+  // clarify timeout runs its own course) and read as a pass, but remember the baseline + thread
   // (runtime-only) so the finished reply can be posted late into the RIGHT
   // thread instead of vanishing.
+  recordGroupActivity(group, { kind: 'timed-out', member: member.name, thread })
+  syncGroupClarify(group, member, null)
   updateGroupChat(group, r => {
     r.stranded = { ...(r.stranded || {}), [groupMemberKey(member)]: { before, thread } }
     return r
@@ -4144,7 +4781,7 @@ async function harvestStrandedGroupReply(group, member) {
   try {
     const stored = room.sessions?.[memberKey]
     state = await requestForBot(member, 'session.resume', {
-      session_id: stored || `Group: ${group}`,
+      session_id: stored || `Group: ${room.roomId || group}`,
       profile: member.name
     })
   } catch {
@@ -4153,6 +4790,12 @@ async function harvestStrandedGroupReply(group, member) {
 
   if (state?.inflight || state?.running) {
     return // still grinding — keep waiting
+  }
+
+  // A stranded member blocked on a clarify is not "grinding" — surface the
+  // question card (#90694) and keep the marker until it resolves.
+  if (syncGroupClarify(group, member, state)) {
+    return
   }
 
   // Done (or dead): the marker is consumed either way.
@@ -4181,6 +4824,7 @@ async function harvestStrandedGroupReply(group, member) {
       const reply = String(text).trim()
 
       if (reply && !isGroupPassText(reply)) {
+        recordGroupActivity(group, { kind: 'delivered', member: member.name, thread: strandedThread })
         appendGroupChatEntry(
           group,
           { kind: 'member', name: member.name, ...(member.remoteSource ? { source: member.connectionLabel || member.connectionId } : {}) },
@@ -4215,6 +4859,7 @@ async function runGroupChatRounds(group, members, thread) {
       // late, never lost.
       for (const member of members) {
         if (!isCurrent()) {
+          recordGroupActivity(group, { kind: 'cancelled', member: null, thread })
           return
         }
 
@@ -4222,11 +4867,28 @@ async function runGroupChatRounds(group, members, thread) {
       }
 
       const roomLog = (($groupChats.get()[group] || {}).log || []).filter(e => groupThreadOf(e) === thread)
+      // Exclude members the harvest pass just above confirmed are STILL
+      // running (their stranded marker survived harvest because
+      // state.inflight/running was true). Re-selecting one here would
+      // prompt.submit into their live session — the gateway's default busy
+      // policy redirects or hard-interrupts that turn (tui_gateway's
+      // _handle_busy_submit), killing exactly the long-running work this
+      // stranded/harvest mechanism exists to protect. Skip them; the next
+      // harvest pass picks the reply up once it actually lands. A marker's
+      // mere presence means "still stranded" (harvestStrandedGroupReply
+      // deletes it once the member is confirmed done/dead) — presence, not
+      // value shape, since markers are a bare number pre-thread or
+      // {before, thread} post-thread.
+      const strandedNow = ($groupChats.get()[group] || {}).stranded || {}
       const responders = rotateGroupSpeakers(resolveGroupResponders(roomLog, members), round)
+        .filter(member => !Object.prototype.hasOwnProperty.call(strandedNow, groupMemberKey(member)))
       let spokeThisRound = 0
 
       for (const member of responders) {
         if (!isCurrent() || posted >= GROUP_CHAT_MAX_MESSAGES) {
+          if (!isCurrent()) {
+            recordGroupActivity(group, { kind: 'cancelled', member: null, thread })
+          }
           return
         }
 
@@ -4268,6 +4930,7 @@ async function runGroupChatRounds(group, members, thread) {
         try {
           reply = await runGroupChatMemberTurn(group, member, prompt, thread, deltaImages)
         } catch {
+          recordGroupActivity(group, { kind: 'failed', member: member.name, thread })
           reply = null // a failed turn is a pass, never a room error
         }
 
@@ -4300,13 +4963,62 @@ async function runGroupChatRounds(group, members, thread) {
     }
   } finally {
     if (isCurrent()) {
+      recordGroupActivity(group, { kind: 'settled', member: null, thread })
       updateGroupChat(group, r => {
         r.running = false
         r.turn = null
         return r
       })
+
+      // #89545: the loop's harvest pass only ran at the top of each round of
+      // an ACTIVE loop — a member whose turn timed out after the final round
+      // stayed stranded until the user's NEXT send. Poll for the late reply
+      // in the background (bounded) so long work is late, never lost.
+      // (window feature-detect: the engine also runs under node in tests.)
+      const strandedLeft = Object.keys(($groupChats.get()[group] || {}).stranded || {})
+
+      if (strandedLeft.length && typeof window !== 'undefined') {
+        void harvestStrandedUntilSettled(group, members, thread)
+      }
     }
   }
+}
+
+/** Bounded background harvest for members whose replies outlived the turn
+ *  loop. Polls every 5s for up to 5 minutes; stops early when nothing is
+ *  stranded, a new loop takes the room over (it harvests on its own), or the
+ *  room record disappears (disband). */
+async function harvestStrandedUntilSettled(group, members, thread) {
+  const HARVEST_INTERVAL_MS = 5000
+  const HARVEST_MAX_TRIES = 60
+
+  for (let attempt = 0; attempt < HARVEST_MAX_TRIES; attempt++) {
+    await new Promise(resolve => window.setTimeout(resolve, HARVEST_INTERVAL_MS))
+
+    const room = $groupChats.get()[group]
+
+    if (!room || room.running) {
+      return
+    }
+
+    const stranded = room.stranded || {}
+
+    if (!Object.keys(stranded).length) {
+      return
+    }
+
+    for (const member of members) {
+      if (Object.prototype.hasOwnProperty.call(stranded, groupMemberKey(member))) {
+        try {
+          await harvestStrandedGroupReply(group, member)
+        } catch {
+          // Best-effort: the next tick retries; the bound stops runaways.
+        }
+      }
+    }
+  }
+
+  recordGroupActivity(group, { kind: 'failed', member: null, thread })
 }
 
 /** User send into a group room. `thread` continues that thread (its reply
@@ -4334,6 +5046,8 @@ function sendToGroupChat(group, members, text, thread, images) {
     room.running = true
     return room
   })
+
+  recordGroupActivity(group, { kind: 'queued', member: 'You', thread: target })
 
   if (!wasRunning) {
     void runGroupChatRounds(group, members, target).catch(() => {
@@ -4533,7 +5247,11 @@ function previewKind(preview) {
   }
   const match = text.match(A2A_RE)
   if (match) {
-    return { fromBot: (match[1] || match[2] || '').trim().toLowerCase() || null }
+    // The captured name is whatever the delivery prefix carried — a raw
+    // profile name. Map it the way every other surface does so the primary
+    // profile reads @hermes, never @default (#89484).
+    const sender = (match[1] || match[2] || '').trim().toLowerCase()
+    return { fromBot: sender ? botHandle(sender) : null }
   }
   return { fromBot: null }
 }
@@ -4569,17 +5287,55 @@ function generatedSessionTitle(session, preview) {
  *  seconds is treated as "active now" (pulsing dot in its row). */
 const ACTIVE_WINDOW_S = 90
 
+/** The session whose activity best represents this bot — the FRESHER of the
+ *  pinned canonical Bot Chat (preferred_session) and the profile's newest
+ *  visible conversation (last_session).
+ *
+ *  Canonical Bot Chats are hidden from the session list by design, so
+ *  last_session alone never sees them: a bot you talk to all day through its
+ *  Bot Chat reads "6d ago" because its newest VISIBLE session is a week old.
+ *  #88690 moved the preview text to preferred_session but left every activity
+ *  signal (age label, pulse dot, unread watermark, recency sort) on
+ *  last_session. All of them key off this helper now. Older gateways without
+ *  the preferred_session resolver degrade to last_session unchanged. */
+function botActivitySession(bot) {
+  const preferred = bot?.preferred_session
+  const last = bot?.last_session
+
+  if (!preferred || !last) {
+    return preferred || last || null
+  }
+
+  return (preferred.last_active || 0) >= (last.last_active || 0) ? preferred : last
+}
+
+/** Worker liveness window: kanban/tool workers heartbeat last_activity_at
+ *  at least every 60s while running (agent/session_activity.py), so a
+ *  worker whose stamp is older than this is finished or stalled. Wider
+ *  than ACTIVE_WINDOW_S to bridge one missed heartbeat. */
+const WORKER_ACTIVE_WINDOW_S = 150
+
+/** True while this bot's freshest kanban/tool worker looks alive. Workers
+ *  never surface in conversation lists, so without this a profile grinding
+ *  through a 30-minute kanban task reads idle ("3 hr ago") the whole time
+ *  (hermes-agent#90268). Older gateways omit worker_session — always false. */
+function workerActiveAt(bot, now = Date.now()) {
+  const ts = bot?.worker_session?.last_active || 0
+  return Boolean(ts && now / 1000 - ts < WORKER_ACTIVE_WINDOW_S)
+}
+
 /** Bots that are working right now: the profile the gateway is running a
- *  turn for (busy), plus any bot whose last message landed inside the
- *  liveness window. Pure — output follows the input roster's order, so
- *  presence never reorders or hides the normal list. */
+ *  turn for (busy), any bot whose last message landed inside the liveness
+ *  window, plus any bot with a live kanban/tool worker. Pure — output
+ *  follows the input roster's order, so presence never reorders or hides
+ *  the normal list. */
 function activeBots(roster, activeProfile, gatewayState, now = Date.now()) {
   return (roster || []).filter(bot => {
     const busyTurn = !bot.remoteSource && bot.name === activeProfile && gatewayState === 'busy'
-    const last = bot.last_session?.last_active || 0
+    const last = botActivitySession(bot)?.last_active || 0
     const inWindow = Boolean(last && now / 1000 - last < ACTIVE_WINDOW_S)
 
-    return busyTurn || inWindow
+    return busyTurn || inWindow || workerActiveAt(bot, now)
   })
 }
 
@@ -4587,30 +5343,50 @@ function activeBots(roster, activeProfile, gatewayState, now = Date.now()) {
 
 function BotRow({ bot, onDelete, onEdit, onGroup }) {
   const activeProfile = useValue(host.state.profile)
+  const focusedProfile = useValue($focusedBotProfile)
+  const activeGroup = useValue($groupChatWorkspace)
   const meta = botRosterMeta(bot, useValue($botMeta))
   const groups = botGroups(meta)
   const last = bot.last_session
-  const isActive = !bot.remoteSource && bot.name === activeProfile
+  // Highlight follows the chat on screen (focused session's owner), not the
+  // gateway socket's home — a focused tab doesn't swap the socket, and on the
+  // old keying the wrong bot stayed highlighted while you read another's chat.
+  // A selected group chat suppresses every bot-row highlight: the group row
+  // owns the selection then (#88979).
+  const isActive = !activeGroup && !bot.remoteSource && bot.name === focusedProfile
+  // Turn-busy is a SOCKET fact: only the gateway-home profile can be mid-turn.
+  const isGatewayHome = !bot.remoteSource && bot.name === activeProfile
   const { shape, color, image } = botAppearance(bot.name, meta)
   // Keep user photos/pets. Drop the 160px SVG backfill so the math face can move.
   const photo = Boolean(image && !isBackfilledFacePng(image))
   const gatewayState = useValue(host.state.gateway)
-  const activeNow = Boolean(last?.last_active && Date.now() / 1000 - last.last_active < ACTIVE_WINDOW_S)
+  // Preview identity must match click identity (#88200): when the backend
+  // resolved the pinned canonical chat, preview THAT session — not the
+  // profile's most recent (but unrelated) activity. Activity signals
+  // (age label, pulse dot) follow the same rule via botActivitySession:
+  // the canonical Bot Chat is hidden from last_session, so keying age off
+  // last_session alone shows "6d ago" on a bot you just messaged.
+  const previewSession = bot.preferred_session || last
+  const activitySession = botActivitySession(bot)
+  // A live kanban/tool worker counts as activity (#90268): pulse + fresh
+  // age while it runs, falling back to chat activity when it ends.
+  const workerActive = workerActiveAt(bot)
+  const activeNow =
+    workerActive ||
+    Boolean(activitySession?.last_active && Date.now() / 1000 - activitySession.last_active < ACTIVE_WINDOW_S)
+  const rowAgeTs = workerActive
+    ? Math.max(activitySession?.last_active || 0, bot.worker_session?.last_active || 0)
+    : activitySession?.last_active || 0
   // Work pose only when this bot is actually doing something: the active
   // profile while the gateway is busy, or a bot that wrote within the
   // liveness window. Not every bot whenever the gateway is busy.
-  const botMood = (isActive && gatewayState === 'busy') || activeNow ? 'work' : 'idle'
+  const botMood = (isGatewayHome && gatewayState === 'busy') || activeNow ? 'work' : 'idle'
   // Subscribe on every render. A source switch turns the same keyed row from
   // thin to rich; conditionally calling useValue here breaks React hook order.
   const unreadByName = useValue($botUnread)
   const unread = !bot.remoteSource && Boolean(unreadByName[bot.name])
-  // WHO sent the last message (bot-to-bot DM vs human) — the full stored
-  // history lives in the Sessions workspace (context menu), not inline.
-  // Preview identity must match click identity (#88200): when the backend
-  // resolved the pinned canonical chat, preview THAT session — not the
-  // profile's most recent (but unrelated) activity. Liveness checks above
-  // keep last_session semantics: any recent activity means the bot is alive.
-  const previewSession = bot.preferred_session || last
+  // WHO sent the last message (bot-to-bot DM vs human) — shown in the row
+  // preview; the conversation itself lives in the bot's one canonical chat.
   const { fromBot } = previewKind(previewSession?.preview)
   // DM previews read like DMs: strip the delivery prefix, keep the message.
   const displayPreview = stripPreviewMarkdown(
@@ -4645,6 +5421,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
   const open = async () => {
     const generation = ++botOpenGeneration
     haptic('tap')
+    $groupChatWorkspace.set(null)
     $selectedBot.set(bot.name)
 
     if (bot.remoteSource) {
@@ -4746,19 +5523,22 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
                       })
                     : null,
                   jsx('span', {
-                    className: 'truncate text-[0.8125rem] font-medium',
+                    className: cn(
+                      'truncate text-[0.8125rem] font-medium',
+                      bot.remoteSource && 'max-w-[42%] shrink-0'
+                    ),
                     children: displayName(bot, meta)
                   }),
                   showsHandle(bot.name, meta, bot)
                     ? jsx('span', {
-                        className: 'shrink-0 font-mono text-[0.6875rem] text-(--ui-text-quaternary)',
+                        className: 'min-w-0 truncate font-mono text-[0.6875rem] text-(--ui-text-quaternary)',
                         children: `@${botHandle(bot.name, bot)}`
                       })
                     : null,
                   bot.remoteSource
                     ? jsx('span', {
                         className:
-                          'shrink-0 rounded bg-(--chrome-action-hover) px-1 font-mono text-[0.625rem] text-(--ui-text-tertiary)',
+                          'max-w-[28%] shrink-0 truncate rounded bg-(--chrome-action-hover) px-1 font-mono text-[0.625rem] text-(--ui-text-tertiary)',
                         title: `Lives on ${bot.connectionLabel}`,
                         children: bot.connectionLabel
                       })
@@ -4774,13 +5554,13 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
               activeNow
                 ? jsx('span', {
                     className: 'hermes-bots-pulse size-1.5 shrink-0 rounded-full bg-(--ui-accent,#4f9cf9)',
-                    title: 'Active in the last 90s'
+                    title: workerActive ? 'Working on a task right now' : 'Active in the last 90s'
                   })
                 : null,
-              last
+              rowAgeTs
                 ? jsx('span', {
                     className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
-                    children: relativeTime(last.last_active * 1000)
+                    children: relativeTime(rowAgeTs * 1000)
                   })
                 : null
             ]
@@ -4854,10 +5634,6 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
             children: meta?.hidden ? 'Unhide Bot' : 'Hide Bot'
           }),
           jsx(ContextMenuSeparator, {}),
-          jsx(ContextMenuItem, {
-            onSelect: () => openBotSessionsWorkspace(bot),
-            children: 'Sessions'
-          }),
           jsx(ContextMenuItem, { onSelect: () => onEdit(bot), children: 'Edit Profile' }),
           !bot.remoteSource
             ? jsx(ContextMenuItem, {
@@ -5952,7 +6728,10 @@ function CreateAgentDialog({ open, onClose, roster }) {
 
     host
       .connections()
-      .then(value => setConnections(Array.isArray(value) ? value : []))
+      // host.connections() returns the registry ROWS on current SDKs, but the
+      // envelope object ({version, primary, connections: [...]}) on desktops
+      // that predate the SDK-side unwrap — accept both shapes.
+      .then(value => setConnections(Array.isArray(value) ? value : Array.isArray(value?.connections) ? value.connections : []))
       .catch(() => setConnections([]))
   }, [open, connections])
 
@@ -7393,13 +8172,33 @@ function CreateRoutineDialog({ bot, open, onClose }) {
   })
 }
 
+/** Keeps $selectedBot in sync with the focused chat's owner profile.
+ *  nanostores' `.listen()` never replays the current value the way
+ *  `.subscribe()` does, so a disable → profile switch → re-enable sequence
+ *  would otherwise leave $selectedBot pointed at whichever bot was active
+ *  before the plugin was disabled — reseeding here on every register() call
+ *  closes that gap. Returns the unbind function for ctx.onDispose. */
+function bindProfileSync(profileStore) {
+  const current = profileStore.get?.()
+  if (current && typeof current === 'string') {
+    $selectedBot.set(current)
+  }
+  return profileStore.listen(profile => {
+    if (profile && typeof profile === 'string') {
+      $selectedBot.set(profile)
+    }
+  })
+}
+
 function RoutinesPane() {
   const selected = useValue($selectedBot)
-  const gatewayProfile = useValue(host.state.profile)
-  // The tile maps to the bot you're chatting with: the live gateway profile
-  // is the truth once a chat opens; $selectedBot covers the gap between a
-  // roster click and the profile swap landing.
-  const bot = (gatewayProfile || selected || 'default').trim() || 'default'
+  const focusedProfile = useValue($focusedBotProfile)
+  // The tile maps to the bot you're chatting with: the focused chat's owner
+  // profile is the truth once a chat opens (on older desktops without the
+  // focused-owner atom this is the live gateway profile, the previous
+  // behavior); $selectedBot covers the gap between a roster click and the
+  // focus/profile swap landing.
+  const bot = (focusedProfile || selected || 'default').trim() || 'default'
   const meta = useValue($botMeta)[bot]
   const { shape, color, image } = botAppearance(bot, meta)
   const { data, error, isLoading, refetch } = useRoutines(bot)
@@ -7533,162 +8332,6 @@ function RoutinesPane() {
         // key is the jsx() THIRD argument — as a prop it is silently ignored
         // and the dialog kept stale per-bot form state when the target changed.
       }, createTarget)
-    ]
-  })
-}
-
-// ── profile session workspace ────────────────────────────────────────────────
-
-const PROFILE_SESSION_LIST_LIMIT = 200
-
-function openBotSessionsWorkspace(bot) {
-  if (bot?.name && NAME_RE.test(bot.name)) {
-    $botSessionsWorkspace.set(bot.name)
-  }
-}
-
-function filterProfileSessions(sessions, query) {
-  const needle = String(query || '').trim().toLowerCase()
-  const rows = Array.isArray(sessions) ? sessions : []
-  if (!needle) return rows
-  return rows.filter(session =>
-    `${session?.title || ''} ${session?.preview || ''} ${session?.source || ''}`.toLowerCase().includes(needle)
-  )
-}
-
-function useProfileSessions(botName, gatewayGeneration) {
-  return useQuery({
-    queryKey: [ID, 'profile-sessions', botName, gatewayGeneration],
-    enabled: Boolean(botName),
-    // include_hidden: this browser exists precisely to see the profile's own
-    // (always-hidden) Bot Mode sessions alongside its regular ones.
-    queryFn: () => host.request('session.list', { profile: botName, limit: PROFILE_SESSION_LIST_LIMIT, include_hidden: true }),
-    refetchInterval: 8000,
-    staleTime: 4000,
-    retry: false
-  })
-}
-
-async function openProfileSession(botName, session, gatewayGeneration) {
-  const profile = String(botName || '')
-  const id = String(session?.id || '')
-  if (!NAME_RE.test(profile) || !id || gatewayGeneration !== $sessionsGatewayGeneration.get()) return
-  if (typeof host.openSession !== 'function') {
-    throw new Error('This Hermes Desktop version cannot open stored sessions')
-  }
-
-  // Same hydration contract as canonical Bot Chats (#89206): a bare open can
-  // focus a main surface whose runtime/transcript silently vanished, leaving a
-  // blank pane while the row preview still shows the conversation. Waiting on
-  // hydration lets the SDK issue the explicit resume when the surface is stale.
-  const hasAuthoritativeCount =
-    typeof session?.message_count === 'number' && Number.isFinite(session.message_count)
-  const expectHistory = hasAuthoritativeCount ? session.message_count > 0 : Boolean(session?.preview)
-
-  await host.openSession(id, { profile, awaitHydration: true, expectHistory })
-  if (gatewayGeneration !== $sessionsGatewayGeneration.get()) return
-  $botSelectedSessions.set({ ...$botSelectedSessions.get(), [profile]: id })
-}
-
-function ProfileSessionRow({ session, botName, active, gatewayGeneration }) {
-  return jsxs('button', {
-    type: 'button',
-    'aria-current': active ? 'page' : undefined,
-    onClick: () => void openProfileSession(botName, session, gatewayGeneration).catch(err => host.notifyError(err, 'Could not open session')),
-    className: cn(
-      'flex w-full flex-col gap-0.5 overflow-hidden rounded-md px-2 py-1.5 text-left transition-colors',
-      'hover:bg-(--chrome-action-hover)',
-      active && 'bg-(--ui-row-active-background)'
-    ),
-    children: [
-      jsx('span', {
-        className: 'truncate text-[0.8125rem] font-medium',
-        children: session.title || 'Untitled session'
-      }),
-      jsx('div', {
-        className: 'truncate text-[0.7rem] text-(--ui-text-tertiary)',
-        children: session.preview || session.source || 'No messages yet'
-      })
-    ]
-  })
-}
-
-function ProfileSessionsWorkspace({ bot }) {
-  const gatewayGeneration = useValue($sessionsGatewayGeneration)
-  const { data, isLoading, error } = useProfileSessions(bot.name, gatewayGeneration)
-  const selectedByProfile = useValue($botSelectedSessions)
-  const [query, setQuery] = useState('')
-  const sourceSessions = data?.sessions || []
-  const sessions = filterProfileSessions(sourceSessions, query)
-  const inventoryBounded = sourceSessions.length >= PROFILE_SESSION_LIST_LIMIT
-  const selectedId = selectedByProfile[bot.name] || ''
-
-  const header = jsxs('div', {
-    className: 'flex items-center gap-2 px-2.5 pt-2.5 pb-2',
-    children: [
-      jsx(Button, {
-        variant: 'ghost',
-        size: 'sm',
-        onClick: () => $botSessionsWorkspace.set(null),
-        children: 'Back'
-      }),
-      jsx('div', {
-        className: 'min-w-0 flex-1 truncate text-sm font-semibold',
-        children: `${displayName(bot, $botMeta.get()[bot.name])} sessions`
-      })
-    ]
-  })
-
-  return jsxs('div', {
-    className: 'flex h-full flex-col',
-    children: [
-      header,
-      jsx('div', {
-        className: 'px-2 pb-2',
-        children: jsx(Input, {
-          'aria-label': 'Filter sessions',
-          placeholder: 'Filter sessions…',
-          value: query,
-          onChange: event => setQuery(event.target.value)
-        })
-      }),
-      inventoryBounded
-        ? jsx('div', {
-            className: 'px-2.5 pb-2 text-[0.65rem] text-(--ui-text-quaternary)',
-            children: `Showing the ${PROFILE_SESSION_LIST_LIMIT} most recent sessions.`
-          })
-        : null,
-      isLoading
-        ? jsx('div', {
-            className: 'flex flex-1 items-center justify-center',
-            children: jsx(GlyphSpinner, { spinner: 'breathe' })
-          })
-        : error
-          ? jsx('div', {
-              className: 'px-3 py-3 text-xs text-(--ui-text-tertiary)',
-              children: 'Could not load sessions for this profile.'
-            })
-          : jsx(ScrollArea, {
-              className: 'min-h-0 flex-1',
-              children: jsx('div', {
-                className: 'grid gap-0.5 px-1.5 pb-2',
-                children: sessions.length
-                  ? sessions.map(session => jsx(ProfileSessionRow, {
-                      session,
-                      botName: bot.name,
-                      active: selectedId === session.id,
-                      gatewayGeneration
-                    }, session.id))
-                  : jsx('div', {
-                      className: 'px-2 py-3 text-center text-xs text-(--ui-text-tertiary)',
-                      children: query.trim()
-                        ? inventoryBounded
-                          ? `No matching sessions in the ${PROFILE_SESSION_LIST_LIMIT} most recent.`
-                          : 'No sessions match that filter.'
-                        : 'No stored sessions yet.'
-                    })
-              })
-            })
     ]
   })
 }
@@ -8042,9 +8685,9 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
   const canCreate = selected.length >= 2 && Boolean(name.trim() || selected.length)
 
   const create = () => {
-    let groupName = (name.trim() || placeholder).slice(0, 64)
+    const base = (name.trim() || placeholder).slice(0, 64)
 
-    if (selected.length < 2 || !groupName) {
+    if (selected.length < 2 || !base) {
       return
     }
 
@@ -8052,8 +8695,11 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
     // group under an existing name (easy — the default name is just the
     // member names) silently reopens the old room with its full log, which
     // reads as "not a fresh group" (db's Aug 2026 report). Uniquify against
-    // both live rooms and any bot's current grouping.
-    const taken = new Set(Object.keys($groupChats.get()))
+    // both live rooms and any bot's current grouping, then mint a fresh
+    // roomId: member sessions are titled by that roomId, so a
+    // disbanded-and-recreated group with the SAME display name still gets
+    // new sessions instead of resuming the old room's by title.
+    const taken = new Set(liveGroupChatNames())
 
     for (const meta of Object.values($botMeta.get() || {})) {
       for (const existing of botGroups(meta)) {
@@ -8061,15 +8707,8 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
       }
     }
 
-    if (taken.has(groupName)) {
-      let n = 2
-
-      while (taken.has(`${groupName} ${n}`)) {
-        n += 1
-      }
-
-      groupName = `${groupName} ${n}`.slice(0, 64)
-    }
+    const groupName = uniqueGroupChatName(base, taken)
+    const roomId = mintGroupRoomId()
 
     for (const bot of selected) {
       if (!bot.remoteSource) {
@@ -8084,6 +8723,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
 
     updateGroupChat(groupName, room => {
       room.members = roomMembers
+      room.roomId = roomId
 
       if (image) {
         room.image = image
@@ -8300,7 +8940,7 @@ function mentionTokenAt(text, caret) {
  *  the strings parseGroupChatMentions resolves. Keyboard: Up/Down navigate,
  *  Enter/Tab insert (Enter falls through to submit when the popover is
  *  closed), Escape dismisses. */
-function GroupMentionInput({ members, onChange, value, ...inputProps }) {
+function GroupMentionInput({ members, onChange, onSubmitDraft, value, ...inputProps }) {
   const allMeta = useValue($botMeta)
   const inputRef = useRef(null)
   const [token, setToken] = useState(null)
@@ -8317,14 +8957,26 @@ function GroupMentionInput({ members, onChange, value, ...inputProps }) {
 
     for (const member of members) {
       const handle = String(member.handle || botHandle(member.name, member) || '').trim()
+      const display = displayName(member, botRosterMeta(member, allMeta))
+      // Renamed members complete on their friendly tag; parser resolves both.
+      const tag = String(botMentionTag(member) || handle).trim()
 
-      if (!handle || (token.query && !handle.toLowerCase().startsWith(token.query))) {
+      if (!tag) {
+        continue
+      }
+
+      if (
+        token.query &&
+        !tag.toLowerCase().startsWith(token.query) &&
+        !(handle && handle.toLowerCase().startsWith(token.query)) &&
+        !display.toLowerCase().startsWith(token.query)
+      ) {
         continue
       }
 
       options.push({
-        handle,
-        meta: displayName(member, botRosterMeta(member, allMeta))
+        handle: tag,
+        meta: display
       })
     }
   }
@@ -8391,32 +9043,55 @@ function GroupMentionInput({ members, onChange, value, ...inputProps }) {
             )
           })
         : null,
-      jsx(Input, {
+      jsx(Textarea, {
         ...inputProps,
         ref: inputRef,
         value,
+        rows: 1,
+        // Multi-line room prompts (#89884): the composer was a single-line
+        // Input whose form submitted on every Enter — newlines were
+        // impossible. Enter (no Shift) still submits via onSubmitDraft;
+        // Shift+Enter falls through to the textarea's native newline.
+        className: cn('max-h-40 min-h-9 resize-none', inputProps.className),
         onChange: event => {
           onChange(event.target.value)
           refreshToken(event.target)
         },
         onClick: event => refreshToken(event.target),
         onKeyDown: event => {
-          if (!open) {
-            return
+          if (open) {
+            if (event.key === 'ArrowDown') {
+              event.preventDefault()
+              setSelected((active + 1) % options.length)
+
+              return
+            }
+
+            if (event.key === 'ArrowUp') {
+              event.preventDefault()
+              setSelected((active - 1 + options.length) % options.length)
+
+              return
+            }
+
+            if (event.key === 'Enter' || event.key === 'Tab') {
+              event.preventDefault()
+              insert(options[active].handle)
+
+              return
+            }
+
+            if (event.key === 'Escape') {
+              event.preventDefault()
+              setToken(null)
+
+              return
+            }
           }
 
-          if (event.key === 'ArrowDown') {
+          if (event.key === 'Enter' && !event.shiftKey) {
             event.preventDefault()
-            setSelected((active + 1) % options.length)
-          } else if (event.key === 'ArrowUp') {
-            event.preventDefault()
-            setSelected((active - 1 + options.length) % options.length)
-          } else if (event.key === 'Enter' || event.key === 'Tab') {
-            event.preventDefault()
-            insert(options[active].handle)
-          } else if (event.key === 'Escape') {
-            event.preventDefault()
-            setToken(null)
+            onSubmitDraft?.()
           }
         },
         onBlur: () => setToken(null)
@@ -8425,7 +9100,175 @@ function GroupMentionInput({ members, onChange, value, ...inputProps }) {
   })
 }
 
-function GroupChatWorkspace({ group, members, onBack }) {
+/** One member's pending prompt, rendered in the room (#90694).
+ *  - clarify: choices as tap buttons (multi-select stages; single-select
+ *    stages one), free text always available, batch sub-questions each get
+ *    their own input.
+ *  - approval: the command in a code row plus the server's choice set
+ *    (once/session/always/deny) as buttons — no free text; approvals are a
+ *    closed choice. Answer sends via the member's own source. */
+function GroupClarifyCard({ entry, members }) {
+  const { group } = entry
+  const isApproval = entry.kind === 'approval'
+  const member = members.find(m => groupMemberKey(m) === entry.memberKey) || members.find(m => m.name === entry.member)
+  const [drafts, setDrafts] = useState({})
+  const [picked, setPicked] = useState({})
+  const [sending, setSending] = useState(false)
+  const questions = entry.questions && entry.questions.length
+    ? entry.questions.map((q, i) => ({
+        qid: q?.qid ?? q?.id ?? `q${i}`,
+        question: typeof q?.question === 'string' ? q.question : '',
+        choices: Array.isArray(q?.choices) ? q.choices.filter(c => typeof c === 'string' && c) : [],
+        multiSelect: Boolean(q?.multi_select ?? q?.multiSelect)
+      }))
+    : [{ qid: '__single__', question: entry.question, choices: entry.choices, multiSelect: entry.multiSelect }]
+
+  const answerFor = q => {
+    const chosen = picked[q.qid] || []
+
+    if (chosen.length) {
+      return q.multiSelect ? JSON.stringify(chosen) : chosen[0]
+    }
+
+    return isApproval ? '' : (drafts[q.qid] || '').trim()
+  }
+
+  const allAnswered = questions.every(q => answerFor(q))
+
+  const submit = async () => {
+    if (!member || sending || !allAnswered) {
+      return
+    }
+
+    setSending(true)
+
+    try {
+      if (isApproval || !(entry.questions && entry.questions.length)) {
+        await answerGroupClarify(entry, member, answerFor(questions[0]))
+      } else {
+        const answers = {}
+
+        for (const q of questions) {
+          answers[q.qid] = answerFor(q)
+        }
+
+        await answerGroupClarify(entry, member, answers)
+      }
+
+      // Echo the exchange into the room log so the thread reads complete.
+      const summary = isApproval
+        ? `${answerFor(questions[0])} — ${entry.command || entry.question || 'command approval'}`
+        : questions
+            .map(q => (questions.length > 1 ? `${q.question}: ${answerFor(q)}` : answerFor(q)))
+            .join('\n')
+      appendGroupChatEntry(group, { kind: 'user', name: 'You' }, summary, entry.thread || 'legacy')
+    } catch (err) {
+      host.notify({ kind: 'error', message: `Could not send the answer to @${botHandle(entry.member, member)}: ${err?.message || err}` })
+    } finally {
+      setSending(false)
+    }
+  }
+
+  return jsxs('div', {
+    className:
+      'grid gap-1.5 rounded-md border border-(--ui-accent,#4f9cf9)/50 bg-(--ui-accent,#4f9cf9)/5 px-2.5 py-2',
+    children: [
+      jsxs('div', {
+        className: 'flex items-center gap-1.5 text-xs font-medium',
+        children: [
+          jsx(Codicon, {
+            name: isApproval ? 'shield' : 'question',
+            className: 'shrink-0 text-(--ui-accent,#4f9cf9)'
+          }),
+          isApproval
+            ? `@${botHandle(entry.member, member)} wants to run a command:`
+            : `@${botHandle(entry.member, member)} asks:`
+        ]
+      }),
+      isApproval && entry.command
+        ? jsx('code', {
+            className:
+              'block overflow-x-auto rounded bg-(--ui-bg-secondary,rgba(0,0,0,0.25)) px-2 py-1 font-mono text-[0.7rem] whitespace-pre-wrap break-all',
+            children: entry.command
+          })
+        : null,
+      ...questions.map(q =>
+        jsxs('div', {
+          className: 'grid gap-1',
+          children: [
+            q.question
+              ? jsx('div', { className: 'text-xs whitespace-pre-wrap', children: q.question })
+              : null,
+            q.choices.length
+              ? jsx('div', {
+                  className: 'flex flex-wrap gap-1',
+                  children: q.choices.map(choice => {
+                    const chosen = (picked[q.qid] || []).includes(choice)
+
+                    return jsx(Button, {
+                      size: 'sm',
+                      variant: chosen ? 'default' : 'secondary',
+                      className: cn(
+                        'h-6 px-2 text-[0.7rem]',
+                        isApproval && choice === 'deny' && !chosen && 'text-destructive'
+                      ),
+                      onClick: () => {
+                        setDrafts(prev => ({ ...prev, [q.qid]: '' }))
+                        setPicked(prev => {
+                          const current = prev[q.qid] || []
+                          const next = q.multiSelect
+                            ? chosen
+                              ? current.filter(c => c !== choice)
+                              : [...current, choice]
+                            : chosen
+                              ? []
+                              : [choice]
+
+                          return { ...prev, [q.qid]: next }
+                        })
+                      },
+                      children: choice
+                    }, `choice:${q.qid}:${choice}`)
+                  })
+                })
+              : null,
+            // Approvals are a closed choice set — no free-text input.
+            isApproval
+              ? null
+              : jsx(Input, {
+                  'aria-label': `Answer @${entry.member}`,
+                  placeholder: q.choices.length ? 'Or type your own answer…' : 'Type your answer…',
+                  value: drafts[q.qid] || '',
+                  onChange: event => {
+                    const value = event.target.value
+                    setPicked(prev => ({ ...prev, [q.qid]: [] }))
+                    setDrafts(prev => ({ ...prev, [q.qid]: value }))
+                  },
+                  onKeyDown: event => {
+                    if (event.key === 'Enter' && questions.length === 1) {
+                      event.preventDefault()
+                      void submit()
+                    }
+                  },
+                  className: 'h-7 text-xs'
+                }, `input:${q.qid}`)
+          ]
+        }, `q:${q.qid}`)
+      ),
+      jsx('div', {
+        className: 'flex justify-end',
+        children: jsx(Button, {
+          size: 'sm',
+          disabled: sending || !allAnswered || !member,
+          onClick: () => void submit(),
+          children: sending ? 'Sending…' : isApproval ? 'Respond' : 'Answer'
+        })
+      })
+    ]
+  })
+}
+
+function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   const rooms = useValue($groupChats)
   const allMeta = useValue($botMeta)
   const room = rooms[group] || { log: [], running: false }
@@ -8449,6 +9292,55 @@ function GroupChatWorkspace({ group, members, onBack }) {
   // downscaled — they ride the send into every responding member's session.
   const [pendingImages, setPendingImages] = useState({})
 
+  // Scroll anchoring (#89835): rooms used to open at scroll position 0 and
+  // stay there while replies streamed in. Scroll the bottom sentinel into
+  // view on mount and whenever the log grows — but only when the user is
+  // already near the bottom, so reading history is never yanked away.
+  const bottomSentinelRef = useRef(null)
+  const stickToBottomRef = useRef(true)
+
+  useEffect(() => {
+    const sentinel = bottomSentinelRef.current
+
+    if (!sentinel) {
+      return
+    }
+
+    const viewport = sentinel.closest('[data-slot="scroll-area-viewport"]')
+
+    if (viewport) {
+      const onScroll = () => {
+        stickToBottomRef.current = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 80
+      }
+
+      viewport.addEventListener('scroll', onScroll, { passive: true })
+
+      return () => viewport.removeEventListener('scroll', onScroll)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (stickToBottomRef.current) {
+      bottomSentinelRef.current?.scrollIntoView({ block: 'end' })
+    }
+  }, [room.log.length, room.running])
+
+  // Retained-pane reopen (#89835 follow-up): a hot-mounted room pane stays
+  // mounted while another workspace tab is active, so returning to it never
+  // remounts and the mount-time anchor doesn't rerun. Re-anchor on the
+  // hidden → visible edge — an explicit reopen, so it overrides a stale
+  // read-position and mirrors what a fresh open does.
+  const wasVisibleRef = useRef(visible)
+
+  useEffect(() => {
+    if (visible && !wasVisibleRef.current) {
+      stickToBottomRef.current = true
+      bottomSentinelRef.current?.scrollIntoView({ block: 'end' })
+    }
+
+    wasVisibleRef.current = visible
+  }, [visible])
+
   const imagesFor = thread => pendingImages[thread ?? 'main'] || []
 
   const addImages = (thread, picked) => {
@@ -8470,17 +9362,46 @@ function GroupChatWorkspace({ group, members, onBack }) {
     setPendingImages(prev => ({ ...prev, [key]: (prev[key] || []).filter((_, i) => i !== index) }))
   }
 
-  // Ctrl/⌘-V a screenshot into any composer in this room.
+  // Ctrl/⌘-V a screenshot (or any file) into any composer in this room.
   const pasteImages = (thread, event) => {
-    const files = [...(event.clipboardData?.files || [])].filter(f => /^image\//.test(f.type || ''))
+    const files = [...(event.clipboardData?.files || [])]
 
     if (!files.length) {
       return
     }
 
     event.preventDefault()
-    void filesToGroupImages(files).then(picked => addImages(thread, picked))
+    void filesToGroupAttachments(files).then(picked => addImages(thread, picked))
   }
+
+  // Drag & drop anywhere on the room drops into the ACTIVE composer — the
+  // open reply box when one owns the composer, else the main (new-thread)
+  // composer. Matches the 1:1 chat's drop affordance.
+  const [dragOver, setDragOver] = useState(false)
+
+  const dropFiles = event => {
+    const files = [...(event.dataTransfer?.files || [])]
+
+    setDragOver(false)
+
+    if (!files.length) {
+      return
+    }
+
+    event.preventDefault()
+    void filesToGroupAttachments(files).then(picked => addImages(replyThread, picked))
+  }
+
+  // Collapsible Activity view: collapsed by default — opening it is always an
+  // explicit user action, it never steals focus, and it never auto-scrolls.
+  const [activityOpen, setActivityOpen] = useState(false)
+  // Subscribe: activity rows re-render as turn events land.
+  useValue($groupActivity)
+  // Pending member questions for THIS room (#90694), oldest first.
+  const clarifyAll = useValue($groupClarify)
+  const roomClarifies = Object.values(clarifyAll || {})
+    .filter(entry => entry?.group === group)
+    .sort((a, b) => (a.at || 0) - (b.at || 0))
 
   const header = jsxs('div', {
     className: 'flex items-center gap-2 px-2.5 pt-2.5 pb-2',
@@ -8548,6 +9469,71 @@ function GroupChatWorkspace({ group, members, onBack }) {
       title: (b.remoteSource ? '' : allMeta[b.name]?.title) || b.title || ''
     }))
 
+  // Activity disclosure: quiet, collapsed by default. The collapsed row shows
+  // the latest event; expanding lists the current run's events newest-first.
+  // Events are epoch-tagged, so a superseded run's history drops out of view.
+  const activityEvents = currentGroupActivity(group)
+  const latestActivity = activityEvents.length ? activityEvents[activityEvents.length - 1] : null
+  const activityPanel = jsxs('div', {
+    className: 'border-b border-(--ui-stroke-secondary)',
+    children: [
+      jsxs('button', {
+        type: 'button',
+        'aria-expanded': activityOpen,
+        'aria-controls': `group-activity:${group}`,
+        title: activityOpen ? 'Hide room activity' : 'Show room activity',
+        className:
+          'flex w-full items-center gap-1.5 px-2.5 py-1 text-left text-[0.7rem] text-(--ui-text-quaternary) transition-colors hover:text-foreground',
+        onClick: () => setActivityOpen(prev => !prev),
+        children: [
+          jsx(Codicon, {
+            name: activityOpen ? 'chevron-down' : 'chevron-right',
+            className: 'shrink-0 text-[0.65rem]'
+          }),
+          jsx('span', { className: 'shrink-0 font-medium', children: 'Activity' }),
+          latestActivity
+            ? jsx('span', {
+                className: 'min-w-0 flex-1 truncate',
+                children: `${groupActivityLabel(latestActivity)} · ${relativeTime(latestActivity.at)}`
+              })
+            : null
+        ]
+      }),
+      activityOpen
+        ? jsx('div', {
+            id: `group-activity:${group}`,
+            className: 'grid gap-0.5 px-2.5 pb-1.5',
+            children: activityEvents.length
+              ? [...activityEvents]
+                  .reverse()
+                  .map((event, i) =>
+                    jsxs('div', {
+                      className: 'flex items-center gap-1.5 text-[0.7rem]',
+                      children: [
+                        jsx(Codicon, {
+                          name: GROUP_ACTIVITY_GLYPHS[event.kind] || 'circle-outline',
+                          className: cn('shrink-0 text-[0.65rem]', groupActivityTone(event.kind))
+                        }),
+                        jsx('span', {
+                          className: cn('min-w-0 flex-1 truncate', groupActivityTone(event.kind)),
+                          children: groupActivityLabel(event)
+                        }),
+                        jsx('span', {
+                          className: 'shrink-0 text-[0.625rem] text-(--ui-text-quaternary)',
+                          children: relativeTime(event.at)
+                        })
+                      ]
+                    }, `${event.at}:${i}`)
+                  )
+              : jsx('div', {
+                  className: 'px-0.5 pb-0.5 text-[0.625rem] text-(--ui-text-quaternary)',
+                  children: 'No activity in this turn yet.'
+                })
+          })
+        : null
+    ]
+  })
+
   const submit = () => {
     const text = draft.trim()
     const images = imagesFor(null)
@@ -8584,8 +9570,9 @@ function GroupChatWorkspace({ group, members, onBack }) {
     setOpenThreads(prev => ({ ...prev, [thread]: true }))
   }
 
-  /** Pending-attachment chips + the paperclip picker for one composer
-   *  (thread = null → main). Chips preview the image and X removes it. */
+  /** Pending-attachment chips + the picker for one composer (thread = null →
+   *  main). Image chips preview the pixels; PDFs/files show a type icon.
+   *  X removes it. */
   const attachmentRow = thread => {
     const images = imagesFor(thread)
 
@@ -8600,7 +9587,12 @@ function GroupChatWorkspace({ group, members, onBack }) {
           className:
             'flex items-center gap-1 rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-secondary,#181818) px-1 py-0.5',
           children: [
-            jsx('img', { src: img.data, alt: '', className: 'size-6 rounded object-cover' }),
+            img.kind === 'pdf' || img.kind === 'file'
+              ? jsx(Codicon, {
+                  name: img.kind === 'pdf' ? 'file-pdf' : 'file',
+                  className: 'text-[0.9rem] text-(--ui-text-tertiary)'
+                })
+              : jsx('img', { src: img.data, alt: '', className: 'size-6 rounded object-cover' }),
             jsx('span', {
               className: 'max-w-32 truncate text-[0.65rem] text-(--ui-text-tertiary)',
               children: img.name || 'image'
@@ -8624,9 +9616,9 @@ function GroupChatWorkspace({ group, members, onBack }) {
       variant: 'ghost',
       size: 'sm',
       className: 'shrink-0 text-(--ui-text-tertiary) hover:text-foreground',
-      title: 'Attach images — every responding bot sees them',
-      onClick: () => void pickGroupImages().then(picked => addImages(thread, picked)),
-      children: jsx(Codicon, { name: 'device-camera' })
+      title: 'Attach files — every responding bot sees them',
+      onClick: () => void pickGroupAttachments().then(picked => addImages(thread, picked)),
+      children: jsx(Codicon, { name: 'attach' })
     })
 
   // One log entry, rendered exactly as before conversation folding existed.
@@ -8727,18 +9719,30 @@ function GroupChatWorkspace({ group, members, onBack }) {
                             'data-selectable-text': 'true',
                             children: Streamdown ? jsx(Streamdown, { children: entry.text }) : entry.text
                           }),
-                          // User attachments: the images every responding bot was shown.
+                          // User attachments: what every responding bot was
+                          // shown — image previews, or a named chip for
+                          // PDFs/files.
                           Array.isArray(entry.images) && entry.images.length
                             ? jsx('div', {
-                                className: 'mt-1 flex flex-wrap gap-1.5',
+                                className: 'mt-1 flex flex-wrap items-center gap-1.5',
                                 children: entry.images.map((img, imgIndex) =>
-                                  jsx('img', {
-                                    src: img.data,
-                                    alt: img.name || 'attached image',
-                                    title: img.name || 'attached image',
-                                    className:
-                                      'max-h-40 max-w-60 rounded-md border border-(--ui-stroke-secondary) object-contain'
-                                  }, `${entryKey}:img:${imgIndex}`)
+                                  img.kind === 'pdf' || img.kind === 'file'
+                                    ? jsxs('div', {
+                                        className:
+                                          'flex items-center gap-1 rounded-md border border-(--ui-stroke-secondary) px-1.5 py-1 text-[0.65rem] text-(--ui-text-tertiary)',
+                                        title: img.name || 'attached file',
+                                        children: [
+                                          jsx(Codicon, { name: img.kind === 'pdf' ? 'file-pdf' : 'file', className: 'text-[0.8rem]' }),
+                                          jsx('span', { className: 'max-w-48 truncate', children: img.name || 'attached file' })
+                                        ]
+                                      }, `${entryKey}:img:${imgIndex}`)
+                                    : jsx('img', {
+                                        src: img.data,
+                                        alt: img.name || 'attached image',
+                                        title: img.name || 'attached image',
+                                        className:
+                                          'max-h-40 max-w-60 rounded-md border border-(--ui-stroke-secondary) object-contain'
+                                      }, `${entryKey}:img:${imgIndex}`)
                                 )
                               })
                             : null
@@ -8849,6 +9853,7 @@ function GroupChatWorkspace({ group, members, onBack }) {
                     members,
                     value: replyDrafts[id] || '',
                     onChange: text => setReplyDrafts(prev => ({ ...prev, [id]: text })),
+                    onSubmitDraft: () => submitReply(id),
                     onPaste: event => pasteImages(id, event)
                   }),
                   attachButton(id),
@@ -8880,9 +9885,31 @@ function GroupChatWorkspace({ group, members, onBack }) {
   })
 
   return jsxs('div', {
-    className: 'flex h-full flex-col',
+    className: 'relative flex h-full flex-col',
+    onDragOver: event => {
+      if ([...(event.dataTransfer?.types || [])].includes('Files')) {
+        event.preventDefault()
+        setDragOver(true)
+      }
+    },
+    onDragLeave: event => {
+      // Only clear when leaving the room container itself, not when the
+      // cursor moves between its children.
+      if (!event.currentTarget.contains(event.relatedTarget)) {
+        setDragOver(false)
+      }
+    },
+    onDrop: dropFiles,
     children: [
+      dragOver
+        ? jsx('div', {
+            className:
+              'pointer-events-none absolute inset-0 z-40 flex items-center justify-center border-2 border-dashed border-(--ui-accent,#4f9cf9) text-sm font-medium text-(--ui-accent,#4f9cf9)',
+            children: replyThread ? 'Drop to attach to this thread reply' : 'Drop to attach — every responding bot sees it'
+          }, 'dropzone')
+        : null,
       header,
+      activityPanel,
       jsx(ScrollArea, {
         className: 'min-h-0 flex-1',
         children: jsxs('div', {
@@ -8896,14 +9923,23 @@ function GroupChatWorkspace({ group, members, onBack }) {
                     children: 'Say something — every bot in this group hears the room.'
                   }, 'empty')
                 ]),
+            ...roomClarifies.map(entry =>
+              jsx(GroupClarifyCard, { entry, members }, `clarify:${entry.memberKey}:${entry.requestId}`)
+            ),
             room.running
               ? jsx('div', {
                   className: 'px-2 py-1 text-[0.7rem] italic text-(--ui-text-quaternary)',
-                  children: room.turn
-                    ? `${groupSpeakerLabel(room.turn)} is thinking…`
-                    : 'The room is working…'
+                  children: roomClarifies.length
+                    ? 'Waiting for your answer…'
+                    : room.turn
+                      ? `${groupSpeakerLabel(room.turn)} is thinking…`
+                      : 'The room is working…'
                 }, 'working')
-              : null
+              : null,
+            // Scroll anchor (#89835): rooms opened at scroll position 0, mid-
+            // history. The effect below scrolls this sentinel into view on
+            // mount and on log growth — unless the user has scrolled up.
+            jsx('div', { ref: bottomSentinelRef, 'aria-hidden': true }, 'bottom-sentinel')
           ]
         })
       }),
@@ -8926,6 +9962,7 @@ function GroupChatWorkspace({ group, members, onBack }) {
                   members,
                   value: draft,
                   onChange: setDraft,
+                  onSubmitDraft: submit,
                   onPaste: event => pasteImages(null, event)
                 }),
                 attachButton(null),
@@ -8955,9 +9992,9 @@ function GroupChatWorkspace({ group, members, onBack }) {
             jsx('span', { className: 'font-medium text-foreground', children: group }),
             ' grouping from its ',
             String(members.length),
-            ' bots and clears the shared room log. The bots themselves and their “Group: ',
-            group,
-            '” sessions are kept — you can still open those from each bot’s session browser.'
+            // New rooms title member sessions by roomId, legacy rooms by name —
+            // so the copy names the concept, not a literal session title.
+            ' bots and clears the shared room log. The bots themselves and their per-group sessions are kept.'
           ]
         }),
         destructive: true,
@@ -8978,10 +10015,44 @@ function GroupChatWorkspace({ group, members, onBack }) {
  *  disband (or the room view's own Back) can retire the tab it opened. */
 const groupChatMainTabs = new Map()
 
+/** Reactive shadow of `groupChatMainTabs` membership. The Map itself can't
+ *  notify React, and #89788's first fix read it non-reactively: a BotsPane
+ *  render that landed between selecting the group and recording its main
+ *  tab kept the in-pane room on screen forever (the map write repaints
+ *  nothing). Every map mutation goes through the two helpers below so the
+ *  rev bump re-evaluates the gate. */
+const $groupMainTabsRev = atom(0)
+
+function recordGroupMainTab(group, close) {
+  groupChatMainTabs.set(group, close)
+  $groupMainTabsRev.set($groupMainTabsRev.get() + 1)
+}
+
+function dropGroupMainTab(group) {
+  if (groupChatMainTabs.delete(group)) {
+    $groupMainTabsRev.set($groupMainTabsRev.get() + 1)
+  }
+}
+
+/** The in-panel room is the FALLBACK surface, not a second copy: it renders
+ *  only while no main-window tab owns the group. On desktops with the door
+ *  the room already lives in a main tab, and painting it here too produced
+ *  two live panes with independent drafts driving one shared engine (#89788).
+ *  The selection atom stays set either way so the roster row still
+ *  highlights. Callers must subscribe to `$groupMainTabsRev` (BotsPane does)
+ *  so ownership changes re-run this gate. */
+function shouldRenderGroupChatInPane(group) {
+  return Boolean(group && !groupChatMainTabs.has(group))
+}
+
 function closeGroupChatMainTab(group) {
   const close = groupChatMainTabs.get(group)
 
-  groupChatMainTabs.delete(group)
+  dropGroupMainTab(group)
+
+  if ($groupChatWorkspace.get() === group) {
+    $groupChatWorkspace.set(null)
+  }
 
   if (typeof close === 'function') {
     try {
@@ -8994,20 +10065,37 @@ function closeGroupChatMainTab(group) {
 
 /** Main-window wrapper: seats the member roster reactively (live roster +
  *  bot meta + the room's stored cross-connection descriptors) so the room
- *  keeps working as members change while the tab is open. */
+ *  keeps working as members change while the tab is open. Also subscribes to
+ *  this pane's visibility (feature-detected host.paneVisibility): retained
+ *  panes stay mounted while hidden, so the workspace needs the hidden →
+ *  visible edge to re-anchor its log to the bottom (#89835 follow-up). */
 function GroupChatMainView({ group }) {
   const allMeta = useValue($botMeta)
   // Subscribe: membership changes ride bot meta AND the room record.
   useValue($groupChats)
   const roster = useValue($lastRoster)
   const members = groupChatMemberBots(group, roster, allMeta)
+  // Older SDKs have no paneVisibility: fall back to an always-visible atom so
+  // the hook order stays stable and behavior matches the previous build.
+  const $visible = useMemo(
+    () => (typeof host.paneVisibility === 'function' ? host.paneVisibility(`plugin-workspace:${ID}:group:${slugify(group)}`) : atom(true)),
+    [group]
+  )
+  const visible = useValue($visible)
 
-  return jsx(GroupChatWorkspace, { group, members, onBack: () => closeGroupChatMainTab(group) })
+  return jsx(GroupChatWorkspace, { group, members, visible, onBack: () => closeGroupChatMainTab(group) })
 }
 
 /** Open a group chat the Discord way: a tab taking over the MAIN chat window
  *  (host.openWorkspace, newer desktops), falling back to the in-panel room
- *  view on desktops whose SDK predates the main-area door. */
+ *  view on desktops whose SDK predates the main-area door.
+ *
+ *  Ordering matters (#89788 follow-up): the main tab must be RECORDED before
+ *  the selection atom is set. Setting the atom first opened a window where
+ *  BotsPane rendered with a selected group and an empty tab map — the
+ *  in-pane fallback painted alongside the main tab, and because the map
+ *  write itself repaints nothing, the duplicate stuck until an unrelated
+ *  re-render. */
 function openGroupChat(group) {
   $groupNeedsYou.set({ ...$groupNeedsYou.get(), [group]: false })
 
@@ -9017,10 +10105,19 @@ function openGroupChat(group) {
         title: group,
         minWidth: '24rem',
         render: () => jsx(GroupChatMainView, { group }),
-        onClose: () => groupChatMainTabs.delete(group)
+        onClose: () => {
+          dropGroupMainTab(group)
+
+          if ($groupChatWorkspace.get() === group) {
+            $groupChatWorkspace.set(null)
+          }
+        }
       })
 
-      groupChatMainTabs.set(group, close)
+      recordGroupMainTab(group, close)
+      // Tab ownership is on record — the atom now only drives the roster
+      // highlight; shouldRenderGroupChatInPane stays false throughout.
+      $groupChatWorkspace.set(group)
 
       return
     } catch {
@@ -9028,6 +10125,8 @@ function openGroupChat(group) {
     }
   }
 
+  // No main-window door (older desktop) or it threw: select the group so
+  // the in-panel room renders as the fallback surface.
   $groupChatWorkspace.set(group)
 }
 
@@ -9036,19 +10135,23 @@ function openGroupChat(group) {
  *  (markdown flattened), relative time of the last activity, and the
  *  needs-you badge on the row itself. Sorts into the same recency ordering
  *  as bot rows; clicking opens the room in the main chat window. */
-function GroupRow({ group, members, needsYou, onOpen }) {
+function GroupRow({ active, group, members, needsYou, onOpen, onDisband }) {
   const rooms = useValue($groupChats)
   const allMeta = useValue($botMeta)
   const room = rooms[group] || { log: [] }
   const log = Array.isArray(room.log) ? room.log : []
   const last = log.length ? log[log.length - 1] : null
   const lastAt = groupLastActivity(room)
+  // Room previews speak the same handle vocabulary as the roster, mentions
+  // and the group prompt: the primary profile is @hermes, not @default.
+  const lastFrom = last?.from?.name || ''
+  const lastHandle = botHandle(lastFrom || 'bot', members.find(member => member?.name === lastFrom))
   const preview = last
-    ? `${last.from?.kind === 'user' ? 'You' : `@${last.from?.name || 'bot'}`}: ${stripPreviewMarkdown(last.text) || '…'}`
+    ? `${last.from?.kind === 'user' ? 'You' : `@${lastHandle}`}: ${stripPreviewMarkdown(last.text) || '…'}`
     : 'No messages yet — say hi to the room'
   const faces = members.slice(0, 3)
 
-  return jsxs('button', {
+  const row = jsxs('button', {
     type: 'button',
     onClick: () => {
       haptic('tap')
@@ -9056,7 +10159,8 @@ function GroupRow({ group, members, needsYou, onOpen }) {
     },
     className: cn(
       'flex w-full min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md px-2 py-2 text-left transition-colors',
-      'hover:bg-(--chrome-action-hover)'
+      'hover:bg-(--chrome-action-hover)',
+      active && 'bg-(--ui-row-active-background)'
     ),
     children: [
       // Room picture when the user set one; else a composite avatar of up to
@@ -9136,6 +10240,26 @@ function GroupRow({ group, members, needsYou, onOpen }) {
       })
     ]
   })
+
+  return jsxs(ContextMenu, {
+    children: [
+      jsx(ContextMenuTrigger, { asChild: true, children: row }),
+      jsxs(ContextMenuContent, {
+        children: [
+          jsx(ContextMenuItem, {
+            onSelect: () => onOpen(group),
+            children: 'Open Group Chat'
+          }),
+          jsx(ContextMenuSeparator, {}),
+          jsx(ContextMenuItem, {
+            className: 'text-destructive focus:text-destructive',
+            onSelect: () => onDisband({ name: group, members }),
+            children: 'Delete Group'
+          })
+        ]
+      })
+    ]
+  })
 }
 
 function BotsPane() {
@@ -9147,11 +10271,16 @@ function BotsPane() {
   const [groupCreateOpen, setGroupCreateOpen] = useState(false)
   const [editing, setEditing] = useState(null)
   const [deleting, setDeleting] = useState(null)
+  const [deletingGroup, setDeletingGroup] = useState(null)
   const [grouping, setGrouping] = useState(null)
   const [query, setQuery] = useState('')
   const activityToasts = useValue($activityToasts)
-  const sessionsWorkspaceName = useValue($botSessionsWorkspace)
   const groupChatName = useValue($groupChatWorkspace)
+  // Main-tab ownership is a module Map; this rev subscription makes the
+  // shouldRenderGroupChatInPane gate below reactive to tab open/close
+  // (#89788 follow-up — without it a stale render could paint the in-pane
+  // room beside a live main tab and stick).
+  useValue($groupMainTabsRev)
   const groupNeedsYou = useValue($groupNeedsYou)
   const groupRooms = useValue($groupChats)
 
@@ -9169,7 +10298,7 @@ function BotsPane() {
   // No special slot for the primary bot — it competes on recency too.
   const activityOf = bot => {
     const created = botRosterMeta(bot, allMeta)?.created || bot.ui_meta?.['hermes-bots']?.created || 0
-    const lastMsg = (bot.last_session?.last_active || 0) * 1000
+    const lastMsg = (botActivitySession(bot)?.last_active || 0) * 1000
 
     return Math.max(created, lastMsg)
   }
@@ -9233,7 +10362,7 @@ function BotsPane() {
 
   if (live) {
     $lastRoster.set(roster)
-    mergeServerMeta(activeSourceRoster)
+    mergeServerMeta(activeSourceRoster, data?.fetchedAt || 0)
     pullServerAvatars(activeSourceRoster)
     trackInboundActivity(activeSourceRoster)
     backfillMessagingProtocol(activeSourceRoster)
@@ -9242,15 +10371,10 @@ function BotsPane() {
   const staleNotice = error && !live && roster.length
     ? 'Roster refresh failed — showing the last good list.' + (gatewayUp ? '' : ' Waiting for the gateway to reconnect…')
     : null
-  const sessionsWorkspaceBot = roster.find(bot => bot.name === sessionsWorkspaceName)
-
-  if (sessionsWorkspaceBot) {
-    return jsx(ProfileSessionsWorkspace, { bot: sessionsWorkspaceBot })
-  }
 
   const groupChatMembers = groupChatName ? groupChatMemberBots(groupChatName, roster, allMeta) : []
 
-  if (groupChatName && groupChatMembers.length) {
+  if (shouldRenderGroupChatInPane(groupChatName) && groupChatMembers.length) {
     return jsx(GroupChatWorkspace, { group: groupChatName, members: groupChatMembers })
   }
 
@@ -9481,10 +10605,12 @@ function BotsPane() {
                         ? jsx(
                             GroupRow,
                             {
+                              active: groupChatName === row.name,
                               group: row.name,
                               members: row.members,
                               needsYou: Boolean(groupNeedsYou[row.name]),
-                              onOpen: openGroupChat
+                              onOpen: openGroupChat,
+                              onDisband: setDeletingGroup
                             },
                             `group:${row.name}`
                           )
@@ -9559,6 +10685,23 @@ function BotsPane() {
           await refetch()
           host.notify({ kind: 'success', message: `Deleted profile ${name}` })
         }
+      }),
+      jsx(ConfirmDialog, {
+        open: Boolean(deletingGroup),
+        title: 'Delete group chat?',
+        description: deletingGroup
+          ? `This removes “${deletingGroup.name}” from its bots and clears the shared room log. The bots and their individual chats are kept.`
+          : null,
+        destructive: true,
+        confirmLabel: 'Delete Group',
+        busyLabel: 'Deleting…',
+        doneLabel: 'Deleted',
+        onClose: () => setDeletingGroup(null),
+        onConfirm: async () => {
+          if (!deletingGroup) return
+          await disbandGroupChat(deletingGroup.name, deletingGroup.members)
+          host.notify({ kind: 'success', message: `Deleted group “${deletingGroup.name}”` })
+        }
       })
     ]
   })
@@ -9611,17 +10754,25 @@ export default {
             }
 
             const handle = botHandle(profile.name, profile)
+            const display = displayName(profile, $botMeta.get()[profile.name])
+            // Renamed bots complete on their friendly name — the tag is the
+            // renamed slug when one exists, the profile handle otherwise.
+            const tag = botMentionTag(profile)
 
-            if (q && !handle.toLowerCase().startsWith(q)) {
+            if (
+              q &&
+              !tag.toLowerCase().startsWith(q) &&
+              !handle.toLowerCase().startsWith(q) &&
+              !display.toLowerCase().startsWith(q)
+            ) {
               continue
             }
 
-            const display = displayName(profile, $botMeta.get()[profile.name])
             const source = profile.connectionLabel ? ` · ${profile.connectionLabel}` : ''
 
             items.push({
-              insert: `@${handle}`,
-              display: `@${handle}`,
+              insert: `@${tag}`,
+              display: `@${tag}`,
               meta: `Bot · ${display}${source}`
             })
           }
@@ -9695,6 +10846,7 @@ export default {
                   sessions: room.sessions && typeof room.sessions === 'object' ? room.sessions : {},
                   stranded: room.stranded && typeof room.stranded === 'object' ? room.stranded : {},
                   members: Array.isArray(room.members) ? room.members : [],
+                  roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
                   image: typeof room.image === 'string' && room.image ? room.image : null,
                   epoch: 0,
                   running: false
@@ -9710,15 +10862,15 @@ export default {
       /* no storage — rooms start empty */
     }
 
-    // Routines follow the chat you're in: track the live gateway profile.
+    // Routines follow the chat you're in: track the focused chat's owner
+    // profile (falls back to the live gateway profile on older desktops —
+    // see $focusedBotProfile). Keying this off the socket's home alone left
+    // the unread-suppression and Routines scope on the wrong bot whenever a
+    // focused tab showed another profile's chat.
     // Capture the unbinds: without them a disable → re-enable cycle stacks a
     // duplicate listener per cycle (same survives-disable class as the face
     // clock before its onDispose hook — these kept firing until app restart).
-    const unbindProfileListener = host.state.profile.listen(profile => {
-      if (profile && typeof profile === 'string') {
-        $selectedBot.set(profile)
-      }
-    })
+    const unbindProfileListener = bindProfileSync($focusedBotProfile)
     const unbindGatewayListener = host.state.gateway.listen(handleSessionsGatewayTransition)
 
     if (typeof ctx.onDispose === 'function') {
@@ -9777,7 +10929,7 @@ export default {
       // sessions pane collapses alone without this flag. The zone then keeps
       // a stranded BOTS tab on screen. The narrow edge overlay mirrors the
       // zone's tab strip, so the pane stays reachable while collapsed.
-      data: { placement: 'left', width: '260px', collapsible: true, dock: { pane: 'sessions', pos: 'center', enforce: true } },
+      data: { placement: 'left', width: '260px', collapsible: true, showCloseButton: false, hideOnly: true, dock: { pane: 'sessions', pos: 'center', enforce: true } },
       render: () => jsx(BotsPane, {})
     })
 
@@ -9800,7 +10952,8 @@ export default {
         title: 'Cronjobs',
         data: {
           placement: 'main',
-          dock: { pane: 'workspace', pos: 'right' },
+          // Repair persisted layouts that stranded Cronjobs in the Bots tab strip.
+          dock: { pane: 'workspace', pos: 'right', enforce: true },
           width: '250px'
         },
         render: () => jsx(RoutinesPane, {})
@@ -9898,30 +11051,14 @@ export default {
           let mentionedBots = roster ? resolveRosterMentions(text, roster, live) : []
 
           if (!roster) {
-            let names = []
             try {
               const res = await host.request('profiles.list', { include_sessions: false })
-              names = (res?.profiles ?? []).map(p => p.name)
+              // Same resolver as the cached path — renamed bots (display_name
+              // / ui_meta title) stay taggable when the roster cache is cold.
+              mentionedBots = resolveRosterMentions(text, res?.profiles ?? [], live).map(bot => ({ ...bot, remoteSource: false }))
             } catch {
               return draft
             }
-
-            const prose = text.replace(/```[\s\S]*?```/g, ' ').replace(/`[^`\n]*`/g, ' ')
-            const mentioned = []
-
-            for (const match of prose.matchAll(/(^|\s)@([a-z0-9][a-z0-9_-]*)/gi)) {
-              let name = match[2].toLowerCase()
-
-              if (name === 'hermes' && !names.includes('hermes') && names.includes('default')) {
-                name = 'default'
-              }
-
-              if (names.includes(name) && name !== live.name && !mentioned.includes(name)) {
-                mentioned.push(name)
-              }
-            }
-
-            mentionedBots = mentioned.map(name => ({ name }))
           }
 
           if (!mentionedBots.length) {

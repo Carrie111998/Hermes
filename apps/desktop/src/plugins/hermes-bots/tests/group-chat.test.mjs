@@ -8,7 +8,7 @@ const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf
 /** Load the plugin in a vm with a scripted cli.exec so member turns are
  *  deterministic. `turnScript(profile, prompt)` returns the member's reply
  *  text (or throws to simulate a failed turn). */
-function load(turnScript) {
+function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approvalUntilResumeCall } = {}) {
   const values = new Map()
   const atom = initial => {
     const slot = { get: () => values.get(slot), set: value => values.set(slot, value) }
@@ -16,10 +16,18 @@ function load(turnScript) {
     return slot
   }
   const calls = []
+  const clarifyResponds = []
+  const approvalResponds = []
   const sessions = new Map()
   const runtimeToStored = new Map()
   const titleToStored = new Map()
   let sessionSequence = 0
+  // busyUntilResumeCall[profile] = N: this profile's session.resume reports
+  // inflight/running for its first N calls, then flips to done — simulating
+  // a turn that is genuinely still running when harvested, without an
+  // unbounded real-time wait if a caller polls it (used to exercise the
+  // stranded/busy-responder guard).
+  const resumeCallCounts = new Map()
 
   const resolveSession = (profile, target) => {
     const stored = runtimeToStored.get(target) || (sessions.has(target) ? target : titleToStored.get(`${profile}::${target}`))
@@ -52,13 +60,28 @@ function load(turnScript) {
           if (!session) {
             throw new Error(`session not found: ${params.session_id}`)
           }
+          const profile = params.profile
+          const seen = (resumeCallCounts.get(profile) || 0) + 1
+          resumeCallCounts.set(profile, seen)
+          const limit = busyUntilResumeCall && busyUntilResumeCall[profile]
+          const busy = Boolean(limit && seen <= limit)
+          // clarifyUntilResumeCall[profile] = {payload, until}: the resume
+          // snapshot carries pending_clarify for the first `until` calls —
+          // simulating a member blocked on its clarify tool (#90694).
+          const clarify = clarifyUntilResumeCall && clarifyUntilResumeCall[profile]
+          const pendingClarify = clarify && seen <= clarify.until ? clarify.payload : null
+          // Same window shape for pending command approvals (#90694 class).
+          const approval = approvalUntilResumeCall && approvalUntilResumeCall[profile]
+          const pendingApproval = approval && seen <= approval.until ? approval.payload : null
           return {
             session_id: session.runtime,
             session_key: session.stored,
             message_count: session.messages.length,
             messages: [...session.messages],
-            inflight: false,
-            running: false
+            inflight: busy,
+            running: busy,
+            ...(pendingClarify ? { pending_clarify: pendingClarify } : {}),
+            ...(pendingApproval ? { pending_approval: pendingApproval } : {})
           }
         }
         if (method === 'prompt.submit') {
@@ -78,6 +101,14 @@ function load(turnScript) {
           session.messages.push({ role: 'assistant', content: reply })
           return {}
         }
+        if (method === 'clarify.respond') {
+          clarifyResponds.push({ ...params })
+          return { ok: true }
+        }
+        if (method === 'approval.respond') {
+          approvalResponds.push({ ...params })
+          return { resolved: true }
+        }
         return {}
       },
       state: { profile: { get: () => 'default', listen: () => undefined }, gateway: { listen: () => undefined } },
@@ -93,7 +124,7 @@ function load(turnScript) {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, disbandGroupChat, updateGroupChat, $groupChats, $groupNeedsYou, $groupChatWorkspace, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, disbandGroupChat, updateGroupChat, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -101,7 +132,7 @@ function load(turnScript) {
     storage: { get: () => null, set: (key, value) => storageWrites.set(key, value) },
     register: () => undefined
   })
-  return { ...context.__gc, calls, sessions, storageWrites }
+  return { ...context.__gc, approvalResponds, calls, clarifyResponds, host: context.host, sessions, storageWrites }
 }
 
 const MEMBERS = [{ name: 'research', title: '' }, { name: 'builder', title: '' }, { name: 'ops', title: 'The Ops' }]
@@ -293,6 +324,88 @@ test('concurrent groups sharing one member keep sessions, deltas, and context is
   assert.equal(betaSession.messages.some(message => String(message.content).includes('ALPHA_ONLY')), false)
 })
 
+test('recreating a same-name group after disband mints fresh member sessions', async () => {
+  const gc = load(() => '(pass)')
+  const member = { name: 'research', title: '' }
+
+  // First incarnation of the room.
+  gc.updateGroupChat('Alpha', r => {
+    r.roomId = 'r-one'
+    return r
+  })
+  const first = await gc.ensureGroupChatSession('Alpha', member)
+
+  // Disband: the room record is gone; the member's gateway session survives.
+  const rooms = { ...gc.$groupChats.get() }
+  delete rooms.Alpha
+  gc.$groupChats.set(rooms)
+
+  // Recreate under the same display name with a freshly minted roomId.
+  gc.updateGroupChat('Alpha', r => {
+    r.roomId = 'r-two'
+    return r
+  })
+  const second = await gc.ensureGroupChatSession('Alpha', member)
+
+  assert.notEqual(first.stored, second.stored, 'the recreated room must not resume the old member session')
+  assert.equal(gc.sessions.get(first.stored).title, 'Group: r-one')
+  assert.equal(gc.sessions.get(second.stored).title, 'Group: r-two')
+})
+
+test('group session titles are pinned to the roomId, with a legacy fallback to the display name', async () => {
+  const gc = load(() => '(pass)')
+
+  // Rooms persisted before roomIds keep name-based titles so their existing
+  // "Group: <name>" sessions keep resolving after an upgrade.
+  gc.updateGroupChat('Legacy', r => r)
+  const legacy = await gc.ensureGroupChatSession('Legacy', { name: 'research', title: '' })
+  assert.equal(gc.sessions.get(legacy.stored).title, 'Group: Legacy')
+
+  // New rooms pin the title to the immutable roomId, never the display name.
+  gc.updateGroupChat('New', r => {
+    r.roomId = 'r-abc'
+    return r
+  })
+  const fresh = await gc.ensureGroupChatSession('New', { name: 'research', title: '' })
+  assert.equal(gc.sessions.get(fresh.stored).title, 'Group: r-abc')
+})
+
+test('same-name group dedup reserves suffix length at the 64-char cap', () => {
+  const gc = load(() => '(pass)')
+
+  assert.equal(gc.uniqueGroupChatName('Team', new Set(['Other'])), 'Team')
+
+  // Slicing the joined string would chop the " 2"/" 3" suffix off a
+  // max-length base and collide with the original forever.
+  const base = 'x'.repeat(64)
+  const taken = new Set([base, `${base.slice(0, 62)} 2`])
+
+  const next = gc.uniqueGroupChatName(base, taken)
+
+  assert.notEqual(next, base)
+  assert.equal(next.length, 64)
+  assert.equal(next, `${base.slice(0, 62)} 3`)
+})
+
+test('roomId persists with the room record and survives disband of other rooms', async () => {
+  const gc = load(() => '(pass)')
+
+  gc.updateGroupChat('Keep', r => {
+    r.roomId = 'r-keep'
+    return r
+  })
+  gc.updateGroupChat('Gone', r => {
+    r.roomId = 'r-gone'
+    return r
+  })
+
+  await gc.disbandGroupChat('Gone', [{ name: 'builder' }])
+
+  const durable = gc.storageWrites.get('group-chats')
+  assert.equal(durable.Keep.roomId, 'r-keep', 'roomId survives disband of another room')
+  assert.ok(!('Gone' in durable), 'disbanded room not persisted')
+})
+
 test('needs-you: a member reply mentioning @user badges the group; user send clears it', async () => {
   const gc = load(profile => (profile === 'research' ? 'Blocked on billing access — @user which account?' : '(pass)'))
 
@@ -321,7 +434,7 @@ test('turn transport is gateway-native (session RPCs) and hostile text rides ver
   assert.equal(call.prompt.includes('hello "there" `whoami` $(id)'), true)
   // The per-group session is created with the room title.
   assert.match(pluginSource, /title,\n/)
-  assert.match(pluginSource, /const title = `Group: \$\{group\}`/)
+  assert.match(pluginSource, /const title = `Group: \$\{room\.roomId \|\| group\}`/)
 })
 
 test('log trimming keeps watermarks consistent', () => {
@@ -342,6 +455,109 @@ test('source contract: workspace + main-window door + prompt rules are wired', (
   assert.match(pluginSource, /\$groupChatWorkspace\.set\(group\)/)
   assert.match(pluginSource, /reply with exactly "\(pass\)"/i)
   assert.match(pluginSource, /\[Group chat: "\$\{groupName\}"\]/)
+})
+
+test('group selection follows main-window open and close', () => {
+  const gc = load(() => '(pass)')
+  let onClose
+
+  gc.host.openWorkspace = (_id, options) => {
+    onClose = options.onClose
+    return () => onClose()
+  }
+
+  gc.openGroupChat('Core')
+  assert.equal(gc.$groupChatWorkspace.get(), 'Core')
+  // #89788: the main tab owns the room, so the pane keeps its roster.
+  assert.equal(gc.shouldRenderGroupChatInPane('Core'), false)
+
+  onClose()
+  assert.equal(gc.$groupChatWorkspace.get(), null)
+  assert.equal(gc.shouldRenderGroupChatInPane('Core'), true)
+})
+
+test('older and failed workspace hosts keep the in-pane group fallback', () => {
+  const older = load(() => '(pass)')
+
+  older.openGroupChat('Core')
+  assert.equal(older.$groupChatWorkspace.get(), 'Core')
+  assert.equal(older.shouldRenderGroupChatInPane('Core'), true)
+
+  const failed = load(() => '(pass)')
+
+  failed.host.openWorkspace = () => {
+    throw new Error('workspace unavailable')
+  }
+
+  failed.openGroupChat('Ops')
+  assert.equal(failed.$groupChatWorkspace.get(), 'Ops')
+  assert.equal(failed.shouldRenderGroupChatInPane('Ops'), true)
+})
+
+test('main-tab ownership is recorded before the selection atom paints (#89788 follow-up)', () => {
+  const gc = load(() => '(pass)')
+  // Simulate a BotsPane render racing the open: sample the gate at the
+  // moment the selection atom flips. If the tab were recorded after the
+  // atom set, this probe would observe selected-but-unowned and the
+  // in-pane duplicate would paint beside the main tab.
+  let gateAtSelection = null
+  const realSet = gc.$groupChatWorkspace.set
+
+  gc.$groupChatWorkspace.set = value => {
+    if (value === 'Core' && gateAtSelection === null) {
+      gateAtSelection = gc.shouldRenderGroupChatInPane('Core')
+    }
+
+    realSet(value)
+  }
+  gc.host.openWorkspace = () => () => undefined
+
+  gc.openGroupChat('Core')
+  assert.equal(gateAtSelection, false)
+})
+
+test('tab open/close bumps the reactive rev so the pane gate re-evaluates', () => {
+  const gc = load(() => '(pass)')
+  let onClose
+
+  gc.host.openWorkspace = (_id, options) => {
+    onClose = options.onClose
+    return () => onClose()
+  }
+
+  const before = gc.$groupMainTabsRev.get()
+
+  gc.openGroupChat('Core')
+  assert.ok(gc.$groupMainTabsRev.get() > before, 'recording the main tab must bump the rev')
+
+  const afterOpen = gc.$groupMainTabsRev.get()
+
+  onClose()
+  assert.ok(gc.$groupMainTabsRev.get() > afterOpen, 'closing the main tab must bump the rev')
+})
+
+test('closing an older selected group does not clear the newer selection', () => {
+  const gc = load(() => '(pass)')
+
+  gc.host.openWorkspace = () => () => undefined
+  gc.openGroupChat('Core')
+  gc.openGroupChat('Ops')
+  gc.closeGroupChatMainTab('Core')
+
+  assert.equal(gc.$groupChatWorkspace.get(), 'Ops')
+})
+
+test('source contract: active group styling suppresses bot styling', () => {
+  assert.match(pluginSource, /const isActive = !activeGroup && !bot\.remoteSource && bot\.name === focusedProfile/)
+  assert.match(pluginSource, /active && 'bg-\(--ui-row-active-background\)'/)
+  assert.match(pluginSource, /active: groupChatName === row\.name/)
+})
+
+test('source contract: group roster rows expose a confirmed Delete Group action', () => {
+  assert.match(pluginSource, /function GroupRow\(\{ active, group, members, needsYou, onOpen, onDisband \}\)/)
+  assert.match(pluginSource, /children: 'Delete Group'/)
+  assert.match(pluginSource, /title: 'Delete group chat\?'/)
+  assert.match(pluginSource, /await disbandGroupChat\(deletingGroup\.name, deletingGroup\.members\)/)
 })
 
 test('disband: removes only this membership, room log, workspace, and needs-you state', async () => {
@@ -426,8 +642,23 @@ test('disband: a running room leaves an epoch-bumped empty tombstone so in-fligh
   assert.equal(tomb.log.length, 0)
   assert.equal(tomb.running, false)
   assert.equal(tomb.epoch, 4, 'epoch bumped so the loop bails at its member boundary')
+  assert.equal(tomb.tombstone, true, 'flagged so persistence and name-dedup skip it')
   const durable = gc.storageWrites.get('group-chats')
   assert.ok(!durable || !('Live' in (durable || {})), 'tombstone is never persisted')
+
+  // Regression (#90028 live E2E): updateGroupChat persists the WHOLE atom
+  // map — an unrelated room write while the tombstone lingers must not
+  // smuggle the tombstone into durable storage, and the disbanded name must
+  // be immediately reusable (uniqueGroupChatName would suffix it otherwise).
+  gc.updateGroupChat('Other', room => {
+    room.log.push({ at: Date.now(), from: { kind: 'user' }, text: 'x', thread: 't' })
+    return room
+  })
+  const durable2 = gc.storageWrites.get('group-chats')
+  assert.ok(durable2 && 'Other' in durable2, 'real room persists')
+  assert.ok(!('Live' in durable2), 'tombstone excluded from later whole-map writes')
+  assert.equal(gc.uniqueGroupChatName('Live', new Set(gc.liveGroupChatNames())), 'Live',
+    'disbanded name is immediately reusable — tombstone does not hold it')
 })
 
 test('source contract: workspace header offers disband behind a ConfirmDialog', () => {
@@ -532,6 +763,62 @@ test('stranded harvest: a timed-out turn whose reply landed late posts into the 
   assert.equal(gc.$groupChats.get().Late.stranded.research, undefined, 'marker consumed')
 })
 
+test('stranded + still busy: the round loop never re-submits into a member whose harvest just confirmed they are still running', async () => {
+  // research is confirmed busy on exactly its first two session.resume
+  // calls — the number of harvest-only touches the FIXED code makes across
+  // two rounds. If the responder guard is missing, research gets re-
+  // selected and picks up two EXTRA resume calls of its own (session
+  // resolution + turn baseline) before its very first post-resubmit poll
+  // — call #4 — which then reports done, so the mutated run still finishes
+  // fast (no real wall-clock wait) while still proving the resubmission
+  // happened.
+  const gc = load(profile => (profile === 'builder' ? 'builder here, all good' : '(pass)'), {
+    busyUntilResumeCall: { research: 2 }
+  })
+
+  // research's session is pre-seeded and resolvable, exactly like the
+  // sibling stranded-harvest test above — its stranded marker is the
+  // pre-thread bare-number shape (still supported: harvestStrandedGroupReply
+  // normalizes both shapes, and presence in `stranded` is what the round-loop
+  // guard checks, not the marker's value shape).
+  gc.sessions.set('sid-research', {
+    stored: 'sid-research',
+    runtime: 'rt-research',
+    profile: 'research',
+    title: 'Group: Grind',
+    messages: []
+  })
+
+  // research is already stranded from an earlier (unmodeled) timeout, and
+  // its session is STILL genuinely running per session.resume. Both members
+  // are mentioned, so without the busy-responder guard both would be
+  // re-selected this round — and resubmitting into research's live session
+  // would trigger the gateway's default busy policy (redirect/hard-
+  // interrupt), destroying the very turn the stranded marker exists to wait
+  // out.
+  gc.updateGroupChat('Grind', r => {
+    r.stranded = { research: 0 }
+    r.sessions = { research: 'sid-research' }
+    r.log = [{ from: { kind: 'user', name: 'You' }, text: '@research @builder status?', at: 1 }]
+    r.watermarks = { 'legacy::research': 0, 'legacy::builder': 0 }
+    return r
+  })
+
+  await gc.runGroupChatRounds('Grind', [{ name: 'research', title: '' }, { name: 'builder', title: '' }], 'legacy')
+
+  assert.equal(
+    gc.calls.filter(c => c.profile === 'research').length,
+    0,
+    'research (still busy) must never receive a new prompt.submit'
+  )
+  assert.equal(
+    gc.$groupChats.get().Grind.stranded.research,
+    0,
+    'marker survives untouched — harvest confirmed research is still running'
+  )
+  assert.equal(gc.calls.filter(c => c.profile === 'builder').length, 1, 'builder (not stranded) still gets its turn')
+})
+
 test('stranded harvest: a late (pass) or no-new-message consumes the marker without posting', async () => {
   const gc = load(() => '(pass)')
 
@@ -583,8 +870,10 @@ test('source contract: the working line names the member on turn', () => {
 })
 
 test('source contract: creating a group with a taken name mints a fresh room, never reopens the old log', () => {
-  assert.match(pluginSource, /const taken = new Set\(Object\.keys\(\$groupChats\.get\(\)\)\)/)
-  assert.match(pluginSource, /while \(taken\.has\(`\$\{groupName\} \$\{n\}`\)\)/)
+  assert.match(pluginSource, /const taken = new Set\(liveGroupChatNames\(\)\)/)
+  assert.match(pluginSource, /const groupName = uniqueGroupChatName\(base, taken\)/)
+  assert.match(pluginSource, /const roomId = mintGroupRoomId\(\)/)
+  assert.match(pluginSource, /room\.roomId = roomId/)
 })
 
 test('turn prompt: results are full quality — only chatter is asked to stay short', () => {
@@ -713,4 +1002,231 @@ test('source contract: group chat message bodies opt back into selectable text',
   // body, drag-select and Cmd/Ctrl+C are dead in group chat logs.
   const src = groupChatWorkspaceSource()
   assert.match(src, /'data-selectable-text':\s*'true'/)
+})
+
+test('group room preview renders the bot HANDLE, not the raw profile name', () => {
+  // #89484: the room line read "@default: …" while the bot answers to
+  // @hermes, so users concluded mention routing was broken.
+  assert.match(pluginSource, /const lastHandle = botHandle\(lastFrom \|\| 'bot', members\.find\(/)
+  assert.match(pluginSource, /\? `\$\{last\.from\?\.kind === 'user' \? 'You' : `@\$\{lastHandle\}`\}/)
+  assert.doesNotMatch(pluginSource, /`@\$\{last\.from\?\.name \|\| 'bot'\}`/)
+})
+
+// ── group clarify (#90694): member questions surface in the room ──────────
+
+const CLARIFY_PAYLOAD = {
+  request_id: 'req-clarify-1',
+  question: 'Which env should I target?',
+  choices: ['staging', 'prod'],
+  multi_select: false
+}
+
+test('a member blocked on clarify surfaces its question and holds the turn open', async () => {
+  // research reports pending_clarify on its first two resumes after the
+  // submit; the turn must NOT read it as done/pass while the question waits.
+  const gc = load(() => 'targeting staging', {
+    clarifyUntilResumeCall: { research: { payload: CLARIFY_PAYLOAD, until: 3 } }
+  })
+
+  const thread = gc.sendToGroupChat('Core', [MEMBERS[0]], '@research deploy it', null, [])
+  await new Promise(resolve => setTimeout(resolve, 0))
+  await new Promise(resolve => setTimeout(resolve, 0))
+
+  // Mirrored while blocked, cleared once the resume stops reporting it.
+  const log = gc.$groupChats.get().Core.log.filter(e => e.thread === thread)
+  const replies = log.filter(e => e.from.kind === 'member')
+
+  assert.equal(replies.length, 1, 'the finished reply still lands after the clarify clears')
+  assert.equal(replies[0].text, 'targeting staging')
+  assert.equal(Object.keys(gc.$groupClarify.get()).length, 0, 'the mirrored question is cleared once resolved')
+  // The mirror pass ran while the question was blocking: it badges the room
+  // needs-you. The sabotaged (pre-fix) poll never inspects pending_clarify,
+  // so this stays unset — the observable proof the gate executed.
+  assert.equal(gc.$groupNeedsYou.get().Core, true, 'the blocking question badged the room')
+})
+
+test('syncGroupClarify mirrors, badges needs-you, and is idempotent per request', () => {
+  const gc = load(() => '(pass)')
+  const member = { name: 'research', title: '' }
+
+  const blocked = gc.syncGroupClarify('Core', member, { pending_clarify: CLARIFY_PAYLOAD })
+  assert.equal(blocked, true)
+
+  const mirrored = Object.values(gc.$groupClarify.get())
+  assert.equal(mirrored.length, 1)
+  assert.equal(mirrored[0].requestId, 'req-clarify-1')
+  assert.equal(mirrored[0].question, 'Which env should I target?')
+  assert.equal(JSON.stringify(mirrored[0].choices), JSON.stringify(['staging', 'prod']))
+  assert.equal(gc.$groupNeedsYou.get().Core, true)
+
+  // Same request again: no new entry, identity preserved.
+  const first = mirrored[0]
+  gc.syncGroupClarify('Core', member, { pending_clarify: CLARIFY_PAYLOAD })
+  assert.equal(Object.values(gc.$groupClarify.get())[0], first)
+
+  // Question resolved server-side: the mirror clears.
+  const still = gc.syncGroupClarify('Core', member, {})
+  assert.equal(still, false)
+  assert.equal(Object.keys(gc.$groupClarify.get()).length, 0)
+})
+
+test('older backends without pending_clarify never mirror a question', () => {
+  const gc = load(() => '(pass)')
+
+  assert.equal(gc.syncGroupClarify('Core', { name: 'research' }, { messages: [] }), false)
+  assert.equal(Object.keys(gc.$groupClarify.get()).length, 0)
+})
+
+test('answerGroupClarify routes clarify.respond and clears the mirror', async () => {
+  const gc = load(() => '(pass)')
+  const member = { name: 'research', title: '' }
+
+  gc.syncGroupClarify('Core', member, { pending_clarify: CLARIFY_PAYLOAD })
+  const entry = Object.values(gc.$groupClarify.get())[0]
+
+  await gc.answerGroupClarify(entry, member, 'staging')
+
+  assert.equal(JSON.stringify(gc.clarifyResponds), JSON.stringify([{ request_id: 'req-clarify-1', answer: 'staging' }]))
+  assert.equal(Object.keys(gc.$groupClarify.get()).length, 0)
+})
+
+test('answerGroupClarify sends one respond per batch question, in order', async () => {
+  const gc = load(() => '(pass)')
+  const member = { name: 'research', title: '' }
+  const batch = {
+    request_id: 'req-batch-1',
+    questions: [
+      { qid: 'q0', question: 'Env?', choices: ['staging', 'prod'] },
+      { qid: 'q1', question: 'Region?', choices: [] }
+    ]
+  }
+
+  gc.syncGroupClarify('Core', member, { pending_clarify: batch })
+  const entry = Object.values(gc.$groupClarify.get())[0]
+
+  await gc.answerGroupClarify(entry, member, { q0: 'staging', q1: 'eu-west' })
+
+  assert.equal(
+    JSON.stringify(gc.clarifyResponds),
+    JSON.stringify([
+      { request_id: 'req-batch-1', question_id: 'q0', answer: 'staging' },
+      { request_id: 'req-batch-1', question_id: 'q1', answer: 'eu-west' }
+    ])
+  )
+  assert.equal(Object.keys(gc.$groupClarify.get()).length, 0)
+})
+
+test('disband clears the room mirrored questions', async () => {
+  const gc = load(() => '(pass)')
+
+  gc.syncGroupClarify('Core', { name: 'research' }, { pending_clarify: CLARIFY_PAYLOAD })
+  gc.syncGroupClarify('Other', { name: 'ops' }, { pending_clarify: { ...CLARIFY_PAYLOAD, request_id: 'req-2' } })
+
+  await gc.disbandGroupChat('Core', [])
+
+  const remaining = Object.values(gc.$groupClarify.get())
+  assert.equal(remaining.length, 1)
+  assert.equal(remaining[0].group, 'Other')
+})
+
+test('source contract: room renders clarify cards and the poll gates on them', () => {
+  assert.match(pluginSource, /function GroupClarifyCard\(/)
+  assert.match(pluginSource, /syncGroupClarify\(group, member, state\)/)
+  assert.match(pluginSource, /const done = !busy && !awaitingUser/)
+  assert.match(pluginSource, /busy \|\| awaitingUser/)
+  assert.match(pluginSource, /roomClarifies\.map\(entry =>/)
+  assert.match(pluginSource, /'clarify\.respond'/)
+})
+
+// ── group approvals: same hidden-session class as clarify (#90694) ─────────
+
+const APPROVAL_PAYLOAD = {
+  request_id: 'req-approval-1',
+  command: 'rm -rf ./build',
+  description: 'Clean the build directory',
+  choices: ['once', 'session', 'deny']
+}
+
+test('a member blocked on a command approval surfaces an approval card and holds the turn', async () => {
+  const gc = load(() => 'build cleaned', {
+    approvalUntilResumeCall: { research: { payload: APPROVAL_PAYLOAD, until: 3 } }
+  })
+
+  const thread = gc.sendToGroupChat('Core', [MEMBERS[0]], '@research clean up', null, [])
+  await new Promise(resolve => setTimeout(resolve, 0))
+  await new Promise(resolve => setTimeout(resolve, 0))
+
+  const log = gc.$groupChats.get().Core.log.filter(e => e.thread === thread)
+  const replies = log.filter(e => e.from.kind === 'member')
+
+  assert.equal(replies.length, 1, 'the finished reply still lands after the approval clears')
+  assert.equal(replies[0].text, 'build cleaned')
+  assert.equal(Object.keys(gc.$groupClarify.get()).length, 0)
+  assert.equal(gc.$groupNeedsYou.get().Core, true, 'the blocking approval badged the room')
+})
+
+test('syncGroupClarify mirrors an approval with kind, command, and server choices', () => {
+  const gc = load(() => '(pass)')
+  const member = { name: 'research', title: '' }
+
+  const blocked = gc.syncGroupClarify('Core', member, {
+    session_id: 'rt-research-1',
+    pending_approval: APPROVAL_PAYLOAD
+  })
+  assert.equal(blocked, true)
+
+  const entry = Object.values(gc.$groupClarify.get())[0]
+  assert.equal(entry.kind, 'approval')
+  assert.equal(entry.command, 'rm -rf ./build')
+  assert.equal(entry.question, 'Clean the build directory')
+  assert.equal(JSON.stringify(entry.choices), JSON.stringify(['once', 'session', 'deny']))
+  assert.equal(entry.sessionId, 'rt-research-1')
+})
+
+test('an approval without a server choice set falls back to once/deny', () => {
+  const gc = load(() => '(pass)')
+
+  gc.syncGroupClarify('Core', { name: 'research' }, {
+    pending_approval: { request_id: 'req-a2', command: 'ls' }
+  })
+
+  const entry = Object.values(gc.$groupClarify.get())[0]
+  assert.equal(JSON.stringify(entry.choices), JSON.stringify(['once', 'deny']))
+})
+
+test('answerGroupClarify routes approvals through approval.respond with session + choice', async () => {
+  const gc = load(() => '(pass)')
+  const member = { name: 'research', title: '' }
+
+  gc.syncGroupClarify('Core', member, { session_id: 'rt-research-1', pending_approval: APPROVAL_PAYLOAD })
+  const entry = Object.values(gc.$groupClarify.get())[0]
+
+  await gc.answerGroupClarify(entry, member, 'once')
+
+  assert.equal(
+    JSON.stringify(gc.approvalResponds),
+    JSON.stringify([{ session_id: 'rt-research-1', request_id: 'req-approval-1', choice: 'once' }])
+  )
+  assert.equal(gc.clarifyResponds.length, 0, 'approvals never touch the clarify wire')
+  assert.equal(Object.keys(gc.$groupClarify.get()).length, 0)
+})
+
+test('clarify outranks approval when a snapshot carries both', () => {
+  const gc = load(() => '(pass)')
+
+  gc.syncGroupClarify('Core', { name: 'research' }, {
+    pending_clarify: CLARIFY_PAYLOAD,
+    pending_approval: APPROVAL_PAYLOAD
+  })
+
+  const entry = Object.values(gc.$groupClarify.get())[0]
+  assert.equal(entry.kind, 'clarify')
+  assert.equal(entry.requestId, 'req-clarify-1')
+})
+
+test('source contract: approval card renders the command and routes approval.respond', () => {
+  assert.match(pluginSource, /pending_approval/)
+  assert.match(pluginSource, /'approval\.respond'/)
+  assert.match(pluginSource, /kind: 'approval'/)
+  assert.match(pluginSource, /wants to run a command/)
 })
