@@ -2092,6 +2092,24 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             if existing is None:
                 print(f"no such task: {args.task_id}", file=sys.stderr)
                 return 1
+            rejected = conn.execute(
+                "SELECT kind, payload FROM task_events "
+                "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                (args.task_id,),
+            ).fetchone()
+            if rejected and rejected["kind"] == "claim_rejected" and rejected["payload"]:
+                try:
+                    payload = json.loads(rejected["payload"])
+                except (json.JSONDecodeError, TypeError):
+                    payload = {}
+                if payload.get("reason") == "max_in_progress":
+                    print(
+                        f"cannot claim {args.task_id}: max_in_progress "
+                        f"capacity exhausted (observed={payload.get('observed')} "
+                        f"cap={payload.get('cap')})",
+                        file=sys.stderr,
+                    )
+                    return 1
             print(
                 f"cannot claim {args.task_id}: status={existing.status} "
                 f"lock={existing.claim_lock or '(none)'}",
@@ -2686,6 +2704,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "capacity_exhausted": (
+                {
+                    "observed": res.capacity_exhausted[0],
+                    "cap": res.capacity_exhausted[1],
+                }
+                if res.capacity_exhausted is not None
+                else None
+            ),
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
         return 0
@@ -2723,6 +2749,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
+        )
+    if res.capacity_exhausted is not None:
+        observed, cap = res.capacity_exhausted
+        print(
+            "Deferred (max_in_progress capacity exhausted): "
+            f"observed={observed} cap={cap}"
         )
     return 0
 

@@ -4603,6 +4603,74 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+# ``None`` remains an explicit opt-out for internal setup/recovery callers.
+# Normal claim callers use the configured board cap by default, while dispatcher
+# callers pass their already-resolved cap (which may include the memory-derived
+# default).  A sentinel is required so those two meanings stay distinct.
+_CONFIGURED_PARENT_CAP = object()
+
+
+def _claim_rejected_for_capacity(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_status: str,
+    max_in_progress: object,
+) -> bool:
+    """Reject an eligible parent claim at capacity inside its write txn.
+
+    The count and the later status transition run under the same SQLite
+    ``BEGIN IMMEDIATE`` transaction.  Independent gateway, API, CLI, and review
+    owners therefore serialize on the board DB and cannot both consume the
+    final slot.
+    """
+    if max_in_progress is _CONFIGURED_PARENT_CAP:
+        cap = configured_max_in_progress()
+    elif isinstance(max_in_progress, int) and not isinstance(max_in_progress, bool):
+        cap = max_in_progress if max_in_progress > 0 else None
+    else:
+        cap = None
+    if cap is None:
+        return False
+
+    candidate = conn.execute(
+        "SELECT status, claim_lock FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if (
+        candidate is None
+        or candidate["status"] != expected_status
+        or candidate["claim_lock"] is not None
+    ):
+        return False
+
+    observed = int(conn.execute(
+        "SELECT COUNT(*) AS n FROM tasks WHERE status = 'running'"
+    ).fetchone()["n"])
+    if observed < cap:
+        return False
+
+    _append_event(
+        conn,
+        task_id,
+        "claim_rejected",
+        {
+            "reason": "max_in_progress",
+            "observed": observed,
+            "cap": cap,
+            "source_status": expected_status,
+        },
+    )
+    _log.warning(
+        "kanban claim refused: parent worker capacity exhausted "
+        "(observed=%d cap=%d task=%s source=%s)",
+        observed,
+        cap,
+        task_id,
+        expected_status,
+    )
+    return True
+
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return whether every direct parent is terminal for dependency gating."""
     return conn.execute(
@@ -4620,6 +4688,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    max_in_progress: object = _CONFIGURED_PARENT_CAP,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4654,6 +4723,13 @@ def claim_task(
                 conn, task_id, "claim_rejected",
                 {"reason": "parents_not_done"},
             )
+            return None
+        if _claim_rejected_for_capacity(
+            conn,
+            task_id,
+            expected_status="ready",
+            max_in_progress=max_in_progress,
+        ):
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
@@ -4742,6 +4818,7 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    max_in_progress: object = _CONFIGURED_PARENT_CAP,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -4774,6 +4851,13 @@ def claim_review_task(
                         "source_status": "review",
                     },
                 )
+            return None
+        if _claim_rejected_for_capacity(
+            conn,
+            task_id,
+            expected_status="review",
+            max_in_progress=max_in_progress,
+        ):
             return None
         cur = conn.execute(
             """
@@ -8075,6 +8159,11 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    capacity_exhausted: Optional[tuple[int, int]] = None
+    """``(observed_parent_workers, cap)`` when no parent launch was allowed.
+
+    This content-free diagnostic is shared by CLI, gateway, and Desktop/API
+    serialization of ``DispatchResult``. Active workers are preserved."""
     memory_pressure: Optional[str] = None
     """System memory pressure observed at spawn time when the memory guard
     restricted this tick (OOF-30/OOF-77): ``"critical"`` — no new workers
@@ -10004,6 +10093,13 @@ def _dispatch_once_locked(
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.capacity_exhausted = (total_running, max_in_progress)
+            _log.warning(
+                "kanban dispatch refused: parent worker capacity exhausted "
+                "(observed=%d cap=%d)",
+                total_running,
+                max_in_progress,
+            )
             return result
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
@@ -10227,7 +10323,12 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            max_in_progress=max_in_progress,
+        )
         if claimed is None:
             continue
         try:
@@ -10354,7 +10455,12 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_review_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            max_in_progress=max_in_progress,
+        )
         if claimed is None:
             continue
         try:

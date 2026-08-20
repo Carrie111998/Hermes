@@ -2287,8 +2287,15 @@ def dispatch(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        max_in_progress = kanban_db.resolve_max_in_progress(
+            kanban_db.configured_max_in_progress()
+        )
         result = kanban_db.dispatch_once(
-            conn, dry_run=dry_run, max_spawn=max_n, board=board,
+            conn,
+            dry_run=dry_run,
+            max_spawn=max_n,
+            max_in_progress=max_in_progress,
+            board=board,
         )
         # DispatchResult is a dataclass.
         try:

@@ -515,6 +515,26 @@ def test_dispatch_dry_run(client):
     assert isinstance(body, dict)
 
 
+def test_dispatch_uses_configured_parent_cap(client, monkeypatch):
+    """Desktop/API dispatch returns the same full-cap diagnostic as gateway/CLI."""
+    monkeypatch.setattr(kb, "configured_max_in_progress", lambda: 3)
+    with kb.connect() as conn:
+        for i in range(3):
+            task_id = kb.create_task(
+                conn, title=f"running-{i}", assignee="researcher"
+            )
+            assert kb.claim_task(conn, task_id, max_in_progress=None) is not None
+    client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "waiting", "assignee": "researcher"},
+    )
+
+    response = client.post("/api/plugins/kanban/dispatch?max=8")
+
+    assert response.status_code == 200
+    assert response.json()["capacity_exhausted"] == [3, 3]
+
+
 # ---------------------------------------------------------------------------
 # Triage column (new v1 status)
 # ---------------------------------------------------------------------------

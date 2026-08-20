@@ -1491,6 +1491,13 @@ class TestAsyncCapUnified(unittest.TestCase):
         from tools.delegate_tool import _get_max_async_children
         self.assertEqual(_get_max_async_children(), 15)
 
+
+class TestConfiguredThreeChildCap(unittest.TestCase):
+    @patch("tools.delegate_tool._load_config",
+           return_value={"max_concurrent_children": 3})
+    def test_three_child_cap_is_enforced_independently(self, mock_cfg):
+        self.assertEqual(_get_max_concurrent_children(), 3)
+
 # =========================================================================
 # max_spawn_depth clamping
 # =========================================================================
