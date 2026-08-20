@@ -4,7 +4,17 @@
 #          .venv python 3.12, Windows. pyproject addopts supply
 #          --timeout=30 --timeout-method=thread. 9434 collected every run.
 #
-# STABLE CORE: 248 failures across 61 files. DIFF AGAINST THIS.
+# STABLE CORE: 246 failures across 60 files. DIFF AGAINST THIS.
+#
+# AMENDED 2026-08-20 (c915a8678c): 248 -> 246 across 60 files. Removed the two
+# test_kanban_reclaim_claim_lock_guard.py rows. They were never product
+# failures -- the 2026-08-17 isolation triage classified both POLLUTION. The
+# tests spawned the POSIX binaries `true` and `sleep`, which on Windows resolve
+# only via Git/MSYS usr/bin, so any earlier test that narrowed PATH made them
+# raise FileNotFoundError: [WinError 2]. They now spawn sys.executable and take
+# no PATH lookup, so they pass in-sweep. Collection is unchanged at 9434 -- the
+# two tests still run, they just no longer fail. Everything else below is still
+# the frozen db0977b4c0 core.
 #
 # Evidence: 9 independent full runs. Every one printed a summary line and
 # reported FDGUARD-SUMMARY collected=9434 CLEAN. The core was set-identical
@@ -164,8 +174,6 @@ tests/hermes_cli/test_hooks_cli.py::TestHooksTest::test_fires_real_subprocess_an
 tests/hermes_cli/test_hooks_cli.py::TestHooksTest::test_synthetic_payload_matches_production_shape
 tests/hermes_cli/test_install_cua_driver.py::TestStaleInstallLockClear::test_dead_holder_lock_is_cleared
 tests/hermes_cli/test_install_cua_driver.py::TestStaleInstallLockClear::test_pidless_old_lock_is_cleared
-tests/hermes_cli/test_kanban_reclaim_claim_lock_guard.py::test_genuine_crash_still_reclaims
-tests/hermes_cli/test_kanban_reclaim_claim_lock_guard.py::test_stale_crash_reset_rejected_for_reclaimed_task
 tests/hermes_cli/test_managed_uv.py::TestEnsureUv::test_already_installed_no_bootstrap
 tests/hermes_cli/test_managed_uv.py::TestEnsureUv::test_install_failure_returns_falsy
 tests/hermes_cli/test_managed_uv.py::TestEnsureUv::test_installs_if_missing
