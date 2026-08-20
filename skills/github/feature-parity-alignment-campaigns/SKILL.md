@@ -1,7 +1,8 @@
 ---
 name: feature-parity-alignment-campaigns
-description: Build, reconcile, and release platform Feature Parity & Alignment campaigns through an executable capability ledger.
+description: Govern platform parity campaigns with verifiable ledgers.
 version: 2.0.0
+author: Axl Ibiza (andrexibiza), Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
