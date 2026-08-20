@@ -1,5 +1,6 @@
 """Tests for the CLI incognito mode contract."""
 
+import hashlib
 from unittest.mock import MagicMock
 
 from hermes_cli._parser import build_top_level_parser
@@ -100,3 +101,62 @@ def test_incognito_cli_close_removes_any_empty_session_row(monkeypatch, tmp_path
 
     assert db.list_sessions_rich(limit=10) == []
     db.close()
+
+
+def test_incognito_cli_session_does_not_open_or_modify_state_db(monkeypatch, tmp_path):
+    """An incognito CLI lifecycle must not touch SQLite at all.
+
+    The mtime assertion is intentional: SQLite can modify sidecar or database
+    metadata without changing the logical contents, and strict incognito mode
+    must not silently allow that kind of store access.
+    """
+    hermes_home = tmp_path / "hm"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    from hermes_state import SessionDB
+
+    seed_db = SessionDB(db_path=hermes_home / "state.db")
+    seed_db.create_session("existing", source="cli")
+    seed_db.close()
+
+    tracked_paths = [
+        hermes_home / "state.db",
+        hermes_home / "state.db-wal",
+        hermes_home / "state.db-shm",
+    ]
+
+    def snapshot(path):
+        if not path.exists():
+            return None
+        return (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns)
+
+    before = {path: snapshot(path) for path in tracked_paths}
+
+    session_db_factory = MagicMock(name="SessionDB")
+    monkeypatch.setattr("hermes_state.SessionDB", session_db_factory)
+
+    from cli import HermesCLI
+    from hermes_cli import mcp_startup
+
+    cli = HermesCLI(incognito=True, compact=True)
+    cli._install_tool_callbacks = lambda: None
+    cli._ensure_tirith_security = lambda: None
+    cli._ensure_runtime_credentials = lambda: True
+    monkeypatch.setattr(mcp_startup, "ensure_mcp_discovery_before_agent_build", lambda **_: None)
+    agent = MagicMock()
+    agent.run_conversation.return_value = {
+        "final_response": "temporary response",
+        "messages": [],
+        "api_calls": 1,
+        "completed": True,
+    }
+    agent_factory = MagicMock(return_value=agent)
+    monkeypatch.setattr("cli.AIAgent", agent_factory)
+
+    assert cli.chat("temporary prompt") == "temporary response"
+    cli._persist_active_session_before_close()
+
+    session_db_factory.assert_not_called()
+    assert agent_factory.call_args.kwargs["session_db"] is None
+    after = {path: snapshot(path) for path in tracked_paths}
+    assert after == before

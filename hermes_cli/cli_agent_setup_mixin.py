@@ -367,8 +367,10 @@ class CLIAgentSetupMixin:
             single_query=getattr(self, "_single_query_mode", False),
         )
 
-        # Initialize SQLite session store for CLI sessions (if not already done in __init__)
-        if self._session_db is None:
+        # Initialize SQLite session store for CLI sessions (if not already done in __init__).
+        # Incognito deliberately keeps this unset for the entire lifecycle;
+        # opening it here would bypass the constructor's persistence boundary.
+        if self._session_db is None and not getattr(self, "incognito", False):
             try:
                 from hermes_state import SessionDB
                 self._session_db = SessionDB()
