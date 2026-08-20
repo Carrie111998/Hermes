@@ -997,7 +997,7 @@ function chatWindowSurfaceOptions() {
     // (electron#49443). Chat windows on glass-capable Windows are born
     // transparent so a live Clear→Glass toggle doesn't need a recreate; the
     // opaque themed backgroundColor covers it while glass is off.
-    ...(IS_WINDOWS && GLASS_SUPPORTED ? { transparent: true } : {}),
+    ...(IS_WINDOWS && GLASS_SUPPORTED && glassActive(translucencyState) ? { transparent: true } : {}),
     backgroundMaterial: IS_WINDOWS && GLASS_SUPPORTED ? backgroundMaterialFor(translucencyState) : undefined,
     opacity: windowOpacity(),
     ...windowBackingOptions(translucencyState, getWindowBackgroundColor())
