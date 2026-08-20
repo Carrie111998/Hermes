@@ -87,7 +87,9 @@ def test_null_bytes_in_user_env_are_stripped(tmp_path, monkeypatch):
     assert os.getenv("OPENAI_API_KEY") == "sk-123"
 
 
-def test_main_import_applies_user_env_over_shell_values(tmp_path, monkeypatch):
+def test_main_import_applies_user_env_over_shell_values(
+    tmp_path, monkeypatch, restore_purged_modules
+):
     home = tmp_path / "hermes"
     home.mkdir()
     (home / ".env").write_text(
@@ -99,6 +101,12 @@ def test_main_import_applies_user_env_over_shell_values(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_BASE_URL", "https://old.example/v1")
     monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "openrouter")
 
+    # ``restore_purged_modules`` puts the original module objects back after
+    # this test. Without it the re-import below leaves a SECOND
+    # ``hermes_cli.main`` in ``sys.modules`` while test modules imported at
+    # collection time still hold the first, so their
+    # ``monkeypatch.setattr('hermes_cli.main....')`` calls land on a module
+    # nobody reads and the real code path runs unstubbed.
     sys.modules.pop("hermes_cli.main", None)
     importlib.import_module("hermes_cli.main")
 
