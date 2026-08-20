@@ -49,6 +49,12 @@ export {
   type WindowsBackgroundMaterial
 } from '../../shared/src/translucency'
 
+type WindowBackingOptions = {
+  backgroundColor?: string
+  backgroundMaterial?: undefined
+  transparent?: boolean
+}
+
 /**
  * BrowserWindow constructor options for a chat window's backing, given the
  * translucency state at creation time.
@@ -60,7 +66,10 @@ export {
  * window is quietly treated as opaque.
  *
  * Glass inactive → the opaque themed backing (anti-flash paint before the
- * renderer's first paint, and what clear mode fades against).
+ * renderer's first paint, and what clear mode fades against). On Windows this
+ * also explicitly overrides the glass-capable constructor defaults so a chat
+ * window remains a normal opaque DWM window while glass is off; that preserves
+ * native Snap and FancyZones participation.
  *
  * A runtime `setBackgroundColor` swap (see applyWindowTranslucency in main)
  * only settles reliably on a window that has been compositing for a while —
@@ -68,6 +77,26 @@ export {
  * seconds of a fresh process were lost, including from 'ready-to-show' and
  * 'did-finish-load' — so creation must not rely on a post-creation fixup.
  */
-export function windowBackingOptions(state: TranslucencyState, themedColor: string): { backgroundColor?: string } {
-  return glassActive(state) ? {} : { backgroundColor: themedColor }
+export function windowBackingOptionsForPlatform(
+  state: TranslucencyState,
+  themedColor: string,
+  platform: NodeJS.Platform
+): WindowBackingOptions {
+  if (glassActive(state)) {
+    return {}
+  }
+
+  if (platform === 'win32') {
+    return {
+      backgroundColor: themedColor,
+      backgroundMaterial: undefined,
+      transparent: false
+    }
+  }
+
+  return { backgroundColor: themedColor }
+}
+
+export function windowBackingOptions(state: TranslucencyState, themedColor: string): WindowBackingOptions {
+  return windowBackingOptionsForPlatform(state, themedColor, process.platform)
 }
