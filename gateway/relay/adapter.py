@@ -640,6 +640,38 @@ class RelayAdapter(BasePlatformAdapter):
             )
         return SendResult(success=bool(result.get("success")))
 
+    async def abandon_open_draft(
+        self,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Seal an orphaned stream when its turn dies (review B8).
+
+        A stopped (/stop, /new) or superseded turn previously left its
+        native stream open forever: the Slack message kept the live
+        streaming indicator and the adapter kept armed interception state,
+        which the NEXT turn's key could inherit. Seal in place with
+        ``content`` — the text already on screen (the consumer passes its
+        last delivered frame), so the seal adds nothing and claims
+        nothing: it only ends the stream. Delivery flags are the
+        consumer's business; this never sets any.
+
+        Best-effort by contract: failure is reported, never raised — the
+        connector reaps truly orphaned streams via recycling/eviction.
+        """
+        draft_key = self._match_open_draft(str(chat_id), metadata)
+        if draft_key is None:
+            return SendResult(success=True)  # nothing armed — no-op
+        try:
+            return await self._seal_open_draft(
+                chat_id, content, metadata, draft_key=draft_key
+            )
+        except Exception as e:
+            return SendResult(
+                success=False, error=f"abandon seal transport error: {e}"
+            )
+
 
     # ── abstract methods (delegated to the transport) ────────────────────
     async def connect(self, *, is_reconnect: bool = False) -> bool:

@@ -859,6 +859,7 @@ class GatewayStreamConsumer:
                 # (e.g. /new or /stop). Prevents stale deltas from being
                 # delivered after the user has already moved on.
                 if not self._run_still_current():
+                    await self._abandon_native_stream()
                     return
 
                 # Drain all available items from the queue
@@ -1311,6 +1312,14 @@ class GatewayStreamConsumer:
                     )
                 except Exception:
                     pass
+            elif self._message_id is None:
+                # Native draft path deliberately keeps _message_id=None, so
+                # the best-effort edit above never runs for it — the stream
+                # stayed visibly live (streaming indicator) forever and the
+                # adapter kept armed interception state for the next turn
+                # to inherit (review B8). Seal in place with what's already
+                # on screen; sets no delivery flags.
+                await self._abandon_native_stream()
             # Only confirm final delivery if the best-effort send above
             # actually succeeded OR if the final response was already
             # confirmed before we were cancelled.  Previously this
@@ -1888,6 +1897,35 @@ class GatewayStreamConsumer:
         # Frame delivered.  Track text for parity with edit-based no-op skip.
         self._last_sent_text = text
         return True
+
+    async def _abandon_native_stream(self) -> None:
+        """Close an orphaned native draft stream on turn death (review B8).
+
+        Stale-generation exits and cancellations previously returned with
+        the stream still open: the platform message kept its live
+        streaming indicator forever, and the adapter's armed interception
+        state survived into the next turn. Seal in place with the last
+        delivered frame (adds nothing new on screen), via the adapter's
+        best-effort ``abandon_open_draft``. Never sets delivery flags —
+        an abandoned turn's text was partial, and the gateway's normal
+        paths still own whatever happens next.
+        """
+        if not self._use_draft_streaming:
+            return
+        abandon = getattr(type(self.adapter), "abandon_open_draft", None)
+        if abandon is None:
+            return
+        try:
+            _md = dict(self.metadata) if self.metadata else {}
+            if self._initial_reply_to_id:
+                _md.setdefault("reply_to_message_id", self._initial_reply_to_id)
+            await self.adapter.abandon_open_draft(
+                self.chat_id,
+                self._last_sent_text or self._clean_for_display(self._accumulated),
+                metadata=_md or None,
+            )
+        except Exception as e:
+            logger.debug("abandon_open_draft failed (best-effort): %s", e)
 
     async def _flush_segment_tail_on_edit_failure(self) -> None:
         """Deliver un-sent tail content before a segment-break reset.
