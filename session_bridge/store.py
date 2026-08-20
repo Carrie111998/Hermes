@@ -1711,16 +1711,41 @@ class SessionBridgeStore:
                 and due["error_detail"]
                 == "operator authorized exact UUID reconciliation"
             )
-            if int(due["attempts"]) >= max_attempts and not operator_recovery:
+            # session_claude_registration_usage is append-only and its
+            # UNIQUE(job_id, attempt_ordinal) key does not carry local_day, so the
+            # ledger -- not the mutable counter -- is the authority on how many paid
+            # attempts a job has actually spent. A hand-repair that re-queues a job
+            # can zero attempts while leaving the ledger intact; trusting the counter
+            # then bypasses this guard and every later INSERT collides forever.
+            max_ordinal_row = conn.execute(
+                """SELECT MAX(attempt_ordinal) AS max_ordinal
+                   FROM session_claude_registration_usage
+                   WHERE job_id = ?""",
+                (due["id"],),
+            ).fetchone()
+            max_ordinal = (
+                0
+                if max_ordinal_row is None or max_ordinal_row["max_ordinal"] is None
+                else int(max_ordinal_row["max_ordinal"])
+            )
+            attempts_spent = max(int(due["attempts"]), max_ordinal)
+            if attempts_spent >= max_attempts and not operator_recovery:
                 cursor = conn.execute(
                     """UPDATE session_claude_visibility_jobs
-                       SET state = 'claude_failed', lease_digest = NULL,
+                       SET state = 'claude_failed', attempts = ?,
+                           lease_digest = NULL,
                            lease_expires_at = NULL, lease_kind = NULL,
                            error_code = 'max_attempts_exhausted',
                            error_detail = 'maximum paid launch attempts exhausted',
                            updated_at = ?
                        WHERE id = ? AND state = ? AND attempts = ?""",
-                    (operation_time, due["id"], due["state"], due["attempts"]),
+                    (
+                        attempts_spent,
+                        operation_time,
+                        due["id"],
+                        due["state"],
+                        due["attempts"],
+                    ),
                 )
                 if cursor.rowcount != 1:
                     raise ValueError("stale Claude visibility exhaustion transition")
@@ -1757,7 +1782,7 @@ class SessionBridgeStore:
                 is not None
             ):
                 raise ValueError("Claude visibility lease factory returned a duplicate")
-            attempt = int(due["attempts"]) + 1
+            attempt = attempts_spent + 1
             prior_error_code = due["error_code"]
             if absence is not None:
                 consumed = conn.execute(

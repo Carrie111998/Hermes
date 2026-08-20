@@ -13044,6 +13044,94 @@ def test_claude_visibility_exact_absence_at_max_terminalizes_without_usage(
     assert len(_rows(db, "SELECT * FROM session_claude_registration_usage")) == 1
 
 
+def _corrupt_claude_visibility_counter(
+    db: SessionDB,
+    job_id: str,
+    spent_ordinals: int,
+    *,
+    local_day: str = "2026-08-13",
+) -> None:
+    """Reproduce the 2026-08-13 hand-repair: re-queue the job row with a zeroed
+    ``attempts`` counter while the append-only usage ledger keeps its spent
+    ``attempt_ordinal`` rows. ``UNIQUE(job_id, attempt_ordinal)`` does not carry
+    ``local_day``, so a new day grants no fresh ordinal namespace."""
+
+    def _write(conn):
+        conn.execute(
+            """UPDATE session_claude_visibility_jobs
+               SET state = 'claude_pending', attempts = 0, error_code = NULL,
+                   error_detail = NULL, next_attempt_at = 0.0,
+                   lease_digest = NULL, lease_expires_at = NULL,
+                   lease_kind = NULL, updated_at = 100.0
+               WHERE id = ?""",
+            (job_id,),
+        )
+        conn.execute(
+            "DELETE FROM session_claude_registration_usage WHERE job_id = ?",
+            (job_id,),
+        )
+        for ordinal in range(1, spent_ordinals + 1):
+            conn.execute(
+                """INSERT INTO session_claude_registration_usage (
+                       local_day, job_id, attempt_ordinal,
+                       reserved_estimated_cost_usd, reserved_at
+                   ) VALUES (?, ?, ?, ?, ?)""",
+                (local_day, job_id, ordinal, "0.02", 100.0),
+            )
+
+    db._execute_write(_write)
+
+
+def test_claude_visibility_reset_counter_with_spent_usage_terminalizes(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("reset-counter-exhausted")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    _corrupt_claude_visibility_counter(db, identity.job_id, 7)
+
+    claim = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02", 7)
+
+    assert claim.status == "max_attempts_exhausted"
+    assert _rows(
+        db,
+        "SELECT state, attempts, error_code FROM session_claude_visibility_jobs",
+    ) == [
+        {
+            "state": "claude_failed",
+            "attempts": 7,
+            "error_code": "max_attempts_exhausted",
+        }
+    ]
+    assert len(_rows(db, "SELECT * FROM session_claude_registration_usage")) == 7
+    assert store.claim_claude_visibility_job(
+        100.0, 60, 25, "0.50", "0.02", 7
+    ).status == "no_due_job"
+
+
+def test_claude_visibility_reset_counter_below_max_resumes_after_spent_ordinals(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("reset-counter-partial")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    _corrupt_claude_visibility_counter(db, identity.job_id, 3)
+
+    claim = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02", 7)
+
+    assert claim.status == "claimed"
+    assert claim.attempt_ordinal == 4
+    assert sorted(
+        row["attempt_ordinal"]
+        for row in _rows(
+            db, "SELECT attempt_ordinal FROM session_claude_registration_usage"
+        )
+    ) == [1, 2, 3, 4]
+    assert _rows(
+        db, "SELECT state, attempts FROM session_claude_visibility_jobs"
+    ) == [{"state": "claude_leased", "attempts": 4}]
+
+
 def test_exact_operator_recovery_preserves_exhausted_identity_and_attempt_history(
     db: SessionDB,
 ) -> None:
