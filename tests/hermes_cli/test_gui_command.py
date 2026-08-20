@@ -490,6 +490,7 @@ def test_relaunchable_fixup_falls_back_to_legacy_adhoc_on_failure(tmp_path, monk
     assert ["/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(app)] in calls
 
 
+@pytest.mark.macos_only
 def test_relaunchable_fixup_stable_identity_skips_keychain_reset(tmp_path, monkeypatch):
     """A successful stable-identity re-sign must NOT delete the safeStorage item.
 
@@ -499,6 +500,9 @@ def test_relaunchable_fixup_stable_identity_skips_keychain_reset(tmp_path, monke
     stable path the cert-anchored designated requirement is stable across
     rebuilds, so after the first launch the keychain ACL already matches and
     deleting the item would destroy working credentials on every update.
+
+    ``macos_only``: the fixup no-ops on non-macOS (sys.platform guard), and
+    the subject is codesign against a real ``.app`` bundle layout.
     """
     root = _make_desktop_tree(tmp_path)
     desktop_dir = root / "apps" / "desktop"
@@ -522,6 +526,7 @@ def test_relaunchable_fixup_stable_identity_skips_keychain_reset(tmp_path, monke
     assert resets == []
 
 
+@pytest.mark.macos_only
 def test_relaunchable_fixup_legacy_adhoc_still_resets_keychain_item(tmp_path, monkeypatch):
     """The legacy ad-hoc fallback keeps the keychain reset (documented trade-off).
 
@@ -530,6 +535,9 @@ def test_relaunchable_fixup_legacy_adhoc_still_resets_keychain_item(tmp_path, mo
     is the documented trade-off there (re-enter credentials once per update);
     the durable fix is a stable signing identity, which makes this path
     unreachable.
+
+    ``macos_only``: the fixup no-ops on non-macOS (sys.platform guard), and
+    the subject is codesign against a real ``.app`` bundle layout.
     """
     root = _make_desktop_tree(tmp_path)
     desktop_dir = root / "apps" / "desktop"
