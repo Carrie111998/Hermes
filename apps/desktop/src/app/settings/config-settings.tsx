@@ -387,6 +387,14 @@ function ConfigSettingsInner({
           where image-attachment behavior already lives, so this sits above the
           schema fields for that section. */}
       {activeSectionId === 'chat' ? <AttachmentSizeSetting /> : null}
+      {/* Desktop's push-to-talk binding lives in the rebindable keybind store
+          (`composer.voice`), not in this config-backed section — `voice.record_key`
+          from config.yaml is a CLI/TUI-only setting and was previously shown here
+          without ever doing anything (NousResearch/hermes-agent#40855). Point users
+          at the real control instead of re-adding a dead field. */}
+      {activeSectionId === 'voice' ? (
+        <ListRow description={c.voiceShortcutHintDesc} title={c.voiceShortcutHintTitle} />
+      ) : null}
       {visibleFields.length === 0 && activeSectionId !== 'chat' ? (
         <EmptyState description={c.emptyDesc} title={c.emptyTitle} />
       ) : visibleFields.length === 0 ? null : (

@@ -563,6 +563,8 @@ export interface Translations {
       disableF12Desc: string
       attachmentSizeTitle: string
       attachmentSizeDesc: string
+      voiceShortcutHintTitle: string
+      voiceShortcutHintDesc: string
       attachmentSizeUnit: string
       attachmentSizeLabel: string
     }
