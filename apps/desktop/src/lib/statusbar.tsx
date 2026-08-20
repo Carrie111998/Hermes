@@ -67,7 +67,7 @@ export function tokPerCallLabel(usage: UsageStats): string {
     return ''
   }
 
-  return `${usage.tok_per_call.toFixed(1)} tok/s`
+  return `call ${usage.tok_per_call.toFixed(1)} tok/s`
 }
 
 export function tokPerTurnLabel(usage: UsageStats): string {
@@ -77,7 +77,7 @@ export function tokPerTurnLabel(usage: UsageStats): string {
     return ''
   }
 
-  return `${usage.tok_per_turn.toFixed(1)} tok/s`
+  return `turn ${usage.tok_per_turn.toFixed(1)} tok/s`
 }
 
 export function LiveDuration({ since }: { since: number | null | undefined }) {
