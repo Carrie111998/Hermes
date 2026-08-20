@@ -385,7 +385,7 @@ def run_conversation(
         system_message (str): Custom system message (optional, overrides ephemeral_system_prompt if provided)
         conversation_history (List[Dict]): Previous conversation messages (optional)
         task_id (str): Unique identifier for this task to isolate VMs between concurrent tasks (optional, auto-generated if not provided)
-        stream_callback: Optional callback invoked with each text delta during streaming.
+        stream_callback: Optional callback invoked witheach text delta during streaming.
             Used by the TTS pipeline to start audio generation before the full response.
             When None (default), API calls use the standard non-streaming path.
         persist_user_message: Optional clean user message to store in
@@ -1152,7 +1152,7 @@ def run_conversation(
                     
                     # Eager fallback: empty/malformed responses are a common
                     # rate-limit symptom.  Switch to fallback immediately
-                    # rather than retrying with extended backoff.
+                    # rather than retrying withextended backoff.
                     if agent._fallback_index < len(agent._fallback_chain):
                         agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
                     if agent._try_activate_fallback():
@@ -1576,7 +1576,7 @@ def run_conversation(
                     # Forward canonical token + cache buckets so context engines
                     # can make decisions on cache hit ratios / reasoning costs,
                     # not just legacy aggregate tokens. Legacy keys stay for
-                    # back-compat with engines that only read prompt/completion/total.
+                    # back-compat withengines that only read prompt/completion/total.
                     usage_dict = {
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
@@ -2153,7 +2153,7 @@ def run_conversation(
                         print(f"{agent.log_prefix}🔐 Nous agent key refreshed after 401. Retrying request...")
                         continue
                     # Credential refresh didn't help — show diagnostic info.
-                    # Most common causes: Portal OAuth expired/revoked,
+                    # Most common causes: Portal OAuthexpired/revoked,
                     # account out of credits, or agent key blocked.
                     from hermes_constants import display_hermes_home as _dhh_fn
                     _dhh = _dhh_fn()
@@ -2168,7 +2168,7 @@ def run_conversation(
                     if _body_text:
                         print(f"{agent.log_prefix}   Response: {_body_text}")
                     if not _print_nous_entitlement_guidance(agent, "Nous model access"):
-                        print(f"{agent.log_prefix}   Most likely: Portal OAuth expired, account out of credits, or agent key revoked.")
+                        print(f"{agent.log_prefix}   Most likely: Portal OAuthexpired, account out of credits, or agent key revoked.")
                     print(f"{agent.log_prefix}   Troubleshooting:")
                     print(f"{agent.log_prefix}     • Re-authenticate: hermes auth add nous")
                     print(f"{agent.log_prefix}     • Check credits / billing: https://portal.nousresearch.com")
@@ -2522,7 +2522,7 @@ def run_conversation(
 
                 # Eager fallback for rate-limit errors (429 or quota exhaustion).
                 # When a fallback model is configured, switch immediately instead
-                # of burning through retries with exponential backoff -- the
+                # of burning through retries withexponential backoff -- the
                 # primary provider won't recover within the retry window.
                 is_rate_limited = classified.reason in {
                     FailoverReason.rate_limit,
@@ -2706,7 +2706,7 @@ def run_conversation(
                             "compression_exhausted": True,
                         }
 
-                # Check for context-length errors BEFORE generic 4xx handler.
+                # Check for context-lengtherrors BEFORE generic 4xx handler.
                 # The classifier detects context overflow from: explicit error
                 # messages, generic 400 + large session heuristic (#1630), and
                 # server disconnect + large session pattern (#2153).
@@ -2753,7 +2753,7 @@ def run_conversation(
                                 "messages": messages,
                                 "completed": False,
                                 "api_calls": api_call_count,
-                                "error": f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached.",
+                                "error": f"Context lengthexceeded: max compression attempts ({max_compression_attempts}) reached.",
                                 "partial": True,
                                 "failed": True,
                                 "compression_exhausted": True,
@@ -2799,7 +2799,7 @@ def run_conversation(
                         if hasattr(compressor, "_context_probed"):
                             compressor._context_probed = True
                             compressor._context_probe_persistable = True
-                        agent._buffer_vprint(f"⚠️  Context length exceeded — using provider limit: {old_ctx:,} → {new_ctx:,} tokens")
+                        agent._buffer_vprint(f"⚠️  Context lengthexceeded — using provider limit: {old_ctx:,} → {new_ctx:,} tokens")
                     elif minimax_delta_only_overflow:
                         agent._buffer_vprint(
                             f"Provider reported overflow amount only; "
@@ -2807,7 +2807,7 @@ def run_conversation(
                         )
                     else:
                         agent._buffer_vprint(
-                            f"⚠️  Context length exceeded, but provider did not report a max context length; "
+                            f"⚠️  Context lengthexceeded, but provider did not report a max context length; "
                             f"keeping context_length at {old_ctx:,} tokens and compressing."
                         )
 
@@ -2822,7 +2822,7 @@ def run_conversation(
                             "messages": messages,
                             "completed": False,
                             "api_calls": api_call_count,
-                            "error": f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached.",
+                            "error": f"Context lengthexceeded: max compression attempts ({max_compression_attempts}) reached.",
                             "partial": True,
                             "failed": True,
                             "compression_exhausted": True,
@@ -2848,15 +2848,15 @@ def run_conversation(
                     else:
                         # Can't compress further and already at minimum tier
                         agent._flush_status_buffer()
-                        agent._vprint(f"{agent.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
+                        agent._vprint(f"{agent.log_prefix}❌ Context lengthexceeded and cannot compress further.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
-                        logger.error(f"{agent.log_prefix}Context length exceeded: {approx_tokens:,} tokens. Cannot compress further.")
+                        logger.error(f"{agent.log_prefix}Context lengthexceeded: {approx_tokens:,} tokens. Cannot compress further.")
                         agent._persist_session(messages, conversation_history)
                         return {
                             "messages": messages,
                             "completed": False,
                             "api_calls": api_call_count,
-                            "error": f"Context length exceeded ({approx_tokens:,} tokens). Cannot compress further.",
+                            "error": f"Context lengthexceeded ({approx_tokens:,} tokens). Cannot compress further.",
                             "partial": True,
                             "failed": True,
                             "compression_exhausted": True,
@@ -2970,7 +2970,7 @@ def run_conversation(
                     agent._vprint(f"{agent.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
                     agent._vprint(f"{agent.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
                     agent._vprint(f"{agent.log_prefix}   🌐 Endpoint: {_base}", force=True)
-                    # Actionable guidance for common auth errors
+                    # Actionable guidance for common autherrors
                     if classified.is_auth or classified.reason == FailoverReason.billing:
                         if classified.reason == FailoverReason.billing and _print_billing_or_entitlement_guidance(
                             agent,
@@ -3270,7 +3270,7 @@ def run_conversation(
             continue
 
         # Guard: if all retries exhausted without a successful response
-        # (e.g. repeated context-length errors that exhausted retry_count),
+        # (e.g. repeated context-lengtherrors that exhausted retry_count),
         # the `response` variable is still None. Break out cleanly.
         if response is None:
             _turn_exit_reason = "all_retries_exhausted_no_response"
