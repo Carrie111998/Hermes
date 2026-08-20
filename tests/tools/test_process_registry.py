@@ -1181,6 +1181,27 @@ def test_async_delegation_display_metadata_single_task_defaults():
     assert "duration_seconds" not in meta
 
 
+def test_async_delegation_display_metadata_counts_only_completed_states():
+    """cancelled/timeout/interrupted are terminal but NOT completed — the old
+    task_count - failed_count fallback counted them as completed."""
+    meta = async_delegation_display_metadata({
+        "delegation_id": "deleg_3",
+        "results": [
+            {"status": "completed"},
+            {"status": "success"},
+            {"status": "failed"},
+            {"status": "cancelled"},
+            {"status": "timeout"},
+            {"status": "interrupted"},
+            {"status": "error"},
+            "not-a-dict",
+        ],
+    })
+    assert meta["task_count"] == 7
+    assert meta["completed_count"] == 2
+    assert meta["failed_count"] == 2
+
+
 def test_drain_notifications_completion_callback_exception_fails_closed(registry):
     event = {
         "type": "completion",

@@ -2898,10 +2898,16 @@ def async_delegation_display_metadata(evt: dict) -> dict:
         1 for result in results
         if result.get("status") in {"failed", "error"}
     )
+    # Only results in a genuinely terminal success state count as completed.
+    # cancelled / timeout / interrupted are terminal but neither completed
+    # nor failed — the old `task_count - failed_count` fallback silently
+    # counted them as completed. The fallback survives only for the
+    # no-results placeholder (a single task whose per-result status was never
+    # captured), where the completion event itself is the evidence of success.
     metadata = {
         "delegation_id": str(evt.get("delegation_id") or ""),
         "task_count": task_count,
-        "completed_count": completed_count or task_count - failed_count,
+        "completed_count": completed_count if results else task_count - failed_count,
         "failed_count": failed_count,
     }
     duration = evt.get("total_duration_seconds") or evt.get("duration_seconds")
