@@ -9562,8 +9562,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         print(f"  Config File: {config_path} {config_status}")
         print()
     
-    def _list_recent_sessions(self, limit: int = 10) -> list[dict[str, Any]]:
-        """Return recent CLI sessions for in-chat browsing/resume affordances."""
+    def _list_recent_sessions(
+        self, limit: int = 10, *, include_all_sources: bool = False,
+        include_unnamed: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Return recent sessions for in-chat browsing/resume affordances.
+
+        By default this is scoped to ``source="cli"`` — the classic
+        ``/sessions`` behaviour, meant to resume a previous CLI chat. When
+        ``include_all_sources`` is True (``/sessions all``), it widens to
+        every surface (CLI, TUI, desktop/web) so sessions started elsewhere
+        but sharing this one state.db become visible and resumable. ``tool``
+        and ``kanban`` sub-sessions stay excluded in both modes as noise.
+        """
         if not self._session_db:
             return []
         try:
@@ -9571,22 +9582,31 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             return query_session_listing(
                 self._session_db,
-                source="cli",
+                source=None if include_all_sources else "cli",
                 current_session_id=self.session_id,
-                include_all_sources=False,
-                include_unnamed=True,
+                include_all_sources=include_all_sources,
+                include_unnamed=include_unnamed,
                 limit=limit,
                 exclude_sources=["kanban", "tool"],
             )
         except Exception:
             return []
 
-    def _show_recent_sessions(self, *, reason: str = "history", limit: int = 10) -> bool:
+    def _show_recent_sessions(
+        self, *, reason: str = "history", limit: int = 10,
+        include_all_sources: bool = False, include_unnamed: bool = True,
+    ) -> bool:
         """Render recent sessions inline from the active chat TUI.
 
         Returns True when something was shown, False if no session list was available.
+
+        When ``include_all_sources`` is True the list spans every surface and a
+        ``Src`` column is shown so CLI/TUI/desktop sessions are distinguishable.
         """
-        sessions = self._list_recent_sessions(limit=limit)
+        sessions = self._list_recent_sessions(
+            limit=limit, include_all_sources=include_all_sources,
+            include_unnamed=include_unnamed,
+        )
         if not sessions:
             return False
 
@@ -9595,16 +9615,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _cli_visible_print()
         if reason == "history":
             _cli_visible_print("(._.) No messages in the current chat yet — here are recent sessions you can resume:")
+        elif include_all_sources:
+            _cli_visible_print("  Recent sessions (all surfaces):")
         else:
             _cli_visible_print("  Recent sessions:")
         _cli_visible_print()
-        _cli_visible_print(f"  {'#':<3} {'Title':<32} {'Preview':<40} {'Last Active':<13} {'ID'}")
-        _cli_visible_print(f"  {'─' * 3} {'─' * 32} {'─' * 40} {'─' * 13} {'─' * 24}")
-        for idx, session in enumerate(sessions, start=1):
-            title = session.get("title") or "—"
-            preview = (session.get("preview") or "")[:38]
-            last_active = _relative_time(session.get("last_active"))
-            _cli_visible_print(f"  {idx:<3} {title:<32} {preview:<40} {last_active:<13} {session['id']}")
+        if include_all_sources:
+            _cli_visible_print(f"  {'#':<3} {'Title':<30} {'Preview':<34} {'Src':<6} {'Last Active':<13} {'ID'}")
+            _cli_visible_print(f"  {'─' * 3} {'─' * 30} {'─' * 34} {'─' * 6} {'─' * 13} {'─' * 24}")
+            for idx, session in enumerate(sessions, start=1):
+                title = (session.get("title") or "—")[:28]
+                preview = (session.get("preview") or "")[:32]
+                src = (session.get("source") or "-")[:6]
+                last_active = _relative_time(session.get("last_active"))
+                _cli_visible_print(f"  {idx:<3} {title:<30} {preview:<34} {src:<6} {last_active:<13} {session['id']}")
+        else:
+            _cli_visible_print(f"  {'#':<3} {'Title':<32} {'Preview':<40} {'Last Active':<13} {'ID'}")
+            _cli_visible_print(f"  {'─' * 3} {'─' * 32} {'─' * 40} {'─' * 13} {'─' * 24}")
+            for idx, session in enumerate(sessions, start=1):
+                title = session.get("title") or "—"
+                preview = (session.get("preview") or "")[:38]
+                last_active = _relative_time(session.get("last_active"))
+                _cli_visible_print(f"  {idx:<3} {title:<32} {preview:<40} {last_active:<13} {session['id']}")
         _cli_visible_print()
         _cli_visible_print("  Use /resume <number>, /resume <session id>, or /resume <session title> to continue.")
         _cli_visible_print("  Example: /resume 2")
@@ -10037,7 +10069,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             _cprint("  Use /resume with no arguments to see available sessions.")
             return True
 
-        self._handle_resume_command(f"/resume {index}")
+        # Resolve by the ID captured in the exact list that was shown, not by
+        # re-passing the index: /resume <n> recomputes a cli-only list, which
+        # would mis-resolve a number picked from an all-sources /sessions list.
+        selected = pending[index - 1]
+        sel_id = selected.get("id") if isinstance(selected, dict) else None
+        if sel_id:
+            self._handle_resume_command(f"/resume {sel_id}")
+        else:
+            self._handle_resume_command(f"/resume {index}")
         return True
 
 

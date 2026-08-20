@@ -1201,22 +1201,82 @@ class CLICommandsMixin:
         registered in the central COMMAND_REGISTRY.
         """
         from cli import _cprint
+        from hermes_cli.session_listing import parse_session_listing_args
         parts = cmd_original.split(None, 1)
-        arg = parts[1].strip() if len(parts) > 1 else ""
-        sub = arg.lower()
+        raw_args = parts[1].strip() if len(parts) > 1 else ""
 
-        # Bare /sessions or /sessions list — show recent sessions inline.
-        if not arg or sub in {"list", "ls", "browse"}:
+        # Delegate arg parsing to the shared helper so the classic CLI honours
+        # the same grammar as the gateway/TUI slash surface:
+        #   /sessions            → recent CLI sessions (default)
+        #   /sessions all        → every surface (cli/tui/desktop), Src column
+        #   /sessions full       → include unnamed sessions
+        #   /sessions search <q> → title/id search across sessions
+        #   /sessions <id|title> → delegate to /resume
+        include_all, include_unnamed, target, search_query = (
+            parse_session_listing_args(raw_args)
+        )
+
+        # A search request or any list-style invocation (no positional target)
+        # renders inline; a positional target resumes.
+        if not target:
             if not self._session_db:
                 from hermes_state import format_session_db_unavailable
                 _cprint(f"  {format_session_db_unavailable()}")
                 return
-            if not self._show_recent_sessions(reason="sessions"):
+            if search_query is not None:
+                # /sessions search — reuse the shared query path directly so
+                # id/title matching and ordering match the gateway. Search
+                # spans ALL surfaces by default (a name lookup rarely cares
+                # which surface it ran on); `/sessions search all <q>` is
+                # therefore redundant but harmless.
+                from hermes_cli.main import _relative_time
+                from hermes_cli.session_listing import query_session_listing
+                rows = query_session_listing(
+                    self._session_db,
+                    source=None,
+                    current_session_id=self.session_id,
+                    include_all_sources=True,
+                    include_unnamed=True,
+                    search_query=search_query,
+                    limit=10,
+                    exclude_sources=["kanban", "tool"],
+                )
+                if not rows:
+                    _cprint(f"  (._.) No sessions match '{search_query}'.")
+                    return
+                _cprint("")
+                _cprint(f"  Sessions matching '{search_query}':")
+                _cprint("")
+                _cprint(f"  {'#':<3} {'Title':<30} {'Src':<6} {'Last Active':<13} {'ID'}")
+                _cprint(f"  {'─' * 3} {'─' * 30} {'─' * 6} {'─' * 13} {'─' * 24}")
+                for idx, s in enumerate(rows, start=1):
+                    title = (s.get("title") or "—")[:28]
+                    src = (s.get("source") or "-")[:6]
+                    la = _relative_time(s.get("last_active"))
+                    _cprint(f"  {idx:<3} {title:<30} {src:<6} {la:<13} {s['id']}")
+                _cprint("")
+                _cprint("  Use /resume <session id> to continue.")
+                _cprint("")
+                self._pending_resume_sessions = rows
+                return
+            if not self._show_recent_sessions(
+                reason="sessions",
+                include_all_sources=include_all,
+                include_unnamed=include_unnamed,
+            ):
                 _cprint("  (._.) No previous sessions yet.")
+                return
+            # Arm a one-shot pending-resume selection so a bare number on the
+            # next line resolves against the EXACT list just shown (matters for
+            # `all`, whose ordering differs from the default CLI-only list).
+            self._pending_resume_sessions = self._list_recent_sessions(
+                limit=10, include_all_sources=include_all,
+                include_unnamed=include_unnamed,
+            )
             return
 
         # /sessions <id_or_title> behaves the same as /resume <id_or_title>.
-        self._handle_resume_command(f"/resume {arg}")
+        self._handle_resume_command(f"/resume {target}")
 
     def _handle_worktree_command(self, cmd_original: str) -> None:
         """Handle /worktree — inspect, create, or reclaim isolated git worktrees.
