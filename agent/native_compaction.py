@@ -38,8 +38,11 @@ conversation loop can share the gate without import cycles.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
+
+logger = logging.getLogger(__name__)
 
 # Native compaction fires this many tokens below the local compressor's
 # trigger so the server always gets the first shot at compaction.
@@ -147,15 +150,11 @@ def native_compaction_context_management(
 # Retention budget for plaintext user messages carried across a native
 # compaction boundary (mirrors Codex CLI's RETAINED_MESSAGE_TOKEN_BUDGET).
 # Live verification (Aug 2026, gpt-5.6 @ api.openai.com): the server renders
-# NOTHING placed before a replayed compaction checkpoint — a fact stated in a
-# pre-checkpoint input item is invisible to the model ("NONE" recall), while
-# the same item placed after the checkpoint recalls perfectly. Without
-# retention, every plaintext user ask from before the compaction survives
-# only as whatever the opaque server summary kept — the goal-drift failure
-# mode. Codex CLI solves this by rebuilding history with user messages
-# retained verbatim; ``prune_pre_checkpoint_items`` is our wire-level
-# equivalent.
 RETAINED_USER_MESSAGE_TOKEN_BUDGET = 64_000
+
+# Retention budget for local compression summary messages carried across a native
+# compaction boundary to prevent summary token inflation.
+RETAINED_SUMMARY_TOKEN_BUDGET = 32_000
 
 
 def _approx_tokens(text: str) -> int:
@@ -163,30 +162,100 @@ def _approx_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-def _user_item_text(item: Dict[str, Any]) -> Optional[str]:
-    """Extract the retained-budget text of a user-role input item.
+def _extract_item_text(item: Any) -> Optional[str]:
+    """Extract measurable text from string, list content, output_text, or nested metadata text.
 
-    Returns None when the item carries no measurable text (empty message).
-    Multimodal list content is measured by its ``input_text`` parts; images
-    count as zero, matching Codex's retention accounting.
+    Returns None when the item carries no measurable text.
+    Handles string content, multipart lists (input_text/text/output_text), and fallback keys.
     """
+    if not isinstance(item, dict):
+        return None
+
     content = item.get("content")
+    if content is None and "output_text" in item:
+        content = item.get("output_text")
+
     if isinstance(content, str):
         return content if content.strip() else None
+
     if isinstance(content, list):
-        text = "".join(
-            part.get("text", "")
-            for part in content
-            if isinstance(part, dict)
-            and (part.get("type") in ("input_text", "text") or isinstance(part.get("text"), str))
-        )
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                if part.strip():
+                    parts.append(part.strip())
+            elif isinstance(part, dict):
+                part_text = part.get("text") or part.get("input_text") or part.get("output_text")
+                if isinstance(part_text, str) and part_text.strip():
+                    parts.append(part_text.strip())
+                part_meta = part.get("metadata")
+                if isinstance(part_meta, dict) and isinstance(part_meta.get("text"), str):
+                    if part_meta["text"].strip():
+                        parts.append(part_meta["text"].strip())
+        text = " ".join(parts)
         return text if text.strip() or content else None
+
     return None
+
+
+def _user_item_text(item: Dict[str, Any]) -> Optional[str]:
+    """Extract the retained-budget text of a user-role input item (backward compatibility wrapper)."""
+    return _extract_item_text(item)
+
+
+def _is_summary_item(item: Any) -> bool:
+    """Robust summary item detection supporting flags, metadata dicts, and content headers."""
+    if not isinstance(item, dict):
+        return False
+
+    # 1. Top-level summary boolean or string flags
+    if (
+        item.get("_compressed_summary")
+        or item.get("_is_compression_summary")
+        or item.get("_hermes_compressed_summary")
+    ):
+        return True
+
+    # 2. Dynamic underscore key scan
+    if any(isinstance(k, str) and k.startswith("_") and "summary" in k.lower() for k in item.keys()):
+        return True
+
+    # 3. Nested metadata inspection (metadata / _metadata)
+    for meta_key in ("metadata", "_metadata"):
+        meta = item.get(meta_key)
+        if isinstance(meta, dict):
+            if meta.get("summary") or meta.get("is_summary") or meta.get("_compressed_summary"):
+                return True
+            if any(
+                isinstance(k, str) and ("summary" in k.lower() or "compression" in k.lower())
+                for k in meta.keys()
+            ):
+                return True
+
+    # 4. Text header inspection
+    text = _extract_item_text(item)
+    if text:
+        text_lower = text.lower()
+        summary_phrases = (
+            "summary of previous conversation",
+            "conversation summary",
+            "handoff from a previous context",
+            "previous conversation summary",
+            "context summary",
+            "[summary]",
+            "## summary",
+        )
+        if any(phrase in text_lower for phrase in summary_phrases):
+            return True
+
+    return False
 
 
 def prune_pre_checkpoint_items(
     items: List[Dict[str, Any]],
     retained_user_token_budget: int = RETAINED_USER_MESSAGE_TOKEN_BUDGET,
+    retained_summary_token_budget: int = RETAINED_SUMMARY_TOKEN_BUDGET,
+    enable_summary_retention: bool = True,
 ) -> List[Dict[str, Any]]:
     """Restructure Responses input around the newest compaction checkpoint.
 
@@ -195,26 +264,16 @@ def prune_pre_checkpoint_items(
     weight AND silently erases the user's plaintext asks. When a checkpoint
     is present, rebuild the wire as::
 
-        [checkpoint run] + [retained user messages (newest-first budget)] + [post]
+        [checkpoint run] + [retained user & summary messages (newest-first budget)] + [post]
 
-    - The NEWEST contiguous run of checkpoints wins (the server can emit
-      more than one compaction item in a single response — live-observed
-      Aug 2026 — and they arrive adjacent; a run from a newer response
-      cumulatively carries prior windows, so older runs are dropped).
-    - Retained user messages are the user-role items from before the
-      checkpoint, kept verbatim newest-first within
-      ``retained_user_token_budget``; the boundary message is head-truncated
-      when it only partially fits (string content only).
-    - Everything after the checkpoint is untouched, so function_call /
-      function_call_output pairing is preserved (a checkpoint is captured on
-      an assistant response, and that response's own calls and their outputs
-      are all emitted after its reasoning items).
-    - No checkpoint in ``items`` → returned unchanged (self-gating: non-native
-      routes and kill-switched sessions never see a restructured wire).
-
-    Deterministic for a given history, so the request prefix stays stable
-    across turns and server-side prompt caching keeps working.
+    - The NEWEST contiguous run of checkpoints wins.
+    - Retained user messages are kept verbatim within ``retained_user_token_budget``.
+    - Compression summary messages are retained within ``retained_summary_token_budget``.
+    - Original relative chronological order between user messages and summaries is preserved.
     """
+    if not isinstance(items, list) or not items:
+        return items
+
     last_cp = None
     for i, item in enumerate(items):
         if isinstance(item, dict) and item.get("type") == "compaction":
@@ -236,49 +295,66 @@ def prune_pre_checkpoint_items(
     post = items[last_cp + 1 :]
 
     retained_reversed: List[Dict[str, Any]] = []
-    remaining = max(0, int(retained_user_token_budget))
+    user_remaining = max(0, int(retained_user_token_budget))
+    summary_remaining = max(0, int(retained_summary_token_budget))
+
     for item in reversed(pre):
         if not isinstance(item, dict):
             continue
+
+        # Skip typed non-message items
+        if "type" in item and item.get("type") not in ("message", "summary", "context_summary"):
+            continue
+
+        is_summary = enable_summary_retention and _is_summary_item(item)
         is_user = item.get("role") == "user"
-        is_summary = bool(
-            item.get("_compressed_summary")
-            or item.get("_is_compression_summary")
-            or item.get("_hermes_compressed_summary")
-            or any(isinstance(k, str) and k.startswith("_") and "summary" in k.lower() for k in item.keys())
-            or "Summary of previous conversation" in str(item.get("content", ""))
-            or "Conversation Summary" in str(item.get("content", ""))
-            or "conversation summary" in str(item.get("content", "")).lower()
-            or "handoff from a previous context" in str(item.get("content", "")).lower()
-        )
+
         if not is_user and not is_summary:
             continue
-        # Skip typed items (function_call_output etc. never carry role=user,
-        # but stay defensive about future shapes).
-        if "type" in item and item.get("type") != "message":
-            continue
-        if remaining <= 0 and not is_summary:
-            break
-        text = _user_item_text(item) if is_user else str(item.get("content") or "")
+
+        text = _extract_item_text(item)
         if not text:
             continue
-        cost = _approx_tokens(text)
-        if cost <= remaining or is_summary:
-            retained_reversed.append(item)
-            if not is_summary:
-                remaining -= cost
-        elif isinstance(item.get("content"), str):
-            # Head-truncate the boundary message: goals are usually stated
-            # up front, so the head is the valuable end.
-            truncated = dict(item)
-            truncated["content"] = item["content"][: remaining * 4]
-            if truncated["content"].strip():
-                retained_reversed.append(truncated)
-            remaining = 0
-        # Multimodal boundary message that doesn't fit whole: skip rather
-        # than rewrite parts.
 
-    return checkpoint_run + list(reversed(retained_reversed)) + post
+        cost = _approx_tokens(text)
+
+        if is_summary:
+            if summary_remaining <= 0:
+                continue
+            if cost <= summary_remaining:
+                retained_reversed.append(item)
+                summary_remaining -= cost
+            elif isinstance(item.get("content"), str):
+                truncated = dict(item)
+                truncated["content"] = item["content"][: summary_remaining * 4]
+                if truncated["content"].strip():
+                    retained_reversed.append(truncated)
+                summary_remaining = 0
+        elif is_user:
+            if user_remaining <= 0:
+                continue
+            if cost <= user_remaining:
+                retained_reversed.append(item)
+                user_remaining -= cost
+            elif isinstance(item.get("content"), str):
+                truncated = dict(item)
+                truncated["content"] = item["content"][: user_remaining * 4]
+                if truncated["content"].strip():
+                    retained_reversed.append(truncated)
+                user_remaining = 0
+
+    retained_ordered = list(reversed(retained_reversed))
+    result = checkpoint_run + retained_ordered + post
+
+    logger.debug(
+        "Pruned pre-checkpoint items: %d input -> %d retained (user_rem=%d, summary_rem=%d)",
+        len(items),
+        len(result),
+        user_remaining,
+        summary_remaining,
+    )
+
+    return result
 
 
 def is_native_compaction_rejection(error: Any, status_code: Any = None) -> bool:

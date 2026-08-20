@@ -1,74 +1,134 @@
-"""Tests for native compaction retaining compression summaries preceding a checkpoint."""
+"""Comprehensive tests for native compaction summary retention, token budgeting, and robustness."""
 
-from agent.native_compaction import prune_pre_checkpoint_items
+from agent.native_compaction import (
+    prune_pre_checkpoint_items,
+    _is_summary_item,
+    _extract_item_text,
+)
 
 
-def test_prune_pre_checkpoint_items_retains_assistant_summary():
-    """Compression summaries with role='assistant' or marked metadata must not be discarded by pre-checkpoint pruning."""
+def test_is_summary_item_robustness():
+    """Validates summary detection across metadata dicts, headers, and flags."""
+    # Top level flags
+    assert _is_summary_item({"_compressed_summary": True}) is True
+    assert _is_summary_item({"_is_compression_summary": True}) is True
+    assert _is_summary_item({"_hermes_compressed_summary": True}) is True
+    assert _is_summary_item({"_my_custom_summary_flag": True}) is True
+
+    # Nested metadata dict
+    assert _is_summary_item({"metadata": {"summary": True}}) is True
+    assert _is_summary_item({"_metadata": {"is_summary": True}}) is True
+    assert _is_summary_item({"metadata": {"_compressed_summary": True}}) is True
+    assert _is_summary_item({"metadata": {"compression_v2": True}}) is True
+
+    # Text headers
+    assert _is_summary_item({"content": "summary of previous conversation: ..."}) is True
+    assert _is_summary_item({"content": "Conversation Summary\nDone"}) is True
+    assert _is_summary_item({"content": "Handoff from a previous context"}) is True
+    assert _is_summary_item({"content": "## Summary of work"}) is True
+
+    # Negative cases
+    assert _is_summary_item({"role": "user", "content": "Just normal prompt"}) is False
+    assert _is_summary_item(None) is False
+    assert _is_summary_item(123) is False
+    assert _is_summary_item({}) is False
+
+
+def test_extract_item_text_variations():
+    """Validates text extraction across string, multipart list, output_text, and malformed structures."""
+    # String
+    assert _extract_item_text({"content": "Hello world"}) == "Hello world"
+
+    # Multipart list
+    item_list = {
+        "content": [
+            {"type": "input_text", "text": "Part 1"},
+            {"type": "text", "text": "Part 2"},
+            {"type": "other", "output_text": "Part 3"},
+        ]
+    }
+    assert _extract_item_text(item_list) == "Part 1 Part 2 Part 3"
+
+    # output_text fallback
+    assert _extract_item_text({"output_text": "Output fallback"}) == "Output fallback"
+
+    # Malformed / Empty
+    assert _extract_item_text({"content": None}) is None
+    assert _extract_item_text({"content": []}) is None
+    assert _extract_item_text(None) is None
+    assert _extract_item_text("string_item") is None
+
+
+def test_prune_pre_checkpoint_items_retains_summary_and_user_in_order():
+    """Preserves chronological order of user messages and summary messages."""
     items = [
-        {"role": "user", "content": "Goal: build the system"},
-        {"role": "assistant", "content": "Working on it..."},
-        {
-            "role": "assistant",
-            "content": "Summary of previous conversation:\n- Set up database\n- Built API",
-            "_compressed_summary": True,
-        },
-        {"type": "compaction", "encrypted_content": "dummy_checkpoint_blob"},
-        {"role": "user", "content": "Now add frontend"},
-        {"role": "assistant", "content": "Frontend added."},
+        {"role": "user", "content": "User Ask 1"},
+        {"role": "assistant", "content": "Conversation Summary: Step 1 complete", "_compressed_summary": True},
+        {"role": "user", "content": "User Ask 2"},
+        {"role": "assistant", "content": "Normal chatter to prune"},
+        {"type": "compaction", "encrypted_content": "blob_cp"},
+        {"role": "user", "content": "User Ask 3"},
     ]
 
     pruned = prune_pre_checkpoint_items(items, retained_user_token_budget=1000)
 
-    # The checkpoint must be first
+    # Checkpoint comes first, followed by retained items in original sequence
     assert pruned[0]["type"] == "compaction"
-    
-    # Both the early user goal and the compression summary must be retained
-    roles_or_types = [m.get("type") or m.get("role") for m in pruned]
-    assert "compaction" in roles_or_types
-    
-    # Check that the summary survives in the pruned output
-    summaries = [
-        m for m in pruned
-        if "Summary of previous conversation" in str(m.get("content", ""))
+    contents = [m.get("content") for m in pruned[1:]]
+    assert contents == [
+        "User Ask 1",
+        "Conversation Summary: Step 1 complete",
+        "User Ask 2",
+        "User Ask 3",
     ]
-    assert len(summaries) == 1
-    assert summaries[0]["role"] == "assistant"
 
 
-def test_prune_pre_checkpoint_items_normal_messages_pruned():
-    """Ordinary assistant messages before the checkpoint are still pruned."""
+def test_prune_pre_checkpoint_items_summary_budget_cap_and_truncation():
+    """Enforces token budget limit and truncation for summaries."""
+    long_summary = "Summary line " * 500  # ~6500 chars = ~1625 tokens
     items = [
-        {"role": "user", "content": "U1"},
-        {"role": "assistant", "content": "Normal assistant chatter to be pruned"},
-        {"type": "compaction", "encrypted_content": "blob"},
-        {"role": "user", "content": "U2"},
+        {"role": "assistant", "content": long_summary, "_compressed_summary": True},
+        {"type": "compaction", "encrypted_content": "blob_cp"},
+        {"role": "user", "content": "Ask"},
     ]
 
-    pruned = prune_pre_checkpoint_items(items, retained_user_token_budget=1000)
-    contents = [m.get("content") for m in pruned]
-    assert "Normal assistant chatter to be pruned" not in contents
+    # Restrict summary budget to 100 tokens (~400 chars)
+    pruned = prune_pre_checkpoint_items(
+        items,
+        retained_summary_token_budget=100,
+    )
+
+    retained_sum = [m for m in pruned if m.get("_compressed_summary")][0]
+    assert len(retained_sum["content"]) <= 400
+    assert len(retained_sum["content"]) > 0
 
 
-def test_prune_pre_checkpoint_items_retains_metadata_flagged_summaries():
-    """Assistant messages marked with _is_compression_summary or _hermes_compressed_summary must be retained."""
+def test_prune_pre_checkpoint_items_enable_summary_retention_toggle():
+    """Disabling summary retention drops pre-checkpoint summaries."""
     items = [
-        {"role": "user", "content": "Goal: build system"},
-        {
-            "role": "assistant",
-            "content": "Custom structured summary 1",
-            "_is_compression_summary": True,
-        },
-        {
-            "role": "assistant",
-            "content": "Custom structured summary 2",
-            "_hermes_compressed_summary": True,
-        },
+        {"role": "assistant", "content": "Conversation Summary: Old", "_compressed_summary": True},
         {"type": "compaction", "encrypted_content": "blob"},
-        {"role": "user", "content": "Next step"},
+        {"role": "user", "content": "New ask"},
     ]
 
-    pruned = prune_pre_checkpoint_items(items, retained_user_token_budget=1000)
-    contents = [m.get("content") for m in pruned]
-    assert "Custom structured summary 1" in contents
-    assert "Custom structured summary 2" in contents
+    pruned_disabled = prune_pre_checkpoint_items(items, enable_summary_retention=False)
+    contents = [m.get("content") for m in pruned_disabled]
+    assert "Conversation Summary: Old" not in contents
+
+
+def test_prune_pre_checkpoint_items_malformed_inputs_handled_safely():
+    """Handles None, non-dict elements, empty lists, and invalid items without crashing."""
+    assert prune_pre_checkpoint_items(None) is None
+    assert prune_pre_checkpoint_items([]) == []
+
+    items = [
+        None,
+        123,
+        "raw_string",
+        {"role": "user", "content": "Valid user ask"},
+        {"type": "compaction", "encrypted_content": "blob"},
+    ]
+    pruned = prune_pre_checkpoint_items(items)
+    assert len(pruned) == 2
+    assert pruned[0]["type"] == "compaction"
+    assert pruned[1]["content"] == "Valid user ask"
