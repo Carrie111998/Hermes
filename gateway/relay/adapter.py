@@ -573,16 +573,25 @@ class RelayAdapter(BasePlatformAdapter):
             # Slack card streams are thread replies (same rule as draft):
             # anchor on the triggering message when the runner gave us one.
             merged_meta["thread_ts"] = str(reply_to)
-        result = await self._transport.send_outbound(
-            {
-                "op": "task_card",
-                "chat_id": chat_id,
-                "card_id": card_id,
-                "chunks": [dict(t) for t in tasks],
-                "metadata": self._with_scope(chat_id, merged_meta),
-            },
-            platform=self._platform_by_chat.get(str(chat_id)),
-        )
+        try:
+            result = await self._transport.send_outbound(
+                {
+                    "op": "task_card",
+                    "chat_id": chat_id,
+                    "card_id": card_id,
+                    "chunks": [dict(t) for t in tasks],
+                    "metadata": self._with_scope(chat_id, merged_meta),
+                },
+                platform=self._platform_by_chat.get(str(chat_id)),
+            )
+        except Exception as e:
+            # Progress is advisory: a transport drop must degrade to the
+            # TurnRunner's text fallback (failed SendResult), never raise
+            # into the progress loop / turn-cleanup path (review B7 — an
+            # escaping card exception in cleanup skipped final delivery).
+            return SendResult(
+                success=False, error=f"task_card transport error: {e}"
+            )
         if result.get("success"):
             return SendResult(success=True)
         return SendResult(
@@ -610,15 +619,25 @@ class RelayAdapter(BasePlatformAdapter):
         # Same per-turn key derivation as send (shared helper) so the stop
         # hits the open stream.
         card_id = self._card_key(reply_to, metadata)
-        result = await self._transport.send_outbound(
-            {
-                "op": "task_card_stop",
-                "chat_id": chat_id,
-                "card_id": card_id,
-                "metadata": self._with_scope(chat_id, dict(metadata or {})),
-            },
-            platform=self._platform_by_chat.get(str(chat_id)),
-        )
+        try:
+            result = await self._transport.send_outbound(
+                {
+                    "op": "task_card_stop",
+                    "chat_id": chat_id,
+                    "card_id": card_id,
+                    "metadata": self._with_scope(chat_id, dict(metadata or {})),
+                },
+                platform=self._platform_by_chat.get(str(chat_id)),
+            )
+        except Exception as e:
+            # Best-effort by contract: the stop runs in the progress loop's
+            # finally block on the turn-cleanup path — an escaping transport
+            # exception there skipped final delivery (review B7). The
+            # connector seals orphaned card streams on its own (recycling /
+            # eviction), so a lost stop is cosmetic.
+            return SendResult(
+                success=False, error=f"task_card_stop transport error: {e}"
+            )
         return SendResult(success=bool(result.get("success")))
 
 
