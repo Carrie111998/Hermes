@@ -62,7 +62,7 @@ $ErrorActionPreference = 'Stop'
 function Write-Log   { param([string]$Msg) Write-Host       "[hermes] $Msg" -ForegroundColor Cyan }
 function Write-Ok    { param([string]$Msg) Write-Host       "[hermes] $Msg" -ForegroundColor Green }
 function Write-Warn2 { param([string]$Msg) Write-Host       "[hermes] $Msg" -ForegroundColor Yellow }
-function Write-Die   { param([string]$Msg) Write-Host "[hermes] ERROR: $Msg" -ForegroundColor Red; exit 1 }
+function Write-Die   { param([string]$Msg) Write-Host "[hermes] ERROR: $Msg" -ForegroundColor Red; throw $Msg }
 
 function Invoke-Native {
     param([scriptblock]$Block, [string]$Description = 'command')
@@ -86,7 +86,10 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     Write-Die "docker not found. Install Docker Desktop: https://docs.docker.com/desktop/setup/windows-install/"
 }
 try {
-    Invoke-Native { docker compose version *> $null } -Description 'docker compose version check'
+    $composeVersion = docker compose version 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Die "docker compose (v2) not found. Upgrade Docker Desktop or install the Compose plugin."
+    }
 } catch {
     Write-Die "docker compose (v2) not found. Upgrade Docker Desktop or install the Compose plugin."
 }
@@ -135,7 +138,7 @@ if ((Test-Path $composePath) -and -not $Force) {
     Write-Host '  Web UI              : http://localhost:9119' -ForegroundColor Cyan
     Write-Host '  Stop all            : docker compose -f docker-compose.upstream.yml down' -ForegroundColor Cyan
     Write-Host '  View logs           : docker compose -f docker-compose.upstream.yml logs -f' -ForegroundColor Cyan
-    exit 0
+    return
 }
 
 if ($Force -and (Test-Path $InstallDirFull)) {

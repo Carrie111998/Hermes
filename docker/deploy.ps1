@@ -39,7 +39,7 @@ $EnvTemplate = 'docker/hermes-env.example'
 function Write-Log  { param([string]$Msg) Write-Host       "[hermes] $Msg" -ForegroundColor Cyan }
 function Write-Ok   { param([string]$Msg) Write-Host       "[hermes] $Msg" -ForegroundColor Green }
 function Write-Warn2 { param([string]$Msg) Write-Host      "[hermes] $Msg" -ForegroundColor Yellow }
-function Write-Die  { param([string]$Msg) Write-Host "[hermes] ERROR: $Msg" -ForegroundColor Red; exit 1 }
+function Write-Die  { param([string]$Msg) Write-Host "[hermes] ERROR: $Msg" -ForegroundColor Red; throw $Msg }
 
 # Treat non-zero exit codes from native commands as errors (PS7+ does this
 # automatically when $PSNativeCommandUseErrorActionPreference is true; for
@@ -57,7 +57,10 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     Write-Die "docker not found. Install Docker Desktop: https://docs.docker.com/desktop/setup/windows-install/"
 }
 try {
-    Invoke-Native { docker compose version *> $null }
+    $composeVersion = docker compose version 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Die "docker compose (v2) not found. Upgrade Docker Desktop or install the Compose plugin."
+    }
 } catch {
     Write-Die "docker compose (v2) not found. Upgrade Docker Desktop or install the Compose plugin."
 }
