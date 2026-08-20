@@ -405,3 +405,73 @@ def test_run_job_requires_owner_bearing_claim_agreement(monkeypatch, tmp_path):
     scheduler.run_job(claimed)
     assert observed[-1]["HERMES_CRON_EXECUTION_ID"] == claimed["execution_id"]
     assert observed[-1]["HERMES_CRON_INVOCATION_KIND"] == claimed["fire_claim"]["invocation_kind"]
+
+
+def test_tick_binds_atomic_operator_claim_after_stale_snapshot(monkeypatch, tmp_path):
+    """A trigger arriving after the due snapshot must win the atomic claim."""
+    import cron.executions as executions
+    import cron.scheduler as scheduler
+    from cron.context import OPERATOR_TRIGGERED, SCHEDULED_ON_TIME
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db"
+    )
+    now = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+    due_job = {
+        "id": "operator-race",
+        "name": "operator-race",
+        "schedule": {"kind": "cron", "expr": "* * * * *"},
+        "next_run_at": (now - timedelta(seconds=30)).isoformat(),
+        "enabled": True,
+        "state": "scheduled",
+    }
+    monkeypatch.setattr(scheduler, "_hermes_now", lambda: now)
+    monkeypatch.setattr(
+        scheduler,
+        "_get_lock_paths",
+        lambda: (tmp_path / "locks", tmp_path / "locks" / "tick.lock"),
+    )
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [due_job])
+    monkeypatch.setattr(scheduler, "advance_next_runs", lambda _ids: 0)
+    monkeypatch.setattr(scheduler, "load_config", lambda: {})
+    monkeypatch.setattr(scheduler, "try_register_running_job", lambda _job_id: True)
+    monkeypatch.setattr(scheduler, "release_running_job", lambda _job_id: None)
+    monkeypatch.setattr(scheduler, "_interpreter_shutting_down", lambda *_a: False)
+    monkeypatch.setattr(executions, "recover_interrupted_executions", lambda: 0)
+
+    claim_calls = []
+
+    def atomic_claim(job_id, **kwargs):
+        claim_calls.append((job_id, kwargs))
+        execution_id = kwargs["execution_id"]
+        return {
+            **due_job,
+            "execution_id": execution_id,
+            "fire_claim": {
+                "by": "operator-owner",
+                "execution_id": execution_id,
+                "invocation_kind": OPERATOR_TRIGGERED,
+                "intended_fire_at": None,
+            },
+        }
+
+    # Match the production function identity check so this exercises the
+    # capability-backed scheduler path, not a legacy test-double path.
+    atomic_claim.__module__ = "cron.jobs"
+    monkeypatch.setattr(scheduler, "claim_job_for_fire", atomic_claim)
+    ran = []
+    monkeypatch.setattr(
+        scheduler,
+        "run_one_job",
+        lambda claimed, **_kwargs: ran.append(claimed) or True,
+    )
+
+    assert scheduler.tick(verbose=False, sync=True) == 1
+    assert claim_calls[0][1]["invocation_kind"] == SCHEDULED_ON_TIME
+    assert ran[0]["fire_claim"]["invocation_kind"] == OPERATOR_TRIGGERED
+
+    persisted = executions.latest_execution(due_job["id"])
+    assert persisted["invocation_kind"] == OPERATOR_TRIGGERED
+    assert persisted["claim_owner"] == "operator-owner"
+    assert persisted["intended_fire_at"] is None

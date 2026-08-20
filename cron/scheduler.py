@@ -7513,7 +7513,15 @@ def tick(
                     )
                     return True
                 owner = str(claim.get("by") or "")
-                if claim.get("invocation_kind") != invocation_kind or not owner:
+                claim_kind = normalize_invocation_kind(claim.get("invocation_kind"))
+                # The capability-backed store claim is the authority.  The
+                # snapshot classification above can be stale when an
+                # operator trigger lands between get_due_jobs() and this
+                # atomic claim, so never compare it to the returned kind.
+                # Require the persisted value to already be one of the closed
+                # vocabulary entries instead of laundering malformed data to
+                # UNKNOWN here.
+                if claim.get("invocation_kind") != claim_kind or not owner:
                     finish_execution(
                         job["execution_id"],
                         success=False,
@@ -7522,7 +7530,7 @@ def tick(
                     return True
                 if bind_execution_claim(
                     job["execution_id"],
-                    invocation_kind=claim["invocation_kind"],
+                    invocation_kind=claim_kind,
                     intended_fire_at=claim.get("intended_fire_at"),
                     claim_owner=owner,
                 ) is None:
