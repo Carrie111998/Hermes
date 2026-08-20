@@ -3918,6 +3918,70 @@ import weakref as _weakref
 _gateway_runner_ref: _weakref.ref = lambda: None
 
 
+# One recovery message per hermes_state.PERSISTENCE_ERROR_CAUSES bucket.
+#
+# That tuple's own comment requires consumers to iterate it rather than
+# hardcode causes, "so adding a bucket can never silently desynchronize
+# them" -- which is exactly what happened to the code below. The ``:disk``
+# special case predates the ``:corrupt`` bucket (#87853), so a structurally
+# corrupt state.db fell through to the generic transient text and told the
+# operator their message "should already be saved" and to "send it again in
+# a moment": permanent damage reported as busy storage, and a retry that can
+# only fail the same way. The `corrupt` wording here matches what run_agent's
+# turn explainer and this module's own session-DB-init handler already say,
+# so the CLI and the gateway stop disagreeing about the same failure.
+#
+# test_gateway_persistence_recovery.py iterates PERSISTENCE_ERROR_CAUSES and
+# fails if a bucket has no entry here, so the next bucket cannot desync too.
+_PERSISTENCE_RECOVERY_MESSAGES: dict[str, str] = {
+    "locked": (
+        "\u26a0\ufe0f Session storage was busy (another Hermes process was "
+        "writing to the state database), so this turn was stopped to protect "
+        "your conversation history. Your message should already be saved \u2014 "
+        "please send it again in a moment."
+    ),
+    "compression": (
+        "\u26a0\ufe0f This session was being compressed by another process, so "
+        "this turn was stopped to protect your conversation history. Your "
+        "message should already be saved \u2014 please send it again once "
+        "compression completes."
+    ),
+    "compression_closed": (
+        "\u26a0\ufe0f This session was rotated by context compression and its "
+        "live continuation could not be adopted, so this turn was stopped. The "
+        "storage itself is healthy \u2014 refresh the client so it picks up the "
+        "new session id, then send your message again."
+    ),
+    "turn_lease": (
+        "\u26a0\ufe0f Another Hermes process took over this session, so this "
+        "turn was stopped. Your reply was NOT saved \u2014 wait for the other "
+        "process to finish, then send your message again."
+    ),
+    "corrupt": (
+        "\u26a0\ufe0f The state database reported structural corruption, so "
+        "this turn was stopped (the transcript would have been lost on "
+        "restart). This will not clear on its own and freeing disk space will "
+        "not help. Recovery options:\n"
+        "1. Run `hermes doctor --fix`\n"
+        "2. Salvage with: sqlite3 ~/.hermes/state.db \".recover\" "
+        "(then replace state.db)\n"
+        "3. Restore from a backup in ~/.hermes/backups/\n"
+        "Then send your message again."
+    ),
+    "disk": (
+        "\u26a0\ufe0f Session storage was unavailable, so this turn was stopped "
+        "to protect your conversation history. Please check available disk "
+        "space and that the state database is writable, then send your message "
+        "again."
+    ),
+    "unknown": (
+        "\u26a0\ufe0f Session storage was temporarily unavailable, so this turn "
+        "was stopped to protect your conversation history. Your message should "
+        "already be saved \u2014 please send it again in a moment."
+    ),
+}
+
+
 def _normalize_empty_agent_response(
     agent_result: dict,
     response: str,
@@ -3954,18 +4018,18 @@ def _normalize_empty_agent_response(
         if failure_reason.startswith("session_persistence_failed") or (
             "session storage" in error_str
         ):
-            if failure_reason.endswith(":disk") or "disk" in error_str:
-                return (
-                    "⚠️ Session storage was temporarily unavailable, so this "
-                    "turn was stopped to protect your conversation history. "
-                    "Please check available disk space, then send your "
-                    "message again."
-                )
-            return (
-                "⚠️ Session storage was temporarily unavailable, so this "
-                "turn was stopped to protect your conversation history. "
-                "Your message should already be saved — please send it "
-                "again in a moment."
+            cause = failure_reason.partition(":")[2].strip()
+            if not cause:
+                # Reached via the error-string fallback, or from an agent
+                # result predating structured causes. Classify the text with
+                # the canonical helper rather than an ad-hoc "disk" substring
+                # test: "database disk image is malformed" contains "disk",
+                # and that steal is the documented misdiagnosis on #77386.
+                from hermes_state import classify_persistence_error
+
+                cause = classify_persistence_error(error_detail)
+            return _PERSISTENCE_RECOVERY_MESSAGES.get(
+                cause, _PERSISTENCE_RECOVERY_MESSAGES["unknown"]
             )
         is_context_failure = any(
             p in error_str
