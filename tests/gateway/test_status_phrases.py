@@ -4,6 +4,7 @@ from gateway.status_phrases import (
     classify_status_context,
     choose_status_phrase,
     resolve_status_phrase_catalog,
+    status_phrase_catalog_is_custom,
 )
 
 
@@ -54,3 +55,14 @@ def test_choose_status_phrase_uses_custom_catalog_without_leaking_args():
 
     assert msg == "custom safe status text"
     assert "SECRET" not in msg
+
+
+def test_custom_catalog_detection_distinguishes_builtins_from_user_phrases():
+    builtins = resolve_status_phrase_catalog({}, "telegram")
+    custom = resolve_status_phrase_catalog(
+        {"display": {"status_phrases": {"mode": "replace", "status": ["arbeite noch"]}}},
+        "telegram",
+    )
+
+    assert status_phrase_catalog_is_custom(builtins) is False
+    assert status_phrase_catalog_is_custom(custom) is True

@@ -183,6 +183,46 @@ class TestTelegramBotCommands:
         assert "queue" in names
         assert "steer" in names
 
+    def test_german_localizes_every_visible_builtin_description(self, monkeypatch):
+        """Bundled Telegram built-ins should not leave an English menu behind."""
+        from agent import i18n
+
+        monkeypatch.setenv("HERMES_LANGUAGE", "de")
+        i18n.reset_language_cache()
+        try:
+            localized = dict(telegram_bot_commands())
+        finally:
+            i18n.reset_language_cache()
+
+        original_by_name = {
+            _sanitize_telegram_name(cmd.name): cmd.description
+            for cmd in COMMAND_REGISTRY
+            if _sanitize_telegram_name(cmd.name) in localized
+        }
+        assert original_by_name
+        potential_builtin_names = {
+            _sanitize_telegram_name(cmd.name)
+            for cmd in COMMAND_REGISTRY
+            if not cmd.cli_only or cmd.gateway_config_gate
+        }
+        translated_names = {
+            key.removeprefix("telegram_command_descriptions.")
+            for key in i18n._load_catalog("de")
+            if key.startswith("telegram_command_descriptions.")
+        }
+        assert translated_names == potential_builtin_names, (
+            "German Telegram description keys must track all potential gateway built-ins"
+        )
+        missing = {
+            name: description
+            for name, description in original_by_name.items()
+            if localized[name] == description
+        }
+        assert not missing, f"German Telegram descriptions missing: {missing}"
+        assert localized["new"].startswith("Neue Sitzung")
+        assert localized["stop"].startswith("Alle laufenden")
+        assert localized["status"].startswith("Sitzungs-, Modell-")
+
 
 class TestSlackSubcommandMap:
     def test_returns_dict(self):

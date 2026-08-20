@@ -1378,9 +1378,9 @@ DEFAULT_CONFIG = {
         "focus_view": False,
         "focus_saved_tool_progress": "all",
         "skin": "default",
-        # UI language for static user-facing messages (approval prompts, a
-        # handful of gateway slash-command replies).  Does NOT affect agent
-        # responses, log lines, tool outputs, or slash-command descriptions.
+        # UI language for static user-facing messages (approval prompts,
+        # gateway slash-command replies, and bundled platform-menu labels).
+        # Does NOT affect agent responses, log lines, or tool outputs.
         # Supported: en, zh, ja, de, es, fr, tr, uk.  Unknown values fall back to en.
         "language": "en",
         # TUI busy indicator style: kaomoji (default), emoji, unicode (braille

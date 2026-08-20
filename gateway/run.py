@@ -59,7 +59,7 @@ from agent.conversation_compression import (
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
 )
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
-from agent.i18n import t
+from agent.i18n import get_language, t
 from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import (
     compression_made_progress,
@@ -114,6 +114,28 @@ _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
+
+
+def _format_long_running_heartbeat(*, minutes: int, detail: str = "") -> str:
+    """Render the localized long-running status line."""
+    return t("gateway.working.heartbeat", minutes=minutes, detail=detail)
+
+
+def _format_long_running_notification(
+    *,
+    mode: str,
+    minutes: int,
+    detail: str,
+    generic_phrase: Callable[[], str],
+    has_custom_phrase_catalog: bool = False,
+) -> str:
+    """Use generic phrases for English or an explicitly customized catalog."""
+    if mode == "generic" and (
+        get_language() == "en" or has_custom_phrase_catalog
+    ):
+        return generic_phrase()
+    return _format_long_running_heartbeat(minutes=minutes, detail=detail)
+
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -7779,32 +7801,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return True
 
     def _telegram_topic_root_lobby_message(self) -> str:
-        return (
-            "This main chat is reserved for system commands.\n\n"
-            "To start a new Hermes chat, open the All Messages topic at the top "
-            "of this bot interface and send any message there. Telegram will "
-            "create a new topic for that message; each topic works as an "
-            "independent Hermes session."
-        )
+        return t("gateway.telegram_topics.root_lobby")
 
     def _telegram_topic_root_new_message(self) -> str:
-        return (
-            "To start a new parallel Hermes chat, open the All Messages topic "
-            "at the top of this bot interface and send any message there. "
-            "Telegram will create a new topic for it.\n\n"
-            "Each topic is an independent Hermes session. Use /new inside an "
-            "existing topic only if you want to replace that topic's current session."
-        )
+        return t("gateway.telegram_topics.root_new")
 
     def _telegram_topic_new_header(self, source: SessionSource) -> Optional[str]:
         if not self._is_telegram_topic_lane(source):
             return None
-        return (
-            "Started a new Hermes session in this topic.\n\n"
-            "Tip: for parallel work, open All Messages and send a message there "
-            "to create a separate topic instead of using /new here. /new replaces "
-            "the session attached to the current topic."
-        )
+        return t("gateway.telegram_topics.new_header")
 
     def _record_telegram_topic_binding(
         self,
@@ -17250,10 +17255,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event=event,
                 command="new",
                 title="/new",
-                detail=(
-                    "This starts a fresh session and discards the current "
-                    "conversation history."
-                ),
+                detail=t("gateway.destructive_slash.new_detail"),
                 execute=_do_reset,
             )
 
@@ -17439,9 +17441,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except (ValueError, IndexError):
                     _undo_n = 1
             _undo_detail = (
-                "This removes the last user/assistant exchange from history."
+                t("gateway.destructive_slash.undo_one_detail")
                 if _undo_n == 1
-                else f"This removes the last {_undo_n} user turns from history."
+                else t("gateway.destructive_slash.undo_many_detail", count=_undo_n)
             )
             return await self._maybe_confirm_destructive_slash(
                 event=event,
@@ -20835,13 +20837,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         base_url = resolved.base_url
         context_length = resolved.context_length
 
-        # Format context source hint
         if resolved.context_source == "config":
-            ctx_source = "config"
+            ctx_source = t("gateway.session_info.source_config")
         elif resolved.context_source == "default":
-            ctx_source = "default — set model.context_length in config to override"
+            ctx_source = t("gateway.session_info.source_default")
         else:
-            ctx_source = "detected"
+            ctx_source = t("gateway.session_info.source_detected")
 
         # Format context length for display
         if context_length >= 1_000_000:
@@ -20852,14 +20853,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ctx_display = str(context_length)
 
         lines = [
-            f"◆ Model: `{model}`",
-            f"◆ Provider: {provider or 'openrouter'}",
-            f"◆ Context: {ctx_display} tokens ({ctx_source})",
+            f"◆ {t('gateway.context.model', model=model)}",
+            f"◆ {t('gateway.model.provider_label', provider=provider or 'openrouter')}",
+            f"◆ {t('gateway.model.context_label', tokens=ctx_display)} ({ctx_source})",
         ]
 
         # Show endpoint for local/custom setups
         if base_url and base_url_hostname(base_url) in ("localhost", "127.0.0.1", "0.0.0.0"):
-            lines.append(f"◆ Endpoint: {base_url}")
+            lines.append(f"◆ {t('gateway.session_info.endpoint', url=base_url)}")
 
         return "\n".join(lines)
 
@@ -23379,7 +23380,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         async def _on_confirm(choice: str):
             if choice == "cancel":
-                return f"🟡 /{command} cancelled. Conversation unchanged."
+                return t("gateway.destructive_slash.cancelled", command=command)
             persisted = False
             if choice == "always":
                 try:
@@ -23408,22 +23409,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             result = await execute()
             if choice == "always":
                 if persisted:
-                    note = (
-                        "\n\nℹ️ Future /clear, /new, /reset, and /undo will run "
-                        "without confirmation. Re-enable via "
-                        "`approvals.destructive_slash_confirm: true` in config.yaml."
-                    )
+                    note = t("gateway.destructive_slash.always_followup")
                 else:
                     # The user did approve this run, so the action still goes
                     # ahead, but the preference did not stick and the prompt
                     # will be back next time. Say so rather than promising an
                     # opt-out that was never written.
-                    note = (
-                        "\n\n⚠️ Could not save that preference (config.yaml is not "
-                        "writable), so /clear, /new, /reset, and /undo will ask "
-                        "again next time. To silence it permanently, set "
-                        "`approvals.destructive_slash_confirm: false` in config.yaml."
-                    )
+                    note = t("gateway.destructive_slash.persist_failed")
                 if isinstance(result, str):
                     return result + note
                 # EphemeralReply or other: leave untouched, since the note would
@@ -23432,14 +23424,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return result
 
         _p = self._typed_command_prefix_for(event.source.platform)
-        prompt_message = (
-            f"⚠️ **Confirm /{command}**\n\n"
-            f"{detail}\n\n"
-            "Choose:\n"
-            "• **Approve Once** — proceed this time only\n"
-            "• **Always Approve** — proceed and silence this prompt permanently\n"
-            "• **Cancel** — keep current conversation\n\n"
-            f"_Text fallback: reply `{_p}approve`, `{_p}always`, or `{_p}cancel`._"
+        prompt_message = t(
+            "gateway.destructive_slash.confirm_prompt",
+            command=command,
+            detail=detail,
+            prefix=_p,
         )
         return await self._request_slash_confirm(
             event=event,
@@ -24101,7 +24090,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             result = await transport.send(
                 platform,
                 str(chat_id),
-                "♻ Gateway restarted successfully. Your session continues.",
+                t("gateway.restart.success"),
                 metadata=_non_conversational_metadata(metadata, platform=platform),
             )
             # adapter.send() catches provider errors (e.g. "Chat not found")
@@ -24142,7 +24131,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
-        message = "♻️ Gateway online — Hermes is back and ready."
+        message = t("gateway.restart.online")
 
         for platform, platform_cfg in self.config.platforms.items():
             home = platform_cfg.home_channel
@@ -28040,9 +28029,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
-        from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
+        from gateway.status_phrases import (
+            choose_status_phrase,
+            resolve_status_phrase_catalog,
+            status_phrase_catalog_is_custom,
+        )
         _generic_status_recent: List[str] = []
         _generic_status_catalog = resolve_status_phrase_catalog(user_config, platform_key)
+        _generic_status_catalog_is_custom = status_phrase_catalog_is_custom(
+            _generic_status_catalog
+        )
 
         def _display_surface_mode(
             setting: str,
@@ -28730,7 +28726,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _parts = []
                         if _want_iteration_detail:
                             _parts.append(
-                                f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
+                                t(
+                                    "gateway.working.iteration",
+                                    current=_a["api_call_count"],
+                                    maximum=_a["max_iterations"],
+                                )
                             )
                         _action = _a.get("current_tool") or _a.get("last_activity_desc")
                         if _action:
@@ -28739,10 +28739,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _status_detail = " — " + ", ".join(_parts)
                     except Exception:
                         pass
-                _heartbeat_text = (
-                    _generic_status_phrase("status")
-                    if _long_running_mode == "generic"
-                    else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
+                _heartbeat_text = _format_long_running_notification(
+                    mode=_long_running_mode,
+                    minutes=_elapsed_mins,
+                    detail=_status_detail,
+                    generic_phrase=lambda: _generic_status_phrase("status"),
+                    has_custom_phrase_catalog=_generic_status_catalog_is_custom,
                 )
                 try:
                     _notify_res = None

@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
-from agent.i18n import t
+from agent.i18n import get_language, t
 from agent.turn_context import extract_api_content_sidecar
 from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
@@ -54,6 +54,23 @@ logger = logging.getLogger("gateway.run")
 # past this the reset proceeds and the cleanup is left to finish (or leak) in
 # its worker thread. (#35994)
 _RESET_CLEANUP_TIMEOUT_S = 30.0
+
+
+def _localized_reset_tip() -> str:
+    """Render a reset tip only when its corpus matches the active language.
+
+    The bundled tip corpus is currently English-only. A translated ``Tip:``
+    prefix followed by an English sentence is worse than omitting the optional
+    hint, so non-English UIs stay clean until localized corpora are available.
+    """
+    if get_language() != "en":
+        return ""
+    try:
+        from hermes_cli.tips import get_random_tip
+
+        return t("gateway.reset.tip", tip=get_random_tip())
+    except Exception:
+        return ""
 
 
 def _clean_str(value: Any) -> str:
@@ -341,12 +358,8 @@ class GatewaySlashCommandsMixin:
         except Exception:
             pass
 
-        # Append a random tip to the reset message
-        try:
-            from hermes_cli.tips import get_random_tip
-            _tip_line = t("gateway.reset.tip", tip=get_random_tip())
-        except Exception:
-            _tip_line = ""
+        # Do not mix the English-only tip corpus into localized reset banners.
+        _tip_line = _localized_reset_tip()
 
         if session_info:
             return EphemeralReply(f"{header}\n\n{session_info}{_tip_line}")

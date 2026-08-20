@@ -38,6 +38,41 @@ def _redact_telegram_error_text(error: object) -> str:
         return "<telegram error redacted>"
 
 
+def _slash_confirm_labels() -> Dict[str, str]:
+    """Return localized Telegram labels for the generic slash confirmation UI."""
+    from agent.i18n import t
+
+    return {
+        "button_once": t("gateway.slash_confirm.button_once"),
+        "button_always": t("gateway.slash_confirm.button_always"),
+        "button_cancel": t("gateway.slash_confirm.button_cancel"),
+        "result_once": t("gateway.slash_confirm.result_once"),
+        "result_always": t("gateway.slash_confirm.result_always"),
+        "result_cancel": t("gateway.slash_confirm.result_cancel"),
+        "resolved": t("gateway.slash_confirm.resolved"),
+        "by_user": t("gateway.slash_confirm.by_user"),
+        "unauthorized": t("gateway.slash_confirm.unauthorized"),
+        "already_resolved": t("gateway.slash_confirm.already_resolved"),
+    }
+
+
+def _clarify_labels() -> Dict[str, str]:
+    """Return localized Telegram labels for interactive clarify prompts."""
+    from agent.i18n import t
+
+    return {
+        "other_button": t("gateway.clarify.other_button"),
+        "type_answer": t("gateway.clarify.type_answer"),
+        "awaiting_typed": t("gateway.clarify.awaiting_typed"),
+        "invalid_choice": t("gateway.clarify.invalid_choice"),
+        "fallback_choice": t("gateway.clarify.fallback_choice"),
+        "expired_answer": t("gateway.clarify.expired_answer"),
+        "expired_edit": t("gateway.clarify.expired_edit"),
+        "unauthorized": t("gateway.slash_confirm.unauthorized"),
+        "already_resolved": t("gateway.slash_confirm.already_resolved"),
+    }
+
+
 def _scoped_gate_env(name: str, default: str = "") -> str:
     """Read a TELEGRAM_*/GATEWAY_* authorization gate env var per-profile.
 
@@ -6240,14 +6275,15 @@ class TelegramAdapter(BasePlatformAdapter):
 
         try:
             preview = self.format_message(self._truncate_preview(message, 3800))
+            labels = _slash_confirm_labels()
 
             keyboard = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("✅ Approve Once", callback_data=f"sc:once:{confirm_id}"),
-                    InlineKeyboardButton("🔒 Always Approve", callback_data=f"sc:always:{confirm_id}"),
+                    InlineKeyboardButton(labels["button_once"], callback_data=f"sc:once:{confirm_id}"),
+                    InlineKeyboardButton(labels["button_always"], callback_data=f"sc:always:{confirm_id}"),
                 ],
                 [
-                    InlineKeyboardButton("❌ Cancel", callback_data=f"sc:cancel:{confirm_id}"),
+                    InlineKeyboardButton(labels["button_cancel"], callback_data=f"sc:cancel:{confirm_id}"),
                 ],
             ])
 
@@ -6303,6 +6339,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         try:
             text = f"❓ {_html.escape(question)}"
+            labels = _clarify_labels()
             thread_id = self._metadata_thread_id(metadata)
 
             if choices:
@@ -6336,7 +6373,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     ])
                 rows.append([
                     InlineKeyboardButton(
-                        "✏️ Other (type answer)",
+                        labels["other_button"],
                         callback_data=f"cl:{clarify_id}:other",
                     )
                 ])
@@ -7006,15 +7043,16 @@ class TelegramAdapter(BasePlatformAdapter):
         misleading ✓ (or an "awaiting typed response" prompt) on a button the
         agent never receives.
         """
+        labels = _clarify_labels()
         try:
-            await query.answer(text="⚠️ This prompt expired — please /retry.")
+            await query.answer(text=labels["expired_answer"])
         except Exception:
             pass
         try:
             await query.edit_message_text(
                 text=(
                     f"❓ {_html.escape(query.message.text or '')}\n\n"
-                    "<i>⚠️ This question expired or the session reset — please /retry.</i>"
+                    f"<i>{_html.escape(labels['expired_edit'])}</i>"
                 ),
                 parse_mode=ParseMode.HTML,
                 reply_markup=None,
@@ -7156,6 +7194,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 confirm_id = parts[2]
 
                 caller_id = str(getattr(query.from_user, "id", ""))
+                labels = _slash_confirm_labels()
                 if not self._is_callback_user_authorized(
                     caller_id,
                     chat_id=query_chat_id,
@@ -7163,27 +7202,29 @@ class TelegramAdapter(BasePlatformAdapter):
                     thread_id=str(query_thread_id) if query_thread_id is not None else None,
                     user_name=query_user_name,
                 ):
-                    await query.answer(text="⛔ You are not authorized to answer this prompt.")
+                    await query.answer(text=labels["unauthorized"])
                     return
 
                 session_key = self._slash_confirm_state.pop(confirm_id, None)
                 if not session_key:
-                    await query.answer(text="This prompt has already been resolved.")
+                    await query.answer(text=labels["already_resolved"])
                     return
 
                 label_map = {
-                    "once": "✅ Approved once",
-                    "always": "🔒 Always approve",
-                    "cancel": "❌ Cancelled",
+                    "once": labels["result_once"],
+                    "always": labels["result_always"],
+                    "cancel": labels["result_cancel"],
                 }
                 user_display = getattr(query.from_user, "first_name", "User")
-                label = label_map.get(choice, "Resolved")
+                label = label_map.get(choice, labels["resolved"])
 
                 await query.answer(text=label)
 
                 try:
                     await query.edit_message_text(
-                        text=self.format_message(f"{label} by {user_display}"),
+                        text=self.format_message(
+                            labels["by_user"].format(label=label, user=user_display)
+                        ),
                         parse_mode=ParseMode.MARKDOWN_V2,
                         reply_markup=None,
                     )
@@ -7254,6 +7295,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if len(parts) == 3:
                 clarify_id = parts[1]
                 choice_token = parts[2]
+                labels = _clarify_labels()
 
                 caller_id = str(getattr(query.from_user, "id", ""))
                 if not self._is_callback_user_authorized(
@@ -7263,12 +7305,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     thread_id=str(query_thread_id) if query_thread_id is not None else None,
                     user_name=query_user_name,
                 ):
-                    await query.answer(text="⛔ You are not authorized to answer this prompt.")
+                    await query.answer(text=labels["unauthorized"])
                     return
 
                 session_key = self._clarify_state.get(clarify_id)
                 if not session_key:
-                    await query.answer(text="This prompt has already been resolved.")
+                    await query.answer(text=labels["already_resolved"])
                     return
 
                 user_display = getattr(query.from_user, "first_name", "User")
@@ -7294,10 +7336,14 @@ class TelegramAdapter(BasePlatformAdapter):
                         await self._notify_clarify_expired(query, user_display)
                         return
 
-                    await query.answer(text="✏️ Type your answer in the chat.")
+                    await query.answer(text=labels["type_answer"])
                     try:
                         await query.edit_message_text(
-                            text=f"❓ {query.message.text or ''}\n\n<i>Awaiting typed response from {_html.escape(user_display)}…</i>",
+                            text=(
+                                f"❓ {query.message.text or ''}\n\n<i>"
+                                f"{_html.escape(labels['awaiting_typed'].format(user=user_display))}"
+                                "</i>"
+                            ),
                             parse_mode=ParseMode.HTML,
                             reply_markup=None,
                         )
@@ -7309,7 +7355,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 try:
                     idx = int(choice_token)
                 except (ValueError, TypeError):
-                    await query.answer(text="Invalid choice.")
+                    await query.answer(text=labels["invalid_choice"])
                     return
 
                 # Look up the choice text from the entry registered in the
@@ -7328,7 +7374,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     # Race: entry vanished. Echo the index as a number so
                     # the agent at least sees an intentional response
                     # rather than nothing.
-                    resolved_text = f"choice {idx + 1}"
+                    resolved_text = labels["fallback_choice"].format(index=idx + 1)
 
                 # Pop state and resolve
                 self._clarify_state.pop(clarify_id, None)

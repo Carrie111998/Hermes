@@ -1,14 +1,15 @@
 # Hermes static-message catalog -- English (baseline / source of truth)
 #
-# Only user-facing static messages from the CLI approval prompt and a handful
-# of gateway slash-command replies live here.  Agent-generated output, log
-# lines, error tracebacks, tool outputs, and slash-command descriptions stay
-# in English and are NOT translated -- see agent/i18n.py for scope rationale.
+# User-facing static messages from approval prompts and gateway slash-command
+# replies live here, plus sparse platform-menu overrides where available.
+# Agent-generated output, logs, error tracebacks, and tool outputs are not
+# translated -- see agent/i18n.py for scope rationale.
 #
 # Keys are dotted paths; nesting below is purely for readability.  Values may
 # contain {placeholder} tokens for str.format substitution.  When adding a
-# new key, add it to EVERY locale file (en/zh/ja/de/es/fr/tr/uk) in the same commit --
-# tests/agent/test_i18n.py asserts catalog parity.
+# new core key, add it to EVERY locale file in the same commit --
+# tests/agent/test_i18n.py asserts parity. Sparse platform-menu and incremental
+# gateway overrides are explicitly exempt and fall back cleanly.
 
 approval:
   # CLI approval prompt -- shown when a dangerous command needs user review.
@@ -37,6 +38,51 @@ gateway:
   no_active_goal:   "No active goal."
   config_read_failed: "⚠️ Could not read config.yaml: {error}"
   config_save_failed: "⚠️ Could not save config: {error}"
+
+  slash_confirm:
+    button_once:       "✅ Approve Once"
+    button_always:     "🔒 Always Approve"
+    button_cancel:     "❌ Cancel"
+    result_once:       "✅ Approved once"
+    result_always:     "🔒 Always approve"
+    result_cancel:     "❌ Cancelled"
+    resolved:          "Resolved"
+    by_user:           "{label} by {user}"
+    unauthorized:      "⛔ You are not authorized to answer this prompt."
+    already_resolved:  "This prompt has already been resolved."
+
+  destructive_slash:
+    cancelled:         "🟡 /{command} cancelled. Conversation unchanged."
+    always_followup:   "\n\nℹ️ Future /clear, /new, /reset, and /undo will run without confirmation. Re-enable via `approvals.destructive_slash_confirm: true` in config.yaml."
+    persist_failed:    "\n\n⚠️ Could not save that preference (config.yaml is not writable), so /clear, /new, /reset, and /undo will ask again next time. To silence it permanently, set `approvals.destructive_slash_confirm: false` in config.yaml."
+    confirm_prompt:    "⚠️ **Confirm /{command}**\n\n{detail}\n\nChoose:\n• **Approve Once** — proceed this time only\n• **Always Approve** — proceed and silence this prompt permanently\n• **Cancel** — keep current conversation\n\n_Text fallback: reply `{prefix}approve`, `{prefix}always`, or `{prefix}cancel`._"
+    new_detail:        "This starts a fresh session and discards the current conversation history."
+    undo_one_detail:   "This removes the last user/assistant exchange from history."
+    undo_many_detail:  "This removes the last {count} user turns from history."
+
+  session_info:
+    source_config:     "config"
+    source_default:    "default — set model.context_length in config to override"
+    source_detected:   "detected"
+    endpoint:          "Endpoint: {url}"
+
+  telegram_topics:
+    root_lobby:        "This main chat is reserved for system commands.\n\nTo start a new Hermes chat, open the All Messages topic at the top of this bot interface and send any message there. Telegram will create a new topic for that message; each topic works as an independent Hermes session."
+    root_new:          "To start a new parallel Hermes chat, open the All Messages topic at the top of this bot interface and send any message there. Telegram will create a new topic for it.\n\nEach topic is an independent Hermes session. Use /new inside an existing topic only if you want to replace that topic's current session."
+    new_header:        "Started a new Hermes session in this topic.\n\nTip: for parallel work, open All Messages and send a message there to create a separate topic instead of using /new here. /new replaces the session attached to the current topic."
+
+  clarify:
+    other_button:      "✏️ Other (type answer)"
+    type_answer:       "✏️ Type your answer in the chat."
+    awaiting_typed:    "Awaiting typed response from {user}…"
+    invalid_choice:    "Invalid choice."
+    fallback_choice:   "choice {index}"
+    expired_answer:    "⚠️ This prompt expired — please /retry."
+    expired_edit:      "⚠️ This question expired or the session reset — please /retry."
+
+  working:
+    iteration:         "iteration {current}/{maximum}"
+    heartbeat:         "⏳ Working — {minutes} min{detail}"
 
   # /model command output -- shown after a model switch or when listing models.
   # Provider names, model IDs, capability strings, and cost figures are NOT
@@ -258,6 +304,8 @@ gateway:
   restart:
     in_progress:           "⏳ Gateway restart already in progress..."
     restarting:            "♻ Restarting gateway. If you aren't notified within 60 seconds, restart from the console with `hermes gateway restart`."
+    success:               "♻ Gateway restarted successfully. Your session continues."
+    online:                "♻️ Gateway online — Hermes is back and ready."
 
   resume:
     db_unavailable:        "Session database not available."

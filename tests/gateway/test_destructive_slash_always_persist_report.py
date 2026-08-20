@@ -37,6 +37,7 @@ def _runner():
 
     async def _request_slash_confirm(*, event, command, title, message, handler):
         captured["handler"] = handler
+        captured["message"] = message
         return "prompted"
 
     obj._request_slash_confirm = _request_slash_confirm
@@ -130,3 +131,43 @@ async def test_cancel_does_not_persist(fake_cli):
 
     assert fake_cli.calls == []
     assert "cancelled" in out.lower()
+
+
+@pytest.mark.asyncio
+async def test_german_prompt_and_success_followup_are_localized(fake_cli, monkeypatch):
+    from agent import i18n
+
+    monkeypatch.setenv("HERMES_LANGUAGE", "de")
+    i18n.reset_language_cache()
+    runner = _runner()
+    try:
+        out = await _resolve(runner, "always", result="✨ Neue Sitzung gestartet!")
+    finally:
+        i18n.reset_language_cache()
+
+    prompt = runner._captured["message"]
+    assert "bestätigen" in prompt.lower()
+    assert "Einmal genehmigen" in prompt
+    assert "Dauerhaft genehmigen" in prompt
+    assert "Abbrechen" in prompt
+    assert "Choose:" not in prompt
+    assert "Approve Once" not in prompt
+    assert "künftig ohne Rückfrage" in out
+    assert "Sicherheitsabfrage" in out
+    assert "Future /clear" not in out
+
+
+@pytest.mark.asyncio
+async def test_german_cancel_result_is_localized(fake_cli, monkeypatch):
+    from agent import i18n
+
+    monkeypatch.setenv("HERMES_LANGUAGE", "de")
+    i18n.reset_language_cache()
+    try:
+        out = await _resolve(_runner(), "cancel")
+    finally:
+        i18n.reset_language_cache()
+
+    assert "abgebrochen" in out.lower()
+    assert "unverändert" in out.lower()
+    assert "cancelled" not in out.lower()

@@ -1831,7 +1831,7 @@ display:
   file_mutation_verifier: true    # Append an advisory footer when write_file/patch calls failed this turn
   credits_notices: true   # Nous credits status-bar notices (usage bands, grant-spent, depleted). false = silence them; /usage still works
   cli_rebuild_scrollback_on_redraw: false  # Classic CLI: also wipe terminal scrollback (CSI 3J) on /redraw / Ctrl+L / width-change resize recovery. Enable when a terminal/tmux stack stamps stale prompt chrome into scrollback on maximize/restore.
-  language: en            # UI language for static messages (approval prompts, some gateway replies). en | zh | zh-hant | ja | de | es | fr | tr | uk | af | ko | it | ga | pt | ru | hu
+  language: en            # UI language for static messages and bundled platform menus. en | zh | zh-hant | ja | de | es | fr | tr | uk | af | ko | it | ga | pt | ru | hu
 ```
 
 ### Per-turn summary and spinner token flow
@@ -1894,7 +1894,9 @@ If writes to Hermes state (cron jobs, skills, scripts under `~/.hermes/`) are fa
 
 ### UI language for static messages
 
-The `display.language` setting translates a small set of static user-facing messages — the CLI approval prompt, a handful of gateway slash-command replies (e.g. restart-drain notices, "approval expired", "goal cleared"). It does **not** translate agent responses, log lines, tool output, error tracebacks, or slash-command descriptions — those stay in English. If you want the agent itself to reply in another language, just tell it in your prompt or system message.
+The `display.language` setting translates static user-facing messages such as the CLI approval prompt, gateway slash-command replies, reset/session banners, and any bundled platform-menu descriptions available for that language. Telegram uses these localized descriptions for built-in commands; plugin and skill commands keep the text supplied by their owners. Agent responses, log lines, tool output, and error tracebacks are not translated. If you want the agent itself to reply in another language, tell it in your prompt or system message.
+
+The general tip corpus is currently English-only. Non-English reset banners omit that optional tip instead of mixing an English sentence into an otherwise localized response. The bundled generic long-running phrase catalog is also English-only; non-English UIs use the localized structured heartbeat instead, unless a custom phrase catalog is configured.
 
 Supported values: `en` (default), `zh` (Simplified Chinese), `zh-hant` (Traditional Chinese), `ja` (Japanese), `de` (German), `es` (Spanish), `fr` (French), `tr` (Turkish), `uk` (Ukrainian), `af` (Afrikaans), `ko` (Korean), `it` (Italian), `ga` (Irish), `pt` (Portuguese), `ru` (Russian), `hu` (Hungarian). Unknown values fall back to English.
 

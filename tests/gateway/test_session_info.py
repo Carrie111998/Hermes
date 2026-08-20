@@ -1,6 +1,7 @@
 """Tests for GatewayRunner._format_session_info — session config surfacing."""
 
 import pytest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from gateway.run import GatewayRunner
@@ -25,6 +26,61 @@ def _patch_info(tmp_path, config_yaml, model, runtime):
 
 
 class TestFormatSessionInfo:
+
+    def test_uses_configured_german_labels(self, runner, monkeypatch):
+        """The reset banner must not mix English labels into a German UI."""
+        from agent import i18n
+
+        monkeypatch.setenv("HERMES_LANGUAGE", "de")
+        i18n.reset_language_cache()
+        resolved = SimpleNamespace(
+            model="gpt-5.6-sol",
+            provider="openai-codex",
+            base_url="http://localhost:11434/v1",
+            context_length=900_000,
+            context_source="detected",
+        )
+        try:
+            with patch("gateway.run._resolve_gateway_model_context", return_value=resolved):
+                info = runner._format_session_info()
+        finally:
+            i18n.reset_language_cache()
+
+        assert "◆ Modell: `gpt-5.6-sol`" in info
+        assert "◆ Anbieter: openai-codex" in info
+        assert "◆ Kontext: 900K Tokens (automatisch erkannt)" in info
+        assert "◆ Endpunkt: http://localhost:11434/v1" in info
+        assert "◆ Model:" not in info
+        assert "◆ Provider:" not in info
+        assert "◆ Context:" not in info
+        assert "◆ Endpoint:" not in info
+
+    def test_english_context_source_wording_stays_backward_compatible(
+        self, runner, monkeypatch
+    ):
+        """Localization must not rewrite the established English reset banner."""
+        from agent import i18n
+
+        monkeypatch.setenv("HERMES_LANGUAGE", "en")
+        i18n.reset_language_cache()
+        resolved = SimpleNamespace(
+            model="test-model",
+            provider="openrouter",
+            base_url="",
+            context_length=128_000,
+            context_source="detected",
+        )
+        try:
+            with patch("gateway.run._resolve_gateway_model_context", return_value=resolved):
+                info = runner._format_session_info()
+        finally:
+            i18n.reset_language_cache()
+
+        assert info == (
+            "◆ Model: `test-model`\n"
+            "◆ Provider: openrouter\n"
+            "◆ Context: 128K tokens (detected)"
+        )
 
     def test_includes_model_name(self, runner, tmp_path):
         p1, p2, p3 = _patch_info(tmp_path, "model:\n  default: anthropic/claude-opus-4.6\n  provider: openrouter\n",
