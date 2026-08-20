@@ -832,8 +832,9 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // it — Cursor-style. Every click opens a fresh "New session" tab (multiple
   // empty tabs are fine since none touch the session list).
   const openNewSessionTab = useCallback(() => {
+    $newChatProfile.set(null)
     void openNewSessionTile('center', { listed: false })
-  }, [openNewSessionTile])
+  }, [openNewSessionTile, $newChatProfile])
 
   // Archive the selected session (rebindable `session.archive` hotkey).
   const archiveSelectedSession = useCallback(() => {
