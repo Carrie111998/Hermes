@@ -71,4 +71,20 @@ describe('sidebar navigation selection', () => {
       })
     ).toBe(false)
   })
+
+  test.each<[string, string]>([
+    ['skills', '/skills'],
+    ['messaging', '/messaging'],
+    ['artifacts', '/artifacts'],
+    ['cron', '/cron']
+  ])('clears stale built in %s route selection while a session tile is visible', (id, route) => {
+    expect(
+      sidebarNavItemIsActive({
+        contributed: false,
+        currentView: 'chat',
+        item: item(id, route),
+        pathname: route
+      })
+    ).toBe(false)
+  })
 })
