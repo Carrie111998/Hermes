@@ -4,9 +4,11 @@ oauth-reauth-expiry-check feature).
 Covers: the 2-day warning-window boundary math, the jid-vs-family-member
 differentiated notification behavior (daily-until-fixed vs. one-time
 heads-up+expired), the no-sidecar fallback (purely reactive), state reset on
-a fresh re-auth cycle, and vault-Profile.md-based delivery-target resolution
-(scripts/_family_delivery.py) — including the missing/malformed-profile
-failure modes, which must skip loudly rather than guess or misdeliver.
+a fresh re-auth cycle, vault-Profile.md-frontmatter-based delivery-target
+resolution (scripts/_family_delivery.py) — including the missing/malformed
+frontmatter failure modes, which must skip loudly rather than guess or
+misdeliver — and the pre-flight canary check that proactively alerts the
+primary identity when any identity's delivery target fails to resolve.
 
 Identity generality: nothing here special-cases "jid" or "zarkash" by name —
 every differentiated-behavior test constructs its own registry with
@@ -108,23 +110,44 @@ def _profile_path(vault_root: Path, identity: str, *, is_primary: bool) -> Path:
 
 def _write_profile(
     vault_root: Path, identity: str, chat_id: str, *, is_primary: bool = False,
-    table_row: "str | None" = None,
+    frontmatter_field: "str | None" = None, include_field: bool = True,
 ) -> Path:
-    """Write a realistic vault Profile.md fixture with a Platform Identity
-    table, matching the real format observed on the live vault."""
+    """Write a realistic vault Profile.md fixture with a ``telegram_chat_id``
+    YAML frontmatter field, matching the real format observed on the live
+    vault. The "Platform Identity" table is also included since it's still
+    present on real profiles as the human-readable record, but it is no
+    longer what resolution reads.
+
+    ``frontmatter_field`` overrides the generated field line entirely (used
+    to construct malformed-value fixtures). ``include_field=False`` omits
+    the field altogether (used to construct missing-field fixtures).
+    """
     path = _profile_path(vault_root, identity, is_primary=is_primary)
     path.parent.mkdir(parents=True, exist_ok=True)
-    row = table_row if table_row is not None else f"| Telegram | — | {chat_id} |"
+    if frontmatter_field is not None:
+        field_line = frontmatter_field
+        if not field_line.endswith("\n"):
+            field_line += "\n"
+    elif include_field:
+        field_line = (
+            f'telegram_chat_id: "{chat_id}"  '
+            "# read by hermes-oauth-expiry-check.py -- do not rename/remove\n"
+        )
+    else:
+        field_line = ""
     path.write_text(
-        "---\nstatus: canonical\n---\n\n"
+        "---\nstatus: canonical\n"
+        f"{field_line}"
+        "---\n\n"
         f"# {identity.capitalize()} Profile\n\n"
         "## Platform Identity\n\n"
         "| Platform | Username | User ID |\n"
         "|---|---|---|\n"
         "| Slack | someone | U0123456789 |\n"
-        f"{row}\n"
+        f"| Telegram | — | {chat_id} |\n"
         "| Discord | — | 1519435081708736513 |\n\n"
-        "Recorded here for consistency.\n",
+        "Recorded here for consistency (human-readable mirror only -- "
+        "resolution reads the frontmatter field above).\n",
         encoding="utf-8",
     )
     return path
@@ -413,14 +436,14 @@ class TestDeliveryTargetGap:
         assert any("SKIPPED" in line for line in logs)
         assert sent == []
 
-    def test_malformed_telegram_row_skips_without_guessing(self, mod, hermes_home, vault_root, monkeypatch):
+    def test_malformed_telegram_chat_id_field_skips_without_guessing(self, mod, hermes_home, vault_root, monkeypatch):
         entry_dir = hermes_home / "family_credentials" / "mystery_person"
         now = datetime.now(timezone.utc)
         _write_sidecar(entry_dir, (now - timedelta(days=6)).timestamp(), identity="mystery_person")
         entry = {"credentials_dir": entry_dir}
-        # Telegram row present but the ID cell is the "not recorded yet"
+        # Frontmatter field present but its value is the "not recorded yet"
         # placeholder, not a real numeric id.
-        _write_profile(vault_root, "mystery_person", "—", table_row="| Telegram | — | — |")
+        _write_profile(vault_root, "mystery_person", "—", frontmatter_field='telegram_chat_id: "—"')
         sent = _patch_common(mod, monkeypatch, check_ok=True)
 
         state: dict = {}
@@ -431,14 +454,12 @@ class TestDeliveryTargetGap:
         assert any("SKIPPED" in line for line in logs)
         assert sent == []
 
-    def test_missing_telegram_row_entirely_skips(self, mod, hermes_home, vault_root, monkeypatch):
+    def test_missing_telegram_chat_id_field_entirely_skips(self, mod, hermes_home, vault_root, monkeypatch):
         entry_dir = hermes_home / "family_credentials" / "mystery_person"
         now = datetime.now(timezone.utc)
         _write_sidecar(entry_dir, (now - timedelta(days=6)).timestamp(), identity="mystery_person")
         entry = {"credentials_dir": entry_dir}
-        path = _profile_path(vault_root, "mystery_person", is_primary=False)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("---\nstatus: canonical\n---\n\n# Mystery Person\n\nNo platform table here.\n", encoding="utf-8")
+        _write_profile(vault_root, "mystery_person", "000", is_primary=False, include_field=False)
         sent = _patch_common(mod, monkeypatch, check_ok=True)
 
         state: dict = {}
@@ -503,18 +524,28 @@ class TestFamilyDeliveryResolutionUnit:
                 "nobody", is_primary=False, vault_root=vault_root, hermes_home=hermes_home,
             )
 
-    def test_missing_telegram_row_raises(self, fd, vault_root, hermes_home):
+    def test_missing_telegram_chat_id_field_raises(self, fd, vault_root, hermes_home):
         path = _profile_path(vault_root, "nobody", is_primary=False)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("---\nstatus: canonical\n---\n\n# Nobody\n", encoding="utf-8")
-        with pytest.raises(fd.DeliveryTargetResolutionError, match="no '\\| Telegram"):
+        with pytest.raises(fd.DeliveryTargetResolutionError, match="no 'telegram_chat_id' field"):
             fd.resolve_telegram_chat_id(
                 "nobody", is_primary=False, vault_root=vault_root, hermes_home=hermes_home,
             )
 
     def test_non_numeric_id_raises(self, fd, vault_root, hermes_home):
-        _write_profile(vault_root, "nobody", "—", table_row="| Telegram | — | — |")
-        with pytest.raises(fd.DeliveryTargetResolutionError, match="non-numeric"):
+        _write_profile(vault_root, "nobody", "—", frontmatter_field='telegram_chat_id: "—"')
+        with pytest.raises(fd.DeliveryTargetResolutionError, match="not a valid numeric id"):
+            fd.resolve_telegram_chat_id(
+                "nobody", is_primary=False, vault_root=vault_root, hermes_home=hermes_home,
+            )
+
+    def test_malformed_frontmatter_yaml_raises(self, fd, vault_root, hermes_home):
+        path = _profile_path(vault_root, "nobody", is_primary=False)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Unterminated frontmatter block -- no closing '---' line.
+        path.write_text("---\nstatus: canonical\n\n# Nobody\n", encoding="utf-8")
+        with pytest.raises(fd.DeliveryTargetResolutionError, match="not properly closed"):
             fd.resolve_telegram_chat_id(
                 "nobody", is_primary=False, vault_root=vault_root, hermes_home=hermes_home,
             )
@@ -558,3 +589,107 @@ class TestReminderMessageShape:
         assert "https://accounts.google.com/fake" in msg
         assert "reply to this message" in msg.lower() or "reply to THIS message" in msg
         assert "swipe" in msg.lower() or "hold" in msg.lower()
+
+
+class TestCanaryCheck:
+    """The pre-flight canary: catch a broken delivery target the same day
+    it breaks, by alerting the primary identity directly, separate from the
+    normal reminder flow."""
+
+    def test_all_resolvable_is_silent(self, mod, hermes_home, vault_root, monkeypatch):
+        _write_profile(vault_root, "admin_person", "111", is_primary=True)
+        _write_profile(vault_root, "family_person", "222")
+        identities = {
+            "admin_person": {"credentials_dir": hermes_home},
+            "family_person": {"credentials_dir": hermes_home / "family_credentials" / "family_person"},
+        }
+        sent = []
+        monkeypatch.setattr(
+            mod, "send_telegram_message",
+            lambda chat_id, message: (sent.append((chat_id, message)), (True, "ok"))[1],
+        )
+        logs = mod.run_canary_check(hermes_home, vault_root, identities)
+        assert logs == []
+        assert sent == []
+
+    def test_broken_family_member_alerts_primary(self, mod, hermes_home, vault_root, monkeypatch):
+        _write_profile(vault_root, "admin_person", "111", is_primary=True)
+        # family_person's Profile.md deliberately missing -> unresolvable.
+        identities = {
+            "admin_person": {"credentials_dir": hermes_home},
+            "family_person": {"credentials_dir": hermes_home / "family_credentials" / "family_person"},
+        }
+        sent = []
+        monkeypatch.setattr(
+            mod, "send_telegram_message",
+            lambda chat_id, message: (sent.append((chat_id, message)), (True, "ok"))[1],
+        )
+        logs = mod.run_canary_check(hermes_home, vault_root, identities)
+        assert any("canary" in line and "alerted primary" in line for line in logs)
+        assert len(sent) == 1
+        assert sent[0][0] == "111"  # sent to the PRIMARY's chat id
+        assert "family_person" in sent[0][1]
+
+    def test_broken_primary_itself_cannot_alert_anyone(self, mod, hermes_home, vault_root, monkeypatch):
+        # No Profile.md written for the primary at all -> its own delivery
+        # target is unresolvable, so there is nobody left to alert.
+        identities = {
+            "admin_person": {"credentials_dir": hermes_home},
+        }
+        sent = []
+        monkeypatch.setattr(
+            mod, "send_telegram_message",
+            lambda chat_id, message: (sent.append((chat_id, message)), (True, "ok"))[1],
+        )
+        logs = mod.run_canary_check(hermes_home, vault_root, identities)
+        assert any("cannot send a proactive alert" in line for line in logs)
+        assert sent == []
+
+    def test_dry_run_logs_without_sending(self, mod, hermes_home, vault_root, monkeypatch):
+        _write_profile(vault_root, "admin_person", "111", is_primary=True)
+        identities = {
+            "admin_person": {"credentials_dir": hermes_home},
+            "family_person": {"credentials_dir": hermes_home / "family_credentials" / "family_person"},
+        }
+        sent = []
+        monkeypatch.setattr(
+            mod, "send_telegram_message",
+            lambda chat_id, message: (sent.append((chat_id, message)), (True, "ok"))[1],
+        )
+        logs = mod.run_canary_check(hermes_home, vault_root, identities, dry_run=True)
+        assert any("[dry-run]" in line for line in logs)
+        assert sent == []
+
+    def test_main_wires_canary_check_before_identity_loop(self, mod, hermes_home, vault_root, monkeypatch, capsys):
+        """End-to-end smoke test: a broken family member's delivery target
+        must show up in main()'s own printed run summary via the canary
+        check, without crashing the rest of the run."""
+        _write_profile(vault_root, "jid", "8758899353", is_primary=True)
+        monkeypatch.setattr(
+            mod, "load_identities_registry",
+            lambda hermes_home: {
+                "jid": {"credentials_dir": hermes_home},
+                "family_person": {"credentials_dir": hermes_home / "family_credentials" / "family_person"},
+            },
+        )
+        # No sidecar written for "jid" -> falls into the no-sidecar fallback
+        # path, which still calls check_auth_live/fetch_fresh_auth_url/
+        # stage_reminder -- stub all three so this stays a deterministic
+        # unit test of the canary wiring, not a real subprocess/staging call.
+        _patch_common(mod, monkeypatch, check_ok=True)
+        sent = []
+        monkeypatch.setattr(
+            mod, "send_telegram_message",
+            lambda chat_id, message: (sent.append((chat_id, message)), (True, "ok"))[1],
+        )
+        monkeypatch.setattr(sys, "argv", [
+            "hermes-oauth-expiry-check.py",
+            "--hermes-home", str(hermes_home),
+            "--vault-root", str(vault_root),
+        ])
+        rc = mod.main()
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "canary" in out
+        assert "family_person" in out
+        assert any(c == "8758899353" for c, _ in sent)

@@ -34,23 +34,32 @@ changes to this file.
 
 Delivery-target resolution
 --------------------------
-Each identity's Telegram delivery target is resolved from their vault
-Profile.md's "Platform Identity" table (``scripts/_family_delivery.py``,
-same directory as this file) — confirmed live for both identities that
-exist today: ``jid`` -> ``Hermes/Profile/JID Profile.md``, ``zarkash`` ->
-``Hermes/Profile/Family/Zarkash/Zarkash Profile.md``. A new family member
-added to the Google identity registry resolves automatically via
+Each identity's Telegram delivery target is resolved from a
+``telegram_chat_id`` field in their vault Profile.md's YAML frontmatter
+block (``scripts/_family_delivery.py``, same directory as this file) —
+confirmed live for both identities that exist today: ``jid`` ->
+``Hermes/Profile/JID Profile.md``, ``zarkash`` ->
+``Hermes/Profile/Family/Zarkash/Zarkash Profile.md``. Frontmatter, not the
+"Platform Identity" table further down each file, is deliberately what gets
+parsed: it's a structurally separate block that normal profile edits (bios,
+notes) have no natural reason to touch, which meaningfully reduces the
+chance of an unrelated edit breaking this field. A new family member added
+to the Google identity registry resolves automatically via
 ``Hermes/Profile/Family/<Capitalized identity>/<Capitalized identity>
 Profile.md`` — zero code changes needed. See that module's docstring for
 the full resolution + fail-loud contract, including the cross-check against
 config.yaml's ``telegram.allow_from`` (per JID Profile.md's own stated
 policy: config.yaml wins on disagreement). If resolution fails for any
-reason (missing profile, missing/malformed Telegram row, or a mismatch
+reason (missing profile, missing/malformed frontmatter, or a mismatch
 against config.yaml), this job SKIPS that identity's reminder and says so
 loudly in its own operational summary rather than guessing a chat id or
 falling back to anyone else's — the same failure mode that caused the real
 2026-08-12 cross-person data-disclosure incident this system already has on
-record.
+record. See ``run_canary_check`` below for the proactive side of this: a
+pre-flight pass, run before anything else each invocation, that alerts the
+primary identity directly the same day any identity's delivery target
+breaks, rather than only surfacing the problem whenever that identity's
+reminder would next need to fire.
 
 Part 2 / Part 3 coupling
 -------------------------
@@ -414,6 +423,83 @@ def build_reminder_message(
 
 
 # ---------------------------------------------------------------------------
+# Pre-flight canary: catch a broken delivery target the same day it breaks,
+# rather than only discovering it the moment a reminder would need to fire.
+# ---------------------------------------------------------------------------
+
+def run_canary_check(
+    hermes_home: Path,
+    vault_root: Path,
+    identities: Dict[str, dict],
+    *,
+    dry_run: bool = False,
+) -> List[str]:
+    """Resolve every registered identity's Telegram delivery target before
+    doing anything else this run. If any identity fails to resolve, alert
+    the PRIMARY identity directly (a separate message from the normal
+    reminder flow, sent regardless of warning-window state) naming which
+    identity is broken and why -- so a vault-frontmatter formatting break
+    (or a missing config.yaml allow_from entry) surfaces proactively the
+    same day, not only whenever that identity's reminder would next need
+    to fire.
+    """
+    logs: List[str] = []
+    broken: List["tuple[str, str]"] = []
+    primary_chat_id: Optional[str] = None
+
+    for identity, entry in identities.items():
+        primary = is_primary_identity(entry, hermes_home)
+        chat_id = resolve_telegram_chat_id(
+            identity, is_primary=primary, vault_root=vault_root, hermes_home=hermes_home,
+        )
+        if chat_id is None:
+            reason = _LAST_DELIVERY_RESOLUTION_ERROR.pop(identity, "reason unknown")
+            broken.append((identity, reason))
+        elif primary:
+            primary_chat_id = chat_id
+
+    if not broken:
+        return logs
+
+    if primary_chat_id is None:
+        logs.append(
+            f"canary: {len(broken)} identity(ies) have a broken delivery "
+            "target, AND the primary identity's own delivery target is "
+            "also unresolvable -- cannot send a proactive alert to anyone. "
+            f"Broken: {', '.join(identity for identity, _ in broken)}"
+        )
+        return logs
+
+    detail_lines = "\n".join(f"- {identity}: {reason}" for identity, reason in broken)
+    message = (
+        "🩺 hermes-oauth-expiry-check canary alert\n\n"
+        "One or more family members' Telegram delivery target could not be "
+        "resolved this run -- their Google re-auth reminders will NOT be "
+        "sent until this is fixed:\n\n"
+        f"{detail_lines}\n\n"
+        "Check the affected identity's Profile.md -- the YAML frontmatter "
+        "block at the top of the file should have a valid "
+        "'telegram_chat_id' field."
+    )
+    if dry_run:
+        logs.append(
+            f"canary: [dry-run] would alert primary about {len(broken)} "
+            "broken identity(ies)"
+        )
+        return logs
+
+    ok, send_detail = send_telegram_message(primary_chat_id, message)
+    if ok:
+        logs.append(f"canary: alerted primary about {len(broken)} broken identity(ies)")
+    else:
+        logs.append(
+            f"canary: FAILED to alert primary about {len(broken)} broken "
+            f"identity(ies): {send_detail}"
+        )
+    return logs
+
+
+# ---------------------------------------------------------------------------
 # Per-identity evaluation
 # ---------------------------------------------------------------------------
 
@@ -614,6 +700,14 @@ def main() -> int:
 
     state = load_state(hermes_home)
     all_logs: List[str] = []
+
+    try:
+        all_logs.extend(
+            run_canary_check(hermes_home, vault_root, identities, dry_run=args.dry_run)
+        )
+    except Exception as exc:
+        all_logs.append(f"canary: CRASHED: {type(exc).__name__}: {exc}")
+
     for identity, entry in identities.items():
         try:
             all_logs.extend(
@@ -638,7 +732,13 @@ def main() -> int:
     # message content, auth URLs, or codes) and follows the standard
     # no_agent convention: silent when there's nothing notable to report.
     notable = any(
-        ("SKIPPED" in line or "FAILED" in line or "sent " in line or "CRASHED" in line)
+        (
+            "SKIPPED" in line
+            or "FAILED" in line
+            or "sent " in line
+            or "CRASHED" in line
+            or "canary:" in line
+        )
         for line in all_logs
     )
     if notable:

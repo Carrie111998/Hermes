@@ -9,24 +9,38 @@ data-disclosure incident.
 
 Where the data comes from
 --------------------------
-Every identity's platform IDs are already recorded, by convention, in a
-"Platform Identity" markdown table in that person's vault Profile.md:
+Every identity's Telegram chat id is recorded in a ``telegram_chat_id``
+field in that person's vault Profile.md YAML frontmatter (the ``---``
+delimited block at the very top of the file), e.g.:
 
-    | Platform | Username | User ID |
-    |---|---|---|
-    | Telegram | — | <chat_id> |
+    ---
+    status: canonical
+    purpose: ...
+    telegram_chat_id: "8758899353"  # read by hermes-oauth-expiry-check.py -- do not rename/remove
+    ---
 
 confirmed live for both identities that exist today:
   * jid     -> ``Hermes/Profile/JID Profile.md``
   * zarkash -> ``Hermes/Profile/Family/Zarkash/Zarkash Profile.md``
 
-JID Profile.md's own text says this table is "the human-readable mirror" of
-what's enforced at the gateway level (``config.yaml``'s ``telegram.allow_from``),
-"not a separate source of truth. If the two ever disagree, config.yaml's
-live gateway config wins; flag the mismatch." This module honors that
-explicitly: after parsing an ID out of Profile.md, it cross-checks the ID is
-also present in ``config.yaml``'s ``telegram.allow_from`` and raises rather
-than delivers if the two disagree, instead of trusting the vault file alone.
+Why frontmatter instead of the "Platform Identity" markdown table (this
+module's original design): the table lives in the file's prose body,
+alongside content that gets edited far more often (bios, notes, relationship
+history). Frontmatter is a structurally separate block at the top of the
+file that normal profile edits have no natural reason to touch, which
+meaningfully reduces the chance of an unrelated edit accidentally breaking
+this field. The "Platform Identity" table is left in each Profile.md as the
+human-readable record for people reading the file — it is no longer what
+this module parses.
+
+JID Profile.md's own text says these platform IDs are "the human-readable
+mirror" of what's enforced at the gateway level (``config.yaml``'s
+``telegram.allow_from``), "not a separate source of truth. If the two ever
+disagree, config.yaml's live gateway config wins; flag the mismatch." This
+module honors that explicitly: after parsing an id out of frontmatter, it
+cross-checks the id is also present in ``config.yaml``'s
+``telegram.allow_from`` and raises rather than delivers if the two
+disagree, instead of trusting the vault file alone.
 
 Path convention for a NEW identity (generality)
 -------------------------------------------------
@@ -47,14 +61,16 @@ e.g. ``zarkash`` -> ``Family/Zarkash/Zarkash Profile.md``. A new family
 member added to ``_google_identities.py`` as, say, ``"aria"`` resolves
 automatically to ``Family/Aria/Aria Profile.md`` — matching the exact
 folder-naming convention already used for Zarkash — the moment their vault
-folder exists with that name and a populated Platform Identity table.
+folder exists with that name, a populated frontmatter block, and a
+``telegram_chat_id`` field in it.
 """
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Optional
+
+import yaml
 
 # Fixed by vault convention, not derived from the identity string -- see
 # module docstring. There is exactly one master-user identity in this
@@ -62,21 +78,20 @@ from typing import Optional
 # identifies it); this is simply where THAT identity's own profile lives.
 _PRIMARY_PROFILE_RELATIVE_PATH = Path("Hermes") / "Profile" / "JID Profile.md"
 
-# Matches a full markdown table row for the Telegram platform, e.g.:
-#   | Telegram | — | 8758899353 |
-# Captures the LAST cell (User ID column). Deliberately anchored to a line
-# starting with "| Telegram |" (case-sensitive, matching the vault's own
-# consistent capitalization) rather than trying to parse the whole table
-# structurally -- narrower surface, easier to reason about failure modes.
-_TELEGRAM_ROW_RE = re.compile(
-    r"^\|\s*Telegram\s*\|[^\n|]*\|\s*([^\n|]+?)\s*\|\s*$", re.MULTILINE
-)
-
 # A real Telegram user/chat id is an integer, optionally negative (group
-# chats). Anything else parsed out of the cell is treated as malformed --
-# e.g. a literal "—" placeholder (no ID recorded yet) must fail loudly, not
-# be silently used as a chat id.
-_VALID_CHAT_ID_RE = re.compile(r"^-?\d+$")
+# chats). Anything else parsed out of the frontmatter field is treated as
+# malformed and must fail loudly, not be silently used as a chat id.
+
+
+def _is_valid_chat_id(value: object) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    if isinstance(value, str):
+        s = value.strip()
+        return bool(s) and (s.lstrip("-").isdigit())
+    return False
 
 
 class DeliveryTargetResolutionError(RuntimeError):
@@ -103,34 +118,57 @@ def profile_path_for_identity(identity: str, *, is_primary: bool, vault_root: Pa
     return vault_root / "Hermes" / "Profile" / "Family" / name / f"{name} Profile.md"
 
 
-def _parse_telegram_chat_id_from_text(text: str, *, profile_path: Path) -> str:
-    match = _TELEGRAM_ROW_RE.search(text)
-    if not match:
+def _extract_frontmatter_block(text: str, *, profile_path: Path) -> str:
+    if not text.startswith("---\n"):
         raise DeliveryTargetResolutionError(
-            f"no '| Telegram | ... |' row found in {profile_path} — cannot "
-            "resolve a delivery target for this identity"
+            f"{profile_path} has no YAML frontmatter block (must start with "
+            "'---') — cannot resolve a delivery target for this identity"
         )
-    raw = match.group(1).strip()
-    if not _VALID_CHAT_ID_RE.match(raw):
+    try:
+        end_idx = text.index("\n---\n", 4)
+    except ValueError as exc:
         raise DeliveryTargetResolutionError(
-            f"{profile_path}'s Telegram row has a non-numeric User ID "
-            f"({raw!r}) — cannot resolve a delivery target for this identity"
+            f"{profile_path}'s frontmatter block is not properly closed "
+            "(no terminating '---' line found) — cannot resolve a delivery "
+            "target for this identity"
+        ) from exc
+    return text[4:end_idx]
+
+
+def _parse_telegram_chat_id_from_frontmatter(text: str, *, profile_path: Path) -> str:
+    frontmatter_text = _extract_frontmatter_block(text, profile_path=profile_path)
+    try:
+        data = yaml.safe_load(frontmatter_text)
+    except yaml.YAMLError as exc:
+        raise DeliveryTargetResolutionError(
+            f"{profile_path}'s frontmatter block is not valid YAML: {exc} — "
+            "cannot resolve a delivery target for this identity"
+        ) from exc
+    if not isinstance(data, dict) or "telegram_chat_id" not in data:
+        raise DeliveryTargetResolutionError(
+            f"{profile_path}'s frontmatter has no 'telegram_chat_id' field "
+            "— cannot resolve a delivery target for this identity"
         )
-    return raw
+    raw = data["telegram_chat_id"]
+    if not _is_valid_chat_id(raw):
+        raise DeliveryTargetResolutionError(
+            f"{profile_path}'s frontmatter 'telegram_chat_id' field is not "
+            f"a valid numeric id ({raw!r}) — cannot resolve a delivery "
+            "target for this identity"
+        )
+    return str(raw).strip()
 
 
 def _load_telegram_allow_from(hermes_home: Path) -> Optional[list]:
     """Best-effort read of config.yaml's telegram.allow_from, for the
     cross-check below. Returns None (skips the cross-check) rather than
-    raising when config.yaml is unreadable/malformed -- the vault Profile.md
-    parse is still the primary signal; this is defense-in-depth, not a hard
-    dependency."""
+    raising when config.yaml is unreadable/malformed -- the vault
+    frontmatter parse is still the primary signal; this is defense-in-depth,
+    not a hard dependency."""
     config_path = hermes_home / "config.yaml"
     if not config_path.is_file():
         return None
     try:
-        import yaml
-
         data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
         allow_from = ((data.get("telegram") or {}).get("allow_from")) or None
         if allow_from is None:
@@ -143,11 +181,13 @@ def _load_telegram_allow_from(hermes_home: Path) -> Optional[list]:
 def resolve_telegram_chat_id(
     identity: str, *, is_primary: bool, vault_root: Path, hermes_home: Path
 ) -> str:
-    """Resolve identity's Telegram chat_id from their vault Profile.md.
+    """Resolve identity's Telegram chat_id from their vault Profile.md's
+    YAML frontmatter (``telegram_chat_id`` field).
 
     Raises :class:`DeliveryTargetResolutionError` — never returns a guessed
-    or partial value — when the profile file is missing, the Telegram row
-    is missing/malformed, or (when config.yaml is readable) the resolved id
+    or partial value — when the profile file is missing, the frontmatter
+    block is missing/malformed, the ``telegram_chat_id`` field is
+    missing/malformed, or (when config.yaml is readable) the resolved id
     disagrees with ``telegram.allow_from`` — per JID Profile.md's own stated
     policy that config.yaml's live gateway config wins on any disagreement
     and a mismatch must be flagged, not silently trusted from the vault
@@ -166,7 +206,7 @@ def resolve_telegram_chat_id(
             f"could not read {profile_path} for identity={identity!r}: {exc}"
         ) from exc
 
-    chat_id = _parse_telegram_chat_id_from_text(text, profile_path=profile_path)
+    chat_id = _parse_telegram_chat_id_from_frontmatter(text, profile_path=profile_path)
 
     allow_from = _load_telegram_allow_from(hermes_home)
     if allow_from is not None and chat_id not in allow_from:
