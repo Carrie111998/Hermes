@@ -529,6 +529,10 @@ def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
     """
     from plugins.web.keyless_mcp import extract_with_failover
 
+    # Policy blocks are authoritative: do not replace them via rescue.
+    if any(isinstance(r, dict) and r.get("blocked_by_policy") for r in results):
+        return results
+
     original_error = next(
         (r.get("error") for r in results if r.get("error")), "extract failed"
     )
