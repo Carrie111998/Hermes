@@ -492,6 +492,18 @@ DEFAULT_CONFIG = {
         "search_backend": "",    # per-capability override for web_search (e.g. "searxng")
         "extract_backend": "",   # per-capability override for web_extract (e.g. "native")
         "extract_char_limit": 15000,  # per-page char budget for web_extract; larger pages truncate + store full text in cache/web
+        # Keyless free-tier fallback: with NO web backend configured or keyed,
+        # web_search/web_extract fall back to Parallel's / Exa's public
+        # anonymous MCP endpoints (rate-limited free tiers). Never pre-empts
+        # a configured or keyed backend. Set false to disable entirely.
+        "keyless_fallback": True,
+        # Per-provider tier selection for providers with both a keyless free
+        # endpoint and a keyed paid SDK path (exa, parallel). Set by the
+        # `hermes tools` picker's "Free (keyless)" / "Paid (API key)" rows.
+        #   free  — always use the anonymous free endpoint (even with a key)
+        #   paid  — always use the keyed SDK path (missing key = error)
+        #   unset — auto: keyed when the API key is present, else keyless
+        "provider_tier": {},
     },
 
     "browser": {
@@ -1853,6 +1865,10 @@ DEFAULT_CONFIG = {
         "write_approval": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        # Periodic built-in memory review. External providers with automatic
+        # turn/session extraction can set this to 0 and keep the small local
+        # store reserved for explicit high-frequency operational facts.
+        "nudge_interval": 10,
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".
@@ -3599,7 +3615,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 37,
+    "_config_version": 38,
 }
 
 # Optional environment variables that enhance functionality
