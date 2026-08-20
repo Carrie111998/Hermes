@@ -146,9 +146,7 @@ class TestDisplayResumedHistory:
         output = self._capture_display(cli)
 
         assert "◈ model changed" in output
-        # Delegation completions are internal control turns — skipped entirely,
-        # never rendered as events or user input.
-        assert "background delegation completed" not in output
+        assert "◈ background delegation completed" in output
         assert "You:" not in output
         assert "opaque" not in output
 

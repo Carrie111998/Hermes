@@ -784,8 +784,7 @@ class CLIAgentSetupMixin:
                 entries.append(("event", "model changed"))
                 continue
             if display_kind == "async_delegation_complete":
-                # Internal control turn (parent-agent wake for a finished
-                # subagent batch) — not user-visible conversation content.
+                entries.append(("event", "background delegation completed"))
                 continue
             if display_kind == "auto_continue":
                 entries.append(("event", "resumed interrupted turn"))

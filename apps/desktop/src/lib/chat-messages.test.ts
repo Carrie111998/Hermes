@@ -359,31 +359,27 @@ describe('toChatMessages', () => {
       }
     ])
 
-    expect(messages.map(message => message.role)).toEqual(['user', 'assistant', 'system', 'system', 'system'])
+    expect(messages.map(message => message.role)).toEqual(['user', 'assistant', 'system', 'system', 'system', 'system'])
     expect(messages.map(chatMessageText)).toEqual([
       'real user turn',
       'real assistant reply',
       'model changed',
+      'background agent work finished',
       'resumed interrupted turn',
       'personality changed'
     ])
-    // The delegation completion is an internal control turn: it must not
-    // surface at all, not even as a timeline label.
-    for (const message of messages) {
-      expect(chatMessageText(message)).not.toContain('delegation')
-    }
+    expect(messages.map(chatMessageText)).not.toContain('opaque delegation context payload')
   })
 
   // A backend older than this app serves display_metadata as unparsed JSON
-  // text. Indexing into that string used to throw and fail the whole resume —
-  // and must not regress now that the row is filtered by its structured kind.
+  // text. Indexing into that string used to throw and fail the whole resume.
   it.each([
-    ['an object', { delegation_id: 'deleg_1', task_count: 2 }],
-    ['JSON text', JSON.stringify({ delegation_id: 'deleg_1', task_count: 1 })],
-    ['unparseable text', '{not-json'],
-    ['text that is not an object', '"deleg_1"'],
-    ['a missing task count', { delegation_id: 'deleg_1' }]
-  ])('drops a delegation event regardless of %s', (_case, displayMetadata) => {
+    ['an object', { delegation_id: 'deleg_1', task_count: 2 }, '2 background agents finished'],
+    ['JSON text', JSON.stringify({ delegation_id: 'deleg_1', task_count: 1 }), '1 background agent finished'],
+    ['unparseable text', '{not-json', 'background agent work finished'],
+    ['text that is not an object', '"deleg_1"', 'background agent work finished'],
+    ['a missing task count', { delegation_id: 'deleg_1' }, 'background agent work finished']
+  ])('labels a delegation event given %s', (_case, displayMetadata, expected) => {
     const read = () =>
       toChatMessages([
         {
@@ -396,7 +392,7 @@ describe('toChatMessages', () => {
       ])
 
     expect(read).not.toThrow()
-    expect(read()).toEqual([])
+    expect(chatMessageText(read()[0])).toBe(expected)
   })
 })
 

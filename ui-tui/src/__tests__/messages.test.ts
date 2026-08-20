@@ -55,7 +55,7 @@ describe('toTranscriptMessages', () => {
     ])
   })
 
-  it('skips async_delegation_complete rows entirely (internal control turns)', () => {
+  it('projects async_delegation_complete with task_count metadata', () => {
     const rows = [
       { role: 'user', text: 'do work' },
       { role: 'assistant', text: 'done' },
@@ -69,14 +69,20 @@ describe('toTranscriptMessages', () => {
     ]
 
     const result = toTranscriptMessages(rows)
-    expect(result.map(msg => msg.text)).toEqual(['do work', 'done', 'merged'])
-    expect(result.every(m => m.kind !== 'event')).toBe(true)
+    expect(result.map(msg => [msg.kind, msg.text])).toEqual([
+      [undefined, 'do work'],
+      [undefined, 'done'],
+      ['event', '3 background agents finished'],
+      [undefined, 'merged']
+    ])
   })
 
-  it('skips async_delegation_complete without metadata', () => {
+  it('projects async_delegation_complete without metadata as generic text', () => {
     const rows = [{ role: 'user', text: 'event', display_kind: 'async_delegation_complete' }]
 
-    expect(toTranscriptMessages(rows)).toEqual([])
+    const result = toTranscriptMessages(rows)
+    expect(result[0]?.kind).toBe('event')
+    expect(result[0]?.text).toBe('background agent work finished')
   })
 })
 

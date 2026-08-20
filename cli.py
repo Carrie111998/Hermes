@@ -12836,9 +12836,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 continue
             # Async-delegation completions are internal control turns for the
             # parent agent. Carry their structured display typing so the row
-            # persists as async_delegation_complete (hidden from the visible
-            # transcript) instead of an ordinary user message — same contract
-            # as the TUI poller injection path.
+            # persists as async_delegation_complete instead of an ordinary
+            # user message. Renderers can then replace the raw control payload
+            # with the compact background-agent completion marker — same
+            # contract as the TUI poller injection path.
             if event.get("type") == "async_delegation":
                 from tools.process_registry import async_delegation_display_metadata
 
@@ -16128,8 +16129,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 (gates the concise voice-response prefix, #65827)
             display_kind: Structured display typing for synthesized turns
                 (async-delegation completions). Persisted on the user row so
-                renderers keep the internal control turn out of the visible
-                transcript.
+                renderers replace the raw control payload with a compact
+                timeline marker.
             display_metadata: Display-only payload for that kind.
             
         Returns:

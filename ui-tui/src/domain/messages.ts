@@ -50,14 +50,6 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
       continue
     }
 
-    // Async-delegation completions are internal control turns for the parent
-    // agent, not conversation content. Skip them like `hidden` — the
-    // completion is surfaced as a transient status line while live, and the
-    // agent's follow-up reply stays in the transcript.
-    if (display_kind === 'async_delegation_complete') {
-      continue
-    }
-
     if (display_kind === 'model_switch') {
       out.push({ kind: 'event', role: 'system', text: 'model changed' })
       pending = []
@@ -79,8 +71,20 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
       continue
     }
 
-    // `async_delegation_complete` rows were skipped above (internal control
-    // turns never reach the visible transcript).
+    if (display_kind === 'async_delegation_complete') {
+      const meta = (row as TranscriptRow).display_metadata
+      const count = meta && typeof meta.task_count === 'number' ? meta.task_count : undefined
+
+      const label =
+        count === undefined
+          ? 'background agent work finished'
+          : `${count} background agent${count === 1 ? '' : 's'} finished`
+
+      out.push({ kind: 'event', role: 'system', text: label })
+      pending = []
+
+      continue
+    }
 
     if (role === 'assistant') {
       out.push({ role, text, ...(createdAt !== undefined && { createdAt }), ...(pending.length && { tools: pending }) })

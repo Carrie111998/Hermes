@@ -2880,10 +2880,10 @@ def async_delegation_display_metadata(evt: dict) -> dict:
     Shared by every surface that injects a delegation completion as a
     synthetic turn (TUI/Desktop poller, CLI drain) so the persisted
     ``display_metadata`` payload stays identical regardless of transport.
-    Rows are typed ``display_kind="async_delegation_complete"``; renderers
-    treat that kind as internal and keep it out of the user-visible
-    transcript, but the metadata remains available for status surfaces
-    (Agents panel, transient toasts).
+    Rows are typed ``display_kind="async_delegation_complete"`` so renderers
+    can replace the internal payload with a compact completion marker. The
+    metadata also remains available for status surfaces (Agents panel,
+    transient toasts).
     """
     raw_results = evt.get("results")
     results: list[dict] = [
