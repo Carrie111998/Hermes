@@ -6711,9 +6711,7 @@ def create_job_with_scheduler_registration(**kwargs) -> dict:
     from cron.jobs import _create_job
     from cron.scheduler_provider import resolve_cron_scheduler
 
-    # Preserve the durable dedup result so replaying an idempotent create does
-    # not register a second external trigger.  The public create_job wrapper
-    # intentionally keeps its historical dict-only return shape.
+    # An idempotent replay must not register a second external trigger.
     job, created = _create_job(_return_creation=True, **kwargs)
     if not created:
         return job

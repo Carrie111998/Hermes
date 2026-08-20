@@ -1342,7 +1342,6 @@ try:
         resume_job_exact as _cron_resume,
     )
     from cron.scheduler import (
-        CronSchedulerRegistrationError as _CronSchedulerRegistrationError,
         create_job_with_scheduler_registration as _cron_create,
     )
     _CRON_AVAILABLE = True
@@ -1354,10 +1353,6 @@ except ImportError:
     _cron_remove = None
     _cron_pause = None
     _cron_resume = None
-
-    class _CronSchedulerRegistrationError(RuntimeError):
-        pass
-
 
 def _notify_cron_provider_jobs_changed() -> None:
     """Tell the active cron scheduler provider the job set changed after a REST
@@ -5785,6 +5780,8 @@ class APIServerAdapter(BasePlatformAdapter):
         cron_err = self._check_jobs_available()
         if cron_err:
             return cron_err
+        from cron.jobs import CronDedupConflict, CronDedupKeyInvalid
+        from cron.scheduler import CronSchedulerRegistrationError
         try:
             body = await request.json()
             name = (body.get("name") or "").strip()
@@ -5825,11 +5822,13 @@ class APIServerAdapter(BasePlatformAdapter):
             if repeat is not None:
                 kwargs["repeat"] = repeat
             if dedup_key is not None:
-                kwargs["dedup_key"] = str(dedup_key).strip()
+                kwargs["dedup_key"] = dedup_key
 
             job = _cron_create(**kwargs)
             return web.json_response({"job": job})
-        except _CronSchedulerRegistrationError as e:
+        except CronDedupKeyInvalid as e: return web.json_response({"error": str(e)}, status=400)
+        except CronDedupConflict as e: return web.json_response({"error": str(e), "job_id": e.job_id}, status=409)
+        except CronSchedulerRegistrationError as e:
             return web.json_response(e.to_dict(), status=424)
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
@@ -5972,9 +5971,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     return web.json_response({"error": "Job not found"}, status=404)
 
                 from cron.executions import execution_projection, latest_execution
-                from cron.scheduler_provider import provider_supports_claim_force, resolve_cron_scheduler
+                from cron.scheduler_provider import provider_supports_claim_force, provider_supports_split_fire, resolve_cron_scheduler
                 provider = resolve_cron_scheduler()
                 provider_source = str(getattr(provider, "name", "provider"))
+                if not provider_supports_split_fire(provider): return web.json_response({"error": "cron provider does not support typed run identity", "job_id": job_id}, status=409)
                 previous_execution = latest_execution(job_id)
                 claim_kwargs = {"force": True} if provider_supports_claim_force(provider) else {}
                 try:

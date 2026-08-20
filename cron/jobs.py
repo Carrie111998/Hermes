@@ -120,6 +120,9 @@ ONESHOT_GRACE_SECONDS = 120
 
 
 class CronStoreLockUnavailable(RuntimeError): retryable = True
+class CronDedupKeyInvalid(ValueError): pass
+class CronDedupConflict(ValueError):
+    def __init__(self, job_id: str): self.job_id = job_id; super().__init__("dedup_key conflicts with an existing job")
 @dataclass(frozen=True)
 class _CronStorePaths:
     cron_dir: Path
@@ -484,7 +487,17 @@ _IMMUTABLE_JOB_FIELDS = frozenset({"id", "dedup_key"})
 
 
 def _normalize_dedup_key(value: Any) -> Optional[str]:
-    return str(value).strip() or None if value is not None else None
+    if value is None: return None
+    if not isinstance(value, str) or re.fullmatch(r"[!-~]{1,128}", value) is None:
+        raise CronDedupKeyInvalid("dedup_key must be 1-128 printable ASCII characters without spaces")
+    return value
+
+
+_DEDUP_SEMANTIC_FIELDS = ("name", "prompt", "skills", "model", "provider", "base_url", "script", "no_agent", "monitor_script", "monitor_url", "context_from", "schedule", "repeat", "deliver", "enabled_toolsets", "workdir", "attach_to_session")
+def _dedup_fingerprint(job: Dict[str, Any], schedule: Optional[str] = None) -> str:
+    payload = {key: job.get(key) for key in _DEDUP_SEMANTIC_FIELDS}
+    payload["schedule"] = schedule.strip() if schedule is not None else payload["schedule"]
+    return uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)).hex
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -561,6 +574,7 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     ensure consumers never crash while formatting or running those records.
     """
     normalized = _apply_skill_fields(job)
+    normalized.pop("_dedup_fingerprint", None)
     job_id = _coerce_job_text(normalized.get("id"), "unknown")
     prompt = _coerce_job_text(normalized.get("prompt"))
     normalized["id"] = job_id
@@ -2027,6 +2041,8 @@ def _create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    if normalized_dedup_key is not None:
+        job["_dedup_fingerprint"] = _dedup_fingerprint(job, schedule)
 
     lock = (
         _jobs_lock(require_cross_process=True)
@@ -2038,16 +2054,16 @@ def _create_job(
         if normalized_dedup_key is not None:
             for existing in jobs:
                 if _normalize_dedup_key(existing.get("dedup_key")) == normalized_dedup_key:
+                    if existing.get("_dedup_fingerprint") != job["_dedup_fingerprint"]: raise CronDedupConflict(str(existing.get("id") or ""))
                     replay = _normalize_job_record(existing)
                     return (replay, False) if _return_creation else replay
         jobs.append(job)
         save_jobs(jobs)
 
-    return (job, True) if _return_creation else job
+    return (_normalize_job_record(job), True) if _return_creation else _normalize_job_record(job)
 
 
 def create_job(*args, **kwargs) -> Dict[str, Any]:
-    """Create one job and always return its public dict record."""
     kwargs.pop("_return_creation", None)
     return _create_job(*args, **kwargs)
 

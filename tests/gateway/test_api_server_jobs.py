@@ -141,6 +141,20 @@ class TestCreateJob:
                 assert call_kwargs["origin"]["forwarded_for"] == "203.0.113.11"
                 assert call_kwargs["origin"]["user_agent"] == "cron-client"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure,status", [("invalid", 400), ("conflict", 409)])
+    async def test_create_job_maps_dedup_errors(self, adapter, failure, status):
+        from cron.jobs import CronDedupConflict, CronDedupKeyInvalid
+        error = (CronDedupKeyInvalid("invalid") if failure == "invalid"
+                 else CronDedupConflict(VALID_JOB_ID))
+        app = _create_app(adapter)
+        with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+            f"{_MOD}._cron_create", side_effect=error
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post("/api/jobs", json={"name": "n", "schedule": "30m"})
+        assert response.status == status
+
 
     @pytest.mark.asyncio
     async def test_create_job_reports_saved_but_unregistered(self, adapter):
@@ -382,6 +396,25 @@ class TestRunJob:
         assert fired == ["exec-native"]
 
     @pytest.mark.asyncio
+    async def test_run_job_rejects_legacy_single_phase_provider(self, adapter):
+        from cron.scheduler_provider import CronScheduler
+        calls = []
+
+        class Legacy(CronScheduler):
+            name = "legacy"
+            def start(self, stop_event, **kwargs): pass
+            def fire_due(self, job_id, **kwargs): calls.append(job_id)
+
+        app = _create_app(adapter)
+        with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+            f"{_MOD}._cron_get", return_value=SAMPLE_JOB
+        ), patch("cron.scheduler_provider.resolve_cron_scheduler", return_value=Legacy()):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
+        assert response.status == 409
+        assert calls == []
+
+    @pytest.mark.asyncio
     async def test_run_job_setup_failure_aborts_claim_once(self, adapter):
         app = _create_app(adapter)
         claimed = {
@@ -557,16 +590,17 @@ class TestRunJob:
                     assert response.status == 400
 
     @pytest.mark.asyncio
-    async def test_list_job_runs_rejects_malformed_compound_cursor(self, adapter):
+    async def test_list_job_runs_rejects_malformed_cursor(self, adapter):
         app = _create_app(adapter)
         with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
             f"{_MOD}._cron_get", return_value=SAMPLE_JOB
         ):
             async with TestClient(TestServer(app)) as cli:
-                response = await cli.get(
-                    f"/api/jobs/{VALID_JOB_ID}/runs?before_claimed_at=bad|cursor"
-                )
-        assert response.status == 400
+                for cursor in ("bad|cursor", "not-a-timestamp"):
+                    response = await cli.get(
+                        f"/api/jobs/{VALID_JOB_ID}/runs?before_claimed_at={cursor}"
+                    )
+                    assert response.status == 400
 
     @pytest.mark.asyncio
     async def test_list_job_runs_uses_extra_row_for_has_more(self, adapter):

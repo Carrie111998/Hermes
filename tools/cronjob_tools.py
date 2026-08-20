@@ -1250,6 +1250,7 @@ def cronjob(
                 CronSchedulerRegistrationError,
                 create_job_with_scheduler_registration,
             )
+            from cron.jobs import CronDedupConflict, CronDedupKeyInvalid
 
             try:
                 job = create_job_with_scheduler_registration(
@@ -1278,6 +1279,7 @@ def cronjob(
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
                 return tool_error(_partial.pop("error"), success=False, **_partial)
+            except (CronDedupConflict, CronDedupKeyInvalid) as exc: return tool_error(str(exc), success=False)
             _create_message = f"Cron job '{job['name']}' created."
             _local_notice = _local_delivery_notice(job, _normalize_deliver_param(deliver))
             if _local_notice:

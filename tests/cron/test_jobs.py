@@ -196,12 +196,24 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 class TestJobCRUD:
     def test_create_dedup_key_returns_existing_job(self, tmp_cron_dir):
-        first = create_job(prompt="one", schedule="30m", dedup_key="routine-1")
-        with pytest.raises(ValueError):
-            create_job(prompt="changed", schedule="not-a-schedule", dedup_key="routine-1")
-        second = create_job(prompt="changed", schedule="30m", dedup_key="routine-1")
+        import cron.jobs as jobs_mod
+        first = create_job(prompt="one", schedule="30m", dedup_key="routine-1", attach_to_session=True)
+        second = create_job(prompt="one", schedule="30m", dedup_key="routine-1", attach_to_session=True)
         assert second["id"] == first["id"]
+        assert "_dedup_fingerprint" not in second
+        for changed in ({"prompt": "changed", "schedule": "30m"},
+                        {"prompt": "one", "schedule": "31m"},
+                        {"prompt": "one", "schedule": "30m", "attach_to_session": False}):
+            with pytest.raises(jobs_mod.CronDedupConflict) as conflict:
+                create_job(**changed, dedup_key="routine-1")
+            assert conflict.value.job_id == first["id"]
         assert len(load_jobs()) == 1
+
+    @pytest.mark.parametrize("key", ["", "space key", "\n", "x" * 129, 7])
+    def test_create_rejects_invalid_dedup_key(self, tmp_cron_dir, key):
+        import cron.jobs as jobs_mod
+        with pytest.raises(jobs_mod.CronDedupKeyInvalid):
+            create_job(prompt="one", schedule="30m", dedup_key=key)
 
     def test_create_dedup_key_is_atomic_across_threads(self, tmp_cron_dir):
         results = []

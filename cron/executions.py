@@ -279,6 +279,7 @@ def list_executions(
             clauses.append("(claimed_at < ? OR (claimed_at = ? AND id < ?))")
             params.extend((claimed_at, claimed_at, execution_id))
         else:
+            datetime.fromisoformat(cursor.replace("Z", "+00:00"))
             clauses.append("claimed_at < ?")
             params.append(str(before_claimed_at))
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
