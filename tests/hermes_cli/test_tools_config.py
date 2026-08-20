@@ -177,6 +177,41 @@ def test_empty_string_platform_toolsets_disables_all():
     assert enabled == set()
 
 
+def test_empty_list_with_default_mcp_servers_stays_exactly_empty():
+    """F7 (exact-head re-review): an explicit ``[]`` must stay EXACTLY empty
+    even at the production default call site (``include_default_mcp_servers
+    =True``). The MCP block used to re-add every globally enabled server when
+    no server was explicitly named and ``no_mcp`` was absent — the existing
+    explicit-empty tests all pass ``include_default_mcp_servers=False``,
+    which never reaches that branch. With a live server ``srv`` enabled, the
+    operator's ``[] = disable all`` must still hold."""
+    import hermes_cli.tools_config as _tc
+
+    with patch.object(_tc, "enabled_mcp_server_names", return_value={"srv"}):
+        config = {"platform_toolsets": {"cli": []}}
+        enabled = _get_platform_tools(config, "cli")
+    assert enabled == set()
+
+
+def test_empty_string_with_nondefault_context_engine_stays_exactly_empty():
+    """F7 (exact-head re-review): an explicitly saved empty STRING (raw value
+    ``""``, normalized to ``[]``) with a NON-default context engine must stay
+    EXACTLY empty at the default call site. The context-engine block checked
+    ``isinstance(platform_toolsets.get(platform), list)`` against the RAW
+    config value — a string is not a list, so ``explicit_empty_selection``
+    was False and ``context_engine`` (plus every default MCP server) was
+    re-added. Neither the engine nor MCP servers nor plugins may reappear."""
+    import hermes_cli.tools_config as _tc
+
+    with patch.object(_tc, "enabled_mcp_server_names", return_value={"srv"}):
+        config = {
+            "platform_toolsets": {"cli": ""},
+            "context": {"engine": "claude_code"},
+        }
+        enabled = _get_platform_tools(config, "cli")
+    assert enabled == set()
+
+
 def test_numeric_platform_toolsets_value_never_default():
     """F7/P2: a numeric restriction value (YAML parses bare numbers as int)
     is EXPLICIT, not unset — the full default toolset must not reappear."""

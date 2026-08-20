@@ -2691,12 +2691,13 @@ def _get_platform_tools(
     if not isinstance(context_cfg, dict):
         context_cfg = {}
     context_engine_name = str(context_cfg.get("engine") or "compressor").strip().lower()
-    explicit_empty_selection = (
-        platform in platform_toolsets
-        and isinstance(platform_toolsets.get(platform), list)
-        and not toolset_names
-    )
-    if context_engine_name and context_engine_name != "compressor" and not explicit_empty_selection:
+    # F7 (exact-head re-review): the normalized ``explicit_empty`` flag is the
+    # single authority for the context-engine injection too. The previous
+    # ``explicit_empty_selection`` re-derived emptiness from the RAW config
+    # value with ``isinstance(..., list)``, so an explicitly empty STRING
+    # (``""``, normalized to ``[]`` earlier) read as non-empty and the
+    # non-default engine was re-added, reopening the disable-all contract.
+    if context_engine_name and context_engine_name != "compressor" and not explicit_empty:
         enabled_toolsets.add("context_engine")
 
     # Preserve any explicit non-configurable toolset entries (for example,
@@ -2724,7 +2725,12 @@ def _get_platform_tools(
     if include_default_mcp_servers:
         if explicit_mcp_servers or "no_mcp" in toolset_names:
             enabled_toolsets.update(explicit_mcp_servers)
-        else:
+        elif not explicit_empty:
+            # F7 (exact-head re-review): an explicitly empty selection ([] or
+            # normalized "") must NOT be reopened by the default MCP servers —
+            # the operator disabled all toolsets. A server is only added back
+            # when the operator explicitly names it in a non-empty selection
+            # (handled by the branch above).
             enabled_toolsets.update(enabled_mcp_servers)
     else:
         enabled_toolsets.update(explicit_mcp_servers)
