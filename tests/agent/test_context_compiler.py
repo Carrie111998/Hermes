@@ -181,3 +181,44 @@ def test_compiler_insertion_is_shared_pre_provider_boundary():
     loop_source = (root / "agent/conversation_loop.py").read_text()
     assert turn_source.index("ContextCompiler") < turn_source.index("return TurnContext")
     assert loop_source.index("build_turn_context(") < loop_source.index("_interruptible_api_call")
+
+
+def test_get_context_metrics_returns_none_when_attribute_missing():
+    """get_context_metrics() returns None when _context_compiler_metrics is not set."""
+    from types import SimpleNamespace
+
+    agent = SimpleNamespace()
+    # No _context_compiler_metrics attribute set
+    result = getattr(agent, "_context_compiler_metrics", None)
+    assert result is None
+
+
+def test_get_context_metrics_returns_metrics_when_set():
+    """get_context_metrics() returns the ContextMetrics when _context_compiler_metrics is set."""
+    from types import SimpleNamespace
+
+    from agent.context_compiler import ContextMetrics
+
+    metrics = ContextMetrics(raw_transcript_tokens=1000, compiled_context_tokens=200)
+    agent = SimpleNamespace(_context_compiler_metrics=metrics)
+    result = getattr(agent, "_context_compiler_metrics", None)
+    assert result is not None
+    assert isinstance(result, ContextMetrics)
+    assert result.raw_transcript_tokens == 1000
+    assert result.compiled_context_tokens == 200
+
+
+def test_get_context_metrics_is_read_only():
+    """get_context_metrics() does not mutate _context_compiler_metrics."""
+    from types import SimpleNamespace
+
+    from agent.context_compiler import ContextMetrics
+
+    metrics = ContextMetrics(raw_transcript_tokens=500)
+    agent = SimpleNamespace(_context_compiler_metrics=metrics)
+    before = agent._context_compiler_metrics.raw_transcript_tokens
+    # Simulate get_context_metrics() read
+    result = getattr(agent, "_context_compiler_metrics", None)
+    after = agent._context_compiler_metrics.raw_transcript_tokens
+    assert before == after
+    assert result is metrics

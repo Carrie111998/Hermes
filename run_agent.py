@@ -2731,6 +2731,15 @@ class AIAgent:
         """Return the last captured RateLimitState, or None."""
         return self._rate_limit_state
 
+    def get_context_metrics(self):
+        """Return the current P3 ContextMetrics snapshot, or None.
+
+        Read-only retrieval surface for the durable context compiler's
+        runtime telemetry. Exposes existing P3 ContextMetrics at the
+        real runtime boundary without changing P1/P2/P3 semantics.
+        """
+        return getattr(self, "_context_compiler_metrics", None)
+
     def _capture_credits(self, http_response: Any) -> None:
         """Parse x-nous-credits-* headers, cache CreditsState, fire threshold notices.
 
