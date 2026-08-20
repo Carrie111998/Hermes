@@ -7,7 +7,7 @@ fails here instead of silently misrouting in production.
 
 import pytest
 
-from events.outcomes import OutcomeState, marker_for_verdict
+from events.outcomes import OutcomeState, evaluate_outcome, marker_for_verdict
 from events.routing_policy import (
     ACTION_REQUIRED,
     AGENTS_MEMORY,
@@ -42,6 +42,102 @@ def make_event(event_type, payload=None, priority=None, source="test"):
 
 
 # ---------------------------------------------------------------- invariants
+
+# Alert-class types allowed to carry NO type-level verdict, each with the
+# reason it is allowed. Two distinct groups, and the difference matters --
+# group (a) is CORRECT and must never be "fixed", group (b) is a pending
+# product decision.
+#
+# The set this guards drifted twice in exactly one way: a type was added
+# beside an already-classified sibling and nobody classified it.
+# DEVFLOW_DEPLOY_FAILED sat unclassified next to DEVFLOW_BUILD_FAILED;
+# BACKEND_CONTRACT_DRIFT sat unclassified next to AGENT_LOOP_FAULT, which was
+# introduced in the SAME schema comment block. Both reached the phone headed
+# "UNKNOWN". This test is the thing that would have caught either on the
+# commit that introduced it.
+_VERDICT_EXEMPT = {
+    # (a) BIDIRECTIONAL -- the verdict genuinely lives in the payload, so an
+    # empty-payload UNKNOWN is the RIGHT answer. Adding any of these to
+    # _FAILURE_EVENT_TYPES would render their own recoveries as red failures,
+    # because `failed` wins over recovery in the precedence order.
+    # test_payload_driven_exemptions_still_classify below proves each one
+    # actually works, so the exemption cannot hide a regression.
+    EventType.CODE_DRIFT: "bidirectional: status=='resolved' is a recovery",
+    EventType.WATCHDOG_PROBE_TRANSITION: "bidirectional: payload.after",
+    EventType.WATCHDOG_BURST: "bidirectional: payload.transitions list",
+    EventType.MODEL_RATE_LIMITED: "bidirectional: outcome=='recovered'",
+    # (b) NOT FAILURES -- good news that needs a human, or a governance flag.
+    # These are ACT/WARN because they need attention, not because anything
+    # broke. Giving them a failure verdict would be wrong; whether they should
+    # carry some OTHER label is an open product decision (2026-08-20).
+    EventType.INTERVIEW_SIGNAL: "good news needing action; labelling undecided",
+    EventType.OFFER_SIGNAL: "good news needing action; labelling undecided",
+    EventType.FOLLOWUP_DUE: "a reminder, not a failure; labelling undecided",
+    EventType.DEVFLOW_AUTO_MERGED: "governance flag on an ungated merge, not a failure",
+}
+
+# Representative payloads proving the group (a) exemptions really do classify.
+_PAYLOAD_DRIVEN_CASES = {
+    EventType.CODE_DRIFT: {"status": "resolved"},
+    EventType.WATCHDOG_PROBE_TRANSITION: {"before": "healthy", "after": "down"},
+    EventType.WATCHDOG_BURST: {"transitions": [{"after": "healthy", "tier": "critical"}]},
+    EventType.MODEL_RATE_LIMITED: {"outcome": "chain_exhausted"},
+}
+
+
+@pytest.mark.parametrize("et", list(EventType))
+def test_every_alerting_event_type_can_describe_itself(et):
+    """An event the system will wake a human for must be able to say whether
+    it is good or bad. WARN/ACT with an UNKNOWN type-level verdict means the
+    header renders "UNKNOWN <TYPE>" -- which is what reached the phone for
+    watchdog_probe_transition, container_crash_loop, devflow.deploy_failed,
+    secret_detected, credential_loss, backend_contract_drift and boot_summary
+    before 2026-08-19/20.
+
+    A NEW event type added with a wa_tier and no verdict fails here, on the
+    commit that adds it, instead of on Diego's phone.
+    """
+    route = classify(make_event(et))
+    if route.attention not in (Attention.WARN, Attention.ACT):
+        return
+    if evaluate_outcome(make_event(et)).state is not OutcomeState.UNKNOWN:
+        return
+    assert et in _VERDICT_EXEMPT, (
+        f"{et.type_string} is {route.attention.name}-class (wa_tier="
+        f"{route.wa_tier}) but has no type-level verdict, so its header will "
+        f"read 'UNKNOWN {et.type_string.upper()}'. Either classify it in "
+        f"events.outcomes, or add it to _VERDICT_EXEMPT with the reason."
+    )
+
+
+@pytest.mark.parametrize("et", sorted(_VERDICT_EXEMPT, key=lambda e: e.type_string))
+def test_no_stale_verdict_exemptions(et):
+    """An exemption that stops being true must be deleted, not left to rot.
+    Without this, classifying a type later leaves a stale entry that would
+    silently excuse a future regression on the same type."""
+    route = classify(make_event(et))
+    assert route.attention in (Attention.WARN, Attention.ACT), (
+        f"{et.type_string} is no longer alert-class; drop it from _VERDICT_EXEMPT"
+    )
+    assert evaluate_outcome(make_event(et)).state is OutcomeState.UNKNOWN, (
+        f"{et.type_string} now HAS a type-level verdict; drop it from "
+        f"_VERDICT_EXEMPT so the guard applies to it again"
+    )
+
+
+@pytest.mark.parametrize("et", sorted(_PAYLOAD_DRIVEN_CASES, key=lambda e: e.type_string))
+def test_payload_driven_exemptions_still_classify(et):
+    """The group (a) exemptions are only defensible because these types DO
+    reach a verdict from a real payload. Asserting that turns each exemption
+    from a blanket excuse into a proof, so a broken payload rule cannot hide
+    behind the allowlist."""
+    verdict = evaluate_outcome(make_event(et, payload=_PAYLOAD_DRIVEN_CASES[et]))
+
+    assert verdict.state is not OutcomeState.UNKNOWN, (
+        f"{et.type_string} is exempt as payload-driven, but its representative "
+        f"payload still yields UNKNOWN -- the payload rule is broken"
+    )
+
 
 def test_every_event_type_has_policy_entry():
     missing = [et.type_string for et in EventType if et not in _POLICY]
