@@ -128,18 +128,20 @@ def test_db_unavailable_error_reads_server_db_error(monkeypatch):
 # ── T5: forward-dep seam (server._load_cfg / _apply_managed call-time) ────────
 
 
-def test_launch_configured_cwd_reads_server_load_cfg_at_call_time(monkeypatch):
+def test_launch_configured_cwd_reads_server_load_cfg_at_call_time(monkeypatch, tmp_path):
     calls = []
+    configured_cwd = tmp_path / "configured-cwd"
+    configured_cwd.mkdir()
 
     def fake_load_cfg():
         calls.append(1)
-        return {"terminal": {"cwd": "C:/tmp"}}
+        return {"terminal": {"cwd": str(configured_cwd)}}
 
     monkeypatch.setattr(server, "_load_cfg", fake_load_cfg)
-    assert sdb._launch_configured_cwd() == os.path.abspath("C:/tmp")
+    assert sdb._launch_configured_cwd() == os.path.abspath(str(configured_cwd))
     assert len(calls) == 1
     # and the re-exported name sees the same patch
-    assert server._launch_configured_cwd() == os.path.abspath("C:/tmp")
+    assert server._launch_configured_cwd() == os.path.abspath(str(configured_cwd))
 
 
 def test_launch_configured_cwd_load_cfg_raise_returns_none(monkeypatch):
