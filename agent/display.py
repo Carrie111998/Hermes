@@ -1332,6 +1332,14 @@ def _trim_error(msg: str) -> str:
     return msg
 
 
+# Success-shaped serialized fields: the key is present but carries an explicit
+# null / false value. Stripped from the lowercased 500-char window in
+# _detect_tool_failure's generic heuristic so an unconditional "error": null
+# on success is not counted as a failure (#91166).
+_NULL_ERROR_FIELD_RE = re.compile(r'"error"\s*:\s*null\b')
+_FALSE_FAILED_FIELD_RE = re.compile(r'"failed"\s*:\s*false\b')
+
+
 def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]:
     """Inspect a tool result string for signs of failure.
 
@@ -1376,7 +1384,14 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
     if not isinstance(result, str):
         return False, ""
     lower = result[:500].lower()
-    if '"error"' in lower or '"failed"' in lower or result.startswith("Error"):
+    # A serialized "error": null / "failed": false is a success shape —
+    # tools like web_extract include the key unconditionally on success, and
+    # a short result can land the field inside the 500-char window. Strip
+    # those field forms first, then look for the literal keys in what's left
+    # (#91166).
+    scrubbed = _NULL_ERROR_FIELD_RE.sub(" ", lower)
+    scrubbed = _FALSE_FAILED_FIELD_RE.sub(" ", scrubbed)
+    if '"error"' in scrubbed or '"failed"' in scrubbed or result.startswith("Error"):
         return True, " [error]"
 
     return False, ""

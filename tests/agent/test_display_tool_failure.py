@@ -119,3 +119,38 @@ class TestGetCuteToolMessageFailureSuffix:
         line = get_cute_tool_message("web_search", {"query": "hi"}, 0.2, result=ok)
         assert "[" not in line.split("0.2s", 1)[1]
 
+
+class TestNullErrorFieldIsSuccess:
+    """A serialized "error": null is a success shape, not a failure (#91166).
+
+    Tools like web_extract include the key unconditionally on success; when the
+    whole result is short enough for the field to land inside the 500-char
+    heuristic window, the literal-"error" match used to tag the result [error]
+    and feed the tool-loop guardrail's failure counter.
+    """
+
+    SHORT_NULL_ERROR = (
+        '{\n  "results": [\n    {\n      "url": "https://example.com",\n'
+        '      "title": "Example Domain",\n      "content": "Example Domain",\n'
+        '      "error": null\n    }\n  ]\n}'
+    )
+
+    def test_null_error_inside_window_is_success(self):
+        assert _detect_tool_failure("web_extract", self.SHORT_NULL_ERROR) == (False, "")
+
+    def test_failed_false_inside_window_is_success(self):
+        assert _detect_tool_failure("web_extract", '{"failed": false}') == (False, "")
+
+    def test_non_null_error_still_flags(self):
+        is_failure, suffix = _detect_tool_failure(
+            "web_extract", '{"results": [{"error": "boom"}]}'
+        )
+        assert is_failure is True
+        assert suffix == " [error]"
+
+    def test_failed_true_still_flags(self):
+        assert _detect_tool_failure("web_extract", '{"failed": true}') == (True, " [error]")
+
+    def test_error_null_with_compact_spacing(self):
+        assert _detect_tool_failure("web_extract", '{"error":null,"data":1}') == (False, "")
+
