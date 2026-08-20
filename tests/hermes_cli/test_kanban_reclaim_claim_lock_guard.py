@@ -15,7 +15,10 @@ computed for.
 
 from __future__ import annotations
 
+import json
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -111,3 +114,61 @@ def test_genuine_crash_still_reclaims(conn):
     assert tid in crashed
     final = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
     assert final["status"] in ("ready", "blocked", "todo")
+
+
+def test_manual_reclaim_defers_when_worker_survives_termination(conn, monkeypatch):
+    """Manual reclaim must not release a claim held by a live worker."""
+    host = kb._claimer_id().split(":", 1)[0]
+    tid = kb.create_task(conn, title="live manual reclaim", assignee="w")
+    claim_lock = f"{host}:manual-reclaim"
+    now = int(time.time())
+    conn.execute(
+        "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
+        "worker_pid=? WHERE id=?",
+        (claim_lock, now - 1, 12345, tid),
+    )
+    conn.execute(
+        "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
+        "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
+        (tid, claim_lock, now - 1, 12345, now),
+    )
+    run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, tid))
+    conn.commit()
+
+    signals = []
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(kb.time, "sleep", lambda _seconds: None)
+
+    result = kb.reclaim_task(
+        conn,
+        tid,
+        reason="operator retry",
+        signal_fn=lambda pid, sig: signals.append((pid, sig)),
+    )
+
+    row = conn.execute(
+        "SELECT status, claim_lock, worker_pid, claim_expires "
+        "FROM tasks WHERE id=?",
+        (tid,),
+    ).fetchone()
+    events = [
+        (event["kind"], json.loads(event["payload"]))
+        for event in conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id",
+            (tid,),
+        )
+    ]
+
+    assert result is False
+    assert row["status"] == "running"
+    assert row["claim_lock"] == claim_lock
+    assert row["worker_pid"] == 12345
+    assert row["claim_expires"] >= now + kb.RECLAIM_DEFER_GRACE_SECONDS
+    assert [kind for kind, _payload in events].count("reclaim_deferred") == 1
+    assert not any(kind == "reclaimed" for kind, _payload in events)
+    deferred = next(payload for kind, payload in events if kind == "reclaim_deferred")
+    assert deferred["reason"] == "manual_reclaim_worker_alive"
+    assert deferred["termination_attempted"] is True
+    assert deferred["terminated"] is False
+    assert signals == [(12345, signal.SIGTERM), (12345, signal.SIGKILL)]
