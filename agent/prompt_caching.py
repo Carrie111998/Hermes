@@ -382,6 +382,34 @@ def _completed_transaction_endpoint_indexes(
     return endpoints
 
 
+def _enforce_max_cache_budget(
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    max_budget: int = 4,
+) -> None:
+    """Clamp total cache markers across messages and tools to max_budget as defense-in-depth."""
+    total = _count_cache_markers(messages, tools)
+    if total <= max_budget:
+        return
+
+    # Strip oldest non-system markers first if an overflow ever occurs
+    for msg in messages:
+        if total <= max_budget:
+            break
+        if not isinstance(msg, dict) or msg.get("role") == "system":
+            continue
+        if "cache_control" in msg:
+            msg.pop("cache_control", None)
+            total -= 1
+        elif isinstance(msg.get("content"), list):
+            for part in msg["content"]:
+                if isinstance(part, dict) and "cache_control" in part:
+                    part.pop("cache_control", None)
+                    total -= 1
+                    if total <= max_budget:
+                        break
+
+
 def build_prompt_cache_plan(
     api_messages: List[Dict[str, Any]],
     tools: List[Dict[str, Any]] | None,
@@ -422,15 +450,23 @@ def build_prompt_cache_plan(
             mark_suffix=False,
             fallback_to_whole=False,
         )
-    planned_tools[-1]["cache_control"] = dict(marker)
-    remaining_msg_budget = max(0, 4 - (sys_used + 1))
+
+    tool_used = 0
+    if planned_tools:
+        planned_tools[-1]["cache_control"] = dict(marker)
+        tool_used = 1
+
+    remaining_msg_budget = max(0, 4 - (sys_used + tool_used))
     if remaining_msg_budget > 0:
         endpoints = _completed_transaction_endpoint_indexes(
             messages,
             native_anthropic=True,
         )
-        for endpoint in endpoints[-remaining_msg_budget:]:
-            _apply_cache_marker(messages[endpoint], marker, native_anthropic=True)
+        if endpoints:
+            for endpoint in endpoints[-remaining_msg_budget:]:
+                _apply_cache_marker(messages[endpoint], marker, native_anthropic=True)
+
+    _enforce_max_cache_budget(messages, planned_tools, max_budget=4)
 
     return PromptCachePlan(messages=messages, tools=planned_tools)
 
@@ -477,8 +513,11 @@ def apply_anthropic_cache_control(
             if messages[i].get("role") != "system"
             and _can_carry_marker(messages[i], native_anthropic=native_anthropic)
         ]
-        for idx in non_sys[-remaining:]:
-            messages[idx] = copy.deepcopy(messages[idx])
-            _apply_cache_marker(messages[idx], marker, native_anthropic=native_anthropic)
+        if non_sys:
+            for idx in non_sys[-remaining:]:
+                messages[idx] = copy.deepcopy(messages[idx])
+                _apply_cache_marker(messages[idx], marker, native_anthropic=native_anthropic)
+
+    _enforce_max_cache_budget(messages, [], max_budget=4)
 
     return messages
