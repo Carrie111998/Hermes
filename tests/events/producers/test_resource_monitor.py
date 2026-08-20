@@ -654,3 +654,114 @@ class TestBandRatchetAndChangeStamp:
         monitor.evaluate(make_sample(disk_free_gb=10.0), now=2000.0)
         assert self._changes(bus) == ["rising_edge", "rising_edge"]
         assert _pressure_events(bus)[-1].payload["disk_band"] == "severe"
+
+
+class TestCommitAndPhysBands:
+    """Commit and phys carry severity bands too — added 2026-08-20.
+
+    The 2026-08-14 band work fixed the disk axis and stopped there, so commit
+    and phys kept the exact pathology the bands exist to cure. Measured on
+    2026-08-20: the box reached 99.1% commit (126.09/127.20 GB), the monitor
+    emitted 24 ``commit_high`` events that day, and only 8 were delivered —
+    the 96.0% sample among the silent ones. ``band_changed`` was computed from
+    ``disk_band_for`` alone, so once commit latched at its 85% trigger every
+    later sample stamped ``sustained_repeat``, which subscribers drop bus-only.
+    An escalation from 85% to 99% was structurally undeliverable.
+    """
+
+    def _changes(self, bus):
+        return [e.payload["change"] for e in _pressure_events(bus)]
+
+    def test_commit_escalation_is_delivered_not_a_sustained_repeat(self, bus):
+        """The 2026-08-20 incident, reduced: commit climbs inside one episode."""
+        monitor = ResourcePressureMonitor(bus)
+        monitor.evaluate(make_sample(commit_pct=86.0), now=0.0)
+        monitor.evaluate(make_sample(commit_pct=96.5), now=60.0)
+        changes = self._changes(bus)
+        assert changes == ["rising_edge", "band_change"]
+        assert "sustained_repeat" not in changes
+        assert _pressure_events(bus)[-1].payload["commit_band"] == "critical"
+
+    def test_first_commit_breach_carries_the_high_band(self, bus):
+        monitor = ResourcePressureMonitor(bus)
+        monitor.evaluate(make_sample(commit_pct=86.0), now=0.0)
+        p = _pressure_events(bus)[0].payload
+        assert p["commit_band"] == "high"
+        assert p["commit_band_edge_pct"] == 85
+
+    def test_a_climb_past_several_commit_edges_announces_only_the_deepest(self, bus):
+        monitor = ResourcePressureMonitor(bus)
+        monitor.evaluate(make_sample(commit_pct=99.5), now=0.0)
+        events = _pressure_events(bus)
+        assert len(events) == 1
+        assert events[0].payload["commit_band"] == "exhausted"
+
+    def test_hovering_inside_a_commit_band_never_re_announces(self, bus):
+        monitor = ResourcePressureMonitor(bus)
+        monitor.evaluate(make_sample(commit_pct=93.0), now=0.0)
+        monitor.evaluate(make_sample(commit_pct=94.0), now=60.0)
+        monitor.evaluate(make_sample(commit_pct=93.5), now=120.0)
+        assert self._changes(bus) == ["rising_edge"]
+
+    def test_a_commit_dip_inside_the_band_does_not_rearm_the_edge(self, bus):
+        """Mirrors the disk ratchet: only a comfortable recovery re-arms."""
+        monitor = ResourcePressureMonitor(bus)
+        monitor.evaluate(make_sample(commit_pct=96.0), now=0.0)
+        monitor.evaluate(make_sample(commit_pct=93.0), now=60.0)
+        monitor.evaluate(make_sample(commit_pct=96.0), now=120.0)
+        assert "band_change" not in self._changes(bus)[1:]
+
+    def test_phys_escalation_is_delivered(self, bus):
+        monitor = ResourcePressureMonitor(bus)
+        monitor.evaluate(make_sample(phys_pct=93.0), now=0.0)
+        monitor.evaluate(make_sample(phys_pct=98.5), now=60.0)
+        changes = self._changes(bus)
+        assert changes == ["rising_edge", "band_change"]
+        assert _pressure_events(bus)[-1].payload["phys_band"] == "critical"
+
+    def test_a_non_commit_episode_has_no_commit_band(self, bus):
+        monitor = ResourcePressureMonitor(bus)
+        monitor.evaluate(make_sample(disk_free_gb=30.0), now=0.0)
+        p = _pressure_events(bus)[0].payload
+        assert p["reasons"] == ["disk_low"]
+        assert p["commit_band"] is None
+        assert p["phys_band"] is None
+
+    def test_a_new_episode_announces_the_commit_band_again(self, bus):
+        monitor = ResourcePressureMonitor(bus)
+        monitor.evaluate(make_sample(commit_pct=96.0), now=0.0)
+        monitor.evaluate(make_sample(commit_pct=50.0), now=1000.0)
+        monitor.evaluate(make_sample(commit_pct=96.0), now=2000.0)
+        assert self._changes(bus) == ["rising_edge", "rising_edge"]
+
+    def test_axes_band_independently(self, bus):
+        """A commit edge crossed while disk sits still is its own message."""
+        monitor = ResourcePressureMonitor(bus)
+        monitor.evaluate(make_sample(commit_pct=86.0, disk_free_gb=30.0), now=0.0)
+        monitor.evaluate(make_sample(commit_pct=96.5, disk_free_gb=30.0), now=60.0)
+        last = _pressure_events(bus)[-1].payload
+        assert last["change"] == "band_change"
+        assert last["commit_band"] == "critical"
+        assert last["disk_band"] == "low"
+
+    def test_every_commit_band_edge_sits_above_the_disarm(self, bus):
+        """The 2026-08-14 lesson: an unreachable disarm latches an axis forever."""
+        from events.producers.resource_monitor import (
+            COMMIT_BANDS, PHYS_BANDS,
+            DEFAULT_COMMIT_PCT_DISARM, DEFAULT_PHYS_PCT_DISARM,
+        )
+        assert all(edge > DEFAULT_COMMIT_PCT_DISARM for edge, _ in COMMIT_BANDS)
+        assert all(edge > DEFAULT_PHYS_PCT_DISARM for edge, _ in PHYS_BANDS)
+        # Ascending, and the shallowest edge IS the trigger, as disk's is.
+        assert [e for e, _ in COMMIT_BANDS] == sorted(e for e, _ in COMMIT_BANDS)
+        assert [e for e, _ in PHYS_BANDS] == sorted(e for e, _ in PHYS_BANDS)
+
+    def test_a_band_edge_is_exclusive_like_the_trigger(self):
+        """``pct_band_for`` uses strict ``>``, matching how the axis triggers
+        (``commit_pct > commit_pct_threshold``). A reading sitting EXACTLY on an
+        edge has not crossed it, so 96.0 is still ``severe``; 85.0 does not
+        breach at all, exactly as the trigger does not."""
+        from events.producers.resource_monitor import COMMIT_BANDS, pct_band_for
+        assert pct_band_for(96.0, COMMIT_BANDS)[0] == "severe"
+        assert pct_band_for(96.1, COMMIT_BANDS)[0] == "critical"
+        assert pct_band_for(85.0, COMMIT_BANDS) == (None, None)

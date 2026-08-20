@@ -170,6 +170,64 @@ DISK_BANDS: Tuple[Tuple[float, str], ...] = (
 # that is the intended outcome, not a gap.
 DISK_BAND_REARM_FACTOR = 1.2
 
+# Commit / phys severity bands (2026-08-20). The 08-14 band work above cured the
+# disk axis and stopped there, so commit and phys kept the identical pathology:
+# ``band_changed`` was computed from ``disk_band_for`` alone, so once commit
+# latched at its 85% trigger every later sample stamped ``sustained_repeat`` --
+# which subscribers drop bus-only -- and an escalation from 85% to 99% could not
+# reach chat at all. Measured 2026-08-20: commit hit 99.1% (126.09/127.20 GB),
+# 24 ``commit_high`` events were emitted that day and 8 delivered; the 96.0%
+# sample was among the silent ones. Same cure as disk: a LETTERS label the
+# fingerprint can see, so crossing an edge mints a genuinely new message.
+#
+# ASCENDING, unlike DISK_BANDS -- for these axes higher is worse, so the DEEPEST
+# edge crossed is the HIGHEST one. The shallowest edge is deliberately the axis's
+# own trigger (85.0 == DEFAULT_COMMIT_PCT_THRESHOLD, 92.0 ==
+# DEFAULT_PHYS_PCT_THRESHOLD), mirroring DISK_BANDS[0] == 45.0 == the disk
+# trigger, so a first breach always carries a band.
+#
+# Every edge sits ABOVE its axis's disarm (commit 80, phys 87) so a genuinely
+# recovered axis ends the episode and re-arms the whole set. Note the reachability
+# invariant from the 08-14 disk tuning applies to DISARM levels, not to band
+# edges: an unreachable disarm latches an axis forever, whereas an unreachable
+# top band simply never announces (as disk's 1.0 GB "full" band mostly never does).
+COMMIT_BANDS: Tuple[Tuple[float, str], ...] = (
+    (85.0, "high"),
+    (92.0, "severe"),
+    (96.0, "critical"),
+    (99.0, "exhausted"),
+)
+PHYS_BANDS: Tuple[Tuple[float, str], ...] = (
+    (92.0, "high"),
+    (96.0, "severe"),
+    (98.0, "critical"),
+    (99.5, "exhausted"),
+)
+# An announced percentage edge re-arms only once the axis falls this many points
+# back below it. A MULTIPLICATIVE factor like DISK_BAND_REARM_FACTOR is wrong for
+# a 0-100 bounded axis -- 96/1.2 is 80, which collides with commit's disarm and
+# would make the ratchet meaningless. An absolute gap mirrors the per-axis disarm
+# gaps instead (commit 85->80, phys 92->87), so hovering at an edge cannot flap
+# while a real 96 -> 88 -> 96 round trip does re-announce.
+BAND_REARM_GAP_PCT = 5.0
+
+
+def pct_band_for(
+    pct: float, bands: Tuple[Tuple[float, str], ...]
+) -> Tuple[Optional[str], Optional[float]]:
+    """Highest ascending band edge ``pct`` has risen above.
+
+    The percentage-axis twin of ``disk_band_for``: same contract (``(label,
+    edge)``, or ``(None, None)`` below every edge), opposite direction, because
+    for commit and phys a HIGHER reading is the worse one.
+    """
+    label: Optional[str] = None
+    edge: Optional[float] = None
+    for band_edge, band_label in bands:
+        if pct > band_edge:
+            label, edge = band_label, band_edge
+    return label, edge
+
 
 def disk_band_for(free_bytes: int) -> Tuple[Optional[str], Optional[float]]:
     """Deepest band whose edge ``free_bytes`` has fallen below.
@@ -328,11 +386,13 @@ class ResourcePressureMonitor:
         # comfortably clear (its disarm level); episode = any axis latched.
         self._latched: Set[str] = set()
         self._last_emit: Optional[float] = None
-        # Disk band edges already ANNOUNCED this episode. Ratchets down; an
-        # edge re-arms only once free space recovers past
-        # ``edge * DISK_BAND_REARM_FACTOR``, and the whole set clears when the
-        # episode ends.
-        self._announced_disk_edges: Set[float] = set()
+        # Band edges already ANNOUNCED this episode, keyed by AXIS so numerically
+        # equal edges on different axes (and there will be more as bands are
+        # tuned) can never alias each other. Each axis ratchets toward its own
+        # worse direction; an edge re-arms only once its axis recovers
+        # comfortably back past it, and the whole set clears when the episode
+        # ends. Was disk-only until 2026-08-20.
+        self._announced_band_edges: Set[Tuple[str, float]] = set()
         # ``reasons`` of the last EMITTED event, for reasons_change detection.
         self._last_reasons: Optional[Set[str]] = None
 
@@ -406,7 +466,7 @@ class ResourcePressureMonitor:
             if not self._latched:
                 # Episode over: every band re-arms, so the NEXT episode
                 # announces its severity from scratch.
-                self._announced_disk_edges.clear()
+                self._announced_band_edges.clear()
             return None
 
         # Severity band for the disk axis. Gated on ``reasons`` rather than on
@@ -416,25 +476,55 @@ class ResourcePressureMonitor:
         band, band_edge = (
             disk_band_for(sample.disk_free_bytes) if disk_axis else (None, None)
         )
-
-        # Re-arm first: an edge the disk has climbed comfortably back above may
-        # announce again. Unconditional -- an episode kept alive by another axis
-        # must still re-arm its disk edges.
-        self._announced_disk_edges = {
-            edge for edge in self._announced_disk_edges
-            if sample.disk_free_bytes <= edge * DISK_BAND_REARM_FACTOR * _GB
-        }
-        band_changed = (
-            band_edge is not None
-            and band_edge not in self._announced_disk_edges
+        # Commit and phys band the same way (2026-08-20). Each is gated on
+        # ``reasons`` exactly as disk is, so a lowered threshold cannot make a
+        # band appear on an episode that axis is not part of.
+        commit_band, commit_band_edge = (
+            pct_band_for(sample.commit_pct, COMMIT_BANDS)
+            if "commit_high" in reasons else (None, None)
         )
-        if band_changed:
+        phys_band, phys_band_edge = (
+            pct_band_for(sample.phys_pct, PHYS_BANDS)
+            if "phys_high" in reasons else (None, None)
+        )
+
+        # Re-arm first: an edge an axis has recovered comfortably back past may
+        # announce again. Unconditional -- an episode kept alive by another axis
+        # must still re-arm its edges. Each axis re-arms in its own direction:
+        # disk multiplicatively upward (free space recovering), the percentage
+        # axes by an absolute gap downward.
+        self._announced_band_edges = {
+            (axis, edge) for axis, edge in self._announced_band_edges
+            if (sample.disk_free_bytes <= edge * DISK_BAND_REARM_FACTOR * _GB
+                if axis == "disk" else
+                (sample.commit_pct if axis == "commit" else sample.phys_pct)
+                > edge - BAND_REARM_GAP_PCT)
+        }
+
+        # One ``change`` stamp covers the whole event, so ANY axis crossing a
+        # fresh edge makes this a band_change -- that is what carries an
+        # escalation into chat.
+        crossed = [
+            ("disk", band_edge, DISK_BANDS,
+             lambda e: sample.disk_free_bytes < e * _GB),
+            ("commit", commit_band_edge, COMMIT_BANDS,
+             lambda e: sample.commit_pct > e),
+            ("phys", phys_band_edge, PHYS_BANDS,
+             lambda e: sample.phys_pct > e),
+        ]
+        band_changed = any(
+            edge is not None and (axis, edge) not in self._announced_band_edges
+            for axis, edge, _bands, _is_past in crossed
+        )
+        for axis, edge, axis_bands, is_past in crossed:
+            if edge is None or (axis, edge) in self._announced_band_edges:
+                continue
             # Mark EVERY crossed edge announced, not just the deepest, so a
-            # single steep drop is one message instead of one per edge on the
-            # way down.
-            self._announced_disk_edges.update(
-                edge for edge, _label in DISK_BANDS
-                if sample.disk_free_bytes < edge * _GB
+            # single steep move is one message instead of one per edge along
+            # the way.
+            self._announced_band_edges.update(
+                (axis, band_edge_gb) for band_edge_gb, _label in axis_bands
+                if is_past(band_edge_gb)
             )
         reasons_changed = (
             self._last_reasons is not None and set(reasons) != self._last_reasons
@@ -482,12 +572,19 @@ class ResourcePressureMonitor:
 
         self._last_emit = now
         self._last_reasons = set(reasons)
-        return self._emit(sample, reasons, growth_bytes, band, band_edge, change)
+        return self._emit(
+            sample, reasons, growth_bytes, band, band_edge, change,
+            commit_band, commit_band_edge, phys_band, phys_band_edge,
+        )
 
     def _emit(
         self, sample: ResourceSample, reasons: List[str], growth_bytes: int,
         band: Optional[str] = None, band_edge: Optional[float] = None,
         change: str = "rising_edge",
+        commit_band: Optional[str] = None,
+        commit_band_edge: Optional[float] = None,
+        phys_band: Optional[str] = None,
+        phys_band_edge: Optional[float] = None,
     ) -> str:
         payload = {
             "reasons": reasons,
@@ -501,6 +598,13 @@ class ResourcePressureMonitor:
             "disk_c_free_gb": round(sample.disk_free_bytes / _GB, 2),
             "disk_band": band,
             "disk_band_edge_gb": band_edge,
+            # Per-axis severity labels (2026-08-20). Kept as separate keys rather
+            # than folded into ``disk_band`` so existing consumers, replayed
+            # events and the 08-14 disk tests all keep their exact shape.
+            "commit_band": commit_band,
+            "commit_band_edge_pct": commit_band_edge,
+            "phys_band": phys_band,
+            "phys_band_edge_pct": phys_band_edge,
             "change": change,
             "thresholds": {
                 "commit_pct": self.commit_pct_threshold,

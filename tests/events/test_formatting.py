@@ -972,6 +972,64 @@ def test_resource_pressure_body_without_a_band_still_renders():
     assert "None" not in body
 
 
+# --- commit / phys severity bands (2026-08-20) ------------------------------
+
+def _pct_pressure_payload(commit_pct, commit_band, phys_pct=75.8, phys_band=None):
+    """A commit/phys episode -- no disk axis, so disk_band stays None."""
+    return {
+        "reasons": ["commit_high"] + (["phys_high"] if phys_band else []),
+        "commit_used_gb": 126.09, "commit_limit_gb": 127.2,
+        "commit_pct": commit_pct,
+        "phys_used_pct": phys_pct, "phys_available_gb": 1.36,
+        "pagefile_allocated_gb": 64.0, "pagefile_growth_gb_10min": 0.0,
+        "disk_c_free_gb": 300.0, "disk_band": None, "disk_band_edge_gb": None,
+        "commit_band": commit_band, "commit_band_edge_pct": 96.0,
+        "phys_band": phys_band, "phys_band_edge_pct": 98.0,
+        "change": "band_change",
+        "thresholds": {"commit_pct": 85.0, "phys_pct": 92.0},
+    }
+
+
+def test_commit_band_changes_the_fingerprint_but_digits_alone_do_not():
+    """The 2026-08-20 half of the band work, and the reason it exists.
+
+    Producer-side bands alone do not fix delivery: RepeatGuard fingerprints the
+    RENDERED BODY, and normalize_for_fingerprint collapses digit runs to "N".
+    Before this, commit 85.7% and commit 99.1% rendered one fingerprint, so an
+    escalation was suppressed as a verbatim repeat even when it escaped the
+    sustained_repeat drop. Severity must reach the body as LETTERS -- while two
+    readings inside one band must still collapse.
+    """
+    from events.formatting import resource_pressure_body
+    from events.noise_guards import normalize_for_fingerprint
+
+    high = resource_pressure_body(_pct_pressure_payload(86.0, "high"))
+    high_later = resource_pressure_body(_pct_pressure_payload(90.4, "high"))
+    critical = resource_pressure_body(_pct_pressure_payload(96.0, "critical"))
+
+    assert normalize_for_fingerprint(high) == normalize_for_fingerprint(high_later)
+    assert normalize_for_fingerprint(high) != normalize_for_fingerprint(critical)
+
+
+def test_phys_band_changes_the_fingerprint():
+    from events.formatting import resource_pressure_body
+    from events.noise_guards import normalize_for_fingerprint
+
+    severe = resource_pressure_body(_pct_pressure_payload(86.0, "high", 96.5, "severe"))
+    critical = resource_pressure_body(_pct_pressure_payload(86.0, "high", 98.4, "critical"))
+    assert normalize_for_fingerprint(severe) != normalize_for_fingerprint(critical)
+
+
+def test_body_names_the_phys_axis_it_reports():
+    """phys was in ``reasons`` but absent from the body entirely until 08-20 --
+    a paging alert that never said how much RAM was left."""
+    from events.formatting import resource_pressure_body
+    body = resource_pressure_body(_pct_pressure_payload(86.0, "high", 98.4, "critical"))
+    assert "1.36" in body           # phys_available_gb
+    assert "CRITICAL" in body.upper()
+    assert "None" not in body
+
+
 class TestCronStaleBody:
     """CRON_STALE carries four distinct meanings on one event type.
 

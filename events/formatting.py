@@ -497,11 +497,38 @@ def resource_pressure_body(payload: dict) -> str:
         edge = p.get("disk_band_edge_gb")
         if edge is not None:
             disk += f" (under {edge:g} GiB)"
+
+    # Commit and phys carry bands too since 2026-08-20, for exactly the reason
+    # the disk band exists: the guard sees only letters. Before this, commit
+    # 85.7% and commit 99.1% were ONE fingerprint, so a climb toward commit
+    # exhaustion was suppressed as a verbatim repeat. Rendered as "over N%"
+    # (the disk line reads "under N GiB") because these axes worsen upward.
+    commit = (f"Commit: {p.get('commit_pct', '?')}% "
+              f"({p.get('commit_used_gb', '?')}/{p.get('commit_limit_gb', '?')} GB)")
+    commit_band = p.get("commit_band")
+    if commit_band:
+        commit += f" — {str(commit_band).upper()}"
+        commit_edge = p.get("commit_band_edge_pct")
+        if commit_edge is not None:
+            commit += f" (over {commit_edge:g}%)"
+
+    # phys was in ``reasons`` but rendered NOWHERE until 2026-08-20 — a paging
+    # alert that never said how much RAM was left. The 2026-07-16 axis landed
+    # without touching this renderer.
+    phys = (f"Phys: {p.get('phys_used_pct', '?')}% used "
+            f"({p.get('phys_available_gb', '?')} GB avail)")
+    phys_band = p.get("phys_band")
+    if phys_band:
+        phys += f" — {str(phys_band).upper()}"
+        phys_edge = p.get("phys_band_edge_pct")
+        if phys_edge is not None:
+            phys += f" (over {phys_edge:g}%)"
+
     return (
         f"⚠ Resource pressure: {reasons}\n"
         f"{disk}\n"
-        f"Commit: {p.get('commit_pct', '?')}% "
-        f"({p.get('commit_used_gb', '?')}/{p.get('commit_limit_gb', '?')} GB)\n"
+        f"{commit}\n"
+        f"{phys}\n"
         f"Pagefile: {p.get('pagefile_allocated_gb', '?')} GB "
         f"(+{p.get('pagefile_growth_gb_10min', '?')} GB/10m)"
     )
