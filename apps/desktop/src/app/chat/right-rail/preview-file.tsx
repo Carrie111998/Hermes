@@ -1947,9 +1947,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
                     <span>
                       {jumpTarget.index >= jumpTarget.changes.length
                         ? t.preview.backToReading
-                        : typeof t.preview.jumpToChange === 'function'
-                          ? t.preview.jumpToChange(jumpTarget.index + 1, jumpTarget.changes.length)
-                          : `${t.preview.jumpToChange} ${jumpTarget.index + 1}/${jumpTarget.changes.length}`}
+                        : `${t.preview.jumpToChange} ${jumpTarget.index + 1}/${jumpTarget.changes.length}`}
                     </span>
                   </button>
                 </Tip>
