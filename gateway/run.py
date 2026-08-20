@@ -13451,6 +13451,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 f"run /sethome on the desired chat first"
             )
 
+        home_chat_id = str(home.chat_id)
+        handoff_source_profile = (
+            self._handoff_source_profile(row) if move_source_key else None
+        )
+        destination_guild_id = None
+        if move_source_key:
+            destination_guild_id = await self._webhook_handoff_destination_guild_id(
+                platform=platform,
+                adapter=adapter,
+                home=home,
+            )
+            self._validate_webhook_handoff_destination_profile(
+                SessionSource(
+                    platform=platform,
+                    chat_id=home_chat_id,
+                    chat_name=home.name,
+                    chat_type="group",
+                    user_id=str(home.user_id) if home.user_id else None,
+                    scope_id=str(home.scope_id) if home.scope_id else None,
+                    guild_id=destination_guild_id,
+                    profile=handoff_source_profile,
+                ),
+                handoff_source_profile,
+            )
+
         session_title = row.get("title") or handoff_session_id[:8]
 
         # Try to create a fresh thread on the destination so the handoff
@@ -13495,7 +13520,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # source shape as the user's next real message; otherwise the synthetic
         # handoff turn binds a generic `thread` session key while real replies
         # arrive on a `dm` session key.
-        home_chat_id = str(home.chat_id)
         is_telegram_private_chat = (
             platform == Platform.TELEGRAM
             and looks_like_telegram_private_chat_id(home_chat_id)
@@ -13552,11 +13576,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_name="Handoff",
             thread_id=effective_thread_id,
             scope_id=home.scope_id if move_source_key else None,
+            guild_id=destination_guild_id if move_source_key else None,
             parent_chat_id=(
                 home_chat_id if move_source_key and effective_thread_id else None
             ),
-            profile=(self._handoff_source_profile(row) if move_source_key else None),
+            profile=handoff_source_profile,
         )
+        if move_source_key:
+            self._validate_webhook_handoff_destination_profile(
+                dest_source,
+                handoff_source_profile,
+            )
 
         # Compute the gateway's session_key for that destination using the
         # same rules its adapters use, so switch_session targets the right
@@ -13674,8 +13704,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             err = getattr(result, "error", "send returned success=False")
             raise RuntimeError(f"adapter.send failed: {err}")
 
-    @staticmethod
-    def _handoff_source_profile(row: Dict[str, Any]) -> Optional[str]:
+    def _handoff_source_profile(self, row: Dict[str, Any]) -> Optional[str]:
         """Recover the trusted source profile for destination key namespacing."""
         raw_origin = row.get("origin_json")
         if raw_origin:
@@ -13686,7 +13715,77 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
         profile = row.get("profile_name")
-        return str(profile) if profile else None
+        if profile:
+            return str(profile)
+        if getattr(self.config, "multiplex_profiles", False):
+            # Handoff routes are currently default-profile-only. Older pending
+            # rows and unprefixed /webhooks requests may not have persisted an
+            # explicit profile, but their effective namespace is still default.
+            return "default"
+        return None
+
+    async def _webhook_handoff_destination_guild_id(
+        self,
+        *,
+        platform: "Platform",
+        adapter: Any,
+        home: Any,
+    ) -> Optional[str]:
+        """Resolve guild provenance needed to check destination profile routes."""
+        if not getattr(self.config, "multiplex_profiles", False):
+            return str(home.scope_id) if home.scope_id else None
+
+        routes = getattr(self.config, "profile_routes", None) or []
+        guild_routes = [
+            route
+            for route in routes
+            if getattr(route, "enabled", True)
+            and getattr(route, "platform", None) == platform.value
+            and getattr(route, "guild_id", None)
+        ]
+        if not guild_routes:
+            return str(home.scope_id) if home.scope_id else None
+        if home.scope_id:
+            return str(home.scope_id)
+
+        get_chat_info = getattr(adapter, "get_chat_info", None)
+        if not callable(get_chat_info):
+            raise RuntimeError(
+                f"cannot verify {platform.value} home profile routing"
+            )
+        info = await get_chat_info(str(home.chat_id))
+        guild_id = info.get("guild_id") if isinstance(info, dict) else None
+        if not guild_id or (isinstance(info, dict) and info.get("error")):
+            raise RuntimeError(
+                f"cannot verify {platform.value} home profile routing"
+            )
+        return str(guild_id)
+
+    def _validate_webhook_handoff_destination_profile(
+        self,
+        source: "SessionSource",
+        handoff_source_profile: Optional[str],
+    ) -> None:
+        """Reject a destination that organic replies route to another profile."""
+        if not getattr(self.config, "multiplex_profiles", False):
+            return
+
+        from gateway.profile_routing import match_profile_route
+
+        matched = match_profile_route(
+            getattr(self.config, "profile_routes", None) or [],
+            platform=source.platform.value,
+            guild_id=source.guild_id,
+            chat_id=source.chat_id,
+            thread_id=source.thread_id,
+            parent_chat_id=source.parent_chat_id,
+        )
+        if matched and matched.profile != handoff_source_profile:
+            raise RuntimeError(
+                f"handoff destination matches named profile route "
+                f"'{matched.name}' ({matched.profile}); webhook handoff is "
+                "currently default-profile-only"
+            )
 
     async def _session_expiry_watcher(self, interval: int = 300):
         """Background task that finalizes expired sessions.

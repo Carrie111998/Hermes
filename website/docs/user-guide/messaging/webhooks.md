@@ -348,7 +348,7 @@ platforms:
           handoff_to: discord
 ```
 
-The destination comes only from trusted local route configuration; payload fields cannot choose or interpolate it. Configure the Discord home channel first with `/sethome`. Handoff mode is exclusive: it does not also post the legacy webhook response to `deliver` or the parent channel, and `deliver_only: true` is rejected. A repeated delivery ID reuses the durable handoff marker and does not create another session or thread. In a multiplexed gateway, handoff routes currently belong to the default profile; a named `profile` on a handoff route is rejected instead of silently reading another profile's session store or home channel.
+The destination comes only from trusted local route configuration; payload fields cannot choose or interpolate it. Configure the Discord home channel first with `/sethome`. Handoff mode is exclusive: it does not also post the legacy webhook response to `deliver` or the parent channel, and `deliver_only: true` is rejected. A repeated delivery ID reuses the durable handoff marker and does not create another session or thread. In a multiplexed gateway, handoff routes currently belong to the default profile; a named `profile` on a handoff route is rejected instead of silently reading another profile's session store or home channel. The configured Discord home must also resolve to the default profile: a matching named `gateway.profile_routes` rule fails the handoff visibly before a thread is created.
 
 Routes without `handoff_to` retain the normal delivery behavior described above.
 

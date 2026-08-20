@@ -35,6 +35,9 @@ def _handoff_routes(**overrides):
 def _create_app(adapter: WebhookAdapter) -> web.Application:
     app = web.Application()
     app.router.add_post("/webhooks/{route_name}", adapter._handle_webhook)
+    app.router.add_post(
+        "/p/{profile}/webhooks/{route_name}", adapter._handle_webhook
+    )
     return app
 
 
@@ -197,6 +200,58 @@ async def test_handoff_target_is_config_only_not_payload_interpolation():
     )
     assert event.metadata["_webhook_handoff_delivery"] == marker
     claim.assert_awaited_once_with(state_key, accepted_state)
+
+
+@pytest.mark.asyncio
+async def test_default_profile_url_aliases_share_one_durable_claim():
+    adapter = _make_adapter(_handoff_routes())
+    durable = {}
+
+    async def _set_meta_if_absent(key, value):
+        if key in durable:
+            return False
+        durable[key] = value
+        return True
+
+    async def _get_meta(key):
+        return durable[key]
+
+    db = SimpleNamespace(
+        set_meta_if_absent=AsyncMock(side_effect=_set_meta_if_absent),
+        get_meta=AsyncMock(side_effect=_get_meta),
+    )
+    adapter.gateway_runner = SimpleNamespace(
+        config=SimpleNamespace(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=[],
+        ),
+        _session_db=db,
+        _profile_name_for_source=lambda _source: None,
+    )
+    adapter.handle_message = AsyncMock()
+
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        headers = {"X-GitHub-Delivery": "default-profile-alias"}
+        first = await client.post(
+            "/webhooks/alerts", json={"message": "same"}, headers=headers
+        )
+        second = await client.post(
+            "/p/default/webhooks/alerts",
+            json={"message": "same"},
+            headers=headers,
+        )
+        second_body = await second.json()
+
+    assert first.status == 202
+    assert second.status == 200
+    assert second_body["status"] == "duplicate"
+    assert len(durable) == 1
+    assert db.set_meta_if_absent.await_count == 2
+    first_claim, second_claim = db.set_meta_if_absent.await_args_list
+    assert first_claim.args == second_claim.args
+    await asyncio.sleep(0)
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.await_args.args[0].source.profile == "default"
 
 
 @pytest.mark.asyncio

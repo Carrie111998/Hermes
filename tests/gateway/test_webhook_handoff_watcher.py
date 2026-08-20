@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
+from gateway.profile_routing import ProfileRoute
 from gateway.run import GatewayRunner
 from gateway.session import (
     AsyncSessionStore,
@@ -22,10 +23,15 @@ def _discord_config(
     *,
     thread_sessions_per_user=False,
     home_user_id=None,
+    home_scope_id="guild-1",
+    multiplex_profiles=False,
+    profile_routes=None,
 ):
     return GatewayConfig(
         sessions_dir=tmp_path / "sessions",
         thread_sessions_per_user=thread_sessions_per_user,
+        multiplex_profiles=multiplex_profiles,
+        profile_routes=profile_routes or [],
         platforms={
             Platform.DISCORD: PlatformConfig(
                 enabled=True,
@@ -35,7 +41,7 @@ def _discord_config(
                     chat_id="parent-1",
                     name="Hermes Home",
                     user_id=home_user_id,
-                    scope_id="guild-1",
+                    scope_id=home_scope_id,
                 ),
                 extra={
                     "thread_sessions_per_user": thread_sessions_per_user,
@@ -54,6 +60,13 @@ def _runner_with_store(config, store, db):
 
     adapter = SimpleNamespace(
         create_handoff_thread=AsyncMock(return_value="thread-42"),
+        get_chat_info=AsyncMock(
+            return_value={
+                "name": "Hermes Home",
+                "type": "channel",
+                "guild_id": "guild-1",
+            }
+        ),
         send=AsyncMock(return_value=SimpleNamespace(success=True)),
     )
     runner.adapters = {Platform.DISCORD: adapter}
@@ -226,6 +239,115 @@ async def test_thread_per_user_handoff_keys_to_authenticated_home_user(tmp_path)
     assert moved.origin.user_id == "discord-user-7"
     assert store.get_or_create_session(next_reply_source).session_id == entry.session_id
     assert next_reply_key.endswith(":discord-user-7")
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_multiplex_default_handoff_matches_unprofiled_organic_reply(
+    tmp_path,
+):
+    """An unprefixed default webhook and Discord reply share one namespace."""
+    config = _discord_config(tmp_path, multiplex_profiles=True)
+    with patch("gateway.session.SessionStore._ensure_loaded"):
+        store = SessionStore(sessions_dir=config.sessions_dir, config=config)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    store._db = db
+    store._loaded = True
+
+    source = SessionSource(
+        platform=Platform.WEBHOOK,
+        chat_id="webhook:alerts:default-profile",
+        chat_type="webhook",
+        user_id="webhook:alerts",
+    )
+    with patch(
+        "hermes_cli.profiles.get_active_profile_name",
+        return_value="default",
+    ):
+        entry = store.get_or_create_session(source)
+        runner, _adapter = _runner_with_store(config, store, db)
+        row = db.get_session(entry.session_id)
+        row.update(
+            {
+                "handoff_platform": "discord",
+                "source": "webhook",
+                "session_key": entry.session_key,
+            }
+        )
+
+        await runner._process_handoff(row)
+
+        next_reply = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="thread-42",
+            chat_name="Hermes Home",
+            chat_type="thread",
+            user_id="discord-user",
+            thread_id="thread-42",
+            scope_id="guild-1",
+            guild_id="guild-1",
+            parent_chat_id="parent-1",
+        )
+        destination_key = runner._session_key_for_source(next_reply)
+        resumed = store.get_or_create_session(next_reply)
+
+    assert entry.session_key.startswith("agent:main:")
+    assert destination_key.startswith("agent:main:")
+    assert resumed.session_id == entry.session_id
+    assert store.lookup_by_session_key(entry.session_key) is None
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_named_destination_profile_route_is_rejected_before_thread(
+    tmp_path,
+):
+    """A named-profile Discord home cannot receive a default-profile handoff."""
+    config = _discord_config(
+        tmp_path,
+        home_scope_id=None,
+        multiplex_profiles=True,
+        profile_routes=[
+            ProfileRoute(
+                name="work-guild",
+                platform="discord",
+                guild_id="guild-1",
+                profile="work",
+            )
+        ],
+    )
+    with patch("gateway.session.SessionStore._ensure_loaded"):
+        store = SessionStore(sessions_dir=config.sessions_dir, config=config)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    store._db = db
+    store._loaded = True
+
+    source = SessionSource(
+        platform=Platform.WEBHOOK,
+        chat_id="webhook:alerts:named-destination",
+        chat_type="webhook",
+        user_id="webhook:alerts",
+        profile="default",
+    )
+    entry = store.get_or_create_session(source)
+    runner, adapter = _runner_with_store(config, store, db)
+    row = db.get_session(entry.session_id)
+    row.update(
+        {
+            "handoff_platform": "discord",
+            "source": "webhook",
+            "session_key": entry.session_key,
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="named profile route 'work-guild'"):
+        await runner._process_handoff(row)
+
+    assert store.peek_session_id(entry.session_key) == entry.session_id
+    adapter.get_chat_info.assert_awaited_once_with("parent-1")
+    adapter.create_handoff_thread.assert_not_awaited()
+    runner._handle_message.assert_not_awaited()
+    adapter.send.assert_not_awaited()
     db.close()
 
 

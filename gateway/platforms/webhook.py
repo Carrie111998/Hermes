@@ -1086,6 +1086,16 @@ class WebhookAdapter(BasePlatformAdapter):
         )
         if profile and isinstance(profile, str):
             source.profile = profile
+        elif handoff_to and getattr(
+            getattr(self.gateway_runner, "config", None),
+            "multiplex_profiles",
+            False,
+        ):
+            # Both the unprefixed webhook URL and /p/default authorize the
+            # same default-profile route. Stamp that effective profile so
+            # session keys and the durable delivery identity cannot diverge
+            # based on which equivalent URL the provider retried.
+            source.profile = "default"
         event = MessageEvent(
             text=prompt,
             message_type=MessageType.TEXT,
@@ -1193,8 +1203,9 @@ class WebhookAdapter(BasePlatformAdapter):
         *, profile: Optional[str], route_name: str, delivery_id: str
     ) -> str:
         """Stable, JSON-safe identity for durable webhook retry detection."""
+        effective_profile = str(profile or "default").strip() or "default"
         return json.dumps(
-            [str(profile or ""), str(route_name), str(delivery_id)],
+            [effective_profile, str(route_name), str(delivery_id)],
             separators=(",", ":"),
         )
 
