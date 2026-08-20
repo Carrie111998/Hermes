@@ -5193,7 +5193,11 @@ class PluginManager:
             callback_name = getattr(cb, "__name__", repr(cb))
             callback_key = (hook_name, id(cb))
             bounded = hook_name in _HOOK_TIMEOUT_BOUNDED_HOOKS or hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
-            if hook_name in _HOOK_CALLER_THREAD_HOOKS or not bounded:
+            if (
+                hook_name in _HOOK_CALLER_THREAD_HOOKS
+                or not bounded
+                or callback_name.startswith("shell_hook[")
+            ):
                 try:
                     ret = self._invoke_hook_callback(cb, kwargs)
                     if ret is not None:
@@ -5205,18 +5209,26 @@ class PluginManager:
             while True:
                 now = time.monotonic()
                 with self._hook_timeout_lock:
-                    suppressed_until = self._hook_timeout_suppressed_until.get(callback_key)
-                    if suppressed_until is not None and suppressed_until > now:
-                        skip_reason = "suppressed"
+                    callback_live = any(
+                        registered is cb
+                        for registered in self._hooks.get(hook_name, [])
+                    )
+                    if not callback_live:
+                        skip_reason = "unloaded"
                         running_event = None
                     else:
-                        if suppressed_until is not None:
-                            self._hook_timeout_suppressed_until.pop(callback_key, None)
-                        running_event = self._hook_running_callbacks.get(callback_key)
-                        if running_event is None:
-                            running_event = threading.Event()
-                            self._hook_running_callbacks[callback_key] = running_event
-                            break
+                        suppressed_until = self._hook_timeout_suppressed_until.get(callback_key)
+                        if suppressed_until is not None and suppressed_until > now:
+                            skip_reason = "suppressed"
+                            running_event = None
+                        else:
+                            if suppressed_until is not None:
+                                self._hook_timeout_suppressed_until.pop(callback_key, None)
+                            running_event = self._hook_running_callbacks.get(callback_key)
+                            if running_event is None:
+                                running_event = threading.Event()
+                                self._hook_running_callbacks[callback_key] = running_event
+                                break
                 if skip_reason is not None:
                     break
                 if running_event.wait(self._hook_timeout_seconds):
@@ -5226,8 +5238,9 @@ class PluginManager:
                         self._hook_timeout_suppressed_until[callback_key] = (
                             time.monotonic() + self._hook_timeout_suppression_seconds
                         )
-                skip_reason = "active callback timed out"
-                break
+                        skip_reason = "active callback timed out"
+                        break
+                continue
             if skip_reason is not None:
                 logger.warning(
                     "Hook '%s' callback %s skipped while %s; continuing %s",
@@ -5236,7 +5249,10 @@ class PluginManager:
                     skip_reason,
                     "fail-closed" if hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS else "fail-open",
                 )
-                if hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS:
+                if (
+                    hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
+                    and skip_reason != "unloaded"
+                ):
                     results.append({"action": "block", "message": "pre_tool_call plugin callback timed out or is still running"})
                 continue
             context = contextvars.copy_context()
@@ -5262,9 +5278,20 @@ class PluginManager:
                 )
                 if bounded_result.timed_out:
                     with self._hook_timeout_lock:
-                        self._hook_timeout_suppressed_until[callback_key] = (
-                            time.monotonic() + self._hook_timeout_suppression_seconds
+                        callback_live = any(
+                            registered is cb
+                            for registered in self._hooks.get(hook_name, [])
                         )
+                        state_is_current = (
+                            callback_live
+                            and self._hook_running_callbacks.get(callback_key) is running_event
+                        )
+                        if state_is_current:
+                            self._hook_timeout_suppressed_until[callback_key] = (
+                                time.monotonic() + self._hook_timeout_suppression_seconds
+                            )
+                    if not state_is_current:
+                        continue
                     if hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS:
                         results.append({"action": "block", "message": "pre_tool_call plugin callback timed out or is still running"})
                     continue

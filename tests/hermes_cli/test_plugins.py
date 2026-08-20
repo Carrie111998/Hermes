@@ -1036,6 +1036,35 @@ class TestPluginHooks:
         assert errors == []
         assert results == [[], []]
 
+    def test_shell_hook_callback_keeps_its_caller_thread_and_timeout(self):
+        mgr = PluginManager()
+        entered = threading.Event()
+        release = threading.Event()
+        callback_thread = []
+        caller_thread = []
+
+        def shell_hook(**kwargs):
+            callback_thread.append(threading.current_thread())
+            entered.set()
+            release.wait(1)
+            return {"action": "allow"}
+
+        shell_hook.__name__ = "shell_hook[pre_tool_call:echo]"
+        mgr._hooks["pre_tool_call"] = [shell_hook]
+
+        def invoke():
+            caller_thread.append(threading.current_thread())
+            return mgr.invoke_hook("pre_tool_call", tool_name="terminal")
+
+        thread = threading.Thread(target=invoke)
+        thread.start()
+        assert entered.wait(1)
+        release.set()
+        thread.join(1)
+
+        assert callback_thread == caller_thread
+
+
     def test_bounded_hook_uses_shared_adapter_and_caller_context(self):
         mgr = PluginManager()
         marker = ContextVar("plugin-test-marker", default="missing")
@@ -1135,6 +1164,56 @@ class TestPluginHooks:
 
         mgr.unload("test-plugin")
 
+        assert mgr._hook_timeout_suppressed_until == {}
+        assert mgr._hook_running_callbacks == {}
+
+    def test_scoped_unload_invalidates_waiting_callback_snapshot(self):
+        mgr = PluginManager()
+        mgr._hook_timeout_seconds = 0.2
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def callback(**kwargs):
+            calls.append(True)
+            entered.set()
+            release.wait(1)
+
+        PluginContext(PluginManifest(name="test-plugin"), mgr).register_hook(
+            "pre_tool_call", callback
+        )
+        results = []
+        first = threading.Thread(
+            target=lambda: results.append(mgr.invoke_hook("pre_tool_call"))
+        )
+        second = threading.Thread(
+            target=lambda: results.append(mgr.invoke_hook("pre_tool_call"))
+        )
+        first.start()
+        assert entered.wait(1)
+        second.start()
+        time.sleep(0.05)
+        mgr.unload("test-plugin")
+        release.set()
+        first.join(1)
+        second.join(1)
+
+        assert calls == [True]
+        assert results == [[], []]
+
+    def test_unload_prevents_timeout_state_repopulation(self, monkeypatch):
+        mgr = PluginManager()
+        PluginContext(PluginManifest(name="test-plugin"), mgr).register_hook(
+            "pre_tool_call", lambda **kwargs: None
+        )
+
+        def timed_out_runner(callback, timeout, **kwargs):
+            mgr.unload("test-plugin")
+            return types.SimpleNamespace(timed_out=True, value=None)
+
+        monkeypatch.setattr(plugins, "run_bounded_sync", timed_out_runner)
+
+        assert mgr.invoke_hook("pre_tool_call") == []
         assert mgr._hook_timeout_suppressed_until == {}
         assert mgr._hook_running_callbacks == {}
 
