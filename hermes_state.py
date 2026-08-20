@@ -1507,6 +1507,20 @@ class SessionDB:
         query += " ORDER BY created_at"
         return [self._action_from_row(row) for row in self._conn.execute(query, params).fetchall()]
 
+    def list_recent_actions(self, mission_id: str, limit: int = 1):
+        """Return a bounded newest-first action view for derived context only."""
+        limit = max(0, min(int(limit), 8))
+        if not limit:
+            return []
+        rows = self._conn.execute(
+            """SELECT * FROM mission_actions
+               WHERE mission_id = ?
+               ORDER BY updated_at DESC, created_at DESC
+               LIMIT ?""",
+            (mission_id, limit),
+        ).fetchall()
+        return [self._action_from_row(row) for row in rows]
+
     def _transition_action(self, action_id: str, target, **fields):
         from agent.action_commit import ActionLedgerError, ActionStatus, validate_transition
 

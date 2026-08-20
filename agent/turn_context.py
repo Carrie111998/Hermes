@@ -356,6 +356,9 @@ def build_turn_context(
     pending_actions = []
     if checkpoint is not None and getattr(agent, "_session_db", None) is not None:
         pending_actions = list(agent._session_db.list_pending_actions(checkpoint.mission_id))
+        recent_actions = list(getattr(agent._session_db, "list_recent_actions", lambda *_a, **_k: [])(checkpoint.mission_id, 1))
+        pending_ids = {action.action_id for action in pending_actions}
+        pending_actions.extend(action for action in recent_actions if action.action_id not in pending_ids)
     context_window = getattr(getattr(agent, "context_compressor", None), "context_length", None)
     context_window = context_window or getattr(agent, "_config_context_length", None) or 32000
     reserved_headroom = max(1024, int(context_window * 0.20), int(getattr(agent, "max_tokens", 0) or 0))

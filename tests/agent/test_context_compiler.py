@@ -91,6 +91,15 @@ def test_hot_state_and_unresolved_action_are_always_present():
     assert "VERIFY_REQUIRED: true" in result.machine_context
 
 
+def test_recent_committed_action_is_a_bounded_reference():
+    result = ContextCompiler(token_budget=1200, reserved_headroom=300).compile(
+        checkpoint=checkpoint(),
+        actions=[action(status=ActionStatus.COMMITTED)],
+    )
+    assert "ACTION_ID: act-1" in result.machine_context
+    assert "ACTION_STATUS: COMMITTED" in result.machine_context
+
+
 def test_contradictory_conversation_is_bounded_and_non_authoritative():
     result = ContextCompiler(token_budget=1000, reserved_headroom=250).compile(
         checkpoint=checkpoint(next_action="correct_action"),

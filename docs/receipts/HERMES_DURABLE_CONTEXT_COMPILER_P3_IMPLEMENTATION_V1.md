@@ -15,6 +15,7 @@
 
 - `agent/context_compiler.py`
 - `agent/turn_context.py`
+- `hermes_state.py` (bounded read-only recent-action query)
 - `tests/agent/test_context_compiler.py`
 
 ## Context compiler
@@ -50,8 +51,8 @@
 
 ## Tests
 
-- focused P3 + turn-context: `16 passed`
-- combined P1/P2/P3/turn-context: `90 passed`
+- focused P3 + turn-context: `17 passed`
+- combined P1/P2/P3/turn-context: `91 passed`
 - relevant canonical non-async subset: `479 passed`, `5 skipped`
 - TUI direct startup suite: `238 passed`
 - gateway API sync tests: `43 passed`
