@@ -183,3 +183,9 @@ test-results/
 
 # Isolated feature worktrees created by the agent workflow.
 .worktrees/
+
+# Customer and candidate corpus data. Contact lists and company corpora are
+# private commercial input, never repo content — see server/README.md.
+customer list*.csv
+*CustomerData*.csv
+*candidates*.csv
