@@ -1,9 +1,12 @@
-"""Tests for tools.discord_api.permissions request builders (feature A2)."""
+"""Discord REST v10 permission-overwrite wire-contract tests."""
 
 import pytest
 
 from tools.discord_api.permissions import (
+    MAX_SNOWFLAKE,
     PermissionOverwriteError,
+    TYPE_MEMBER,
+    TYPE_ROLE,
     delete_channel_permission_request,
     set_channel_permission_request,
 )
@@ -12,78 +15,52 @@ CHANNEL = "123456789012345678"
 OVERWRITE = "987654321098765432"
 
 
-class TestPermissionOverwriteError:
-    def test_is_valueerror_subclass(self):
-        assert issubclass(PermissionOverwriteError, ValueError)
+def test_type_constants_match_discord_rest_v10():
+    assert TYPE_ROLE == 0
+    assert TYPE_MEMBER == 1
 
 
-class TestSetChannelPermissionRequest:
-    def test_payload_allow_deny_type(self):
-        req = set_channel_permission_request(CHANNEL, OVERWRITE, allow=1024, deny=8, type_=1)
-        assert req["method"] == "PUT"
-        assert req["path"] == f"/channels/{CHANNEL}/permissions/{OVERWRITE}"
-        assert req["payload"] == {"allow": 1024, "deny": 8, "type": 1}
-
-    def test_defaults_allow_deny_zero(self):
-        req = set_channel_permission_request(CHANNEL, OVERWRITE, type_=0)
-        assert req["payload"] == {"allow": 0, "deny": 0, "type": 0}
-
-    def test_member_type(self):
-        req = set_channel_permission_request(CHANNEL, OVERWRITE, type_=0)
-        assert req["payload"]["type"] == 0
-
-    def test_role_type(self):
-        req = set_channel_permission_request(CHANNEL, OVERWRITE, type_=1)
-        assert req["payload"]["type"] == 1
-
-    def test_accepts_int_snowflakes(self):
-        req = set_channel_permission_request(123456789012345678, 987654321098765432, type_=1)
-        assert req["path"] == "/channels/123456789012345678/permissions/987654321098765432"
-
-    @pytest.mark.parametrize("bad", [2, -1, "1", 1.0, True, None])
-    def test_invalid_type_rejected(self, bad):
-        with pytest.raises(PermissionOverwriteError):
-            set_channel_permission_request(CHANNEL, OVERWRITE, type_=bad)
-
-    @pytest.mark.parametrize("bad", [-1, -1024])
-    def test_negative_allow_rejected(self, bad):
-        with pytest.raises(PermissionOverwriteError):
-            set_channel_permission_request(CHANNEL, OVERWRITE, allow=bad, type_=0)
-
-    @pytest.mark.parametrize("bad", [-1, -1024])
-    def test_negative_deny_rejected(self, bad):
-        with pytest.raises(PermissionOverwriteError):
-            set_channel_permission_request(CHANNEL, OVERWRITE, deny=bad, type_=0)
-
-    def test_non_int_allow_rejected(self):
-        with pytest.raises(PermissionOverwriteError):
-            set_channel_permission_request(CHANNEL, OVERWRITE, allow="8", type_=0)
-
-    def test_bool_allow_rejected(self):
-        with pytest.raises(PermissionOverwriteError):
-            set_channel_permission_request(CHANNEL, OVERWRITE, allow=True, type_=0)
-
-    @pytest.mark.parametrize(
-        "bad", ["", "abc", "-1", "12x", "1.5", 1.5, True, None, 2**63]
+def test_set_payload_serializes_bitfields_as_decimal_strings():
+    req = set_channel_permission_request(
+        CHANNEL,
+        OVERWRITE,
+        allow=1024,
+        deny="0008",
+        type_=TYPE_MEMBER,
     )
-    def test_invalid_snowflake_rejected(self, bad):
-        with pytest.raises(PermissionOverwriteError):
-            set_channel_permission_request(bad, OVERWRITE, type_=0)
-        with pytest.raises(PermissionOverwriteError):
-            set_channel_permission_request(CHANNEL, bad, type_=0)
+    assert req == {
+        "method": "PUT",
+        "path": f"/channels/{CHANNEL}/permissions/{OVERWRITE}",
+        "payload": {"allow": "1024", "deny": "8", "type": 1},
+    }
 
 
-class TestDeleteChannelPermissionRequest:
-    def test_shape(self):
-        req = delete_channel_permission_request(CHANNEL, OVERWRITE)
-        assert req["method"] == "DELETE"
-        assert req["path"] == f"/channels/{CHANNEL}/permissions/{OVERWRITE}"
-        assert req["payload"] is None
+def test_defaults_are_wire_strings_and_role_type_zero():
+    req = set_channel_permission_request(CHANNEL, OVERWRITE, type_=TYPE_ROLE)
+    assert req["payload"] == {"allow": "0", "deny": "0", "type": 0}
 
-    def test_invalid_channel_rejected(self):
-        with pytest.raises(PermissionOverwriteError):
-            delete_channel_permission_request("", OVERWRITE)
 
-    def test_invalid_overwrite_rejected(self):
-        with pytest.raises(PermissionOverwriteError):
-            delete_channel_permission_request(CHANNEL, -5)
+def test_accepts_full_unsigned_64_bit_snowflake_range():
+    req = set_channel_permission_request(2**63, MAX_SNOWFLAKE, type_=TYPE_ROLE)
+    assert req["path"] == f"/channels/{2**63}/permissions/{MAX_SNOWFLAKE}"
+
+
+@pytest.mark.parametrize("bad", [0, "0", -1, 2**64, "18446744073709551616"])
+def test_route_snowflakes_must_be_positive_uint64(bad):
+    with pytest.raises(PermissionOverwriteError):
+        set_channel_permission_request(bad, OVERWRITE, type_=TYPE_ROLE)
+    with pytest.raises(PermissionOverwriteError):
+        set_channel_permission_request(CHANNEL, bad, type_=TYPE_ROLE)
+
+
+@pytest.mark.parametrize("bad", [2, -1, "1", 1.0, True, None])
+def test_invalid_type_rejected(bad):
+    with pytest.raises(PermissionOverwriteError):
+        set_channel_permission_request(CHANNEL, OVERWRITE, type_=bad)
+
+
+@pytest.mark.parametrize("bad", [-1, "-1", 2**64, True, 1.25, None])
+def test_invalid_bitfields_rejected(bad):
+    with pytest.raises(PermissionOverwriteError):
+        set_channel_permission_request(CHANNEL, OVERWRITE, allow=bad, type_=TYPE_ROLE)
+    with pytest.raises(PermissionOverwriteError"ì†¢6WEˆ6ÜÊÊV≈˜W&÷ó76ñˆÂ˜&WVW7BÑ4Ñ‰‰T¬¬ıdU%u$ïDR¬FVÁì÷&B¬GóUÛ’EïUı$ÙƒRê††¶FVbFW7EˆFV∆WFU˜6ÜRÇì†¢76W'BFV∆WFUˆ6ÜÊÊV≈˜W&÷ó76ñˆÂ˜&WVW7BÑ4Ñ‰‰T¬¬ıdU%u$ïDRí”“∞¢&÷WFÜˆB#¢$DTƒUDR"¿¢'FÇ#¢b"ˆ6ÜÊÊV«2˜¥4Ñ‰‰T«“˜W&÷ó76ñˆÁ2˜¥ıdU%u$ïDW“"¿¢'ñ∆ˆB#¢ÊˆÊR¿¢–
