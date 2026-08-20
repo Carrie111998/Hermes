@@ -354,6 +354,19 @@ describe('AppContextMenu', () => {
     expect($contextMenu.get()).toBeNull()
   })
 
+  // The statusbar <footer> carries data-slot="statusbar" (the pet's perch),
+  // not the radix context-menu-trigger marker, but it owns a context menu too.
+  // Regression: right-clicking the bar must NOT fall through to the app menu.
+  it('leaves the statusbar surface alone (data-slot="statusbar")', () => {
+    installBridge()
+    mountMenu()
+    const host = attach('<div data-slot="statusbar"><span>gateway pill</span></div>')
+
+    fireEvent.contextMenu(host.querySelector('span')!)
+
+    expect($contextMenu.get()).toBeNull()
+  })
+
   it('shows the terminal menu through a registered handle', async () => {
     installBridge()
     mountMenu()

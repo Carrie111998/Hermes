@@ -609,7 +609,12 @@ export function AppContextMenu() {
       const element = event.target instanceof Element ? event.target : null
 
       // Surfaces with their own Radix context menu keep the whole gesture.
-      if (element?.closest('[data-slot="context-menu-trigger"]')) {
+      // `data-slot="statusbar"` (the statusbar <footer>) is ALSO an owned
+      // surface: its footer carries that data-slot for the pet's perch (not
+      // `context-menu-trigger`, which a plain data-slot on the same node
+      // would collide with), so exempt it here or right-clicking the bar
+      // falls through to this app menu instead of the statusbar customize menu.
+      if (element?.closest('[data-slot="context-menu-trigger"], [data-slot="statusbar"]')) {
         return
       }
 
