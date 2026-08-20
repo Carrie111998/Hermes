@@ -89,6 +89,44 @@ def test_arg_canonicalization_ignores_key_order():
     assert c.observe_identical_call("t", {"a": 1, "b": 2}, r) is not None
 
 
+def test_todo_merge_jitter_still_fires_on_third_identical_result():
+    c = ToolCallGuardrailController()
+    todos = [
+        {"id": "1", "content": "inspect", "status": "completed"},
+        {"id": "2", "content": "fix", "status": "in_progress"},
+    ]
+
+    assert c.observe_identical_call("todo", {"todos": todos, "merge": True}, "same") is None
+    assert c.observe_identical_call("todo", {"todos": todos, "merge": False}, "same") is None
+    notice = c.observe_identical_call("todo", {"todos": todos, "merge": True}, "same")
+
+    assert notice is not None
+    assert "3rd" in notice
+
+
+def test_todo_item_order_remains_significant_for_stall_detection():
+    c = ToolCallGuardrailController()
+    todos = [
+        {"id": "1", "content": "first", "status": "pending"},
+        {"id": "2", "content": "second", "status": "pending"},
+    ]
+
+    for args in (
+        {"todos": todos, "merge": True},
+        {"todos": list(reversed(todos)), "merge": False},
+        {"todos": todos, "merge": True},
+    ):
+        assert c.observe_identical_call("todo", args, "same") is None
+
+
+def test_stall_arg_normalization_is_scoped_to_todo():
+    c = ToolCallGuardrailController()
+    for merge in (True, False, True):
+        assert c.observe_identical_call(
+            "other_tool", {"todos": [{"id": "1"}], "merge": merge}, "same"
+        ) is None
+
+
 def test_allowlisted_pollers_never_fire():
     c = ToolCallGuardrailController()
     for tool in ("process", "bfl_flux3_get_result", "vendor_get_result", "job_poll"):

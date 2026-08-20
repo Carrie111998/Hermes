@@ -268,6 +268,29 @@ def canonical_tool_args(args: Mapping[str, Any]) -> str:
     )
 
 
+def _stall_guard_signature(
+    tool_name: str, args: Mapping[str, Any] | None
+) -> ToolCallSignature:
+    """Return the call identity used by the observational stall guard.
+
+    Some tools declare a desired end state while also accepting arguments that
+    only select how to apply it. For ``todo``, ``merge`` is such an argument:
+    alternating it while re-asserting the same list is still the same stalled
+    action. Normalize that one observed jitter pattern without weakening the
+    stricter signatures used by failure and no-progress guardrails.
+
+    Todo item order remains significant because it defines priority. All other
+    tools and argument differences retain their exact canonical identity.
+    """
+    coerced = _coerce_args(args)
+    if tool_name != "todo" or not isinstance(coerced.get("todos"), list):
+        return ToolCallSignature.from_call(tool_name, coerced)
+
+    normalized = dict(coerced)
+    normalized.pop("merge", None)
+    return ToolCallSignature.from_call(tool_name, normalized)
+
+
 def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]:
     """Safety-fallback classifier used only when callers don't pass ``failed``.
 
@@ -509,7 +532,7 @@ class ToolCallGuardrailController:
             self._identical_streak_count = 0
             return None
 
-        signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+        signature = _stall_guard_signature(tool_name, args)
         result_hash = _result_hash(result)
         if (
             self._identical_streak_sig == signature
