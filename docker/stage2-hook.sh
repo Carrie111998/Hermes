@@ -431,6 +431,33 @@ seed_one ".env" ".env.example"
 seed_one "config.yaml" "cli-config.yaml.example"
 seed_one "SOUL.md" "docker/SOUL.md"
 
+# --- Ensure a gateway api_server key exists (loopback control plane) ---
+# The gateway's aiohttp api_server refuses to start without a strong
+# API_SERVER_KEY (>=16 chars; startup guard in gateway/platforms/api_server.py).
+# Hosted deployments need that listener on loopback so the dashboard — the
+# container's only public HTTP door — can forward Chronos cron fires into the
+# GATEWAY process, where the live platform adapters (relay, E2EE) live. The
+# cron-fire route itself is NAS-JWT-authed, not key-authed; the key gates the
+# rest of the api_server surface. Generate once, persist in .env (mounted
+# volume), never overwrite an operator-provided value. Loopback-only: the
+# default bind host is 127.0.0.1 and the Fly service only exposes the
+# dashboard's port, so this listener is never publicly reachable.
+if [ -f "$HERMES_HOME/.env" ] && ! grep -q '^API_SERVER_KEY=..*' "$HERMES_HOME/.env" 2>/dev/null; then
+    if refuse_symlinked_path "append" "$HERMES_HOME/.env"; then
+        :
+    else
+        _gen_key=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+        if [ -n "$_gen_key" ]; then
+            # Drop an empty assignment line if the seed left one behind, then
+            # append the generated key.
+            sed -i '/^API_SERVER_KEY=$/d' "$HERMES_HOME/.env" 2>/dev/null || true
+            printf 'API_SERVER_KEY=%s\n' "$_gen_key" >> "$HERMES_HOME/.env"
+            echo "[stage2] Generated API_SERVER_KEY for the loopback gateway api_server"
+        fi
+        unset _gen_key
+    fi
+fi
+
 # .env holds API keys and secrets — restrict to owner-only access. Applied
 # unconditionally (not only on first-seed) so a host-mounted .env that was
 # created with a permissive umask gets tightened on every container start.
@@ -440,6 +467,29 @@ if [ -f "$HERMES_HOME/.env" ]; then
     else
         chown hermes:hermes "$HERMES_HOME/.env" 2>/dev/null || true
         chmod 600 "$HERMES_HOME/.env" 2>/dev/null || true
+    fi
+fi
+
+# --- Grant the gateway access to the Fly Machines API socket (scale-to-zero) ---
+# On Fly, flyd mounts the local Machines API ("flaps") unix socket at /.fly/api
+# owned root:root 0755. The gateway's scale-to-zero self-suspend
+# (gateway/scale_to_zero.py suspend_self) must POST to it, but the gateway runs
+# as the unprivileged `hermes` user — without this it gets EACCES on every
+# suspend attempt and the machine can never sleep (fail-awake; verified live on
+# staging 2026-08-20: "flaps suspend request failed: [Errno 13]"). This hook
+# runs as root before user services (the gateway) start, so grant group access
+# here. Scope note: group-write exposes the WHOLE local Machines API to the
+# hermes group (any group member could e.g. stop/suspend this machine), not
+# just the suspend endpoint — accepted because the agent already executes
+# arbitrary user code as that same principal and the socket only controls THIS
+# machine. No-op off Fly (socket absent).
+if [ -S /.fly/api ]; then
+    if refuse_symlinked_path "chgrp/chmod" /.fly/api; then
+        :
+    elif chgrp hermes /.fly/api 2>/dev/null && chmod g+w /.fly/api 2>/dev/null; then
+        echo "[stage2] Granted hermes group access to the Fly Machines API socket"
+    else
+        echo "[stage2] Warning: could not grant group access to /.fly/api — scale-to-zero self-suspend will fail EACCES (fail-awake)"
     fi
 fi
 
