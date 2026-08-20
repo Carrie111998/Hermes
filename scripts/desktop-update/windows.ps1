@@ -47,12 +47,13 @@ param(
     [string]$RelaunchExe = "",
     [switch]$NoUi,
     [switch]$NoMarkerCleanup,
-    [switch]$SelfTestUi
+    [switch]$SelfTestUi,
+    [switch]$SelfTestPipeDrain
 )
 
-if (-not $SelfTestUi -and -not $InstallRoot) {
-    # Mandatory in spirit; relaxed in the signature only so -SelfTestUi can
-    # drive the UI without a checkout.
+if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $InstallRoot) {
+    # Mandatory in spirit; relaxed in the signature only so the self-test
+    # switches can drive the UI / the pipe drain without a checkout.
     throw "-InstallRoot is required"
 }
 
@@ -746,6 +747,77 @@ if ($SelfTestUi) {
     } else {
         Close-ProgressWindow
     }
+    exit 0
+}
+
+# -SelfTestPipeDrain: prove Invoke-HermesStep survives a leaked pipe ------
+# The #90455 deadlock needs no update, no checkout and no Hermes install to
+# reproduce -- only a step whose grandchild outlives it holding the inherited
+# write end of the redirected pipe. That is exactly what this builds, so the
+# fix has an executable proof on Windows instead of a source-grep. Exits
+# before any marker/desktop machinery, same as -SelfTestUi; touches nothing
+# but its own temp files.
+if ($SelfTestPipeDrain) {
+    New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction SilentlyContinue | Out-Null
+    $hold = 60
+    if ($env:HERMES_SELFTEST_HOLD_SECONDS) { $hold = [int]$env:HERMES_SELFTEST_HOLD_SECONDS }
+    # $PSHOME is this interpreter's own directory -- no hardcoded system path.
+    $powershell = Join-Path $PSHOME "powershell.exe"
+    $stamp = [Guid]::NewGuid().ToString("N")
+    $childPs1 = Join-Path $TempDir "hermes-pipe-drain-$stamp.ps1"
+    $pidFile = Join-Path $TempDir "hermes-pipe-drain-$stamp.pid"
+    # UseShellExecute=$false with no redirection is what makes the grandchild
+    # inherit our stdout/stderr -- the whole point of the fixture. Anything
+    # that redirects (Start-Process, subprocess with stdout=DEVNULL) would
+    # close the handle and the deadlock would not reproduce.
+    $childSource = @'
+param([int]$Hold, [string]$PidFile)
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = Join-Path $PSHOME "powershell.exe"
+$psi.Arguments = "-NoProfile -Command Start-Sleep -Seconds $Hold"
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
+$grandchild = [System.Diagnostics.Process]::Start($psi)
+[System.IO.File]::WriteAllText($PidFile, [string]$grandchild.Id)
+Write-Output "pipe-drain step output"
+[Console]::Out.Flush()
+exit 7
+'@
+    [System.IO.File]::WriteAllText($childPs1, $childSource)
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $res = Invoke-HermesStep $powershell @(
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $childPs1,
+        "-Hold", [string]$hold, "-PidFile", $pidFile
+    ) "pipedrain"
+    $sw.Stop()
+    $elapsed = [Math]::Round($sw.Elapsed.TotalSeconds, 2)
+
+    $leakPid = 0
+    if (Test-Path -LiteralPath $pidFile) {
+        [void][int]::TryParse((Get-Content -LiteralPath $pidFile -Raw).Trim(), [ref]$leakPid)
+    }
+    $leakAlive = $false
+    if ($leakPid -gt 0) {
+        $leakAlive = [bool](Get-Process -Id $leakPid -ErrorAction SilentlyContinue)
+        Stop-Process -Id $leakPid -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -LiteralPath $childPs1, $pidFile -Force -ErrorAction SilentlyContinue
+
+    # The grandchild still being alive at return is what makes this a proof
+    # rather than a timing coincidence: the pipe was demonstrably still open.
+    $budget = $script:StepDrainGraceSeconds + 30
+    $problems = @()
+    if (-not $leakAlive) { $problems += "handle-holding grandchild was not alive on return (fixture did not reproduce the leak)" }
+    if ($elapsed -ge $budget) { $problems += "returned in ${elapsed}s, over the ${budget}s budget" }
+    if ($res.Code -ne 7) { $problems += "exit code $($res.Code), expected 7" }
+    if ($res.Output -notmatch "pipe-drain step output") { $problems += "step output was lost" }
+
+    $detail = "elapsed=${elapsed}s budget=${budget}s code=$($res.Code) grandchildAlive=$leakAlive"
+    if ($problems.Count -gt 0) {
+        Write-Host "PIPE-DRAIN SELF-TEST: FAIL $detail -- $($problems -join '; ')"
+        exit 1
+    }
+    Write-Host "PIPE-DRAIN SELF-TEST: PASS $detail"
     exit 0
 }
 
