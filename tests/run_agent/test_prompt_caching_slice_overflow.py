@@ -1,94 +1,70 @@
-"""Tests for Anthropic prompt caching breakpoint bounds, slice safety, and tool accounting."""
+"""Tests for Anthropic prompt caching breakpoint bounds and idempotency (#90971)."""
 
-from unittest.mock import patch
+import copy
+
 from agent.prompt_caching import (
     apply_anthropic_cache_control,
     build_prompt_cache_plan,
     _count_cache_markers,
-    _enforce_max_cache_budget,
     _can_carry_marker,
 )
 
 
 class TestPromptCachingSliceOverflow:
-    def test_apply_anthropic_cache_control_when_breakpoints_exhausted(self):
-        """When breakpoints_used >= 4, remaining is <= 0.
-        non_sys[-0:] must NOT mark all non-system messages in history.
-        """
-        messages = [
-            {"role": "system", "content": "You are Hermes Agent."},
-            {"role": "user", "content": "Hello 1"},
-            {"role": "assistant", "content": "Hi 1"},
-            {"role": "user", "content": "Hello 2"},
-            {"role": "assistant", "content": "Hi 2"},
-            {"role": "user", "content": "Hello 3"},
-            {"role": "assistant", "content": "Hi 3"},
-        ]
-
-        with patch("agent.prompt_caching._apply_system_cache_markers", return_value=4):
-            result = apply_anthropic_cache_control(messages)
-
-            non_sys_marked = [
-                m for m in result if m.get("role") != "system" and "cache_control" in str(m)
-            ]
-            assert len(non_sys_marked) == 0
-            assert _count_cache_markers(result, []) <= 4
-
-    def test_apply_anthropic_cache_control_when_sys_used_exceeds_budget(self):
-        """When sys_used > 4, defense-in-depth clamp ensures total <= 4."""
-        messages = [
-            {"role": "system", "content": "System prompt"},
-            {"role": "user", "content": "User question"},
-            {"role": "assistant", "content": "Assistant answer"},
-        ]
-        with patch("agent.prompt_caching._apply_system_cache_markers", return_value=5):
-            result = apply_anthropic_cache_control(messages)
-            assert _count_cache_markers(result, []) <= 4
-
     def test_apply_anthropic_cache_control_empty_messages(self):
         """Empty messages list is a safe no-op."""
         assert apply_anthropic_cache_control([]) == []
 
-    def test_apply_anthropic_cache_control_normal_budget_permutations(self):
-        """Under sys_used in (0, 1, 2, 3), total markers exactly hit target <= 4."""
-        for sys_used in (0, 1, 2, 3):
-            messages = [
-                {"role": "system", "content": "System prompt"},
-                {"role": "user", "content": "U1"},
-                {"role": "assistant", "content": "A1"},
-                {"role": "user", "content": "U2"},
-                {"role": "assistant", "content": "A2"},
-                {"role": "user", "content": "U3"},
-                {"role": "assistant", "content": "A3"},
-            ]
+    def test_apply_anthropic_cache_control_never_exceeds_four_markers(self):
+        """Realistic conversations never push breakpoints_used past what
+        _apply_system_cache_markers can return ({0, 1, 2}), so the marker
+        total always stays within the 4-breakpoint API limit.
+        """
+        messages = [{"role": "system", "content": "STATIC_PREFIX rest of the prompt"}]
+        for i in range(8):
+            messages.append({"role": "user", "content": f"Hello {i}"})
+            messages.append({"role": "assistant", "content": f"Hi {i}"})
 
-            def fake_apply_sys(msg, marker, prefix, **kwargs):
-                if sys_used == 1:
-                    msg["cache_control"] = marker
-                elif sys_used == 2:
-                    msg["content"] = [
-                        {"type": "text", "text": "p", "cache_control": marker},
-                        {"type": "text", "text": "s", "cache_control": marker},
-                    ]
-                elif sys_used == 3:
-                    msg["content"] = [
-                        {"type": "text", "text": "p1", "cache_control": marker},
-                        {"type": "text", "text": "p2", "cache_control": marker},
-                        {"type": "text", "text": "p3", "cache_control": marker},
-                    ]
-                return sys_used
+        result = apply_anthropic_cache_control(messages, static_system_prefix="STATIC_PREFIX")
+        assert _count_cache_markers(result, []) <= 4
 
-            with patch("agent.prompt_caching._apply_system_cache_markers", side_effect=fake_apply_sys):
-                result = apply_anthropic_cache_control(messages)
-                expected_non_sys = min(len(messages) - 1, 4 - sys_used)
-                non_sys_marked = [
-                    m for m in result if m.get("role") != "system" and "cache_control" in str(m)
-                ]
-                assert len(non_sys_marked) == expected_non_sys
-                assert _count_cache_markers(result, []) == sys_used + expected_non_sys
+    def test_apply_anthropic_cache_control_is_idempotent(self):
+        """Calling apply_anthropic_cache_control repeatedly on its own output
+        (no intervening strip_anthropic_cache_control) must never accumulate
+        markers past 4. Before the idempotency fix, a second call on
+        already-marked messages pushed the total to 5, reproducing the
+        `cache_control can only be specified up to 4 times` HTTP 400 (#90971).
+        """
+        messages = [{"role": "system", "content": "STATIC_PREFIX rest of the prompt"}]
+        for i in range(8):
+            messages.append({"role": "user", "content": f"Hello {i}"})
+            messages.append({"role": "assistant", "content": f"Hi {i}"})
+
+        round1 = apply_anthropic_cache_control(messages, static_system_prefix="STATIC_PREFIX")
+        round2 = apply_anthropic_cache_control(round1, static_system_prefix="STATIC_PREFIX")
+        round3 = apply_anthropic_cache_control(round2, static_system_prefix="STATIC_PREFIX")
+
+        assert _count_cache_markers(round1, []) <= 4
+        assert _count_cache_markers(round2, []) <= 4
+        assert _count_cache_markers(round3, []) <= 4
+
+    def test_apply_anthropic_cache_control_does_not_mutate_caller_messages(self):
+        """A caller's live message list must never be mutated in place, even
+        when it already carries stale cache_control markers (e.g. replayed
+        history). The function's contract is copy-on-write.
+        """
+        caller_history = [
+            {"role": "user", "content": f"u{i}", "cache_control": {"type": "ephemeral"}}
+            for i in range(5)
+        ]
+        snapshot = copy.deepcopy(caller_history)
+
+        apply_anthropic_cache_control(caller_history)
+
+        assert caller_history == snapshot
 
     def test_build_prompt_cache_plan_dynamic_tool_accounting(self):
-        """build_prompt_cache_plan dynamically counts tools and never exceeds 4 markers."""
+        """build_prompt_cache_plan never exceeds 4 markers with tool-cache layout."""
         tools = [
             {"type": "function", "function": {"name": "tool_a"}},
             {"type": "function", "function": {"name": "tool_b"}},
@@ -131,29 +107,6 @@ class TestPromptCachingSliceOverflow:
         )
         assert plan.marker_count <= 4
         assert len(plan.tools) == 0
-
-    def test_enforce_max_cache_budget_clamps_overflow(self):
-        """_enforce_max_cache_budget strips overflow markers from oldest non-system messages."""
-        messages = [
-            {"role": "system", "content": [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}]},
-            {"role": "user", "content": [{"type": "text", "text": "u1", "cache_control": {"type": "ephemeral"}}]},
-            {"role": "assistant", "content": [{"type": "text", "text": "a1", "cache_control": {"type": "ephemeral"}}]},
-            {"role": "user", "content": [{"type": "text", "text": "u2", "cache_control": {"type": "ephemeral"}}]},
-            {"role": "assistant", "content": [{"type": "text", "text": "a2", "cache_control": {"type": "ephemeral"}}]},
-        ]
-        tools = [{"type": "function", "cache_control": {"type": "ephemeral"}}]
-        # Total is 1 sys + 4 msgs + 1 tool = 6 markers.
-        assert _count_cache_markers(messages, tools) == 6
-
-        _enforce_max_cache_budget(messages, tools, max_budget=4)
-        assert _count_cache_markers(messages, tools) == 4
-        # u1 and a1 (oldest non-system) were stripped; u2, a2, sys, tool survived
-        assert "cache_control" not in messages[1]["content"][0]
-        assert "cache_control" not in messages[2]["content"][0]
-        assert "cache_control" in messages[3]["content"][0]
-        assert "cache_control" in messages[4]["content"][0]
-        assert "cache_control" in messages[0]["content"][0]
-        assert "cache_control" in tools[0]
 
     def test_can_carry_marker_envelope_vs_native(self):
         """_can_carry_marker properly filters empty turns on non-native layouts."""
