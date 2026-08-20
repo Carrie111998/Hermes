@@ -56,6 +56,12 @@ test('a nightly payload tag moves BOTH variants onto their nightly feed channel'
   assert.equal(light.channel, 'light-nightly')
 })
 
+test('bundled variant uses hermes:// scheme, not hermes-bundled://', async () => {
+  const bundled = await identityForVariant('bundled')
+  assert.equal(bundled.protocolScheme, 'hermes')
+  assert.equal(bundled.light, false)
+})
+
 test('stable tags and tagless dev builds publish to the stable channels', async () => {
   process.env.HERMES_PAYLOAD_TAG = 'v0.28.0'
   assert.equal((await identityForVariant(undefined)).channel, 'latest')

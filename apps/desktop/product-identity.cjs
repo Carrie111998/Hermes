@@ -52,7 +52,14 @@ const identity = {
   displayName: name.display,
   appId: `com.nousresearch.${name.kebab}`,
   channel: light ? (nightly ? 'light-nightly' : 'light') : (nightly ? 'nightly' : 'latest'),
-  protocolScheme: name.kebab,
+  // The deep-link protocol scheme. Only the light variant gets its own
+  // scheme (hermes-light://) so it can install side-by-side with the full
+  // app without fighting over the OS handler. Full and bundled both use
+  // hermes:// — the bundled variant must NOT use hermes-bundled:// because
+  // deep-link-route.ts derives 'hermes' for any non-light payload, so a
+  // hermes-bundled:// scheme in the OS manifest would mismatch the runtime
+  // registration (app.setAsDefaultProtocolClient).
+  protocolScheme: light ? 'hermes-light' : 'hermes',
   appNamePascal: name.pascal,
   msixAppIdWithOrg: `NousResearch.${name.pascal}`
 }
