@@ -36,12 +36,16 @@ class TestResumeListingSemantics:
         from hermes_state import SessionDB
 
         db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("sess_user", "telegram", user_id="12345", chat_id="67890")
+        event = _make_event(text="/resume")
+        lane_key = _session_key_for_event(event)
+        db.create_session(
+            "sess_user", "telegram", user_id="12345", chat_id="67890",
+            session_key=lane_key,
+        )
         db.set_session_title("sess_user", "Real Work")
         db.create_session("sess_tool", "tool")
         db.set_session_title("sess_tool", "Tool Noise")
 
-        event = _make_event(text="/resume")
         runner = _make_runner(session_db=db, event=event)
         result = await runner._handle_resume_command(event)
 
@@ -54,18 +58,22 @@ class TestResumeListingSemantics:
         from hermes_state import SessionDB
 
         db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("chain_root", "telegram", user_id="12345", chat_id="67890")
+        event = _make_event(text="/resume")
+        lane_key = _session_key_for_event(event)
+        db.create_session(
+            "chain_root", "telegram", user_id="12345", chat_id="67890",
+            session_key=lane_key,
+        )
         db.set_session_title("chain_root", "Chain Alpha")
         db.end_session("chain_root", end_reason="compression")
         db.create_session(
             "chain_tip", "telegram", user_id="12345", chat_id="67890",
-            parent_session_id="chain_root",
+            parent_session_id="chain_root", session_key=lane_key,
         )
         # Compression copies the title forward onto the continuation, so the
         # projected tip carries the title in real flows.
         db.set_session_title("chain_tip", "Chain Alpha")
 
-        event = _make_event(text="/resume")
         runner = _make_runner(session_db=db, event=event)
         result = await runner._handle_resume_command(event)
 
@@ -79,21 +87,26 @@ class TestResumeListingSemantics:
         from hermes_state import SessionDB
 
         db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("chain_root", "telegram", user_id="12345", chat_id="67890")
+        event = _make_event(text="/resume 1")
+        lane_key = _session_key_for_event(event)
+        db.create_session(
+            "chain_root", "telegram", user_id="12345", chat_id="67890",
+            session_key=lane_key,
+        )
         db.set_session_title("chain_root", "Chain Alpha")
         db.end_session("chain_root", end_reason="compression")
         db.create_session(
             "chain_tip", "telegram", user_id="12345", chat_id="67890",
-            parent_session_id="chain_root",
+            parent_session_id="chain_root", session_key=lane_key,
         )
         # Compression copies the title forward onto the continuation, so the
         # projected tip carries the title in real flows.
         db.set_session_title("chain_tip", "Chain Alpha")
         db.create_session(
-            "current_session_001", "telegram", user_id="12345", chat_id="67890"
+            "current_session_001", "telegram", user_id="12345", chat_id="67890",
+            session_key=lane_key,
         )
 
-        event = _make_event(text="/resume 1")
         runner = _make_runner(
             session_db=db, current_session_id="current_session_001", event=event
         )
@@ -575,11 +588,6 @@ class TestHandleSessionsCommand:
         db.close()
 
     @pytest.mark.asyncio
-    @pytest.mark.skip(
-        reason="Branch design: gateway /sessions lists per-source (matching CLI "
-        "semantics), not per-lane. This main test asserts pre-branch lane-scoping "
-        "behavior that the sessions-resume-improvements branch intentionally replaced."
-    )
     async def test_sessions_busy_platform_lists_exact_lane_and_excludes_current_tip(
         self, tmp_path
     ):

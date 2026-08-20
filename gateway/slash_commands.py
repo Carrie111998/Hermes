@@ -4800,6 +4800,11 @@ class GatewaySlashCommandsMixin:
 
         async def _list_titled_sessions() -> list[dict]:
             user_source = source.platform.value if source.platform else None
+            # Only an admin's explicit --all widens past the caller's own
+            # conversation lane; everyone else stays lane-scoped in SQL so a
+            # busy platform cannot starve the caller's sessions out of the
+            # numbered list (restored pre-refactor semantics, #90619).
+            widen = allow_all and self._resume_caller_is_admin(source)
             db = getattr(self._session_db, "_db", self._session_db)
             # Same canonical listing as the CLI surfaces: source-scoped,
             # tool sessions excluded, compression chains projected to their
@@ -4811,6 +4816,7 @@ class GatewaySlashCommandsMixin:
                 query_session_listing,
                 db,
                 source=user_source,
+                session_key=None if widen else session_key,
                 include_unnamed=False,
                 limit=20,
                 exclude_sources=["tool"],
@@ -5018,6 +5024,7 @@ class GatewaySlashCommandsMixin:
                 query_session_listing,
                 db,
                 source=source.platform.value if source.platform else None,
+                session_key=None if cross_origin else session_key,
                 current_session_id=current_entry.session_id,
                 include_all_sources=cross_origin,
                 include_unnamed=include_unnamed,
