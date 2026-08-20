@@ -107,6 +107,7 @@ import os
 import random
 import re
 import shutil
+import ssl
 import sys
 import threading
 import time
@@ -1485,8 +1486,9 @@ def _validate_remote_mcp_url(server_name: str, url: Any) -> str:
 def _resolve_client_cert(server_name: str, config: dict):
     """Resolve the ``client_cert`` / ``client_key`` config for mTLS.
 
-    Returns whatever ``httpx``'s ``cert=`` parameter accepts, or ``None`` when
-    no client certificate is configured:
+    Returns the certificate-chain description consumed by
+    :func:`_build_httpx_ssl_context`, or ``None`` when no client certificate
+    is configured:
 
       - ``None`` if neither ``client_cert`` nor ``client_key`` is set.
       - A single absolute path string if ``client_cert`` is a string and
@@ -1553,6 +1555,84 @@ def _resolve_client_cert(server_name: str, config: dict):
         return (cert_path, key_path)
     # Single combined PEM file (cert + key in one file).
     return cert_path
+
+
+def _build_httpx_ssl_context(
+    server_name: str,
+    ssl_verify: Any = True,
+    client_cert: Any = None,
+) -> ssl.SSLContext:
+    """Build the single TLS context used by every remote MCP transport.
+
+    HTTPX 0.28.x does not reliably combine ``verify=<custom CA path>`` with
+    its deprecated ``cert=`` argument: constructing the verification context
+    from the path can bypass loading the client identity.  Normalize both
+    settings here and load the client chain directly into the verification
+    context so preflight, SSE, and both Streamable HTTP implementations share
+    identical mTLS behavior.
+    """
+    try:
+        if isinstance(ssl_verify, ssl.SSLContext):
+            context = ssl_verify
+        elif ssl_verify is True:
+            context = ssl.create_default_context()
+        elif ssl_verify is False:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        elif isinstance(ssl_verify, (str, os.PathLike)):
+            ca_path = os.path.expanduser(os.fspath(ssl_verify).strip())
+            if os.path.isfile(ca_path):
+                context = ssl.create_default_context(cafile=ca_path)
+            elif os.path.isdir(ca_path):
+                context = ssl.create_default_context(capath=ca_path)
+            else:
+                raise FileNotFoundError(
+                    f"MCP server '{server_name}': ssl_verify CA path not found"
+                )
+        else:
+            raise ValueError(
+                f"MCP server '{server_name}': ssl_verify must be true, false, "
+                "a CA file/directory path, or an SSLContext"
+            )
+    except (FileNotFoundError, ValueError):
+        raise
+    except (OSError, ssl.SSLError) as exc:
+        raise ValueError(
+            f"MCP server '{server_name}': could not load ssl_verify CA material"
+        ) from exc
+
+    if client_cert is None:
+        return context
+
+    try:
+        if isinstance(client_cert, str):
+            context.load_cert_chain(client_cert)
+        elif isinstance(client_cert, tuple) and len(client_cert) == 2:
+            context.load_cert_chain(client_cert[0], client_cert[1])
+        elif isinstance(client_cert, tuple) and len(client_cert) == 3:
+            context.load_cert_chain(
+                client_cert[0], client_cert[1], password=client_cert[2]
+            )
+        else:
+            raise ValueError(
+                f"MCP server '{server_name}': invalid resolved client certificate"
+            )
+    except ValueError as exc:
+        # Preserve our own setup error, but replace OpenSSL parse/password
+        # details so no key material or passphrase can reach logs.
+        if str(exc).startswith(f"MCP server '{server_name}':"):
+            raise
+        raise ValueError(
+            f"MCP server '{server_name}': could not load client certificate "
+            "or key; check the configured files and passphrase"
+        ) from exc
+    except (OSError, ssl.SSLError) as exc:
+        raise ValueError(
+            f"MCP server '{server_name}': could not load client certificate "
+            "or key; check the configured files and passphrase"
+        ) from exc
+    return context
 
 
 def _resolve_identity_header(server_name: str, config: dict):
@@ -3215,7 +3295,7 @@ class MCPServerTask:
         url: str,
         *,
         headers: Optional[dict] = None,
-        ssl_verify: bool = True,
+        ssl_verify: Any = True,
         client_cert=None,
         timeout: float = 5.0,
     ) -> None:
@@ -3253,12 +3333,12 @@ class MCPServerTask:
             return  # No httpx → skip probe; SDK import would have failed first.
 
         client_kwargs: dict = {
-            "verify": ssl_verify,
+            "verify": _build_httpx_ssl_context(
+                self.name, ssl_verify, client_cert
+            ),
             "follow_redirects": True,
             "timeout": _httpx.Timeout(timeout),
         }
-        if client_cert is not None:
-            client_kwargs["cert"] = client_cert
 
         probe_headers = dict(headers) if headers else {}
         try:
@@ -3415,6 +3495,9 @@ class MCPServerTask:
         connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
         ssl_verify = config.get("ssl_verify", True)
         client_cert = _resolve_client_cert(self.name, config)
+        ssl_context = _build_httpx_ssl_context(
+            self.name, ssl_verify, client_cert
+        )
 
         # OAuth 2.1 PKCE: route through the central MCPOAuthManager so the
         # same provider instance is reused across reconnects, pre-flow
@@ -3440,6 +3523,21 @@ class MCPServerTask:
             sampling_kwargs["message_handler"] = self._make_message_handler()
         if _MCP_LOGGING_CALLBACK_SUPPORTED:
             sampling_kwargs["logging_callback"] = self._make_logging_callback()
+
+        _httpx_mod = sdk_httpx()
+
+        def _mcp_http_client_factory(headers=None, timeout=None, auth=None):
+            """Mirror the MCP SDK factory while applying normalized TLS."""
+            kwargs: dict = {
+                "follow_redirects": True,
+                "verify": ssl_context,
+                "timeout": timeout or _httpx_mod.Timeout(30.0, read=300.0),
+            }
+            if headers is not None:
+                kwargs["headers"] = headers
+            if auth is not None:
+                kwargs["auth"] = auth
+            return _httpx_mod.AsyncClient(**kwargs)
 
         # SSE transport (for MCP servers that implement the SSE transport protocol
         # rather than Streamable HTTP). Configure with ``transport: sse`` in the
@@ -3478,39 +3576,9 @@ class MCPServerTask:
                 # behind OAuth 2.1 PKCE work. Previously built but never
                 # forwarded — SSE OAuth would silently fail with 401s.
                 _sse_kwargs["auth"] = _oauth_auth
-            if client_cert is not None or ssl_verify is not True:
-                # SSE transport doesn't expose verify/cert as kwargs, so route
-                # them through an httpx_client_factory that wraps the SDK's
-                # defaults (follow_redirects=True) and adds our TLS settings.
-                # The SDK calls the factory with (headers, auth, timeout); we
-                # forward all of those and layer verify/cert on top.
-                # The client MUST come from the SDK's own httpx module
-                # (httpx2 on mcp >= 2.0) — see sdk_httpx().
-                _httpx_mod = sdk_httpx()
-
-                _cert_for_factory = client_cert
-                _verify_for_factory = ssl_verify
-
-                def _mcp_http_client_factory(
-                    headers=None, timeout=None, auth=None,
-                ):
-                    kwargs: dict = {
-                        "follow_redirects": True,
-                        "verify": _verify_for_factory,
-                    }
-                    if timeout is not None:
-                        kwargs["timeout"] = timeout
-                    else:
-                        kwargs["timeout"] = _httpx_mod.Timeout(30.0, read=300.0)
-                    if headers is not None:
-                        kwargs["headers"] = headers
-                    if auth is not None:
-                        kwargs["auth"] = auth
-                    if _cert_for_factory is not None:
-                        kwargs["cert"] = _cert_for_factory
-                    return _httpx_mod.AsyncClient(**kwargs)
-
-                _sse_kwargs["httpx_client_factory"] = _mcp_http_client_factory
+            # SSE doesn't expose ``verify`` directly. Route the normalized
+            # context through the SDK factory while preserving its arguments.
+            _sse_kwargs["httpx_client_factory"] = _mcp_http_client_factory
             try:
                 async with sse_client(**_sse_kwargs) as (read_stream, write_stream):
                     async with ClientSession(
@@ -3563,15 +3631,13 @@ class MCPServerTask:
             client_kwargs: dict = {
                 "follow_redirects": True,
                 "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
-                "verify": ssl_verify,
+                "verify": ssl_context,
                 "event_hooks": {"response": [_strip_auth_on_cross_origin_redirect]},
             }
             if headers:
                 client_kwargs["headers"] = headers
             if _oauth_auth is not None:
                 client_kwargs["auth"] = _oauth_auth
-            if client_cert is not None:
-                client_kwargs["cert"] = client_cert
 
             # Caller owns the client lifecycle — the SDK skips cleanup when
             # http_client is provided, so we wrap in async-with.
@@ -3622,7 +3688,7 @@ class MCPServerTask:
             _http_kwargs: dict = {
                 "headers": headers,
                 "timeout": float(connect_timeout),
-                "verify": ssl_verify,
+                "httpx_client_factory": _mcp_http_client_factory,
             }
             if _oauth_auth is not None:
                 _http_kwargs["auth"] = _oauth_auth
