@@ -1,7 +1,0 @@
-{
-  "task": 12,
-  "path": "tools/approval.py",
-  "lines": 5059,
-  "reason": "pre-existing god-file; Task 12 adds the fail-closed approval-gate patch",
-  "type": "pre-existing-owner-exception"
-}
