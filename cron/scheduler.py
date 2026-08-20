@@ -14,6 +14,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -59,6 +60,20 @@ from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
     enter_non_dispatcher_owned_context,
     exit_non_dispatcher_owned_context,
+)
+from cron.context import (
+    OPERATOR_TRIGGERED,
+    PROVIDER_SCHEDULED,
+    RECOVERY_CATCHUP,
+    SCHEDULED_ON_TIME,
+    UNKNOWN,
+    canonical_json,
+    classify_scheduled_fire,
+    cron_execution_context,
+    delivery_details,
+    file_attestation,
+    normalize_invocation_kind,
+    set_delivery_detail,
 )
 
 logger = logging.getLogger(__name__)
@@ -494,6 +509,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 
 from cron.jobs import (
     advance_next_runs,
+    bind_fire_claim_execution,
     claim_dispatch,
     claim_job_for_fire,
     fire_claim_fence,
@@ -505,7 +521,12 @@ from cron.jobs import (
     save_job_output,
     use_cron_store,
 )
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import (
+    bind_execution_claim,
+    create_execution,
+    finish_execution,
+    mark_execution_running,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -539,6 +560,19 @@ def _is_cron_silence_response(text: str) -> bool:
     from gateway.response_filters import is_autonomous_silence_response
 
     return is_autonomous_silence_response(text)
+
+
+def classify_builtin_invocation(
+    job: dict,
+    *,
+    now: Any = None,
+) -> tuple[str, Optional[str]]:
+    """Return the scheduler-owned origin and intended instant for one due job."""
+    if isinstance(job.get("trigger_marker"), dict):
+        return OPERATOR_TRIGGERED, str(job.get("next_run_at") or "") or None
+    intended = job.get("next_run_at")
+    kind = classify_scheduled_fire(intended, now=now, provider=False)
+    return kind, str(intended) if intended is not None else None
 
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
@@ -2620,6 +2654,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     Returns None on success, or an error string on failure.
     """
     targets = _resolve_delivery_targets(job)
+    set_delivery_detail("target_count", len(targets))
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
         if deliver_value == "local":
@@ -2724,6 +2759,24 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         return msg
 
     delivery_errors = []
+
+    def _record_send_result(send_result: Any, *, success: bool) -> None:
+        if success:
+            set_delivery_detail("provider_accepted", True)
+        if isinstance(send_result, dict):
+            receipt = send_result.get("message_id")
+            if receipt is None:
+                raw = send_result.get("raw_response")
+                if isinstance(raw, dict):
+                    receipt = raw.get("message_id") or raw.get("id")
+        else:
+            receipt = getattr(send_result, "message_id", None)
+            if receipt is None:
+                raw = getattr(send_result, "raw_response", None)
+                if isinstance(raw, dict):
+                    receipt = raw.get("message_id") or raw.get("id")
+        if receipt is not None:
+            set_delivery_detail("provider_receipt_id", str(receipt))
 
     for target in targets:
         platform_name = target["platform"]
@@ -3126,6 +3179,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 send_success = _confirm_adapter_delivery(send_result)
                                 send_raw_response = getattr(send_result, "raw_response", None)
                                 delivered_message_id = getattr(send_result, "message_id", None)
+                            _record_send_result(send_result, success=send_success)
 
                             if not send_success:
                                 if isinstance(send_result, dict):
@@ -3374,6 +3428,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
                 continue
+
+            _record_send_result(result, success=True)
 
             # Standalone senders report per-file attachment failures in
             # ``warnings`` while still returning success (the text leg
@@ -4770,6 +4826,39 @@ class _BoundedCronSessionDB:
 
 
 def run_job(
+    job: dict,
+    *,
+    defer_agent_teardown: Optional[list] = None,
+    extra_prompt: Optional[str] = None,
+    cancel_event: Optional[_CancelEventLike] = None,
+) -> tuple[bool, str, str, Optional[str]]:
+    """Run one cron turn under its scheduler-owned task-local attestation."""
+    claim = job.get("fire_claim")
+    execution_id = job.get("execution_id") or (
+        claim.get("execution_id") if isinstance(claim, dict) else None
+    )
+    invocation_kind = job.get("invocation_kind") or (
+        claim.get("invocation_kind") if isinstance(claim, dict) else UNKNOWN
+    )
+    if not execution_id:
+        # Direct callers are not scheduler-attested.  Keep the closed kind in
+        # durable records, but do not expose a fabricated UUID to subprocesses.
+        return _run_job(
+            job,
+            defer_agent_teardown=defer_agent_teardown,
+            extra_prompt=extra_prompt,
+            cancel_event=cancel_event,
+        )
+    with cron_execution_context(execution_id, invocation_kind):
+        return _run_job(
+            job,
+            defer_agent_teardown=defer_agent_teardown,
+            extra_prompt=extra_prompt,
+            cancel_event=cancel_event,
+        )
+
+
+def _run_job(
     job: dict,
     *,
     defer_agent_teardown: Optional[list] = None,
@@ -6431,10 +6520,64 @@ def _run_one_job_body(
         return True
 
     execution_id = job.get("execution_id")
+    claim_kind = normalize_invocation_kind(
+        claim.get("invocation_kind") if isinstance(claim, dict) else OPERATOR_TRIGGERED
+    )
+    intended_fire_at = claim.get("intended_fire_at") if isinstance(claim, dict) else None
     if not execution_id:
-        execution_id = create_execution(job["id"], source="direct")["id"]
+        execution = create_execution(
+            job["id"],
+            source="direct",
+            invocation_kind=claim_kind,
+            intended_fire_at=intended_fire_at,
+            claim_owner=fire_owner,
+        )
+        execution_id = execution["id"]
+        if fire_owner and bind_fire_claim_execution(
+            job["id"],
+            expected_owner=fire_owner,
+            execution_id=execution_id,
+        ) is None:
+            raise RuntimeError("Fire claim execution binding was lost before dispatch")
     delivery_attempted = False
     delivery_error = None
+    delivery_status = "NOT_ATTEMPTED"
+    delivery_target = canonical_json(_resolve_delivery_targets(job))
+    delivery_target_class = _normalize_deliver_value(job.get("deliver", "local"))
+    delivery_content_sha256 = None
+    delivery_attempted_at = None
+    delivery_completed_at = None
+    delivery_receipt_id = None
+    output_path = None
+    output_sha256 = None
+    founder_card_path = None
+    founder_card_sha256 = None
+
+    def _finish_execution(*, success: bool, error: Optional[str] = None, delivery_outcome: Optional[str] = None):
+        base_kwargs = {
+            "success": success,
+            "error": error,
+            "delivery_outcome": delivery_outcome,
+        }
+        # Existing integrations/test doubles override the pre-Phase-A
+        # three-key finish API.  The production ledger receives the complete
+        # execution-keyed evidence set; legacy overrides remain callable.
+        if getattr(finish_execution, "__module__", "cron.executions") == "cron.executions":
+            base_kwargs.update(
+                delivery_status=delivery_status,
+                delivery_target=delivery_target,
+                delivery_target_class=delivery_target_class,
+                delivery_content_sha256=delivery_content_sha256,
+                delivery_attempted_at=delivery_attempted_at,
+                delivery_completed_at=delivery_completed_at,
+                delivery_error=delivery_error,
+                delivery_receipt_id=delivery_receipt_id,
+                output_path=output_path,
+                output_sha256=output_sha256,
+                founder_card_path=founder_card_path,
+                founder_card_sha256=founder_card_sha256,
+            )
+        return finish_execution(execution_id, **base_kwargs)
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -6448,8 +6591,7 @@ def _run_one_job_body(
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]),
             )
-            finish_execution(
-                execution_id,
+            _finish_execution(
                 success=False,
                 error="Dispatch claim rejected; execution was not started.",
             )
@@ -6527,14 +6669,12 @@ def _run_one_job_body(
                     "Interrupted by shutdown before terminal completion.",
                     expected_fire_owner=fire_owner,
                 )
-                finish_execution(
-                    execution_id,
+                _finish_execution(
                     success=False,
                     error="Interrupted by shutdown before terminal completion.",
                 )
             else:
-                finish_execution(
-                    execution_id,
+                _finish_execution(
                     success=False,
                     error="Fire claim ownership lost; stale result was discarded.",
                 )
@@ -6553,6 +6693,10 @@ def _run_one_job_body(
                 if not owns_output:
                     raise _FireClaimLostDuringSideEffect
                 output_file = save_job_output(job["id"], output)
+                output_path, output_sha256 = file_attestation(output_file)
+                # The founder-card artifact is execution-keyed by the ledger;
+                # Phase A's exact saved output is the canonical card payload.
+                founder_card_path, founder_card_sha256 = output_path, output_sha256
             if verbose:
                 logger.info("Output saved to: %s", output_file)
 
@@ -6651,6 +6795,9 @@ def _run_one_job_body(
                 )
 
             if should_deliver:
+                delivery_content_sha256 = hashlib.sha256(
+                    deliver_content.encode("utf-8")
+                ).hexdigest()
                 unresolved_origin = (
                     _normalize_deliver_value(job.get("deliver", "local")) == "origin"
                     and not _resolve_delivery_targets(job)
@@ -6660,16 +6807,30 @@ def _run_one_job_body(
                         if not owns_delivery:
                             raise _FireClaimLostDuringSideEffect
                         delivery_attempted = True
-                        delivery_error = _deliver_result(
-                            job,
-                            deliver_content,
-                            adapters=adapters,
-                            loop=loop,
-                        )
+                        delivery_attempted_at = _hermes_now().isoformat()
+                        with delivery_details() as _details:
+                            delivery_error = _deliver_result(
+                                job,
+                                deliver_content,
+                                adapters=adapters,
+                                loop=loop,
+                            )
+                        delivery_completed_at = _hermes_now().isoformat()
+                        delivery_receipt_id = _details.get("provider_receipt_id")
+                        if delivery_error:
+                            delivery_status = "FAILED"
+                        elif unresolved_origin:
+                            delivery_status = "NOT_CONFIGURED"
+                        elif _details.get("provider_accepted"):
+                            delivery_status = "PROVIDER_ACCEPTED"
+                        else:
+                            delivery_status = "SUPPRESSED"
                 except Exception as de:
                     if isinstance(de, _FireClaimLostDuringSideEffect):
                         raise
                     delivery_error = str(de)
+                    delivery_status = "FAILED"
+                    delivery_completed_at = _hermes_now().isoformat()
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
         except _FireClaimLostDuringSideEffect:
             side_effect_ownership_lost = True
@@ -6693,14 +6854,12 @@ def _run_one_job_body(
                     "Interrupted by shutdown before terminal completion.",
                     expected_fire_owner=fire_owner,
                 )
-                finish_execution(
-                    execution_id,
+                _finish_execution(
                     success=False,
                     error="Interrupted by shutdown before terminal completion.",
                 )
             else:
-                finish_execution(
-                    execution_id,
+                _finish_execution(
                     success=False,
                     error="Fire claim ownership lost; stale result was discarded.",
                 )
@@ -6732,8 +6891,7 @@ def _run_one_job_body(
                         "Failed recording delivery_error for interrupted job %s: %s",
                         job["id"], _rec_err,
                     )
-            finish_execution(
-                execution_id,
+            _finish_execution(
                 success=False,
                 error="Interrupted by gateway shutdown before terminal completion.",
             )
@@ -6746,8 +6904,7 @@ def _run_one_job_body(
             mark_kwargs["status"] = "blocked_config"
         marked = mark_job_run(job["id"], success, error, **mark_kwargs)
         if fire_owner is not None and not marked:
-            finish_execution(
-                execution_id,
+            _finish_execution(
                 success=False,
                 error="Fire claim ownership lost before terminal completion.",
             )
@@ -6761,8 +6918,12 @@ def _run_one_job_body(
             delivery_outcome = "delivered"
         else:
             delivery_outcome = "suppressed"
-        finish_execution(
-            execution_id,
+        if delivery_status == "NOT_ATTEMPTED":
+            if should_deliver and unresolved_origin:
+                delivery_status = "NOT_CONFIGURED"
+            else:
+                delivery_status = "SUPPRESSED"
+        _finish_execution(
             success=success,
             error=error,
             delivery_outcome=delivery_outcome,
@@ -6797,16 +6958,25 @@ def _run_one_job_body(
                 job.get("deliver", "local")
             )
             unresolved_origin = False
+            failure_content = _summarize_cron_failure_for_delivery(job, _err_text)
+            delivery_content_sha256 = hashlib.sha256(
+                failure_content.encode("utf-8")
+            ).hexdigest()
             try:
                 delivery_attempted = True
-                delivery_error = _deliver_result(
-                    job,
-                    _summarize_cron_failure_for_delivery(job, _err_text),
-                    adapters=adapters,
-                    loop=loop,
-                )
+                delivery_attempted_at = _hermes_now().isoformat()
+                with delivery_details() as _details:
+                    delivery_error = _deliver_result(
+                        job,
+                        failure_content,
+                        adapters=adapters,
+                        loop=loop,
+                    )
+                delivery_completed_at = _hermes_now().isoformat()
+                delivery_receipt_id = _details.get("provider_receipt_id")
             except Exception as delivery_exc:
                 delivery_error = str(delivery_exc)
+                delivery_completed_at = _hermes_now().isoformat()
                 logger.error(
                     "Delivery failed for job %s: %s", job["id"], delivery_exc
                 )
@@ -6814,10 +6984,15 @@ def _run_one_job_body(
                 unresolved_origin = not _resolve_delivery_targets(job)
             if delivery_error:
                 delivery_outcome = "failed"
+                delivery_status = "FAILED"
             elif unresolved_origin:
                 delivery_outcome = "not_configured"
+                delivery_status = "NOT_CONFIGURED"
             elif normalized_deliver != "local":
                 delivery_outcome = "delivered"
+                delivery_status = "PROVIDER_ACCEPTED"
+            else:
+                delivery_status = "SUPPRESSED"
         try:
             if not _consume_interrupted_flag(job["id"], execution_token):
                 mark_kwargs = {}
@@ -6833,8 +7008,7 @@ def _run_one_job_body(
                 job["id"], record_err,
             )
         try:
-            finish_execution(
-                execution_id,
+            _finish_execution(
                 success=False,
                 error=_err_text,
                 delivery_outcome=delivery_outcome,
@@ -7128,7 +7302,17 @@ def tick(
             # Acquire the durable claim only when this worker actually starts,
             # not while it may wait behind other work in an executor queue.
             # This prevents a queued lease from expiring before execution.
-            claimed = claim_job_for_fire(job["id"], return_job=True)
+            invocation_kind, intended_fire_at = classify_builtin_invocation(
+                job,
+                now=_hermes_now(),
+            )
+            claimed = claim_job_for_fire(
+                job["id"],
+                invocation_kind=invocation_kind,
+                intended_fire_at=intended_fire_at,
+                execution_id=job["execution_id"],
+                return_job=True,
+            )
             if not claimed:
                 finish_execution(
                     job["execution_id"],
@@ -7141,6 +7325,35 @@ def tick(
             # compatible; real callers using return_job=True never take it.
             claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
             claimed_job["execution_id"] = job["execution_id"]
+            if isinstance(claimed, dict):
+                claim = claimed.get("fire_claim")
+                if not isinstance(claim, dict):
+                    finish_execution(
+                        job["execution_id"],
+                        success=False,
+                        error="Fire claim did not return an attested claim",
+                    )
+                    return True
+                owner = str(claim.get("by") or "")
+                if claim.get("invocation_kind") != invocation_kind or not owner:
+                    finish_execution(
+                        job["execution_id"],
+                        success=False,
+                        error="Fire claim provenance did not match scheduler classification",
+                    )
+                    return True
+                if bind_execution_claim(
+                    job["execution_id"],
+                    invocation_kind=claim["invocation_kind"],
+                    intended_fire_at=claim.get("intended_fire_at"),
+                    claim_owner=owner,
+                ) is None:
+                    finish_execution(
+                        job["execution_id"],
+                        success=False,
+                        error="Fire claim execution binding was lost before dispatch",
+                    )
+                    return True
             return run_one_job(
                 claimed_job,
                 adapters=adapters,
@@ -7215,7 +7428,16 @@ def tick(
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
             try:
-                execution = create_execution(job_id, source="builtin")
+                invocation_kind, intended_fire_at = classify_builtin_invocation(
+                    job,
+                    now=_hermes_now(),
+                )
+                execution = create_execution(
+                    job_id,
+                    source="builtin",
+                    invocation_kind=invocation_kind,
+                    intended_fire_at=intended_fire_at,
+                )
                 dispatched_job = dict(job, execution_id=execution["id"])
                 _ctx = contextvars.copy_context()
             except Exception as execution_err:

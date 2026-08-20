@@ -36,6 +36,15 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Optional, Dict, List, Any, Set, Tuple, Union, Collection
 
+from cron.context import (
+    OPERATOR_TRIGGERED,
+    RECOVERY_CATCHUP,
+    SCHEDULED_ON_TIME,
+    UNKNOWN,
+    classify_scheduled_fire,
+    normalize_invocation_kind,
+)
+
 logger = logging.getLogger(__name__)
 
 from hermes_time import now as _hermes_now
@@ -2239,6 +2248,7 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     job = resolve_job_ref(job_id)
     if not job:
         return None
+    trigger_at = _hermes_now().isoformat()
     return update_job(
         job["id"],
         {
@@ -2246,7 +2256,15 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
             "state": "scheduled",
             "paused_at": None,
             "paused_reason": None,
-            "next_run_at": _hermes_now().isoformat(),
+            "next_run_at": trigger_at,
+            # Dashboard/CLI trigger requests are durable operator evidence.
+            # The marker is consumed into the immutable fire_claim by the
+            # next scheduler claimant; it never changes the user prompt.
+            "trigger_marker": {
+                "kind": OPERATOR_TRIGGERED,
+                "at": trigger_at,
+                "id": uuid.uuid4().hex,
+            },
         },
     )
 
@@ -2807,6 +2825,9 @@ def claim_job_for_fire(
     *,
     claim_ttl_seconds: int = 300,
     force: bool = False,
+    invocation_kind: Optional[str] = None,
+    intended_fire_at: Optional[str] = None,
+    execution_id: Optional[str] = None,
     return_job: bool = False,
 ) -> Union[bool, Dict[str, Any]]:
     with _fire_job_lock(job_id) as acquired:
@@ -2816,6 +2837,9 @@ def claim_job_for_fire(
             job_id,
             claim_ttl_seconds=claim_ttl_seconds,
             force=force,
+            invocation_kind=invocation_kind,
+            intended_fire_at=intended_fire_at,
+            execution_id=execution_id,
             return_job=return_job,
         )
 
@@ -2825,6 +2849,9 @@ def _claim_job_for_fire_locked(
     *,
     claim_ttl_seconds: int = 300,
     force: bool = False,
+    invocation_kind: Optional[str] = None,
+    intended_fire_at: Optional[str] = None,
+    execution_id: Optional[str] = None,
     return_job: bool = False,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for a single external 'fire' (multi-machine
@@ -2882,11 +2909,51 @@ def _claim_job_for_fire_locked(
                 job["state"] = "scheduled"
                 job["paused_at"] = None
                 job["paused_reason"] = None
+
+            # A persisted operator trigger always wins over a scheduler hint
+            # and is consumed atomically into this claim.  This is the durable
+            # marker used by dashboard/CLI `run` requests; it prevents the
+            # next builtin tick from laundering an operator action into an
+            # on-time scheduled execution.
+            trigger_marker = job.get("trigger_marker")
+            requested_kind = normalize_invocation_kind(invocation_kind)
+            if force or trigger_marker:
+                claimed_kind = OPERATOR_TRIGGERED
+            elif invocation_kind is None:
+                # Direct/manual callers do not possess scheduler attestation.
+                claimed_kind = OPERATOR_TRIGGERED
+            else:
+                claimed_kind = requested_kind
+
+            if claimed_kind in {SCHEDULED_ON_TIME, RECOVERY_CATCHUP}:
+                reclassified = classify_scheduled_fire(
+                    intended_fire_at,
+                    now=now,
+                    provider=False,
+                )
+                if reclassified != claimed_kind:
+                    claimed_kind = reclassified
+            elif claimed_kind == UNKNOWN:
+                claimed_kind = UNKNOWN
+
             # Per-acquisition token: a process may legitimately reclaim its own
             # stale lease, and the previous runner must not heartbeat the new
             # claim merely because hostname + PID are unchanged.
             owner = f"{_machine_id()}:{uuid.uuid4().hex}"
-            job["fire_claim"] = {"at": now.isoformat(), "by": owner}
+            claim = {
+                "at": now.isoformat(),
+                "by": owner,
+                "invocation_kind": claimed_kind,
+                "intended_fire_at": (
+                    str(intended_fire_at) if intended_fire_at is not None else None
+                ),
+            }
+            if execution_id:
+                claim["execution_id"] = str(execution_id)
+            if isinstance(trigger_marker, dict):
+                claim["trigger_marker_id"] = str(trigger_marker.get("id") or "")
+            job["fire_claim"] = claim
+            job.pop("trigger_marker", None)
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
@@ -2895,6 +2962,33 @@ def _claim_job_for_fire_locked(
             save_jobs(jobs)
             return copy.deepcopy(job) if return_job else True
         return False
+
+
+def bind_fire_claim_execution(
+    job_id: str,
+    *,
+    expected_owner: str,
+    execution_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Attach the scheduler-created execution UUID to its owned fire claim."""
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            return None
+        with _jobs_lock():
+            jobs = load_jobs()
+            for job in jobs:
+                if job.get("id") != job_id:
+                    continue
+                claim = job.get("fire_claim")
+                if not isinstance(claim, dict) or claim.get("by") != expected_owner:
+                    return None
+                existing = claim.get("execution_id")
+                if existing and str(existing) != str(execution_id):
+                    return None
+                claim["execution_id"] = str(execution_id)
+                save_jobs(jobs)
+                return copy.deepcopy(job)
+    return None
 
 
 # Completed one-shot job records are retained in jobs.json (final status +

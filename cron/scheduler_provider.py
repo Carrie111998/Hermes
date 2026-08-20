@@ -24,6 +24,15 @@ import threading
 from abc import ABC, abstractmethod
 from typing import Any
 
+from cron.context import (
+    OPERATOR_TRIGGERED,
+    PROVIDER_SCHEDULED,
+    RECOVERY_CATCHUP,
+    UNKNOWN,
+    classify_scheduled_fire,
+    normalize_invocation_kind,
+)
+
 # Cap for the exponential tick backoff applied while consecutive ticks fail
 # with fd exhaustion (EMFILE/ENFILE, #87644).  Base is the tick interval
 # (60s by default); each consecutive EMFILE failure doubles the wait, capped
@@ -154,6 +163,8 @@ class CronScheduler(ABC):
         adapters: Any = None,
         loop: Any = None,
         force: bool = False,
+        intended_fire_at: Any = None,
+        invocation_kind: Any = None,
     ) -> bool:
         """Run a single job NOW via the shared orchestrator. Called by the
         inbound fire webhook when an external scheduler signals a job is due.
@@ -167,25 +178,75 @@ class CronScheduler(ABC):
         the job itself failed. Returns False only if the claim was lost
         (another machine/retry won it) or the job no longer exists.
         """
-        claimed_job = self.claim_fire(job_id, force=force)
+        claimed_job = self.claim_fire(
+            job_id,
+            force=force,
+            intended_fire_at=intended_fire_at,
+            invocation_kind=invocation_kind,
+        )
         if claimed_job is None:
             return False
         return self.fire_claimed(claimed_job, adapters=adapters, loop=loop)
 
-    def claim_fire(self, job_id: str, *, force: bool = False) -> dict | None:
+    def claim_fire(
+        self,
+        job_id: str,
+        *,
+        force: bool = False,
+        intended_fire_at: Any = None,
+        invocation_kind: Any = None,
+    ) -> dict | None:
         """Durably claim one fire and create its audit attempt before dispatch.
 
         Webhook transports call this synchronously before acknowledging the
         external scheduler, then pass the exact owner-bearing snapshot to
         ``fire_claimed`` in tracked background work.
         """
-        from cron.executions import create_execution, finish_execution
-        from cron.jobs import claim_job_for_fire
+        from cron.executions import (
+            bind_execution_claim,
+            create_execution,
+            finish_execution,
+        )
+        from cron.jobs import _hermes_now, bind_fire_claim_execution, claim_job_for_fire
 
-        execution = create_execution(job_id, source=self.name)
+        if force:
+            claimed_kind = OPERATOR_TRIGGERED
+        elif invocation_kind is not None:
+            claimed_kind = normalize_invocation_kind(invocation_kind)
+        else:
+            claimed_kind = classify_scheduled_fire(
+                intended_fire_at,
+                now=_hermes_now(),
+                provider=True,
+            )
+        if claimed_kind not in {
+            PROVIDER_SCHEDULED,
+            RECOVERY_CATCHUP,
+            OPERATOR_TRIGGERED,
+            UNKNOWN,
+        }:
+            claimed_kind = UNKNOWN
+        try:
+            execution = create_execution(
+                job_id,
+                source=self.name,
+                invocation_kind=claimed_kind,
+                intended_fire_at=intended_fire_at,
+            )
+            legacy_execution_factory = False
+        except TypeError:
+            # Keep pre-Phase-A test/provider doubles callable while the real
+            # ledger always receives the immutable classification.
+            execution = create_execution(job_id, source=self.name)
+            legacy_execution_factory = True
         claim_kwargs = {"return_job": True}
         if force:
             claim_kwargs["force"] = True
+        claim_function_is_legacy = getattr(claim_job_for_fire, "__module__", "cron.jobs") != "cron.jobs"
+        if not claim_function_is_legacy:
+            claim_kwargs["invocation_kind"] = claimed_kind
+            claim_kwargs["intended_fire_at"] = intended_fire_at
+            claim_kwargs["execution_id"] = execution["id"]
         try:
             claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
         except BaseException as exc:
@@ -202,6 +263,53 @@ class CronScheduler(ABC):
                 error="Fire claim was not acquired",
             )
             return None
+        claim = claimed_job.get("fire_claim")
+        if not isinstance(claim, dict):
+            finish_execution(
+                execution["id"],
+                success=False,
+                error="Fire claim did not return an attested claim",
+            )
+            return None
+        if claim.get("invocation_kind") is None and claim_function_is_legacy:
+            claim["invocation_kind"] = claimed_kind
+        if claim.get("invocation_kind") != claimed_kind:
+            finish_execution(
+                execution["id"],
+                success=False,
+                error="Fire claim provenance did not match scheduler classification",
+            )
+            return None
+        owner = str(claim.get("by") or "")
+        if not owner or (not legacy_execution_factory and bind_execution_claim(
+            execution["id"],
+            invocation_kind=claimed_kind,
+            intended_fire_at=claim.get("intended_fire_at"),
+            claim_owner=owner,
+        ) is None):
+            finish_execution(
+                execution["id"],
+                success=False,
+                error="Fire claim execution binding was lost before dispatch",
+            )
+            return None
+        bound_job = (
+            claimed_job
+            if legacy_execution_factory or claim_function_is_legacy
+            else bind_fire_claim_execution(
+                job_id,
+                expected_owner=owner,
+                execution_id=execution["id"],
+            )
+        )
+        if not isinstance(bound_job, dict):
+            finish_execution(
+                execution["id"],
+                success=False,
+                error="Fire claim execution binding was lost before dispatch",
+            )
+            return None
+        claimed_job = bound_job
         claimed_job["execution_id"] = execution["id"]
         return claimed_job
 
@@ -407,7 +515,11 @@ def fire_overdue_jobs(
             # CAS — losing means an external retry beat us, which is
             # fine), then run the job off-thread so the caller's loop is
             # never blocked for the length of an agent run.
-            claimed = provider.claim_fire(job_id)
+            claimed = provider.claim_fire(
+                job_id,
+                invocation_kind=RECOVERY_CATCHUP,
+                intended_fire_at=next_run_at,
+            )
             if claimed is None:
                 continue
             threading.Thread(
