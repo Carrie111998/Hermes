@@ -7539,6 +7539,359 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Admin archive graph (dominated closure)
+# ---------------------------------------------------------------------------
+
+_ADMIN_GROUP_PREFIX = "ag_"
+
+
+def _admin_group_id() -> str:
+    """Generate an admin archive group id: ``ag_`` + 16 lowercase hex."""
+    return _ADMIN_GROUP_PREFIX + secrets.token_hex(8)
+
+
+def _dominated_closure(conn, roots):
+    """Compute the dominated closure of ``roots`` over the task graph.
+
+    Roots enter unconditionally. A non-root task enters only when every
+    parent is already in the closure or already ``archived``. Iterates to
+    a fixed point. Returns ``(closure, statuses)`` where ``statuses`` maps
+    every task id in the board to its current status.
+    """
+    statuses = {
+        row["id"]: row["status"]
+        for row in conn.execute("SELECT id, status FROM tasks").fetchall()
+    }
+    parents: dict = {}
+    for row in conn.execute(
+        "SELECT parent_id, child_id FROM task_links"
+    ).fetchall():
+        parents.setdefault(row["child_id"], set()).add(row["parent_id"])
+    closure = set(roots)
+    changed = True
+    while changed:
+        changed = False
+        for child, ps in parents.items():
+            if child in closure or child not in statuses:
+                continue
+            if all(
+                (p in closure) or (statuses.get(p) == "archived")
+                for p in ps
+            ):
+                closure.add(child)
+                changed = True
+    return closure, statuses
+
+
+def _task_active(conn, task_id) -> bool:
+    row = conn.execute(
+        "SELECT status, current_run_id, claim_lock, claim_expires, worker_pid "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return False
+    if row["status"] == "running":
+        return True
+    return bool(
+        row["current_run_id"]
+        or row["claim_lock"]
+        or row["claim_expires"]
+        or row["worker_pid"]
+    )
+
+
+def _task_would_promote(conn, task_id, closure) -> bool:
+    """Mirror ``recompute_ready``'s promotion decision for one task.
+
+    ``closure`` tasks are treated as already archived (their ``inside``
+    parents are about to become terminal), matching the post-commit state
+    that ``recompute_ready`` will observe.
+    """
+    row = conn.execute(
+        "SELECT status, consecutive_failures, max_retries "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row or row["status"] not in ("todo", "blocked"):
+        return False
+    cur_status = row["status"]
+    if cur_status == "blocked" and _has_sticky_block(conn, task_id):
+        return False
+    parents = conn.execute(
+        "SELECT t.id, t.status FROM tasks t "
+        "JOIN task_links l ON l.parent_id = t.id "
+        "WHERE l.child_id = ?",
+        (task_id,),
+    ).fetchall()
+    if not all(
+        (p["id"] in closure) or (p["status"] in ("done", "archived"))
+        for p in parents
+    ):
+        return False
+    if cur_status == "blocked":
+        failures = int(row["consecutive_failures"] or 0)
+        task_limit = row["max_retries"]
+        effective_limit = (
+            int(task_limit) if task_limit is not None
+            else int(DEFAULT_FAILURE_LIMIT)
+        )
+        if failures >= effective_limit:
+            return False
+    return True
+
+
+def _empty_admin_graph_result(roots, dry_run) -> dict:
+    return {
+        "dry_run": bool(dry_run),
+        "archive_group_id": None,
+        "root_ids": sorted(roots),
+        "tasks": [],
+        "skipped_archived": [],
+        "internal_edges": [],
+        "external_edges": [],
+        "would_promote": [],
+        "active_runs": [],
+        "archived_ids": [],
+        "warnings": [],
+    }
+
+
+def _admin_refuse(result, message) -> dict:
+    out = dict(result)
+    out["error"] = message
+    out["archived_ids"] = []
+    return out
+
+
+def admin_archive_graph(
+    conn,
+    root_ids,
+    *,
+    reason,
+    actor,
+    dry_run=False,
+    allow_promotions=False,
+    force_running=False,
+) -> dict:
+    """Safely archive a dominated closure of tasks under ``root_ids``.
+
+    Returns a structured report dict (see the card contract). Refusals
+    (unknown ids, a promotion hazard without ``allow_promotions``, or a
+    live run without ``force_running``) return an error-carrying dict and
+    write nothing.
+    """
+    if not root_ids:
+        raise ValueError("root_ids must be non-empty")
+    reason_s = (reason or "").strip()
+    actor_s = (actor or "").strip()
+    if not reason_s:
+        raise ValueError("reason must be non-empty")
+    if not actor_s:
+        raise ValueError("actor must be non-empty")
+
+    roots = sorted(set(root_ids))
+    existing = {
+        row["id"] for row in conn.execute("SELECT id FROM tasks").fetchall()
+    }
+    missing = [rid for rid in roots if rid not in existing]
+    if missing:
+        return _admin_refuse(
+            _empty_admin_graph_result(roots, bool(dry_run)),
+            f"unknown task id(s), nothing archived: {sorted(missing)}",
+        )
+
+    closure, statuses = _dominated_closure(conn, roots)
+
+    id_placeholders = ",".join("?" * len(closure))
+    meta = {
+        row["id"]: row
+        for row in conn.execute(
+            "SELECT id, title, status, workspace_path, workspace_kind "
+            f"FROM tasks WHERE id IN ({id_placeholders})",
+            tuple(sorted(closure)),
+        ).fetchall()
+    }
+    tasks_rows = []
+    for tid in sorted(closure):
+        r = meta[tid]
+        ws = r["workspace_path"]
+        tasks_rows.append(
+            {
+                "id": tid,
+                "title": r["title"],
+                "status": r["status"],
+                "workspace_path": ws,
+                "workspace_exists": bool(ws) and Path(ws).exists(),
+            }
+        )
+
+    all_links = [
+        (row["parent_id"], row["child_id"])
+        for row in conn.execute(
+            "SELECT parent_id, child_id FROM task_links"
+        ).fetchall()
+    ]
+    internal_edges = []
+    external_edges = []
+    for pid, cid in all_links:
+        pin = pid in closure
+        cin = cid in closure
+        if pin and cin:
+            internal_edges.append({"parent_id": pid, "child_id": cid})
+        elif pin and not cin:
+            external_edges.append(
+                {"direction": "outbound", "parent_id": pid, "child_id": cid}
+            )
+        elif not pin and cin:
+            external_edges.append(
+                {"direction": "inbound", "parent_id": pid, "child_id": cid}
+            )
+    internal_edges.sort(key=lambda e: (e["parent_id"], e["child_id"]))
+    external_edges.sort(
+        key=lambda e: (e["parent_id"], e["child_id"], e["direction"])
+    )
+
+    root_set = set(roots)
+    warnings = []
+    for pid, cid in all_links:
+        if cid in closure and pid not in closure:
+            if statuses.get(pid) != "archived" and cid in root_set:
+                warnings.append(
+                    {
+                        "code": "live_external_parent",
+                        "parent_id": pid,
+                        "root_id": cid,
+                    }
+                )
+    warnings.sort(key=lambda w: (w["root_id"], w["parent_id"]))
+
+    active_runs = sorted(tid for tid in closure if _task_active(conn, tid))
+    boundary = sorted(
+        {
+            cid
+            for pid, cid in all_links
+            if pid in closure and cid not in closure and cid in statuses
+        }
+    )
+    would_promote = sorted(
+        tid for tid in boundary if _task_would_promote(conn, tid, closure)
+    )
+    skipped_archived = sorted(
+        tid for tid in closure if statuses.get(tid) == "archived"
+    )
+    to_archive = sorted(
+        tid for tid in closure if statuses.get(tid) != "archived"
+    )
+
+    result = {
+        "dry_run": bool(dry_run),
+        "archive_group_id": None,
+        "root_ids": roots,
+        "tasks": tasks_rows,
+        "skipped_archived": skipped_archived,
+        "internal_edges": internal_edges,
+        "external_edges": external_edges,
+        "would_promote": would_promote,
+        "active_runs": active_runs,
+        "archived_ids": [],
+        "warnings": warnings,
+    }
+
+    if dry_run:
+        return result
+
+    if would_promote and not allow_promotions:
+        return _admin_refuse(
+            result,
+            "graph would promote detached boundary task(s); pass "
+            f"--allow-promotions to proceed: {would_promote}",
+        )
+    if active_runs and not force_running:
+        return _admin_refuse(
+            result,
+            "closure contains active run(s); pass --force-running to "
+            f"terminate and archive: {active_runs}",
+        )
+
+    if active_runs:
+        survivors = []
+        for tid in active_runs:
+            prow = conn.execute(
+                "SELECT worker_pid, claim_lock FROM tasks WHERE id = ?", (tid,)
+            ).fetchone()
+            termination = _terminate_reclaimed_worker(
+                prow["worker_pid"], prow["claim_lock"]
+            )
+            if _worker_survived_termination(termination):
+                survivors.append(tid)
+        if survivors:
+            return _admin_refuse(
+                result,
+                "worker(s) survived termination; refusing to archive: "
+                f"{survivors}",
+            )
+
+    group_id = _admin_group_id()
+    n = len(to_archive)
+    with write_txn(conn):
+        for tid in to_archive:
+            prior_status = statuses.get(tid)
+            run_id = _end_run(
+                conn,
+                tid,
+                outcome="reclaimed",
+                status="reclaimed",
+                error="admin_archived with run active",
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'archived', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+                (tid,),
+            )
+            if run_id is not None:
+                _append_event(
+                    conn,
+                    tid,
+                    "reclaimed",
+                    {
+                        "admin_archive": True,
+                        "archive_group_id": group_id,
+                        "actor": actor_s,
+                        "reason": reason_s,
+                    },
+                    run_id=run_id,
+                )
+            _append_event(
+                conn,
+                tid,
+                "admin_archived",
+                {
+                    "archive_group_id": group_id,
+                    "actor": actor_s,
+                    "reason": reason_s,
+                    "prior_status": prior_status,
+                },
+                run_id=run_id,
+            )
+        for rid in roots:
+            body = f"Admin-archived graph {group_id} ({n} tasks): {reason_s}"
+            add_comment(conn, rid, actor_s, body)
+
+    if allow_promotions:
+        recompute_ready(conn)
+
+    result["archive_group_id"] = group_id
+    result["archived_ids"] = to_archive
+    arched = set(to_archive)
+    result["tasks"] = [
+        {**t, "status": "archived" if t["id"] in arched else t["status"]}
+        for t in result["tasks"]
+    ]
+    return result
+
+
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Permanently remove an already-archived task and its related rows.
 
