@@ -1037,10 +1037,10 @@ def _set_path_parts(dotted_key: str) -> List[str]:
         if field in _CUSTOM_PROVIDER_MODEL_OVERRIDE_FIELDS:
             model_id = ".".join(model_path[:-1])
             return parts[:3] + [model_id, field]
-        if len(model_path) > 2:
+        if len(model_path) > 1:
             raise ValueError(
-                "dotted custom-provider model IDs can only address supported "
-                "model override fields: "
+                "ambiguous custom-provider model paths can only address "
+                "supported model override fields: "
                 + ", ".join(sorted(_CUSTOM_PROVIDER_MODEL_OVERRIDE_FIELDS))
             )
     return parts

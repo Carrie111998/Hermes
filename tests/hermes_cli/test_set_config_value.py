@@ -347,18 +347,30 @@ class TestDottedCustomProviderModelIds:
             "qwen3.5:4b": {"context_length": 65_536}
         }
 
-    def test_rejects_ambiguous_dotted_model_metadata_path(
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            (
+                "custom_providers.0.models.vendor.model.unsupported_flag",
+                "true",
+            ),
+            (
+                "custom_providers.0.models.qwen3.5:4b",
+                "{context_length: 65536}",
+            ),
+        ],
+    )
+    def test_rejects_ambiguous_dotted_model_path(
         self,
         _isolated_hermes_home,
+        key,
+        value,
     ):
         self._write_config(_isolated_hermes_home, {})
         before = _read_config(_isolated_hermes_home)
 
         with pytest.raises(SystemExit) as exc:
-            set_config_value(
-                "custom_providers.0.models.vendor.model.unsupported_flag",
-                "true",
-            )
+            set_config_value(key, value)
 
         assert exc.value.code == 1
         assert _read_config(_isolated_hermes_home) == before
