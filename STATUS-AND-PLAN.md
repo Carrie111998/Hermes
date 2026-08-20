@@ -10,7 +10,7 @@ they already settled. The demo does not depend on the enrichment work.
 |---|---|
 | App | `agent-rota` (Fly, region `fra`, one machine, one volume) |
 | Host | https://agent-rota.fly.dev |
-| Release running | v10 — **predates `2ec40dcad6`, so incremental selection is not deployed** |
+| Release running | v11, 2026-08-20 09:15 UTC — 12 minutes after `2ec40dcad6`, so incremental selection ships in it. Only `139f23cee0` (tests) is unreleased. Image contents not grep-verified. |
 | Database | Supabase Postgres, migrations 001–009 all applied |
 | Model | `minimax/MiniMax-M3`, `MINIMAX_API_KEY` set |
 | Verifier | Bright Data Web Unlocker, zone `cli_unlocker`, `active` server-side |
@@ -41,10 +41,22 @@ release.
 
 ### Remaining — two steps, both in the WebUI
 
-1. **Enable the data source.** Sign in as `demo@tugrap.dev` → Data sources.
-   `dataset_definitions` is still empty because the rows seed lazily when that
-   page is first opened (`service.catalog` → `ensure_catalog`). Bright Data will
-   appear installed and disabled; click **Enable**. Health must read `active`.
+1. **Enable the data source — as the admin, not as the demo user.** Provider
+   catalog sources are admin-managed by design: `_source_enabled`
+   (`server/routes/operations.py:534`) rejects a non-admin principal for any
+   `source_id` in the registry, and the only page that renders the control is
+   `/admin/data-sources`. `demo@tugrap.dev` is `role='customer'`
+   (`server/provisioning.py:77`), so it cannot do this and has no UI for it.
+
+   Sign in as `INTERFAZE_BOOTSTRAP_ADMIN_EMAIL` → **Customers** → the demo
+   company → **Open workspace**. That button is the only thing that writes
+   `session.company`, and `config.beforeRequest` (`server/webui/js/main.js:62`)
+   only sends `X-Company-ID` when it is set — without it every admin call 400s
+   on `company_id is required for admin requests`. Then **Data sources**:
+   `dataset_definitions` seeds lazily on first view (`service.catalog` →
+   `ensure_catalog`), and Bright Data arrives `installed=1, enabled=0`
+   (`default_enabled: false` in the provider catalog), so it is one **Enable**
+   click. Health must read `active`.
 2. **Import at least one product.** Candidates are matched against product
    terms, so an empty catalog produces an empty funnel no matter how good the
    corpus is.
