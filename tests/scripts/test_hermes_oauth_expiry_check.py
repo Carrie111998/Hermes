@@ -4,14 +4,18 @@ oauth-reauth-expiry-check feature).
 Covers: the 2-day warning-window boundary math, the jid-vs-family-member
 differentiated notification behavior (daily-until-fixed vs. one-time
 heads-up+expired), the no-sidecar fallback (purely reactive), state reset on
-a fresh re-auth cycle, and the delivery-target resolution gap (skip rather
-than guess a chat id).
+a fresh re-auth cycle, and vault-Profile.md-based delivery-target resolution
+(scripts/_family_delivery.py) — including the missing/malformed-profile
+failure modes, which must skip loudly rather than guess or misdeliver.
 
 Identity generality: nothing here special-cases "jid" or "zarkash" by name —
 every differentiated-behavior test constructs its own registry with
 synthetic identity names to prove the primary/non-primary split is driven by
 ``is_primary_identity()``'s structural rule (credentials_dir == HERMES_HOME),
-not a hardcoded name list, per the generality requirement.
+not a hardcoded name list, per the generality requirement. Delivery-target
+tests similarly use synthetic names to prove ``_family_delivery.py``'s path
+convention (``Family/<Capitalized name>/<Capitalized name> Profile.md``)
+generalizes to a brand-new identity with zero code changes.
 """
 
 from __future__ import annotations
@@ -29,11 +33,24 @@ import pytest
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[2] / "scripts" / "hermes-oauth-expiry-check.py"
 )
+FAMILY_DELIVERY_PATH = (
+    Path(__file__).resolve().parents[2] / "scripts" / "_family_delivery.py"
+)
 
 
 def _load_module(tmp_path):
     spec = importlib.util.spec_from_file_location(
         "hermes_oauth_expiry_check_test", SCRIPT_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_family_delivery_module():
+    spec = importlib.util.spec_from_file_location(
+        "family_delivery_test", FAMILY_DELIVERY_PATH
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -47,10 +64,22 @@ def mod(tmp_path):
 
 
 @pytest.fixture
+def fd(tmp_path):
+    return _load_family_delivery_module()
+
+
+@pytest.fixture
 def hermes_home(tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
     return home
+
+
+@pytest.fixture
+def vault_root(tmp_path):
+    root = tmp_path / "Obsidian Core"
+    root.mkdir()
+    return root
 
 
 def _write_sidecar(entry_dir: Path, recorded_at_epoch: float, identity: str = "x"):
@@ -68,6 +97,37 @@ def _write_sidecar(entry_dir: Path, recorded_at_epoch: float, identity: str = "x
         ),
         encoding="utf-8",
     )
+
+
+def _profile_path(vault_root: Path, identity: str, *, is_primary: bool) -> Path:
+    if is_primary:
+        return vault_root / "Hermes" / "Profile" / "JID Profile.md"
+    name = identity.capitalize()
+    return vault_root / "Hermes" / "Profile" / "Family" / name / f"{name} Profile.md"
+
+
+def _write_profile(
+    vault_root: Path, identity: str, chat_id: str, *, is_primary: bool = False,
+    table_row: "str | None" = None,
+) -> Path:
+    """Write a realistic vault Profile.md fixture with a Platform Identity
+    table, matching the real format observed on the live vault."""
+    path = _profile_path(vault_root, identity, is_primary=is_primary)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = table_row if table_row is not None else f"| Telegram | — | {chat_id} |"
+    path.write_text(
+        "---\nstatus: canonical\n---\n\n"
+        f"# {identity.capitalize()} Profile\n\n"
+        "## Platform Identity\n\n"
+        "| Platform | Username | User ID |\n"
+        "|---|---|---|\n"
+        "| Slack | someone | U0123456789 |\n"
+        f"{row}\n"
+        "| Discord | — | 1519435081708736513 |\n\n"
+        "Recorded here for consistency.\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 class TestWarningWindowMath:
@@ -145,19 +205,20 @@ class TestPrimaryVsFamilyMemberDifferentiation:
     prove the daily-vs-one-time split is driven by is_primary_identity()'s
     structural rule, not by name."""
 
-    def test_primary_sends_daily_with_no_suppression(self, mod, hermes_home, monkeypatch):
+    def test_primary_sends_daily_with_no_suppression(self, mod, hermes_home, vault_root, monkeypatch):
         entry_dir = hermes_home  # primary: credentials_dir == HERMES_HOME
         now = datetime.now(timezone.utc)
         recorded_at = (now - timedelta(days=6)).timestamp()  # 1 day left -> in window
         _write_sidecar(entry_dir, recorded_at, identity="admin_person")
         entry = {"credentials_dir": entry_dir}
+        _write_profile(vault_root, "admin_person", "111", is_primary=True)
 
-        monkeypatch.setenv("HERMES_IDENTITY_TELEGRAM_CHAT_ID__ADMIN_PERSON", "111")
         sent = _patch_common(mod, monkeypatch, check_ok=True)
 
         state: dict = {}
         logs1 = mod.process_identity(
-            "admin_person", entry, hermes_home=hermes_home, now=now, state=state,
+            "admin_person", entry, hermes_home=hermes_home, vault_root=vault_root,
+            now=now, state=state,
         )
         assert any("sent daily_warning" in line for line in logs1)
         assert len(sent) == 1
@@ -166,24 +227,26 @@ class TestPrimaryVsFamilyMemberDifferentiation:
         # happened) -- primary must send AGAIN, no one-time suppression.
         now2 = now + timedelta(days=1)
         logs2 = mod.process_identity(
-            "admin_person", entry, hermes_home=hermes_home, now=now2, state=state,
+            "admin_person", entry, hermes_home=hermes_home, vault_root=vault_root,
+            now=now2, state=state,
         )
         assert any("sent daily_warning" in line for line in logs2)
         assert len(sent) == 2
 
-    def test_family_member_sends_heads_up_exactly_once(self, mod, hermes_home, monkeypatch):
+    def test_family_member_sends_heads_up_exactly_once(self, mod, hermes_home, vault_root, monkeypatch):
         entry_dir = hermes_home / "family_credentials" / "family_person"
         now = datetime.now(timezone.utc)
         recorded_at = (now - timedelta(days=6)).timestamp()  # in window, not yet revoked
         _write_sidecar(entry_dir, recorded_at, identity="family_person")
         entry = {"credentials_dir": entry_dir}
+        _write_profile(vault_root, "family_person", "222")
 
-        monkeypatch.setenv("HERMES_IDENTITY_TELEGRAM_CHAT_ID__FAMILY_PERSON", "222")
         sent = _patch_common(mod, monkeypatch, check_ok=True)  # check_ok=True -> not revoked
 
         state: dict = {}
         logs1 = mod.process_identity(
-            "family_person", entry, hermes_home=hermes_home, now=now, state=state,
+            "family_person", entry, hermes_home=hermes_home, vault_root=vault_root,
+            now=now, state=state,
         )
         assert any("sent heads_up" in line for line in logs1)
         assert len(sent) == 1
@@ -192,98 +255,107 @@ class TestPrimaryVsFamilyMemberDifferentiation:
         # must NOT send again.
         now2 = now + timedelta(hours=12)
         logs2 = mod.process_identity(
-            "family_person", entry, hermes_home=hermes_home, now=now2, state=state,
+            "family_person", entry, hermes_home=hermes_home, vault_root=vault_root,
+            now=now2, state=state,
         )
         assert any("already sent one-time heads-up" in line for line in logs2)
         assert len(sent) == 1
 
-    def test_family_member_sends_expired_exactly_once_when_revoked(self, mod, hermes_home, monkeypatch):
+    def test_family_member_sends_expired_exactly_once_when_revoked(self, mod, hermes_home, vault_root, monkeypatch):
         entry_dir = hermes_home / "family_credentials" / "family_person"
         now = datetime.now(timezone.utc)
         recorded_at = (now - timedelta(days=8)).timestamp()  # already past 7 days
         _write_sidecar(entry_dir, recorded_at, identity="family_person")
         entry = {"credentials_dir": entry_dir}
+        _write_profile(vault_root, "family_person", "222")
 
-        monkeypatch.setenv("HERMES_IDENTITY_TELEGRAM_CHAT_ID__FAMILY_PERSON", "222")
         sent = _patch_common(mod, monkeypatch, check_ok=False)  # revoked
 
         state: dict = {}
         logs1 = mod.process_identity(
-            "family_person", entry, hermes_home=hermes_home, now=now, state=state,
+            "family_person", entry, hermes_home=hermes_home, vault_root=vault_root,
+            now=now, state=state,
         )
         assert any("sent expired" in line for line in logs1)
         assert len(sent) == 1
 
         logs2 = mod.process_identity(
-            "family_person", entry, hermes_home=hermes_home, now=now + timedelta(days=1),
-            state=state,
+            "family_person", entry, hermes_home=hermes_home, vault_root=vault_root,
+            now=now + timedelta(days=1), state=state,
         )
         assert any("already sent one-time EXPIRED" in line for line in logs2)
         assert len(sent) == 1
 
 
 class TestFallbackNoSidecar:
-    def test_no_sidecar_ok_check_is_silent(self, mod, hermes_home, monkeypatch):
+    def test_no_sidecar_ok_check_is_silent(self, mod, hermes_home, vault_root, monkeypatch):
         entry = {"credentials_dir": hermes_home / "family_credentials" / "legacy_person"}
-        monkeypatch.setenv("HERMES_IDENTITY_TELEGRAM_CHAT_ID__LEGACY_PERSON", "333")
+        _write_profile(vault_root, "legacy_person", "333")
         sent = _patch_common(mod, monkeypatch, check_ok=True)
 
         state: dict = {}
         logs = mod.process_identity(
-            "legacy_person", entry, hermes_home=hermes_home,
+            "legacy_person", entry, hermes_home=hermes_home, vault_root=vault_root,
             now=datetime.now(timezone.utc), state=state,
         )
         assert any("fallback reactive mode, --check OK" in line for line in logs)
         assert sent == []
 
-    def test_no_sidecar_failed_check_sends_once_for_family_member(self, mod, hermes_home, monkeypatch):
+    def test_no_sidecar_failed_check_sends_once_for_family_member(self, mod, hermes_home, vault_root, monkeypatch):
         entry = {"credentials_dir": hermes_home / "family_credentials" / "legacy_person"}
-        monkeypatch.setenv("HERMES_IDENTITY_TELEGRAM_CHAT_ID__LEGACY_PERSON", "333")
+        _write_profile(vault_root, "legacy_person", "333")
         sent = _patch_common(mod, monkeypatch, check_ok=False)
 
         state: dict = {}
         now = datetime.now(timezone.utc)
         logs1 = mod.process_identity(
-            "legacy_person", entry, hermes_home=hermes_home, now=now, state=state,
+            "legacy_person", entry, hermes_home=hermes_home, vault_root=vault_root,
+            now=now, state=state,
         )
         assert any("sent reactive_expired_once" in line for line in logs1)
         assert len(sent) == 1
 
         logs2 = mod.process_identity(
-            "legacy_person", entry, hermes_home=hermes_home,
+            "legacy_person", entry, hermes_home=hermes_home, vault_root=vault_root,
             now=now + timedelta(days=1), state=state,
         )
         assert any("already sent one-time expired notice" in line for line in logs2)
         assert len(sent) == 1
 
-    def test_no_sidecar_failed_check_sends_daily_for_primary(self, mod, hermes_home, monkeypatch):
+    def test_no_sidecar_failed_check_sends_daily_for_primary(self, mod, hermes_home, vault_root, monkeypatch):
         entry = {"credentials_dir": hermes_home}
-        monkeypatch.setenv("HERMES_IDENTITY_TELEGRAM_CHAT_ID__ADMIN_PERSON", "111")
+        _write_profile(vault_root, "admin_person", "111", is_primary=True)
         sent = _patch_common(mod, monkeypatch, check_ok=False)
 
         state: dict = {}
         now = datetime.now(timezone.utc)
-        mod.process_identity("admin_person", entry, hermes_home=hermes_home, now=now, state=state)
         mod.process_identity(
-            "admin_person", entry, hermes_home=hermes_home,
+            "admin_person", entry, hermes_home=hermes_home, vault_root=vault_root,
+            now=now, state=state,
+        )
+        mod.process_identity(
+            "admin_person", entry, hermes_home=hermes_home, vault_root=vault_root,
             now=now + timedelta(days=1), state=state,
         )
         assert len(sent) == 2
 
 
 class TestStateResetOnFreshReauth:
-    def test_new_sidecar_timestamp_resets_one_time_flags(self, mod, hermes_home, monkeypatch):
+    def test_new_sidecar_timestamp_resets_one_time_flags(self, mod, hermes_home, vault_root, monkeypatch):
         entry_dir = hermes_home / "family_credentials" / "family_person"
         now = datetime.now(timezone.utc)
         recorded_at = (now - timedelta(days=6)).timestamp()
         _write_sidecar(entry_dir, recorded_at, identity="family_person")
         entry = {"credentials_dir": entry_dir}
+        _write_profile(vault_root, "family_person", "222")
 
-        monkeypatch.setenv("HERMES_IDENTITY_TELEGRAM_CHAT_ID__FAMILY_PERSON", "222")
         sent = _patch_common(mod, monkeypatch, check_ok=True)
 
         state: dict = {}
-        mod.process_identity("family_person", entry, hermes_home=hermes_home, now=now, state=state)
+        mod.process_identity(
+            "family_person", entry, hermes_home=hermes_home, vault_root=vault_root,
+            now=now, state=state,
+        )
         assert len(sent) == 1
         assert state["family_person"]["heads_up_sent_at"] is not None
 
@@ -294,7 +366,7 @@ class TestStateResetOnFreshReauth:
         _write_sidecar(entry_dir, new_recorded_at, identity="family_person")
 
         logs = mod.process_identity(
-            "family_person", entry, hermes_home=hermes_home,
+            "family_person", entry, hermes_home=hermes_home, vault_root=vault_root,
             now=now + timedelta(minutes=5), state=state,
         )
         assert any("new re-auth cycle detected" in line for line in logs)
@@ -322,27 +394,158 @@ class TestStateResetOnFreshReauth:
 
 
 class TestDeliveryTargetGap:
-    def test_missing_env_var_skips_without_guessing(self, mod, hermes_home, monkeypatch):
+    """Vault-Profile.md-based resolution must skip loudly -- never guess,
+    never misdeliver -- when the profile is missing or malformed."""
+
+    def test_missing_profile_skips_without_guessing(self, mod, hermes_home, vault_root, monkeypatch):
         entry_dir = hermes_home / "family_credentials" / "mystery_person"
         now = datetime.now(timezone.utc)
         _write_sidecar(entry_dir, (now - timedelta(days=6)).timestamp(), identity="mystery_person")
         entry = {"credentials_dir": entry_dir}
-        # Deliberately NOT setting HERMES_IDENTITY_TELEGRAM_CHAT_ID__MYSTERY_PERSON
-        monkeypatch.delenv("HERMES_IDENTITY_TELEGRAM_CHAT_ID__MYSTERY_PERSON", raising=False)
+        # Deliberately NOT writing a Profile.md for this identity.
         sent = _patch_common(mod, monkeypatch, check_ok=True)
 
         state: dict = {}
         logs = mod.process_identity(
-            "mystery_person", entry, hermes_home=hermes_home, now=now, state=state,
+            "mystery_person", entry, hermes_home=hermes_home, vault_root=vault_root,
+            now=now, state=state,
         )
-        assert any("SKIPPED" in line and "not set" in line for line in logs)
+        assert any("SKIPPED" in line for line in logs)
         assert sent == []
 
-    def test_resolve_telegram_chat_id_is_env_driven_not_hardcoded(self, mod, monkeypatch):
-        monkeypatch.delenv("HERMES_IDENTITY_TELEGRAM_CHAT_ID__WHOEVER", raising=False)
-        assert mod.resolve_telegram_chat_id("whoever") is None
-        monkeypatch.setenv("HERMES_IDENTITY_TELEGRAM_CHAT_ID__WHOEVER", "999")
-        assert mod.resolve_telegram_chat_id("whoever") == "999"
+    def test_malformed_telegram_row_skips_without_guessing(self, mod, hermes_home, vault_root, monkeypatch):
+        entry_dir = hermes_home / "family_credentials" / "mystery_person"
+        now = datetime.now(timezone.utc)
+        _write_sidecar(entry_dir, (now - timedelta(days=6)).timestamp(), identity="mystery_person")
+        entry = {"credentials_dir": entry_dir}
+        # Telegram row present but the ID cell is the "not recorded yet"
+        # placeholder, not a real numeric id.
+        _write_profile(vault_root, "mystery_person", "—", table_row="| Telegram | — | — |")
+        sent = _patch_common(mod, monkeypatch, check_ok=True)
+
+        state: dict = {}
+        logs = mod.process_identity(
+            "mystery_person", entry, hermes_home=hermes_home, vault_root=vault_root,
+            now=now, state=state,
+        )
+        assert any("SKIPPED" in line for line in logs)
+        assert sent == []
+
+    def test_missing_telegram_row_entirely_skips(self, mod, hermes_home, vault_root, monkeypatch):
+        entry_dir = hermes_home / "family_credentials" / "mystery_person"
+        now = datetime.now(timezone.utc)
+        _write_sidecar(entry_dir, (now - timedelta(days=6)).timestamp(), identity="mystery_person")
+        entry = {"credentials_dir": entry_dir}
+        path = _profile_path(vault_root, "mystery_person", is_primary=False)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("---\nstatus: canonical\n---\n\n# Mystery Person\n\nNo platform table here.\n", encoding="utf-8")
+        sent = _patch_common(mod, monkeypatch, check_ok=True)
+
+        state: dict = {}
+        logs = mod.process_identity(
+            "mystery_person", entry, hermes_home=hermes_home, vault_root=vault_root,
+            now=now, state=state,
+        )
+        assert any("SKIPPED" in line for line in logs)
+        assert sent == []
+
+    def test_new_identity_resolves_via_generic_family_path_convention(self, mod, hermes_home, vault_root, monkeypatch):
+        """A brand-new identity ("brandnew") never referenced by name
+        anywhere in this codebase must still resolve correctly, proving the
+        Family/<Capitalized>/<Capitalized> Profile.md convention is
+        mechanical, not a lookup table."""
+        entry_dir = hermes_home / "family_credentials" / "brandnew"
+        now = datetime.now(timezone.utc)
+        recorded_at = (now - timedelta(days=6)).timestamp()
+        _write_sidecar(entry_dir, recorded_at, identity="brandnew")
+        entry = {"credentials_dir": entry_dir}
+        _write_profile(vault_root, "brandnew", "999888777")
+
+        sent = _patch_common(mod, monkeypatch, check_ok=True)
+        state: dict = {}
+        logs = mod.process_identity(
+            "brandnew", entry, hermes_home=hermes_home, vault_root=vault_root,
+            now=now, state=state,
+        )
+        assert any("sent heads_up" in line for line in logs)
+        assert len(sent) == 1
+        assert sent[0][0] == "999888777"
+
+
+class TestFamilyDeliveryResolutionUnit:
+    """Direct unit tests of scripts/_family_delivery.py."""
+
+    def test_resolves_primary_identity_chat_id(self, fd, vault_root, hermes_home):
+        _write_profile(vault_root, "admin_person", "111", is_primary=True)
+        chat_id = fd.resolve_telegram_chat_id(
+            "admin_person", is_primary=True, vault_root=vault_root, hermes_home=hermes_home,
+        )
+        assert chat_id == "111"
+
+    def test_resolves_family_member_chat_id(self, fd, vault_root, hermes_home):
+        _write_profile(vault_root, "zarkash", "5542989100")
+        chat_id = fd.resolve_telegram_chat_id(
+            "zarkash", is_primary=False, vault_root=vault_root, hermes_home=hermes_home,
+        )
+        assert chat_id == "5542989100"
+
+    def test_profile_path_convention_for_family_member(self, fd, vault_root):
+        path = fd.profile_path_for_identity("zarkash", is_primary=False, vault_root=vault_root)
+        assert path == vault_root / "Hermes" / "Profile" / "Family" / "Zarkash" / "Zarkash Profile.md"
+
+    def test_profile_path_convention_for_primary(self, fd, vault_root):
+        path = fd.profile_path_for_identity("jid", is_primary=True, vault_root=vault_root)
+        assert path == vault_root / "Hermes" / "Profile" / "JID Profile.md"
+
+    def test_missing_profile_raises(self, fd, vault_root, hermes_home):
+        with pytest.raises(fd.DeliveryTargetResolutionError):
+            fd.resolve_telegram_chat_id(
+                "nobody", is_primary=False, vault_root=vault_root, hermes_home=hermes_home,
+            )
+
+    def test_missing_telegram_row_raises(self, fd, vault_root, hermes_home):
+        path = _profile_path(vault_root, "nobody", is_primary=False)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("---\nstatus: canonical\n---\n\n# Nobody\n", encoding="utf-8")
+        with pytest.raises(fd.DeliveryTargetResolutionError, match="no '\\| Telegram"):
+            fd.resolve_telegram_chat_id(
+                "nobody", is_primary=False, vault_root=vault_root, hermes_home=hermes_home,
+            )
+
+    def test_non_numeric_id_raises(self, fd, vault_root, hermes_home):
+        _write_profile(vault_root, "nobody", "—", table_row="| Telegram | — | — |")
+        with pytest.raises(fd.DeliveryTargetResolutionError, match="non-numeric"):
+            fd.resolve_telegram_chat_id(
+                "nobody", is_primary=False, vault_root=vault_root, hermes_home=hermes_home,
+            )
+
+    def test_config_yaml_mismatch_raises_rather_than_trusting_vault_alone(self, fd, vault_root, hermes_home):
+        _write_profile(vault_root, "someone", "111222333")
+        (hermes_home / "config.yaml").write_text(
+            "telegram:\n  allow_from:\n    - '999999999'\n", encoding="utf-8",
+        )
+        with pytest.raises(fd.DeliveryTargetResolutionError, match="NOT present"):
+            fd.resolve_telegram_chat_id(
+                "someone", is_primary=False, vault_root=vault_root, hermes_home=hermes_home,
+            )
+
+    def test_config_yaml_match_succeeds(self, fd, vault_root, hermes_home):
+        _write_profile(vault_root, "someone", "111222333")
+        (hermes_home / "config.yaml").write_text(
+            "telegram:\n  allow_from:\n    - '111222333'\n", encoding="utf-8",
+        )
+        chat_id = fd.resolve_telegram_chat_id(
+            "someone", is_primary=False, vault_root=vault_root, hermes_home=hermes_home,
+        )
+        assert chat_id == "111222333"
+
+    def test_no_config_yaml_skips_cross_check_but_still_resolves(self, fd, vault_root, hermes_home):
+        _write_profile(vault_root, "someone", "111222333")
+        # hermes_home exists but has no config.yaml at all.
+        chat_id = fd.resolve_telegram_chat_id(
+            "someone", is_primary=False, vault_root=vault_root, hermes_home=hermes_home,
+        )
+        assert chat_id == "111222333"
 
 
 class TestReminderMessageShape:

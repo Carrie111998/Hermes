@@ -32,33 +32,25 @@ family member added to the registry later is automatically treated as
 non-primary and gets the same one-time-reminder behavior as Zee, with zero
 changes to this file.
 
-Delivery-target resolution — flagged gap
------------------------------------------
-There is currently no code-level registry anywhere in this codebase mapping
-a Hermes identity name to a per-platform delivery target (Telegram chat id,
-etc.). ``telegram.allow_from`` in config.yaml is an unordered INBOUND
-allowlist, not an identity-keyed outbound map; the actual jid/zarkash
-Telegram IDs only exist as prose in vault ``Profile/*.md`` files, which this
-script deliberately does not parse (fragile, and couples a git-tracked cron
-script to vault layout). Rather than hardcode a jid/zarkash lookup table
-here — which would need a code change for every future family member, the
-exact thing this generality pass is meant to avoid — target resolution uses
-an env-var convention consistent with how every other per-platform value in
-this system is already supplied (``TELEGRAM_BOT_TOKEN``,
-``TELEGRAM_HOME_CHANNEL``, ...):
-
-    HERMES_IDENTITY_TELEGRAM_CHAT_ID__<IDENTITY, upper-cased>
-
-e.g. ``HERMES_IDENTITY_TELEGRAM_CHAT_ID__JID=8758899353`` and
-``HERMES_IDENTITY_TELEGRAM_CHAT_ID__ZARKASH=5542989100``. These do NOT exist
-in ``~/.hermes/.env`` yet as of this PR — JID needs to add them as part of
-live deployment (see the PR description). Onboarding a new family member
-after that needs exactly one new env-var line and a Google identity
-registry entry — zero code changes to this script. If a given identity's
-env var is unset, this job SKIPS that identity's reminder and says so in
-its own operational summary rather than guessing a chat id — the same
-failure mode that caused the real 2026-08-12 cross-person data-disclosure
-incident this system already has on record.
+Delivery-target resolution
+--------------------------
+Each identity's Telegram delivery target is resolved from their vault
+Profile.md's "Platform Identity" table (``scripts/_family_delivery.py``,
+same directory as this file) — confirmed live for both identities that
+exist today: ``jid`` -> ``Hermes/Profile/JID Profile.md``, ``zarkash`` ->
+``Hermes/Profile/Family/Zarkash/Zarkash Profile.md``. A new family member
+added to the Google identity registry resolves automatically via
+``Hermes/Profile/Family/<Capitalized identity>/<Capitalized identity>
+Profile.md`` — zero code changes needed. See that module's docstring for
+the full resolution + fail-loud contract, including the cross-check against
+config.yaml's ``telegram.allow_from`` (per JID Profile.md's own stated
+policy: config.yaml wins on disagreement). If resolution fails for any
+reason (missing profile, missing/malformed Telegram row, or a mismatch
+against config.yaml), this job SKIPS that identity's reminder and says so
+loudly in its own operational summary rather than guessing a chat id or
+falling back to anyone else's — the same failure mode that caused the real
+2026-08-12 cross-person data-disclosure incident this system already has on
+record.
 
 Part 2 / Part 3 coupling
 -------------------------
@@ -294,13 +286,48 @@ def fetch_fresh_auth_url(hermes_home: Path, identity: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Delivery-target resolution (see module docstring's flagged gap) + send
+# Delivery-target resolution (see module docstring + _family_delivery.py) + send
 # ---------------------------------------------------------------------------
 
-def resolve_telegram_chat_id(identity: str) -> Optional[str]:
-    env_key = f"HERMES_IDENTITY_TELEGRAM_CHAT_ID__{identity.upper()}"
-    value = (os.environ.get(env_key) or "").strip()
-    return value or None
+def _load_family_delivery_module(hermes_home: Path):
+    """Import scripts/_family_delivery.py, the sibling module resolving each
+    identity's Telegram chat_id from their vault Profile.md. Loaded via
+    spec_from_file_location (same technique as load_identities_registry
+    above) so this works regardless of whether scripts/ is on sys.path as a
+    package."""
+    scripts_dir = Path(__file__).resolve().parent
+    path = scripts_dir / "_family_delivery.py"
+    scripts_dir_str = str(scripts_dir)
+    if scripts_dir_str not in sys.path:
+        sys.path.insert(0, scripts_dir_str)
+    spec = importlib.util.spec_from_file_location("_family_delivery", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def resolve_telegram_chat_id(
+    identity: str, *, is_primary: bool, vault_root: Path, hermes_home: Path
+) -> Optional[str]:
+    """Resolve identity's Telegram chat_id from their vault Profile.md
+    (see scripts/_family_delivery.py). Returns None — never a guess — when
+    resolution fails for any reason; the caller logs why and skips."""
+    family_delivery = _load_family_delivery_module(hermes_home)
+    try:
+        return family_delivery.resolve_telegram_chat_id(
+            identity, is_primary=is_primary, vault_root=vault_root, hermes_home=hermes_home,
+        )
+    except family_delivery.DeliveryTargetResolutionError as exc:
+        _LAST_DELIVERY_RESOLUTION_ERROR[identity] = str(exc)
+        return None
+
+
+# Small side-channel so process_identity() can surface the SPECIFIC parse/
+# mismatch reason in its log line without resolve_telegram_chat_id() having
+# to change its return type away from a plain Optional[str]. Keyed by
+# identity, overwritten every call -- read immediately after resolution.
+_LAST_DELIVERY_RESOLUTION_ERROR: Dict[str, str] = {}
 
 
 def send_telegram_message(chat_id: str, message: str) -> "tuple[bool, str]":
@@ -426,6 +453,7 @@ def process_identity(
     entry: dict,
     *,
     hermes_home: Path,
+    vault_root: Path,
     now: datetime,
     state: Dict[str, Any],
     dry_run: bool = False,
@@ -456,12 +484,14 @@ def process_identity(
         identity_state = _blank_identity_state(recorded_at_epoch)
         logs.append(f"{identity}: new re-auth cycle detected, one-time flags reset")
 
-    chat_id = resolve_telegram_chat_id(identity)
+    chat_id = resolve_telegram_chat_id(
+        identity, is_primary=primary, vault_root=vault_root, hermes_home=hermes_home,
+    )
     if chat_id is None:
+        reason = _LAST_DELIVERY_RESOLUTION_ERROR.pop(identity, "reason unknown")
         logs.append(
-            f"{identity}: SKIPPED — no delivery target resolvable "
-            f"(HERMES_IDENTITY_TELEGRAM_CHAT_ID__{identity.upper()} not set). "
-            "Not guessing a chat id for this identity — flagged as a gap."
+            f"{identity}: SKIPPED — no delivery target resolvable ({reason}). "
+            "Not guessing a chat id for this identity."
         )
         state[identity] = identity_state
         return logs
@@ -545,6 +575,11 @@ def process_identity(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hermes-home", type=Path, default=Path.home() / ".hermes")
+    # Same default sibling no_agent scripts already use (see
+    # daily-brief-validate.py's --vault-root) — the vault Profile.md files
+    # are where scripts/_family_delivery.py resolves each identity's
+    # Telegram delivery target from.
+    parser.add_argument("--vault-root", type=Path, default=Path.home() / "Obsidian Core")
     parser.add_argument("--now", help="ISO timestamp override for deterministic tests")
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -565,6 +600,7 @@ def _parse_now(value: Optional[str]) -> datetime:
 def main() -> int:
     args = parse_args()
     hermes_home = args.hermes_home
+    vault_root = args.vault_root
     now = _parse_now(args.now)
 
     try:
@@ -583,7 +619,7 @@ def main() -> int:
             all_logs.extend(
                 process_identity(
                     identity, entry,
-                    hermes_home=hermes_home, now=now, state=state,
+                    hermes_home=hermes_home, vault_root=vault_root, now=now, state=state,
                     dry_run=args.dry_run,
                 )
             )
