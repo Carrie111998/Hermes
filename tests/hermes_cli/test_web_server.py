@@ -1172,6 +1172,40 @@ class TestWebServerEndpoints:
         assert status_data["pid"] is None
         assert any("docker pull nousresearch/hermes-agent:latest" in line for line in status_data["lines"])
 
+    def test_update_hermes_returns_apt_guidance_without_spawning(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        spawned = False
+
+        def fail_spawn(*_args, **_kwargs):
+            nonlocal spawned
+            spawned = True
+            raise AssertionError("APT-managed update guard should not spawn hermes update")
+
+        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "apt")
+        monkeypatch.setattr(web_server, "_spawn_hermes_action", fail_spawn)
+        web_server._ACTION_PROCS.pop("hermes-update", None)
+        web_server._ACTION_RESULTS.pop("hermes-update", None)
+
+        resp = self.client.post("/api/hermes/update")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is False
+        assert data["pid"] is None
+        assert data["error"] == "apt_update_required"
+        assert data["update_command"] == "pkg upgrade hermes-agent"
+        assert spawned is False
+
+        check = self.client.get("/api/hermes/update/check")
+        assert check.status_code == 200
+        check_data = check.json()
+        assert check_data["install_method"] == "apt"
+        assert check_data["can_apply"] is False
+        assert check_data["update_command"] == "pkg upgrade hermes-agent"
+        assert "Termux APT" in check_data["message"]
+
     def test_update_hermes_spawns_with_action_id(self, monkeypatch):
         import hermes_cli.web_server as web_server
 
@@ -3961,6 +3995,51 @@ class TestDashboardPluginManifestExtensions:
         finally:
             reset_hermes_home_override(token)
         assert any(p["name"] == "skin-home" for p in plugins)
+
+    def test_user_plugins_found_under_profile_scoped_process(self, tmp_path, monkeypatch):
+        """Regression #87197: a profile-scoped process (``--profile <name>``
+        sets HERMES_HOME=<root>/profiles/<name>) must still discover user
+        plugins installed in the hermes root's plugins/ directory."""
+        root = tmp_path / "hermes-root"
+        profile_home = root / "profiles" / "presale"
+        profile_home.mkdir(parents=True)
+        self._write_plugin(root, "meeting-intelligence", {
+            "name": "meeting-intelligence",
+            "label": "Meeting Intelligence",
+            "tab": {"path": "/meetings"},
+            "entry": "dist/index.js",
+        })
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        from hermes_cli import web_server
+        plugins = web_server._discover_dashboard_plugins()
+        assert any(p["name"] == "meeting-intelligence" for p in plugins)
+
+    def test_profile_local_plugin_wins_over_root_plugin(self, tmp_path, monkeypatch):
+        """A same-named plugin in the profile home takes precedence over the
+        root copy (seen_names dedupe, profile scanned first)."""
+        root = tmp_path / "hermes-root"
+        profile_home = root / "profiles" / "presale"
+        profile_home.mkdir(parents=True)
+        self._write_plugin(profile_home, "dupe", {
+            "name": "dupe",
+            "label": "Profile Copy",
+            "tab": {"path": "/from-profile"},
+            "entry": "dist/index.js",
+        })
+        self._write_plugin(root, "dupe", {
+            "name": "dupe",
+            "label": "Root Copy",
+            "tab": {"path": "/from-root"},
+            "entry": "dist/index.js",
+        })
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        from hermes_cli import web_server
+        plugins = web_server._discover_dashboard_plugins()
+        entries = [p for p in plugins if p["name"] == "dupe"]
+        assert len(entries) == 1
+        assert entries[0]["tab"]["path"] == "/from-profile"
 
 
 

@@ -529,35 +529,35 @@ def _scan_gateway_pids(
             # Prefer wmic when present (fast, stable output format).  On
             # modern Windows 11 / Win 10 late builds, wmic has been
             # removed as part of the WMIC deprecation — fall back to
-            # PowerShell's Get-CimInstance.  Any OSError here (FileNotFoundError
-            # on missing wmic) trips the fallback.
-            # Hide the console window: this scan runs inside the windowless
-            # pythonw.exe gateway/desktop backend, so a bare wmic/powershell
-            # spawn would flash a conhost window on every watchdog probe.
-            from hermes_cli._subprocess_compat import windows_hide_flags
+            # PowerShell's Get-CimInstance.  A spawn failure or timeout
+            # (result is None) trips the fallback.
+            # The scans go through ``bounded_probe_run`` — NOT plain
+            # ``subprocess.run(timeout=...)`` — because on Windows ``run()``'s
+            # post-timeout cleanup joins the pipe reader threads unbounded; a
+            # descendant (conhost.exe) holding duplicated pipe handles then
+            # wedges the caller forever. ``hermes update`` hung exactly there
+            # on slow-WMI machines where the full Win32_Process scan exceeds
+            # its budget (#87134).
+            # bounded_probe_run also hides the console window: this scan runs
+            # inside the windowless pythonw.exe gateway/desktop backend, so a
+            # bare wmic/powershell spawn would flash a conhost window on every
+            # watchdog probe.
+            from hermes_cli._subprocess_compat import bounded_probe_run
 
-            _no_window = {"creationflags": windows_hide_flags()}
             wmic_path = shutil.which("wmic")
             result = None
             if wmic_path is not None:
-                try:
-                    result = subprocess.run(
-                        [
-                            wmic_path,
-                            "process",
-                            "get",
-                            "ProcessId,CommandLine",
-                            "/FORMAT:LIST",
-                        ],
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="ignore",
-                        timeout=10,
-                        **_no_window,
-                    )
-                except (OSError, subprocess.TimeoutExpired):
-                    result = None
+                result = bounded_probe_run(
+                    [
+                        wmic_path,
+                        "process",
+                        "get",
+                        "ProcessId,CommandLine",
+                        "/FORMAT:LIST",
+                    ],
+                    timeout=10,
+                    errors="ignore",
+                )
             if result is None or result.returncode != 0 or not (result.stdout or ""):
                 # Fallback: PowerShell Get-CimInstance, emit LIST-style output
                 # so the downstream parser below doesn't need to branch.
@@ -572,17 +572,12 @@ def _scan_gateway_pids(
                     "  '' "
                     "}"
                 )
-                try:
-                    result = subprocess.run(
-                        [powershell, "-NoProfile", "-Command", ps_cmd],
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="ignore",
-                        timeout=15,
-                        **_no_window,
-                    )
-                except (OSError, subprocess.TimeoutExpired):
+                result = bounded_probe_run(
+                    [powershell, "-NoProfile", "-Command", ps_cmd],
+                    timeout=15,
+                    errors="ignore",
+                )
+                if result is None:
                     return []
             if result.returncode != 0 or result.stdout is None:
                 return []
@@ -2051,6 +2046,32 @@ def _windows_gateway_should_absorb_console_controls() -> bool:
         return True
 
 
+def _windows_console_window_attached() -> bool | None:
+    """Return whether Windows assigned this process a console window."""
+    if not is_windows():
+        return None
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.kernel32.GetConsoleWindow())  # type: ignore[attr-defined]
+    except (OSError, AttributeError):
+        return None
+
+
+def _windows_gateway_breakaway_state() -> bool | None:
+    """Consume private spawn metadata without guessing for older launchers."""
+    if not is_windows():
+        return None
+    from hermes_cli._subprocess_compat import _WINDOWS_GATEWAY_BREAKAWAY_ENV
+
+    value = os.environ.pop(_WINDOWS_GATEWAY_BREAKAWAY_ENV, None)
+    if value == "1":
+        return True
+    if value == "0":
+        return False
+    return None
+
+
 # =============================================================================
 # Service Configuration
 # =============================================================================
@@ -2192,16 +2213,48 @@ def _user_systemd_private_socket_path() -> Path:
     return Path(xdg) / "systemd" / "private"
 
 
+def _path_exists_safe(path: Path) -> bool:
+    """``Path.exists()`` that treats an inaccessible path as absent.
+
+    ``Path.exists()`` only swallows a subset of ``OSError`` (ENOENT/ENOTDIR/
+    EBADF/ELOOP); ``EACCES`` still propagates. When ``XDG_RUNTIME_DIR`` leaks
+    from another user — the classic ``su``/``sudo -u`` from a root shell case,
+    where ``/run/user/0`` is ``0700 root:root`` — stat-ing a socket underneath
+    it raises ``PermissionError`` that escapes the systemd preflight as a raw
+    traceback (#86558). An unreadable path is, for our purposes, not reachable.
+    """
+    try:
+        return path.exists()
+    except OSError:  # e.g. EACCES on another user's runtime dir
+        return False
+
+
+def _runtime_dir_is_ours(runtime_dir: str) -> bool:
+    """True when *runtime_dir* exists and is owned by the current uid.
+
+    A leaked ``XDG_RUNTIME_DIR`` belonging to another user must not be trusted:
+    its sockets are unreadable (``EACCES``) and its bus is not ours to drive.
+    """
+    try:
+        return Path(runtime_dir).stat().st_uid == os.getuid()  # windows-footgun: ok — POSIX systemd helper, never invoked on Windows
+    except OSError:
+        return False
+
+
 def _user_systemd_socket_ready() -> bool:
     """Return True when user-scope systemd has a reachable control socket.
 
     Some distros expose only the per-user systemd private socket even when the
     D-Bus session bus socket is absent. ``systemctl --user`` can still work in
     that configuration, so preflight checks must treat either socket as valid.
+
+    An inaccessible socket path (e.g. a foreign ``XDG_RUNTIME_DIR`` inherited
+    across ``su``) is treated as not-ready rather than crashing, so the caller
+    falls through to the documented ``UserSystemdUnavailableError`` path.
     """
     return (
-        _user_dbus_socket_path().exists()
-        or _user_systemd_private_socket_path().exists()
+        _path_exists_safe(_user_dbus_socket_path())
+        or _path_exists_safe(_user_systemd_private_socket_path())
     )
 
 
@@ -2213,17 +2266,23 @@ def _ensure_user_systemd_env() -> None:
     ``systemctl --user`` fails with "Failed to connect to bus: No medium found".
     We detect the standard socket path and set the vars so all subsequent
     subprocess calls inherit them.
+
+    An ``XDG_RUNTIME_DIR`` that leaked from another user (``su``/``sudo -u``
+    from root, where the env still points at ``/run/user/0``) is dropped in
+    favour of our own ``/run/user/{uid}`` so ``systemctl --user`` targets the
+    right instance instead of an unreadable foreign socket (#86558).
     """
     uid = os.getuid()  # windows-footgun: ok — POSIX systemd helper, never invoked on Windows
-    if "XDG_RUNTIME_DIR" not in os.environ:
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if not xdg or not _runtime_dir_is_ours(xdg):
         runtime_dir = f"/run/user/{uid}"
-        if Path(runtime_dir).exists():
+        if _runtime_dir_is_ours(runtime_dir):
             os.environ["XDG_RUNTIME_DIR"] = runtime_dir
 
     if "DBUS_SESSION_BUS_ADDRESS" not in os.environ:
         xdg_runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{uid}")
         bus_path = Path(xdg_runtime) / "bus"
-        if bus_path.exists():
+        if _path_exists_safe(bus_path):
             os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_path}"
 
 
@@ -3202,9 +3261,13 @@ def _append_node_dir_for_service(
 
     PATH lookup remains the fallback rung for installs with no managed Node.
     """
-    from hermes_constants import iter_hermes_node_dirs
+    from hermes_constants import (
+        hermes_managed_node_tree_present,
+        iter_hermes_node_dirs,
+    )
 
-    for directory in iter_hermes_node_dirs(hermes_root):
+    managed_node_present = hermes_managed_node_tree_present(hermes_root)
+    for directory in iter_hermes_node_dirs(hermes_root) if managed_node_present else ():
         entry = str(directory)
         try:
             present = directory.is_dir()
@@ -3212,6 +3275,12 @@ def _append_node_dir_for_service(
             present = False
         if present and entry not in path_entries:
             path_entries.append(entry)
+
+    # Ambient PATH lookup is a fallback, not an additional rung. Once the
+    # target Hermes home provides managed Node, consulting the invoker's PATH
+    # makes a system unit differ between sudo/root and its service user.
+    if managed_node_present:
+        return
 
     resolved_node = shutil.which("node")
     if not resolved_node:
@@ -5492,6 +5561,12 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         _stdin_is_tty = bool(sys.stdin and sys.stdin.isatty())
     except (ValueError, OSError):
         _stdin_is_tty = False
+    _console_window_attached = _windows_console_window_attached()
+    _gateway_detached = (
+        os.getenv("HERMES_GATEWAY_DETACHED", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    _breakaway = _windows_gateway_breakaway_state()
     _absorb_windows_console_controls = _windows_gateway_should_absorb_console_controls()
     if _absorb_windows_console_controls:
         try:
@@ -5594,6 +5669,9 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         replace=replace,
         argv=sys.argv,
         stdin_is_tty=_stdin_is_tty,
+        console_window_attached=_console_window_attached,
+        detached=_gateway_detached,
+        breakaway=_breakaway,
         absorb_windows_console_controls=_absorb_windows_console_controls,
     )
 
