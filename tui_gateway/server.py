@@ -5220,6 +5220,32 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
         )
 
 
+def _pending_switch_selection_warning(model: str, provider: str) -> str | None:
+    """Selection-guard message for a model queued mid-turn, or ``None``.
+
+    Runs BEFORE the pick is stashed, while the client still has a live response
+    it can turn into a confirm prompt. Only pre-resolution inputs exist here --
+    the model id the user picked and any explicit ``--provider`` -- which is
+    exactly what the data-policy guard keys on. Guards that can only decide
+    once base_url / api_key / model_info have settled still get their chance in
+    ``_apply_model_switch``; the cost guard returns ``None`` when pricing is
+    unknown, so an early call can only under-fire, never over-fire.
+
+    A misbehaving guard must never break the pick, so exceptions are swallowed
+    and treated as "no warning" -- the apply-time check remains the backstop.
+    """
+    if not model:
+        return None
+    try:
+        from hermes_cli.model_selection_guards import combined_selection_warning
+
+        warning = combined_selection_warning(model, provider=provider or None)
+    except Exception:
+        return None
+
+    return warning.message if warning is not None else None
+
+
 def _apply_pending_model_switch(sid: str, session: dict) -> None:
     """Apply a model switch queued while a turn was running.
 
@@ -11957,19 +11983,49 @@ def _(rid, params: dict) -> dict:
                         pending_model = parsed.model_input
                     except Exception:
                         pending_model = str(value)
+                    pending_provider = (
+                        getattr(parsed, "explicit_provider", "") or ""
+                    ).strip()
+                    confirmed = bool(params.get("confirm_expensive_model", False))
+                    # Run the selection guards HERE, not only at apply time.
+                    # This branch used to answer confirm_required=False without
+                    # consulting them, so a client that implements the confirm
+                    # round-trip was told no consent was needed. It stashed the
+                    # pick, and _apply_pending_model_switch -- which calls the
+                    # guards with the stashed (unconfirmed) flag -- dropped the
+                    # switch at the next turn start. The model reverted with no
+                    # confirm ever offered, because the one moment a round-trip
+                    # was possible had already passed.
+                    if not confirmed:
+                        pending_warning = _pending_switch_selection_warning(
+                            pending_model, pending_provider
+                        )
+                        if pending_warning is not None:
+                            # Nothing is stashed: an unconfirmed guarded pick
+                            # leaves the session exactly as it was, and the
+                            # client re-sends with confirm_expensive_model to
+                            # queue it for real.
+                            return _ok(
+                                rid,
+                                {
+                                    "key": key,
+                                    "value": pending_model,
+                                    "warning": pending_warning,
+                                    "confirm_required": True,
+                                    "confirm_message": pending_warning,
+                                    "scope": "session",
+                                    "deferred": False,
+                                },
+                            )
                     session["pending_model_switch"] = {
                         "raw": value,
-                        "confirm_expensive_model": bool(
-                            params.get("confirm_expensive_model", False)
-                        ),
+                        "confirm_expensive_model": confirmed,
                         # The resolved model/provider the next turn will run on.
                         # _session_info reports these while the switch is pending
                         # so the end-of-turn settle keeps showing the user's pick
                         # instead of blipping back to the still-live old model.
                         "display_model": pending_model,
-                        "display_provider": (
-                            getattr(parsed, "explicit_provider", "") or ""
-                        ).strip(),
+                        "display_provider": pending_provider,
                     }
                     return _ok(
                         rid,
