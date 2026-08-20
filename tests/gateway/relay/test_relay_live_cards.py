@@ -159,12 +159,39 @@ class TestDraftOp:
             adapter.send_draft(chat_id="C1", draft_id=1, content="x")
         )
         assert not result.success
-        # Failed draft must NOT leave seal-interception armed: the stream
-        # consumer falls back to edit-based streaming and the final send
-        # must go out as a REAL send.
+        # DEFINITE connector rejection disarms seal-interception: the
+        # stream consumer falls back to edit-based streaming on this
+        # failure, and its turn-final must go out as a REAL send — never
+        # a seal on a stream the connector just rejected.
         stub.next_send_result = {"success": True, "message_id": "m2"}
         loop.run_until_complete(adapter.send("C1", "final", reply_to=None))
         assert [s["op"] for s in stub.sent][-1] == "send"
+
+    def test_draft_transport_exception_keeps_interception_armed(self, loop):
+        """Ambiguity contract (G-D1): a transport EXCEPTION — as opposed
+        to an explicit rejection — may mean the frame was delivered, so
+        interception stays armed and the turn-final still seals."""
+        adapter, _ = _connected_adapter()
+
+        class _FlakyOnce:
+            def __init__(self):
+                self.calls = 0
+
+            async def send_outbound(self, payload, platform=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise ConnectionError("mid-write drop")
+                return {"success": True, "message_id": "ts.9"}
+
+        adapter._transport = _FlakyOnce()
+        result = loop.run_until_complete(
+            adapter.send_draft(chat_id="C1", draft_id=2, content="x")
+        )
+        assert not result.success
+        # Still armed: the turn-final converts to the sealing frame.
+        final = loop.run_until_complete(adapter.send("C1", "final", reply_to=None))
+        assert final.success
+        assert final.message_id == "ts.9"
 
     def test_drafts_are_per_chat(self, loop):
         adapter, stub = _connected_adapter()

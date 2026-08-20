@@ -473,6 +473,17 @@ class RelayAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"draft transport error: {e}")
         if result.get("success"):
             return SendResult(success=True)
+        # DEFINITE connector rejection (an explicit result, not a transport
+        # ambiguity): disarm interception for this key. The stream consumer
+        # disables the draft transport on this failure and falls back to
+        # edit-based streaming — its turn-final must go out as a REAL send,
+        # not get converted into a seal on a stream the connector just told
+        # us is unusable. (This restores the disarm-on-failure semantics the
+        # G-D1 optimistic-arming change silently dropped; the ambiguity that
+        # motivated G-D1 lives in the except branch above, which still keeps
+        # the key armed.)
+        if self._open_draft_by_chat.get(chat_key) == draft_id:
+            self._open_draft_by_chat.pop(chat_key, None)
         return SendResult(
             success=False, error=str(result.get("error") or "draft failed")
         )
