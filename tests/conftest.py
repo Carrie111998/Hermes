@@ -1373,6 +1373,15 @@ def _live_system_guard(request, monkeypatch):
                 raise
         if _is_own_subtree(int(pid)):
             try:
+                if sys.platform == "win32" and int(sig) != 0:
+                    import signal as _sig
+                    valid_win_signals = {
+                        getattr(_sig, "SIGTERM", 15),
+                        getattr(_sig, "CTRL_C_EVENT", 0),
+                        getattr(_sig, "CTRL_BREAK_EVENT", 1),
+                    }
+                    if int(sig) not in valid_win_signals:
+                        sig = getattr(_sig, "SIGTERM", 15)
                 return real_kill(pid, sig, *args, **kwargs)
             except OSError as exc:
                 if getattr(exc, "winerror", None) == 87 and sys.platform == "win32":
