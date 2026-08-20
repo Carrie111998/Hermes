@@ -509,8 +509,21 @@ def _search_with_fallback(
             errors.append(f"{name}: not found or search unsupported")
             continue
         if not provider.is_available():
-            errors.append(f"{name}: not available (missing key or package)")
-            continue
+            # A missing key is a fallback trigger — unless the provider can
+            # serve the request without one via the keyless free tier
+            # (e.g. Tavily in keyless mode).  main's dispatcher does not
+            # gate the configured backend on is_available() for this reason;
+            # the provider's own search() routes through the ring.
+            keyless_ok = False
+            is_keyless = getattr(provider, "is_keyless_available", None)
+            if callable(is_keyless):
+                try:
+                    keyless_ok = bool(is_keyless())
+                except Exception:  # noqa: BLE001 — broken provider == not ready
+                    keyless_ok = False
+            if not keyless_ok:
+                errors.append(f"{name}: not available (missing key or package)")
+                continue
 
         try:
             result = provider.search(query, limit)

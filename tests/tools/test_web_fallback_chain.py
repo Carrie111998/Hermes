@@ -136,6 +136,7 @@ class TestSearchWithFallback:
         with patch("agent.web_search_registry.get_provider") as mock_gp:
             mock_unavail = MagicMock()
             mock_unavail.is_available.return_value = False
+            mock_unavail.is_keyless_available.return_value = False
             mock_unavail.supports_search.return_value = True
 
             mock_good = MagicMock()
@@ -180,6 +181,7 @@ class TestSearchWithFallback:
         with patch("agent.web_search_registry.get_provider") as mock_gp:
             mock_provider = MagicMock()
             mock_provider.is_available.return_value = False
+            mock_provider.is_keyless_available.return_value = False
             mock_gp.return_value = mock_provider
             result, errors, _ = _search_with_fallback("test", 5, chain)
             assert result is None
