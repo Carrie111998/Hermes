@@ -1,10 +1,10 @@
 """OpenCode provider profiles (Zen + Go).
 
 Both use per-model api_mode routing:
-  - OpenCode Zen: Claude → anthropic_messages, GPT-5/Codex → codex_responses,
-    everything else → chat_completions (this profile)
-  - OpenCode Go: GPT → codex_responses, MiniMax/Qwen → anthropic_messages,
-    GLM/Kimi/DeepSeek/MiMo → chat_completions (this profile)
+  - OpenCode Zen: Claude → anthropic_messages, GPT-5/Codex/Muse Spark →
+    codex_responses, everything else → chat_completions (this profile)
+  - OpenCode Go: GPT / Muse Spark → codex_responses, MiniMax/Qwen →
+    anthropic_messages, GLM/Kimi/DeepSeek/MiMo → chat_completions (this profile)
 """
 
 from __future__ import annotations

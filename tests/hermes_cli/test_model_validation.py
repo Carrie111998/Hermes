@@ -272,6 +272,13 @@ class TestCopilotNormalization:
         # GPT models on Go are Responses-only (Go endpoint table).
         assert opencode_model_api_mode("opencode-go", "gpt-5.6-luna") == "codex_responses"
         assert opencode_model_api_mode("opencode-go", "opencode-go/gpt-5.6-luna") == "codex_responses"
+        # Muse Spark on Go is Responses-only too — /v1/chat/completions returns
+        # HTTP 200 but streams empty choices (no content, no finish_reason).
+        assert opencode_model_api_mode("opencode-go", "muse-spark-1.2") == "codex_responses"
+        assert opencode_model_api_mode("opencode-go", "muse-spark-1.2-contributor") == "codex_responses"
+        assert opencode_model_api_mode("opencode-go", "opencode-go/muse-spark-1.2-contributor") == "codex_responses"
+        # Standard Muse Spark on Zen is served via /v1/responses too.
+        assert opencode_model_api_mode("opencode-zen", "muse-spark-1.2") == "codex_responses"
 
 
 class TestNormalizeOpencodeBaseUrl:
