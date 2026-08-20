@@ -3971,6 +3971,22 @@ OPTIONAL_ENV_VARS = {
         "category": "provider",
         "advanced": True,
     },
+    "CLINE_API_KEY": {
+        "description": "ClinePass API key (flat subscription for curated open coding models via cline.bot)",
+        "prompt": "ClinePass API key",
+        "url": "https://app.cline.bot/dashboard/settings/api-keys",
+        "password": True,
+        "category": "provider",
+        "advanced": True,
+    },
+    "CLINE_BASE_URL": {
+        "description": "ClinePass base URL override",
+        "prompt": "ClinePass base URL (leave empty for default)",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
     "HF_TOKEN": {
         "description": "Hugging Face token for Inference Providers (20+ open models via router.huggingface.co)",
         "prompt": "Hugging Face Token",

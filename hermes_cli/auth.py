@@ -484,6 +484,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("OPENCODE_GO_API_KEY",),
         base_url_env_var="OPENCODE_GO_BASE_URL",
     ),
+    "cline-pass": ProviderConfig(
+        id="cline-pass",
+        name="ClinePass",
+        auth_type="api_key",
+        inference_base_url="https://api.cline.bot/api/v1",
+        api_key_env_vars=("CLINE_API_KEY",),
+        base_url_env_var="CLINE_BASE_URL",
+    ),
     "kilocode": ProviderConfig(
         id="kilocode",
         name="Kilo Code",

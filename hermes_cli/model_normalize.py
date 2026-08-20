@@ -512,6 +512,18 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
             return _dots_to_hyphens(name)
         return name
 
+    # --- ClinePass: API requires ``cline-pass/<model>`` format.
+    #     Always ensure the prefix is present.  Strip any other vendor prefix
+    #     first (e.g. ``deepseek/deepseek-v4-flash`` → ``deepseek-v4-flash``
+    #     → ``cline-pass/deepseek-v4-flash``). ---
+    if provider == "cline-pass":
+        if "/" in name:
+            _, bare = name.split("/", 1)
+            name = bare.strip() or name
+        if not name.startswith("cline-pass/"):
+            return f"cline-pass/{name}"
+        return name
+
     # --- Anthropic: strip matching provider prefix, dots -> hyphens ---
     if provider in _DOT_TO_HYPHEN_PROVIDERS:
         bare = _strip_matching_provider_prefix(name, provider)

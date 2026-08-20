@@ -1,0 +1,5 @@
+name: cline-pass-provider
+kind: model-provider
+version: 1.0.0
+description: ClinePass (curated open models via cline.bot subscription)
+author: Nous Research
