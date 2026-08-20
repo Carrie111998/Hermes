@@ -697,3 +697,42 @@ def test_existing_identity_match_refreshes_verified_facts_links_and_lead(match_m
     assert refreshed_lead["company_name"] == "Verified Atlas DE GmbH"
     assert refreshed_lead["website"] == "verified-buyer-de-1.example.test"
     assert refreshed_lead["country"] == "DE"
+
+
+def test_enabling_a_catalog_source_flips_the_catalog_row():
+    """Enable/disable are shared endpoints serving two different tables.
+
+    A catalog source must be flipped in dataset_definitions; a tenant-created
+    source in data_sources. Nothing else pins which row each branch touches.
+    """
+    app, client, headers, company_id = make_research_client()
+    source_id = fixture_definition().source_id
+    assert client.get("/api/v1/data-sources/catalog", headers=headers).status_code == 200
+
+    def enabled() -> int:
+        return app.state.db.one(
+            "SELECT enabled FROM dataset_definitions WHERE company_id=? AND source_id=?",
+            (company_id, source_id),
+        )["enabled"]
+
+    off = client.post(f"/api/v1/data-sources/{source_id}/disable", headers=headers)
+    assert off.status_code == 200, off.text
+    assert enabled() == 0
+
+    on = client.post(f"/api/v1/data-sources/{source_id}/enable", headers=headers)
+    assert on.status_code == 200, on.text
+    assert enabled() == 1
+
+
+def test_a_tenant_connected_source_still_enables_normally():
+    """The catalog branch must not swallow ordinary data_sources rows."""
+    _, client, headers, _ = make_research_client()
+    created = client.post("/api/v1/data-sources", headers=headers, json={
+        "source_type": "manual", "name": "Internal export sheet", "enabled": False,
+    })
+    assert created.status_code == 201, created.text
+    source_id = created.json()["id"]
+
+    response = client.post(f"/api/v1/data-sources/{source_id}/enable", headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["enabled"] is True
