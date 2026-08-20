@@ -1674,6 +1674,33 @@ def emit_cron_triggered_safe(
 ) -> None:
     """Best-effort CRON_TRIGGERED emit shared by every off-schedule trigger path.
 
+    "Every" is load-bearing and enumerable. A cron job runs at an instant its
+    schedule does not name for exactly three reasons, and all three emit here
+    (a fourth apparent cause, plain LATENESS, is the scheduler observing an
+    on-schedule job late — not a trigger, and deliberately not emitted):
+
+    ==================  ==========================  ======================
+    cause               call site                   reason=
+    ==================  ==========================  ======================
+    explicit trigger    ``trigger_job`` /           caller-supplied
+                        ``request_run`` /
+                        the cronjob tool
+    event wake          ``cron.scheduler.``         ``"event_wake"``
+                        ``_collect_woken_jobs``
+    missed-run          ``_emit_recovery_fire_``    ``"missed_run_
+    recovery            ``triggers`` (this module)  recovery"``
+    ==================  ==========================  ======================
+
+    Only the first MOVES the schedule; the other two record a fire that
+    happens *in addition* to the regular cadence, and pass
+    ``previous_next_run_at == new_next_run_at`` to say so in the payload.
+
+    Until 2026-08-20 this docstring claimed the "shared by every path"
+    property while the wake and recovery paths emitted nothing at all —
+    which is what made two separate investigations conclude that off-schedule
+    provenance was unobtainable. If a path is added, add it to the table or
+    delete the claim.
+
     Both ``trigger_job`` (schedule-for-next-tick) and the cronjob tool's
     execute-now path route through here so the audit contract can't drift
     between them again (the 0.18.2 upstream merge dropped the emit from the
@@ -2213,6 +2240,66 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
         return False
 
 
+#: Transient key stamped on a due-job dict when the miss-recovery tree decided
+#: to fire it once on catch-up. Consumed (and popped) by
+#: ``_emit_recovery_fire_triggers`` after the jobs lock is released. It is only
+#: ever set on the deepcopy the due scan builds, never on a ``raw_jobs``
+#: element, so it cannot reach jobs.json.
+_RECOVERY_FIRE_MARKER = "_missed_run_recovery"
+
+#: The reason= string every miss-recovery catch-up fire carries in its
+#: cron_triggered payload. Kept distinct from the wake path's "event_wake" so
+#: the two stay separable in audit.jsonl by payload alone.
+RECOVERY_FIRE_REASON = "missed_run_recovery"
+
+
+def _emit_recovery_fire_triggers(due: List[Dict[str, Any]]) -> None:
+    """Emit one cron_triggered per catch-up fire, with the jobs lock RELEASED.
+
+    Why not emit at the decision site inside ``_get_due_jobs_locked``: that
+    runs under ``_jobs_lock()``, a cross-process advisory file lock whose
+    documented contract is that "every critical section that uses it is short
+    (field updates only — no agent execution)". An event-bus emit is a SQLite
+    transaction against a different file; putting one inside would make every
+    standalone ``hermes cron`` invocation on the box wait behind it. The
+    existing ``cron_skipped`` path already uses this shape — the decision is
+    recorded as data under the lock and emitted by the caller afterwards.
+
+    Marker-driven rather than list-driven on purpose: only jobs that actually
+    survived the rest of the scan into ``due`` are here, so a catch-up
+    decision later withdrawn (one-shot dispatch-limit removal, malformed-job
+    ``continue``) cannot emit a fire that never happened.
+
+    Never raises. The try/except is not redundant with
+    ``emit_cron_triggered_safe``'s own — that one guards the emit's INTERNALS,
+    this one guards the due scan against an emitter that is unavailable or
+    refactored to raise. Losing an audit record must never cost a tick its
+    jobs. Per-job rather than around the loop, so one bad record cannot
+    silently drop the provenance of every job behind it.
+    """
+    for job in due:
+        try:
+            marker = job.pop(_RECOVERY_FIRE_MARKER, None)
+            if not marker:
+                continue
+            emit_cron_triggered_safe(
+                job_id=job.get("id") or "?",
+                job_name=job.get("name") or job.get("id") or "?",
+                caller="cron.miss_recovery",
+                reason=RECOVERY_FIRE_REASON,
+                # The catch-up deliberately leaves next_run_at alone —
+                # scheduler.advance_next_run() moves it just before the run.
+                # Equal values record "this fire did not move the schedule".
+                previous_next_run_at=marker.get("missed_at"),
+                new_next_run_at=marker.get("missed_at"),
+            )
+        except Exception:
+            logger.exception(
+                "recovery-fire cron_triggered emit failed for job_id=%s",
+                job.get("id"),
+            )
+
+
 def get_due_and_skipped_jobs() -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Return (due, skipped) lists.
 
@@ -2236,7 +2323,10 @@ def get_due_and_skipped_jobs() -> tuple[List[Dict[str, Any]], List[Dict[str, Any
     a ``repeat.times`` limit consumes one of its runs on that catch-up fire.
     """
     with _jobs_lock():
-        return _get_due_jobs_locked()
+        due, skipped = _get_due_jobs_locked()
+    # Deliberately outside the lock — see _emit_recovery_fire_triggers.
+    _emit_recovery_fire_triggers(due)
+    return due, skipped
 
 
 def _get_due_jobs_locked() -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -2547,6 +2637,15 @@ def _get_due_jobs_locked() -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
                         next_run,
                         missed_seconds,
                     )
+                    # Record the catch-up for cron_triggered. Stamped, not
+                    # emitted, because this runs under _jobs_lock(); the
+                    # emit happens in get_due_and_skipped_jobs() once the
+                    # lock is released. ``job`` is a deepcopy built at the
+                    # top of this scan, so the key cannot reach jobs.json.
+                    job[_RECOVERY_FIRE_MARKER] = {
+                        "missed_at": next_run,
+                        "missed_seconds": missed_seconds,
+                    }
 
                 # One-shot dispatch-limit guard (issue #38758): a finite one-shot
                 # claimed via claim_dispatch() but whose tick died before

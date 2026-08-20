@@ -346,6 +346,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 from cron.jobs import (
     advance_next_run,
     claim_dispatch,
+    emit_cron_triggered_safe,
     get_due_and_skipped_jobs,
     # Unused here, but tests/cron/test_scheduler.py does
     # patch("cron.scheduler.get_due_jobs"); patching a name this module
@@ -4140,12 +4141,24 @@ def _finish_cron_activity(
         )
 
 
+#: cron_triggered attribution for an event-driven wake. The caller names the
+#: MECHANISM, not the producer: a wake can be re-queued across ticks (see the
+#: re-queue branch in _collect_woken_jobs), so the process that requested it is
+#: not necessarily the one whose event this fire answers. The producer is
+#: recoverable from the wake_channel INFO line and the dispatcher's activation
+#: ledger; the mechanism is what audit.jsonl needs to separate the four causes.
+WAKE_TRIGGER_CALLER = "cron.wake_channel"
+WAKE_TRIGGER_REASON = "event_wake"
+
+
 def _collect_woken_jobs(*, exclude_ids: set) -> list:
     """Turn pending event wakes into jobs to execute on this tick.
 
     Deliberately does NOT advance ``next_run_at``: an event says "there is work
     now", not "the schedule moved". Advancing would let inbound traffic drift a
-    job's regular cadence.
+    job's regular cadence. Each fire emits a ``cron_triggered`` event
+    (``reason="event_wake"``) so the run is attributable in audit.jsonl; that
+    emit records the transition and must never change it.
 
     A wake is consumed even when it cannot be *usefully* used (job unknown,
     disabled, or already firing this tick) — otherwise a disabled worker's wake
@@ -4210,6 +4223,40 @@ def _collect_woken_jobs(*, exclude_ids: set) -> list:
                 "cron wake for %s deferred — job still running; re-queued", job_id
             )
             continue
+
+        # Provenance. Emitted HERE — one event per job that actually fires —
+        # and not in wake_channel.request_wake(), which is called once per
+        # producer event AND again by the re-queue branch above, so emitting
+        # there would count a busy worker's wake once per tick until its run
+        # ended. Duplicate producer events also collapse in the channel's set,
+        # so request_wake fires more often than the job does; _collect_woken_jobs
+        # is the only site where "this job is about to run off its schedule" is
+        # true exactly once.
+        #
+        # previous == new next_run_at is not a placeholder: it is the record
+        # that a wake adds a run WITHOUT moving the schedule (see this
+        # function's docstring).
+        #
+        # The try/except is NOT redundant with emit_cron_triggered_safe's own.
+        # That one guards the emit's INTERNALS; this one guards the promise
+        # this function makes to tick() — that it never raises — which must
+        # not depend on a callee keeping its bargain. An unavailable emitter
+        # (patched, partially imported, refactored to raise) would otherwise
+        # take down every scheduled job on the tick to lose one audit record.
+        try:
+            emit_cron_triggered_safe(
+                job_id=job_id,
+                job_name=job.get("name") or job_id,
+                caller=WAKE_TRIGGER_CALLER,
+                reason=WAKE_TRIGGER_REASON,
+                previous_next_run_at=job.get("next_run_at"),
+                new_next_run_at=job.get("next_run_at"),
+            )
+        except Exception:
+            logger.exception(
+                "cron wake provenance emit failed for job %s — firing anyway",
+                job_id,
+            )
         collected.append(job)
 
     if collected:
