@@ -323,13 +323,20 @@ def _durable_notify_origin(
 
 
 def resolve_notify_origin(
-    conn: sqlite3.Connection, task_id: str
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    allow_live: bool = True,
 ) -> Optional[SessionOrigin]:
     """Authoritative delivery origin for ``task_id``.
 
     Prefer the durable objective origin (copied from the human/root session)
     over the current process session. A worker or auto-decomposer must not
     replace that origin with its own WebUI chat.
+
+    Lifecycle notifications such as review-cap pass ``allow_live=False`` so a
+    root supervisor with no durable origin fails closed instead of inventing
+    the live worker WebUI session.
     """
     ensure_supervisor_tables(conn)
     parent_task = os.environ.get("HERMES_KANBAN_TASK") or ""
@@ -341,6 +348,8 @@ def resolve_notify_origin(
         return durable if durable and durable.usable else None
     if durable and durable.usable and _objective_origin(conn, task_id):
         return durable
+    if not allow_live:
+        return durable if durable and durable.usable else None
     live = capture_session_origin()
     # A leftover notify+wake row is not proof the current chat will wake.
     # Only reuse a stored sub when this process has no live session

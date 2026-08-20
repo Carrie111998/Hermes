@@ -874,7 +874,7 @@ def record_review_verdict(
             "allowance": allowance,
         }
 
-    origin = resolve_notify_origin(conn, task_id)
+    origin = resolve_notify_origin(conn, task_id, allow_live=False)
     if origin is None or not origin.usable:
         _record_supervisor_event(
             conn,
