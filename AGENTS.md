@@ -1157,7 +1157,7 @@ assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
 # invariant: no plan-only model leaks into the legacy list
 assert not (set(moonshot_models) & coding_plan_only_models)
 
-# invariant: every model in the catalog has a context-length entry
+# invariant: every model in the catalog has a context-lengthentry
 for m in _PROVIDER_MODELS["huggingface"]:
     assert m.lower() in DEFAULT_CONTEXT_LENGTHS_LOWER
 ```
