@@ -2131,6 +2131,25 @@ class TestElementTokenAttachment:
         # The matching token rode along — cua-driver will prefer it.
         assert args["element_token"] == "s0001:5"
 
+    def test_token_attached_when_schema_accepts_field_without_capability(self):
+        """Current cua-driver releases expose element_token in inputSchema
+        but may omit the legacy custom capability field from tools/list."""
+        backend = self._backend_with_session({"click": set()})
+        session = cast(Any, backend._session)
+        session.supports_input_property = (
+            lambda tool, property_name: (
+                tool == "click" and property_name == "element_token"
+            )
+        )
+        backend._snapshot_tokens = {5: "s0001:5"}
+
+        backend.click(element=5, button="left")
+
+        name, args = session.call_tool.call_args.args
+        assert name == "click"
+        assert args["element_index"] == 5
+        assert args["element_token"] == "s0001:5"
+
 
     def test_capture_refreshes_snapshot_tokens(self):
         """A fresh capture should overwrite any stale tokens from a
