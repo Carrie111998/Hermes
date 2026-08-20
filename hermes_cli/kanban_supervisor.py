@@ -221,21 +221,52 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
 
 def _parents_of(conn: sqlite3.Connection, task_id: str) -> list[str]:
     rows = conn.execute(
-        "SELECT parent_id FROM task_links WHERE child_id = ?",
+        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id ASC",
         (task_id,),
     ).fetchall()
     return [r["parent_id"] if isinstance(r, sqlite3.Row) else r[0] for r in rows]
 
 
-def _root_task_id(conn: sqlite3.Connection, task_id: str) -> str:
+def collect_graph_roots(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    """Deterministic graph roots reachable from ``task_id``."""
+    if not task_id:
+        return []
     seen: set[str] = set()
-    current = task_id
-    while current and current not in seen:
+    roots: set[str] = set()
+    stack = [task_id]
+    while stack:
+        current = stack.pop()
+        if not current or current in seen:
+            continue
         seen.add(current)
         parents = _parents_of(conn, current)
         if not parents:
-            return current
-        current = parents[0]
+            roots.add(current)
+            continue
+        stack.extend(reversed(parents))
+    return sorted(roots)
+
+
+def canonical_root_task_id(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Single canonical root, or ``None`` on cross-objective fan-in.
+
+    A child with multiple parents is allowed only when every parent
+    resolves to the same root. Two independent roots sharing a child
+    do not get an arbitrary winner.
+    """
+    roots = collect_graph_roots(conn, task_id)
+    if len(roots) == 1:
+        return roots[0]
+    if not roots:
+        return task_id or None
+    return None
+
+
+def _root_task_id(conn: sqlite3.Connection, task_id: str) -> str:
+    root = canonical_root_task_id(conn, task_id)
+    if root:
+        return root
+    # Cross-objective fan-in: never pick unordered first-parent.
     return task_id
 
 
@@ -551,8 +582,31 @@ def note_kanban_child(
         ensure_supervisor_tables(conn)
         parent_ids = [p for p in parents if p]
         if not parent_ids:
+            parent_ids = _parents_of(conn, child_id)
+        if not parent_ids:
             return None
-        root = _root_task_id(conn, parent_ids[0])
+        parent_roots: list[str] = []
+        for pid in parent_ids:
+            root = canonical_root_task_id(conn, pid)
+            if root is None:
+                logger.warning(
+                    "note_kanban_child: refusing child %s; parent %s has "
+                    "cross-objective ancestry",
+                    child_id,
+                    pid,
+                )
+                return None
+            parent_roots.append(root)
+        unique_roots = sorted(set(parent_roots))
+        if len(unique_roots) != 1:
+            logger.warning(
+                "note_kanban_child: refusing cross-objective fan-in "
+                "child=%s roots=%s",
+                child_id,
+                unique_roots,
+            )
+            return None
+        root = unique_roots[0]
         # Child delivery follows the durable parent/objective origin.
         # Never fall back to the live process chat — that is how
         # kanban_create from 73c58f750cba subscribed 7779276c4c10.
@@ -820,11 +874,7 @@ def note_kanban_terminal(
         logger.debug("note_kanban_terminal failed for %s", task_id, exc_info=True)
 
 
-_TRUSTED_JUDE_AUTHORS = frozenset({"jude", "jude-verdict"})
 _FULL_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-_REVIEWED_HEAD_RE = re.compile(
-    r"(?im)^reviewed_head\s*[:=]\s*([0-9a-fA-F]{40})\s*$"
-)
 
 
 def _full_git_sha(value: Optional[str]) -> Optional[str]:
@@ -834,36 +884,65 @@ def _full_git_sha(value: Optional[str]) -> Optional[str]:
     return None
 
 
-def _maybe_record_jude_proof(conn: sqlite3.Connection, task_id: str) -> None:
-    comments = conn.execute(
-        "SELECT author, body FROM task_comments WHERE task_id = ? ORDER BY created_at DESC",
+def _authenticated_review_pass_receipt(
+    conn: sqlite3.Connection, task_id: str, live_head: str
+) -> Optional[dict]:
+    """Canonical review-verdict event bound to this task and exact HEAD.
+
+    Task comments are never authority, even when they contain
+    ``jude-verdict: pass`` or a matching ``reviewed_head``.
+    """
+    if not _table_exists(conn, "kanban_supervisor_events"):
+        return None
+    rows = conn.execute(
+        "SELECT payload FROM kanban_supervisor_events "
+        "WHERE kind = 'review_verdict' AND task_id = ? "
+        "ORDER BY created_at DESC",
         (task_id,),
     ).fetchall()
+    for row in rows:
+        raw = row["payload"] if isinstance(row, sqlite3.Row) else row[0]
+        try:
+            payload = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("verified") is not True:
+            continue
+        if payload.get("stale") or payload.get("blockers"):
+            continue
+        if str(payload.get("verdict") or "").strip().lower() != "pass":
+            continue
+        reviewed = _full_git_sha(payload.get("head"))
+        current = _full_git_sha(payload.get("current_head")) or live_head
+        if reviewed is None or reviewed != live_head or current != live_head:
+            continue
+        return payload
+    return None
+
+
+def _maybe_record_jude_proof(conn: sqlite3.Connection, task_id: str) -> None:
     live = _full_git_sha(_task_git_head(conn, task_id))
     if not live:
         return
-    trusted = False
-    for comment in comments:
-        author = str(comment["author"] or "").strip().lower()
-        body = comment["body"] or ""
-        if author not in _TRUSTED_JUDE_AUTHORS:
-            continue
-        if "jude-verdict: pass" not in body.lower():
-            continue
-        match = _REVIEWED_HEAD_RE.search(body)
-        if match is None:
-            continue
-        reviewed = _full_git_sha(match.group(1))
-        if reviewed is not None and reviewed == live:
-            trusted = True
-            break
-    if not trusted:
+    receipt = _authenticated_review_pass_receipt(conn, task_id, live)
+    if receipt is None:
         return
-    obj = get_objective_for_root(conn, _root_task_id(conn, task_id))
+    root = canonical_root_task_id(conn, task_id)
+    if root is None:
+        return
+    obj = get_objective_for_root(conn, root)
     owning = str(obj["id"]) if obj else ""
     if not owning:
         return
-    proof = {"type": "jude_verdict", "verdict": "pass", "head": live}
+    proof = {
+        "type": "jude_verdict",
+        "verdict": "pass",
+        "head": live,
+        "verified": True,
+        "receipt": "review_verdict",
+    }
     conn.execute(
         """
         UPDATE kanban_objective_units
@@ -1879,7 +1958,7 @@ def _unit_satisfies_predicate(conn: sqlite3.Connection, unit: dict) -> bool:
         current = _task_git_head(conn, unit["ref"])
         if not recorded or not current or current != recorded:
             return False
-        return (proof or {}).get("verdict") == "pass" and proof.get("verified") is not False
+        return (proof or {}).get("verdict") == "pass" and proof.get("verified") is True
     if predicate == "task_done_with_proof":
         if unit.get("kind") == "kanban":
             task = conn.execute(

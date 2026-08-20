@@ -3719,6 +3719,26 @@ def _inherit_notify_subs(
     parent_ids = tuple(dict.fromkeys(p for p in parents if p))
     if not parent_ids:
         return
+    try:
+        from hermes_cli.kanban_supervisor import canonical_root_task_id
+
+        roots: list[str] = []
+        conflict = False
+        for pid in parent_ids:
+            root = canonical_root_task_id(conn, pid)
+            if root is None:
+                conflict = True
+                break
+            roots.append(root)
+        unique = tuple(dict.fromkeys(roots))
+        if conflict or len(unique) != 1:
+            # Cross-objective fan-in must not inherit mixed origins.
+            return
+        parent_ids = unique
+    except Exception:
+        _log.debug(
+            "canonical origin inherit failed for %s", child_id, exc_info=True
+        )
     row = conn.execute(
         "SELECT COALESCE(MAX(id), 0) AS cursor FROM task_events WHERE task_id = ?",
         (child_id,),

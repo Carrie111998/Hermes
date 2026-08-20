@@ -136,7 +136,7 @@ def process_exit_status(raw_status: Optional[str]) -> bool:
 
 def _parents_of(conn: sqlite3.Connection, task_id: str) -> list[str]:
     rows = conn.execute(
-        "SELECT parent_id FROM task_links WHERE child_id = ?",
+        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id ASC",
         (task_id,),
     ).fetchall()
     return [r["parent_id"] if isinstance(r, sqlite3.Row) else r[0] for r in rows]
@@ -800,12 +800,16 @@ def record_review_verdict(
                 "current_head": live_head,
             }
         stale = bool(submitted_sha != current_sha or live_sha != submitted_sha)
+    verified_pass = bool(
+        verdict_n == "pass" and not blockers and not stale
+    )
     payload = {
         "verdict": verdict_n,
         "head": head,
         "current_head": live_head,
         "blockers": blockers,
         "stale": stale,
+        "verified": verified_pass,
     }
     count_before = blocking_review_count_since_pass(conn, task_id)
     seq = count_before + (1 if verdict_n in BLOCKING_VERDICTS else 0)
