@@ -281,6 +281,7 @@ class RelayAdapter(BasePlatformAdapter):
         self,
         chat_type: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        chat_id: Optional[str] = None,
     ) -> bool:
         # Native draft streaming needs BOTH the descriptor flag and the
         # "draft" op. supported_ops is fail-open for legacy connectors
@@ -288,9 +289,40 @@ class RelayAdapter(BasePlatformAdapter):
         # pre-contract, so it must NOT fail open: an explicit advertisement
         # is required. Without it the stream consumer stays on the
         # edit-based path exactly as today.
+        #
+        # Per-chat resolution (review r2, finding 2): one adapter fronts N
+        # platforms, and the scalar descriptor only reflects the PRIMARY
+        # identity — a Telegram primary must not starve a secondary Slack
+        # chat of native streaming, nor vice versa. When the caller can
+        # name the chat, resolve through its platform's negotiated
+        # descriptor; the scalar remains the fallback (chat unknown,
+        # single-platform gateways: identical behavior).
+        desc = (
+            self._descriptor_for_chat(str(chat_id))
+            if chat_id is not None
+            else self.descriptor
+        )
         return (
-            self.descriptor.supports_draft_streaming
-            and "draft" in (self.descriptor.supported_ops or ())
+            desc.supports_draft_streaming
+            and "draft" in (desc.supported_ops or ())
+        )
+
+    def stream_is_message_for_chat(self, chat_id: str) -> bool:
+        """Per-chat stream-is-the-message semantic (review r2, finding 2).
+
+        The class-level ``draft_stream_is_message`` can only reflect the
+        primary identity's platform. On a multi-platform relay, a Slack
+        primary must not impose seal semantics on a Telegram chat (its
+        turn-final would become draft(final=true) — no history message),
+        and a Telegram primary must not deny a secondary Slack chat its
+        native streaming. Resolve through the chat's own negotiated
+        descriptor. Platform-name inference is deliberate for now — a
+        descriptor-level field is the eventual contract (gg follow-up)
+        so a future platform can advertise the semantic explicitly.
+        """
+        return (
+            str(self._descriptor_for_chat(str(chat_id)).platform or "").lower()
+            == "slack"
         )
 
     # ── Live cards: native draft streaming + task cards (NS-658) ─────────
@@ -426,7 +458,7 @@ class RelayAdapter(BasePlatformAdapter):
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        if not self.supports_draft_streaming():
+        if not self.supports_draft_streaming(chat_id=str(chat_id)):
             raise NotImplementedError(
                 "connector does not advertise the 'draft' relay op"
             )
@@ -447,12 +479,13 @@ class RelayAdapter(BasePlatformAdapter):
             # Post-seal straggler: its content is already in the sealed
             # message; report success, send nothing, arm nothing.
             return SendResult(success=True)
-        # Arm seal-interception ONLY for stream-is-the-message platforms
-        # (review B4): on a Telegram-shaped connector the draft clears
-        # client-side and the final MUST go out as a separate real send —
-        # arming here would intercept that final into draft(final=true)
-        # and no history message would ever be posted.
-        if self.draft_stream_is_message:
+        # Arm seal-interception ONLY for stream-is-the-message chats
+        # (review B4, per-chat in r2 finding 2): on a Telegram-shaped
+        # connector the draft clears client-side and the final MUST go out
+        # as a separate real send — arming here would intercept that final
+        # into draft(final=true) and no history message would ever be
+        # posted. Resolved per chat: one adapter fronts N platforms.
+        if self.stream_is_message_for_chat(str(chat_id)):
             self._open_draft_by_chat[chat_key] = draft_id
             self._evict_oldest(self._open_draft_by_chat)
         try:

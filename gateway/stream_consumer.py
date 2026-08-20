@@ -339,6 +339,24 @@ class GatewayStreamConsumer:
         self._draft_failures = 0
         self._before_finalize_notified = False
 
+    def _stream_is_message(self) -> bool:
+        """Whether THIS chat's transport treats the stream as the message.
+
+        Prefers the adapter's per-chat probe (multi-platform relay: one
+        adapter fronts N platforms, and the class attribute can only
+        reflect the primary identity — review r2, finding 2). Falls back
+        to the legacy attribute for adapters without the probe. Both are
+        resolved on the CLASS to stay MagicMock-safe (auto-created
+        instance attributes are truthy).
+        """
+        probe = getattr(type(self.adapter), "stream_is_message_for_chat", None)
+        if callable(probe):
+            try:
+                return probe(self.adapter, str(self.chat_id)) is True
+            except Exception:
+                return False
+        return getattr(self.adapter, "draft_stream_is_message", False) is True
+
     def _metadata_for_send(
         self,
         *,
@@ -632,7 +650,7 @@ class GatewayStreamConsumer:
             # card, and the connector's suffix-delta logic appends each new
             # segment cleanly (prefix mismatch → whole-segment append).
             # Telegram-shaped drafts (clear + separate final) keep the bump.
-            if not getattr(self.adapter, "draft_stream_is_message", False):
+            if not self._stream_is_message():
                 type(self)._draft_id_counter += 1
                 self._draft_id = type(self)._draft_id_counter
 
@@ -1225,10 +1243,7 @@ class GatewayStreamConsumer:
                     # native stream continues cumulatively. Resetting here
                     # would break the append-only invariant the connector's
                     # delta computation depends on (whole-snapshot re-append).
-                    _stream_is_msg_c = (
-                        getattr(self.adapter, "draft_stream_is_message", False)
-                        is True
-                    )
+                    _stream_is_msg_c = self._stream_is_message()
                     if _stream_is_msg_c and self._use_draft_streaming:
                         await self._send_commentary(commentary_text)
                         self._last_edit_time = time.monotonic()
@@ -1263,7 +1278,7 @@ class GatewayStreamConsumer:
                     # return truthy auto-attributes, and an edit-based run on a
                     # stream-capable adapter still needs the legacy reset.
                     if (
-                        getattr(self.adapter, "draft_stream_is_message", False) is True
+                        self._stream_is_message()
                         and self._use_draft_streaming
                     ):
                         pass
@@ -1832,10 +1847,21 @@ class GatewayStreamConsumer:
         if not isinstance(self.adapter, _BasePlatformAdapter):
             return False
         try:
-            supported = self.adapter.supports_draft_streaming(
-                chat_type=self.cfg.chat_type or None,
-                metadata=self.metadata,
-            )
+            try:
+                # Per-chat capability (review r2, finding 2): multi-platform
+                # relay adapters resolve draft support through the CHAT's
+                # negotiated descriptor, not the primary identity's. Older
+                # adapters without the kwarg keep the legacy probe.
+                supported = self.adapter.supports_draft_streaming(
+                    chat_type=self.cfg.chat_type or None,
+                    metadata=self.metadata,
+                    chat_id=self.chat_id,
+                )
+            except TypeError:
+                supported = self.adapter.supports_draft_streaming(
+                    chat_type=self.cfg.chat_type or None,
+                    metadata=self.metadata,
+                )
         except Exception:
             logger.debug("supports_draft_streaming probe raised", exc_info=True)
             supported = False
@@ -2324,9 +2350,7 @@ class GatewayStreamConsumer:
         # segment; only the turn-final seal belongs). Those adapters keep
         # ONE stream per turn: mid-turn boundaries just emit another
         # cumulative frame; only got_done (is_turn_final) seals.
-        _stream_is_msg = (
-            getattr(self.adapter, "draft_stream_is_message", False) is True
-        )
+        _stream_is_msg = self._stream_is_message()
         if (
             self._use_draft_streaming
             and self._message_id is None
