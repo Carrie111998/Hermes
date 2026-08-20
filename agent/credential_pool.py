@@ -1958,6 +1958,10 @@ class CredentialPool:
         if pending_refresh:
             self._refresh_pending_entries(pending_refresh)
         if entry is not None:
+            if self._entry_needs_refresh(entry):
+                refreshed = self._refresh_entry(entry, force=False)
+                if refreshed is not None:
+                    entry = refreshed
             # A normal (non-recovery) selection starts a fresh episode —
             # don't let a leftover unmatched-rotation streak from an old
             # failure trip the #70401 bound early next time.
@@ -1968,6 +1972,10 @@ class CredentialPool:
         if pending_refresh:
             entry, _ = self._select_under_lock()
             if entry is not None:
+                if self._entry_needs_refresh(entry):
+                    refreshed = self._refresh_entry(entry, force=False)
+                    if refreshed is not None:
+                        entry = refreshed
                 self._unmatched_rotation_streak = 0
         return entry
 
@@ -2326,6 +2334,10 @@ class CredentialPool:
                 )
                 self._current_id = None
                 next_entry, _pending = self._select_unlocked(refresh=False)
+                if next_entry is not None and self._entry_needs_refresh(next_entry):
+                    refreshed = self._refresh_entry(next_entry, force=False)
+                    if refreshed is not None:
+                        next_entry = refreshed
                 avail, _ = self._available_entries()
                 if next_entry is not None and len(avail) == 1:
                     # A single-entry pool cannot rotate. Returning its only
