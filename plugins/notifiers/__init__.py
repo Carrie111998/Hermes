@@ -158,7 +158,12 @@ def discover_notifier_providers() -> List[Tuple[str, str, bool]]:
     """Scan bundled and user-installed directories for available providers.
 
     Returns list of (name, description, is_available) tuples.
-    Bundled providers take precedence on name collisions.
+    These are the same four sources the general ``PluginManager`` scans, but the
+    precedence is deliberately the reverse of its later-source-wins order: here
+    **bundled wins**. A notifier provider is activated by name, so letting a
+    directory dropped into the working tree shadow a shipped provider would
+    silently intercept agent notifications. Changing this order is a breaking
+    change, which justifies the custom scanner.
     """
     results = []
 
@@ -352,7 +357,7 @@ def _get_active_notifier_provider() -> Optional[str]:
     try:
         from hermes_cli.config import load_config
         config = load_config()
-        return cfg_get(config, "memory", "provider") or None
+        return cfg_get(config, "notifier", "provider") or None
     except Exception:
         return None
 

@@ -156,40 +156,41 @@ class GatewayNotifierProvider(NotifierProvider):
                 )
                 continue
             
-            try:
-                _send_res = await adapter.send(
-                    sub["chat_id"], msg, metadata=metadata,
-                )
-                if getattr(_send_res, "success", True) is False:
-                    raise RuntimeError(
-                        "adapter send() reported failure: "
-                        f"{getattr(_send_res, 'error', None) or 'unknown error'}"
+            if send_passive:
+                try:
+                    _send_res = await adapter.send(
+                        sub["chat_id"], msg, metadata=metadata,
                     )
-                logger.debug(
-                    "kanban notifier: delivered %s event for %s to %s/%s on board %s",
-                    kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
-                )
-                
-                if kind == "completed":
-                    try:
-                        await gateway_runner._deliver_kanban_artifacts(
-                            adapter=adapter,
-                            chat_id=sub["chat_id"],
-                            metadata=metadata,
-                            event_payload=getattr(ev, "payload", None),
-                            task=task,
+                    if getattr(_send_res, "success", True) is False:
+                        raise RuntimeError(
+                            "adapter send() reported failure: "
+                            f"{getattr(_send_res, 'error', None) or 'unknown error'}"
                         )
-                    except Exception as art_exc:
-                        logger.debug(
-                            "kanban notifier: artifact delivery for %s failed: %s",
-                            sub["task_id"], art_exc,
-                        )
-            except Exception as exc:
-                logger.warning(
-                    "kanban notifier: send failed for %s on %s: %s",
-                    sub["task_id"], platform_str, exc,
-                )
-                return False
+                    logger.debug(
+                        "kanban notifier: delivered %s event for %s to %s/%s on board %s",
+                        kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
+                    )
+                    
+                    if kind == "completed":
+                        try:
+                            await gateway_runner._deliver_kanban_artifacts(
+                                adapter=adapter,
+                                chat_id=sub["chat_id"],
+                                metadata=metadata,
+                                event_payload=getattr(ev, "payload", None),
+                                task=task,
+                            )
+                        except Exception as art_exc:
+                            logger.debug(
+                                "kanban notifier: artifact delivery for %s failed: %s",
+                                sub["task_id"], art_exc,
+                            )
+                except Exception as exc:
+                    logger.warning(
+                        "kanban notifier: send failed for %s on %s: %s",
+                        sub["task_id"], platform_str, exc,
+                    )
+                    return False
 
         task_terminal = task and task.status in {"done", "archived"}
         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
@@ -199,9 +200,9 @@ class GatewayNotifierProvider(NotifierProvider):
         _is_push_adapter = _adapter_push_ok(adapter)
         _session_key = ""
         _synth = ""
-        if _wake_kinds:
-            _session_key = getattr(task, "session_id", None) or ""
-        if _wake_kinds and _session_key:
+        if _wake_kinds and wake_agent:
+            _session_key = sub.get("session_id") or getattr(task, "session_id", None) or ""
+        if _wake_kinds and wake_agent:
             _title = (task.title if task else sub["task_id"])[:120]
             _assignee = task.assignee if task else ""
             _parts = []
@@ -220,7 +221,7 @@ class GatewayNotifierProvider(NotifierProvider):
                 board=board_slug,
             )
 
-        if not _is_push_adapter and _wake_kinds and _session_key:
+        if not _is_push_adapter and _wake_kinds and wake_agent:
             from gateway.wake import deliver_wake
             try:
                 await deliver_wake(
@@ -239,7 +240,7 @@ class GatewayNotifierProvider(NotifierProvider):
                 )
                 return False
 
-        if _is_push_adapter and _wake_kinds and _session_key:
+        if _is_push_adapter and _wake_kinds and wake_agent:
             try:
                 from gateway.session import SessionSource
                 from gateway.wake import deliver_wake
