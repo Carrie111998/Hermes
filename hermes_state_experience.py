@@ -396,6 +396,28 @@ class ExperienceStoreMixin:
             logger.warning("prune_experiences failed", exc_info=True)
             return 0
 
+    def delete_experience(self, experience_id: str) -> bool:
+        """Delete one experience outright. Returns whether a row went away.
+
+        Distinct from ``superseded``, which only stops a row being retrieved
+        while keeping it as evidence. This is the "forget it entirely" path a
+        user needs when a stored task should never have been recorded — the
+        row is gone, not hidden.
+        """
+        if not experience_id or self.read_only:
+            return False
+
+        def _do(conn: sqlite3.Connection) -> int:
+            return conn.execute(
+                "DELETE FROM experiences WHERE id = ?", (str(experience_id),)
+            ).rowcount or 0
+
+        try:
+            return bool(self._execute_write(_do))
+        except Exception:
+            logger.warning("delete_experience failed", exc_info=True)
+            return False
+
     def clear_experiences(self) -> int:
         """Delete every experience. Used by ``/forget``-style flows and tests."""
         if self.read_only:

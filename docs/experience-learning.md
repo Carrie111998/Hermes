@@ -23,6 +23,7 @@ block to a single prompt.
 | Retrieval + correction hooks | `agent/turn_context.py` (turn prologue) |
 | Scoring / rendering | `agent/experience.py::rank_rows`, `format_experience_block` |
 | Agent glue + config | `agent/experience_runtime.py` |
+| CLI surface | `hermes_cli/experience.py` — `hermes experience …` |
 | Injection point | `agent/turn_context.py::compose_user_api_content` |
 
 ## What a record holds
@@ -131,6 +132,47 @@ does not change.
   user request, the system prompt, or policy.
 - The block is injected into the **API copy** of the user message only
   (the `api_content` sidecar). The stored transcript content stays clean.
+
+## Inspecting it
+
+The feature changes prompts you never see and accumulates rows you never
+asked for, so it ships with a way to audit both.
+
+```bash
+hermes experience stats                 # what has been learned
+hermes experience list [--workspace .] [--outcome failure] [--all] [--json]
+hermes experience show <id>             # everything stored for one row
+hermes experience why "<prompt>"        # what THAT prompt would retrieve, and why
+hermes experience forget <id> | --all   # delete for real (confirms first)
+hermes experience prune                 # drop expired and surplus rows
+```
+
+`why` is the important one. It runs the real scoring path — same candidate
+fetch, same ranking, same renderer the turn prologue uses — and prints the
+score behind each row plus the exact block the model would be handed:
+
+```
+workspace   /home/me/proj
+query terms build, module, payment, failing
+candidates  3 live rows considered
+floor       0.18 (rows scoring below are dropped)
+
+  score  id          task
+  0.815  7f3c60d8    fix the failing build in the payment module
+
+would be injected into the API copy of the user message:
+
+<experience-context>
+...
+```
+
+It also reports when the feature is off, so "why did nothing happen" has an
+answer that is not "read the config".
+
+`forget` deletes the row outright — distinct from `superseded`, which only
+stops a row being retrieved while keeping it as evidence. It confirms before
+deleting, and refuses outright when stdin is not a terminal unless `--yes` is
+passed, so a pipe or a CI job cannot quietly wipe the store.
 
 ## Configuration
 
