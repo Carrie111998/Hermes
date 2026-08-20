@@ -136,6 +136,24 @@ class TestLegacyPlacementOnlyCallers:
         assert len(seals) == 1 and seals[0]["draft_id"] == 31
 
     @pytest.mark.asyncio
+    async def test_thread_anchored_placement_only_final_seals(self):
+        """Review r2, finding 5: metadata carrying ONLY a thread anchor is
+        placement info, not turn identity — with one open turn-keyed
+        stream in the chat, the final must absorb into it, not post a
+        plain duplicate beside the live stream."""
+        adapter, t = _adapter()
+        md_frames = {"thread_ts": "1700.9", "message_id": "1700.910"}
+        await adapter.send_draft("C1", 32, "partial", metadata=md_frames)
+        r = await adapter.send("C1", "final", metadata={"thread_ts": "1700.9"})
+        assert r.success
+        seals = [o for o in t.ops if o["op"] == "draft" and o.get("final")]
+        assert len(seals) == 1 and seals[0]["draft_id"] == 32, (
+            "placement-only final must seal the single open stream"
+        )
+        assert not [o for o in t.ops if o["op"] == "send"]
+        assert not adapter._open_draft_by_chat
+
+    @pytest.mark.asyncio
     async def test_multiple_open_streams_identityless_send_stays_plain(self):
         """With several open streams, an identity-less send must NOT guess:
         plain send (recoverable) over sealing the wrong stream (not)."""
@@ -150,3 +168,27 @@ class TestLegacyPlacementOnlyCallers:
         assert r.success
         assert [o["op"] for o in t.ops][-1] == "send"
         assert not [o for o in t.ops if o["op"] == "draft" and o.get("final")]
+
+    @pytest.mark.asyncio
+    async def test_placement_only_with_multiple_open_streams_stays_plain(self):
+        adapter, t = _adapter()
+        await adapter.send_draft(
+            "C1", 43, "A", metadata={"thread_ts": "1700.9", "message_id": "m.3"}
+        )
+        await adapter.send_draft(
+            "C1", 44, "B", metadata={"thread_ts": "1700.9", "message_id": "m.4"}
+        )
+        r = await adapter.send("C1", "ambiguous", metadata={"thread_ts": "1700.9"})
+        assert r.success
+        assert [o["op"] for o in t.ops][-1] == "send"
+
+    @pytest.mark.asyncio
+    async def test_message_id_mismatch_never_falls_back(self):
+        """A caller WITH a message id whose key misses must not steal the
+        one open stream — its identity is authoritative (different turn)."""
+        adapter, t = _adapter()
+        await adapter.send_draft("C1", 45, "A", metadata={"message_id": "m.5"})
+        r = await adapter.send("C1", "other turn", metadata={"message_id": "m.OTHER"})
+        assert r.success
+        assert [o["op"] for o in t.ops][-1] == "send"
+        assert adapter._open_draft_by_chat, "stream must survive the mismatch"

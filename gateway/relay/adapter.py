@@ -424,24 +424,33 @@ class RelayAdapter(BasePlatformAdapter):
     ) -> Optional[str]:
         """Resolve which open stream (if any) a turn-final send belongs to.
 
-        Exact key match first. A caller with NO turn identity in its
-        metadata (legacy resolver lanes that only carry placement info)
-        may still absorb the final — but ONLY when the chat has exactly
-        one open stream. With several open streams the send stays a plain
-        send: a duplicate message is recoverable, sealing someone else's
-        stream with the wrong content is not (review B2).
+        Exact key match first. Callers WITHOUT a per-turn message id fall
+        into two classes (review r2, finding 5):
+
+          - placement-only metadata (thread_ts/thread_id but no message
+            id — legacy resolver lanes): the thread anchor is placement
+            info, not turn identity, and streams are keyed per turn — an
+            exact match will practically never fire for them. They may
+            still absorb the final via the single-open-stream fallback.
+          - no metadata at all: same fallback.
+
+        The fallback only fires when the chat has EXACTLY one open
+        stream. With several open, the send stays a plain send: a
+        duplicate message is recoverable, sealing someone else's stream
+        with the wrong content is not (review B2). Callers that DO carry
+        a message id never fall back — their identity is authoritative,
+        and a mismatch means the stream is someone else's.
         """
         key = self._draft_key(str(chat_id), metadata)
         if key in self._open_draft_by_chat:
             return key
         md = metadata or {}
-        has_turn_identity = bool(
-            md.get("message_id")
-            or md.get("reply_to_message_id")
-            or md.get("thread_ts")
-            or md.get("thread_id")
-        )
-        if has_turn_identity:
+        # Only a per-turn MESSAGE id is turn identity. Thread anchors are
+        # placement info shared by every turn in the thread — treating
+        # them as identity made the single-open-stream fallback dead for
+        # placement-only callers (probed: plain final beside an open
+        # turn-keyed stream).
+        if md.get("message_id") or md.get("reply_to_message_id"):
             return None
         prefix = f"{chat_id}:"
         candidates = [
