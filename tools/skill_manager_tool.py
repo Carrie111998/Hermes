@@ -1006,7 +1006,8 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     if _pending_target_anchor.get() is None:
         skill_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write SKILL.md atomically
+    # Write instructional documents with a readable mode while preserving
+    # the mode of an existing file across the atomic replacement.
     skill_md = skill_dir / "SKILL.md"
     pre_image_guard = _pending_pre_image_guard(name, category)
     if pre_image_guard:
@@ -2171,6 +2172,7 @@ def _atomic_create_text_noreplace(
     content: str,
     *,
     create_parents: bool = False,
+    create_mode: int = 0o644,
 ) -> None:
     """Atomically publish a new text leaf without replacing an existing one."""
     if create_parents:
@@ -2184,6 +2186,8 @@ def _atomic_create_text_noreplace(
     fd = os.open(temp, flags, 0o600)
     linked = False
     try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, create_mode)
         view = memoryview(content.encode("utf-8"))
         while view:
             written = os.write(fd, view)
@@ -2220,9 +2224,15 @@ def _pending_atomic_write_text(
                 target,
                 content,
                 create_parents=create_parents,
+                create_mode=0o644,
             )
         else:
-            atomic_write_text(target, content)
+            atomic_write_text(
+                target,
+                content,
+                preserve_mode=True,
+                create_mode=0o644,
+            )
         return
     if not _pending_anchor_is_current():
         raise ValueError("Pending skill write target pre-image changed")
@@ -2259,6 +2269,16 @@ def _pending_atomic_write_text(
         )
         published = False
         try:
+            publish_mode = (
+                stat.S_IMODE(existing.st_mode) if existing is not None else 0o644
+            )
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, publish_mode)
+            if existing is not None and hasattr(os, "fchown"):
+                try:
+                    os.fchown(fd, existing.st_uid, existing.st_gid)
+                except PermissionError:
+                    pass
             data = content.encode("utf-8")
             view = memoryview(data)
             while view:

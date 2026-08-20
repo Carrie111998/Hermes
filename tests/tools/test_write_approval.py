@@ -1575,6 +1575,7 @@ def test_skill_approval_applies_unchanged_v2_record(hermes_home, monkeypatch):
     skill_dir.mkdir(parents=True)
     skill_md = skill_dir / "SKILL.md"
     skill_md.write_text(_SKILL, encoding="utf-8")
+    skill_md.chmod(0o660)
     monkeypatch.setattr(sm, "SKILLS_DIR", skills_dir)
     _set_approval("skills", True)
     tokens = set_session_vars(source="cli", profile="default")
@@ -1599,6 +1600,7 @@ def test_skill_approval_applies_unchanged_v2_record(hermes_home, monkeypatch):
 
     assert output == "Approved 1 skills write(s)."
     assert "updated body" in skill_md.read_text(encoding="utf-8")
+    assert stat.S_IMODE(skill_md.stat().st_mode) == 0o660
     assert wa.get_pending(wa.SKILLS, staged["pending_id"]) is None
 
 
@@ -1627,7 +1629,9 @@ def test_first_approved_skill_create_builds_missing_skills_root(
     output = handle_pending_subcommand(wa.SKILLS, ["approve", record["id"]])
 
     assert output == "Approved 1 skills write(s)."
-    assert (skills_dir / "demo" / "SKILL.md").read_text(encoding="utf-8") == _SKILL
+    skill_md = skills_dir / "demo" / "SKILL.md"
+    assert skill_md.read_text(encoding="utf-8") == _SKILL
+    assert stat.S_IMODE(skill_md.stat().st_mode) == 0o644
     assert wa.get_pending(wa.SKILLS, record["id"]) is None
 
 
@@ -1681,11 +1685,15 @@ def test_descriptor_anchored_skill_apply_supports_every_mutation(
 
     assert result["success"] is True, result
     if action == "create":
-        assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == _SKILL
+        skill_md = skill_dir / "SKILL.md"
+        assert skill_md.read_text(encoding="utf-8") == _SKILL
+        assert stat.S_IMODE(skill_md.stat().st_mode) == 0o644
     elif action == "edit":
         assert "edited body" in (skill_dir / "SKILL.md").read_text(encoding="utf-8")
     elif action == "write_file":
-        assert (skill_dir / "references" / "note.md").read_text(encoding="utf-8") == "note"
+        note = skill_dir / "references" / "note.md"
+        assert note.read_text(encoding="utf-8") == "note"
+        assert stat.S_IMODE(note.stat().st_mode) == 0o644
     elif action == "remove_file":
         assert not (skill_dir / "references" / "note.md").exists()
 
