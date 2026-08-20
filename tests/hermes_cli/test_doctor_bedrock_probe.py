@@ -86,3 +86,20 @@ class TestBedrockProbe:
         icon, label, detail = result.lines[0]
         assert "RuntimeError" in detail
         assert any("ListFoundationModels" in issue for issue in result.issues)
+
+    def test_broken_adapter_import_is_not_a_silent_pass(self, monkeypatch):
+        """A user WITH credentials but a broken agent.bedrock_adapter install
+        must see a warning, not an empty result indistinguishable from
+        'no AWS credentials configured' (a silent green pass)."""
+        monkeypatch.setitem(sys.modules, "agent.bedrock_adapter", None)
+
+        result = doctor._probe_bedrock()
+
+        assert len(result.lines) == 1
+        icon, label, detail = result.lines[0]
+        assert label.strip() == "AWS Bedrock"
+        assert "bedrock adapter unavailable" in detail
+        assert any(
+            "agent.bedrock_adapter failed to import" in issue
+            for issue in result.issues
+        )

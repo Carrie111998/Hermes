@@ -541,8 +541,17 @@ def _probe_bedrock() -> "_ConnectivityResult":
             resolve_aws_auth_env_var,
             resolve_bedrock_region,
         )
-    except ImportError:
-        return _ConnectivityResult("AWS Bedrock", [], [])
+    except ImportError as e:
+        # A broken/incompatible adapter install must not read as a silent
+        # green pass (indistinguishable from "no AWS credentials") — a
+        # user WITH credentials would never learn the probe didn't run.
+        warn_label = "AWS Bedrock".ljust(20)
+        return _ConnectivityResult(
+            "AWS Bedrock",
+            [(color("⚠", Colors.YELLOW), warn_label,
+              color(f"(bedrock adapter unavailable: {e})", Colors.DIM))],
+            ["Bedrock probe skipped: agent.bedrock_adapter failed to import"],
+        )
     if not has_aws_credentials():
         return _ConnectivityResult("AWS Bedrock", [], [])
     auth_var = resolve_aws_auth_env_var()
