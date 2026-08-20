@@ -289,6 +289,15 @@ test('process probes reject PIDs outside the Linux pid_max range without executi
   }
 })
 
+test('pidIsOurDashboard rejects malformed ownership IDs without executing SSH', async () => {
+  for (const ownershipId of ['abc', 'A'.repeat(32), '../'.repeat(11)]) {
+    const ssh = fakeSsh([])
+
+    assert.equal(await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, '/x/hermes', '~/.hermes', ownershipId, ''), false)
+    assert.deepEqual(ssh.calls, [])
+  }
+})
+
 test('metadata and process proof transport failures remain indeterminate', async () => {
   const failure = new Error('connection reset')
   await assert.rejects(

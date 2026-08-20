@@ -414,6 +414,7 @@ async function pidIsOurDashboard(
     pid <= 0 ||
     pid > 4194304 ||
     !/^[0-9a-f]{16}$/.test(String(spawnNonce || '')) ||
+    (ownershipId && !/^[0-9a-f]{32}$/.test(String(ownershipId))) ||
     !hermesPath
   ) {
     return false
