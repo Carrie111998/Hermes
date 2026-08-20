@@ -6,7 +6,7 @@
 #
 # STABLE CORE: 246 failures across 60 files. DIFF AGAINST THIS.
 #
-# AMENDED 2026-08-20 (c915a8678c): 248 -> 246 across 60 files. Removed the two
+# AMENDED 2026-08-20 (0a5e268a96): 248 -> 246 across 60 files. Removed the two
 # test_kanban_reclaim_claim_lock_guard.py rows. They were never product
 # failures -- the 2026-08-17 isolation triage classified both POLLUTION. The
 # tests spawned the POSIX binaries `true` and `sleep`, which on Windows resolve
