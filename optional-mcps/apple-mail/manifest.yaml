@@ -14,9 +14,9 @@ source: https://github.com/sweetrb/apple-mail-mcp
 # auditable); bump the pin via PR after validating a new release.
 #
 # How this pin was validated (catalog policy: "version validated on macOS").
-# On macOS, `npx -y apple-mail-mcp@2.16.0`:
+# On macOS, `npx -y apple-mail-mcp@2.16.1`:
 #   - completes an MCP `initialize` handshake reporting serverInfo.version
-#     2.16.0 — i.e. the bytes npx resolved are the bytes pinned here;
+#     2.16.1 — i.e. the bytes npx resolved are the bytes pinned here;
 #   - returns a full `tools/list` of 50 tools, every one carrying a description;
 #   - resolves all 18 `tools.default_enabled` entries below against that
 #     list, so no allow-listed name went stale across the bump.
@@ -28,7 +28,7 @@ transport:
   command: "npx"
   args:
     - "-y"
-    - "apple-mail-mcp@2.16.0"
+    - "apple-mail-mcp@2.16.1"
 
 # Drives Apple Mail locally via AppleScript; no credentials.
 auth:
