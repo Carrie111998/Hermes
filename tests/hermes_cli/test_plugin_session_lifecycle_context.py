@@ -130,14 +130,17 @@ def test_plugin_hook_cwd_never_uses_terminal_cwd_fallback(monkeypatch, tmp_path)
     assert turn_context._plugin_hook_cwd("missing") == ""
 
 
-def test_plugin_hook_cwd_uses_terminal_config_only_for_classic_cli(
+def test_trusted_classic_cli_ignores_import_side_effect_gateway_marker(
     monkeypatch, tmp_path
 ):
     from agent import turn_context
     from tools import file_tools, terminal_tool
 
     monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
-    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+    # Importing gateway.run marks the process even when the active agent is a
+    # trusted one-shot/classic CLI. The constructor seal—not this ambient module
+    # side effect—is the authority boundary.
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
     monkeypatch.setattr(terminal_tool, "get_session_cwd", lambda task_id: None)
     monkeypatch.setattr(file_tools, "_registered_task_cwd_override", lambda task_id: None)
 

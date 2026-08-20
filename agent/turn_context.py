@@ -78,7 +78,7 @@ def _plugin_hook_cwd(
             return bound
     except Exception:
         pass
-    if allow_cli_fallback and os.environ.get("_HERMES_GATEWAY") != "1":
+    if allow_cli_fallback:
         configured = str(os.environ.get("TERMINAL_CWD") or "").strip()
         if configured:
             resolved = os.path.abspath(os.path.expanduser(configured))
