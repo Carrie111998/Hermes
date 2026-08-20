@@ -98,6 +98,9 @@ export interface Translations {
     revealInSidebar: string
     copyPath: string
     copyRelativePath: string
+    download: string
+    downloadSaved: string
+    downloadFailed: string
     rename: string
     delete: string
     renameTitle: string
@@ -421,6 +424,8 @@ export interface Translations {
       translucencyGlassDesc: string
       translucencyModeClear: string
       translucencyModeGlass: string
+      translucencyTintTitle: string
+      translucencyFadeTitle: string
       translucencyFrostTitle: string
       translucencyFrost: {
         'under-window': string
@@ -435,6 +440,8 @@ export interface Translations {
       }
       backdropTitle: string
       backdropDesc: string
+      introSplashTitle: string
+      introSplashDesc: string
       reactionsTitle: string
       reactionsDesc: string
       composerPopoutTitle: string
@@ -1906,6 +1913,7 @@ export interface Translations {
     endShort: string
     stopDictation: string
     transcribingDictation: string
+    voiceControls: string
     voiceDictation: string
     speakReplies: string
     stopSpeakingReplies: string
@@ -2057,6 +2065,7 @@ export interface Translations {
       openPr: string
       ghMissing: string
       agentShip: string
+      agentShipUnavailable: string
       agentShipPrompt: string
       newBranch: string
       branchOffFrom: (base: string) => string
