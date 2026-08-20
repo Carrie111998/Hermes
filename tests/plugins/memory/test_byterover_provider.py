@@ -1,7 +1,10 @@
 """Tests for the ByteRover memory provider config gates."""
 
+import threading
+
 import pytest
 
+from agent.memory_manager import MemoryManager
 from plugins.memory.byterover import ByteRoverMemoryProvider
 
 
@@ -60,6 +63,45 @@ def test_timeout_query_reaches_prefetch_and_tool_query(monkeypatch):
     assert provider.prefetch("a sufficiently long query")
     assert provider._tool_query({"query": "a sufficiently long query"})
     assert [kwargs["timeout"] for _, kwargs in calls] == [17.5, 17.5]
+
+
+@pytest.mark.parametrize(
+    ("prefetch_timeout", "timeout_query", "expected_deadline"),
+    [(8.0, 10.0, 8.0), (12.0, 10.0, 10.0)],
+    ids=["prefetch-8-query-10", "prefetch-12-query-10"],
+)
+def test_prefetch_all_returns_context_with_minimum_effective_deadline(
+    prefetch_timeout,
+    timeout_query,
+    expected_deadline,
+    monkeypatch,
+):
+    calls = []
+    join_timeouts = []
+    provider = ByteRoverMemoryProvider({"timeout_query": timeout_query})
+    provider.initialize("session-1")
+    manager = MemoryManager(external_prefetch_timeout=prefetch_timeout)
+    manager.add_provider(provider)
+
+    original_join = threading.Thread.join
+
+    def record_join(thread, timeout=None):
+        join_timeouts.append(timeout)
+        return original_join(thread, timeout)
+
+    def fake_run_brv(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"success": True, "output": "relevant memory content"}
+
+    monkeypatch.setattr("agent.memory_manager.threading.Thread.join", record_join)
+    monkeypatch.setattr("plugins.memory.byterover._run_brv", fake_run_brv)
+
+    context = manager.prefetch_all("a sufficiently long query")
+
+    assert context == "## ByteRover Context\nrelevant memory content"
+    assert join_timeouts == [prefetch_timeout]
+    assert [kwargs["timeout"] for _, kwargs in calls] == [timeout_query]
+    assert min(manager._external_prefetch_timeout, provider._timeout_query) == expected_deadline
 
 
 def test_prefetch_keeps_runtime_docstring():

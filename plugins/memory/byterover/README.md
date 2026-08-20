@@ -28,14 +28,14 @@ echo "BRV_API_KEY=your-key" >> ~/.hermes/.env
 
 `BRV_API_KEY` is optional and only needed for cloud sync. ByteRover is local-first by default.
 
-ByteRover queries time out after 10 seconds unless configured otherwise:
+Automatic ByteRover prefetch uses an effective deadline of `min(memory.prefetch_timeout, memory.byterover.timeout_query)`. The defaults are 8 seconds for `memory.prefetch_timeout` and 10 seconds for `memory.byterover.timeout_query`, so automatic prefetch waits for at most 8 seconds. Direct `brv_query` calls use `memory.byterover.timeout_query` only, which defaults to 10 seconds.
 
 ```bash
 hermes config set memory.byterover.timeout_query 30
 hermes config set memory.prefetch_timeout 31
 ```
 
-Both values are in seconds and accept numbers from 0.01 to 3600. The outer `memory.prefetch_timeout` must be larger than `memory.byterover.timeout_query`; otherwise Hermes may stop waiting before the ByteRover query finishes.
+Both values are in seconds and accept numbers from 0.01 to 3600.
 
 Working directory: `$HERMES_HOME/byterover/` (profile-scoped).
 
