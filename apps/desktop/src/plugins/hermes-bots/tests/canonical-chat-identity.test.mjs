@@ -194,7 +194,9 @@ test('pin: compression-rotated pin opens the live tip, keeps the durable pin', a
 
 test('pin: definitively gone pin re-pins to the previewed session, not rows[0]', async () => {
   const runtime = loadOpenPath({
-    openSession: async () => undefined,
+    openSession: async id => {
+      if (id === 'dead-pin') throw new Error('session vanished')
+    },
     request: async method => {
       if (method === 'profiles.list') {
         return { profiles: [{ name: 'ops', preferred_session: null }] }
@@ -212,7 +214,9 @@ test('pin: definitively gone pin re-pins to the previewed session, not rows[0]',
 
 test('safety: a dead pin does not re-anchor on an ordinary latest session', async () => {
   const runtime = loadOpenPath({
-    openSession: async () => undefined,
+    openSession: async id => {
+      if (id === 'dead-pin') throw new Error('session vanished')
+    },
     request: async method => {
       if (method === 'profiles.list') return { profiles: [{ name: 'ops', preferred_session: null }] }
       if (method === 'session.create') return { stored_session_id: 'safe-replacement', session_id: 'safe-replacement-runtime' }
@@ -233,7 +237,9 @@ test('safety: a dead pin does not re-anchor on an ordinary latest session', asyn
 
 test('pin: gone pin + no history clears the pin and creates', async () => {
   const runtime = loadOpenPath({
-    openSession: async () => undefined,
+    openSession: async id => {
+      if (id === 'dead-pin') throw new Error('session vanished')
+    },
     request: async method => {
       if (method === 'profiles.list') {
         return { profiles: [{ name: 'ops', preferred_session: null }] }

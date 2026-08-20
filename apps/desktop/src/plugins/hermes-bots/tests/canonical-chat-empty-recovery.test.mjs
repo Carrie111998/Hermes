@@ -31,14 +31,15 @@ function loadCanonicalRecovery({ openSession, request }) {
 }
 
 test('regression: a definitively-gone pin with no history clears and creates a replacement', async () => {
-  // New contract (hermes-agent#88200): the pin is verified through the
-  // backend's precise preferred_session resolver — NOT a paginated,
-  // hidden-excluding session.list window. preferred_session=null is the
-  // definitive "this session is gone"; with no previewed history to
-  // re-anchor on, recovery clears the pin and creates a fresh chat.
+  // New contract (hermes-agent#88200 + #90458): preferred_session=null
+  // means the pin is not in this profile store. Recovery remints only after
+  // the opener also reports the session missing.
   const opened = []
   const runtime = loadCanonicalRecovery({
-    openSession: async id => opened.push(id),
+    openSession: async id => {
+      if (id === 'stale-pin') throw new Error('session vanished')
+      opened.push(id)
+    },
     request: async method => {
       if (method === 'profiles.list') return { profiles: [{ name: 'ops', preferred_session: null }] }
       if (method === 'session.create') return { stored_session_id: 'replacement', session_id: 'replacement-runtime' }
@@ -81,7 +82,10 @@ test('regression: a dead pin re-anchors on the previewed chat instead of the new
   // previewed history row when one exists — session.create never fires.
   const opened = []
   const runtime = loadCanonicalRecovery({
-    openSession: async id => opened.push(id),
+    openSession: async id => {
+      if (id === 'old-pin') throw new Error('session vanished')
+      opened.push(id)
+    },
     request: async method => {
       if (method === 'profiles.list') return { profiles: [{ name: 'ops', preferred_session: null }] }
       if (method === 'session.create') throw new Error('must not create')

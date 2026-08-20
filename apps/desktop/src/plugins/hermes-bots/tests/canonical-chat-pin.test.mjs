@@ -69,7 +69,9 @@ test('regression: a live pinned canonical chat is opened as-is, never replaced',
 
 test('regression: only an actually-missing pin triggers recovery', async () => {
   const runtime = loadOpenPath({
-    openSession: async () => undefined,
+    openSession: async id => {
+      if (id === 'dead-pin') throw new Error('session vanished')
+    },
     request: async method => {
       if (method === 'profiles.list') {
         return { profiles: [{ name: 'ops', preferred_session: null }] }

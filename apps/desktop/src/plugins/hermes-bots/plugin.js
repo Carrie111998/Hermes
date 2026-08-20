@@ -3395,7 +3395,16 @@ const canonicalCreations = new Map()
 /** Upper bound for per-profile session.list scans (hide sweep, canonical-chat
  *  adoption, stored-session lookups). */
 const PROFILE_SESSION_LIST_LIMIT = 200
+// Last successful canonical pin per bot. Extra clicks often still snapshot
+// meta.chat as null (React has not re-rendered) or as a launch-store id
+// that profiles.list cannot see in the bot profile store (#90458).
+const lastCanonicalPins = new Map()
 let botOpenGeneration = 0
+
+function isMissingCanonicalChat(error) {
+  const msg = String(error?.message || error || '')
+  return /not found|vanished|unknown session|no such session|does not exist|session not found/i.test(msg)
+}
 
 async function openStoredBotChat(name, storedId, summary) {
   if (!storedId || typeof host.openSession !== 'function') {
@@ -3496,6 +3505,7 @@ function createCanonicalChat(name) {
     const runtime = res?.session_id
 
     if (sid) {
+      lastCanonicalPins.set(name, sid)
       saveBotMeta(name, { chat: sid })
     }
 
@@ -3548,6 +3558,9 @@ function createCanonicalChat(name) {
  *    resolver (hidden rows still resolve; compression lineages resolve to
  *    the live tip) — never inferred from a paginated, hidden-excluding
  *    session.list window, which misjudged real hidden pins as gone;
+ *  - preferred_session=null means the pin is not in this profile store,
+ *    not that it is gone: try the stored id as-is and remint only after
+ *    the opener proves the session is missing (hermes-agent#90458);
  *  - transient lookup failures keep the pin: try the stored id as-is, and
  *    only a rejected open enters recovery. */
 function isCanonicalBotChatHistory(history) {
@@ -3558,12 +3571,17 @@ function isCanonicalBotChatHistory(history) {
 
 async function openBotCanonicalChat(name, pinned, history) {
   if (!pinned) {
+    pinned = lastCanonicalPins.get(name) || null
+  }
+
+  if (!pinned) {
     // Grandfather only an actual Bot Chat. `last_session` is merely the most
     // recent row for the profile; adopting it blindly can claim an unrelated
     // user conversation and the hide sweep would then hide that conversation.
     const adoptId = isCanonicalBotChatHistory(history) ? history.id : null
     if (adoptId && typeof host.openSession === 'function') {
       await openStoredBotChat(name, adoptId, history)
+      lastCanonicalPins.set(name, adoptId)
       saveBotMeta(name, { chat: adoptId })
       return adoptId
     }
@@ -3594,12 +3612,14 @@ async function openBotCanonicalChat(name, pinned, history) {
     // until proven guilty — try it as-is. A rejected open is still ambiguous:
     // it can be the same reconnect/hydration outage that broke this lookup, so
     // preserve the forever-chat pin and surface Retry instead of forking it.
+    lastCanonicalPins.set(name, pinned)
     return openStoredBotChat(name, pinned, history)
   }
 
   if (preferred && isCanonicalBotChatHistory(preferred)) {
     try {
       await openStoredBotChat(name, preferred.resolved_id || preferred.id, preferred)
+      lastCanonicalPins.set(name, pinned)
       return pinned
     } catch (error) {
       // The precise lookup JUST confirmed this session exists, so a failed
@@ -3632,23 +3652,39 @@ async function openBotCanonicalChat(name, pinned, history) {
 
     if (messageCount > 0) {
       await openStoredBotChat(name, preferred.resolved_id || preferred.id, preferred)
+      lastCanonicalPins.set(name, pinned)
       return pinned
     }
 
+    lastCanonicalPins.delete(name)
     await saveBotMeta(name, { chat: null })
     return createCanonicalChat(name)
   }
 
-  // Definitively gone (db reset, or the lineage was rewritten past
-  // recovery): re-anchor on the previewed session when there is one.
-  // A previewed row is safe to re-anchor only when it is Bot Mode plumbing.
-  // Otherwise a stale pin must not steal the profile's ordinary latest chat.
+  // preferred_session=null is "not in this profile store", not "gone".
+  // A kickoff minted against the launch/default TUI lands in
+  // ~/.hermes/state.db while this lookup reads profiles/<bot>/state.db
+  // (#90458). Try the existing pin before reminting or overwriting it.
+  try {
+    await openStoredBotChat(name, pinned, history)
+    lastCanonicalPins.set(name, pinned)
+    return pinned
+  } catch (error) {
+    if (!isMissingCanonicalChat(error)) {
+      throw error
+    }
+  }
+
+  // Proven missing from the opener too: re-anchor on a previewed Bot Chat
+  // when there is one. Ordinary latest chats are never adopted.
   const recoveryId = isCanonicalBotChatHistory(history) ? history.id : null
   if (recoveryId && typeof host.openSession === 'function') {
     await openStoredBotChat(name, recoveryId, history)
+    lastCanonicalPins.set(name, recoveryId)
     saveBotMeta(name, { chat: recoveryId })
     return recoveryId
   }
+  lastCanonicalPins.delete(name)
   saveBotMeta(name, { chat: null })
   return createCanonicalChat(name)
 }
