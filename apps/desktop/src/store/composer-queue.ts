@@ -207,6 +207,25 @@ export const promoteQueuedPrompt = (key: string | null | undefined, id: string):
   return true
 }
 
+export const reorderQueuedPrompts = (key: string | null | undefined, ids: string[]): boolean => {
+  const sid = sidOf(key)
+
+  if (!sid) {
+    return false
+  }
+
+  const queue = queueFor(sid)
+  const next = ids.map(id => queue.find(e => e.id === id)).filter((e): e is QueuedPromptEntry => Boolean(e))
+
+  if (next.length === 0 || next.length !== queue.length) {
+    return false
+  }
+
+  writeSession(sid, next)
+
+  return true
+}
+
 export const updateQueuedPrompt = (
   key: string | null | undefined,
   id: string,

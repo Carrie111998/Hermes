@@ -13,6 +13,7 @@ import {
   parkQueuedPrompts,
   promoteQueuedPrompt,
   removeQueuedPrompt,
+  reorderQueuedPrompts,
   shouldAutoDrain,
   unparkQueuedPrompts,
   updateQueuedPrompt,
@@ -81,6 +82,33 @@ describe('composer queue store', () => {
     expect(promoteQueuedPrompt(SESSION_KEY, third!.id)).toBe(true)
     expect(getQueuedPrompts(SESSION_KEY).map(entry => entry.text)).toEqual(['third', 'first', 'second'])
     expect(promoteQueuedPrompt(SESSION_KEY, third!.id)).toBe(false)
+  })
+
+  it('reorders queued entries by a full id list', () => {
+    const first = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'first' })
+    const second = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'second' })
+    const third = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'third' })
+
+    expect(first).not.toBeNull()
+    expect(second).not.toBeNull()
+    expect(third).not.toBeNull()
+
+    expect(reorderQueuedPrompts(SESSION_KEY, [third!.id, first!.id, second!.id])).toBe(true)
+    expect(getQueuedPrompts(SESSION_KEY).map(entry => entry.text)).toEqual(['third', 'first', 'second'])
+  })
+
+  it('rejects a reorder that drops or invents ids', () => {
+    const first = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'first' })
+    const second = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'second' })
+
+    expect(first).not.toBeNull()
+    expect(second).not.toBeNull()
+
+    // Missing one id.
+    expect(reorderQueuedPrompts(SESSION_KEY, [first!.id])).toBe(false)
+    // Extra unknown id.
+    expect(reorderQueuedPrompts(SESSION_KEY, [first!.id, second!.id, 'unknown-id'])).toBe(false)
+    expect(getQueuedPrompts(SESSION_KEY).map(entry => entry.text)).toEqual(['first', 'second'])
   })
 
   it('updates queued text and attachment snapshot', () => {
