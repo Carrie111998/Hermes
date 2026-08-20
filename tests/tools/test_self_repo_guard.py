@@ -541,6 +541,17 @@ class TestWindowsQuotedNativePathResolution:
         hit, _ = _detect(f"git -C {repo} checkout main", tmp_path, repo)
         assert hit is False
 
+    @pytest.mark.parametrize("quote", ["'", '"'])
+    def test_quoted_relative_native_path_targeting_repo(
+        self, repo, tmp_path, quote
+    ):
+        nested = repo / "nested"
+        nested.mkdir()
+        relative = f"{repo.name}\\nested"
+        command = f"git -C {quote}{relative}{quote} checkout main"
+        hit, _ = _detect(command, repo.parent, repo)
+        assert hit is True
+
 
 class TestSourceRootResolution:
     def test_resolves_to_repo_when_git_dir_present(self):

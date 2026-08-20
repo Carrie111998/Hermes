@@ -377,9 +377,18 @@ def _shell_words_at(command: str, start: int) -> list[str]:
                 candidate = shell_values[0]
                 for placeholder, replacement in replacements.items():
                     candidate = candidate.replace(placeholder, replacement)
+                is_quoted_relative_windows_path = (
+                    len(raw_word) >= 2
+                    and raw_word[0] in {"'", '"'}
+                    and raw_word[-1] == raw_word[0]
+                    and "\\" in candidate
+                )
                 if has_verified_path or (
                     not has_protected_literal
-                    and _WINDOWS_PATH_TOKEN_RE.search(candidate)
+                    and (
+                        _WINDOWS_PATH_TOKEN_RE.search(candidate)
+                        or is_quoted_relative_windows_path
+                    )
                 ):
                     decoded = candidate
         if decoded is None:
