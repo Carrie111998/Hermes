@@ -482,6 +482,27 @@ def _non_conversational_metadata(
     return merged
 
 
+def _interim_metadata(
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Mark a mid-turn status/advisory send as NOT the turn-final.
+
+    Stream-is-the-message adapters (relay Slack native streaming) intercept
+    the first unmarked send to an armed (chat, turn) key and seal the live
+    stream with its content. Every gateway-side send that can fire while a
+    turn is streaming — heartbeats, inactivity warnings, approval fallbacks,
+    background-review notices — MUST carry this marker or it will seal the
+    user's answer stream with status text (PR 85796 review, B5: probed live,
+    the 3-minute heartbeat sealed the stream and the real final arrived as
+    a duplicate while later frames were silently swallowed by the seal
+    tombstone). The marker is gateway-internal; adapters strip it before
+    the wire.
+    """
+    merged = dict(metadata or {})
+    merged["_interim_send"] = True
+    return merged
+
+
 def _seed_hygiene_system_prompt(
     agent: Any,
     session_row: Optional[Dict[str, Any]],
@@ -5419,7 +5440,7 @@ class TurnRunner:
                 ctx._status_adapter.send(
                     ctx._status_chat_id,
                     message,
-                    metadata=_non_conversational_metadata(ctx._status_thread_metadata, platform=ctx.source.platform),
+                    metadata=_interim_metadata(_non_conversational_metadata(ctx._status_thread_metadata, platform=ctx.source.platform)),
                 ),
                 ctx._loop_for_step,
                 logger=logger,
@@ -5725,7 +5746,7 @@ class TurnRunner:
                     ctx._status_adapter.send(
                         ctx._status_chat_id,
                         msg,
-                        metadata=ctx._status_thread_metadata,
+                        metadata=_interim_metadata(ctx._status_thread_metadata),
                     ),
                     ctx._loop_for_step,
                     logger=logger,
@@ -27004,7 +27025,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _notify_res = await _notify_adapter.send(
                             source.chat_id,
                             _heartbeat_text,
-                            metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
+                            metadata=_interim_metadata(_non_conversational_metadata(_status_thread_metadata, platform=source.platform)),
                         )
                         if getattr(_notify_res, "success", False) and getattr(
                             _notify_res, "message_id", None
@@ -27235,7 +27256,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     f"If the agent does not respond soon, it will "
                                     f"be timed out in {_remaining_mins} min. "
                                     f"You can continue waiting or use /reset.",
-                                    metadata=_status_thread_metadata,
+                                    metadata=_interim_metadata(_status_thread_metadata),
                                 )
                             except Exception as _warn_err:
                                 logger.debug("Inactivity warning send error: %s", _warn_err)
