@@ -691,6 +691,26 @@ class TestHealthEndpoint:
             assert isinstance(data["version"], str)
             assert data["version"] != ""
 
+    @pytest.mark.asyncio
+    async def test_health_requires_bearer_when_key_configured(self, auth_adapter):
+        """When API_SERVER_KEY is set, GET /health matches other API routes."""
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            unauth = await cli.get("/health")
+            assert unauth.status == 401
+            body = await unauth.json()
+            assert body["error"]["code"] == "gateway_auth_failed"
+
+            auth = await cli.get("/health", headers={"Authorization": "Bearer sk-secret"})
+            assert auth.status == 200
+            data = await auth.json()
+            assert data["status"] == "ok"
+            assert isinstance(data.get("version"), str) and data["version"] != ""
+
+            v1 = await cli.get("/v1/health", headers={"Authorization": "Bearer sk-secret"})
+            assert v1.status == 200
+
+
 
 # ---------------------------------------------------------------------------
 # /health/detailed endpoint
