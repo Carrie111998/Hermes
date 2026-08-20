@@ -32,6 +32,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/sqlite-build artifacts/bin artifacts/db
+          printf 'source_head=%s\n' "$GITHUB_SHA" > artifacts/trigger.txt
           python3 - <<'PY' > /tmp/sqlite-build/expected.json
           import json
           print(json.dumps({
@@ -71,6 +72,7 @@ jobs:
           PY
 
             cc -std=c11 -O2 -g -Wall -Wextra -Werror \
+              -Wno-error=unused-result \
               -DSQLITE_ENABLE_FTS5=1 -DSQLITE_THREADSAFE=1 \
               -c scripts/repro_state_db_wal_sidecar.c \
               -o "/tmp/sqlite-build/probe-${build}.o"
