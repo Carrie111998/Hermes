@@ -48,8 +48,8 @@ def _git(cwd: Path, *args: str) -> None:
     )
 
 
-def _make_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / "repo"
+def _make_repo(tmp_path: Path, name: str = "repo") -> Path:
+    repo = tmp_path / name
     repo.mkdir()
     subprocess.run(
         ["git", "init", "-b", "main", str(repo)],
@@ -95,6 +95,87 @@ def test_resolve_linked_repo_root_anchor_materializes_task_worktree(
         check=True,
     ).stdout.strip()
     assert head == branch
+
+
+def test_linked_anchor_inside_source_repo_stays_nested_under_anchor(
+    kanban_home, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    linked_root = _add_worktree(repo, repo / "canonical", "anchor/main")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="nested linked anchor",
+            workspace_kind="worktree",
+            workspace_path=str(linked_root),
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    workspace, _branch = kb._resolve_worktree_workspace(task)
+    assert workspace == linked_root / ".worktrees" / tid
+    assert kb._git_common_dir(workspace) == kb._git_common_dir(repo)
+
+
+def test_linked_anchor_inside_unrelated_repo_uses_anchor_repository(
+    kanban_home, tmp_path
+):
+    source = _make_repo(tmp_path, "source")
+    unrelated = _make_repo(tmp_path, "unrelated")
+    linked_root = _add_worktree(source, unrelated / "canonical", "anchor/main")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="cross-repo linked anchor",
+            workspace_kind="worktree",
+            workspace_path=str(linked_root),
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    workspace, _branch = kb._resolve_worktree_workspace(task)
+    assert workspace == linked_root / ".worktrees" / tid
+    assert kb._git_common_dir(workspace) == kb._git_common_dir(source)
+    assert kb._git_common_dir(workspace) != kb._git_common_dir(unrelated)
+
+
+def test_linked_repo_root_matching_branch_is_never_reused(kanban_home, tmp_path):
+    repo = _make_repo(tmp_path)
+    linked_root = _add_worktree(repo, tmp_path / "linked-root", "anchor/main")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="matching linked anchor",
+            workspace_kind="worktree",
+            workspace_path=str(linked_root),
+            branch_name="anchor/main",
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    with pytest.raises(RuntimeError):
+        kb._resolve_worktree_workspace(task)
+    assert linked_root.is_dir()
+    assert not (linked_root / ".worktrees" / tid).exists()
+
+
+def test_existing_task_target_on_wrong_branch_fails_closed(kanban_home, tmp_path):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "t_existing"
+    _add_worktree(repo, target, "wt/other-task")
+
+    with pytest.raises(RuntimeError, match="branch ownership"):
+        kb._ensure_git_worktree(repo, target, "wt/t_existing")
+    head = subprocess.run(
+        ["git", "-C", str(target), "branch", "--show-current"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert head == "wt/other-task"
 
 
 def test_decompose_worktree_children_get_own_workspace(kanban_home):
