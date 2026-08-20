@@ -6,6 +6,8 @@ handling without requiring a running terminal environment.
 
 import json
 import logging
+import os
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -48,14 +50,20 @@ class TestWriteFileHandler:
     def test_writes_content(self, mock_get):
         mock_ops = MagicMock()
         result_obj = MagicMock()
-        result_obj.to_dict.return_value = {"status": "ok", "path": "/tmp/out.txt", "bytes": 13}
+        # Use a path with a drive letter so it's stable on both platforms;
+        # ``os.path.normpath`` converts forward slashes to backslashes on
+        # Windows so the expected call matches the actual call (the resolve
+        # helper normalizes the path before passing to file_ops).
+        test_path = "C:/tmp/out.txt" if sys.platform == "win32" else "/tmp/out.txt"
+        expected_path = os.path.normpath(test_path)
+        result_obj.to_dict.return_value = {"status": "ok", "path": expected_path, "bytes": 13}
         mock_ops.write_file.return_value = result_obj
         mock_get.return_value = mock_ops
 
         from tools.file_tools import write_file_tool
-        result = json.loads(write_file_tool("/tmp/out.txt", "hello world!\n"))
+        result = json.loads(write_file_tool(test_path, "hello world!\n"))
         assert result["status"] == "ok"
-        mock_ops.write_file.assert_called_once_with("/tmp/out.txt", "hello world!\n")
+        mock_ops.write_file.assert_called_once_with(expected_path, "hello world!\n")
 
     @patch("tools.file_tools._get_file_ops")
     def test_permission_error_returns_error_json_without_error_log(self, mock_get, caplog):
@@ -169,13 +177,17 @@ class TestPatchHandler:
         mock_ops.patch_replace.return_value = result_obj
         mock_get.return_value = mock_ops
 
+        # Use a path with a drive letter on Windows so it survives ntpath.normpath.
+        test_path = "C:/tmp/f.py" if sys.platform == "win32" else "/tmp/f.py"
+        expected_path = os.path.normpath(test_path)
+
         from tools.file_tools import patch_tool
         result = json.loads(patch_tool(
-            mode="replace", path="/tmp/f.py",
+            mode="replace", path=test_path,
             old_string="foo", new_string="bar"
         ))
         assert result["status"] == "ok"
-        mock_ops.patch_replace.assert_called_once_with("/tmp/f.py", "foo", "bar", False)
+        mock_ops.patch_replace.assert_called_once_with(expected_path, "foo", "bar", False)
 
 
     @patch("tools.file_tools._get_file_ops")
@@ -257,9 +269,11 @@ class TestPatchSensitivePathExtraction:
     @patch("tools.file_tools._get_file_ops")
     def test_patch_move_to_sensitive_dst_blocked(self, mock_get):
         from tools.file_tools import patch_tool
+        # Use a path the Windows resolver leaves intact (has a drive letter).
+        work_path = "C:/tmp/work.txt" if sys.platform == "win32" else "/tmp/work.txt"
         patch_text = (
             "*** Begin Patch\n"
-            "*** Move File: /tmp/work.txt -> /etc/crontab\n"
+            f"*** Move File: {work_path} -> /etc/crontab\n"
             "*** End Patch\n"
         )
         result = json.loads(patch_tool(mode="patch", patch=patch_text))

@@ -654,6 +654,15 @@ _SENSITIVE_PATH_PREFIXES = (
     # symlinks), and /private/var/tmp is a normal temp dir.
     "/private/var/db/", "/private/var/root/",
 )
+
+# Windows variants: on Windows, os.path.normpath("/etc/passwd") yields
+# "\\etc\\passwd", which doesn't start with "/etc/". Add the backslash
+# variants so the check still fires after path normalization. The check is
+# a single ``startswith`` scan so the doubled list is cheap.
+if os.sep == "\\":
+    _SENSITIVE_PATH_PREFIXES = _SENSITIVE_PATH_PREFIXES + tuple(
+        p.replace("/", os.sep) for p in _SENSITIVE_PATH_PREFIXES
+    )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
 _hermes_config_resolved: str | None = None
