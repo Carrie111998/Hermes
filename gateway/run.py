@@ -13004,6 +13004,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         start_time=getattr(self, "_gateway_started_at", 0.0),
                     )
                 )
+                # Permanent process-lifetime loop, not transient work: must not
+                # hold the scale-to-zero busy check open (same tag as
+                # _spawn_supervised; see _scale_to_zero_has_live_background_work).
+                self._loop_heartbeat_task._hermes_supervised_watcher = True  # type: ignore[attr-defined]
                 _bg = getattr(self, "_background_tasks", None)
                 if _bg is not None:
                     _bg.add(self._loop_heartbeat_task)
@@ -21248,6 +21252,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             task = asyncio.create_task(_poll_loop())
+            # Gateway-wide permanent poll loop (lives until process exit once
+            # any /heartbeat is registered) — tag it out of the scale-to-zero
+            # busy check like every other permanent loop. The heartbeat DUE
+            # check itself still wakes work through the adapter FIFO, which
+            # stamps real inbound and blocks suspend the normal way.
+            task._hermes_supervised_watcher = True  # type: ignore[attr-defined]
             self._heartbeat_poll_task = task
             _bg = getattr(self, "_background_tasks", None)
             if _bg is not None:

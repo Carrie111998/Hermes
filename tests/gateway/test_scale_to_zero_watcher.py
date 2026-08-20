@@ -370,3 +370,54 @@ async def test_done_supervised_watcher_is_ignored_either_way():
     await t
     r._background_tasks = {t}
     assert r._scale_to_zero_has_live_background_work() is False
+
+
+# ── OTHER permanent loops must carry the supervised tag too (staging E2E bug) ──
+#
+# The first staging E2E after the watcher-exclusion fix STILL never went
+# dormant: the loop-liveness heartbeat task (started in run(), not via
+# _spawn_supervised) sits untagged in _background_tasks for the whole process
+# life, holding the busy check True forever. Same class: any PERMANENT loop
+# parked in _background_tasks must carry _hermes_supervised_watcher. The
+# heartbeat POLLER (started on /heartbeat use) is the same shape.
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_poller_does_not_block_idle():
+    """_start_heartbeat_poller is a real call site that parks a permanent loop
+    in _background_tasks — it must tag it out of the busy check."""
+    r = GatewayRunner.__new__(GatewayRunner)
+    r._running = True
+    r._background_tasks = set()
+    r._heartbeat_watch = {}
+    r._running_agents = {}
+
+    r._start_heartbeat_poller()
+    await asyncio.sleep(0)
+    try:
+        assert r._heartbeat_poll_task is not None
+        assert r._heartbeat_poll_task in r._background_tasks
+        assert r._scale_to_zero_has_live_background_work() is False
+    finally:
+        r._heartbeat_poll_task.cancel()
+        await asyncio.gather(r._heartbeat_poll_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_loop_heartbeat_shape_is_excluded_when_tagged():
+    """The run()-started loop-liveness heartbeat is tagged at its call site;
+    a tagged forever-running task must be excluded from the busy check."""
+    r = GatewayRunner.__new__(GatewayRunner)
+    r._running = True
+
+    async def _forever():
+        await asyncio.sleep(3600)
+
+    tagged = asyncio.create_task(_forever())
+    tagged._hermes_supervised_watcher = True
+    r._background_tasks = {tagged}
+    try:
+        assert r._scale_to_zero_has_live_background_work() is False
+    finally:
+        tagged.cancel()
+        await asyncio.gather(tagged, return_exceptions=True)
