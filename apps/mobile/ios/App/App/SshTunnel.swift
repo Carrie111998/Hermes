@@ -299,7 +299,7 @@ actor SshTunnel {
         if let pid {
             processCheck = "if (tr '\\0' ' ' < /proc/\(pid)/cmdline 2>/dev/null || ps -o command= -p \(pid) 2>/dev/null) | grep -F -- \(shellQuote("hermes serve")) >/dev/null && (tr '\\0' ' ' < /proc/\(pid)/cmdline 2>/dev/null || ps -o command= -p \(pid) 2>/dev/null) | grep -F -- \(shellQuote("--ssh-owner-nonce \(identity.nonce)")) >/dev/null; then kill \(pid) 2>/dev/null || true; fi"
         } else {
-            processCheck = "self=$$; parent=$PPID; for candidate in $(ps -eo pid=); do [ \"$candidate\" = \"$self\" ] || [ \"$candidate\" = \"$parent\" ] && continue; commandLine=$(tr '\\0' ' ' < /proc/$candidate/cmdline 2>/dev/null || true); case \"$commandLine\" in *'hermes serve'*'--ssh-owner-nonce \(identity.nonce)'*) kill \"$candidate\" 2>/dev/null || true;; esac; done"
+            processCheck = "self=$$; parent=$PPID; processList=$(ps -eo pid=,command= 2>/dev/null || true); if [ -n \"$processList\" ]; then printf '%s\\n' \"$processList\" | while read -r candidate commandLine; do [ \"$candidate\" = \"$self\" ] || [ \"$candidate\" = \"$parent\" ] && continue; case \"$commandLine\" in *'hermes serve'*'--ssh-owner-nonce \(identity.nonce)'*) kill \"$candidate\" 2>/dev/null || true;; esac; done; else for candidate in /proc/[0-9]*; do candidate=\"${candidate##*/}\"; [ \"$candidate\" = \"$self\" ] || [ \"$candidate\" = \"$parent\" ] && continue; commandLine=$(tr '\\0' ' ' < /proc/$candidate/cmdline 2>/dev/null || true); case \"$commandLine\" in *'hermes serve'*'--ssh-owner-nonce \(identity.nonce)'*) kill \"$candidate\" 2>/dev/null || true;; esac; done; fi"
         }
         let command = "\(processCheck); rm -f \(tokenPath) \(logPath)"
         _ = try? await sshClient.executeCommand(command)
