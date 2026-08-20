@@ -2,7 +2,8 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { test } from 'vitest'
+
+const { test } = process.env.VITEST ? await import('vitest') : await import('node:test')
 
 import {
   GET_WINDOWS_MISSING_ROOT_MARKER,
