@@ -128,6 +128,23 @@ _PENDING_EVENT_TYPES = frozenset(
         EventType.DEVFLOW_APPROVAL_REQUESTED,
         EventType.DEVFLOW_PR_REVIEW_REQUESTED,
         EventType.TRACKER_PARTIAL_BACKLOG,
+        # Good news that still needs a human. These were the last ACT-class
+        # types with no verdict, and they are the same shape as the seven
+        # above: ACT because Diego must DO something, not because anything
+        # broke. PENDING says "awaiting you", which is the honest reading --
+        # SUCCEEDED would claim an outcome that has not happened yet (an
+        # interview is offered, not won) and any failure state would be
+        # plainly wrong. Third instance of the same sibling asymmetry that
+        # left DEVFLOW_DEPLOY_FAILED and BACKEND_CONTRACT_DRIFT unclassified.
+        #
+        # NOTE this changes the LABEL only: marker_for_verdict renders PENDING
+        # and UNKNOWN with the same amber dot, so the header goes from
+        # "UNKNOWN INTERVIEW SIGNAL" to "PENDING INTERVIEW SIGNAL" and the
+        # colour is unchanged. PENDING also carries priority_floor=None, so
+        # routing, priority and escalation are untouched.
+        EventType.INTERVIEW_SIGNAL,
+        EventType.OFFER_SIGNAL,
+        EventType.FOLLOWUP_DUE,
     }
 )
 

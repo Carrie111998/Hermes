@@ -66,13 +66,13 @@ _VERDICT_EXEMPT = {
     EventType.WATCHDOG_PROBE_TRANSITION: "bidirectional: payload.after",
     EventType.WATCHDOG_BURST: "bidirectional: payload.transitions list",
     EventType.MODEL_RATE_LIMITED: "bidirectional: outcome=='recovered'",
-    # (b) NOT FAILURES -- good news that needs a human, or a governance flag.
-    # These are ACT/WARN because they need attention, not because anything
-    # broke. Giving them a failure verdict would be wrong; whether they should
-    # carry some OTHER label is an open product decision (2026-08-20).
-    EventType.INTERVIEW_SIGNAL: "good news needing action; labelling undecided",
-    EventType.OFFER_SIGNAL: "good news needing action; labelling undecided",
-    EventType.FOLLOWUP_DUE: "a reminder, not a failure; labelling undecided",
+    # (b) NOT A FAILURE and not awaiting anyone -- a WARN-class governance
+    # flag on a merge that already happened with no human gate. Nothing is
+    # pending and nothing broke, so every existing state would misdescribe it.
+    # The good-news ACT trio (interview_signal, offer_signal, followup_due)
+    # USED to sit here "labelling undecided"; they are now PENDING alongside
+    # their seven ACT siblings, and test_no_stale_verdict_exemptions is what
+    # forced this list to be updated when they were classified.
     EventType.DEVFLOW_AUTO_MERGED: "governance flag on an ungated merge, not a failure",
 }
 
@@ -83,6 +83,51 @@ _PAYLOAD_DRIVEN_CASES = {
     EventType.WATCHDOG_BURST: {"transitions": [{"after": "healthy", "tier": "critical"}]},
     EventType.MODEL_RATE_LIMITED: {"outcome": "chain_exhausted"},
 }
+
+
+# The ACT contract: an event that needs a human says so. Every ACT-class type
+# is PENDING unless something actually broke (credential_loss and
+# secret_detected are FAILED). The trio below were the last ACT types with no
+# verdict at all, rendering "UNKNOWN INTERVIEW SIGNAL" on the phone.
+_GOOD_NEWS_ACT = [
+    EventType.INTERVIEW_SIGNAL,
+    EventType.OFFER_SIGNAL,
+    EventType.FOLLOWUP_DUE,
+]
+
+
+@pytest.mark.parametrize("et", _GOOD_NEWS_ACT)
+def test_good_news_act_types_are_pending_not_unknown(et):
+    """PENDING is the honest reading: awaiting Diego. SUCCEEDED would claim an
+    outcome that has not happened (an interview is offered, not won), and any
+    failure state would be plainly wrong."""
+    verdict = evaluate_outcome(make_event(et))
+
+    assert verdict.state is OutcomeState.PENDING
+
+
+@pytest.mark.parametrize("et", _GOOD_NEWS_ACT)
+def test_labelling_the_trio_did_not_move_priority_or_escalation(et):
+    """PENDING carries priority_floor=None, so this was a LABEL change only.
+    If a future edit gives PENDING a floor, ACT routing shifts underneath
+    these three and this fails."""
+    route = classify(make_event(et))
+
+    assert evaluate_outcome(make_event(et)).priority_floor is None
+    assert route.wa_tier in (WA_IMMEDIATE, WA_URGENT)
+
+
+def test_every_act_type_states_whether_it_needs_a_human():
+    """The contract as one assertion over the enum: no ACT-class type may be
+    UNKNOWN. ACT means a human must act, which is not something the system is
+    allowed to be unsure about."""
+    unknown = sorted(
+        et.type_string for et in EventType
+        if classify(make_event(et)).attention is Attention.ACT
+        and evaluate_outcome(make_event(et)).state is OutcomeState.UNKNOWN
+    )
+
+    assert unknown == [], f"ACT-class types with no verdict: {unknown}"
 
 
 @pytest.mark.parametrize("et", list(EventType))
