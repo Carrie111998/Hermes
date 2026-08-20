@@ -287,7 +287,7 @@ async def test_lobby_marks_failed_when_target_processing_task_does_not_start(tmp
     source_adapter = FakeAdapter()
     target_adapter = FakeAdapter(thread_id="777")
     target_adapter._session_tasks = {}
-    target_adapter._batch_session_key_for_event = lambda _event: "target-session"
+    target_adapter._text_batch_key = lambda _event: "target-session"
     runner = Harness()
     runner.config = SimpleNamespace(smart_lobby=_raw_config())
     runner.adapters = {Platform.DISCORD: source_adapter}

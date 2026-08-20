@@ -529,7 +529,7 @@ class GatewaySmartLobbyMixin:
             )
         except Exception:
             logger.debug("Smart lobby prompt mirror failed", exc_info=True)
-        session_key_fn = getattr(target_adapter, "_batch_session_key_for_event", None)
+        session_key_fn = getattr(target_adapter, "_text_batch_key", None)
         target_session_key = (
             session_key_fn(routed_event) if callable(session_key_fn) else None
         )
