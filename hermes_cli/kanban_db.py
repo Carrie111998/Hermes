@@ -4330,6 +4330,7 @@ def _end_run(
     error: Optional[str] = None,
     metadata: Optional[dict] = None,
     status: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
 ) -> Optional[int]:
     """Close the currently-active run for ``task_id`` and clear the pointer.
 
@@ -4347,7 +4348,9 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
-    conn.execute(
+    if expected_run_id is not None and run_id != int(expected_run_id):
+        return None
+    cur = conn.execute(
         """
         UPDATE task_runs
            SET status        = ?,
@@ -4360,6 +4363,7 @@ def _end_run(
                claim_expires = NULL,
                worker_pid    = NULL
          WHERE id = ?
+           AND task_id = ?
            AND ended_at IS NULL
         """,
         (
@@ -4370,11 +4374,18 @@ def _end_run(
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
             now,
             run_id,
+            task_id,
         ),
     )
-    conn.execute(
-        "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
+    if cur.rowcount != 1:
+        raise sqlite3.IntegrityError("active run could not be closed exactly once")
+    pointer = conn.execute(
+        "UPDATE tasks SET current_run_id = NULL "
+        "WHERE id = ? AND current_run_id = ?",
+        (task_id, run_id),
     )
+    if pointer.rowcount != 1:
+        raise sqlite3.IntegrityError("active run pointer changed during terminalization")
     return run_id
 
 
@@ -5493,7 +5504,10 @@ def complete_task(
             outcome="completed", status="done",
             summary=summary if summary is not None else result,
             metadata=metadata,
+            expected_run_id=expected_run_id,
         )
+        if expected_run_id is not None and run_id != int(expected_run_id):
+            raise sqlite3.IntegrityError("expected run was not terminalized")
         # If complete_task was called on a never-claimed task (ready or
         # blocked → done with no run in flight), synthesize a
         # zero-duration run so the handoff fields are persisted in
@@ -6328,7 +6342,10 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                expected_run_id=expected_run_id,
             )
+            if expected_run_id is not None and run_id != int(expected_run_id):
+                raise sqlite3.IntegrityError("expected run was not terminalized")
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
@@ -6386,7 +6403,10 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                expected_run_id=expected_run_id,
             )
+            if expected_run_id is not None and run_id != int(expected_run_id):
+                raise sqlite3.IntegrityError("expected run was not terminalized")
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
@@ -6440,7 +6460,10 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                expected_run_id=expected_run_id,
             )
+            if expected_run_id is not None and run_id != int(expected_run_id):
+                raise sqlite3.IntegrityError("expected run was not terminalized")
             # Synthesize a run when blocking a never-claimed task so the
             # reason is preserved in attempt history.
             if run_id is None and reason:
@@ -6624,7 +6647,10 @@ def request_review(
             status="review",
             summary=summary,
             metadata=metadata,
+            expected_run_id=expected_run_id,
         )
+        if expected_run_id is not None and run_id != int(expected_run_id):
+            raise sqlite3.IntegrityError("expected run was not terminalized")
         if run_id is None and (summary or metadata):
             run_id = _synthesize_ended_run(
                 conn,
@@ -6752,7 +6778,10 @@ def request_changes(
             outcome="changes_requested",
             status=new_status,
             summary=reason,
+            expected_run_id=expected_run_id,
         )
+        if expected_run_id is not None and run_id != int(expected_run_id):
+            raise sqlite3.IntegrityError("expected run was not terminalized")
         _append_event(
             conn,
             task_id,
@@ -7946,7 +7975,10 @@ def schedule_task(
             conn, task_id,
             outcome="scheduled", status="scheduled",
             summary=reason,
+            expected_run_id=expected_run_id,
         )
+        if expected_run_id is not None and run_id != int(expected_run_id):
+            raise sqlite3.IntegrityError("expected run was not terminalized")
         if run_id is None and reason:
             run_id = _synthesize_ended_run(
                 conn, task_id,
