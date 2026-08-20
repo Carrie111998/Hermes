@@ -139,7 +139,9 @@ jobs:
         run: |
           set -euo pipefail
           npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+          npm update nanoid --package-lock-only --ignore-scripts --no-audit --no-fund --workspaces --include-workspace-root
           npm --prefix website install --package-lock-only --ignore-scripts --no-audit --no-fund
+          npm --prefix website update nanoid --package-lock-only --ignore-scripts --no-audit --no-fund
           uv lock --upgrade-package h2
 
       - name: Install exact Node graphs
