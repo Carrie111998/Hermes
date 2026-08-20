@@ -38,10 +38,18 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+)
 from urllib.parse import parse_qs, urlencode, urlparse
-
-import httpx
 
 from hermes_cli.config import (
     get_hermes_home,
@@ -55,6 +63,68 @@ from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_replace, env_float, is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Lazy httpx
+# ---------------------------------------------------------------------------
+#
+# This module used to carry ``import httpx`` at module scope. It is imported on
+# a path that makes no HTTP request at all: ``gateway.config.load_gateway_config()``
+# does ``from hermes_cli.auth import has_usable_secret``, and every ``hermes send``
+# to a real platform calls that. ``import httpx`` costs 256 modules on this box --
+# httpx 0.28.1's ``__init__`` runs ``from ._main import main``, which pulls in
+# click, rich, pygments and attrs -- so a Telegram notification paid for an OAuth
+# HTTP client and a terminal-rendering stack it could never use.
+#
+# All 38 ``httpx`` references in this file sit inside functions, none at module
+# scope. Sixteen of them touch it at RUNTIME and now open with
+# ``httpx = _ensure_httpx()``, leaving their call sites unchanged. The other
+# seven only name it in a ``client: httpx.Client`` parameter annotation -- their
+# caller builds the client -- and are covered by the TYPE_CHECKING import above,
+# which costs nothing at runtime because of ``from __future__ import annotations``.
+#
+# WHY THROUGH THE MODULE GLOBAL rather than a plain ``import httpx`` inside each
+# function: eight tests in tests/hermes_cli/test_auth_qwen_provider.py use
+# ``patch("hermes_cli.auth.httpx")``, which swaps the whole module ATTRIBUTE for a
+# MagicMock. A function-local import would fetch the real httpx and silently
+# ignore that patch, turning a mocked test into a live network call. Reading the
+# global honours it. Eight further references patch through the attribute
+# (``patch("hermes_cli.auth.httpx.Client")``); ``__getattr__`` below serves those
+# by importing the real module and caching it here, so they patch exactly the
+# object they always did.
+#
+# Regression test: tests/hermes_cli/test_auth_import_cost.py
+
+
+def _ensure_httpx():
+    """Return the module-global ``httpx``, importing it on first use.
+
+    Reads ``globals()`` rather than importing directly, so a test that has
+    replaced ``hermes_cli.auth.httpx`` wholesale gets its replacement back.
+    """
+    module = globals().get("httpx")
+    if module is None:
+        import httpx as module
+
+        globals()["httpx"] = module
+    return module
+
+
+def __getattr__(name: str):
+    """Resolve ``hermes_cli.auth.httpx`` on first attribute access (PEP 562).
+
+    Keeps the module attribute that ``import httpx`` used to provide, without
+    paying for it at import time. Callers -- and ``patch("hermes_cli.auth.httpx
+    .Client")`` -- get the same global module object they always did.
+    """
+    if name == "httpx":
+        return _ensure_httpx()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only, never imported at runtime
+    import httpx
 
 try:
     import fcntl
@@ -647,6 +717,8 @@ def detect_zai_endpoint(api_key: str, timeout: float = 8.0) -> Optional[Dict[str
     first working endpoint, or None if all fail.  For endpoints with multiple
     candidate models, tries each in order and returns the first that succeeds.
     """
+    httpx = _ensure_httpx()
+
     for ep_id, base_url, probe_models, label in ZAI_ENDPOINTS:
         for model in probe_models:
             try:
@@ -2380,6 +2452,8 @@ def _qwen_access_token_is_expiring(expiry_date_ms: Any, skew_seconds: int = QWEN
 
 
 def _refresh_qwen_cli_tokens(tokens: Dict[str, Any], timeout_seconds: float = 20.0) -> Dict[str, Any]:
+    httpx = _ensure_httpx()
+
     refresh_token = str(tokens.get("refresh_token", "") or "").strip()
     if not refresh_token:
         raise AuthError(
@@ -2805,6 +2879,8 @@ def _spotify_exchange_code_for_tokens(
     accounts_base_url: str,
     timeout_seconds: float = 20.0,
 ) -> Dict[str, Any]:
+    httpx = _ensure_httpx()
+
     try:
         response = httpx.post(
             f"{accounts_base_url}/api/token",
@@ -2848,6 +2924,8 @@ def _refresh_spotify_oauth_state(
     *,
     timeout_seconds: float = 20.0,
 ) -> Dict[str, Any]:
+    httpx = _ensure_httpx()
+
     refresh_token = str(state.get("refresh_token", "") or "").strip()
     if not refresh_token:
         raise AuthError(
@@ -3594,6 +3672,8 @@ def refresh_codex_oauth_pure(
     timeout_seconds: float = 20.0,
 ) -> Dict[str, Any]:
     """Refresh Codex OAuth tokens without mutating Hermes auth state."""
+    httpx = _ensure_httpx()
+
     del access_token  # Access token is only used by callers to decide whether to refresh.
     if not isinstance(refresh_token, str) or not refresh_token.strip():
         raise AuthError(
@@ -4414,6 +4494,8 @@ def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:
 
 
 def _xai_oauth_discovery(timeout_seconds: float = 15.0) -> Dict[str, str]:
+    httpx = _ensure_httpx()
+
     try:
         response = httpx.get(
             XAI_OAUTH_DISCOVERY_URL,
@@ -4469,6 +4551,8 @@ def refresh_xai_oauth_pure(
     token_endpoint: str = "",
     timeout_seconds: float = 20.0,
 ) -> Dict[str, Any]:
+    httpx = _ensure_httpx()
+
     del access_token
     if not isinstance(refresh_token, str) or not refresh_token.strip():
         raise AuthError(
@@ -5408,6 +5492,8 @@ def fetch_nous_models(
     verify: bool | str = True,
 ) -> List[str]:
     """Fetch available model IDs from the Nous inference API."""
+    httpx = _ensure_httpx()
+
     timeout = httpx.Timeout(timeout_seconds)
     with httpx.Client(timeout=timeout, headers={"Accept": "application/json"}, verify=verify) as client:
         response = client.get(
@@ -5477,6 +5563,8 @@ def resolve_nous_access_token(
     refresh_skew_seconds: int = ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
 ) -> str:
     """Resolve a refresh-aware Nous Portal access token for managed tool gateways."""
+    httpx = _ensure_httpx()
+
     with _provider_state_transaction("nous") as (
         auth_store,
         state,
@@ -5617,6 +5705,8 @@ def refresh_nous_oauth_pure(
     Callers that own persistent state can use it to save the newly rotated
     refresh token before later validation can fail.
     """
+    httpx = _ensure_httpx()
+
     state: Dict[str, Any] = {
         "access_token": access_token,
         "refresh_token": refresh_token,
@@ -5809,6 +5899,8 @@ def resolve_nous_runtime_credentials(
     Returns dict with: provider, base_url, api_key, key_id, expires_at,
     expires_in, source ("invoke_jwt"), and auth_path.
     """
+    httpx = _ensure_httpx()
+
     sequence_id = uuid.uuid4().hex[:12]
 
     with _provider_state_transaction("nous") as (
@@ -7426,6 +7518,8 @@ def _xai_oauth_device_code_login(
     timeout_seconds: float = 20.0,
     open_browser: bool = True,
 ) -> Dict[str, Any]:
+    httpx = _ensure_httpx()
+
     discovery = _xai_oauth_discovery(timeout_seconds)
     token_endpoint = discovery["token_endpoint"]
     timeout = httpx.Timeout(max(20.0, timeout_seconds))
@@ -7493,6 +7587,8 @@ def _xai_oauth_device_code_login(
 
 def _codex_device_code_login() -> Dict[str, Any]:
     """Run the OpenAI device code login flow and return credentials dict."""
+    httpx = _ensure_httpx()
+
     import time as _time
 
     issuer = "https://auth.openai.com"
@@ -7833,6 +7929,8 @@ def _minimax_oauth_login(
     timeout_seconds: float = 15.0,
 ) -> Dict[str, Any]:
     """Run MiniMax OAuth flow, persist tokens, return auth state dict."""
+    httpx = _ensure_httpx()
+
     pconfig = PROVIDER_REGISTRY["minimax-oauth"]
     if region == "cn":
         portal_base_url = pconfig.extra["cn_portal_base_url"]
@@ -7916,6 +8014,8 @@ def _refresh_minimax_oauth_state(
     force: bool = False,
 ) -> Dict[str, Any]:
     """Refresh MiniMax OAuth access token if close to expiry (or forced)."""
+    httpx = _ensure_httpx()
+
     if not state.get("refresh_token"):
         raise AuthError(
             "MiniMax OAuth state has no refresh_token; please re-login.",
@@ -8135,6 +8235,8 @@ def _nous_device_code_login(
     on_verification: Optional[Callable[[str, str], None]] = None,
 ) -> Dict[str, Any]:
     """Run the Nous device-code flow and return full OAuth state without persisting."""
+    httpx = _ensure_httpx()
+
     pconfig = PROVIDER_REGISTRY["nous"]
     portal_base_url = (
         portal_base_url

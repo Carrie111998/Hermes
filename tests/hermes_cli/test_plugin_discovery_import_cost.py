@@ -37,6 +37,11 @@ nothing. Import each candidate ALONE in a fresh interpreter instead.
 The AST scan below is the durable half: it fails for a NEW backend plugin that
 re-introduces a module-scope client import, which no measurement of today's
 tree can do.
+
+Sequel: ``hermes_cli/auth.py`` carried the same defect and was fixed the next
+day (tests/hermes_cli/test_auth_import_cost.py). That is what let the discovery
+guard at the bottom tighten from requests-only to every HTTP client, and what
+retired the spotify tripwire.
 """
 
 from __future__ import annotations
@@ -77,17 +82,13 @@ FIXED_PLUGIN_MODULES = [
 # when the upstream import is fixed this file goes red and tells the next
 # person to move the entry into the clean set.
 #
-# ``plugins.spotify.client`` imports ``hermes_cli.auth`` for its OAuth token
-# handling, and ``hermes_cli/auth.py`` line 44 is a module-scope ``import
-# httpx``. Same defect class, different owner: 23 call sites across an
-# 8,500-line credential module, and 46 tests patch ``hermes_cli.auth.httpx`` --
-# several with ``patch("hermes_cli.auth.httpx")``, which replaces the whole
-# module attribute and therefore cannot be satisfied by a function-local
-# import the way the plugin fixes were. Deferring it needs a lazy module proxy
-# in a credential path, which is a deliberately separate decision.
-TRANSITIVE_CLIENT_VIA_HERMES_CLI_AUTH = {
-    "plugins.spotify.client": "hermes_cli.auth",
-}
+# EMPTY as of 2026-08-20, and that is the tripwire working. It held
+# ``plugins.spotify.client``, which imports ``hermes_cli.auth`` for its OAuth
+# token handling while ``hermes_cli/auth.py`` carried a module-scope ``import
+# httpx``. That import is now lazy -- see tests/hermes_cli/test_auth_import_cost.py
+# -- so this test went red naming the fix, and spotify moved into the real
+# assertion below. Leave the mechanism here for the next transitive case.
+TRANSITIVE_CLIENT_VIA_HERMES_CLI_AUTH: dict[str, str] = {}
 
 
 def _child_env() -> dict:
@@ -255,21 +256,23 @@ def test_lazy_client_attribute_still_resolves(module, client):
 
 
 @pytest.mark.timeout(900)
-def test_plugin_discovery_does_not_import_requests():
-    """``discover_plugins()`` must not pull the requests stack.
+def test_plugin_discovery_does_not_import_an_http_client():
+    """``discover_plugins()`` must not pull an HTTP client at all.
 
-    Only ``requests`` and ``urllib3`` are asserted here, not ``httpx``:
-    ``load_gateway_config()`` also imports ``hermes_cli.auth``, which still
-    carries a module-scope ``import httpx`` of its own. That is a separate
-    (larger) defect on the same path -- 23 call sites in an 8,500-line module --
-    and forbidding httpx here would assert something this change did not fix.
-    The per-module tests above cover the httpx half of the plugin side.
+    ``httpx`` and ``rich`` joined this list on 2026-08-20, once
+    ``hermes_cli/auth.py`` stopped importing httpx at module scope --
+    ``load_gateway_config()`` imports that module for ``has_usable_secret``, so
+    until then httpx arrived here no matter what the plugins did. ``rich`` is
+    named separately because it is the visible symptom: httpx 0.28.1's
+    ``__init__`` runs ``from ._main import main``, which pulls click, rich,
+    pygments and attrs.
     """
     proc = _run(
         "import sys\n"
         "from hermes_cli.plugins import discover_plugins\n"
         "discover_plugins()\n"
-        "bad = sorted(m for m in ('requests', 'urllib3') if m in sys.modules)\n"
+        "watch = ('requests', 'urllib3', 'httpx', 'rich')\n"
+        "bad = sorted(m for m in watch if m in sys.modules)\n"
         "print('OFFENDERS=[' + ','.join(bad) + ']')\n"
     )
     assert proc.returncode == 0, (
@@ -277,6 +280,8 @@ def test_plugin_discovery_does_not_import_requests():
         f"stderr tail:\n{proc.stderr[-3000:]}"
     )
     assert "OFFENDERS=[]" in proc.stdout, (
-        f"discover_plugins() imported the requests stack: {proc.stdout.strip()}\n"
-        "A bundled backend plugin is importing it at module scope again."
+        f"discover_plugins() imported an HTTP client: {proc.stdout.strip()}\n"
+        "Either a bundled backend plugin is importing one at module scope "
+        "again, or something discovery reaches -- hermes_cli.auth is the one "
+        "with history -- has re-added a module-scope import."
     )
