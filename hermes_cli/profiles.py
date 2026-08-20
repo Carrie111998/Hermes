@@ -512,6 +512,62 @@ def remove_wrapper_script(name: str) -> bool:
     return False
 
 
+def _seed_memory_provider_from_default(profile_dir: Path) -> None:
+    """Activate the default profile's holographic provider on a fresh profile.
+
+    Fresh profiles ship with no ``config.yaml``, so they fall through to
+    ``DEFAULT_CONFIG``'s empty ``memory.provider`` even when the default
+    profile has holographic enabled. Bots *are* profiles — without this,
+    every New Agent starts with built-in MEMORY.md only.
+
+    Copies provider *activation* and holographic plugin knobs only — not
+    ``memory_store.db`` / MEMORY.md, so facts stay isolated per bot.
+    No-op when the new profile already has a config.yaml (clone) or when
+    the default profile has no holographic provider set. Cloud providers
+    are not inherited: they need per-profile credentials we must not copy.
+    """
+    config_path = profile_dir / "config.yaml"
+    if config_path.exists():
+        return
+    default_config_path = _get_default_hermes_home() / "config.yaml"
+    if not default_config_path.is_file():
+        return
+    try:
+        import yaml
+        raw = yaml.safe_load(default_config_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return
+    if not isinstance(raw, dict):
+        return
+    mem = raw.get("memory")
+    if not isinstance(mem, dict):
+        return
+    provider = str(mem.get("provider") or "").strip()
+    if provider != "holographic":
+        return
+    plugin_cfg: dict = {}
+    plugins = raw.get("plugins")
+    store_cfg = plugins.get("hermes-memory-store") if isinstance(plugins, dict) else None
+    if isinstance(store_cfg, dict):
+        for key in ("auto_extract", "default_trust", "hrr_dim"):
+            if key in store_cfg:
+                plugin_cfg[key] = store_cfg[key]
+    if not plugin_cfg:
+        plugin_cfg = {"auto_extract": True, "default_trust": 0.5, "hrr_dim": 1024}
+    seeded = {
+        "memory": {"provider": "holographic"},
+        "plugins": {"hermes-memory-store": plugin_cfg},
+    }
+    try:
+        config_path.write_text(
+            yaml.safe_dump(seeded, default_flow_style=False, sort_keys=False),
+            encoding="utf-8",
+        )
+        os.chmod(str(config_path), 0o600)
+    except Exception:
+        pass  # best-effort — profile creation must not fail over this
+
+
 def _migrate_profile_config_if_outdated(profile_dir: Path) -> None:
     """Bring a copied profile config.yaml up to the current schema.
 
@@ -1219,6 +1275,13 @@ def create_profile(
             soul_path.write_text(DEFAULT_SOUL_MD, encoding="utf-8")
         except Exception:
             pass  # best-effort — don't fail profile creation over this
+
+    # Fresh profiles have no config.yaml. Inherit holographic activation
+    # from the default profile so new bots get their own memory_store.db
+    # instead of silently falling back to built-in MEMORY.md only.
+    # No-op on clones (config.yaml already exists) and when default has
+    # no holographic provider. Must run before config migration.
+    _seed_memory_provider_from_default(profile_dir)
 
     # Write the opt-out marker so seed_profile_skills() and `hermes update`'s
     # all-profile sync loop both skip this profile for bundled-skill seeding.

@@ -132,8 +132,56 @@ class TestCreateProfile:
         mode = stat.S_IMODE(env_path.stat().st_mode)
         assert mode == 0o600
 
+    def test_fresh_profile_inherits_holographic_from_default(self, profile_env):
+        """New bots/profiles pick up holographic when the default profile has it.
 
+        Activation only — facts stay isolated (no memory_store.db copy).
+        """
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        (default_home / "config.yaml").write_text(
+            "memory:\n"
+            "  provider: holographic\n"
+            "plugins:\n"
+            "  hermes-memory-store:\n"
+            "    auto_extract: true\n"
+            "    default_trust: 0.5\n"
+            "    hrr_dim: 1024\n",
+            encoding="utf-8",
+        )
+        (default_home / "memory_store.db").write_bytes(b"not-copied")
 
+        profile_dir = create_profile("botty", no_alias=True)
+
+        cfg = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8"))
+        assert cfg["memory"]["provider"] == "holographic"
+        store = cfg["plugins"]["hermes-memory-store"]
+        assert store["auto_extract"] is True
+        assert store["default_trust"] == 0.5
+        assert store["hrr_dim"] == 1024
+        assert not (profile_dir / "memory_store.db").exists()
+
+    def test_fresh_profile_does_not_invent_holographic(self, profile_env):
+        """No default provider → fresh profile stays built-in-only (no config.yaml)."""
+        profile_dir = create_profile("plain", no_alias=True)
+        assert not (profile_dir / "config.yaml").exists()
+
+    def test_clone_config_not_overwritten_by_holographic_seed(self, profile_env):
+        """Clone copies the source config; holographic seed must not replace it."""
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        (default_home / "config.yaml").write_text(
+            "model: test\n"
+            "memory:\n"
+            "  provider: holographic\n",
+            encoding="utf-8",
+        )
+
+        profile_dir = create_profile("coder", clone_config=True, no_alias=True)
+
+        cloned_config = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        assert cloned_config["model"] == "test"
+        assert cloned_config["memory"]["provider"] == "holographic"
 
     def test_clone_config_copies_files(self, profile_env):
         tmp_path = profile_env
