@@ -63,4 +63,14 @@ def test_invalid_type_rejected(bad):
 def test_invalid_bitfields_rejected(bad):
     with pytest.raises(PermissionOverwriteError):
         set_channel_permission_request(CHANNEL, OVERWRITE, allow=bad, type_=TYPE_ROLE)
-    with pytest.raises(PermissionOverwriteError"“ ¢6WEö6†ææVÅ÷W&Ö—76–öå÷&WVW7B„4„ääTÂÂõdU%u$•DRÂFVç“Ö&BÂG—UóÕE•Uõ$ôÄR  ¦FVbFW7EöFVÆWFU÷6†R‚“ ¢76W'BFVÆWFUö6†ææVÅ÷W&Ö—76–öå÷&WVW7B„4„ääTÂÂõdU%u$•DR’ÓÒ°¢&ÖWF†öB#¢$DTÄUDR"À¢'F‚#¢b"ö6†ææVÇ2÷´4„ääTÇÒ÷W&Ö—76–öç2÷´õdU%u$•DWÒ"À¢'–ÆöB#¢æöæRÀ¢Ğ
+    with pytest.raises(PermissionOverwriteError):
+        set_channel_permission_request(CHANNEL, OVERWRITE, deny=bad, type_=TYPE_ROLE)
+
+
+def test_delete_request_shape():
+    req = delete_channel_permission_request(CHANNEL, OVERWRITE)
+    assert req == {
+        "method": "DELETE",
+        "path": f"/channels/{CHANNEL}/permissions/{OVERWRITE}",
+        "payload": None,
+    }
