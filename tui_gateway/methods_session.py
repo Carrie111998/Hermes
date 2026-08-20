@@ -174,8 +174,11 @@ def _(rid, params: dict) -> dict:
             # sources (``tool`` sub-agent runs and ``kanban`` dispatcher
             # workers) rather than allow-listing a fixed set of platform names
             # that goes stale whenever a new platform is added or a user names
-            # their own source.
-            deny = frozenset({"kanban", "tool"})
+            # their own source. Profile-specific conversation browsers may
+            # explicitly opt into internal work transcripts; merely listing
+            # them is read-only and does not start an agent inference.
+            include_internal = is_truthy_value(params.get("include_internal", False))
+            deny = frozenset() if include_internal else frozenset({"kanban", "tool"})
 
             limit = int(params.get("limit", 200) or 200)
             # ``include_hidden``: surfaces that OWN hidden sessions (the Bots

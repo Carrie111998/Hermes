@@ -175,9 +175,9 @@ test('hideOwnedBotSessions chains the ownership sweep and survives its absence o
   assert.match(source, /return Promise\.all\(\[known, sweepBotProfileSessions\(\)\.catch\(\(\) => undefined\)\]\)/)
 })
 
-test('the Bots session browser lists with include_hidden', () => {
-  // The one session.list consumer that must see the always-hidden rows.
-  // (Canonical-chat recovery now goes through profiles.list
-  // preferred_session_ids, whose resolver already sees hidden rows.)
-  assert.match(source, /session\.list', \{ profile: botName, limit: PROFILE_SESSION_LIST_LIMIT, include_hidden: true \}/)
+test('the Bots conversation browser includes hidden and internal work transcripts', () => {
+  // This profile-scoped browser is the one session.list consumer that sees both
+  // the always-hidden canonical chat and Kanban/worker transcripts. Inventory
+  // remains read-only until the user explicitly opens a row.
+  assert.match(source, /session\.list', \{ profile: botName, limit: PROFILE_SESSION_LIST_LIMIT, include_hidden: true, include_internal: true \}/)
 })

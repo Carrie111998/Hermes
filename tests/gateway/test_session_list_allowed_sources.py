@@ -28,10 +28,12 @@ class _StubDB:
         return list(self.rows)
 
 
-def _call(limit: int | None = None):
+def _call(limit: int | None = None, *, include_internal: bool = False):
     params: dict = {}
     if limit is not None:
         params["limit"] = limit
+    if include_internal:
+        params["include_internal"] = True
     return server.handle_request({
         "id": "1",
         "method": "session.list",
@@ -67,5 +69,24 @@ def test_session_list_surfaces_all_user_facing_sources(monkeypatch):
 
     # Only internal sub-agent runs stay hidden.
     assert "tool-1" not in ids
+
+
+def test_session_list_can_include_internal_work_conversations(monkeypatch):
+    """Profile conversation browsers may opt into kanban/worker transcripts."""
+    rows = [
+        {"id": "tg-1", "source": "telegram", "started_at": 9},
+        {"id": "kanban-1", "source": "kanban", "started_at": 8},
+        {"id": "tool-1", "source": "tool", "started_at": 7},
+    ]
+    db = _StubDB(rows)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    resp = _call(limit=10, include_internal=True)
+
+    assert [s["id"] for s in resp["result"]["sessions"]] == [
+        "tg-1",
+        "kanban-1",
+        "tool-1",
+    ]
 
 
