@@ -369,6 +369,49 @@ def _editable_install_is_current(git_cmd, cwd, pre_pull_sha: str | None) -> bool
         return False
     return not result.stdout.strip()
 
+def _preserve_local_commits_before_reset(git_cmd, cwd, remote_ref) -> str | None:
+    """Branch off HEAD before ``git reset --hard <remote_ref>`` orphans work.
+
+    The autostash only covers working-tree changes. When the ff-only merge
+    fails, the updater resets to the remote tip, and any local-only COMMITS
+    on the branch (``<remote_ref>..HEAD``) silently leave every ref —
+    recoverable only via the reflog, which expires. Create a
+    ``hermes-update-backup-*`` branch at HEAD so that work survives the
+    reset under a real ref name.
+
+    Returns the backup branch name, or None when HEAD has no local-only
+    commits (the common managed-install case — no branch, no output). The
+    refs are known to resolve at this point (the failed ff-only merge just
+    used both), so a rev-list failure is treated as "nothing to preserve"
+    rather than aborting the update recovery. A branch-creation failure
+    (e.g. a same-second backup name collision, which already points at this
+    same HEAD) warns loudly and also returns None.
+    """
+    ahead = subprocess.run(
+        git_cmd + ["rev-list", f"{remote_ref}..HEAD", "--count"],
+        cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    if ahead.returncode != 0 or not ahead.stdout.strip().isdigit():
+        return None
+    local_count = int(ahead.stdout.strip())
+    if local_count == 0:
+        return None
+
+    from datetime import timezone
+
+    backup = datetime.now(timezone.utc).strftime("hermes-update-backup-%Y%m%d-%H%M%S")
+    created = subprocess.run(
+        git_cmd + ["branch", backup, "HEAD"],
+        cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    if created.returncode != 0:
+        print(
+            f"  ⚠ Could not create a backup branch for {local_count} local "
+            "commit(s) before the reset — they are recoverable via `git reflog`."
+        )
+        return None
+    return backup
+
 def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]:
     """Compile each file in ``_UPDATE_CRITICAL_FILES`` to catch SyntaxErrors.
 
@@ -6717,11 +6760,24 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         sys.exit(1)
                 else:
                     # Same branch as the update target — a true upstream
-                    # force-push/rebase. Local changes are already stashed;
-                    # reset to match the remote exactly (original behaviour).
+                    # force-push/rebase. Local changes are already stashed,
+                    # but that stash does NOT cover local COMMITS: branch off
+                    # HEAD first so they survive the reset under a real ref
+                    # name instead of depending on the expiring reflog.
+                    backup_branch = _preserve_local_commits_before_reset(
+                        git_cmd, _m().PROJECT_ROOT, f"origin/{branch}"
+                    )
                     print(
                         "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
                     )
+                    if backup_branch:
+                        print(
+                            f"  ℹ Local commit(s) preserved on branch '{backup_branch}'"
+                        )
+                        print(
+                            f"    Recover with: git rebase origin/{branch} {backup_branch}"
+                            "  (or cherry-pick from it)"
+                        )
                     reset_result = subprocess.run(
                         git_cmd + ["reset", "--hard", f"origin/{branch}"],
                         cwd=_m().PROJECT_ROOT,
