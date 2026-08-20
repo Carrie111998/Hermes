@@ -37,12 +37,14 @@ from hermes_constants import get_hermes_home
 from typing import Optional, Dict, List, Any, Set, Tuple, Union, Collection
 
 from cron.context import (
+    _AUTHENTICATED_PROVIDER_ADMISSION,
+    _BUILTIN_SCHEDULER_ADMISSION,
+    _RECOVERY_SCHEDULER_ADMISSION,
     OPERATOR_TRIGGERED,
     RECOVERY_CATCHUP,
     SCHEDULED_ON_TIME,
     UNKNOWN,
     classify_scheduled_fire,
-    normalize_invocation_kind,
 )
 
 logger = logging.getLogger(__name__)
@@ -2829,6 +2831,7 @@ def claim_job_for_fire(
     intended_fire_at: Optional[str] = None,
     execution_id: Optional[str] = None,
     return_job: bool = False,
+    _scheduler_admission: Any = None,
 ) -> Union[bool, Dict[str, Any]]:
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
@@ -2841,6 +2844,7 @@ def claim_job_for_fire(
             intended_fire_at=intended_fire_at,
             execution_id=execution_id,
             return_job=return_job,
+            _scheduler_admission=_scheduler_admission,
         )
 
 
@@ -2853,6 +2857,7 @@ def _claim_job_for_fire_locked(
     intended_fire_at: Optional[str] = None,
     execution_id: Optional[str] = None,
     return_job: bool = False,
+    _scheduler_admission: Any = None,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
@@ -2916,25 +2921,35 @@ def _claim_job_for_fire_locked(
             # next builtin tick from laundering an operator action into an
             # on-time scheduled execution.
             trigger_marker = job.get("trigger_marker")
-            requested_kind = normalize_invocation_kind(invocation_kind)
+            authoritative_intended_fire_at = job.get("next_run_at")
             if force or trigger_marker:
                 claimed_kind = OPERATOR_TRIGGERED
-            elif invocation_kind is None:
-                # Direct/manual callers do not possess scheduler attestation.
-                claimed_kind = OPERATOR_TRIGGERED
-            else:
-                claimed_kind = requested_kind
-
-            if claimed_kind in {SCHEDULED_ON_TIME, RECOVERY_CATCHUP}:
-                reclassified = classify_scheduled_fire(
-                    intended_fire_at,
+                claim_intended_fire_at = None
+            elif _scheduler_admission is _AUTHENTICATED_PROVIDER_ADMISSION:
+                claim_intended_fire_at = authoritative_intended_fire_at
+                claimed_kind = classify_scheduled_fire(
+                    claim_intended_fire_at,
+                    now=now,
+                    provider=True,
+                )
+            elif _scheduler_admission is _BUILTIN_SCHEDULER_ADMISSION:
+                claim_intended_fire_at = authoritative_intended_fire_at
+                claimed_kind = classify_scheduled_fire(
+                    claim_intended_fire_at,
                     now=now,
                     provider=False,
                 )
-                if reclassified != claimed_kind:
-                    claimed_kind = reclassified
-            elif claimed_kind == UNKNOWN:
+            elif _scheduler_admission is _RECOVERY_SCHEDULER_ADMISSION:
+                claim_intended_fire_at = authoritative_intended_fire_at
+                claimed_kind = RECOVERY_CATCHUP
+            elif invocation_kind in {None, OPERATOR_TRIGGERED}:
+                # Direct/manual callers do not possess scheduler attestation.
+                claimed_kind = OPERATOR_TRIGGERED
+                claim_intended_fire_at = None
+            else:
+                # A caller-controlled eligible label is never an admission.
                 claimed_kind = UNKNOWN
+                claim_intended_fire_at = None
 
             # Per-acquisition token: a process may legitimately reclaim its own
             # stale lease, and the previous runner must not heartbeat the new
@@ -2945,7 +2960,9 @@ def _claim_job_for_fire_locked(
                 "by": owner,
                 "invocation_kind": claimed_kind,
                 "intended_fire_at": (
-                    str(intended_fire_at) if intended_fire_at is not None else None
+                    str(claim_intended_fire_at)
+                    if claim_intended_fire_at is not None
+                    else None
                 ),
             }
             if execution_id:
@@ -3640,6 +3657,48 @@ def save_job_output(job_id: str, output: str):
     # Bound per-job output growth so long-running deploys don't fill the disk (#52383).
     _prune_job_output(job_output_dir, _cron_output_keep())
 
+    return output_file
+
+
+def save_founder_card_output(execution_id: str, output: str):
+    """Persist one execution-keyed founder-card payload without overwriting.
+
+    The regular job output is the full agent document.  Presentation delivery
+    gets its own immutable file because the wrapped/failure card can differ
+    from that document and must be auditable by execution UUID.
+    """
+    execution_text = str(execution_id or "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", execution_text):
+        raise ValueError("invalid execution id for founder-card artifact")
+    ensure_dirs()
+    artifact_dir = _current_cron_store().output_dir / "founder-cards"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    _secure_dir(artifact_dir)
+    output_file = artifact_dir / f"{execution_text}.md"
+    payload = str(output).encode("utf-8")
+    try:
+        fd = os.open(
+            output_file,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            try:
+                output_file.unlink()
+            except OSError:
+                pass
+            raise
+    except FileExistsError:
+        if output_file.read_bytes() != payload:
+            raise FileExistsError(
+                f"founder-card artifact already exists for execution {execution_text}"
+            )
+    _secure_file(output_file)
     return output_file
 
 

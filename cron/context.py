@@ -35,6 +35,12 @@ GRADUATION_ELIGIBLE_INVOCATION_KINDS = frozenset({
 })
 ON_TIME_GRACE_SECONDS = 5 * 60
 
+# Identity capabilities are private object identities, not caller-controlled
+# labels.  The jobs store consumes them while holding its atomic lock.
+_BUILTIN_SCHEDULER_ADMISSION = object()
+_AUTHENTICATED_PROVIDER_ADMISSION = object()
+_RECOVERY_SCHEDULER_ADMISSION = object()
+
 DELIVERY_STATUSES = frozenset({
     "NOT_ATTEMPTED",
     "SUPPRESSED",

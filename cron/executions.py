@@ -245,7 +245,8 @@ def bind_execution_claim(
         cur = conn.execute(
             """UPDATE executions
                SET invocation_kind=?, intended_fire_at=?, claim_owner=?
-               WHERE id=? AND status='claimed'""",
+               WHERE id=? AND status='claimed'
+                 AND (claim_owner IS NULL OR claim_owner='')""",
             (
                 normalized_kind,
                 str(intended_fire_at) if intended_fire_at is not None else None,
@@ -438,6 +439,15 @@ def list_executions(
 def latest_execution(job_id: str) -> Optional[Dict[str, Any]]:
     rows = list_executions(job_id=job_id, limit=1)
     return rows[0] if rows else None
+
+
+def get_execution(execution_id: str) -> Optional[Dict[str, Any]]:
+    """Load one execution by its scheduler-owned immutable ID."""
+    with _transaction() as conn:
+        row = conn.execute(
+            "SELECT * FROM executions WHERE id=?", (str(execution_id),)
+        ).fetchone()
+    return _record(row)
 
 
 def latest_executions(job_ids: List[str]) -> Dict[str, Dict[str, Any]]:

@@ -408,3 +408,61 @@ async def test_fire_without_runner_passes_none_adapters(adapter, monkeypatch):
 
     assert seen.get("job_id") == "no-runner"
     assert seen.get("adapters") is None
+
+
+@pytest.mark.asyncio
+async def test_authenticated_provider_receives_authoritative_instant_capability(
+    adapter, monkeypatch
+):
+    """The verified gateway boundary supplies provenance, not webhook text."""
+    seen = {}
+
+    class AuthenticatedProvider:
+        def claim_fire(
+            self, job_id, *, intended_fire_at=None, _provider_admission=None
+        ):
+            seen.update(
+                job_id=job_id,
+                intended_fire_at=intended_fire_at,
+                admission=_provider_admission,
+            )
+            return {"id": job_id, "execution_id": "exec-authoritative"}
+
+        def fire_claimed(self, job, *, adapters=None, loop=None):
+            seen["fired"] = job["id"]
+            return True
+
+    provider = AuthenticatedProvider()
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: provider)
+    monkeypatch.setattr(
+        "cron.jobs.get_job",
+        lambda _job_id: (_ for _ in ()).throw(
+            AssertionError("gateway must not pre-read the mutable job")
+        ),
+    )
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
+    )
+
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            "/api/cron/fire",
+            headers={"Authorization": "Bearer nas-jwt"},
+            json={
+                "job_id": "chronos-job",
+                "intended_fire_at": "2099-01-01T00:00:00+00:00",
+                "invocation_kind": "PROVIDER_SCHEDULED",
+            },
+        )
+        assert response.status == 202
+        for _ in range(50):
+            if seen.get("fired"):
+                break
+            await asyncio.sleep(0.01)
+
+    assert seen["job_id"] == "chronos-job"
+    assert seen["intended_fire_at"] is None
+    assert seen["admission"] is not None
+    assert seen["fired"] == "chronos-job"

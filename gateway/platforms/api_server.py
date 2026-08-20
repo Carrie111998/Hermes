@@ -44,6 +44,7 @@ import asyncio
 import errno
 import hashlib
 import hmac
+import inspect
 import itertools
 import json
 from contextlib import contextmanager, nullcontext, suppress
@@ -70,6 +71,41 @@ _PROFILE_REJECTED = object()
 _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
+
+
+def _call_authenticated_cron_provider(
+    provider: Any,
+    method_name: str,
+    job_id: str,
+    *,
+    intended_fire_at: Optional[str],
+    **kwargs: Any,
+) -> Any:
+    """Pass the JWT admission capability only to providers that declare it.
+
+    Older third-party providers remain callable with their historical method
+    shape, but cannot receive a provider-scheduled attestation unless they
+    explicitly accept the private admission capability.
+    """
+    method = getattr(provider, method_name)
+    try:
+        parameters = inspect.signature(method).parameters.values()
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        names = {parameter.name for parameter in parameters}
+    except (TypeError, ValueError):
+        accepts_kwargs = False
+        names = set()
+    call_kwargs = dict(kwargs)
+    if accepts_kwargs or "intended_fire_at" in names:
+        call_kwargs["intended_fire_at"] = intended_fire_at
+    if accepts_kwargs or "_provider_admission" in names:
+        from cron.scheduler_provider import _AUTHENTICATED_PROVIDER_ADMISSION
+
+        call_kwargs["_provider_admission"] = _AUTHENTICATED_PROVIDER_ADMISSION
+    return method(job_id, **call_kwargs)
 
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
     if smart_denied:
@@ -6021,8 +6057,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 # split claim path would silently bypass that override.
                 task = asyncio.create_task(
                     asyncio.to_thread(
-                        provider.fire_due,
+                        _call_authenticated_cron_provider,
+                        provider,
+                        "fire_due",
                         job_id,
+                        intended_fire_at=None,
                         adapters=adapters,
                         loop=loop,
                     )
@@ -6043,7 +6082,13 @@ class APIServerAdapter(BasePlatformAdapter):
             # Persist the attempt and exact store owner before acknowledging NAS.
             # A failure here is retryable and the reservation remains attached.
             try:
-                claimed_job = await asyncio.to_thread(provider.claim_fire, job_id)
+                claimed_job = await asyncio.to_thread(
+                    _call_authenticated_cron_provider,
+                    provider,
+                    "claim_fire",
+                    job_id,
+                    intended_fire_at=None,
+                )
             except Exception as exc:
                 logger.error("cron fire admission failed for %s: %s", job_id, exc)
                 return web.json_response(

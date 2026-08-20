@@ -25,13 +25,19 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from cron.context import (
+    _AUTHENTICATED_PROVIDER_ADMISSION,
+    _RECOVERY_SCHEDULER_ADMISSION,
     OPERATOR_TRIGGERED,
     PROVIDER_SCHEDULED,
     RECOVERY_CATCHUP,
     UNKNOWN,
-    classify_scheduled_fire,
-    normalize_invocation_kind,
 )
+
+# Only the JWT-verified gateway admission boundary holds this capability.  A
+# boolean/string caller argument would let a direct provider invocation
+# launder itself into PROVIDER_SCHEDULED.
+# Re-export the private capability for the already-authenticated gateway
+# adapter; only object identity, never a public label, admits provider origin.
 
 # Cap for the exponential tick backoff applied while consecutive ticks fail
 # with fd exhaustion (EMFILE/ENFILE, #87644).  Base is the tick interval
@@ -165,6 +171,7 @@ class CronScheduler(ABC):
         force: bool = False,
         intended_fire_at: Any = None,
         invocation_kind: Any = None,
+        _provider_admission: Any = None,
     ) -> bool:
         """Run a single job NOW via the shared orchestrator. Called by the
         inbound fire webhook when an external scheduler signals a job is due.
@@ -183,6 +190,7 @@ class CronScheduler(ABC):
             force=force,
             intended_fire_at=intended_fire_at,
             invocation_kind=invocation_kind,
+            _provider_admission=_provider_admission,
         )
         if claimed_job is None:
             return False
@@ -195,6 +203,7 @@ class CronScheduler(ABC):
         force: bool = False,
         intended_fire_at: Any = None,
         invocation_kind: Any = None,
+        _provider_admission: Any = None,
     ) -> dict | None:
         """Durably claim one fire and create its audit attempt before dispatch.
 
@@ -207,31 +216,15 @@ class CronScheduler(ABC):
             create_execution,
             finish_execution,
         )
-        from cron.jobs import _hermes_now, bind_fire_claim_execution, claim_job_for_fire
+        from cron.jobs import bind_fire_claim_execution, claim_job_for_fire
 
-        if force:
-            claimed_kind = OPERATOR_TRIGGERED
-        elif invocation_kind is not None:
-            claimed_kind = normalize_invocation_kind(invocation_kind)
-        else:
-            claimed_kind = classify_scheduled_fire(
-                intended_fire_at,
-                now=_hermes_now(),
-                provider=True,
-            )
-        if claimed_kind not in {
-            PROVIDER_SCHEDULED,
-            RECOVERY_CATCHUP,
-            OPERATOR_TRIGGERED,
-            UNKNOWN,
-        }:
-            claimed_kind = UNKNOWN
+        authenticated_provider = _provider_admission is _AUTHENTICATED_PROVIDER_ADMISSION
+        recovery_admission = _provider_admission is _RECOVERY_SCHEDULER_ADMISSION
         try:
             execution = create_execution(
                 job_id,
                 source=self.name,
-                invocation_kind=claimed_kind,
-                intended_fire_at=intended_fire_at,
+                invocation_kind=UNKNOWN,
             )
             legacy_execution_factory = False
         except TypeError:
@@ -244,9 +237,11 @@ class CronScheduler(ABC):
             claim_kwargs["force"] = True
         claim_function_is_legacy = getattr(claim_job_for_fire, "__module__", "cron.jobs") != "cron.jobs"
         if not claim_function_is_legacy:
-            claim_kwargs["invocation_kind"] = claimed_kind
-            claim_kwargs["intended_fire_at"] = intended_fire_at
             claim_kwargs["execution_id"] = execution["id"]
+            if authenticated_provider:
+                claim_kwargs["_scheduler_admission"] = _AUTHENTICATED_PROVIDER_ADMISSION
+            elif recovery_admission:
+                claim_kwargs["_scheduler_admission"] = _RECOVERY_SCHEDULER_ADMISSION
         try:
             claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
         except BaseException as exc:
@@ -272,7 +267,17 @@ class CronScheduler(ABC):
             )
             return None
         if claim.get("invocation_kind") is None and claim_function_is_legacy:
+            claim["invocation_kind"] = OPERATOR_TRIGGERED if force else UNKNOWN
+        claimed_kind = claim.get("invocation_kind", UNKNOWN)
+        if claimed_kind not in {
+            PROVIDER_SCHEDULED,
+            RECOVERY_CATCHUP,
+            OPERATOR_TRIGGERED,
+            UNKNOWN,
+        }:
+            claimed_kind = UNKNOWN
             claim["invocation_kind"] = claimed_kind
+        intended_fire_at = claim.get("intended_fire_at")
         if claim.get("invocation_kind") != claimed_kind:
             finish_execution(
                 execution["id"],
@@ -519,6 +524,7 @@ def fire_overdue_jobs(
                 job_id,
                 invocation_kind=RECOVERY_CATCHUP,
                 intended_fire_at=next_run_at,
+                _provider_admission=_RECOVERY_SCHEDULER_ADMISSION,
             )
             if claimed is None:
                 continue

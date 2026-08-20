@@ -62,6 +62,7 @@ from agent.delegation_context import (
     exit_non_dispatcher_owned_context,
 )
 from cron.context import (
+    _BUILTIN_SCHEDULER_ADMISSION,
     OPERATOR_TRIGGERED,
     PROVIDER_SCHEDULED,
     RECOVERY_CATCHUP,
@@ -518,6 +519,7 @@ from cron.jobs import (
     heartbeat_fire_claim,
     heartbeat_run_claim,
     mark_job_run,
+    save_founder_card_output,
     save_job_output,
     use_cron_store,
 )
@@ -2718,6 +2720,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     apply_media_policy_env(user_cfg)
 
     media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+    # This is the exact text handed to the transport after cron wrapping and
+    # MEDIA-tag removal.  The scheduler binds its founder-card artifact/hash
+    # to this value, never to the full saved output document.
+    set_delivery_detail("dispatched_content", cleaned_delivery_content)
     requested_media = [(str(p), v) for p, v in media_files]
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
     # Attachments the policy filter dropped will never be sent on ANY lane —
@@ -3078,6 +3084,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 timed_out = False
                 delivered_message_id = None
                 if text_to_send:
+                    set_delivery_detail("dispatched_content", text_to_send)
                     from agent.async_utils import safe_schedule_threadsafe
 
                     router = DeliveryRouter(config, adapters)
@@ -3104,6 +3111,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         adapter_ok = False
                         target_errors.append("live adapter event loop scheduling failed")
                     else:
+                        set_delivery_detail("provider_attempted", True)
+                        set_delivery_detail(
+                            "provider_attempted_at", _hermes_now().isoformat()
+                        )
                         send_result = None
                         timeout_handled = False
                         try:
@@ -3139,9 +3150,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 target_errors.append(msg)
                                 adapter_ok = False  # fall through to standalone path
                                 timeout_handled = True
+                                set_delivery_detail("provider_attempted", False)
                             else:
                                 timed_out = True
                                 timeout_handled = True
+                                set_delivery_detail("ambiguous", True)
                                 logger.warning(
                                     "Job '%s': live adapter send to %s:%s timed out "
                                     "after 60s; already dispatched (in flight), "
@@ -3329,6 +3342,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         enabled=mirror_this_target and not thread_seeded and not inchannel_seeded,
                     )
             except Exception as e:
+                set_delivery_detail("transport_exception", True)
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
                     target_errors.append(err_msg)
@@ -3366,6 +3380,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
             coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
             try:
+                set_delivery_detail("provider_attempted", True)
+                set_delivery_detail(
+                    "provider_attempted_at", _hermes_now().isoformat()
+                )
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
                 # asyncio.run() checks for a running loop before awaiting the coroutine;
@@ -3398,6 +3416,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     finally:
                         pool.shutdown(wait=False)
                 except Exception as e:
+                    set_delivery_detail("transport_exception", True)
                     # A shutdown-race here is expected during teardown; downgrade
                     # to a warning so it doesn't read as a genuine failure.
                     if _interpreter_shutting_down(e):
@@ -3412,6 +3431,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     delivery_errors.extend(target_errors)
                     continue
             except Exception as e:
+                set_delivery_detail("transport_exception", True)
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
                 logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
                 target_errors.extend([msg])
@@ -4825,6 +4845,43 @@ class _BoundedCronSessionDB:
         return _bounded
 
 
+def _execution_claim_is_current(
+    job: dict,
+    execution_id: str,
+    invocation_kind: str,
+    claim_owner: str,
+) -> bool:
+    """Require ledger ownership and the current store claim before export."""
+    try:
+        from cron.executions import get_execution
+        from cron.jobs import get_job
+
+        execution = get_execution(execution_id)
+        if not isinstance(execution, dict):
+            return False
+        if str(execution.get("job_id") or "") != str(job.get("id") or ""):
+            return False
+        if execution.get("status") not in {"claimed", "running"}:
+            return False
+        if execution.get("invocation_kind") != invocation_kind:
+            return False
+        if str(execution.get("claim_owner") or "") != claim_owner:
+            return False
+
+        current_job = get_job(str(job.get("id") or ""))
+        current_claim = current_job.get("fire_claim") if isinstance(current_job, dict) else None
+        return (
+            isinstance(current_claim, dict)
+            and str(current_claim.get("by") or "") == claim_owner
+            and str(current_claim.get("execution_id") or "") == execution_id
+            and normalize_invocation_kind(current_claim.get("invocation_kind"))
+            == invocation_kind
+        )
+    except Exception:
+        logger.debug("Cron execution attestation validation failed", exc_info=True)
+        return False
+
+
 def run_job(
     job: dict,
     *,
@@ -4834,13 +4891,37 @@ def run_job(
 ) -> tuple[bool, str, str, Optional[str]]:
     """Run one cron turn under its scheduler-owned task-local attestation."""
     claim = job.get("fire_claim")
-    execution_id = job.get("execution_id") or (
-        claim.get("execution_id") if isinstance(claim, dict) else None
+    claim_execution_id = (
+        str(claim.get("execution_id") or "")
+        if isinstance(claim, dict)
+        else ""
     )
-    invocation_kind = job.get("invocation_kind") or (
-        claim.get("invocation_kind") if isinstance(claim, dict) else UNKNOWN
+    claim_owner = (
+        str(claim.get("by") or "")
+        if isinstance(claim, dict)
+        else ""
     )
-    if not execution_id:
+    claim_kind = (
+        normalize_invocation_kind(claim.get("invocation_kind"))
+        if isinstance(claim, dict)
+        else UNKNOWN
+    )
+    top_level_id = job.get("execution_id")
+    top_level_kind = job.get("invocation_kind")
+    attestation_matches = bool(claim_execution_id and claim_owner and claim_kind != UNKNOWN)
+    if top_level_id is not None:
+        attestation_matches = attestation_matches and str(top_level_id) == claim_execution_id
+    if top_level_kind is not None:
+        attestation_matches = (
+            attestation_matches
+            and normalize_invocation_kind(top_level_kind) == claim_kind
+        )
+    if not attestation_matches or not _execution_claim_is_current(
+        job,
+        claim_execution_id,
+        claim_kind,
+        claim_owner,
+    ):
         # Direct callers are not scheduler-attested.  Keep the closed kind in
         # durable records, but do not expose a fabricated UUID to subprocesses.
         return _run_job(
@@ -4849,7 +4930,7 @@ def run_job(
             extra_prompt=extra_prompt,
             cancel_event=cancel_event,
         )
-    with cron_execution_context(execution_id, invocation_kind):
+    with cron_execution_context(claim_execution_id, claim_kind):
         return _run_job(
             job,
             defer_agent_teardown=defer_agent_teardown,
@@ -6520,29 +6601,22 @@ def _run_one_job_body(
         return True
 
     execution_id = job.get("execution_id")
-    claim_kind = normalize_invocation_kind(
-        claim.get("invocation_kind") if isinstance(claim, dict) else OPERATOR_TRIGGERED
-    )
-    intended_fire_at = claim.get("intended_fire_at") if isinstance(claim, dict) else None
     if not execution_id:
+        # A direct caller has no owner-bearing scheduler claim.  Record the
+        # explicit operator origin, but never manufacture a claim binding or
+        # export attestation to subprocesses from an arbitrary job dict.
         execution = create_execution(
             job["id"],
             source="direct",
-            invocation_kind=claim_kind,
-            intended_fire_at=intended_fire_at,
-            claim_owner=fire_owner,
+            invocation_kind=OPERATOR_TRIGGERED,
         )
         execution_id = execution["id"]
-        if fire_owner and bind_fire_claim_execution(
-            job["id"],
-            expected_owner=fire_owner,
-            execution_id=execution_id,
-        ) is None:
-            raise RuntimeError("Fire claim execution binding was lost before dispatch")
     delivery_attempted = False
+    delivery_call_started = False
     delivery_error = None
     delivery_status = "NOT_ATTEMPTED"
-    delivery_target = canonical_json(_resolve_delivery_targets(job))
+    delivery_targets = _resolve_delivery_targets(job)
+    delivery_target = canonical_json(delivery_targets)
     delivery_target_class = _normalize_deliver_value(job.get("deliver", "local"))
     delivery_content_sha256 = None
     delivery_attempted_at = None
@@ -6552,6 +6626,25 @@ def _run_one_job_body(
     output_sha256 = None
     founder_card_path = None
     founder_card_sha256 = None
+
+    def _attest_dispatched_content(details: dict, fallback: Optional[str] = None) -> None:
+        """Bind the exact post-wrapper transport text to this execution."""
+        nonlocal delivery_content_sha256, founder_card_path, founder_card_sha256
+        if not details.get("provider_attempted"):
+            return
+        dispatched_content = details.get("dispatched_content")
+        if dispatched_content is None:
+            dispatched_content = fallback
+        if dispatched_content is None:
+            return
+        dispatched_text = str(dispatched_content)
+        delivery_content_sha256 = hashlib.sha256(
+            dispatched_text.encode("utf-8")
+        ).hexdigest()
+        if founder_card_path is not None:
+            return
+        founder_card_file = save_founder_card_output(execution_id, dispatched_text)
+        founder_card_path, founder_card_sha256 = file_attestation(founder_card_file)
 
     def _finish_execution(*, success: bool, error: Optional[str] = None, delivery_outcome: Optional[str] = None):
         base_kwargs = {
@@ -6694,9 +6787,6 @@ def _run_one_job_body(
                     raise _FireClaimLostDuringSideEffect
                 output_file = save_job_output(job["id"], output)
                 output_path, output_sha256 = file_attestation(output_file)
-                # The founder-card artifact is execution-keyed by the ledger;
-                # Phase A's exact saved output is the canonical card payload.
-                founder_card_path, founder_card_sha256 = output_path, output_sha256
             if verbose:
                 logger.info("Output saved to: %s", output_file)
 
@@ -6795,43 +6885,81 @@ def _run_one_job_body(
                 )
 
             if should_deliver:
-                delivery_content_sha256 = hashlib.sha256(
-                    deliver_content.encode("utf-8")
-                ).hexdigest()
                 unresolved_origin = (
                     _normalize_deliver_value(job.get("deliver", "local")) == "origin"
-                    and not _resolve_delivery_targets(job)
+                    and not delivery_targets
                 )
-                try:
-                    with _side_effect_fence() as owns_delivery:
-                        if not owns_delivery:
-                            raise _FireClaimLostDuringSideEffect
-                        delivery_attempted = True
-                        delivery_attempted_at = _hermes_now().isoformat()
-                        with delivery_details() as _details:
-                            delivery_error = _deliver_result(
-                                job,
-                                deliver_content,
-                                adapters=adapters,
-                                loop=loop,
-                            )
-                        delivery_completed_at = _hermes_now().isoformat()
+                if not delivery_targets:
+                    # No resolved target means no provider send was attempted.
+                    # Keep local-only suppression distinct from an origin or
+                    # explicit target that cannot be configured.
+                    _details = {}
+                    delivery_call_started = True
+                    with delivery_details() as _details:
+                        delivery_error = _deliver_result(
+                            job,
+                            deliver_content,
+                            adapters=adapters,
+                            loop=loop,
+                        )
+                        _attest_dispatched_content(_details, deliver_content)
+                    delivery_status = (
+                        "SUPPRESSED"
+                        if _normalize_deliver_value(job.get("deliver", "local")) == "local"
+                        else "NOT_CONFIGURED"
+                    )
+                else:
+                    _details = {}
+                    try:
+                        with _side_effect_fence() as owns_delivery:
+                            if not owns_delivery:
+                                raise _FireClaimLostDuringSideEffect
+                            delivery_call_started = True
+                            with delivery_details() as _details:
+                                delivery_error = _deliver_result(
+                                    job,
+                                    deliver_content,
+                                    adapters=adapters,
+                                    loop=loop,
+                                )
+                                delivery_attempted = bool(
+                                    _details.get("provider_attempted")
+                                )
+                                delivery_attempted_at = (
+                                    _details.get("provider_attempted_at")
+                                    if delivery_attempted
+                                    else None
+                                )
+                                delivery_receipt_id = _details.get("provider_receipt_id")
+                                _attest_dispatched_content(_details, deliver_content)
+                            delivery_completed_at = _hermes_now().isoformat()
+                            if _details.get("transport_exception"):
+                                delivery_status = "UNKNOWN"
+                            elif delivery_error:
+                                delivery_status = (
+                                    "FAILED" if delivery_attempted else "NOT_CONFIGURED"
+                                )
+                            elif _details.get("ambiguous"):
+                                delivery_status = "UNKNOWN"
+                            elif _details.get("provider_accepted"):
+                                delivery_status = "PROVIDER_ACCEPTED"
+                            else:
+                                delivery_status = "SUPPRESSED"
+                    except Exception as de:
+                        if isinstance(de, _FireClaimLostDuringSideEffect):
+                            raise
+                        delivery_error = str(de)
+                        delivery_attempted = bool(_details.get("provider_attempted"))
+                        delivery_attempted_at = (
+                            _details.get("provider_attempted_at")
+                            if delivery_attempted
+                            else None
+                        )
                         delivery_receipt_id = _details.get("provider_receipt_id")
-                        if delivery_error:
-                            delivery_status = "FAILED"
-                        elif unresolved_origin:
-                            delivery_status = "NOT_CONFIGURED"
-                        elif _details.get("provider_accepted"):
-                            delivery_status = "PROVIDER_ACCEPTED"
-                        else:
-                            delivery_status = "SUPPRESSED"
-                except Exception as de:
-                    if isinstance(de, _FireClaimLostDuringSideEffect):
-                        raise
-                    delivery_error = str(de)
-                    delivery_status = "FAILED"
-                    delivery_completed_at = _hermes_now().isoformat()
-                    logger.error("Delivery failed for job %s: %s", job["id"], de)
+                        _attest_dispatched_content(_details, deliver_content)
+                        delivery_status = "UNKNOWN"
+                        delivery_completed_at = _hermes_now().isoformat()
+                        logger.error("Delivery failed for job %s: %s", job["id"], de)
         except _FireClaimLostDuringSideEffect:
             side_effect_ownership_lost = True
         finally:
@@ -6910,7 +7038,11 @@ def _run_one_job_body(
             )
             return True
         normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
-        if delivery_error:
+        if delivery_status == "UNKNOWN":
+            delivery_outcome = "unknown"
+        elif delivery_status == "NOT_CONFIGURED":
+            delivery_outcome = "not_configured"
+        elif delivery_error:
             delivery_outcome = "failed"
         elif should_deliver and unresolved_origin:
             delivery_outcome = "not_configured"
@@ -6950,7 +7082,7 @@ def _run_one_job_body(
         # the fenced bookkeeping below decide what (if anything) to record.
         if (
             isinstance(e, Exception)
-            and not delivery_attempted
+            and not delivery_call_started
             and not isinstance(e, _FireClaimLostDuringSideEffect)
             and not _fire_claim_ownership_lost()
         ):
@@ -6959,12 +7091,10 @@ def _run_one_job_body(
             )
             unresolved_origin = False
             failure_content = _summarize_cron_failure_for_delivery(job, _err_text)
-            delivery_content_sha256 = hashlib.sha256(
-                failure_content.encode("utf-8")
-            ).hexdigest()
-            try:
-                delivery_attempted = True
-                delivery_attempted_at = _hermes_now().isoformat()
+            unresolved_origin = normalized_deliver == "origin" and not delivery_targets
+            if not delivery_targets:
+                _details = {}
+                delivery_call_started = True
                 with delivery_details() as _details:
                     delivery_error = _deliver_result(
                         job,
@@ -6972,27 +7102,73 @@ def _run_one_job_body(
                         adapters=adapters,
                         loop=loop,
                     )
-                delivery_completed_at = _hermes_now().isoformat()
-                delivery_receipt_id = _details.get("provider_receipt_id")
-            except Exception as delivery_exc:
-                delivery_error = str(delivery_exc)
-                delivery_completed_at = _hermes_now().isoformat()
-                logger.error(
-                    "Delivery failed for job %s: %s", job["id"], delivery_exc
+                    _attest_dispatched_content(_details, failure_content)
+                delivery_status = (
+                    "SUPPRESSED" if normalized_deliver == "local" else "NOT_CONFIGURED"
                 )
-            if not delivery_error and normalized_deliver == "origin":
-                unresolved_origin = not _resolve_delivery_targets(job)
-            if delivery_error:
-                delivery_outcome = "failed"
-                delivery_status = "FAILED"
-            elif unresolved_origin:
-                delivery_outcome = "not_configured"
-                delivery_status = "NOT_CONFIGURED"
-            elif normalized_deliver != "local":
-                delivery_outcome = "delivered"
-                delivery_status = "PROVIDER_ACCEPTED"
+                delivery_outcome = (
+                    "suppressed"
+                    if normalized_deliver == "local"
+                    else ("delivered" if not delivery_error else "not_configured")
+                )
             else:
-                delivery_status = "SUPPRESSED"
+                _details = {}
+                try:
+                    with delivery_details() as _details:
+                        delivery_error = _deliver_result(
+                            job,
+                            failure_content,
+                            adapters=adapters,
+                            loop=loop,
+                        )
+                        delivery_attempted = bool(
+                            _details.get("provider_attempted")
+                        )
+                        delivery_attempted_at = (
+                            _details.get("provider_attempted_at")
+                            if delivery_attempted
+                            else None
+                        )
+                        delivery_receipt_id = _details.get("provider_receipt_id")
+                        _attest_dispatched_content(_details, failure_content)
+                    delivery_completed_at = _hermes_now().isoformat()
+                    if _details.get("transport_exception"):
+                        delivery_status = "UNKNOWN"
+                    elif delivery_error:
+                        delivery_status = (
+                            "FAILED" if delivery_attempted else "NOT_CONFIGURED"
+                        )
+                    elif _details.get("ambiguous"):
+                        delivery_status = "UNKNOWN"
+                    elif _details.get("provider_accepted"):
+                        delivery_status = "PROVIDER_ACCEPTED"
+                    else:
+                        delivery_status = "SUPPRESSED"
+                except Exception as delivery_exc:
+                    delivery_error = str(delivery_exc)
+                    delivery_attempted = bool(_details.get("provider_attempted"))
+                    delivery_attempted_at = (
+                        _details.get("provider_attempted_at")
+                        if delivery_attempted
+                        else None
+                    )
+                    delivery_receipt_id = _details.get("provider_receipt_id")
+                    _attest_dispatched_content(_details, failure_content)
+                    delivery_status = "UNKNOWN"
+                    delivery_completed_at = _hermes_now().isoformat()
+                    logger.error(
+                        "Delivery failed for job %s: %s", job["id"], delivery_exc
+                    )
+                if delivery_status == "FAILED":
+                    delivery_outcome = "failed"
+                elif delivery_status == "UNKNOWN":
+                    delivery_outcome = "unknown"
+                elif delivery_status == "NOT_CONFIGURED":
+                    delivery_outcome = "not_configured"
+                elif delivery_status == "PROVIDER_ACCEPTED":
+                    delivery_outcome = "delivered"
+                else:
+                    delivery_outcome = "suppressed"
         try:
             if not _consume_interrupted_flag(job["id"], execution_token):
                 mark_kwargs = {}
@@ -7306,13 +7482,15 @@ def tick(
                 job,
                 now=_hermes_now(),
             )
-            claimed = claim_job_for_fire(
-                job["id"],
-                invocation_kind=invocation_kind,
-                intended_fire_at=intended_fire_at,
-                execution_id=job["execution_id"],
-                return_job=True,
-            )
+            claim_kwargs = {
+                "invocation_kind": invocation_kind,
+                "intended_fire_at": intended_fire_at,
+                "execution_id": job["execution_id"],
+                "return_job": True,
+            }
+            if getattr(claim_job_for_fire, "__module__", "cron.jobs") == "cron.jobs":
+                claim_kwargs["_scheduler_admission"] = _BUILTIN_SCHEDULER_ADMISSION
+            claimed = claim_job_for_fire(job["id"], **claim_kwargs)
             if not claimed:
                 finish_execution(
                     job["execution_id"],
