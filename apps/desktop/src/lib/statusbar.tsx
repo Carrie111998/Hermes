@@ -60,10 +60,12 @@ export function contextBarLabel(usage: UsageStats): string {
 }
 
 export function tokPerCallLabel(usage: UsageStats): string {
-  // WHY: a missing or zero rate means the backend has not finished an API call
-  // yet, so render nothing and let the pill stay hidden instead of showing a
-  // fabricated 0.0.
-  if (!usage.tok_per_call) {
+  // WHY: the backend omits tok_per_call entirely when no API call has
+  // completed yet, so a null/undefined value means "no measurement". We must
+  // NOT use a falsy check here: a real but tiny rate (e.g. 1 token / 30s)
+  // rounds to 0.0 and would be wrongly hidden. Only hide when the field is
+  // absent.
+  if (usage.tok_per_call == null) {
     return ''
   }
 
@@ -71,9 +73,9 @@ export function tokPerCallLabel(usage: UsageStats): string {
 }
 
 export function tokPerTurnLabel(usage: UsageStats): string {
-  // WHY: same rule as tokPerCallLabel, hide the pill until a turn has
-  // completed and produced a real per-turn rate.
-  if (!usage.tok_per_turn) {
+  // WHY: same rule as tokPerCallLabel. The backend omits tok_per_turn until a
+  // turn completes; a real 0.0 rate is still a measurement and must show.
+  if (usage.tok_per_turn == null) {
     return ''
   }
 
