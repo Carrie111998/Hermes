@@ -12,13 +12,14 @@ import {
   allKeybindActions,
   KEYBIND_CATEGORIES,
   KEYBIND_PANEL_ACTION,
-  KEYBIND_READONLY,
   type KeybindActionMeta,
   type KeybindReadonly,
-  KEYBINDS_AREA
+  KEYBINDS_AREA,
+  readonlyKeybindsFor
 } from '@/lib/keybinds/actions'
 import { formatCombo } from '@/lib/keybinds/combo'
 import { arraysEqual } from '@/lib/storage'
+import { $composerEnterSends } from '@/store/composer-prefs'
 import {
   $bindings,
   $capture,
@@ -35,11 +36,15 @@ import { SettingsContent } from './primitives'
 export function KeybindSettings() {
   const { t } = useI18n()
   const bindings = useStore($bindings)
+  const enterSends = useStore($composerEnterSends)
   const k = t.keybinds
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set())
   // Subscribe so contributed actions appear/disappear live in the map.
   useContributions(KEYBINDS_AREA)
   const actionList = allKeybindActions()
+
+  const readonlyList = useMemo(() => readonlyKeybindsFor(enterSends), [enterSends])
+
   const [query, setQuery] = useState('')
 
   const openCombo = bindings[KEYBIND_PANEL_ACTION]?.[0]
@@ -86,12 +91,12 @@ export function KeybindSettings() {
 
     const lower = query.toLowerCase()
 
-    return KEYBIND_READONLY.filter(shortcut => {
+    return readonlyList.filter(shortcut => {
       const label = k.actions[shortcut.id] ?? shortcut.id
 
       return label.toLowerCase().includes(lower) || shortcut.id.includes(lower)
     })
-  }, [isSearching, query, k.actions])
+  }, [isSearching, query, k.actions, readonlyList])
 
   return (
     <SettingsContent>
@@ -144,7 +149,7 @@ export function KeybindSettings() {
               action => action.category === category && action.id !== KEYBIND_PANEL_ACTION
             )
 
-            const readonly = KEYBIND_READONLY.filter(shortcut => shortcut.category === category)
+            const readonly = readonlyList.filter(shortcut => shortcut.category === category)
 
             if (actions.length === 0 && readonly.length === 0) {
               return null
