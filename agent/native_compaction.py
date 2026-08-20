@@ -248,6 +248,8 @@ def prune_pre_checkpoint_items(
             or any(isinstance(k, str) and k.startswith("_") and "summary" in k.lower() for k in item.keys())
             or "Summary of previous conversation" in str(item.get("content", ""))
             or "Conversation Summary" in str(item.get("content", ""))
+            or "conversation summary" in str(item.get("content", "")).lower()
+            or "handoff from a previous context" in str(item.get("content", "")).lower()
         )
         if not is_user and not is_summary:
             continue
