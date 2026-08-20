@@ -1,12 +1,14 @@
 import { atom } from 'nanostores'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
-import { $sidebarAgentsGrouped } from '@/store/layout'
+import { NO_PROJECT_ID, type SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
+import { $sidebarAgentsGrouped, setSidebarAgentsGrouped } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
+import { $currentCwd, $selectedStoredSessionId, $sessions, applyConfiguredDefaultProjectDir } from '@/store/session'
 
 import {
   $activeProjectId,
+  $projects,
   $projectScope,
   $projectsRpcAvailable,
   $projectTree,
@@ -21,11 +23,14 @@ import {
   exitProjectScope,
   openProjectCreate,
   pickProjectFolder,
+  projectIdForCwd,
   projectNameForCwd,
   refreshProjects,
   refreshProjectTree,
   refreshWorktrees,
+  resolveNewSessionCwd,
   scanAndRecordRepos,
+  startWorkInRepo,
   tombstoneSessions
 } from './projects'
 
@@ -50,7 +55,10 @@ vi.mock('@/store/gateway', () => ({
   ensureActiveGatewayOpen: vi.fn()
 }))
 
-vi.mock('@/lib/desktop-git', () => ({ desktopGit: vi.fn() }))
+vi.mock('@/lib/desktop-git', async importOriginal => ({
+  ...((await importOriginal()) as Record<string, unknown>),
+  desktopGit: vi.fn()
+}))
 
 vi.mock('@/hermes', () => ({
   getHermesConfig: vi.fn(),
@@ -99,14 +107,98 @@ describe('project scope', () => {
     expect($projectScope.get()).toBe(ALL_PROJECTS)
   })
 
-  it('entering the synthetic No-project bucket still scopes (no active pin)', () => {
-    enterProject('__no_project__')
-    expect($projectScope.get()).toBe('__no_project__')
+  it('entering the synthetic Home bucket still scopes (no active pin)', () => {
+    enterProject(NO_PROJECT_ID)
+    expect($projectScope.get()).toBe(NO_PROJECT_ID)
   })
 
   it('persists the scope to localStorage', () => {
     enterProject('p_abc')
     expect(window.localStorage.getItem('hermes.desktop.projectScope')).toBe('p_abc')
+  })
+})
+
+describe('resolveNewSessionCwd', () => {
+  beforeEach(() => {
+    $projectScope.set(ALL_PROJECTS)
+    applyConfiguredDefaultProjectDir('/home/user/configured')
+    $currentCwd.set('')
+    $selectedStoredSessionId.set(null)
+    $sessions.set([])
+    // Reset focused-session projections by clearing the inputs they read.
+    // $focusedStoredSessionId falls back to $selectedStoredSessionId.
+    // $focusedSessionState needs a runtime — leave it empty via no session states.
+  })
+
+  afterEach(() => {
+    applyConfiguredDefaultProjectDir(null)
+    $projectScope.set(ALL_PROJECTS)
+    $currentCwd.set('')
+    $selectedStoredSessionId.set(null)
+    $sessions.set([])
+  })
+
+  it('starts a chat detached inside Home, ignoring the configured default dir', () => {
+    // Attaching the default dir here would move the new chat out of Home the
+    // moment it was created — "no folder" is what the bucket means.
+    enterProject(NO_PROJECT_ID)
+
+    expect(resolveNewSessionCwd()).toBe('')
+  })
+
+  it('still falls back to the configured default outside Home', () => {
+    expect(resolveNewSessionCwd()).toBe('/home/user/configured')
+  })
+
+  it('does not inherit the focused session workspace — new chat uses the configured default', () => {
+    // Regression for #71873 / #80213: after a restart the focused session is
+    // usually the just-resumed one, whose stored cwd can be a stale fallback
+    // (e.g. the user's home dir on Windows). A new chat must NOT land there —
+    // it falls through to the configured default project dir.
+    $selectedStoredSessionId.set('sess-a')
+    $sessions.set([
+      {
+        archived: false,
+        cwd: 'C:\\Users\\sonny',
+        ended_at: null,
+        id: 'sess-a',
+        input_tokens: 0,
+        is_active: true,
+        last_active: 0,
+        message_count: 1,
+        model: null,
+        output_tokens: 0,
+        started_at: 0,
+        title: 'work'
+      } as never
+    ])
+
+    expect(resolveNewSessionCwd()).toBe('/home/user/configured')
+  })
+
+  it('does not re-attach a remembered cwd when the focused session is detached', () => {
+    $currentCwd.set('/Users/me/stale-remembered')
+    $selectedStoredSessionId.set('sess-detached')
+    $sessions.set([
+      {
+        archived: false,
+        cwd: null,
+        ended_at: null,
+        id: 'sess-detached',
+        input_tokens: 0,
+        is_active: true,
+        last_active: 0,
+        message_count: 1,
+        model: null,
+        output_tokens: 0,
+        started_at: 0,
+        title: 'loose'
+      } as never
+    ])
+
+    // Focused session has no workspace → fall through to configured default,
+    // not the stale $currentCwd from an earlier chat.
+    expect(resolveNewSessionCwd()).toBe('/home/user/configured')
   })
 })
 
@@ -155,6 +247,13 @@ describe('projectNameForCwd', () => {
     expect(projectNameForCwd('/elsewhere/mono-feature/src')).toBe('Monorepo')
   })
 
+  it('matches nested Windows paths across separator and case differences', () => {
+    $projectTree.set([treeNode({ id: 'p_win', label: 'Windows app', path: 'C:\\Repos\\App' })])
+
+    expect(projectIdForCwd('c:/repos/app/src')).toBe('p_win')
+    expect(projectNameForCwd('c:/repos/app/src')).toBe('Windows app')
+  })
+
   it('ignores auto-projects and the No-project bucket (no named identity)', () => {
     $projectTree.set([
       treeNode({ id: '/repos/loose', label: 'loose', path: '/repos/loose', isAuto: true }),
@@ -177,6 +276,33 @@ describe('worktree refresh', () => {
     const before = $worktreeRefreshToken.get()
     refreshWorktrees()
     expect($worktreeRefreshToken.get()).toBe(before + 1)
+  })
+})
+
+describe('startWorkInRepo remote capability gate (#81724)', () => {
+  it('names the stale-backend remedy when a remote gateway lacks the worktree route', async () => {
+    isDesktopFsRemoteMode.mockReturnValue(true)
+    desktopGit.mockReturnValue({
+      worktreeAdd: vi.fn(async () => {
+        throw new Error(
+          'Expected JSON from https://vps/api/git/worktree/add but got HTML (status 404). The endpoint is likely missing on the Hermes backend.'
+        )
+      })
+    } as never)
+
+    // The i18n mock echoes keys, so the surfaced error is the catalog key.
+    await expect(startWorkInRepo('/srv/repo', { branch: 'x' })).rejects.toThrow('sidebar.projects.worktreeStaleBackend')
+  })
+
+  it('re-throws real git failures untouched (a remote 400 is not a capability verdict)', async () => {
+    isDesktopFsRemoteMode.mockReturnValue(true)
+    desktopGit.mockReturnValue({
+      worktreeAdd: vi.fn(async () => {
+        throw new Error("400: fatal: 'stale' is not a commit")
+      })
+    } as never)
+
+    await expect(startWorkInRepo('/srv/repo', { branch: 'x' })).rejects.toThrow('not a commit')
   })
 })
 
@@ -217,7 +343,7 @@ describe('pickProjectFolder', () => {
 describe('createProject', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    $sidebarAgentsGrouped.set(false)
+    setSidebarAgentsGrouped(false)
     $activeProjectId.set(null)
     $projectsRpcAvailable.set(null)
   })
@@ -273,6 +399,34 @@ describe('projects RPC capability', () => {
     await refreshProjects()
 
     expect($projectsRpcAvailable.get()).toBe(false)
+  })
+
+  it('does not publish a late project list from the previous source', async () => {
+    let resolveA: ((value: unknown) => void) | undefined
+
+    const responseA = new Promise(resolve => {
+      resolveA = resolve
+    })
+
+    const gatewayA = { connectionState: 'open', request: vi.fn(() => responseA) }
+
+    const gatewayB = {
+      connectionState: 'open',
+      request: vi.fn().mockResolvedValue({ active_id: null, projects: [{ id: 'source-b', name: 'Source B' }] })
+    }
+
+    let current = gatewayA
+
+    activeGateway.mockImplementation(() => current as never)
+    const pendingA = refreshProjects()
+
+    current = gatewayB
+    await refreshProjects()
+
+    resolveA?.({ active_id: null, projects: [{ id: 'source-a', name: 'Source A' }] })
+    await pendingA
+
+    expect($projects.get().map(project => project.id)).toEqual(['source-b'])
   })
 
   it('blocks opening the create dialog once the backend is known stale', () => {

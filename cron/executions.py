@@ -7,76 +7,63 @@ proved gone. Terminal states are immutable.
 
 from __future__ import annotations
 
-import json
 import os
 import sqlite3
 import threading
 import uuid
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
+# Optional test override. Production resolves the path at transaction time so
+# dashboard operations that temporarily enter another profile cannot leak that
+# profile's execution records into the import-time home.
+EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
 
-def get_executions_file() -> Path:
-    """Resolve the ledger path at call time, never at import time.
-
-    HERMES_HOME can legitimately change after this module is imported:
-    pytest's hermetic fixture monkeypatches it per test, and profile
-    switches install a context-local override. A module-level constant
-    captured the pre-fixture value and sent test fixture rows into the
-    real ``~/.hermes/cron/executions.db``.
-    """
-    return get_hermes_home().resolve() / "cron" / "executions.db"
-
-
 def _connect() -> sqlite3.Connection:
-    executions_file = get_executions_file()
-    executions_file.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(executions_file, timeout=5)
-    try:
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS executions (
-                 id TEXT PRIMARY KEY,
-                 job_id TEXT NOT NULL,
-                 source TEXT NOT NULL,
-                 process_id TEXT NOT NULL,
-                 pid INTEGER NOT NULL,
-                 process_started_at INTEGER,
-                 status TEXT NOT NULL CHECK(status IN
-                   ('claimed','running','completed','failed','unknown')),
-                 claimed_at TEXT NOT NULL,
-                 started_at TEXT,
-                 finished_at TEXT,
-                 error TEXT
-               )"""
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
-            "ON executions(job_id, claimed_at DESC, id DESC)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
-            "ON executions(status, claimed_at DESC, id DESC)"
-        )
-    except Exception:
-        conn.close()
-        raise
-    return conn
+    path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(path, timeout=5)
 
 
-from contextlib import contextmanager
-from typing import Iterator
+def _initialize_schema(conn: sqlite3.Connection) -> None:
+    from hermes_state import apply_wal_with_fallback
+
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    apply_wal_with_fallback(conn, db_label="cron/executions.db")
+    conn.execute("PRAGMA synchronous=FULL")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS executions (
+             id TEXT PRIMARY KEY,
+             job_id TEXT NOT NULL,
+             source TEXT NOT NULL,
+             process_id TEXT NOT NULL,
+             pid INTEGER NOT NULL,
+             process_started_at INTEGER,
+             status TEXT NOT NULL CHECK(status IN
+               ('claimed','running','completed','failed','unknown')),
+             claimed_at TEXT NOT NULL,
+             started_at TEXT,
+             finished_at TEXT,
+             error TEXT
+           )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
+        "ON executions(job_id, claimed_at DESC, id DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
+        "ON executions(status, claimed_at DESC, id DESC)"
+    )
 
 
 @contextmanager
@@ -85,23 +72,35 @@ def _transaction() -> Iterator[sqlite3.Connection]:
 
     ``sqlite3.Connection.__enter__``/``__exit__`` only commit or roll back
     the transaction; it does not close the connection. Relying on that alone
-    leaks a connection (and its WAL/SHM file descriptors) on every call.
-    Schema init runs inside the ``try`` too, so a PRAGMA/DDL failure after
-    a successful ``connect()`` still closes the connection instead of leaking it.
+    leaks a connection (and its WAL/SHM file descriptors) on every call,
+    since closing then depends on the garbage collector. Schema init runs
+    inside the ``try`` too, so a PRAGMA/DDL failure after a successful
+    ``connect()`` still closes the connection instead of leaking it.
     """
     with _lock:
-        conn = None
+        conn = _connect()
         try:
-            conn = _connect()
+            _initialize_schema(conn)
             with conn:
                 yield conn
         finally:
-            if conn is not None:
-                conn.close()
+            conn.close()
 
 
 def _record(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
     return dict(row) if row is not None else None
+
+
+def _emit_execution_state(
+    record: Optional[Dict[str, Any]], *, delivery_outcome: Optional[str] = None
+) -> None:
+    """Project durable state to monitoring without affecting ledger behavior."""
+    try:
+        from agent.monitoring.cron_health import emit_execution_state
+
+        emit_execution_state(record, delivery_outcome=delivery_outcome)
+    except Exception:
+        pass
 
 
 def _process_start_time(pid: int) -> Optional[int]:
@@ -154,7 +153,9 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
         row = conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
         ).fetchone()
-    return _record(row)  # type: ignore[return-value]
+    record = _record(row)
+    _emit_execution_state(record)
+    return record  # type: ignore[return-value]
 
 
 def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
@@ -168,13 +169,16 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
         )
         if cur.rowcount != 1:
             return None
-        return _record(conn.execute(
+        record = _record(conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
         ).fetchone())
+    _emit_execution_state(record)
+    return record
 
 
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
+    delivery_outcome: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten."""
     now = _hermes_now().isoformat()
@@ -189,15 +193,18 @@ def finish_execution(
         if cur.rowcount != 1:
             return None
         _prune_unlocked(conn)
-        return _record(conn.execute(
+        record = _record(conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
         ).fetchone())
+    _emit_execution_state(record, delivery_outcome=delivery_outcome)
+    return record
 
 
 def recover_interrupted_executions() -> int:
     """Mark provably abandoned attempts unknown without scheduling retries."""
     now = _hermes_now().isoformat()
     changed = 0
+    recovered: List[Dict[str, Any]] = []
     with _transaction() as conn:
         rows = conn.execute(
             """SELECT id, process_id, pid, process_started_at FROM executions
@@ -217,8 +224,16 @@ def recover_interrupted_executions() -> int:
                  row["id"]),
             )
             changed += cur.rowcount
+            if cur.rowcount:
+                record = _record(conn.execute(
+                    "SELECT * FROM executions WHERE id=?", (row["id"],)
+                ).fetchone())
+                if record is not None:
+                    recovered.append(record)
         if changed:
             _prune_unlocked(conn)
+    for record in recovered:
+        _emit_execution_state(record)
     return changed
 
 
