@@ -1283,7 +1283,7 @@ class TestAuxiliaryPoolAwareness:
             with (
                 patch(
                     "agent.auxiliary_client._resolve_task_provider_model",
-                    return_value=("auto", "nous-model", None, None, None),
+                    return_value=("auto", None, None, None, None),
                 ),
                 patch(
                     "agent.auxiliary_client.resolve_provider_client",
@@ -1307,10 +1307,12 @@ class TestAuxiliaryPoolAwareness:
             ):
                 first = call_llm(
                     task="goal_judge",
+                    main_runtime={"provider": "nous", "model": "main-model"},
                     messages=[{"role": "user", "content": "first"}],
                 )
                 second = call_llm(
                     task="goal_judge",
+                    main_runtime={"provider": "nous", "model": "main-model"},
                     messages=[{"role": "user", "content": "second"}],
                 )
         finally:
@@ -1337,7 +1339,7 @@ class TestAuxiliaryPoolAwareness:
         fresh_client.base_url = "https://inference-api.nousresearch.com/v1"
         fresh_client.chat.completions.create = AsyncMock(return_value={"ok": True})
 
-        main_runtime = {"provider": "nous", "model": "nous-model"}
+        main_runtime = {"provider": "nous", "model": "main-model"}
 
         import agent.auxiliary_client as aux
 
@@ -1346,7 +1348,7 @@ class TestAuxiliaryPoolAwareness:
             with (
                 patch(
                     "agent.auxiliary_client._resolve_task_provider_model",
-                    return_value=("auto", "nous-model", None, None, None),
+                    return_value=("auto", None, None, None, None),
                 ),
                 patch(
                     "agent.auxiliary_client.resolve_provider_client",

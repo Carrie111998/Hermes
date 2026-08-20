@@ -7583,6 +7583,7 @@ def _refresh_nous_auxiliary_client(
     *,
     cache_provider: str,
     model: Optional[str],
+    cache_model: Optional[str],
     async_mode: bool,
     task: Optional[str] = None,
     base_url: Optional[str] = None,
@@ -7620,7 +7621,7 @@ def _refresh_nous_auxiliary_client(
         main_runtime=main_runtime,
         is_vision=is_vision,
         task=task,
-        model=final_model,
+        model=cache_model,
     )
     _store_cached_client(cache_key, client, final_model, bound_loop=current_loop)
     return client, final_model
@@ -9724,6 +9725,7 @@ def _call_llm_impl(
             refreshed_client, refreshed_model = _refresh_nous_auxiliary_client(
                 cache_provider=resolved_provider or "nous",
                 model=final_model,
+                cache_model=resolved_model,
                 async_mode=False,
                 task=task,
                 base_url=resolved_base_url,
@@ -9761,6 +9763,7 @@ def _call_llm_impl(
             refreshed_client, refreshed_model = _refresh_nous_auxiliary_client(
                 cache_provider=resolved_provider or "nous",
                 model=final_model,
+                cache_model=resolved_model,
                 async_mode=False,
                 task=task,
                 base_url=resolved_base_url,
@@ -10471,6 +10474,7 @@ async def _async_call_llm_impl(
             refreshed_client, refreshed_model = _refresh_nous_auxiliary_client(
                 cache_provider=resolved_provider or "nous",
                 model=final_model,
+                cache_model=resolved_model,
                 async_mode=True,
                 task=task,
                 base_url=resolved_base_url,
@@ -10508,6 +10512,7 @@ async def _async_call_llm_impl(
             refreshed_client, refreshed_model = _refresh_nous_auxiliary_client(
                 cache_provider=resolved_provider or "nous",
                 model=final_model,
+                cache_model=resolved_model,
                 async_mode=True,
                 task=task,
                 base_url=resolved_base_url,
