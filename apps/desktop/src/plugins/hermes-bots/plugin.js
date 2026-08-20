@@ -214,6 +214,12 @@ const $groupNeedsYou = atom({})
 // the room renders answer cards from it.
 const $groupClarify = atom({})
 
+// Timed-out group turns keep running in their hidden member sessions. These
+// timers harvest the eventual answer without requiring another user message.
+const groupStrandedTimers = new Map()
+const groupStrandedInFlight = new Set()
+let groupStrandedDisposed = false
+
 // ── group activity feed ─────────────────────────────────────────────────────
 // Runtime-only, bounded per-room record of turn events that feeds the
 // collapsible Activity view. Never persisted — it is presentation state like
@@ -4159,6 +4165,7 @@ async function disbandGroupChat(group, members) {
   // Invalidate any in-flight round-robin FIRST: bump the epoch so a running
   // drive bails at its next member boundary instead of appending to a room
   // the user just discarded.
+  cancelStrandedGroupTimers(group)
   const all = { ...$groupChats.get() }
   const prior = all[group] || {}
 
@@ -4195,6 +4202,7 @@ async function disbandGroupChat(group, members) {
           log: room.log,
           watermarks: room.watermarks,
           sessions: room.sessions || {},
+          stranded: room.stranded || {},
           members: Array.isArray(room.members) ? room.members : [],
           image: room.image || null
         }
@@ -4326,8 +4334,8 @@ async function renameGroupChat(oldName, newName, members) {
   return next
 }
 
-function appendGroupChatEntry(group, from, text, thread, images) {
-  const entry = { at: Date.now(), from, text: String(text).trim(), thread: thread || 'legacy' }
+function appendGroupChatEntry(group, from, text, thread, images, extra = {}) {
+  const entry = { at: Date.now(), from, text: String(text).trim(), thread: thread || 'legacy', ...extra }
 
   if (Array.isArray(images) && images.length) {
     // [{ name, data }] — data URLs. Persisted with the room log so reloads
@@ -4359,6 +4367,7 @@ async function ensureGroupChatSession(group, member) {
   const room = $groupChats.get()[group] || {}
   const key = groupMemberKey(member)
   const known = room.sessions && room.sessions[key]
+  let rotateOversizedSession = false
 
   // Try resuming what we know (stored sid first, then title lookup).
   for (const target of [known, title]) {
@@ -4374,6 +4383,17 @@ async function ensureGroupChatSession(group, member) {
       })
 
       if (res?.session_id) {
+        const messageCount = Number(res.message_count || 0)
+
+        // Hidden group sessions accumulate the complete room transcript plus
+        // tool output. Rotate an idle oversized session before its context
+        // starts degrading tool calls. The previous session remains intact
+        // in Hermes history; only the room's active pointer changes.
+        if (!res.inflight && !res.running && messageCount >= GROUP_SESSION_ROTATE_MESSAGES) {
+          rotateOversizedSession = true
+          break
+        }
+
         return { runtime: res.session_id, stored: res.session_key || known }
       }
     } catch {
@@ -4383,7 +4403,7 @@ async function ensureGroupChatSession(group, member) {
 
   const created = await requestForBot(member, 'session.create', {
     profile: member.name,
-    title,
+    title: rotateOversizedSession ? `${title} · ${Date.now()}` : title,
     // Room member sessions are plumbing — always hidden from the sidebar.
     hidden: true
   })
@@ -4401,12 +4421,118 @@ async function ensureGroupChatSession(group, member) {
 
 const GROUP_TURN_TIMEOUT_MS = 180000
 const GROUP_TURN_POLL_MS = 2000
-// A member turn that is VISIBLY still working (session reports
-// inflight/running) keeps its slot alive up to this hard cap. The base
-// timeout alone silently dropped long real turns: a 7-minute research run
-// timed out at 3 minutes, read as a pass, and its finished result never
-// reached the room (db's Aug 2026 report).
-const GROUP_TURN_HARD_CAP_MS = 20 * 60000
+const GROUP_SESSION_ROTATE_MESSAGES = 300
+const GROUP_LATE_POLL_MS = 10000
+const GROUP_LATE_TTL_MS = 24 * 60 * 60 * 1000
+
+function durableGroupMember(member) {
+  const durable = {
+    name: String(member?.name || '').trim() || 'default',
+    title: String(member?.title || '').trim()
+  }
+
+  for (const key of ['handle', 'connectionId', 'connectionKind', 'connectionLabel']) {
+    if (member?.[key]) {
+      durable[key] = member[key]
+    }
+  }
+
+  if (member?.remoteSource) {
+    durable.remoteSource = true
+    durable.sourceScoped = true
+  }
+
+  return durable
+}
+
+function strandedTimerKey(group, memberKey) {
+  return `${group}\u0000${memberKey}`
+}
+
+function cancelStrandedGroupTimers(group = null) {
+  for (const [key, timer] of groupStrandedTimers.entries()) {
+    if (group === null || key.startsWith(`${group}\u0000`)) {
+      clearTimeout(timer)
+      groupStrandedTimers.delete(key)
+    }
+  }
+}
+
+function scheduleStrandedGroupHarvest(group, memberKey, delay = GROUP_LATE_POLL_MS) {
+  if (groupStrandedDisposed) {
+    return
+  }
+
+  const key = strandedTimerKey(group, memberKey)
+
+  if (groupStrandedTimers.has(key) || groupStrandedInFlight.has(key)) {
+    return
+  }
+
+  const timer = setTimeout(() => {
+    groupStrandedTimers.delete(key)
+    void pollStrandedGroupReply(group, memberKey)
+  }, delay)
+
+  groupStrandedTimers.set(key, timer)
+}
+
+function resumeStrandedGroupTurns() {
+  for (const [group, room] of Object.entries($groupChats.get())) {
+    for (const memberKey of Object.keys(room?.stranded || {})) {
+      scheduleStrandedGroupHarvest(group, memberKey, 0)
+    }
+  }
+}
+
+async function pollStrandedGroupReply(group, memberKey) {
+  const room = $groupChats.get()[group]
+  const marker = room?.stranded?.[memberKey]
+
+  if (marker === undefined || marker === null) {
+    return
+  }
+
+  const expiresAt = typeof marker === 'object' ? marker.expiresAt : null
+
+  if (expiresAt && Date.now() >= expiresAt) {
+    updateGroupChat(group, r => {
+      const next = { ...(r.stranded || {}) }
+      delete next[memberKey]
+      r.stranded = next
+      return r
+    })
+    appendGroupChatEntry(
+      group,
+      { kind: 'system', name: 'Hermes' },
+      `@${marker.member?.name || memberKey}'s background turn did not finish within 24 hours.`,
+      marker.thread || 'legacy'
+    )
+    return
+  }
+
+  const member = marker?.member
+    || (room.members || []).find(candidate => groupMemberKey(candidate) === memberKey)
+
+  if (!member) {
+    scheduleStrandedGroupHarvest(group, memberKey)
+    return
+  }
+
+  const before = room.log.length
+  await harvestStrandedGroupReply(group, member)
+  const current = $groupChats.get()[group]
+
+  if (current?.stranded?.[memberKey]) {
+    scheduleStrandedGroupHarvest(group, memberKey)
+  } else if (current?.log?.length > before) {
+    host.notify?.({
+      kind: 'success',
+      title: `@${member.name} finished`,
+      message: `The reply was posted in “${group}”.`
+    })
+  }
+}
 
 /** Mirror a member's pending prompt — clarify question OR command approval —
  *  from its resume snapshot into the room store, keyed
@@ -4549,11 +4675,9 @@ async function answerGroupClarify(entry, member, answers) {
 
 /** One member turn, gateway-native: submit the room delta as a prompt into
  *  the member's per-group session, then poll the session until a NEW
- *  assistant message lands (or timeout → pass). While the session visibly
- *  reports work in flight the deadline extends (bounded by the hard cap),
- *  so slow models aren't cut off mid-run. A turn that still times out
- *  records a stranded marker so the finished reply can be harvested into
- *  the room at the member's next turn instead of being lost. */
+ *  assistant message lands. At three minutes the room is released while a
+ *  durable background watcher keeps polling the same session and posts the
+ *  eventual answer back into the original thread. */
 async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
   const { runtime, stored } = await ensureGroupChatSession(group, member)
 
@@ -4627,8 +4751,7 @@ async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
 
   await requestForBot(member, 'prompt.submit', { session_id: runtime, text: turnText })
 
-  const started = Date.now()
-  let deadline = started + GROUP_TURN_TIMEOUT_MS
+  const deadline = Date.now() + GROUP_TURN_TIMEOUT_MS
 
   while (Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, GROUP_TURN_POLL_MS))
@@ -4679,12 +4802,6 @@ async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
       return null
     }
 
-    // Still visibly working — or waiting on the user's answer to a clarify:
-    // extend the deadline (never past the hard cap). A pending question must
-    // outlive the base turn timeout or it dies unanswered at 3 minutes.
-    if (busy || awaitingUser) {
-      deadline = Math.min(started + GROUP_TURN_HARD_CAP_MS, Math.max(deadline, Date.now() + GROUP_TURN_TIMEOUT_MS))
-    }
   }
 
   // Timeout — clear any still-mirrored question card (the server-side
@@ -4693,92 +4810,122 @@ async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
   // thread instead of vanishing.
   recordGroupActivity(group, { kind: 'timed-out', member: member.name, thread })
   syncGroupClarify(group, member, null)
+  const memberKey = groupMemberKey(member)
+  const now = Date.now()
+  const lateTurnId = `${memberKey}-${now}-${Math.random().toString(36).slice(2, 9)}`
+
   updateGroupChat(group, r => {
-    r.stranded = { ...(r.stranded || {}), [groupMemberKey(member)]: { before, thread } }
+    r.stranded = {
+      ...(r.stranded || {}),
+      [memberKey]: {
+        id: lateTurnId,
+        before,
+        thread,
+        member: durableGroupMember(member),
+        submittedAt: now,
+        expiresAt: now + GROUP_LATE_TTL_MS
+      }
+    }
     return r
   })
+  scheduleStrandedGroupHarvest(group, memberKey)
 
   return null
 }
 
 /** Post a timed-out member's finished reply into the room, if it landed
- *  after we stopped waiting. Called at the member's next turn boundary and
- *  on user sends, so long-running work is delivered late rather than lost. */
+ *  after we stopped waiting. A background poller calls this until the member
+ *  finishes, so delivery does not depend on another user message. */
 async function harvestStrandedGroupReply(group, member) {
   const memberKey = groupMemberKey(member)
-  const room = $groupChats.get()[group] || {}
-  const marker = room.stranded?.[memberKey]
-  // Markers were a bare number before threads; normalize both shapes.
-  const strandedBefore = typeof marker === 'number' ? marker : marker?.before
-  const strandedThread = (typeof marker === 'object' && marker?.thread) || 'legacy'
+  const harvestKey = strandedTimerKey(group, memberKey)
 
-  if (typeof strandedBefore !== 'number') {
+  if (groupStrandedInFlight.has(harvestKey)) {
     return
   }
 
-  let state = null
+  groupStrandedInFlight.add(harvestKey)
 
   try {
-    const stored = room.sessions?.[memberKey]
-    state = await requestForBot(member, 'session.resume', {
-      session_id: stored || `Group: ${group}`,
-      profile: member.name
-    })
-  } catch {
-    return // source unreachable — leave the marker for the next boundary
-  }
+    const room = $groupChats.get()[group] || {}
+    const marker = room.stranded?.[memberKey]
+    // Markers were a bare number before threads; normalize both shapes.
+    const strandedBefore = typeof marker === 'number' ? marker : marker?.before
+    const strandedThread = (typeof marker === 'object' && marker?.thread) || 'legacy'
 
-  if (state?.inflight || state?.running) {
-    return // still grinding — keep waiting
-  }
-
-  // A stranded member blocked on a clarify is not "grinding" — surface the
-  // question card (#90694) and keep the marker until it resolves.
-  if (syncGroupClarify(group, member, state)) {
-    return
-  }
-
-  // Done (or dead): the marker is consumed either way.
-  updateGroupChat(group, r => {
-    const next = { ...(r.stranded || {}) }
-    delete next[memberKey]
-    r.stranded = next
-    return r
-  })
-
-  const messages = Array.isArray(state?.messages) ? state.messages : []
-
-  if (messages.length <= strandedBefore) {
-    return
-  }
-
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i]
-
-    if (msg?.role === 'assistant') {
-      const text = typeof msg.content === 'string'
-        ? msg.content
-        : Array.isArray(msg.content)
-          ? msg.content.map(p => (typeof p === 'string' ? p : p?.text || '')).join('')
-          : msg?.text || ''
-      const reply = String(text).trim()
-
-      if (reply && !isGroupPassText(reply)) {
-        recordGroupActivity(group, { kind: 'delivered', member: member.name, thread: strandedThread })
-        appendGroupChatEntry(
-          group,
-          { kind: 'member', name: member.name, ...(member.remoteSource ? { source: member.connectionLabel || member.connectionId } : {}) },
-          reply,
-          strandedThread
-        )
-        updateGroupChat(group, r => {
-          r.watermarks[`${strandedThread}::${memberKey}`] = r.log.length
-          return r
-        })
-      }
-
+    if (typeof strandedBefore !== 'number') {
       return
     }
+
+    let state = null
+
+    try {
+      const stored = room.sessions?.[memberKey]
+      state = await requestForBot(member, 'session.resume', {
+        session_id: stored || `Group: ${group}`,
+        profile: member.name
+      })
+    } catch {
+      return // source unreachable — leave the marker for the next poll
+    }
+
+    if (state?.inflight || state?.running) {
+      return // still grinding — keep waiting
+    }
+
+    // A stranded member blocked on a clarify is not "grinding" — surface the
+    // question card (#90694) and keep the marker until it resolves.
+    if (syncGroupClarify(group, member, state)) {
+      return
+    }
+
+    // Done (or dead): the marker is consumed either way.
+    updateGroupChat(group, r => {
+      const next = { ...(r.stranded || {}) }
+      delete next[memberKey]
+      r.stranded = next
+      return r
+    })
+
+    const messages = Array.isArray(state?.messages) ? state.messages : []
+
+    if (messages.length <= strandedBefore) {
+      return
+    }
+
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i]
+
+      if (msg?.role === 'assistant') {
+        const text = typeof msg.content === 'string'
+          ? msg.content
+          : Array.isArray(msg.content)
+            ? msg.content.map(p => (typeof p === 'string' ? p : p?.text || '')).join('')
+            : msg?.text || ''
+        const reply = String(text).trim()
+        const lateTurnId = typeof marker === 'object' ? marker.id : null
+
+        if (reply && !isGroupPassText(reply) && !room.log.some(entry => lateTurnId && entry.lateTurnId === lateTurnId)) {
+          recordGroupActivity(group, { kind: 'delivered', member: member.name, thread: strandedThread })
+          appendGroupChatEntry(
+            group,
+            { kind: 'member', name: member.name, ...(member.remoteSource ? { source: member.connectionLabel || member.connectionId } : {}) },
+            reply,
+            strandedThread,
+            null,
+            { late: true, ...(lateTurnId ? { lateTurnId } : {}) }
+          )
+          updateGroupChat(group, r => {
+            r.watermarks[`${strandedThread}::${memberKey}`] = r.log.length
+            return r
+          })
+        }
+
+        return
+      }
+    }
+  } finally {
+    groupStrandedInFlight.delete(harvestKey)
   }
 }
 
@@ -9144,6 +9291,9 @@ function GroupChatWorkspace({ group, members, onBack }) {
   const rooms = useValue($groupChats)
   const allMeta = useValue($botMeta)
   const room = rooms[group] || { log: [], running: false }
+  const strandedNames = Object.values(room.stranded || {})
+    .map(marker => marker?.member?.name)
+    .filter(Boolean)
   const [draft, setDraft] = useState('')
   const [confirmDisband, setConfirmDisband] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -9748,10 +9898,12 @@ function GroupChatWorkspace({ group, members, onBack }) {
             ...roomClarifies.map(entry =>
               jsx(GroupClarifyCard, { entry, members }, `clarify:${entry.memberKey}:${entry.requestId}`)
             ),
-            room.running
+            room.running || strandedNames.length
               ? jsx('div', {
                   className: 'px-2 py-1 text-[0.7rem] italic text-(--ui-text-quaternary)',
-                  children: roomClarifies.length
+                  children: strandedNames.length
+                    ? `${strandedNames.map(groupSpeakerLabel).join(', ')} still working — the finished reply will return here automatically.`
+                    : roomClarifies.length
                     ? 'Waiting for your answer…'
                     : room.turn
                       ? `${groupSpeakerLabel(room.turn)} is thinking…`
@@ -10483,6 +10635,7 @@ export default {
   description: 'Bot Mode — a one-chat-per-agent roster with avatars, routines, group chats, and bot-to-bot messaging. Ships with the app; disable here if unwanted.',
   register(ctx) {
     pluginCtx = ctx
+    groupStrandedDisposed = false
     startFaceClock()
     // Disabling the plugin (or a hot reload) must actually stop the clock —
     // before this, the rAF loop + 1Hz document scan ran until app restart.
@@ -10622,6 +10775,7 @@ export default {
             }
 
             $groupChats.set({ ...rooms, ...$groupChats.get() })
+            resumeStrandedGroupTurns()
           }
         })
         .catch(() => undefined)
@@ -10642,6 +10796,8 @@ export default {
 
     if (typeof ctx.onDispose === 'function') {
       ctx.onDispose(() => {
+        groupStrandedDisposed = true
+        cancelStrandedGroupTimers()
         if (typeof unbindProfileListener === 'function') {
           unbindProfileListener()
         }

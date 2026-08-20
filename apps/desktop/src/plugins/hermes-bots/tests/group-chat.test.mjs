@@ -124,7 +124,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, disbandGroupChat, updateGroupChat, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, ensureGroupChatSession, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, disbandGroupChat, updateGroupChat, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -659,6 +659,42 @@ test('stranded harvest: a timed-out turn whose reply landed late posts into the 
   assert.equal(gc.$groupChats.get().Late.stranded.research, undefined, 'marker consumed')
 })
 
+test('stranded harvest: the same completed turn is delivered exactly once', async () => {
+  const gc = load(() => '(pass)')
+  const marker = {
+    id: 'late-turn-1',
+    before: 0,
+    thread: 'thread-1',
+    member: { name: 'research', title: '' }
+  }
+
+  gc.updateGroupChat('Once', r => {
+    r.stranded = { research: marker }
+    r.sessions = { research: 'sid-research' }
+    return r
+  })
+  gc.sessions.set('sid-research', {
+    stored: 'sid-research',
+    runtime: 'rt-research',
+    profile: 'research',
+    title: 'Group: Once',
+    messages: [
+      { role: 'user', content: 'work' },
+      { role: 'assistant', content: 'Finished exactly once.' }
+    ]
+  })
+
+  await gc.harvestStrandedGroupReply('Once', { name: 'research', title: '' })
+  // Recreate a stale persisted marker to simulate a reload/racing poll.
+  gc.updateGroupChat('Once', r => {
+    r.stranded = { research: marker }
+    return r
+  })
+  await gc.harvestStrandedGroupReply('Once', { name: 'research', title: '' })
+
+  assert.equal(roomLog(gc, 'Once').filter(entry => entry.lateTurnId === marker.id).length, 1)
+})
+
 test('stranded + still busy: the round loop never re-submits into a member whose harvest just confirmed they are still running', async () => {
   // research is confirmed busy on exactly its first two session.resume
   // calls — the number of harvest-only touches the FIXED code makes across
@@ -754,9 +790,36 @@ test('stranded markers persist so late replies survive a window reload', async (
   assert.equal(durable.Persist.stranded.research, 3, 'stranded marker rides the durable map')
 })
 
-test('source contract: long visible turns extend the deadline up to a hard cap', () => {
-  assert.match(pluginSource, /const GROUP_TURN_HARD_CAP_MS = /)
-  assert.match(pluginSource, /deadline = Math\.min\(started \+ GROUP_TURN_HARD_CAP_MS/)
+test('source contract: room releases at three minutes and polls late work automatically', () => {
+  assert.match(pluginSource, /const GROUP_TURN_TIMEOUT_MS = 180000/)
+  assert.match(pluginSource, /const deadline = Date\.now\(\) \+ GROUP_TURN_TIMEOUT_MS/)
+  assert.match(pluginSource, /scheduleStrandedGroupHarvest\(group, memberKey\)/)
+  assert.match(pluginSource, /resumeStrandedGroupTurns\(\)/)
+  assert.match(pluginSource, /finished reply will return here automatically/)
+  assert.doesNotMatch(pluginSource, /GROUP_TURN_HARD_CAP_MS/)
+})
+
+test('oversized hidden group session rotates without deleting its history', async () => {
+  const gc = load(() => '(pass)')
+  const messages = Array.from({ length: 300 }, (_, index) => ({ role: 'user', content: `message-${index}` }))
+
+  gc.sessions.set('sid-rory-old', {
+    stored: 'sid-rory-old',
+    runtime: 'rt-rory-old',
+    profile: 'rory',
+    title: 'Group: Marketing Team',
+    messages
+  })
+  gc.updateGroupChat('Marketing Team', r => {
+    r.sessions = { rory: 'sid-rory-old' }
+    return r
+  })
+
+  const active = await gc.ensureGroupChatSession('Marketing Team', { name: 'rory', title: '' })
+
+  assert.notEqual(active.stored, 'sid-rory-old', 'room points at a fresh hidden session')
+  assert.equal(gc.sessions.get('sid-rory-old').messages.length, 300, 'old history remains intact')
+  assert.equal(gc.$groupChats.get()['Marketing Team'].sessions.rory, active.stored)
 })
 
 test('source contract: the working line names the member on turn', () => {
@@ -1027,7 +1090,7 @@ test('source contract: room renders clarify cards and the poll gates on them', (
   assert.match(pluginSource, /function GroupClarifyCard\(/)
   assert.match(pluginSource, /syncGroupClarify\(group, member, state\)/)
   assert.match(pluginSource, /const done = !busy && !awaitingUser/)
-  assert.match(pluginSource, /busy \|\| awaitingUser/)
+  assert.match(pluginSource, /const done = !busy && !awaitingUser/)
   assert.match(pluginSource, /roomClarifies\.map\(entry =>/)
   assert.match(pluginSource, /'clarify\.respond'/)
 })
