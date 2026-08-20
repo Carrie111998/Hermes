@@ -330,6 +330,37 @@ class TestMemoryToolDispatcher:
         assert "the real one" in store.memory_entries
         assert "ignored" not in store.memory_entries
 
+    def test_empty_content_falls_back_to_new_text_on_replace(self, store):
+        # Regression: runtimes that send content="" instead of omitting it
+        # must still fall back to new_text instead of erroring
+        # "content is required for 'replace' action." (#90468).
+        store.add("memory", "fact A")
+        result = json.loads(
+            memory_tool(
+                action="replace",
+                old_text="fact A",
+                content="",
+                new_text="fact A refined",
+                store=store,
+            )
+        )
+        assert result["success"] is True
+        assert "fact A refined" in store.memory_entries
+        assert "fact A" not in [e for e in store.memory_entries if e == "fact A"]
+
+    def test_empty_content_falls_back_to_new_text_on_add(self, store):
+        result = json.loads(
+            memory_tool(action="add", content="", new_text="added via new_text", store=store)
+        )
+        assert result["success"] is True
+        assert "added via new_text" in store.memory_entries
+
+    def test_empty_content_without_new_text_still_fails_validation(self, store):
+        # content="" with no new_text is genuinely missing content; must fail.
+        result = json.loads(memory_tool(action="add", content="", store=store))
+        assert result["success"] is False
+        assert "content is required" in result["error"].lower()
+
 
 class TestMemoryBatch:
     """The 'operations' batch shape: atomic, all-or-nothing, final-budget."""
