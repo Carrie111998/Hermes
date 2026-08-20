@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from hermes_state import COMPRESSION_CHAIN_MAX_HOPS
+from hermes_state_common import COMPRESSION_CHAIN_MAX_HOPS
 
 
 def parse_session_listing_args(raw_args: str) -> tuple[bool, bool, str, str | None]:

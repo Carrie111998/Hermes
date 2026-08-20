@@ -717,7 +717,7 @@ def _chain_token_totals(conn, root_ids) -> "Dict[str, Tuple[Optional[int], Optio
             FROM chain c
             JOIN sessions parent ON parent.id = c.sid AND parent.end_reason = 'compression'
             JOIN sessions child ON child.parent_session_id = parent.id
-            WHERE c.depth < 100
+            WHERE c.depth < {COMPRESSION_CHAIN_MAX_HOPS}
               AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
               AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
               AND COALESCE(child.source, '') != 'tool'
