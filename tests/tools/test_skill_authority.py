@@ -113,3 +113,22 @@ def test_deployment_atomically_converges_and_writes_manifest(tmp_path):
     assert manifest["schema_version"] == 1
     assert manifest["skills"]["lah-repo-router"]["invocation_name"] == "lah-repo-router"
     assert validate_runtime_authority(runtime, manifest, critical=("lah-repo-router",))["valid"] is True
+
+
+def test_deployment_creates_missing_target_parents_in_fresh_runtime(tmp_path):
+    source = _skill(tmp_path / "source", "software-development", "lah-repo-router", "source")
+    runtime = tmp_path / "fresh-runtime"
+
+    manifest = deploy_runtime_authority(
+        runtime,
+        {
+            "lah-repo-router": {
+                "source_path": str(source),
+                "source_repo": "test",
+                "runtime_path": "software-development/lah-repo-router",
+            }
+        },
+    )
+
+    assert (runtime / "software-development/lah-repo-router/SKILL.md").is_file()
+    assert validate_runtime_authority(runtime, manifest, critical=("lah-repo-router",))["valid"] is True

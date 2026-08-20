@@ -174,6 +174,7 @@ def deploy_runtime_authority(
             staged_dir = staging_root / "payload" / relative
             if target_dir.exists():
                 shutil.rmtree(target_dir)
+            target_dir.parent.mkdir(parents=True, exist_ok=True)
             os.replace(staged_dir, target_dir)
 
         manifest_file = manifest_path(runtime_root)
