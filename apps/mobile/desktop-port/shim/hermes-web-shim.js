@@ -88,7 +88,8 @@
         host: String(parsed.host),
         port: Number(parsed.port) || 22,
         username: String(parsed.username),
-        hostKey: String(parsed.hostKey)
+        hostKey: String(parsed.hostKey),
+        sshRemoteProfile: typeof parsed.sshRemoteProfile === 'string' ? parsed.sshRemoteProfile : ''
       }
     } catch {
       return null
@@ -319,7 +320,8 @@
       sshUser: ssh ? ssh.username : '',
       sshPort: ssh ? ssh.port : null,
       sshKeyPath: '',
-      sshRemoteHermesPath: ''
+      sshRemoteHermesPath: '',
+      sshRemoteProfile: ssh ? ssh.sshRemoteProfile : ''
     }
   }
 
@@ -353,7 +355,8 @@
       // iOS keeps the actual key in Keychain. This compatibility field is
       // deliberately blank; the renderer must never receive private material.
       sshKeyPath: '',
-      sshRemoteHermesPath: ''
+      sshRemoteHermesPath: '',
+      sshRemoteProfile: ssh ? ssh.sshRemoteProfile : ''
     }
   }
 
