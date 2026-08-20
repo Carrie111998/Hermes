@@ -17410,6 +17410,18 @@ def mount_spa(application: FastAPI):
             html = html.replace('href="/fonts/', f'href="{prefix}/fonts/')
             html = html.replace('href="/ds-assets/', f'href="{prefix}/ds-assets/')
             html = html.replace('src="/ds-assets/', f'src="{prefix}/ds-assets/')
+        # Anchor Vite's relative asset URLs to the external prefix so lazy
+        # chunks and their dependencies do not escape a prefixed proxy
+        # (#90068).
+        asset_prefix = prefix or ""
+        asset_root = f"{asset_prefix}/assets/" if asset_prefix else "/assets/"
+        html = html.replace('href="./assets/', f'href="{asset_root}')
+        html = html.replace('src="./assets/', f'src="{asset_root}')
+        if prefix:
+            html = html.replace('href="./favicon.ico"', f'href="{prefix}/favicon.ico"')
+            html = html.replace('href="./fonts/', f'href="{prefix}/fonts/')
+            html = html.replace('href="./ds-assets/', f'href="{prefix}/ds-assets/')
+            html = html.replace('src="./ds-assets/', f'src="{prefix}/ds-assets/')
         # Theme flash mitigation: when the active theme is a user theme
         # (``HERMES_HOME/dashboard-themes/<name>.yaml``), inject a minimal
         # critical-CSS block so the first paint uses the target palette.
