@@ -1652,6 +1652,16 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
         and "requested" in error_lower
         and "output tokens" in error_lower
     ) or (
+        # Anthropic output-cap phrasing, distinct from prompt/context overflow:
+        #   "max_tokens: 100000 > 64000, which is the maximum allowed number
+        #    of output tokens for claude-sonnet-4-5"
+        # The provider is saying the requested response budget is above the
+        # model's output ceiling.  Treat it as an output-cap retry, not as
+        # input/context overflow.  Port of cline/cline#12876's stricter
+        # Anthropic invalid_request_error disambiguation.
+        "max_tokens" in error_lower
+        and "maximum allowed number of output tokens" in error_lower
+    ) or (
         # DashScope / Alibaba Cloud (Qwen) phrasing.  The provider rejects an
         # over-cap output request with a bounded range whose upper bound IS the
         # real max-output cap, e.g.
@@ -1662,6 +1672,17 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
     )
     if not is_output_cap_error:
         return None
+
+    # Anthropic output ceiling form: "max_tokens: 100000 > 64000, which is
+    # the maximum allowed number of output tokens for claude-sonnet-4-5".
+    _m_anthropic_output_cap = re.search(
+        r'max_tokens\s*:\s*\d+\s*>\s*(\d+)\s*,?\s*which is the maximum allowed number of output tokens',
+        error_lower,
+    )
+    if _m_anthropic_output_cap:
+        _cap = int(_m_anthropic_output_cap.group(1))
+        if _cap >= 1:
+            return _cap
 
     # DashScope / Alibaba range form: "Range of max_tokens should be [1, 65536]".
     # The upper bound is the available output cap.
@@ -1779,6 +1800,7 @@ def is_output_cap_error(error_msg: str) -> bool:
             and "maximum context length" in error_lower)
         or ("requested" in error_lower                      # LM Studio / llama.cpp
             and "output tokens" in error_lower)
+        or "maximum allowed number of output tokens" in error_lower  # Anthropic
         or "should be" in error_lower                       # generic "max_tokens should be <= N"
         or "less than or equal" in error_lower
         or "must be" in error_lower
