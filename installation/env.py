@@ -180,6 +180,18 @@ def managed_tool_env(
         if fact is not None and (store / fact.path).is_file():
             env["PLAYWRIGHT_BROWSERS_PATH"] = str(store)
             break
+
+    # Camoufox: the pin table stages the browser binary in the tool store
+    # and writes version.json so camoufox-js sees it as installed, but
+    # camoufox-js also reads CAMOFOX_INSTALL_DIR to locate the binary
+    # directory. Without this env var, camoufox-js ignores the provisioned
+    # copy and downloads ~650MB itself at first run — duplicating the
+    # provisioner's work and hitting the GitHub releases API that the pin
+    # was specifically designed to avoid (rate limits, non-reproducible
+    # versions). Only exported when the fact exists and the path is valid.
+    camoufox = facts.get("camoufox")
+    if camoufox is not None and (store / camoufox.path).is_file():
+        env["CAMOFOX_INSTALL_DIR"] = str((store / camoufox.path).parent)
     return env
 
 
