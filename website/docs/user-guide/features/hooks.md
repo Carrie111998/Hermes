@@ -408,6 +408,18 @@ def register(ctx):
 | [`transform_terminal_output`](#transform_terminal_output) | Inside the `terminal` tool, before truncation/ANSI-strip/redact | `str` to replace the raw output, `None` to leave unchanged |
 | [`transform_llm_output`](#transform_llm_output) | After the tool-calling loop completes, before the final response is delivered | `str` to replace the response text, `None`/empty to leave unchanged |
 
+:::note Temporary chats
+For a [temporary chat](temporary-chats.md), observe-only hooks — the ones
+whose return value is ignored (`on_session_start`/`end`/`finalize`/`reset`,
+`pre_api_request`, `post_api_request`, `post_llm_call`, `post_tool_call`,
+`subagent_start`/`stop`, `on_skill_lifecycle`, `api_request_error`) — are
+**not delivered at all**: a plugin that exports trajectories or tracks files
+must never see a conversation the user was promised leaves no trace. Hooks
+whose results the core consumes (blocking, context injection, transforms,
+approvals) still fire, and their kwargs carry `ephemeral: true`. If your
+hook records anything durable, treat that flag as "do not record".
+:::
+
 ---
 
 ### `pre_tool_call`

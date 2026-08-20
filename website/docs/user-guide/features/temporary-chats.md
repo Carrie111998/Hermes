@@ -44,6 +44,12 @@ temporary can never silently downgrade to a saved one.
   conversations into memory and skill updates (including `/refine`) does
   not run on a temporary chat — its entire output would be durable state
   derived from the conversation.
+- **No plugin observability.** Observe-only plugin hooks (session
+  lifecycle, API request/response, tool-call and subagent telemetry) are
+  not delivered for a temporary chat, so plugins that export trajectories
+  or track files never see it. Functional hooks (context injection, tool
+  blocking, approvals) still fire and carry `ephemeral: true` — plugin
+  authors should treat that flag as "do not record".
 - **No resumability.** `/resume` has nothing to find.
 - **Minimal logs.** The agent's operational log records that a turn happened,
   but the message preview is redacted.

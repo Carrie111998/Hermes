@@ -2290,11 +2290,71 @@ def discover_plugins(force: bool = False) -> None:
     get_plugin_manager().discover_and_load(force=force)
 
 
+# Hooks that only OBSERVE a session — fire-and-forget deliveries whose return
+# values the core never consumes: telemetry marks, trajectory/ATIF exports,
+# file tracking, session accounting. For a temporary (/temp, --no-session)
+# session these are suppressed ENTIRELY at dispatch: plugins are arbitrary
+# code the core cannot audit, and the two bundled examples alone would
+# durably record a temporary chat (disk-cleanup writes its tracked.json from
+# post_tool_call; nemo_relay exports a full ATIF trajectory file from
+# on_session_end/finalize/reset). Suppressing observe-hooks cannot break an
+# in-flight turn precisely because nothing reads their results.
+#
+# Hooks whose results the core consumes (pre_llm_call context injection,
+# pre_tool_call blocking, transform_llm_output, approval prompts,
+# pre_gateway_dispatch routing) still fire — a temporary chat must stay
+# functional — but their kwargs carry ``ephemeral=True`` so a well-behaved
+# plugin can decline to record what it sees.
+_EPHEMERAL_SUPPRESSED_HOOKS = frozenset({
+    "on_session_start",
+    "on_session_end",
+    "on_session_finalize",
+    "on_session_reset",
+    "on_skill_lifecycle",
+    "pre_api_request",
+    "post_api_request",
+    "post_llm_call",
+    "post_tool_call",
+    "subagent_start",
+    "subagent_stop",
+    "api_request_error",
+})
+
+
+def ephemeral_hook_delivery(
+    hook_name: str, kwargs: Dict[str, Any]
+) -> tuple[bool, Dict[str, Any]]:
+    """Apply the temporary-session contract to one hook delivery.
+
+    Returns ``(deliver, kwargs)``: observe-only hooks for a registered
+    temporary session are not delivered at all; every other delivery for such
+    a session is stamped ``ephemeral=True``. Hooks without a ``session_id``
+    cannot be classified and deliver unchanged — every content-bearing hook
+    in the core passes one.
+    """
+    session_id = str(kwargs.get("session_id") or "")
+    if not session_id:
+        return True, kwargs
+    try:
+        from hermes_state import is_session_ephemeral
+
+        if not is_session_ephemeral(session_id):
+            return True, kwargs
+    except Exception:
+        return True, kwargs
+    if hook_name in _EPHEMERAL_SUPPRESSED_HOOKS:
+        return False, kwargs
+    return True, {**kwargs, "ephemeral": True}
+
+
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     """Invoke a lifecycle hook on loaded plugins.
 
     Returns a list of non-``None`` return values from plugin callbacks.
     """
+    deliver, kwargs = ephemeral_hook_delivery(hook_name, kwargs)
+    if not deliver:
+        return []
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
 
 
