@@ -2,43 +2,59 @@
 """Post one message into an existing Bot Mode group room.
 
 Lives in the ``desktop_ui`` toolset, which the GUI gateway enables only for a
-session whose source is the desktop app. Emits ``bots.group.send`` through the
-shared ``desktop_ui`` bridge; the bundled Bot Mode plugin feeds the existing
-room engine (``sendToGroupChat``). This queues delivery — it does not wait for
-member rounds to settle, and it is not a headless CLI.
+session whose source is the desktop app. Round-trips through the gateway's
+blocking-prompt bridge like ``tour``: tui_gateway emits
+``bots.group.send.request``, the bundled Bot Mode plugin feeds the existing
+room engine and answers ``bots.group.send.respond``. Unknown groups and empty
+payloads fail closed. This is not a headless CLI.
 """
 
 import json
+from typing import Callable, Optional
 
-from tools import desktop_ui
 from tools.registry import registry, tool_error
 
 
-def send_bot_group_tool(group: str, message: str, thread: str = "") -> str:
+def send_bot_group_tool(
+    group: str = "",
+    message: str = "",
+    thread: str = "",
+    callback: Optional[Callable] = None,
+) -> str:
     """Ask Bot Mode to post ``message`` into the existing ``group`` room."""
-    name = (group or "").strip()
-    text = (message or "").strip()
-    if not name:
-        return tool_error("group is required — the existing Bot Mode room name, e.g. 'Workshop'.")
-    if not text:
-        return tool_error("message is required — the text to post into the group room.")
+    if callback is None:
+        return tool_error("Bot Mode group send is only available in the Hermes desktop app.")
 
-    payload = {"group": name, "text": text}
-    topic = (thread or "").strip()
+    if not isinstance(group, str) or not group.strip():
+        return tool_error("group is required — the existing Bot Mode room name, e.g. 'Workshop'.")
+    if not isinstance(message, str) or not message.strip():
+        return tool_error("message is required — the text to post into the group room.")
+    if thread not in (None, "") and not isinstance(thread, str):
+        return tool_error("thread must be a string.")
+
+    payload = {"group": group.strip(), "text": message.strip()}
+    topic = (thread or "").strip() if isinstance(thread, str) else ""
     if topic:
         payload["thread"] = topic
 
     try:
-        ok = desktop_ui.emit("bots.group.send", payload)
+        raw = callback(payload)
     except Exception as exc:
-        return tool_error(f"Failed to send to Bot Mode group '{name}': {exc}")
-    if not ok:
-        return tool_error("Bot Mode group send is only available in the Hermes desktop app.")
+        return tool_error(f"Failed to send to Bot Mode group '{payload['group']}': {exc}")
+    if not raw:
+        return tool_error(
+            "No Hermes Desktop window answered the group send. Update the desktop app "
+            "and start a new session if Bot Mode is older than this tool."
+        )
 
-    result = {"success": True, "queued": True, "group": name}
-    if topic:
-        result["thread"] = topic
-    return json.dumps(result, ensure_ascii=False)
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return json.dumps({"text": str(raw)}, ensure_ascii=False)
+
+    if isinstance(parsed, dict) and parsed.get("error"):
+        return tool_error(str(parsed["error"]))
+    return json.dumps(parsed, ensure_ascii=False)
 
 
 SEND_BOT_GROUP_SCHEMA = {
@@ -48,7 +64,7 @@ SEND_BOT_GROUP_SCHEMA = {
         "Strategy, or another room on this desktop). Every bot in the room hears "
         "the same send and the normal mention/round-robin rules apply. Use this "
         "instead of typing through the UI or sending separate 1:1 Bot Chats. "
-        "Returns queued delivery — it does not wait for the room to settle. "
+        "Returns queued delivery only after the room accepts the send. "
         "Desktop sessions only."
     ),
     "parameters": {
@@ -80,6 +96,7 @@ registry.register(
         group=args.get("group", ""),
         message=args.get("message", ""),
         thread=args.get("thread", ""),
+        callback=kw.get("callback"),
     ),
     emoji="💬",
 )

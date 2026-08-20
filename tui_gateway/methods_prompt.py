@@ -1442,6 +1442,14 @@ def _(rid, params: dict) -> dict:
     return _respond(rid, params, "text", allow_expired=True)
 
 
+@method("bots.group.send.respond")
+def _(rid, params: dict) -> dict:
+    # `text` is a JSON string with the Bot Mode room's accept/reject outcome.
+    # allow_expired=True: ingest is sync, but a late plugin answer after the
+    # tool's short wait must not surface a raw 4009.
+    return _respond(rid, params, "text", allow_expired=True)
+
+
 @method("mcp.setup.respond")
 def _(rid, params: dict) -> dict:
     # `result` is a JSON string of the setup card's outcome ({status, server,

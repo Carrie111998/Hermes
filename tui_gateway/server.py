@@ -3552,6 +3552,7 @@ def _block(
         "window.read.request",
         "mcp.setup.request",
         "tour.request",
+        "bots.group.send.request",
     }:
         _emit(
             f"{event.removesuffix('.request')}.expire",
@@ -6395,6 +6396,12 @@ def _agent_cbs(sid: str) -> dict:
         # preview pane's webview — and answers tour.respond with the outcome
         # (did the selector match, which step is active).
         "tour_callback": lambda payload: _tour_request(sid, payload),
+        "send_bot_group_callback": lambda payload: _block(
+            "bots.group.send.request",
+            sid,
+            dict(payload),
+            timeout=15,
+        ),
     }
 
     # Interim assistant commentary (text alongside tool calls, or the attempted

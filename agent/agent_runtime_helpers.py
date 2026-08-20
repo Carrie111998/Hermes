@@ -3260,6 +3260,18 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 ),
                 next_args,
             )
+    elif function_name == "send_bot_group":
+        def _execute(next_args: dict) -> Any:
+            from tools.send_bot_group_tool import send_bot_group_tool as _send_bot_group_tool
+            return _finish_agent_tool(
+                _send_bot_group_tool(
+                    group=next_args.get("group", ""),
+                    message=next_args.get("message", ""),
+                    thread=next_args.get("thread", ""),
+                    callback=getattr(agent, "send_bot_group_callback", None),
+                ),
+                next_args,
+            )
     elif function_name == "setup_mcp":
         def _execute(next_args: dict) -> Any:
             from tools.setup_mcp_tool import setup_mcp_tool as _setup_mcp_tool

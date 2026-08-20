@@ -2227,6 +2227,28 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('tour', function_args, tool_duration, result=function_result)}")
+        elif function_name == "send_bot_group":
+            def _execute(next_args: dict) -> Any:
+                from tools.send_bot_group_tool import send_bot_group_tool as _send_bot_group_tool
+                return _send_bot_group_tool(
+                    group=next_args.get("group", ""),
+                    message=next_args.get("message", ""),
+                    thread=next_args.get("thread", ""),
+                    callback=getattr(agent, "send_bot_group_callback", None),
+                )
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                execute=_execute,
+                scope_block=_ts_scope_block,
+                display_index=i,
+            ))
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl('send_bot_group', function_args, tool_duration, result=function_result)}")
         elif function_name == "setup_mcp":
             def _execute(next_args: dict) -> Any:
                 from tools.setup_mcp_tool import setup_mcp_tool as _setup_mcp_tool

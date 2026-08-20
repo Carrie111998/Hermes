@@ -7,13 +7,14 @@ const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf
 
 /** Load the plugin in a vm and capture host.onEvent subscriptions so a
  *  desktop_ui ``bots.group.send`` event can drive the existing room engine. */
-function load(turnScript = () => '(pass)') {
+function load() {
   const values = new Map()
   const atom = initial => {
     const slot = { get: () => values.get(slot), set: value => values.set(slot, value) }
     values.set(slot, initial)
     return slot
   }
+  const rpc = []
   const eventListeners = new Map()
   const context = {
     atom,
@@ -26,7 +27,10 @@ function load(turnScript = () => '(pass)') {
     COMPOSER_AREAS: { middleware: 'middleware' },
     document: { getElementById: () => null, createElement: () => ({}), head: { appendChild: () => undefined } },
     host: {
-      request: async () => ({}),
+      request: async (method, params) => {
+        rpc.push({ method, params })
+        return {}
+      },
       state: { profile: { get: () => 'default', listen: () => undefined }, gateway: { listen: () => undefined } },
       notify: () => undefined,
       notifyError: () => undefined,
@@ -45,10 +49,11 @@ function load(turnScript = () => '(pass)') {
     .replace(/^import .* from 'react'\r?\n/m, '')
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
-    .concat(
-      '\nglobalThis.__gs = { sendToGroupChat, $groupChats, $botMeta, $lastRoster };\n' +
-        'try { globalThis.__gs.ingestBotGroupSend = ingestBotGroupSend } catch {}\n'
-    )
+    .concat(`
+globalThis.__gs = { sendToGroupChat, $groupChats, $botMeta, $lastRoster };
+try { globalThis.__gs.ingestBotGroupSend = ingestBotGroupSend } catch {}
+try { globalThis.__gs.resolveBotGroupSendMembers = resolveBotGroupSendMembers } catch {}
+`)
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
   context.plugin.register({
@@ -59,6 +64,7 @@ function load(turnScript = () => '(pass)') {
     ...context.__gs,
     eventListeners,
     host: context.host,
+    rpc,
     emit(type, event) {
       for (const listener of eventListeners.get(type) || []) {
         listener(event)
@@ -119,4 +125,62 @@ test('register subscribes host.onEvent for bots.group.send', () => {
 
   const log = (gs.$groupChats.get().Workshop || { log: [] }).log
   assert.equal(log[0].text, '@builder take Gate 0')
+})
+
+test('non-string group or text fail closed instead of String()-coercing', () => {
+  const gs = load()
+  seatWorkshop(gs)
+
+  assert.equal(post(gs, { group: ['Workshop'], text: 'hello' }), false)
+  assert.equal(gs.$groupChats.get().Workshop, undefined)
+
+  assert.equal(post(gs, { group: 'Workshop', text: ['hello'] }), false)
+  assert.equal(gs.$groupChats.get().Workshop, undefined)
+})
+
+test('a remote same-named member keeps its own title, not the local meta title', () => {
+  const gs = load()
+  gs.$botMeta.set({
+    research: { title: 'Local Research', groups: ['Workshop'], group: 'Workshop' }
+  })
+  gs.$lastRoster.set([{ name: 'research' }])
+  gs.$groupChats.set({
+    Workshop: {
+      log: [],
+      watermarks: {},
+      epoch: 0,
+      running: false,
+      members: [
+        {
+          name: 'research',
+          title: 'Remote Research',
+          handle: 'research-mini',
+          remoteSource: true,
+          connectionId: 'mini',
+          connectionLabel: 'Mac Mini'
+        }
+      ]
+    }
+  })
+
+  const members = gs.resolveBotGroupSendMembers('Workshop')
+  const remote = members.find(member => member.remoteSource)
+
+  assert.equal(Boolean(remote), true)
+  assert.equal(remote.title, 'Remote Research')
+})
+
+test('a request_id is answered with posted=false for an unknown group', () => {
+  const gs = load()
+  seatWorkshop(gs)
+
+  gs.emit('bots.group.send', {
+    type: 'bots.group.send',
+    payload: { group: 'DoesNotExist', text: 'hello', request_id: 'rid-1' }
+  })
+
+  const answer = gs.rpc.find(call => call.method === 'bots.group.send.respond')
+  assert.equal(Boolean(answer), true)
+  assert.equal(answer.params.request_id, 'rid-1')
+  assert.equal(JSON.parse(answer.params.text).error.includes('Unknown'), true)
 })

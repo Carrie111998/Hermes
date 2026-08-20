@@ -9973,29 +9973,28 @@ function BotsPane() {
 
 /** Desktop-agent send into an existing group room. Resolves current members
  *  from the live roster + bot-meta (and stored remote seats), then reuses
- *  sendToGroupChat so headless/UI sends share one engine. Returns false when
+ *  sendToGroupChat so agent/UI sends share one engine. Returns false when
  *  the group is unknown or the payload is empty — never mints a room. */
-function ingestBotGroupSend(payload) {
-  const source = payload && typeof payload === 'object' ? payload : {}
-  const group = String(source.group || '').trim()
-  const text = String(source.text || source.message || '').trim()
-  const thread = String(source.thread || '').trim() || null
+function asGroupSendString(value) {
+  return typeof value === 'string' ? value.trim() : ''
+}
 
-  if (!group || !text) {
-    return false
-  }
-
+function resolveBotGroupSendMembers(group) {
   const meta = $botMeta.get()
   const roster = $lastRoster.get()
   const seated = groupChatMemberBots(group, roster, meta)
-  const members = seated.map(bot => ({
-    name: bot.name,
-    title: (meta[bot.name] && meta[bot.name].title) || bot.title || '',
-    handle: bot.handle,
-    remoteSource: bot.remoteSource,
-    connectionId: bot.connectionId,
-    connectionLabel: bot.connectionLabel
-  }))
+  const members = seated.map(bot => {
+    const localMeta = botRosterMeta(bot, meta)
+
+    return {
+      name: bot.name,
+      title: (localMeta && localMeta.title) || bot.title || '',
+      handle: bot.handle,
+      remoteSource: bot.remoteSource,
+      connectionId: bot.connectionId,
+      connectionLabel: bot.connectionLabel
+    }
+  })
 
   if (!members.length) {
     for (const [name, botMeta] of Object.entries(meta || {})) {
@@ -10005,6 +10004,21 @@ function ingestBotGroupSend(payload) {
     }
   }
 
+  return members
+}
+
+function ingestBotGroupSend(payload) {
+  const source = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {}
+  const group = asGroupSendString(source.group)
+  const text = asGroupSendString(source.text) || asGroupSendString(source.message)
+  const thread = asGroupSendString(source.thread) || null
+
+  if (!group || !text) {
+    return false
+  }
+
+  const members = resolveBotGroupSendMembers(group)
+
   if (!members.length) {
     return false
   }
@@ -10013,8 +10027,25 @@ function ingestBotGroupSend(payload) {
 }
 
 function handleBotGroupSendEvent(event) {
-  const payload = event && event.payload && typeof event.payload === 'object' ? event.payload : event
-  ingestBotGroupSend(payload)
+  const payload =
+    event && event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
+      ? event.payload
+      : event
+  const posted = ingestBotGroupSend(payload)
+  const requestId = asGroupSendString(payload && payload.request_id)
+
+  if (requestId && typeof host.request === 'function') {
+    const group = asGroupSendString(payload && payload.group)
+    const body = posted
+      ? { success: true, queued: true, group }
+      : { error: 'Unknown Bot Mode group, or the message was empty.' }
+
+    void Promise.resolve(
+      host.request('bots.group.send.respond', { request_id: requestId, text: JSON.stringify(body) })
+    ).catch(() => undefined)
+  }
+
+  return posted
 }
 
 // ── plugin ───────────────────────────────────────────────────────────────────
@@ -10037,9 +10068,16 @@ export default {
     // mint rooms from a typo'd name.
     if (typeof host.onEvent === 'function') {
       const offGroupSend = host.onEvent('bots.group.send', handleBotGroupSendEvent)
+      const offGroupSendRequest = host.onEvent('bots.group.send.request', handleBotGroupSendEvent)
 
-      if (typeof ctx.onDispose === 'function' && typeof offGroupSend === 'function') {
-        ctx.onDispose(offGroupSend)
+      if (typeof ctx.onDispose === 'function') {
+        if (typeof offGroupSend === 'function') {
+          ctx.onDispose(offGroupSend)
+        }
+
+        if (typeof offGroupSendRequest === 'function') {
+          ctx.onDispose(offGroupSendRequest)
+        }
       }
     }
 
