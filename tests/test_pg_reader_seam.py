@@ -131,7 +131,7 @@ class TestOpenStoreForProfile:
             get_profile_dir=lambda n: profile_dir,
         )
         with mock.patch.dict("sys.modules", {"hermes_cli.profiles": profiles_stub}):
-            with pytest.raises(RuntimeError, match="postgres_dsn is not set"):
+            with pytest.raises(RuntimeError, match="no DSN"):
                 hermes_state_postgres.open_store_for_profile("beta")
 
     def test_postgres_profile_with_dsn_opens_pg_backed_session_db(
