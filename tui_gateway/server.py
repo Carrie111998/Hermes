@@ -1524,6 +1524,15 @@ def _profile_home(profile: str | None) -> Path | None:
     try:
         from hermes_cli import profiles as profiles_mod
 
+        # Reject traversal/absolute/reserved names BEFORE any path math
+        # (#90699): get_profile_dir only strip()+lower()s, so an unvalidated
+        # "../x" escapes the profiles root and an absolute path replaces it
+        # entirely (pathlib join semantics) — pointing session.* RPCs and the
+        # HERMES_HOME override at an attacker-chosen directory. An invalid
+        # name falls through to the launch profile, same as an unknown one.
+        profiles_mod.validate_profile_name(
+            profiles_mod.normalize_profile_name(name)
+        )
         home = Path(profiles_mod.get_profile_dir(name))
     except Exception:
         return None
