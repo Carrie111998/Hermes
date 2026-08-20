@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 import os
 import sqlite3
 import tempfile
@@ -81,6 +82,57 @@ def _supports_budget(fetch_usage: Callable[..., object]) -> bool:
         parameter.kind == inspect.Parameter.VAR_KEYWORD
         for parameter in signature.parameters.values()
     )
+
+
+
+# ---------------------------------------------------------------------------
+# Deadline baseline
+#
+# collect()'s budget was a flat 90s measured from ITS OWN entry, which cannot
+# bound what the scheduler actually limits. AIUsageCollector's
+# ExecutionTimeLimit (PT6M = 360s) runs from the moment Task Scheduler starts
+# the wrapper, and on this box interpreter startup plus imports is where nearly
+# all of that goes -- ~229s at BelowNormal. A budget blind to that prefix is
+# respected in full while the task is killed anyway, and a kill produces
+# NOTHING: no snapshot, no diagnostics, just a stale ai-tokens.json. The 90s
+# only ever bounded the tail of an unbounded prefix.
+#
+# So bin/ai_usage_collector_run.ps1 publishes the ABSOLUTE instant the run must
+# finish by. An instant, not a duration: the remaining time is computed here,
+# AFTER the imports have been paid, so the prefix subtracts itself. When the
+# variable is absent -- a hand-run ``python -m ai_usage``, or an older wrapper
+# -- the historical constant stands, so nothing regresses.
+#
+# This is strictly a TIGHTENING mechanism. The result is capped at the
+# historical constant, so a fast import cannot buy a longer run than collect()
+# was ever trusted with, and a garbage-large published value cannot buy an
+# unbounded one.
+DEADLINE_EPOCH_ENV = "HERMES_AI_USAGE_DEADLINE_EPOCH"
+FALLBACK_DEADLINE_SECONDS = 90.0
+
+
+def _derive_deadline_seconds(
+    now_epoch: Optional[Callable[[], float]] = None,
+) -> float:
+    """Seconds collect() may spend, measured against the TASK's clock.
+
+    ``now_epoch`` is resolved at CALL time, not bound as a default: a default of
+    ``time.time`` captures the function object at import and would sail straight
+    past ``monkeypatch.setattr(collector.time, "time", ...)``, which is how the
+    wiring test for this was silently reading the real clock.
+    """
+    clock = now_epoch or time.time
+    raw = (os.environ.get(DEADLINE_EPOCH_ENV) or "").strip()
+    if not raw:
+        return FALLBACK_DEADLINE_SECONDS
+    try:
+        finish_by = float(raw)
+    except (TypeError, ValueError):
+        return FALLBACK_DEADLINE_SECONDS
+    if not math.isfinite(finish_by):
+        return FALLBACK_DEADLINE_SECONDS
+    remaining = finish_by - clock()
+    return max(0.0, min(remaining, FALLBACK_DEADLINE_SECONDS))
 
 
 def _episode_model_for(finding: dict) -> str:
@@ -184,12 +236,14 @@ def collect(
     fetch_usage: Callable[..., object],
     now: Optional[datetime] = None,
     manual_store_path: Optional[str] = None,
-    deadline_seconds: float = 90.0,
+    deadline_seconds: Optional[float] = None,
     _monotonic: Callable[[], float] = time.monotonic,
 ) -> dict:
     now = now or datetime.now(timezone.utc)
     started = _monotonic()
     manual = read_manual_snapshot(manual_store_path, now) if manual_store_path else {}
+    if deadline_seconds is None:
+        deadline_seconds = _derive_deadline_seconds()
     deadline_seconds = max(0.0, float(deadline_seconds))
     deadline = started + deadline_seconds
     accepts_budget = _supports_budget(fetch_usage)
