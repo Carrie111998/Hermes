@@ -101,3 +101,132 @@ class TestLoadReasoningConfigYamlBoolean:
         ):
             assert server._load_reasoning_config() == {"enabled": False}
 
+
+class TestReasoningUpdateCallback:
+    def _session(self, sid: str, agent=None) -> dict:
+        return {"session_key": f"key-{sid}", "agent": agent}
+
+    def test_session_scope_lands_on_create_override(self) -> None:
+        session = self._session("s1")
+        with patch.dict(server._sessions, {"s1": session}, clear=False), \
+                patch.object(server, "_write_config_key") as write_key:
+            persisted = server._make_reasoning_update_callback("s1")(
+                "high", {"enabled": True, "effort": "high"}, False
+            )
+        assert persisted is False
+        assert session["create_reasoning_override"] == {"enabled": True, "effort": "high"}
+        write_key.assert_not_called()
+
+    def test_persist_writes_config_and_clears_override(self) -> None:
+        session = self._session("s2")
+        session["create_reasoning_override"] = {"enabled": True, "effort": "low"}
+        with patch.dict(server._sessions, {"s2": session}, clear=False), \
+                patch.object(server, "_write_config_key") as write_key:
+            persisted = server._make_reasoning_update_callback("s2")(
+                "high", {"enabled": True, "effort": "high"}, True
+            )
+        assert persisted is True
+        write_key.assert_called_once_with("agent.reasoning_effort", "high")
+        assert "create_reasoning_override" not in session
+
+    def test_persist_failure_falls_back_to_session_override(self) -> None:
+        session = self._session("s3")
+        with patch.dict(server._sessions, {"s3": session}, clear=False), \
+                patch.object(server, "_write_config_key", side_effect=OSError("disk full")):
+            persisted = server._make_reasoning_update_callback("s3")(
+                "high", {"enabled": True, "effort": "high"}, True
+            )
+        assert persisted is False
+        assert session["create_reasoning_override"] == {"enabled": True, "effort": "high"}
+
+    def test_live_agent_gets_config_and_footer_update(self) -> None:
+        agent = _agent(None)
+        session = self._session("s4", agent=agent)
+        with patch.dict(server._sessions, {"s4": session}, clear=False), \
+                patch.object(server, "_persist_live_session_runtime") as persist_rt, \
+                patch.object(server, "_emit") as emit:
+            server._make_reasoning_update_callback("s4")(
+                "xhigh", {"enabled": True, "effort": "xhigh"}, False
+            )
+        assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
+        persist_rt.assert_called_once_with(session)
+        assert emit.call_args.args[0] == "session.info"
+
+    def test_unknown_session_is_noop_but_persist_still_works(self) -> None:
+        with patch.object(server, "_write_config_key") as write_key:
+            persisted = server._make_reasoning_update_callback("gone")(
+                "low", {"enabled": True, "effort": "low"}, True
+            )
+        assert persisted is True
+        write_key.assert_called_once_with("agent.reasoning_effort", "low")
+
+
+class TestPersistTrueEndToEnd:
+    def test_persist_true_saves_tui_default(self, tmp_path, monkeypatch) -> None:
+        import json as _json
+        import yaml
+
+        home = tmp_path / "hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text("agent:\n  reasoning_effort: medium\n", encoding="utf-8")
+        monkeypatch.setattr(server, "_hermes_home", home)
+        monkeypatch.setattr(server, "_cfg_cache", None)
+        monkeypatch.setattr(server, "_cfg_mtime", None)
+        monkeypatch.setattr(server, "_cfg_path", None)
+        tool_defs = [{"type": "function", "function": {
+            "name": "reasoning_effort", "description": "reasoning_effort tool",
+            "parameters": {"type": "object", "properties": {}}
+        }}]
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tool_defs),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            from run_agent import AIAgent
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                reasoning_config={"enabled": True, "effort": "medium"},
+                reasoning_update_callback=server._make_reasoning_update_callback("sid-e2e"),
+            )
+        session = {
+            "session_key": "key-e2e", "agent": agent,
+            "create_reasoning_override": {"enabled": True, "effort": "medium"},
+        }
+        with patch.dict(server._sessions, {"sid-e2e": session}, clear=False), \
+                patch.object(server, "_persist_live_session_runtime"), \
+                patch.object(server, "_emit"):
+            result = _json.loads(agent._apply_reasoning_effort({"level": "high", "persist": True}))
+        assert result["success"] is True
+        assert result["persisted"] is True
+        assert agent.reasoning_config == {"enabled": True, "effort": "high"}
+        saved = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+        assert saved["agent"]["reasoning_effort"] == "high"
+        assert "create_reasoning_override" not in session
+
+
+class TestMakeAgentWiresReasoningCallback:
+    def test_make_agent_passes_callback(self) -> None:
+        from unittest.mock import MagicMock
+
+        fake_runtime = {
+            "provider": "openrouter", "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "sk-test", "api_mode": "chat_completions", "command": None,
+            "args": None, "credential_pool": None,
+        }
+        with (
+            patch.object(server, "_load_cfg", return_value={"agent": {}}),
+            patch.object(server, "_get_db", return_value=MagicMock()),
+            patch.object(server, "_load_tool_progress_mode", return_value="compact"),
+            patch.object(server, "_load_reasoning_config", return_value=None),
+            patch.object(server, "_load_service_tier", return_value=None),
+            patch.object(server, "_load_enabled_toolsets", return_value=None),
+            patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=fake_runtime),
+            patch("run_agent.AIAgent") as mock_agent,
+        ):
+            server._make_agent("sid-cb", "key-cb")
+        assert callable(mock_agent.call_args.kwargs.get("reasoning_update_callback"))
+

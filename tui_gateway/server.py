@@ -6304,6 +6304,37 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
             _child_mirrors.pop(child_key, None)
 
 
+def _make_reasoning_update_callback(sid: str):
+    """Persist or session-scope reasoning updates for TUI/desktop agents."""
+    def _callback(level: str, parsed_config: dict, persist: bool = False) -> bool:
+        persisted = False
+        if persist:
+            try:
+                _write_config_key("agent.reasoning_effort", level)
+                persisted = True
+            except Exception:
+                logger.error("failed to persist reasoning_effort from tool", exc_info=True)
+
+        with _sessions_lock:
+            session = _sessions.get(sid)
+        if session is not None:
+            if persisted:
+                session.pop("create_reasoning_override", None)
+            else:
+                session["create_reasoning_override"] = dict(parsed_config)
+            agent = session.get("agent")
+            if agent is not None:
+                agent.reasoning_config = dict(parsed_config)
+                try:
+                    _persist_live_session_runtime(session)
+                    _emit("session.info", sid, _session_info(agent, session))
+                except Exception:
+                    logger.debug("failed to publish reasoning update", exc_info=True)
+        return persisted
+
+    return _callback
+
+
 def _agent_cbs(sid: str) -> dict:
     callbacks = {
         "tool_start_callback": lambda tc_id, name, args: _on_tool_start(
@@ -7181,6 +7212,10 @@ def _make_agent(
         skip_context_files=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
         skip_memory=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
         fallback_model=_load_fallback_model(),
+        # Session-scoped hook for the reasoning_effort tool — without it a
+        # TUI/desktop `persist: true` (or any tool-set level on a rebuilt
+        # session) is silently dropped. See _make_reasoning_update_callback.
+        reasoning_update_callback=_make_reasoning_update_callback(sid),
         **_agent_cbs(sid),
     )
 
