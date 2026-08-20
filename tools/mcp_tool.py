@@ -4564,11 +4564,13 @@ def _signal_reconnect(server: Any) -> bool:
 
 
 def reconnect_mcp_server(server_name: str) -> bool:
-    """Ask a currently-live MCP server to rebuild after external re-auth."""
+    """Ask a same-profile live MCP server to rebuild after external re-auth."""
     with _lock:
         server = _servers.get(server_name)
-    if server is None:
-        return False
+        if server is None or not _server_instance_owned_by_current_home(
+            server_name, server
+        ):
+            return False
     return _signal_reconnect(server)
 
 
@@ -4630,6 +4632,16 @@ def _signal_reconnect_and_wait(
     failures in long-lived gateway sessions even though a fresh CLI process
     could connect successfully.
     """
+    with _lock:
+        if not _server_instance_owned_by_current_home(server_name, srv):
+            logger.warning(
+                "MCP server '%s': %s reconnect refused for profile home %s; "
+                "transport owner is %s (F5).",
+                server_name, op_description, _mcp_current_home(),
+                _server_home.get(server_name, "?"),
+            )
+            return False
+
     loop = _mcp_loop
     if loop is None or not loop.is_running():
         return False
@@ -5662,6 +5674,15 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
 
 def _request_lazy_reconnect(server_name: str, server: MCPServerTask) -> bool:
     """Wake a recycled stdio server and wait briefly for a fresh session."""
+    with _lock:
+        if not _server_instance_owned_by_current_home(server_name, server):
+            logger.warning(
+                "MCP server '%s' reconnect refused for profile home %s; "
+                "the recycled transport is owned by profile home %s (F5).",
+                server_name, _mcp_current_home(),
+                _server_home.get(server_name, "?"),
+            )
+            return False
     if not server._is_recycled_stdio():
         return False
 
@@ -5789,6 +5810,41 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     return server is not None and server.session is not None
 
 
+def _server_owned_by_current_home(server_name: str) -> bool:
+    """Whether a live server entry, if any, is owned by the current profile home.
+
+    F5: every live connection records its owning profile home at connect
+    time (``_discover_and_register_server``). A connection recorded for a
+    DIFFERENT home carries that profile's credentials and trust decisions
+    and must never be handed to this profile's calls. A live entry with no
+    recorded owner predates the F5 owner-tracking; treat it as owned by the
+    current home so pre-F5 / injected connections keep working (production
+    always records the owner).
+
+    Callers must hold ``_lock``.
+    """
+    server = _servers.get(server_name)
+    if server is None:
+        return True
+    owner = _server_home.get(server_name)
+    return owner is None or owner == _mcp_current_home()
+
+
+def _server_instance_owned_by_current_home(
+    server_name: str, server: Any
+) -> bool:
+    """Whether *server* is the current same-home entry for ``server_name``.
+
+    Callers must hold ``_lock``. Checking the raw-name owner alone is
+    insufficient after connect/reconnect races: the name can be rebound to a
+    current-home object while a caller still holds a stale foreign object.
+    """
+    if _servers.get(server_name) is not server:
+        return False
+    owner = _server_home.get(server_name)
+    return owner is None or owner == _mcp_current_home()
+
+
 def _get_connected_server_for_call(server_name: str) -> Optional[MCPServerTask]:
     """Return a connected server, lazily reconnecting recycled stdio state.
 
@@ -5799,15 +5855,45 @@ def _get_connected_server_for_call(server_name: str) -> Optional[MCPServerTask]:
     with _lock:
         server = _servers.get(server_name)
         is_lazy = _mcp_scope_key(server_name) in _lazy_server_configs
+        # F5: the ownership boundary applies FIRST, on every path (live,
+        # parked, recycled, lazy). A live connection owned by another
+        # profile home is never returned to this profile's calls — it
+        # carries the other profile's credentials and trust decisions.
+        owner_conflict = (
+            server is not None and not _server_owned_by_current_home(server_name)
+        )
+    if owner_conflict:
+        logger.warning(
+            "MCP server '%s' is already connected for profile home %s; "
+            "refusing this profile's call on that connection (different "
+            "credentials/trust — F5). Rename the server in one profile "
+            "to resolve the collision.",
+            server_name, _server_home.get(server_name, "?"),
+        )
+        return None
     if is_lazy and (server is None or server.session is None):
         _ensure_lazy_server_connected(server_name)
         with _lock:
             server = _servers.get(server_name)
-        return server
     if server is not None and server.session is None and server._is_recycled_stdio():
         _request_lazy_reconnect(server_name, server)
         with _lock:
             server = _servers.get(server_name)
+    # Re-check after lazy connect/recycled reconnect. Another profile can win
+    # the same-name installation race after the initial empty/parked lookup;
+    # never return that newly installed foreign transport to this caller.
+    with _lock:
+        owner_conflict = (
+            server is not None
+            and not _server_instance_owned_by_current_home(server_name, server)
+        )
+    if owner_conflict:
+        logger.warning(
+            "MCP server '%s' connected for profile home %s during reconnect; "
+            "refusing this profile's call on that connection (F5).",
+            server_name, _server_home.get(server_name, "?"),
+        )
+        return None
     return server
 
 
@@ -5833,6 +5919,20 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         gate_error = _trust_gate_check(server_name, tool_name)
         if gate_error is not None:
             return gate_error
+
+        # A same-named live transport owned by another profile is an ownership
+        # refusal, not a transport failure. Keep it out of the raw-name circuit
+        # breaker or repeated calls from profile B can deny profile A's healthy
+        # server for the cooldown window.
+        with _lock:
+            owner_conflict = (
+                _servers.get(server_name) is not None
+                and not _server_owned_by_current_home(server_name)
+            )
+        if owner_conflict:
+            return tool_error(
+                f"MCP server '{server_name}' is not connected for the current profile"
+            )
 
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
@@ -6337,6 +6437,11 @@ def _make_check_fn(server_name: str):
     def _check() -> bool:
         with _lock:
             server = _servers.get(server_name)
+            # F5: a live connection owned by ANOTHER profile home is not
+            # part of this profile's tool surface — report it unavailable
+            # instead of letting a same-named server appear ready here.
+            if server is not None and not _server_owned_by_current_home(server_name):
+                return False
             if server is not None and (
                 server.session is not None or server._is_recycled_stdio()
             ):
@@ -7332,10 +7437,31 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     # from multiple entry-points before the first batch finishes (#58862).
     with _lock:
         connecting = set(_server_connecting)
+        # F5: the same-name owner-mismatch collision check runs BEFORE the
+        # ``k not in _servers`` idempotency filter below — the filter
+        # previously proved every name absent from ``_servers``, making the
+        # refusal unreachable. A live connection owned by another profile
+        # home carries that profile's credentials/trust; this profile's
+        # registration must be refused up front, not silently inherited.
+        _current_home = _mcp_current_home()
+        collided = {
+            k
+            for k in servers
+            if k in _servers and not _server_owned_by_current_home(k)
+        }
+        for _name in sorted(collided):
+            logger.warning(
+                "MCP server '%s' is already connected for profile home "
+                "%s; not registering this profile's '%s' (different "
+                "credentials/trust — F5). Rename the server in one "
+                "profile to resolve the collision.",
+                _name, _server_home.get(_name, "?"), _name,
+            )
         new_servers = {
             k: v
             for k, v in servers.items()
-            if k not in _servers
+            if k not in collided
+            and k not in _servers
             and k not in connecting
             # Servers already lazily registered from the schema cache are
             # not re-registered; they connect on first tool use (#56832).
@@ -7352,23 +7478,6 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             # connect or by a manual /mcp refresh.
             and not _connect_cooldown_active(k)
         }
-        # F5: a server name already connected under a DIFFERENT profile home
-        # is never re-registered for this profile — the existing connection
-        # carries the other profile's credentials, and this profile's trust
-        # decision must not be silently inherited by (or from) it. The
-        # trust gate resolves under THIS profile's home, so a profile that
-        # never configured the name stays fail-closed untrusted.
-        _current_home = _mcp_current_home()
-        for _name in list(new_servers):
-            if _name in _servers and _server_home.get(_name) != _current_home:
-                new_servers.pop(_name)
-                logger.warning(
-                    "MCP server '%s' is already connected for profile home "
-                    "%s; not registering this profile's '%s' (different "
-                    "credentials/trust — F5). Rename the server in one "
-                    "profile to resolve the collision.",
-                    _name, _server_home.get(_name, "?"), _name,
-                )
         # Cached entries with no live session are parked or mid-reconnect.
         # Their tools are deregistered, so nothing else can reach
         # _signal_reconnect — without this nudge a new session silently
@@ -7377,13 +7486,17 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         stale_cached = [
             _servers[k]
             for k in servers
-            if k in _servers and getattr(_servers[k], "session", None) is None
+            if k not in collided
+            and k in _servers
+            and getattr(_servers[k], "session", None) is None
         ]
         _server_connecting.update(new_servers)
         for srv_name in new_servers:
             _server_connect_errors.pop(srv_name, None)
         # Track which servers opt-in to parallel tool calls (idempotent).
         for srv_name, srv_cfg in servers.items():
+            if srv_name in collided:
+                continue
             if _parse_boolish(srv_cfg.get("supports_parallel_tool_calls", False), default=False):
                 _parallel_safe_servers.add(srv_name)
             else:
