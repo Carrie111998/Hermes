@@ -1836,17 +1836,23 @@ class GatewayStreamConsumer:
         if not text.strip():
             return False
         try:
+            metadata = dict(self.metadata or {})
+            # Mark completed assistant prose explicitly so platform adapters can
+            # distinguish it from mandatory unmarked sends (direct delivery,
+            # recovered finals, clarification, and approval fallbacks). Do not
+            # infer interim intent from a missing ``notify`` marker.
+            metadata["interim_assistant_message"] = True
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=metadata,
             )
             # Note: do NOT set _already_sent = True here.
             # Commentary messages are interim status updates (e.g. "Using browser
             # tool..."), not the final response. Setting already_sent would cause
             # the final response to be incorrectly suppressed when there are
             # multiple tool calls. See: https://github.com/NousResearch/hermes-agent/issues/10454
-            if result.success:
+            if result.success and getattr(result, "delivered", None) is not False:
                 # Commentary counts as fresh content — close off any
                 # stale tool bubble above it so the next tool starts a
                 # new bubble below.

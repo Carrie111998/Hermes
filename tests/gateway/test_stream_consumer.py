@@ -819,6 +819,7 @@ class TestInterimCommentaryMessages:
             adapter,
             "chat_123",
             StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5),
+            metadata={"thread_id": "thread_7"},
         )
 
         consumer.on_commentary("I'll inspect the repository first.")
@@ -829,7 +830,40 @@ class TestInterimCommentaryMessages:
 
         sent_texts = [call[1]["content"] for call in adapter.send.call_args_list]
         assert sent_texts == ["I'll inspect the repository first.", "Done."]
+        commentary_metadata = adapter.send.call_args_list[0].kwargs["metadata"]
+        assert commentary_metadata == {
+            "thread_id": "thread_7",
+            "interim_assistant_message": True,
+        }
+        final_metadata = adapter.send.call_args_list[1].kwargs["metadata"]
+        assert final_metadata == {"thread_id": "thread_7", "notify": True}
         assert consumer.final_response_sent is True
+
+    @pytest.mark.asyncio
+    async def test_suppressed_commentary_is_not_recorded_as_visible_delivery(self):
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(
+                success=True,
+                message_id="suppressed",
+                delivered=False,
+            )
+        )
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        new_messages = []
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(),
+            on_new_message=lambda: new_messages.append(True),
+        )
+
+        result = await consumer._send_commentary("Final answer")
+
+        assert result is True
+        assert consumer.has_delivered_text("Final answer") is False
+        assert consumer._delivered_commentary_texts == []
+        assert new_messages == []
 
 
 class TestCancelledConsumerSetsFlags:

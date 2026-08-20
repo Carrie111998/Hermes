@@ -1006,6 +1006,7 @@ async def _run_with_agent(
     adapter_cls=ProgressCaptureAdapter,
     user_id=None,
     scope_id=None,
+    stream_consumer_config_error=False,
 ):
     if config_data:
         import yaml
@@ -1022,6 +1023,14 @@ async def _run_with_agent(
 
     adapter = adapter_cls(platform=platform)
     runner = _make_runner(adapter)
+    if stream_consumer_config_error:
+        adapter.stream_consumer_config_error_called = False
+
+        def _fail_stream_consumer_config(*args, **kwargs):
+            adapter.stream_consumer_config_error_called = True
+            raise RuntimeError("synthetic stream consumer setup failure")
+
+        runner._build_stream_consumer_config = _fail_stream_consumer_config
     gateway_run = importlib.import_module("gateway.run")
     if config_data and "streaming" in config_data:
         runner.config.streaming = StreamingConfig.from_dict(config_data["streaming"])
@@ -1181,6 +1190,30 @@ async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, 
     assert result.get("already_sent") is not True
     assert adapter.edits == []
     assert [call["content"] for call in adapter.sent] == ["I'll inspect the repo first."]
+    assert adapter.sent[0]["metadata"]["interim_assistant_message"] is True
+
+
+@pytest.mark.asyncio
+async def test_interim_fallback_send_marks_interim_intent_when_consumer_setup_fails(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentaryAgent,
+        session_id="sess-interim-fallback-metadata",
+        config_data={
+            "display": {"interim_assistant_messages": True},
+            "streaming": {"enabled": False},
+        },
+        stream_consumer_config_error=True,
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.stream_consumer_config_error_called is True
+    assert [call["content"] for call in adapter.sent] == ["I'll inspect the repo first."]
+    assert adapter.sent[0]["metadata"]["thread_id"] == "17585"
+    assert adapter.sent[0]["metadata"]["interim_assistant_message"] is True
 
 
 class TransformedStreamAgent:

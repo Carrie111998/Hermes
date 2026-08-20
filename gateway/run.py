@@ -5360,11 +5360,13 @@ class TurnRunner:
                 return
             if already_streamed or not ctx._status_adapter or not str(display_text or "").strip():
                 return
+            interim_metadata = dict(ctx._status_thread_metadata or {})
+            interim_metadata["interim_assistant_message"] = True
             safe_schedule_threadsafe(
                 ctx._status_adapter.send(
                     ctx._status_chat_id,
                     display_text,
-                    metadata=ctx._status_thread_metadata,
+                    metadata=interim_metadata,
                 ),
                 ctx._loop_for_step,
                 logger=logger,
