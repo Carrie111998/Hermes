@@ -19,6 +19,7 @@ import asyncio
 import inspect
 import logging
 import queue
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -195,17 +196,19 @@ class GatewayStreamConsumer:
     # animates a draft when the same draft_id is reused across consecutive
     # calls in the same chat, so we need a fresh non-zero id per response.
     #
-    # Seeded from wall-clock milliseconds at process start, NOT zero (PR
-    # 85796 review, B3): draft_id is the wire identity for the relay
-    # connector's per-(channel, draft_id) sealed-stream tombstones, which
-    # outlive this process. Relay gateways are disposable by design
-    # (scale-to-zero), so a counter restarting at 1 replays ids the
-    # connector already sealed — it then answers frames from the NEW turn
-    # out of the OLD tombstone (zero platform calls, old message identity)
-    # and the user's reply is silently dropped. A millisecond-epoch seed
-    # makes ids unique across incarnations while staying a plain int
-    # within the existing contract op.
-    _draft_id_counter: int = time.time_ns() // 1_000_000
+    # Seeded from a RANDOM process nonce, not zero and not the clock (PR
+    # 85796 review, B3 + r2 follow-up): draft_id is the wire identity for
+    # the relay connector's per-(channel, draft_id) sealed-stream
+    # tombstones, which outlive this process. Relay gateways are
+    # disposable by design (scale-to-zero), so a counter restarting at 1
+    # replays ids the connector already sealed — it then answers frames
+    # from the NEW turn out of the OLD tombstone (zero platform calls,
+    # old message identity) and the user's reply is silently dropped.
+    # An epoch-ms seed (the first fix) still collides on same-millisecond
+    # starts, forks, and clock steps; 49 random bits make collision
+    # probability negligible while keeping ids + realistic turn counts
+    # comfortably inside the connector's JS number range (2^53).
+    _draft_id_counter: int = secrets.randbits(49)
 
     def __init__(
         self,
