@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -13,7 +14,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 os.environ.setdefault("FREEMAXXING_PORT", "0")
+import providers as provider_registry  # noqa: E402
 from providers import get_provider_profile  # noqa: E402
+
+for module_name in list(sys.modules):
+    if module_name.startswith("plugins.model_providers.freemaxxing"):
+        sys.modules.pop(module_name, None)
+provider_registry._REGISTRY.clear()
+provider_registry._ALIASES.clear()
+provider_registry._PROVIDER_LIST_CACHE = None
+provider_registry._discovered = False
+provider_registry._user_plugins_dir = lambda: None
 
 PROFILE = get_provider_profile("freemaxxing")
 PLUGIN = importlib.import_module("plugins.model_providers.freemaxxing")

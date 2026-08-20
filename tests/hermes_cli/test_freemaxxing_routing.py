@@ -14,8 +14,20 @@ from agent.secret_scope import (  # noqa: E402
     set_multiplex_active,
     set_secret_scope,
 )
-from hermes_cli.auth import resolve_api_key_provider_credentials  # noqa: E402
+import providers as provider_registry  # noqa: E402
 from providers import get_provider_profile  # noqa: E402
+
+# Provider discovery is process-global and pytest may have populated it from the
+# operator's HERMES_HOME before collecting this module. This contract targets
+# the bundled plugin, so reset discovery and suppress user-plugin overrides.
+for module_name in list(sys.modules):
+    if module_name.startswith("plugins.model_providers.freemaxxing"):
+        sys.modules.pop(module_name, None)
+provider_registry._REGISTRY.clear()
+provider_registry._ALIASES.clear()
+provider_registry._PROVIDER_LIST_CACHE = None
+provider_registry._discovered = False
+provider_registry._user_plugins_dir = lambda: None
 
 # Bundled model-provider plugins are loaded by the provider registry under a
 # synthetic module name. Trigger canonical discovery, then consume the exact
@@ -26,6 +38,10 @@ PROFILE = get_provider_profile("freemaxxing")
 assert PROFILE is not None
 PLUGIN = sys.modules["plugins.model_providers.freemaxxing"]
 PROXY = sys.modules["plugins.model_providers.freemaxxing.proxy"]
+
+# Import auth only after the bundled profile has registered its scoped env-var
+# contract and loopback capability.
+from hermes_cli.auth import resolve_api_key_provider_credentials  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -52,7 +68,11 @@ def test_static_catalog_is_metadata_only(monkeypatch):
 
 
 def test_generic_runtime_resolver_carries_the_local_capability():
-    credentials = resolve_api_key_provider_credentials("freemaxxing")
+    token = set_secret_scope({"FREEMAXXING_API_KEY": PLUGIN.local_token()})
+    try:
+        credentials = resolve_api_key_provider_credentials("freemaxxing")
+    finally:
+        reset_secret_scope(token)
     assert credentials["api_key"] == PLUGIN.local_token()
     assert credentials["base_url"].startswith("http://127.0.0.1:")
     assert credentials["base_url"].endswith("/v1")
