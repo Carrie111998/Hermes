@@ -52,6 +52,32 @@ logger = logging.getLogger(__name__)
 _MAX_TOOL_WORKERS = 8
 
 
+def _governance_preflight(agent, function_name: str, function_args: dict) -> Optional[str]:
+    state = getattr(agent, "_governed_skill_state", None)
+    if state is None:
+        return None
+    decision = state.before_tool(function_name, function_args)
+    return None if decision.allowed else decision.result
+
+
+def _governance_observe(agent, function_name: str, function_args: dict, function_result: Any) -> None:
+    if function_name != "skill_view":
+        return
+    state = getattr(agent, "_governed_skill_state", None)
+    if state is None:
+        return
+    try:
+        data = json.loads(function_result) if isinstance(function_result, str) else function_result
+        requested = function_args.get("name")
+        if requested:
+            state.observe_skill_result(requested, data if isinstance(data, dict) else {})
+    except (TypeError, ValueError):
+        state.observe_skill_result(
+            function_args.get("name", ""),
+            {"success": False, "error": "invalid skill_view result"},
+        )
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so patches like ``run_agent._set_interrupt`` work."""
     import run_agent
@@ -337,7 +363,22 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # checkpoint state (dedup slot, real snapshots).
         block_result = None
         blocked_by_guardrail = False
-        if _ts_scope_block is not None:
+        governance_block = _governance_preflight(agent, function_name, function_args)
+        if governance_block is not None:
+            block_result = governance_block
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=block_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                status="blocked",
+                error_type="governance_block",
+                error_message="governed mandatory skill gate",
+                middleware_trace=list(middleware_trace),
+            )
+        elif _ts_scope_block is not None:
             # Out-of-scope tool_call: reject before hooks/guardrails/dispatch.
             block_result = _ts_scope_block
             _emit_terminal_post_tool_call(
@@ -533,6 +574,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
+            _governance_observe(agent, function_name, function_args, result)
             duration = time.time() - start
             is_error, _ = _detect_tool_failure(function_name, result)
             if is_error:
@@ -840,7 +882,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Check plugin hooks for a block directive before executing.
         _block_msg: Optional[str] = None
         _block_error_type = "plugin_block"
-        if _ts_scope_block is not None:
+        _governance_block = _governance_preflight(agent, function_name, function_args)
+        if _governance_block is not None:
+            _block_msg = _governance_block
+            _block_error_type = "governance_block"
+        elif _ts_scope_block is not None:
             _block_msg = _ts_scope_block
             _block_error_type = "tool_scope_block"
         else:
@@ -1274,6 +1320,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
 
+        _governance_observe(agent, function_name, function_args, function_result)
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
