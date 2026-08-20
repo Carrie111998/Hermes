@@ -609,10 +609,12 @@ if ($env:HERMES_UPDATE_PIPE_DRAIN_SECONDS) {
     }
 }
 
-function Step-PipeDrain($Reader, [ref]$Task, $Buffer, $Sink) {
+function Step-PipeDrain($Reader, [ref]$Task, $Buffer, $Sink, [ref]$Moved) {
     # Advance one redirected pipe by whatever has already arrived, without
     # ever blocking. Returns $true once the pipe has reached EOF (or its read
-    # faulted), $false while more may still come.
+    # faulted), $false while more may still come. Sets $Moved when this call
+    # actually consumed bytes, so the caller can tell a busy pipe from a quiet
+    # one and skip its idle sleep.
     #
     # The chunked ReadAsync loop is the point: ReadToEndAsync().Result cannot
     # hand back a partial read, so abandoning it loses the whole step's output.
@@ -630,6 +632,7 @@ function Step-PipeDrain($Reader, [ref]$Task, $Buffer, $Sink) {
     }
     if ($count -le 0) { $Task.Value = $null; return $true }
     [void]$Sink.Append($Buffer, 0, $count)
+    $Moved.Value = $true
     $Task.Value = $Reader.ReadAsync($Buffer, 0, $Buffer.Length)
     return $false
 }
@@ -680,8 +683,9 @@ function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
     $abandonAt = $null
     $abandoned = $false
     while ($true) {
-        $outDone = Step-PipeDrain $proc.StandardOutput ([ref]$outTask) $outBuffer $outSink
-        $errDone = Step-PipeDrain $proc.StandardError ([ref]$errTask) $errBuffer $errSink
+        $moved = $false
+        $outDone = Step-PipeDrain $proc.StandardOutput ([ref]$outTask) $outBuffer $outSink ([ref]$moved)
+        $errDone = Step-PipeDrain $proc.StandardError ([ref]$errTask) $errBuffer $errSink ([ref]$moved)
         if ($proc.HasExited) {
             if ($outDone -and $errDone) { break }
             # Clock starts at the step's exit, not at its start: a slow step is
@@ -693,7 +697,30 @@ function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
                 break
             }
         }
-        Start-Sleep -Milliseconds 150
+        # Only idle when both pipes came up empty this pass, and idle on the
+        # reads themselves rather than on the clock.
+        #
+        # Sleeping after a chunk that DID arrive meters the drain at one buffer
+        # per tick (16 KiB / 150ms ~ 107 KB/s), and because the pipe then backs
+        # up that is backpressure on the running step, not just a slow read --
+        # a chatty step blocks on write() waiting for us. Waiting for EOF and
+        # trickling toward it are two ways to make a fast step slow, and this
+        # function is upstream of the hand-off's obligations either way.
+        #
+        # A flat sleep is not enough on its own: a freshly issued ReadAsync is
+        # rarely complete by the very next pass, so the loop would sleep 150ms
+        # between chunks anyway. WaitAny returns the instant either pipe has
+        # something (and immediately if one already does), and expires on its
+        # own so a silent step still animates the marquee and still advances
+        # the abandon deadline.
+        if (-not $moved) {
+            $live = @($outTask, $errTask) | Where-Object { $null -ne $_ }
+            if ($live.Count -gt 0) {
+                [void][System.Threading.Tasks.Task]::WaitAny([System.Threading.Tasks.Task[]]$live, 150)
+            } else {
+                Start-Sleep -Milliseconds 150
+            }
+        }
         if ($script:Ui) { [System.Windows.Forms.Application]::DoEvents() }
     }
     # Bounded overload deliberately: the argument-less overload also waits on
@@ -757,14 +784,26 @@ if ($SelfTestUi) {
 # fix has an executable proof on Windows instead of a source-grep. Exits
 # before any marker/desktop machinery, same as -SelfTestUi; touches nothing
 # but its own temp files.
+#
+# Two arms, because the bound and the drain rate fail in opposite directions:
+#
+#   leak  -- a step whose grandchild outlives it. Guards the #90455 deadlock:
+#            the drain must abandon rather than wait out the descendant.
+#   flood -- a chatty step that leaks nothing. Guards the other cliff: a drain
+#            that idles after every chunk it reads is metered at one buffer per
+#            tick, which backpressures the running step. Waiting for EOF and
+#            trickling toward it are both ways to make a fast step slow.
 if ($SelfTestPipeDrain) {
     New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction SilentlyContinue | Out-Null
     $hold = 60
     if ($env:HERMES_SELFTEST_HOLD_SECONDS) { $hold = [int]$env:HERMES_SELFTEST_HOLD_SECONDS }
+    $floodKb = 8192
+    if ($env:HERMES_SELFTEST_FLOOD_KB) { $floodKb = [int]$env:HERMES_SELFTEST_FLOOD_KB }
     # $PSHOME is this interpreter's own directory -- no hardcoded system path.
     $powershell = Join-Path $PSHOME "powershell.exe"
     $stamp = [Guid]::NewGuid().ToString("N")
     $childPs1 = Join-Path $TempDir "hermes-pipe-drain-$stamp.ps1"
+    $floodPs1 = Join-Path $TempDir "hermes-pipe-flood-$stamp.ps1"
     $pidFile = Join-Path $TempDir "hermes-pipe-drain-$stamp.pid"
     # UseShellExecute=$false with no redirection is what makes the grandchild
     # inherit our stdout/stderr -- the whole point of the fixture. Anything
@@ -783,7 +822,21 @@ Write-Output "pipe-drain step output"
 [Console]::Out.Flush()
 exit 7
 '@
+    # Writes straight to the console stream, holding nothing: a step that is
+    # merely loud. `hermes update` is this shape -- the Electron/vite build
+    # alone is megabytes. Few large lines rather than many small ones on
+    # purpose: Write-HandoffLog is one Add-Content per line and runs inside the
+    # measured window, so line-heavy output would time the logger instead of
+    # the drain.
+    $floodSource = @'
+param([int]$Kb)
+$chunk = "x" * (131072 - 1)
+for ($i = 0; $i -lt [Math]::Ceiling($Kb / 128); $i++) { [Console]::Out.Write($chunk + "`n") }
+[Console]::Out.Flush()
+exit 5
+'@
     [System.IO.File]::WriteAllText($childPs1, $childSource)
+    [System.IO.File]::WriteAllText($floodPs1, $floodSource)
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $res = Invoke-HermesStep $powershell @(
         "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $childPs1,
@@ -801,18 +854,34 @@ exit 7
         $leakAlive = [bool](Get-Process -Id $leakPid -ErrorAction SilentlyContinue)
         Stop-Process -Id $leakPid -Force -ErrorAction SilentlyContinue
     }
-    Remove-Item -LiteralPath $childPs1, $pidFile -Force -ErrorAction SilentlyContinue
+
+    $floodSw = [System.Diagnostics.Stopwatch]::StartNew()
+    $flood = Invoke-HermesStep $powershell @(
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $floodPs1,
+        "-Kb", [string]$floodKb
+    ) "pipeflood"
+    $floodSw.Stop()
+    $floodElapsed = [Math]::Round($floodSw.Elapsed.TotalSeconds, 2)
+    $floodBytes = $flood.Output.Length
+
+    Remove-Item -LiteralPath $childPs1, $floodPs1, $pidFile -Force -ErrorAction SilentlyContinue
 
     # The grandchild still being alive at return is what makes this a proof
     # rather than a timing coincidence: the pipe was demonstrably still open.
     $budget = $script:StepDrainGraceSeconds + 30
+    # A sleep-per-chunk drain moves 16 KiB/150ms ~ 107 KB/s, so 8 MiB takes
+    # ~76s. Generous enough for a loaded CI runner, far under the trickle.
+    $floodBudget = 25
     $problems = @()
     if (-not $leakAlive) { $problems += "handle-holding grandchild was not alive on return (fixture did not reproduce the leak)" }
-    if ($elapsed -ge $budget) { $problems += "returned in ${elapsed}s, over the ${budget}s budget" }
-    if ($res.Code -ne 7) { $problems += "exit code $($res.Code), expected 7" }
-    if ($res.Output -notmatch "pipe-drain step output") { $problems += "step output was lost" }
+    if ($elapsed -ge $budget) { $problems += "leak arm returned in ${elapsed}s, over the ${budget}s budget" }
+    if ($res.Code -ne 7) { $problems += "leak arm exit code $($res.Code), expected 7" }
+    if ($res.Output -notmatch "pipe-drain step output") { $problems += "leak arm step output was lost" }
+    if ($floodElapsed -ge $floodBudget) { $problems += "flood arm returned in ${floodElapsed}s, over the ${floodBudget}s budget -- the drain is metering itself, which backpressures the step" }
+    if ($flood.Code -ne 5) { $problems += "flood arm exit code $($flood.Code), expected 5" }
+    if ($floodBytes -lt ($floodKb * 1024)) { $problems += "flood arm captured $floodBytes bytes of $($floodKb * 1024)" }
 
-    $detail = "elapsed=${elapsed}s budget=${budget}s code=$($res.Code) grandchildAlive=$leakAlive"
+    $detail = "leak: elapsed=${elapsed}s budget=${budget}s code=$($res.Code) grandchildAlive=$leakAlive | flood: ${floodKb}KB in ${floodElapsed}s budget=${floodBudget}s bytes=$floodBytes code=$($flood.Code)"
     if ($problems.Count -gt 0) {
         Write-Host "PIPE-DRAIN SELF-TEST: FAIL $detail -- $($problems -join '; ')"
         exit 1
