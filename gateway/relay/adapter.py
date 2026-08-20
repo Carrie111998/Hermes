@@ -389,17 +389,43 @@ class RelayAdapter(BasePlatformAdapter):
         self._sealed_draft_by_chat[draft_key] = draft_id
         if self._transport is None:
             return SendResult(success=False, error="no transport")
-        result = await self._transport.send_outbound(
-            {
-                "op": "draft",
-                "chat_id": chat_id,
-                "draft_id": draft_id,
-                "content": content,
-                "final": True,
-                "metadata": self._with_scope(chat_id, dict(metadata or {})),
-            },
-            platform=self._platform_by_chat.get(str(chat_id)),
-        )
+        seal_frame = {
+            "op": "draft",
+            "chat_id": chat_id,
+            "draft_id": draft_id,
+            "content": content,
+            "final": True,
+            "metadata": self._with_scope(chat_id, dict(metadata or {})),
+        }
+        _seal_platform = self._platform_by_chat.get(str(chat_id))
+        try:
+            result = await self._transport.send_outbound(
+                seal_frame, platform=_seal_platform
+            )
+        except Exception as e:
+            # Ambiguous outcome: the seal may have been applied before the
+            # socket dropped. The connector's sealed-key tombstone makes a
+            # repeated final frame idempotent (it returns the original
+            # stream ts and never opens a second stream), so retry the SAME
+            # frame once rather than falling straight to a plain send —
+            # a plain send after a landed seal is the duplicate-final class
+            # this whole lane exists to kill.
+            logger.warning(
+                "relay seal transport error (%s); retrying idempotent final frame",
+                e,
+            )
+            try:
+                result = await self._transport.send_outbound(
+                    seal_frame, platform=_seal_platform
+                )
+            except Exception as e2:
+                # Still down. Report failure so the caller's fail-open plain
+                # send runs (it shares this transport, so if the seal truly
+                # cannot go out, neither can a duplicate — the consumer's
+                # flags stay unset and the gateway's fallback owns delivery).
+                return SendResult(
+                    success=False, error=f"draft seal transport error: {e2}"
+                )
         if result.get("success"):
             # The connector returns the stream's ts as the message identity.
             return SendResult(

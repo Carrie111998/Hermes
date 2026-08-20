@@ -1191,7 +1191,17 @@ class GatewayStreamConsumer:
                                 # not duplicate the visible prefix.
                                 await self._send_fallback_final(self._accumulated)
                         elif not self._already_sent:
-                            self._final_response_sent = await self._send_or_edit(self._accumulated)
+                            # Turn-final retry after the finalize tick above
+                            # failed (transport error, seal exception).
+                            # finalize=True so a stream-is-the-message adapter
+                            # can never route this through the draft-frame
+                            # branch: its no-op dedupe compares against the
+                            # last UNSEALED frame and would report success
+                            # without any transport call, recording a final
+                            # the user never received (silent-loss class).
+                            self._final_response_sent = await self._send_or_edit(
+                                self._accumulated, finalize=True,
+                            )
                             if self._final_response_sent:
                                 self._final_content_delivered = True
                                 self._record_turn_final_payload(self._accumulated)
