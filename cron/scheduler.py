@@ -5720,29 +5720,12 @@ def run_job(
     # ---------------------------------------------------------------
     from run_agent import AIAgent
 
-<<<<<<< HEAD
     # NOTE: the SQLite session store used to be initialized here, BEFORE the
     # wake-gate and prompt-validation early returns below. Every gated run
     # (``wakeAgent: false``, blocked prompt) opened state.db and returned
     # without reaching the finally that closes it, relying on GC to release
     # the handle. Init now happens inside the main try, right before the
     # agent is constructed — after every early-return path (#96290).
-=======
-    # Initialize SQLite session store so cron job messages are persisted
-    # and discoverable via session_search (same pattern as gateway/run.py).
-    #
-    # Bounded with its own timeout (separate from HERMES_CRON_TIMEOUT, which
-    # only watches the agent's run_conversation below): SessionDB.__init__
-    # opens/migrates state.db synchronously and has no timeout of its own
-    # against a wedged sqlite3.connect (e.g. a stale flock left by a crashed
-    # sibling process). An unbounded hang here is invisible to every other
-    # cron safeguard, because it happens BEFORE _submit_with_guard's future
-    # exists — the finally block that releases the job from
-    # _running_job_ids never runs, so the job stays wedged "running" until
-    # the whole gateway process is restarted, silently skipping every
-    # scheduled fire in between with "already running — skipping".
-    _session_db = _open_cron_session_db(f"Job '{job.get('id', '?')}'")
->>>>>>> 6ec2ef4a3c (fix(cron): reap stale sessions with owner leases)
 
     # Wake-gate: if this job has a pre-check script, run it BEFORE building
     # the prompt so a ``{"wakeAgent": false}`` response can short-circuit
