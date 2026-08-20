@@ -385,7 +385,11 @@ export async function mount(root, ctx) {
       page.replaceChildren(emptyState({
         icon: 'search',
         title: 'No research brief yet',
-        hint: 'An administrator can configure and run an evidence-backed research brief.',
+        hint: 'Say which markets to look in and what makes a good lead, and the search runs against every source connected for you.',
+        action: button('New lead search', {
+          kind: 'primary',
+          onClick: () => ctx.navigate('/app/research/new'),
+        }),
       }));
       return;
     }
@@ -434,11 +438,16 @@ export async function mount(root, ctx) {
       listBody = resultTable(viewState.items, state.selected[state.view], chooseResult);
     }
 
+    const newSearchAction = button('New lead search', {
+      kind: 'primary',
+      onClick: () => ctx.navigate('/app/research/new'),
+    });
+
     page.replaceChildren(
       pageHead({
         title: 'Research results',
         sub: 'Review fit and evidence separately. Unknowns stay visible and every source remains traceable.',
-        actions: [campaignSelect, exportAction],
+        actions: [campaignSelect, newSearchAction, exportAction],
       }),
       noticeNode(current),
       briefNode(current),

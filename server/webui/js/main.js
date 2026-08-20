@@ -19,6 +19,7 @@ import * as agentRuns from './pages/agent-runs.js';
 import * as adminDocuments from './pages/admin-documents.js';
 import * as research from './pages/research.js';
 import * as researchEditor from './pages/research-editor.js';
+import * as researchBrief from './pages/research-brief.js';
 import * as researchDetail from './pages/research-detail.js';
 
 // Bearer auth for every real-backend request (api.js reads this per call).
@@ -127,7 +128,9 @@ const LEGACY_REDIRECTS = [
   // Agent Runs is a log viewer: admin-only now. Research configuration moved too.
   { path: '/app/agent-runs',      to: () => '/app/today' },
   { path: '/app/agent-runs/:runId', to: () => '/app/today' },
-  { path: '/app/research/new',    to: () => '/app/research' },
+  // /app/research/new is a real customer page now: source access stays
+  // admin-owned, but the brief — markets, sector, what a good lead weighs —
+  // belongs to whoever has to act on the results.
   { path: '/app/research/:campaignId', to: () => '/app/research' },
   { path: '/app/research/:campaignId/edit', to: () => '/app/research' },
 ];
@@ -140,6 +143,7 @@ const routes = [
   { path: '/app/today',           mount: appPage('Today', today.mount) },
   { path: '/app/approvals',       mount: appPage('Approvals', approvals.mount) },
   { path: '/app/research',        mount: appPage('Research', researchResults.mount) },
+  { path: '/app/research/new',    mount: appPage('New lead search', researchBrief.mount) },
   { path: '/app/setup',           mount: appPage('Setup', setup.mount) },
   // Kept and reachable from Today's "See the numbers", deliberately off the nav.
   { path: '/app/analytics',       mount: appPage('Analytics', analytics.mount) },
