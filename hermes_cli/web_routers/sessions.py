@@ -343,13 +343,24 @@ async def search_sessions(
             # Auto-add prefix wildcards so partial words match
             # e.g. "nimb" → "nimb*" matches "nimby"
             # Preserve quoted phrases and existing wildcards as-is
+            # Strip the appended wildcard from CJK-only tokens so they don't
+            # poison the LIKE fallback (the * is not a LIKE wildcard and becomes
+            # a literal match requirement: "秃发*" matches nothing).
             import re
             terms = []
             for token in re.findall(r'"[^"]*"|\S+', q.strip()):
                 if token.startswith('"') or token.endswith("*"):
                     terms.append(token)
                 else:
-                    terms.append(token + "*")
+                    # Append wildcard for prefix matching
+                    wildcard_token = token + "*"
+                    # CJK detection: if the token contains only CJK chars (no ASCII/latin),
+                    # strip the trailing wildcard so the LIKE path doesn't treat * as literal.
+                    # This preserves English partial matching while fixing CJK short queries.
+                    if re.match(r'^[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]+$', token):
+                        terms.append(token)  # CJK-only: no wildcard
+                    else:
+                        terms.append(wildcard_token)  # Mixed/Latin: keep wildcard
             prefix_query = " ".join(terms)
             # Over-fetch so lineage dedup can still surface `limit` distinct
             # conversations even when several hits collapse onto one root.
