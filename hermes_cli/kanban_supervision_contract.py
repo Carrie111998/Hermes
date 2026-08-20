@@ -816,7 +816,9 @@ def record_review_verdict(
         task_id=task_id,
         payload=payload,
     )
-    oid = ensure_objective(conn, _root_task_id(conn, task_id))
+    # Review-cap must not persist a live worker WebUI session as the
+    # objective origin before the missing-origin check below.
+    oid = ensure_objective(conn, _root_task_id(conn, task_id), allow_live=False)
     if stale:
         upsert_unit(
             conn,

@@ -1109,6 +1109,62 @@ def test_root_review_cap_missing_durable_origin_fails_closed_without_live_webui(
         assert obj["remoko_request_id"] in (None, "")
 
 
+def test_root_review_cap_without_objective_does_not_capture_live_webui(
+    kanban_home, monkeypatch,
+):
+    remoko = FakeRemoko()
+    capture_calls = {"n": 0}
+    real_capture = sup.capture_session_origin
+
+    def _count_capture() -> sup.SessionOrigin:
+        capture_calls["n"] += 1
+        return real_capture()
+
+    monkeypatch.setattr(sup, "capture_session_origin", _count_capture)
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="root-no-objective", assignee="default")
+        assert sup.get_objective_for_root(conn, root) is None
+        conn.execute("DELETE FROM kanban_notify_subs")
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        monkeypatch.delenv("HERMES_OBJECTIVE_ID", raising=False)
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "webui")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "worker-webui")
+        monkeypatch.setenv("HERMES_SESSION_KEY", "worker-webui")
+        capture_calls["n"] = 0
+        last = None
+        for i in range(5):
+            last = contract.record_review_verdict(
+                conn, task_id=root, verdict="fail", head=f"h{i}",
+                blockers=["p1"], remoko=remoko,
+            )
+        assert last is not None
+        assert last["review_cap"] is True
+        assert last.get("ok") is False
+        assert last.get("request_id") in (None, "")
+        assert last.get("lifecycle_fault") == "review_cap_missing_origin"
+        assert remoko.calls == []
+        assert capture_calls["n"] == 0
+        chats = {
+            row["chat_id"]
+            for row in conn.execute("SELECT chat_id FROM kanban_notify_subs").fetchall()
+        }
+        assert "worker-webui" not in chats
+        obj = sup.get_objective_for_root(conn, root)
+        assert obj is not None
+        assert obj["origin_chat_id"] in (None, "")
+        assert obj["origin_session_key"] in (None, "")
+        assert obj["origin_platform"] in (None, "")
+        assert obj["remoko_request_id"] in (None, "")
+        faults = conn.execute(
+            "SELECT kind, payload FROM kanban_supervisor_events "
+            "WHERE kind = 'lifecycle_fault' AND task_id = ?",
+            (root,),
+        ).fetchall()
+        assert faults
+        payload = json.loads(faults[0]["payload"] or "{}")
+        assert payload.get("reason") == "review_cap_missing_origin"
+
+
 def test_root_review_cap_durable_origin_still_sends_one_remoko(
     kanban_home, monkeypatch,
 ):

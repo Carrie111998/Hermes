@@ -399,7 +399,14 @@ def ensure_objective(
     *,
     origin: Optional[SessionOrigin] = None,
     delegator_profile: Optional[str] = None,
+    allow_live: bool = True,
 ) -> str:
+    """Create or return the objective for ``root_task_id``.
+
+    Lifecycle callers such as review-cap pass ``allow_live=False`` so a
+    missing durable origin stays empty instead of capturing the live
+    worker WebUI session and later treating it as a notify target.
+    """
     ensure_supervisor_tables(conn)
     existing = get_objective_for_root(conn, root_task_id)
     if existing:
@@ -409,7 +416,7 @@ def ensure_objective(
         origin = _durable_notify_origin(conn, root_task_id)
     worker_task = os.environ.get("HERMES_KANBAN_TASK") or ""
     if origin is None or not origin.usable:
-        if worker_task:
+        if worker_task or not allow_live:
             origin = SessionOrigin()
         else:
             origin = capture_session_origin()
