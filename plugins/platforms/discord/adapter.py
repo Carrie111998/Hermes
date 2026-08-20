@@ -427,6 +427,7 @@ _GATE_ENV_KEYS = (
     "DISCORD_IGNORED_CHANNELS",
     "DISCORD_NO_THREAD_CHANNELS",
     "DISCORD_FREE_RESPONSE_CHANNELS",
+    "DISCORD_AUTO_THREAD_FREE_RESPONSE",
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS",
     "DISCORD_ALLOW_ALL_USERS",
     "DISCORD_ALLOW_BOTS",
@@ -6547,6 +6548,22 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
 
+    def _discord_auto_thread_free_response(self) -> bool:
+        """Return whether free-response channels should opt into auto-threading.
+
+        ``PlatformConfig.extra`` is authoritative when the key is present,
+        including an explicit ``False``. The adapter's per-profile env
+        snapshot (or scope-aware env fallback before connect) is used only
+        when config is absent. The default remains ``False`` so existing
+        free-response channels stay inline.
+        """
+        configured = self.config.extra.get("auto_thread_free_response")
+        if configured is None:
+            configured = self._gate_env("DISCORD_AUTO_THREAD_FREE_RESPONSE")
+        if isinstance(configured, str):
+            return configured.strip().lower() in {"true", "1", "yes", "on"}
+        return bool(configured) if configured is not None else False
+
     def _discord_allow_any_attachment(self) -> bool:
         """Return whether Discord attachments bypass the SUPPORTED_DOCUMENT_TYPES allowlist.
 
@@ -8162,11 +8179,8 @@ class DiscordAdapter(BasePlatformAdapter):
             # Free-response channels normally stay inline. Opt-in mode preserves
             # no-mention convenience while giving thread-first workflows a fresh
             # conversation for every top-level message.
-            auto_thread_free_response = os.getenv(
-                "DISCORD_AUTO_THREAD_FREE_RESPONSE", "false"
-            ).lower() in {"true", "1", "yes"}
             skip_thread = bool(channel_keys & no_thread_channels) or (
-                is_free_channel and not auto_thread_free_response
+                is_free_channel and not self._discord_auto_thread_free_response()
             )
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
@@ -10326,10 +10340,11 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     legacy ``discord_cfg`` block that used to live in
     ``gateway/config.py::load_gateway_config()`` before this migration.
 
-    The DiscordAdapter reads its runtime configuration via ``os.getenv()``
+    The DiscordAdapter reads most legacy runtime configuration via ``os.getenv()``
     throughout the connect / handle code paths (``DISCORD_ALLOWED_USERS``,
     ``DISCORD_REQUIRE_MENTION``, ``DISCORD_FREE_RESPONSE_CHANNELS``,
-    ``DISCORD_AUTO_THREAD``, ``DISCORD_REACTIONS``,
+    ``DISCORD_AUTO_THREAD``, ``DISCORD_AUTO_THREAD_FREE_RESPONSE``,
+    ``DISCORD_REACTIONS``,
     ``DISCORD_IGNORED_CHANNELS``, ``DISCORD_ALLOWED_CHANNELS``,
     ``DISCORD_NO_THREAD_CHANNELS``, ``DISCORD_HISTORY_BACKFILL``,
     ``DISCORD_HISTORY_BACKFILL_LIMIT``, ``DISCORD_ALLOW_MENTION_*``,
@@ -10410,10 +10425,22 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
     if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
         os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
-    if "auto_thread_free_response" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD_FREE_RESPONSE"):
-        os.environ["DISCORD_AUTO_THREAD_FREE_RESPONSE"] = str(
-            discord_cfg["auto_thread_free_response"]
-        ).lower()
+    auto_thread_free_response_cfg = discord_cfg.get("auto_thread_free_response")
+    if auto_thread_free_response_cfg is None:
+        _discord_extra_cfg = discord_cfg.get("extra")
+        if isinstance(_discord_extra_cfg, dict):
+            auto_thread_free_response_cfg = _discord_extra_cfg.get("auto_thread_free_response")
+    if auto_thread_free_response_cfg is None:
+        auto_thread_free_response_cfg = platform_extra_cfg.get("auto_thread_free_response")
+    if auto_thread_free_response_cfg is not None:
+        # Keep this in PlatformConfig.extra so multiplexed profiles do not
+        # depend on process-global env propagation. The adapter gives this
+        # explicit config value precedence over the scoped env fallback.
+        seeded_extra["auto_thread_free_response"] = auto_thread_free_response_cfg
+        if not _skip_env_bridge and not os.getenv("DISCORD_AUTO_THREAD_FREE_RESPONSE"):
+            os.environ["DISCORD_AUTO_THREAD_FREE_RESPONSE"] = str(
+                auto_thread_free_response_cfg
+            ).lower()
     if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
         os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
     backfill_cfg = discord_cfg.get("missed_message_backfill")
@@ -10546,7 +10573,7 @@ def register(ctx) -> None:
         setup_fn=interactive_setup,
         # YAML→env config bridge — owns the translation of ``config.yaml``
         # ``discord:`` keys (require_mention, free_response_channels,
-        # auto_thread, reactions, ignored_channels, allowed_channels,
+        # auto_thread, auto_thread_free_response, reactions, ignored_channels, allowed_channels,
         # no_thread_channels, allow_mentions.*, reply_to_mode,
         # thread_require_mention) into ``DISCORD_*`` env vars that the
         # adapter reads via ``os.getenv()``.  Replaces the hardcoded block
