@@ -31,6 +31,46 @@ from agent.usage_pricing import (
     format_duration_compact,
     has_known_pricing,
 )
+from hermes_state_common import _ephemeral_child_sql
+
+
+def _session_token_total(session: Dict[str, Any]) -> int:
+    return (
+        int(session.get("input_tokens") or 0)
+        + int(session.get("output_tokens") or 0)
+        + int(session.get("cache_read_tokens") or 0)
+        + int(session.get("cache_write_tokens") or 0)
+    )
+
+
+def fold_parent_child_session_usage(sessions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Drop child rows only when the parent token fields already cover them.
+
+    If the parent is smaller than its ephemeral children, keep both (no
+    token rollup). If the parent is at least as large, treat the parent as
+    already including child activity and omit the children so insights
+    does not double-count.
+    """
+    by_id = {s.get("id"): s for s in sessions if s.get("id")}
+    children_by_parent: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    drop_ids: set[str] = set()
+    for session in sessions:
+        if int(session.get("is_ephemeral") or 0) != 1:
+            continue
+        parent_id = session.get("parent_session_id")
+        if not parent_id:
+            continue
+        children_by_parent[str(parent_id)].append(session)
+    for parent_id, kids in children_by_parent.items():
+        parent = by_id.get(parent_id)
+        if parent is None:
+            continue
+        child_total = sum(_session_token_total(kid) for kid in kids)
+        if _session_token_total(parent) >= child_total:
+            drop_ids.update(str(kid["id"]) for kid in kids if kid.get("id"))
+    if not drop_ids:
+        return sessions
+    return [session for session in sessions if session.get("id") not in drop_ids]
 
 
 def _fmt_est_cost(est_cost: float) -> str:
@@ -158,7 +198,7 @@ class InsightsEngine:
             flush()
 
         # Gather raw data
-        sessions = self._get_sessions(cutoff, source)
+        sessions = fold_parent_child_session_usage(self._get_sessions(cutoff, source))
         tool_usage = self._get_tool_usage(cutoff, source)
         skill_usage = self._get_skill_usage(cutoff, source)
         message_stats = self._get_message_stats(cutoff, source)
@@ -232,19 +272,23 @@ class InsightsEngine:
                      "message_count, tool_call_count, input_tokens, output_tokens, "
                      "cache_read_tokens, cache_write_tokens, billing_provider, "
                      "billing_base_url, billing_mode, estimated_cost_usd, "
-                     "actual_cost_usd, cost_status, cost_source, api_call_count")
+                     "actual_cost_usd, cost_status, cost_source, api_call_count, "
+                     "parent_session_id")
 
     # Pre-computed query strings — f-string evaluated once at class definition,
     # not at runtime, so no user-controlled value can alter the query structure.
+    _EPHEMERAL_FLAG = (
+        f", CASE WHEN {_ephemeral_child_sql('s')} THEN 1 ELSE 0 END AS is_ephemeral"
+    )
     _GET_SESSIONS_WITH_SOURCE = (
-        f"SELECT {_SESSION_COLS} FROM sessions"
-        " WHERE started_at >= ? AND source = ?"
-        " ORDER BY started_at DESC"
+        f"SELECT {_SESSION_COLS}{_EPHEMERAL_FLAG} FROM sessions s"
+        " WHERE s.started_at >= ? AND s.source = ?"
+        " ORDER BY s.started_at DESC"
     )
     _GET_SESSIONS_ALL = (
-        f"SELECT {_SESSION_COLS} FROM sessions"
-        " WHERE started_at >= ?"
-        " ORDER BY started_at DESC"
+        f"SELECT {_SESSION_COLS}{_EPHEMERAL_FLAG} FROM sessions s"
+        " WHERE s.started_at >= ?"
+        " ORDER BY s.started_at DESC"
     )
 
     # Assistant ``tool_calls`` scan for tool/skill usage.  ``INDEXED BY`` pins
@@ -670,6 +714,8 @@ class InsightsEngine:
             return display_model
 
         usage_rows = self._get_model_usage(cutoff, source)
+        allowed_ids = {s.get("id") for s in sessions if s.get("id")}
+        usage_rows = [r for r in usage_rows if r.get("session_id") in allowed_ids]
         usage_totals = defaultdict(lambda: {
             "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
             "cache_write_tokens": 0, "reasoning_tokens": 0,

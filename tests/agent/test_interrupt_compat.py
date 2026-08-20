@@ -5,7 +5,12 @@ from __future__ import annotations
 import threading
 from unittest.mock import MagicMock
 
-from agent.interrupt_compat import request_hard_interrupt
+from agent.interrupt_compat import (
+    request_hard_interrupt,
+    should_enqueue_interrupt_followup,
+    interrupt_followup_disposition,
+    interrupt_join_should_stop,
+)
 
 
 class _ModernAgent:
@@ -101,3 +106,19 @@ def test_tui_subagent_interrupt_is_an_explicit_hard_stop() -> None:
             delegate_tool._active_subagents.pop(subagent_id, None)
 
     assert agent.calls == [("hard", f"Interrupted via TUI ({subagent_id})")]
+
+
+def test_interrupt_followup_is_not_enqueued_while_agent_thread_alive() -> None:
+    assert should_enqueue_interrupt_followup(agent_thread_alive=False) is True
+    assert should_enqueue_interrupt_followup(agent_thread_alive=True) is False
+    assert interrupt_followup_disposition(agent_thread_alive=True) == "park"
+    assert interrupt_followup_disposition(
+        agent_thread_alive=True, should_exit=True
+    ) == "drop"
+    assert interrupt_followup_disposition(agent_thread_alive=False) == "enqueue"
+    assert interrupt_join_should_stop(
+        ticks_elapsed=50, agent_thread_alive=True, should_exit=False
+    ) is True
+    assert interrupt_join_should_stop(
+        ticks_elapsed=1, agent_thread_alive=True, should_exit=False
+    ) is False

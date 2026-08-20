@@ -188,7 +188,8 @@ class TestCodexSingleWriter:
         mock_client = MagicMock()
         mock_client.responses.create.return_value = event_gen()
 
-        run_codex_stream(agent, {"model": "gpt-5.3-codex"}, client=mock_client)
+        with pytest.raises(InterruptedError, match="superseded"):
+            run_codex_stream(agent, {"model": "gpt-5.3-codex"}, client=mock_client)
 
         assert "".join(delivered) == "first"
         assert "-stale-tail" not in "".join(delivered)

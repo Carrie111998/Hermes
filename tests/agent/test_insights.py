@@ -9,6 +9,7 @@ from agent.insights import (
     InsightsEngine,
     _estimate_cost,
     _bar_chart,
+    fold_parent_child_session_usage,
 )
 from agent.usage_pricing import (
     format_duration_compact as _format_duration,
@@ -772,5 +773,80 @@ class TestEdgeCases:
         # The session has no cost data, so it falls in the "unknown" bucket.
         assert "💰 Cost" in text
         assert "Unknown" in text
+
+
+class TestDelegateChildAccounting:
+    def test_insights_do_not_double_count_delegate_child_token_rows(self, db):
+        """Parent token fields can already include child activity; child session
+        rows must not be summed on top (incident #91040 ~2x insights totals).
+        """
+        now = time.time()
+        db.create_session("parent", source="cli", model="gpt-5.6-sol")
+        db.create_session(
+            "child-a",
+            source="cli",
+            model="gpt-5.6-sol",
+            parent_session_id="parent",
+        )
+        db.create_session(
+            "child-b",
+            source="cli",
+            model="gpt-5.6-sol",
+            parent_session_id="parent",
+        )
+        db.update_token_counts("parent", input_tokens=148_700_000, output_tokens=1)
+        db.update_token_counts("child-a", input_tokens=80_000_000, output_tokens=1)
+        db.update_token_counts("child-b", input_tokens=64_700_000, output_tokens=1)
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id IN ('parent','child-a','child-b')",
+            (now,),
+        )
+        db._conn.commit()
+
+        report = InsightsEngine(db).generate(days=1)
+        assert report["overview"]["total_tokens"] == 148_700_001
+
+    def test_insights_keep_disjoint_parent_and_child_token_rows(self, db):
+        now = time.time()
+        db.create_session("parent", source="cli", model="gpt-5.6-sol")
+        db.create_session(
+            "child-a",
+            source="cli",
+            model="gpt-5.6-sol",
+            parent_session_id="parent",
+        )
+        db.update_token_counts("parent", input_tokens=4_000_000, output_tokens=1)
+        db.update_token_counts("child-a", input_tokens=80_000_000, output_tokens=1)
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id IN ('parent','child-a')",
+            (now,),
+        )
+        db._conn.commit()
+
+        report = InsightsEngine(db).generate(days=1)
+        assert report["overview"]["total_tokens"] == 84_000_002
+
+    def test_fold_parent_child_session_usage_is_pure(self):
+        sessions = [
+            {
+                "id": "p",
+                "is_ephemeral": 0,
+                "input_tokens": 10,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+            },
+            {
+                "id": "c",
+                "parent_session_id": "p",
+                "is_ephemeral": 1,
+                "input_tokens": 10,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+            },
+        ]
+        folded = fold_parent_child_session_usage(sessions)
+        assert [s["id"] for s in folded] == ["p"]
 
 

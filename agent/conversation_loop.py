@@ -1998,6 +1998,20 @@ def run_conversation(
             if not agent.quiet_mode:
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break
+
+        if getattr(agent, "_delegate_depth", 0) > 0:
+            try:
+                from agent.tool_guardrails import child_session_budget_exhausted
+                _child_cap = child_session_budget_exhausted(agent)
+                if _child_cap is not None:
+                    interrupted = True
+                    _turn_exit_reason = "child_session_budget"
+                    agent._interrupt_requested = True
+                    if not agent.quiet_mode:
+                        agent._safe_print(f"\n{_child_cap.message}")
+                    break
+            except Exception:
+                pass
         
         api_call_count += 1
         agent._api_call_count = api_call_count
@@ -2883,6 +2897,65 @@ def run_conversation(
                     pass
                 except Exception:
                     pass  # Never let rate guard break the agent loop
+
+            # Codex weekly allowance circuit breaker (#91040). Fail-open on
+            # fetch errors; 0 disables. Prefer fallback over burning the cap.
+            if str(getattr(agent, "provider", "") or "") == "openai-codex":
+                try:
+                    _caps = getattr(
+                        getattr(agent, "_tool_guardrails", None), "config", None
+                    )
+                    _loop_caps = getattr(_caps, "loop_caps", None)
+                    _weekly_pct = int(
+                        getattr(_loop_caps, "codex_weekly_break_percent", 90) or 0
+                    )
+                    if _weekly_pct > 0:
+                        from agent.account_usage import (
+                            cached_codex_usage_snapshot,
+                            codex_weekly_used_percent,
+                            should_trip_codex_weekly_breaker,
+                        )
+                        _snap = cached_codex_usage_snapshot(agent)
+                        if should_trip_codex_weekly_breaker(_snap, _weekly_pct):
+                            _used = codex_weekly_used_percent(_snap)
+                            _codex_msg = (
+                                f"Codex weekly usage is at {_used:.0f}% "
+                                f"(circuit breaker {_weekly_pct}%). Stopping "
+                                "further API calls this turn."
+                            )
+                            agent._buffer_vprint(f"⏳ {_codex_msg} Trying fallback...")
+                            agent._buffer_status(f"⏳ {_codex_msg}")
+                            try:
+                                from agent.interrupt_compat import request_hard_interrupt
+                                request_hard_interrupt(agent, _codex_msg)
+                            except Exception:
+                                agent._interrupt_requested = True
+                            if agent._try_activate_fallback():
+                                active_system_prompt = _sync_failover_system_message(
+                                    agent, api_messages, active_system_prompt)
+                                retry_count = 0
+                                compression_attempts = 0
+                                _retry.primary_recovery_attempted = False
+                                _retry.restart_with_rebuilt_messages = True
+                                break
+                            agent._flush_status_buffer()
+                            agent._persist_session(messages, conversation_history)
+                            return {
+                                "final_response": (
+                                    f"⏳ {_codex_msg}\n\n"
+                                    "No fallback provider available. "
+                                    "Wait for the weekly reset, redeem a "
+                                    "Codex reset credit, or add a fallback "
+                                    "provider in config.yaml."
+                                ),
+                                "messages": messages,
+                                "api_calls": api_call_count,
+                                "completed": False,
+                                "failed": True,
+                                "error": _codex_msg,
+                            }
+                except Exception:
+                    pass
 
             try:
                 agent._reset_stream_delivery_tracking()
@@ -4193,6 +4266,17 @@ def run_conversation(
                     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
                     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
                     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+
+                    if getattr(agent, "_delegate_depth", 0) > 0:
+                        try:
+                            from agent.tool_guardrails import record_child_session_usage
+                            record_child_session_usage(
+                                agent,
+                                api_calls=1,
+                                tokens=int(total_tokens or 0),
+                            )
+                        except Exception:
+                            pass
 
                     # Log API call details for debugging/observability
                     _cache_pct = ""

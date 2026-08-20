@@ -471,12 +471,14 @@ class CLICommandsMixin:
         print(f"  Use it: hermes -p {imported}")
 
     def _handle_stop_command(self):
-        """Handle /stop — kill all running background processes and
-        background (async) delegations.
+        """Handle /stop — halt the current parent/child turn plus background work.
 
         Inspired by OpenAI Codex's separation of interrupt (stop current turn)
         from /stop (clean up background processes). See openai/codex#14602.
+        The incident in #91040 showed /stop leaving the parent thread and
+        delegated children running; foreground hard-interrupt is required.
         """
+        from agent.interrupt_compat import request_hard_interrupt
         from tools.process_registry import process_registry
 
         processes = process_registry.list_sessions()
@@ -491,7 +493,12 @@ class CLICommandsMixin:
             n_async = 0
             interrupt_all = None
 
-        if not running and not n_async:
+        foreground = bool(getattr(self, "_agent_running", False) and getattr(self, "agent", None))
+        if foreground:
+            request_hard_interrupt(self.agent, "/stop")
+            print("  Interrupted the running agent and any child delegates.")
+
+        if not running and not n_async and not foreground:
             print("  No running background processes.")
             return
 
