@@ -473,15 +473,23 @@ class RelayAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"draft transport error: {e}")
         if result.get("success"):
             return SendResult(success=True)
-        # DEFINITE connector rejection (an explicit result, not a transport
-        # ambiguity): disarm interception for this key. The stream consumer
-        # disables the draft transport on this failure and falls back to
-        # edit-based streaming — its turn-final must go out as a REAL send,
-        # not get converted into a seal on a stream the connector just told
-        # us is unusable. (This restores the disarm-on-failure semantics the
-        # G-D1 optimistic-arming change silently dropped; the ambiguity that
-        # motivated G-D1 lives in the except branch above, which still keeps
-        # the key armed.)
+        if result.get("ambiguous"):
+            # Ack lost (transport timeout) — the production ws transport
+            # RETURNS this shape rather than raising (PR 85796 review,
+            # round 2): the connector may have applied the frame. Same
+            # contract as the except branch: keep interception armed.
+            return SendResult(
+                success=False, error=str(result.get("error") or "draft ack lost")
+            )
+        # DEFINITE connector rejection (an explicit non-ambiguous result):
+        # disarm interception for this key. The stream consumer disables
+        # the draft transport on this failure and falls back to edit-based
+        # streaming — its turn-final must go out as a REAL send, not get
+        # converted into a seal on a stream the connector just told us is
+        # unusable. (This restores the disarm-on-failure semantics the
+        # G-D1 optimistic-arming change silently dropped; the ambiguity
+        # that motivated G-D1 lives in the except branch above and the
+        # ambiguous-result branch — both keep the key armed.)
         if self._open_draft_by_chat.get(chat_key) == draft_id:
             self._open_draft_by_chat.pop(chat_key, None)
         return SendResult(
@@ -521,34 +529,47 @@ class RelayAdapter(BasePlatformAdapter):
             "metadata": self._with_scope(chat_id, dict(metadata or {})),
         }
         _seal_platform = self._platform_by_chat.get(str(chat_id))
-        try:
-            result = await self._transport.send_outbound(
-                seal_frame, platform=_seal_platform
-            )
-        except Exception as e:
-            # Ambiguous outcome: the seal may have been applied before the
-            # socket dropped. The connector's sealed-key tombstone makes a
-            # repeated final frame idempotent (it returns the original
-            # stream ts and never opens a second stream), so retry the SAME
-            # frame once rather than falling straight to a plain send —
-            # a plain send after a landed seal is the duplicate-final class
-            # this whole lane exists to kill.
-            logger.warning(
-                "relay seal transport error (%s); retrying idempotent final frame",
-                e,
-            )
+        _transport = self._transport  # narrowed by the None-guard above
+
+        async def _attempt() -> Optional[Dict[str, Any]]:
+            """One seal attempt; None means ambiguous (exception or lost ack)."""
             try:
-                result = await self._transport.send_outbound(
+                r = await _transport.send_outbound(
                     seal_frame, platform=_seal_platform
                 )
-            except Exception as e2:
-                # Still down. Report failure so the caller's fail-open plain
-                # send runs (it shares this transport, so if the seal truly
-                # cannot go out, neither can a duplicate — the consumer's
-                # flags stay unset and the gateway's fallback owns delivery).
-                return SendResult(
-                    success=False, error=f"draft seal transport error: {e2}"
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("relay seal transport error (ambiguous): %s", e)
+                return None
+            if r.get("ambiguous"):
+                # The production ws transport returns this shape on ack
+                # timeout instead of raising (PR 85796 review, round 2):
+                # the connector may have sealed and lost only the ack.
+                logger.warning(
+                    "relay seal ack lost (ambiguous): %s", r.get("error")
                 )
+                return None
+            return r
+
+        # Ambiguous outcomes (exception OR timeout-shaped result) retry the
+        # SAME idempotent frame once: the connector's sealed-key tombstone
+        # returns the original stream ts for a repeated final and never
+        # opens a second stream, so the retry can turn "unknown" into a
+        # definite answer for free. Only after BOTH attempts stay ambiguous
+        # do we report failure — the caller's fail-open plain send is a
+        # possible duplicate, but a silent loss is worse, and two
+        # consecutive ack losses on one socket almost always mean the
+        # transport is actually down (so the plain send fails too and the
+        # gateway's fallback owns delivery).
+        result = await _attempt()
+        if result is None:
+            result = await _attempt()
+        if result is None:
+            return SendResult(
+                success=False,
+                error="draft seal ambiguous after retry (transport ack lost)",
+            )
         if result.get("success"):
             # The connector returns the stream's ts as the message identity.
             return SendResult(
