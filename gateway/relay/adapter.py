@@ -99,7 +99,7 @@ class RelayAdapter(BasePlatformAdapter):
         # (NS-658 live cards). Armed by send_draft on a successful frame;
         # consumed by send() to convert the turn-final delivery into the
         # sealing draft(final=true) frame instead of a duplicate post.
-        # Keyed by _draft_key (chat + turn thread anchor), NOT bare chat:
+        # Keyed by _draft_key (chat + per-turn identity), NOT bare chat:
         # parallel turns in one DM are distinct streams (live finding #10 —
         # per-chat keying collided three concurrent turns: merged task
         # cards, clobbered seal state, 3x duplicate finals).
@@ -107,15 +107,29 @@ class RelayAdapter(BasePlatformAdapter):
         # chat_id -> draft_id of the most recently SEALED stream (gateway
         # mirror of the connector's sealed-key tombstone): post-seal
         # straggler frames must neither re-arm interception nor re-open a
-        # stream. One entry per chat; a NEW turn's fresh draft_id differs,
-        # so it arms normally and overwrites the tombstone at its own seal.
+        # stream. One entry per turn key; a NEW turn's fresh draft_id
+        # differs, so it arms normally and writes its own tombstone at its
+        # own seal. Bounded like the sibling caches (see send_draft).
         self._sealed_draft_by_chat: Dict[str, int] = {}
         # Stream-is-the-message marker (finding #4): the stream consumer
         # checks this to keep ONE draft stream per turn instead of bumping
         # draft_id at tool boundaries (which opens a new Slack message per
         # segment on native streaming — Telegram-shaped adapters want the
         # bump, we don't).
-        self.draft_stream_is_message = True
+        #
+        # SLACK-ONLY semantic, gated on the negotiated descriptor (review
+        # B4): the base send_draft contract is Telegram-shaped — the draft
+        # clears and the final arrives as a separate real send. Setting
+        # this unconditionally made ANY relay connector that advertises
+        # the draft op (e.g. a Telegram connector) intercept the turn-final
+        # into draft(final=true), so no real history message was ever
+        # posted. A future connector platform whose native streaming is
+        # also stream-is-the-message should advertise it explicitly
+        # (descriptor field within the contract) rather than widening this
+        # platform check by guesswork.
+        self.draft_stream_is_message = (
+            str(getattr(descriptor, "platform", "") or "").lower() == "slack"
+        )
         # chat_id -> event fired when the entry above lands, so a consumer that
         # arrives before the send can wait for it instead of polling. See
         # wait_for_auto_thread_info.
@@ -421,7 +435,13 @@ class RelayAdapter(BasePlatformAdapter):
             # Post-seal straggler: its content is already in the sealed
             # message; report success, send nothing, arm nothing.
             return SendResult(success=True)
-        self._open_draft_by_chat[chat_key] = draft_id
+        # Arm seal-interception ONLY for stream-is-the-message platforms
+        # (review B4): on a Telegram-shaped connector the draft clears
+        # client-side and the final MUST go out as a separate real send —
+        # arming here would intercept that final into draft(final=true)
+        # and no history message would ever be posted.
+        if self.draft_stream_is_message:
+            self._open_draft_by_chat[chat_key] = draft_id
         try:
             result = await self._transport.send_outbound(
                 {
