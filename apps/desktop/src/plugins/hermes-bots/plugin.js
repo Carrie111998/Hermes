@@ -3381,6 +3381,31 @@ async function openStoredBotChat(name, storedId, summary) {
   return storedId
 }
 
+/** Open the human-facing session that made a bot appear in Active now.
+ *  Active-now chips represent live work, so they must not route through the
+ *  roster row's canonical-chat opener (which may create a new chat or fall
+ *  back to a Home draft when no canonical pin exists). */
+async function openActiveBotSession(name, session) {
+  const storedId = session?.resolved_id || session?.id
+
+  if (!storedId || typeof host.openSession !== 'function') {
+    return null
+  }
+
+  try {
+    await openStoredBotChat(name, storedId, session)
+    return storedId
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+
+    if (/session not found/i.test(message)) {
+      return null
+    }
+
+    throw error
+  }
+}
+
 /** Adopt-before-mint: the profile may already own a canonical Bot Chat that
  *  the pin lost track of (pin cleared during an outage, ui_meta rolled back,
  *  a fork squatting the title). The core UNIQUE title index guarantees at
@@ -4987,6 +5012,15 @@ function botActivitySession(bot) {
   return (preferred.last_active || 0) >= (last.last_active || 0) ? preferred : last
 }
 
+/** The human-facing session that actually made this bot active now. A live
+ * worker or a busy turn can light the strip without a fresh chat, so callers
+ * must not mistake stale human history for the active destination. */
+function activeHumanSession(bot, now = Date.now()) {
+  const session = botActivitySession(bot)
+  const lastActive = session?.last_active || 0
+  return lastActive && now / 1000 - lastActive < ACTIVE_WINDOW_S ? session : null
+}
+
 /** Worker liveness window: kanban/tool workers heartbeat last_activity_at
  *  at least every 60s while running (agent/session_activity.py), so a
  *  worker whose stamp is older than this is finished or stalled. Wider
@@ -5010,8 +5044,7 @@ function workerActiveAt(bot, now = Date.now()) {
 function activeBots(roster, activeProfile, gatewayState, now = Date.now()) {
   return (roster || []).filter(bot => {
     const busyTurn = !bot.remoteSource && bot.name === activeProfile && gatewayState === 'busy'
-    const last = botActivitySession(bot)?.last_active || 0
-    const inWindow = Boolean(last && now / 1000 - last < ACTIVE_WINDOW_S)
+    const inWindow = Boolean(activeHumanSession(bot, now))
 
     return busyTurn || inWindow || workerActiveAt(bot, now)
   })
@@ -8019,7 +8052,7 @@ function RoutinesPane() {
 /** "Active now" presence strip above the roster: chips for every bot that is
  *  working right now (the gateway-busy selected profile + bots whose last
  *  message landed inside the liveness window). Reuses the row avatar; each
- *  chip opens that bot's canonical Bot Chat. Omitted entirely when nothing
+ *  chip opens that bot's active human-facing session. Omitted entirely when nothing
  *  is active, and never reorders the roster below it. */
 function ActiveNowStrip({ roster, activeProfile, gatewayState, metaByName, onOpen }) {
   const active = activeBots(roster, activeProfile, gatewayState)
@@ -8046,7 +8079,7 @@ function ActiveNowStrip({ roster, activeProfile, gatewayState, metaByName, onOpe
 
         return jsx('button', {
           type: 'button',
-          title: `Open ${label}'s chat`,
+          title: `Open ${label}'s active chat`,
           className: cn(
             'flex items-center gap-1.5 rounded-md bg-(--chrome-action-hover) px-1.5 py-1 text-left transition-colors',
             'hover:bg-(--chrome-action-hover) hover:text-foreground'
@@ -9901,6 +9934,17 @@ function BotsPane() {
             }
 
             try {
+              const activeSession = activeHumanSession(bot)
+              const activeId = await openActiveBotSession(bot.name, activeSession)
+
+              if (generation !== botOpenGeneration) {
+                return
+              }
+
+              if (activeId) {
+                return
+              }
+
               const id = await openBotCanonicalChat(
                 bot.name,
                 pinnedChat,

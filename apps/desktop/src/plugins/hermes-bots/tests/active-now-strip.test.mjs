@@ -15,7 +15,7 @@ function loadActiveBotsSlice() {
 
   const context = {}
   vm.runInNewContext(
-    `${source.slice(start, end)}\nglobalThis.__activeBots = activeBots;\nglobalThis.__botActivitySession = botActivitySession;`,
+    `${source.slice(start, end)}\nglobalThis.__activeBots = activeBots;\nglobalThis.__botActivitySession = botActivitySession;\nglobalThis.__activeHumanSession = activeHumanSession;`,
     context
   )
 
@@ -28,6 +28,10 @@ function loadActiveBots() {
 
 function loadBotActivitySession() {
   return loadActiveBotsSlice().__botActivitySession
+}
+
+function loadActiveHumanSession() {
+  return loadActiveBotsSlice().__activeHumanSession
 }
 
 // Fixed clock so "inside the window" vs "stale" is deterministic.
@@ -112,6 +116,24 @@ test('botActivitySession degrades to whichever side exists (older gateways / no 
   assert.equal(botActivitySession(null), null)
 })
 
+test('activeHumanSession returns the fresh session that supplied the activity signal', () => {
+  const activeHumanSession = loadActiveHumanSession()
+  const fresh = { id: 'live', last_active: NOW / 1000 - 10 }
+  const stale = { id: 'old', last_active: NOW / 1000 - 400 }
+
+  assert.equal(activeHumanSession({ preferred_session: stale, last_session: fresh }, NOW).id, 'live')
+})
+
+test('activeHumanSession ignores stale human history when only a worker is active', () => {
+  const activeHumanSession = loadActiveHumanSession()
+  const bot = {
+    last_session: { id: 'old', last_active: NOW / 1000 - 400 },
+    worker_session: { id: 'worker', source: 'kanban', last_active: NOW / 1000 - 10 }
+  }
+
+  assert.equal(activeHumanSession(bot, NOW), null)
+})
+
 test('activeBots counts Bot Chat activity that last_session cannot see', () => {
   const activeBots = loadActiveBots()
   const bots = [
@@ -173,13 +195,21 @@ test('ActiveNowStrip renders above the roster, is a live region, and is click-ac
   // Live region announces membership changes politely.
   assert.match(source, /'aria-live': 'polite'/)
   // Chips are real buttons (keyboard/click accessible), reuse BotFace, and
-  // open the canonical chat via the same path as roster rows.
-  assert.match(source, /jsx\('button', \{\s*type: 'button',\s*title: `Open \$\{label\}'s chat`/)
+  // open the active human-facing session instead of the canonical chat used
+  // by ordinary roster rows.
+  assert.match(source, /jsx\('button', \{\s*type: 'button',\s*title: `Open \$\{label\}'s active chat`/)
   // The key rides as jsx()'s third argument — the ONLY form React treats as
   // a list key; a `key:` prop leaves chips unkeyed (index identity).
   assert.match(source, /\}, botRosterKey\(bot\)\)\s*\}\)\s*\]\s*\}\)\s*\}\s*\/\*\* Assign a bot to a group/s)
   assert.match(source, /jsx\(BotFace,\s*\{[\s\S]*?mood: 'work'/)
   assert.match(source, /let pinnedChat = botRosterMeta\(bot, allMeta\)\?\.chat/)
   assert.match(source, /await prepareBotSource\(bot, pinnedChat\)/)
+  assert.match(source, /const activeSession = activeHumanSession\(bot\)/)
+  assert.match(source, /await openActiveBotSession\(bot\.name, activeSession\)/)
   assert.match(source, /bot\.preferred_session \|\| bot\.last_session/)
+
+  const handlerStart = source.indexOf('onOpen: bot =>')
+  const handlerEnd = source.indexOf("children: 'Search bots…'", handlerStart)
+  const handler = source.slice(handlerStart, handlerEnd)
+  assert.ok(handler.indexOf('openActiveBotSession') < handler.indexOf('openBotCanonicalChat'))
 })
