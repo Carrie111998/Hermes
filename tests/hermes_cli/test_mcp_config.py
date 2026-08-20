@@ -277,6 +277,34 @@ class TestMcpAdd:
         assert srv["args"] == ["-y", "test-mcp-server"]
         assert "env" not in srv
 
+    def test_add_returns_failure_when_discovered_server_is_not_persisted(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        for subdir in ("cron", "sessions", "logs", "memories"):
+            (tmp_path / subdir).mkdir()
+        (tmp_path / ".managed").write_text("nixos", encoding="utf-8")
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda name, config: [("search", "Search")],
+        )
+        monkeypatch.setattr("builtins.input", lambda _: "")
+
+        from hermes_cli.mcp_config import mcp_command
+
+        rc = mcp_command(
+            _make_args(
+                name="github",
+                mcp_action="add",
+                mcp_command="npx",
+                args=["@mcp/github"],
+            )
+        )
+
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "Saved 'github'" not in captured.out
+        assert "was not persisted" in captured.err.lower()
+
 
 # ---------------------------------------------------------------------------
 # Tests: cmd_mcp_test
@@ -653,6 +681,24 @@ class TestConfigHelpers:
         servers = _get_mcp_servers()
         assert "mysvr" in servers
         assert servers["mysvr"]["url"] == "https://example.com/mcp"
+
+    def test_save_reports_failure_when_config_write_is_refused(
+        self, tmp_path, capsys
+    ):
+        """A refused write must not be reported as a persisted MCP server."""
+        for subdir in ("cron", "sessions", "logs", "memories"):
+            (tmp_path / subdir).mkdir()
+        (tmp_path / ".managed").write_text("nixos", encoding="utf-8")
+
+        from hermes_cli.mcp_config import _save_mcp_server
+
+        saved = _save_mcp_server(
+            "mysvr", {"url": "https://example.com/mcp", "enabled": True}
+        )
+
+        assert saved is False
+        assert not (tmp_path / "config.yaml").exists()
+        assert "was not persisted" in capsys.readouterr().err.lower()
 
 
     def test_env_key_for_server(self):
