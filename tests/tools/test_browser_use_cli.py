@@ -100,6 +100,11 @@ class TestSubprocessEnvironment:
         monkeypatch.setitem(sys.modules, "tools.browser_tool", browser_tool)
         env = bu_cli._base_subprocess_env()
         assert env["ANONYMIZED_TELEMETRY"] == "false"
+        assert env["BH_TELEMETRY"] == "0"
+        assert env["BROWSER_HARNESS_TELEMETRY"] == "0"
+        assert env["BH_RECORD"] == "0"
+        assert env["BH_UPDATE_CHECK"] == "0"
+        assert env["BH_OPEN_LIVE_URL"] == "0"
 
     def test_subprocess_env_strips_parent_python_import_paths(self, monkeypatch):
         """#83427/#84841/#86006/#86104: the browser-use CLI runs under its
@@ -777,9 +782,29 @@ class TestSkillTextDescription:
         assert overrides["description"].endswith(bu_cli._HELPERS_DIGEST)
 
     def test_digest_names_core_helpers(self):
-        for helper in ("new_tab(", "page_info()", "js(", "fill_input(",
-                       "click_at_xy(", "capture_screenshot()", "cdp("):
+        for helper in (
+            "new_tab(",
+            "page_info()",
+            "js(",
+            "fill_input(",
+            "click_at_xy(",
+            "capture_screenshot()",
+            "wait_for_element(",
+            "wait_for_network_idle(",
+            "list_tabs()",
+            "current_tab()",
+            "activate_tab(",
+            "close_tab(",
+            "upload_file(",
+            "cdp(",
+        ):
             assert helper in bu_cli._HELPERS_DIGEST
+
+    def test_native_vision_requires_final_screenshot_verification(self, monkeypatch):
+        monkeypatch.setattr(
+            "tools.vision_tools._should_use_native_vision_fast_path", lambda: True
+        )
+        assert "fresh final screenshot" in bu_cli._description_header()
 
     def test_static_fallback_carries_digest_and_install_hint(self):
         desc = bu_cli.BROWSER_EXEC_SCHEMA["description"]
