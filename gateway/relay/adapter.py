@@ -595,9 +595,23 @@ class RelayAdapter(BasePlatformAdapter):
         # consecutive ack losses on one socket almost always mean the
         # transport is actually down (so the plain send fails too and the
         # gateway's fallback owns delivery).
-        result = await _attempt()
-        if result is None:
+        #
+        # Cancellation safety (review r2, finding 4): the open entry was
+        # popped and the tombstone written BEFORE the await. If the task is
+        # cancelled mid-seal, CancelledError bypasses the failure handling
+        # and the later abandon pass would find nothing to close — the
+        # connector-side stream stays visibly live until eviction. Restore
+        # the open entry (and drop our premature tombstone) before
+        # re-raising so the abandon path can seal it.
+        try:
             result = await _attempt()
+            if result is None:
+                result = await _attempt()
+        except asyncio.CancelledError:
+            self._open_draft_by_chat[draft_key] = draft_id
+            if self._sealed_draft_by_chat.get(draft_key) == draft_id:
+                self._sealed_draft_by_chat.pop(draft_key, None)
+            raise
         if result is None:
             return SendResult(
                 success=False,
