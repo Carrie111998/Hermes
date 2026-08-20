@@ -145,3 +145,33 @@ def is_partial_silence_marker(text: Any) -> bool:
         if candidate and any(marker.startswith(candidate) for marker in LIVE_GATEWAY_SILENT_MARKERS):
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Leaked-scaffolding guard
+# ---------------------------------------------------------------------------
+
+# Prefix stamped on compaction handoff summaries by agent/context_compressor.py.
+# Small local models can echo the injected handoff block verbatim as their
+# visible reply on the first turn after an auto-compaction; that block embeds
+# excerpts of memory/identity files and must never reach a chat surface
+# (2026-08-19 incident: 5.9k-char handoff echo delivered to Telegram, and the
+# bare file paths inside it triggered native attachment of 6 internal files).
+COMPACTION_HANDOFF_MARKER = "[CONTEXT COMPACTION"
+
+
+def is_leaked_scaffolding_response(response: Any) -> bool:
+    """True when a response is (or leads with) an echoed compaction handoff.
+
+    An echo reproduces the handoff header as its own line at the head of the
+    reply; prose that merely *discusses* compaction mentions the marker
+    mid-sentence (often in backticks) and must be delivered.  So: flag only
+    when one of the first few lines starts with the marker (allowing quote/
+    heading decoration).
+    """
+    if not isinstance(response, str):
+        return False
+    for line in response.lstrip().split("\n", 5)[:5]:
+        if line.lstrip().lstrip(">*# ").startswith(COMPACTION_HANDOFF_MARKER):
+            return True
+    return False
