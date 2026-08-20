@@ -1896,7 +1896,31 @@ def nous_model_reasoning_capabilities(
         caps_by_id = _fetch_nous_reasoning_caps(timeout=timeout)
     if caps_by_id is None:
         return None
-    return caps_by_id.get(model)
+    detail = caps_by_id.get(model)
+
+    # Portal's native Anthropic Messages routes currently publish an empty
+    # OpenAI-style ``supported_parameters`` list on their base model rows.
+    # That list describes the chat-completions surface, not the native
+    # ``/v1/messages`` request Hermes selects for every ``anthropic/*`` model,
+    # so parsing it literally produces a false ``supports_reasoning=False``.
+    #
+    # The same catalog publishes the model-level reasoning contract on the
+    # corresponding ``:batch`` row, including whether reasoning is mandatory.
+    # Reuse that live Portal verdict for the native row rather than hiding a
+    # working effort control. Haiku stays on the exact-row verdict because the
+    # Anthropic adapter deliberately does not emit thinking parameters for it.
+    if (
+        detail
+        and not detail.get("supports_reasoning")
+        and model.lower().startswith("anthropic/")
+        and ":" not in model
+        and "haiku" not in model.lower()
+    ):
+        batch_detail = caps_by_id.get(f"{model}:batch")
+        if batch_detail and batch_detail.get("supports_reasoning"):
+            return batch_detail
+
+    return detail
 
 
 _nous_caps_disk_checked = False

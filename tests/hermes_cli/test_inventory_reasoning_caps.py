@@ -9,6 +9,7 @@ the Portal honors levels a route doesn't advertise, so publishing it would
 invite a picker filter that hides working levels.
 """
 
+import agent.models_dev as models_dev
 import hermes_cli.inventory as inv
 import hermes_cli.models as models_mod
 
@@ -95,6 +96,34 @@ def test_reasoning_mandatory_route_cannot_disable(monkeypatch):
     inv._apply_capabilities(rows)
 
     assert rows[0]["capabilities"]["z-ai/glm-5.3"]["can_disable_reasoning"] is False
+
+
+def test_native_fable_keeps_effort_but_hides_the_off_switch(monkeypatch):
+    """Portal's empty base row must not erase its native Messages contract."""
+    monkeypatch.setattr(models_mod, "model_supports_fast_mode", lambda model: False)
+    monkeypatch.setattr(models_mod, "warm_nous_reasoning_caps_async", lambda: None)
+    monkeypatch.setattr(models_dev, "get_model_capabilities", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        models_mod,
+        "_nous_reasoning_caps_cache",
+        {
+            "anthropic/claude-fable-5": {"supports_reasoning": False},
+            "anthropic/claude-fable-5:batch": {
+                "supports_reasoning": True,
+                "supported_efforts": ["max", "xhigh", "high"],
+                "mandatory": True,
+            },
+        },
+    )
+    monkeypatch.setattr(models_mod, "_nous_caps_disk_checked", True)
+
+    rows = [{"slug": "nous", "models": ["anthropic/claude-fable-5"]}]
+    inv._apply_capabilities(rows)
+
+    caps = rows[0]["capabilities"]["anthropic/claude-fable-5"]
+    assert caps["reasoning"] is True
+    assert caps["can_disable_reasoning"] is False
+    assert "supported_efforts" not in caps
 
 
 def test_unlisted_model_states_no_restriction(monkeypatch):

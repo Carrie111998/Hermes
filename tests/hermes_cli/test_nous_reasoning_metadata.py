@@ -34,6 +34,25 @@ _CATALOG = (
 )
 
 
+_NATIVE_ANTHROPIC_CATALOG = (
+    b'{"data": ['
+    b'{"id": "anthropic/claude-fable-5", "supported_parameters": []},'
+    b'{"id": "anthropic/claude-fable-5:batch",'
+    b' "supported_parameters": ["reasoning", "reasoning_effort"],'
+    b' "reasoning": {"mandatory": true, "supported_efforts": ["max", "xhigh", "high"]}},'
+    b'{"id": "anthropic/claude-opus-5", "supported_parameters": []},'
+    b'{"id": "anthropic/claude-opus-5:batch",'
+    b' "supported_parameters": ["reasoning", "reasoning_effort"],'
+    b' "reasoning": {"mandatory": false, "supported_efforts": ["max", "high", "low"]}},'
+    b'{"id": "anthropic/claude-haiku-4.5", "supported_parameters": []},'
+    b'{"id": "anthropic/claude-haiku-4.5:batch",'
+    b' "supported_parameters": ["reasoning"]},'
+    b'{"id": "other/model", "supported_parameters": []},'
+    b'{"id": "other/model:batch", "supported_parameters": ["reasoning"]}'
+    b']}'
+)
+
+
 @pytest.fixture
 def cold_cache(monkeypatch):
     """A freshly started process that has never mirrored a catalog to disk."""
@@ -64,6 +83,53 @@ class TestNousModelReasoningCapabilities:
 
         mandatory = nous_model_reasoning_capabilities("arcee-ai/trinity-large-thinking")
         assert mandatory["mandatory"] is True
+
+    def test_native_anthropic_base_uses_batch_reasoning_contract(
+        self, cold_cache, monkeypatch
+    ):
+        """Empty base metadata must not hide native Messages effort controls."""
+        from hermes_cli.models import nous_model_reasoning_capabilities
+
+        monkeypatch.setattr(
+            cold_cache,
+            "_urlopen_model_catalog_request",
+            lambda req, *, timeout: _mock_response(_NATIVE_ANTHROPIC_CATALOG),
+        )
+
+        fable = nous_model_reasoning_capabilities(
+            "anthropic/claude-fable-5", allow_fetch=True
+        )
+        assert fable == {
+            "supports_reasoning": True,
+            "supported_efforts": ["max", "xhigh", "high"],
+            "mandatory": True,
+        }
+
+        opus = nous_model_reasoning_capabilities("anthropic/claude-opus-5")
+        assert opus["supports_reasoning"] is True
+        assert opus["mandatory"] is False
+
+    def test_native_anthropic_fallback_is_scoped_to_supported_adapter_models(
+        self, cold_cache, monkeypatch
+    ):
+        """Do not borrow batch metadata for Haiku or non-Anthropic routes."""
+        from hermes_cli.models import nous_model_reasoning_capabilities
+
+        monkeypatch.setattr(
+            cold_cache,
+            "_urlopen_model_catalog_request",
+            lambda req, *, timeout: _mock_response(_NATIVE_ANTHROPIC_CATALOG),
+        )
+        nous_model_reasoning_capabilities(
+            "anthropic/claude-fable-5", allow_fetch=True
+        )
+
+        assert nous_model_reasoning_capabilities(
+            "anthropic/claude-haiku-4.5"
+        ) == {"supports_reasoning": False}
+        assert nous_model_reasoning_capabilities("other/model") == {
+            "supports_reasoning": False
+        }
 
     def test_catalog_read_sends_user_agent(self, cold_cache, monkeypatch):
         """The Portal 403s an anonymous catalog read."""
