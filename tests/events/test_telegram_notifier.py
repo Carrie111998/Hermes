@@ -437,6 +437,41 @@ class TestStatusBlackoutSelfDegradedRouting:
 
 
 class TestTelegramNotifier:
+    def test_blocked_question_lists_the_ats_options(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """application_blocked had no branch: the generic fallback printed the
+        envelope as `key: value`, so a list-valued `options` reached Diego as a
+        Python repr of the very labels an answer must be copied from."""
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        event = Event.create(
+            EventType.APPLICATION_BLOCKED, "applier",
+            {"company": "Capital One", "title": "Director",
+             "question": "Answer needed for How Did You Hear About Us?",
+             "options": ["Internet", "Contacted by Recruiter"]},
+        )
+        body = notifier._format_payload(event)
+        assert "Capital One" in body
+        assert "1. Internet" in body
+        assert "2. Contacted by Recruiter" in body
+        assert "[" not in body  # not a repr of the list
+
+    def test_blocked_question_without_options_lists_no_choices(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        event = Event.create(
+            EventType.APPLICATION_BLOCKED, "applier",
+            {"company": "Acme", "question": "Why do you want this role?"},
+        )
+        body = notifier._format_payload(event)
+        assert "Why do you want this role?" in body
+        assert "EXACTLY" not in body
+
     def test_formats_message(self, bus, topics_config, verbosity_config):
         notifier = TelegramNotifier(
             bus, topics_path=topics_config, verbosity_path=verbosity_config,

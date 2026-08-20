@@ -353,6 +353,8 @@ class WhatsAppEscalator(BaseSubscriber):
         branch (or a shared body helper in events.formatting) instead.
         """
         from events.formatting import (
+            blocked_question_line,
+            blocked_question_options_block,
             boot_summary_body,
             container_crash_loop_body,
             failure_cluster_body,
@@ -377,7 +379,16 @@ class WhatsAppEscalator(BaseSubscriber):
         elif et == EventType.OFFER_SIGNAL:
             text = f"Offer received from {p.get('company', '?')}! {p.get('detail', '')}"
         elif et == EventType.APPLICATION_BLOCKED:
-            text = f"Application blocked at {p.get('company', '?')}: {p.get('question', 'needs your input')}"
+            # The choices go on their own lines, not inline: an answer to a
+            # Workday listbox has to be VERBATIM one of the tenant's labels or
+            # it is never clicked, and a comma run inside `question` is both
+            # ambiguous about where a label ends and subject to the 200-char
+            # summary budget that already truncated the real Capital One list.
+            text = (f"Application blocked at {p.get('company', '?')}: "
+                    f"{blocked_question_line(p)}")
+            options = blocked_question_options_block(p)
+            if options:
+                text = text + "\n\n" + options
         elif et == EventType.APPLICATION_FAILED:
             text = f"Application failed for {p.get('company', '?')}: {p.get('error', 'unknown error')}"
         elif et == EventType.APPLICATION_READY:

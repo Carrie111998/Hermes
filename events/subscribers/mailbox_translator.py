@@ -320,6 +320,14 @@ class MailboxTranslator(BaseSubscriber):
         if not payload.get("question"):
             payload["question"] = _blocked_question_text(inner)
 
+        # The ATS's own option labels, carried in their own key so they survive
+        # `question`'s 200-char summary budget. Set only when there is something
+        # to choose from: every renderer treats absent and empty alike, and an
+        # empty list would show up in the TelegramNotifier generic fallback.
+        options = _blocked_question_options(inner)
+        if options:
+            payload["options"] = options
+
         return payload
 
     def _submit_result_emissions(
@@ -745,6 +753,56 @@ def _question_labels(value: Any) -> List[str]:
         if label:
             labels.append(label)
     return labels
+
+
+def _blocked_question_options(inner: Dict[str, Any]) -> List[str]:
+    """The tenant's own listbox labels for the blocked question.
+
+    A Workday listbox answer is matched against the tenant's OWN option text,
+    so a human answer that is not verbatim one of these labels is never
+    clicked -- the run re-stalls looking exactly like nobody answered. The
+    applier emits them under `options`
+    (profiles/applier/workspace/tmp_ready_sweep_cron.py `question_options`,
+    2026-08-20) and protocol.md has always documented that key, but a key this
+    translator does not copy is a key Diego never sees, so until now the only
+    way through was to inline the labels in `question` itself -- where
+    MailboxWatcher._summarize caps at 200 chars and the real Capital One list
+    measured exactly 200 with no margin.
+
+    The producer's flat list wins; the per-question lists in
+    `questions[i].options` are the fallback for the notifier-bridge envelope
+    and for a replay of an envelope written before the flat key existed. As
+    with `question`, that means a fixed producer passes through untouched and
+    a stale one is still salvaged.
+
+    Flat by contract, so it is the FIRST question that offers any -- matching
+    the applier helper of the same name. Absent stays absent: nothing to
+    choose from is not the same claim as "the ATS offers nothing", and a
+    free-text answer must remain possible either way.
+    """
+    def _labels(value: Any) -> List[str]:
+        if not isinstance(value, (list, tuple)):
+            return []
+        out: List[str] = []
+        for option in value:
+            label = str(option).strip()
+            if label and label not in out:
+                out.append(label)
+        return out
+
+    direct = _labels(inner.get("options"))
+    if direct:
+        return direct
+
+    questions = inner.get("questions") or inner.get("unansweredQuestions")
+    if isinstance(questions, list):
+        for entry in questions:
+            if not isinstance(entry, dict):
+                continue
+            labels = _labels(entry.get("options"))
+            if labels:
+                return labels
+    return []
 
 
 def _blocked_question_text(inner: Dict[str, Any]) -> str:

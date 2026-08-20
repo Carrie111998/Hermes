@@ -332,6 +332,43 @@ class TestMessageFormat:
         assert "Acme" in msg
         assert "Details in Telegram" in msg
 
+    def test_blocked_question_options_render_as_a_list(
+        self, bus, quiet_config, queue_path,
+    ):
+        """A Workday listbox answer must be VERBATIM one of the tenant's own
+        labels, so the labels have to reach the phone whole and unambiguously
+        delimited -- an inline comma run cannot say where a label ends, and it
+        rides inside `question`, which MailboxWatcher._summarize caps at 200."""
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path)
+        event = Event.create(
+            EventType.APPLICATION_BLOCKED, "applier",
+            {"company": "Capital One",
+             "question": "Answer needed for How Did You Hear About Us?",
+             "options": ["Internet", "Contacted by Recruiter", "Job Fair"]},
+        )
+        msg = escalator.format_message(event)
+        assert "1. Internet" in msg
+        assert "2. Contacted by Recruiter" in msg
+        assert "3. Job Fair" in msg
+        assert "EXACTLY" in msg
+
+    def test_blocked_question_without_options_is_unchanged(
+        self, bus, quiet_config, queue_path,
+    ):
+        """A free-text question must not grow an empty choice list."""
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path)
+        event = Event.create(
+            EventType.APPLICATION_BLOCKED, "applier",
+            {"company": "Acme", "question": "What is your visa status?"},
+        )
+        msg = escalator.format_message(event)
+        assert "EXACTLY" not in msg
+        # format_whatsapp_message prepends the header; the blocked sentence is
+        # a line of its own and must not have grown a choice list.
+        assert "Application blocked at Acme: What is your visa status?" in msg
+
 
 class TestThrottleBuffer:
     """Tests for the 15-minute throttle window on non-breakthrough events."""

@@ -1265,3 +1265,97 @@ class TestSubmitConfirmIsNotAnOutcome:
         assert len(submitted) == 1
         assert submitted[0]["submission_id"] == "CONF-123"
         assert submitted[0]["company"] == "Tala"
+
+
+class TestBlockedQuestionOptions:
+    """`options` must reach Diego independently of the 200-char `question`.
+
+    A Workday listbox answer is matched against the tenant's own option text,
+    so an answer that is not verbatim one of those labels is never clicked and
+    the run re-stalls looking exactly like nobody answered. The applier emits
+    the labels (`question_options`, 2026-08-20) and protocol.md documents the
+    key, but the translator copied only company/title/job_key/question -- so
+    the only way through was to inline them in `question`, where the real
+    Capital One list measured exactly 200 chars with zero margin.
+    """
+
+    # The Capital One list, from the applier-side helper's docstring.
+    OPTIONS = [
+        "Internet",
+        "Contacted by Recruiter",
+        "Job Fair",
+        "Employee Referral",
+    ]
+
+    def _blocked(self, bus):
+        events = _recent_domain_events(bus)
+        return next(p for et, p in events if et == EventType.APPLICATION_BLOCKED)
+
+    def test_flat_options_key_is_carried_through(self, bus):
+        _mailbox_event(bus, "BLOCKED_QUESTION", {
+            "job_key": "j1",
+            "question": "Answer needed for How Did You Hear About Us?",
+            "options": self.OPTIONS,
+        })
+        _translate(bus)
+        assert self._blocked(bus)["options"] == self.OPTIONS
+
+    def test_options_survive_a_question_at_the_summary_budget(self, bus):
+        """The point of a separate key: truncation must not eat the choices."""
+        _mailbox_event(bus, "BLOCKED_QUESTION", {
+            "job_key": "j1",
+            "questions": [{"label": "Q%d %s" % (i, "x" * 40)} for i in range(20)],
+            "options": self.OPTIONS,
+        })
+        _translate(bus)
+        out = self._blocked(bus)
+        assert len(out["question"]) <= 200
+        assert out["options"] == self.OPTIONS
+
+    def test_options_are_recovered_from_the_per_question_lists(self, bus):
+        """Envelopes written before the flat key existed, and the
+        notifier-bridge producer, only carry `questions[i].options`."""
+        _mailbox_event(bus, "BLOCKED_QUESTION", {
+            "job_key": "j1",
+            "unansweredQuestions": [
+                {"label": "First Name*", "type": "text"},
+                {"label": "How Did You Hear About Us?", "type": "listbox",
+                 "options": self.OPTIONS},
+            ],
+        })
+        _translate(bus)
+        assert self._blocked(bus)["options"] == self.OPTIONS
+
+    def test_a_producer_supplied_list_wins_over_the_per_question_one(self, bus):
+        _mailbox_event(bus, "BLOCKED_QUESTION", {
+            "job_key": "j1",
+            "options": ["Internet"],
+            "questions": [{"label": "Q", "options": ["Job Fair"]}],
+        })
+        _translate(bus)
+        assert self._blocked(bus)["options"] == ["Internet"]
+
+    def test_free_text_question_carries_no_options_key(self, bus):
+        """Absent is not the same claim as "the ATS offers nothing to pick";
+        a free-text answer has to stay possible, and an empty list would reach
+        the TelegramNotifier generic fallback as `options: []`."""
+        _mailbox_event(bus, "BLOCKED_QUESTION", {
+            "job_key": "j1",
+            "questions": [{"label": "Why do you want this role?", "type": "text"}],
+        })
+        _translate(bus)
+        assert "options" not in self._blocked(bus)
+
+    def test_blank_and_duplicate_labels_are_dropped(self, bus):
+        _mailbox_event(bus, "BLOCKED_QUESTION", {
+            "job_key": "j1",
+            "options": ["Internet", "  ", "Internet", " Job Fair "],
+        })
+        _translate(bus)
+        assert self._blocked(bus)["options"] == ["Internet", "Job Fair"]
+
+    def test_a_non_list_options_value_is_ignored_not_raised(self, bus):
+        _mailbox_event(bus, "BLOCKED_QUESTION", {
+            "job_key": "j1", "options": "Internet, Job Fair"})
+        _translate(bus)
+        assert "options" not in self._blocked(bus)

@@ -949,6 +949,84 @@ def boot_summary_body(payload: dict, *, max_listed: int = 5) -> str:
 # double-space gap.
 #
 # So the process shipping the incomplete table reports it, once, at import.
+# A Workday listbox answer is matched against the tenant's OWN option text, so
+# an answer that is not verbatim one of these labels is never clicked: the run
+# re-stalls looking exactly like nobody answered. The labels therefore have to
+# reach Diego intact, which is what BLOCKED_QUESTION's `options` key carries
+# (applier `blocked_question_payload`, MailboxTranslator `_blocked_question_
+# options`). Rendering them as a numbered list rather than an inline comma run
+# is not cosmetic: `question` is capped at MailboxWatcher._summarize's 200
+# chars, and the Capital One list measured exactly 200 inside it -- one longer
+# tenant list and the tail is lost to an ellipsis.
+BLOCKED_QUESTION_MAX_OPTIONS = 12
+
+
+def blocked_question_options(payload: Mapping, *, max_listed: int = BLOCKED_QUESTION_MAX_OPTIONS):
+    """(shown, hidden) -- the option labels to print and how many were dropped.
+
+    Tolerant of a producer that sends non-strings: the labels are clicked as
+    text downstream, so anything that stringifies is better than dropping the
+    choice silently.
+    """
+    raw = payload.get("options") if isinstance(payload, Mapping) else None
+    if not isinstance(raw, (list, tuple)):
+        return [], 0
+    labels = [str(o).strip() for o in raw if str(o).strip()]
+    if max_listed is not None and len(labels) > max_listed:
+        return labels[:max_listed], len(labels) - max_listed
+    return labels, 0
+
+
+# The applier's stop-gap framing, verbatim: `blocked_question_text` in
+# profiles/applier/workspace/tmp_ready_sweep_cron.py builds
+# "Answer needed for <label>. Options: a, b, c" because until the translator
+# carried `options` the labels could only reach Diego inside `question`.
+_INLINE_OPTIONS_MARKER = ". Options: "
+
+
+def blocked_question_line(payload: Mapping) -> str:
+    """The question sentence, with the producer's inline option run removed.
+
+    Only when this rendering is about to print the labels as a list -- otherwise
+    the inline run is the ONLY way they reach the reader and must stay. It is
+    cut at the producer's own literal marker, so a `question` from any other
+    producer, or one that never carried options, passes through untouched.
+
+    Cutting at the marker rather than matching the exact tail is deliberate: the
+    producer truncates `question` to MailboxWatcher._summarize's 200-char budget,
+    so on a long tenant list the inline run arrives ALREADY ellipsised and no
+    exact comparison could recognise it -- which is precisely the case where
+    leaving a half-printed list above a complete one is most confusing.
+    """
+    question = str(payload.get("question") or "").strip() or "needs your input"
+    shown, _hidden = blocked_question_options(payload, max_listed=None)
+    if not shown:
+        return question
+    head, marker, _tail = question.rpartition(_INLINE_OPTIONS_MARKER)
+    if marker and head.strip():
+        return head.strip()
+    return question
+
+
+def blocked_question_options_block(
+    payload: Mapping, *, max_listed: int = BLOCKED_QUESTION_MAX_OPTIONS
+) -> str:
+    """The numbered choice list appended to every blocked-question rendering.
+
+    Empty string when the envelope offers nothing to choose from -- a free-text
+    question, or an older producer that never emitted `options`. Both surfaces
+    lead with their own sentence, so this is only the block.
+    """
+    shown, hidden = blocked_question_options(payload, max_listed=max_listed)
+    if not shown:
+        return ""
+    lines = ["Reply with EXACTLY one of these labels:"]
+    lines += [f"{i}. {label}" for i, label in enumerate(shown, 1)]
+    if hidden:
+        lines.append(f"...and {hidden} more (see the attempt artifacts)")
+    return "\n".join(lines)
+
+
 # Non-fatal: a missing icon is cosmetic, and raising here would take the
 # gateway down over it.
 #

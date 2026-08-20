@@ -559,6 +559,28 @@ class TelegramNotifier(BaseSubscriber):
         if et == EventType.APPLICATION_FAILED:
             return f"Error: {p.get('error', 'Unknown')}\nCompany: {p.get('company', '?')}"
 
+        if et == EventType.APPLICATION_BLOCKED:
+            # Had no branch of its own: the generic fallback below printed the
+            # whole envelope as `key: value` lines, which for a list-valued
+            # `options` is a Python repr of the very labels the answer must be
+            # copied from verbatim. Lead with the question, then the choices as
+            # a numbered list (events.formatting owns the list rendering so the
+            # WhatsApp page and this cannot drift).
+            from events.formatting import (
+                blocked_question_line,
+                blocked_question_options_block,
+            )
+            lines = [
+                f"Company: {p.get('company', '?')}",
+                f"Title: {p.get('title', '?')}",
+                f"Question: {blocked_question_line(p)}",
+            ]
+            options = blocked_question_options_block(p)
+            if options:
+                lines.append("")
+                lines.append(options)
+            return "\n".join(lines)
+
         if et == EventType.GATEWAY_HEALTH:
             # Lead with the plain-language diagnosis; keep the raw error
             # below it — Telegram is the diagnostic surface.

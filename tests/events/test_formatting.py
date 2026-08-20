@@ -1264,3 +1264,70 @@ class TestAgentNoteHeaderOmitsUnknownVerdict:
     def test_no_verdict_passed_is_unchanged(self):
         event = self._note()
         assert "UNKNOWN" not in format_header(event)
+
+
+class TestBlockedQuestionOptionsBlock:
+    """The one renderer both escalation surfaces share, so they cannot drift."""
+
+    def _block(self, payload, **kw):
+        from events.formatting import blocked_question_options_block
+        return blocked_question_options_block(payload, **kw)
+
+    def test_numbers_every_label(self):
+        block = self._block({"options": ["Internet", "Job Fair"]})
+        assert "1. Internet" in block
+        assert "2. Job Fair" in block
+
+    def test_empty_when_there_is_nothing_to_choose_from(self):
+        assert self._block({}) == ""
+        assert self._block({"options": []}) == ""
+        assert self._block({"options": "Internet, Job Fair"}) == ""
+
+    def test_long_lists_are_capped_and_say_so(self):
+        block = self._block({"options": ["opt%d" % i for i in range(20)]},
+                            max_listed=5)
+        assert "5. opt4" in block
+        assert "6. opt5" not in block
+        assert "15 more" in block
+
+    def test_blank_labels_are_dropped(self):
+        block = self._block({"options": ["Internet", "   ", "Job Fair"]})
+        assert "2. Job Fair" in block
+        assert "3." not in block
+
+
+class TestBlockedQuestionLine:
+    """The inline option run and the numbered list must never both print."""
+
+    def _line(self, payload):
+        from events.formatting import blocked_question_line
+        return blocked_question_line(payload)
+
+    def test_inline_run_is_cut_when_the_list_will_be_printed(self):
+        line = self._line({
+            "question": "Answer needed for How Did You Hear About Us?. "
+                        "Options: Internet, Job Fair",
+            "options": ["Internet", "Job Fair"],
+        })
+        assert line == "Answer needed for How Did You Hear About Us?"
+
+    def test_a_truncated_inline_run_is_cut_too(self):
+        """The producer ellipsises at 200 chars, so no exact tail match could
+        recognise the very case where a half-list is most confusing."""
+        line = self._line({
+            "question": "Answer needed for Source?. Options: Internet, Contacted"
+                        " by Recruiter, College/University Even…",
+            "options": ["Internet", "Contacted by Recruiter"],
+        })
+        assert line == "Answer needed for Source?"
+
+    def test_question_is_untouched_when_there_are_no_options_to_list(self):
+        q = "Answer needed for Source?. Options: Internet, Job Fair"
+        assert self._line({"question": q}) == q
+
+    def test_a_question_without_the_marker_passes_through(self):
+        q = "The ATS dry run needs answers for required application questions: Email*"
+        assert self._line({"question": q, "options": ["a"]}) == q
+
+    def test_missing_question_falls_back_to_the_placeholder(self):
+        assert self._line({}) == "needs your input"
