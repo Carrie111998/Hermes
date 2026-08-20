@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -158,6 +159,7 @@ class TestLegitimateFreshBuild:
         db = MagicMock()
         agent = _make_agent(session_db=db)
 
+        started = time.perf_counter()
         try:
             _restore_or_build_system_prompt(agent, None, [])
         finally:
@@ -165,6 +167,7 @@ class TestLegitimateFreshBuild:
 
         assert agent._cached_system_prompt == "BUILT_PROMPT"
         db.update_system_prompt.assert_called_once_with(agent.session_id, "BUILT_PROMPT")
+        assert time.perf_counter() - started < 0.50
 
 
 # ---------------------------------------------------------------------------

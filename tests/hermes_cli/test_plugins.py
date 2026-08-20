@@ -783,6 +783,8 @@ class TestPluginLoading:
 
 
 class TestPluginHooks:
+    """Tests for lifecycle hook registration and invocation."""
+
     def test_hook_policies_are_disjoint_and_valid(self):
         policies = (
             plugins._HOOK_TIMEOUT_BOUNDED_HOOKS,
@@ -814,10 +816,6 @@ class TestPluginHooks:
         assert plugins._get_hook_timeout_seconds() == 1.5
         assert plugins._get_hook_timeout_seconds() == plugins._DEFAULT_HOOK_TIMEOUT_SECONDS
         assert plugins._get_hook_timeout_seconds() == plugins._DEFAULT_HOOK_TIMEOUT_SECONDS
-
-    """Tests for lifecycle hook registration and invocation."""
-
-
 
     def test_pre_gateway_dispatch_collects_action_dicts(self, tmp_path, monkeypatch):
         """pre_gateway_dispatch callbacks return action dicts (skip/rewrite/allow)."""
@@ -1002,6 +1000,42 @@ class TestPluginHooks:
         finally:
             release.set()
 
+    def test_concurrent_healthy_callbacks_wait_without_blocking(self):
+        mgr = PluginManager()
+        mgr._hook_timeout_seconds = 0.2
+        entered = threading.Event()
+        release = threading.Event()
+        second_started = threading.Event()
+        results = []
+        errors = []
+
+        def healthy(**kwargs):
+            entered.set()
+            release.wait(1)
+
+        def invoke():
+            try:
+                results.append(mgr.invoke_hook("pre_tool_call", tool_name="terminal"))
+            except BaseException as exc:
+                errors.append(exc)
+
+        mgr._hooks["pre_tool_call"] = [healthy]
+        first = threading.Thread(target=invoke)
+        second = threading.Thread(
+            target=lambda: (second_started.set(), invoke()),
+        )
+        first.start()
+        assert entered.wait(1)
+        second.start()
+        assert second_started.wait(1)
+        time.sleep(0.05)
+        release.set()
+        first.join(1)
+        second.join(1)
+
+        assert errors == []
+        assert results == [[], []]
+
     def test_bounded_hook_uses_shared_adapter_and_caller_context(self):
         mgr = PluginManager()
         marker = ContextVar("plugin-test-marker", default="missing")
@@ -1082,12 +1116,27 @@ class TestPluginHooks:
         mgr = PluginManager()
         callback_key = ("pre_tool_call", 1)
         mgr._hook_timeout_suppressed_until[callback_key] = time.monotonic() + 60
-        mgr._hook_running_callbacks.add(callback_key)
+        mgr._hook_running_callbacks[callback_key] = threading.Event()
 
         mgr.unload()
 
         assert mgr._hook_timeout_suppressed_until == {}
-        assert mgr._hook_running_callbacks == set()
+        assert mgr._hook_running_callbacks == {}
+
+    def test_scoped_unload_clears_removed_hook_timeout_state(self):
+        mgr = PluginManager()
+        callback = lambda **kwargs: None
+        PluginContext(PluginManifest(name="test-plugin"), mgr).register_hook(
+            "pre_tool_call", callback
+        )
+        callback_key = ("pre_tool_call", id(callback))
+        mgr._hook_timeout_suppressed_until[callback_key] = time.monotonic() + 60
+        mgr._hook_running_callbacks[callback_key] = threading.Event()
+
+        mgr.unload("test-plugin")
+
+        assert mgr._hook_timeout_suppressed_until == {}
+        assert mgr._hook_running_callbacks == {}
 
     def test_non_hot_hook_stays_on_caller_thread(self):
         """Lifecycle hooks preserve caller-thread semantics outside hot paths."""

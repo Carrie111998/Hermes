@@ -3497,7 +3497,7 @@ class PluginManager:
         self._hook_timeout_seconds = _get_hook_timeout_seconds()
         self._hook_timeout_suppression_seconds = _HOOK_TIMEOUT_SUPPRESSION_SECONDS
         self._hook_timeout_suppressed_until: Dict[tuple, float] = {}
-        self._hook_running_callbacks: Set[tuple] = set()
+        self._hook_running_callbacks: Dict[tuple, threading.Event] = {}
         self._hook_timeout_lock = threading.Lock()
 
     # -----------------------------------------------------------------------
@@ -3697,8 +3697,30 @@ class PluginManager:
             ]
 
         found = bool(target_keys or registrations)
+        hook_names = {registration.key for registration in registrations if registration.kind == "hook"}
         self._dispose_registrations(registrations)
         self._forget_registrations(registrations)
+
+        if not unload_all and hook_names:
+            stale_events = []
+            with self._hook_timeout_lock:
+                live_callback_keys = {
+                    (hook_name, id(callback))
+                    for hook_name in hook_names
+                    for callback in self._hooks.get(hook_name, [])
+                }
+                stale_keys = [
+                    key
+                    for key in self._hook_running_callbacks
+                    if key[0] in hook_names and key not in live_callback_keys
+                ]
+                for key in stale_keys:
+                    event = self._hook_running_callbacks.pop(key, None)
+                    if event is not None:
+                        stale_events.append(event)
+                    self._hook_timeout_suppressed_until.pop(key, None)
+            for event in stale_events:
+                event.set()
 
         if unload_all:
             # The handles are authoritative for global registries, while the
@@ -5179,31 +5201,59 @@ class PluginManager:
                 except Exception as exc:
                     logger.warning("Hook '%s' callback %s raised: %s", hook_name, callback_name, exc)
                 continue
-            now = time.monotonic()
-            with self._hook_timeout_lock:
-                suppressed_until = self._hook_timeout_suppressed_until.get(callback_key)
-                active = callback_key in self._hook_running_callbacks
-                if active or (suppressed_until is not None and suppressed_until > now):
-                    logger.warning(
-                        "Hook '%s' callback %s skipped while active or suppressed; continuing %s",
-                        hook_name,
-                        callback_name,
-                        "fail-closed" if hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS else "fail-open",
-                    )
-                    if hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS:
-                        results.append({"action": "block", "message": "pre_tool_call plugin callback timed out or is still running"})
+            skip_reason = None
+            while True:
+                now = time.monotonic()
+                with self._hook_timeout_lock:
+                    suppressed_until = self._hook_timeout_suppressed_until.get(callback_key)
+                    if suppressed_until is not None and suppressed_until > now:
+                        skip_reason = "suppressed"
+                        running_event = None
+                    else:
+                        if suppressed_until is not None:
+                            self._hook_timeout_suppressed_until.pop(callback_key, None)
+                        running_event = self._hook_running_callbacks.get(callback_key)
+                        if running_event is None:
+                            running_event = threading.Event()
+                            self._hook_running_callbacks[callback_key] = running_event
+                            break
+                if skip_reason is not None:
+                    break
+                if running_event.wait(self._hook_timeout_seconds):
                     continue
-                if suppressed_until is not None:
-                    self._hook_timeout_suppressed_until.pop(callback_key, None)
-                self._hook_running_callbacks.add(callback_key)
+                with self._hook_timeout_lock:
+                    if self._hook_running_callbacks.get(callback_key) is running_event:
+                        self._hook_timeout_suppressed_until[callback_key] = (
+                            time.monotonic() + self._hook_timeout_suppression_seconds
+                        )
+                skip_reason = "active callback timed out"
+                break
+            if skip_reason is not None:
+                logger.warning(
+                    "Hook '%s' callback %s skipped while %s; continuing %s",
+                    hook_name,
+                    callback_name,
+                    skip_reason,
+                    "fail-closed" if hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS else "fail-open",
+                )
+                if hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS:
+                    results.append({"action": "block", "message": "pre_tool_call plugin callback timed out or is still running"})
+                continue
             context = contextvars.copy_context()
 
-            def bounded_callback(callback=cb, callback_key=callback_key, context=context) -> Any:
+            def bounded_callback(
+                callback=cb,
+                callback_key=callback_key,
+                context=context,
+                running_event=running_event,
+            ) -> Any:
                 try:
                     return context.run(self._invoke_hook_callback, callback, kwargs)
                 finally:
                     with self._hook_timeout_lock:
-                        self._hook_running_callbacks.discard(callback_key)
+                        if self._hook_running_callbacks.get(callback_key) is running_event:
+                            self._hook_running_callbacks.pop(callback_key, None)
+                    running_event.set()
             try:
                 bounded_result = run_bounded_sync(
                     bounded_callback,
