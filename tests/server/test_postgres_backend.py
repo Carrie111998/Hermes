@@ -9,13 +9,14 @@ that, plus the ``?`` → ``$n`` translation the repository SQL depends on.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from pathlib import Path
 
 import pytest
 
 from server.document_artifacts import _ARTIFACT_COLUMNS, _ATTEMPT_COLUMNS
-from server.postgres import PostgresDatabase, _sql
+from server.postgres import PostgresDatabase, _TransactionProxy, _returns_rows, _sql
 
 MIGRATIONS = Path(__file__).resolve().parents[2] / "server" / "supabase" / "migrations"
 MIGRATION_007 = (MIGRATIONS / "007_document_artifacts.sql").read_text(encoding="utf-8")
@@ -102,3 +103,67 @@ def test_repository_column_lists_are_explicit_and_aligned():
 )
 def test_sql_translation_examples(sql, expected):
     assert _sql(sql) == expected
+
+
+# provision_demo_account SELECTs inside db.transaction(), and the proxy used to
+# hand back asyncpg's status string ("SELECT 1"), so .fetchone() raised
+# AttributeError on Postgres while passing on SQLite.
+class _FakeConn:
+    def __init__(self, rows):
+        self.rows = rows
+        self.fetched: list[tuple] = []
+        self.executed: list[tuple] = []
+
+    async def fetch(self, sql, *params):
+        self.fetched.append((sql, params))
+        return self.rows
+
+    async def execute(self, sql, *params):
+        self.executed.append((sql, params))
+        return "INSERT 0 1"
+
+
+class _FakeDb:
+    @staticmethod
+    def _run(awaitable):
+        return asyncio.run(awaitable)
+
+
+def _proxy(rows):
+    proxy = _TransactionProxy(_FakeDb())
+    proxy.conn = _FakeConn(rows)
+    return proxy
+
+
+def test_transaction_select_answers_the_cursor_api():
+    proxy = _proxy([{"id": "usr_1", "company_id": None}])
+    result = proxy.execute(
+        "SELECT id,company_id FROM users WHERE lower(email)=lower(?)", ("a@b.test",)
+    )
+    assert result.fetchone() == {"id": "usr_1", "company_id": None}
+    assert proxy.conn.fetched[0][0].endswith("lower($1)"), "? was not translated"
+    assert not proxy.conn.executed, "a SELECT must not go through execute()"
+
+
+def test_transaction_select_with_no_rows_returns_none():
+    assert _proxy([]).execute("SELECT 1 FROM leads WHERE company_id=?", ("c",)).fetchone() is None
+
+
+def test_transaction_write_stays_on_execute():
+    proxy = _proxy([])
+    result = proxy.execute("INSERT INTO companies(id) VALUES(?)", ("cmp_1",))
+    assert result.fetchone() is None
+    assert proxy.conn.executed and not proxy.conn.fetched
+
+
+@pytest.mark.parametrize("sql,expected", [
+    ("SELECT 1", True),
+    ("  select id from users", True),
+    ("WITH x AS (SELECT 1) SELECT * FROM x", True),
+    ("INSERT INTO t(id) VALUES(?) RETURNING id", True),
+    ("INSERT INTO t(id) VALUES(?)", False),
+    ("UPDATE t SET a=?", False),
+    ("DELETE FROM t WHERE id=?", False),
+])
+def test_row_returning_classification(sql, expected):
+    assert _returns_rows(sql) is expected

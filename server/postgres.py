@@ -31,6 +31,34 @@ def _row(value):
     return dict(value) if value is not None else None
 
 
+# A row-returning statement has to go through asyncpg's fetch(); execute()
+# hands back only a status string ("SELECT 1"). Writes stay on execute() so
+# their behaviour — including multi-statement strings — is unchanged.
+def _returns_rows(sql: str) -> bool:
+    head = sql.lstrip().lstrip("(").lstrip()[:6].upper()
+    return head.startswith(("SELECT", "WITH")) or " RETURNING " in f" {sql.upper()} "
+
+
+class _Result:
+    """Cursor-shaped view of one statement, matching the sqlite3 API.
+
+    Callers share one repository contract across both backends, so a
+    transaction here must answer fetchone()/fetchall() exactly as
+    sqlite3.Connection.execute() does.
+    """
+
+    __slots__ = ("_rows",)
+
+    def __init__(self, rows: list[dict]) -> None:
+        self._rows = rows
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self) -> list[dict]:
+        return list(self._rows)
+
+
 class _TransactionProxy:
     def __init__(self, db: "PostgresDatabase"):
         self.db = db
@@ -47,7 +75,12 @@ class _TransactionProxy:
         return self
 
     def execute(self, sql: str, params: Sequence[Any] = ()):
-        return self.db._run(self.conn.execute(_sql(sql), *params))
+        statement = _sql(sql)
+        if _returns_rows(sql):
+            rows = self.db._run(self.conn.fetch(statement, *params))
+            return _Result([_row(row) for row in rows])
+        self.db._run(self.conn.execute(statement, *params))
+        return _Result([])
 
     def executemany(self, sql: str, rows):
         return self.db._run(self.conn.executemany(_sql(sql), rows))
