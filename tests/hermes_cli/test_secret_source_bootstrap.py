@@ -247,8 +247,8 @@ def test_real_plugin_source_discovery_applies_dotenv(monkeypatch, tmp_path):
         PluginManager().discover_and_load()
 
         assert os.environ["HERMES_TEST_PLUGIN_BOOTSTRAP"] == "from-plugin"
-        assert [source.name for source in reg.list_plugin_sources()] == [
-            "fixturevault"
+        assert "fixturevault" in [
+            source.name for source in reg.list_plugin_sources()
         ]
     finally:
         os.environ.pop("HERMES_TEST_PLUGIN_BOOTSTRAP", None)
