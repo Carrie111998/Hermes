@@ -310,21 +310,41 @@ actor SshTunnel {
             throw SshTunnelError.notStarted
         }
 
+        var firstError: Error?
+        defer {
+            listener = nil
+            client = nil
+            eventLoopGroup = nil
+            remoteBackend = nil
+        }
+
         if let listener {
-            try await listener.close()
+            do {
+                try await listener.close()
+            } catch {
+                firstError = error
+            }
         }
         if let remoteBackend {
             await stopRemoteBackend(remoteBackend, using: client)
         }
         if let client {
-            try await client.close()
+            do {
+                try await client.close()
+            } catch {
+                firstError = firstError ?? error
+            }
         }
         if let eventLoopGroup {
-            try await eventLoopGroup.shutdownGracefully()
+            do {
+                try await eventLoopGroup.shutdownGracefully()
+            } catch {
+                firstError = firstError ?? error
+            }
         }
-        listener = nil
-        client = nil
-        eventLoopGroup = nil
-        remoteBackend = nil
+
+        if let firstError {
+            throw firstError
+        }
     }
 }
