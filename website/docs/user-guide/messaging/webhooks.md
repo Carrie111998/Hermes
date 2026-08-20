@@ -238,14 +238,14 @@ Setting `session_key` on a route separates the two: the rendered template become
 
 ```yaml
 routes:
-  voice-assistant:
-    secret: "voice-webhook-secret"
-    session_key: "{satellite}"
-    prompt: "[voice from {satellite}] {message}"
-    deliver: homeassistant
+  customer-chat:
+    secret: "chat-bridge-secret"
+    session_key: "{tenant_id}:{account_id}:{conversation_id}"
+    prompt: "Customer message: {message}"
+    deliver: telegram
 ```
 
-Two POSTs with `"satellite": "assist_satellite.pod1"` land in the same session; a POST from `pod2` gets its own. Session count is bounded by distinct rendered values, not by delivery count.
+Two POSTs with the same tenant, account, and conversation IDs land in the same session. Changing any one of those IDs creates an isolated session. Session count is bounded by distinct rendered keys, not by delivery count.
 
 Behavior notes:
 
@@ -253,6 +253,9 @@ Behavior notes:
 - **Fallback** — if the template doesn't resolve against a payload (e.g. the field is missing), that delivery gets a per-delivery session, same as an unconfigured route.
 - **Lifecycle** — persistent sessions are not auto-closed after each event (they expect follow-up turns). Manage them with `hermes sessions prune` or your idle-timeout policy.
 - **Ordering vs. concurrency** — deliveries sharing a `session_key` are processed sequentially on that session. For conversational sources this is what you want (turns stay ordered); routes that need concurrent processing should leave `session_key` unset.
+- **Delivery routing stays per request** — `session_key` identifies the conversation only. Each delivery keeps its own rendered `deliver_extra`, so overlapping turns cannot redirect an earlier response.
+- **Profile isolation is additional** — a route bound to a multiplexed `profile` is automatically namespaced to that profile. Use `session_key` for application boundaries such as tenant, account, and conversation; use profiles for isolated persona, memory, skills, tools, and credentials.
+- **Use stable opaque IDs** — include every application isolation boundary, and avoid names, secrets, email addresses, or other raw personal data. If any template field is unresolved, Hermes safely falls back to a one-shot session for that delivery.
 - **Sender-controlled** — the key is rendered from the payload, so a sender chooses which of the route's sessions their event joins. This is scoped to the route (the route name is part of the session identity) and gated by the route's HMAC secret; the [untrusted-content warning](#authenticated-does-not-mean-trusted) applies to session_key values as it does to every payload field.
 
 ---

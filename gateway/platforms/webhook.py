@@ -42,6 +42,7 @@ import subprocess
 import sys
 import time
 from collections import deque
+from contextvars import ContextVar
 from typing import Any, Deque, Dict, List, Optional
 
 try:
@@ -201,7 +202,9 @@ class WebhookAdapter(BasePlatformAdapter):
         # (once-per-route so a busy sender doesn't spam the log).
         self._v1_signature_warned: set[str] = set()
 
-        # Delivery info keyed by session chat_id.
+        # One-shot routes key delivery info by session chat_id. Persistent
+        # routes key it by delivery_id so overlapping turns in one conversation
+        # cannot overwrite each other's rendered response target.
         #
         # Read by every send() invocation for the chat_id (status messages
         # AND the final response).  Cleaned up via TTL on each POST so the
@@ -213,6 +216,9 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info: Dict[str, dict] = {}
         self._delivery_info_created: Dict[str, float] = {}
         self._delivery_info_order: Deque[tuple[float, str]] = deque()
+        self._active_delivery_id: ContextVar[Optional[str]] = ContextVar(
+            f"webhook_delivery_id_{id(self)}", default=None
+        )
 
         # Reference to gateway runner for cross-platform delivery (set externally)
         self.gateway_runner = None
@@ -359,8 +365,10 @@ class WebhookAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Deliver the agent's response to the configured destination.
 
-        chat_id is ``webhook:{route}:{delivery_id}``.  The delivery info
-        stored during webhook receipt is read with ``.get()`` (not popped)
+        ``chat_id`` identifies the conversation. Delivery identity stays
+        separate for persistent sessions so each turn keeps its own rendered
+        target. The delivery info stored during webhook receipt is read with
+        ``.get()`` (not popped)
         so that interim status messages emitted before the final response
         — fallback-model notifications, context-pressure warnings, etc. —
         do not consume the entry and silently downgrade the final response
@@ -372,7 +380,12 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             return SendResult(success=True)
 
-        delivery = self._delivery_info.get(chat_id, {})
+        delivery_id = self._active_delivery_id.get()
+        delivery = self._delivery_info.get(delivery_id or "", {})
+        if not delivery and reply_to:
+            delivery = self._delivery_info.get(str(reply_to), {})
+        if not delivery:
+            delivery = self._delivery_info.get(chat_id, {})
         deliver_type = delivery.get("deliver", "log")
 
         if deliver_type == "log":
@@ -907,8 +920,9 @@ class WebhookAdapter(BasePlatformAdapter):
                 status=502,
             )
 
-        # Use delivery_id in session key so concurrent webhooks on the
-        # same route get independent agent runs (not queued/interrupted).
+        # Per-delivery remains the default. A successfully rendered session_key
+        # opts into a persistent conversation; unresolved templates fall back
+        # to the one-shot delivery identity.
         session_key = ""
         session_key_tpl = route_config.get("session_key", "")
         if session_key_tpl:
@@ -917,18 +931,21 @@ class WebhookAdapter(BasePlatformAdapter):
                 session_key = ""
         session_chat_id = f"webhook:{route_name}:{session_key or delivery_id}"
 
-        # Store delivery info for send().  Read by every send() invocation
-        # for this chat_id (interim status messages and the final response),
-        # so we do NOT pop on send.  TTL-based cleanup keeps the dict bounded.
+        is_persistent_session = bool(session_key)
+        delivery_info_key = delivery_id if is_persistent_session else session_chat_id
+
+        # Store delivery info for send(). Persistent conversations keep this
+        # per delivery rather than per chat_id so later requests cannot replace
+        # an in-flight turn's rendered deliver_extra.
         deliver_config = {
             "deliver": route_config.get("deliver", "log"),
             "deliver_extra": self._render_delivery_extra(
                 route_config.get("deliver_extra", {}), payload
             ),
         }
-        self._delivery_info[session_chat_id] = deliver_config
-        self._delivery_info_created[session_chat_id] = now
-        self._delivery_info_order.append((now, session_chat_id))
+        self._delivery_info[delivery_info_key] = deliver_config
+        self._delivery_info_created[delivery_info_key] = now
+        self._delivery_info_order.append((now, delivery_info_key))
         self._prune_delivery_info(now)
 
         # Build source and event
@@ -947,6 +964,7 @@ class WebhookAdapter(BasePlatformAdapter):
             source=source,
             raw_message=payload,
             message_id=delivery_id,
+            metadata={"webhook_persistent_session": is_persistent_session},
         )
 
         logger.info(
@@ -977,6 +995,11 @@ class WebhookAdapter(BasePlatformAdapter):
             status=202,
         )
 
+    async def on_processing_start(self, event: "MessageEvent") -> None:
+        """Bind response routing to this delivery for the current async turn."""
+        if event.message_id:
+            self._active_delivery_id.set(str(event.message_id))
+
     async def on_processing_complete(
         self, event: "MessageEvent", outcome: Any
     ) -> None:
@@ -999,8 +1022,7 @@ class WebhookAdapter(BasePlatformAdapter):
         ``end_session()`` is first-reason-wins and no-ops on an already-ended
         row, so this never clobbers a ``compression``/``agent_close`` reason.
         """
-        route_name = (event.source.user_id or "").removeprefix("webhook:")
-        if self._routes.get(route_name, {}).get("session_key"):
+        if bool((event.metadata or {}).get("webhook_persistent_session")):
             return
         await self._end_webhook_session(event, event.source.chat_id)
 
