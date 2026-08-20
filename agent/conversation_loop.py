@@ -7277,12 +7277,17 @@ def run_conversation(
                     except Exception:
                         pass
 
-                agent._execute_tool_calls(
+                # Keep dispatch ownership on the response object so the public
+                # executor call shape remains backward-compatible for plugins
+                # and test doubles while concurrent workers share this exact
+                # request-local map.
+                object.__setattr__(
                     assistant_message,
-                    messages,
-                    effective_task_id,
-                    api_call_count,
+                    "_request_registry_bindings",
                     request_registry_bindings,
+                )
+                agent._execute_tool_calls(
+                    assistant_message, messages, effective_task_id, api_call_count
                 )
 
                 if getattr(agent, "_incremental_persistence_failed", False):

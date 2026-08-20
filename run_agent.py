@@ -8193,6 +8193,10 @@ class AIAgent:
         while side-effect ordering is preserved.
         """
         tool_calls = assistant_message.tool_calls
+        if request_registry_bindings is None:
+            request_registry_bindings = getattr(
+                assistant_message, "_request_registry_bindings", None
+            )
 
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True

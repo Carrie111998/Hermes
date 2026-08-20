@@ -3265,9 +3265,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
-                expected_registry_entry=expected_registry_entry,
-                enforce_registry_entry=enforce_registry_entry,
             )
+            if enforce_registry_entry:
+                dispatch_kwargs["expected_registry_entry"] = expected_registry_entry
+                dispatch_kwargs["enforce_registry_entry"] = True
             if skip_tool_execution_middleware:
                 dispatch_kwargs["skip_tool_execution_middleware"] = True
             return _ra().handle_function_call(
