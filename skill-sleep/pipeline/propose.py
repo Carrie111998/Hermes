@@ -32,7 +32,7 @@ except ImportError:
 
 # ── Constants ───────────────────────────────────────────────────────────────
 
-DEFAULT_MODEL = "9router/ocg/muse-spark-1.2-contributor"
+DEFAULT_MODEL = "9router/cbcn/deepseek-v4-flash"
 MAX_ADDED_LINES = 30
 
 # Secret patterns — if diff contains any, refuse to write and WARN
