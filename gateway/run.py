@@ -7014,13 +7014,71 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # gateway lazily imports run_agent inside per-request handlers,
         # so the discover_plugins() side-effect in model_tools.py is NOT
         # guaranteed to have run by the time we reach this point.
+        _plugin_discovery_error = None
         try:
             from hermes_cli.plugins import discover_plugins
             discover_plugins()
-        except Exception:
+        except Exception as _plugin_exc:
+            _plugin_discovery_error = _plugin_exc
             logger.warning(
                 "plugin discovery failed at gateway startup", exc_info=True,
             )
+
+        _required_plugins = list(getattr(self.config, "required_plugins", []) or [])
+        if _required_plugins:
+            _required_failure = None
+            if os.getenv("HERMES_SAFE_MODE", "").lower() in {"1", "true", "yes", "on"}:
+                _required_failure = "required plugins unavailable in safe mode"
+            elif _plugin_discovery_error is not None:
+                _required_failure = "required plugin discovery failed"
+            else:
+                try:
+                    from hermes_cli.plugins import get_plugin_manager
+                    _loaded_by_id = {}
+                    for _state in get_plugin_manager().list_plugins():
+                        for _plugin_id in (_state.get("key"), _state.get("name")):
+                            if isinstance(_plugin_id, str) and _plugin_id:
+                                _loaded_by_id[_plugin_id] = _state
+                    for _required in _required_plugins:
+                        _state = _loaded_by_id.get(_required)
+                        if _state is None or not _state.get("enabled") or _state.get("error"):
+                            _required_failure = f"required plugin unavailable: {_required}"
+                            break
+                        _required_hooks = set(
+                            getattr(self.config, "required_plugin_hooks", {}).get(
+                                _required, []
+                            )
+                        )
+                        if not _required_hooks:
+                            _required_failure = (
+                                f"required plugin hooks not configured: {_required}"
+                            )
+                            break
+                        _registered_hooks = set(_state.get("hook_names") or [])
+                        _missing_hooks = sorted(_required_hooks - _registered_hooks)
+                        if _missing_hooks:
+                            _required_failure = (
+                                f"required plugin hooks unavailable: {_required}: "
+                                f"{','.join(_missing_hooks)}"
+                            )
+                            break
+                except Exception:
+                    logger.warning("required plugin preflight failed", exc_info=True)
+                    _required_failure = "required plugin preflight failed"
+
+            if _required_failure:
+                logger.error("Refusing to start gateway: %s", _required_failure)
+                try:
+                    from gateway.status import write_runtime_status
+                    write_runtime_status(
+                        gateway_state="startup_failed",
+                        exit_reason=_required_failure,
+                    )
+                except Exception:
+                    pass
+                self._exit_code = GATEWAY_FATAL_CONFIG_EXIT_CODE
+                self._request_clean_exit(_required_failure)
+                return True
 
         # Register the generic relay adapter when a connector relay URL is
         # configured (GATEWAY_RELAY_URL / gateway.relay_url). No URL -> no-op, so
@@ -9025,6 +9083,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception as _hook_exc:
                 logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
+                if getattr(self.config, "required_plugins", None):
+                    logger.error(
+                        "Blocking inbound dispatch because required plugin gate failed"
+                    )
+                    return None
                 _hook_results = []
 
             for _result in _hook_results:
