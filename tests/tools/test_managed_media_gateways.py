@@ -1,5 +1,6 @@
 import sys
 import types
+import wave
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
@@ -259,7 +260,11 @@ def test_transcription_uses_model_specific_response_formats(monkeypatch, tmp_pat
     )
     transcription_tools._load_stt_config = lambda: {"provider": "openai"}
     audio_path = tmp_path / "audio.wav"
-    audio_path.write_bytes(b"RIFF0000WAVEfmt ")
+    with wave.open(str(audio_path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16_000)
+        wav_file.writeframes(b"\x00\x00" * 1_600)
 
     whisper_result = transcription_tools.transcribe_audio(str(audio_path), model="whisper-1")
     assert whisper_result["success"] is True
