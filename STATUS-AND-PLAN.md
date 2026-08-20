@@ -46,8 +46,12 @@ release.
   corpus report `active` and `available`; Bright Data reports `active` as soon
   as `BRIGHTDATA_API_KEY` is in the serving shell's environment, and
   `credential_required` without it. The key is deliberately not on local disk.
-- A real campaign ran end to end on that tenant: 91 qualified leads from the
-  TED-derived list. Nothing here is fixture data.
+- A real campaign ran end to end on that tenant: 173 qualified leads from the
+  TED-derived list with per-lead research on. Nothing here is fixture data.
+- Fly is on v12 and carries all of it. The Data Sources page showed nine
+  entries until the pruning seed ran — it is lazy, so the first catalog view
+  after deploy is what clears the stale tenant rows. All three sources now read
+  active and available there, Bright Data included.
 
 ### Remaining — two steps, both in the WebUI
 
@@ -267,6 +271,61 @@ went out with `climatherm.ro`.
 Websites are now matched by name and dropped when nothing matches, which is why
 only 40 of 201 rows carry one. That corpus version was withdrawn rather than
 edited; corpora are immutable, so the fix shipped as version 2.
+
+## Per-lead research and the customer brief
+
+Two things the campaign was missing, both now wired.
+
+### Research each lead
+
+`run()` never mentioned enrichment. `FeaturePlanner` and `EnrichmentService`
+were importable and referenced by exactly one unit test, and the
+`EnrichmentProfile` the editor collects was stored in the config and read by
+nobody. A source match was the end of the line.
+
+Qualified candidates now get a second pass aimed at what the first one did not
+establish, searching the sector's own vocabulary — "white goods", "private
+label", "distributor wanted" — instead of repeating the campaign's terms
+against the same pages.
+
+Three things that decide whether it does anything:
+
+- **The vocabularies had never met.** Playbooks ask for `product_fit`;
+  verifiers emit `product_term`. `PLAYBOOK_SATISFIED_BY` is that bridge and is
+  written out explicitly, because a guessed mapping marks a gap filled without
+  filling it.
+- **`research_each_lead` is not `enabled`.** They are different mechanisms.
+  `enabled` is the local-model fallback and still requires a `model_profile`;
+  this pass costs requests, not tokens, and needs no model. Overloading one
+  flag would have made the model contract a lie.
+- **Only `web_evidence` sources are re-queried.** TED retrieves by winner name
+  and country, so asking it again returns the same notices and spends a request
+  to learn nothing. Bright Data searches the terms and reaches different pages.
+  The capability is already declared in the catalog, so this is a lookup rather
+  than a hardcoded source id.
+
+The corpora now carry `household-appliances`, the canonical sector id from
+`sectors.py`. `kitchen-appliances` matched no playbook at all, so every gap
+looked closed and enrichment could never have run whatever else was fixed.
+That change alone took the same campaign from 91 qualified leads to 173,
+because the sector's buyer roles finally lined up with the eligibility gate.
+
+### The customer brief
+
+Campaign configuration was admin-only by **routing**, not by permission. The
+API scopes by company and never checks `is_admin`; the WebUI simply redirected
+every `/app/research/*` path back to the results list. The person who has to
+act on the leads could not choose markets or touch the weights.
+
+`/app/research/new` is a customer page now. It asks for the three things that
+are theirs — markets, sector, and what a good lead weighs — and nothing else.
+Source access stays admin-owned, so it never shows a provider picker: it runs
+whatever the tenant already has, names them, and refuses to start when that
+list is empty rather than running a search that cannot find anything.
+
+Buyer roles come from the sector rather than a free-text field, which is the
+direct fix for the trap below.
+
 
 ## Corpus provenance
 
