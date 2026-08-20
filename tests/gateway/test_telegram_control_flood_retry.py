@@ -18,11 +18,7 @@ _repo = str(Path(__file__).resolve().parents[2])
 if _repo not in sys.path:
     sys.path.insert(0, _repo)
 
-from tests.gateway.test_telegram_approval_buttons import (  # noqa: E402
-    _ensure_telegram_mock,
-)
-
-_ensure_telegram_mock()
+# telegram mock is installed by tests/gateway/conftest.py at import time
 
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 from gateway.config import PlatformConfig  # noqa: E402
@@ -86,3 +82,50 @@ async def test_control_send_non_flood_errors_pass_through():
             chat_id="123", text="approve?"
         )
     assert adapter._bot.send_message.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_clarify_cap_rides_out_long_penalty():
+    """A 115s hint (2026-08-20 incident) exceeds the approval cap but must
+    be retried under the clarify cap."""
+    adapter = _make_adapter()
+    ok = MagicMock(message_id=7)
+    adapter._bot.send_message = AsyncMock(side_effect=[_FloodError(115), ok])
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        msg = await adapter._send_message_with_thread_fallback(
+            _flood_retry_cap=TelegramAdapter._CLARIFY_FLOOD_RETRY_CAP,
+            chat_id="123", text="which option?",
+        )
+    assert msg is ok
+    assert adapter._bot.send_message.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_double_flood_within_cap_retries_twice():
+    adapter = _make_adapter()
+    ok = MagicMock(message_id=8)
+    adapter._bot.send_message = AsyncMock(
+        side_effect=[_FloodError(100), _FloodError(120), ok]
+    )
+    with patch("asyncio.sleep", new=AsyncMock()):
+        msg = await adapter._send_message_with_thread_fallback(
+            _flood_retry_cap=600.0, chat_id="123", text="q",
+        )
+    assert msg is ok
+    assert adapter._bot.send_message.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_cumulative_waits_respect_cap():
+    adapter = _make_adapter()
+    adapter._bot.send_message = AsyncMock(
+        side_effect=[_FloodError(300), _FloodError(350), MagicMock()]
+    )
+    with patch("asyncio.sleep", new=AsyncMock()):
+        with pytest.raises(_FloodError):
+            await adapter._send_message_with_thread_fallback(
+                _flood_retry_cap=600.0, chat_id="123", text="q",
+            )
+    # first wait (300) fits; second (300+350) would exceed 600 -> raise
+    assert adapter._bot.send_message.call_count == 2
