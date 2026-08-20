@@ -1264,7 +1264,7 @@ test('disband: a running room leaves an epoch-bumped empty tombstone so in-fligh
 test('source contract: workspace header offers disband behind a ConfirmDialog', () => {
   assert.match(pluginSource, /function disbandGroupChat\(/)
   assert.match(pluginSource, /Disband group chat\?/)
-  assert.match(pluginSource, /title: `Disband the \$\{group\} group chat`/)
+  assert.match(pluginSource, /title: t\('thread\.disbandTheGroupChat', group\)/)
 })
 
 test('default profile speaks as Hermes in room transcripts, not @default', () => {
@@ -1569,7 +1569,7 @@ test('source contract: thread UI — folded rows, per-thread reply box, new-thre
   assert.match(pluginSource, /Open this thread/)
   assert.match(pluginSource, /Collapse thread/)
   assert.match(pluginSource, /Reply in thread…/)
-  assert.match(pluginSource, /children: 'New Thread'/)
+  assert.match(pluginSource, /children: t\('thread\.newThread'\)/)
   assert.match(pluginSource, /const markKey = `\$\{thread\}::\$\{memberKey\}`/)
 })
 

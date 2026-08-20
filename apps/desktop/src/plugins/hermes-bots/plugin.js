@@ -90,6 +90,476 @@ const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
 /** Captured in register() so components can reach plugin storage. */
 let pluginCtx = null
 
+/**
+ * Plugin-scoped i18n (see `src/i18n/plugin-i18n.ts`). Bot Mode ships its own
+ * message bundles and never touches core `en.ts`.
+ *
+ * `t` resolves against the app's active locale once `register()` has wired
+ * `ctx.i18n`. Before that — and in the test harnesses that call `register()`
+ * with a bare ctx stub — it falls back to the English bundle below, so the UI
+ * never renders a raw key and the plugin stays loadable on older desktops
+ * whose plugin context predates `ctx.i18n`.
+ */
+const EN_MESSAGES = {
+  misc: {
+    delete: 'Delete',
+    couldNotDeleteProfile: (p0) => `Could not delete profile ${p0}.`,
+    searchPets: (p0) => `Search ${p0} pets…`,
+    scrollForMoreOf: (p0, p1) => `Scroll for more (${p0} of ${p1})`,
+    stillOnNot: (p0, p1) => `Still on ${p0}, not ${p1}`,
+    needsSetup: 'needs setup (',
+    setUp: 'set up \u2713',
+    saveTest: 'Save & test',
+    cancel: 'Cancel',
+    working: 'Working\u2026',
+    retry: 'retry',
+  },
+  avatar: {
+    imageTooLargeMax: 'Image too large (max 15MB).',
+    removeImageUseShape: 'Remove image — use shape',
+    auto: 'Auto',
+    randomize: 'Randomize',
+    classicShapes: 'Classic shapes',
+    describeYourAvatar: 'Describe your avatar…',
+    leaveBlankToGenerate: 'Leave blank to generate from the agent\u2019s name and description.',
+  },
+  pets: {
+    noPetsInThe: 'No pets in the petdex gallery. Run `hermes pets` to explore.',
+    pickAPetAs: 'Pick a pet as this agent’s profile picture.',
+    removeBackToShape: 'Remove — back to shape avatar',
+    noPetsMatch: 'No pets match.',
+    couldNotLoadThat: 'Could not load that pet — try another.',
+  },
+  chat: {
+    heyTellMeAbout: 'Hey, tell me about yourself!',
+  },
+  roster: {
+    stayInThisChat: (p0) => `Stay in this chat and @${p0} to message them. Gateway stays on this device.`,
+    couldNotOpenS: (p0) => `Could not open ${p0}'s chat — try again`,
+    livesOn: (p0) => `Lives on ${p0}`,
+    couldNotReach: (p0) => `Could not reach ${p0}`,
+    pinned: 'Pinned',
+    hiddenFromTheRoster: 'Hidden from the roster',
+    editProfile: 'Edit Profile',
+    duplicate: 'Duplicate',
+    newChatWithThis: 'New chat with this agent',
+  },
+  model: {
+    lastMessageCameFrom: (p0) => `Last message came from @${p0} (bot-to-bot)`,
+    groups: (p0) => `Groups: ${p0}…`,
+    duplicating: (p0) => `Duplicating ${p0}…`,
+    createdFullCopyOf: (p0, p1) => `Created ${p0} — full copy of ${p1}`,
+    eGOmnirouterInferx: 'e.g. omnirouter, inferx, 9router',
+    eGAntigravityGemini: 'e.g. antigravity/gemini-3.6-flash-high',
+    backToDropdowns: '← Back to dropdowns',
+    inheritLaunchProfile: 'Inherit (launch profile)',
+    enterManually: '✏️ Enter manually…',
+    fullConfigurationNeedsA: 'Full configuration needs a newer gateway (restart it after updating Hermes).',
+  },
+  caps: {
+    skillsEnabled: (p0, p1) => `Skills (${p0}/${p1} enabled)`,
+    filterSkills: 'Filter skills…',
+    noMcpServersConfigured: 'No MCP servers configured or in the catalog.',
+  },
+  hub: {
+    toolsetsEnabledUncheckingAll: (p0, p1) => `Toolsets (${p0}/${p1} enabled — unchecking all restores the default)`,
+    skillInstalled: (p0) => `Skill "${p0}" installed`,
+    installingFailed: (p0) => `Installing "${p0}" failed`,
+    skillsHub: 'Skills Hub',
+    hermesSkillsHub: 'Hermes Skills Hub',
+    searchTheHubCommunity: 'Search the hub (community + well-known sources)…',
+    searchingCommunityWellKnown: 'Searching community + well-known sources — can take ~10s…',
+    noHubSkillsMatched: 'No hub skills matched.',
+    added: '✓ added',
+  },
+  profile: {
+    installing: (p0) => `Installing "${p0}"…`,
+    installAndAddIt: (p0) => `Install "${p0}" and add it to the list above`,
+    someSectionsFailed: (p0) => `Some sections failed: ${p0}`,
+    appearanceAndRoleFor: (p0, p1) => `Appearance and role for ${p0} (${p1}).`,
+    savedLookLocallyRemote: 'Saved look locally; remote persistence failed',
+    whatShouldThisAgent: 'What should this agent help with?',
+  },
+  agentNew: {
+    namedTeammateDesc: 'A named teammate with its own memory, skills, and chat. It can message your other agents.',
+    draftAgentDiscarded: (p0) => `Draft agent "${p0}" discarded`,
+    couldNotCleanUp: (p0) => `Could not clean up draft profile "${p0}"`,
+    agentCreatedOn: (p0, p1) => `Agent "${p0}" created on ${p1}`,
+    agentCreated: (p0) => `Agent "${p0}" created`,
+    anAgentNamedAlready: (p0, p1) => `An agent named "${p0}" already exists on ${p1}.`,
+    anAgentNamedAlready2: (p0) => `An agent named "${p0}" already exists.`,
+    theAgentIsCreated: (p0) => `The agent is created on ${p0} and appears in the roster as a Connections bot. Chat routes to that machine.`,
+    cloneFromProfileOn: (p0) => `Clone from profile (on ${p0})`,
+    newAgent: 'New Agent',
+    whatShouldThisBot: 'What should this Bot help with?',
+    general: 'General',
+    capabilities: 'Capabilities',
+    skills: 'Skills',
+    tools: 'Tools',
+    freshProfileBundledSkills: 'Fresh profile (bundled skills)',
+    createEmptyIsChecked: '“Create empty” is checked — no bundled skills will be installed.',
+    leavingAllOrNone: 'Leaving all (or none) checked keeps the default toolset behavior.',
+  },
+  cron: {
+    catalogFromUncheckedSkills: (p0) => `Catalog from ${p0} — unchecked skills are disabled after creation.`,
+    once: (p0) => `Once (${p0})`,
+    once2: (p0, p1) => `Once (${p0}${p1})`,
+    everyDays: (p0) => `Every ${p0} days`,
+    everyH: (p0) => `Every ${p0}h`,
+    everyM: (p0) => `Every ${p0}m`,
+    runsOnceFromNow: (p0, p1) => `Runs once, ${p0} ${p1} from now`,
+    runsEveryDayAt: (p0) => `Runs every day at ${p0}`,
+    runsMondayFridayAt: (p0) => `Runs Monday\u2013Friday at ${p0}`,
+    runsEveryAt: (p0, p1) => `Runs every ${p0} at ${p1}`,
+    runsOnDayOf: (p0, p1) => `Runs on day ${p0} of each month at ${p1}`,
+    runsEvery: (p0, p1) => `Runs every ${p0} ${p1}`,
+    cronjobScheduled: (p0) => `Cronjob "${p0}" scheduled`,
+    deleteCronjob: 'Delete cronjob',
+    pausedForSecurityDelete: 'Paused for security: delete and recreate this legacy cronjob before running it again.',
+    onceIn: 'Once, in\u2026',
+    everyHour: 'Every hour',
+    everyDay: 'Every day',
+    weekdays: 'Weekdays',
+    everyWeek: 'Every week',
+    everyMonth: 'Every month',
+    interval: 'Interval',
+    advanced: 'Advanced\u2026',
+    monday: 'Monday',
+    tuesday: 'Tuesday',
+    wednesday: 'Wednesday',
+    thursday: 'Thursday',
+    friday: 'Friday',
+    saturday: 'Saturday',
+    sunday: 'Sunday',
+    minutesFromNow: 'minutes from now',
+    hoursFromNow: 'hours from now',
+    daysFromNow: 'days from now',
+    minutes: 'minutes',
+    hours: 'hours',
+    days: 'days',
+    every1dEvery2h: 'every 1d \u00b7 every 2h \u00b7 0 9 * * * (cron)',
+    stopAfter: 'Stop after',
+    runsBlankForever: 'runs (blank = forever)',
+    newCronjob: 'New Cronjob',
+    nameThisCronjob: 'Name this cronjob',
+    whatShouldThisCronjob: 'What should this cronjob do each time it runs?',
+    cronjobs: 'Cronjobs',
+    newCronjob2: 'New Cronjob',
+    couldNotLoadCronjobs: 'Could not load cronjobs. The list may still be there.',
+    retry: 'Retry',
+  },
+  groups: {
+    membershipsSync: 'A bot can join multiple group chats. Memberships sync to every machine.',
+    openSChat: (p0) => `Open ${p0}'s chat`,
+    pick2BotsLocal: (p0) => `Pick 2–${p0} bots. Local memberships sync through each Bot profile; cross-machine members stay scoped to this room.`,
+    activeNow: 'Active now',
+    manageGroups: 'Manage groups',
+    createJoin: 'Create & join',
+    removeFromAllGroups: 'Remove from all groups',
+    upload: 'Upload',
+    remove: 'Remove',
+    groupSettings: 'Group settings',
+    renameTheGroupOr: 'Rename the group or set a room picture. Members and history are kept.',
+    save: 'Save',
+    newGroupChat: 'New Group Chat',
+    searchBotsToAdd: 'Search bots to add…',
+    removeFromSelection: 'Remove from selection',
+  },
+  thread: {
+    botNeedsInput: 'A bot in this room needs your input',
+    noBotsMatch: (p0) => `No bots match “${p0}”`,
+    couldNotSendThe: (p0, p1) => `Could not send the answer to @${p0}: ${p1}`,
+    answer: (p0) => `Answer @${p0}`,
+    groupSettingsRenameOr: (p0) => `Group settings — rename ${p0} or set a room picture`,
+    disbandTheGroupChat: (p0) => `Disband the ${p0} group chat`,
+    back: 'Back',
+    activity: 'Activity',
+    noActivityInThis: 'No activity in this turn yet.',
+    removeAttachment: 'Remove attachment',
+    attachFilesEveryResponding: 'Attach files — every responding bot sees them',
+    openThisThread: 'Open this thread',
+    collapseThisThread: 'Collapse this thread',
+    collapseThread: 'Collapse thread',
+    replyInThread: 'Reply in thread…',
+    reply: 'Reply',
+    replyInThread2: 'Reply in thread',
+    saySomethingEveryBot: 'Say something — every bot in this group hears the room.',
+    newThread: 'New Thread',
+    disbandGroupChat: 'Disband group chat?',
+    disband: 'Disband',
+  },
+  pane: {
+    message: (p0) => `Message ${p0}`,
+    newThreadInName: (p0) => `New thread in ${p0}… (@name to direct, @everyone for all)`,
+    disbanded: (p0) => `Disbanded “${p0}”`,
+    showHiddenBot: (p0, p1) => `Show ${p0} hidden bot${p1}`,
+    couldNotOpenS: (p0) => `Could not open ${p0}'s chat — try again`,
+    rosterUnavailableIfYour: (p0) => `Roster unavailable: ${p0}. If your gateway predates profiles.list, update Hermes and restart the gateway.`,
+    deletedProfile: (p0) => `Deleted profile ${p0}`,
+    bot: (p0, p1) => `Bot · ${p0}${p1}`,
+    needsYou: 'needs you',
+    bots: 'Bots',
+    new: 'New…',
+    newAgent: 'New Agent',
+    newGroupChat: 'New Group Chat',
+    searchBots: 'Search bots…',
+    retryNow: 'Retry now',
+    noAgentsYet: 'No agents yet',
+    createYourFirstTeammate: 'Create your first teammate.',
+    deleteBotAndProfile: 'Delete bot and profile?',
+    botModeAOne: 'Bot Mode — a one-chat-per-agent roster with avatars, routines, group chats, and bot-to-bot messaging. Ships with the app; disable here if unwanted.',
+    bots2: 'Bots',
+    cronjobs: 'Cronjobs',
+    newAgent2: 'New Agent…',
+    openTheBotsPane: 'Open the Bots pane and hit “New Agent”.',
+    thisChatNeverResets: 'This chat never resets',
+  },
+  a11y: {
+    activeNow: 'Active now',
+    groupName: 'Group name',
+    searchBotsToAdd: 'Search bots to add',
+    replyInThread: 'Reply in thread',
+    newAgentOrGroupChat: 'New agent or group chat',
+    searchBots: 'Search bots',
+  },
+}
+
+const DE_MESSAGES = {
+  misc: {
+    couldNotDeleteProfile: (p0) => `Profil ${p0} konnte nicht gelöscht werden.`,
+    searchPets: (p0) => `${p0} Pets durchsuchen…`,
+    scrollForMoreOf: (p0, p1) => `Scrollen für mehr (${p0} von ${p1})`,
+    stillOnNot: (p0, p1) => `Weiterhin auf ${p0}, nicht ${p1}`,
+    delete: 'Löschen',
+    needsSetup: 'benötigt Einrichtung (',
+    setUp: 'eingerichtet \u2713',
+    saveTest: 'Speichern & testen',
+    cancel: 'Abbrechen',
+    working: 'Arbeite\u2026',
+    retry: 'erneut versuchen',
+  },
+  avatar: {
+    imageTooLargeMax: 'Bild zu groß (max. 15 MB).',
+    removeImageUseShape: 'Bild entfernen — Form nutzen',
+    auto: 'Auto',
+    randomize: 'Zufällig',
+    classicShapes: 'Klassische Formen',
+    describeYourAvatar: 'Beschreibe deinen Avatar…',
+    leaveBlankToGenerate: 'Leer lassen, um aus Name und Beschreibung des Agents zu generieren.',
+  },
+  pets: {
+    noPetsInThe: 'Keine Pets in der Petdex-Galerie. Führe `hermes pets` aus, um zu stöbern.',
+    pickAPetAs: 'Wähle ein Pet als Profilbild dieses Agents.',
+    removeBackToShape: 'Entfernen — zurück zum Form-Avatar',
+    noPetsMatch: 'Keine passenden Pets.',
+    couldNotLoadThat: 'Dieses Pet konnte nicht geladen werden — probier ein anderes.',
+  },
+  chat: {
+    heyTellMeAbout: 'Hey, erzähl mir was über dich!',
+  },
+  roster: {
+    stayInThisChat: (p0) => `Bleib in diesem Chat und schreib @${p0} an. Das Gateway bleibt auf diesem Gerät.`,
+    couldNotOpenS: (p0) => `Chat von ${p0} konnte nicht geöffnet werden — versuch es nochmal`,
+    livesOn: (p0) => `Läuft auf ${p0}`,
+    couldNotReach: (p0) => `${p0} nicht erreichbar`,
+    pinned: 'Angepinnt',
+    hiddenFromTheRoster: 'Aus der Übersicht ausgeblendet',
+    editProfile: 'Profil bearbeiten',
+    duplicate: 'Duplizieren',
+    newChatWithThis: 'Neuer Chat mit diesem Agent',
+  },
+  model: {
+    lastMessageCameFrom: (p0) => `Letzte Nachricht kam von @${p0} (Bot-zu-Bot)`,
+    groups: (p0) => `Gruppen: ${p0}…`,
+    duplicating: (p0) => `Dupliziere ${p0}…`,
+    createdFullCopyOf: (p0, p1) => `${p0} erstellt — vollständige Kopie von ${p1}`,
+    eGOmnirouterInferx: 'z. B. omnirouter, inferx, 9router',
+    eGAntigravityGemini: 'z. B. antigravity/gemini-3.6-flash-high',
+    backToDropdowns: '← Zurück zu den Auswahllisten',
+    inheritLaunchProfile: 'Erben (Start-Profil)',
+    enterManually: '✏️ Manuell eingeben…',
+    fullConfigurationNeedsA: 'Die vollständige Konfiguration braucht ein neueres Gateway (nach dem Hermes-Update neu starten).',
+  },
+  caps: {
+    skillsEnabled: (p0, p1) => `Skills (${p0}/${p1} aktiviert)`,
+    filterSkills: 'Skills filtern…',
+    noMcpServersConfigured: 'Keine MCP-Server konfiguriert oder im Katalog.',
+  },
+  hub: {
+    toolsetsEnabledUncheckingAll: (p0, p1) => `Toolsets (${p0}/${p1} aktiviert — alle abwählen stellt den Standard wieder her)`,
+    skillInstalled: (p0) => `Skill "${p0}" installiert`,
+    installingFailed: (p0) => `Installation von "${p0}" fehlgeschlagen`,
+    skillsHub: 'Skills Hub',
+    hermesSkillsHub: 'Hermes Skills Hub',
+    searchTheHubCommunity: 'Hub durchsuchen (Community + bekannte Quellen)…',
+    searchingCommunityWellKnown: 'Suche in Community + bekannten Quellen — kann ~10 s dauern…',
+    noHubSkillsMatched: 'Keine passenden Hub-Skills.',
+    added: '✓ hinzugefügt',
+  },
+  profile: {
+    installing: (p0) => `Installiere "${p0}"…`,
+    installAndAddIt: (p0) => `"${p0}" installieren und zur Liste oben hinzufügen`,
+    someSectionsFailed: (p0) => `Einige Abschnitte fehlgeschlagen: ${p0}`,
+    appearanceAndRoleFor: (p0, p1) => `Aussehen und Rolle für ${p0} (${p1}).`,
+    savedLookLocallyRemote: 'Look lokal gespeichert; Remote-Speicherung fehlgeschlagen',
+    whatShouldThisAgent: 'Wobei soll dieser Agent helfen?',
+  },
+  agentNew: {
+    draftAgentDiscarded: (p0) => `Entwurfs-Agent "${p0}" verworfen`,
+    couldNotCleanUp: (p0) => `Entwurfs-Profil "${p0}" konnte nicht aufgeräumt werden`,
+    agentCreatedOn: (p0, p1) => `Agent "${p0}" auf ${p1} erstellt`,
+    agentCreated: (p0) => `Agent "${p0}" erstellt`,
+    anAgentNamedAlready: (p0, p1) => `Ein Agent namens "${p0}" existiert auf ${p1} bereits.`,
+    anAgentNamedAlready2: (p0) => `Ein Agent namens "${p0}" existiert bereits.`,
+    theAgentIsCreated: (p0) => `Der Agent wird auf ${p0} erstellt und erscheint in der Übersicht als Connections-Bot. Der Chat wird zu diesem Rechner geroutet.`,
+    cloneFromProfileOn: (p0) => `Aus Profil klonen (auf ${p0})`,
+    namedTeammateDesc: 'Ein benannter Teamkollege mit eigenem Gedächtnis, eigenen Skills und eigenem Chat. Kann deine anderen Agenten anschreiben.',
+    newAgent: 'Neuer Agent',
+    whatShouldThisBot: 'Wobei soll dieser Bot helfen?',
+    general: 'Allgemein',
+    capabilities: 'Fähigkeiten',
+    skills: 'Skills',
+    tools: 'Tools',
+    freshProfileBundledSkills: 'Frisches Profil (mitgelieferte Skills)',
+    createEmptyIsChecked: '„Leer erstellen“ ist aktiviert — es werden keine mitgelieferten Skills installiert.',
+    leavingAllOrNone: 'Alle (oder keine) angehakt zu lassen behält das Standard-Toolset-Verhalten bei.',
+  },
+  cron: {
+    catalogFromUncheckedSkills: (p0) => `Katalog von ${p0} — abgewählte Skills sind nach dem Erstellen deaktiviert.`,
+    once: (p0) => `Einmal (${p0})`,
+    once2: (p0, p1) => `Einmal (${p0}${p1})`,
+    everyDays: (p0) => `Alle ${p0} Tage`,
+    everyH: (p0) => `Alle ${p0}h`,
+    everyM: (p0) => `Alle ${p0}m`,
+    runsOnceFromNow: (p0, p1) => `Läuft einmal, in ${p0} ${p1}`,
+    runsEveryDayAt: (p0) => `Läuft täglich um ${p0}`,
+    runsMondayFridayAt: (p0) => `Läuft Montag\u2013Freitag um ${p0}`,
+    runsEveryAt: (p0, p1) => `Läuft jeden ${p0} um ${p1}`,
+    runsOnDayOf: (p0, p1) => `Läuft am ${p0}. Tag jedes Monats um ${p1}`,
+    runsEvery: (p0, p1) => `Läuft alle ${p0} ${p1}`,
+    cronjobScheduled: (p0) => `Cronjob "${p0}" eingeplant`,
+    deleteCronjob: 'Cronjob löschen',
+    pausedForSecurityDelete: 'Aus Sicherheitsgründen pausiert: Lösche diesen alten Cronjob und lege ihn neu an, bevor du ihn wieder ausführst.',
+    onceIn: 'Einmal, in\u2026',
+    everyHour: 'Jede Stunde',
+    everyDay: 'Jeden Tag',
+    weekdays: 'Wochentags',
+    everyWeek: 'Jede Woche',
+    everyMonth: 'Jeden Monat',
+    interval: 'Intervall',
+    advanced: 'Erweitert\u2026',
+    monday: 'Montag',
+    tuesday: 'Dienstag',
+    wednesday: 'Mittwoch',
+    thursday: 'Donnerstag',
+    friday: 'Freitag',
+    saturday: 'Samstag',
+    sunday: 'Sonntag',
+    minutesFromNow: 'Minuten ab jetzt',
+    hoursFromNow: 'Stunden ab jetzt',
+    daysFromNow: 'Tage ab jetzt',
+    minutes: 'Minuten',
+    hours: 'Stunden',
+    days: 'Tage',
+    every1dEvery2h: 'alle 1d \u00b7 alle 2h \u00b7 0 9 * * * (Cron)',
+    stopAfter: 'Stoppen nach',
+    runsBlankForever: 'Durchläufen (leer = für immer)',
+    newCronjob: 'Neuer Cronjob',
+    nameThisCronjob: 'Diesen Cronjob benennen',
+    whatShouldThisCronjob: 'Was soll dieser Cronjob bei jedem Durchlauf tun?',
+    cronjobs: 'Cronjobs',
+    newCronjob2: 'Neuer Cronjob',
+    couldNotLoadCronjobs: 'Cronjobs konnten nicht geladen werden. Die Liste ist vielleicht trotzdem da.',
+    retry: 'Erneut versuchen',
+  },
+  groups: {
+    openSChat: (p0) => `Chat von ${p0} öffnen`,
+    pick2BotsLocal: (p0) => `Wähle 2–${p0} Bots. Lokale Mitgliedschaften synchronisieren über jedes Bot-Profil; Mitglieder von anderen Rechnern bleiben auf diesen Raum beschränkt.`,
+    membershipsSync: 'Ein Bot kann mehreren Gruppenchats beitreten. Mitgliedschaften werden auf alle Geräte synchronisiert.',
+    activeNow: 'Jetzt aktiv',
+    manageGroups: 'Gruppen verwalten',
+    createJoin: 'Erstellen & beitreten',
+    removeFromAllGroups: 'Aus allen Gruppen entfernen',
+    upload: 'Hochladen',
+    remove: 'Entfernen',
+    groupSettings: 'Gruppen-Einstellungen',
+    renameTheGroupOr: 'Benenne die Gruppe um oder setze ein Raumbild. Mitglieder und Verlauf bleiben erhalten.',
+    save: 'Speichern',
+    newGroupChat: 'Neuer Gruppenchat',
+    searchBotsToAdd: 'Bots zum Hinzufügen suchen…',
+    removeFromSelection: 'Aus der Auswahl entfernen',
+  },
+  thread: {
+    noBotsMatch: (p0) => `Keine Bots passen zu “${p0}”`,
+    couldNotSendThe: (p0, p1) => `Antwort an @${p0} konnte nicht gesendet werden: ${p1}`,
+    answer: (p0) => `@${p0} antworten`,
+    groupSettingsRenameOr: (p0) => `Gruppen-Einstellungen — ${p0} umbenennen oder Raumbild setzen`,
+    disbandTheGroupChat: (p0) => `Gruppenchat ${p0} auflösen`,
+    botNeedsInput: 'Ein Bot in diesem Raum braucht deine Eingabe',
+    back: 'Zurück',
+    activity: 'Aktivität',
+    noActivityInThis: 'Noch keine Aktivität in diesem Durchlauf.',
+    removeAttachment: 'Anhang entfernen',
+    attachFilesEveryResponding: 'Dateien anhängen — jeder antwortende Bot sieht sie',
+    openThisThread: 'Diesen Thread öffnen',
+    collapseThisThread: 'Diesen Thread einklappen',
+    collapseThread: 'Thread einklappen',
+    replyInThread: 'Im Thread antworten…',
+    reply: 'Antworten',
+    replyInThread2: 'Im Thread antworten',
+    saySomethingEveryBot: 'Sag etwas — jeder Bot in dieser Gruppe hört mit.',
+    newThread: 'Neuer Thread',
+    disbandGroupChat: 'Gruppenchat auflösen?',
+    disband: 'Auflösen',
+  },
+  pane: {
+    message: (p0) => `${p0} anschreiben`,
+    newThreadInName: (p0) => `Neuer Thread in ${p0}… (@name für direkt, @everyone für alle)`,
+    disbanded: (p0) => `“${p0}” aufgelöst`,
+    showHiddenBot: (p0, p1) => `${p0} ausgeblendete Bot${p1} anzeigen`,
+    couldNotOpenS: (p0) => `Chat von ${p0} konnte nicht geöffnet werden — versuch es nochmal`,
+    rosterUnavailableIfYour: (p0) => `Übersicht nicht verfügbar: ${p0}. Wenn dein Gateway älter als profiles.list ist, aktualisiere Hermes und starte das Gateway neu.`,
+    deletedProfile: (p0) => `Profil ${p0} gelöscht`,
+    bot: (p0, p1) => `Bot · ${p0}${p1}`,
+    needsYou: 'braucht dich',
+    bots: 'Bots',
+    new: 'Neu…',
+    newAgent: 'Neuer Agent',
+    newGroupChat: 'Neuer Gruppenchat',
+    searchBots: 'Bots suchen…',
+    retryNow: 'Jetzt erneut versuchen',
+    noAgentsYet: 'Noch keine Agents',
+    createYourFirstTeammate: 'Erstelle deinen ersten Teamkollegen.',
+    deleteBotAndProfile: 'Bot und Profil löschen?',
+    botModeAOne: 'Bot-Modus — eine Übersicht mit einem Chat pro Agent, inklusive Avataren, Routinen, Gruppenchats und Bot-zu-Bot-Nachrichten. Ist in der App enthalten; hier deaktivieren, wenn nicht gewünscht.',
+    bots2: 'Bots',
+    cronjobs: 'Cronjobs',
+    newAgent2: 'Neuer Agent…',
+    openTheBotsPane: 'Öffne das Bots-Panel und klicke auf „Neuer Agent“.',
+    thisChatNeverResets: 'Dieser Chat wird nie zurückgesetzt',
+  },
+  a11y: {
+    activeNow: 'Jetzt aktiv',
+    groupName: 'Gruppenname',
+    searchBotsToAdd: 'Bots zum Hinzufügen suchen',
+    replyInThread: 'Im Thread antworten',
+    newAgentOrGroupChat: 'Neuer Agent oder Gruppenchat',
+    searchBots: 'Bots suchen',
+  },
+}
+
+function resolveMessage(bundle, key, args) {
+  const value = key.split('.').reduce((node, part) => (node == null ? undefined : node[part]), bundle)
+
+  if (typeof value === 'function') {
+    return value(...args)
+  }
+
+  return typeof value === 'string' ? value : key
+}
+
+let t = (key, ...args) => resolveMessage(EN_MESSAGES, key, args)
+
 /** Live roster snapshot for imperative handlers (context menus). */
 const $lastRoster = atom([])
 
@@ -1638,7 +2108,7 @@ async function deleteBot(bot) {
     })
 
     if (result?.blocked || result?.code !== 0) {
-      throw new Error(result?.hint || result?.output || `Could not delete profile ${bot.name}.`)
+      throw new Error(result?.hint || result?.output || t('misc.couldNotDeleteProfile', bot.name))
     }
   }
 
@@ -2762,11 +3232,11 @@ function McpSetupButton({ profile, entry, onDone, ensureProfile }) {
   if (supported === false) {
     return jsx('span', {
       className: 'ml-1.5 text-[0.65rem] text-(--ui-text-quaternary)',
-      children: 'needs setup (' + requires.join(', ') + ') \u2014 restart the gateway to enable in-app setup'
+      children: t('misc.needsSetup') + requires.join(', ') + ') \u2014 restart the gateway to enable in-app setup'
     })
   }
   if (phase === 'done') {
-    return jsx('span', { className: 'ml-1.5 text-[0.65rem] text-(--ui-success,#22c55e)', children: 'set up \u2713' })
+    return jsx('span', { className: 'ml-1.5 text-[0.65rem] text-(--ui-success,#22c55e)', children: t('misc.setUp') })
   }
   if (phase === 'keys') {
     return jsxs('div', {
@@ -2785,8 +3255,8 @@ function McpSetupButton({ profile, entry, onDone, ensureProfile }) {
         jsxs('div', {
           className: 'flex gap-1',
           children: [
-            jsx(Button, { size: 'xs', variant: 'secondary', onClick: () => void submitKeys(), children: 'Save & test' }),
-            jsx(Button, { size: 'xs', variant: 'ghost', onClick: () => setPhase('idle'), children: 'Cancel' })
+            jsx(Button, { size: 'xs', variant: 'secondary', onClick: () => void submitKeys(), children: t('misc.saveTest') }),
+            jsx(Button, { size: 'xs', variant: 'ghost', onClick: () => setPhase('idle'), children: t('misc.cancel') })
           ]
         })
       ]
@@ -2796,12 +3266,12 @@ function McpSetupButton({ profile, entry, onDone, ensureProfile }) {
     return jsx('span', { className: 'ml-1.5 text-[0.65rem] text-(--ui-text-quaternary)', children: message || 'Authorizing\u2026' })
   }
   if (phase === 'busy') {
-    return jsx('span', { className: 'ml-1.5 text-[0.65rem] text-(--ui-text-quaternary)', children: 'Working\u2026' })
+    return jsx('span', { className: 'ml-1.5 text-[0.65rem] text-(--ui-text-quaternary)', children: t('misc.working') })
   }
   if (phase === 'error') {
     return jsxs('span', {
       className: 'ml-1.5 text-[0.65rem] text-(--ui-danger,#ef4444)',
-      children: [(message || 'Setup failed') + ' ', jsx('button', { className: 'underline', onClick: () => setPhase('idle'), children: 'retry' })]
+      children: [(message || 'Setup failed') + ' ', jsx('button', { className: 'underline', onClick: () => setPhase('idle'), children: t('misc.retry') })]
     })
   }
   // idle
@@ -2868,7 +3338,7 @@ function pickImageFromDevice() {
       }
 
       if (file.size > 15_000_000) {
-        host.notify({ kind: 'error', message: 'Image too large (max 15MB).' })
+        host.notify({ kind: 'error', message: t('avatar.imageTooLargeMax') })
         return resolve(null)
       }
 
@@ -3118,7 +3588,7 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
             variant: 'ghost',
             size: 'sm',
             onClick: () => onImage(null),
-            children: 'Remove image — use shape'
+            children: t('avatar.removeImageUseShape')
           })
         : null,
 
@@ -3155,7 +3625,7 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
                           },
                           children: k
                             ? jsx(BotFace, { shape: blobShapeString(seedPart, k), color, size: 32, name: pickerName })
-                            : jsx('span', { className: 'text-[0.6rem] text-(--ui-text-tertiary)', children: 'Auto' })
+                            : jsx('span', { className: 'text-[0.6rem] text-(--ui-text-tertiary)', children: t('avatar.auto') })
                         },
                         k || 'auto'
                       )
@@ -3172,7 +3642,7 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
                           onImage(null)
                           onShape(blobShapeString(Math.random().toString(36).slice(2, 10), kind))
                         },
-                        children: [jsx(Codicon, { name: 'refresh', className: 'mr-1 text-[0.8rem]' }), 'Randomize']
+                        children: [jsx(Codicon, { name: 'refresh', className: 'mr-1 text-[0.8rem]' }), t('avatar.randomize')]
                       }),
                       jsxs(Button, {
                         type: 'button',
@@ -3199,7 +3669,7 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
                     size: 'sm',
                     className: 'text-(--ui-text-tertiary)',
                     onClick: () => onShape(defaultShapeFor(pickerName)),
-                    children: 'Classic shapes'
+                    children: t('avatar.classicShapes')
                   })
                 ]
               })
@@ -3269,7 +3739,7 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
               children: [
                 jsx(Textarea, {
                   className: 'min-h-16 text-xs',
-                  placeholder: 'Describe your avatar…',
+                  placeholder: t('avatar.describeYourAvatar'),
                   value: describe,
                   onChange: event => setDescribe(event.target.value)
                 }),
@@ -3290,7 +3760,7 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
                   ? null
                   : jsx('div', {
                       className: 'text-center text-[0.65rem] text-(--ui-text-quaternary)',
-                      children: 'Leave blank to generate from the agent\u2019s name and description.'
+                      children: t('avatar.leaveBlankToGenerate')
                     })
               ]
             })
@@ -3431,7 +3901,7 @@ function PetTab({ image, onImage }) {
   if (!pets.length) {
     return jsx('div', {
       className: 'px-2 py-3 text-center text-xs text-(--ui-text-tertiary)',
-      children: 'No pets in the petdex gallery. Run `hermes pets` to explore.'
+      children: t('pets.noPetsInThe')
     })
   }
 
@@ -3459,11 +3929,11 @@ function PetTab({ image, onImage }) {
     children: [
       jsx('div', {
         className: 'text-center text-[0.65rem] text-(--ui-text-quaternary)',
-        children: 'Pick a pet as this agent’s profile picture.'
+        children: t('pets.pickAPetAs')
       }),
       jsx(Input, {
         className: 'h-7 text-xs',
-        placeholder: `Search ${pets.length} pets…`,
+        placeholder: t('misc.searchPets', pets.length),
         value: query,
         onChange: event => {
           setQuery(event.target.value)
@@ -3480,13 +3950,13 @@ function PetTab({ image, onImage }) {
               setSelectedSlug(null)
               onImage(null)
             },
-            children: 'Remove — back to shape avatar'
+            children: t('pets.removeBackToShape')
           })
         : null,
       filtered.length === 0
         ? jsx('div', {
             className: 'py-3 text-center text-xs text-(--ui-text-quaternary)',
-            children: 'No pets match.'
+            children: t('pets.noPetsMatch')
           })
         : jsxs('div', {
             onScroll,
@@ -3517,7 +3987,7 @@ function PetTab({ image, onImage }) {
                             onImage(icon)
                           } else {
                             setSelectedSlug(null)
-                            host.notify({ kind: 'error', message: 'Could not load that pet — try another.' })
+                            host.notify({ kind: 'error', message: t('pets.couldNotLoadThat') })
                           }
                         })
                       },
@@ -3536,7 +4006,7 @@ function PetTab({ image, onImage }) {
               limit < ranked.length
                 ? jsx('div', {
                     className: 'py-2 text-center text-[0.65rem] text-(--ui-text-quaternary)',
-                    children: `Scroll for more (${limit} of ${ranked.length})`
+                    children: t('misc.scrollForMoreOf', limit, ranked.length)
                   })
                 : null
             ]
@@ -4167,7 +4637,7 @@ function createCanonicalChat(name) {
       await new Promise(resolve => window.setTimeout(resolve, 400))
 
       try {
-        await host.request('prompt.submit', { session_id: runtime, text: 'Hey, tell me about yourself!' })
+        await host.request('prompt.submit', { session_id: runtime, text: t('chat.heyTellMeAbout') })
 
         if (!opened && sid && typeof host.openSession === 'function') {
           await host.openSession(sid, { profile: name, intent: 'main', keepAllProfilesScope: false })
@@ -4221,7 +4691,7 @@ async function prepareBotSource(bot) {
   const targetId = String(bot.connectionId || '').trim()
 
   if (targetId && targetId !== 'local' && liveId !== targetId) {
-    throw new Error(`Still on ${liveId || 'this device'}, not ${bot.connectionLabel || targetId}`)
+    throw new Error(t('misc.stillOnNot', liveId || 'this device', bot.connectionLabel || targetId))
   }
 
   // The canonical chat is found by NAME on the now-active owner source —
@@ -6001,7 +6471,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
       host.notify?.({
         kind: 'info',
         title: displayName(bot),
-        message: `Stay in this chat and @${handle} to message them. Gateway stays on this device.`
+        message: t('roster.stayInThisChat', handle)
       })
       return
     }
@@ -6017,7 +6487,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
     try {
       await prepareBotSource(bot)
     } catch (error) {
-      host.notifyError?.(error, `Could not reach ${bot.connectionLabel || 'the remote source'}`)
+      host.notifyError?.(error, t('roster.couldNotReach', bot.connectionLabel || 'the remote source'))
 
       return
     }
@@ -6037,7 +6507,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
       }
     } catch (error) {
       if (generation === botOpenGeneration) {
-        host.notifyError?.(error, `Could not open ${displayName(bot, meta)}'s chat — try again`)
+        host.notifyError?.(error, t('roster.couldNotOpenS', displayName(bot, meta)))
       }
 
       return
@@ -6084,7 +6554,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
                   meta?.pinned
                     ? jsx('span', {
                         className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
-                        title: 'Pinned',
+                        title: t('roster.pinned'),
                         children: '📌'
                       })
                     : null,
@@ -6092,7 +6562,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
                     ? jsx(Codicon, {
                         name: 'eye-closed',
                         className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
-                        title: 'Hidden from the roster'
+                        title: t('roster.hiddenFromTheRoster')
                       })
                     : null,
                   jsx('span', {
@@ -6112,7 +6582,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
                     ? jsx('span', {
                         className:
                           'max-w-[28%] shrink-0 truncate rounded bg-(--chrome-action-hover) px-1 font-mono text-[0.625rem] text-(--ui-text-tertiary)',
-                        title: `Lives on ${bot.connectionLabel}`,
+                        title: t('roster.livesOn', bot.connectionLabel),
                         children: bot.connectionLabel
                       })
                     : null
@@ -6151,7 +6621,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
                 ? jsxs('span', {
                     className:
                       'flex shrink-0 items-center gap-1 rounded-full bg-(--chrome-action-hover) px-1.5 py-px text-[0.625rem] font-medium text-(--ui-accent,#4f9cf9)',
-                    title: `Last message came from @${fromBot} (bot-to-bot)`,
+                    title: t('model.lastMessageCameFrom', fromBot),
                     children: ['🤖', `@${fromBot}`]
                   })
                 : null
@@ -6207,24 +6677,24 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
             children: meta?.hidden ? 'Unhide Bot' : 'Hide Bot'
           }),
           jsx(ContextMenuSeparator, {}),
-          jsx(ContextMenuItem, { onSelect: () => onEdit(bot), children: 'Edit Profile' }),
+          jsx(ContextMenuItem, { onSelect: () => onEdit(bot), children: t('roster.editProfile') }),
           !bot.remoteSource
             ? jsx(ContextMenuItem, {
                 onSelect: () => onGroup(bot),
-                children: groups.length ? `Groups: ${groups.join(', ')}…` : 'Manage groups…'
+                children: groups.length ? t('model.groups', groups.join(', ')) : 'Manage groups…'
               })
             : null,
           jsx(ContextMenuItem, {
             onSelect: () => {
-              host.notify({ kind: 'info', message: `Duplicating ${displayName(bot, meta)}…` })
+              host.notify({ kind: 'info', message: t('model.duplicating', displayName(bot, meta)) })
               duplicateBot(bot, $lastRoster.get().filter(candidate => !candidate.remoteSource))
                 .then(name => {
                   queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
-                  host.notify({ kind: 'success', message: `Created ${name} — full copy of ${bot.name}` })
+                  host.notify({ kind: 'success', message: t('model.createdFullCopyOf', name, bot.name) })
                 })
                 .catch(err => host.notifyError(err, 'Duplicate failed'))
             },
-            children: 'Duplicate'
+            children: t('roster.duplicate')
           }),
           jsx(ContextMenuSeparator, {}),
           jsx(ContextMenuItem, {
@@ -6235,7 +6705,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
                 host.newChat(bot.name)
               }
             },
-            children: 'New chat with this agent'
+            children: t('roster.newChatWithThis')
           }),
           bot.is_default ? null : jsx(ContextMenuSeparator, {}),
           bot.is_default
@@ -6243,7 +6713,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
             : jsx(ContextMenuItem, {
                 onSelect: () => onDelete(bot),
                 variant: 'destructive',
-                children: 'Delete'
+                children: t('misc.delete')
               })
         ]
       })
@@ -6321,7 +6791,7 @@ function ModelPicker({ value, onChange, placeholderModel = 'gateway default' }) 
             labeled(
               'Provider (Custom)',
               jsx(Input, {
-                placeholder: 'e.g. omnirouter, inferx, 9router',
+                placeholder: t('model.eGOmnirouterInferx'),
                 value: value.provider,
                 onChange: event => onChange({ provider: event.target.value })
               })
@@ -6329,7 +6799,7 @@ function ModelPicker({ value, onChange, placeholderModel = 'gateway default' }) 
             labeled(
               'Model (Custom)',
               jsx(Input, {
-                placeholder: 'e.g. antigravity/gemini-3.6-flash-high',
+                placeholder: t('model.eGAntigravityGemini'),
                 value: value.model,
                 onChange: event => onChange({ model: event.target.value })
               })
@@ -6341,7 +6811,7 @@ function ModelPicker({ value, onChange, placeholderModel = 'gateway default' }) 
           size: 'sm',
           className: 'h-6 self-start text-xs text-(--ui-text-tertiary)',
           onClick: () => setUseFreeText(false),
-          children: '← Back to dropdowns'
+          children: t('model.backToDropdowns')
         })
       ]
     })
@@ -6380,7 +6850,7 @@ function ModelPicker({ value, onChange, placeholderModel = 'gateway default' }) 
             jsx(SelectTrigger, { className: 'h-8 rounded-md', children: jsx(SelectValue, {}) }),
             jsxs(SelectContent, {
               children: [
-                jsx(SelectItem, { value: NONE, children: 'Inherit (launch profile)' }),
+                jsx(SelectItem, { value: NONE, children: t('model.inheritLaunchProfile') }),
                 ...providers.map(p =>
                   jsx(
                     SelectItem,
@@ -6388,7 +6858,7 @@ function ModelPicker({ value, onChange, placeholderModel = 'gateway default' }) 
                     p.slug
                   )
                 ),
-                jsx(SelectItem, { value: CUSTOM, children: '✏️ Enter manually…' })
+                jsx(SelectItem, { value: CUSTOM, children: t('model.enterManually') })
               ]
             })
           ]
@@ -6499,7 +6969,7 @@ function AdvancedProfileConfig({ bot, state, setState }) {
   if (unsupported) {
     return jsx('div', {
       className: 'px-2 py-3 text-center text-xs text-(--ui-text-tertiary)',
-      children: 'Full configuration needs a newer gateway (restart it after updating Hermes).'
+      children: t('model.fullConfigurationNeedsA')
     })
   }
 
@@ -6583,13 +7053,13 @@ function AdvancedProfileConfig({ bot, state, setState }) {
         onChange: patch => setState(prev => ({ ...prev, dirtyModel: true, ...patch }))
       }),
       labeled(
-        `Skills (${enabledSkills}/${state.skills.length} enabled)`,
+        t('caps.skillsEnabled', enabledSkills, state.skills.length),
         jsxs('div', {
           className: 'grid gap-1.5 rounded-md border border-(--ui-stroke-secondary) p-2',
           children: [
             jsx(Input, {
               className: 'h-7 text-xs',
-              placeholder: 'Filter skills…',
+              placeholder: t('caps.filterSkills'),
               value: skillFilter,
               onChange: event => setSkillFilter(event.target.value)
             }),
@@ -6611,7 +7081,7 @@ function AdvancedProfileConfig({ bot, state, setState }) {
         })
       ),
       labeled(
-        `Toolsets (${enabledToolsets}/${state.toolsets.length} enabled — unchecking all restores the default)`,
+        t('hub.toolsetsEnabledUncheckingAll', enabledToolsets, state.toolsets.length),
         jsx('div', {
           className: 'rounded-md border border-(--ui-stroke-secondary) p-2',
           children: jsx(ScrollArea, {
@@ -6669,7 +7139,7 @@ function AdvancedProfileConfig({ bot, state, setState }) {
             : mcpList.length === 0
               ? jsx('div', {
                   className: 'px-1 py-2 text-center text-xs text-(--ui-text-tertiary)',
-                  children: 'No MCP servers configured or in the catalog.'
+                  children: t('caps.noMcpServersConfigured')
                 })
               : jsx(ScrollArea, {
                   className: 'hermes-scroll-cap',
@@ -6835,13 +7305,13 @@ function HubSkillsSection({ forProfile, onInstalled }) {
         ...(forProfile ? { profile: forProfile } : {})
       })
       setInstalled(prev => ({ ...prev, [label]: true }))
-      host.notify({ kind: 'success', message: `Skill "${label}" installed` })
+      host.notify({ kind: 'success', message: t('hub.skillInstalled', label) })
 
       if (typeof onInstalled === 'function') {
         onInstalled(label)
       }
     } catch (err) {
-      host.notifyError(err, `Installing "${label}" failed`)
+      host.notifyError(err, t('hub.installingFailed', label))
     } finally {
       setInstalling(null)
     }
@@ -6857,7 +7327,7 @@ function HubSkillsSection({ forProfile, onInstalled }) {
         children: [
           jsx('div', {
             className: 'text-[0.7rem] font-medium text-(--ui-text-secondary)',
-            children: 'Skills Hub'
+            children: t('hub.skillsHub')
           }),
           jsx('button', {
             type: 'button',
@@ -6891,7 +7361,7 @@ function HubSkillsSection({ forProfile, onInstalled }) {
                 },
                 children: jsx('iframe', {
                   src: HUB_PICKER_URL,
-                  title: 'Hermes Skills Hub',
+                  title: t('hub.hermesSkillsHub'),
                   ref: frameRef,
                   style: {
                     width: '133.34%',
@@ -6908,7 +7378,7 @@ function HubSkillsSection({ forProfile, onInstalled }) {
                 className: 'px-1 text-[0.65rem] leading-4 text-(--ui-text-quaternary)',
                 children:
                   installing
-                    ? `Installing "${installing}"…`
+                    ? t('profile.installing', installing)
                     : 'Hit "+ Add to this Agent" on any skill — it installs and appears in the list above. Drag the corner to resize.'
               })
             ]
@@ -6919,7 +7389,7 @@ function HubSkillsSection({ forProfile, onInstalled }) {
         children: [
           jsx(Input, {
             className: 'h-7 flex-1 text-xs',
-            placeholder: 'Search the hub (community + well-known sources)…',
+            placeholder: t('hub.searchTheHubCommunity'),
             value: query,
             onChange: event => setQuery(event.target.value),
             onKeyDown: event => {
@@ -6941,7 +7411,7 @@ function HubSkillsSection({ forProfile, onInstalled }) {
       searching
         ? jsx('div', {
             className: 'px-1 text-[0.65rem] text-(--ui-text-quaternary)',
-            children: 'Searching community + well-known sources — can take ~10s…'
+            children: t('hub.searchingCommunityWellKnown')
           })
         : null,
       results === null
@@ -6949,7 +7419,7 @@ function HubSkillsSection({ forProfile, onInstalled }) {
         : results.length === 0
           ? jsx('div', {
               className: 'px-1 py-1.5 text-[0.7rem] text-(--ui-text-quaternary)',
-              children: 'No hub skills matched.'
+              children: t('hub.noHubSkillsMatched')
             })
           : jsx(ScrollArea, {
               className: 'hermes-scroll-cap',
@@ -6977,14 +7447,14 @@ function HubSkillsSection({ forProfile, onInstalled }) {
                         installed[r.name]
                           ? jsx('span', {
                               className: 'shrink-0 text-[0.65rem] text-(--ui-text-tertiary)',
-                              children: '✓ added'
+                              children: t('hub.added')
                             })
                           : jsx(Button, {
                               size: 'sm',
                               variant: 'ghost',
                               className: 'shrink-0 px-2 font-semibold',
                               disabled: installing !== null,
-                              title: `Install "${r.name}" and add it to the list above`,
+                              title: t('profile.installAndAddIt', r.name),
                               onClick: () => void install(r.name),
                               children: installing === r.name ? '…' : '+'
                             })
@@ -7141,7 +7611,7 @@ function EditProfileDialog({ bot, open, onClose }) {
     const lookFailed = persistence.serverOutcome === 'failed'
 
     if (lookFailed) {
-      host.notify({ kind: 'error', message: 'Saved look locally; remote persistence failed' })
+      host.notify({ kind: 'error', message: t('profile.savedLookLocallyRemote') })
     }
     if (persistence.serverOutcome === 'persisted') {
       queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
@@ -7166,7 +7636,7 @@ function EditProfileDialog({ bot, open, onClose }) {
 
         if (failed.length) {
           advancedFailed = true
-          host.notify({ kind: 'error', message: `Some sections failed: ${failed.map(([k]) => k).join(', ')}` })
+          host.notify({ kind: 'error', message: t('profile.someSectionsFailed', failed.map(([k]) => k).join(', ')) })
         }
       } catch (err) {
         advancedFailed = true
@@ -7193,8 +7663,8 @@ function EditProfileDialog({ bot, open, onClose }) {
       children: [
         jsxs(DialogHeader, {
           children: [
-            jsx(DialogTitle, { children: 'Edit Profile' }),
-            jsx(DialogDescription, { children: `Appearance and role for ${displayName(bot, null)} (${bot.name}).` })
+            jsx(DialogTitle, { children: t('roster.editProfile') }),
+            jsx(DialogDescription, { children: t('profile.appearanceAndRoleFor', displayName(bot, null), bot.name) })
           ]
         }),
         jsxs('div', {
@@ -7225,7 +7695,7 @@ function EditProfileDialog({ bot, open, onClose }) {
               'Description',
               jsx(Textarea, {
                 className: 'min-h-16',
-                placeholder: 'What should this agent help with?',
+                placeholder: t('profile.whatShouldThisAgent'),
                 value: description,
                 onChange: event => setDescription(event.target.value)
               })
@@ -7250,7 +7720,7 @@ function EditProfileDialog({ bot, open, onClose }) {
         }),
         jsxs(DialogFooter, {
           children: [
-            jsx(Button, { variant: 'ghost', disabled: busy, onClick: onClose, children: 'Cancel' }),
+            jsx(Button, { variant: 'ghost', disabled: busy, onClick: onClose, children: t('misc.cancel') }),
             jsx(Button, { disabled: busy, onClick: submit, children: busy ? 'Saving…' : 'Save' })
           ]
         })
@@ -7368,8 +7838,8 @@ function CreateAgentDialog({ open, onClose, roster }) {
       ? requestForTarget('cli.exec', { argv: ['profile', 'delete', draft, '--yes'] })
       : deleteBot({ name: draft })
     void Promise.resolve(discard)
-      .then(() => host.notify({ kind: 'success', message: `Draft agent "${draft}" discarded` }))
-      .catch(err => host.notifyError(err, `Could not clean up draft profile "${draft}"`))
+      .then(() => host.notify({ kind: 'success', message: t('agentNew.draftAgentDiscarded', draft) }))
+      .catch(err => host.notifyError(err, t('agentNew.couldNotCleanUp', draft)))
   }
 
   const reset = () => {
@@ -7571,8 +8041,8 @@ function CreateAgentDialog({ open, onClose, roster }) {
       host.notify({
         kind: 'success',
         message: remoteTarget
-          ? `Agent "${displayName({ name: slug, title })}" created on ${targetLabel}`
-          : `Agent "${displayName({ name: slug, title })}" created`
+          ? t('agentNew.agentCreatedOn', displayName({ name: slug, title }), targetLabel)
+          : t('agentNew.agentCreated', displayName({ name: slug, title }))
       })
       const wasRemote = remoteTarget
       reset()
@@ -7630,9 +8100,9 @@ function CreateAgentDialog({ open, onClose, roster }) {
       children: [
         jsxs(DialogHeader, {
           children: [
-            jsx(DialogTitle, { children: 'New Agent' }),
+            jsx(DialogTitle, { children: t('agentNew.newAgent') }),
             jsx(DialogDescription, {
-              children: 'A named teammate with its own memory, skills, and chat. It can message your other agents.'
+              children: t('agentNew.namedTeammateDesc')
             })
           ]
         }),
@@ -7665,8 +8135,8 @@ function CreateAgentDialog({ open, onClose, roster }) {
               ? jsx('div', {
                   className: 'text-xs text-(--ui-accent)',
                   children: remoteTarget
-                    ? `An agent named "${slug}" already exists on ${targetLabel}.`
-                    : `An agent named "${slug}" already exists.`
+                    ? t('agentNew.anAgentNamedAlready', slug, targetLabel)
+                    : t('agentNew.anAgentNamedAlready2', slug)
                 })
               : null,
             // Multi-connection desktops choose WHERE the agent lives. Hidden
@@ -7714,7 +8184,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
             remoteTarget
               ? jsx('div', {
                   className: 'text-[0.7rem] leading-5 text-(--ui-text-tertiary)',
-                  children: `The agent is created on ${targetLabel} and appears in the roster as a Connections bot. Chat routes to that machine.`
+                  children: t('agentNew.theAgentIsCreated', targetLabel)
                 })
               : null,
             labeled(
@@ -7729,7 +8199,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
               'Description',
               jsx(Textarea, {
                 className: 'min-h-16',
-                placeholder: 'What should this Bot help with?',
+                placeholder: t('agentNew.whatShouldThisBot'),
                 value: description,
                 onChange: event => setDescription(event.target.value)
               })
@@ -7768,13 +8238,13 @@ function CreateAgentDialog({ open, onClose, roster }) {
                       // reads already route to the target).
                       children: (SkillsView && (!remoteTarget || skillsViewRoutesConnections)
                         ? [
-                            ['general', 'General'],
-                            ['capabilities', 'Capabilities']
+                            ['general', t('agentNew.general')],
+                            ['capabilities', t('agentNew.capabilities')]
                           ]
                         : [
-                            ['general', 'General'],
-                            ['skills', 'Skills'],
-                            ['toolsets', 'Tools'],
+                            ['general', t('agentNew.general')],
+                            ['skills', t('agentNew.skills')],
+                            ['toolsets', t('agentNew.tools')],
                             ['mcp', 'MCP']
                           ]
                       ).map(([id, label]) =>
@@ -7813,7 +8283,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
                           className: 'grid gap-3.5',
                           children: [
                             labeled(
-                              remoteTarget ? `Clone from profile (on ${targetLabel})` : 'Clone from profile',
+                              remoteTarget ? t('agentNew.cloneFromProfileOn', targetLabel) : 'Clone from profile',
                               jsxs(Select, {
                                 disabled: remoteTarget,
                                 value: remoteTarget ? 'default' : cloneFrom,
@@ -7831,7 +8301,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
                                     children: [
                                       jsx(SelectItem, {
                                         value: '__none__',
-                                        children: 'Fresh profile (bundled skills)'
+                                        children: t('agentNew.freshProfileBundledSkills')
                                       }),
                                       ...roster.map(b => jsx(SelectItem, { value: b.name, children: b.name }, b.name))
                                     ]
@@ -7937,14 +8407,14 @@ function CreateAgentDialog({ open, onClose, roster }) {
                             ? noSkills
                               ? jsx('div', {
                                   className: 'px-2 py-3 text-center text-xs text-(--ui-text-tertiary)',
-                                  children: '“Create empty” is checked — no bundled skills will be installed.'
+                                  children: t('agentNew.createEmptyIsChecked')
                                 })
                               : jsxs('div', {
                                   className: 'grid gap-1.5',
                                   children: [
                                     jsx(Input, {
                                       className: 'h-7 text-xs',
-                                      placeholder: 'Filter skills…',
+                                      placeholder: t('caps.filterSkills'),
                                       value: capFilter,
                                       onChange: event => setCapFilter(event.target.value)
                                     }),
@@ -7963,7 +8433,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
                                     }),
                                     jsx('div', {
                                       className: 'text-[0.65rem] leading-4 text-(--ui-text-quaternary)',
-                                      children: `Catalog from ${caps.source} — unchecked skills are disabled after creation.`
+                                      children: t('cron.catalogFromUncheckedSkills', caps.source)
                                     }),
                                     jsx(HubSkillsSection, {
                                       forProfile: null,
@@ -7991,14 +8461,14 @@ function CreateAgentDialog({ open, onClose, roster }) {
                                     }),
                                     jsx('div', {
                                       className: 'text-[0.65rem] leading-4 text-(--ui-text-quaternary)',
-                                      children: 'Leaving all (or none) checked keeps the default toolset behavior.'
+                                      children: t('agentNew.leavingAllOrNone')
                                     })
                                   ]
                                 })
                               : caps.mcp.length === 0
                                 ? jsx('div', {
                                     className: 'px-2 py-3 text-center text-xs text-(--ui-text-tertiary)',
-                                    children: 'No MCP servers configured or in the catalog.'
+                                    children: t('caps.noMcpServersConfigured')
                                   })
                                 : jsxs('div', {
                                     className: 'grid gap-1.5',
@@ -8102,7 +8572,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
                 reset()
                 onClose()
               },
-              children: 'Cancel'
+              children: t('misc.cancel')
             }),
             jsx(Button, {
               disabled: busy || !valid || taken,
@@ -8263,13 +8733,13 @@ function scheduleLabel(schedule) {
   const once = /^once in (.+)$/.exec(schedule || '')
 
   if (once) {
-    return `Once (${once[1]})`
+    return t('cron.once', once[1])
   }
 
   const bare = /^(\d+)([mhd])$/.exec(schedule || '')
 
   if (bare) {
-    return `Once (${bare[1]}${bare[2]})`
+    return t('cron.once2', bare[1], bare[2])
   }
 
   const match = /^every (\d+)m$/.exec(schedule || '')
@@ -8279,15 +8749,15 @@ function scheduleLabel(schedule) {
 
     if (minutes % 1440 === 0) {
       const d = minutes / 1440
-      return d === 1 ? 'Daily' : `Every ${d} days`
+      return d === 1 ? 'Daily' : t('cron.everyDays', d)
     }
 
     if (minutes % 60 === 0) {
       const h = minutes / 60
-      return h === 1 ? 'Hourly' : `Every ${h}h`
+      return h === 1 ? 'Hourly' : t('cron.everyH', h)
     }
 
-    return `Every ${minutes}m`
+    return t('cron.everyM', minutes)
   }
 
   return schedule || ''
@@ -8351,7 +8821,7 @@ function RoutineRow({ job, profile }) {
             onCheckedChange: value => act(value ? 'resume' : 'pause')
           }),
           jsx(Tip, {
-            label: 'Delete cronjob',
+            label: t('cron.deleteCronjob'),
             children: jsx('button', {
               type: 'button',
               disabled: busy,
@@ -8381,7 +8851,7 @@ function RoutineRow({ job, profile }) {
         ? jsx('div', {
             className:
               'rounded-md border border-(--ui-stroke-secondary) px-2 py-1.5 text-[0.65rem] leading-4 text-(--ui-accent)',
-            children: 'Paused for security: delete and recreate this legacy cronjob before running it again.'
+            children: t('cron.pausedForSecurityDelete')
           })
         : null
     ]
@@ -8392,24 +8862,24 @@ function RoutineRow({ job, profile }) {
 // frequency needs (time of day, weekday, day of month, interval). Emits a
 // Hermes-native schedule string; Advanced exposes it raw.
 const FREQUENCIES = [
-  { id: 'once', label: 'Once, in\u2026' },
-  { id: 'hourly', label: 'Every hour' },
-  { id: 'daily', label: 'Every day' },
-  { id: 'weekdays', label: 'Weekdays' },
-  { id: 'weekly', label: 'Every week' },
-  { id: 'monthly', label: 'Every month' },
-  { id: 'interval', label: 'Interval' },
-  { id: 'advanced', label: 'Advanced\u2026' }
+  { id: 'once', label: t('cron.onceIn') },
+  { id: 'hourly', label: t('cron.everyHour') },
+  { id: 'daily', label: t('cron.everyDay') },
+  { id: 'weekdays', label: t('cron.weekdays') },
+  { id: 'weekly', label: t('cron.everyWeek') },
+  { id: 'monthly', label: t('cron.everyMonth') },
+  { id: 'interval', label: t('cron.interval') },
+  { id: 'advanced', label: t('cron.advanced') }
 ]
 
 const WEEKDAYS = [
-  { id: '1', label: 'Monday' },
-  { id: '2', label: 'Tuesday' },
-  { id: '3', label: 'Wednesday' },
-  { id: '4', label: 'Thursday' },
-  { id: '5', label: 'Friday' },
-  { id: '6', label: 'Saturday' },
-  { id: '0', label: 'Sunday' }
+  { id: '1', label: t('cron.monday') },
+  { id: '2', label: t('cron.tuesday') },
+  { id: '3', label: t('cron.wednesday') },
+  { id: '4', label: t('cron.thursday') },
+  { id: '5', label: t('cron.friday') },
+  { id: '6', label: t('cron.saturday') },
+  { id: '0', label: t('cron.sunday') }
 ]
 
 const TIMES = (() => {
@@ -8464,19 +8934,19 @@ function scheduleSummary(state) {
 
   switch (state.freq) {
     case 'once':
-      return `Runs once, ${Math.max(1, parseInt(state.onceN, 10) || 1)} ${unitWord(state.onceUnit)} from now`
+      return t('cron.runsOnceFromNow', Math.max(1, parseInt(state.onceN, 10) || 1), unitWord(state.onceUnit))
     case 'hourly':
       return 'Runs at the top of every hour' + cap
     case 'daily':
-      return `Runs every day at ${tl}` + cap
+      return t('cron.runsEveryDayAt', tl) + cap
     case 'weekdays':
-      return `Runs Monday\u2013Friday at ${tl}` + cap
+      return t('cron.runsMondayFridayAt', tl) + cap
     case 'weekly':
-      return `Runs every ${(WEEKDAYS.find(w => w.id === state.weekday) || WEEKDAYS[0]).label} at ${tl}` + cap
+      return t('cron.runsEveryAt', (WEEKDAYS.find(w => w.id === state.weekday) || WEEKDAYS[0]).label, tl) + cap
     case 'monthly':
-      return `Runs on day ${state.monthday || '1'} of each month at ${tl}` + cap
+      return t('cron.runsOnDayOf', state.monthday || '1', tl) + cap
     case 'interval':
-      return `Runs every ${Math.max(1, parseInt(state.intervalN, 10) || 1)} ${unitWord(state.intervalUnit)}` + cap
+      return t('cron.runsEvery', Math.max(1, parseInt(state.intervalN, 10) || 1), unitWord(state.intervalUnit)) + cap
     default:
       return 'Raw schedule \u2014 every Nm/Nh/Nd or 5-field cron'
   }
@@ -8520,9 +8990,9 @@ function SchedulePicker({ state, setState }) {
                 onChange: event => upd({ onceN: event.target.value.replace(/[^0-9]/g, '').slice(0, 4) })
               }),
               pickerSelect(state.onceUnit, v => upd({ onceUnit: v }), [
-                { id: 'm', label: 'minutes from now' },
-                { id: 'h', label: 'hours from now' },
-                { id: 'd', label: 'days from now' }
+                { id: 'm', label: t('cron.minutesFromNow') },
+                { id: 'h', label: t('cron.hoursFromNow') },
+                { id: 'd', label: t('cron.daysFromNow') }
               ])
             ]
           })
@@ -8552,9 +9022,9 @@ function SchedulePicker({ state, setState }) {
                 onChange: event => upd({ intervalN: event.target.value.replace(/[^0-9]/g, '').slice(0, 4) })
               }),
               pickerSelect(state.intervalUnit, v => upd({ intervalUnit: v }), [
-                { id: 'm', label: 'minutes' },
-                { id: 'h', label: 'hours' },
-                { id: 'd', label: 'days' }
+                { id: 'm', label: t('cron.minutes') },
+                { id: 'h', label: t('cron.hours') },
+                { id: 'd', label: t('cron.days') }
               ])
             ]
           })
@@ -8562,7 +9032,7 @@ function SchedulePicker({ state, setState }) {
       state.freq === 'advanced'
         ? jsx(Input, {
             className: 'h-8 font-mono text-xs',
-            placeholder: 'every 1d \u00b7 every 2h \u00b7 0 9 * * * (cron)',
+            placeholder: t('cron.every1dEvery2h'),
             value: state.raw,
             onChange: event => upd({ raw: event.target.value })
           })
@@ -8571,14 +9041,14 @@ function SchedulePicker({ state, setState }) {
         ? jsxs('div', {
             className: 'flex items-center gap-2',
             children: [
-              jsx('span', { className: 'text-xs text-(--ui-text-tertiary)', children: 'Stop after' }),
+              jsx('span', { className: 'text-xs text-(--ui-text-tertiary)', children: t('cron.stopAfter') }),
               jsx(Input, {
                 className: 'h-7 w-16 text-xs',
                 placeholder: '\u221e',
                 value: state.repeatN,
                 onChange: event => upd({ repeatN: event.target.value.replace(/[^0-9]/g, '').slice(0, 4) })
               }),
-              jsx('span', { className: 'text-xs text-(--ui-text-tertiary)', children: 'runs (blank = forever)' })
+              jsx('span', { className: 'text-xs text-(--ui-text-tertiary)', children: t('cron.runsBlankForever') })
             ]
           })
         : null,
@@ -8655,7 +9125,7 @@ function CreateRoutineDialog({ bot, open, onClose }) {
         ...(target === 'bot-chat' ? { deliver: 'bot-chat' } : {})
       })
       await invalidateRoutineOwner(bot)
-      host.notify({ kind: 'success', message: `Cronjob "${title}" scheduled` })
+      host.notify({ kind: 'success', message: t('cron.cronjobScheduled', title) })
       reset()
       onClose()
     } catch (err) {
@@ -8677,7 +9147,7 @@ function CreateRoutineDialog({ bot, open, onClose }) {
       children: [
         jsxs(DialogHeader, {
           children: [
-            jsx(DialogTitle, { children: 'New Cronjob' }),
+            jsx(DialogTitle, { children: t('cron.newCronjob') }),
             jsx(DialogDescription, {
               children: `A recurring task ${displayName({ name: bot }, $botMeta.get()[bot])} runs on a schedule. Runs land in its own chat history.`
             })
@@ -8690,7 +9160,7 @@ function CreateRoutineDialog({ bot, open, onClose }) {
               'Name',
               jsx(Input, {
                 autoFocus: true,
-                placeholder: 'Name this cronjob',
+                placeholder: t('cron.nameThisCronjob'),
                 value: name,
                 onChange: event => setName(event.target.value)
               })
@@ -8699,7 +9169,7 @@ function CreateRoutineDialog({ bot, open, onClose }) {
               'Instruction',
               jsx(Textarea, {
                 className: 'min-h-20',
-                placeholder: 'What should this cronjob do each time it runs?',
+                placeholder: t('cron.whatShouldThisCronjob'),
                 value: instruction,
                 onChange: event => setInstruction(event.target.value)
               })
@@ -8741,7 +9211,7 @@ function CreateRoutineDialog({ bot, open, onClose }) {
                 reset()
                 onClose()
               },
-              children: 'Cancel'
+              children: t('misc.cancel')
             }),
             jsx(Button, {
               disabled: busy || !name.trim() || !instruction.trim() || !schedule.trim(),
@@ -8831,12 +9301,12 @@ function RoutinesPane() {
               }),
               jsx('div', {
                 className: 'text-[0.65rem] uppercase tracking-wider text-(--ui-text-quaternary)',
-                children: 'Cronjobs'
+                children: t('cron.cronjobs')
               })
             ]
           }),
           jsx(Tip, {
-            label: 'New Cronjob',
+            label: t('cron.newCronjob2'),
             children: jsx('button', {
               type: 'button',
               className:
@@ -8866,13 +9336,13 @@ function RoutinesPane() {
                 jsx(Codicon, { name: 'warning', className: 'text-[1.6rem] text-(--ui-text-quaternary)' }),
                 jsx('div', {
                   className: 'text-xs leading-5 text-(--ui-text-tertiary)',
-                  children: 'Could not load cronjobs. The list may still be there.'
+                  children: t('cron.couldNotLoadCronjobs')
                 }),
                 jsx(Button, {
                   variant: 'secondary',
                   size: 'sm',
                   onClick: () => void refetch(),
-                  children: 'Retry'
+                  children: t('cron.retry')
                 })
               ]
             })
@@ -8936,12 +9406,12 @@ function ActiveNowStrip({ roster, activeProfile, gatewayState, metaByName, onOpe
   return jsxs('div', {
     role: 'status',
     'aria-live': 'polite',
-    'aria-label': 'Active now',
+    'aria-label': t('a11y.activeNow'),
     className: 'flex flex-wrap items-center gap-1.5 px-2.5 pb-1.5',
     children: [
       jsx('span', {
         className: 'text-[0.6875rem] font-semibold uppercase tracking-wider text-(--ui-text-quaternary)',
-        children: 'Active now'
+        children: t('groups.activeNow')
       }),
       ...active.map(bot => {
         const meta = metaByName?.[bot.name]
@@ -8951,7 +9421,7 @@ function ActiveNowStrip({ roster, activeProfile, gatewayState, metaByName, onOpe
 
         return jsx('button', {
           type: 'button',
-          title: `Open ${label}'s chat`,
+          title: t('groups.openSChat', label),
           className: cn(
             'flex items-center gap-1.5 rounded-md bg-(--chrome-action-hover) px-1.5 py-1 text-left transition-colors',
             'hover:bg-(--chrome-action-hover) hover:text-foreground'
@@ -9008,9 +9478,9 @@ function GroupDialog({ bot, onClose }) {
       children: [
         jsxs(DialogHeader, {
           children: [
-            jsx(DialogTitle, { children: 'Manage groups' }),
+            jsx(DialogTitle, { children: t('groups.manageGroups') }),
             jsx(DialogDescription, {
-              children: 'A bot can join multiple group chats. Memberships sync to every machine.'
+              children: t('groups.membershipsSync')
             })
           ]
         }),
@@ -9056,7 +9526,7 @@ function GroupDialog({ bot, onClose }) {
               value: name,
               onChange: event => setName(event.target.value)
             }),
-            jsx(Button, { type: 'submit', size: 'sm', disabled: !name.trim(), children: 'Create & join' })
+            jsx(Button, { type: 'submit', size: 'sm', disabled: !name.trim(), children: t('groups.createJoin') })
           ]
         }),
         current.length
@@ -9065,7 +9535,7 @@ function GroupDialog({ bot, onClose }) {
               size: 'sm',
               className: 'justify-self-start',
               onClick: () => saveBotMeta(bot.name, { groups: [], group: null }),
-              children: 'Remove from all groups'
+              children: t('groups.removeFromAllGroups')
             })
           : null
       ]
@@ -9137,7 +9607,7 @@ function GroupImageControls({ image, onImage, seedName, seedMembers }) {
           ? jsx('img', { src: image, alt: '', className: 'size-full object-cover' })
           : jsx(Codicon, { name: 'organization', className: 'text-(--ui-text-tertiary)' })
       }),
-      jsx(Button, { type: 'button', variant: 'secondary', size: 'sm', onClick: upload, children: 'Upload' }),
+      jsx(Button, { type: 'button', variant: 'secondary', size: 'sm', onClick: upload, children: t('groups.upload') }),
       imagen
         ? jsx(Button, {
             type: 'button',
@@ -9149,7 +9619,7 @@ function GroupImageControls({ image, onImage, seedName, seedMembers }) {
           })
         : null,
       image
-        ? jsx(Button, { type: 'button', variant: 'ghost', size: 'sm', onClick: () => onImage(null), children: 'Remove' })
+        ? jsx(Button, { type: 'button', variant: 'ghost', size: 'sm', onClick: () => onImage(null), children: t('groups.remove') })
         : null
     ]
   })
@@ -9202,9 +9672,9 @@ function GroupChatSettingsDialog({ group, members, open, onClose, onRenamed }) {
       children: [
         jsxs(DialogHeader, {
           children: [
-            jsx(DialogTitle, { children: 'Group settings' }),
+            jsx(DialogTitle, { children: t('groups.groupSettings') }),
             jsx(DialogDescription, {
-              children: 'Rename the group or set a room picture. Members and history are kept.'
+              children: t('groups.renameTheGroupOr')
             })
           ]
         }),
@@ -9220,7 +9690,7 @@ function GroupChatSettingsDialog({ group, members, open, onClose, onRenamed }) {
             void save()
           },
           children: jsx(Input, {
-            'aria-label': 'Group name',
+            'aria-label': t('a11y.groupName'),
             autoFocus: true,
             maxLength: 64,
             value: name,
@@ -9229,8 +9699,8 @@ function GroupChatSettingsDialog({ group, members, open, onClose, onRenamed }) {
         }),
         jsxs(DialogFooter, {
           children: [
-            jsx(Button, { variant: 'secondary', onClick: onClose, children: 'Cancel' }),
-            jsx(Button, { disabled: !name.trim(), onClick: () => void save(), children: 'Save' })
+            jsx(Button, { variant: 'secondary', onClick: onClose, children: t('misc.cancel') }),
+            jsx(Button, { disabled: !name.trim(), onClick: () => void save(), children: t('groups.save') })
           ]
         })
       ]
@@ -9332,18 +9802,18 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
       children: [
         jsxs(DialogHeader, {
           children: [
-            jsx(DialogTitle, { children: 'New Group Chat' }),
+            jsx(DialogTitle, { children: t('groups.newGroupChat') }),
             jsx(DialogDescription, {
-              children: `Pick 2–${GROUP_CHAT_MAX_MEMBERS} bots. Local memberships sync through each Bot profile; cross-machine members stay scoped to this room.`
+              children: t('groups.pick2BotsLocal', GROUP_CHAT_MAX_MEMBERS)
             })
           ]
         }),
         jsx(SearchField, {
-          'aria-label': 'Search bots to add',
+          'aria-label': t('a11y.searchBotsToAdd'),
           autoFocus: true,
           containerClassName: 'w-full',
           inputClassName: 'w-full',
-          placeholder: 'Search bots to add…',
+          placeholder: t('groups.searchBotsToAdd'),
           value: query,
           onChange: setQuery
         }),
@@ -9355,7 +9825,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
                   type: 'button',
                   className:
                     'flex items-center gap-1 rounded-full bg-(--chrome-action-hover) py-0.5 pl-2 pr-1.5 text-[0.6875rem] text-(--ui-text-secondary) transition-colors hover:text-foreground',
-                  title: 'Remove from selection',
+                  title: t('groups.removeFromSelection'),
                   onClick: () => setChecked(prev => ({ ...prev, [botRosterKey(bot)]: false })),
                   children: [displayName(bot, botRosterMeta(bot, allMeta)), jsx(Codicon, { name: 'close', className: 'text-[0.6rem]' })]
                 }, botRosterKey(bot))
@@ -9412,7 +9882,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
                 })
               : jsx('div', {
                   className: 'px-1.5 py-3 text-center text-xs text-(--ui-text-tertiary)',
-                  children: query.trim() ? `No bots match “${query.trim()}”` : 'No bots yet — create agents first.'
+                  children: query.trim() ? t('thread.noBotsMatch', query.trim()) : 'No bots yet — create agents first.'
                 })
           })
         }),
@@ -9431,7 +9901,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
                 create()
               },
               children: jsx(Input, {
-                'aria-label': 'Group name',
+                'aria-label': t('a11y.groupName'),
                 maxLength: 64,
                 placeholder,
                 value: name,
@@ -9442,7 +9912,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
         }),
         jsxs(DialogFooter, {
           children: [
-            jsx(Button, { variant: 'secondary', onClick: onClose, children: 'Cancel' }),
+            jsx(Button, { variant: 'secondary', onClick: onClose, children: t('misc.cancel') }),
             jsx(Button, {
               disabled: !canCreate,
               title: selected.length < 2 ? 'Pick at least 2 bots' : undefined,
@@ -9746,7 +10216,7 @@ function GroupClarifyCard({ entry, members }) {
             .join('\n')
       appendGroupChatEntry(group, { kind: 'user', name: 'You' }, summary, entry.thread || 'legacy')
     } catch (err) {
-      host.notify({ kind: 'error', message: `Could not send the answer to @${botHandle(entry.member, member)}: ${err?.message || err}` })
+      host.notify({ kind: 'error', message: t('thread.couldNotSendThe', botHandle(entry.member, member), err?.message || err) })
     } finally {
       setSending(false)
     }
@@ -9819,7 +10289,7 @@ function GroupClarifyCard({ entry, members }) {
             isApproval
               ? null
               : jsx(Input, {
-                  'aria-label': `Answer @${entry.member}`,
+                  'aria-label': t('thread.answer', entry.member),
                   placeholder: q.choices.length ? 'Or type your own answer…' : 'Type your answer…',
                   value: drafts[q.qid] || '',
                   onChange: event => {
@@ -9993,7 +10463,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
         variant: 'ghost',
         size: 'sm',
         onClick: () => (onBack ? onBack() : $groupChatWorkspace.set(null)),
-        children: 'Back'
+        children: t('thread.back')
       }),
       // Room picture (set via Group settings) leads the title when present.
       room.image
@@ -10031,7 +10501,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
         variant: 'ghost',
         size: 'sm',
         className: 'shrink-0 text-(--ui-text-tertiary) hover:text-foreground',
-        title: `Group settings — rename ${group} or set a room picture`,
+        title: t('thread.groupSettingsRenameOr', group),
         onClick: () => setSettingsOpen(true),
         children: jsx(Codicon, { name: 'gear' })
       }),
@@ -10039,7 +10509,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
         variant: 'ghost',
         size: 'sm',
         className: 'shrink-0 text-(--ui-text-tertiary) hover:text-destructive',
-        title: `Disband the ${group} group chat`,
+        title: t('thread.disbandTheGroupChat', group),
         onClick: () => setConfirmDisband(true),
         children: jsx(Codicon, { name: 'trash' })
       })
@@ -10073,7 +10543,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
             name: activityOpen ? 'chevron-down' : 'chevron-right',
             className: 'shrink-0 text-[0.65rem]'
           }),
-          jsx('span', { className: 'shrink-0 font-medium', children: 'Activity' }),
+          jsx('span', { className: 'shrink-0 font-medium', children: t('thread.activity') }),
           latestActivity
             ? jsx('span', {
                 className: 'min-w-0 flex-1 truncate',
@@ -10110,7 +10580,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                   )
               : jsx('div', {
                   className: 'px-0.5 pb-0.5 text-[0.625rem] text-(--ui-text-quaternary)',
-                  children: 'No activity in this turn yet.'
+                  children: t('thread.noActivityInThis')
                 })
           })
         : null
@@ -10183,7 +10653,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
             jsx('button', {
               type: 'button',
               className: 'cursor-pointer border-0 bg-transparent p-0 text-(--ui-text-quaternary) hover:text-foreground',
-              title: 'Remove attachment',
+              title: t('thread.removeAttachment'),
               onClick: () => removeImage(thread, index),
               children: jsx(Codicon, { name: 'close', className: 'text-[0.65rem]' })
             })
@@ -10199,7 +10669,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
       variant: 'ghost',
       size: 'sm',
       className: 'shrink-0 text-(--ui-text-tertiary) hover:text-foreground',
-      title: 'Attach files — every responding bot sees them',
+      title: t('thread.attachFilesEveryResponding'),
       onClick: () => void pickGroupAttachments().then(picked => addImages(thread, picked)),
       children: jsx(Codicon, { name: 'attach' })
     })
@@ -10377,7 +10847,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
           type: 'button',
           className:
             'flex w-full items-center gap-2 rounded-md border border-(--ui-stroke-secondary) px-2 py-1.5 text-left text-xs text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover)',
-          title: 'Open this thread',
+          title: t('thread.openThisThread'),
           onClick: () => setOpenThreads(prev => ({ ...prev, [id]: true })),
           children: [
             jsx(Codicon, { name: 'chevron-right', className: 'shrink-0 text-[0.65rem]' }),
@@ -10403,9 +10873,9 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
           type: 'button',
           className:
             'flex w-full items-center gap-1.5 px-2 pt-1 text-left text-[0.65rem] text-(--ui-text-quaternary) transition-colors hover:text-foreground',
-          title: 'Collapse this thread',
+          title: t('thread.collapseThisThread'),
           onClick: () => setOpenThreads(prev => ({ ...prev, [id]: false })),
-          children: [jsx(Codicon, { name: 'chevron-down', className: 'text-[0.6rem]' }), 'Collapse thread']
+          children: [jsx(Codicon, { name: 'chevron-down', className: 'text-[0.6rem]' }), t('thread.collapseThread')]
         }, `unfold:${id}`)
       )
     }
@@ -10430,9 +10900,9 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                 className: 'flex items-center gap-1.5',
                 children: [
                   jsx(GroupMentionInput, {
-                    'aria-label': 'Reply in thread',
+                    'aria-label': t('a11y.replyInThread'),
                     autoFocus: true,
-                    placeholder: 'Reply in thread…',
+                    placeholder: t('thread.replyInThread'),
                     members,
                     value: replyDrafts[id] || '',
                     onChange: text => setReplyDrafts(prev => ({ ...prev, [id]: text })),
@@ -10444,7 +10914,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                     type: 'submit',
                     size: 'sm',
                     disabled: !(replyDrafts[id] || '').trim() && !imagesFor(id).length,
-                    children: 'Reply'
+                    children: t('thread.reply')
                   })
                 ]
               })
@@ -10455,7 +10925,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
             className:
               'w-fit px-2 pb-1 text-left text-[0.65rem] text-(--ui-accent,#4f9cf9) transition-colors hover:underline',
             onClick: () => setReplyThread(id),
-            children: 'Reply in thread'
+            children: t('thread.replyInThread2')
           }, `replylink:${id}`)
     )
 
@@ -10503,7 +10973,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
               : [
                   jsx('div', {
                     className: 'px-2 py-4 text-center text-xs text-(--ui-text-tertiary)',
-                    children: 'Say something — every bot in this group hears the room.'
+                    children: t('thread.saySomethingEveryBot')
                   }, 'empty')
                 ]),
             ...roomClarifies.map(entry =>
@@ -10540,8 +11010,8 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
               className: 'flex items-center gap-1.5',
               children: [
                 jsx(GroupMentionInput, {
-                  'aria-label': `Message ${group}`,
-                  placeholder: `New thread in ${group}… (@name to direct, @everyone for all)`,
+                  'aria-label': t('pane.message', group),
+                  placeholder: t('pane.newThreadInName', group),
                   members,
                   value: draft,
                   onChange: setDraft,
@@ -10553,7 +11023,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                   type: 'submit',
                   size: 'sm',
                   disabled: !draft.trim() && !imagesFor(null).length,
-                  children: 'New Thread'
+                  children: t('thread.newThread')
                 })
               ]
             })
@@ -10568,7 +11038,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
       }),
       jsx(ConfirmDialog, {
         open: confirmDisband,
-        title: 'Disband group chat?',
+        title: t('thread.disbandGroupChat'),
         description: jsxs('span', {
           children: [
             'This removes the ',
@@ -10581,13 +11051,13 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
           ]
         }),
         destructive: true,
-        confirmLabel: 'Disband',
+        confirmLabel: t('thread.disband'),
         busyLabel: 'Disbanding…',
         doneLabel: 'Disbanded',
         onClose: () => setConfirmDisband(false),
         onConfirm: async () => {
           await disbandGroupChat(group, members)
-          host.notify({ kind: 'success', message: `Disbanded “${group}”` })
+          host.notify({ kind: 'success', message: t('pane.disbanded', group) })
         }
       })
     ]
@@ -10803,8 +11273,8 @@ function GroupRow({ active, group, members, needsYou, onOpen, onDisband }) {
                 ? jsx('span', {
                     className:
                       'shrink-0 rounded-full bg-(--ui-accent,#4f9cf9) px-1.5 text-[0.6rem] font-semibold text-white',
-                    title: 'A bot in this room needs your input',
-                    children: 'needs you'
+                    title: t('thread.botNeedsInput'),
+                    children: t('pane.needsYou')
                   })
                 : null,
               lastAt
@@ -10969,7 +11439,7 @@ function BotsPane() {
         children: [
           jsx('span', {
             className: 'text-[0.6875rem] font-semibold uppercase tracking-wider text-(--ui-text-quaternary)',
-            children: 'Bots'
+            children: t('pane.bots')
           }),
           jsxs('div', {
             className: 'flex items-center gap-0.5',
@@ -10991,7 +11461,7 @@ function BotsPane() {
                 ? jsx(Tip, {
                     label: showHidden
                       ? 'Hide hidden bots again'
-                      : `Show ${hiddenBots.length} hidden bot${hiddenBots.length === 1 ? '' : 's'}`,
+                      : t('pane.showHiddenBot', hiddenBots.length, hiddenBots.length === 1 ? '' : 's'),
                     children: jsxs('button', {
                       type: 'button',
                       'aria-label': showHidden ? 'Hide hidden bots' : 'Show hidden bots',
@@ -11016,12 +11486,12 @@ function BotsPane() {
               jsxs(DropdownMenu, {
                 children: [
                   jsx(Tip, {
-                    label: 'New…',
+                    label: t('pane.new'),
                     children: jsx(DropdownMenuTrigger, {
                       asChild: true,
                       children: jsx('button', {
                         type: 'button',
-                        'aria-label': 'New agent or group chat',
+                        'aria-label': t('a11y.newAgentOrGroupChat'),
                         className:
                           'flex size-6 items-center justify-center rounded-md text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
                         children: jsx(Codicon, { name: 'add' })
@@ -11033,12 +11503,12 @@ function BotsPane() {
                     children: [
                       jsxs(DropdownMenuItem, {
                         onSelect: () => setCreateOpen(true),
-                        children: [jsx(Codicon, { name: 'hubot', className: 'mr-1.5' }), 'New Agent']
+                        children: [jsx(Codicon, { name: 'hubot', className: 'mr-1.5' }), t('pane.newAgent')]
                       }),
                       jsxs(DropdownMenuItem, {
                         disabled: activeSourceRoster.length < 2,
                         onSelect: () => setGroupCreateOpen(true),
-                        children: [jsx(Codicon, { name: 'organization', className: 'mr-1.5' }), 'New Group Chat']
+                        children: [jsx(Codicon, { name: 'organization', className: 'mr-1.5' }), t('pane.newGroupChat')]
                       })
                     ]
                   })
@@ -11063,7 +11533,7 @@ function BotsPane() {
             host.notify?.({
               kind: 'info',
               title: displayName(bot),
-              message: `Stay in this chat and @${handle} to message them. Gateway stays on this device.`
+              message: t('roster.stayInThisChat', handle)
             })
             return
           }
@@ -11078,7 +11548,7 @@ function BotsPane() {
             try {
               await prepareBotSource(bot)
             } catch (error) {
-              host.notifyError?.(error, `Could not reach ${bot.connectionLabel || 'the remote source'}`)
+              host.notifyError?.(error, t('roster.couldNotReach', bot.connectionLabel || 'the remote source'))
 
               return
             }
@@ -11095,7 +11565,7 @@ function BotsPane() {
               }
             } catch (error) {
               if (generation === botOpenGeneration) {
-                host.notifyError?.(error, `Could not open ${displayName(bot)}'s chat — try again`)
+                host.notifyError?.(error, t('pane.couldNotOpenS', displayName(bot)))
               }
 
               return
@@ -11117,10 +11587,10 @@ function BotsPane() {
         ? jsx('div', {
             className: 'px-2.5 pb-1.5',
             children: jsx(SearchField, {
-              'aria-label': 'Search bots',
+              'aria-label': t('a11y.searchBots'),
               containerClassName: 'w-full',
               inputClassName: 'w-full',
-              placeholder: 'Search bots…',
+              placeholder: t('pane.searchBots'),
               value: query,
               onChange: setQuery
             })
@@ -11143,7 +11613,7 @@ function BotsPane() {
               children: [
                 jsx('div', {
                   children: gatewayUp
-                    ? `Roster unavailable: ${error instanceof Error ? error.message : 'gateway error'}. If your gateway predates profiles.list, update Hermes and restart the gateway.`
+                    ? t('pane.rosterUnavailableIfYour', error instanceof Error ? error.message : 'gateway error')
                     : 'Waiting for the gateway connection… (remote gateways can take a few seconds; retries automatically)'
                 }),
                 jsx(Button, {
@@ -11151,15 +11621,15 @@ function BotsPane() {
                   size: 'sm',
                   className: 'justify-self-start',
                   onClick: () => void refetch(),
-                  children: 'Retry now'
+                  children: t('pane.retryNow')
                 })
               ]
             })
           : roster.length === 0
             ? jsx(EmptyState, {
                 icon: 'hubot',
-                title: 'No agents yet',
-                description: 'Create your first teammate.'
+                title: t('pane.noAgentsYet'),
+                description: t('pane.createYourFirstTeammate')
               })
             : filteredRoster.length === 0 && rosterRows.length === 0
               ? jsx('div', {
@@ -11168,7 +11638,7 @@ function BotsPane() {
                     'flex flex-1 items-center justify-center px-4 text-center text-xs text-(--ui-text-tertiary)',
                   role: 'status',
                   children: query.trim()
-                    ? `No bots match “${query.trim()}”`
+                    ? t('thread.noBotsMatch', query.trim())
                     : 'All bots are hidden — use the eye button above to show them.'
                 })
               : jsx(ScrollArea, {
@@ -11205,7 +11675,7 @@ function BotsPane() {
           className: 'w-full justify-center gap-1.5',
           variant: 'secondary',
           onClick: () => setCreateOpen(true),
-          children: [jsx(Codicon, { name: 'add' }), 'New Agent']
+          children: [jsx(Codicon, { name: 'add' }), t('pane.newAgent')]
         })
       }),
       jsx(CreateAgentDialog, {
@@ -11235,7 +11705,7 @@ function BotsPane() {
       grouping ? jsx(GroupDialog, { bot: grouping, onClose: () => setGrouping(null) }) : null,
       jsx(ConfirmDialog, {
         open: Boolean(deleting),
-        title: 'Delete bot and profile?',
+        title: t('pane.deleteBotAndProfile'),
         description: deleting
           ? jsxs('span', {
               children: [
@@ -11248,7 +11718,7 @@ function BotsPane() {
             })
           : null,
         destructive: true,
-        confirmLabel: 'Delete',
+        confirmLabel: t('misc.delete'),
         busyLabel: 'Deleting…',
         doneLabel: 'Deleted',
         onClose: () => setDeleting(null),
@@ -11260,7 +11730,7 @@ function BotsPane() {
           const name = deleting.name
           await deleteBot(deleting)
           await refetch()
-          host.notify({ kind: 'success', message: `Deleted profile ${name}` })
+          host.notify({ kind: 'success', message: t('pane.deletedProfile', name) })
         }
       }),
       jsx(ConfirmDialog, {
@@ -11289,10 +11759,17 @@ function BotsPane() {
 export default {
   id: ID,
   name: 'Bots',
-  description: 'Bot Mode — a one-chat-per-agent roster with avatars, routines, group chats, and bot-to-bot messaging. Ships with the app; disable here if unwanted.',
+  description: t('pane.botModeAOne'),
   register(ctx) {
     pluginCtx = ctx
     groupChatSyncDisposed = false
+
+    // Locale bundles + the live translator. Feature-detected: a desktop (or
+    // test harness) without `ctx.i18n` keeps the English fallback above.
+    if (ctx.i18n) {
+      ctx.i18n.register({ en: EN_MESSAGES, de: DE_MESSAGES })
+      t = (key, ...args) => ctx.i18n.t(key, ...args)
+    }
     startFaceClock()
     // Disabling the plugin (or a hot reload) must actually stop the clock —
     // before this, the rAF loop + 1Hz document scan ran until app restart.
@@ -11351,7 +11828,7 @@ export default {
             items.push({
               insert: `@${tag}`,
               display: `@${tag}`,
-              meta: `Bot · ${display}${source}`
+              meta: t('pane.bot', display, source)
             })
           }
 
@@ -11492,7 +11969,7 @@ export default {
     ctx.register({
       id: 'pane',
       area: 'panes',
-      title: 'Bots',
+      title: t('pane.bots2'),
       // dock: explicit adoption gesture — CENTER-STACK into the sessions zone
       // so the sidebar grows a SESSIONS | BOTS tab strip instead of splitting
       // two cramped panes down the column. Center is safe now: insertAtGroup
@@ -11535,7 +12012,7 @@ export default {
       ctx.register({
         id: 'routines',
         area: 'panes',
-        title: 'Cronjobs',
+        title: t('pane.cronjobs'),
         data: {
           placement: 'main',
           // Repair persisted layouts that stranded Cronjobs in the Bots tab strip.
@@ -11576,10 +12053,10 @@ export default {
       area: PALETTE_AREA,
       data: {
         id: `${ID}.new-agent`,
-        label: 'New Agent…',
+        label: t('pane.newAgent2'),
         keywords: ['bot', 'agent', 'profile', 'teammate', 'create'],
         run: () => {
-          host.notify({ kind: 'info', message: 'Open the Bots pane and hit “New Agent”.' })
+          host.notify({ kind: 'info', message: t('pane.openTheBotsPane') })
         }
       }
     })
@@ -11621,7 +12098,7 @@ export default {
             if (activeBot && currentId && canonicalIds.includes(String(currentId))) {
               host.notify({
                 kind: 'info',
-                title: 'This chat never resets',
+                title: t('pane.thisChatNeverResets'),
                 message:
                   'Bot chats are one continuous conversation — compacting instead. ' +
                   'For a throwaway session with this agent, use Sessions mode.'
