@@ -11,6 +11,39 @@ method = _registry.method
 _profile_scoped = _registry.profile_scoped
 
 
+def _normalize_docker_session_cwd(raw_cwd: str, terminal_backend: str) -> str:
+    """Translate Windows host paths to container paths when backend is Docker.
+    
+    When the desktop app creates a session with a Windows host path (e.g.
+    D:\\.hermes) and the terminal backend is Docker, that path cannot be used
+    as the container's working directory. This function maps it to the
+    container-side mount point (/workspace) so terminal commands work.
+    
+    Args:
+        raw_cwd: The working directory path from session.create params
+        terminal_backend: The terminal.backend config value
+        
+    Returns:
+        Container-side path (/workspace) if Docker + Windows host path,
+        otherwise the original path unchanged.
+    """
+    if not raw_cwd or not terminal_backend:
+        return raw_cwd
+    
+    backend = terminal_backend.strip().lower()
+    if backend != "docker":
+        return raw_cwd
+    
+    # Windows drive paths: C:\, D:\, E:\, F:\, C:/, D:/, E:/, F:/
+    # These are host paths that don't exist inside Linux containers
+    if raw_cwd.startswith(("C:\\", "D:\\", "E:\\", "F:\\", "C:/", "D:/", "E:/", "F:/")):
+        # Map to the standard Docker workspace mount point
+        # This matches the documented docker_volumes: '[\"D:/.hermes:/workspace:rw\"]' pattern
+        return "/workspace"
+    
+    return raw_cwd
+
+
 @method("session.create")
 def _(rid, params: dict) -> dict:
     sid = uuid.uuid4().hex[:8]
@@ -31,7 +64,21 @@ def _(rid, params: dict) -> dict:
         explicit_cwd = bool(raw_cwd) and os.path.isdir(os.path.abspath(os.path.expanduser(raw_cwd)))
     except Exception:
         explicit_cwd = False
+    
+    # Get terminal backend to check if we need to translate paths
+    try:
+        terminal_cfg = _load_cfg().get("terminal", {})
+        terminal_backend = str(terminal_cfg.get("backend") or "local").strip() if isinstance(terminal_cfg, dict) else "local"
+    except Exception:
+        terminal_backend = "local"
+    
     resolved_cwd = _completion_cwd(params)
+    
+    # Normalize the resolved cwd for Docker: translate Windows host paths
+    # to container paths so terminal commands don't fail with
+    # "cd: D:\.hermes: No such file or directory"
+    resolved_cwd = _normalize_docker_session_cwd(resolved_cwd, terminal_backend)
+    
     source = _resolve_session_source(str(params.get("source") or "").strip() or None)
     _enable_gateway_prompts()
 
