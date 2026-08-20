@@ -72,6 +72,16 @@ STALL_GUARD_REPEATABLE_TOOLS = frozenset(
     }
 )
 
+# Tools whose repeat-result envelope explicitly certifies that previously
+# returned content is unchanged and intentionally omitted. Keep this narrow:
+# arbitrary tools may use similarly named fields with different semantics.
+STALL_GUARD_UNCHANGED_RESULT_TOOLS = frozenset(
+    {
+        "read_file",
+        "skill_view",
+    }
+)
+
 # Poller naming conventions (e.g. ``<vendor>_get_result``) used by generated /
 # MCP tool surfaces. Matched as suffixes so vendor-prefixed pollers are exempt
 # without enumerating every vendor.
@@ -345,6 +355,7 @@ class ToolCallGuardrailController:
         # varied polling are never flagged. Per-turn, like everything else here.
         self._identical_streak_sig: ToolCallSignature | None = None
         self._identical_streak_result_hash: str = ""
+        self._identical_streak_anchor_result_hash: str = ""
         self._identical_streak_count: int = 0
         # Per-turn runaway-loop cap counters. Reset every turn (this method
         # runs at the start of each run_conversation), so the caps bound a
@@ -530,20 +541,23 @@ class ToolCallGuardrailController:
             # Don't let a poller streak carry over into the next tool either.
             self._identical_streak_sig = None
             self._identical_streak_result_hash = ""
+            self._identical_streak_anchor_result_hash = ""
             self._identical_streak_count = 0
             return None
 
         signature = _stall_guard_signature(tool_name, args)
         result_hash = _result_hash(result)
-        explicit_unchanged = _is_explicit_unchanged_result(result)
+        explicit_unchanged = _is_explicit_unchanged_result(tool_name, result)
         same_signature = self._identical_streak_sig == signature
         if same_signature and (
             self._identical_streak_result_hash == result_hash
+            or self._identical_streak_anchor_result_hash == result_hash
             or explicit_unchanged
         ):
             self._identical_streak_count += 1
         else:
             self._identical_streak_sig = signature
+            self._identical_streak_anchor_result_hash = result_hash
             self._identical_streak_count = 1
         self._identical_streak_result_hash = result_hash
 
@@ -691,9 +705,9 @@ def _result_hash(result: str | None) -> str:
     return _sha256(canonical)
 
 
-def _is_explicit_unchanged_result(result: str | None) -> bool:
-    """Whether a tool explicitly says its underlying content did not change."""
-    if not isinstance(result, str):
+def _is_explicit_unchanged_result(tool_name: str, result: str | None) -> bool:
+    """Whether a known tool certifies that its underlying content is unchanged."""
+    if tool_name not in STALL_GUARD_UNCHANGED_RESULT_TOOLS or not isinstance(result, str):
         return False
     parsed = safe_json_loads(result)
     return bool(
