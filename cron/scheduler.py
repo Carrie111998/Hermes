@@ -614,9 +614,40 @@ class _ReadWriteLock:
             self._cond.notify_all()
 
 
-# Serializes the per-job TERMINAL_CWD override against every other concurrently
+# Serializes a job's process-global overrides against every other concurrently
 # running cron job.  See _ReadWriteLock and run_job for the usage contract.
 _terminal_cwd_lock = _ReadWriteLock()
+
+
+def _job_mutates_process_globals(job: dict) -> bool:
+    """True when this job overrides process-global state for its whole run.
+
+    SINGLE SOURCE OF TRUTH.  Two kinds of job do this and they must be treated
+    identically by the tick() sequential/parallel partition AND by the
+    readers-writer lock:
+
+    * ``workdir`` jobs override ``os.environ["TERMINAL_CWD"]``.
+    * ``profile`` jobs go through :func:`_job_profile_context`, which sets the
+      module-global ``_hermes_home``, installs a Hermes-home override, and
+      snapshots/restores ``os.environ``.  While one is active
+      ``_get_hermes_home()`` returns that profile's home for EVERY thread.
+
+    The two classifications were written separately and drifted: the partition
+    tested ``workdir or profile`` while the lock tested ``workdir`` alone.  A
+    profile job therefore went to the sequential pool (which only stops
+    sequential jobs overlapping EACH OTHER) while taking the lock as a READER,
+    so the parallel pool kept running beside it and those jobs resolved their
+    ``script:`` slot under the wrong profile.
+
+    Not hypothetical: 8 "Script not found" failures across 6 jobs on
+    2026-08-19/20, every one under ``profiles/financier`` and every one
+    concurrent with a financier-profile job.  They fail SILENTLY -- the job's
+    ``last_status`` stays ``ok`` because the LLM addendum runs fine on empty
+    input -- so nothing downstream could see it.
+    """
+    return bool(
+        (job.get("workdir") or "").strip() or (job.get("profile") or "").strip()
+    )
 
 
 def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
@@ -1707,8 +1738,6 @@ def _job_profile_context(job_id: str, profile: Optional[str]):
         yield None
         return
 
-    global _hermes_home
-    prior_override = _hermes_home
     env_snapshot = os.environ.copy()
 
     from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
@@ -1728,8 +1757,19 @@ def _job_profile_context(job_id: str, profile: Optional[str]):
 
     override_token = None
     try:
+        # ONLY the context-local override. Assigning the module-global
+        # `_hermes_home` here as well is what leaked this profile to every
+        # other thread: `_get_hermes_home()` reads that global FIRST
+        # (`_hermes_home or get_hermes_home()`), so the global silently
+        # defeated the ContextVar's isolation and a concurrently-firing job
+        # resolved HERMES_HOME/scripts/<name> under THIS profile. Measured
+        # 2026-08-19/20: 8 "Script not found" failures across 6 jobs, all under
+        # profiles/financier, all concurrent with a financier-profile job, each
+        # collecting nothing while still reporting last_status=ok.
+        #
+        # The global remains a TEST/monkeypatch hook (see _get_hermes_home) --
+        # it is simply never written from the job path any more.
         override_token = set_hermes_home_override(profile_home)
-        _hermes_home = profile_home
         logger.info(
             "Job '%s': using Hermes profile '%s' (%s)",
             job_id,
@@ -1738,7 +1778,6 @@ def _job_profile_context(job_id: str, profile: Optional[str]):
         )
         yield normalized_profile
     finally:
-        _hermes_home = prior_override
         if override_token is not None:
             reset_hermes_home_override(override_token)
         # Delta-based restore: remove added keys, restore changed keys.
@@ -4633,7 +4672,16 @@ def _run_job_impl(
     # acquire) and is a no-op for workdir-less jobs (they never mutate the env).
     _prior_terminal_cwd = os.environ.get("TERMINAL_CWD", "_UNSET_")
 
-    _holds_cwd_write = _job_workdir is not None
+    # Writer status is NOT "has a workdir" — it is "overrides process-global
+    # state", which a profile job does too (see _job_mutates_process_globals).
+    # Keying on workdir alone let a profile job take the lock as a reader and
+    # run beside the parallel pool while its Hermes-home override was live.
+    # `job` is used rather than `_job_workdir` so a workdir that vanished
+    # between validation and now still degrades to reader for the CWD half,
+    # while the profile half is judged on its own.
+    _holds_cwd_write = _job_workdir is not None or bool(
+        (job.get("profile") or "").strip()
+    )
     if _holds_cwd_write:
         _terminal_cwd_lock.acquire_write()
     else:
@@ -6205,13 +6253,17 @@ def tick(
         # stay parallel-safe.
         # (Fork's Guard #3 in-flight release above is preserved; upstream's
         # workdir+profile partition supersedes the fork's workdir-only pass.)
+        # Same predicate the readers-writer lock uses — see
+        # _job_mutates_process_globals. These were duplicated literals and
+        # drifted (partition: workdir OR profile; lock: workdir alone), which is
+        # exactly how profile jobs came to race the parallel pool.
         sequential_jobs = [
             j for j in due_jobs
-            if (j.get("workdir") or "").strip() or (j.get("profile") or "").strip()
+            if _job_mutates_process_globals(j)
         ]
         parallel_jobs = [
             j for j in due_jobs
-            if not ((j.get("workdir") or "").strip() or (j.get("profile") or "").strip())
+            if not _job_mutates_process_globals(j)
         ]
 
         _results: list = []
