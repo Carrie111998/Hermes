@@ -54,7 +54,7 @@ Everything goes through the `terminal` tool as an HTTPS call. Scrape one page to
 
 ```bash
 curl -sS https://api.hydrafetch.com/v1/web/scrape \
-  -H "Authorization: Bearer $HYDRAFETCH_API_KEY" \
+  -H "X-API-Key: $HYDRAFETCH_API_KEY" \
   -H 'content-type: application/json' \
   -d '{"url":"https://example.com/article","formats":["markdown"]}' \
 | jq -r '.data.markdown'
@@ -86,7 +86,7 @@ Base URL `https://api.hydrafetch.com`. Full spec at <https://api.hydrafetch.com/
 
    ```bash
    curl -sS https://api.hydrafetch.com/v1/web/map \
-     -H "Authorization: Bearer $HYDRAFETCH_API_KEY" \
+     -H "X-API-Key: $HYDRAFETCH_API_KEY" \
      -H 'content-type: application/json' \
      -d '{"url":"https://example.com"}' | jq -r '.data.links[]'
    ```
@@ -95,7 +95,7 @@ Base URL `https://api.hydrafetch.com`. Full spec at <https://api.hydrafetch.com/
 
    ```bash
    curl -sS https://api.hydrafetch.com/v1/web/extract \
-     -H "Authorization: Bearer $HYDRAFETCH_API_KEY" \
+     -H "X-API-Key: $HYDRAFETCH_API_KEY" \
      -H 'content-type: application/json' \
      -d '{"urls":["https://example.com/product/1"],
           "schema":{"type":"object","properties":{
@@ -106,13 +106,13 @@ Base URL `https://api.hydrafetch.com`. Full spec at <https://api.hydrafetch.com/
 
    ```bash
    JOB=$(curl -sS https://api.hydrafetch.com/v1/web/batch \
-     -H "Authorization: Bearer $HYDRAFETCH_API_KEY" \
+     -H "X-API-Key: $HYDRAFETCH_API_KEY" \
      -H 'content-type: application/json' \
      -d '{"urls":["https://a.example/1","https://a.example/2"],
           "scrapeOptions":{"formats":["markdown"]}}' | jq -r '.batchId')
 
    curl -sS "https://api.hydrafetch.com/v1/web/batch/$JOB" \
-     -H "Authorization: Bearer $HYDRAFETCH_API_KEY" | jq '.data.status'
+     -H "X-API-Key: $HYDRAFETCH_API_KEY" | jq '.data.status'
    ```
 
    Both `batch` and `crawl` accept a `webhook` if you would rather be told than poll.
@@ -132,7 +132,7 @@ Base URL `https://api.hydrafetch.com`. Full spec at <https://api.hydrafetch.com/
 
 ```bash
 curl -sS https://api.hydrafetch.com/v1/web/scrape \
-  -H "Authorization: Bearer $HYDRAFETCH_API_KEY" \
+  -H "X-API-Key: $HYDRAFETCH_API_KEY" \
   -H 'content-type: application/json' \
   -d '{"url":"https://example.com","formats":["markdown"]}' \
 | jq -e '.data.markdown | length > 0'
