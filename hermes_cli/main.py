@@ -2681,6 +2681,7 @@ def _launch_tui(
     pass_session_id: bool = False,
     max_turns: Optional[int] = None,
     accept_hooks: bool = False,
+    incognito: bool = False,
 ):
     """Replace current process with the TUI."""
     tui_dir = PROJECT_ROOT / "ui-tui"
@@ -2691,6 +2692,12 @@ def _launch_tui(
     # the single factory; keep secrets (the TUI/agent needs provider creds).
     from tools.environments.local import build_subprocess_env
     env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=True)
+    # Incognito is an explicit in-process value. Only expose it through the
+    # child environment because the TUI gateway is a separate process; never
+    # mutate the supervisor's os.environ.
+    env.pop("HERMES_INCOGNITO", None)
+    if incognito:
+        env["HERMES_INCOGNITO"] = "1"
     try:
         from hermes_cli.config import apply_terminal_config_to_env
         apply_terminal_config_to_env(env=env)
@@ -3161,12 +3168,6 @@ def cmd_chat(args):
     if getattr(args, "ignore_rules", False):
         os.environ["HERMES_IGNORE_RULES"] = "1"
 
-    # --incognito: disable persistent memory and conversation persistence.
-    # The agent receives the explicit flag below; the environment marker also
-    # lets relaunch/TUI paths preserve the invocation-level mode.
-    if getattr(args, "incognito", False):
-        os.environ["HERMES_INCOGNITO"] = "1"
-
     # --source: tag session source for filtering (e.g. 'tool' for third-party integrations)
     if getattr(args, "source", None):
         os.environ["HERMES_SESSION_SOURCE"] = args.source
@@ -3191,6 +3192,7 @@ def cmd_chat(args):
             pass_session_id=getattr(args, "pass_session_id", False),
             max_turns=getattr(args, "max_turns", None),
             accept_hooks=getattr(args, "accept_hooks", False),
+            incognito=getattr(args, "incognito", False),
         )
 
     # Import and run the CLI

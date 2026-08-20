@@ -1,6 +1,7 @@
 """Tests for the CLI incognito mode contract."""
 
 import hashlib
+import os
 import sys
 from unittest.mock import MagicMock
 
@@ -357,3 +358,92 @@ def test_real_cli_chat_keeps_existing_storage_unchanged(monkeypatch, tmp_path):
     assert not sessions_dir.exists() or not list(sessions_dir.glob("*"))
     agent.commit_memory_session.assert_not_called()
     assert getattr(agent, "_memory_manager", None) is None or not agent._memory_manager.mock_calls
+
+
+def test_cmd_chat_does_not_leak_incognito_between_calls(monkeypatch, tmp_path):
+    """A later in-process CLI call must not inherit an earlier incognito run."""
+    hermes_home = tmp_path / "hm"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HERMES_INCOGNITO", raising=False)
+
+    from hermes_cli import main as main_mod
+
+    parser, _subparsers, chat_parser = build_top_level_parser()
+    chat_parser.set_defaults(func=main_mod.cmd_chat)
+    incognito_args = parser.parse_args(
+        ["chat", "--incognito", "-q", "temporary prompt", "--model", "test-model"]
+    )
+    normal_args = parser.parse_args(
+        ["chat", "-q", "ordinary prompt", "--model", "test-model"]
+    )
+
+    monkeypatch.setattr(main_mod, "_resolve_use_tui", lambda _args: False)
+    monkeypatch.setattr(main_mod, "_has_any_provider_configured", lambda: True)
+    monkeypatch.setattr(main_mod, "_sync_bundled_skills_for_startup", lambda: None)
+    monkeypatch.setattr(main_mod, "_termux_should_prefetch_update_check", lambda: False)
+    monkeypatch.setattr(main_mod, "_prepare_agent_startup", lambda _args: None)
+    monkeypatch.setattr(main_mod, "_confirm_startup_expensive_model_override", lambda _args: None)
+    monkeypatch.setattr("cli.HermesCLI._ensure_runtime_credentials", lambda self: True)
+    monkeypatch.setattr("cli.HermesCLI._claim_active_session", lambda self, *a, **k: True)
+    monkeypatch.setattr("cli.HermesCLI._install_tool_callbacks", lambda self: None)
+    monkeypatch.setattr("cli.HermesCLI._ensure_tirith_security", lambda self: None)
+    monkeypatch.setattr(
+        "hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build",
+        lambda **_kwargs: None,
+    )
+
+    agents = []
+    for response in ("temporary response", "ordinary response"):
+        agent = MagicMock()
+        agent._memory_manager = None
+        agent.commit_memory_session = MagicMock()
+        agent.run_conversation.return_value = {
+            "final_response": response,
+            "messages": [],
+            "api_calls": 1,
+            "completed": True,
+        }
+        agents.append(agent)
+    agent_factory = MagicMock(side_effect=agents)
+    monkeypatch.setattr("cli.AIAgent", agent_factory)
+
+    main_mod.cmd_chat(incognito_args)
+    assert agent_factory.call_args_list[0].kwargs["incognito"] is True
+    assert "HERMES_INCOGNITO" not in os.environ
+
+    main_mod.cmd_chat(normal_args)
+    assert agent_factory.call_args_list[1].kwargs["incognito"] is False
+    assert "HERMES_INCOGNITO" not in os.environ
+
+
+def test_launch_tui_passes_incognito_only_to_child_environment(monkeypatch, tmp_path):
+    """TUI receives incognito via its child env, never the parent process."""
+    from hermes_cli import main as main_mod
+    from tools.environments import local as local_environment
+
+    monkeypatch.delenv("HERMES_INCOGNITO", raising=False)
+    monkeypatch.setattr(
+        local_environment,
+        "build_subprocess_env",
+        lambda **_kwargs: {"HERMES_INCOGNITO": "stale"},
+    )
+    monkeypatch.setattr(main_mod, "_apply_tui_python_env", lambda _env: None)
+    monkeypatch.setattr(main_mod, "_make_tui_argv", lambda *_args: (["node"], tmp_path))
+    monkeypatch.setattr(main_mod, "_print_tui_exit_summary", lambda *_args: None)
+    monkeypatch.setattr(main_mod.subprocess, "call", lambda *_args, **_kwargs: 0)
+
+    child_envs = []
+    monkeypatch.setattr(
+        main_mod.subprocess,
+        "call",
+        lambda _argv, **kwargs: (child_envs.append(kwargs["env"]) or 0),
+    )
+
+    for incognito in (True, False):
+        with pytest.raises(SystemExit) as exc_info:
+            main_mod._launch_tui(incognito=incognito)
+        assert exc_info.value.code == 0
+
+    assert child_envs[0]["HERMES_INCOGNITO"] == "1"
+    assert "HERMES_INCOGNITO" not in child_envs[1]
+    assert "HERMES_INCOGNITO" not in os.environ
