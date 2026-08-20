@@ -16,11 +16,33 @@ computed for.
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+
+
+# These tests need two real OS processes: one that has already exited (to stand
+# in for a crashed worker's pid) and one that stays alive (for the worker that
+# still owns the claim). They used to spawn the POSIX binaries ``true`` and
+# ``sleep``, which on Windows resolve only when Git/MSYS's ``usr/bin`` happens to
+# be on PATH. Any earlier test in the same process that narrowed or blanked PATH
+# therefore turned these into ``FileNotFoundError: [WinError 2]`` -- a pollution
+# artifact that says nothing about the reclaim logic under test. Spawning the
+# running interpreter needs no PATH lookup, so the outcome no longer depends on
+# what ran before.
+def _spawn_dead_worker() -> subprocess.Popen:
+    """A process that has already exited, for use as a dead worker's pid."""
+    proc = subprocess.Popen([sys.executable, "-c", ""])
+    proc.wait()
+    return proc
+
+
+def _spawn_live_worker() -> subprocess.Popen:
+    """A process that stays alive until terminated, for a live worker's pid."""
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
 
 
 @pytest.fixture
@@ -58,8 +80,7 @@ def test_stale_crash_reset_rejected_for_reclaimed_task(conn):
 
     # Worker A claims, then dies.
     kb.claim_task(conn, tid, claimer=f"{host}:A")
-    dead = subprocess.Popen(["true"])
-    dead.wait()
+    dead = _spawn_dead_worker()
     kb._set_worker_pid(conn, tid, dead.pid)
     old = conn.execute(
         "SELECT claim_lock, worker_pid FROM tasks WHERE id=?", (tid,)
@@ -73,7 +94,7 @@ def test_stale_crash_reset_rejected_for_reclaimed_task(conn):
     )
     conn.commit()
     kb.claim_task(conn, tid, claimer=f"{host}:B")
-    sleeper = subprocess.Popen(["sleep", "30"])
+    sleeper = _spawn_live_worker()
     try:
         kb._set_worker_pid(conn, tid, sleeper.pid)
 
@@ -103,8 +124,7 @@ def test_genuine_crash_still_reclaims(conn):
     host = kb._claimer_id().split(":", 1)[0]
     tid = kb.create_task(conn, title="legit", assignee="w")
     kb.claim_task(conn, tid, claimer=f"{host}:A")
-    dead = subprocess.Popen(["true"])
-    dead.wait()
+    dead = _spawn_dead_worker()
     kb._set_worker_pid(conn, tid, dead.pid)
     # Rewind started_at so the launch grace window doesn't skip the check.
     conn.execute("UPDATE tasks SET started_at = started_at - 9999 WHERE id=?", (tid,))
