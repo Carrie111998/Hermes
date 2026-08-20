@@ -1201,6 +1201,7 @@ def cronjob(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    delivery_choices: Optional[List[str]] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1301,6 +1302,7 @@ def cronjob(
                     attach_to_session=attach_to_session,
                     monitor_script=_normalize_optional_job_value(monitor_script),
                     monitor_url=_normalize_optional_job_value(monitor_url),
+                    delivery_choices=delivery_choices or None,
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1567,6 +1569,8 @@ def cronjob(
                 updates["enabled_toolsets"] = enabled_toolsets or None
             if attach_to_session is not None:
                 updates["attach_to_session"] = bool(attach_to_session)
+            if delivery_choices is not None:
+                updates["delivery_choices"] = delivery_choices or None
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
@@ -1736,6 +1740,11 @@ Scheduling from cron-run sessions is disabled by default and enabled via cron.al
             "attach_to_session": {
                 "type": "boolean",
                 "description": "When True, this job becomes CONTINUABLE: the user can reply to its delivery and the agent has the brief in context instead of asking 'what is that?'. On thread-capable platforms (Telegram topics, Discord/Slack threads) a dedicated thread is opened for the job and its replies; on DM-only platforms (WhatsApp/Signal) the brief is mirrored into the origin DM session. Use this for conversational recurring jobs the user will reply to — daily briefings, reminders that kick off follow-up work. Leave unset for fire-and-forget alerts/watchdogs. Overrides the global cron.mirror_delivery config for this one job. Only the origin chat is touched (never fan-out targets); no effect when deliver='local'."
+            },
+            "delivery_choices": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional fallback action-button labels for Telegram (and other adapters that implement send_delivery_choices). Attached to the cron delivery itself — the worker does not call clarify and does not wait. A tap becomes a user turn in the continuable session. The agent's final response may instead end with a last-line {\"delivery_choices\": [...]} envelope (that wins). On update, pass an empty array to clear. No effect when deliver='local'."
             },
         },
         "required": ["action"]

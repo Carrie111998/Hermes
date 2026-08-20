@@ -2254,6 +2254,34 @@ class TestCronDeliveryMirror:
         assert "Cronjob Response:" not in mirrored_text
         assert "To stop or manage this job" not in mirrored_text
 
+    def test_delivery_strips_choices_envelope_from_mirror(self):
+        """Last-line delivery_choices JSON is not shown to the user."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
+             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+            job = {
+                "id": "test-job",
+                "name": "bank-queue",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+                "attach_to_session": True,
+            }
+            _deliver_result(
+                job,
+                'Vercel 163,32\n{"delivery_choices": ["vis bilag", "spring over"]}',
+            )
+
+        mirrored_text = mirror_mock.call_args[0][2]
+        assert "Vercel 163,32" in mirrored_text
+        assert "delivery_choices" not in mirrored_text
+
 
     # --- origin-scoping (mirror only into the conversation that created the job) ---
 

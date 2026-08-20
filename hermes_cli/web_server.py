@@ -12499,6 +12499,8 @@ def _normalize_dashboard_cron_updates(
         normalized["context_from"] = _cron_string_list(normalized["context_from"])
     if "enabled_toolsets" in normalized:
         normalized["enabled_toolsets"] = _cron_string_list(normalized["enabled_toolsets"])
+    if "delivery_choices" in normalized:
+        normalized["delivery_choices"] = _cron_string_list(normalized["delivery_choices"])
     return normalized
 
 
@@ -12851,6 +12853,7 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
             enabled_toolsets=_cron_string_list(body.enabled_toolsets),
             workdir=_cron_optional_text(body.workdir),
             no_agent=no_agent,
+            delivery_choices=_cron_string_list(body.delivery_choices) or None,
         )
     except HTTPException:
         raise
