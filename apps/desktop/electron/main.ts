@@ -149,11 +149,14 @@ import {
 import { createFirstRunSetupGate } from './first-run-setup-gate'
 import { registerFsIpc } from './fs-ipc'
 import {
+  contentLengthExceedsLimit,
   filenameFromContentDisposition,
+  GATEWAY_DOWNLOAD_MAX_BYTES,
+  GatewayDownloadTooLargeError,
   gatewayFilePath,
   isNotFoundError,
   parseDataUrlToBuffer,
-  pumpStreamToFile
+  pumpStreamToFileAtomically
 } from './gateway-file-download'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { registerGitIpc } from './git-ipc'
@@ -1227,7 +1230,8 @@ function registerMediaProtocol() {
         bypassCustomProtocolHandlers: true,
         credentials: 'omit',
         headers,
-        method
+        method,
+        redirect: 'error'
       }),
     fetchRemoteWithCookies: (url, headers, method) => {
       const oauthSession = getOauthSession()
@@ -1240,7 +1244,8 @@ function registerMediaProtocol() {
         bypassCustomProtocolHandlers: true,
         credentials: 'include',
         headers,
-        method
+        method,
+        redirect: 'error'
       })
     },
     resolveLocalFile: async filePath => {
@@ -5399,7 +5404,7 @@ async function resourceBufferFromUrl(rawUrl) {
   })
 }
 
-async function saveImageFromUrl(rawUrl) {
+async function saveImageFromUrl(rawUrl, ctx: any = {}) {
   const { buffer, mimeType } = (await resourceBufferFromUrl(rawUrl)) as any
   const extension = extensionForMimeType(mimeType) || '.png'
   // Generated-image URLs (fal.media etc.) usually end in an extensionless
@@ -5417,7 +5422,7 @@ async function saveImageFromUrl(rawUrl) {
     // Downloads directory to offer.
   }
 
-  const result = await dialog.showSaveDialog(mainWindow, {
+  const result = await dialog.showSaveDialog(ctx.window ?? mainWindow, {
     title: 'Save Image',
     defaultPath: downloadsDir ? path.join(downloadsDir, fallbackName) : fallbackName,
     filters: [
@@ -7195,6 +7200,17 @@ function downloadViaOauthSessionToFile(url, ctx, options: any = {}) {
 // destination. On an HTTP error the status code is attached so saveGatewayFile
 // can trigger the 404-only compatibility fallback.
 async function finalizeGatewayDownload(res, statusCode, headers, ctx: any = {}) {
+  // Redirects cross the gateway boundary: neither transport follows them
+  // automatically, and a 3xx body (typically an interstitial login page) must
+  // never be saved as the requested file.
+  if (statusCode >= 300 && statusCode < 400) {
+    const location = headers.location || headers.Location || ''
+    const error: any = new Error(`Unexpected gateway redirect (${statusCode}${location ? ` → ${location}` : ''})`)
+    error.statusCode = statusCode
+    ctx.abort?.()
+    throw error
+  }
+
   if (statusCode >= 400) {
     const message = await readGatewayErrorText(res)
     const error: any = new Error(`${statusCode}: ${message}`)
@@ -7202,10 +7218,17 @@ async function finalizeGatewayDownload(res, statusCode, headers, ctx: any = {}) 
     throw error
   }
 
+  // Fail fast on an announced over-limit body, before the user picks a
+  // destination. The streamed byte count is still enforced during the pump.
+  if (contentLengthExceedsLimit(headers, GATEWAY_DOWNLOAD_MAX_BYTES)) {
+    ctx.abort?.()
+    throw new GatewayDownloadTooLargeError()
+  }
+
   const disposition = headers['content-disposition'] || headers['Content-Disposition']
   const filename = filenameFromContentDisposition(disposition) || ctx.suggested || ctx.fallbackName
 
-  const result = await dialog.showSaveDialog(mainWindow, {
+  const result = await dialog.showSaveDialog(ctx.window ?? mainWindow, {
     defaultPath: filename,
     title: 'Save File'
   })
@@ -7217,10 +7240,18 @@ async function finalizeGatewayDownload(res, statusCode, headers, ctx: any = {}) 
   }
 
   try {
-    await pumpStreamToFile(res, result.filePath, {
-      createWriteStream: (destPath: string) => fs.createWriteStream(destPath),
-      unlink: (destPath: string) => fs.promises.unlink(destPath)
-    })
+    await pumpStreamToFileAtomically(
+      res,
+      result.filePath,
+      {
+        createWriteStream: (destPath: string) => fs.createWriteStream(destPath),
+        mkdtemp: (prefix: string) => fs.promises.mkdtemp(prefix),
+        rename: (oldPath: string, newPath: string) => fs.promises.rename(oldPath, newPath),
+        rm: (target: string, options: { force: boolean; recursive: boolean }) => fs.promises.rm(target, options),
+        unlink: (destPath: string) => fs.promises.unlink(destPath)
+      },
+      GATEWAY_DOWNLOAD_MAX_BYTES
+    )
   } catch (error) {
     ctx.abort?.()
     throw error
@@ -7250,7 +7281,7 @@ function readGatewayErrorText(res): Promise<string> {
   })
 }
 
-async function saveGatewayFile(payload: any = {}) {
+async function saveGatewayFile(payload: any = {}, ctx: any = {}) {
   const filePath = gatewayFilePath(payload.path)
 
   if (!filePath) {
@@ -7261,7 +7292,7 @@ async function saveGatewayFile(payload: any = {}) {
   const connection = await ensureBackend(profile)
   const suggested = String(payload.suggestedName || '').trim()
   const fallbackName = path.basename(filePath) || suggested || 'download'
-  const ctx = { suggested, fallbackName }
+  const downloadCtx = { ...ctx, suggested, fallbackName }
 
   const requestPath = pathWithGlobalRemoteProfile(
     `/api/fs/download?path=${encodeURIComponent(filePath)}`,
@@ -7273,14 +7304,14 @@ async function saveGatewayFile(payload: any = {}) {
 
   try {
     return await (connection.authMode === 'oauth'
-      ? downloadViaOauthSessionToFile(url, ctx)
-      : downloadViaTokenToFile(url, connection.token, ctx))
+      ? downloadViaOauthSessionToFile(url, downloadCtx)
+      : downloadViaTokenToFile(url, connection.token, downloadCtx))
   } catch (error) {
     // Desktop and the remote gateway update independently. A gateway predating
     // /api/fs/download 404s here; fall back (ONLY on 404) to the older capped
     // data-URL route so downloads keep working against older backends.
     if (isNotFoundError(error)) {
-      return await saveGatewayFileViaDataUrl(connection, profile, filePath, ctx)
+      return await saveGatewayFileViaDataUrl(connection, profile, filePath, downloadCtx)
     }
 
     throw error
@@ -7313,7 +7344,7 @@ async function saveGatewayFileViaDataUrl(connection, profile, filePath, ctx: any
   const buffer = parseDataUrlToBuffer(dataUrl)
   const filename = ctx.suggested || ctx.fallbackName
 
-  const result = await dialog.showSaveDialog(mainWindow, {
+  const result = await dialog.showSaveDialog(ctx.window ?? mainWindow, {
     defaultPath: filename,
     title: 'Save File'
   })
@@ -13658,8 +13689,8 @@ ipcMain.handle('hermes:writeClipboard', (_event, text) => {
 
 // Native save-location picker (profile export etc.) — the write itself happens
 // elsewhere (the backend, for profile archives); this only picks the path.
-ipcMain.handle('hermes:selectSavePath', async (_event, options: any = {}) => {
-  const result = await dialog.showSaveDialog(mainWindow, {
+ipcMain.handle('hermes:selectSavePath', async (event, options: any = {}) => {
+  const result = await dialog.showSaveDialog(BrowserWindow.fromWebContents(event.sender) ?? mainWindow, {
     title: options?.title || 'Save',
     defaultPath: options?.defaultPath ? String(options.defaultPath) : undefined,
     filters: Array.isArray(options?.filters) ? options.filters : undefined
@@ -13678,9 +13709,16 @@ ipcMain.handle('hermes:selectSavePath', async (_event, options: any = {}) => {
 // canvas. The main process has no such gate.
 ipcMain.handle('hermes:readClipboard', () => clipboard.readText())
 
-ipcMain.handle('hermes:saveGatewayFile', (_event, payload) => saveGatewayFile(payload))
+// The save dialog must be modal to the window the download was triggered
+// from — binding to the global mainWindow strands the prompt behind secondary
+// session windows and leaks the interaction across windows.
+ipcMain.handle('hermes:saveGatewayFile', (event, payload) =>
+  saveGatewayFile(payload, { window: BrowserWindow.fromWebContents(event.sender) ?? mainWindow })
+)
 
-ipcMain.handle('hermes:saveImageFromUrl', (_event, url) => saveImageFromUrl(String(url || '')))
+ipcMain.handle('hermes:saveImageFromUrl', (event, url) =>
+  saveImageFromUrl(String(url || ''), { window: BrowserWindow.fromWebContents(event.sender) ?? mainWindow })
+)
 
 // The custom context menu's edit verbs. They act on the SENDER's focused
 // element, so the renderer restores focus to the editable before invoking.
