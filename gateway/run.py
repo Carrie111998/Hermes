@@ -22363,10 +22363,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reply_to_message_id=reply_to_message_id or getattr(source, "message_id", None),
         )
         if getattr(source, "platform", None) == Platform.SLACK:
+            # Per-turn egress identity (R3-5, connector PR gateway-gateway#210).
+            # Slack's chat.startStream requires recipient_user_id (+
+            # recipient_team_id) when streaming to a channel, and the relay
+            # connector fills those from metadata.user_id / metadata.scope_id.
+            # The relay adapter's _with_scope fallback resolves BOTH from
+            # per-chat caches keyed only by chat_id — mutable state that a
+            # CONCURRENT turn overwrites: two users with overlapping turns in
+            # one channel would open U1's stream with U2 as the recipient.
+            # Stamp the authentic per-turn values from THIS turn's source here,
+            # where they are still turn-scoped; _with_scope only fills keys
+            # that are absent, so the cache degrades to what it should be — a
+            # restart/synthetic-send fallback.
             team_id = getattr(source, "scope_id", None)
-            if team_id:
+            user_id = getattr(source, "user_id", None)
+            if team_id or user_id:
                 metadata = dict(metadata or {})
-                metadata["slack_team_id"] = str(team_id)
+                if team_id:
+                    metadata["slack_team_id"] = str(team_id)
+                    metadata.setdefault("scope_id", str(team_id))
+                if user_id:
+                    metadata.setdefault("user_id", str(user_id))
         return metadata
 
     def _thread_metadata_for_target(
