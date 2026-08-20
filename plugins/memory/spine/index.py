@@ -230,6 +230,7 @@ class MemoryIndex:
     def __init__(self, db_path: str):
         self._db_path = Path(db_path)
         self._conn: Optional[sqlite3.Connection] = None
+        self._canonical_root: Optional[str] = None
         # (signature, ids, blobs, stacked_matrix) — see _wiki_vectors
         self._wiki_cache: Optional[Tuple[Any, List[str], List[Any], Any]] = None
 
@@ -409,10 +410,56 @@ class MemoryIndex:
         )
 
     def update_status(self, obs_id: str, status: str) -> None:
-        """Update observation status."""
+        """Update observation status in the DB AND the canonical JSONL.
+
+        Status used to live only in the DB. Because rebuild-index.py rebuilds
+        the table from the JSONL, that made a rebuild silently destructive: it
+        reverted every demotion, flipped those rows back to 'active', and the
+        next promote pass re-inflated the MEMORY.md hot core. 147 rows had
+        drifted by the time it was found.
+
+        The canonical store is append-only, so the write-back is a patch line,
+        which load_observations() already merges in order.
+        """
         self.conn.execute(
             "UPDATE observations SET status=? WHERE id=?", (status, obs_id)
         )
+        self._write_back_status(obs_id, status)
+
+    def _write_back_status(self, obs_id: str, status: str) -> None:
+        row = self.conn.execute(
+            "SELECT profile FROM observations WHERE id=?", (obs_id,)).fetchone()
+        if not row:
+            return
+        path = self._canonical_jsonl(row[0])
+        if not path or not os.path.exists(path):
+            # No canonical file means nothing to keep in step. Never create one
+            # here: a status patch is not a place to invent a store.
+            return
+        try:
+            from .jsonl_writer import JSONLWriter
+            JSONLWriter(path).append({
+                "id": obs_id,
+                "patch": {"status": status},
+                "ts": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception as e:  # noqa: BLE001
+            # The DB write already landed. Losing the write-back is a drift bug,
+            # not a data-loss bug, and the heartbeat's `divergence` check counts
+            # exactly this. Log it rather than failing the consolidation run.
+            logger.warning("status write-back failed for %s: %s", obs_id, e)
+
+    def _canonical_jsonl(self, profile: str) -> Optional[str]:
+        if self._canonical_root is None:
+            try:
+                from .config import load_spine_config
+                self._canonical_root = os.path.expanduser(
+                    load_spine_config().canonical_root)
+            except Exception:  # noqa: BLE001
+                self._canonical_root = ""
+        if not self._canonical_root:
+            return None
+        return os.path.join(self._canonical_root, "observations", f"{profile}.jsonl")
 
     def delete_observation(self, obs_id: str) -> None:
         """Remove an observation (FTS5 trigger handles cleanup)."""
