@@ -1,5 +1,13 @@
 import { useStore } from '@nanostores/react'
-import { Children, type CSSProperties, type ReactNode, type PointerEvent as ReactPointerEvent, useEffect, useRef, useState } from 'react'
+import {
+  Children,
+  type CSSProperties,
+  type ReactNode,
+  type PointerEvent as ReactPointerEvent,
+  useEffect,
+  useRef,
+  useState
+} from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
@@ -9,7 +17,13 @@ import { Switch } from '@/components/ui/switch'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
-import { $paneHeightOverride, $paneState, $paneWidthOverride, setPaneHeightOverride, setPaneWidthOverride } from '@/store/panes'
+import {
+  $paneHeightOverride,
+  $paneState,
+  $paneWidthOverride,
+  setPaneHeightOverride,
+  setPaneWidthOverride
+} from '@/store/panes'
 
 // Monospace capability chip (tool name, transport, …). Shared by the Skills
 // and MCP tabs so the pill reads identically everywhere.
@@ -435,7 +449,11 @@ export function CapRow({
   return (
     <div
       className={cn(
-        'group/row row-hover flex w-full shrink-0 items-center rounded-md hover:text-foreground',
+        // content-visibility:auto lets the browser skip layout/paint for
+        // offscreen rows — the Capabilities lists routinely hold 80+ entries.
+        // Row height is already fixed (h-8/h-11), so skipped rows keep their
+        // exact size and scrollbar geometry never jumps.
+        'group/row row-hover flex w-full shrink-0 items-center rounded-md [content-visibility:auto] hover:text-foreground',
         subtitle ? 'h-11' : 'h-8',
         active ? 'bg-(--ui-row-active-background) text-foreground' : 'text-(--ui-text-secondary)'
       )}
