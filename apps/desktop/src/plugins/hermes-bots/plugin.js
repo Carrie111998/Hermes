@@ -9737,7 +9737,12 @@ function BotsPane() {
 
   const groupChatMembers = groupChatName ? groupChatMemberBots(groupChatName, roster, allMeta) : []
 
-  if (groupChatName && groupChatMembers.length) {
+  // Render the in-panel room ONLY as the fallback for desktops without the
+  // main-window door. When openGroupChat succeeded via host.openWorkspace the
+  // room already lives in a main tab (tracked in groupChatMainTabs) — painting
+  // it here too produced two live panes with independent drafts driving one
+  // shared engine (#89788). The atom stays set so the roster row highlights.
+  if (groupChatName && groupChatMembers.length && !groupChatMainTabs.has(groupChatName)) {
     return jsx(GroupChatWorkspace, { group: groupChatName, members: groupChatMembers })
   }
 
