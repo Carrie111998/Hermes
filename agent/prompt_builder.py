@@ -2154,9 +2154,11 @@ def _build_skills_system_prompt_inner(
         result = (
             "## Available skills\n"
             "Review the index before acting. Load a skill with skill_view(name) when its "
-            "description directly matches the user's request or a tool needed to complete it, "
-            "then read and follow that skill fully. Do not load skills merely because they are "
-            "partially relevant, and do not treat workflow skills as automatic prerequisites.\n"
+            "description matches the user's request, a tool needed to complete it, or is "
+            "partially relevant to the workflow, then read and follow that skill fully. "
+            "Err on the side of loading supporting skills so established steps, pitfalls, "
+            "and user conventions are not missed. Do not treat every listed skill as an "
+            "automatic prerequisite.\n"
             "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
             "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
             "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
@@ -2169,7 +2171,7 @@ def _build_skills_system_prompt_inner(
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
             "\n"
-            "Proceed without loading a skill when none directly match the task."
+            "Proceed without loading a skill only when genuinely none are relevant to the task."
             + hidden_note
         )
 

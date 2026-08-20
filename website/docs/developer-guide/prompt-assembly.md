@@ -87,9 +87,10 @@ would do or plan to do without actually doing it.
 
 # Layer 7: Skills index
 ## Available skills
-Review the skills below. If one directly matches the request or a
-tool needed for it, load it with skill_view(name) and follow it fully.
-Do not treat partially relevant workflow skills as prerequisites.
+Review the skills below. If one matches the request, a tool needed for it,
+or is partially relevant to the workflow, load it with skill_view(name) and
+follow it fully. Err on the side of loading supporting skills, but do not
+treat every listed skill as an automatic prerequisite.
 ...
 <available_skills>
   software-development:
