@@ -18,7 +18,7 @@ vi.mock('@/i18n', () => ({
           sessionDensityComfortable: 'Comfortable',
           sessionDensityDesc: 'Choose how much context appears beneath session titles in the sidebar.',
           sessionDensityDetailed: 'Detailed',
-          sessionDensityPreview: 'Hold to preview your current session list',
+          sessionDensityPreview: 'Preview current session list. Hold to keep open.',
           sessionDensityTitle: 'Session List Density'
         }
       }
@@ -62,7 +62,7 @@ describe('SessionDensitySetting', () => {
 
   it('keeps the overlay ghosted for the duration of a pointer hold', () => {
     render(<SessionDensitySetting />)
-    const preview = screen.getByRole('button', { name: 'Hold to preview your current session list' })
+    const preview = screen.getByRole('button', { name: 'Preview current session list. Hold to keep open.' })
 
     fireEvent.pointerDown(preview, { button: 0, pointerId: 1 })
     expect($overlayPeek.get()).toBe(1)
@@ -76,7 +76,7 @@ describe('SessionDensitySetting', () => {
 
   it('turns a quick pointer tap into a bounded preview', () => {
     render(<SessionDensitySetting />)
-    const preview = screen.getByRole('button', { name: 'Hold to preview your current session list' })
+    const preview = screen.getByRole('button', { name: 'Preview current session list. Hold to keep open.' })
 
     fireEvent.pointerDown(preview, { button: 0, pointerId: 1 })
     fireEvent.pointerUp(preview, { button: 0, pointerId: 1 })
@@ -90,7 +90,7 @@ describe('SessionDensitySetting', () => {
 
   it('supports a keyboard hold without counting key repeat twice', () => {
     render(<SessionDensitySetting />)
-    const preview = screen.getByRole('button', { name: 'Hold to preview your current session list' })
+    const preview = screen.getByRole('button', { name: 'Preview current session list. Hold to keep open.' })
 
     fireEvent.keyDown(preview, { key: ' ', repeat: false })
     fireEvent.keyDown(preview, { key: ' ', repeat: true })
@@ -110,7 +110,7 @@ describe('SessionDensitySetting', () => {
 
   it('turns a quick keyboard tap into one bounded preview', () => {
     render(<SessionDensitySetting />)
-    const preview = screen.getByRole('button', { name: 'Hold to preview your current session list' })
+    const preview = screen.getByRole('button', { name: 'Preview current session list. Hold to keep open.' })
 
     fireEvent.keyDown(preview, { key: 'Enter', repeat: false })
     fireEvent.click(preview, { detail: 0 })
@@ -126,7 +126,7 @@ describe('SessionDensitySetting', () => {
 
   it('cancels keyboard state on blur so the next hold still works', () => {
     render(<SessionDensitySetting />)
-    const preview = screen.getByRole('button', { name: 'Hold to preview your current session list' })
+    const preview = screen.getByRole('button', { name: 'Preview current session list. Hold to keep open.' })
 
     fireEvent.keyDown(preview, { key: ' ', repeat: false })
     expect(active()).toBe(true)
@@ -145,7 +145,7 @@ describe('SessionDensitySetting', () => {
 
   it('offers a bounded preview for click and assistive activation', () => {
     render(<SessionDensitySetting />)
-    const preview = screen.getByRole('button', { name: 'Hold to preview your current session list' })
+    const preview = screen.getByRole('button', { name: 'Preview current session list. Hold to keep open.' })
 
     fireEvent.click(preview)
     expect(active()).toBe(true)
@@ -156,7 +156,7 @@ describe('SessionDensitySetting', () => {
 
   it('fails closed when the setting unmounts during a hold', () => {
     const view = render(<SessionDensitySetting />)
-    const preview = screen.getByRole('button', { name: 'Hold to preview your current session list' })
+    const preview = screen.getByRole('button', { name: 'Preview current session list. Hold to keep open.' })
 
     fireEvent.pointerDown(preview, { button: 0, pointerId: 1 })
     expect(active()).toBe(true)
