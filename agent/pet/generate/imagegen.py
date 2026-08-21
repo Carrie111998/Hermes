@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # (Nous Portal → OpenAI → OpenRouter → …). OpenRouter/Nous run a quality-first
 # model chain and may fall back depending on account access and endpoint behavior,
 # so fidelity can vary by configured backend + model availability.
-_REF_CAPABLE = ("nous", "openai", "openai-codex", "openrouter", "krea")
+_REF_CAPABLE = ("nous", "openai", "openai-codex", "openrouter", "openrouter-image-api", "krea")
 
 # Friendly display label per reference-capable provider, surfaced in the desktop
 # pet-gen picker.

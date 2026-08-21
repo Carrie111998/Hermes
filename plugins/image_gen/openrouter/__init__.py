@@ -1,22 +1,34 @@
-"""OpenRouter-compatible image generation backend (OpenRouter + Nous Portal).
+"""OpenRouter-compatible image generation backends (OpenRouter + Nous Portal).
 
-Both OpenRouter and the Nous Portal inference endpoint speak the same
-OpenAI-style ``/chat/completions`` image-generation protocol: send
-``modalities: ["image", "text"]`` with an image-output model (e.g.
-``google/gemini-3-pro-image``), pass reference images as ``image_url``
-content parts for grounding, and read the generated images back from
-``choices[0].message.images[].image_url.url`` (a ``data:image/...;base64`` URI).
+Two distinct OpenRouter API surfaces are supported by separate provider classes
+in this module:
 
-Nous Portal proxies OpenRouter, so one implementation services both — we only
-swap the resolved ``(base_url, api_key)``. Credentials are resolved through the
-agent's existing :func:`~hermes_cli.runtime_provider.resolve_runtime_provider`,
-which already understands OpenRouter's key pool and the Nous OAuth device-code
-token, so this plugin never reinvents auth.
+1. **Chat-completions image output** (``OpenRouterCompatImageProvider``)
+   — sends ``modalities: ["image", "text"]`` to ``/chat/completions`` with an
+   image-output model (e.g. ``openai/gpt-5.4-image-2``, ``google/gemini-3-pro-image``).
+   Generated images arrive as ``choices[0].message.images[].image_url.url``
+   (typically a base64 data URI). Reference images are passed as ``image_url``
+   content parts for grounding.
 
-Reference grounding is the reason pet sprite generation cares about this
-backend: each animation row must stay the same character as the chosen base
-frame, which only works on models that accept image input. Gemini Flash Image
-("nano-banana") does, so both providers advertise image-to-image support.
+2. **Dedicated Image API** (``OpenRouterImageAPIProvider``)
+   — sends text-to-image requests to ``POST /api/v1/images``, the OpenRouter
+   endpoint designed for models like ``x-ai/grok-imagine-image-2.0`` that
+   expose a pure image-generation API. Supports ``aspect_ratio``, ``resolution``,
+   ``quality``, and ``input_references`` (image-to-image, up to 3 refs).
+   Generated images arrive as ``data[i].b64_json`` in the JSON response body.
+
+Nous Portal proxies OpenRouter, so the chat-completions implementation services
+both — we only swap the resolved ``(base_url, api_key)``. Credentials are
+resolved through the agent's existing
+:func:`~hermes_cli.runtime_provider.resolve_runtime_provider`, which already
+understands OpenRouter's key pool and the Nous OAuth device-code token, so this
+plugin never reinvents auth.
+
+Reference grounding is the reason pet sprite generation cares about the
+chat-completions backend: each animation row must stay the same character as the
+chosen base frame, which only works on models that accept image input as content
+parts. The Image API backend uses ``input_references`` for image-to-image, which
+is a different mechanism.
 """
 
 from __future__ import annotations
@@ -482,7 +494,338 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
         )
 
 
-def _build_providers() -> List[OpenRouterCompatImageProvider]:
+# ---------------------------------------------------------------------------
+# OpenRouter Image API provider (dedicated /api/v1/images endpoint)
+# ---------------------------------------------------------------------------
+
+# OpenRouter Image API aspect ratios (full spec)
+_IMAGE_API_ASPECT_RATIOS = {
+    "square": "1:1",
+    "landscape": "16:9",
+    "portrait": "9:16",
+    "4:3": "4:3",
+    "3:4": "3:4",
+    "3:2": "3:2",
+    "2:3": "2:3",
+    "9:19.5": "9:19.5",
+    "19.5:9": "19.5:9",
+    "9:20": "9:20",
+    "20:9": "20:9",
+    "1:2": "1:2",
+    "2:1": "2:1",
+}
+
+_IMAGE_API_RESOLUTIONS = {"1k": "1K", "2k": "2K"}
+_IMAGE_API_DEFAULT_RESOLUTION = "1K"
+_IMAGE_API_DEFAULT_MODEL = "x-ai/grok-imagine-image-2.0"
+_IMAGE_API_QUALITY_OPTIONS = {"low", "medium"}
+
+
+class OpenRouterImageAPIProvider(ImageGenProvider):
+    """Image generation via OpenRouter's dedicated ``/api/v1/images`` endpoint.
+
+    This is the correct OpenRouter API surface for models that expose a pure
+    image-generation API (e.g. ``x-ai/grok-imagine-image-2.0``). It is a
+    separate endpoint from the chat-completions path used by
+    :class:`OpenRouterCompatImageProvider` — different request/response shapes,
+    different parameter conventions.
+    """
+
+    @property
+    def name(self) -> str:
+        return "openrouter-image-api"
+
+    @property
+    def display_name(self) -> str:
+        return "OpenRouter Image API"
+
+    def _resolve_runtime(self) -> Dict[str, str]:
+        """Resolve OpenRouter credentials via the shared runtime resolver."""
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(requested="openrouter")
+        api_key = str(runtime.get("api_key") or "").strip()
+        base_url = str(runtime.get("base_url") or "https://openrouter.ai/api/v1").strip().rstrip("/")
+        return {"api_key": api_key, "base_url": base_url}
+
+    def is_available(self) -> bool:
+        try:
+            runtime = self._resolve_runtime()
+            return bool(str(runtime.get("api_key") or "").strip())
+        except Exception:
+            return False
+
+    def get_setup_schema(self) -> Dict[str, Any]:
+        return {
+            "name": "OpenRouter Image API",
+            "badge": "paid",
+            "tag": (
+                "x-ai/grok-imagine-image-2.0 via OpenRouter's /api/v1/images endpoint; "
+                "uses OPENROUTER_API_KEY"
+            ),
+            "env_vars": [
+                {
+                    "key": "OPENROUTER_API_KEY",
+                    "prompt": "OpenRouter API key",
+                    "url": "https://openrouter.ai/keys",
+                }
+            ],
+        }
+
+    def list_models(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "id": _IMAGE_API_DEFAULT_MODEL,
+                "display": "Grok Imagine Image 2.0",
+                "speed": "~5-10s",
+                "strengths": "Latest Grok Imagine — OpenRouter Image API",
+            },
+        ]
+
+    def default_model(self) -> Optional[str]:
+        return _IMAGE_API_DEFAULT_MODEL
+
+    def capabilities(self) -> Dict[str, Any]:
+        return {
+            "modalities": ["text", "image"],
+            "max_reference_images": 3,
+        }
+
+    def _resolve_image_api_model(self) -> str:
+        """Resolve model from env, config scoped to this provider, or top-level image_gen.model."""
+        env_override = os.environ.get("OPENROUTER_IMAGES_API_MODEL", "").strip()
+        if env_override:
+            return env_override
+        cfg = _load_image_gen_config()
+        scoped = cfg.get("openrouter-image-api") if isinstance(cfg.get("openrouter-image-api"), dict) else {}
+        value = scoped.get("model") if isinstance(scoped.get("model"), str) else None
+        if value and value.strip():
+            return value.strip()
+        top = cfg.get("model")
+        if isinstance(top, str) and top.strip():
+            return top.strip()
+        return _IMAGE_API_DEFAULT_MODEL
+
+    def generate(
+        self,
+        prompt: str,
+        aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+        *,
+        image_url: Optional[str] = None,
+        reference_image_urls: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        import requests
+
+        try:
+            runtime = self._resolve_runtime()
+        except Exception as exc:
+            return error_response(
+                error=f"Could not resolve OpenRouter credentials: {exc}",
+                error_type="missing_api_key",
+                provider=self.name,
+                aspect_ratio=aspect_ratio,
+            )
+
+        api_key = runtime["api_key"]
+        base_url = runtime["base_url"]
+        if not api_key:
+            return error_response(
+                error="No OpenRouter API key found. "
+                "Set OPENROUTER_API_KEY in ~/.hermes/.env or run `hermes auth add openrouter`.",
+                error_type="missing_api_key",
+                provider=self.name,
+                aspect_ratio=aspect_ratio,
+            )
+
+        model_id = self._resolve_image_api_model()
+        aspect = resolve_aspect_ratio(aspect_ratio)
+        or_aspect = _IMAGE_API_ASPECT_RATIOS.get(aspect, "1:1")
+
+        payload: Dict[str, Any] = {
+            "model": model_id,
+            "prompt": prompt,
+            "n": 1,
+            "aspect_ratio": or_aspect,
+        }
+
+        # Resolution
+        res_env = os.environ.get("OPENROUTER_IMAGES_API_RESOLUTION", "").strip().lower()
+        if not res_env:
+            cfg = _load_image_gen_config()
+            scoped = cfg.get("openrouter-image-api") if isinstance(cfg.get("openrouter-image-api"), dict) else {}
+            res_cfg = scoped.get("resolution") if isinstance(scoped.get("resolution"), str) else None
+            if res_cfg:
+                res_env = res_cfg.strip().lower()
+        payload["resolution"] = _IMAGE_API_RESOLUTIONS.get(res_env, _IMAGE_API_DEFAULT_RESOLUTION)
+
+        # Quality
+        quality_raw = kwargs.get("quality") or ""
+        if quality_raw and str(quality_raw).strip().lower() in _IMAGE_API_QUALITY_OPTIONS:
+            payload["quality"] = str(quality_raw).strip().lower()
+
+        # Reference images (image-to-image via input_references)
+        ref_images: List[str] = []
+        if isinstance(image_url, str) and image_url.strip():
+            ref_images.append(image_url.strip())
+        if isinstance(reference_image_urls, list):
+            for ref in reference_image_urls:
+                if isinstance(ref, str) and ref.strip():
+                    ref_images.append(ref.strip())
+        if ref_images:
+            from agent.file_safety import raise_if_read_blocked
+
+            refs: List[Dict[str, Any]] = []
+            for ref in ref_images[:3]:
+                lower = ref.lower()
+                if lower.startswith(("http://", "https://", "data:")):
+                    refs.append({"type": "image_url", "image_url": {"url": ref}})
+                else:
+                    try:
+                        raise_if_read_blocked(ref)
+                        path = Path(ref).expanduser()
+                        raw = path.read_bytes()
+                        mime = mimetypes.guess_type(path.name)[0] or "image/png"
+                        b64 = base64.b64encode(raw).decode("ascii")
+                        refs.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+                    except Exception as exc:
+                        return error_response(
+                            error=f"Could not read reference image '{ref}': {exc}",
+                            error_type="io_error",
+                            provider=self.name,
+                            model=model_id,
+                            prompt=prompt,
+                            aspect_ratio=aspect,
+                        )
+            if refs:
+                payload["input_references"] = refs
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/NousResearch/hermes-agent",
+            "X-Title": "Hermes Agent",
+        }
+
+        try:
+            response = requests.post(
+                f"{base_url}/images",
+                headers=headers,
+                json=payload,
+                timeout=120,
+            )
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            resp = exc.response
+            status = resp.status_code if resp is not None else 0
+            try:
+                err_msg = resp.json().get("error", {}).get("message", resp.text[:300])
+            except Exception:
+                err_msg = resp.text[:300] if resp is not None else str(exc)
+            logger.error("OpenRouter Image API failed (%d): %s", status, err_msg)
+            return error_response(
+                error=f"OpenRouter Image API failed ({status}): {err_msg}",
+                error_type="api_error",
+                provider=self.name,
+                model=model_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
+        except requests.Timeout:
+            return error_response(
+                error="OpenRouter Image API timed out (120s)",
+                error_type="timeout",
+                provider=self.name,
+                model=model_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
+        except requests.ConnectionError as exc:
+            return error_response(
+                error=f"OpenRouter connection error: {exc}",
+                error_type="connection_error",
+                provider=self.name,
+                model=model_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
+
+        try:
+            result = response.json()
+        except Exception as exc:
+            return error_response(
+                error=f"OpenRouter returned invalid JSON: {exc}",
+                error_type="invalid_response",
+                provider=self.name,
+                model=model_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
+
+        data = result.get("data", [])
+        if not data:
+            return error_response(
+                error="OpenRouter returned no image data",
+                error_type="empty_response",
+                provider=self.name,
+                model=model_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
+
+        first = data[0]
+        b64 = first.get("b64_json")
+        media_type = first.get("media_type", "image/png")
+
+        if b64:
+            ext = mimetypes.guess_extension(media_type) or "png"
+            ext = ext.lstrip(".")
+            try:
+                saved_path = save_b64_image(b64, prefix=f"openrouter_{model_id.replace('/', '_')}", extension=ext)
+            except Exception as exc:
+                return error_response(
+                    error=f"Could not save image: {exc}",
+                    error_type="io_error",
+                    provider=self.name,
+                    model=model_id,
+                    prompt=prompt,
+                    aspect_ratio=aspect,
+                )
+            image_ref = str(saved_path)
+        else:
+            url = first.get("url")
+            if url:
+                try:
+                    saved_path = save_url_image(url, prefix=f"openrouter_{model_id.replace('/', '_')}")
+                    image_ref = str(saved_path)
+                except Exception as exc:
+                    logger.warning("Could not cache URL (%s); returning raw URL", exc)
+                    image_ref = url
+            else:
+                return error_response(
+                    error="OpenRouter response contained neither b64_json nor URL",
+                    error_type="empty_response",
+                    provider=self.name,
+                    model=model_id,
+                    prompt=prompt,
+                    aspect_ratio=aspect,
+                )
+
+        return success_response(
+            image=image_ref,
+            model=model_id,
+            prompt=prompt,
+            aspect_ratio=aspect,
+            provider=self.name,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Provider registry
+# ---------------------------------------------------------------------------
+
+
+def _build_providers() -> List[ImageGenProvider]:
     return [
         OpenRouterCompatImageProvider(
             provider_name="openrouter",
@@ -517,10 +860,11 @@ def _build_providers() -> List[OpenRouterCompatImageProvider]:
                 "requires_nous_auth": True,
             },
         ),
+        OpenRouterImageAPIProvider(),
     ]
 
 
 def register(ctx: Any) -> None:
-    """Register the OpenRouter + Nous Portal image gen providers."""
+    """Register the OpenRouter + Nous Portal + OpenRouter Image API providers."""
     for provider in _build_providers():
         ctx.register_image_gen_provider(provider)

@@ -68,7 +68,7 @@ class TestProviderClass:
         from plugins.image_gen.openrouter import _build_providers
 
         names = {p.name for p in _build_providers()}
-        assert names == {"openrouter", "nous"}
+        assert names == {"openrouter", "nous", "openrouter-image-api"}
 
     def test_display_names(self):
         from plugins.image_gen.openrouter import _build_providers
@@ -76,6 +76,7 @@ class TestProviderClass:
         by_name = {p.name: p for p in _build_providers()}
         assert by_name["openrouter"].display_name == "OpenRouter"
         assert by_name["nous"].display_name == "Nous Portal"
+        assert by_name["openrouter-image-api"].display_name == "OpenRouter Image API"
 
     def test_capabilities_support_image_input(self):
         caps = _openrouter().capabilities()
@@ -440,10 +441,11 @@ class TestRegistration:
         ctx = MagicMock()
         register(ctx)
         registered = [c.args[0].name for c in ctx.register_image_gen_provider.call_args_list]
-        assert set(registered) == {"openrouter", "nous"}
+        assert set(registered) == {"openrouter", "nous", "openrouter-image-api"}
 
-    def test_both_are_reference_capable_for_pets(self):
+    def test_reference_capable_providers(self):
         from agent.pet.generate.imagegen import _REF_CAPABLE
 
         assert "openrouter" in _REF_CAPABLE
         assert "nous" in _REF_CAPABLE
+        assert "openrouter-image-api" in _REF_CAPABLE

@@ -7,7 +7,14 @@ sidebar_position: 6
 
 # Image Generation
 
-Hermes Agent generates images from text prompts via FAL.ai. Eleven models are supported out of the box, each with different speed, quality, and cost tradeoffs. The active model is user-configurable via `hermes tools` and persists in `config.yaml`.
+Hermes Agent generates images from text prompts via **FAL.ai**, **OpenRouter**, **xAI**, **OpenAI**, and other backends. Each backend is user-configurable via `hermes tools` and persists in `config.yaml`.
+
+Two OpenRouter-based backends are available:
+
+- **OpenRouter** — chat-completions image output (``openai/gpt-5.4-image-2``, ``google/gemini-3-pro-image``) via ``/chat/completions`` with ``modalities: ["image", "text"]``
+- **OpenRouter Image API** — dedicated image generation (``x-ai/grok-imagine-image-2.0``) via ``/api/v1/images``
+
+Both use your existing ``OPENROUTER_API_KEY`` — no extra credentials needed.
 
 ## Supported Models
 
