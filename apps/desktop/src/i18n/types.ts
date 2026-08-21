@@ -2660,6 +2660,7 @@ export interface Translations {
       errorSwitchProvider: string
       errorOpenLogs: string
       errorOpenLogsFailed: string
+      errorNousSupport: string
       errorCopyDiagnostics: string
       filesChanged: (count: number) => string
       reviewChanges: string
