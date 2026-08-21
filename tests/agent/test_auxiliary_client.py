@@ -4710,7 +4710,27 @@ def _responses_output(text, *, usage):
             output_text="Connect timeout, please try again later.",
             usage=SimpleNamespace(output_tokens=0),
         ),
+        SimpleNamespace(
+            output=[],
+            output_text="Connect timeout, please try again later.",
+            usage=SimpleNamespace(output_tokens=0),
+        ),
+        SimpleNamespace(
+            output=[SimpleNamespace(type="reasoning", summary=[])],
+            output_text="Connect timeout, please try again later.",
+            usage=SimpleNamespace(output_tokens=0),
+        ),
         {
+            "output_text": "Connect timeout, please try again later.",
+            "usage": {"output_tokens": 0},
+        },
+        {
+            "output": [],
+            "output_text": "Connect timeout, please try again later.",
+            "usage": {"output_tokens": 0},
+        },
+        {
+            "output": [{"type": "reasoning", "summary": []}],
             "output_text": "Connect timeout, please try again later.",
             "usage": {"output_tokens": 0},
         },
@@ -5023,9 +5043,8 @@ def test_sync_auxiliary_router_timeout_shim_continues_to_fallback():
     primary = MagicMock()
     primary.base_url = "https://primary.example/v1"
     primary.chat.completions.create.return_value = SimpleNamespace(
-        output=[SimpleNamespace(content=[SimpleNamespace(
-            text="Connect timeout, please try again later.",
-        )])],
+        output=[],
+        output_text="Connect timeout, please try again later.",
         usage=SimpleNamespace(output_tokens=0),
     )
     fallback = MagicMock()
@@ -5063,11 +5082,8 @@ async def test_async_auxiliary_router_timeout_shim_continues_to_fallback():
     primary.base_url = "https://primary.example/v1"
     primary.chat.completions.create = AsyncMock(
         return_value={
-            "output": [{
-                "content": [{
-                    "text": "Connect timeout, please try again later.",
-                }],
-            }],
+            "output": [],
+            "output_text": "Connect timeout, please try again later.",
             "usage": {"output_tokens": 0},
         }
     )
