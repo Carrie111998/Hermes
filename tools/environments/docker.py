@@ -429,10 +429,39 @@ def _egress_proxy_args_for_docker() -> tuple[list[str], dict[str, str], list[str
 
     cfg = load_config()
     proxy_cfg = cfg.get("proxy") or {}
-    if not proxy_cfg.get("enabled"):
-        return ([], {}, [])
+    shared_from_default = False
+    if proxy_cfg.get("enabled"):
+        status = ip.get_status()
+        mappings = ip.load_mappings()
+    else:
+        from hermes_constants import (
+            get_default_hermes_root,
+            get_hermes_home,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
 
-    status = ip.get_status()
+        profile_home = get_hermes_home()
+        default_home = get_default_hermes_root()
+        if profile_home.resolve() == default_home.resolve():
+            return ([], {}, [])
+
+        token = set_hermes_home_override(default_home)
+        try:
+            default_cfg = load_config()
+            default_proxy_cfg = default_cfg.get("proxy") or {}
+            if not (
+                default_proxy_cfg.get("enabled")
+                and default_proxy_cfg.get("share_with_profiles")
+            ):
+                return ([], {}, [])
+            proxy_cfg = default_proxy_cfg
+            status = ip.get_status()
+            mappings = ip.load_mappings()
+            shared_from_default = True
+        finally:
+            reset_hermes_home_override(token)
+
     enforce = bool(proxy_cfg.get("enforce_on_docker", True))
 
     if not status.configured:
@@ -446,9 +475,14 @@ def _egress_proxy_args_for_docker() -> tuple[list[str], dict[str, str], list[str
         return ([], {}, [])
 
     if not (status.pid and status.listening):
+        start_hint = (
+            "Start it from the default profile with `hermes egress start`."
+            if shared_from_default
+            else "Start it with `hermes egress start`."
+        )
         msg = (
             f"iron-proxy is enabled but not running on port {status.tunnel_port}. "
-            "Start it with `hermes egress start`."
+            f"{start_hint}"
         )
         if enforce:
             raise RuntimeError(msg)
@@ -476,7 +510,6 @@ def _egress_proxy_args_for_docker() -> tuple[list[str], dict[str, str], list[str
     # indistinguishable from an upstream outage from inside the sandbox
     # (every request returns 403).  Refuse to mount with empty mappings
     # rather than ship a broken sandbox.
-    mappings = ip.load_mappings()
     if not mappings:
         msg = (
             "iron-proxy is configured but mappings.json is empty or "
