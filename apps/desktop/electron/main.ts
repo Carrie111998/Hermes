@@ -181,7 +181,7 @@ import {
   writeSecretFileAtomic
 } from './hardening'
 import { cursorPointInWindow } from './hud-cursor'
-import { defaultHudBounds } from './hud-geometry'
+import { applyHudResetBounds, defaultHudBounds } from './hud-geometry'
 import { registerHudIpc } from './hud-ipc'
 import { snapHudBounds } from './hud-snap'
 import { createHudSnapShortcut } from './hud-snap-shortcut'
@@ -11441,18 +11441,11 @@ function resetHudWindowLayout(): boolean {
   const win = hudWindow
   const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
   const bounds = defaultHudBounds(display?.workArea)
-  const wasResizable = win.isResizable()
 
-  if (!wasResizable) {
-    win.setResizable(true)
-  }
+  if (!applyHudResetBounds(win, bounds)) {
+    rememberLog('[hud-state] reset layout failed while applying native bounds')
 
-  try {
-    win.setBounds(bounds)
-  } finally {
-    if (!wasResizable && !win.isDestroyed()) {
-      win.setResizable(false)
-    }
+    return false
   }
 
   persistHudState()
