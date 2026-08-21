@@ -127,6 +127,39 @@ test('remote DM carries sender attribution and relays the reply', async () => {
   )
 })
 
+test('remote DM strips target routing @mention tokens from delivered text', async () => {
+  const submits = []
+  const ctx = runtime({
+    requestProfile: async (route, method, params) => {
+      if (method === 'profiles.list') {
+        return { profiles: [] }
+      }
+      if (method === 'session.resume' && params.session_id === 'Bot Chat' && params.omit_messages) {
+        return { session_id: 'runtime-1', session_key: 'stored-1' }
+      }
+      if (method === 'prompt.submit') {
+        submits.push(params.text)
+        return {}
+      }
+      if (method === 'session.resume') {
+        return submits.length
+          ? { messages: [{ role: 'user', content: 'x' }, { role: 'assistant', content: 'pong' }], inflight: false, running: false }
+          : { messages: [] }
+      }
+      return {}
+    }
+  })
+
+  await ctx.__dm.deliverRemoteRosterMentions(
+    [{ name: 'default-homeserver', connectionId: 'ssh-node', connectionLabel: 'Homeserver', remoteSource: true }],
+    '@default-homeserver: ping test',
+    { name: 'Win-corp', handle: 'hermes' }
+  )
+
+  assert.equal(submits.length, 1)
+  assert.equal(submits[0], 'Message from 🤖 Win-corp (@hermes): ping test')
+})
+
 test('source contract: DM poll shares the group-turn shape (bounded, new-assistant-message)', () => {
   assert.match(pluginSource, /const REMOTE_DM_TIMEOUT_MS = /)
   assert.match(pluginSource, /pollRemoteDmReply/)

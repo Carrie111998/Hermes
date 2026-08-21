@@ -4092,6 +4092,43 @@ async function pollRemoteDmReply(route, profile, sessionRef, before) {
   return null
 }
 
+function stripBotMentionTokens(text, bot) {
+  let cleaned = String(text || '')
+  const forms = new Set()
+
+  if (bot?.name) {
+    forms.add(String(bot.name).toLowerCase())
+  }
+
+  const handle = String(botHandle(bot?.name, bot) || '').toLowerCase()
+  if (handle) {
+    forms.add(handle)
+  }
+
+  if (bot?.handle) {
+    forms.add(String(bot.handle).toLowerCase())
+  }
+
+  for (const friendly of botFriendlyNames(bot)) {
+    for (const form of mentionNameForms(friendly)) {
+      if (form) {
+        forms.add(String(form).toLowerCase())
+      }
+    }
+  }
+
+  for (const form of forms) {
+    if (!form) {
+      continue
+    }
+    const escaped = form.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const re = new RegExp(`(^|\\s)@${escaped}\\b[:,-]?`, 'gi')
+    cleaned = cleaned.replace(re, ' ')
+  }
+
+  return cleaned.replace(/\s+/g, ' ').trim()
+}
+
 /** Deliver a user mention to bots on OTHER connections: into each bot's
  *  canonical Bot Chat, with the standard sender-attribution prefix (so the
  *  recipient's messaging protocol recognizes an agent-to-agent message), then
@@ -4135,11 +4172,13 @@ async function deliverRemoteRosterMentions(bots, userText, sender) {
         /* lazy session — zero messages */
       }
 
+      const payload = stripBotMentionTokens(text, bot) || text
+
       // The delivery prefix is the recipient's cue that an agent (not its
       // human) is talking — same contract as the local CLI handoff.
       await host.requestProfile(route, 'prompt.submit', {
         session_id: runtime,
-        text: `Message from \u{1F916} ${senderName} (@${senderHandle}): ${text}`
+        text: `Message from \u{1F916} ${senderName} (@${senderHandle}): ${payload}`
       })
       host.notify?.({
         kind: 'info',
