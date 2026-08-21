@@ -81,6 +81,10 @@ _HEADER_PAGE_COUNT_OFFSET = 28
 _live_lock = threading.RLock()
 # canonical path -> number of live connections opened by this process
 _live_connections: dict[str, int] = {}
+# canonical path -> connection id -> journal mode observed at open time.
+# A mode hint lets a read-only probe choose a safe URI when raw header access
+# is forbidden because another tracked connection is already live.
+_live_journal_modes: dict[str, dict[int, Optional[str]]] = {}
 
 
 class UntrackableConnectionError(RuntimeError):
@@ -133,11 +137,83 @@ def untrack_connection(path: Path | str) -> None:
     """Record that one connection to *path* has been closed."""
     key = _key(path)
     with _live_lock:
-        remaining = _live_connections.get(key, 0) - 1
-        if remaining > 0:
-            _live_connections[key] = remaining
-        else:
-            _live_connections.pop(key, None)
+        _decrement_live_connection(key)
+
+
+def _decrement_live_connection(key: str) -> None:
+    """Drop one registry count while the caller holds ``_live_lock``."""
+    remaining = _live_connections.get(key, 0) - 1
+    if remaining > 0:
+        _live_connections[key] = remaining
+    else:
+        _live_connections.pop(key, None)
+        _live_journal_modes.pop(key, None)
+
+
+def _read_journal_mode(conn: sqlite3.Connection) -> Optional[str]:
+    """Read a connection's current journal mode without touching the file."""
+    try:
+        row = conn.execute("PRAGMA journal_mode").fetchone()
+    except (sqlite3.Error, TypeError, IndexError):
+        return None
+    if not row or row[0] is None:
+        return None
+    mode = row[0]
+    if isinstance(mode, bytes):
+        try:
+            mode = mode.decode("ascii")
+        except UnicodeDecodeError:
+            return None
+    return str(mode).strip().lower() or None
+
+
+def set_live_connection_journal_mode(
+    conn: sqlite3.Connection,
+    mode: Optional[str],
+) -> None:
+    """Refresh the journal-mode hint for a tracked connection.
+
+    Some callers change the journal mode immediately after opening a
+    connection (Kanban's WAL/DELETE policy is one such caller), so the mode
+    observed by :func:`connect_tracked` may be stale. Unknown modes remain
+    unknown rather than being guessed.
+    """
+    path = getattr(conn, "_hermes_tracked_path", None)
+    if path is None:
+        return
+    normalized = str(mode).strip().lower() if mode is not None else None
+    with _live_lock:
+        modes = _live_journal_modes.get(path)
+        if modes is not None and id(conn) in modes:
+            modes[id(conn)] = normalized
+
+
+def live_connection_journal_mode(path: Path | str) -> Optional[str]:
+    """Return one unambiguous journal mode for all tracked *path* connections.
+
+    ``None`` means no mode is known, a manually tracked connection has no
+    metadata, or live connections disagree. Callers must fail closed in that
+    case; this helper never infers a mode from missing sidecars.
+    """
+    key = _key(path)
+    with _live_lock:
+        total = _live_connections.get(key, 0)
+        modes = _live_journal_modes.get(key, {})
+        if total <= 0 or len(modes) != total:
+            return None
+        observed = set(modes.values())
+        if len(observed) != 1:
+            return None
+        return next(iter(observed))
+
+
+def _untrack_tracked_connection(path: str, conn: object) -> None:
+    """Remove one tracked connection and its journal-mode hint."""
+    with _live_lock:
+        modes = _live_journal_modes.get(path)
+        if modes is not None:
+            modes.pop(id(conn), None)
+        _decrement_live_connection(path)
 
 
 def has_live_connection(path: Path | str) -> bool:
@@ -161,7 +237,7 @@ class _TrackingMixin:
             super().close()  # type: ignore[misc]
             if path is not None:
                 self._hermes_tracked_path = None
-                untrack_connection(path)
+                _untrack_tracked_connection(path, self)
 
 
 class TrackedConnection(_TrackingMixin, sqlite3.Connection):
@@ -260,8 +336,12 @@ def connect_tracked(
                 # releases the registry entry, rather than handing back a
                 # connection whose database has silently lost probe safety.
                 conn = _retrofit_tracking(conn, resolved)
+            mode = _read_journal_mode(conn)
             conn._hermes_tracked_path = resolved
+            if resolved not in _live_connections:
+                _live_journal_modes.pop(resolved, None)
             _live_connections[resolved] = _live_connections.get(resolved, 0) + 1
+            _live_journal_modes.setdefault(resolved, {})[id(conn)] = mode
             return conn
         except Exception:
             try:

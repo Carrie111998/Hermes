@@ -82,6 +82,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import logging
 import time
@@ -134,6 +135,37 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+
+# Board/project scope is deliberately represented by a snapshot owned by the
+# shared board.  The project catalog is per-profile, so it cannot be required
+# when another profile creates or dispatches a task on the board.
+BOARD_PROJECT_FIELDS = (
+    "project_id",
+    "project_slug",
+    "project_name",
+    "project_primary_path",
+)
+BOARD_AUDIT_CODES = frozenset({
+    "MALFORMED_BOARD_METADATA",
+    "MISSING_BOARD_METADATA",
+    "MISSING_PROJECT_SNAPSHOT",
+    "INVALID_PRIMARY_PATH",
+    "PROJECT_WORKDIR_MISMATCH",
+    "DUPLICATE_PROJECT_BINDING",
+    "STALE_PROJECT_BOARD_BINDING",
+    "STALE_CURRENT_BOARD",
+    "UNSCOPED_LEGACY",
+    "UNSCOPED_TASK_ON_SCOPED_BOARD",
+    "TASK_PROJECT_MISMATCH",
+})
+
+
+class BoardProjectError(ValueError):
+    """Stable, machine-readable validation failure for board/project scope."""
+
+    def __init__(self, code: str, message: str):
+        self.code = code
+        super().__init__(f"{code}: {message}")
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -526,6 +558,13 @@ def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
 # ---------------------------------------------------------------------------
 
 DEFAULT_BOARD = "default"
+# These boards predate project-first intake and are shared domain queues, not
+# project identities. Gateway-created project work must not select one of them
+# merely because a request sounds like that domain; legacy compatibility can
+# still opt in explicitly with ``legacy_unscoped``.
+GATEWAY_SHARED_DOMAIN_BOARDS = frozenset(
+    {"infra", "coding", "security", "lifeos", "home", "personal"}
+)
 _CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
     "hermes_kanban_current_board_override",
     default=None,
@@ -830,43 +869,278 @@ def _default_board_display_name(slug: str) -> str:
     return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
 
 
-def read_board_metadata(board: Optional[str] = None) -> dict:
-    """Return ``board.json`` contents (or synthesized defaults).
-
-    Never raises — a missing / malformed ``board.json`` falls back to a
-    synthesised entry so the dashboard always has something to render.
-    Includes the canonical ``slug`` and ``db_path`` so the caller
-    doesn't need to reconstruct them.
-    """
-    slug = _normalize_board_slug(board) or DEFAULT_BOARD
-    meta: dict[str, Any] = {
+def _board_metadata_defaults(slug: str) -> dict[str, Any]:
+    """Return the in-memory defaults for a board metadata document."""
+    return {
         "slug": slug,
         "name": _default_board_display_name(slug),
         "description": "",
         "icon": "",
         "color": "",
         "default_workdir": None,
-        # Optional first-class Project this board is scoped to. When set, new
-        # tasks inherit it (deterministic worktree + branch under the project's
-        # primary repo) and ``default_workdir`` mirrors the project's primary
-        # path so the persistent-workspace inheritance path keeps working.
         "project_id": None,
+        "project_slug": None,
+        "project_name": None,
+        "project_primary_path": None,
         "created_at": None,
         "archived": False,
+        # The default board is the intentional legacy escape hatch. Named
+        # boards set this only when created with --legacy-unscoped.
+        "legacy_unscoped": slug == DEFAULT_BOARD,
     }
+
+
+def _read_board_metadata_raw(slug: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Read a board document without hiding corruption from the audit."""
+    path = board_metadata_path(slug)
+    if not path.exists():
+        return None, None
     try:
-        p = board_metadata_path(slug)
-        if p.exists():
-            raw = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                # Never let the metadata file claim a different slug than
-                # its directory — trust the filesystem.
-                raw["slug"] = slug
-                meta.update(raw)
-    except (OSError, json.JSONDecodeError):
-        pass
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, str(exc)
+    if not isinstance(raw, dict):
+        return None, "board metadata must be a JSON object"
+    return raw, None
+
+
+def _project_snapshot(meta: Mapping[str, Any]) -> Optional[dict[str, str]]:
+    """Return a validated project snapshot, or ``None`` for unscoped boards."""
+    project_id = str(meta.get("project_id") or "").strip()
+    if not project_id:
+        return None
+    values = {field: str(meta.get(field) or "").strip() for field in BOARD_PROJECT_FIELDS}
+    if any(not values[field] for field in BOARD_PROJECT_FIELDS):
+        raise BoardProjectError(
+            "MISSING_PROJECT_SNAPSHOT",
+            "a scoped board must store project_id, project_slug, project_name, "
+            "and project_primary_path",
+        )
+    primary = Path(values["project_primary_path"]).expanduser()
+    if not primary.is_absolute():
+        raise BoardProjectError(
+            "INVALID_PRIMARY_PATH",
+            "project_primary_path must be absolute",
+        )
+    return values
+
+
+def read_board_metadata(board: Optional[str] = None) -> dict:
+    """Return board-owned metadata, including the canonical project snapshot.
+
+    Reads are intentionally forgiving so list/show/dashboard surfaces remain
+    useful when an operator has hand-edited or damaged ``board.json``. The
+    ``metadata_error`` field preserves the reason for the read-only audit.
+    Mutating paths call :func:`validate_board_project_scope` before writing.
+    """
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    meta = _board_metadata_defaults(slug)
+    raw, error = _read_board_metadata_raw(slug)
+    if raw is not None:
+        # Never let metadata claim a different slug than its directory.
+        raw["slug"] = slug
+        meta.update(raw)
+        meta["metadata_present"] = True
+    else:
+        meta["metadata_present"] = False
+    if error:
+        meta["metadata_error"] = error
+    meta["slug"] = slug
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
+
+
+def validate_board_project_scope(meta: Mapping[str, Any]) -> Optional[dict[str, str]]:
+    """Validate and return a board's canonical project snapshot."""
+    snapshot = _project_snapshot(meta)
+    if snapshot is None:
+        return None
+    primary = Path(snapshot["project_primary_path"]).expanduser().resolve()
+    if not primary.is_dir():
+        raise BoardProjectError(
+            "INVALID_PRIMARY_PATH",
+            f"project_primary_path is not an existing directory: {primary}",
+        )
+    workdir = str(meta.get("default_workdir") or "").strip()
+    if workdir != str(primary):
+        raise BoardProjectError(
+            "PROJECT_WORKDIR_MISMATCH",
+            "default_workdir must match project_primary_path on a scoped board",
+        )
+    snapshot["project_primary_path"] = str(primary)
+    return snapshot
+
+
+def _resolve_local_project(ref: str):
+    """Resolve a project id/slug in the active profile's local catalog."""
+    from hermes_cli import projects_db as _pdb
+
+    try:
+        with _pdb.connect_closing() as conn:
+            return _pdb.get_project(conn, str(ref).strip())
+    except (OSError, sqlite3.Error):
+        return None
+
+
+def _snapshot_from_project(project: Any) -> dict[str, str]:
+    primary = str(getattr(project, "primary_path", None) or "").strip()
+    if not primary:
+        raise BoardProjectError(
+            "INVALID_PRIMARY_PATH",
+            "project must have a primary folder before it can scope a board",
+        )
+    path = Path(primary).expanduser().resolve()
+    if not path.is_dir():
+        raise BoardProjectError(
+            "INVALID_PRIMARY_PATH",
+            f"project primary folder is not an existing directory: {path}",
+        )
+    return {
+        "project_id": str(project.id),
+        "project_slug": str(project.slug),
+        "project_name": str(project.name),
+        "project_primary_path": str(path),
+    }
+
+
+def _snapshot_from_reference(ref: str, snapshot: Optional[Mapping[str, Any]] = None) -> dict[str, str]:
+    """Resolve a local project or validate a caller-provided snapshot."""
+    if snapshot is not None:
+        values = {field: str(snapshot.get(field) or "").strip() for field in BOARD_PROJECT_FIELDS}
+        if any(not values[field] for field in BOARD_PROJECT_FIELDS):
+            raise BoardProjectError(
+                "MISSING_PROJECT_SNAPSHOT",
+                "project binding requires all canonical project snapshot fields",
+            )
+        path = Path(values["project_primary_path"]).expanduser()
+        if not path.is_absolute() or not path.is_dir():
+            raise BoardProjectError(
+                "INVALID_PRIMARY_PATH",
+                "project_primary_path must be an existing absolute directory",
+            )
+        return values
+    project = _resolve_local_project(ref)
+    if project is None:
+        raise BoardProjectError("UNKNOWN_PROJECT", f"project {ref!r} does not exist")
+    return _snapshot_from_project(project)
+
+
+def _board_project_bindings() -> dict[str, str]:
+    """Return project id -> board slug from board-owned snapshots."""
+    bindings: dict[str, str] = {}
+    for meta in list_boards(include_archived=False):
+        pid = str(meta.get("project_id") or "").strip()
+        if pid:
+            bindings.setdefault(pid, str(meta["slug"]))
+    return bindings
+
+
+def bind_board_project(
+    board: str,
+    project_ref: Optional[str] = None,
+    *,
+    snapshot: Optional[Mapping[str, Any]] = None,
+    sync_project_store: bool = True,
+) -> dict:
+    """Bind one project snapshot to one board and mirror the local catalog.
+
+    The board document is authoritative for shared task routing. The local
+    project row is updated when it is available, but a missing per-profile
+    catalog is not an error when a complete snapshot was supplied (the
+    cross-profile case).
+    """
+    _assert_not_delegated_child_mutation()
+    slug = _normalize_board_slug(board)
+    if not slug or not board_exists(slug):
+        raise BoardProjectError("UNKNOWN_BOARD", f"board {board!r} does not exist")
+    if not project_ref and snapshot is None:
+        raise BoardProjectError("PROJECT_REQUIRED", "project reference is required")
+    values = _snapshot_from_reference(project_ref or "", snapshot)
+    existing = read_board_metadata(slug)
+    current = str(existing.get("project_id") or "").strip()
+    if current and current != values["project_id"]:
+        raise BoardProjectError(
+            "BOARD_ALREADY_BOUND",
+            f"board {slug!r} is already bound to project {current!r}",
+        )
+    # Legacy boards may be bound in place, but only when their existing
+    # project-linked rows agree with the requested project. Null legacy rows
+    # remain untouched; a conflicting non-null row is never silently rewritten.
+    task_projects = {
+        str(row.get("project_id")).strip()
+        for row in _read_only_task_rows(kanban_db_path(slug))
+        if row.get("project_id") and row.get("status") != "archived"
+    }
+    conflicting_tasks = task_projects - {values["project_id"]}
+    if conflicting_tasks:
+        raise BoardProjectError(
+            "TASK_PROJECT_MISMATCH",
+            f"board {slug!r} contains tasks linked to conflicting project(s): "
+            f"{', '.join(sorted(conflicting_tasks))}",
+        )
+    bound = _board_project_bindings()
+    other = bound.get(values["project_id"])
+    if other and other != slug:
+        raise BoardProjectError(
+            "PROJECT_ALREADY_BOUND",
+            f"project {values['project_id']!r} is already bound to board {other!r}",
+        )
+    old_path = board_metadata_path(slug)
+    old_bytes = old_path.read_bytes() if old_path.exists() else None
+    try:
+        result = write_board_metadata(
+            slug,
+            default_workdir=values["project_primary_path"],
+            project_id=values["project_id"],
+            project_slug=values["project_slug"],
+            project_name=values["project_name"],
+            project_primary_path=values["project_primary_path"],
+            legacy_unscoped=False,
+        )
+        if sync_project_store:
+            project = _resolve_local_project(values["project_id"])
+            if project is not None and project.board_slug not in (None, "", slug):
+                raise BoardProjectError(
+                    "PROJECT_ALREADY_BOUND",
+                    f"project {project.id!r} is already bound to board {project.board_slug!r}",
+                )
+            if project is not None:
+                from hermes_cli import projects_db as _pdb
+                with _pdb.connect_closing() as pconn:
+                    _pdb.update_project(pconn, project.id, board_slug=slug)
+        return result
+    except Exception:
+        if old_bytes is None:
+            old_path.unlink(missing_ok=True)
+        else:
+            old_path.write_bytes(old_bytes)
+        raise
+
+
+def unbind_board_project(board: str, *, sync_project_store: bool = True) -> dict:
+    """Clear a board's project snapshot and its matching local mirror."""
+    _assert_not_delegated_child_mutation()
+    slug = _normalize_board_slug(board)
+    if not slug or not board_exists(slug):
+        raise BoardProjectError("UNKNOWN_BOARD", f"board {board!r} does not exist")
+    old = read_board_metadata(slug)
+    project_id = str(old.get("project_id") or "").strip()
+    result = write_board_metadata(
+        slug,
+        default_workdir="",
+        project_id="",
+        project_slug="",
+        project_name="",
+        project_primary_path="",
+        legacy_unscoped=True,
+    )
+    if sync_project_store and project_id:
+        project = _resolve_local_project(project_id)
+        if project is not None and project.board_slug == slug:
+            from hermes_cli import projects_db as _pdb
+            with _pdb.connect_closing() as pconn:
+                _pdb.update_project(pconn, project.id, board_slug="")
+    return result
 
 
 def write_board_metadata(
@@ -879,6 +1153,10 @@ def write_board_metadata(
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
+    project_slug: Optional[str] = None,
+    project_name: Optional[str] = None,
+    project_primary_path: Optional[str] = None,
+    legacy_unscoped: Optional[bool] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
@@ -886,8 +1164,9 @@ def write_board_metadata(
     ``created_at`` on first write. Returns the resulting metadata dict.
 
     ``project_id``: ``None`` leaves it unchanged; empty string clears the
-    project scope; a value sets it (not validated here — the caller resolves
-    it against ``projects_db``).
+    project scope; a value sets it. The snapshot fields are optional only for
+    backwards-compatible low-level metadata edits; board binding uses
+    :func:`bind_board_project` and always writes all four canonical fields.
     """
     _assert_not_delegated_child_mutation()
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
@@ -906,9 +1185,31 @@ def write_board_metadata(
     if archived is not None:
         meta["archived"] = bool(archived)
     if default_workdir is not None:
-        meta["default_workdir"] = str(default_workdir) if default_workdir else None
+        if default_workdir:
+            path = Path(str(default_workdir)).expanduser()
+            if not path.is_absolute():
+                raise ValueError("default_workdir must be an absolute path")
+            if not path.is_dir():
+                raise ValueError("default_workdir must be an existing directory")
+            meta["default_workdir"] = str(path.resolve())
+        else:
+            meta["default_workdir"] = None
     if project_id is not None:
-        meta["project_id"] = str(project_id) if project_id else None
+        if project_id:
+            meta["project_id"] = str(project_id).strip()
+        else:
+            meta["project_id"] = None
+            for field in BOARD_PROJECT_FIELDS[1:]:
+                meta[field] = None
+    for field, value in (
+        ("project_slug", project_slug),
+        ("project_name", project_name),
+        ("project_primary_path", project_primary_path),
+    ):
+        if value is not None:
+            meta[field] = str(value).strip() or None
+    if legacy_unscoped is not None:
+        meta["legacy_unscoped"] = bool(legacy_unscoped)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -930,6 +1231,13 @@ def create_board(
     color: Optional[str] = None,
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
+    project_slug: Optional[str] = None,
+    project_name: Optional[str] = None,
+    project_primary_path: Optional[str] = None,
+    # ``None`` preserves the historical low-level helper behaviour for
+    # callers that create a board directly. CLI/API callers pass False unless
+    # the user explicitly selected --legacy-unscoped.
+    legacy_unscoped: Optional[bool] = None,
 ) -> dict:
     """Create a new board directory + DB + metadata. Idempotent.
 
@@ -937,18 +1245,71 @@ def create_board(
     malformed slug; returns the existing metadata (not an error) if the
     board already exists — matching ``mkdir -p`` semantics.
     """
+    _assert_not_delegated_child_mutation()
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
-    meta = write_board_metadata(
-        normed,
-        name=name,
-        description=description,
-        icon=icon,
-        color=color,
-        default_workdir=default_workdir,
-        project_id=project_id,
+    already = board_exists(normed) and (
+        normed == DEFAULT_BOARD or board_metadata_path(normed).exists() or kanban_db_path(normed).exists()
     )
+    if project_id:
+        # A direct caller may provide a complete snapshot to avoid opening a
+        # different profile's projects.db. Otherwise resolve the local catalog
+        # once and persist its identity permanently in board.json.
+        snapshot = _snapshot_from_reference(
+            str(project_id),
+            {
+                "project_id": project_id,
+                "project_slug": project_slug,
+                "project_name": project_name,
+                "project_primary_path": project_primary_path,
+            }
+            if project_slug is not None or project_name is not None or project_primary_path is not None
+            else None,
+        )
+        if already:
+            meta = bind_board_project(normed, snapshot=snapshot)
+            meta = write_board_metadata(
+                normed,
+                name=name,
+                description=description,
+                icon=icon,
+                color=color,
+            )
+        else:
+            meta = write_board_metadata(
+                normed,
+                name=name,
+                description=description,
+                icon=icon,
+                color=color,
+                default_workdir=snapshot["project_primary_path"],
+                project_id=snapshot["project_id"],
+                project_slug=snapshot["project_slug"],
+                project_name=snapshot["project_name"],
+                project_primary_path=snapshot["project_primary_path"],
+                legacy_unscoped=False,
+            )
+            # Mirror the reciprocal project pointer after the board snapshot
+            # exists. ``bind_board_project`` is idempotent for this exact
+            # snapshot and performs the same collision checks as the existing
+            # board path.
+            meta = bind_board_project(normed, snapshot=snapshot)
+    else:
+        if normed != DEFAULT_BOARD and legacy_unscoped is False:
+            raise ValueError(
+                "new named boards require a project; pass legacy_unscoped=True "
+                "only for an intentional legacy unscoped board"
+            )
+        meta = write_board_metadata(
+            normed,
+            name=name,
+            description=description,
+            icon=icon,
+            color=color,
+            default_workdir=default_workdir,
+            legacy_unscoped=(legacy_unscoped if legacy_unscoped is not None else None),
+        )
     # Touch the DB so list_boards() sees it immediately.
     init_db(board=normed)
     return meta
@@ -995,6 +1356,486 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
                 continue
             entries.append(meta)
             seen.add(normed)
+    try:
+        audited = {row["slug"]: row for row in audit_boards()["boards"]}
+        for entry in entries:
+            health = audited.get(entry["slug"])
+            if health:
+                entry["scope_status"] = health["status"]
+                entry["scope_issues"] = health["issues"]
+    except Exception:
+        # Board listing must remain useful even while a private project store
+        # or a hand-edited metadata file is unavailable.
+        pass
+    return entries
+
+
+def _audit_issue(
+    issues: list[dict[str, Any]],
+    code: str,
+    message: str,
+    *,
+    board: Optional[str] = None,
+    task_id: Optional[str] = None,
+    severity: str = "error",
+) -> None:
+    if code not in BOARD_AUDIT_CODES:
+        raise ValueError(f"unknown board audit code: {code}")
+    issue: dict[str, Any] = {
+        "code": code,
+        "severity": severity,
+        "message": message,
+    }
+    if board is not None:
+        issue["board"] = board
+    if task_id is not None:
+        issue["task_id"] = task_id
+    issues.append(issue)
+
+
+def _sqlite_header_is_wal(header: bytes) -> bool:
+    """Return whether SQLite's file header declares WAL journal mode."""
+    return len(header) >= 20 and header[18:20] == b"\x02\x02"
+
+
+def _sqlite_file_state(path: Path) -> Optional[tuple[int, int, int, int]]:
+    """Return a cheap identity/size/mtime tuple for a SQLite sidecar."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _copy_wal_snapshot(source: Path, destination: Path) -> None:
+    """Copy a WAL database and its WAL frames only after a stable read."""
+    wal_source = Path(f"{source}-wal")
+    wal_destination = Path(f"{destination}-wal")
+    for attempt in range(3):
+        before = (_sqlite_file_state(source), _sqlite_file_state(wal_source))
+        if before[0] is None:
+            raise OSError(f"SQLite database disappeared during snapshot: {source}")
+        try:
+            shutil.copyfile(source, destination)
+            if before[1] is None:
+                wal_destination.unlink(missing_ok=True)
+            else:
+                shutil.copyfile(wal_source, wal_destination)
+        except OSError:
+            if attempt >= 2:
+                raise
+            time.sleep(0.01)
+            continue
+        after = (_sqlite_file_state(source), _sqlite_file_state(wal_source))
+        if before == after:
+            return
+        if attempt < 2:
+            time.sleep(0.01)
+    raise sqlite3.OperationalError(
+        f"SQLite database changed during read-only snapshot: {source}"
+    )
+
+
+@contextlib.contextmanager
+def _read_only_connection(path: Path):
+    """Open *path* without writing SQLite sidecars beside the source DB.
+
+    SQLite's regular ``mode=ro`` URI still creates ``-wal``/``-shm`` files
+    when a WAL database has no existing shared-memory index.  A WAL database
+    is therefore copied to a temporary directory first; the main file and
+    any committed WAL frames are opened from that snapshot, so the source
+    tree remains untouched while WAL visibility is preserved. Databases that
+    are not in WAL mode can use a tracked ordinary ``mode=ro`` connection
+    directly without creating journal sidecars. If a tracked same-process
+    writer already owns the source, a known DELETE-mode connection can be
+    shared directly; a WAL connection is shareable only when both sidecars
+    already exist. Unknown mode refuses raw access rather than guessing.
+    """
+    source = path.resolve()
+    temp_dir = None
+    read_path = source
+    try:
+        from hermes_cli.sqlite_safe_read import (
+            LiveConnectionError,
+            connect_tracked,
+            live_connection_journal_mode,
+            offline_file_access,
+        )
+
+        try:
+            # The lifecycle guard must cover both the header read and the
+            # main/WAL copies. A separate has_live_connection() check would
+            # leave a race where a writer opens between the check and close().
+            with offline_file_access(source, what="snapshot"):
+                with source.open("rb") as handle:
+                    header = handle.read(20)
+                if _sqlite_header_is_wal(header):
+                    temp_dir = tempfile.TemporaryDirectory(prefix="hermes-kanban-read-")
+                    read_path = Path(temp_dir.name) / source.name
+                    _copy_wal_snapshot(source, read_path)
+                    uri = read_path.as_uri() + "?mode=ro"
+                else:
+                    uri = source.as_uri() + "?mode=ro"
+        except LiveConnectionError:
+            # A live same-process writer already owns the source file, so raw
+            # snapshot I/O is forbidden. A tracked DELETE-mode connection can
+            # be shared through mode=ro without creating sidecars; a tracked
+            # WAL connection is shareable only when both sidecars already
+            # exist. Unknown mode fails closed rather than guessing from
+            # missing sidecars.
+            journal_mode = live_connection_journal_mode(source)
+            wal_path = Path(f"{source}-wal")
+            shm_path = Path(f"{source}-shm")
+            if journal_mode == "delete":
+                uri = source.as_uri() + "?mode=ro"
+            elif journal_mode == "wal" and wal_path.is_file() and shm_path.is_file():
+                uri = source.as_uri() + "?mode=ro"
+            else:
+                raise sqlite3.OperationalError(
+                    "cannot safely read a live SQLite database without a "
+                    "known journal mode and, for WAL, both sidecars: "
+                    f"{source}"
+                )
+
+        conn = connect_tracked(
+            uri,
+            uri=True,
+            tracking_path=read_path,
+        )
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+    finally:
+        if temp_dir is not None:
+            temp_dir.cleanup()
+
+
+def _read_only_task_rows(path: Path) -> list[dict[str, Any]]:
+    """Read task scope columns without initializing or migrating a DB."""
+    if not path.is_file():
+        return []
+    try:
+        with _read_only_connection(path) as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'"
+            ).fetchone()
+            if not exists:
+                return []
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+            selected = [field for field in ("id", "project_id", "legacy_unscoped", "status") if field in cols]
+            if "id" not in selected:
+                return []
+            return [dict(row) for row in conn.execute(f"SELECT {', '.join(selected)} FROM tasks")]
+    except (OSError, sqlite3.Error):
+        return []
+
+
+def audit_boards() -> dict[str, Any]:
+    """Run a strictly read-only integrity audit over board/project scope.
+
+    This function never calls :func:`connect`, :func:`init_db`, or any project
+    mutator. SQLite databases are opened through a source-tree-safe snapshot
+    helper and metadata is only parsed in memory, so running it cannot create
+    files, WAL journals, or migration columns beside the audited databases.
+    """
+    issues: list[dict[str, Any]] = []
+    boards: list[dict[str, Any]] = []
+    raw_entries: list[tuple[str, Optional[dict[str, Any]], Optional[str]]] = []
+    # Default is a valid legacy board even before its first DB initialization.
+    raw_entries.append((DEFAULT_BOARD, *_read_board_metadata_raw(DEFAULT_BOARD)))
+    root = boards_root()
+    if root.is_dir():
+        for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+            if not child.is_dir() or child.name == "_archived":
+                continue
+            try:
+                slug = _normalize_board_slug(child.name)
+            except ValueError:
+                continue
+            if (
+                not slug
+                or slug == DEFAULT_BOARD
+                or not ((child / "board.json").exists() or (child / "kanban.db").exists())
+            ):
+                continue
+            raw_entries.append((slug, *_read_board_metadata_raw(slug)))
+
+    project_to_boards: dict[str, list[str]] = {}
+    for slug, raw, metadata_error in raw_entries:
+        meta = _board_metadata_defaults(slug)
+        meta["metadata_present"] = raw is not None
+        if raw is not None:
+            meta.update(raw)
+        meta["slug"] = slug
+        boards.append({
+            "slug": slug,
+            "metadata_present": bool(raw is not None),
+            "project_id": meta.get("project_id"),
+        })
+        if metadata_error:
+            _audit_issue(
+                issues,
+                "MALFORMED_BOARD_METADATA",
+                metadata_error,
+                board=slug,
+            )
+            continue
+        if slug != DEFAULT_BOARD and raw is None:
+            _audit_issue(
+                issues,
+                "MISSING_BOARD_METADATA",
+                "named board has no board.json",
+                board=slug,
+            )
+        pid = str(meta.get("project_id") or "").strip()
+        if pid:
+            project_to_boards.setdefault(pid, []).append(slug)
+            try:
+                snapshot = _project_snapshot(meta)
+            except BoardProjectError as exc:
+                _audit_issue(issues, exc.code, str(exc), board=slug)
+                snapshot = None
+            if snapshot is not None:
+                primary = Path(snapshot["project_primary_path"]).expanduser()
+                if not primary.is_absolute() or not primary.is_dir():
+                    _audit_issue(
+                        issues,
+                        "INVALID_PRIMARY_PATH",
+                        f"project primary path is not an existing absolute directory: {primary}",
+                        board=slug,
+                    )
+                workdir = str(meta.get("default_workdir") or "").strip()
+                if workdir != str(primary.resolve()):
+                    _audit_issue(
+                        issues,
+                        "PROJECT_WORKDIR_MISMATCH",
+                        "default_workdir does not match project_primary_path",
+                        board=slug,
+                    )
+        else:
+            _audit_issue(
+                issues,
+                "UNSCOPED_LEGACY",
+                "board has no project snapshot; use a project board for new durable work",
+                board=slug,
+                severity="warning",
+            )
+        # A malformed board metadata file is intentionally not opened as a
+        # task DB; a valid sibling DB can still be audited independently.
+        for row in _read_only_task_rows(kanban_db_path(slug)):
+            if not pid or row.get("status") == "archived":
+                continue
+            task_project = str(row.get("project_id") or "").strip()
+            if not task_project:
+                if not bool(row.get("legacy_unscoped", 0)):
+                    _audit_issue(
+                        issues,
+                        "UNSCOPED_TASK_ON_SCOPED_BOARD",
+                        "task has no project_id on a project-scoped board",
+                        board=slug,
+                        task_id=str(row.get("id")),
+                    )
+            elif task_project != pid:
+                _audit_issue(
+                    issues,
+                    "TASK_PROJECT_MISMATCH",
+                    f"task project {task_project!r} differs from board project {pid!r}",
+                    board=slug,
+                    task_id=str(row.get("id")),
+                )
+
+    for pid, slugs in project_to_boards.items():
+        if len(slugs) > 1:
+            for slug in slugs:
+                _audit_issue(
+                    issues,
+                    "DUPLICATE_PROJECT_BINDING",
+                    f"project {pid!r} is present on multiple boards: {', '.join(sorted(slugs))}",
+                    board=slug,
+                )
+
+    current_path = current_board_path()
+    if current_path.exists():
+        try:
+            current = current_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            current = ""
+        if not current or not any(b["slug"] == current for b in boards):
+            _audit_issue(
+                issues,
+                "STALE_CURRENT_BOARD",
+                f"current board pointer {current!r} does not resolve to a board",
+            )
+
+    # The active profile's projects.db is only inspected read-only. Its
+    # reciprocal pointers are useful diagnostics, but never make an audit
+    # dependent on a private store existing.
+    project_db = None
+    try:
+        from hermes_cli.projects_db import projects_db_path
+        project_db = projects_db_path()
+    except Exception:
+        pass
+    if project_db and project_db.is_file():
+        try:
+            with _read_only_connection(project_db) as conn:
+                rows = conn.execute(
+                    "SELECT id, slug, board_slug FROM projects "
+                    "WHERE board_slug IS NOT NULL AND trim(board_slug) != ''"
+                ).fetchall()
+                seen_board: dict[str, str] = {}
+                for row in rows:
+                    board_slug = str(row["board_slug"]).strip().lower()
+                    if board_slug in seen_board and seen_board[board_slug] != str(row["id"]):
+                        _audit_issue(
+                            issues,
+                            "DUPLICATE_PROJECT_BINDING",
+                            f"multiple projects point to board {board_slug!r}",
+                            board=board_slug,
+                        )
+                    seen_board[board_slug] = str(row["id"])
+                    board_meta = next((m for m in boards if m["slug"] == board_slug), None)
+                    if board_meta is None or board_meta.get("project_id") != row["id"]:
+                        _audit_issue(
+                            issues,
+                            "STALE_PROJECT_BOARD_BINDING",
+                            f"project {row['id']!r} points to board {board_slug!r}, but the board snapshot disagrees",
+                            board=board_slug,
+                        )
+        except (OSError, sqlite3.Error):
+            pass
+    invalid_codes = {
+        "MALFORMED_BOARD_METADATA",
+        "MISSING_BOARD_METADATA",
+        "MISSING_PROJECT_SNAPSHOT",
+        "INVALID_PRIMARY_PATH",
+        "PROJECT_WORKDIR_MISMATCH",
+    }
+    conflict_codes = {
+        "DUPLICATE_PROJECT_BINDING",
+        "STALE_PROJECT_BOARD_BINDING",
+        "TASK_PROJECT_MISMATCH",
+        "UNSCOPED_TASK_ON_SCOPED_BOARD",
+    }
+    for board in boards:
+        board_issues = [issue for issue in issues if issue.get("board") == board["slug"]]
+        board["issues"] = board_issues
+        board["status"] = (
+            "invalid"
+            if any(issue["code"] in invalid_codes for issue in board_issues)
+            else "conflict"
+            if any(issue["code"] in conflict_codes for issue in board_issues)
+            else "scoped"
+            if board.get("project_id")
+            else "legacy_unscoped"
+        )
+    return {"read_only": True, "boards": boards, "issues": issues}
+
+
+def resolve_board_for_notification_context(
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve a unique board already bound to a gateway conversation.
+
+    Notification subscriptions are the durable thread/session binding: they
+    are stored in each board's database, so this lookup works when the active
+    gateway profile cannot read another profile's private project catalog. A
+    missing or ambiguous match returns ``None`` rather than falling back to
+    the mutable current-board pointer.
+
+    This is intentionally read-only. It opens existing board databases through
+    the source-tree-safe snapshot helper and never initializes a board or
+    writes a cursor.
+    """
+    platform = str(platform or "").strip()
+    chat_id = str(chat_id or "").strip()
+    thread_id = str(thread_id or "").strip()
+    if not platform or not chat_id:
+        return None
+    matches: set[str] = set()
+    for meta in _audit_board_entries():
+        slug = str(meta[0])
+        path = kanban_db_path(slug)
+        if not path.is_file():
+            continue
+        try:
+            with _read_only_connection(path) as conn:
+                columns = {
+                    row["name"] for row in conn.execute("PRAGMA table_info(kanban_notify_subs)")
+                }
+                if not {"platform", "chat_id", "thread_id"}.issubset(columns):
+                    continue
+                row = conn.execute(
+                    "SELECT 1 FROM kanban_notify_subs "
+                    "WHERE platform = ? AND chat_id = ? "
+                    "AND COALESCE(thread_id, '') = ? LIMIT 1",
+                    (platform, chat_id, thread_id),
+                ).fetchone()
+                if row is not None:
+                    matches.add(slug)
+        except (OSError, sqlite3.Error):
+            continue
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
+def gateway_board_selection_error(
+    board: Optional[str],
+    *,
+    legacy_unscoped: bool = False,
+) -> Optional[str]:
+    """Reject implicit project intake onto a shared legacy domain board.
+
+    Board slugs are deliberately the only signal considered here. No title,
+    body, assignee, or profile name is inspected, so a request cannot be
+    routed to a domain queue by textual similarity. A domain slug is allowed
+    when it already carries a canonical project snapshot, or when the caller
+    explicitly opts into legacy unscoped compatibility.
+    """
+    if not board or legacy_unscoped:
+        return None
+    try:
+        normed = _normalize_board_slug(board)
+    except ValueError:
+        return None
+    if normed not in GATEWAY_SHARED_DOMAIN_BOARDS:
+        return None
+    metadata = read_board_metadata(normed)
+    if metadata.get("project_id"):
+        return None
+    return (
+        f"gateway-created project work cannot use shared legacy board {normed!r}; "
+        "select or create an explicit project board, or pass "
+        "legacy_unscoped=true for compatibility work"
+    )
+
+
+def _audit_board_entries() -> list[tuple[str, Optional[dict[str, Any]], Optional[str]]]:
+    """Enumerate board metadata for read-only conversation resolution."""
+    entries: list[tuple[str, Optional[dict[str, Any]], Optional[str]]] = [
+        (DEFAULT_BOARD, *_read_board_metadata_raw(DEFAULT_BOARD))
+    ]
+    root = boards_root()
+    if not root.is_dir():
+        return entries
+    for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+        if not child.is_dir() or child.name == "_archived":
+            continue
+        try:
+            slug = _normalize_board_slug(child.name)
+        except ValueError:
+            continue
+        if (
+            not slug
+            or slug == DEFAULT_BOARD
+            or not ((child / "board.json").exists() or (child / "kanban.db").exists())
+        ):
+            continue
+        entries.append((slug, *_read_board_metadata_raw(slug)))
     return entries
 
 
@@ -1022,6 +1863,20 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     # If the user removed the currently-active board, revert to default.
     if get_current_board() == normed:
         clear_current_board()
+
+    # Keep the per-profile project mirror from pointing at an archived or
+    # deleted board. The board snapshot remains in an archive for recovery,
+    # but it is no longer an active binding.
+    bound_project_id = str(read_board_metadata(normed).get("project_id") or "").strip()
+    if bound_project_id:
+        project = _resolve_local_project(bound_project_id)
+        if project is not None and project.board_slug == normed:
+            try:
+                from hermes_cli import projects_db as _pdb
+                with _pdb.connect_closing() as pconn:
+                    _pdb.update_project(pconn, project.id, board_slug="")
+            except Exception:
+                _log.warning("Could not clear project %s board binding", bound_project_id)
 
     # A concurrent connect(board=normed) after the rename/delete recreates
     # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
@@ -1071,6 +1926,10 @@ class Task:
     tenant: Optional[str]
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
+    # Explicit escape for an intentionally unscoped task on a scoped board.
+    # Keeping this bit on the row lets the read-only audit distinguish a
+    # deliberate legacy task from accidental scope loss.
+    legacy_unscoped: bool = False
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
     # Unified non-success counter. Incremented on any of:
@@ -1170,6 +2029,7 @@ class Task:
             workspace_path=row["workspace_path"],
             branch_name=row["branch_name"] if "branch_name" in keys else None,
             project_id=row["project_id"] if "project_id" in keys else None,
+            legacy_unscoped=bool(row["legacy_unscoped"]) if "legacy_unscoped" in keys else False,
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             tenant=row["tenant"] if "tenant" in keys else None,
@@ -1349,6 +2209,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- the task's worktree is anchored under the project's primary repo with a
     -- deterministic branch name instead of a random wt/<task-id> fallback.
     project_id           TEXT,
+    -- Explicit legacy escape for an intentionally unscoped task on a scoped
+    -- board. NULL/0 is the normal scoped behavior.
+    legacy_unscoped      INTEGER NOT NULL DEFAULT 0,
     claim_lock           TEXT,
     claim_expires        INTEGER,
     tenant               TEXT,
@@ -2371,7 +3234,11 @@ def connect(
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
                 from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+                journal_mode = apply_wal_with_fallback(
+                    conn, db_label=f"kanban.db ({path.name})"
+                )
+                from hermes_cli.sqlite_safe_read import set_live_connection_journal_mode
+                set_live_connection_journal_mode(conn, journal_mode)
                 conn.execute("PRAGMA synchronous=FULL")
                 conn.execute("PRAGMA wal_autocheckpoint=100")
                 # Bound the WAL file size now that the periodic explicit
@@ -2431,7 +3298,11 @@ def connect(
                 # falls back to DELETE with one ERROR log so kanban stays usable there.
                 # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
                 from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+                journal_mode = apply_wal_with_fallback(
+                    conn, db_label=f"kanban.db ({path.name})"
+                )
+                from hermes_cli.sqlite_safe_read import set_live_connection_journal_mode
+                set_live_connection_journal_mode(conn, journal_mode)
                 # FULL (was NORMAL): fsync before each checkpoint to narrow the
                 # crash window that can leave a b-tree page header torn.
                 conn.execute("PRAGMA synchronous=FULL")
@@ -2543,6 +3414,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
     if "project_id" not in cols:
         _add_column_if_missing(conn, "tasks", "project_id", "project_id TEXT")
+    if "legacy_unscoped" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "legacy_unscoped",
+            "legacy_unscoped INTEGER NOT NULL DEFAULT 0",
+        )
     if "idempotency_key" not in cols:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
@@ -3184,6 +4062,8 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    legacy_unscoped: bool = False,
+    enforce_project_scope: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3246,25 +4126,45 @@ def create_task(
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
 
-    # Inherit the board's scoped project when the caller didn't name one, so a
-    # project-scoped board anchors every new task to that project's repo
-    # (deterministic worktree + branch) without each surface repeating it.
-    if project_id is None:
+    board_slug = _normalize_board_slug(board) or get_current_board()
+    board_meta = read_board_metadata(board_slug)
+    board_snapshot: Optional[dict[str, str]] = None
+    if board_meta.get("project_id"):
         try:
-            _bmeta = read_board_metadata(board if board else get_current_board())
-            _board_project = (_bmeta.get("project_id") or "").strip()
-            if _board_project:
-                project_id = _board_project
-        except Exception:
-            pass
+            board_snapshot = validate_board_project_scope(board_meta)
+        except BoardProjectError:
+            # Do not silently turn a damaged scoped board into a legacy board.
+            if not legacy_unscoped:
+                raise
+        if board_snapshot is not None:
+            if project_id is None:
+                if not legacy_unscoped:
+                    project_id = board_snapshot["project_id"]
+            else:
+                requested = str(project_id).strip()
+                if requested not in {
+                    board_snapshot["project_id"],
+                    board_snapshot["project_slug"],
+                }:
+                    raise BoardProjectError(
+                        "TASK_PROJECT_MISMATCH",
+                        f"task project {requested!r} differs from board project "
+                        f"{board_snapshot['project_id']!r}",
+                    )
+                project_id = board_snapshot["project_id"]
+    elif project_id and (enforce_project_scope or board is not None or board_slug != DEFAULT_BOARD):
+        # A project argument is not a back-door way to scope an unscoped board.
+        # A legacy low-level caller that omits the board argument retains the
+        # old project-link behavior so pre-board integrations can still read
+        # and create compatibility rows. CLI/API callers pass the enforcement
+        # flag and cannot use this escape accidentally.
+        raise BoardProjectError(
+            "PROJECT_ON_UNSCOPED_BOARD",
+            "bind the board to a project before creating a project-linked task",
+        )
 
-    # Resolve an optional first-class Project link. A project-linked task is
-    # anchored to the project's primary repo as a git worktree, so its branch
-    # can be named deterministically (project slug + task id) instead of the
-    # random ``wt/<task-id>`` fallback the worker skill applies when no branch
-    # is set. Projects live in the creator's per-profile projects.db; the repo
-    # path is absolute (profile-independent) and the branch name is pure, so the
-    # cross-profile dispatcher needs no projects.db access at dispatch time.
+    # Resolve the project link. For a scoped board this uses only the snapshot,
+    # never the assignee/creator profile's private projects.db.
     project_obj = None
     # Primary repo of a project-linked worktree task whose path we still need to
     # derive (a fresh worktree dir under the repo, computed once task_id exists).
@@ -3274,11 +4174,20 @@ def create_task(
     if project_id:
         from hermes_cli import projects_db as _pdb
 
-        try:
-            with _pdb.connect_closing() as _pconn:
-                project_obj = _pdb.get_project(_pconn, project_id)
-        except Exception:
-            project_obj = None
+        if board_snapshot is not None:
+            project_obj = _pdb.Project(
+                id=board_snapshot["project_id"],
+                slug=board_snapshot["project_slug"],
+                name=board_snapshot["project_name"],
+                created_at=0,
+                primary_path=board_snapshot["project_primary_path"],
+            )
+        else:
+            try:
+                with _pdb.connect_closing() as _pconn:
+                    project_obj = _pdb.get_project(_pconn, project_id)
+            except Exception:
+                project_obj = None
         if project_obj is None and project_source_task_id:
             # Worker profiles have their own projects.db, while the Kanban DB is
             # intentionally shared. Recover routing only from a canonical
@@ -3328,10 +4237,10 @@ def create_task(
                             workspace_kind = "worktree"
 
         if project_obj is None:
-            # A project id/slug that doesn't resolve must not crash task
-            # creation or persist a dangling reference — drop the link and
-            # create the task as an ordinary (scratch) task.
-            project_id = None
+            raise BoardProjectError(
+                "UNKNOWN_PROJECT",
+                f"project {project_id!r} does not exist in the active profile",
+            )
         else:
             # Canonicalise (a slug may have been passed) and anchor the
             # worktree under the project's primary repo.
@@ -3494,12 +4403,12 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        branch_name, project_id, legacy_unscoped, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3514,6 +4423,7 @@ def create_task(
                         workspace_path,
                         branch_name,
                         project_id,
+                        1 if legacy_unscoped else 0,
                         tenant,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
@@ -3549,6 +4459,14 @@ def create_task(
                         "workspace_path": workspace_path,
                         "branch_name": branch_name,
                         "project_id": project_id,
+                        "legacy_unscoped": bool(legacy_unscoped),
+                        "scope_warning": (
+                            "legacy unscoped task on an unscoped board"
+                            if project_id is None and board_snapshot is None
+                            else "explicit legacy unscoped task"
+                            if legacy_unscoped and board_snapshot is not None
+                            else None
+                        ),
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
@@ -11982,13 +12900,12 @@ def count_notify_subs(
 
     Cheap probe for the gateway notifier's zero-subscription early exit:
     unlike :func:`connect`, this never creates the DB file, never runs
-    schema init/migration, and never opens the database writable (no
-    write locks, no checkpoints — though a read-only open of a WAL
-    database may still create the ``-shm``/``-wal`` sidecars, it cannot
-    write table content). Rows in a not-yet-checkpointed WAL are
-    visible, so a freshly added subscription is never missed. A missing
-    DB, or a legacy DB that predates the subscriptions table, counts as
-    zero. When ``notifier_profiles`` is supplied, only subscriptions owned
+    schema init/migration, and never opens the source database writable (no
+    write locks or checkpoints). WAL rows are read through the same
+    source-tree-safe snapshot helper used by :func:`audit_boards`, so the
+    probe does not create ``-shm``/``-wal`` sidecars beside the source. A
+    missing DB, or a legacy DB that predates the subscriptions table, counts
+    as zero. When ``notifier_profiles`` is supplied, only subscriptions owned
     by those profiles are counted; ``include_unowned`` also includes legacy
     rows without an owner stamp. Optional platform/chat/thread filters narrow
     the probe to one notification owner without changing the unfiltered count.
@@ -12001,8 +12918,7 @@ def count_notify_subs(
     path = db_path if db_path is not None else kanban_db_path(board=board)
     if not path.exists():
         return 0
-    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
-    try:
+    with _read_only_connection(path) as conn:
         try:
             owner_where, owner_params = _notify_profile_filter(
                 notifier_profiles, include_unowned=include_unowned,
@@ -12030,8 +12946,6 @@ def count_notify_subs(
                 return 0
             raise
         return int(row[0]) if row else 0
-    finally:
-        conn.close()
 
 
 def remove_notify_sub(
@@ -12348,28 +13262,53 @@ def list_profiles_on_disk() -> list[str]:
     ``hermes_cli.profiles`` (which pulls in a large chunk of the CLI startup
     path).
     """
+    return sorted(row["name"] for row in _profile_roster_metadata())
+
+
+def _profile_roster_metadata() -> list[dict[str, Any]]:
+    """Return the global profile roster used by every assignee surface."""
     try:
-        from hermes_constants import get_default_hermes_root
-        default_root = get_default_hermes_root()
-        profiles_dir = default_root / "profiles"
+        from hermes_cli import profiles as profiles_mod
+        return [
+            {
+                "name": info.name,
+                "on_disk": True,
+                "description": info.description or "",
+                "description_auto": bool(info.description_auto),
+                "has_description": bool((info.description or "").strip()),
+            }
+            for info in profiles_mod.list_profiles()
+        ]
     except Exception:
-        return []
-
-    names: set[str] = set()
-    if default_root.exists():
-        names.add("default")
-
-    if profiles_dir.is_dir():
+        # Keep a narrow fallback for startup/import cycles. Unlike the old
+        # implementation this accepts metadata-only profile directories, so a
+        # profile can appear in the picker before its config is fully seeded.
         try:
-            for entry in sorted(profiles_dir.iterdir()):
-                if not entry.is_dir():
-                    continue
-                if (entry / "config.yaml").is_file():
-                    names.add(entry.name)
-        except OSError:
-            pass
-
-    return sorted(names)
+            from hermes_constants import get_default_hermes_root
+            root = get_default_hermes_root()
+            names: list[dict[str, Any]] = []
+            if root.is_dir():
+                names.append({
+                    "name": "default",
+                    "on_disk": True,
+                    "description": "",
+                    "description_auto": False,
+                    "has_description": False,
+                })
+                profiles_dir = root / "profiles"
+                if profiles_dir.is_dir():
+                    for entry in sorted(profiles_dir.iterdir(), key=lambda p: p.name):
+                        if entry.is_dir() and re.match(r"^[a-z0-9][a-z0-9_-]{0,63}$", entry.name):
+                            names.append({
+                                "name": entry.name,
+                                "on_disk": True,
+                                "description": "",
+                                "description_auto": False,
+                                "has_description": False,
+                            })
+            return names
+        except Exception:
+            return []
 
 
 def known_assignees(conn: sqlite3.Connection) -> list[dict]:
@@ -12385,7 +13324,9 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
     - Router-profile heuristics ("who's overloaded?") without scanning
       the whole board.
     """
-    on_disk = set(list_profiles_on_disk())
+    roster = _profile_roster_metadata()
+    on_disk = {row["name"] for row in roster}
+    profile_meta = {row["name"]: row for row in roster}
 
     # Count tasks per (assignee, status), excluding archived.
     counts: dict[str, dict[str, int]] = {}
@@ -12402,6 +13343,9 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
             "name": name,
             "on_disk": name in on_disk,
             "counts": counts.get(name, {}),
+            "description": profile_meta.get(name, {}).get("description", ""),
+            "description_auto": bool(profile_meta.get(name, {}).get("description_auto", False)),
+            "has_description": bool(profile_meta.get(name, {}).get("has_description", False)),
         }
         for name in names
     ]
