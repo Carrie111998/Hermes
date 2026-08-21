@@ -22,10 +22,10 @@ const request = {
   confirmedParticipants: ['15550001111:2@c.us'],
 };
 
-const token = '0123456789abcdef'.repeat(2);
-assert.equal(authorizeGroupControl(`Bearer ${token}`, token), true);
+const credential = 'x'.repeat(32);
+assert.equal(authorizeGroupControl(`Bearer ${credential}`, credential), true);
 assert.equal(authorizeGroupControl('Bearer short', 'short'), false);
-assert.equal(authorizeGroupControl('', token), false);
+assert.equal(authorizeGroupControl('', credential), false);
 assert.deepEqual([...allowed], ['15550001111@s.whatsapp.net', '998877@lid']);
 assert.deepEqual(
   validateGroupCreatePayload(request, allowed).participants,

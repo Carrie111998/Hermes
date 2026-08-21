@@ -20,7 +20,7 @@ def _env(monkeypatch, **values):
     )
 
 
-_TEST_TOKEN = "0123456789abcdef" * 2
+_TEST_CREDENTIAL = "x" * 32
 
 
 def _config(monkeypatch, *, admins=(), participants=()):
@@ -77,7 +77,7 @@ def test_group_request_requires_exact_confirmation_and_allowlisted_jids(monkeypa
 
 def test_tool_availability_fails_closed_without_each_private_boundary(monkeypatch):
     complete = {
-        "WHATSAPP_GROUP_CONTROL_TOKEN": _TEST_TOKEN,
+        "WHATSAPP_GROUP_CONTROL_TOKEN": _TEST_CREDENTIAL,
     }
     _config(
         monkeypatch,
@@ -97,7 +97,7 @@ def test_tool_availability_fails_closed_without_each_private_boundary(monkeypatc
 
 def test_group_tool_sends_token_only_in_header_and_redacts_participants(monkeypatch):
     values = {
-        "WHATSAPP_GROUP_CONTROL_TOKEN": _TEST_TOKEN,
+        "WHATSAPP_GROUP_CONTROL_TOKEN": _TEST_CREDENTIAL,
     }
     _env(monkeypatch, **values)
     _config(
@@ -158,8 +158,8 @@ def test_group_tool_sends_token_only_in_header_and_redacts_participants(monkeypa
         "group_id": "12036300@g.us",
     }
     assert captured["url"] == "http://127.0.0.1:3123/groups/create"
-    assert captured["headers"] == {"Authorization": f"Bearer {_TEST_TOKEN}"}
-    assert _TEST_TOKEN not in json.dumps(captured["json"])
+    assert captured["headers"] == {"Authorization": f"Bearer {_TEST_CREDENTIAL}"}
+    assert _TEST_CREDENTIAL not in json.dumps(captured["json"])
     assert "participants" not in json.dumps(result)
 
 
