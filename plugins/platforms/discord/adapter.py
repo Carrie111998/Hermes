@@ -8099,7 +8099,10 @@ class DiscordAdapter(BasePlatformAdapter):
             if snapshot_text_parts and not raw_content:
                 raw_content = "\n".join(snapshot_text_parts)
                 normalized_content = raw_content
-        inline_mention = self._self_is_raw_mentioned(message)
+        is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
+        # Reply routing alone needs the raw token, so do not scan ordinary
+        # messages before their content is stripped for display.
+        inline_mention = is_reply_message and self._self_is_raw_mentioned(message)
         if self._self_is_explicitly_mentioned(message):
             mention_prefix = True
             if self._client.user:
@@ -8162,7 +8165,6 @@ class DiscordAdapter(BasePlatformAdapter):
             no_thread_channels = self._get_no_thread_channels()
             skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
-            is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             # #9399 preserves unmentioned quote-replies inline. Discord can add
             # a reply-ping to resolved mentions, so only a raw <@bot> token
             # makes a reply a new thread-first task.
