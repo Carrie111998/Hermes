@@ -1876,7 +1876,7 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None) -> Optional[str]:
     """
     Mark a job as having been run.
     
@@ -1935,7 +1935,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         # Remove the job (limit reached)
                         jobs.pop(i)
                         save_jobs(jobs)
-                        return
+                        return now
                 
                 # Compute next run
                 job["next_run_at"] = compute_next_run(job["schedule"], now)
@@ -1970,9 +1970,57 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     job["state"] = "scheduled"
 
                 save_jobs(jobs)
-                return
+                return now
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+        return None
+
+
+def amend_late_outcome_after_abandon(
+    job_id: str,
+    *,
+    abandon_error: str,
+    success: bool,
+    error: Optional[str] = None,
+    expected_last_run_at: str,
+) -> bool:
+    """Correct a run status after its deadline-abandoned worker finishes.
+
+    The soft deadline marks a parallel-safe run failed and releases its
+    slot WITHOUT killing the worker. This compare-and-swap preserves the
+    worker's real terminal verdict, but only while the job still carries
+    the exact deadline verdict being corrected. The timestamp matters: a
+    successor can hit the byte-identical deadline message while the prior
+    worker is still finishing.
+
+    This intentionally does not call :func:`mark_job_run`: doing so would
+    double-count ``repeat.completed``, recompute ``next_run_at`` from the
+    late finish time, and clear claims that may belong to a successor.
+    Only the status fields are amended.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] != job_id:
+                continue
+            if job.get("last_status") != "error":
+                return False
+            if job.get("last_error") != abandon_error:
+                return False
+            if job.get("last_run_at") != expected_last_run_at:
+                return False
+
+            job["last_status"] = "ok" if success else "error"
+            job["last_error"] = None if success else (error or "unknown failure")
+            if success:
+                job["consecutive_errors"] = 0
+            save_jobs(jobs)
+            return True
+
+        logger.warning(
+            "amend_late_outcome_after_abandon: job_id %s not found", job_id
+        )
+        return False
 
 
 def _is_strictly_newer(candidate: str, existing: str) -> bool:

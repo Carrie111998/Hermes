@@ -173,6 +173,38 @@ def finish_execution(
         ).fetchone())
 
 
+def amend_execution_after_abandon(
+    execution_id: str,
+    *,
+    abandon_error: str,
+    success: bool,
+    error: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Replace only this execution's provisional deadline verdict.
+
+    Terminal rows are otherwise immutable. This narrow compare-and-swap
+    is the exception because the soft deadline explicitly leaves its
+    worker running: ``failed`` means "still running at the deadline",
+    not a known terminal outcome. Exact error matching prevents a late
+    worker from rewriting any later or independently reached failure.
+    """
+    now = _hermes_now().isoformat()
+    status = "completed" if success else "failed"
+    detail = None if success else (str(error) if error else "unknown failure")
+    with _lock, _connect() as conn:
+        cur = conn.execute(
+            """UPDATE executions SET status=?, finished_at=?, error=?
+               WHERE id=? AND status='failed' AND error=?""",
+            (status, now, detail, execution_id, abandon_error),
+        )
+        if cur.rowcount != 1:
+            return None
+        _prune_unlocked(conn)
+        return _record(conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone())
+
+
 def recover_interrupted_executions() -> int:
     """Mark provably abandoned attempts unknown without scheduling retries."""
     return len(recover_interrupted_execution_records())

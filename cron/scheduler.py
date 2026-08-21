@@ -355,9 +355,15 @@ from cron.jobs import (
     heartbeat_run_claim,
     load_jobs,
     mark_job_run,
+    amend_late_outcome_after_abandon,
     save_job_output,
 )
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import (
+    amend_execution_after_abandon,
+    create_execution,
+    finish_execution,
+    mark_execution_running,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -1018,7 +1024,13 @@ def _run_callable_with_deadline(job, process_fn, abandon_on_timeout, ctx):
     job_id = job["id"]
     job_name = job.get("name", job_id)
     abandoned = threading.Event()
-    box: dict = {}
+    box: dict = {
+        "deadline_decided": threading.Event(),
+        "deadline_finalized": threading.Event(),
+        "deadline_monotonic": (
+            time.monotonic() + timeout_s if abandon_on_timeout else None
+        ),
+    }
 
     def _worker():
         try:
@@ -1038,9 +1050,16 @@ def _run_callable_with_deadline(job, process_fn, abandon_on_timeout, ctx):
     t.start()
     t.join(timeout_s)
     if not t.is_alive():
+        box["deadline_decided"].set()
         return bool(box.get("result", False))
 
     deadline_now = time.monotonic()
+    # Signal abandonment BEFORE logging/event emission. Those calls can block;
+    # setting it afterward let a worker finish, commit success, and then be
+    # overwritten by the provisional deadline failure.
+    if abandon_on_timeout:
+        abandoned.set()
+    box["deadline_decided"].set()
     msg = "soft deadline exceeded: still running after %ds%s" % (
         int(timeout_s),
         "; worker abandoned (daemon thread)" if abandon_on_timeout
@@ -1067,7 +1086,6 @@ def _run_callable_with_deadline(job, process_fn, abandon_on_timeout, ctx):
         t.join()
         return bool(box.get("result", False))
 
-    abandoned.set()
     firecrawl_state = box.get("firecrawl_state")
     if firecrawl_state and firecrawl_state.first_failure:
         _finalize_agent_iteration_event(
@@ -1077,25 +1095,134 @@ def _run_callable_with_deadline(job, process_fn, abandon_on_timeout, ctx):
             success=False,
             firecrawl_state=firecrawl_state,
         )
+    box["deadline_error"] = msg
     try:
-        mark_job_run(job_id, False, msg)
-    except Exception:
-        logger.exception("Failed to mark timed-out cron job %s", job_id)
-    # Finish the execution-ledger row for the abandoned attempt (upstream
-    # 0.19.0 ledger): the abandoned worker suppresses its own late
-    # mark/finish writes once ``abandoned`` is set, so without this the
-    # attempt would dangle as "running" until the recovery classifier
-    # writes it off as unknown at the next process start.
-    _deadline_execution_id = job.get("execution_id")
-    if _deadline_execution_id:
         try:
-            finish_execution(_deadline_execution_id, success=False, error=msg)
+            box["deadline_last_run_at"] = mark_job_run(job_id, False, msg)
         except Exception:
-            logger.debug(
-                "finish_execution failed for deadline-abandoned %s", job_id
-            )
+            logger.exception("Failed to mark timed-out cron job %s", job_id)
+        # This execution verdict is provisional: the abandoned worker remains
+        # alive and can compare-and-swap it to the real outcome when it finishes.
+        _deadline_execution_id = job.get("execution_id")
+        if _deadline_execution_id:
+            try:
+                finish_execution(_deadline_execution_id, success=False, error=msg)
+            except Exception:
+                logger.debug(
+                    "finish_execution failed for deadline-abandoned %s", job_id
+                )
+    finally:
+        # The worker can cross its finish line while the deadline owner is
+        # still persisting the provisional verdict. Order that handoff
+        # explicitly instead of racing on dict keys or wall time.
+        box["deadline_finalized"].set()
     _release_in_flight_started_before(job_id, deadline_now)
     return False
+
+
+def _deadline_has_elapsed(
+    abandoned: Optional[threading.Event], deadline_box: Optional[dict]
+) -> bool:
+    """Recognize abandonment without a thread-scheduling race.
+
+    After ``join(timeout)`` returns, the worker can run before the watchdog
+    thread sets ``abandoned``. Crossing the monotonic boundary makes it wait
+    for the watchdog's authoritative live/dead decision rather than infer
+    abandonment from thread scheduling.
+    """
+    if abandoned is None:
+        return False
+    if abandoned.is_set():
+        return True
+    if deadline_box is None:
+        return False
+    deadline = deadline_box.get("deadline_monotonic")
+    if deadline is None or time.monotonic() < deadline:
+        return False
+    # We crossed the boundary while the watchdog thread may still be waking
+    # from join(timeout). Wait for its authoritative decision: if this worker
+    # is still alive, it will declare abandonment; if the join observed a
+    # completed worker, normal completion owns the verdict.
+    decided = deadline_box.get("deadline_decided")
+    if decided is None or not decided.wait(timeout=30):
+        logger.error("Deadline watchdog did not publish its boundary decision")
+        return False
+    return abandoned.is_set()
+
+
+def _amend_late_deadline_outcome(
+    job: dict,
+    *,
+    success: bool,
+    error: Optional[str],
+    deadline_box: Optional[dict],
+) -> bool:
+    """Persist a deadline-abandoned worker's real terminal outcome.
+
+    Delivery, completion events, and slot mutation remain suppressed. The
+    durable job and execution records are the exception: leaving them at
+    the provisional deadline failure is the false-red defect this handoff
+    repairs. Both writes are narrow compare-and-swaps, so a successor fire
+    always wins.
+    """
+    if deadline_box is None:
+        return False
+    finalized = deadline_box.get("deadline_finalized")
+    if finalized is None:
+        logger.error(
+            "Job '%s': deadline finalization signal missing; late outcome not amended",
+            job.get("id"),
+        )
+        return False
+    # The watchdog owns the provisional write and must finish it before either
+    # CAS can identify that exact attempt. Do not turn a slow event subscriber
+    # or jobs/ledger write into a permanent false red by giving up here: this
+    # already-abandoned daemon worker has no later retry path. The watchdog sets
+    # this event from a finally block, so every ordinary success/failure path
+    # releases the handoff.
+    finalized.wait()
+    abandon_error = deadline_box.get("deadline_error")
+    deadline_last_run_at = deadline_box.get("deadline_last_run_at")
+    if not abandon_error:
+        logger.error(
+            "Job '%s': deadline error identity missing; late outcome not amended",
+            job.get("id"),
+        )
+        return False
+
+    job_amended = False
+    if deadline_last_run_at:
+        try:
+            job_amended = amend_late_outcome_after_abandon(
+                job["id"],
+                abandon_error=abandon_error,
+                expected_last_run_at=deadline_last_run_at,
+                success=success,
+                error=error,
+            )
+        except Exception:
+            logger.exception("Late job-status amendment failed for %s", job.get("id"))
+    else:
+        logger.error(
+            "Job '%s': deadline job timestamp missing; job status not amended",
+            job.get("id"),
+        )
+
+    ledger_amended = False
+    execution_id = job.get("execution_id")
+    if execution_id:
+        try:
+            ledger_amended = amend_execution_after_abandon(
+                execution_id,
+                abandon_error=abandon_error,
+                success=success,
+                error=error,
+            ) is not None
+        except Exception:
+            logger.exception(
+                "Late execution-ledger amendment failed for %s", job.get("id")
+            )
+    return job_amended or ledger_amended
 
 
 def _summarize_for_event_bus(final_response: str) -> str:
@@ -6085,19 +6212,42 @@ def tick(
                 success, output, final_response, error = run_job(job)
                 _job_duration = _time.monotonic() - _job_start
 
-                if _abandoned is not None and _abandoned.is_set():
-                    # The deadline handler already marked this run failed,
-                    # emitted its event, and released the in-flight slot.
-                    # Keep the output for forensics; suppress everything
-                    # user-visible or state-mutating.
-                    try:
-                        save_job_output(job["id"], output)
-                    except Exception:
-                        logger.debug("Late output save failed for %s", job["id"])
+                # Persist the run transcript before choosing the normal or late
+                # terminal path. Output persistence can itself cross the soft
+                # deadline; checking only before this call let the watchdog
+                # abandon/release the slot while this worker later delivered and
+                # overwrote a successor through the normal completion writer.
+                output_file = save_job_output(job["id"], output)
+                if verbose:
+                    logger.info("Output saved to: %s", output_file)
+
+                if _deadline_has_elapsed(_abandoned, _deadline_box):
+                    # The deadline owner already emitted its alert, released
+                    # the slot, and suppressed delivery. Preserve those race
+                    # boundaries, but replace its PROVISIONAL failure in the
+                    # durable records with the worker's real terminal verdict.
+                    if success and _is_interrupted(job["id"]):
+                        success = False
+                        error = (
+                            "Interrupted by gateway shutdown before the run finished "
+                            "(tool subprocess was killed mid-flight)."
+                        )
+                    if success and not final_response.strip():
+                        success = False
+                        error = (
+                            "Agent completed but produced empty response "
+                            "(model error, timeout, or misconfiguration)"
+                        )
+                    amended = _amend_late_deadline_outcome(
+                        job,
+                        success=success,
+                        error=error,
+                        deadline_box=_deadline_box,
+                    )
                     logger.warning(
-                        "Job '%s': finished %.1fs after deadline abandon — "
-                        "late result suppressed (success=%s)",
-                        job["id"], _job_duration, success,
+                        "Job '%s': finished %.1fs after deadline abandon -- "
+                        "delivery suppressed; durable outcome amended=%s (success=%s)",
+                        job["id"], _job_duration, amended, success,
                     )
                     try:
                         _cron_span.set_attribute("cron.deadline_abandoned", True)
@@ -6105,10 +6255,6 @@ def tick(
                     except Exception:
                         pass
                     return False
-
-                output_file = save_job_output(job["id"], output)
-                if verbose:
-                    logger.info("Output saved to: %s", output_file)
 
                 # If the gateway shutdown killed this job's tool subprocess
                 # mid-flight (#60432), the agent may still have produced a
@@ -6238,11 +6384,16 @@ def tick(
                 except Exception:
                     pass
                 logger.error("Error processing job %s: %s", job['id'], e)
-                # Late failure after a deadline abandon: the deadline handler
-                # already marked the run failed and finished its execution —
-                # suppress this run's own writes (same rule as the success
-                # branch above).
-                if _abandoned is None or not _abandoned.is_set():
+                # A deadline-abandoned worker can fail by raising instead of
+                # returning a structured failure. Preserve that real cause too.
+                if _deadline_has_elapsed(_abandoned, _deadline_box):
+                    _amend_late_deadline_outcome(
+                        job,
+                        success=False,
+                        error=str(e),
+                        deadline_box=_deadline_box,
+                    )
+                else:
                     if not _consume_interrupted_flag(job["id"]):
                         mark_job_run(job["id"], False, str(e))
                     if _execution_id:
@@ -6259,7 +6410,7 @@ def tick(
             finally:
                 try:
                     try:
-                        if _abandoned is None or not _abandoned.is_set():
+                        if not _deadline_has_elapsed(_abandoned, _deadline_box):
                             _finalize_agent_iteration_event(
                                 emitter,
                                 job,
@@ -6288,7 +6439,7 @@ def tick(
                     # EXCEPT when the deadline handler abandoned this run: it
                     # already released the slot, and a successor fire may have
                     # registered a fresh record that must not be popped here.
-                    if _abandoned is None or not _abandoned.is_set():
+                    if not _deadline_has_elapsed(_abandoned, _deadline_box):
                         _release_in_flight(_job_id)
 
         # Partition due jobs: jobs with a per-job workdir and/or profile touch
