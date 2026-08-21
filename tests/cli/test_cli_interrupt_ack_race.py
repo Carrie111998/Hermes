@@ -155,6 +155,37 @@ def test_unacknowledged_interrupt_message_is_requeued_not_dropped():
     assert agent.clear_calls >= 1
 
 
+def test_chat_preserves_structured_failure_before_display_error():
+    cli = _make_cli()
+
+    class _FailedAgent(_StubAgent):
+        def run_conversation(self, **kwargs):
+            return {
+                "final_response": "",
+                "messages": [{"role": "user", "content": "original"}],
+                "api_calls": 1,
+                "completed": False,
+                "failed": True,
+                "failure_reason": "timeout",
+            }
+
+    cli.agent = _FailedAgent(cli.session_id, turn_seconds=0)
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
+         patch.object(cli, "_resolve_turn_agent_config", return_value={
+             "signature": cli._active_agent_route_signature,
+             "model": None, "runtime": None, "request_overrides": None,
+         }), \
+         patch.object(cli, "_init_agent", return_value=True), \
+         patch.object(cli, "_flush_stream", side_effect=RuntimeError("display failed")):
+        assert cli.chat("original") is None
+
+    assert cli._last_run_result["failed"] is True
+    assert cli._last_run_result["failure_reason"] == "timeout"
+
+
 
 
 def test_chat_persists_clean_input_when_a_queued_note_changes_api_message():

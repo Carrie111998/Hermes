@@ -16636,6 +16636,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # idle time since the last final response.
             self._last_turn_finished_at = time.time()
 
+            # Preserve the structured result before any display/cleanup work.
+            # Human-facing one-shot callers use this to derive their process
+            # exit code; a later renderer or stdout failure must not turn an
+            # already-classified provider failure back into rc=0.
+            self._last_run_result = result
+
             # Proactively clean up async clients whose event loop is dead.
             # The agent thread may have created AsyncOpenAI clients bound
             # to a per-thread event loop; if that loop is now closed, those
@@ -16926,7 +16932,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 print(f"\n⏩ Delivering leftover /steer as next turn: '{preview}'")
                 self._pending_input.put(_leftover_steer)
 
-            self._last_run_result = result
             return response
             
         except Exception as e:
