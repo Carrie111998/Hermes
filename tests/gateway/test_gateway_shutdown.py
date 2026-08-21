@@ -148,6 +148,29 @@ async def test_gateway_stop_settles_completion_batch_before_adapter_disconnect()
 
 
 @pytest.mark.asyncio
+async def test_gateway_stop_drains_subagent_status_before_adapter_disconnect():
+    runner, adapter = make_restart_runner()
+    call_order = []
+
+    class Registry:
+        async def shutdown(self, *, timeout):
+            call_order.append(("status_shutdown", timeout))
+
+    async def disconnect():
+        call_order.append(("disconnect", None))
+
+    runner._subagent_status_registry = Registry()
+    adapter.disconnect = disconnect
+
+    with patch("gateway.status.remove_pid_file"), patch(
+        "gateway.status.write_runtime_status"
+    ):
+        await runner.stop()
+
+    assert call_order == [("status_shutdown", 7.0), ("disconnect", None)]
+
+
+@pytest.mark.asyncio
 async def test_in_chat_restart_skips_home_shutdown_even_with_active_session():
     runner, adapter = make_restart_runner()
     source = make_restart_source(thread_id="42")

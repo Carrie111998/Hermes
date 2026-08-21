@@ -4304,6 +4304,25 @@ class TurnRunner:
         self._runner = runner
         self._ctx = ctx
 
+    def _run_conversation_with_status(
+        self, agent: Any, message: str, conversation_kwargs: dict
+    ) -> dict:
+        from tools.delegation_status import bind_detached_status_owner
+
+        owner = self._ctx.subagent_status_owner
+        with bind_detached_status_owner(owner):
+            try:
+                return agent.run_conversation(message, **conversation_kwargs)
+            finally:
+                if owner is not None:
+                    try:
+                        owner.request_seal()
+                    except Exception:
+                        logger.warning(
+                            "Could not seal detached subagent status owner",
+                            exc_info=True,
+                        )
+
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
@@ -6414,7 +6433,9 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            result = self._run_conversation_with_status(
+                agent, _api_run_message, _conversation_kwargs
+            )
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -6752,6 +6773,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _profile_failed_platforms: Optional[Dict[str, Dict[Platform, asyncio.Task]]] = None
     _systemd_watchdog: Optional[Any] = None
     _startup_restore_in_progress: bool = False
+
+    def _prepare_subagent_status_owner(
+        self,
+        *,
+        source: SessionSource,
+        adapter: BasePlatformAdapter | None,
+        route_metadata: Optional[Dict[str, Any]],
+        surface_mode: str,
+        loop: asyncio.AbstractEventLoop,
+    ) -> Any:
+        if surface_mode == "off" or adapter is None:
+            return None
+
+        from gateway.subagent_status import (
+            SubagentStatusRegistry,
+            create_telegram_subagent_status,
+        )
+
+        registry = getattr(self, "_subagent_status_registry", None)
+        candidate_registry = registry or SubagentStatusRegistry()
+        pair = create_telegram_subagent_status(
+            source=source,
+            adapter=adapter,
+            route_metadata=route_metadata,
+            loop=loop,
+            registry=candidate_registry,
+        )
+        if pair is None:
+            return None
+        if registry is None:
+            self._subagent_status_registry = candidate_registry
+        owner, _publisher = pair
+        return owner
 
     # ------------------------------------------------------------------
     # Legacy per-session dict adapters.  All per-session state lives in
@@ -14899,6 +14953,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             if cancel_completion_batches is not None:
                 await cancel_completion_batches()
+
+            subagent_status_registry = getattr(
+                self, "_subagent_status_registry", None
+            )
+            if subagent_status_registry is not None:
+                try:
+                    await subagent_status_registry.shutdown(timeout=7.0)
+                except Exception:
+                    logger.warning(
+                        "Detached subagent status shutdown failed",
+                        exc_info=True,
+                    )
 
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)
@@ -28796,6 +28862,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if _long_running_mode == "off":
             _NOTIFY_INTERVAL = None
+        turn_ctx.subagent_status_owner = self._prepare_subagent_status_owner(
+            source=source,
+            adapter=_status_adapter,
+            route_metadata=_status_thread_metadata,
+            surface_mode=_long_running_mode,
+            loop=getattr(self, "_gateway_loop", None)
+            or asyncio.get_running_loop(),
+        )
         _notify_start = time.time()
 
         async def _notify_long_running():

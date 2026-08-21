@@ -2786,8 +2786,11 @@ def _run_single_child(
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
+            from tools.delegation_status import bind_detached_status_owner
 
-            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+            with delegated_child_context(
+                str(getattr(child, "session_id", "") or "")
+            ), bind_detached_status_owner(None):
                 return child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,
@@ -2953,11 +2956,14 @@ def _run_single_child(
                 _schema_retries = 1
                 _retry_result = None
                 try:
-                    _retry_result = child.run_conversation(
-                        user_message=build_retry_message(_schema_errors),
-                        task_id=child_task_id,
-                        stream_callback=_relay_child_text,
-                    )
+                    from tools.delegation_status import bind_detached_status_owner
+
+                    with bind_detached_status_owner(None):
+                        _retry_result = child.run_conversation(
+                            user_message=build_retry_message(_schema_errors),
+                            task_id=child_task_id,
+                            stream_callback=_relay_child_text,
+                        )
                 except Exception as _retry_exc:
                     logger.warning(
                         "Subagent %d schema-retry turn failed: %s",
@@ -4178,6 +4184,17 @@ def delegate_task(
                 _session_key = _agent_session_id
         _parent_session_id = getattr(parent_agent, "session_id", None)
         _child_agents = [c for (_, _, c) in children]
+        from tools.delegation_status import (
+            attach_detached_status_sink,
+            bind_detached_status_owner,
+            get_detached_status_owner,
+        )
+
+        _status_owner: Any = get_detached_status_owner()
+        _status_start_gate = (
+            threading.Event() if _status_owner is not None else None
+        )
+        _status_sink_ref = [None]
 
         # Detach every child from the parent's interrupt-propagation list — the
         # batch's lifecycle is owned by the async registry now, not the parent
@@ -4197,7 +4214,15 @@ def delegate_task(
         def _batch_runner():
             # This batch is detached from the foreground turn. Its lifecycle is
             # owned by the async registry and cancelled only via _batch_interrupt.
-            return _execute_and_aggregate(honor_parent_interrupt=False)
+            if _status_start_gate is not None:
+                _status_start_gate.wait(timeout=10.0)
+            with bind_detached_status_owner(None):
+                return _execute_and_aggregate(honor_parent_interrupt=False)
+
+        def _finalize_status_batch(outcomes):
+            sink = _status_sink_ref[0]
+            if sink is not None:
+                sink.finalize(outcomes)
 
         def _batch_interrupt():
             for _c in _child_agents:
@@ -4260,10 +4285,27 @@ def delegate_task(
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
             progress_fn=_batch_progress,
+            status_finalize_fn=(
+                _finalize_status_batch if _status_owner is not None else None
+            ),
         )
 
         if dispatch.get("status") == "dispatched":
             n = len(_goals)
+            if _status_owner is not None:
+                try:
+                    sink = _status_owner.admit_batch(n)
+                    _status_sink_ref[0] = sink
+                    if sink is not None:
+                        for task_index, _goal, child in children:
+                            attach_detached_status_sink(
+                                child, sink, task_index=task_index
+                            )
+                except Exception:
+                    logger.warning("Detached status admission failed", exc_info=True)
+                finally:
+                    assert _status_start_gate is not None
+                    _status_start_gate.set()
             note = (
                 "Subagent is running in the background. You and the user can "
                 "keep working; its full result re-enters the conversation as a "
