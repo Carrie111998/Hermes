@@ -89,6 +89,12 @@ export function windowBackingOptions(state: TranslucencyState, themedColor: stri
  * `current` is the way back: a window that is already faded has already paid
  * for the layering, and it has to be able to return to opaque — so it keeps
  * getting the call even when the value it is going to is 1.
+ *
+ * What this cannot do is un-layer. Electron offers no way back off
+ * `WS_EX_LAYERED`, so a Windows window that has been faded once keeps the
+ * layered compositing path until it is recreated. Not opening the door on the
+ * default path is the whole of the fix; someone who deliberately fades and
+ * then returns to glass still wants a restart.
  */
 export function opacityNeedsSetting(next: number, current = 1): boolean {
   return next < 1 || current < 1
