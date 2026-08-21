@@ -65,6 +65,10 @@ class TurnState:
     started_ts: float = 0.0
     # Cross-process active-session slot lease (None = none held).
     lease: Any = None
+    # Owner token for the pre-agent adaptive routing phase.  The pending
+    # sentinel alone prevents a second turn from starting, but this token is
+    # what makes adaptive cleanup conditional on the turn that acquired it.
+    routing_owner: Optional[str] = None
     # Last busy-ack timestamp (debounce; 0.0 = never acked).
     busy_ack_ts: float = 0.0
     # Held turn-lease token + the run generation that acquired it.  The old
@@ -84,6 +88,7 @@ class TurnState:
         self.agent = None
         self.started_ts = 0.0
         self.lease = None
+        self.routing_owner = None
         self.busy_ack_ts = 0.0
 
 
