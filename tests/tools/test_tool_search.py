@@ -677,3 +677,14 @@ class TestDeferredCallSchemaProbe:
         ))
         assert result.get("ok") is True
         assert result.get("doc") == "abc"
+
+
+def test_resolve_underlying_call_passes_through_visible_non_deferrable():
+    from tools.tool_search import resolve_underlying_call
+    name, args, err = resolve_underlying_call(
+        {"name": "mcp__composio__OUTLOOK_QUERY_EMAILS", "arguments": {"query": "from:x"}},
+        visible_names={"mcp__composio__OUTLOOK_QUERY_EMAILS"},
+    )
+    assert err is None
+    assert name == "mcp__composio__OUTLOOK_QUERY_EMAILS"
+    assert args["query"] == "from:x"

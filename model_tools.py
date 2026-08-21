@@ -1301,25 +1301,31 @@ def handle_function_call(
                 )
             )
         if function_name == _ts_mod.TOOL_CALL_NAME:
-            underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(function_args or {})
+            _visible_names = {
+                t["function"]["name"]
+                for t in current_defs
+                if isinstance(t, dict) and t.get("function", {}).get("name")
+            }
+            underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(
+                function_args or {},
+                visible_names=_visible_names,
+            )
             if err or not underlying_name:
                 return _return_bridge_result(
                     tool_error(err or "tool_call could not be resolved")
                 )
-            # Defense in depth: the underlying tool MUST be in the session's
-            # scoped deferrable catalog. resolve_underlying_call() only checks
-            # that the name is deferrable in the global registry; this gate
-            # additionally rejects any tool the session was not granted, so a
-            # restricted session can never invoke an out-of-scope tool through
-            # the bridge even if the catalog scoping above regressed.
-            _scoped_deferrable = _ts_mod.scoped_deferrable_names(current_defs)
-            if underlying_name not in _scoped_deferrable:
-                return _return_bridge_result(
-                    tool_error(
-                        f"'{underlying_name}' is not available in this session. "
-                        "Use tool_search to find tools you can call."
+            # Already-visible tools (eager in current_defs) skip the deferrable
+            # catalog gate — the model wrapped a tool it already had. True
+            # deferred tools still must be in the scoped deferrable catalog.
+            if underlying_name not in _visible_names:
+                _scoped_deferrable = _ts_mod.scoped_deferrable_names(current_defs)
+                if underlying_name not in _scoped_deferrable:
+                    return _return_bridge_result(
+                        tool_error(
+                            f"'{underlying_name}' is not available in this session. "
+                            "Use tool_search to find tools you can call."
+                        )
                     )
-                )
             # Probe-validate against the deferred tool's schema (ironclaw#5149):
             # a blind call missing required arguments returns the parameter
             # schema instead of dispatching into an opaque downstream failure.

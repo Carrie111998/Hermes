@@ -1029,7 +1029,10 @@ def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str
         return None
 
 
-def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
+def resolve_underlying_call(
+    args: Dict[str, Any],
+    visible_names: Optional[set[str]] = None,
+) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
     """Parse a ``tool_call`` invocation into (underlying_name, args, error_msg).
 
     Used by:
@@ -1038,6 +1041,10 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
     * the trajectory recorder.
 
     On parse error, returns ``(None, {}, error_message)``.
+
+    ``visible_names``: optional set of names already in the model-facing tools
+    list. A non-deferrable tool in that set (and not a bridge tool) is
+    unwrapped so a wrapped call still dispatches instead of erroring.
     """
     name = str(args.get("name") or "").strip()
     if not name:
@@ -1055,6 +1062,8 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
     if not isinstance(raw_args, dict):
         return None, {}, "tool_call 'arguments' must be an object"
     if not is_deferrable_tool_name(name):
+        if visible_names and name in visible_names and name not in BRIDGE_TOOL_NAMES:
+            return name, raw_args, None
         return None, {}, (
             f"'{name}' is not a deferrable tool. If it appears in the model-facing tools "
             "list already, call it directly instead of via tool_call."
