@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 
-SCANNER_VERSION = "skills-guard-v1"
+SCANNER_VERSION = "skills-guard-v2"  # v2: credential_destinations exemptions (#91569)
 
 
 
@@ -682,6 +682,13 @@ def scan_skill(skill_path: Path, source: str = "community") -> ScanResult:
     elif skill_path.is_file():
         all_findings.extend(scan_file(skill_path, skill_path.name))
 
+    # Declarative credential exemptions (#91569) — fail-closed; findings
+    # only downgrade when the secret is declared AND every host in the
+    # finding's scope is a declared destination.
+    declarations = _load_credential_destinations(skill_path)
+    if declarations:
+        all_findings = _exempt_declared_credential_use(all_findings, skill_path, declarations)
+
     verdict = _determine_verdict(all_findings)
     summary = _build_summary(skill_name, source, trust_level, verdict, all_findings)
 
@@ -1147,6 +1154,129 @@ def _resolve_trust_level(source: str) -> str:
         if normalized_source == trusted or normalized_source.startswith(f"{trusted}/"):
             return "trusted"
     return "community"
+
+
+# ---------------------------------------------------------------------------
+# Declarative credential destinations (#91569)
+# ---------------------------------------------------------------------------
+
+# Secret-read/secret-send findings whose pattern IDs participate in the
+# declaration exemption below.
+_CREDENTIAL_EXFIL_PATTERN_IDS = {
+    "env_exfil_curl", "env_exfil_wget", "env_exfil_fetch",
+    "env_exfil_httpx", "env_exfil_requests",
+    "python_os_environ",
+    "python_environ_get_secret", "python_getenv_secret",
+    "ruby_env_secret",
+}
+
+_SECRET_NAME_RE = re.compile(r'\b([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)[A-Z0-9_]*)\b')
+_URL_HOST_RE = re.compile(r'https?://([A-Za-z0-9.-]+)')
+
+
+def _load_credential_destinations(skill_path: Path) -> dict:
+    """Parse ``credential_destinations`` from SKILL.md frontmatter.
+
+    Expected shape::
+
+        credential_destinations:
+          JINA_API_KEY: [r.jina.ai]
+
+    Returns ``{SECRET_NAME: [host, ...]}`` with hosts lowercased. Any
+    parse failure or shape mismatch yields ``{}`` — fail-closed, no
+    exemptions.
+    """
+    skill_md = skill_path / "SKILL.md" if skill_path.is_dir() else skill_path
+    try:
+        import yaml
+        text = skill_md.read_text(encoding="utf-8")
+        if not text.startswith("---"):
+            return {}
+        end = text.find("\n---", 3)
+        if end == -1:
+            return {}
+        meta = yaml.safe_load(text[4:end]) or {}
+    except Exception:
+        return {}
+    decl = meta.get("credential_destinations")
+    if not isinstance(decl, dict):
+        return {}
+    out: dict = {}
+    for name, hosts in decl.items():
+        if isinstance(hosts, str):
+            hosts = [hosts]
+        if not isinstance(hosts, list):
+            continue
+        cleaned = [str(h).strip().lower() for h in hosts if str(h).strip()]
+        if cleaned:
+            out[str(name).upper()] = cleaned
+    return out
+
+
+def _exempt_declared_credential_use(
+    findings: List[Finding],
+    skill_path: Path,
+    declarations: dict,
+) -> List[Finding]:
+    """Apply credential_destinations exemptions, FAIL-CLOSED.
+
+    A secret-related exfiltration finding is downgraded ONLY when:
+      1. the matched text names a secret declared in frontmatter, AND
+      2. every network host reachable from the finding's scope — the
+         enclosing ``def``/``class`` block for Python files, else a ±3-line
+         window — is in that secret's declared destination list.
+
+    Any undeclared host in scope keeps the original severity, so sending
+    the credential anywhere unlisted stays DANGEROUS (#91569).
+    """
+    if not declarations or not findings:
+        return findings
+
+    def scope_hosts(file_rel: str, line_no: int) -> set:
+        path = skill_path / file_rel if skill_path.is_dir() else skill_path
+        try:
+            lines = path.read_text(encoding="utf-8").split("\n")
+        except (OSError, UnicodeDecodeError):
+            return {"<unreadable>"}  # fail closed
+        if not (1 <= line_no <= len(lines)):
+            return {"<unreadable>"}
+        if path.suffix == ".py":
+            start = line_no
+            while start > 1 and not re.match(r"^\s*(def |class |@)", lines[start - 1]):
+                start -= 1
+            end = line_no
+            while end < len(lines) and not re.match(r"^(def |class )", lines[end]):
+                end += 1
+        else:
+            start = max(1, line_no - 3)
+            end = min(len(lines), line_no + 3)
+        return {h.lower() for l in lines[start - 1:end] for h in _URL_HOST_RE.findall(l)}
+
+    result: List[Finding] = []
+    for f in findings:
+        if f.pattern_id in _CREDENTIAL_EXFIL_PATTERN_IDS and f.category == "exfiltration":
+            secret = next(
+                (s for s in _SECRET_NAME_RE.findall(f.match or "") if s in declarations),
+                None,
+            )
+            if secret is not None:
+                hosts = scope_hosts(f.file, f.line)
+                if hosts and hosts.issubset(set(declarations[secret])):
+                    result.append(Finding(
+                        pattern_id=f.pattern_id,
+                        severity="low",
+                        category="exfiltration",
+                        file=f.file,
+                        line=f.line,
+                        match=f.match,
+                        description=(
+                            f"[declared] {f.description} — declared destination"
+                            f" {secret} -> {', '.join(declarations[secret])}"
+                        ),
+                    ))
+                    continue
+        result.append(f)
+    return result
 
 
 def _determine_verdict(findings: List[Finding]) -> str:
