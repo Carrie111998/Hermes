@@ -206,7 +206,9 @@ def estimate_campaign(campaign_id: str, request: Request,
     company_id = _scope(principal, x_company_id)
     row = _row(request, company_id, campaign_id)
     config = CampaignConfig.model_validate(json_load(row["config"], {}))
-    estimate = request.app.state.lead_research.estimate(config).model_dump(mode="json")
+    estimate = request.app.state.lead_research.estimate(
+        config, company_id,
+    ).model_dump(mode="json")
     request.app.state.db.execute(
         "UPDATE research_campaigns SET estimate=?,updated_at=? WHERE id=? AND company_id=?",
         (json_dump(estimate), now(), campaign_id, company_id),

@@ -35,6 +35,33 @@ UZ VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW
 """.split())
 
 
+def searchable_term(value: Any) -> str:
+    """Normalise a term or a haystack for discovery matching.
+
+    `normalize_name` casefolds and strips diacritics but leaves separators
+    alone, so `household-appliances` and "Household Appliances" were different
+    strings and a sector id matched a corpus that spelled its category with
+    spaces not at all. Folding `-` and `_` to spaces on both sides is the same
+    treatment `satisfies_buyer_role` already gives role names.
+    """
+    return normalize_name(str(value).replace("_", " ").replace("-", " "))
+
+
+def _terms(product_terms) -> list[str]:
+    return [
+        searchable_term(value) for value in product_terms if str(value).strip()
+    ]
+
+
+def _haystack(row, data: dict) -> str:
+    """Everything a term may match against for one candidate row."""
+    return " ".join([
+        searchable_term(row["normalized_name"]),
+        *[searchable_term(value) for value in data.get("aliases", [])],
+        *[searchable_term(value) for value in data.get("categories", [])],
+    ])
+
+
 class CandidateImportValidationError(ValueError):
     """The supplied corpus is malformed; no part of it was written."""
 
@@ -274,6 +301,52 @@ class CandidateRepository:
                 newest[dataset_id] = version
         return newest
 
+    def term_match_counts(
+        self, *, countries: list[str], product_terms: list[str]
+    ) -> dict[str, int]:
+        """How many candidates each term matches on its own.
+
+        The diagnostic for an empty search. Term matching is substring matching
+        against a corpus category, so a term that is merely spelled differently
+        from what was imported selects nothing and looks identical to a market
+        with no buyers in it. Per-term counts tell those apart: a sector id at 0
+        beside another at 5,470 names the problem outright.
+        """
+        counts = {str(term): 0 for term in product_terms if str(term).strip()}
+        if not counts:
+            return {}
+        folded = {str(term): searchable_term(term) for term in counts}
+        for row, data in self._rows(countries):
+            haystack = _haystack(row, data)
+            for term, needle in folded.items():
+                if needle and needle in haystack:
+                    counts[term] += 1
+        return counts
+
+    def _rows(self, countries: list[str]):
+        """Current-version rows for these countries, decoded once."""
+        current = self._current_versions()
+        if not current:
+            return
+        normalized = {
+            str(value).strip().upper() for value in countries if str(value).strip()
+        }
+        clauses, params = [], []
+        if normalized:
+            clauses.append(f"country IN ({','.join('?' for _ in normalized)})")
+            params.extend(sorted(normalized))
+        clauses.append(
+            "(" + " OR ".join("(dataset_id=? AND version=?)" for _ in current) + ")"
+        )
+        for dataset_id in sorted(current):
+            params.extend((dataset_id, current[dataset_id]))
+        for row in self.db.all(
+            "SELECT normalized_name,data FROM candidate_records WHERE "
+            + " AND ".join(clauses),
+            tuple(params),
+        ):
+            yield row, json_load(row["data"], {})
+
     def select(
         self,
         *,
@@ -334,16 +407,17 @@ class CandidateRepository:
         # are content hashes, so this interleaves datasets evenly and stays
         # deterministic.
         query += " ORDER BY source_record_id,dataset_id,version"
-        terms = [normalize_name(str(value)) for value in product_terms if str(value).strip()]
+        terms = _terms(product_terms)
         results: list[CandidateRecord] = []
         for row in self.db.all(query, tuple(params)):
             data = json_load(row["data"], {})
-            searchable = " ".join([
-                row["normalized_name"],
-                *[normalize_name(value) for value in data.get("aliases", [])],
-                *[normalize_name(value) for value in data.get("categories", [])],
-            ])
-            if terms and not all(term in searchable for term in terms):
+            searchable = _haystack(row, data)
+            # Any term, not every term. A campaign's sector ids, HS codes and
+            # product names are alternative descriptions of one scope, not
+            # conditions to satisfy together — and no company name contains two
+            # different product names, so requiring all of them made selecting a
+            # second product guarantee zero candidates.
+            if terms and not any(term in searchable for term in terms):
                 continue
             if (row["normalized_name"], (row["country"] or "").upper()) in skip:
                 continue

@@ -188,6 +188,18 @@ export async function mount(root, ctx) {
           ? el('span', { class: 'ifz-hint' }, `Unavailable: ${estimate.unavailable_source_ids.join(', ')}`) : null);
     }
     return el('div', { class: 'ifz-estimate-panel' },
+      // First, because it is the only figure here that is counted rather than
+      // projected: the ranges below describe what a source knows in general and
+      // never consulted the corpus, so they read healthy for terms that select
+      // nothing at all.
+      estimate.corpus_candidates == null ? null : el('div', {},
+        el('span', {}, 'Candidates matching these terms'),
+        el('strong', {}, String(estimate.corpus_candidates))),
+      estimate.unmatched_terms?.length
+        ? el('p', { class: 'ifz-hint' },
+            `Matched no candidate: ${estimate.unmatched_terms.join(', ')}. `
+            + 'A term matching nothing is spelled differently from the imported corpus category.')
+        : null,
       el('div', {}, el('span', {}, 'Estimated named candidates'), el('strong', {}, estimate.named_candidate_range.join('–'))),
       el('div', {}, el('span', {}, 'Estimated eligible companies'), el('strong', {}, estimate.eligible_range.join('–'))),
       el('div', {}, el('span', {}, 'Estimated qualified leads'), el('strong', {}, estimate.qualified_range.join('–'))),

@@ -121,6 +121,18 @@ export async function mount(root, ctx) {
           },
         },
       });
+      // Selection is the only source of companies to research, so a brief that
+      // matches none of them cannot produce a lead however long it runs. Saying
+      // so here costs one call and saves a search that was already decided.
+      const estimate = await call('researchCampaigns.estimate', { params: { campaignId: campaign.id } });
+      if (estimate?.corpus_candidates === 0) {
+        toast(
+          `No companies in ${brief.markets.join(', ')} match ${sector?.name || 'this sector'}. `
+          + 'Nothing was searched. Try another market or sector.',
+          'error',
+        );
+        return;
+      }
       await call('researchCampaigns.start', { params: { campaignId: campaign.id } });
       // Queued, not finished: the search runs in the background and each
       // company is verified before it appears. Claiming it had finished sent

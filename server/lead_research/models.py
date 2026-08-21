@@ -381,3 +381,10 @@ class CampaignEstimate(ApiModel):
     qualified_range: list[int] | None = None
     unavailable_source_ids: list[str] = Field(default_factory=list)
     expected_partitions: int = 0
+    # What the corpus can actually supply for these terms and markets. The
+    # provider-reported ranges above describe how much a source knows in
+    # general; they never consulted the candidate corpus, so an estimate could
+    # promise leads for terms that select nothing at all. None means not
+    # computed, rather than zero.
+    corpus_candidates: int | None = None
+    unmatched_terms: list[str] = Field(default_factory=list)

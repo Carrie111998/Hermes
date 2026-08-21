@@ -35,12 +35,15 @@ function baseResponses(overrides = {}) {
   };
 }
 
-function stubFetch(responses, posts = []) {
+function stubFetch(responses, posts = [], postResponses = {}) {
   globalThis.fetch = async (url, init = {}) => {
     if (init.method && init.method !== 'GET') {
       posts.push({ url, body: init.body ? JSON.parse(init.body) : null });
+      // Keyed by suffix so a test can answer one specific POST — the estimate,
+      // say — while the rest keep the default created-campaign shape.
+      const match = Object.keys(postResponses).find(suffix => url.endsWith(suffix));
       return { ok: true, status: 201, headers: { get: () => 'application/json' },
-               json: async () => ({ id: 'rc_new' }) };
+               json: async () => (match ? postResponses[match] : { id: 'rc_new' }) };
     }
     const body = responses[url];
     return { ok: body !== undefined, status: body === undefined ? 404 : 200,
@@ -50,7 +53,7 @@ function stubFetch(responses, posts = []) {
 }
 
 async function mountBrief(responses, ctx = {}) {
-  stubFetch(responses, ctx.posts);
+  stubFetch(responses, ctx.posts, ctx.postResponses);
   const { mount } = await import('../../../server/webui/js/pages/research-brief.js');
   const root = document.createElement('div');
   await mount(root, { navigate: path => ctx.navigated?.push(path), ...ctx });
@@ -120,4 +123,46 @@ test('no markets means Setup, not an empty search', async () => {
   byText(root, 'button', 'Run lead search').click();
   await nextTurn();
   assert.equal(posts.length, 0, 'nothing may be created without a market');
+});
+
+
+// Selection is the only source of companies to research, so a brief matching
+// none of them cannot produce a lead however long it runs. It used to run
+// anyway, succeed, and show an empty list — indistinguishable from a market
+// with no buyers in it.
+test('a brief that matches no candidate is not started', async () => {
+  const posts = [];
+  const navigated = [];
+  const root = await mountBrief(baseResponses(), {
+    posts,
+    navigated,
+    postResponses: {
+      '/estimate': { status: 'available', corpus_candidates: 0, unmatched_terms: ['household-appliances'] },
+    },
+  });
+
+  byText(root, 'button', 'Run lead search').click();
+  await nextTurn();
+  await nextTurn();
+
+  assert.ok(posts.some(entry => entry.url.endsWith('/estimate')), 'the brief must check first');
+  assert.equal(posts.some(entry => entry.url.endsWith('/start')), false, 'nothing may be searched');
+  assert.deepEqual(navigated, [], 'the customer stays on the brief to change it');
+});
+
+test('a brief that matches candidates still starts', async () => {
+  const posts = [];
+  const navigated = [];
+  const root = await mountBrief(baseResponses(), {
+    posts,
+    navigated,
+    postResponses: { '/estimate': { status: 'available', corpus_candidates: 12 } },
+  });
+
+  byText(root, 'button', 'Run lead search').click();
+  await nextTurn();
+  await nextTurn();
+
+  assert.ok(posts.some(entry => entry.url.endsWith('/start')), 'the campaign must start');
+  assert.deepEqual(navigated, ['/app/research']);
 });

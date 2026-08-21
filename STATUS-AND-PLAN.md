@@ -152,23 +152,19 @@ tenant holding both a plain contact list and a procurement-derived corpus never
 reached the second one — and on the demo that meant a limit of 9 drew 9
 uncitable rows and verified none of them.
 
-Term matching is `all(term in searchable for term in terms)`: **AND, substring,
-against the candidate name plus its aliases and categories.** Two consequences
-that decide whether a demo produces anything at all:
+Term matching is **any term, substring, against the candidate name plus its
+aliases and categories**, with `-` and `_` folded to spaces on both sides. See
+"The term trap" below for what this used to be and why it changed — the short
+version is that it was AND over separator-sensitive strings, so a second product
+guaranteed zero candidates and `Household Appliances` matched a
+`household-appliances` corpus not at all.
 
-- Selecting **two or more products guarantees zero candidates.** No company
-  name contains two different product names.
-- Selecting **one product almost certainly returns zero too.** The term is the
-  product's `name` column, e.g. `built-in oven series (svn-b)`, and that is not
-  a substring of `al ahmadi trading co.`.
-
-What does work is a term that matches the category stamped on every corpus row
-by `build_corpus.py`: `kitchen-appliances`, or any substring of it. Matching is
-case-sensitive after `normalize_name`, which only lowercases — `Kitchen
-Appliances` matches nothing, `kitchen-appliances` matches all 5,470.
-
-So: put the term in `sector_ids`, leave `product_ids` empty. Products are still
-worth importing for outreach copy; they are just not a discovery filter.
+A product name is still a weak discovery term on its own: it is the product's
+`name` column, e.g. `built-in oven series (svn-b)`, which is not a substring of
+`al ahmadi trading co.`. What reliably matches is the category stamped on every
+corpus row by `build_corpus.py`. The difference now is that adding a product
+alongside a sector *widens* the search instead of emptying it, and a term that
+matches nothing is named rather than silently fatal.
 
 ### 2. Verification
 
@@ -961,6 +957,58 @@ say what broke.
 
 Verified by reverting all three: three tests fail. 522 server tests pass across
 three consecutive runs, plus six WebUI suites.
+
+### D2. The term trap
+
+Discovery matched terms with AND, as substrings, after a normalisation that left
+separators alone. Three consequences, and every one of them returned zero
+candidates without saying so:
+
+- **A second term guaranteed nothing matched.** `all(term in searchable)` over
+  sector ids, HS codes and product names — but those are alternative
+  descriptions of one scope, not conditions to satisfy together, and no company
+  name contains two different product names. Picking a second product could
+  never match anything, and one unmatched term vetoed a search that would
+  otherwise have worked. It is `any` now.
+- **`household-appliances` did not match "Household Appliances".**
+  `normalize_name` casefolds and strips diacritics but leaves `-` and `_` alone,
+  so the canonical sector id the brief page offers matched a customer corpus
+  spelling its category with spaces not at all. Both sides now fold separators
+  to spaces — the same treatment `satisfies_buyer_role` already gives role
+  names. This is what cost the kitchen-appliance corpus a full re-import.
+- **And the campaign then ran, succeeded, and reported no leads**, which is
+  indistinguishable from a market with no buyers in it.
+
+The earlier guidance in this document — put the term in `sector_ids`, type
+exactly `kitchen-appliances`, never select two products — was a workaround for
+all of this. Those paragraphs are corrected above; they now describe behaviour
+rather than a spell to recite.
+
+Zero is explained in three places now:
+
+- **`term_match_counts`** returns per-term counts, so a sector id at 0 beside
+  another at 5,470 names the problem outright instead of leaving an operator to
+  bisect their own config.
+- **A market that selected nothing records a `no_candidates_selected` issue**
+  carrying those counts, so a finished run says which it was.
+- **The estimate counts the corpus.** `CampaignEstimate` gained
+  `corpus_candidates` and `unmatched_terms`, because the provider ranges describe
+  what a source knows in general and never consulted the candidate corpus — an
+  estimate could read `available` with a healthy range for terms that select
+  nothing. `None` means not computed, which is not the same as 0.
+- **The brief page refuses to start a futile search.** Selection is the only
+  source of companies to research, so a brief matching none of them cannot
+  produce a lead however long it runs. One estimate call saves a search that was
+  already decided, and the customer stays on the brief to change it rather than
+  being sent to an empty list.
+
+Not changed: term matching is still substring matching, so `oven` still matches
+`Ovenden Trading`. Tightening that to token matching would break the category
+match the whole corpus relies on, and the fix for a term that is too broad is a
+better term — which the per-term counts now make visible.
+
+Verified by reverting: nine tests fail with AND and separator-sensitive
+matching restored. 542 server tests and seven WebUI suites pass.
 
 ## Carried-over risks
 

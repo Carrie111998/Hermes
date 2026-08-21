@@ -239,9 +239,32 @@ class LeadResearchService:
             })
         return result
 
-    def estimate(self, config: CampaignConfig):
+    def estimate(self, config: CampaignConfig, company_id: str | None = None):
+        """A pre-run estimate, including what the corpus can actually supply.
+
+        The provider ranges say how much a source knows in general and never
+        consulted the candidate corpus, so an estimate could read `available`
+        with a healthy range while selection matched nothing — which is how a
+        term spelled differently from the imported category became a campaign
+        that ran, succeeded, and returned zero leads without explanation.
+        """
         providers = [self.registry.get(source_id) for source_id in config.enabled_source_ids]
-        return estimate_campaign(config, providers)
+        estimate = estimate_campaign(config, providers)
+        if company_id is None:
+            return estimate
+        terms = self._product_terms(company_id, config)
+        matches = self.candidates.term_match_counts(
+            countries=config.target_countries, product_terms=terms,
+        )
+        selected = self.candidates.select(
+            countries=config.target_countries,
+            product_terms=terms,
+            limit=config.max_qualified_leads_per_country * max(1, len(config.target_countries)) * 3,
+        )
+        return estimate.model_copy(update={
+            "corpus_candidates": len(selected),
+            "unmatched_terms": sorted(term for term, count in matches.items() if not count),
+        })
 
     def _lead_ids_by_organization(self, company_id: str) -> dict[str, str]:
         """Existing leads, keyed by the organization they belong to.
@@ -1018,6 +1041,27 @@ class LeadResearchService:
                     limit=config.max_qualified_leads_per_country * 3,
                     exclude=settled,
                 )
+                if not candidates:
+                    # A market that selected nothing is indistinguishable from a
+                    # market with no buyers in it unless the run says which it
+                    # was. Term matching is substring matching against a corpus
+                    # category, so a term spelled differently from what was
+                    # imported silently selects zero — the failure this names.
+                    self._try_save_processing_issue(
+                        company_id, campaign_id, None, "no_candidates_selected",
+                        {
+                            "country": country,
+                            "terms": product_terms,
+                            "term_matches": self.candidates.term_match_counts(
+                                countries=[country], product_terms=product_terms,
+                            ),
+                            "message": (
+                                "No candidate matched these terms in this market. "
+                                "A term matching 0 is spelled differently from the "
+                                "imported corpus category."
+                            ),
+                        },
+                    )
                 metrics["raw_records"] += len(candidates)
                 metrics["named_candidates"] += len(candidates)
                 for source_id in config.enabled_source_ids:
