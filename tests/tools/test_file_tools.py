@@ -91,6 +91,22 @@ class TestWriteFileHandler:
         assert result["error"] == "boom"
         assert any("write_file error" in r.getMessage() for r in caplog.records)
 
+    @patch("tools.file_tools._get_file_ops")
+    def test_enoent_error_names_path_and_cwd(self, mock_get):
+        """t_886b35f5 — a bare ENOENT must not come back undiagnosed: the
+        message names the target path, the process CWD, and the first
+        missing parent component so a deleted-CWD (workspace-wipe) failure
+        is distinguishable from a genuinely missing parent directory."""
+        mock_get.side_effect = FileNotFoundError(2, "No such file or directory")
+
+        from tools.file_tools import write_file_tool
+        result = json.loads(write_file_tool("/no/such/dir/out.py", "x = 1\n"))
+        assert "error" in result
+        assert "target path" in result["error"]
+        assert "/no/such/dir/out.py" in result["error"]
+        assert "process cwd" in result["error"]
+        assert "missing parent" in result["error"]
+
     def test_missing_content_key_returns_error(self):
         """#19096 — handler must reject tool calls where 'content' key is absent."""
         from tools.file_tools import _handle_write_file

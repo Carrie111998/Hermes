@@ -7735,8 +7735,12 @@ def _gateway_command_inner(args):
         if os.getenv("_HERMES_GATEWAY") == "1":
             print_error(
                 "Refusing to stop the gateway from inside the gateway process.\n"
-                "This command was blocked to prevent restart loops.\n"
-                "Use `hermes gateway stop` from a shell outside the running gateway."
+                "This command was blocked to prevent restart loops — an in-process\n"
+                "stop is impossible by design (SIGTERM would kill this command\n"
+                "first). Sanctioned alternatives: trigger the external watchdog\n"
+                "(`launchctl start ai.hermes.gateway-watchdog`) when the gateway\n"
+                "is dead/frozen/deaf, or have a human run the stop in a standalone\n"
+                "Terminal (see the hermes-local-services skill)."
             )
             sys.exit(1)
 
@@ -7828,8 +7832,12 @@ def _gateway_command_inner(args):
         if os.getenv("_HERMES_GATEWAY") == "1":
             print_error(
                 "Refusing to restart the gateway from inside the gateway process.\n"
-                "This command was blocked to prevent restart loops.\n"
-                "Use `hermes gateway restart` from a shell outside the running gateway."
+                "This command was blocked to prevent restart loops — an in-process\n"
+                "restart is impossible by design (SIGTERM would kill this command\n"
+                "first). Sanctioned alternatives: trigger the external watchdog\n"
+                "(`launchctl start ai.hermes.gateway-watchdog`) when the gateway\n"
+                "is dead/frozen/deaf, or have a human run the kickstart restart in\n"
+                "a standalone Terminal (see the hermes-local-services skill)."
             )
             sys.exit(1)
 

@@ -98,12 +98,23 @@ def is_dispatcher_owned_worker_context() -> bool:
     """Return True only when this execution owns the dispatcher's Kanban task.
 
     The single predicate every ``HERMES_KANBAN_*`` identity gate should use
-    before trusting those vars.  False for delegate_task children and for cron
-    jobs fired in-process from a worker.
+    before trusting those vars.  False for delegate_task children, for cron
+    jobs fired in-process from a worker, and for any process carrying the
+    ``HERMES_DELEGATED_CHILD_CONTEXT`` env marker (a forked child of a worker
+    spawned through the terminal tool — a fresh ``hermes chat`` process that
+    inherited the worker's env must never be mistaken for the worker itself).
     """
     if _DELEGATED_CHILD_CONTEXT.get():
         return False
-    return not _NON_DISPATCHER_OWNED_CONTEXT.get()
+    if _NON_DISPATCHER_OWNED_CONTEXT.get():
+        return False
+    # Forked-child lineage: scrub_kanban_env stamps this marker on every
+    # subprocess env a worker (or delegated child) hands to a child process.
+    # The dispatcher itself never sets it, so its presence is proof this
+    # execution is not the run owner, even if HERMES_KANBAN_* vars leaked in.
+    import os
+
+    return not os.environ.get(DELEGATED_CHILD_ENV_MARKER)
 
 
 def enter_non_dispatcher_owned_context() -> Token[bool]:
@@ -131,10 +142,26 @@ def is_delegated_child_process_context() -> bool:
 
 
 def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[str, str]:
-    """Return *env* with dispatcher-only Kanban variables removed."""
+    """Return *env* with dispatcher-only Kanban variables removed.
+
+    Drops the canonical ``KANBAN_ENV_KEYS`` plus every other
+    ``HERMES_KANBAN_*`` var (behaviour knobs like ``HERMES_KANBAN_GOAL_MODE``
+    and ``HERMES_KANBAN_BRANCH`` are not identity, but they are equally
+    meaningless outside the dispatcher and must never let a spawned child
+    reconstruct worker behaviour from a partial leak). The caller is then
+    marked with ``HERMES_DELEGATED_CHILD_CONTEXT=1`` so the lineage stays
+    scrubbed across further forks.
+    """
     cleaned = dict(env)
-    for key in KANBAN_ENV_KEYS:
-        cleaned.pop(key, None)
+    for key in list(cleaned):
+        if key.startswith("HERMES_KANBAN_"):
+            cleaned.pop(key, None)
+    # HERMES_SESSION_SOURCE=kanban is part of the worker identity the
+    # dispatcher injects (_default_spawn): it tags the session row so the
+    # sidebar hides it. A spawned child must not inherit that tag — its
+    # session is a normal conversation, not a worker run.
+    if cleaned.get("HERMES_SESSION_SOURCE") == "kanban":
+        cleaned.pop("HERMES_SESSION_SOURCE", None)
     cleaned[DELEGATED_CHILD_ENV_MARKER] = "1"
     return cleaned
 

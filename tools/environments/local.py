@@ -63,7 +63,14 @@ def _resolve_local_initial_cwd(cwd: str) -> str:
     values once, up front, so both ``subprocess.Popen(cwd=...)`` and the
     in-shell ``cd`` use the same absolute directory.
     """
-    expanded = os.path.expanduser(cwd) if cwd else os.getcwd()
+    try:
+        expanded = os.path.expanduser(cwd) if cwd else os.getcwd()
+    except OSError:
+        # Process CWD deleted mid-run (workspace-wipe family) — os.getcwd()
+        # raises ENOENT from a removed directory.  A backend created in that
+        # state must not die on construction; fall back to the home dir,
+        # which is stable as long as the user exists.
+        expanded = os.path.expanduser("~")
     if _IS_WINDOWS:
         expanded = _msys_to_windows_path(expanded)
         # Use the Windows-aware check explicitly: when _IS_WINDOWS is
@@ -531,7 +538,22 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
 
 
 def _scrub_delegated_child_kanban_env(env: dict[str, str]) -> dict[str, str]:
-    """Strip dispatcher-owned Kanban env from delegate_task child subprocesses."""
+    """Strip dispatcher-owned Kanban identity from subprocess environments.
+
+    Two lineages must never see the dispatcher's ``HERMES_KANBAN_*`` vars:
+
+    1. delegate_task children (the ``HERMES_DELEGATED_CHILD_CONTEXT`` ContextVar
+       or env marker carried across forks), and
+    2. ANY subprocess spawned by a kanban worker through the terminal tool
+       (local/PTY spawns, env-backend runs, helper spawns). A worker's child
+       processes inherit ``os.environ`` by default; without this scrub a
+       spawned ``hermes chat -q`` child would misread the worker's card as its
+       own assignment, get the kanban lifecycle tools, and could
+       ``kanban_complete`` the parent card mid-run (rogue completion +
+       workspace wipe). ``scrub_kanban_env`` also stamps the
+       ``HERMES_DELEGATED_CHILD_CONTEXT`` marker so grandchildren stay
+       scrubbed and the child's own identity gates fail closed.
+    """
     try:
         from agent.delegation_context import (
             is_delegated_child_process_context,
@@ -539,6 +561,12 @@ def _scrub_delegated_child_kanban_env(env: dict[str, str]) -> dict[str, str]:
         )
 
         if is_delegated_child_process_context():
+            return scrub_kanban_env(env)
+        # A worker's own subprocesses must not inherit worker identity, even
+        # though the worker process itself legitimately holds it. Any
+        # HERMES_KANBAN_* var in the child env being built means the parent
+        # process is (or is itself a child of) a dispatcher worker.
+        if any(key.startswith("HERMES_KANBAN_") for key in env):
             return scrub_kanban_env(env)
     except Exception:
         pass

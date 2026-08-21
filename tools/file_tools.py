@@ -2219,6 +2219,36 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
     return None
 
 
+def _diagnose_write_oserror(path: str, exc: OSError) -> str:
+    """Augment a write_file OSError with self-diagnosing context.
+
+    A bare ``[Errno 2] No such file or directory`` is ambiguous: the write
+    may have failed because a parent directory is missing/blocked, OR the
+    process CWD was deleted out from under the worker (workspace-wipe
+    family) and ``os.getcwd()`` raised from an unrelated enrichment layer
+    (LSP workspace resolution — the t_886b35f5 incident).  Name the target
+    path, the process CWD, and the first missing parent component so the
+    next occurrence is diagnosable from the tool result alone.
+    """
+    try:
+        cwd = os.getcwd()
+    except OSError as cwd_exc:
+        cwd = f"<deleted/unavailable: {cwd_exc}>"
+    # Walk up from the target's parent to find the first missing component.
+    missing = None
+    parent = os.path.dirname(path)
+    while parent and parent != os.path.dirname(parent):
+        if not os.path.exists(parent):
+            missing = parent
+            parent = os.path.dirname(parent)
+        else:
+            break
+    detail = f"target path: {path!r}; process cwd: {cwd!r}"
+    if missing:
+        detail += f"; first missing parent component: {missing!r}"
+    return f"{exc} ({detail})"
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
                     session_id: str | None = None) -> str:
@@ -2308,6 +2338,10 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             logger.debug("write_file expected denial: %s: %s", type(e).__name__, e)
         else:
             logger.error("write_file error: %s: %s", type(e).__name__, e, exc_info=True)
+        if isinstance(e, OSError) and getattr(e, "errno", None) == errno.ENOENT:
+            # Bare ENOENT is ambiguous (missing parent vs deleted CWD) —
+            # name path + CWD + first missing parent for diagnosis.
+            return tool_error(_diagnose_write_oserror(path, e))
         return tool_error(str(e))
 
 

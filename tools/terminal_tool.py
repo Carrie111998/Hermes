@@ -2948,8 +2948,14 @@ def terminal_tool(
                         "Blocked: command or referenced script cannot restart or stop "
                         "the gateway from inside the gateway process. The gateway would "
                         "kill this command before it could complete (SIGTERM propagates "
-                        "to child processes). Run `hermes gateway restart` from a "
-                        "separate shell outside the running gateway."
+                        "to child processes) — in-process restarts are impossible by "
+                        "design. Sanctioned alternatives: (1) if the gateway is dead, "
+                        "frozen, or deaf, trigger the external watchdog that runs "
+                        "outside this process tree: `launchctl start "
+                        "ai.hermes.gateway-watchdog`; (2) for a clean restart (e.g. "
+                        "after config changes), hand the restart command to the user "
+                        "to run in a standalone Terminal — see the "
+                        "hermes-local-services skill for the exact command."
                     ),
                     "status": "error",
                 }, ensure_ascii=False)

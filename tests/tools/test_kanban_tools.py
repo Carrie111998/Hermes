@@ -371,6 +371,65 @@ def test_comment_happy_path(worker_env):
         conn.close()
 
 
+def test_notify_subscribe_happy_path(worker_env):
+    """A worker can natively subscribe a task to Telegram (the standing
+    notify convention) without shelling out to the blocked `hermes kanban`
+    CLI — this is the native-tool path that replaces the CLI in worker
+    contexts where the CLI is hard-blocked."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_notify_subscribe({
+        "task_id": worker_env,
+        "platform": "telegram",
+        "chat_id": "7825482644",
+        "thread_id": "123",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["subscribed"] is True
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, worker_env)
+        assert any(s["platform"] == "telegram" and s["chat_id"] == "7825482644"
+                   for s in subs)
+    finally:
+        conn.close()
+
+
+def test_notify_subscribe_rejects_delegated_child(worker_env, monkeypatch):
+    """The native notify tool must fail closed in a delegate_task child
+    context, mirroring the CLI and the other kanban mutators."""
+    from agent.delegation_context import delegated_child_context
+    from tools import kanban_tools as kt
+    with delegated_child_context("child-sess"):
+        out = kt._handle_notify_subscribe({
+            "task_id": worker_env,
+            "platform": "telegram",
+            "chat_id": "7825482644",
+        })
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    assert "refused" in d.get("error", "").lower() or "delegate" in d.get("error", "").lower()
+
+
+def test_notify_subscribe_requires_args(worker_env):
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_notify_subscribe({"task_id": worker_env}))
+    assert d.get("ok") is not True
+    assert "platform" in d.get("error", "")
+
+
+def test_notify_list_happy_path(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    kt._handle_notify_subscribe({
+        "task_id": worker_env, "platform": "slack", "chat_id": "#kanban",
+    })
+    d = json.loads(kt._handle_notify_list({"task_id": worker_env}))
+    assert d["ok"] is True
+    assert len(d["subscriptions"]) >= 1
+
+
 def test_comment_ignores_caller_supplied_author(worker_env):
     """``args["author"]`` is no longer honored — the author is always
     derived from ``HERMES_PROFILE`` so a worker can't forge a comment

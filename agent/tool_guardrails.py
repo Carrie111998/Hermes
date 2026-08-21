@@ -14,7 +14,10 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from utils import safe_json_loads
-from agent.tool_result_classification import file_mutation_result_landed
+from agent.tool_result_classification import (
+    detect_http_status_in_output,
+    file_mutation_result_landed,
+)
 
 
 IDEMPOTENT_TOOL_NAMES = frozenset(
@@ -255,6 +258,15 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
             exit_code = data.get("exit_code")
             if exit_code is not None and exit_code != 0:
                 return True, f" [exit {exit_code}]"
+            # exit_code 0 is NOT a success signal for network fetches: curl
+            # without -f exits 0 on HTTP 404/5xx. Classify embedded status
+            # codes so the loop guardrail fires on deterministic HTTP loops.
+            http = detect_http_status_in_output(
+                data.get("output") if isinstance(data.get("output"), str) else None
+            )
+            if http is not None:
+                code, kind = http
+                return True, f" [HTTP {code} {kind}]"
         return False, ""
 
     if tool_name == "memory":
@@ -387,11 +399,7 @@ class ToolCallGuardrailController:
                 return ToolGuardrailDecision(
                     action="warn",
                     code="repeated_exact_failure_warning",
-                    message=(
-                        f"{tool_name} has failed {exact_count} times with identical arguments. "
-                        "This looks like a loop; inspect the error and change strategy "
-                        "instead of retrying it unchanged."
-                    ),
+                    message=_repeated_exact_failure_message(tool_name, exact_count, result),
                     tool_name=tool_name,
                     count=exact_count,
                     signature=signature,
@@ -401,7 +409,7 @@ class ToolCallGuardrailController:
                 return ToolGuardrailDecision(
                     action="warn",
                     code="same_tool_failure_warning",
-                    message=_tool_failure_recovery_hint(tool_name, same_count),
+                    message=_tool_failure_recovery_hint(tool_name, same_count, result),
                     tool_name=tool_name,
                     count=same_count,
                     signature=signature,
@@ -535,7 +543,36 @@ def append_toolguard_guidance(result: str, decision: ToolGuardrailDecision) -> s
     return (result or "") + suffix
 
 
-def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
+def _repeated_exact_failure_message(tool_name: str, count: int, result: str | None = None) -> str:
+    """Warning for repeated identical failed calls, HTTP-aware for terminal."""
+    base = (
+        f"{tool_name} has failed {count} times with identical arguments. "
+        "This looks like a loop; inspect the error and change strategy "
+        "instead of retrying it unchanged."
+    )
+    if tool_name == "terminal":
+        parsed = safe_json_loads(result or "")
+        http = detect_http_status_in_output(
+            parsed.get("output") if isinstance(parsed, dict) and isinstance(parsed.get("output"), str) else None
+        )
+        if http is not None:
+            code, kind = http
+            if kind == "permanent":
+                return base + (
+                    f" The output shows HTTP {code}, a PERMANENT error (4xx: wrong URL, "
+                    "resource gone, bad path/auth). Retrying the same request unchanged "
+                    "will keep failing. Verify the URL/endpoint, switch source "
+                    "(web_search, another host), or report the blocker to the user. "
+                    "Never blind-retry a 4xx without modifying the request."
+                )
+            return base + (
+                f" The output shows HTTP {code}, a TRANSIENT error (5xx: server-side "
+                "flake). One backoff retry is OK; if it still fails, treat it as a blocker."
+            )
+    return base
+
+
+def _tool_failure_recovery_hint(tool_name: str, count: int, result: str | None = None) -> str:
     """Action-oriented guidance for recovering from repeated tool failures."""
     common = (
         f"{tool_name} has failed {count} times this turn. This looks like a loop. "
@@ -543,6 +580,25 @@ def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
         "First inspect the latest error/output and verify your assumptions. "
     )
     if tool_name == "terminal":
+        parsed = safe_json_loads(result or "")
+        http = detect_http_status_in_output(
+            parsed.get("output") if isinstance(parsed, dict) and isinstance(parsed.get("output"), str) else None
+        )
+        if http is not None:
+            code, kind = http
+            if kind == "permanent":
+                return common + (
+                    f"The output shows HTTP {code}, a PERMANENT error (4xx: wrong URL, "
+                    "resource gone, bad path/auth). Retrying the same request unchanged "
+                    "will keep failing. Verify the URL/endpoint, switch source "
+                    "(web_search, another host), or report the blocker to the user. "
+                    "Never blind-retry a 4xx without modifying the request."
+                )
+            return common + (
+                f"The output shows HTTP {code}, a TRANSIENT error (5xx: server-side "
+                "flake). A short backoff retry is legitimate, but if it keeps failing "
+                "after 1-2 retries, treat it as a blocker: switch source or report it."
+            )
         return common + (
             "For terminal failures, run a small diagnostic such as `pwd && ls -la` "
             "in the same tool, then try an absolute path, a simpler command, a different "

@@ -108,7 +108,12 @@ class TestDetectDangerousRm:
                     None,
                 )
 
-    def test_symlinked_temp_dir_only_exempts_canonical_target(self, tmp_path):
+    def test_symlinked_temp_dir_spellings_are_exempt_but_escaping_symlink_is_not(self, tmp_path):
+        # macOS /tmp -> /private/tmp (and /var -> /private/var) means
+        # gettempdir() can legitimately return a symlinked spelling; cleanup
+        # via any spelling that resolves into the canonical temp dir is
+        # legitimate. A symlinked FILE inside the temp dir whose target
+        # escapes it is not our artifact and must stay dangerous.
         real_temp = tmp_path / "real-temp"
         real_temp.mkdir()
         linked_temp = tmp_path / "linked-temp"
@@ -116,12 +121,26 @@ class TestDetectDangerousRm:
         basename = "hermes-verify-example.py"
 
         with mock_patch("tempfile.gettempdir", return_value=str(linked_temp)):
-            assert detect_dangerous_command(f"rm -f {linked_temp / basename}")[0] is True
+            # Symlinked spelling of the temp dir -> legitimate cleanup
+            # (regression for macOS /tmp -> /private/tmp).
+            assert detect_dangerous_command(f"rm -f {linked_temp / basename}") == (
+                False,
+                None,
+                None,
+            )
+            # Canonical spelling -> also legitimate.
             assert detect_dangerous_command(f"rm -f {real_temp / basename}") == (
                 False,
                 None,
                 None,
             )
+            # File symlink inside the temp dir escaping to an outside target
+            # -> not our artifact, still dangerous.
+            escape_target = tmp_path / "outside" / "victim.py"
+            escape_target.parent.mkdir()
+            escape_target.write_text("x")
+            (real_temp / basename).symlink_to(escape_target)
+            assert detect_dangerous_command(f"rm -f {real_temp / basename}")[0] is True
 
     def test_verification_cleanup_exemption_rejects_broader_deletions(self):
         commands = (
@@ -700,6 +719,51 @@ class TestGatewayProtection:
         """pkill targeting unrelated processes should not be flagged."""
         dangerous, key, desc = detect_dangerous_command("pkill -f nginx")
         assert dangerous is False
+
+
+class TestGatewayLifecycleQuotedMentionNotFlagged:
+    """A gateway-lifecycle command SHAPE embedded in a quoted string or ``#``
+    comment is benign mention data, not an instruction. The guard must match
+    real intent, not substring content inside quoted data (kanban t_7da757ed;
+    closes the over-block reported 2026-07-24).
+    """
+
+    @pytest.mark.parametrize("cmd", [
+        'echo "hermes gateway restart"',
+        'echo "hermes update now"',
+        'echo "do not run hermes gateway stop"',
+        'grep -rn "hermes gateway restart" /var/log',
+        'journalctl | grep "hermes gateway restart"',
+        'cat /tmp/notes.txt  # contains hermes gateway stop instructions',
+        "systemctl status hermes-gateway  # do NOT restart",
+        'launchctl print system/ai.hermes.gateway  # not a stop/kickstart',
+    ])
+    def test_quoted_or_commented_mention_not_flagged(self, cmd):
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is False, f"over-blocked benign mention: {cmd!r} ({desc})"
+
+    def test_real_lifecycle_command_still_flagged(self):
+        for cmd in (
+            "hermes gateway restart",
+            "hermes gateway stop",
+            "hermes -p ade gateway restart",
+            "hermes --profile ade gateway stop",
+            "hermes update",
+            "launchctl kickstart -k gui/501/ai.hermes.gateway",
+            'echo hi && hermes gateway restart',
+        ):
+            dangerous, _, desc = detect_dangerous_command(cmd)
+            assert dangerous is True, f"should have flagged: {cmd!r}"
+
+    def test_python_c_flag_still_flagged_for_script_exec(self):
+        """A `python -c` carrying a quoted lifecycle phrase trips the
+        script-execution gate (a separate, correct approval), proving the
+        quoted-mention exemption does not punch a hole through code-exec
+        detection."""
+        cmd = "python3 -c \"print('hermes gateway restart log')\""
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "execution" in desc.lower()
 
 
 class TestNormalizationBypass:

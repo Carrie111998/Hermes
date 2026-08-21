@@ -1029,6 +1029,169 @@ class TestLifecycleGuardModule:
 
 
 # ---------------------------------------------------------------------------
+# Oversized non-executable data file false positive (t_13bf8fdd)
+# ---------------------------------------------------------------------------
+
+class TestOversizedDataFileFalsePositive:
+    """A >1MiB regular file WITHOUT the execute bit is a data file, not a
+    shell script — the guard's oversized fail-closed verdict on it was a
+    hard block on benign commands.
+
+    Repro: session 20260819_094203_3a6b85 — a read-only python heredoc
+    opening /tmp/oui.csv (3.8MB IEEE OUI registry) was blocked with
+    "command or referenced script cannot restart or stop the agent
+    service". shlex cannot distinguish heredoc bodies from command text,
+    so the path token landed in command position and was misclassified as
+    a referenced shell script; the bounded read then failed closed on the
+    size cap. The fix skips the scan only for regular files that are
+    oversized AND non-executable — such a file can never be executed as a
+    bare command (the shell refuses with EACCES), so no protection is
+    lost, while oversized EXECUTABLE scripts keep failing closed.
+    """
+
+    @pytest.fixture()
+    def oversized_data_file(self, tmp_path):
+        from cron.lifecycle_guard import _MAX_REFERENCED_SCRIPT_BYTES
+
+        data = tmp_path / "oui.csv"
+        data.write_text("000C42,Cisco Systems, Inc.\n" * 60000)
+        assert data.stat().st_size > _MAX_REFERENCED_SCRIPT_BYTES
+        return data
+
+    def test_heredoc_referencing_oversized_data_file_not_blocked(
+        self, oversized_data_file, tmp_path
+    ):
+        """The exact repro class: a python heredoc opening a >1MiB CSV must
+        not be hard-blocked — the command has no lifecycle content."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        command = (
+            "python3 - <<'EOF'\n"
+            "import csv\n"
+            f"macs = [row[0] for row in csv.reader(open('{oversized_data_file}'))]\n"
+            "print(len(macs))\n"
+            "EOF"
+        )
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(
+                command, cwd=str(tmp_path)
+            )
+            is False
+        )
+
+    def test_oversized_executable_script_still_fails_closed(self, tmp_path):
+        """Verification counterpart: chmod +x a same-sized file containing a
+        lifecycle command — the oversized fail-closed verdict must still
+        fire (an executable script can actually run the command)."""
+        from cron.lifecycle_guard import (
+            _MAX_REFERENCED_SCRIPT_BYTES,
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        script = tmp_path / "evil-big.sh"
+        script.write_text("#!/bin/bash\nhermes gateway restart\n" + "x\n" * 600000)
+        script.chmod(0o755)
+        assert script.stat().st_size > _MAX_REFERENCED_SCRIPT_BYTES
+
+        # Bare path in command position.
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(
+                str(script), cwd=str(tmp_path)
+            )
+            is True
+        )
+        # Same shape as the oui.csv repro: open('<path>') inside a heredoc.
+        command = (
+            "python3 - <<'EOF'\n"
+            f"open('{script}')\n"
+            "EOF"
+        )
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(
+                command, cwd=str(tmp_path)
+            )
+            is True
+        )
+
+    def test_oversized_nonexec_file_via_sh_and_source_still_fails_closed(
+        self, oversized_data_file, tmp_path
+    ):
+        """sh/bash/source execute content WITHOUT needing the execute bit, so
+        their walk branches must keep yielding oversized files: `bash
+        oui.csv` would genuinely execute the file's lines."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(
+                f"/bin/bash {oversized_data_file}", cwd=str(tmp_path)
+            )
+            is True
+        )
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(
+                f"source {oversized_data_file}", cwd=str(tmp_path)
+            )
+            is True
+        )
+
+    def test_gateway_terminal_executes_heredoc_with_oversized_data_file(
+        self, monkeypatch, tmp_path
+    ):
+        """End-to-end through terminal_tool's gateway guard: the repro-class
+        command must EXECUTE (exit 0), not be hard-blocked."""
+        import tools.terminal_tool as tt
+        from cron.lifecycle_guard import _MAX_REFERENCED_SCRIPT_BYTES
+
+        data = tmp_path / "oui.csv"
+        data.write_text("000C42,Cisco Systems, Inc.\n" * 60000)
+        assert data.stat().st_size > _MAX_REFERENCED_SCRIPT_BYTES
+
+        executed = []
+
+        class _FakeEnv:
+            env = {}
+            cwd = str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                executed.append(command)
+                return {"output": "42", "returncode": 0}
+
+        eid = "default"
+        monkeypatch.setattr(tt, "_active_environments", {eid: _FakeEnv()})
+        monkeypatch.setattr(tt, "_last_activity", {eid: 0.0})
+        monkeypatch.setattr(tt, "_task_env_overrides", {})
+        monkeypatch.setattr(
+            tt,
+            "_get_env_config",
+            lambda: {
+                "env_type": "local",
+                "cwd": str(tmp_path),
+                "timeout": 60,
+                "lifetime_seconds": 3600,
+            },
+        )
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        command = (
+            "python3 - <<'EOF'\n"
+            "import csv\n"
+            f"macs = [row[0] for row in csv.reader(open('{data}'))]\n"
+            "print(len(macs))\n"
+            "EOF"
+        )
+        result = json.loads(tt.terminal_tool(command=command))
+        assert result["exit_code"] == 0
+        assert executed == [command]
+
+
+# ---------------------------------------------------------------------------
 # Defense 2 (chokepoint): cron.jobs.create_job blocks the AGENT model-tool path
 # ---------------------------------------------------------------------------
 

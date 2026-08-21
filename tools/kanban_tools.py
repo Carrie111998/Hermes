@@ -203,6 +203,18 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     if not env_tid:
         # Orchestrator or CLI context — no task-scope restriction.
         return None
+    if not _is_dispatcher_owned_worker():
+        # HERMES_KANBAN_TASK leaked into a process that is not the
+        # dispatcher-owned worker for it: a `hermes chat` child spawned from
+        # a worker's terminal (or a cron job fired in-process). The env var
+        # alone must never grant lifecycle power — refuse ALL mutation, even
+        # on the inherited task id, because the caller is not the run owner.
+        return tool_error(
+            f"worker is scoped to task {env_tid}; refusing to mutate "
+            f"{tid}: this process is not the dispatcher-owned worker for "
+            f"{env_tid} (inherited HERMES_KANBAN_TASK without run "
+            f"ownership). Return findings to the parent worker instead."
+        )
     if tid != env_tid:
         return tool_error(
             f"worker is scoped to task {env_tid}; refusing to mutate "
@@ -1113,6 +1125,72 @@ def _handle_comment(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_comment failed")
         return tool_error(f"kanban_comment: {e}")
+
+
+def _handle_notify_subscribe(args: dict, **kw) -> str:
+    """Subscribe a gateway channel to a task's terminal events (native tool)."""
+    delegated_err = _reject_delegated_child_mutation("kanban_notify_subscribe")
+    if delegated_err:
+        return delegated_err
+    tid = args.get("task_id")
+    platform = args.get("platform")
+    chat_id = args.get("chat_id")
+    if not tid:
+        return tool_error(
+            "task_id is required (subscribe the task you created)"
+        )
+    if not platform or not chat_id:
+        return tool_error("platform and chat_id are required")
+    board = args.get("board")
+    from hermes_cli import kanban_db as kb
+    try:
+        _kb, conn = _connect(board=board)
+        try:
+            if _kb.get_task(conn, tid) is None:
+                return tool_error(f"task {tid} not found")
+            notifier_profile = args.get("notifier_profile") or os.environ.get(
+                "HERMES_PROFILE"
+            ) or "default"
+            _kb.add_notify_sub(
+                conn, task_id=tid,
+                platform=platform, chat_id=chat_id,
+                thread_id=args.get("thread_id") or None,
+                user_id=args.get("user_id") or None,
+                notifier_profile=notifier_profile,
+                delivery_mode=args.get("delivery_mode") or None,
+            )
+            return _ok(
+                task_id=tid, platform=platform, chat_id=chat_id,
+                subscribed=True,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_notify_subscribe: {e}")
+    except Exception as e:
+        logger.exception("kanban_notify_subscribe failed")
+        return tool_error(f"kanban_notify_subscribe: {e}")
+
+
+def _handle_notify_list(args: dict, **kw) -> str:
+    """List the subscriptions registered on a task (native tool)."""
+    tid = args.get("task_id")
+    if not tid:
+        return tool_error("task_id is required")
+    board = args.get("board")
+    from hermes_cli import kanban_db as kb
+    try:
+        _kb, conn = _connect(board=board)
+        try:
+            subs = _kb.list_notify_subs(conn, tid)
+            return _ok(task_id=tid, subscriptions=list(subs))
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_notify_list: {e}")
+    except Exception as e:
+        logger.exception("kanban_notify_list failed")
+        return tool_error(f"kanban_notify_list: {e}")
 
 
 def _handle_attach(args: dict, **kw) -> str:
@@ -2033,6 +2111,73 @@ KANBAN_COMMENT_SCHEMA = {
     },
 }
 
+KANBAN_NOTIFY_SUBSCRIBE_SCHEMA = {
+    "name": "kanban_notify_subscribe",
+    "description": (
+        "Subscribe a gateway channel to a task's terminal-state events "
+        "(completed / blocked / etc.) so a human on that platform gets a "
+        "push notification when the task changes. This is the native-tool "
+        "equivalent of the `hermes kanban notify-subscribe` CLI, provided "
+        "because dispatched kanban workers run under an env-scrubbed "
+        "subprocess where the CLI is hard-blocked. Workers use this to "
+        "subscribe the tasks they create (e.g. the standing Telegram-notify "
+        "convention). Idempotent per (task, platform, chat, thread)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "Task id to subscribe to.",
+            },
+            "platform": {
+                "type": "string",
+                "description": "Delivery platform, e.g. 'telegram', 'discord', 'slack', 'tui'.",
+            },
+            "chat_id": {
+                "type": "string",
+                "description": "Recipient chat/conversation id on that platform.",
+            },
+            "thread_id": {
+                "type": "string",
+                "description": "Optional thread/topic id within the chat.",
+            },
+            "user_id": {
+                "type": "string",
+                "description": "Optional platform user id.",
+            },
+            "delivery_mode": {
+                "type": "string",
+                "description": "Optional delivery mode ('notify', 'wake', 'notify+wake'). Default 'notify'.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id", "platform", "chat_id"],
+    },
+}
+
+KANBAN_NOTIFY_LIST_SCHEMA = {
+    "name": "kanban_notify_list",
+    "description": (
+        "List the gateway subscriptions currently registered on a task "
+        "(who gets notified on task terminal events). Mirrors the "
+        "`hermes kanban notify-list` CLI for the native-tool surface so "
+        "workers can verify the Telegram-notify convention was honored without "
+        "shelling out to the blocked CLI."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "Task id to list subscriptions for.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id"],
+    },
+}
+
 KANBAN_ATTACH_SCHEMA = {
     "name": "kanban_attach",
     "description": (
@@ -2477,4 +2622,22 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
+)
+
+registry.register(
+    name="kanban_notify_subscribe",
+    toolset="kanban",
+    schema=KANBAN_NOTIFY_SUBSCRIBE_SCHEMA,
+    handler=_handle_notify_subscribe,
+    check_fn=_check_kanban_mode,
+    emoji="🔔",
+)
+
+registry.register(
+    name="kanban_notify_list",
+    toolset="kanban",
+    schema=KANBAN_NOTIFY_LIST_SCHEMA,
+    handler=_handle_notify_list,
+    check_fn=_check_kanban_mode,
+    emoji="🔔",
 )

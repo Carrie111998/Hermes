@@ -58,6 +58,39 @@ class TestDetectToolFailureTerminal:
         assert suffix.endswith("]")
 
 
+    def test_exit_zero_with_http_404_in_output_is_failure(self):
+        # curl without -f exits 0 on HTTP 404 — the error lives in the output.
+        result = json.dumps({
+            "output": "HTTP/1.1 404 Not Found\n<HTML><TITLE>404</TITLE></HTML>",
+            "exit_code": 0,
+        })
+        is_failure, suffix = _detect_tool_failure("terminal", result)
+        assert is_failure is True
+        assert "404" in suffix
+        assert "permanent" in suffix
+
+
+    def test_exit_zero_with_http_503_in_output_is_transient_failure(self):
+        result = json.dumps({
+            "output": "HTTP/1.1 503 Service Unavailable",
+            "exit_code": 0,
+        })
+        is_failure, suffix = _detect_tool_failure("terminal", result)
+        assert is_failure is True
+        assert "503" in suffix
+        assert "transient" in suffix
+
+
+    def test_exit_zero_with_plain_404_text_is_success(self):
+        # Ordinary output that merely contains the string "404" (grep hit,
+        # log line, page body) is data, not an HTTP error response.
+        result = json.dumps({
+            "output": "access.log:404 GET /x 200\n",
+            "exit_code": 0,
+        })
+        assert _detect_tool_failure("terminal", result) == (False, "")
+
+
 
 
 class TestDetectToolFailureMemory:

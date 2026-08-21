@@ -99,3 +99,38 @@ def test_patch_replace_propagates_lsp_diagnostics(tmp_path):
 
     assert res.success is True
     assert res.lsp_diagnostics == block
+
+
+# ---------------------------------------------------------------------------
+# enabled_for raising (deleted-CWD workspace resolution) must not break a write
+# ---------------------------------------------------------------------------
+
+
+class _ExplodingService:
+    """Mimics LSPService.enabled_for crashing — as when
+    resolve_workspace_for_file -> os.getcwd() raises ENOENT because the
+    process CWD was deleted mid-run (t_886b35f5)."""
+
+    def enabled_for(self, path):
+        raise FileNotFoundError(2, "No such file or directory")
+
+
+def test_maybe_lsp_diagnostics_swallows_enabled_for_crash(tmp_path):
+    """enabled_for raising must return '' (no diagnostics), never propagate
+    — the documented contract is that LSP can't break a write."""
+    fops = ShellFileOperations(LocalEnvironment(cwd=str(tmp_path)))
+    with patch("agent.lsp.get_service", return_value=_ExplodingService()):
+        block = fops._maybe_lsp_diagnostics(str(tmp_path / "x.py"))
+    assert block == ""
+
+
+def test_write_file_survives_lsp_enabled_for_crash(tmp_path):
+    """End-to-end: a .py write with a crashing LSP enabled_for must succeed
+    and land the file — the write itself is complete before diagnostics run."""
+    fops = ShellFileOperations(LocalEnvironment(cwd=str(tmp_path)))
+    target = tmp_path / "x.py"
+    with patch("agent.lsp.get_service", return_value=_ExplodingService()):
+        res = fops.write_file(str(target), "x = 1\n")
+    assert res.error is None
+    assert res.bytes_written == len("x = 1\n")
+    assert target.read_text() == "x = 1\n"

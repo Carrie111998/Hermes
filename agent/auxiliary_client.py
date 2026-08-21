@@ -5399,6 +5399,11 @@ def _try_payment_fallback(
             continue
         client, model = try_fn()
         if client is not None:
+            if task == "vision" and not _candidate_supports_vision(
+                label, model
+            ):
+                tried.append(f"{label} (text-only)")
+                continue
             logger.info(
                 "Auxiliary %s: %s on %s — falling back to %s (%s)",
                 task or "call", reason, failed_provider, label, model or "default",
@@ -5479,6 +5484,22 @@ def _try_main_agent_model_fallback(
         return None, None, ""
     if _is_provider_unhealthy(main_provider):
         _log_skip_unhealthy(main_provider, task)
+        return None, None, ""
+
+    # Vision tasks must never hand an image payload to the main agent model
+    # when it is known to be text-only — the endpoint rejects the body with
+    # an opaque serde 400 ("unknown variant `image_url`", #31179 class)
+    # instead of a diagnosable error. The primary vision provider already
+    # failed; falling to a text-only model just converts that failure into
+    # a cryptic one. Skip the safety net so the original error surfaces.
+    if task == "vision" and not _candidate_supports_vision(
+        main_provider, main_model
+    ):
+        logger.info(
+            "Auxiliary vision: main agent model %s (%s) is text-only — "
+            "skipping main-agent safety net; original error will surface",
+            main_provider, main_model,
+        )
         return None, None, ""
 
     try:
@@ -5665,6 +5686,13 @@ def _try_configured_fallback_chain(
 
         label = f"fallback_chain[{i}]({fb_provider})"
 
+        if task == "vision" and not _candidate_supports_vision(
+            fb_provider, fb_model,
+            base_url=str(entry.get("base_url") or ""),
+        ):
+            tried.append(f"{label} (text-only)")
+            continue
+
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
         except Exception:
@@ -5806,6 +5834,12 @@ def _try_main_fallback_chain(
         if _is_provider_unhealthy(fb_norm):
             _log_skip_unhealthy(fb_norm, task)
             tried.append(f"{label} (unhealthy)")
+            continue
+        if task == "vision" and not _candidate_supports_vision(
+            fb_provider, fb_model,
+            base_url=str(entry.get("base_url") or ""),
+        ):
+            tried.append(f"{label} (text-only)")
             continue
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
@@ -7184,6 +7218,77 @@ def get_available_vision_backends() -> List[str]:
         if p not in available and _strict_vision_backend_available(p):
             available.append(p)
     return available
+
+
+def _candidate_supports_vision(
+    provider: Optional[str],
+    model: Optional[str],
+    base_url: str = "",
+) -> bool:
+    """Return True when a fallback candidate may receive image payloads.
+
+    Guards the runtime fallback chains (configured chain, main fallback
+    chain, main-agent safety net, payment fallback) for vision tasks: a
+    candidate that is *known* to be text-only must never be handed an image,
+    or the endpoint rejects the body with an opaque provider-side 400
+    (serde ``unknown variant `image_url` `` — the #31179 bug class).  For
+    unknown capability, custom/local endpoints default to text-only (a
+    user can opt a local VLM back in via the ``supports_vision`` config
+    override, which ``_lookup_supports_vision`` honours first); unknown
+    cloud providers conservatively return True so uncatalogued vision
+    endpoints don't regress.
+    """
+    if not provider or not model:
+        return True
+    try:
+        from agent.image_routing import _lookup_supports_vision
+        from hermes_cli.config import load_config_readonly
+        supports = _lookup_supports_vision(
+            provider, model, load_config_readonly()
+        )
+        if supports is False:
+            logger.info(
+                "Auxiliary vision: skipping fallback candidate %s (%s) — "
+                "known text-only, image payload would be rejected",
+                provider, model,
+            )
+            return False
+        if supports is None and _is_local_or_custom_endpoint(provider, base_url):
+            logger.info(
+                "Auxiliary vision: skipping fallback candidate %s (%s) — "
+                "custom/local endpoint with unknown vision capability "
+                "(set supports_vision: true to opt in)",
+                provider, model,
+            )
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _is_local_or_custom_endpoint(provider: Optional[str], base_url: str = "") -> bool:
+    """True for custom providers or loopback/private endpoints.
+
+    Used by :func:`_candidate_supports_vision` to fail closed for local
+    endpoints whose vision capability is unknown (they are usually text-only
+    llama.cpp/ollama servers — a VLM needs an explicit opt-in).
+    """
+    p = (provider or "").strip().lower()
+    if p == "custom" or "local" in p or "custom" in p:
+        return True
+    if not base_url:
+        return False
+    host = base_url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0].strip("[]")
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    if host.startswith("192.168.") or host.startswith("10."):
+        return True
+    if host.startswith("172."):
+        try:
+            return 16 <= int(host.split(".")[1]) <= 31
+        except (IndexError, ValueError):
+            return False
+    return False
 
 
 def resolve_vision_provider_client(

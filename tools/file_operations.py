@@ -2727,7 +2727,14 @@ class ShellFileOperations(FileOperations):
             svc = get_service()
         except Exception:  # noqa: BLE001
             return ""
-        if svc is None or not svc.enabled_for(path):
+        try:
+            # enabled_for → resolve_workspace_for_file → os.getcwd(), which
+            # raises ENOENT when the process CWD was deleted mid-run
+            # (workspace-wipe family).  That must degrade to "no LSP info",
+            # never break the write — the contract in this docstring.
+            if svc is None or not svc.enabled_for(path):
+                return ""
+        except Exception:  # noqa: BLE001
             return ""
 
         # Build a line-shift map when we have both pre and post — it

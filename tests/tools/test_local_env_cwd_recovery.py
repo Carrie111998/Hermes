@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 from tools.environments.local import (
     LocalEnvironment,
+    _resolve_local_initial_cwd,
     _resolve_safe_cwd,
 )
 
@@ -35,6 +36,24 @@ class TestResolveSafeCwd:
         sep = os.path.sep
         monkeypatch.setattr(os.path, "isdir", lambda p: p == sep)
         assert _resolve_safe_cwd("/no/such/deep/dir") == sep
+
+
+class TestResolveLocalInitialCwdDeletedProcessCwd:
+    """t_886b35f5 — LocalEnvironment construction while the process CWD is
+    deleted (workspace-wipe family) must fall back to the home dir instead
+    of raising ENOENT from os.getcwd()."""
+
+    def test_deleted_cwd_falls_back_to_home(self, monkeypatch, tmp_path):
+        def _boom_getcwd():
+            raise FileNotFoundError(2, "No such file or directory")
+
+        monkeypatch.setattr(os, "getcwd", _boom_getcwd)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        resolved = _resolve_local_initial_cwd("")
+        assert resolved == str(tmp_path)
+
+    def test_explicit_cwd_still_used(self, tmp_path):
+        assert _resolve_local_initial_cwd(str(tmp_path)) == str(tmp_path)
 
 
 def _fake_interrupt():

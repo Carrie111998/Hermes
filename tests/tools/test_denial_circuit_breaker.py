@@ -206,6 +206,91 @@ def test_headless_smart_deny_increments_and_trips(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Headless POLICY-deny path (-q single-query mode) also increments: the
+# breaker exists to stop agents burning turns on a blocked operation, and a
+# -q session has no human to interrupt a retry loop. These are NOT guardian
+# LLM verdicts but they are headless denies, so they must carry the same
+# escalated addendum after the threshold (acceptance for t_46f5ebc3).
+# ---------------------------------------------------------------------------
+
+def _headless_policy_session(monkeypatch, *, single_query=True):
+    """Env for the -q single-query (or cron) policy-deny path with detection
+    forced dangerous; returns the bound session key."""
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+    if single_query:
+        monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.setattr(A, "_get_single_query_approval_mode", lambda: "deny")
+    else:
+        monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: "deny")
+    monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
+    monkeypatch.setattr(A, "_get_denial_breaker_threshold", lambda: 3)
+    monkeypatch.setattr(
+        A, "detect_dangerous_command",
+        lambda command: (True, "policy-breaker-danger", f"risk:{command}"),
+    )
+    monkeypatch.setattr(
+        "tools.tirith_security.check_command_security",
+        lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        raising=False,
+    )
+    session_key = f"policy-breaker-{'sq' if single_query else 'cron'}-session"
+    token = A.set_current_session_key(session_key)
+    A._reset_denials(session_key)
+    with A._lock:
+        A._permanent_approved.discard("policy-breaker-danger")
+        A._session_approved.get(session_key, set()).discard(
+            "policy-breaker-danger")
+    return session_key, token
+
+
+@pytest.mark.parametrize("single_query", [True, False])
+def test_headless_policy_deny_increments_and_trips(monkeypatch, single_query):
+    session_key, token = _headless_policy_session(monkeypatch,
+                                                  single_query=single_query)
+    try:
+        first = A.check_all_command_guards("dangerous p1", "local")
+        second = A.check_all_command_guards("dangerous p2", "local")
+        third = A.check_all_command_guards("dangerous p3", "local")
+        assert first["approved"] is False
+        assert BREAKER_MARKER not in first["message"]
+        assert second["approved"] is False
+        assert BREAKER_MARKER not in second["message"]
+        assert third["approved"] is False
+        assert BREAKER_MARKER in third["message"]
+        assert "STOP attempting variations" in third["message"]
+    finally:
+        A.reset_current_session_key(token)
+        A._reset_denials(session_key)
+
+
+@pytest.mark.parametrize("single_query", [True, False])
+def test_headless_policy_deny_trips_execute_code_guard(monkeypatch, single_query):
+    """The execute_code whole-script gate's headless deny branches must carry
+    the same breaker addendum after the threshold."""
+    session_key, token = _headless_policy_session(monkeypatch,
+                                                  single_query=single_query)
+    try:
+        first = A.check_execute_code_guard("print('x')", "local")
+        second = A.check_execute_code_guard("print('y')", "local")
+        third = A.check_execute_code_guard("print('z')", "local")
+        assert first["approved"] is False and first["outcome"] == "blocked"
+        assert BREAKER_MARKER not in first["message"]
+        assert second["approved"] is False
+        assert BREAKER_MARKER not in second["message"]
+        assert third["approved"] is False
+        assert BREAKER_MARKER in third["message"]
+    finally:
+        A.reset_current_session_key(token)
+        A._reset_denials(session_key)
+
+
+# ---------------------------------------------------------------------------
 # Eviction cap: the tally dict never grows past _DENIAL_TALLY_MAX_SESSIONS
 # ---------------------------------------------------------------------------
 

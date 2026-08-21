@@ -608,10 +608,20 @@ def detect_hardline_command(command: str) -> tuple:
     """
     if _command_parser_limit_exceeded(command):
         return (True, _PARSER_LIMIT_DESCRIPTION)
-    normalized = _normalize_command_for_detection(command)
-    _, malformed_grep = _grep_safe_detection_variant(normalized)
-    if malformed_grep:
-        return (True, _MALFORMED_EXEC_DESCRIPTION)
+    # NOTE: an ambiguous/malformed grep parse deliberately does NOT hardline
+    # here. ``_quoted_grep_pattern_spans`` reports ``malformed`` whenever a
+    # ``grep`` word sits inside a ``$(...)`` command substitution that is
+    # itself inside a double-quoted string (a very common inspection idiom:
+    # ``sed -n "$(grep -n 'x' f | cut -d: -f1)p" f``) — the enclosing ``"``
+    # precedes the tokenizer's interior start, so its span parse can't see
+    # the matching closer and looks "unbalanced". Elevating that masking
+    # ambiguity to an unconditional block turned benign read-only source
+    # inspection into a hardline false positive (kanban t_3b7efd90).
+    # Masking a grep PCRE operand only HIDES inert pattern text to avoid
+    # false positives, so an uncertain parse means "don't mask; scan the
+    # original" — which ``_command_detection_variants`` already does, and
+    # genuine dangerous content (rm/sudo/curl|bash/... inside or outside the
+    # grep) is still caught by HARDLINE_PATTERNS against that original.
     for command_variant in _command_detection_variants(command):
         variant_lower = command_variant.lower()
         for pattern_re, description in HARDLINE_PATTERNS_COMPILED:
@@ -667,17 +677,23 @@ def _user_deny_block_result(pattern: str) -> dict:
     }
 
 
-def _save_blocked_payload(command: str) -> Optional[str]:
-    """Persist a parser-limit-blocked command as a runnable script.
+def _save_blocked_payload(command: str, reason: str = "exceeded the inline command parser limit") -> Optional[str]:
+    """Persist a blocked inline command as a runnable script.
 
-    The parser-limit block fires on payload SIZE/shape, not on the
-    operation — the command itself is usually a legitimate script the
-    model inlined (heredoc, giant one-liner). Materialize it to a file so
-    the recovery is one turn (`bash <file>`) instead of two (re-author via
-    write_file, then run). Saving is strictly safer than the hint-only
-    path: the file goes through the same execution pipeline as any other
-    script (including the referenced-script content guard), and nothing
-    is executed here.
+    The parser-limit and inline-script-mechanism blocks fire on payload
+    SIZE/shape or the execution MECHANISM, not on the operation — the
+    command itself is usually a legitimate script the model inlined
+    (heredoc, giant one-liner). Materialize it to a file so the recovery
+    is one turn (`bash <file>`) instead of two (re-author via write_file,
+    then run). Saving is strictly safer than the hint-only path: the file
+    goes through the same execution pipeline as any other script
+    (including the referenced-script content guard), and nothing is
+    executed here.
+
+    Args:
+        command: The blocked command text to persist.
+        reason: Lowercase clause (no leading space) describing why the
+            command was blocked; inserted into the header comment.
 
     Returns the saved path, or None on any failure (the hint then falls
     back to the manual write_file recipe).
@@ -699,8 +715,10 @@ def _save_blocked_payload(command: str) -> Optional[str]:
         path = script_dir / f"blocked-{int(_time.time())}-{_uuid.uuid4().hex[:8]}.sh"
         path.write_text(
             "#!/bin/bash\n"
-            "# Auto-saved by Hermes: this command exceeded the inline command\n"
-            "# parser limit and was blocked from direct execution. Review it,\n"
+            "# Auto-saved by Hermes: this command "
+            + reason
+            + "\n"
+            "# and was blocked from direct execution. Review it,\n"
             "# then run it via: bash " + str(path) + "\n"
             + command
             + ("\n" if not command.endswith("\n") else ""),
@@ -710,6 +728,44 @@ def _save_blocked_payload(command: str) -> Optional[str]:
     except Exception:
         logger.debug("failed to save blocked payload", exc_info=True)
         return None
+
+
+def _inline_script_recovery_hint(command: str, description: str) -> str:
+    """Build a one-turn RECOVERY hint for a content-blind inline-script block.
+
+    The heredoc/-c/-e guard flags the execution mechanism, not the operation.
+    In headless contexts (single-query -q, cron) the deny message is the only
+    output the agent sees, so without a hint the run dead-ends with just
+    "find an alternative approach". Mirror the parser-limit recovery: save
+    the payload to a runnable script and name it. The block still fires
+    (approval stays denied); the hint only gives the agent a reviewable path
+    forward. Genuinely dangerous commands never reach this helper — callers
+    gate on ``_INLINE_SCRIPT_RECOVERY_DESCRIPTIONS``, and detection reports
+    dangerous content under its own description before the mechanism flag.
+
+    Returns "" when no recovery applies (caller keeps the plain deny).
+    """
+    if description not in _INLINE_SCRIPT_RECOVERY_DESCRIPTIONS or not command:
+        return ""
+    saved = _save_blocked_payload(
+        command,
+        reason="was flagged by the inline-script execution guard (heredoc or -c/-e)",
+    )
+    if saved:
+        return (
+            " RECOVERY: this block fires on the inline-script execution "
+            "mechanism (heredoc / -c / -e), not on the operation itself — a "
+            "benign local script is treated the same as a remote fetch. Your "
+            f"command was saved to {saved} — review it, then run: "
+            f'terminal(command="bash {saved}"). Do not retry inline.'
+        )
+    return (
+        " RECOVERY: this block fires on the inline-script execution "
+        "mechanism (heredoc / -c / -e), not on the operation itself. Write "
+        "the script to a file with write_file, then run it: "
+        'terminal(command="bash /path/script.sh") or '
+        '"python3 /path/script.py". Do not retry inline.'
+    )
 
 
 def _hardline_block_result(description: str, command: str = "") -> dict:
@@ -1387,6 +1443,24 @@ _MAX_SEPARATOR_FREE_COMMAND_CHARS = 4_096
 _MAX_DETECTION_SEGMENTS = 25_000
 _PARSER_LIMIT_DESCRIPTION = "command parser limit exceeded"
 _MALFORMED_EXEC_DESCRIPTION = "command parser limit or malformed executable payload"
+
+# Content-blind inline-script mechanism flags. These fire on HOW a command is
+# expressed (heredoc, interpreter -c/-e, bash -c), not on WHAT it does — a
+# benign local patch script is flagged identically to `curl|bash`. In
+# headless contexts (single-query -q, cron) the deny message is the only
+# output the agent sees, so a mechanism-only block dead-ends the run. The
+# recovery hint in _inline_script_recovery_hint() applies ONLY to this set;
+# every genuinely dangerous description ("pipe remote content to shell",
+# decode-and-execute, rm/sudo patterns, ...) stays a hard block with no
+# recovery — detect_dangerous_command scans DANGEROUS_PATTERNS BEFORE
+# _execution_flag_findings, so dangerous content inside a heredoc/-c body is
+# reported under its real description and never lands here.
+_INLINE_SCRIPT_RECOVERY_DESCRIPTIONS = frozenset({
+    "shell execution via heredoc",      # DANGEROUS_PATTERNS: \b(bash|sh|zsh|ksh)\s+<<
+    "script execution via heredoc",     # _execution_flag_findings: interpreter heredoc
+    "script execution via -e/-c flag",  # _execution_flag_findings: interpreter -c/-e/-r
+    "shell command via -c/-lc flag",    # _execution_flag_findings: bash -c/-lc
+})
 
 
 
@@ -2307,13 +2381,20 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
         return False
 
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
+    raw_temp_dir = tempfile.gettempdir()
+    temp_dir = os.path.realpath(raw_temp_dir)
     basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+    # Direct-child requirement: the operand's directory must be spelled as
+    # the temp dir -- either its canonical form or the exact (possibly
+    # symlinked, e.g. macOS /tmp -> /private/tmp) spelling gettempdir()
+    # returned. The comparison stays textual: realpath() would collapse
+    # `nested/../` and let traversal slip through.
+    if os.path.dirname(operand) not in (temp_dir, raw_temp_dir):
         return False
-
-    target = os.path.realpath(operand)
-    if os.path.dirname(target) != temp_dir:
+    # Canonical-target requirement: once symlinks resolve, the operand is
+    # exactly <temp_dir>/<basename>. A symlinked file whose real target
+    # lives elsewhere (or under a different name) is not our artifact.
+    if os.path.realpath(operand) != os.path.join(temp_dir, basename):
         return False
     return re.fullmatch(r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename) is not None
 
@@ -2329,9 +2410,29 @@ def detect_dangerous_command(command: str) -> tuple:
     if _is_verification_artifact_cleanup(command):
         return (False, None, None)
 
+    # Quote/comment-aware gateway-lifecycle guard (kanban t_7da757ed): the
+    # ``hermes gateway stop|restart`` / ``hermes update`` / ``launchctl ...``
+    # patterns must match a REAL command, not a lifecycle phrase embedded in
+    # quoted data or a ``#`` comment (e.g. ``echo "hermes gateway restart"``).
+    # Reuse the shared check from ``cron.lifecycle_guard`` so the execution-
+    # time, cron, and approval guards all behave identically (#30719
+    # follow-up). Imported lazily to avoid a startup import cycle.
+    from cron.lifecycle_guard import contains_gateway_lifecycle_pattern
+
     for command_variant in _command_detection_variants(command):
         command_lower = command_variant.lower()
         for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
+            # Gateway-lifecycle patterns get intent-aware matching: a match
+            # that is entirely inside quotes/comments is a benign mention.
+            if (
+                (
+                    "stop/restart hermes gateway" in description
+                    or "hermes update" in description
+                    or "stop/restart hermes launchd" in description
+                )
+                and not contains_gateway_lifecycle_pattern(description, command_lower)
+            ):
+                continue
             if pattern_re.search(command_lower):
                 pattern_key = description
                 return (True, pattern_key, description)
@@ -2532,7 +2633,15 @@ def _get_denial_breaker_threshold() -> int:
 
 
 def _record_denial(session_key: str) -> int:
-    """Increment and return the session's consecutive guardian-denial count.
+    """Increment and return the session's consecutive-denial count.
+
+    Counts every deny that is NOT a deliberate human choice: guardian LLM
+    DENY verdicts AND headless policy denials (single-query -q / cron deny
+    mode, where there is no human to interrupt a retry loop). Human denials
+    via the interactive prompt deliberately do NOT advance the tally — the
+    breaker exists to stop agents from burning turns on a blocked operation,
+    not to second-guess an explicit owner decision. See
+    :func:`_denial_breaker_addendum`.
 
     Pop-and-reinsert keeps actively-denying sessions at the most-recent end
     of the dict so eviction (insertion-ordered) drops genuinely idle keys.
@@ -3493,9 +3602,11 @@ def _run_approval_gate(
         # Single-query (-q) sessions: respect single_query_mode config
         if _is_single_query_approval_context():
             if _get_single_query_approval_mode() == "deny":
+                _record_denial(session_key)
+                breaker_addendum = _denial_breaker_addendum(session_key)
                 return {
                     "approved": False,
-                    "message": single_query_deny_message,
+                    "message": single_query_deny_message + breaker_addendum,
                     "pattern_key": pattern_key,
                     "description": description,
                 }
@@ -3512,9 +3623,11 @@ def _run_approval_gate(
         # Cron sessions: respect cron_mode config
         if _is_cron_approval_context():
             if _get_cron_approval_mode() == "deny":
+                _record_denial(session_key)
+                breaker_addendum = _denial_breaker_addendum(session_key)
                 return {
                     "approved": False,
-                    "message": cron_deny_message,
+                    "message": cron_deny_message + breaker_addendum,
                     "pattern_key": pattern_key,
                     "description": description,
                 }
@@ -3766,6 +3879,19 @@ def check_dangerous_command(command: str, env_type: str,
     if not is_dangerous:
         return {"approved": True, "message": None}
 
+    # Content-blind inline-script mechanism flags (heredocs, -c/-e inline
+    # programs) get a one-turn recovery in headless contexts: the block
+    # still fires, but the deny message names a reviewable saved copy of
+    # the command instead of dead-ending the run. Only compute it where the
+    # deny message is returned verbatim (single-query -q / cron) —
+    # interactive and gateway paths prompt a human instead and must not
+    # litter blocked-scripts with files for commands they may approve.
+    recovery_hint = ""
+    if description in _INLINE_SCRIPT_RECOVERY_DESCRIPTIONS and (
+        _is_single_query_approval_context() or _is_cron_approval_context()
+    ):
+        recovery_hint = _inline_script_recovery_hint(command, description)
+
     return _run_approval_gate(
         pattern_key=pattern_key,
         description=description,
@@ -3777,14 +3903,14 @@ def check_dangerous_command(command: str, env_type: str,
             "Find an alternative approach that avoids this command. "
             "To allow dangerous commands in cron jobs, set "
             "approvals.cron_mode: approve in config.yaml."
-        ),
+        ) + recovery_hint,
         single_query_deny_message=(
             f"BLOCKED: Command flagged as dangerous ({description}) but "
             "single-query mode (-q) runs without a user present to approve "
             "it. Find an alternative approach that avoids this command. "
             "To allow dangerous commands in single-query mode, set "
             "approvals.single_query_mode: approve in config.yaml."
-        ),
+        ) + recovery_hint,
         autoapprove_log_prefix=(
             "AUTO-APPROVED dangerous command in non-interactive non-gateway context"
         ),
@@ -4420,6 +4546,26 @@ def check_all_command_guards(command: str, env_type: str,
             if _get_single_query_approval_mode() == "deny":
                 is_dangerous, _pk, description = detect_dangerous_command(command)
                 if is_dangerous:
+                    # Permanent pattern-key allowlist (config command_allowlist
+                    # entries that name a detection pattern, e.g. 'script
+                    # execution via -e/-c flag') must be honored here too:
+                    # _run_approval_gate consults it via is_approved(), but
+                    # this headless branch bypasses the gate entirely, so an
+                    # allowlisted pattern would block on the terminal-tool
+                    # path while check_dangerous_command lets it through.
+                    # Dangerous content inside an allowlisted mechanism
+                    # (rm/sudo/curl|bash inside a python -c body) is reported
+                    # under its OWN description before the mechanism flag, so
+                    # it never reaches this allowlist.
+                    if is_approved(get_current_session_key(), _pk):
+                        return {"approved": True, "message": None}
+                    # Headless policy denials advance the consecutive-denial
+                    # breaker too: an agent stuck retrying blocked commands in
+                    # -q mode burns turns with no human to interrupt, so the
+                    # escalated hard-stop text is exactly the signal it needs.
+                    session_key = get_current_session_key()
+                    _record_denial(session_key)
+                    breaker_addendum = _denial_breaker_addendum(session_key)
                     return {
                         "approved": False,
                         "message": (
@@ -4429,7 +4575,8 @@ def check_all_command_guards(command: str, env_type: str,
                             "that avoids this command. To allow dangerous "
                             "commands in single-query mode, set "
                             "approvals.single_query_mode: approve in config.yaml."
-                        ),
+                        ) + _inline_script_recovery_hint(command, description)
+                        + breaker_addendum,
                         "pattern_key": _pk,
                         "description": description,
                     }
@@ -4442,6 +4589,9 @@ def check_all_command_guards(command: str, env_type: str,
                     _sq_tirith = check_command_security(command)
                     if _sq_tirith.get("action") in ("block", "warn"):
                         _sq_desc = _format_tirith_description(_sq_tirith)
+                        session_key = get_current_session_key()
+                        _record_denial(session_key)
+                        breaker_addendum = _denial_breaker_addendum(session_key)
                         return {
                             "approved": False,
                             "message": (
@@ -4451,7 +4601,7 @@ def check_all_command_guards(command: str, env_type: str,
                                 "approach that avoids this command. To allow "
                                 "dangerous commands in single-query mode, set "
                                 "approvals.single_query_mode: approve in config.yaml."
-                            ),
+                            ) + breaker_addendum,
                         }
                 except ImportError:
                     # Tirith not installed. Honour security.tirith_fail_open:
@@ -4469,6 +4619,9 @@ def check_all_command_guards(command: str, env_type: str,
                     except Exception:
                         pass
                     if not _sq_fail_open:
+                        session_key = get_current_session_key()
+                        _record_denial(session_key)
+                        breaker_addendum = _denial_breaker_addendum(session_key)
                         return {
                             "approved": False,
                             "message": (
@@ -4479,7 +4632,7 @@ def check_all_command_guards(command: str, env_type: str,
                                 "present to approve it. Find an alternative "
                                 "approach, install tirith, or set "
                                 "approvals.single_query_mode: approve in config.yaml."
-                            ),
+                            ) + breaker_addendum,
                         }
                     # else: tirith_fail_open is True — allow as before
             # single_query_mode: approve — fall through to auto-approve below.
@@ -4489,6 +4642,15 @@ def check_all_command_guards(command: str, env_type: str,
                 # Run detection to get a description for the block message
                 is_dangerous, _pk, description = detect_dangerous_command(command)
                 if is_dangerous:
+                    # Same pattern-key allowlist honor as the single-query
+                    # branch above: a permanently approved pattern (config
+                    # command_allowlist naming a detection pattern) must not
+                    # be re-blocked here just because cron has no human.
+                    if is_approved(get_current_session_key(), _pk):
+                        return {"approved": True, "message": None}
+                    session_key = get_current_session_key()
+                    _record_denial(session_key)
+                    breaker_addendum = _denial_breaker_addendum(session_key)
                     return {
                         "approved": False,
                         "message": (
@@ -4497,7 +4659,8 @@ def check_all_command_guards(command: str, env_type: str,
                             "Find an alternative approach that avoids this command. "
                             "To allow dangerous commands in cron jobs, set "
                             "approvals.cron_mode: approve in config.yaml."
-                        ),
+                        ) + _inline_script_recovery_hint(command, description)
+                        + breaker_addendum,
                     }
                 # Also run tirith check in cron-deny mode so content-level
                 # threats (homograph URLs, pipe-to-interpreter, terminal
@@ -4508,6 +4671,9 @@ def check_all_command_guards(command: str, env_type: str,
                     _cron_tirith = check_command_security(command)
                     if _cron_tirith.get("action") in ("block", "warn"):
                         _cron_desc = _format_tirith_description(_cron_tirith)
+                        session_key = get_current_session_key()
+                        _record_denial(session_key)
+                        breaker_addendum = _denial_breaker_addendum(session_key)
                         return {
                             "approved": False,
                             "message": (
@@ -4516,7 +4682,7 @@ def check_all_command_guards(command: str, env_type: str,
                                 "Find an alternative approach that avoids this command. "
                                 "To allow dangerous commands in cron jobs, set "
                                 "approvals.cron_mode: approve in config.yaml."
-                            ),
+                            ) + breaker_addendum,
                         }
                 except ImportError:
                     # Tirith not installed. Honour security.tirith_fail_open:
@@ -4534,6 +4700,9 @@ def check_all_command_guards(command: str, env_type: str,
                     except Exception:
                         pass
                     if not _cron_fail_open:
+                        session_key = get_current_session_key()
+                        _record_denial(session_key)
+                        breaker_addendum = _denial_breaker_addendum(session_key)
                         return {
                             "approved": False,
                             "message": (
@@ -4543,7 +4712,7 @@ def check_all_command_guards(command: str, env_type: str,
                                 "cron jobs run without a user present to approve it. "
                                 "Find an alternative approach, install tirith, or set "
                                 "approvals.cron_mode: approve in config.yaml."
-                            ),
+                            ) + breaker_addendum,
                         }
                     # else: tirith_fail_open is True — allow as before
         return {"approved": True, "message": None}
@@ -5032,6 +5201,9 @@ def check_execute_code_guard(code: str, env_type: str,
     # the cron branch below so the -q escape-hatch no longer auto-approves.
     if _is_single_query_approval_context():
         if _get_single_query_approval_mode() == "deny":
+            session_key = get_current_session_key()
+            _record_denial(session_key)
+            breaker_addendum = _denial_breaker_addendum(session_key)
             return {
                 "approved": False,
                 "message": (
@@ -5041,7 +5213,7 @@ def check_execute_code_guard(code: str, env_type: str,
                     "user present to approve it. Use normal tools instead, or "
                     "set approvals.single_query_mode: approve only if this "
                     "single-query run is intentionally trusted."
-                ),
+                ) + breaker_addendum,
                 "pattern_key": pattern_key,
                 "description": description,
                 "outcome": "blocked",
@@ -5052,6 +5224,9 @@ def check_execute_code_guard(code: str, env_type: str,
     # Cron: no user is present to approve arbitrary code.
     if _is_cron_approval_context():
         if _get_cron_approval_mode() == "deny":
+            session_key = get_current_session_key()
+            _record_denial(session_key)
+            breaker_addendum = _denial_breaker_addendum(session_key)
             return {
                 "approved": False,
                 "message": (
@@ -5061,7 +5236,7 @@ def check_execute_code_guard(code: str, env_type: str,
                     "to approve it. Use normal tools instead, or set "
                     "approvals.cron_mode: approve only if this cron profile "
                     "is intentionally trusted."
-                ),
+                ) + breaker_addendum,
                 "pattern_key": pattern_key,
                 "description": description,
                 "outcome": "blocked",

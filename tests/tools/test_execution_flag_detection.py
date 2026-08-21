@@ -235,6 +235,31 @@ def test_grep_pcre_pattern_with_grouped_root_delete_text_stays_safe():
     assert detect_hardline_command(command) == (False, None)
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        # kanban t_3b7efd90 regression: benign read-only source-inspection
+        # idioms with a `grep` inside a "$(...)" command substitution inside a
+        # double-quoted string were hardline-blocked as "command parser limit
+        # or malformed executable payload" (3 events / 2 sessions, 2026-08-20).
+        "cd ~/.hermes/hermes-agent && grep -n \"def _authoritative_workspace_root\" tools/file_tools.py && sed -n \"$(grep -n 'def _authoritative_workspace_root' tools/file_tools.py | cut -d: -f1),+25p\" tools/file_tools.py",
+        "cd ~/.hermes/hermes-agent && grep -n \"def _try_payment_fallback\" agent/auxiliary_client.py; sed -n \"$(grep -n 'def _try_payment_fallback' agent/auxiliary_client.py | cut -d: -f1),+45p\" agent/auxiliary_client.py",
+        "cd ~/.hermes/hermes-agent && grep -n \"_OPENROUTER_MODEL\\\\s*=\" agent/auxiliary_client.py; echo '==='; grep -n \"def _get_auxiliary_task_config\" agent/auxiliary_client.py; sed -n \"$(grep -n 'def _get_auxiliary_task_config' agent/auxiliary_client.py | cut -d: -f1),+25p\" agent/auxiliary_client.py",
+    ],
+)
+def test_grep_inside_dollar_paren_in_double_quotes_is_benign(command):
+    """A grep nested in a \"$(...)\" command substitution is read-only data."""
+    assert detect_hardline_command(command) == (False, None)
+    assert detect_dangerous_command(command) == (False, None, None)
+
+
+def test_malicious_content_inside_dollar_paren_still_reaches_hardline_floor():
+    """Genuinely dangerous content nested in $() is still hardline-blocked."""
+    assert detect_hardline_command(
+        "sed -n \"$(rm -rf --no-preserve-root /)\" file"
+    ) == (True, "recursive delete of root filesystem")
+
+
 def test_interpreter_heredoc_keeps_legacy_approval_key_compatibility():
     from tools.approval import _approval_key_aliases
 

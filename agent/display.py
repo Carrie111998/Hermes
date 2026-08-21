@@ -18,7 +18,10 @@ from urllib.parse import urlsplit
 
 from utils import safe_json_loads
 from agent.redact import redact_sensitive_text
-from agent.tool_result_classification import file_mutation_result_landed
+from agent.tool_result_classification import (
+    detect_http_status_in_output,
+    file_mutation_result_landed,
+)
 
 # ANSI escape codes for coloring tool failure indicators
 _RED = "\033[31m"
@@ -1356,6 +1359,17 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
                 if err_msg:
                     return True, f" [{_trim_error(str(err_msg))}]"
                 return True, f" [exit {exit_code}]"
+            # exit_code 0 does NOT mean success for network fetches: `curl`
+            # without -f exits 0 even when the server answers 404/5xx — the
+            # error is only visible in the output. Blind-retrying such a call
+            # is a deterministic-error loop the guardrail must see. (Only
+            # reaches here when exit_code is 0 or absent.)
+            http = detect_http_status_in_output(
+                data.get("output") if isinstance(data.get("output"), str) else None
+            )
+            if http is not None:
+                code, kind = http
+                return True, f" [HTTP {code} {kind}]"
         return False, ""
 
     # Memory: distinguish "store full" from real errors.

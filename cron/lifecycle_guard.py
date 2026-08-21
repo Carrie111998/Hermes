@@ -60,6 +60,12 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # gateway is benign (a no-op or "already running" error), and a
     # legitimate cron job might start a sibling profile's gateway.
     r"(?:hermes\s+gateway\s+(?:restart|stop))"
+    # Branch A2: `hermes -p <profile> gateway restart|stop` — same foot-gun
+    # with a profile/global flag between `hermes` and `gateway` (the
+    # 2026-04-11 ade-profile self-kill incident). Allow any flags so a
+    # profile flag can't slip the agent past the guard. Mirrors the
+    # `approval.py` `hermes gateway (stop|restart)` pattern shape.
+    r"|(?:hermes\s+(?:-{1,2}\S+(?:\s+\S+)?\s+)*gateway\s+(?:restart|stop))"
     # Branch B: launchctl ops on a hermes-gateway label. macOS launchd
     # labels look like `ai.hermes.gateway` / `hermes-gateway`. Requiring the
     # gateway identifier prevents blocking unrelated hermes services (e.g.
@@ -95,12 +101,126 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
 _SHELL_LINE_CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
 
 
+def _protected_regions(text: str) -> list[tuple[int, int]]:
+    """Return merged ``(start, end)`` spans of quoted strings and ``#`` comments.
+
+    A span is "protected" when its content is data or a comment rather than an
+    executable shell command: single/double-quoted string contents, and ``#``
+    comments (only when the ``#`` follows whitespace or string start, i.e. a
+    real bash comment, not a ``#`` inside a token like ``a#b``).  A gateway
+    lifecycle phrase that lives entirely inside a protected region is a benign
+    mention (e.g. ``echo "hermes gateway restart"``), not an instruction.
+    """
+    raw: list[tuple[int, int]] = []
+    quote: str | None = None
+    qstart = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                raw.append((qstart, i + 1))
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            qstart = i
+            i += 1
+            continue
+        if ch == "#" and (i == 0 or text[i - 1] in " \t"):
+            j = text.find("\n", i)
+            if j == -1:
+                raw.append((i, n))
+                break
+            raw.append((i, j))
+            i = j
+            continue
+        i += 1
+    # Merge overlapping/adjacent intervals.
+    merged: list[list[int]] = []
+    for s, e in sorted(raw):
+        if merged and s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
+
+
+def _span_covered_in_protected_regions(text: str, start: int, end: int) -> bool:
+    """True if every character in ``text[start:end)`` lies inside a quoted
+    string or ``#`` comment — i.e. the span is data, not a real command.
+    """
+    if start >= end:
+        return False
+    pos = start
+    for s, e in _protected_regions(text):
+        if pos >= end:
+            return True
+        if s <= pos < e:
+            pos = max(pos, e)
+    return pos >= end
+
+
 def contains_gateway_lifecycle_command(text: str) -> bool:
-    """Return True if *text* contains a gateway lifecycle command pattern."""
+    """Return True if *text* contains a gateway lifecycle command pattern.
+
+    Deliberately a RAW pattern scan: callers that need benign-data exemptions
+    apply their own context-aware masking first (``_mask_data_sink_arguments``
+    for terminal commands, ``_protected_regions`` for the approval layer's
+    ``contains_gateway_lifecycle_pattern``).  Quoted content can still EXECUTE
+    (sqlite ``.shell``, psql ``-c``, ``$(...)``, ``| sh``), so a blanket
+    quoted-span exemption here would let real commands through.
+    """
     if not text:
         return False
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
     return bool(_GATEWAY_LIFECYCLE_PATTERN.search(normalized))
+
+
+# Regexes that implement the gateway-lifecycle guard inside the broader
+# ``approval.py`` dangerous-command matcher.  These are re-declared here (with
+# the same shapes as ``DANGEROUS_PATTERNS`` in ``tools/approval.py``) so the
+# approval layer can apply the same quote/comment-aware check without a
+# circular import.  Keep the two in sync if the shapes change.
+_GATEWAY_HERMES_PATTERN = re.compile(
+    r"\bhermes\s+(?:-{1,2}\S+(?:\s+\S+)?\s+)*gateway\s+(stop|restart)\b", re.IGNORECASE
+)
+_GATEWAY_UPDATE_PATTERN = re.compile(r"\bhermes\s+update\b", re.IGNORECASE)
+_GATEWAY_LAUNCHCTL_PATTERN = re.compile(
+    r"\blaunchctl\s+(stop|kickstart|bootout|unload|kill|disable|remove)\b.*\b(hermes|ai\.hermes)\b",
+    re.IGNORECASE,
+)
+
+
+def contains_gateway_lifecycle_pattern(description: str, text: str) -> bool:
+    """Quote/comment-aware lifecycle guard for the approval layer.
+
+    Returns True when *text* matches the gateway-lifecycle regex associated
+    with the dangerous-pattern *description* (one of the gateway-lifecycle
+    entries in ``tools/approval.py``), *and* that match is a real command
+    rather than a phrase sitting inside quotes or a ``#`` comment.
+
+    *description* must be the human-readable description string from
+    ``DANGEROUS_PATTERNS``.  Returns False for any description that does not
+    correspond to a gateway-lifecycle pattern, so the caller can delegate
+    other patterns to the normal substring matcher.
+    """
+    if not text:
+        return False
+    if "stop/restart hermes gateway" in description:
+        pattern = _GATEWAY_HERMES_PATTERN
+    elif "hermes update" in description:
+        pattern = _GATEWAY_UPDATE_PATTERN
+    elif "stop/restart hermes launchd" in description:
+        pattern = _GATEWAY_LAUNCHCTL_PATTERN
+    else:
+        return False
+    for m in pattern.finditer(text):
+        if not _span_covered_in_protected_regions(text, m.start(), m.end()):
+            return True
+    return False
 
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
@@ -369,6 +489,59 @@ def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Optiona
     return path
 
 
+def _is_oversized_nonexecutable_regular_file(path: Path) -> bool:
+    """True when *path* is a >1MiB regular file the shell cannot execute.
+
+    shlex cannot tell a heredoc body from real command text, so a path
+    token inside a Python heredoc (``open('/tmp/oui.csv')``) lands in
+    command position and the walk classifies it as a referenced shell
+    script. Small data files merely get scanned; but the bounded read
+    FAILS CLOSED on anything over ``_MAX_REFERENCED_SCRIPT_BYTES``, so a
+    large data file becomes a hard block — a 3.8MB IEEE OUI registry CSV
+    referenced by two benign read-only probes in one session.
+
+    A regular file without the execute bit can never be executed as a
+    bare command (the shell refuses with EACCES before a single line
+    runs), so skipping the scan loses no protection: the oversized
+    fail-closed verdict stays in force for executable scripts (which can
+    actually run a lifecycle command) and for ``sh``/``bash``/``source``
+    references (those run content without needing ``+x``, so their walk
+    branches keep yielding regardless of mode).
+
+    Deliberately conservative at every boundary, so this can only ever
+    ALLOW a command the guard would otherwise have blocked:
+    - Cloud-placeholder paths (lexical or symlink-resolved) are never
+      skipped — the consumer must still fail closed on them without
+      opening (evicted FileProvider placeholders can hang preflight).
+    - Missing paths are never skipped — the remote/sandbox backend
+      fallback (``read_remote_script``) may resolve them on the far side.
+    - Non-regular files (FIFOs, devices) are never skipped — they keep
+      their existing fail-closed verdict in ``_read_referenced_script``.
+    - Files up to the size cap are never skipped — a small
+      non-executable script reference is still scanned (a wrapper may
+      gain exec permission, or the reference may be probed by ``sh``).
+    - Any stat failure returns False, i.e. "do not skip" — the read then
+      applies its own error handling (#76762: a guarded path must never
+      crash the guard).
+    """
+    try:
+        if _is_cloud_placeholder_path(path):
+            return False
+        try:
+            resolved = path.resolve(strict=False)
+        except (OSError, ValueError):
+            resolved = path
+        if _is_cloud_placeholder_path(resolved):
+            return False
+        if not path.exists() or not path.is_file():
+            return False
+        if os.access(path, os.X_OK):
+            return False
+        return path.stat().st_size > _MAX_REFERENCED_SCRIPT_BYTES
+    except OSError:
+        return False
+
+
 def _iter_referenced_shell_scripts(
     command: str,
     *,
@@ -423,7 +596,18 @@ def _iter_referenced_shell_scripts(
         if executable.strip("/"):
             if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
                 resolved = _resolve_terminal_script_path(executable, cwd)
-                if resolved is not None:
+                # A bare path in command position is only a *shell script*
+                # if the shell could actually run it. A >1MiB regular file
+                # without the execute bit cannot be executed (EACCES), so
+                # the guard's oversized fail-closed verdict on it is a
+                # false positive — it is a data file (e.g. /tmp/oui.csv
+                # opened from a python heredoc), not a script. Skip the
+                # scan entirely; executability-blind callers (sh/bash/
+                # source branches, cron script reads) are untouched.
+                if (
+                    resolved is not None
+                    and not _is_oversized_nonexecutable_regular_file(resolved)
+                ):
                     yield resolved
 
 
@@ -796,6 +980,10 @@ def check_gateway_lifecycle(
             "Blocked: cron job contains a gateway lifecycle command or persistent "
             "launchctl submit operation. This is blocked to prevent agent-driven "
             "SIGTERM-respawn loops under launchd/systemd supervision "
-            "(#30719). Run `hermes gateway restart` from a shell outside "
-            "the running gateway instead."
+            "(#30719) — a cron job cannot restart the gateway from inside "
+            "it by design. Sanctioned alternatives: trigger the external "
+            "watchdog from the job (`launchctl start "
+            "ai.hermes.gateway-watchdog`) when the gateway is dead/frozen/"
+            "deaf, or have a human run the kickstart restart in a standalone "
+            "Terminal (see the hermes-local-services skill)."
         )

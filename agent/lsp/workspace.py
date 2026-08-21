@@ -190,8 +190,18 @@ def resolve_workspace_for_file(
 
     Returns ``(None, False)`` when neither path is in a git worktree.
     """
-    cwd = cwd or os.getcwd()
-    cwd_root = find_git_worktree(cwd)
+    try:
+        cwd = cwd or os.getcwd()
+    except OSError:
+        # Process CWD was deleted out from under us (workspace-wipe family —
+        # a kanban scratch workspace removed mid-run, or a sibling cleanup).
+        # os.getcwd() raises ENOENT from a deleted directory, which would
+        # otherwise turn every LSP-gated write into a spurious tool error
+        # even though the write itself succeeded.  Fall back to the file's
+        # own directory so workspace resolution still works; the file-root
+        # anchor below is the meaningful one for LSP gating anyway.
+        cwd = os.path.dirname(file_path) or None
+    cwd_root = find_git_worktree(cwd) if cwd else None
     if cwd_root is not None:
         if is_inside_workspace(file_path, cwd_root):
             return cwd_root, True
