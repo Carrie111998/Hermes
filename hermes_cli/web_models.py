@@ -337,6 +337,8 @@ class SessionRename(BaseModel):
     # session explicitly unread, False marks it read up to now. Mirrored from
     # the Desktop sidebar's "Mark as unread"/"Mark as read". None = leave alone.
     unread: Optional[bool] = None
+    # Explicit null unassigns; omission leaves the current space untouched.
+    space_id: Optional[str] = None
     # Mutate a session belonging to another profile (opens its state.db). Omit
     # for the current/default profile.
     profile: Optional[str] = None

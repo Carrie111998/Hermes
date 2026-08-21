@@ -5,7 +5,8 @@ import type {
   SessionInfo,
   SessionMessage,
   SessionMessagesResponse,
-  SessionSearchResponse
+  SessionSearchResponse,
+  SessionSpace
 } from '@/types/hermes'
 
 import { hermesApi } from './client'
@@ -286,6 +287,36 @@ export function setSessionUnreadRemote(id: string, unread: boolean, profile?: st
     path: `/api/sessions/${encodeURIComponent(id)}`,
     method: 'PATCH',
     body: { unread }
+  })
+}
+
+export function listSessionSpaces(profile?: string | null): Promise<{ spaces: SessionSpace[] }> {
+  const suffix = profile ? `?profile=${encodeURIComponent(profile)}` : ''
+
+  return hermesApi<{ spaces: SessionSpace[] }>({
+    ...(profile ? { profile } : {}),
+    path: `/api/session-spaces${suffix}`
+  })
+}
+
+export function createSessionSpace(
+  input: Pick<SessionSpace, 'name'> & Partial<Pick<SessionSpace, 'chat_id' | 'color' | 'icon' | 'platform'>>,
+  profile?: string | null
+): Promise<{ space: SessionSpace }> {
+  return hermesApi<{ space: SessionSpace }>({
+    ...(profile ? { profile } : {}),
+    path: '/api/session-spaces',
+    method: 'POST',
+    body: { ...input, ...(profile ? { profile } : {}) }
+  })
+}
+
+export function setSessionSpace(id: string, spaceId: null | string, profile?: string | null): Promise<{ ok: boolean }> {
+  return hermesApi<{ ok: boolean }>({
+    ...(profile ? { profile } : {}),
+    path: `/api/sessions/${encodeURIComponent(id)}`,
+    method: 'PATCH',
+    body: { space_id: spaceId, ...(profile ? { profile } : {}) }
   })
 }
 

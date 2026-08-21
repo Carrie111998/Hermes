@@ -1056,6 +1056,62 @@ def cmd_sessions(args, sessions_parser=None):
                 "but fully recoverable (nothing was deleted)."
             )
 
+    elif action in ("spaces", "space-create", "space-assign", "space-delete"):
+        def _resolve_space(value):
+            needle = str(value).strip().casefold()
+            matches = [
+                space for space in db.list_session_spaces()
+                if space["id"].casefold() == needle or space["name"].casefold() == needle
+            ]
+            return matches[0] if len(matches) == 1 else None
+
+        if action == "spaces":
+            spaces = db.list_session_spaces()
+            if not spaces:
+                print("No session spaces.")
+            for space in spaces:
+                binding = (
+                    f"  {space['platform']}:{space['chat_id']}"
+                    if space.get("platform") and space.get("chat_id")
+                    else ""
+                )
+                print(f"{space['id']}  {space['name']}{binding}")
+        elif action == "space-create":
+            try:
+                space = db.create_session_space(
+                    args.name,
+                    platform=args.platform,
+                    chat_id=args.chat_id,
+                )
+            except ValueError as exc:
+                print(f"Error: {exc}")
+                return 1
+            print(f"Created session space '{space['name']}' ({space['id']}).")
+        elif action == "space-assign":
+            session_id = db.resolve_session_id(args.session_id)
+            if not session_id:
+                print(f"Session '{args.session_id}' not found.")
+                return 1
+            if args.space.casefold() in {"none", "unassigned"}:
+                space_id = None
+                label = "Unassigned"
+            else:
+                space = _resolve_space(args.space)
+                if not space:
+                    print(f"Session space '{args.space}' not found.")
+                    return 1
+                space_id = space["id"]
+                label = space["name"]
+            db.set_session_space(session_id, space_id)
+            print(f"Assigned session '{session_id}' to {label}.")
+        else:
+            space = _resolve_space(args.space)
+            if not space:
+                print(f"Session space '{args.space}' not found.")
+                return 1
+            db.delete_session_space(space["id"])
+            print(f"Deleted session space '{space['name']}'.")
+
     elif action == "rename":
         resolved_session_id = db.resolve_session_id(args.session_id)
         if not resolved_session_id:

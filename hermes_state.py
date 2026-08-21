@@ -29,6 +29,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 import weakref
 from collections import deque
 from contextlib import contextmanager
@@ -4537,6 +4538,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         git_repo_root: str = None,
         origin_json: str = None,
         display_name: str = None,
+        space_id: str = None,
     ) -> None:
         """Insert a session row, enriching NULL metadata on conflict.
 
@@ -4580,9 +4582,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
                    model, model_config, system_prompt, system_prompt_hash,
                    parent_session_id, cwd, profile_name, git_repo_root,
-                   origin_json, display_name, started_at
+                   origin_json, display_name, space_id, started_at
                 )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?,
+                           COALESCE(?, (SELECT id FROM session_spaces
+                                        WHERE platform = ? AND chat_id = ?)), ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
                        model_config = CASE
@@ -4623,7 +4627,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        profile_name = COALESCE(sessions.profile_name, excluded.profile_name),
                        git_repo_root = COALESCE(sessions.git_repo_root, excluded.git_repo_root),
                        origin_json = COALESCE(sessions.origin_json, excluded.origin_json),
-                       display_name = COALESCE(sessions.display_name, excluded.display_name)""",
+                       display_name = COALESCE(sessions.display_name, excluded.display_name),
+                       space_id = COALESCE(sessions.space_id, excluded.space_id)""",
                 (
                     session_id,
                     source,
@@ -4641,6 +4646,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     git_repo_root,
                     origin_json,
                     display_name,
+                    space_id,
+                    source,
+                    chat_id,
                     time.time(),
                 ),
             )
@@ -4660,7 +4668,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                                           WHERE p.id = sessions.parent_session_id)),
                            profile_name = COALESCE(sessions.profile_name,
                                           (SELECT p.profile_name FROM sessions p
-                                            WHERE p.id = sessions.parent_session_id))
+                                            WHERE p.id = sessions.parent_session_id)),
+                           space_id = CASE
+                               WHEN json_type(
+                                   COALESCE(sessions.model_config, '{}'),
+                                   '$._reset_from'
+                               ) IS NULL
+                               THEN COALESCE(sessions.space_id,
+                                    (SELECT p.space_id FROM sessions p
+                                      WHERE p.id = sessions.parent_session_id))
+                               ELSE sessions.space_id
+                           END
                      WHERE id = ? AND parent_session_id IS NOT NULL""",
                     (session_id,),
                 )
@@ -4715,6 +4733,122 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    @staticmethod
+    def _clean_space_field(value: Optional[str], *, field: str, maximum: int) -> Optional[str]:
+        if value is None:
+            return None
+        cleaned = str(value).strip()
+        if not cleaned:
+            return None
+        if len(cleaned) > maximum or any(ch in cleaned for ch in "\r\n\x00"):
+            raise ValueError(f"Invalid space {field}")
+        return cleaned
+
+    def list_session_spaces(self) -> List[Dict[str, Any]]:
+        """Return the profile-local, cwd-independent session labels."""
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT id, name, color, icon, platform, chat_id, created_at, updated_at "
+                "FROM session_spaces ORDER BY name COLLATE NOCASE, id"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_session_space(
+        self,
+        name: str,
+        *,
+        space_id: Optional[str] = None,
+        color: Optional[str] = None,
+        icon: Optional[str] = None,
+        platform: Optional[str] = None,
+        chat_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        clean_name = self._clean_space_field(name, field="name", maximum=80)
+        if clean_name is None:
+            raise ValueError("Space name is required")
+        clean_id = self._clean_space_field(space_id, field="id", maximum=128) or f"space_{uuid.uuid4().hex}"
+        clean_color = self._clean_space_field(color, field="color", maximum=64)
+        clean_icon = self._clean_space_field(icon, field="icon", maximum=64)
+        clean_platform = self._clean_space_field(platform, field="platform", maximum=64)
+        clean_chat_id = self._clean_space_field(chat_id, field="chat_id", maximum=512)
+        if (clean_platform is None) != (clean_chat_id is None):
+            raise ValueError("platform and chat_id must be set together")
+
+        def _do(conn):
+            now = time.time()
+            try:
+                conn.execute(
+                    "INSERT INTO session_spaces "
+                    "(id, name, color, icon, platform, chat_id, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (clean_id, clean_name, clean_color, clean_icon, clean_platform, clean_chat_id, now, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("Space name or channel binding already exists") from exc
+            if clean_platform and clean_chat_id:
+                conn.execute(
+                    "UPDATE sessions SET space_id = ? WHERE source = ? AND chat_id = ?",
+                    (clean_id, clean_platform, clean_chat_id),
+                )
+            return dict(conn.execute("SELECT * FROM session_spaces WHERE id = ?", (clean_id,)).fetchone())
+
+        return self._execute_write(_do)
+
+    def update_session_space(self, space_id: str, **changes) -> Dict[str, Any]:
+        allowed = {"name", "color", "icon", "platform", "chat_id"}
+        if not changes or set(changes) - allowed:
+            raise ValueError("Unsupported space fields")
+
+        def _do(conn):
+            current = conn.execute("SELECT * FROM session_spaces WHERE id = ?", (space_id,)).fetchone()
+            if current is None:
+                raise KeyError(space_id)
+            values = dict(current)
+            values.update(changes)
+            name = self._clean_space_field(values.get("name"), field="name", maximum=80)
+            if name is None:
+                raise ValueError("Space name is required")
+            color = self._clean_space_field(values.get("color"), field="color", maximum=64)
+            icon = self._clean_space_field(values.get("icon"), field="icon", maximum=64)
+            platform = self._clean_space_field(values.get("platform"), field="platform", maximum=64)
+            chat_id = self._clean_space_field(values.get("chat_id"), field="chat_id", maximum=512)
+            if (platform is None) != (chat_id is None):
+                raise ValueError("platform and chat_id must be set together")
+            try:
+                conn.execute(
+                    "UPDATE session_spaces SET name=?, color=?, icon=?, platform=?, chat_id=?, updated_at=? WHERE id=?",
+                    (name, color, icon, platform, chat_id, time.time(), space_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("Space name or channel binding already exists") from exc
+            if platform and chat_id:
+                conn.execute(
+                    "UPDATE sessions SET space_id = ? WHERE source = ? AND chat_id = ?",
+                    (space_id, platform, chat_id),
+                )
+            return dict(conn.execute("SELECT * FROM session_spaces WHERE id = ?", (space_id,)).fetchone())
+
+        return self._execute_write(_do)
+
+    def delete_session_space(self, space_id: str) -> bool:
+        def _do(conn):
+            conn.execute("UPDATE sessions SET space_id = NULL WHERE space_id = ?", (space_id,))
+            return conn.execute("DELETE FROM session_spaces WHERE id = ?", (space_id,)).rowcount > 0
+
+        return bool(self._execute_write(_do))
+
+    def set_session_space(self, session_id: str, space_id: Optional[str]) -> bool:
+        def _do(conn):
+            if space_id is not None and conn.execute(
+                "SELECT 1 FROM session_spaces WHERE id = ?", (space_id,)
+            ).fetchone() is None:
+                raise KeyError(space_id)
+            return conn.execute(
+                "UPDATE sessions SET space_id = ? WHERE id = ?", (space_id, session_id)
+            ).rowcount > 0
+
+        return bool(self._execute_write(_do))
 
     def record_gateway_session_peer(
         self,
@@ -4802,9 +4936,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    SET session_key = ?, source = ?, user_id = ?, chat_id = ?,
                        chat_type = ?, thread_id = ?,
                        display_name = COALESCE(?, display_name),
-                       origin_json = COALESCE(?, origin_json)
+                       origin_json = COALESCE(?, origin_json),
+                       space_id = COALESCE(space_id, (
+                           SELECT id FROM session_spaces
+                           WHERE platform = ? AND chat_id = ?
+                       ))
                    {target_clause}""",
-                query_params,
+                query_params[:-1] + [source, chat_id] + query_params[-1:]
+                if not include_compression_ancestors
+                else query_params + [source, chat_id],
             )
             # Self-heal (#82616): the UPDATE is a silent no-op when the row
             # is missing (create_session failed earlier, or a crash landed
@@ -4820,9 +4960,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         """INSERT INTO sessions (
                                id, source, user_id, session_key, chat_id,
                                chat_type, thread_id, display_name, origin_json,
-                               started_at
+                               space_id, started_at
                            )
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                   (SELECT id FROM session_spaces
+                                    WHERE platform = ? AND chat_id = ?), ?)
                            ON CONFLICT(id) DO UPDATE SET
                                session_key = COALESCE(sessions.session_key, excluded.session_key),
                                chat_id = COALESCE(sessions.chat_id, excluded.chat_id),
@@ -4840,6 +4982,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             thread_id,
                             display_name,
                             origin_json,
+                            source,
+                            chat_id,
                             time.time(),
                         ),
                     )

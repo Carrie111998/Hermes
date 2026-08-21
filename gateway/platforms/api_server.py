@@ -2075,6 +2075,10 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
+            ("GET", "/api/session-spaces", self._handle_list_session_spaces),
+            ("POST", "/api/session-spaces", self._handle_create_session_space),
+            ("PATCH", "/api/session-spaces/{space_id}", self._handle_patch_session_space),
+            ("DELETE", "/api/session-spaces/{space_id}", self._handle_delete_session_space),
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
@@ -3343,7 +3347,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "output_tokens", "cache_read_tokens", "cache_write_tokens",
             "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd",
             "api_call_count", "parent_session_id", "last_active", "preview",
-            "_lineage_root_id", "pinned", "archived", "hidden",
+            "_lineage_root_id", "pinned", "archived", "hidden", "space_id",
         )
         payload = {key: session.get(key) for key in safe_keys if key in session}
         # SQLite stores these as 0/1; clients reconcile against a real boolean.
@@ -3431,6 +3435,69 @@ class APIServerAdapter(BasePlatformAdapter):
             "offset": offset,
             "has_more": windowed >= limit,
         })
+
+    async def _handle_list_session_spaces(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+        return web.json_response({"spaces": await asyncio.to_thread(db.list_session_spaces)})
+
+    async def _handle_create_session_space(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+        try:
+            space = await asyncio.to_thread(
+                db.create_session_space,
+                body.get("name"),
+                space_id=body.get("id"),
+                color=body.get("color"),
+                icon=body.get("icon"),
+                platform=body.get("platform"),
+                chat_id=body.get("chat_id"),
+            )
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc), code="invalid_session_space"), status=400)
+        return web.json_response({"space": space}, status=201)
+
+    async def _handle_patch_session_space(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+        try:
+            space = await asyncio.to_thread(db.update_session_space, request.match_info["space_id"], **body)
+        except KeyError:
+            return web.json_response(_openai_error("Session space not found", code="session_space_not_found"), status=404)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc), code="invalid_session_space"), status=400)
+        return web.json_response({"space": space})
+
+    async def _handle_delete_session_space(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+        space_id = request.match_info["space_id"]
+        if not await asyncio.to_thread(db.delete_session_space, space_id):
+            return web.json_response(_openai_error("Session space not found", code="session_space_not_found"), status=404)
+        return web.json_response({"deleted": True, "id": space_id})
 
     async def _handle_create_session(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions -- create an empty Hermes session row.
@@ -3580,7 +3647,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # sweep). Rejecting them here was silently 400ing every pin the desktop
         # made, so pins only ever lived in that one app's localStorage.
         # `unread` is the read-state watermark toggle (same desktop owner).
-        allowed = {"title", "end_reason", "pinned", "archived", "hidden", "unread"}
+        allowed = {"title", "end_reason", "pinned", "archived", "hidden", "unread", "space_id"}
         unknown = sorted(set(body) - allowed)
         if unknown:
             return web.json_response(_openai_error(f"Unsupported session fields: {', '.join(unknown)}", code="unsupported_session_field"), status=400)
@@ -3605,6 +3672,13 @@ class APIServerAdapter(BasePlatformAdapter):
             await asyncio.to_thread(db.set_session_hidden, session_id, body["hidden"])
         if "unread" in body:
             await asyncio.to_thread(db.set_session_read, session_id, read=not body["unread"])
+        if "space_id" in body:
+            if body["space_id"] is not None and not isinstance(body["space_id"], str):
+                return web.json_response(_openai_error("'space_id' must be a string or null", code="invalid_session_field"), status=400)
+            try:
+                await asyncio.to_thread(db.set_session_space, session_id, body["space_id"])
+            except KeyError:
+                return web.json_response(_openai_error("Session space not found", code="session_space_not_found"), status=404)
         if body.get("end_reason"):
             await asyncio.to_thread(db.end_session, session_id, str(body["end_reason"]))
         session = await asyncio.to_thread(db.get_session, session_id) or session

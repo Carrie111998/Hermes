@@ -514,6 +514,8 @@ export interface SessionInfo {
    *  elsewhere. Undefined against a backend predating the flag; treat that as
    *  "no opinion" and leave the local pin set alone. */
   pinned?: boolean
+  /** Backend-owned attention label, independent of cwd/project membership. */
+  space_id?: null | string
   /** Derived read state (backend watermark: `last_read_at` vs `last_active`,
    *  see `SessionDB.session_unread`). True when the conversation was
    *  explicitly marked unread or a response arrived after it was last read.
@@ -543,6 +545,17 @@ export interface SessionInfo {
    *  rows served by the primary/local backend. Opens must route through the
    *  connection-scoped gateway (`ensureGatewayAgent`) when present. */
   connection_id?: string
+}
+
+export interface SessionSpace {
+  chat_id?: null | string
+  color?: null | string
+  created_at: number
+  icon?: null | string
+  id: string
+  name: string
+  platform?: null | string
+  updated_at: number
 }
 
 export type TimelineDisplayMetadata =

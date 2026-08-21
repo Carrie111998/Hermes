@@ -44,6 +44,7 @@ import {
   setSessions
 } from '@/store/session'
 import { $sessionColorOverrides, setSessionColorOverride } from '@/store/session-color'
+import { $sessionSpaces, assignSessionSpace, createAndAssignSessionSpace } from '@/store/session-spaces'
 import { $sessionTiles } from '@/store/session-states'
 import { ackStoredSessionId } from '@/store/session-unread'
 import { canOpenSessionInTerminal, canOpenSessionWindow, openSessionInTerminal } from '@/store/windows'
@@ -181,6 +182,47 @@ function MoveToProjectItems({ kit, sessionId, profile }: { kit: MenuKit; session
   )
 }
 
+function MoveToSpaceItems({
+  kit,
+  onCreate,
+  profile,
+  sessionId
+}: {
+  kit: MenuKit
+  onCreate: () => void
+  profile?: string
+  sessionId: string
+}) {
+  const spaces = useStore($sessionSpaces)
+  const session = useStore($sessions).find(item => sessionMatchesStoredId(item, sessionId))
+
+  const assign = (spaceId: null | string, label: string) => {
+    triggerHaptic('selection')
+    assignSessionSpace(sessionId, spaceId, profile)
+      .then(() => notify({ durationMs: 2_000, kind: 'success', message: `Moved to ${label}` }))
+      .catch(err => notifyError(err, 'Could not update session space'))
+  }
+
+  return (
+    <>
+      {spaces.length === 0 ? (
+        <kit.Item disabled>No spaces</kit.Item>
+      ) : (
+        <kit.Item disabled={!session?.space_id} onSelect={() => assign(null, 'Unassigned')}>
+          Unassigned
+        </kit.Item>
+      )}
+      {spaces.map(space => (
+        <kit.Item disabled={space.id === session?.space_id} key={space.id} onSelect={() => assign(space.id, space.name)}>
+          {space.name}
+        </kit.Item>
+      ))}
+      <kit.Separator />
+      <kit.Item onSelect={onCreate}>New space…</kit.Item>
+    </>
+  )
+}
+
 function useSessionActions({
   sessionId,
   title,
@@ -209,6 +251,7 @@ function useSessionActions({
   // the project menu's appearance-popover guard.
   const suppressCloseFocusRef = useRef(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
+  const [createSpaceOpen, setCreateSpaceOpen] = useState(false)
   const tiles = useStore($sessionTiles)
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
   const isRemote = useStore($connection)?.mode === 'remote'
@@ -490,6 +533,23 @@ function useSessionActions({
           <MoveToProjectItems kit={kit} profile={profile} sessionId={sessionId} />
         </kit.SubContent>
       </kit.Sub>
+      <kit.Sub>
+        <kit.SubTrigger disabled={!sessionId}>
+          <Codicon name="symbol-namespace" size="0.875rem" />
+          <span>Move to space</span>
+        </kit.SubTrigger>
+        <kit.SubContent>
+          <MoveToSpaceItems
+            kit={kit}
+            onCreate={() => {
+              suppressCloseFocusRef.current = true
+              setCreateSpaceOpen(true)
+            }}
+            profile={profile}
+            sessionId={sessionId}
+          />
+        </kit.SubContent>
+      </kit.Sub>
       {tabItems.length > 0 && (
         <>
           <kit.Separator />
@@ -545,7 +605,89 @@ function useSessionActions({
     />
   )
 
-  return { deleteDialog, onCloseAutoFocus, renameDialog, renderItems }
+  const createSpaceDialog = (
+    <CreateSpaceDialog
+      onOpenChange={setCreateSpaceOpen}
+      open={createSpaceOpen}
+      profile={profile}
+      sessionId={sessionId}
+    />
+  )
+
+  return { createSpaceDialog, deleteDialog, onCloseAutoFocus, renameDialog, renderItems }
+}
+
+function CreateSpaceDialog({
+  onOpenChange,
+  open,
+  profile,
+  sessionId
+}: {
+  onOpenChange: (open: boolean) => void
+  open: boolean
+  profile?: string
+  sessionId: string
+}) {
+  const { t } = useI18n()
+  const [name, setName] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+
+  useEffect(() => {
+    if (open) {
+      setName('')
+    }
+  }, [open])
+
+  const submit = async () => {
+    const clean = name.trim()
+
+    if (!clean || submitting) {
+      return
+    }
+
+    setSubmitting(true)
+
+    try {
+      await createAndAssignSessionSpace(sessionId, clean, profile)
+      notify({ durationMs: 2_000, kind: 'success', message: `Moved to ${clean}` })
+      onOpenChange(false)
+    } catch (err) {
+      notifyError(err, 'Could not create session space')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <Dialog onOpenChange={onOpenChange} open={open}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>New session space</DialogTitle>
+        </DialogHeader>
+        <Input
+          autoFocus
+          disabled={submitting}
+          onChange={event => setName(event.target.value)}
+          onKeyDown={event => {
+            if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
+              event.preventDefault()
+              void submit()
+            }
+          }}
+          placeholder="Space name"
+          value={name}
+        />
+        <DialogFooter>
+          <Button disabled={submitting} onClick={() => onOpenChange(false)} type="button" variant="ghost">
+            {t.common.cancel}
+          </Button>
+          <Button disabled={!name.trim() || submitting} onClick={() => void submit()} type="button">
+            {t.common.save}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
 }
 
 interface DeleteSessionDialogProps {
@@ -586,7 +728,7 @@ interface SessionActionsMenuProps
 
 export function SessionActionsMenu({ children, align = 'end', sideOffset = 6, ...actions }: SessionActionsMenuProps) {
   const { t } = useI18n()
-  const { deleteDialog, onCloseAutoFocus, renameDialog, renderItems } = useSessionActions(actions)
+  const { createSpaceDialog, deleteDialog, onCloseAutoFocus, renameDialog, renderItems } = useSessionActions(actions)
 
   return (
     <>
@@ -602,6 +744,7 @@ export function SessionActionsMenu({ children, align = 'end', sideOffset = 6, ..
       </ActionsMenu>
       {renameDialog}
       {deleteDialog}
+      {createSpaceDialog}
     </>
   )
 }
@@ -612,7 +755,7 @@ interface SessionContextMenuProps extends SessionActions {
 
 export function SessionContextMenu({ children, ...actions }: SessionContextMenuProps) {
   const { t } = useI18n()
-  const { deleteDialog, onCloseAutoFocus, renameDialog, renderItems } = useSessionActions(actions)
+  const { createSpaceDialog, deleteDialog, onCloseAutoFocus, renameDialog, renderItems } = useSessionActions(actions)
 
   return (
     <>
@@ -626,6 +769,7 @@ export function SessionContextMenu({ children, ...actions }: SessionContextMenuP
       </ActionsContextMenu>
       {renameDialog}
       {deleteDialog}
+      {createSpaceDialog}
     </>
   )
 }
