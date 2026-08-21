@@ -101,6 +101,56 @@ def test_profile_command_argv_is_literal_and_replaces_only_native_worker(
     assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
     assert captured["env"]["HERMES_KANBAN_BOARD"] == "builds"
     assert captured["env"]["HERMES_KANBAN_RUN_ID"] == "7"
+    assert captured["env"]["HERMES_KANBAN_WORKER_COMPLETION_MODE"] == "exit_code"
+
+
+def test_profile_command_self_reported_completion_mode_reaches_supervisor(
+    spawn_env,
+):
+    root, workspace, captured = spawn_env
+    _write_profile(
+        root,
+        "engine",
+        "worker:\n  command:\n    - /bin/echo\n"
+        "  completion_mode: self_reported\n",
+    )
+
+    kb._default_spawn(_make_task(), str(workspace))
+
+    assert captured["env"]["HERMES_KANBAN_WORKER_COMPLETION_MODE"] == "self_reported"
+
+
+def test_profile_command_completion_mode_ignores_root_config(spawn_env):
+    root, workspace, captured = spawn_env
+    root.joinpath("config.yaml").write_text(
+        "worker:\n  completion_mode: self_reported\n", encoding="utf-8"
+    )
+    _write_profile(
+        root,
+        "engine",
+        "worker:\n  command:\n    - /bin/echo\n",
+    )
+
+    kb._default_spawn(_make_task(), str(workspace))
+
+    assert captured["env"]["HERMES_KANBAN_WORKER_COMPLETION_MODE"] == "exit_code"
+
+
+@pytest.mark.parametrize("value", ["unknown", "", "7", "null"])
+def test_profile_command_unknown_completion_mode_fails_closed(
+    spawn_env, value,
+):
+    root, workspace, captured = spawn_env
+    _write_profile(
+        root,
+        "engine",
+        "worker:\n  command:\n    - /bin/echo\n"
+        f"  completion_mode: {value}\n",
+    )
+
+    with pytest.raises(RuntimeError, match="completion_mode"):
+        kb._default_spawn(_make_task(), str(workspace))
+    assert "cmd" not in captured
 
 
 def test_profile_command_does_not_expand_environment_references(spawn_env, monkeypatch):
@@ -229,6 +279,7 @@ def test_supervisor_re_sanitizes_its_arbitrary_child_environment(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "parent-openai-secret")
     monkeypatch.setenv("GATEWAY_RELAY_SECRET", "parent-relay-secret")
     monkeypatch.setenv("HERMES_KANBAN_WORKER_COMMAND", "[\"/bin/echo\"]")
+    monkeypatch.setenv("HERMES_KANBAN_WORKER_COMPLETION_MODE", "self_reported")
     monkeypatch.setenv("HERMES_KANBAN_TASK_ID", "t_worker_cmd")
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", "/workspace")
 
@@ -237,6 +288,7 @@ def test_supervisor_re_sanitizes_its_arbitrary_child_environment(monkeypatch):
     assert "OPENAI_API_KEY" not in env
     assert "GATEWAY_RELAY_SECRET" not in env
     assert "HERMES_KANBAN_WORKER_COMMAND" not in env
+    assert "HERMES_KANBAN_WORKER_COMPLETION_MODE" not in env
     assert env["HERMES_KANBAN_TASK_ID"] == "t_worker_cmd"
     assert env["HERMES_KANBAN_WORKSPACE"] == "/workspace"
 
@@ -286,7 +338,13 @@ def _run_supervisor(home: Path, task_id: str, run_id: int, argv: list[str]):
     )
 
 
-def _start_supervisor(home: Path, task_id: str, run_id: int, argv: list[str]):
+def _run_supervisor_mode(
+    home: Path,
+    task_id: str,
+    run_id: int,
+    argv: list[str],
+    completion_mode: str,
+):
     env = os.environ.copy()
     repo_root = str(Path(__file__).parents[2])
     env["PYTHONPATH"] = os.pathsep.join(
@@ -301,6 +359,42 @@ def _start_supervisor(home: Path, task_id: str, run_id: int, argv: list[str]):
             "HERMES_KANBAN_TASK": task_id,
             "HERMES_KANBAN_RUN_ID": str(run_id),
             "HERMES_KANBAN_WORKER_COMMAND": json.dumps(argv),
+            "HERMES_KANBAN_WORKER_COMPLETION_MODE": completion_mode,
+        }
+    )
+    return subprocess.run(
+        SUPERVISOR,
+        cwd=str(Path(__file__).parents[2]),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def _start_supervisor(
+    home: Path,
+    task_id: str,
+    run_id: int,
+    argv: list[str],
+    *,
+    completion_mode: str = "exit_code",
+):
+    env = os.environ.copy()
+    repo_root = str(Path(__file__).parents[2])
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (repo_root, env.get("PYTHONPATH", "")) if part
+    )
+    env.update(
+        {
+            "HERMES_HOME": str(home),
+            "HERMES_KANBAN_DB": str(kb.kanban_db_path()),
+            "HERMES_KANBAN_BOARD": "default",
+            "HERMES_KANBAN_TASK_ID": task_id,
+            "HERMES_KANBAN_TASK": task_id,
+            "HERMES_KANBAN_RUN_ID": str(run_id),
+            "HERMES_KANBAN_WORKER_COMMAND": json.dumps(argv),
+            "HERMES_KANBAN_WORKER_COMPLETION_MODE": completion_mode,
         }
     )
     return subprocess.Popen(
@@ -322,6 +416,106 @@ def test_supervisor_maps_exit_code_to_canonical_transition(kanban_home):
     assert proc.returncode == 0, proc.stderr
     with kb.connect() as conn:
         assert kb.get_task(conn, task_id).status == "done"
+
+
+def test_self_reported_success_preserves_worker_metadata(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="reported", assignee="engine")
+        run_id = _claim_with_run(conn, task_id)
+    child = (
+        "import os\n"
+        "from hermes_cli import kanban_db as kb\n"
+        "with kb.connect() as conn:\n"
+        "    kb.complete_task(conn, os.environ['HERMES_KANBAN_TASK_ID'], "
+        "summary='worker summary', metadata={'source': 'helper'}, "
+        "expected_run_id=int(os.environ['HERMES_KANBAN_RUN_ID']))\n"
+    )
+
+    proc = _run_supervisor_mode(
+        kanban_home, task_id, run_id, [sys.executable, "-c", child], "self_reported"
+    )
+    assert proc.returncode == 0, proc.stderr
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        run = kb.get_run(conn, run_id)
+        assert task.status == "done"
+        assert run.outcome == "completed"
+        assert run.summary == "worker summary"
+        assert run.metadata == {"source": "helper"}
+
+
+def test_self_reported_exit_zero_after_helper_failure_blocks_protocol_violation(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="helper failure", assignee="engine")
+        run_id = _claim_with_run(conn, task_id)
+    child = (
+        "import subprocess, sys; "
+        "subprocess.run([sys.executable, '-c', 'sys.exit(7)']); sys.exit(0)"
+    )
+
+    proc = _run_supervisor_mode(
+        kanban_home, task_id, run_id, [sys.executable, "-c", child], "self_reported"
+    )
+    assert proc.returncode == 0, proc.stderr
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        run = kb.get_run(conn, run_id)
+        assert task.status == "blocked"
+        assert run.outcome == "blocked"
+        assert run.summary == "worker_protocol_transition_required"
+
+
+def test_self_reported_dependency_transition_is_preserved(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="dependency", assignee="engine")
+        run_id = _claim_with_run(conn, task_id)
+    child = (
+        "import os\n"
+        "from hermes_cli import kanban_db as kb\n"
+        "with kb.connect() as conn:\n"
+        "    kb.block_task(conn, os.environ['HERMES_KANBAN_TASK_ID'], "
+        "reason='waiting for parent', kind='dependency', "
+        "expected_run_id=int(os.environ['HERMES_KANBAN_RUN_ID']))\n"
+    )
+
+    proc = _run_supervisor_mode(
+        kanban_home, task_id, run_id, [sys.executable, "-c", child], "self_reported"
+    )
+    assert proc.returncode == 0, proc.stderr
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        run = kb.get_run(conn, run_id)
+        assert task.status == "todo"
+        assert run.outcome == "blocked"
+        assert run.summary == "waiting for parent"
+
+
+def test_stale_self_reported_supervisor_cannot_touch_later_run(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="stale", assignee="engine")
+        first_run_id = _claim_with_run(conn, task_id)
+
+    child = "import time; time.sleep(1)"
+    proc = _start_supervisor(
+        kanban_home,
+        task_id,
+        first_run_id,
+        [sys.executable, "-c", child],
+        completion_mode="self_reported",
+    )
+    with kb.connect() as conn:
+        assert kb.block_task(
+            conn, task_id, reason="replace first run", expected_run_id=first_run_id
+        )
+        assert kb.unblock_task(conn, task_id)
+        second_run_id = _claim_with_run(conn, task_id)
+        assert second_run_id != first_run_id
+
+    assert proc.wait(timeout=30) == 0
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).current_run_id == second_run_id
 
 
 def test_stale_supervisor_cannot_overwrite_a_later_run(kanban_home):

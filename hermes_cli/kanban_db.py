@@ -10694,7 +10694,19 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
-def _resolve_worker_command(hermes_home: Optional[str]) -> Optional[list[str]]:
+_WORKER_COMPLETION_MODE_ENV = "HERMES_KANBAN_WORKER_COMPLETION_MODE"
+_WORKER_COMPLETION_MODES = frozenset({"exit_code", "self_reported"})
+
+
+@dataclass(frozen=True)
+class WorkerCommandConfig:
+    command: tuple[str, ...]
+    completion_mode: str
+
+
+def _resolve_worker_config(
+    hermes_home: Optional[str],
+) -> Optional[WorkerCommandConfig]:
     """Resolve a named profile's fixed ``worker.command`` argv.
 
     The profile config is read directly so malformed YAML cannot be swallowed
@@ -10759,7 +10771,25 @@ def _resolve_worker_command(hermes_home: Optional[str]) -> Optional[list[str]]:
         raise RuntimeError(
             f"worker.command executable is missing or not executable: {head!r}"
         )
-    return list(raw)
+    completion_mode = worker_cfg.get("completion_mode", "exit_code")
+    if (
+        not isinstance(completion_mode, str)
+        or completion_mode not in _WORKER_COMPLETION_MODES
+    ):
+        raise RuntimeError(
+            "worker.completion_mode must be one of "
+            f"{sorted(_WORKER_COMPLETION_MODES)}"
+        )
+    return WorkerCommandConfig(
+        command=tuple(raw),
+        completion_mode=completion_mode,
+    )
+
+
+def _resolve_worker_command(hermes_home: Optional[str]) -> Optional[list[str]]:
+    """Back-compatible command-only view of the profile worker config."""
+    config = _resolve_worker_config(hermes_home)
+    return list(config.command) if config is not None else None
 
 
 _retagged_workspace_roots: set[str] = set()
@@ -10821,8 +10851,9 @@ def _default_spawn(
         profile_home = resolve_profile_env(profile_arg)
     except FileNotFoundError:
         profile_home = os.environ.get("HERMES_HOME") or None
-    worker_command = _resolve_worker_command(profile_home)
-    direct_command = worker_command is not None
+    worker_config = _resolve_worker_config(profile_home)
+    worker_command = list(worker_config.command) if worker_config is not None else None
+    direct_command = worker_config is not None
 
     # Native Hermes workers retain the inherited environment from the existing
     # spawn path. Only the arbitrary profile command/supervisor gets the
@@ -10966,6 +10997,7 @@ def _default_spawn(
                 ", ".join(ignored),
             )
         env["HERMES_KANBAN_WORKER_COMMAND"] = json.dumps(worker_command)
+        env[_WORKER_COMPLETION_MODE_ENV] = worker_config.completion_mode
         cmd = [sys.executable, "-P", "-m", "hermes_cli.kanban_command_worker"]
     else:
         cmd = [

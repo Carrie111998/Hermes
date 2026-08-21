@@ -23,6 +23,9 @@ import time
 
 _TERM_GRACE_SECONDS = 3.0
 _WAIT_POLL_SECONDS = 0.2
+_WORKER_COMPLETION_MODE_ENV = "HERMES_KANBAN_WORKER_COMPLETION_MODE"
+_WORKER_COMPLETION_MODES = frozenset({"exit_code", "self_reported"})
+_SELF_REPORTED_PROTOCOL_REASON = "worker_protocol_transition_required"
 _log = logging.getLogger(__name__)
 _CHILD_KANBAN_ENV = frozenset(
     {
@@ -87,6 +90,58 @@ def _absolute_argv0(value: str) -> bool:
     return os.name == "nt" and ntpath.isabs(value)
 
 
+def _observe_self_reported_exit(conn, kb, task_id: str, run_id: int | None) -> None:
+    """Preserve a worker-owned transition or fail closed on no transition."""
+    if run_id is None:
+        raise RuntimeError(
+            "self_reported completion requires a valid expected_run_id"
+        )
+    task = kb.get_task(conn, task_id)
+    run = kb.get_run(conn, run_id)
+    if task is None or run is None or run.task_id != task_id:
+        raise RuntimeError(
+            f"self_reported completion could not inspect task/run {task_id}/{run_id}"
+        )
+
+    # A durable outcome is authoritative even if a concurrent observer has not
+    # yet made the task pointer/status look terminal. Never replace it with the
+    # supervisor's generic exit metadata.
+    if run.outcome is not None:
+        _log.info(
+            "kanban_command_worker: preserving self-reported outcome=%s for %s run=%s",
+            run.outcome,
+            task_id,
+            run_id,
+        )
+        return
+
+    # A changed pointer or status means this supervisor is stale (or another
+    # actor won the transition race). The expected-run CAS must remain the only
+    # authority; do not create a transition for a later run.
+    if task.status != "running" or task.current_run_id != run_id:
+        _log.info(
+            "kanban_command_worker: preserving non-active self-reported run for %s run=%s",
+            task_id,
+            run_id,
+        )
+        return
+
+    # The fixed command exited successfully without making a canonical
+    # transition. Turn that protocol violation into a durable non-success
+    # outcome instead of falsely marking the task done.
+    if not kb.block_task(
+        conn,
+        task_id,
+        reason=_SELF_REPORTED_PROTOCOL_REASON,
+        expected_run_id=run_id,
+    ):
+        _log.info(
+            "kanban_command_worker: self-reported protocol transition raced for %s run=%s",
+            task_id,
+            run_id,
+        )
+
+
 def main() -> int:
     raw_argv = os.environ.get("HERMES_KANBAN_WORKER_COMMAND", "")
     task_id = os.environ.get("HERMES_KANBAN_TASK_ID") or os.environ.get(
@@ -106,6 +161,12 @@ def main() -> int:
         return _fail("worker command must be a JSON list of non-empty strings")
     if not _absolute_argv0(argv[0]):
         return _fail("worker command argv[0] must be an absolute executable path")
+    completion_mode = os.environ.get(_WORKER_COMPLETION_MODE_ENV, "exit_code")
+    if completion_mode not in _WORKER_COMPLETION_MODES:
+        return _fail(
+            f"{_WORKER_COMPLETION_MODE_ENV} must be one of "
+            f"{sorted(_WORKER_COMPLETION_MODES)}"
+        )
 
     raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "")
     try:
@@ -159,13 +220,16 @@ def main() -> int:
 
         with kb.connect() as conn:
             if returncode == 0:
-                kb.complete_task(
-                    conn,
-                    task_id,
-                    summary="worker command exited 0",
-                    metadata={"exit_code": 0, "worker_kind": "command"},
-                    expected_run_id=run_id,
-                )
+                if completion_mode == "self_reported":
+                    _observe_self_reported_exit(conn, kb, task_id, run_id)
+                else:
+                    kb.complete_task(
+                        conn,
+                        task_id,
+                        summary="worker command exited 0",
+                        metadata={"exit_code": 0, "worker_kind": "command"},
+                        expected_run_id=run_id,
+                    )
             else:
                 if returncode < 0:
                     reason = f"worker command terminated by signal {-returncode}"
