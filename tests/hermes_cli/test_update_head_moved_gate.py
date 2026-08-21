@@ -119,6 +119,12 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     monkeypatch.setattr(
         hermes_gateway, "find_profile_gateway_processes", lambda *a, **k: []
     )
+    # _cmd_update_impl calls _purge_stale_hermes_modules() (to pick up
+    # freshly-pulled gateway source on a real update) immediately before
+    # re-importing hermes_cli.gateway — that re-import creates a fresh
+    # module object, silently discarding the three patches above and
+    # reaching the real, unmocked gateway. No-op it for tests.
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None, raising=False)
 
 
 def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):

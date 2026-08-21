@@ -83,9 +83,24 @@ def _patch_gateway_discovery():
     Discovery returning nothing makes the phase a clean no-op for every test
     in this module (none of them assert on gateway restarts).
     """
+    # _cmd_update_impl calls _purge_stale_hermes_modules() (to pick up
+    # freshly-pulled gateway source on a real update) immediately before
+    # re-importing hermes_cli.gateway — that re-import creates a fresh
+    # module object, silently discarding the three patches above and
+    # reaching the real, unmocked gateway. No-op it for tests; see
+    # hermes_cli.update_cmd._m()'s docstring for this patch surface.
+    # _cmd_update_impl also calls _reload_config_modules() after a real pull,
+    # which force-reloads hermes_cli.dashboard_procs from disk to pick up
+    # post-update code — that reload creates a fresh module object, breaking
+    # object-identity assumptions (e.g. test_lazy_command_exports.py's
+    # hermes_cli.main._scan_dashboard_processes is dashboard_procs.
+    # _scan_dashboard_processes check) for any test that runs later in the
+    # same pytest session. No-op it here too, same rationale as the purge.
     with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
          patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
-         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]):
+         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]), \
+         patch("hermes_cli.main._purge_stale_hermes_modules", lambda: None), \
+         patch("hermes_cli.update_cmd._reload_config_modules", lambda: None):
         yield
 
 
