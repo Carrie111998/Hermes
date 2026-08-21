@@ -242,6 +242,22 @@ def test_keygen_warns_on_weak_container_env_key(
     assert "skipping generation" in out
 
 
+def test_keygen_weak_env_key_warning_suppressed_when_env_file_key_wins(
+    stage2_text: str, tmp_path: Path
+) -> None:
+    """Weak container key + strong .env key: the .env key wins at runtime
+    (override=True), the server DOES start — the 'will refuse to start'
+    warning would be false and must not fire. The both-keys warning must."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".env").write_text("API_SERVER_KEY=strong-file-key-abcdef0123456789\n")
+    result = _run_keygen(stage2_text, home, env_key="short-key")
+    assert result.returncode == 0, result.stderr
+    out = result.stdout + result.stderr
+    assert "shorter than 16 characters" not in out
+    assert "the .env value wins" in out
+
+
 def test_dockerignore_keeps_env_example_template() -> None:
     """The first-boot seed copies /opt/hermes/.env.example -> $HERMES_HOME/.env.
 
