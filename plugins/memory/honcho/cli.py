@@ -28,7 +28,7 @@ def clone_honcho_for_profile(
 
     Returns True if a host block was created, False if Honcho isn't configured.
     """
-    cfg = _read_config(config_path)
+    cfg = _read_config() if config_path is None else _read_config(config_path)
     if not cfg:
         return False
 
@@ -77,7 +77,10 @@ def clone_honcho_for_profile(
     new_block["enabled"] = default_block.get("enabled", True)
 
     cfg.setdefault("hosts", {})[new_host] = new_block
-    _write_config(cfg, path=config_path)
+    if config_path is None:
+        _write_config(cfg)
+    else:
+        _write_config(cfg, path=config_path)
 
     # Eagerly create the peer in Honcho so it exists before first message.
     # Preserve the historical one-argument call for ambient configs (and
@@ -95,7 +98,7 @@ def cloned_profile_ai_peer(
     config_path: Path | None = None,
 ) -> str | None:
     """Return the AI peer stored for a cloned profile, if one exists."""
-    cfg = _read_config(config_path)
+    cfg = _read_config() if config_path is None else _read_config(config_path)
     block = cfg.get("hosts", {}).get(profile_host_key(profile_name), {})
     ai_peer = block.get("aiPeer") if isinstance(block, dict) else None
     return ai_peer if isinstance(ai_peer, str) and ai_peer else None
@@ -113,10 +116,13 @@ def _ensure_peer_exists(
     """
     try:
         from plugins.memory.honcho.client import HonchoClientConfig, get_honcho_client
-        hcfg = HonchoClientConfig.from_global_config(
-            host=host_key,
-            config_path=config_path,
-        )
+        if config_path is None:
+            hcfg = HonchoClientConfig.from_global_config(host=host_key)
+        else:
+            hcfg = HonchoClientConfig.from_global_config(
+                host=host_key,
+                config_path=config_path,
+            )
         if not hcfg.enabled or not (hcfg.api_key or hcfg.base_url):
             return False
         client = get_honcho_client(hcfg)
