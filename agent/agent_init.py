@@ -520,7 +520,7 @@ def init_agent(
     command: str = None,
     args: list[str] | None = None,
     model: str = "",
-    max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
+    max_iterations: int = sys.maxsize,  # Default: unlimited tool-calling iterations (shared with subagents)
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
     save_trajectories: bool = False,
@@ -546,6 +546,7 @@ def init_agent(
     clarify_callback: callable = None,
     read_terminal_callback: callable = None,
     read_preview_callback: callable = None,
+    drive_preview_callback: callable = None,
     read_window_below_callback: callable = None,
     setup_mcp_callback: callable = None,
     tour_callback: callable = None,
@@ -843,6 +844,7 @@ def init_agent(
     agent.clarify_callback = clarify_callback
     agent.read_terminal_callback = read_terminal_callback
     agent.read_preview_callback = read_preview_callback
+    agent.drive_preview_callback = drive_preview_callback
     agent.read_window_below_callback = read_window_below_callback
     agent.setup_mcp_callback = setup_mcp_callback
     agent.tour_callback = tour_callback
@@ -1284,6 +1286,19 @@ def init_agent(
                 client_kwargs["command"] = agent.acp_command
                 client_kwargs["args"] = agent.acp_args
             effective_base = base_url
+            # OpenCode Zen free tier (*-free slugs, e.g. x-preview-f-free /
+            # "Ox Alpha"): the Zen relay serves these ANONYMOUSLY and 401s any
+            # unrecognized bearer — including our keyless placeholder. Send an
+            # empty Authorization header to override the SDK's "Bearer <key>".
+            try:
+                from hermes_cli.models import (
+                    OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER,
+                    opencode_zen_free_headers,
+                )
+                if api_key == OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER:
+                    client_kwargs["default_headers"] = opencode_zen_free_headers()
+            except Exception:
+                pass
             if base_url_host_matches(effective_base, "openrouter.ai"):
                 from agent.auxiliary_client import build_or_headers
                 client_kwargs["default_headers"] = build_or_headers()
@@ -1800,24 +1815,36 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
-    # A flush/background agent may pass skip_memory=True to avoid spinning up an
-    # external memory *provider*, but if the caller also explicitly enables the
-    # "memory" toolset it still needs the built-in file-backed store — otherwise
-    # the memory tool dispatches with store=None and every call fails (#65429).
-    # So the built-in store is created unless memory is globally disabled, while
-    # the external-provider block below stays gated on skip_memory.
-    _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
+    # skip_memory=True skips the external memory *provider*. Flush/background
+    # agents can still pass enabled_toolsets=["memory"] so the built-in file
+    # store exists and the memory tool does not fail with store=None (#65429).
+    # A toolset on disabled_toolsets is not a request. Cron always denylists
+    # memory, but the default cron toolset still names it, so an enabled-only
+    # check would load MEMORY.md into an auto-approve job.
+    _enabled_toolsets = agent.enabled_toolsets or []
+    _disabled_toolsets = agent.disabled_toolsets or []
+    _memory_toolset_requested = (
+        "memory" in _enabled_toolsets and "memory" not in _disabled_toolsets
+    )
     if not skip_memory or _memory_toolset_requested:
         try:
-            mem_config = _agent_cfg.get("memory", {})
-            agent._memory_enabled = mem_config.get("memory_enabled", False)
-            agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
+            from tools.memory_tool import (
+                get_builtin_memory_config,
+                get_builtin_memory_store_flags,
+            )
+
+            mem_config = get_builtin_memory_config(_agent_cfg)
+            agent._memory_enabled, agent._user_profile_enabled = get_builtin_memory_store_flags(
+                _agent_cfg
+            )
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
                 from tools.memory_tool import MemoryStore
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
+                    memory_enabled=agent._memory_enabled,
+                    user_profile_enabled=agent._user_profile_enabled,
                 )
                 agent._memory_store.load_from_disk()
         except Exception:
