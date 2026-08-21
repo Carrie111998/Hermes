@@ -9,7 +9,14 @@ const state = vi.hoisted(() => ({
 
 vi.mock('@/hermes', () => ({
   createSessionSpace: state.createSessionSpace,
+  getApiRequestConnection: () => null,
   listSessionSpaces: state.listSessionSpaces,
+  profileScopeKey: (scope?: { connectionId?: null | string; profile?: null | string }) => {
+    const profile = scope?.profile?.trim() || 'default'
+    const connectionId = scope?.connectionId?.trim()
+
+    return connectionId && connectionId !== 'local' ? `${connectionId}::${profile}` : profile
+  },
   setSessionSpace: state.setSessionSpace
 }))
 
@@ -20,10 +27,11 @@ vi.mock('./session', () => ({
 }))
 
 import {
-  $sessionSpaces,
+  $sessionSpacesByScope,
   assignSessionSpace,
   createAndAssignSessionSpace,
-  refreshSessionSpaces
+  refreshSessionSpaces,
+  sessionSpacesForScope
 } from './session-spaces'
 
 const space = {
@@ -38,7 +46,7 @@ afterEach(() => {
   state.listSessionSpaces.mockReset()
   state.setSessionSpace.mockReset()
   state.sessions = [{ id: 's1', space_id: null }]
-  $sessionSpaces.set([])
+  $sessionSpacesByScope.set({})
 })
 
 describe('session spaces', () => {
@@ -48,7 +56,34 @@ describe('session spaces', () => {
     await refreshSessionSpaces('default')
 
     expect(state.listSessionSpaces).toHaveBeenCalledWith('default')
-    expect($sessionSpaces.get()).toEqual([space])
+    expect(sessionSpacesForScope('default')).toEqual([space])
+  })
+
+  it('keeps profile registries isolated when refreshes resolve out of order', async () => {
+    let resolveDefault!: (value: { spaces: typeof space[] }) => void
+    let resolveWork!: (value: { spaces: typeof space[] }) => void
+    const workSpace = { ...space, id: 'space_work', name: 'Work' }
+
+    state.listSessionSpaces.mockImplementation((profile: string) =>
+      new Promise(resolve => {
+        if (profile === 'work') {
+          resolveWork = resolve
+        } else {
+          resolveDefault = resolve
+        }
+      })
+    )
+
+    const defaultRefresh = refreshSessionSpaces('default')
+    const workRefresh = refreshSessionSpaces('work')
+
+    resolveWork({ spaces: [workSpace] })
+    await workRefresh
+    resolveDefault({ spaces: [space] })
+    await defaultRefresh
+
+    expect(sessionSpacesForScope('default')).toEqual([space])
+    expect(sessionSpacesForScope('work')).toEqual([workSpace])
   })
 
   it('rolls an optimistic assignment back when persistence fails', async () => {
@@ -68,5 +103,6 @@ describe('session spaces', () => {
     expect(state.createSessionSpace).toHaveBeenCalledWith({ name: 'Infrastructure' }, undefined)
     expect(state.setSessionSpace).toHaveBeenCalledWith('s1', 'space_1', undefined)
     expect(state.sessions[0].space_id).toBe('space_1')
+    expect(sessionSpacesForScope()).toEqual([space])
   })
 })

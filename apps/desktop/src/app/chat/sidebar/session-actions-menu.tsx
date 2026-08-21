@@ -44,7 +44,13 @@ import {
   setSessions
 } from '@/store/session'
 import { $sessionColorOverrides, setSessionColorOverride } from '@/store/session-color'
-import { $sessionSpaces, assignSessionSpace, createAndAssignSessionSpace } from '@/store/session-spaces'
+import {
+  $sessionSpacesByScope,
+  assignSessionSpace,
+  createAndAssignSessionSpace,
+  refreshSessionSpaces,
+  sessionSpacesScopeKey
+} from '@/store/session-spaces'
 import { $sessionTiles } from '@/store/session-states'
 import { ackStoredSessionId } from '@/store/session-unread'
 import { canOpenSessionInTerminal, canOpenSessionWindow, openSessionInTerminal } from '@/store/windows'
@@ -193,8 +199,13 @@ function MoveToSpaceItems({
   profile?: string
   sessionId: string
 }) {
-  const spaces = useStore($sessionSpaces)
+  const spacesByScope = useStore($sessionSpacesByScope)
+  const spaces = spacesByScope[sessionSpacesScopeKey(profile)] ?? []
   const session = useStore($sessions).find(item => sessionMatchesStoredId(item, sessionId))
+
+  useEffect(() => {
+    void refreshSessionSpaces(profile).catch(() => undefined)
+  }, [profile])
 
   const assign = (spaceId: null | string, label: string) => {
     triggerHaptic('selection')

@@ -1,16 +1,40 @@
 import { atom } from 'nanostores'
 
-import { createSessionSpace, listSessionSpaces, setSessionSpace } from '@/hermes'
+import {
+  createSessionSpace,
+  getApiRequestConnection,
+  listSessionSpaces,
+  profileScopeKey,
+  setSessionSpace
+} from '@/hermes'
 import type { SessionSpace } from '@/hermes'
 
 import { setSessions } from './session'
 
-export const $sessionSpaces = atom<SessionSpace[]>([])
+export const $sessionSpacesByScope = atom<Record<string, SessionSpace[]>>({})
+
+const refreshRevisions = new Map<string, number>()
+
+export function sessionSpacesScopeKey(profile?: string | null, connectionId = getApiRequestConnection()): string {
+  return profileScopeKey({ connectionId, profile })
+}
+
+export function sessionSpacesForScope(profile?: string | null, connectionId = getApiRequestConnection()): SessionSpace[] {
+  return $sessionSpacesByScope.get()[sessionSpacesScopeKey(profile, connectionId)] ?? []
+}
 
 export async function refreshSessionSpaces(profile?: string | null): Promise<void> {
+  const key = sessionSpacesScopeKey(profile)
+  const revision = (refreshRevisions.get(key) ?? 0) + 1
+
+  refreshRevisions.set(key, revision)
   const result = await listSessionSpaces(profile)
 
-  $sessionSpaces.set(result.spaces)
+  if (refreshRevisions.get(key) !== revision) {
+    return
+  }
+
+  $sessionSpacesByScope.set({ ...$sessionSpacesByScope.get(), [key]: result.spaces })
 }
 
 export async function assignSessionSpace(sessionId: string, spaceId: null | string, profile?: string): Promise<void> {
@@ -44,8 +68,13 @@ export async function createAndAssignSessionSpace(
   profile?: string
 ): Promise<SessionSpace> {
   const { space } = await createSessionSpace({ name }, profile)
+  const key = sessionSpacesScopeKey(profile)
+  const current = $sessionSpacesByScope.get()[key] ?? []
 
-  $sessionSpaces.set([...$sessionSpaces.get(), space].sort((a, b) => a.name.localeCompare(b.name)))
+  $sessionSpacesByScope.set({
+    ...$sessionSpacesByScope.get(),
+    [key]: [...current, space].sort((a, b) => a.name.localeCompare(b.name))
+  })
   await assignSessionSpace(sessionId, space.id, profile)
 
   return space

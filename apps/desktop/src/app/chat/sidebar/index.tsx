@@ -126,7 +126,7 @@ import {
   setCurrentCwd
 } from '@/store/session'
 import { $sessionDotStateById, sessionStatusBucket } from '@/store/session-dot-state'
-import { $sessionSpaces, refreshSessionSpaces } from '@/store/session-spaces'
+import { $sessionSpacesByScope, refreshSessionSpaces, sessionSpacesScopeKey } from '@/store/session-spaces'
 import { $focusedStoredSessionId, $workingSessionIds, type SplitDir } from '@/store/session-states'
 import { ackAllSessionsRead } from '@/store/session-unread'
 import { markSessionUnread } from '@/store/session-unread-remote'
@@ -389,7 +389,6 @@ export function ChatSidebar({
   const profiles = useStore($profiles)
   const profileColors = useStore($profileColors)
   const profileScope = useStore($profileScope)
-  const sessionSpaces = useStore($sessionSpaces)
   const activeConnectionId = useStore($activeConnectionId)
 
   // Toggle the persisted read-state watermark from a row menu. The row's own
@@ -413,14 +412,16 @@ export function ChatSidebar({
   // otherwise be stuck in the grouped view with no way out.
   const showAllProfiles = multiProfile && profileScope === ALL_PROFILES
   const messagingProfile = sidebarProfileForScope(profileScope)
+  const sessionSpacesByScope = useStore($sessionSpacesByScope)
+  const sessionSpaces = sessionSpacesByScope[sessionSpacesScopeKey(messagingProfile, activeConnectionId)] ?? []
 
   useEffect(() => {
     if (showAllProfiles) {
       return
     }
 
-    void refreshSessionSpaces(messagingProfile).catch(() => $sessionSpaces.set([]))
-  }, [messagingProfile, showAllProfiles])
+    void refreshSessionSpaces(messagingProfile).catch(() => undefined)
+  }, [activeConnectionId, messagingProfile, showAllProfiles])
 
   const agentOrderIds = useStore($sidebarSessionOrderIds)
   const agentOrderManual = useStore($sidebarSessionOrderManual)
