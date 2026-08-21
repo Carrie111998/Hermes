@@ -39,7 +39,8 @@ import logging
 import sys
 from pathlib import Path
 from typing import List, Optional, Tuple, TYPE_CHECKING
-from hermes_cli.config import cfg_get
+from hermes_cli.config import cfg_get, load_config_readonly
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
 if TYPE_CHECKING:
     from agent.memory_provider import MemoryProvider
@@ -383,15 +384,16 @@ def clone_memory_provider_profile(
     provider_names: list[str] = []
     config_path = source_dir / "config.yaml"
     if config_path.exists():
+        token = set_hermes_home_override(source_dir)
         try:
-            import yaml
-
-            config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            config = load_config_readonly()
             configured = cfg_get(config, "memory", "provider") or None
             if configured:
                 provider_names.append(configured)
         except Exception:
             pass
+        finally:
+            reset_hermes_home_override(token)
 
     for candidate, provider_dir in _iter_provider_dirs():
         manifest_path = provider_dir / "plugin.yaml"
