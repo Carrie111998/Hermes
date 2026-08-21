@@ -1,8 +1,9 @@
 import { translateNow } from '@/i18n'
 import { normalizeChoices, normalizeQuestions, setClarifyRequest, warnDroppedChoices } from '@/store/clarify'
-import { $gateway } from '@/store/gateway'
+import { requestGatewayForAgent } from '@/store/gateway'
 import { setMcpSetupRequest } from '@/store/mcp-setup'
 import { dispatchNativeNotification } from '@/store/native-notifications'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { receiveApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
 import { requestScrollToBottom } from '@/store/thread-scroll'
 
@@ -191,7 +192,17 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
     const command = typeof payload?.command === 'string' ? payload.command : ''
     const description = typeof payload?.description === 'string' ? payload.description : 'dangerous command'
 
-    void receiveApprovalRequest($gateway.get(), {
+    const ownerGateway = {
+      request: (method: string, params: Record<string, unknown>) =>
+        requestGatewayForAgent(
+          event.connectionId ?? null,
+          normalizeProfileKey(event.profile ?? $activeGatewayProfile.get()),
+          method,
+          params
+        )
+    }
+
+    void receiveApprovalRequest(ownerGateway, {
       // false only when a tirith warning forbids it; backend omits the field otherwise.
       allowPermanent: payload?.allow_permanent !== false,
       choices: Array.isArray(payload?.choices)

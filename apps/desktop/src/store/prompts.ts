@@ -76,11 +76,15 @@ export interface ApprovalRequest extends KeyedPrompt {
   choices?: string[]
   command: string
   description: string
+  // The exact runtime connection that emitted this request. Background
+  // profiles can keep streaming while another gateway is active, so approval
+  // controls must not rediscover ownership from the current foreground route.
+  gateway?: ApprovalGateway
   requestId?: string
   smartDenied?: boolean
 }
 
-interface ApprovalGateway {
+export interface ApprovalGateway {
   request: (method: string, params: Record<string, unknown>) => Promise<unknown>
 }
 
@@ -116,7 +120,7 @@ export const setApprovalRequest = approval.set
 export const clearApprovalRequest = approval.clear
 
 export async function receiveApprovalRequest(gateway: ApprovalGateway | null, request: ApprovalRequest): Promise<void> {
-  setApprovalRequest(request)
+  setApprovalRequest(gateway ? { ...request, gateway } : request)
 
   if (gateway && request.requestId && request.sessionId) {
     await gateway.request('approval.received', {

@@ -324,6 +324,27 @@ describe('respondToApprovalAction', () => {
     expect($approvalRequest.get()).toBeNull()
   })
 
+  it('responds through the gateway that owns the approval request', async () => {
+    const ownerRequest = vi.fn().mockResolvedValue({ resolved: true })
+    setActiveSessionId('bg')
+    setApprovalRequest({
+      command: 'rm -rf /',
+      description: 'dangerous',
+      gateway: { request: ownerRequest },
+      requestId: 'req-bg',
+      sessionId: 'bg'
+    })
+
+    await respondToApprovalAction('bg', 'approve')
+
+    expect(ownerRequest).toHaveBeenCalledWith('approval.respond', {
+      choice: 'once',
+      request_id: 'req-bg',
+      session_id: 'bg'
+    })
+    expect(request).not.toHaveBeenCalled()
+  })
+
   it('rejects via approval.respond {choice: "deny"}', async () => {
     await respondToApprovalAction('bg', 'reject')
     expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'deny', session_id: 'bg' })

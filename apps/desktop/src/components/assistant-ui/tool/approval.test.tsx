@@ -3,7 +3,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import type { HermesGateway } from '@/hermes'
 import { $gateway } from '@/store/gateway'
-import { $approvalRequest, clearAllPrompts, setApprovalRequest } from '@/store/prompts'
+import { $approvalRequest, clearAllPrompts, receiveApprovalRequest, setApprovalRequest } from '@/store/prompts'
 import { $activeSessionId } from '@/store/session'
 
 import { PendingApprovalFallback, PendingToolApproval } from './approval'
@@ -86,6 +86,30 @@ describe('PendingToolApproval', () => {
       expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'once', session_id: 'sess-1' })
     })
     expect($approvalRequest.get()).toBeNull()
+  })
+
+  it('responds through the gateway that delivered a background approval', async () => {
+    const activeRequest = mockGateway()
+    const ownerRequest = vi.fn().mockResolvedValue({ resolved: true })
+
+    $activeSessionId.set('sess-1')
+    await receiveApprovalRequest(
+      { request: ownerRequest },
+      { command: 'rm -rf /tmp/x', description: 'dangerous command', requestId: 'req-1', sessionId: 'sess-1' }
+    )
+    ownerRequest.mockClear()
+    render(<PendingToolApproval part={part('terminal')} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Run/ }))
+
+    await waitFor(() => {
+      expect(ownerRequest).toHaveBeenCalledWith('approval.respond', {
+        choice: 'once',
+        request_id: 'req-1',
+        session_id: 'sess-1'
+      })
+    })
+    expect(activeRequest).not.toHaveBeenCalled()
   })
 
   it('reveals the full command inline when the Command toggle is clicked', () => {
