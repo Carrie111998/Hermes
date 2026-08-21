@@ -568,6 +568,23 @@ class CodexAppServerSession:
         last_tool_completion_at: Optional[float] = None
 
         while time.monotonic() < deadline and not turn_complete:
+            # Snapshot self._client once per iteration and use only this
+            # local reference below. close() can run on another thread
+            # (e.g. a session-expiry watchdog) concurrently with this loop
+            # and sets self._client = None; re-reading the attribute
+            # across multiple statements in the same iteration raced that
+            # write and could see it become None between an is_alive()
+            # check and the very next attribute access, crashing the turn
+            # with AttributeError: 'NoneType' object has no attribute
+            # 'is_alive'/'stderr_tail'/etc. A single snapshot makes every
+            # use in this iteration consistent (either the live client or
+            # None), closing that race.
+            client = self._client
+            if client is None:
+                result.error = "codex app-server session was closed during turn execution"
+                result.should_retire = True
+                break
+
             if self._interrupt_event.is_set():
                 self._issue_interrupt(result.turn_id)
                 result.interrupted = True
@@ -577,8 +594,8 @@ class CodexAppServerSession:
             # (e.g. crashed, segfaulted, or its auth refresh thread killed
             # the process), we won't get any more notifications — bail out
             # rather than waiting for the full turn deadline.
-            if not self._client.is_alive():
-                stderr_blob = "\n".join(self._client.stderr_tail(60))
+            if not client.is_alive():
+                stderr_blob = "\n".join(client.stderr_tail(60))
                 hint = _classify_oauth_failure(stderr_blob)
                 if hint is not None:
                     result.error = hint
@@ -610,14 +627,14 @@ class CodexAppServerSession:
 
             # Drain any server-initiated requests (approvals) before
             # reading notifications, so the codex side isn't blocked.
-            sreq = self._client.take_server_request(timeout=0)
+            sreq = client.take_server_request(timeout=0)
             if sreq is not None:
                 # Drain any pending notifications first so per-turn state
                 # (e.g. _pending_file_changes for fileChange approvals) is
                 # up to date when we make the approval decision. Bounded
                 # to avoid starving the server-request response.
                 for _ in range(8):
-                    pending = self._client.take_notification(timeout=0)
+                    pending = client.take_notification(timeout=0)
                     if pending is None:
                         break
                     if not _notification_belongs_to_turn(
@@ -669,7 +686,7 @@ class CodexAppServerSession:
                 last_tool_completion_at = None
                 continue
 
-            note = self._client.take_notification(
+            note = client.take_notification(
                 timeout=notification_poll_timeout
             )
             if note is None:
@@ -746,7 +763,7 @@ class CodexAppServerSession:
                         # rewrite the error into a re-auth hint AND mark
                         # the session for retirement.
                         stderr_blob = "\n".join(
-                            self._client.stderr_tail(40)
+                            client.stderr_tail(40)
                         )
                         hint = _classify_oauth_failure(err_msg, stderr_blob)
                         if hint is not None:

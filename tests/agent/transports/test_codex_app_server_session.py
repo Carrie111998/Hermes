@@ -385,8 +385,34 @@ class TestRunTurn:
             "expectedTurnId": "turn-live-123",
         }
 
+    def test_close_mid_iteration_does_not_crash_run_turn(self):
+        """close() firing between the is_alive() check and the next
+        self._client use (e.g. a session-expiry watchdog on another thread)
+        must not crash the turn with AttributeError.
 
+        Simulated here by having is_alive() itself trigger close() as a
+        side effect — same race window, deterministic without real threads.
+        run_turn must snapshot self._client once per iteration so the rest
+        of that iteration keeps using the live object even after close()
+        clears self._client.
+        """
+        client = FakeClient()
+        s = make_session(client)
 
+        def is_alive_then_close():
+            # close() runs exactly inside the is_alive() call, the same
+            # window that raced self._client in the unpatched code, then
+            # reports the subprocess as dead so the caller goes on to read
+            # client.stderr_tail(60) right after.
+            s.close()  # simulates a concurrent close() from another thread
+            return False
+
+        client.is_alive = is_alive_then_close
+
+        r = s.run_turn("hi", turn_timeout=2.0)
+
+        assert r.error is not None
+        assert r.should_retire is True
 
 
 
