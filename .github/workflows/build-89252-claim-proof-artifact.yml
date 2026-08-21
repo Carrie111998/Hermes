@@ -56,10 +56,10 @@ jobs:
       - name: Format and verify claimant-generation witnesses
         run: |
           set -euo pipefail
-          uv run ruff check --fix gateway/routing_identity.py tests/gateway/test_routing_identity.py tests/gateway/test_transport_claim_generation.py
-          uv run ruff format gateway/routing_identity.py tests/gateway/test_routing_identity.py tests/gateway/test_transport_claim_generation.py
+          uv run --with ruff==0.15.10 ruff check --fix gateway/routing_identity.py tests/gateway/test_routing_identity.py tests/gateway/test_transport_claim_generation.py
+          uv run --with ruff==0.15.10 ruff format gateway/routing_identity.py tests/gateway/test_routing_identity.py tests/gateway/test_transport_claim_generation.py
           python -m py_compile gateway/routing_identity.py
-          uv run pytest -q tests/gateway/test_routing_identity.py tests/gateway/test_transport_claim_generation.py
+          uv run --with pytest==9.1.1 pytest -q tests/gateway/test_routing_identity.py tests/gateway/test_transport_claim_generation.py
           git diff --check
 
       - name: Write exact-object receipt
