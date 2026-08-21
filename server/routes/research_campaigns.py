@@ -314,6 +314,142 @@ def campaign_issues(campaign_id: str, request: Request,
     )]
 
 
+# The bands a scoring profile defines, plus the leads a run rejected outright.
+# Rejected is reported rather than dropped: it is the control group. A band that
+# converts no better than the leads we threw away is the clearest evidence a
+# scoring profile is not discriminating, and it is invisible if the comparison
+# is only ever between A, B and C.
+_OUTCOME_BANDS = ("A", "B", "C", "Rejected")
+
+
+def _rate(numerator: int, denominator: int) -> float | None:
+    """A share, or None when there is nothing to take a share of.
+
+    Deliberately not 0.0 for an empty denominator: a band nobody contacted has
+    no reply rate, and reporting 0% would read as "we tried and it failed"
+    rather than "we have not tried". The whole point of this report is deciding
+    whether to change a scoring profile, and those two lead to opposite
+    decisions.
+    """
+    if denominator <= 0:
+        return None
+    return round(numerator / denominator, 4)
+
+
+@router.get("/research-campaigns/{campaign_id}/outcomes")
+def campaign_outcomes(campaign_id: str, request: Request,
+                      principal: Principal = Depends(current_principal),
+                      x_company_id: str | None = Header(default=None)):
+    """What each priority band actually produced once it was contacted.
+
+    The only ground truth this product has is whether a lead replied. Fit and
+    evidence confidence are our own opinion of a company, measured against
+    evidence we chose to collect and weights the customer chose to set — nothing
+    in that loop closes. This closes it: if band A replies at the same rate as
+    band C, or as the leads the run rejected, then the weights or the criteria
+    are wrong and no amount of further evidence rigour will fix it.
+
+    It also carries a load the customer-facing product deliberately does not.
+    Labels are not shown to customers, so a customer cannot tell us a label is
+    wrong; conversion per band is the only channel through which a mislabelled
+    profile ever surfaces.
+
+    Reported, never applied. Weights are not tuned from this — a handful of
+    replies is noise, and a scoring profile that moves on its own is one a
+    customer cannot be given an explanation for.
+    """
+    company_id = _scope(principal, x_company_id)
+    _row(request, company_id, campaign_id)
+    # Leads first, messages second, aggregated here rather than in SQL: the band
+    # lives in the lead's JSON payload, and `json_extract` is SQLite-only while
+    # Postgres spells it `->>`. One tenant's campaign is hundreds of rows, so
+    # this is cheaper than the portability problem it avoids.
+    rows = request.app.state.db.all(
+        "SELECT research_results.lead_id AS lead_id, research_results.verdict AS verdict, "
+        "research_results.fit_score AS fit_score, "
+        "research_results.evidence_confidence AS evidence_confidence, "
+        "leads.data AS lead_data "
+        "FROM research_results "
+        "JOIN leads ON leads.id=research_results.lead_id "
+        "AND leads.company_id=research_results.company_id "
+        "WHERE research_results.company_id=? AND research_results.campaign_id=? "
+        "AND research_results.lead_id IS NOT NULL",
+        (company_id, campaign_id),
+    )
+    if not rows:
+        return {"campaign_id": campaign_id, "bands": [], "totals": _empty_totals()}
+    lead_bands = {}
+    for row in rows:
+        data = json_load(row["lead_data"], {})
+        band = data.get("priority_band")
+        lead_bands[row["lead_id"]] = {
+            "band": band if band in _OUTCOME_BANDS else "Rejected",
+            "fit_score": row["fit_score"],
+            "evidence_confidence": row["evidence_confidence"],
+        }
+    messages = request.app.state.db.all(
+        "SELECT lead_id, sent_at, replied_at, bounced_at FROM outreach_messages "
+        "WHERE company_id=? AND lead_id IS NOT NULL",
+        (company_id,),
+    )
+    per_lead: dict[str, dict] = {}
+    for message in messages:
+        if message["lead_id"] not in lead_bands:
+            continue
+        counters = per_lead.setdefault(
+            message["lead_id"], {"sent": 0, "replied": 0, "bounced": 0}
+        )
+        # Counted on the timestamp, not on `status`: a message reaches several
+        # statuses in its life and only these three say what happened to it.
+        if message["sent_at"]:
+            counters["sent"] += 1
+        if message["replied_at"]:
+            counters["replied"] += 1
+        if message["bounced_at"]:
+            counters["bounced"] += 1
+    bands = []
+    for name in _OUTCOME_BANDS:
+        members = [key for key, value in lead_bands.items() if value["band"] == name]
+        if not members:
+            continue
+        counted = [per_lead.get(key, {"sent": 0, "replied": 0, "bounced": 0}) for key in members]
+        contacted = sum(1 for value in counted if value["sent"])
+        replied = sum(1 for value in counted if value["replied"])
+        bounced = sum(1 for value in counted if value["bounced"])
+        fits = [lead_bands[key]["fit_score"] for key in members]
+        confidences = [lead_bands[key]["evidence_confidence"] for key in members]
+        bands.append({
+            "band": name,
+            "leads": len(members),
+            "leads_contacted": contacted,
+            "leads_replied": replied,
+            "leads_bounced": bounced,
+            "messages_sent": sum(value["sent"] for value in counted),
+            # Per lead, not per message: three follow-ups to one company that
+            # never answers is one company that never answered, and dividing by
+            # messages would let a persistent sequence look like poor targeting.
+            "reply_rate": _rate(replied, contacted),
+            "bounce_rate": _rate(bounced, contacted),
+            "mean_fit_score": round(sum(fits) / len(fits), 1),
+            "mean_evidence_confidence": round(sum(confidences) / len(confidences), 3),
+        })
+    totals = {
+        "leads": len(lead_bands),
+        "leads_contacted": sum(band["leads_contacted"] for band in bands),
+        "leads_replied": sum(band["leads_replied"] for band in bands),
+        "leads_bounced": sum(band["leads_bounced"] for band in bands),
+    }
+    totals["reply_rate"] = _rate(totals["leads_replied"], totals["leads_contacted"])
+    return {"campaign_id": campaign_id, "bands": bands, "totals": totals}
+
+
+def _empty_totals() -> dict:
+    return {
+        "leads": 0, "leads_contacted": 0, "leads_replied": 0,
+        "leads_bounced": 0, "reply_rate": None,
+    }
+
+
 @router.get("/research-campaigns/{campaign_id}/leads")
 def campaign_leads(campaign_id: str, request: Request,
                    principal: Principal = Depends(current_principal),
