@@ -1401,7 +1401,7 @@ async def test_run_agent_defers_background_review_notification_until_release(mon
 
 
 @pytest.mark.asyncio
-async def test_named_profile_queued_delivery_pops_physical_callback_once(
+async def test_named_profile_queued_delivery_pops_profiled_callback_once(
     monkeypatch,
     tmp_path,
 ):
@@ -1415,8 +1415,7 @@ async def test_named_profile_queued_delivery_pops_physical_callback_once(
         profile="research",
     )
 
-    adapter_key = "agent:main:telegram:group:-1001:17585"
-    state_key = "agent:research:telegram:group:-1001:17585"
+    adapter_key = "agent:research:telegram:group:-1001:17585"
     assert result["final_response"] == "done"
     for _ in range(50):
         if [item["content"] for item in adapter.sent].count(
@@ -1428,7 +1427,6 @@ async def test_named_profile_queued_delivery_pops_physical_callback_once(
     sent_text = [item["content"] for item in adapter.sent]
     assert sent_text.count("💾 Skill 'prospect-scanner' created.") == 1
     assert adapter_key in adapter._post_delivery_callbacks
-    assert state_key not in adapter._post_delivery_callbacks
 
     callback = adapter.pop_post_delivery_callback(adapter_key)
     assert callable(callback)

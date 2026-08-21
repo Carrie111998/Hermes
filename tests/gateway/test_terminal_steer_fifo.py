@@ -356,7 +356,7 @@ async def test_command_shaped_terminal_steer_keeps_accepted_provenance(
 
 
 @pytest.mark.asyncio
-async def test_named_profile_keeps_adapter_slot_and_durable_fifo_keys_separate(
+async def test_named_profile_keeps_adapter_slot_and_durable_fifo_keys_aligned(
     monkeypatch,
     tmp_path,
 ):
@@ -378,7 +378,7 @@ async def test_named_profile_keeps_adapter_slot_and_durable_fifo_keys_separate(
     )
     state_key = runner._session_key_for_source(source)
     adapter_key = adapter.session_key_for_source(source)
-    assert state_key != adapter_key
+    assert state_key == adapter_key
     adapter._active_sessions[adapter_key] = _RecordingInterruptEvent()
     runner._enqueue_fifo(
         state_key,

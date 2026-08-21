@@ -163,7 +163,7 @@ async def test_secondary_profile_busy_mode_controls_priority_path(
     event = _event(profile="research")
     session_key = runner._session_key_for_source(event.source)
     adapter_key = adapter.session_key_for_source(event.source)
-    assert adapter_key != session_key
+    assert adapter_key == session_key
     agent = MagicMock()
     agent._active_children = []
     agent.steer.return_value = True
@@ -175,7 +175,6 @@ async def test_secondary_profile_busy_mode_controls_priority_path(
     if secondary_mode == "queue":
         agent.steer.assert_not_called()
         assert adapter._pending_messages[adapter_key] is event
-        assert session_key not in adapter._pending_messages
     else:
         agent.steer.assert_called_once_with("follow up")
         assert adapter_key not in adapter._pending_messages
@@ -206,11 +205,10 @@ async def test_secondary_profile_busy_mode_controls_busy_handler_restart_drain(
     event = _event(profile="research")
     session_key = runner._session_key_for_source(event.source)
     adapter_key = adapter.session_key_for_source(event.source)
-    assert adapter_key != session_key
+    assert adapter_key == session_key
 
     assert await runner._handle_active_session_busy_message(event, session_key) is True
     assert (adapter_key in adapter._pending_messages) is queued
-    assert session_key not in adapter._pending_messages
 
 
 @pytest.mark.asyncio
@@ -230,7 +228,7 @@ async def test_secondary_profile_busy_mode_controls_priority_restart_drain(
     event = _event(profile="research")
     session_key = runner._session_key_for_source(event.source)
     adapter_key = adapter.session_key_for_source(event.source)
-    assert adapter_key != session_key
+    assert adapter_key == session_key
     agent = MagicMock()
     agent._active_children = []
     runner._running_agents[session_key] = agent
@@ -240,7 +238,6 @@ async def test_secondary_profile_busy_mode_controls_priority_restart_drain(
     assert isinstance(response, str)
     assert "queued" in response
     assert adapter._pending_messages[adapter_key] is event
-    assert session_key not in adapter._pending_messages
     agent.interrupt.assert_not_called()
 
 
@@ -264,6 +261,7 @@ async def test_secondary_adapter_busy_guard_stamps_profile_before_resolving_mode
     # agent:main: key here asserted the pre-fix behaviour, where every profile's
     # adapter collapsed onto the default lane.
     adapter_session_key = build_session_key(event.source, profile="research")
+    assert adapter.session_key_for_source(event.source) == adapter_session_key
     adapter._active_sessions[adapter_session_key] = asyncio.Event()
 
     routed_source = _event(profile="research").source

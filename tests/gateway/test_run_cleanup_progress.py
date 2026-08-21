@@ -318,16 +318,11 @@ async def test_cleanup_chains_with_existing_callback(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("profile", "keys_differ"),
-    [("research", True), ("default", False)],
-    ids=["named-profile", "default-profile"],
-)
+@pytest.mark.parametrize("profile", ["research", "default"])
 async def test_profiled_production_delivery_consumes_adapter_owned_callbacks(
     monkeypatch,
     tmp_path,
     profile,
-    keys_differ,
 ):
     """The real adapter lifecycle consumes review + cleanup callbacks once."""
     adapter = CleanupCaptureAdapter()
@@ -357,7 +352,7 @@ async def test_profiled_production_delivery_consumes_adapter_owned_callbacks(
     )
     state_key = runner._session_key_for_source(source)
     adapter_key = adapter.session_key_for_source(source)
-    assert (state_key != adapter_key) is keys_differ
+    assert state_key == adapter_key
     generation = runner._begin_session_run_generation(state_key)
 
     async def _production_handler(inbound_event):
