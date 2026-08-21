@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import signal
+import secrets
 import subprocess
 import sys
 import threading
@@ -63,6 +64,8 @@ from agent.delegation_context import (
 )
 from cron.context import (
     _BUILTIN_SCHEDULER_ADMISSION,
+    _CRON_ATTESTATION_CAPABILITY,
+    _CronAttestationCapability,
     OPERATOR_TRIGGERED,
     PROVIDER_SCHEDULED,
     RECOVERY_CATCHUP,
@@ -542,6 +545,7 @@ def _advance_due_jobs_for_tick(job_ids) -> dict[str, Any]:
 
 
 from cron.executions import (
+    bind_execution_attestation,
     bind_execution_claim,
     create_execution,
     finish_execution,
@@ -593,6 +597,24 @@ def classify_builtin_invocation(
     intended = job.get("next_run_at")
     kind = classify_scheduled_fire(intended, now=now, provider=False)
     return kind, str(intended) if intended is not None else None
+
+
+def _issue_execution_attestation(
+    execution_id: str,
+) -> Optional[_CronAttestationCapability]:
+    """Generate and ledger-bind one raw nonce after claim binding succeeds."""
+    raw_token = secrets.token_urlsafe(32)
+    digest = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    if bind_execution_attestation(
+        execution_id, token_sha256=digest
+    ) is None:
+        return None
+    return _CronAttestationCapability(
+        execution_id=str(execution_id),
+        token=raw_token,
+        digest=digest,
+        capability=_CRON_ATTESTATION_CAPABILITY,
+    )
 
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
@@ -4868,6 +4890,7 @@ def _execution_claim_is_current(
     execution_id: str,
     invocation_kind: str,
     claim_owner: str,
+    attestation_digest: Optional[str] = None,
 ) -> bool:
     """Require ledger ownership and the current store claim before export."""
     try:
@@ -4884,6 +4907,11 @@ def _execution_claim_is_current(
         if execution.get("invocation_kind") != invocation_kind:
             return False
         if str(execution.get("claim_owner") or "") != claim_owner:
+            return False
+        if (
+            attestation_digest is not None
+            and execution.get("attestation_token_sha256") != attestation_digest
+        ):
             return False
 
         current_job = get_job(str(job.get("id") or ""))
@@ -4906,6 +4934,7 @@ def run_job(
     defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    _attestation_capability: Any = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """Run one cron turn under its scheduler-owned task-local attestation."""
     claim = job.get("fire_claim")
@@ -4924,6 +4953,15 @@ def run_job(
         if isinstance(claim, dict)
         else UNKNOWN
     )
+    attestation_capability = (
+        _attestation_capability
+        if (
+            isinstance(_attestation_capability, _CronAttestationCapability)
+            and _attestation_capability.capability is _CRON_ATTESTATION_CAPABILITY
+            and _attestation_capability.execution_id == claim_execution_id
+        )
+        else None
+    )
     top_level_id = job.get("execution_id")
     top_level_kind = job.get("invocation_kind")
     attestation_matches = bool(claim_execution_id and claim_owner and claim_kind != UNKNOWN)
@@ -4939,6 +4977,7 @@ def run_job(
         claim_execution_id,
         claim_kind,
         claim_owner,
+        attestation_capability.digest if attestation_capability else None,
     ):
         # Direct callers are not scheduler-attested.  Keep the closed kind in
         # durable records, but do not expose a fabricated UUID to subprocesses.
@@ -4948,7 +4987,11 @@ def run_job(
             extra_prompt=extra_prompt,
             cancel_event=cancel_event,
         )
-    with cron_execution_context(claim_execution_id, claim_kind):
+    with cron_execution_context(
+        claim_execution_id,
+        claim_kind,
+        attestation_capability,
+    ):
         return _run_job(
             job,
             defer_agent_teardown=defer_agent_teardown,
@@ -6523,6 +6566,7 @@ def run_one_job(
     verbose: bool = False,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    _attestation_capability: Any = None,
 ) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
@@ -6561,6 +6605,7 @@ def run_one_job(
                 loop=loop,
                 verbose=verbose,
                 extra_prompt=extra_prompt,
+                attestation_capability=_attestation_capability,
                 fire_claim_lost=(
                     _CombinedCancelEvent(lost_ownership, cancel_event)
                     if cancel_event is not None
@@ -6585,6 +6630,7 @@ def _run_one_job_body(
     loop=None,
     verbose: bool = False,
     extra_prompt: Optional[str] = None,
+    attestation_capability: Any = None,
     fire_claim_lost: Optional[_CancelEventLike] = None,
     execution_token: Optional[object] = None,
 ) -> bool:
@@ -6737,19 +6783,17 @@ def _run_one_job_body(
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
         try:
+            run_kwargs = {
+                "defer_agent_teardown": _deferred_agents,
+                "extra_prompt": extra_prompt,
+            }
+            if attestation_capability is not None:
+                run_kwargs["_attestation_capability"] = attestation_capability
             if fire_claim_lost is None:
-                success, output, final_response, error = run_job(
-                    job,
-                    defer_agent_teardown=_deferred_agents,
-                    extra_prompt=extra_prompt,
-                )
+                success, output, final_response, error = run_job(job, **run_kwargs)
             else:
-                success, output, final_response, error = run_job(
-                    job,
-                    defer_agent_teardown=_deferred_agents,
-                    extra_prompt=extra_prompt,
-                    cancel_event=fire_claim_lost,
-                )
+                run_kwargs["cancel_event"] = fire_claim_lost
+                success, output, final_response, error = run_job(job, **run_kwargs)
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
             # it down here so a failed run never leaks its async resources
@@ -7526,6 +7570,7 @@ def tick(
             # compatible; real callers using return_job=True never take it.
             claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
             claimed_job["execution_id"] = job["execution_id"]
+            attestation_capability = None
             if isinstance(claimed, dict):
                 claim = claimed.get("fire_claim")
                 if not isinstance(claim, dict):
@@ -7563,12 +7608,25 @@ def tick(
                         error="Fire claim execution binding was lost before dispatch",
                     )
                     return True
-            return run_one_job(
-                claimed_job,
-                adapters=adapters,
-                loop=loop,
-                verbose=verbose,
-            )
+                if getattr(claim_job_for_fire, "__module__", "cron.jobs") == "cron.jobs":
+                    attestation_capability = _issue_execution_attestation(
+                        job["execution_id"]
+                    )
+                    if attestation_capability is None:
+                        finish_execution(
+                            job["execution_id"],
+                            success=False,
+                            error="Execution attestation binding was lost before dispatch",
+                        )
+                        return True
+            run_kwargs = {
+                "adapters": adapters,
+                "loop": loop,
+                "verbose": verbose,
+            }
+            if attestation_capability is not None:
+                run_kwargs["_attestation_capability"] = attestation_capability
+            return run_one_job(claimed_job, **run_kwargs)
 
         # Partition due jobs: those with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so

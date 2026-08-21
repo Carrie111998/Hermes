@@ -11,6 +11,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 
 def test_legacy_execution_rows_migrate_and_keep_terminal_evidence(
     monkeypatch, tmp_path
@@ -325,6 +327,7 @@ def test_cron_context_reaches_child_and_resets_without_cross_thread_leak(monkeyp
 
     monkeypatch.setenv("HERMES_CRON_EXECUTION_ID", "caller-value")
     monkeypatch.setenv("HERMES_CRON_INVOCATION_KIND", "caller-value")
+    monkeypatch.setenv("HERMES_CRON_ATTESTATION_TOKEN", "caller-token")
 
     def probe(execution_id):
         with cron_execution_context(execution_id, SCHEDULED_ON_TIME):
@@ -333,7 +336,7 @@ def test_cron_context_reaches_child_and_resets_without_cross_thread_leak(monkeyp
                 [
                     sys.executable,
                     "-c",
-                    "import os; print(os.getenv('HERMES_CRON_EXECUTION_ID')); print(os.getenv('HERMES_CRON_INVOCATION_KIND'))",
+                    "import os; print(os.getenv('HERMES_CRON_EXECUTION_ID')); print(os.getenv('HERMES_CRON_INVOCATION_KIND')); print(os.getenv('HERMES_CRON_ATTESTATION_TOKEN'))",
                 ],
                 env=env,
                 text=True,
@@ -343,11 +346,180 @@ def test_cron_context_reaches_child_and_resets_without_cross_thread_leak(monkeyp
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(probe, ("exec-a", "exec-b")))
     assert {item[0] for item in results} == {"exec-a", "exec-b"}
-    assert all(item[1] == [item[0], SCHEDULED_ON_TIME] for item in results)
+    assert all(item[1] == [item[0], SCHEDULED_ON_TIME, "None"] for item in results)
 
     after = build_subprocess_env(scrub_secrets=False)
     assert "HERMES_CRON_EXECUTION_ID" not in after
     assert "HERMES_CRON_INVOCATION_KIND" not in after
+    assert "HERMES_CRON_ATTESTATION_TOKEN" not in after
+
+
+def test_attestation_digest_is_single_assignment_and_raw_never_reaches_db(
+    monkeypatch, tmp_path
+):
+    import cron.executions as executions
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db"
+    )
+    raw = "nonce-for-one-execution"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    row = executions.create_execution("nonce-job", source="builtin")
+
+    bound = executions.bind_execution_attestation(
+        row["id"], token_sha256=digest
+    )
+    assert bound["attestation_token_sha256"] == digest
+    assert raw not in str(bound)
+    assert raw not in (tmp_path / "cron" / "executions.db").read_bytes().decode(
+        "utf-8", errors="ignore"
+    )
+    assert executions.bind_execution_attestation(
+        row["id"], token_sha256=hashlib.sha256(b"replacement").hexdigest()
+    ) is None
+    assert executions.get_execution(row["id"])["attestation_token_sha256"] == digest
+
+
+def test_attestation_context_isolated_and_resets_on_early_failure(monkeypatch):
+    from cron.context import (
+        _CRON_ATTESTATION_CAPABILITY,
+        _CronAttestationCapability,
+        SCHEDULED_ON_TIME,
+        cron_execution_context,
+    )
+    from tools.environments.local import build_subprocess_env
+
+    raw_a = "raw-attestation-a"
+    raw_b = "raw-attestation-b"
+    cap_a = _CronAttestationCapability(
+        "exec-a", raw_a, hashlib.sha256(raw_a.encode()).hexdigest(), _CRON_ATTESTATION_CAPABILITY
+    )
+    cap_b = _CronAttestationCapability(
+        "exec-b", raw_b, hashlib.sha256(raw_b.encode()).hexdigest(), _CRON_ATTESTATION_CAPABILITY
+    )
+
+    def probe(cap):
+        with cron_execution_context(cap.execution_id, SCHEDULED_ON_TIME, cap):
+            return build_subprocess_env(scrub_secrets=False)[
+                "HERMES_CRON_ATTESTATION_TOKEN"
+            ]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert set(pool.map(probe, (cap_a, cap_b))) == {raw_a, raw_b}
+
+    cap_fail = _CronAttestationCapability(
+        "exec-fail",
+        "raw-attestation-fail",
+        hashlib.sha256(b"raw-attestation-fail").hexdigest(),
+        _CRON_ATTESTATION_CAPABILITY,
+    )
+    with pytest.raises(RuntimeError):
+        with cron_execution_context("exec-fail", SCHEDULED_ON_TIME, cap_fail):
+            assert build_subprocess_env(scrub_secrets=False)[
+                "HERMES_CRON_ATTESTATION_TOKEN"
+            ] == cap_fail.token
+            raise RuntimeError("early failure")
+    assert "HERMES_CRON_ATTESTATION_TOKEN" not in build_subprocess_env(
+        scrub_secrets=False
+    )
+
+
+def test_normal_and_provider_no_agent_paths_match_nonce_to_ledger_digest(
+    monkeypatch, tmp_path
+):
+    import cron.executions as executions
+    import cron.jobs as jobs
+    import cron.scheduler as scheduler
+    from cron.context import SCHEDULED_ON_TIME, _BUILTIN_SCHEDULER_ADMISSION
+    from cron.scheduler_provider import (
+        InProcessCronScheduler,
+        _AUTHENTICATED_PROVIDER_ADMISSION,
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db"
+    )
+    fixed_now = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: fixed_now)
+    probe = tmp_path / "scripts" / "probe.py"
+    probe.parent.mkdir(parents=True)
+    probe.write_text(
+        "import hashlib, os\n"
+        "print(hashlib.sha256(os.environ['HERMES_CRON_ATTESTATION_TOKEN'].encode()).hexdigest())\n",
+        encoding="utf-8",
+    )
+
+    def make_job(name):
+        job = jobs.create_job(
+            name,
+            "every 5m",
+            name=name,
+            script="probe.py",
+            no_agent=True,
+            deliver="local",
+        )
+        stored = jobs.load_jobs()
+        next(
+            stored_job for stored_job in stored if stored_job["id"] == job["id"]
+        )["next_run_at"] = fixed_now.isoformat()
+        jobs.save_jobs(stored)
+        return jobs.get_job(job["id"])
+
+    normal = make_job("nonce-normal")
+    normal_execution = executions.create_execution(
+        normal["id"], source="builtin", invocation_kind="UNKNOWN"
+    )
+    normal_claim = jobs.claim_job_for_fire(
+        normal["id"],
+        invocation_kind=SCHEDULED_ON_TIME,
+        intended_fire_at=fixed_now.isoformat(),
+        execution_id=normal_execution["id"],
+        return_job=True,
+        _scheduler_admission=_BUILTIN_SCHEDULER_ADMISSION,
+    )
+    normal_claim["execution_id"] = normal_execution["id"]
+    assert normal_claim["fire_claim"]["invocation_kind"] == SCHEDULED_ON_TIME
+    assert executions.bind_execution_claim(
+        normal_execution["id"],
+        invocation_kind=SCHEDULED_ON_TIME,
+        intended_fire_at=normal_claim["fire_claim"]["intended_fire_at"],
+        claim_owner=normal_claim["fire_claim"]["by"],
+    )
+    normal_cap = scheduler._issue_execution_attestation(normal_execution["id"])
+    assert normal_cap is not None
+    assert scheduler.run_one_job(
+        normal_claim, _attestation_capability=normal_cap
+    ) is True
+    normal_row = executions.get_execution(normal_execution["id"])
+    normal_output = Path(normal_row["output_path"]).read_text(encoding="utf-8")
+    assert normal_row["attestation_token_sha256"] == normal_cap.digest
+    assert normal_cap.digest in normal_output
+    assert normal_cap.token not in normal_output
+
+    provider = InProcessCronScheduler()
+    provider_job = make_job("nonce-provider")
+    provider_claim = provider.claim_fire(
+        provider_job["id"], _provider_admission=_AUTHENTICATED_PROVIDER_ADMISSION
+    )
+    assert provider_claim["fire_claim"]["invocation_kind"] == "PROVIDER_SCHEDULED"
+    issued = []
+    original_issue = scheduler._issue_execution_attestation
+
+    def capture_issue(execution_id):
+        capability = original_issue(execution_id)
+        issued.append(capability)
+        return capability
+
+    monkeypatch.setattr(scheduler, "_issue_execution_attestation", capture_issue)
+    assert provider.fire_claimed(provider_claim) is True
+    provider_cap = issued[0]
+    provider_row = executions.get_execution(provider_claim["execution_id"])
+    provider_output = Path(provider_row["output_path"]).read_text(encoding="utf-8")
+    assert provider_row["attestation_token_sha256"] == provider_cap.digest
+    assert provider_cap.digest in provider_output
+    assert provider_cap.token not in provider_output
 
 
 def test_run_job_requires_owner_bearing_claim_agreement(monkeypatch, tmp_path):

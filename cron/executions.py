@@ -8,6 +8,7 @@ proved gone. Terminal states are immutable.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import threading
 import uuid
@@ -47,6 +48,7 @@ _EXECUTION_MIGRATED_COLUMNS = {
     "output_sha256": "TEXT",
     "founder_card_path": "TEXT",
     "founder_card_sha256": "TEXT",
+    "attestation_token_sha256": "TEXT",
 }
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
@@ -94,7 +96,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              output_path TEXT,
              output_sha256 TEXT,
              founder_card_path TEXT,
-             founder_card_sha256 TEXT
+             founder_card_sha256 TEXT,
+             attestation_token_sha256 TEXT
            )"""
     )
     # Additive migration for ledgers created before Phase A.  Existing rows
@@ -258,6 +261,34 @@ def bind_execution_claim(
             return None
         record = _record(
             conn.execute("SELECT * FROM executions WHERE id=?", (execution_id,)).fetchone()
+        )
+    _emit_execution_state(record)
+    return record
+
+
+def bind_execution_attestation(
+    execution_id: str,
+    *,
+    token_sha256: str,
+) -> Optional[Dict[str, Any]]:
+    """Bind the nonce digest exactly once to a still-live execution row."""
+    digest = str(token_sha256 or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        return None
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions
+               SET attestation_token_sha256=?
+               WHERE id=? AND status IN ('claimed','running')
+                 AND attestation_token_sha256 IS NULL""",
+            (digest, str(execution_id)),
+        )
+        if cur.rowcount != 1:
+            return None
+        record = _record(
+            conn.execute(
+                "SELECT * FROM executions WHERE id=?", (str(execution_id),)
+            ).fetchone()
         )
     _emit_execution_state(record)
     return record

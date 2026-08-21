@@ -11,6 +11,7 @@ import hashlib
 import json
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -40,6 +41,25 @@ ON_TIME_GRACE_SECONDS = 5 * 60
 _BUILTIN_SCHEDULER_ADMISSION = object()
 _AUTHENTICATED_PROVIDER_ADMISSION = object()
 _RECOVERY_SCHEDULER_ADMISSION = object()
+
+# The raw nonce is carried only by this private scheduler capability until it
+# is installed in the execution ContextVar. Its repr intentionally omits the
+# raw value so accidental diagnostics cannot disclose the token.
+_CRON_ATTESTATION_CAPABILITY = object()
+
+
+@dataclass(frozen=True, repr=False)
+class _CronAttestationCapability:
+    execution_id: str
+    token: str
+    digest: str
+    capability: object = _CRON_ATTESTATION_CAPABILITY
+
+    def __repr__(self) -> str:
+        return (
+            "_CronAttestationCapability("
+            f"execution_id={self.execution_id!r}, digest={self.digest!r})"
+        )
 
 DELIVERY_STATUSES = frozenset({
     "NOT_ATTEMPTED",
@@ -130,12 +150,22 @@ def file_attestation(path: Any) -> tuple[str | None, str | None]:
 def cron_execution_context(
     execution_id: Any,
     invocation_kind: Any,
+    attestation: Any = None,
 ) -> Iterator[None]:
     """Bind one scheduler attestation for this turn and restore prior state."""
     from gateway.session_context import bind_cron_execution_context
 
+    attestation_token = None
+    if (
+        isinstance(attestation, _CronAttestationCapability)
+        and attestation.capability is _CRON_ATTESTATION_CAPABILITY
+        and attestation.execution_id == str(execution_id or "")
+    ):
+        attestation_token = attestation.token
     tokens = bind_cron_execution_context(
-        str(execution_id or ""), normalize_invocation_kind(invocation_kind)
+        str(execution_id or ""),
+        normalize_invocation_kind(invocation_kind),
+        attestation_token,
     )
     try:
         yield

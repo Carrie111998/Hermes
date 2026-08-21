@@ -464,6 +464,7 @@ def _inject_session_context_env(env: dict) -> None:
         elif var_name in {
             "HERMES_CRON_EXECUTION_ID",
             "HERMES_CRON_INVOCATION_KIND",
+            "HERMES_CRON_ATTESTATION_TOKEN",
         }:
             # Scheduler attestation is never inherited from a caller's
             # process environment.  A user-supplied value must not be able to

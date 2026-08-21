@@ -333,14 +333,34 @@ class CronScheduler(ABC):
         — e.g. the dashboard lifespan drain signalling pending webhook
         fires before the event loop shuts down.
         """
-        from cron.scheduler import run_one_job
+        from cron.scheduler import _issue_execution_attestation, run_one_job
 
-        run_one_job(
-            claimed_job,
-            adapters=adapters,
-            loop=loop,
-            cancel_event=cancel_event,
-        )
+        attestation_capability = None
+        execution_id = str(claimed_job.get("execution_id") or "")
+        if (
+            execution_id
+            and getattr(run_one_job, "__module__", "cron.scheduler")
+            == "cron.scheduler"
+        ):
+            attestation_capability = _issue_execution_attestation(execution_id)
+            if attestation_capability is None:
+                from cron.executions import finish_execution
+
+                finish_execution(
+                    execution_id,
+                    success=False,
+                    error="Execution attestation binding was lost before dispatch",
+                )
+                return False
+
+        run_kwargs = {
+            "adapters": adapters,
+            "loop": loop,
+            "cancel_event": cancel_event,
+        }
+        if attestation_capability is not None:
+            run_kwargs["_attestation_capability"] = attestation_capability
+        run_one_job(claimed_job, **run_kwargs)
         return True
 
     def reconcile(self) -> None:
