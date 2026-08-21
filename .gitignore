@@ -189,3 +189,6 @@ test-results/
 customer list*.csv
 *CustomerData*.csv
 *candidates*.csv
+
+# Agent worktrees created under .claude/
+.claude/worktrees/
