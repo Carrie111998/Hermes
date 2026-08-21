@@ -366,6 +366,62 @@ def load_memory_provider(
         return None
 
 
+def clone_memory_provider_profile(
+    profile_name: str,
+    *,
+    source_dir: Path,
+    profile_dir: Path,
+    clone_all: bool = False,
+) -> object | None:
+    """Run the cloned profile's configured memory-provider hook.
+
+    The provider normally comes from the source config.yaml. Legacy provider
+    installs that predate ``memory.provider`` may declare a
+    ``profile_clone_config`` marker in plugin.yaml; this keeps profile creation
+    generic while preserving their existing clone behavior.
+    """
+    provider_name = None
+    config_path = source_dir / "config.yaml"
+    if config_path.exists():
+        try:
+            import yaml
+
+            config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            provider_name = cfg_get(config, "memory", "provider") or None
+        except Exception:
+            pass
+
+    if not provider_name:
+        for candidate, provider_dir in _iter_provider_dirs():
+            manifest_path = provider_dir / "plugin.yaml"
+            if not manifest_path.exists():
+                continue
+            try:
+                import yaml
+
+                manifest = yaml.safe_load(
+                    manifest_path.read_text(encoding="utf-8-sig")
+                ) or {}
+                marker = manifest.get("profile_clone_config")
+            except Exception:
+                continue
+            if isinstance(marker, str) and marker and (source_dir / marker).exists():
+                provider_name = candidate
+                break
+
+    if not provider_name:
+        return None
+    provider = load_memory_provider(provider_name, register_skills=False)
+    if provider is None:
+        return None
+    return provider.clone_profile(
+        profile_name,
+        source_dir=source_dir,
+        profile_dir=profile_dir,
+        clone_all=clone_all,
+    )
+
+
 def _load_provider_from_entry_point(
     entry_point,
     *,

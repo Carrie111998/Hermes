@@ -1263,23 +1263,20 @@ def create_profile(
     _maybe_register_gateway_service(canon)
 
     # Profile creation is shared by the CLI, REST/Desktop, and Bot Mode RPC.
-    # Keep the existing Honcho clone integration here so every clone surface
-    # applies the same memory identity policy.
+    # Let the selected memory provider apply its own clone-time identity state
+    # without coupling this core profile module to a specific plugin.
     if source_dir is not None:
         try:
-            from plugins.memory.honcho.cli import clone_honcho_for_profile
+            from plugins.memory import clone_memory_provider_profile
 
-            # Full clones carry a profile-local Honcho config that wins over
-            # the shared default config at runtime. Update that copied file;
-            # config-only clones continue accumulating shared host blocks in
-            # the launch profile's config as before.
-            honcho_path = profile_dir / "honcho.json" if clone_all else None
-            clone_honcho_for_profile(
+            clone_memory_provider_profile(
                 canon,
-                config_path=honcho_path if honcho_path and honcho_path.exists() else None,
+                source_dir=source_dir,
+                profile_dir=profile_dir,
+                clone_all=clone_all,
             )
         except Exception:
-            pass  # Honcho plugin not installed or not configured
+            pass  # provider clone integration is best-effort
 
     return profile_dir
 
