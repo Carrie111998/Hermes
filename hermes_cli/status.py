@@ -8,10 +8,13 @@ import os
 import sys
 import time
 import importlib.util
+import logging
 import subprocess  # noqa: F401 — re-exported for tests that monkeypatch status.subprocess to guard against regressions
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+
+logger = logging.getLogger(__name__)
 
 from hermes_cli.auth import AuthError, resolve_provider
 from hermes_cli.colors import Colors, color
@@ -229,14 +232,19 @@ def show_status(args):
 
         _tts_provider = (_load_tts_config().get("provider") or "").strip()
         if _tts_provider and not check_tts_requirements():
+            # check_tts_requirements() can fail for any prerequisite (SDK,
+            # ffmpeg for some providers, ...), not just a missing SDK —
+            # name the general cause so the line cannot misdiagnose the
+            # remediation (review on #90610).
             print(
                 f"  {'TTS':<12}  {check_mark(False)} "
-                f"{_tts_provider} provider not runnable — SDK missing; voice "
-                "replies silently degrade to text"
+                f"{_tts_provider} not runnable — check that its "
+                "SDK/prerequisites are installed; voice replies silently "
+                "degrade to text"
             )
     except Exception:
         # The status probe must never fail the whole report.
-        pass
+        logger.debug("TTS status probe failed", exc_info=True)
 
     # =========================================================================
     # Auth Providers (OAuth)

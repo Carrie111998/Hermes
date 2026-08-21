@@ -255,8 +255,8 @@ def test_show_status_flags_missing_tts_provider_sdk(monkeypatch, capsys, tmp_pat
 
     output = capsys.readouterr().out
     assert "TTS" in output
-    assert "elevenlabs provider not runnable" in output
-    assert "SDK missing" in output
+    assert "elevenlabs not runnable" in output
+    assert "SDK/prerequisites are installed" in output
 
 
 def test_show_status_no_tts_warning_without_explicit_provider(
@@ -274,4 +274,4 @@ def test_show_status_no_tts_warning_without_explicit_provider(
     show_status(SimpleNamespace(all=True, deep=False))
 
     output = capsys.readouterr().out
-    assert "SDK missing" not in output
+    assert "not runnable" not in output
