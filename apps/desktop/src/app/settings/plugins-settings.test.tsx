@@ -144,8 +144,11 @@ describe('PluginsSettings', () => {
       },
       { ...legacyRow, name: 'browserbase', key: 'browser/browserbase', source: 'bundled' },
       { ...legacyRow, name: 'chronos', key: 'cron_providers/chronos', source: 'bundled' },
+      { ...legacyRow, name: 'basic-auth', key: 'dashboard_auth/basic', source: 'bundled' },
       { ...legacyRow, name: 'deepinfra', key: 'image_gen/deepinfra', source: 'bundled' },
-      { ...legacyRow, name: 'discord', key: 'platforms/discord', source: 'bundled' }
+      { ...legacyRow, name: 'discord', key: 'platforms/discord', source: 'bundled' },
+      { ...legacyRow, name: 'fal-video', key: 'video_gen/fal', source: 'bundled' },
+      { ...legacyRow, name: 'exa', key: 'web/exa', source: 'bundled' }
     ])
 
     renderSettings()
@@ -155,15 +158,18 @@ describe('PluginsSettings', () => {
     expect(screen.getByText('security-guidance')).toBeTruthy()
     expect(screen.queryByText('browserbase')).toBeNull()
     expect(screen.queryByText('chronos')).toBeNull()
+    expect(screen.queryByText('basic-auth')).toBeNull()
     expect(screen.queryByText('deepinfra')).toBeNull()
     expect(screen.queryByText('discord')).toBeNull()
+    expect(screen.queryByText('fal-video')).toBeNull()
+    expect(screen.queryByText('exa')).toBeNull()
     // Count pill reflects the filtered list, not the raw RPC row count.
     expect(screen.getByText('3 installed', { exact: false })).toBeTruthy()
   })
 
-  it('hides legacy other-surface categories even when the backend omits source', () => {
-    // Older backends may not report source reliably — the key-prefix
-    // fallback still hides categories other surfaces own.
+  it('hides legacy other-surface categories when the backend reports an unreliable source', () => {
+    // Older backends may report source unreliably — the key-prefix fallback
+    // still hides categories other surfaces own.
     $agentPlugins.set([{ ...legacyRow, name: 'deepinfra', key: 'model-providers/deepinfra', source: 'user' }])
 
     renderSettings()

@@ -5,9 +5,9 @@ import { notifyError } from '@/store/notifications'
 /**
  * Feature store for backend (agent) plugins — the native Hermes plugins plus
  * portable Agent Plugins v1 packages the backend discovers on disk. Settings
- * renders this next to the desktop (renderer) plugin inventory so every plugin
- * the user has is discoverable and toggleable from one page, whatever process
- * it runs in.
+ * renders general plugins next to the desktop (renderer) inventory; category
+ * plugins remain on the Browser, provider, messaging, and other settings
+ * surfaces that own their configuration.
  *
  * Backed by the gateway's `plugins.manage` RPC — the same list/toggle
  * primitives `hermes plugins` and the dashboard use, so all surfaces agree on
@@ -42,8 +42,9 @@ export const $agentPluginBusy = atom<string | null>(null)
 // Rows the Plugins page actually lists (and search should surface): user
 // plugins plus general bundled plugins such as disk-cleanup and
 // security-guidance. Category plugins stay on the settings surfaces that own
-// their configuration. Key-prefix ownership works for every source and keeps
-// older backends compatible — same curation stance as desktop-slash-commands.
+// their configuration. Key-prefix ownership works for keyed rows regardless
+// of source. Keyless legacy rows remain visible and read-only because their
+// owning surface cannot be inferred — same stance as desktop-slash-commands.
 const HIDDEN_KEY_PREFIXES = [
   'browser/',
   'cron_providers/',
