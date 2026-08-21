@@ -283,6 +283,24 @@ o modelo substitui o atalho idiomático e nome do app da plataforma):
 Durante tudo isso, seu cursor fica onde você deixou e o app de email
 nunca vem ao front.
 
+## Recebendo o screenshot de verdade {#receiving-the-actual-screenshot}
+
+Screenshots tirados durante o controle do computador são normalmente
+internos — existem para o modelo ver a tela, e o agente responde em texto.
+Mas cada captura de imagem também salva uma cópia limitada e compartilhável
+no cache de imagens do Hermes e reporta o caminho, então em superfícies que
+aceitam anexos (Telegram, Discord, Desktop e outras plataformas do gateway)
+você pode simplesmente pedir:
+
+> *"Me manda um screenshot da minha tela."*
+
+e o agente entrega a imagem real como anexo nativo, não só uma descrição.
+Na CLI não há canal de anexo, então o agente te dá o caminho do arquivo
+salvo.
+
+Só os 20 arquivos de captura mais recentes são mantidos, e screenshots
+nunca são enviados automaticamente — só quando você pede um.
+
 ## Compatibilidade de providers {#provider-compatibility}
 
 | Provider | Visão? | Funciona? | Notas |

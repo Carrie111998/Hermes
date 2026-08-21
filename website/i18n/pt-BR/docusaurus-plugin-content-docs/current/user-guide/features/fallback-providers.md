@@ -73,6 +73,7 @@ Cada entrada exige `provider` e `model`. Entradas sem qualquer um dos campos sã
 | OpenCode Zen | `opencode-zen` | `OPENCODE_ZEN_API_KEY` |
 | CommandCode | `commandcode` (alias `commandcode-chat`; Claude via `commandcode-anthropic`) | `COMMANDCODE_API_KEY` |
 | OpenCode Go | `opencode-go` | `OPENCODE_GO_API_KEY` |
+| OpenCode Free | `opencode-free` | — (sem chave, sem credencial) |
 | Kilo Code | `kilocode` | `KILOCODE_API_KEY` |
 | Xiaomi MiMo | `xiaomi` | `XIAOMI_API_KEY` |
 | Arcee AI | `arcee` | `ARCEEAI_API_KEY` |

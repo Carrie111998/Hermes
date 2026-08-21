@@ -51,6 +51,7 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes auth` | Gerencia credenciais — adiciona, lista, remove, redefine, status, logout. Lida com os fluxos OAuth de Codex/Nous/Anthropic. |
 | `hermes login` / `logout` | **Descontinuado** — use `hermes auth`. |
 | `hermes send` | Envia uma mensagem de disparo único a uma plataforma de mensagens configurada (Telegram, Discord, Slack, Signal, SMS, …). Útil em scripts de shell, cron jobs, hooks de CI e daemons de monitoramento — sem loop de agente, sem LLM. |
+| `hermes peer` | Registra gateways Hermes peer em outras máquinas e envia DM aos Bot Chats canônicos dos agentes delas (`hermes peer dm <peer>[/<agent>] "…"`). O transporte por trás de messaging bot-to-bot entre máquinas. |
 | `hermes secrets` | Gerencia fontes externas de segredos (atualmente Bitwarden Secrets Manager) para buscar chaves de API na inicialização do processo em vez de `~/.hermes/.env`. |
 | `hermes migrate` | Diagnostica e (opcionalmente) reescreve o `config.yaml` para substituir referências a modelos descontinuados ou configurações obsoletas (ex.: `migrate xai`). |
 | `hermes status` | Mostra o status do agente, autenticação e plataformas. |
@@ -88,7 +89,7 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes desktop` (alias `gui`) | Compila e inicia o app desktop nativo em Electron. |
 | `hermes profile` | Gerencia perfis — múltiplas instâncias isoladas do Hermes. |
 | `hermes completion` | Imprime scripts de autocompletar do shell (bash/zsh/fish). |
-| `hermes version` | Mostra informações de versão. |
+| `hermes --version` | Mostra informações de versão. |
 | `hermes update` | Baixa o código mais recente e reinstala as dependências. `--check` mostra uma prévia sem instalar; `--backup` faz um snapshot do `HERMES_HOME` antes do pull. |
 | `hermes uninstall` | Remove o Hermes do sistema. |
 
@@ -103,9 +104,10 @@ Opções comuns:
 | Opção | Descrição |
 |--------|-------------|
 | `-q`, `--query "..."` | Prompt não interativo de disparo único. |
+| `--query-file PATH` | Lê o prompt de disparo único de um arquivo (`-` = stdin). Nada é interpretado pelo shell, então aspas, `$(...)` e backticks chegam verbatim — use para corpos de mensagem programáticos ou não confiáveis (DMs de teammate no Bot Mode usam isso). Mutualmente exclusivo com `-q`. |
 | `-m`, `--model <model>` | Sobrescreve o modelo para esta execução. |
 | `-t`, `--toolsets <csv>` | Ativa um conjunto de toolsets separados por vírgula. |
-| `--provider <provider>` | Força um provedor: `auto`, `openrouter`, `nous`, `openai-codex`, `copilot-acp`, `copilot`, `anthropic`, `gemini`, `huggingface`, `novita` (aliases `novita-ai`, `novitaai`), `openai-api`, `zai`, `kimi-coding`, `kimi-coding-cn`, `minimax`, `minimax-cn`, `minimax-oauth`, `kilocode`, `xiaomi`, `arcee`, `gmi`, `upstage` (alias `solar`), `alibaba`, `alibaba-coding-plan` (alias `alibaba_coding`), `deepseek`, `nvidia`, `ollama-cloud`, `xai` (alias `grok`), `xai-oauth` (alias `grok-oauth`), `qwen-oauth`, `bedrock`, `opencode-zen`, `opencode-go`, `commandcode`, `commandcode-anthropic`, `ai-gateway`, `azure-foundry`, `lmstudio`, `stepfun`, `tencent-tokenhub` (alias `tencent`, `tokenhub`). |
+| `--provider <provider>` | Força um provedor: `auto`, `openrouter`, `nous`, `openai-codex`, `copilot-acp`, `copilot`, `anthropic`, `gemini`, `huggingface`, `novita` (aliases `novita-ai`, `novitaai`), `openai-api`, `zai`, `kimi-coding`, `kimi-coding-cn`, `minimax`, `minimax-cn`, `minimax-oauth`, `kilocode`, `xiaomi`, `arcee`, `gmi`, `upstage` (alias `solar`), `alibaba`, `alibaba-coding-plan` (alias `alibaba_coding`), `deepseek`, `nvidia`, `ollama-cloud`, `xai` (alias `grok`), `xai-oauth` (alias `grok-oauth`), `qwen-oauth`, `bedrock`, `opencode-zen`, `opencode-go`, `opencode-free` (aliases `free`, `opencode_free`; keyless), `commandcode`, `commandcode-anthropic`, `ai-gateway`, `azure-foundry`, `lmstudio`, `stepfun`, `tencent-tokenhub` (alias `tencent`, `tokenhub`). |
 | `-s`, `--skills <name>` | Pré-carrega uma ou mais skills para a sessão (pode ser repetido ou separado por vírgula). |
 | `-v`, `--verbose` | Saída detalhada. |
 | `-Q`, `--quiet` | Modo programático: suprime banner/spinner/prévias de ferramentas. |
@@ -400,6 +402,41 @@ hermes send --list telegram         # filter by platform
 ```
 
 
+## `hermes peer`
+
+```bash
+hermes peer add <name> --url http://host:port --key <API_SERVER_KEY>
+hermes peer list
+hermes peer dm <peer>[/<agent>] "message"
+hermes peer remove <name>
+```
+
+DMs bot-to-bot entre máquinas. Registre outro gateway Hermes (qualquer máquina
+rodando a plataforma `api_server`) como um *peer*, depois envie mensagem aos agentes dele:
+`hermes peer dm` resolve a sessão canônica **Bot Chat** do agente remoto
+pelo API server do peer, roda um turn de agente lá e imprime a resposta
+no stdout — o gêmeo cross-machine do comando local de bot-messaging
+`hermes -p <bot> chat --in ~ -c "Bot Chat" …`.
+
+`<peer>` sozinho mira o agente principal do gateway peer;
+`<peer>/<agent>` mira um profile nomeado num peer multiplexado (roteado via
+seu mirror `/p/<profile>/`).
+
+| Subcomando | Descrição |
+|--------|-------------|
+| `add <name> --url <URL> [--key <KEY>] [--note TEXT]` | Registra ou atualiza um peer. A URL vai para `config.yaml` (`bot_peers`); a chave é armazenada como `HERMES_PEER_<NAME>_KEY` em `~/.hermes/.env`. |
+| `list` | Lista peers e se cada um tem chave configurada. |
+| `dm <peer>[/<agent>] [message]` | Envia mensagem ao Bot Chat canônico do agente peer e imprime a resposta (`--json` para saída machine-readable; a mensagem faz fallback para stdin). |
+| `remove <name>` | Remove um peer do registry (a entrada de chave no `.env` é deixada no lugar). |
+
+Quando pelo menos um peer está registrado, o protocolo de messaging do Bot Mode
+(`agent.bot_mode_protocol`) ensinado a todo Bot Chat canônico inclui
+automaticamente o roster de peers e o padrão `hermes peer dm`, então os agentes
+descobrem teammates cross-machine sem edits de SOUL. Veja
+[Bot Mode](../user-guide/bot-mode.md).
+
+Códigos de saída: `0` em sucesso, `1` em falha de entrega/peer, `2` em erros de uso.
+
 ## `hermes secrets`
 
 ```bash
@@ -526,8 +563,8 @@ hermes cron <list|create|edit|pause|resume|run|remove|status|tick>
 | Subcomando | Descrição |
 |------------|-------------|
 | `list` | Mostra os jobs agendados. |
-| `create` / `add` | Cria um job agendado a partir de um prompt, opcionalmente anexando uma ou mais skills via `--skill` repetido. |
-| `edit` | Atualiza a agenda, o prompt, o nome, a entrega, o número de repetições ou as skills anexadas de um job. Suporta `--clear-skills`, `--add-skill` e `--remove-skill`. |
+| `create` / `add` | Cria um job agendado a partir de um prompt, opcionalmente anexando uma ou mais skills via `--skill` repetido. Suporta um pin de reasoning por job via `--reasoning-effort <none\|minimal\|low\|medium\|high\|xhigh\|max\|ultra>`. |
+| `edit` | Atualiza a agenda, o prompt, o nome, a entrega, o número de repetições ou as skills anexadas de um job. Suporta `--clear-skills`, `--add-skill` e `--remove-skill`, mais `--reasoning-effort` (string vazia limpa o pin). |
 | `pause` | Pausa um job sem excluí-lo. |
 | `resume` | Retoma um job pausado e calcula sua próxima execução futura. |
 | `run` | Dispara um job no próximo tick do agendador. |
@@ -1569,7 +1606,7 @@ hermes completion fish > ~/.config/fish/completions/hermes.fish
 ## `hermes update`
 
 ```bash
-hermes update [--gateway] [--check] [--no-backup] [--backup] [--yes]
+hermes update [--gateway] [--check] [--plan] [--no-backup] [--backup] [--yes]
 ```
 
 Baixa o código mais recente do `hermes-agent` e reinstala as dependências no venv gerenciado, depois reexecuta os hooks de pós-instalação (servidores MCP, sincronização de skills, instalação de autocompletar). Seguro para executar em uma instalação ativa. Use `--check` para ver se seu checkout está atrasado em relação a `origin/main` sem instalar.
@@ -1580,6 +1617,7 @@ Baixa o código mais recente do `hermes-agent` e reinstala as dependências no v
 |--------|-------------|
 | `--gateway` | Modo interno usado pelo comando `/update` de mensagens. Usa IPC baseado em arquivo para prompts e streaming de progresso em vez de ler da stdin do terminal. Não é uma flag de reinício do gateway. |
 | `--check` | Verifica se há atualização disponível sem baixar, instalar dependências, ou reiniciar nada. |
+| `--plan` | Imprime o plano de update e sai sem mudar nada: tipo de install (git/Docker/Nix/apt), cada serviço Hermes em execução em todos os profiles com seu supervisor e versão de código em execução, e como cada um será reiniciado. Em installs gerenciados por imagem ou pacote, reporta o comando externo de update correto. Somente leitura. |
 | `--no-backup` | Pula todos os backups pré-atualização nesta execução (tanto o snapshot rápido de estado quanto o zip completo), independentemente de `updates.pre_update_backup`. |
 | `--backup` | Força um backup pré-atualização **completo** nesta execução: o snapshot rápido de estado mais um zip completo do `HERMES_HOME` (config, autenticação, sessões, skills, dados de pareamento). O modo padrão é `quick` — apenas um snapshot leve de estado. Defina o modo permanente via `updates.pre_update_backup: quick | full | off` no `config.yaml`. |
 | `--yes`, `-y` | Assume "sim" para prompts interativos como migração de config e restauração de stash. A entrada de chaves de API é pulada; execute `hermes config migrate` separadamente para isso. |
@@ -1587,6 +1625,7 @@ Baixa o código mais recente do `hermes-agent` e reinstala as dependências no v
 Comportamento adicional:
 
 - **Reinício do gateway.** Após uma atualização bem-sucedida, o Hermes tenta reiniciar automaticamente todos os perfis de gateway em execução para que incorporem o novo código. Use `hermes gateway restart` quando quiser reiniciar um gateway sem aplicar uma atualização.
+- **Receipts de update + checagem de versão da frota.** Toda execução escreve um receipt machine-readable em `~/.hermes/logs/update_receipts/` (plano de frota pré-update, passos, skips com motivos, resultado do restart; `latest.json` aponta para o mais novo). Depois da fase de restart o updater verifica o código em execução de cada gateway live contra o checkout atualizado e imprime uma matriz de versão por profile; um gateway ainda em código pré-update falha o update (exit 1) com o comando exato de restart.
 - **Alterações de código local.** Para instalações via git, arquivos rastreados sujos e arquivos não rastreados são automaticamente colocados em stash antes do checkout de branch ou pull (`git stash push --include-untracked`). Atualizações em terminal interativo perguntam antes de restaurar o stash. Atualizações não interativas o restauram por padrão; defina `updates.non_interactive_local_changes: discard` apenas em instalações gerenciadas onde edições locais de código devem ser descartadas após um pull bem-sucedido. Se a restauração do stash tiver conflitos ou o pull falhar, o stash é deixado no lugar para recuperação manual.
 - **Instabilidade do lockfile do npm.** Antes de colocar em stash ou trocar de branch, o Hermes faz uma limpeza best-effort das diferenças rastreadas de `package-lock.json` produzidas por etapas de npm install/build. Faça commit ou coloque manualmente em stash edições intencionais de lockfile antes de executar `hermes update`.
 - **Snapshot de dados de pareamento.** Mesmo quando `--backup` está desativado, `hermes update` faz um snapshot leve de `~/.hermes/pairing/` e das regras de comentário do Feishu antes do `git pull`. Você pode revertê-lo com `hermes backup restore --state pre-update` se um pull reescrever um arquivo que você estava editando.
@@ -1597,7 +1636,7 @@ Comportamento adicional:
 
 | Comando | Descrição |
 |---------|-------------|
-| `hermes version` | Imprime informações de versão. |
+| `hermes --version` | Imprime informações de versão. |
 | `hermes update` | Baixa as últimas alterações e reinstala as dependências. |
 | `hermes postinstall` | Bootstrap interno. Executa uma vez após o script de instalação provisionar o Hermes (ou após `hermes update`) para instalar dependências não-Python que o pip não pode fornecer — runtime Node.js, navegador headless, ripgrep, ffmpeg — e então dispara o `hermes setup` se o perfil ainda não tiver sido configurado. Seguro para reexecutar idempotentemente. |
 | `hermes uninstall [--full] [--gui] [--yes]` | Remove o Hermes, opcionalmente excluindo toda a config/dados. `--gui` remove apenas a GUI de Chat desktop, deixando o agente intacto; `--full` também exclui config/dados; `--yes` pula os prompts. |

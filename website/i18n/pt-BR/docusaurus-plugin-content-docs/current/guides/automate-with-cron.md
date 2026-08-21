@@ -123,7 +123,7 @@ Otherwise, provide a concise summary of the activity." --name "Repo watcher" --d
 ```
 
 :::warning Prompts Autocontidos
-Observe como o prompt inclui os comandos `gh` exatos. O agente do cron não tem memória de execuções anteriores ou de suas preferências — detalhe tudo.
+Observe como o prompt inclui os comandos `gh` exatos. O agente do cron não tem histórico de conversa de execuções anteriores — detalhe tudo. (Memória persistente carrega sim, então preferências duráveis salvas em MEMORY.md passam adiante, mas não dependa disso para detalhes críticos do job.)
 :::
 
 ---

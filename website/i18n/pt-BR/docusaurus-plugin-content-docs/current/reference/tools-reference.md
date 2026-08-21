@@ -8,7 +8,7 @@ description: "Referência oficial das ferramentas embutidas do Hermes, agrupadas
 
 Esta página documenta as ferramentas embutidas do Hermes, agrupadas por toolset. A disponibilidade varia por plataforma, credenciais e toolsets ativados.
 
-**Contagem rápida (registro atual):** ~83 ferramentas — 10 ferramentas de browser (core) + 2 ferramentas de browser condicionadas por CDP, 4 ferramentas de arquivo, 4 ferramentas do Home Assistant, 2 ferramentas de terminal (`terminal`, `process`), 7 ferramentas de GUI desktop (`read_terminal`, `close_terminal`, `open_preview`, `read_preview`, `read_window_below`, `focus_pane`, `react_to_message` — apenas sessões do app desktop), 2 ferramentas web, 5 ferramentas do Feishu, 7 ferramentas do Spotify (registradas pelo plugin `spotify` incluído), 5 ferramentas do Yuanbao, 12 ferramentas de kanban (registradas quando o dispatcher do kanban cria o agente), 3 ferramentas de projeto (sessões desktop/GUI), 2 ferramentas do Discord, 3 ferramentas de vídeo (`video_generate`, `xai_video_edit`, `xai_video_extend`), e um punhado de ferramentas independentes (`memory`, `clarify`, `delegate_task`, `execute_code`, `cronjob`, `session_search`, `skill_view`/`skill_manage`/`skills_list`, `text_to_speech`, `image_generate`, `vision_analyze`, `video_analyze`, `todo`, `computer_use`, `x_search`).
+**Contagem rápida (registro atual):** ~86 ferramentas — 10 ferramentas de browser (core) + 2 ferramentas de browser condicionadas por CDP, 4 ferramentas de arquivo, 4 ferramentas do Home Assistant, 2 ferramentas de terminal (`terminal`, `process`), 11 ferramentas de GUI desktop (`read_terminal`, `close_terminal`, `open_preview`, `close_preview`, `read_preview`, `drive_preview`, `annotate_preview`, `read_window_below`, `focus_pane`, `react_to_message`, `tour` — apenas sessões do app desktop), 2 ferramentas web, 5 ferramentas do Feishu, 7 ferramentas do Spotify (registradas pelo plugin `spotify` incluído), 5 ferramentas do Yuanbao, 12 ferramentas de kanban (registradas quando o dispatcher do kanban cria o agente), 3 ferramentas de projeto (sessões desktop/GUI), 2 ferramentas do Discord, 3 ferramentas de vídeo (`video_generate`, `xai_video_edit`, `xai_video_extend`), e um punhado de ferramentas independentes (`memory`, `clarify`, `delegate_task`, `execute_code`, `cronjob`, `session_search`, `skill_view`/`skill_manage`/`skills_list`, `text_to_speech`, `image_generate`, `vision_analyze`, `video_analyze`, `todo`, `computer_use`, `x_search`).
 
 :::tip Ferramentas MCP
 Além das ferramentas embutidas, o Hermes pode carregar ferramentas dinamicamente de servidores MCP. As ferramentas MCP aparecem com o prefixo `mcp_<server>_` (ex.: `mcp_github_create_issue` para o servidor MCP `github`). Veja [Integração MCP](/user-guide/features/mcp) para configuração.
@@ -43,6 +43,18 @@ Essas duas ferramentas vivem no toolset `browser`, mas só se registram quando u
 | Ferramenta | Descrição | Requer ambiente |
 |------|-------------|----------------------|
 | `clarify` | Faz uma pergunta ao usuário quando você precisa de esclarecimento, feedback ou uma decisão antes de continuar. Suporta três modos: 1. **Múltipla escolha de seleção única** — até 4 opções; o usuário escolhe uma ou digita a própria resposta via uma 5ª opção 'Other'. 2. **Múltipla escolha multi-select** — `multi_select=true` renderiza checkboxes e retorna uma lista das opções selecionadas. 3. **Aberto** — sem opções; o usuário digita uma resposta livre. As opções são ordenadas melhor-primeiro, então a primeira é rotulada `(Recommended)` em toda superfície e é o destaque padrão; o rótulo é só apresentação e é removido da resposta que o agente lê. No CLI clássico, multi-select usa Space para alternar checkboxes; em plataformas de mensagens sem UI nativa de checkbox o usuário responde com números separados por vírgula/espaço (ex.: "1, 3") ou o texto da opção. | — |
+
+### Fazendo várias perguntas de uma vez {#asking-multiple-questions-at-once}
+
+A ferramenta `clarify` também aceita um array `questions` (2–5 perguntas independentes, cada uma com suas próprias `choices` e `multi_select`) para que o agente possa agrupar várias necessidades de esclarecimento num único prompt em vez de perguntar em sequência. O resultado é um array `responses` na mesma ordem, com o `id` de cada pergunta (quando fornecido) ecoado de volta.
+
+Comportamento por superfície:
+
+- **Desktop** mostra toda pergunta num único card. Escolhas e respostas digitadas ficam staged localmente, e um botão **Confirm and continue** (habilitado quando toda pergunta tem resposta) envia o batch inteiro. Respostas staged permanecem editáveis até esse confirm. Skip cancela o batch inteiro.
+- **TUI e CLI** mostram uma lista compacta de status (`✓` answered / `▸` active / `·` pending) com só as choices da pergunta ativa expandidas. Enter trava a resposta ativa e pula para a próxima pergunta sem resposta; Tab move entre perguntas para responder em qualquer ordem; Esc cancela o batch.
+- **Plataformas de messaging** (Telegram, Discord, …) fazem fallback para perguntar uma de cada vez pelo prompt single-question existente. Se o usuário parar de responder, as perguntas restantes não são enviadas.
+
+Se o prompt der timeout no meio do caminho, respostas que o usuário já travou são mantidas: o resultado da ferramenta as carrega mais `"timed_out": true`, com entradas sem resposta em branco, para o agente distinguir um skip deliberado de um usuário ausente.
 
 ## Toolset `code_execution` {#code_execution-toolset}
 
@@ -180,10 +192,60 @@ Ativado em sessões cuja origem é o app desktop do Hermes, em qualquer backend 
 | `read_terminal` | Lê o que está exibido atualmente no painel de terminal embutido da GUI desktop do Hermes (o shell embutido ao lado deste chat). | — |
 | `close_terminal` | Fecha a aba de terminal somente leitura de um processo em segundo plano na GUI desktop do Hermes. NÃO mata o processo — só remove a aba/visão; use process(action='kill') para pará-lo. | — |
 | `open_preview` | Abre uma URL web, URL de servidor de desenvolvimento localhost ou caminho de arquivo no painel de preview ao lado do chat no app desktop do Hermes. | — |
+| `close_preview` | Fecha o painel de preview ao lado do chat, ou uma aba dentro dele. Omita `url` para fechar o painel inteiro; passe uma URL ou caminho de arquivo para fechar aquela aba. | — |
 | `read_preview` | Lê o que está exibido no painel de preview da GUI desktop do Hermes — o texto da página do Browser in-app (URL + título + texto renderizado, paginável com `start`/`count`), ou a identidade de uma aba de arquivo/artefato. | — |
+| `drive_preview` | Interage com a página aberta no browser in-app: `elements` inventaria o que é clicável e digitável (cada um com um ref que o nomeia, como `btn-sign-in` ou `inp-email`, mais role, label e value), depois `click`, `hover`, `type`, `scroll` e `press` agem num ref, e `back`/`forward`/`reload` dirigem o histórico do painel. O ponteiro e o teclado são input real, então menus de hover abrem. Um ref dura até a página navegar, inclusive após um re-render que reconstrói o elemento, então depois do primeiro inventário toda ação responde só com um delta — o que foi adicionado, removido, mudado ou rebound — em vez da página inteira de novo. | — |
+| `annotate_preview` | Contorna um elemento no browser in-app e deixa a marca até ser removida — a contraparte deliberada das cues transitórias que `drive_preview` desenha enquanto trabalha. `add` marca um ref com um label curto opcional, `remove` tira um, `clear` tira todos. Marcas seguem seu elemento e somem com ele, então uma navegação as limpa. | — |
 | `read_window_below` | Identifica a janela do SO diretamente abaixo da janela do Hermes desktop — nome do app, título, bounds (apenas metadados, nunca pixels). No macOS, títulos de outros apps só aparecem quando Screen Recording já foi concedida; a ferramenta nunca solicita a permissão. | — |
 | `focus_pane` | Revela e foca um painel no app desktop do Hermes (chat, files, terminal, review, sessions). | — |
 | `react_to_message` | Reage a uma mensagem com um único emoji, no estilo tapback do iMessage. Opt-in via Settings → Appearance (`display.message_reactions`). | — |
+| `tour` | Dá um tour guiado ao vivo: escurece a tela, destaca um elemento e anexa um popover narrado (driver.js). Funciona na própria UI do app Hermes e em qualquer página aberta no painel de preview; `targets` descobre o que está na tela, `show` narra passo a passo, `start` entrega ao usuário controles Next/Prev. | — |
+
+### Tours {#tours}
+
+A ferramenta `tour` descobre seus próprios targets — chame `action='targets'` e ela retorna todo elemento endereçável na tela com um selector, um label e uma flag `stable`. Selectors estáveis usam identidade (`data-tour`, `id`, `data-testid`, `aria-label`) e sobrevivem a um re-render; paths posicionais `nth-child` não, então os estáveis ordenam primeiro e devem ser preferidos.
+
+Para dar a um elemento um handle durável seu, marque-o:
+
+```html
+<div data-tour="composer">…</div>
+```
+
+Handles são aplicados no **primitivo**, não no call site, então um edit nomeia toda instância. Os que já existem:
+
+| Handle | O que nomeia |
+|---|---|
+| `overlay-nav` | a nav esquerda de qualquer route overlay (settings, cron, profiles, agents) |
+| `nav-<id>` | uma linha nessa nav — `nav-models`, `nav-appearance`, … |
+| `field-<schemaKey>` | uma linha de settings, pela chave de config — `field-model`, `field-provider`, … |
+| `page-tabs` | as tabs de filtro em qualquer página `PageSearchShell` (artifacts, skills, …) |
+| `artifact-card` | um card de artifact no grid |
+
+Ao adicionar uma superfície, marque o primitivo compartilhado da mesma forma em vez de marcar telas uma a uma — isso mantém o vocabulário de tour pequeno e impede selectors de apodrecer.
+
+O mesmo engine embasa tours curados (não-agente) no app desktop, então uma feature pode enviar seu próprio walkthrough:
+
+```ts
+import { startTour, showTourStep, stopTour } from '@/lib/tour'
+
+startTour([
+  { selector: '[data-tour="composer"]', title: 'Composer', text: 'Type here.' },
+  { selector: '[data-tour="files"]', title: 'Files', text: 'Browse your project.' }
+])
+```
+
+Um step também pode mover o app para onde o target mora, e o tour recoloca as coisas quando termina:
+
+```ts
+startTour([
+  { navigate: '/artifacts', selector: '[data-tour="page-tabs"]', title: 'Filters', text: '…' },
+  { pane: 'sessions', selector: '[data-slot="sidebar"]', title: 'Sessions', text: '…' }
+])
+```
+
+`navigate` recebe um path de route e `pane` um nome de painel desktop. Ambos rodam quando o step é entrado, targets que montam tarde são aguardados, e fechar o tour — por qualquer rota, incluindo Esc — volta para onde começou.
+
+Passe `'preview'` como segundo argumento para rodar contra a página no painel de preview em vez do app.
 
 ## Toolset `todo` {#todo-toolset}
 

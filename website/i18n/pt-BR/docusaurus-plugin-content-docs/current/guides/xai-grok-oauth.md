@@ -161,6 +161,7 @@ O toolset `x_search` é ativado automaticamente sempre que credenciais da xAI (u
 | Chat | `grok-4.20-0309-non-reasoning` | Variante sem raciocínio |
 | Chat | `grok-4.20-multi-agent-0309` | Variante multiagente |
 | Image | `grok-imagine-image` | Padrão; ~5–10 s |
+| Image | `grok-imagine-image-2.0` | Consciente de tipografia/layout; qualidade mais forte; ~10–20 s |
 | Image | `grok-imagine-image-quality` | Fidelidade mais alta; ~10–20 s |
 | Video | `grok-imagine-video` | Texto para vídeo |
 | Video | `grok-imagine-video-1.5-preview` | Imagem para vídeo; alias datado `grok-imagine-video-1.5-2026-05-30` |

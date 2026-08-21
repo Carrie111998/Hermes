@@ -133,7 +133,7 @@ Para autenticação nativa da Anthropic, o Hermes prefere os próprios arquivos 
 | `PARALLEL_API_KEY` | Busca web nativa de IA ([parallel.ai](https://parallel.ai/)) |
 | `FIRECRAWL_API_KEY` | Web scraping e browser em nuvem ([firecrawl.dev](https://firecrawl.dev/)) |
 | `FIRECRAWL_API_URL` | Endpoint customizado da API Firecrawl para instâncias auto-hospedadas (opcional) |
-| `TAVILY_API_KEY` | Chave de API Tavily para busca web nativa de IA, extração e crawling ([app.tavily.com](https://app.tavily.com/home)) |
+| `TAVILY_API_KEY` | Chave de API Tavily opcional para limites maiores de busca/extração. Depois de selecionar Tavily como backend web, o acesso sem chave funciona sem ela ([app.tavily.com](https://app.tavily.com/home), [docs keyless](https://docs.tavily.com/documentation/keyless)) |
 | `SEARXNG_URL` | URL da instância SearXNG para busca web gratuita auto-hospedada — sem necessidade de chave de API ([searxng.github.io](https://searxng.github.io/searxng/)) |
 | `TAVILY_BASE_URL` | Sobrescreve o endpoint da API Tavily. Útil para proxies corporativos e backends de busca compatíveis com Tavily auto-hospedados. Mesmo padrão que `GROQ_BASE_URL`. |
 | `EXA_API_KEY` | Chave de API Exa para busca web e conteúdos nativos de IA ([exa.ai](https://exa.ai/)) |
@@ -143,7 +143,7 @@ Para autenticação nativa da Anthropic, o Hermes prefere os próprios arquivos 
 | `BROWSER_USE_API_KEY` | Chave de API do navegador em nuvem Browser Use ([browser-use.com](https://browser-use.com/)) |
 | `FIRECRAWL_BROWSER_TTL` | TTL da sessão de navegador Firecrawl em segundos (padrão: 300) |
 | `BROWSER_CDP_URL` | URL do Chrome DevTools Protocol para navegador local (definida via `/browser connect`, ex.: `ws://localhost:9222`) |
-| `CAMOFOX_URL` | URL do navegador anti-detecção local Camofox (padrão: `http://localhost:9377`) |
+| `CAMOFOX_URL` | Endereço do servidor de navegador anti-detecção local Camofox (padrão: `http://localhost:9377`). Só o endereço — não seleciona o Camofox como backend; escolha Camofox em `hermes tools` (`browser.cloud_provider: camofox`) |
 | `CAMOFOX_USER_ID` | ID de usuário Camofox opcional gerenciado externamente para sessões visíveis compartilhadas |
 | `CAMOFOX_SESSION_KEY` | Chave de sessão Camofox opcional usada ao criar abas para `CAMOFOX_USER_ID` |
 | `CAMOFOX_ADOPT_EXISTING_TAB` | Defina como `true` para reutilizar uma aba Camofox existente antes de criar uma nova |
@@ -709,7 +709,14 @@ Configurações avançadas por plataforma para regular o batcher de mensagens de
 | `HERMES_FILE_MUTATION_VERIFIER` | Ativa o rodapé verificador de mutação de arquivo por turno (padrão: `true`). Quando ativado, o Hermes acrescenta um aviso listando quaisquer chamadas `write_file` / `patch` que falharam durante o turno e não foram substituídas por uma escrita bem-sucedida. Defina como `0`, `false`, `no`, ou `off` para suprimir. Espelha `display.file_mutation_verifier` no `config.yaml`; a variável de ambiente prevalece quando definida. |
 | `HERMES_CRON_TIMEOUT` | Timeout de inatividade para execuções de agente de job de cron em segundos (padrão: `600`). O agente pode rodar indefinidamente enquanto chama ferramentas ativamente ou recebe tokens de stream — isso só dispara quando ocioso. Defina como `0` para ilimitado. |
 | `HERMES_CRON_SCRIPT_TIMEOUT` | Timeout para scripts de pré-execução anexados a jobs de cron em segundos (padrão: `3600`). Limita apenas o script — jobs de skill/agente usam o orçamento de inatividade separado `HERMES_CRON_TIMEOUT`. Também configurável via `cron.script_timeout_seconds` no `config.yaml`. |
+| `HERMES_CRON_MEDIA_SEND_TIMEOUT` | Timeout para cada envio de anexo de mídia durante entrega de cron via adaptador de gateway ao vivo, em segundos (padrão: `300`). Aumente se anexos grandes (áudio TTS longo, exports grandes) derem timeout no upload. Também configurável via `cron.media_send_timeout_seconds` no `config.yaml`. |
 | `HERMES_CRON_MAX_PARALLEL` | Máximo de jobs de cron rodando em paralelo por tick (padrão: `4`). |
+
+## NeMo Relay {#nemo-relay}
+
+| Variável | Descrição |
+|----------|-------------|
+| `HERMES_NEMO_RELAY_PLUGINS_TOML` | Caminho explícito para o `plugins.toml` padrão do NeMo Relay carregado process-wide pelo core do Hermes. Quando indefinido, o Hermes não inicializa middleware Relay, plugins dinâmicos nem exporters. As variáveis removidas `HERMES_NEMO_RELAY_ATOF_*` e `HERMES_NEMO_RELAY_ATIF_*` são ignoradas; configure essas saídas no arquivo selecionado. Veja [NeMo Relay observability configuration](https://docs.nvidia.com/nemo/relay/configure-plugins/observability/about). |
 
 ## Comportamento do Agente {#agent-behavior}
 

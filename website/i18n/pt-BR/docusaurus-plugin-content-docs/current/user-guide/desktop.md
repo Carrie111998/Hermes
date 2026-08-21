@@ -151,6 +151,17 @@ Gerencie providers, modelos, ferramentas e credenciais numa UI real em vez de ed
 
 O onboarding de primeira execução foi redesenhado num design system de overlay unificado, e você pode escolher **Choose provider later** para pular setup de provider e entrar no app primeiro.
 
+#### Settings por profile: o escopo "Applies to" {#per-profile-settings-the-applies-to-scope}
+
+Quando você tem dois ou mais [profiles](./profiles.md), as páginas de settings respaldadas por config — **Model, Workspace, Safety, Memory & Context, Voice, Chat, Advanced, and Tools & Keys** — e o overlay **Messaging** mostram uma linha de chips compartilhada **Applies to** no topo. Ela seleciona a qual profile seus edits miram:
+
+- A seleção padrão **segue o profile ativo**, que se comporta exatamente como antes — edite o profile que está usando.
+- Escolha outro profile para ver e editar *suas* settings sem trocar o app inteiro; a seleção persiste conforme você move entre páginas de settings.
+- Trocar o profile ativo do app reseta o seletor, então edits não podem continuar silenciosamente caindo num profile selecionado antes.
+- Com menos de dois profiles a linha de chips fica oculta por completo.
+
+(A página Gateways trata profiles de forma diferente — via sua subseção **Per-profile overrides** — e as views Capabilities e Scheduled Jobs têm seus próprios seletores de escopo.)
+
 ### Painéis de gerenciamento {#management-panes}
 
 O app também expõe a superfície mais ampla de gerenciamento Hermes para você não precisar ir ao terminal:
@@ -168,10 +179,25 @@ O app também expõe a superfície mais ampla de gerenciamento Hermes para você
 em que cada [profile Hermes](./profiles.md) aparece como um bot com seu
 próprio avatar (rosto geométrico, imagem enviada, retrato gerado por IA, ou um pixel
 pet), sua própria conversa canônica **Bot Chat**, e suas próprias **Routines**
-(tarefas recorrentes respaldadas pelo cron do Hermes). Crie novos agentes pelo roster —
+(tarefas recorrentes respaldadas pelo cron do Hermes). O roster mora na sidebar
+esquerda como uma tab ao lado das suas conversas — uma faixa de tabs
+**Sessions | Bots** — em vez de um segundo painel empilhado abaixo da lista de
+sessões. Installs que pegaram o layout empilhado antigo são remanejados para a
+faixa de tabs automaticamente, uma vez; se você posicionou painéis à mão, seu
+layout é deixado em paz. O painel **Cronjobs** (Routines) doca ao lado do chat
+só enquanto a tab Bots está ativa e some quando você volta para Sessions
+(builds desktop mais antigos o mantêm sempre visível).
+
+Crie novos agentes pelo roster —
 Name / Title / Description mais um disclosure Advanced com a superfície completa
 de capacidades (model, SOUL, skills, toolsets, servidores MCP) — agrupe-os em
 seções, e abra group chats onde vários bots deliberam.
+Group chats aparecem como linhas standalone estilo Discord no roster — avatars
+de membros empilhados, contagem de membros, preview da última linha da sala, e o
+badge "needs you" — intercalados com as linhas de bots na mesma ordenação
+pin+recency. Clicar numa linha de grupo abre a sala como uma tab que toma a
+**janela principal de chat** (builds desktop mais antigos caem para abrir dentro
+do side panel de bots).
 
 Bots mandam mensagens uns aos outros: digite `@researcher have a look at this` em qualquer chat
 e o bot ativo passa a mensagem e reporta de volta, e bots alcançam
@@ -182,8 +208,26 @@ quando um bot colega a abre headless pela CLI — então replies e handoffs
 bot-a-bot funcionam sem tocar seu SOUL.md, e suas sessões regulares
 permanecem intactas.
 
+Sessões do Bot Mode — o Bot Chat canônico de cada bot e toda sessão de membro
+de group-chat — ficam sempre ocultas da sidebar global Sessions. Elas
+moram no painel Bots (linhas do roster, views de sala e o browser de sessão
+de cada bot) em vez de se intercalarem com suas próprias conversas.
+
+Bots que você não usa podem ser guardados: clique direito numa linha de bot → **Hide
+Bot**. Bots ocultos saem do roster mas continuam funcionando — @mentions ainda
+resolvem e a membership de group-chat fica intacta. Um toggle de olho aparece no
+header Bots sempre que pelo menos um bot está oculto; clique para revelar
+bots ocultos esmaecidos no lugar (clique direito → **Unhide Bot** traz um de volta),
+e o olho mostra um ponto quando um bot oculto tem atividade não lida. O estado
+oculto é armazenado no profile do bot, então segue o bot entre
+máquinas.
+
 Não quer? Desligue em **Settings → Plugins → Bots** — o roster,
 o painel de routines e o middleware do composer desregistram ao vivo, sem restart.
+
+Guia completo — criando agentes (incluindo o picker multi-máquina **Create on**),
+o roster entre conexões, mentions bot-a-bot, e como group chats
+decidem quem responde: [Bot Mode: A Roster of Agents](./bot-mode.md).
 
 ### Teclado e navegação {#keyboard--navigation}
 
@@ -202,6 +246,10 @@ o painel de routines e o middleware do composer desregistram ao vivo, sem restar
 ## Atualização {#updating}
 
 O app verifica atualizações em background e oferece update de um clique quando uma está pronta.
+
+O app desktop e o backend Hermes com que ele conversa atualizam em relógios separados — o pacote do app na sua máquina, o backend onde quer que rode. Quando existe mais de um alvo de update (um gateway remoto, ou vários gateways registrados), as affordances de update (**Update now** no painel About, a linha ⌘K **Update Hermes**, e o toast update-ready) atualizam **tudo**: o backend conectado primeiro, depois todo outro gateway registrado elegível (entradas Hermes Cloud são gerenciadas pela plataforma e puladas), e o próprio app desktop por último, já que aplicar o update do client relança o app. Installs numa só máquina mantêm a experiência de um botão.
+
+Depois de qualquer update de backend, o app também re-checa sua própria versão e avisa com uma ação de um clique **Update desktop app** se a GUI ainda estiver atrás — então atualizar um backend remoto nunca pode deixá-lo silenciosamente num build desktop stale.
 
 O [processo de atualização manual](https://hermes-agent.nousresearch.com/docs/getting-started/updating) também funciona com a GUI.
 
@@ -244,24 +292,29 @@ O app empacotado inclui o shell Electron e uma superfície de chat React nativa.
 
 Por padrão o app inicia e gerencia seu próprio backend **local**. Você pode apontá-lo a um backend Hermes rodando em outra máquina — VPS, home server ou Mini atrás do Tailscale.
 
-**Settings → Gateway → Connection mode** oferece as alternativas ao gateway local:
+Tudo relacionado a conexão mora numa só página de settings: **Settings → Gateways**. (Builds mais antigos dividiam isso entre páginas separadas **Gateway** e **Connections** — agora estão unificadas, e deep links antigos `?tab=connections` redirecionam para a página unificada.)
+
+**Settings → Gateways → Connection mode** oferece as alternativas ao gateway local:
 
 - **Remote gateway** — insira a URL de um backend `hermes serve` que você roda e faça login. Este é o modo que o resto desta seção percorre.
 - **Hermes Cloud** — faça login uma vez no Hermes Cloud e escolha entre os agentes da sua conta; sem URL para colar. O app descobre seus agentes (com organization picker se sua conta abrange várias orgs), e conectar a um troca a sessão automaticamente. A status bar mostra a conexão cloud enquanto ativa.
 
-Modos de conexão são configurados **por profile** — um override por profile pode apontar um profile a backend remoto ou cloud enquanto outros ficam locais (**Use default gateway** remove um override).
+Conexões de gateway são **no nível da máquina**: a página Gateways gerencia a quais backends de gateway este desktop pode conectar, e profiles são descobertos *a partir* dos gateways a que você conecta. Sessões selecionam um gateway de cada vez, enquanto o rail de profile adjacente seleciona um profile descoberto naquele gateway.
 
-### Settings → Connections: o registry multi-conexão {#settings--connections-the-multi-connection-registry}
+### O registry multi-conexão {#the-multi-connection-registry}
 
-Junto ao modo de conexão por profile acima, **Settings → Connections** gerencia um registry nomeado de toda fonte de agente que o app conhece — o runtime local, qualquer número de gateways remotos (LAN, Tailscale, internet), instâncias Hermes Cloud e hosts SSH — todos persistidos juntos num lugar. Você chega lá pelo botão de plug no extremo direito do rail de profiles da sidebar (**Connect another Hermes gateway…**) ou via **⌘K → Connections**. O guia completo, incluindo o roster união de agentes, handles `@name-device`, updates da frota e a superfície plugin SDK, está em [Conectando o Desktop a Muitas Instâncias Hermes](./multi-connection-desktop.md).
+Mais abaixo na mesma página **Settings → Gateways**, **Registered gateways** gerencia uma lista nomeada de todo gateway Hermes que o app conhece — o runtime local, qualquer número de gateways remotos (LAN, Tailscale, internet), instâncias Hermes Cloud e hosts SSH — todos persistidos juntos num lugar. Você chega lá pelo botão de plug no extremo direito do rail de profiles da sidebar (**Connect another Hermes gateway…**) ou via **⌘K → Gateways**. O guia completo, incluindo o roster união de agentes, handles `@name-device`, updates da frota e a superfície plugin SDK, está em [Conectando o Desktop a Muitas Instâncias Hermes](./multi-connection-desktop.md).
 
-- **Toda conexão precisa de um nome único** (um nome de device como "Homelab" ou "Work laptop"). Quando o mesmo nome de profile existe em várias fontes registradas, as superfícies desambiguam como `@profile-device` (ex. `@research-homelab`).
-- **Add / edit / remove / test** conexões pelo painel. A entrada local é gerenciada pelo app e não pode ser removida. **Test** sonda as pernas HTTP e WebSocket da própria conexão diretamente.
-- Settings existentes são **importadas automaticamente** na primeira vez que você roda um build com o registry: sua conexão global atual e quaisquer overrides por profile viram entradas nomeadas. O arquivo de settings legado permanece intacto, então builds mais antigos continuam funcionando.
+- **Toda conexão precisa de um nome único** (um nome de device como "Homelab" ou "Work laptop"). Quando o mesmo nome de profile existe em vários gateways registrados, as superfícies desambiguam como `@profile-device` (ex. `@research-homelab`).
+- **Troque gateways pela sidebar Sessions.** Um seletor de gateway nomeado aparece quando mais de um gateway está registrado e lida com qualquer tamanho de registry sem fazer gateways parecerem profiles. O rail de profile adjacente então mostra só os agentes daquele gateway e lembra o último profile usado lá; conjuntos grandes de profiles condensam independentemente.
+- **Escolha o que abre depois de um restart.** **Open on launch** mantém o default backward-compatible **Primary gateway**, ou pode retomar o gateway **Last used** depois que ele conecta com sucesso. Essa preferência é armazenada fora do application bundle e sobrevive a updates do Desktop.
+- **Add / edit / remove / test** conexões pelo painel. O fluxo **Add** oferece os quatro kinds — **Local**, **Hermes Cloud**, **Remote gateway** e **SSH** (o botão Local fica desabilitado enquanto a entrada local gerenciada pelo app existir, e uma dica aponta adds cloud para o fluxo de sign-in/descoberta acima). A entrada local é gerenciada pelo app e não pode ser removida. **Test** sonda as pernas HTTP e WebSocket da própria conexão diretamente.
+- **Duplicatas são rejeitadas na hora de salvar**: só uma entrada **local** nunca; entradas remote e cloud são deduplicadas na URL normalizada (trimmed, trailing slashes removidos, lowercased — entre ambos os kinds); entradas SSH no `user@host:port` normalizado mais o profile remoto.
+- Settings existentes são **importadas automaticamente** na primeira vez que você roda um build com o registry: sua conexão global atual e quaisquer overrides legados por profile viram entradas nomeadas. O arquivo de settings legado permanece intacto, então builds mais antigos continuam funcionando.
 - Entradas cloud vêm do fluxo de sign-in/descoberta Hermes Cloud acima, não de uma URL digitada à mão.
-- Tokens são armazenados criptografados com o keyring do SO (com o mesmo opt-in explícito de plain-text que Settings → Gateway no Linux sem keyring).
+- Tokens são armazenados criptografados com o keyring do SO (com opt-in explícito de plain-text no Linux sem keyring).
 
-Roteamento lado a lado está ao vivo: cada fonte registrada disca seus próprios backends e sockets sob demanda (keyed por conexão + profile), o plugin SDK expõe o roster união de agentes (`host.agents()` / `host.ensureAgent()`), e **Update all instances** no painel Connections despacha `hermes update` para toda fonte elegível de uma vez — entradas Hermes Cloud são puladas (a plataforma as atualiza), e cada instância reporta seu próprio resultado.
+Roteamento lado a lado está ao vivo: cada gateway registrado disca seus próprios backends e sockets sob demanda (keyed por conexão + profile), o plugin SDK expõe o roster união de agentes (`host.agents()` / `host.ensureAgent()`), e **Update all instances** na página Gateways despacha `hermes update` para todo gateway elegível de uma vez — entradas Hermes Cloud são puladas (a plataforma as atualiza), e cada instância reporta seu próprio resultado.
 
 
 :::info O backend remoto é um processo `hermes serve` rodando
@@ -312,13 +365,13 @@ O backend lê e grava seu `.env` (API keys, secrets) e pode rodar comandos de ag
 
 ### No app {#in-the-app}
 
-**Settings → Gateway → Remote gateway:**
+**Settings → Gateways → Remote gateway:**
 
 1. **Remote URL** — `http://<backend-host>:9119` (prefixos de path como `/hermes` funcionam se você frontar com reverse proxy)
 2. **Sign in** — o app detecta qual provider o backend anuncia e adapta o botão. Para backend username/password mostra botão **Sign in** que abre formulário de credenciais (insira as credenciais do passo 1). Para backend OAuth mostra **Sign in with `<provider>`** (ex.: *Sign in with Nous Research*), que roda o sign-in no browser do provider. De qualquer forma o app termina com sessão autenticada contra o backend.
 3. **Save and reconnect** — troca o shell desktop para o backend remoto. A sessão refresca automaticamente; você permanece logado entre restarts quando `HERMES_DASHBOARD_BASIC_AUTH_SECRET` está definido.
 
-Você também pode definir a URL do backend sem a UI via environment variable `HERMES_DESKTOP_REMOTE_URL` antes de lançar o app (sobrescreve a config in-app); ainda faz login no painel Gateway settings.
+Você também pode definir a URL do backend sem a UI via environment variable `HERMES_DESKTOP_REMOTE_URL` antes de lançar o app (sobrescreve a config in-app); ainda faz login no painel Gateways settings.
 
 :::note Hosts remotos por profile
 O host do gateway remoto é configurado por [profile](./profiles.md), então cada profile pode apontar ao seu próprio backend remoto (ou ficar no local). Trocar profiles troca a qual host remoto o app conecta.
@@ -344,6 +397,16 @@ hot-reloads a cada save. Gerencie plugins instalados ao vivo em **Settings → P
 Veja [Desktop Plugin SDK](../developer-guide/desktop-plugin-sdk.md) para a referência
 completa. (Isso é separado do [sistema de plugins do web dashboard](./features/extending-the-dashboard.md).)
 
+A seção **Agent plugins** na mesma página Settings → Plugins gerencia
+[plugins](./features/plugins.md) de backend (lado agente) que você instalou —
+installs user, git, project, pip e portable. Built-ins bundled do repo (adapters
+de plataforma, plugins de provider e similares) não são listados lá: eles vêm
+habilitados por padrão e são configurados nas próprias superfícies, então a seção
+fica focada no que você adicionou. Com dois ou mais profiles a
+seção também tem seu próprio seletor **Applies to**, para você listar e toggle
+agent plugins de outro profile sem trocar o app inteiro (o RPC
+`plugins.manage` do backend aceita um parâmetro opcional `profile` para isso).
+
 ## Solução de problemas {#troubleshooting-1}
 
 Boot logs caem em `HERMES_HOME/logs/desktop.log` (inclui saída do backend e tracebacks Python recentes) — confira primeiro se o app reporta boot failure. Você também pode tail pelo CLI:
@@ -364,6 +427,20 @@ rm -rf "$HOME/.hermes/hermes-agent/venv"
 # Reset a stuck macOS microphone prompt
 tccutil reset Microphone com.nousresearch.hermes
 ```
+
+### "The host key has CHANGED since you last connected" (SSH remote) {#the-host-key-has-changed-since-you-last-connected-ssh-remote}
+
+Se seu remote SSH foi reinstalado ou sua host key rotacionou, o SSH falha fechado
+e o Desktop trava um overlay de erro em vez de retentar (retentar nunca
+pode ter sucesso até a chave stale ser limpa). Verifique que a mudança é esperada, então
+remova a entrada antiga e retente pelo overlay:
+
+```bash
+ssh-keygen -R <host>
+```
+
+Clique **Retry** (ou re-aplique a conexão em Settings → Gateway) depois
+de limpar a entrada — o latch reseta e o próximo boot disca fresh.
 
 ### "Build desktop app" travado no download do Electron {#build-desktop-app-stuck-on-electron-download}
 

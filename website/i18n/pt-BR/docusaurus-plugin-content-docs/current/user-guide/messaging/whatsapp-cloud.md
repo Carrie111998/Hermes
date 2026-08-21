@@ -365,15 +365,14 @@ Se o modelo emite texto com forma de tool-call em vez de chamada estruturada, ge
 
 ### STT (transcrição de nota de voz) retorna vazio / "could not transcribe" {#stt-voice-note-transcription-returns-empty--could-not-transcribe}
 
-O padrão `stt.provider: local` exige `pip install faster-whisper`. Se você é assinante Nous, pode rotear STT pelo gateway de áudio gerenciado da Meta:
+O padrão `stt.provider: local` exige `pip install faster-whisper`. Se você é assinante Nous, pode rotear STT pelo gateway gerenciado — selecione **Nous Subscription** para speech-to-text em `hermes tools`, ou defina diretamente:
 
 ```bash
-hermes config set stt.provider openai
-hermes config set stt.use_gateway true
+hermes config set stt.provider nous
 hermes gateway restart
 ```
 
-Isso usa seu access token Nous Portal em vez de precisar de chave OpenAI separada.
+Isso usa seu access token Nous Portal em vez de precisar de chave OpenAI separada. (Docs antigas sugeriam `stt.use_gateway true` — essa flag é legada; a seleção do provider sozinha controla o roteamento agora.)
 
 ---
 

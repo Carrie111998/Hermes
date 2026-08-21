@@ -312,6 +312,46 @@ bundle completo em quarentena e registra a URL de origem, hash exato de conteúd
 versão do scanner, achados, timestamp e status fresh-or-cached em
 `skills/.hub/lock.json`.
 
+### Scan advisory SkillEvaluator {#advisory-skillevaluator-scan}
+
+Além do scanner de segurança built-in (que aplica a política de install
+acima), o Hermes pode rodar checagens Tier 1 do
+[NVIDIA SkillEvaluator](https://github.com/NVIDIA/SkillEvaluator)
+em todo install do hub como uma segunda opinião. Tier 1 é
+determinístico e keyless — detecção de PII (emails vazados, paths pessoais,
+connection strings), detecção de unicode-smuggling, lint de script, compliance
+de license, e um scan estático de segurança via
+[NVIDIA SkillSpector](https://github.com/NVIDIA/SkillSpector).
+
+O scan é **apenas advisory**: findings são impressos com arquivo e linha
+antes da confirmação de install, e o install continua. Findings que
+parecem credenciais reais (private keys, cloud access keys, tokens,
+connection strings com credencial) são destacados em vermelho para você
+revisar as linhas sinalizadas antes de decidir. Findings classe PII são
+informativos — o scanner upstream tem classes conhecidas de falso positivo
+(ex. sintaxe SSH `git@github.com`, emails de exemplo em documentação), então
+nunca bloqueiam nada.
+
+Para habilitar, instale os binários opcionais do scanner (o segundo alimenta
+a checagem `security`; sem ele essa checagem simplesmente reporta "not run"):
+
+```bash
+uv tool install --python 3.13 \
+  "skillevaluator @ git+https://github.com/NVIDIA/SkillEvaluator.git@v0.1.0"
+uv tool install "git+https://github.com/NVIDIA/SkillSpector.git@v2.9.5"
+```
+
+Sem o binário no PATH o scan é silenciosamente pulado. Para desligar por
+completo:
+
+```yaml
+skills:
+  tier1_advisory: false
+```
+
+O botão Browse-hub scan do dashboard retorna os mesmos dados advisory na
+resposta (campo `tier1`) junto com o veredicto do scanner built-in.
+
 ## Diretórios externos de skills {#external-skill-directories}
 
 Se você mantém skills fora do Hermes — por exemplo, um diretório compartilhado `~/.agents/skills/` usado por várias ferramentas de IA — você pode dizer ao Hermes para escanear esses diretórios também.
@@ -353,6 +393,49 @@ Paths support `~` expansion and `${VAR}` environment variable substitution.
 ```
 
 As quatro skills aparecem no seu índice de skills. Se você criar localmente uma skill chamada `my-custom-workflow`, ela faz shadow da versão externa.
+
+## Skills locais do projeto {#project-local-skills}
+
+Repos podem carregar suas próprias skills, ativas só para sessões iniciadas dentro daquele projeto — o mesmo padrão que outros agent harnesses usam para configuração repo-local. Quando você lança o Hermes dentro de um checkout git, ele procura skills em:
+
+```text
+<project-root>/.hermes/skills/    # Hermes-native location
+<project-root>/.agents/skills/    # cross-tool convention (shared with other agent CLIs)
+```
+
+A raiz do projeto é o ancestral mais próximo contendo `.git` (worktrees e submodules contam).
+
+### Confiando num projeto {#trusting-a-project}
+
+Skills são documentos de procedimento que o agente segue, então o Hermes **não** as carrega automaticamente de repos clonados arbitrários. Na primeira vez que você roda o Hermes num repo com project skills, o banner mostra um aviso:
+
+```text
+◆ 3 project skill(s) found in /home/you/myproject but not loaded — run `hermes skills trust` to enable them.
+```
+
+Confie no repo uma vez (de dentro dele, ou passando o path):
+
+```bash
+hermes skills trust             # trust the current repo
+hermes skills trust ~/myproject # or explicitly
+hermes skills untrust           # revoke
+```
+
+Raízes confiadas ficam em `skills.trusted_project_dirs` em `~/.hermes/config.yaml`. Defina `skills.project_discovery: false` para desligar a feature por completo (sem scanning, sem avisos).
+
+### Precedência {#precedence}
+
+Project skills são o tier de **maior precedência**: `project → local (~/.hermes/skills/) → external_dirs`. Uma project skill chamada `deploy` sobrescreve uma skill de profile ou bundled de mesmo nome para sessões dentro daquele repo — esse é o ponto: skills vendored do repo vencem em casa, sem tocar seu profile global. Project skills são marcadas `[project]` no índice de skills do agente para a proveniência ficar visível.
+
+Como dirs externos, diretórios de project skills são tratados como property do repo: manutenção autônoma de skills (o curator) nunca os modifica, e skills novas criadas pelo agente sempre vão para `~/.hermes/skills/`.
+
+### Quarentena no scan {#scan-time-quarantine}
+
+Trust é uma decisão no nível do repo, mas o conteúdo de skill de um repo muda a cada `git pull`. Para fechar essa lacuna, toda project skill é escaneada com o mesmo scanner de segurança usado em installs do Skills Hub antes de entrar no índice. Uma skill cujo veredicto de scan é **dangerous** (diretivas de prompt-injection, comandos de exfiltração de credencial, truques de hidden-text) é colocada em quarentena: não aparece no índice de skills, `skills_list`, slash commands, e recusa carregar por nome com um erro explicativo. Scans são cacheados por content-hash sob `~/.hermes/cache/project_skill_scans/` (nunca dentro do seu repo) e re-rodam automaticamente quando o conteúdo da skill muda.
+
+### Superfícies não interativas (cron, API, ACP) {#non-interactive-surfaces-cron-api-acp}
+
+Jobs cron e outras superfícies não interativas herdam sua decisão de trust interativa — nunca pedem confirmação e nunca auto-confiam. A raiz do projeto resolve a partir do working directory da superfície (`workdir` de um job cron, pelo mesmo mecanismo que a ferramenta terminal usa). Um job cron cujo `workdir` está dentro de um repo que você confiou antes carrega as project skills daquele repo; um job num repo untrusted ou undecided não carrega nenhuma.
 
 ## Skill bundles {#skill-bundles}
 

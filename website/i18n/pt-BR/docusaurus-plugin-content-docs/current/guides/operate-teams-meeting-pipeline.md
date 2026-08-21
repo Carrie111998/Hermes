@@ -159,7 +159,15 @@ hermes teams-pipeline run <job-id>
 ```bash
 hermes teams-pipeline fetch --meeting-id <meeting-id>
 hermes teams-pipeline fetch --join-web-url "<join-url>"
+hermes teams-pipeline fetch --join-web-url "<join-url>" --organizer-user-id <entra-user-id>
 ```
+
+Passe `--organizer-user-id` (o Microsoft Entra user ID do organizador) para
+resolver pelo caminho Graph com escopo do organizador
+`/users/{id}/onlineMeetings`. Isso é obrigatório para short URLs Teams
+`/meet/`, que o Graph rejeita no endpoint `/communications/onlineMeetings`.
+Jobs disparados por webhook derivam o organizador automaticamente do
+`@odata.id` da notificação.
 
 ## Runbook de Rotina {#routine-runbook}
 

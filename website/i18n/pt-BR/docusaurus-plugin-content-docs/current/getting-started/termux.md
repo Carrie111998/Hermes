@@ -46,6 +46,38 @@ Isso não impede o Hermes de funcionar bem como agente CLI nativo no telefone �
 
 ---
 
+## Opção nativa com `pkg` mantida pela comunidade {#community-maintained-native-pkg-option}
+
+:::caution Distribuição operada por contributor
+Este repositório APT é **mantido pela comunidade por `@adybag14-cyber` e não é uma distribuição oficial da NousResearch**. A NousResearch não builda, assina, hospeda nem audita esses pacotes. Habilitar o repositório significa confiar no repositório operado pelo contributor e na sua chave de assinatura. O Termux em si continua sendo uma plataforma Tier 2 / best-effort.
+:::
+
+Para usuários que preferem um install via package manager nativo em vez de buildar dependências Python/Rust no telefone, há um repositório APT mantido pela comunidade. O bootstrap do repositório e as fontes de packaging estão publicados em [`adybag14-cyber/termux-python`](https://github.com/adybag14-cyber/termux-python), com o build do pacote Hermes em [`adybag14-cyber/termux-hermes`](https://github.com/adybag14-cyber/termux-hermes).
+
+Instale a chave/fonte do repositório e o Hermes com:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/adybag14-cyber/termux-python/main/scripts/setup_apt_repo.sh | bash
+pkg install hermes-agent
+```
+
+A fingerprint da chave de assinatura do repositório documentada atualmente pela distribuição da comunidade é:
+
+```text
+EAD24A2124EFA7393A78B7B14699F966313F7A6B
+```
+
+Installs Hermes gerenciados por APT são marcados com o método de install `apt`. Por isso o Hermes não roda o self-updater Git contra arquivos de propriedade do pacote; use o package manager:
+
+```bash
+pkg update
+pkg upgrade hermes-agent
+```
+
+Problemas de packaging/repositório/assinatura dessa opção devem ser reportados aos repositórios de packaging da comunidade acima. Bugs de runtime do Hermes ainda podem ser reportados aqui, lembrando que o suporte Android/Termux é best-effort.
+
+---
+
 ## Opção 1: Instalador de uma linha
 
 O Hermes agora tem um caminho de instalador ciente de Termux:
@@ -125,7 +157,7 @@ ln -sf "$PWD/venv/bin/hermes" "$PREFIX/bin/hermes"
 ### 6. Verifique o install
 
 ```bash
-hermes version
+hermes --version
 hermes doctor
 ```
 

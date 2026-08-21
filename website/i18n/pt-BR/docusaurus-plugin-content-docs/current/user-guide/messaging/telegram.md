@@ -957,7 +957,7 @@ gateway:
 
 ## Renderização: mensagens ricas, tabelas e previews de link {#rendering-rich-messages-tables-and-link-previews}
 
-**Mensagens ricas (Bot API 10.1).** Respostas finais que contêm construtos que o caminho legado MarkdownV2 degrada — tabelas, listas de tarefas, `<details>` colapsáveis e matemática em bloco — são enviadas com [`sendRichMessage`](https://core.telegram.org/bots/api#sendrichmessage) nativo do Telegram usando o **markdown bruto** do agente, então renderizam nativamente sem achatamento do lado do cliente. Em DMs, o padrão `rich_drafts: false` mantém o preview animado no caminho de draft legado editável para compatibilidade de cliente, depois envia o final persistente com `sendRichMessage`. Definir `rich_drafts: true` faz o preview ao vivo usar `sendRichMessageDraft` também. Streams baseados em edit podem finalizar um preview existente in-place via parâmetro `rich_message` do `editMessageText`. Respostas ordinárias (prosa simples, negrito/itálico, listas simples) permanecem no caminho MarkdownV2 para peso de fonte e espaçamento consistentes entre clientes.
+**Mensagens ricas (Bot API 10.1).** Respostas finais que contêm construtos que o caminho legado MarkdownV2 degrada — tabelas, listas de tarefas, `<details>` colapsáveis e matemática em bloco — são enviadas com [`sendRichMessage`](https://core.telegram.org/bots/api#sendrichmessage) nativo do Telegram usando o **markdown bruto** do agente, então renderizam nativamente sem achatamento do lado do cliente. Em DMs, o padrão `rich_drafts: false` mantém o preview de streaming plain — usa o transporte de draft efêmero do Telegram com renderização legado (tabelas e outros construtos só-ricos ficam como markdown bruto no preview) — depois persiste a resposta completa com `sendRichMessage`. Definir `rich_drafts: true` faz o preview ao vivo usar `sendRichMessageDraft` também. Streams baseados em edit podem finalizar um preview existente in-place via parâmetro `rich_message` do `editMessageText`. Respostas ordinárias (prosa simples, negrito/itálico, listas simples) permanecem no caminho MarkdownV2 para peso de fonte e espaçamento consistentes entre clientes.
 
 O caminho rico é pulado automaticamente quando o conteúdo excede o limite de 32.768 caracteres de rich text, e qualquer rejeição do Telegram (endpoint não suportado em python-telegram-bot mais antigo, erro de parser, blocos/colunas oversized) **recorre transparentemente** ao caminho MarkdownV2 — sua mensagem nunca se perde. Erros transitórios/de rede *não* são reenviados silenciosamente (sem mensagem final duplicada).
 
@@ -977,7 +977,7 @@ gateway:
         rich_drafts: false
 ```
 
-Esta configuração é para compatibilidade de renderização/cópia no cliente; o Hermes já recorre automaticamente quando o Telegram rejeita a chamada da API rica. `rich_drafts` controla o caminho experimental de preview de draft rico durante streaming de DM Telegram e permanece desligado por padrão porque Telegram Desktop/macOS pode sobrepor visualmente frames de draft rico até o chat redesenhar. Se você quer apenas o comportamento legado "sempre code-block" de tabelas mantendo mensagens ricas ativadas, desative normalização de tabelas definindo `telegram.pretty_tables: false` em `config.yaml` (padrão: `true`).
+Esta configuração é para compatibilidade de renderização/cópia no cliente; o Hermes já recorre automaticamente quando o Telegram rejeita a chamada da API rica. `rich_drafts` controla se o preview de streaming de DM *renderiza* rich (`sendRichMessageDraft`) e permanece desligado por padrão porque Telegram Desktop/macOS pode sobrepor visualmente frames de draft rico até o chat redesenhar; com ele off, o preview faz stream plain e o final ainda chega como Rich Message nativo. Se você quer apenas o comportamento legado "sempre code-block" de tabelas mantendo mensagens ricas ativadas, desative normalização de tabelas definindo `telegram.pretty_tables: false` em `config.yaml` (padrão: `true`).
 
 **Previews de link.** O Telegram gera automaticamente previews de link para URLs em mensagens de bot. Se você preferir suprimi-los (saída longa de `/tools`, resposta do agente que menciona dez links, etc.):
 
@@ -1135,9 +1135,9 @@ Em algumas redes restritas, `api.telegram.org` pode resolver para um IP inacess�
 
 1. Se `TELEGRAM_FALLBACK_IPS` está definido, esses IPs são usados diretamente.
 2. Caso contrário, o adaptador consulta automaticamente **Google DNS** e **Cloudflare DNS** via DNS-over-HTTPS (DoH) para descobrir IPs alternativos para `api.telegram.org`.
-3. IPs retornados por DoH que diferem do resultado DNS do sistema são usados como fallbacks.
-4. Se DoH também estiver bloqueado, um IP seed hardcoded (`149.154.167.220`) é usado como último recurso.
-5. Uma vez que um IP de fallback tem sucesso, ele se torna "sticky" — requisições subsequentes o usam diretamente sem tentar o caminho primário primeiro.
+3. IPs IPv4 conhecidos da API Telegram são tentados **antes** do hostname dual-stack `api.telegram.org`. Um caminho IPv6 blackholed pode ficar preso em `connect()` sem erro, o que antes fixava o event loop de modo que o deadline de init de 30s nunca disparava.
+4. Se DoH também estiver bloqueado ou der timeout, uma lista seed IPv4 hardcoded (`149.154.166.110`, `149.154.167.220`) é usada como essa lista IPv4-first. O hostname permanece como último recurso.
+5. Uma vez que um caminho tem sucesso, ele se torna "sticky" — requisições subsequentes o usam diretamente. O hostname é mantido como último recurso para redes só-IPv6.
 
 ### Configuração {#configuration-3}
 
@@ -1157,7 +1157,7 @@ platforms:
 ```
 
 :::tip
-Você geralmente não precisa configurar isso manualmente. A auto-descoberta via DoH lida com a maioria dos cenários de rede restrita. A variável de ambiente `TELEGRAM_FALLBACK_IPS` só é necessária se DoH também estiver bloqueado na sua rede.
+Você geralmente não precisa configurar isso manualmente. A auto-descoberta via DoH lida com a maioria dos cenários de rede restrita. A variável de ambiente `TELEGRAM_FALLBACK_IPS` só é necessária se DoH também estiver bloqueado na sua rede. Se IPv6 estiver quebrado no host, você também pode definir `network.force_ipv4: true` em `config.yaml` para pular lookups AAAA process-wide.
 :::
 
 ## Suporte a proxy {#proxy-support-1}

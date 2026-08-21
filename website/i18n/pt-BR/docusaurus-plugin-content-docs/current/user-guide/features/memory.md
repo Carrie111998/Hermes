@@ -234,6 +234,23 @@ memory:
   write_approval: false     # false = escrever livremente (padrão) | true = exigir aprovação
 ```
 
+Definir **ambos** `memory_enabled` e `user_profile_enabled` como `false`
+desliga os stores embutidos por completo: a tool `memory` é removida do
+schema e o bloco de orientação some do system prompt, então o modelo nunca
+é informado sobre uma tool que não pode usar. Um provider externo definido
+via `memory.provider` (Hindsight, Mem0, Honcho, …) não é afetado e mantém
+suas próprias tools — use isso quando quiser um backend de memória de
+terceiros *em vez dos* arquivos embutidos. Listar `memory` em
+`agent.disabled_toolsets` é o interruptor mais pesado: ele também esconde
+as tools de providers externos.
+
+Com só `memory_enabled: false` (user profile ainda ligado), a tool
+permanece — ela sustenta o store de perfil — mas o system prompt troca a
+orientação completa de memória por um bloco mais estreito só de perfil. O
+schema da tool anuncia apenas o target `user`, e escritas diretas ou
+staged em `MEMORY.md` desabilitado são rejeitadas. A configuração inversa
+anuncia apenas `memory` e rejeita escritas em `USER.md`.
+
 ## Controlando escritas de memória (`write_approval`) {#controlling-memory-writes-write_approval}
 
 Por padrão o agente salva memória livremente — inclusive pela revisão de auto-melhoria em background que roda após um turno. Se preferir aprovar saves primeiro, defina `memory.write_approval: true`. É um gate simples liga/desliga aplicado a **ambos** turnos em foreground e a revisão em background:
@@ -243,7 +260,7 @@ Por padrão o agente salva memória livremente — inclusive pela revisão de au
 | `false` (padrão) | Escrever livremente — o gate está desligado (comportamento pré-gate). |
 | `true` | Exigir aprovação antes de qualquer coisa ser salva. Na CLI interativa, escritas em foreground pedem confirmação inline (entradas são pequenas o suficiente para ler por completo). Em todo o resto — plataformas de mensagens, scripts e a revisão de auto-melhoria em background — escritas ficam **staged** para revisão com `/memory pending`. |
 
-> Para desligar a memória por completo (não só gatear), defina `memory_enabled: false`.
+> Para desligar a memória por completo (não só gatear), defina ambos `memory_enabled: false` e `user_profile_enabled: false`. Quando os dois stores embutidos estão desabilitados, a tool embutida `memory` é ocultada automaticamente.
 
 Revise escritas staged pela CLI ou qualquer plataforma de mensagens:
 

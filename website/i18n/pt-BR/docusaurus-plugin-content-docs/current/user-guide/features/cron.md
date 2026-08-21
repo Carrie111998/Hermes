@@ -31,6 +31,10 @@ Tudo isso está disponível ao próprio Hermes pela ferramenta `cronjob`, então
 `hermes setup --portal` é a opção de menor atrito para execuções desassistidas já que refresh OAuth é automático. Veja [Nous Portal](/integrations/nous-portal).
 :::
 
+:::tip
+**Esforço de reasoning por job.** Um job pode fixar seu próprio nível de thinking, independente do pin de modelo: um de `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. Quando definido, sobrescreve tanto o `agent.reasoning_effort` global quanto os `agent.reasoning_overrides` por modelo nas runs daquele job (`none` desabilita thinking). Defina via `hermes cron create/edit --reasoning-effort high`; passe uma string vazia no edit para limpar o pin e seguir a config de novo. (Deliberadamente não é exposto na ferramenta `cronjob` do agente — configuração de modelo permanece decisão do usuário.) Níveis que um modelo não suporte são clamped ou omitidos pelo provider no request — fixar `xhigh` num modelo que limita em `high` roda em `high`. O pin não tem efeito em jobs `no_agent` (não há chamada LLM para ajustar). Use para rodar análises agendadas pesadas em `high` enquanto jobs recorrentes baratos rodam em `minimal`, sem tocar no default global.
+:::
+
 :::warning
 Sessões rodadas por cron não podem criar recursivamente mais jobs cron. O Hermes desabilita ferramentas de gestão cron dentro de execuções cron para prevenir loops de agendamento descontrolados.
 :::
@@ -536,6 +540,18 @@ cron:
 
 Defina `cleanup_timeout_seconds: 0` só para restaurar o comportamento legado de limpeza sem limite.
 
+## Timeout de envio de mídia {#media-send-timeout}
+
+Quando uma entrega cron inclui anexos de mídia (um PDF gerado, áudio TTS, um relatório exportado) enviados por um adapter de gateway live, cada upload de anexo é limitado por um timeout — 300 segundos por padrão. Arquivos grandes em uplinks lentos podem precisar de mais:
+
+```yaml
+# ~/.hermes/config.yaml
+cron:
+  media_send_timeout_seconds: 600   # 10 minutes per attachment
+```
+
+Ou defina a variável de ambiente `HERMES_CRON_MEDIA_SEND_TIMEOUT`. A ordem de resolução é: env var → config.yaml → default 300s. Um anexo que estoura o timeout é registrado no status da run do job como falha parcial de entrega (o texto ainda entrega).
+
 ## Modo no-agent (jobs só script) {#no-agent-mode-script-only-jobs}
 
 Para jobs recorrentes que não precisam de raciocínio LLM — watchdogs clássicos, alertas de disco/memória, heartbeats, pings CI — passe `no_agent=True` na criação. O scheduler roda seu script no schedule e entrega stdout diretamente, pulando o agente por completo:
@@ -660,6 +676,30 @@ Jobs cron herdam fallback providers configurados e rotação de credential pool.
 - **Rotacionar para próxima credencial** no seu [credential pool](/user-guide/configuration#credential-pool-strategies) para o mesmo provider
 
 Jobs cron de alta frequência ou em horários de pico são mais resilientes — uma key rate-limited não falha a execução inteira.
+
+## Fires agendados perdidos (`last_fire_error`) {#missed-scheduled-fires-last_fire_error}
+
+Em deployments hosted (managed-cron), um fire agendado viaja do scheduler da plataforma pelo dashboard até o API server interno do gateway. Se esse hand-off final falha — o processo do gateway está down, ou seu listener do API server nunca iniciou — a run nunca começa, então não há registro de execução nem `last_status` para inspecionar. O formato típico: o job funciona toda vez que você dispara manualmente, mas nunca auto-dispara.
+
+Esses misses são carimbados no registro do job como `last_fire_error` (timestamp + motivo) e aparecem em:
+
+- ferramenta `cronjob` → `action: "list"` — o campo `last_fire_error`
+- `hermes cron list` — uma linha vermelha `⚠ Missed scheduled fire:` sob o job
+- A view de job do dashboard
+
+O carimbo sempre reflete a saúde **atual** de auto-fire: é sobrescrito por misses mais novos e limpo automaticamente pela próxima run bem-sucedida. Se você o vir, o job e o schedule estão bem — o lado gateway do caminho de fire precisa de atenção (mais comumente, reinicie o gateway pelo supervisor para carregar o ambiente completo do profile: `hermes gateway restart`).
+
+### Catch-up de misfire {#misfire-catch-up}
+
+Quando um provider externo de scheduler está ativo (managed cron em deployments hosted), o gateway também roda um sweep de catch-up: um job cujo horário agendado passou sem fire entregue — e cuja janela de grace já passou — é claimed e rodado localmente, então uma outage no hand-off de fire custa minutos em vez do dia inteiro. O sweep é de-duplicado contra retries tardios do scheduler pela mesma claim de store usada em fires normais.
+
+```yaml
+cron:
+  misfire_grace_minutes: 10   # wait this long for the scheduler's own retries
+                              # before catching up locally; 0 disables catch-up
+```
+
+Deployments locais (ticker built-in) não precisam disso — o ticker já pega jobs atrasados no próximo tick.
 
 ## Formatos de schedule {#schedule-formats}
 

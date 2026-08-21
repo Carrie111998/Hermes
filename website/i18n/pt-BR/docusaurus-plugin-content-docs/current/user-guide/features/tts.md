@@ -43,7 +43,7 @@ Converta texto em fala com dez providers:
 ```yaml
 # In ~/.hermes/config.yaml
 tts:
-  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "mistral" | "gemini" | "xai" | "neutts" | "kittentts" | "piper"
+  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "mistral" | "gemini" | "xai" | "deepinfra" | "neutts" | "kittentts" | "piper" — ou "nous" para o Tool Gateway gerenciado (gravado quando você escolhe Nous Subscription em `hermes tools`)
   speed: 1.0                    # Global speed multiplier (provider-specific settings override this)
   edge:
     voice: "en-US-AriaNeural"   # 322 voices, 74 languages
@@ -479,10 +479,12 @@ O Hermes escreve a mensagem de voz recebida em `{input_path}`, roda o comando e 
 
 ### Comportamento de fallback {#fallback-behavior}
 
-Se seu provider configurado não estiver disponível, o Hermes faz fallback automaticamente:
+Uma seleção **explícita** de `stt.provider` (gravada em `config.yaml`, ex. via `hermes tools`) é honrada de forma estrita — se esse provider não puder rodar, a transcrição falha com um erro claro (`stt is configured to use <provider> (set via hermes tools), but <failure>. Run 'hermes tools' to change it.`) em vez de trocar engines silenciosamente. Note que `stt.provider: local` gravado na sua config conta como seleção explícita.
+
+Quando **nenhum provider jamais foi selecionado**, o Hermes auto-detecta a partir do que estiver disponível:
 - **Local faster-whisper indisponível** → Tenta CLI `whisper` local ou `HERMES_LOCAL_STT_COMMAND` antes de providers cloud
-- **Chave Groq não definida** → Fallback para transcrição local, depois OpenAI
-- **Chave OpenAI não definida** → Fallback para transcrição local, depois Groq
+- **Chave Groq não definida** → Pulado; próximo provider disponível
+- **Chave OpenAI não definida** → Pulado; próximo provider disponível
 - **Chave/SDK Mistral não definida** → Pulado em auto-detect; passa para próximo provider disponível
 - **Nada disponível** → Mensagens de voz passam com nota precisa ao usuário
 

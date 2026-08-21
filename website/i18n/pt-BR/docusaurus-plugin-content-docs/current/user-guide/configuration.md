@@ -121,6 +121,7 @@ updates:
   pre_update_backup: quick       # quick (state snapshot, default) | full (snapshot + HERMES_HOME zip) | off
   backup_keep: 5                 # Keep this many full pre-update backup zips
   non_interactive_local_changes: stash  # stash | discard
+  auto_switch_parked_branch: true       # auto-switch a clean, fully merged parked branch back to main
 ```
 
 `pre_update_backup` é o único botão de segurança pré-atualização: `quick` (padrão) faz snapshot de arquivos críticos de estado (dados de pairing, jobs cron, config, auth; arquivos acima de 1 GiB são ignorados) em `state-snapshots/`; `full` adicionalmente compacta todo o `HERMES_HOME` em `backups/` e pode levar minutos em homes grandes; `off` desativa ambos. Booleanos legados são honrados (`true` → `full`, `false` → `off`).
@@ -738,6 +739,21 @@ tool_output:
   max_lines: 500
 ```
 
+### Orçamento de spillover de tool-result {#tool-result-spillover-budget}
+
+Separadamente da truncagem, *resultados* de tool oversized são derramados em disco em vez de cortados: a saída completa é salva sob `$HERMES_HOME/cache/spillover/` e o conteúdo in-context é substituído por um preview mais o path do arquivo salvo (legível com `read_file` usando `offset`/`limit`, ou processável com `execute_code`). O limiar genérico de spillover por resultado é 100.000 chars, reduzido automaticamente para modelos de contexto pequeno.
+
+Resultados de tool MCP (tools nomeadas `mcp_*`) derramam num default mais apertado de **50.000 chars**: servidores MCP rotineiramente retornam payloads grandes sem paginação (catálogos de tool-discovery, execuções em batch) que de outra forma ficariam sob o limiar genérico e inchariam o contexto em todo turn seguinte. Nada se perde — o resultado completo é preservado em disco. Sobrescreva o limiar via:
+
+```yaml
+tool_budget:
+  mcp_result_size_chars: 50000   # per-result spillover threshold for mcp_* tools
+```
+
+O limiar MCP é sempre capped no limiar genérico por resultado (possivelmente scaled pelo contexto), então aumentá-lo não pode exceder o que a janela do modelo ativo permite.
+
+O Hermes também sinaliza **elisão do lado do provider**: quando um resultado de tool MCP ou web embute seus próprios marcadores de truncagem (`...N more items`, `"has_more": true`, notas "saved to sandbox"), um aviso de uma linha é anexado ao resultado avisando que os dados visíveis estão incompletos e devem ser paged/fetched antes de tratar qualquer enumeração como completa.
+
 ## Desabilitação global de toolset {#global-toolset-disable}
 
 Para suprimir toolsets específicos na CLI e em toda plataforma de gateway em um
@@ -1000,13 +1016,37 @@ Em vez disso, quando o orçamento esgota de fato (500/500), o Hermes injeta uma 
 
 ```yaml
 agent:
-  max_turns: 500               # Max iterations per conversation turn (default: 500)
+  max_turns: none              # Iterations per conversation turn (default: none = unlimited)
+                               # Set a positive integer to cap; "none"/"null"/
+                               # "unlimited"/"inf"/"infinity"/"infinite"/0/-1 = no limit
   api_max_retries: 3           # Retries per provider before fallback engages (default: 3)
 ```
 
-Quando o orçamento de iterações esgota completamente, a CLI mostra notificação ao usuário: `⚠ Iteration budget reached (500/500) — response may be incomplete`.
+`agent.max_turns` é **ilimitado por padrão** — o cap de turns causava mais problemas do que resolvia (truncagem silenciosa mid-task), então out of the box o Hermes roda um conversation turn até completar. Para impor um cap, defina um inteiro positivo. Para ser explícito sobre "sem limite", qualquer uma destas grafias case-insensitive funciona: `"none"`, `"null"`, `"unlimited"`, `"infinite"`, `"infinity"`, `"inf"`, `0`, `-1` (resolvem para um sentinel `sys.maxsize` para o loop nunca sair por contagem de turns).
 
 `agent.api_max_retries` controla quantas vezes o Hermes retenta uma chamada de API do provedor em erros transitórios (rate limits, quedas de conexão, 5xx) **antes** do fallback-provider switching engajar. O padrão é `3` — quatro tentativas no total. Se tem [fallback providers](/user-guide/features/fallback-providers) configurados e quer failover mais rápido, diminua para `0` para o primeiro erro transitório no primário passar imediatamente ao fallback em vez de churn de retries no endpoint instável.
+
+## Orçamento wall-clock de run {#wall-clock-run-budget}
+
+Separado do orçamento de iterações, você pode dar a cada conversation run um orçamento **wall-clock** opcional. Isso é pensado para invocações one-shot e eval-harness que rodam sob um teto externo duro (ex. limite de 900 segundos por task): sem ele, uma run pode dar timeout com o trabalho essencialmente feito — uma geração aquém de emitir a resposta final, ou presa numa única chamada de provider hung.
+
+```yaml
+agent:
+  run_budget_seconds: null     # Optional; unset/null = feature fully off (default)
+```
+
+Ou por invocação via CLI:
+
+```bash
+hermes chat --run-budget 850 -q "..."
+```
+
+Quando um orçamento está definido, duas coisas acontecem:
+
+1. **Aviso de wrap-up a 80%.** Quando 80% do orçamento passou, o Hermes injeta um aviso **one-time** (entregue de forma cache-safe, anexado ao tool result mais novo como mensagens `/steer`) dizendo ao modelo para parar trabalho novo de discovery/verification e produzir o deliverable final a partir do estado que já tem. Dispara no máximo uma vez por run e espelha o mecanismo existente de wrap-up do orçamento de iterações — não há avisos de pressão repetidos.
+2. **Timeouts stale scaled pelo deadline.** Timeouts stale implícitos non-streaming (o default de 90s e os floors de modelos de reasoning, ex. 600s para modelos DeepSeek reasoning) são capped em `max(60, remaining_budget × 0.5)` para que uma única chamada de provider silenciosamente hung nunca consuma o resto da run. O cap só *aperta* o timeout — nunca o eleva — e um `stale_timeout_seconds` explicitamente configurado (config de provider/modelo ou `HERMES_API_CALL_STALE_TIMEOUT`) sempre vence intacto.
+
+O orçamento é por turn `run_conversation` (reseta a cada mensagem do usuário) e a feature fica completamente dormente quando unset — sem leituras de clock, sem injeção, sem mudanças de timeout.
 
 ## Verify-on-Stop (verificação de código) {#verify-on-stop-coding-verification}
 
@@ -1200,7 +1240,7 @@ auxiliary:
 
 Quando `base_url` está definido, o Hermes ignora o provider e chama esse endpoint diretamente (usando `api_key` ou `OPENAI_API_KEY` para auth). Quando só `provider` está definido, o Hermes usa auth e base URL embutidos desse provider.
 
-Provedores disponíveis para tarefas auxiliares: `auto`, `main`, mais qualquer provedor no [provider registry](/reference/environment-variables) — `openrouter`, `nous`, `openai-codex`, `copilot`, `copilot-acp`, `anthropic`, `gemini`, `qwen-oauth`, `zai`, `kimi-coding`, `kimi-coding-cn`, `minimax`, `minimax-cn`, `minimax-oauth`, `deepseek`, `nvidia`, `xai`, `xai-oauth`, `ollama-cloud`, `alibaba`, `bedrock`, `huggingface`, `arcee`, `xiaomi`, `kilocode`, `opencode-zen`, `opencode-go`, `commandcode`, `commandcode-anthropic`, `ai-gateway`, `azure-foundry` — ou qualquer provedor custom nomeado do seu dict `providers:` (ex.: `provider: "beans"`).
+Provedores disponíveis para tarefas auxiliares: `auto`, `main`, mais qualquer provedor no [provider registry](/reference/environment-variables) — `openrouter`, `nous`, `openai-codex`, `copilot`, `copilot-acp`, `anthropic`, `gemini`, `qwen-oauth`, `zai`, `kimi-coding`, `kimi-coding-cn`, `minimax`, `minimax-cn`, `minimax-oauth`, `deepseek`, `nvidia`, `xai`, `xai-oauth`, `ollama-cloud`, `alibaba`, `bedrock`, `huggingface`, `arcee`, `xiaomi`, `kilocode`, `opencode-zen`, `opencode-go`, `opencode-free`, `commandcode`, `commandcode-anthropic`, `ai-gateway`, `azure-foundry` — ou qualquer provedor custom nomeado do seu dict `providers:` (ex.: `provider: "beans"`).
 
 :::tip MiniMax OAuth
 `minimax-oauth` faz login via browser OAuth (sem API key). Execute `hermes model` e selecione **MiniMax (OAuth)** para autenticar. Tarefas auxiliares usam `MiniMax-M2.7-highspeed` automaticamente. Veja o [guia MiniMax OAuth](../guides/minimax-oauth.md).
@@ -1618,13 +1658,11 @@ agent:
 
 ### O que injeta {#what-it-injects}
 
-Quando habilitado, três camadas de orientação podem ser adicionadas ao prompt de sistema:
+Quando habilitado, duas camadas de orientação podem ser adicionadas ao prompt de sistema:
 
 1. **Enforcement geral de uso de ferramentas** (todos modelos correspondidos) — instrui o modelo a fazer tool calls imediatamente em vez de descrever intenções, continuar trabalhando até a tarefa completar e nunca terminar um turno prometendo ação futura.
 
-2. **Disciplina de execução OpenAI** (modelos GPT, Codex e Grok) — orientação adicional para modos de falha específicos do GPT: abandonar trabalho em resultados parciais, pular lookups de pré-requisito, alucinar em vez de usar ferramentas e declarar "done" sem verificação.
-
-3. **Orientação operacional Google** (só modelos Gemini e Gemma) — concisão, caminhos absolutos, tool calls paralelas e padrões verify-before-edit.
+2. **Orientação operacional Google** (só modelos Gemini e Gemma) — concisão, caminhos absolutos, tool calls paralelas e padrões verify-before-edit.
 
 São transparentes ao usuário e só afetam o prompt de sistema. Modelos que já usam ferramentas de forma confiável (como Claude) não precisam desta orientação, por isso `"auto"` os exclui.
 
@@ -1636,6 +1674,33 @@ Se usa um modelo fora da lista auto padrão e nota que frequentemente descreve o
 agent:
   tool_use_enforcement: ["gpt", "codex", "gemini", "grok", "my-custom-model"]
 ```
+
+## Orientação de execution-discipline {#execution-discipline-guidance}
+
+Separadamente do tool-use enforcement, o Hermes injeta um bloco de **execution-discipline** para famílias de modelo que compartilham um conjunto de modos de falha agentic observados em traces de eval: fazer aritmética em prosa em vez de código, pular verificação de read-back depois de writes externos, "reparar" identificadores malformados, reivindicar completude apesar de mismatches de contagem, e declarar "done" sem verificar todo critério de aceitação.
+
+```yaml
+agent:
+  execution_guidance: "auto"   # "auto" | true | false | ["model-substring", ...]
+```
+
+| Value | Behavior |
+|-------|----------|
+| `"auto"` (default) | Habilitado para modelos que batem: `gpt`, `codex`, `grok`, `deepseek`, `kimi`, `qwen`, `glm`, `minimax`, `mimo`, `mistral`. |
+| `true` | Sempre habilitado, independentemente do modelo. |
+| `false` | Sempre desabilitado, independentemente do modelo. |
+| `["deepseek", "my-custom-model"]` | Habilitado só quando o nome do modelo contém um dos substrings listados (case-insensitive). |
+
+O bloco injetado cobre:
+
+- **Persistência de tool** — continue chamando tools até a tarefa estar completa *e* verificada; retente resultados de lookup vazios, parciais ou suspeitosamente estreitos com uma query mais ampla ou diferente antes de concluir.
+- **Uso obrigatório de tool** — aritmética, hashes, datas, estado do sistema e fatos de arquivo sempre vêm de uma tool, nunca de computação mental.
+- **Read-back de write externo** — depois de qualquer write que muda estado num sistema externo, leia de volta o target exato antes de reivindicar sucesso (edits internos de arquivo que uma tool já confirmou não são re-verificados).
+- **Reconciliação de contagem** — totais declarados (`total`, `reply_count`, `has_more`) são asserções duras; em mismatch, re-fetch ou parse programaticamente.
+- **Preservação literal** — nunca normalize ou "repare" identificadores que falham um formato declarado; um lookup bem-sucedido não valida um token de fonte malformado.
+- **Completion gated por verificação** — "done" significa que todo critério de aceitação nomeado está verificado, nunca um subset plausível.
+
+O gate é independente de `tool_use_enforcement` — qualquer um pode estar on sem o outro. A orientação é escolhida uma vez no início da sessão keyed no nome do modelo, então o system prompt permanece byte-stable (e friendly ao prompt-cache) pela vida da conversa. Gemini/Gemma são excluídos da lista auto porque recebem a orientação operacional Google mais específica; Claude é excluído porque não exibe esses modos de falha — opte qualquer modelo com `true` ou uma lista de substrings.
 
 ## Guardrails de tool-loop {#tool-loop-guardrails}
 
@@ -1669,6 +1734,17 @@ Separado dos thresholds baseados em falha acima, `loop_caps` define tetos rígid
 Um único lote `delegate_task` conta cada task em `max_subagents` (lote de 3 gasta 3), então o cap rastreia subagentes reais spawnados em vez de invocações `delegate_task`.
 
 Isso espelha os caps por sessão WebSearch e subagent do Claude Code (v2.1.212), que também padrão 200 e resetam em `/clear`.
+
+### Guards anti-stall em runtime {#runtime-anti-stall-guards}
+
+Complementando os guardrails baseados em falha acima, `agent.stall_guards` (default `true`) habilita dois guards conservadores de runtime contra turns desperdiçados. Primeiro, um **identical-call loop breaker**: quando a mesma tool é chamada 3+ vezes consecutivas com argumentos idênticos *e* retorna um resultado idêntico, um aviso curto de uma linha é anexado àquele tool result dizendo ao modelo para não repetir a chamada — nunca bloqueia a chamada, e pollers legitimamente-repetíveis (`process`, `*_get_result`, `*_poll`) estão isentos. Segundo, uma **continue-intent recovery**: quando o modelo termina um turn sem tool calls mas sua reply curta termina anunciando uma ação ("Let me now update the file…"), o Hermes o re-prompta a agir via o mesmo mecanismo bounded de continuação usado para intent-ack recovery (máx. 2 re-prompts por turn). Ambos são cache-safe (avisos são adicionados na construção do result, nunca retroativamente) e podem ser desabilitados juntos:
+
+```yaml
+agent:
+  stall_guards: false
+```
+
+O mesmo gate também habilita **result-reference stubbing**: quando uma tool call idêntica re-emitida retorna um resultado fresh byte-idêntico, o payload duplicado entra no contexto como um stub de referência curto apontando para o resultado anterior (nome da tool, `tool_call_id`, um resumo de args, e — se o primeiro resultado foi persistido em disco — seu path de spillover) em vez de repetir a saída completa. A tool ainda executa toda vez, então a semântica de polling é preservada: um resultado mudado sempre flui inteiro. Resultados sob 512 caracteres, resultados de erro e resultados multimodais nunca são stubbed, e pollers *são* stubbed (um poll inalterado é exatamente o caso em que o payload duplicado não carrega informação).
 
 ## Configuração TTS {#tts-configuration}
 
@@ -1960,7 +2036,7 @@ Comportamento do provider:
 
 Providers cloud (groq, openai, mistral, xai, elevenlabs, deepinfra) recebem **trim de silêncio pré-upload** por padrão quando `ffmpeg` está instalado: pausas longas em nota de voz são colapsadas client-side antes do upload, mantendo `cloud_trim_keep_ms` de cada pausa para ritmo natural sobreviver. Áudio mais curto significa uploads mais rápidos, billing menor por minuto de áudio e menos alucinações de silêncio do modelo remoto. Clips menores que 12 segundos pulam o trim (economia não importa lá, e vários providers cobram mínimo por requisição). O trim é best-effort — se ffmpeg falta, trim falha, clip é sobretudo silêncio, ou trim economizaria menos que ~10%, o arquivo original é enviado intacto. Defina `stt.cloud_trim_silence: false` para sempre enviar o original (ex.: ao transcrever música ou áudio ambiente via provider cloud). Providers command-type e plugin nunca recebem áudio trimmed.
 
-Se o provider solicitado não está disponível, o Hermes cai automaticamente nesta ordem: `local` → `groq` → `openai`.
+Um `stt.provider` explicitamente selecionado é honrado estritamente — se estiver indisponível, a transcrição erra com orientação para rodar `hermes tools` em vez de trocar providers. Só quando nenhum provider jamais foi selecionado o Hermes auto-detecta nesta ordem: `local` → `groq` → `openai`.
 
 Sobrescritas de modelo Groq e OpenAI são driven por ambiente:
 
@@ -2186,17 +2262,34 @@ web:
   # Or use per-capability keys to mix providers (e.g. free search + paid extract):
   search_backend: "searxng"
   extract_backend: "firecrawl"
+
+  # Keyless free-tier fallback (default: true). With no backend configured
+  # and no API keys present, web tools rotate across the Exa/Parallel/
+  # Tavily/Firecrawl/Keenable free tiers. Set false to disable.
+  keyless_fallback: true
+
+  # One-shot keyless rescue (default: true). When the chosen/keyed backend
+  # fails a call, that single call retries on the keyless ring; the next
+  # call attempts the chosen backend again (never sticky).
+  keyless_rescue: true
+
+  # Pin Exa/Parallel to a tier (set by the hermes tools Free/Paid rows).
+  # free = always the anonymous endpoint; paid = always the keyed SDK path;
+  # unset = auto (key present -> paid, otherwise free).
+  provider_tier:
+    parallel: free
+    exa: paid
 ```
 
 | Backend | Env Var | Search | Extract |
 |---------|---------|--------|---------|
 | **Firecrawl** (padrão) | `FIRECRAWL_API_KEY` | ✔ | ✔ |
 | **SearXNG** | `SEARXNG_URL` | ✔ | — |
-| **Parallel** | `PARALLEL_API_KEY` | ✔ | ✔ |
-| **Tavily** | `TAVILY_API_KEY` | ✔ | ✔ |
-| **Exa** | `EXA_API_KEY` | ✔ | ✔ |
+| **Parallel** | `PARALLEL_API_KEY` (opcional — free tier keyless) | ✔ | ✔ |
+| **Tavily** | `TAVILY_API_KEY` (opcional — keyless quando selecionado) | ✔ | ✔ |
+| **Exa** | `EXA_API_KEY` (opcional — free tier keyless) | ✔ | ✔ |
 
-**Seleção de backend:** Se `web.backend` não está definido, o backend é auto-detectado de chaves de API disponíveis. Se só `SEARXNG_URL` está definido, SearXNG é usado. Se só `EXA_API_KEY` está definido, Exa é usado. Se só `TAVILY_API_KEY` está definido, Tavily é usado. Se só `PARALLEL_API_KEY` está definido, Parallel é usado. Caso contrário Firecrawl é o padrão.
+**Seleção de backend:** O runtime sempre usa a seleção armazenada de `web.backend` (definida via `hermes tools`; `nous` roteia pelo Tool Gateway gerenciado). Só se nenhum backend web jamais foi selecionado um é auto-detectado de chaves de API disponíveis: se só `SEARXNG_URL` está definido, SearXNG é usado; se só `EXA_API_KEY` está definido, Exa; se só `TAVILY_API_KEY` está definido, Tavily; se só `PARALLEL_API_KEY` está definido, Parallel; se só `KEENABLE_API_KEY` está definido, Keenable. Com **nenhuma seleção e nenhuma credencial**, requests rotacionam round-robin pelo ring keyless de free-tier (Exa / Parallel / Tavily / Firecrawl / Keenable) com failover automático next-in-line em rate limits — veja o [guia Web Search](/user-guide/features/web-search) para detalhes. Uma vez que uma seleção existe, adicionar uma chave ao `.env` não muda a rota. Selecionar Tavily, Firecrawl ou Keenable em `hermes tools` também funciona sem chave.
 
 **SearXNG** é metasearch engine gratuito, self-hosted e respeitoso à privacidade que consulta 70+ search engines. Sem API key — só defina `SEARXNG_URL` para sua instância (ex.: `http://localhost:8080`). SearXNG é só search; `web_extract` requer provider extract separado (defina `web.extract_backend`). Veja o [guia de setup Web Search](/user-guide/features/web-search) para instruções Docker.
 

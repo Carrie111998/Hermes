@@ -80,6 +80,16 @@ Agende tarefas recorrentes, rode jobs em batch ou encadeie ações do agente.
 Jobs de cron deixam o Hermes Agent rodar tarefas sob agendamento — resumos diários, checagens periódicas, relatórios automáticos — sem você estar presente.
 :::
 
+### "Quero um time de Bots especialistas"
+
+Crie Bots nomeados com model, memória, skills, routines e chats próprios, depois reúna-os em group chats ou via `@mentions`.
+
+1. [Desktop](/user-guide/desktop)
+2. [Profiles](/user-guide/profiles)
+3. [Bot Mode](/user-guide/bot-mode)
+4. [Cron Scheduling](/user-guide/features/cron)
+5. [Multi-connection Desktop](/user-guide/multi-connection-desktop)
+
 ### "Quero criar tools/skills custom"
 
 Estenda o Hermes Agent com suas próprias tools e pacotes de skill reutilizáveis.
@@ -132,6 +142,7 @@ Não tem certeza do que está disponível? Aqui vai um diretório rápido dos re
 | **Tools** | Tools embutidas que o agente pode chamar (file I/O, busca, shell, etc.) | [Tools](/user-guide/features/tools) |
 | **Skills** | Pacotes de plugin instaláveis que acrescentam novas capacidades | [Skills](/user-guide/features/skills) |
 | **Memory** | Memória persistente entre sessões | [Memory](/user-guide/features/memory) |
+| **Bot Mode** | Bots especialistas nomeados com chats persistentes, routines, group chats e `@mentions` | [Bot Mode](/user-guide/bot-mode) |
 | **Context Files** | Alimenta arquivos e diretórios nas conversas | [Context Files](/user-guide/features/context-files) |
 | **MCP** | Conecta a servidores de tools externos via Model Context Protocol | [MCP](/user-guide/features/mcp) |
 | **Cron** | Agenda tarefas recorrentes do agente | [Cron](/user-guide/features/cron) |

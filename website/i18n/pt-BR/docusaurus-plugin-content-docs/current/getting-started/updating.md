@@ -42,6 +42,12 @@ hermes update --check --branch experimental   # preview behindness only
 
 Se o checkout local estiver em outro branch, o Hermes faz auto-stash de trabalho não commitado, muda o HEAD para o branch alvo e então puxa. Branches que não existem localmente são auto-tracked a partir de `origin/<name>` (`git checkout -B <name> origin/<name>`). Branches que não existem em lugar nenhum falham limpo — suas mudanças em stash são restauradas antes de sair, então você não fica preso num estado estranho. A lógica de sync fork-upstream só de `main` é pulada automaticamente em branches que não são `main`.
 
+### Checkout estacionado num feature branch {#checkout-parked-on-a-feature-branch}
+
+Se o checkout de source ficou parado num feature branch (por tooling, um experimento de worktree ou um checkout manual), o `hermes update` só o volta automaticamente ao alvo do update quando isso é comprovadamente seguro: a working tree está limpa **e** todo commit no branch estacionado já está contido em `origin/main` (`git cherry` não reporta nada unmerged). Nesse caso o update diz isso — `Checkout was parked on '<branch>' (fully merged) — switched back to main` — e permanece em `main` depois.
+
+Quando o branch estacionado tem mudanças não commitadas ou commits unmerged, o Hermes **não** o toca. O update de código é marcado **SKIPPED** com um aviso alto nomeando o branch, o quanto está atrás de `origin/main`, e os comandos exatos para resolver — em vez de fingir que o update teve sucesso. A linha de conclusão sempre mostra o branch e o HEAD reais (`✓ Update complete! [main @ 30fcf9580]`), então drift fica visível de relance. Defina `updates.auto_switch_parked_branch: false` em `config.yaml` para desabilitar o auto-switch por completo (o aviso de skip ainda dispara).
+
 ### Mudanças locais em updates não interativos
 
 Quando você roda `hermes update` num terminal, o Hermes faz stash de mudanças não commitadas na árvore de source, puxa e **pergunta** se deve restaurá-las — exatamente como sempre foi. Nada muda para updates interativos.
@@ -60,9 +66,29 @@ updates:
 
 No app desktop isso fica em **Settings → Advanced → In-App Update Local Changes**.
 
+**Updates do desktop nunca auto-restauram.** O updater do desktop invoca `hermes update --keep-stash`: edits locais de source ainda são stashados para o update poder prosseguir, mas **não** são reaplicados depois — ficam estacionados no `git stash` e o log do update imprime o comando exato `git stash apply <ref>` para trazê-los de volta. Isso impede que edits locais venham silenciosamente junto em updates do desktop e quebrem o install recém-atualizado. (`non_interactive_local_changes: discard` ainda vence se você optou por descartar.) Para restaurar mudanças estacionadas manualmente:
+
+```bash
+cd ~/.hermes/hermes-agent   # or your install root
+git stash list --format='%gd %H %s'   # find the hermes-update-autostash entry
+git stash apply stash@{0}
+```
+
+Você também pode passar `--keep-stash` a um `hermes update` de terminal se quiser o mesmo comportamento de nunca-reaplicar de forma interativa.
+
 ### Só preview: `hermes update --check`
 
 Quer saber se há update disponível antes de puxar? Rode `hermes update --check` — ele faz fetch e compara commits com `origin/main`. Nenhum arquivo é modificado, nenhum gateway é reiniciado. Útil em scripts e jobs de cron que dependem de "tem update?".
+
+### Preview de frota: `hermes update --plan` {#fleet-preview-hermes-update---plan}
+
+Antes de atualizar uma máquina que roda vários profiles ou serviços, `hermes update --plan` imprime o plano completo de update sem mudar nada: o tipo de install (git checkout, imagem Docker, gerenciado por Nix/apt), cada serviço Hermes em execução em todos os profiles com seu supervisor (systemd, launchd, manual) e a versão de código que realmente está servindo, e o mecanismo de restart que cada um receberá. Em installs gerenciados por imagem ou pacote o plano reporta que o install não é atualizável in-place e nomeia o comando de update correto. Somente leitura e seguro numa frota live.
+
+O mesmo inventário é embutido no receipt de cada update real (`~/.hermes/logs/update_receipts/`), então depois de um update você pode comparar o que o updater viu com o que ele fez.
+
+### Receipts de update e a checagem de versão da frota {#update-receipts-and-the-fleet-version-check}
+
+Toda execução de `hermes update` escreve um receipt machine-readable em `~/.hermes/logs/update_receipts/` (últimos 20 mantidos, `latest.json` sempre aponta para o mais recente): o plano de frota pré-update, cada passo tomado, qualquer coisa pulada e o porquê, o resultado do restart do gateway, e a matriz final de versões da frota. Depois da fase de restart o updater compara o código em execução de cada gateway live com o checkout recém-atualizado e imprime uma matriz por profile — um gateway ainda servindo código pré-update é reportado alto com o comando exato de restart, e o update sai com exit não-zero para que automação nunca trate uma frota de versões mistas como saudável.
 
 ### Backup completo pré-update: `--backup`
 
@@ -160,7 +186,7 @@ Você não precisa mais embrulhar `hermes update` em `screen` ou `tmux` para sob
 ### Conferindo a versão atual
 
 ```bash
-hermes version
+hermes --version
 ```
 
 Compare com o release mais recente na [página de releases do GitHub](https://github.com/NousResearch/hermes-agent/releases).

@@ -331,11 +331,53 @@ mcp_servers:
 ```
 
 Comportamento:
-- O Hermes usa o fluxo OAuth 2.1 PKCE do MCP SDK (descoberta de metadados, registro dinâmico de cliente, troca de token e refresh)
+- O Hermes usa o fluxo OAuth 2.1 PKCE do MCP SDK (descoberta de metadados, identificação de cliente, troca de token e refresh)
 - Na primeira conexão, uma janela do navegador abre para autorização
 - Tokens são persistidos em `~/.hermes/mcp-tokens/<server>.json` e reutilizados entre sessões
 - Refresh de token é automático; reautorização só ocorre quando o refresh falha
 - Aplica-se apenas ao transporte HTTP/StreamableHTTP (servidores baseados em `url`)
+
+### Identificação de cliente: CIMD e DCR {#client-identification-cimd-and-dcr}
+
+O Hermes se identifica para authorization servers com um **Client ID Metadata Document** (CIMD), o mecanismo que a spec MCP `2026-07-28` adotou no lugar de Dynamic Client Registration. O documento é publicado em
+`https://nousresearch.github.io/hermes-agent/docs/oauth/client-metadata.json`, e essa URL *é* o `client_id` — o authorization server o busca para aprender o nome, logo e redirect URIs permitidos do Hermes. Nada é registrado por install, e nada é específico do usuário.
+
+A escolha final pertence ao authorization server: o SDK envia a URL do documento como `client_id` só quando o server anuncia `client_id_metadata_document_supported: true` nos metadados, e caso contrário registra via DCR exatamente como antes. DCR está deprecated na spec MCP mas ainda é o que quase todo server deployed usa hoje.
+
+#### Portas de callback {#callback-ports}
+
+O documento declara um conjunto fixo de redirect URIs de loopback, e a spec exige que o redirect URI num pedido de autorização seja um *match exato de string* contra um deles — então um fluxo CIMD não pode usar a porta alta aleatória que o Hermes normalmente escolhe. O Hermes portanto fixa o callback em uma das portas `27890`–`27894`.
+
+Esse pin precisa ser escolhido antes das capabilities do server serem conhecidas, porque o redirect URI é fixado no início do fluxo enquanto os metadados do server só chegam no meio. Então o Hermes fixa a porta para qualquer fluxo que *possa* acabar usando CIMD, e reverte para uma porta aleatória no restante:
+
+- Um server ao qual o Hermes já se conectou antes, cujos metadados em cache não anunciam CIMD, mantém a porta aleatória que sempre usou.
+- Um server que o Hermes nunca alcançou recebe uma porta fixada nesse primeiro login, já que adivinhar é a única forma de CIMD alguma vez poder ser usado.
+- Qualquer coisa que moveria o callback para outro lugar também reverte: um `oauth.client_id` pré-registrado, um `oauth.client_secret`, um `oauth.client_name` ou `oauth.token_endpoint_auth_method` customizado, um override `oauth.redirect_uri` ou `oauth.redirect_port`, um login dirigido por dashboard ou desktop, um registro de cliente existente em disco, ou todas as cinco portas sendo seguradas por outros processos.
+
+Cada porta fixada é bound assim que escolhida e mantida até o redirect do browser chegar, então dois logins concorrentes — um segundo profile, ou outro server no mesmo processo — não podem cair no mesmo listener.
+
+#### Quando um server rejeita o documento {#when-a-server-rejects-the-document}
+
+Se um server busca o documento e o recusa no endpoint de *token* (`invalid_client`), o Hermes loga a rejeição, a registra sob `~/.hermes/mcp-tokens/<server>.cimd-off`, e usa DCR para aquele server daí em diante.
+
+Um server que não consegue buscar ou validar o documento de forma alguma aborta no endpoint de *authorization* em vez disso, antes de qualquer redirect. Não há sinal que o Hermes possa observar ali, então o browser mostra um erro invalid-client e o login dá timeout depois de cinco minutos. A mensagem de timeout nomeia o documento e aponta para `cimd: false`. Rodar `hermes mcp login <server>` limpa a rejeição registrada, então um documento corrigido ganha outra chance.
+
+#### Chaves opcionais por server {#optional-per-server-keys}
+
+```yaml
+mcp_servers:
+  protected_api:
+    url: "https://mcp.example.com/mcp"
+    auth: oauth
+    oauth:
+      client_metadata_url: "https://example.com/my-cimd.json"  # self-hosted document
+      cimd: false                                              # force DCR
+      user_agent: "My-MCP-Client/1.0"                          # token-request User-Agent
+```
+
+`client_metadata_url` deve ser uma URL HTTPS com path (sem origin bare, sem fragment, sem userinfo, sem segmentos `.`/`..`) que retorna `200` e `Content-Type: application/json` com **sem redirect** — authorization servers são proibidos de seguir redirects ao buscá-la. O Hermes ainda fixa seu callback no mesmo range `27890`–`27894`, então um documento self-hosted deve declarar todas as dez URIs de loopback (`http://127.0.0.1:<port>/callback` e `http://localhost:<port>/callback` para cada porta), e seu `client_id` deve ser sua própria URL.
+
+`user_agent` substitui o `User-Agent` padrão da biblioteca HTTP **só em requests ao token-endpoint** (troca de authorization-code e refresh) — alguns authorization servers e WAFs rejeitam o valor padrão `python-httpx/...` ali. Nunca se aplica a tráfego MCP ou descoberta OAuth, e nenhum outro header de token-request é configurável. Valores vazios ou null são ignorados.
 
 ## Link Add to Hermes {#add-to-hermes-link}
 

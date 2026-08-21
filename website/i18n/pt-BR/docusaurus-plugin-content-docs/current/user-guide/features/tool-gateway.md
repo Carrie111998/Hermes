@@ -124,37 +124,51 @@ O conjunto evolui — `hermes tools` → Image Generation mostra a lista ao vivo
 
 A maioria dos usuários nunca precisa mexer nisso — `hermes model` e `hermes tools` cobrem todo fluxo interativamente. Esta seção é para escrever config.yaml diretamente ou automatizar setups.
 
-### Flag `use_gateway` por ferramenta
+### Uma chave de seleção por categoria de ferramenta {#one-selection-key-per-tool-category}
 
-Cada bloco de config de ferramenta aceita um booleano `use_gateway`:
+Cada categoria de ferramenta tem uma única chave de seleção de provider, escrita pelo picker `hermes tools` (ou pela GUI desktop). Escolher a linha **Nous Subscription** armazena o valor `nous`, que roteia aquela categoria pelo Tool Gateway gerenciado. Escolher uma linha BYOK armazena o nome do vendor (`fal`, `openai`, `firecrawl`, `browser-use`, ...), que vai direto com suas próprias credenciais:
 
 ```yaml
 web:
-  backend: firecrawl
-  use_gateway: true
+  backend: nous          # web search/extract via the Tool Gateway
 
 image_gen:
-  use_gateway: true
+  provider: nous         # image generation via the Tool Gateway
 
 tts:
-  provider: openai
-  use_gateway: true
+  provider: nous         # TTS via the Tool Gateway
+
+stt:
+  provider: nous         # speech-to-text via the Tool Gateway
 
 browser:
-  cloud_provider: browser-use
-  use_gateway: true
+  cloud_provider: nous   # cloud browser via the Tool Gateway
 ```
 
-Precedência: `use_gateway: true` roteia pela Nous independentemente de chaves diretas no `.env`. `use_gateway: false` (ou ausente) usa chaves diretas se disponíveis e só faz fallback ao gateway quando nenhuma existe.
+O runtime **sempre usa a seleção armazenada** — a presença de credenciais nunca seleciona ou reroteia uma categoria. Uma `FAL_KEY` no `.env` é ignorada enquanto `image_gen.provider: nous`; por outro lado, `image_gen.provider: fal` sem `FAL_KEY` produz um erro claro em vez de cair silenciosamente no gateway:
 
-### Desabilitando o gateway {#disabling-the-gateway}
+```
+image_gen is configured to use fal (set via hermes tools), but FAL_KEY is not set. Run 'hermes tools' to change it.
+```
+
+Categorias que você **nunca configurou** (nenhuma chave de seleção jamais escrita) autodetectam a partir das credenciais disponíveis, como antes. Mas uma vez que uma seleção existe, adicionar uma chave ao `.env` não muda a rota — só `hermes tools` (ou editar a chave de seleção) faz isso.
+
+### Voltando às suas próprias chaves {#switching-back-to-your-own-keys}
+
+```bash
+hermes tools    # pick the tool → choose a direct provider (e.g. Firecrawl)
+```
+
+Ou defina a chave de seleção diretamente:
 
 ```yaml
 web:
-  use_gateway: false   # Hermes agora usa FIRECRAWL_API_KEY do .env
+  backend: firecrawl   # Hermes agora usa FIRECRAWL_API_KEY do .env
 ```
 
-`hermes tools` limpa a flag automaticamente quando você escolhe um provider não-gateway, então isso normalmente acontece por você.
+### Flag legada `use_gateway` (deprecated) {#legacy-use_gateway-flag-deprecated}
+
+Versões antigas do Hermes usavam um booleano `use_gateway: true` por ferramenta para rotear pelo gateway. Essa flag é **legada**: nunca mais é escrita, e o picker `hermes tools` a remove da config de uma categoria quando reescreve a seleção. Configs antigas que ainda contêm `use_gateway: true` são interpretadas na leitura como a seleção `nous`, então setups existentes continuam funcionando. Não defina `use_gateway` em configs novas — selecione o provider em `hermes tools`.
 
 ### Gateway self-hosted (avançado) {#self-hosted-gateway-advanced}
 
@@ -189,4 +203,4 @@ Modal está disponível como **add-on opcional** pela assinatura Nous, não faz 
 
 ### Preciso apagar minhas chaves de API existentes ao habilitar o gateway?
 
-Não — mantenha-as no `.env`. Com `use_gateway: true`, o Hermes pula chaves diretas e usa o gateway. Volte a flag para `false` e suas chaves voltam a ser a fonte. O gateway não é lock-in.
+Não — mantenha-as no `.env`. Enquanto a seleção de uma ferramenta for **Nous Subscription**, chaves diretas daquela ferramenta são simplesmente ignoradas. Escolha de novo o provider direto em `hermes tools` e suas chaves voltam a ser a fonte. O gateway não é lock-in.

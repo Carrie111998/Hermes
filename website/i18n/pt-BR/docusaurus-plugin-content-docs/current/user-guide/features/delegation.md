@@ -396,6 +396,11 @@ Com isolamento ligado:
   revisa ou faz merge de cada branch (`git log <branch>`, `git merge <branch>`).
 - Um worktree deixado **sem commits e com árvore limpa é podado automaticamente**
   (`pruned: true`); qualquer um que retenha trabalho é mantido.
+- A poda exige prova. Se um probe de inspeção git falhar — ou a finalização
+  em si der erro — o worktree e o branch são mantidos e a entrada carrega
+  `inspection_failed: true` mais uma `note` — `commits`/`dirty` passam a ser
+  defaults, não medições, então inspecione o worktree em vez de assumir que
+  o filho não produziu nada.
 
 Escopo: opt-in, só git, e só backend de terminal local. Num diretório que não é
 git, em backends docker/ssh/modal, ou se a criação do worktree falhar, a

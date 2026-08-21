@@ -237,7 +237,9 @@ Use servidores HTTP quando:
 
 ### Servidores HTTP com autenticação OAuth {#oauth-authenticated-http-servers}
 
-A maioria dos servidores MCP hospedados (Linear, Sentry, Atlassian, Asana, Figma, Stripe, …) exige OAuth 2.1 em vez de bearer token estático. Defina `auth: oauth` e o Hermes cuida de discovery, registro dinâmico de cliente, PKCE, troca de token, refresh e step-up auth via MCP Python SDK.
+A maioria dos servidores MCP hospedados (Linear, Sentry, Atlassian, Asana, Figma, Stripe, …) exige OAuth 2.1 em vez de bearer token estático. Defina `auth: oauth` e o Hermes cuida de discovery, identificação de cliente, PKCE, troca de token, refresh e step-up auth via MCP Python SDK.
+
+O Hermes se identifica com um [Client ID Metadata Document](../../reference/mcp-config-reference.md#client-identification-cimd-and-dcr) em servidores que suportam um, e faz fallback para Dynamic Client Registration nos que não suportam. Ambos são automáticos; não há nada a configurar.
 
 :::tip Figma remote MCP
 O endpoint hospedado da Figma (`https://mcp.figma.com/mcp`) allowlista Dynamic Client Registration por **`client_name` exato** — `"Hermes Agent"` nu 403s, enquanto `"Claude Code"` e `"Codex"` passam. O Hermes auto-define `oauth.client_name: "Claude Code"` para `mcp.figma.com` para install/login funcionar sem truque especial:

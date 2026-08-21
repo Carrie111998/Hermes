@@ -343,6 +343,41 @@ hermes plugins disable my-plugin             # remove from allow-list + add to d
 hermes plugins capabilities [my-plugin]      # declared vs granted capabilities
 ```
 
+### Links de install em um clique (Desktop) {#one-click-install-links-desktop}
+
+O Hermes Desktop registra o esquema de URL `hermes://`, então um site, README ou
+mensagem de chat pode linkar direto para o install de um plugin:
+
+```
+hermes://plugin/install?repo=owner/repo            # main install link
+hermes://plugin/install?repo=owner/repo&enable=1   # enable the agent plugin after install
+hermes://plugin/install?repo=owner/repo&force=1    # replace an existing install
+```
+
+Clicar abre o Hermes e mostra um **diálogo de confirmação** — o id do repo,
+uma nota "Before you install", e links de browse + clone do GitHub — depois
+faz shallow-clone do repo para detectar o que ele traz (um **agent plugin** —
+backend Python, um **desktop plugin** — UI do app, ou ambos). Você escolhe os
+componentes com checkboxes e confirma. Nada é instalado até você confirmar;
+deep links nunca auto-instalam, e installs de agent-plugin passam pela mesma
+[varredura de segurança na hora do install](#install-time-security-scanning) que
+`hermes plugins install`.
+
+Repos híbridos (metades agent + desktop num só repo) usam um link e um
+diálogo. O mesmo modal é alcançável sem link via **Settings → Plugins →
+Install from Git**. URLs legadas `hermes://plugin-agent/…` e
+`hermes://plugin-desktop/…` entram no mesmo diálogo. Em builds de dev
+(`npm run dev`) o esquema é `hermes-dev://`.
+
+Sites não precisam de SDK — um anchor normal funciona:
+
+```html
+<a href="hermes://plugin/install?repo=owner/repo&enable=1">Install in Hermes</a>
+```
+
+Servidores MCP têm a forma de link equivalente — veja
+[Add to Hermes link](/reference/mcp-config-reference#add-to-hermes-link).
+
 ### Plugin capabilities and consent {#plugin-capabilities-and-consent}
 
 Plugins podem declarar as superfícies host privilegiadas que querem no

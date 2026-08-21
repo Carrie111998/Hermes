@@ -985,6 +985,12 @@ hermes kanban create "monthly report" \
 
 Workers recebem `$HERMES_TENANT` e namespaciam writes de memória por prefix. O board, o dispatcher e as definições de profile são compartilhados; só os dados são scoped.
 
+## Notificações Desktop {#desktop-notifications}
+
+O plugin Kanban do app Desktop surfaceia os mesmos eventos terminais de forma nativa — sem plataforma de gateway. Enquanto o socket de eventos ao vivo do board Kanban estiver conectado, cada evento `completed`, `blocked`, `gave_up`, `crashed`, `timed_out` ou roteado para triage (`block_loop_detected`) dispara um toast in-app com o handoff do worker (summary, motivo de block ou erro) e uma ação "Open Kanban". Quando você está longe da janela do Hermes, o mesmo evento também dispara uma notificação nativa do SO (gateada por **Settings ▸ Notifications ▸ Plugin notifications**), então uma tarefa que bate num blocker enquanto você está em outro app ainda te alcança.
+
+Janela de cobertura: notificações desktop andam no stream de eventos ao vivo, então só disparam enquanto o app está rodando com o plugin Kanban habilitado. Eventos que chegam com o app fechado não são replayados como notificações no próximo launch — use uma subscription de gateway (abaixo) para entrega que precisa sobreviver ao app fechado.
+
 ## Notificações gateway {#gateway-notifications}
 
 Quando você roda `/kanban create …` do gateway (Telegram, Discord, Slack, etc.), o chat originador é automaticamente inscrito na nova tarefa. O notifier em background do gateway poll `task_events` a cada poucos segundos e entrega uma mensagem por evento terminal (`completed`, `blocked`, `gave_up`, `crashed`, `timed_out`) àquele chat. Tarefas completed também enviam a primeira linha do `--result` do worker para você ver o outcome sem `/kanban show`.

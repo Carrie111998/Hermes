@@ -18,18 +18,25 @@ Ambas são configuradas por uma única seleção de backend. Providers são esco
 
 | Provider | Variável de ambiente | Busca | Extração | Free tier |
 |----------|----------------------|-------|----------|-----------|
-| **Firecrawl** (padrão) | `FIRECRAWL_API_KEY` | ✔ | ✔ | 500 credits/mo |
+| **Firecrawl** (padrão) | `FIRECRAWL_API_KEY` (opcional — keyless quando selecionado) | ✔ | ✔ | 500 credits/mo · cloud keyless quando selecionado |
 | **SearXNG** | `SEARXNG_URL` | ✔ | — | ✔ Grátis (self-hosted) |
 | **Brave Search (free tier)** | `BRAVE_SEARCH_API_KEY` | ✔ | — | 2 000 queries/mo |
 | **DDGS (DuckDuckGo)** | — (sem chave) | ✔ | — | ✔ Grátis |
-| **Tavily** | `TAVILY_API_KEY` | ✔ | ✔ | 1 000 searches/mo |
-| **Exa** | `EXA_API_KEY` | ✔ | ✔ | 1 000 searches/mo |
-| **Parallel** | `PARALLEL_API_KEY` | ✔ | ✔ | Pago |
+| **Tavily** | `TAVILY_API_KEY` (opcional) | ✔ | ✔ | ✔ Membro do ring keyless · 1 000 searches/mo com chave free |
+| **Exa** | `EXA_API_KEY` (opcional) | ✔ | ✔ | ✔ Membro do ring keyless · 1 000 searches/mo com chave |
+| **Parallel** | `PARALLEL_API_KEY` (opcional) | ✔ | ✔ | ✔ Membro do ring keyless · pago com chave |
+| **Keenable** | `KEENABLE_API_KEY` (opcional) | ✔ | ✔ | ✔ Membro do ring keyless · pago com chave |
 | **xAI (Grok)** | `XAI_API_KEY` ou `hermes auth add xai-oauth` | ✔ | — | Pago (SuperGrok ou por token) |
 
 Brave Search, DDGS e xAI são **search-only** — combine qualquer um com Firecrawl/Tavily/Exa/Parallel quando também precisar de `web_extract`. DDGS usa o pacote Python [`ddgs`](https://pypi.org/project/ddgs/) por baixo; se ainda não estiver instalado, rode `pip install ddgs` (ou deixe o Hermes lazy-install na primeira uso). xAI roda a ferramenta server-side `web_search` do Grok na Responses API — resultados são gerados por LLM em vez de index-backed, então títulos, descrições e escolha de URL são toda saída do modelo (veja a [ressalva de trust model](#xai-grok) abaixo).
 
 **Split por capacidade:** você pode usar providers diferentes para search e extract independentemente — por exemplo SearXNG (grátis) para search e Firecrawl para extract. Veja [Configuração por capacidade](#per-capability-configuration) abaixo.
+
+:::info Funciona out of the box — rotação keyless de free-tier {#works-out-of-the-box--keyless-free-tier-rotation}
+Uma instalação nova **sem nenhuma credencial web** já tem `web_search` e `web_extract` funcionando: requests rotacionam round-robin pelos free tiers públicos de cinco vendors — **Exa, Parallel, Tavily, Firecrawl e Keenable** — espalhando carga de forma uniforme, e um request rate-limited automaticamente retenta no próximo vendor do ring (multi-hop, até um servir ou todos estarem throttled). Sem signup, sem chave. Esse tier é estritamente last-resort — qualquer backend configurado ou chave de API presente sempre vence — e os requests não carregam identificadores de usuário (só um session id aleatório por processo, rotacionado no restart). Para serviço garantido e sem throttle, configure um provider com chave. Desabilite o tier keyless por completo com `web.keyless_fallback: false`.
+:::
+
+**Escolher free vs paid explicitamente:** em `hermes tools`, Exa, Parallel e Keenable aparecem cada um como duas linhas — **Free (keyless)** e **Paid (API key)**. Escolher Free fixa o endpoint anônimo daquele vendor (mesmo que você depois adicione uma chave); escolher Paid fixa o caminho com chave (chave ausente então erra em vez de fazer downgrade silencioso para o free tier). A seleção é armazenada como `web.provider_tier.<name>: free|paid`; deixe unset para auto (chave presente → paid, senão o ring keyless).
 
 :::tip Assinantes Nous
 Se você tem assinatura paga do [Nous Portal](https://portal.nousresearch.com), web search e extract estão disponíveis pelo **[Tool Gateway](tool-gateway.md)** via Firecrawl gerenciado — sem chave de API. Instalações novas podem rodar `hermes setup --portal` para login e ligar todas as ferramentas do gateway de uma vez; instalações existentes podem ligar só web via `hermes tools`.
@@ -253,14 +260,17 @@ Com essa config, o Hermes usa SearXNG para todas as consultas de search e Firecr
 
 ### Tavily {#tavily}
 
-Search e extract otimizados para IA com free tier generoso.
+Search e extract otimizados para IA. Selecione Tavily em `hermes tools` (ou defina `web.backend: tavily`) para usá-lo **keyless** sem conta (rate-limited). Defina uma chave de API quando quiser limites maiores.
 
 ```bash
+# optional — skip this for keyless access after selecting Tavily
 # ~/.hermes/.env
 TAVILY_API_KEY=tvly-your-key-here
 ```
 
-Obtenha uma chave em [app.tavily.com](https://app.tavily.com/home). O free tier inclui 1 000 searches/mês.
+Obtenha uma chave em [app.tavily.com](https://app.tavily.com/home). Veja [Tavily keyless](https://docs.tavily.com/documentation/keyless).
+
+Instalações vazias mantêm Firecrawl como o default nomeado. Tavily keyless não é auto-selecionado.
 
 ---
 
@@ -360,16 +370,16 @@ web:
   extract_backend: "firecrawl"  # used by web_extract
 ```
 
-Quando chaves por capacidade estão vazias, ambas fazem fallback para `web.backend`. Quando `web.backend` também está vazio, o backend é auto-detectado de qualquer chave/URL presente.
+Quando chaves por capacidade estão vazias, ambas fazem fallback para `web.backend`. Só quando nenhuma seleção web jamais foi escrita o backend é auto-detectado de qualquer chave/URL presente — uma vez que uma seleção existe, o runtime sempre a usa, e adicionar uma chave ao `.env` não reroteia o tráfego web.
 
 **Ordem de prioridade (por capacidade):**
 1. `web.search_backend` / `web.extract_backend` (explícito por capacidade)
-2. `web.backend` (fallback compartilhado)
-3. Auto-detect de variáveis de ambiente
+2. `web.backend` (fallback compartilhado; `nous` = Tool Gateway gerenciado)
+3. Auto-detect de variáveis de ambiente (só setups nunca configurados)
 
 ### Auto-detecção {#auto-detection}
 
-Se nenhum backend estiver explicitamente configurado, o Hermes escolhe o primeiro disponível com base em quais credenciais estão definidas:
+Se nenhum backend **jamais** foi selecionado (nenhuma chave `web.backend` / por capacidade escrita por você ou por `hermes tools`), o Hermes escolhe o primeiro disponível com base em quais credenciais estão definidas:
 
 | Credencial presente | Backend auto-selecionado |
 |--------------------|-----------------------|
@@ -378,6 +388,13 @@ Se nenhum backend estiver explicitamente configurado, o Hermes escolhe o primeir
 | `TAVILY_API_KEY` | tavily |
 | `EXA_API_KEY` | exa |
 | `SEARXNG_URL` | searxng |
+| `BRAVE_SEARCH_API_KEY` | brave-free |
+| `ddgs` package importable | ddgs |
+| *(nada definido)* | ring keyless: exa / parallel / tavily / firecrawl / keenable (round-robin) |
+
+**Ring keyless de free-tier:** quando *nenhuma* credencial acima está presente, requests rotacionam pelos free tiers públicos de cinco vendors (Exa, Parallel, Tavily, Firecrawl, Keenable) para que as tools web funcionem numa instalação nova com zero setup — e um request rate-limited faz failover automaticamente para o próximo vendor do ring. Fixe um vendor em `hermes tools` para parar a rotação (o ring então só é usado como sucessão de failover em throttles). Todos os free tiers têm rate-limit do vendor sob carga em rajada; uso normal sustentado passa bem. Defina `web.keyless_fallback: false` para desligar o tier — com ele off e sem credenciais, as tools web ficam indisponíveis até um provider ser configurado.
+
+**Rescue keyless one-shot para backends com chave:** quando seu backend escolhido/com chave falha numa chamada (chave ruim, outage, 5xx upstream), aquela chamada única automaticamente retenta no ring keyless de free-tier em vez de errar — o resultado anota qual vendor serviu e o porquê (`rescued_from` / `backend_error`). O failover nunca é sticky: a próxima chamada `web_search`/`web_extract` tenta de novo seu backend escolhido. Desabilite com `web.keyless_rescue: false` (também off sempre que `keyless_fallback` estiver off).
 
 xAI Web Search **não** está na cadeia de auto-detecção — ter `XAI_API_KEY` definida (ou estar logado via xAI Grok OAuth) não roteia automaticamente tráfego web pela xAI, já que essas credenciais também são usadas para inferência / TTS / image gen e o usuário pode querer backend diferente para web. Opt-in explicitamente com `web.backend: "xai"`.
 

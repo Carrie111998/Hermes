@@ -32,7 +32,7 @@ Os preços são da FAL no momento da escrita; confira [fal.ai](https://fal.ai/) 
 :::tip Assinantes Nous
 Se você tem uma assinatura paga do [Nous Portal](https://portal.nousresearch.com), pode usar geração de imagens pelo **[Tool Gateway](tool-gateway.md)** sem uma chave de API FAL. Sua seleção de modelo persiste em ambos os caminhos. Instalações novas podem rodar `hermes setup --portal` para fazer login e ligar todas as ferramentas do gateway de uma vez; instalações existentes podem escolher **Nous Subscription** como backend de image-gen via `hermes tools`.
 
-Se o gateway gerenciado retornar `HTTP 4xx` para um modelo específico, esse modelo ainda não está proxied no lado do portal — o agente informará, com passos de remediação (defina `FAL_KEY` para acesso direto, ou escolha outro modelo).
+Se o gateway gerenciado retornar `HTTP 4xx` para um modelo específico, esse modelo ainda não está proxied no lado do portal — o agente informará, com passos de remediação (mude para FAL.ai em `hermes tools` com sua própria `FAL_KEY` para acesso direto, ou escolha outro modelo).
 :::
 
 ### Obtenha uma chave de API FAL {#get-a-fal-api-key}
@@ -62,13 +62,43 @@ Sua seleção é salva em `config.yaml`:
 
 ```yaml
 image_gen:
+  provider: fal                 # `nous` if you picked Nous Subscription
   model: fal-ai/flux-2/klein/9b
-  use_gateway: false            # true if using Nous Subscription
   max_parallel_requests: 4      # concurrent images in one tool-call batch
 ```
 
+`image_gen.provider` é a chave única de seleção: `nous` roteia pelo Tool Gateway gerenciado; um nome de vendor (`fal`, `openai`, `xai`, `krea`, ...) vai direto com sua própria chave. O runtime sempre segue essa seleção armazenada — uma `FAL_KEY` no `.env` é ignorada enquanto `provider: nous`, e `provider: fal` sem `FAL_KEY` erra com `image_gen is configured to use fal (set via hermes tools), but FAL_KEY is not set. Run 'hermes tools' to change it.` em vez de rerotear silenciosamente. Mude providers via `hermes tools`, não adicionando/removendo chaves. (O booleano antigo `use_gateway` é legado — ainda lido como `nous` quando `true`, mas nunca mais escrito.)
+
 `max_parallel_requests` tem padrão `4`. O Hermes limita a pelo menos um e
 ao limite global de tool-workers, então providers de imagem recebem requisições paralelas limitadas sem permitir que um batch de imagens contorne o cap de concorrência do agente.
+
+### OpenRouter: o catálogo completo da Image API {#openrouter-the-full-image-api-catalog}
+
+Com `image_gen.provider: openrouter`, o model picker lista o catálogo live
+inteiro de imagens do OpenRouter — os modelos dedicados da
+[Image API](https://openrouter.ai/docs/guides/overview/multimodal/image-generation)
+(Seedream, FLUX.2, Recraft, Qwen Image, MAI, Krea, Riverflow, Grok
+Imagine, e mais — 40+ ids) mesclados com os modelos de imagem de
+chat-completions. O catálogo é buscado ao vivo de `GET /images/models` e
+`GET /models`, então novos modelos aparecem no picker assim que o
+OpenRouter os serve; nenhum update do Hermes é necessário. A geração
+roteia cada modelo para a superfície que o serve (`POST /images/generations`
+dedicado vs chat-completions) automaticamente. O Nous Portal faz proxy
+só do protocolo chat-completions, então seu picker oferece os modelos
+servidos via chat.
+
+Knobs opcionais por request para modelos da Image API ficam na seção de
+config com escopo (ou env vars `OPENROUTER_IMAGE_API_*`):
+
+```yaml
+image_gen:
+  provider: openrouter
+  model: bytedance-seed/seedream-4.5
+  openrouter:
+    resolution: 2K        # model-dependent: 1K / 2K / 4K
+    quality: high         # gpt-image models
+    output_format: png
+```
 
 ### Qualidade GPT-Image {#gpt-image-quality}
 
@@ -119,6 +149,7 @@ Duas entradas dirigem a edição:
 | **xAI** (Grok Imagine) | ✓ | 1 | `/v1/images/edits` (`grok-imagine-image-quality`) |
 | **Krea** (`Krea 2`) | ✓ | até 10 | geração guiada por referência (`image_style_references`) |
 | **OpenAI (Codex auth)** | ✓ | até 16 | ferramenta Codex Responses `image_generation` com content parts `input_image` |
+| **OpenRouter** (modelos Image API) | ✓ | até 14–16 (por modelo) | `input_references` em `POST /images/generations`; modelos servidos via chat usam content parts `image_url` (até 3) |
 
 Modelos FAL com endpoint de edição: `flux-2/klein/9b`, `flux-2-pro`,
 `nano-banana-pro`, `gpt-image-1.5`, `gpt-image-2`, `ideogram/v3` e
@@ -199,7 +230,7 @@ Se upscaling falhar (problema de rede, rate limit), a imagem original é retorna
 
 1. **Resolução de modelo** — `_resolve_fal_model()` lê `image_gen.model` de `config.yaml`, cai para a env var `FAL_IMAGE_MODEL`, depois para `fal-ai/flux-2/klein/9b`.
 2. **Construção de payload** — `_build_fal_payload()` traduz seu `aspect_ratio` para o formato nativo do modelo (enum preset, enum aspect-ratio ou literal GPT), mescla os params padrão do modelo, aplica quaisquer overrides do caller e filtra pela whitelist `supports` do modelo para que chaves não suportadas nunca sejam enviadas.
-3. **Submissão** — `_submit_fal_request()` roteia via credenciais FAL diretas ou gateway Nous gerenciado.
+3. **Submissão** — `_submit_fal_request()` roteia via credenciais FAL diretas ou gateway Nous gerenciado, conforme a seleção armazenada de `image_gen.provider`.
 4. **Upscaling** — roda só quando o agente passou `upscale: true`; o default do catálogo de todo modelo está off.
 5. **Entrega** — URL final da imagem retornada ao agente, que emite uma tag `MEDIA:<url>` que adapters de plataforma convertem em mídia nativa.
 

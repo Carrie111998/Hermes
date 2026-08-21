@@ -34,7 +34,7 @@ As ferramentas `web_search` e `web_extract` suportam oito backends de provedor, 
 | **SearXNG** | `SEARXNG_URL` | ✔ | — | — |
 | **Brave** (free tier) | `BRAVE_SEARCH_API_KEY` | ✔ | — | — |
 | **DuckDuckGo** (ddgs) | _(none)_ | ✔ | — | — |
-| **Tavily** | `TAVILY_API_KEY` | ✔ | ✔ | ✔ |
+| **Tavily** | `TAVILY_API_KEY` (opcional) | ✔ | ✔ | — |
 | **Exa** | `EXA_API_KEY` | ✔ | ✔ | — |
 | **Parallel** | `PARALLEL_API_KEY` | ✔ | ✔ | — |
 | **xAI** | `XAI_API_KEY` | ✔ | — | — |
@@ -46,7 +46,7 @@ web:
   backend: firecrawl    # firecrawl | searxng | brave-free | ddgs | tavily | exa | parallel | xai
 ```
 
-Se `web.backend` não estiver definido, o backend é detectado automaticamente a partir de qualquer chave de API disponível. Firecrawl self-hosted também é suportado via `FIRECRAWL_API_URL`.
+Se `web.backend` não estiver definido, o backend é detectado automaticamente a partir de qualquer chave de API disponível. Firecrawl self-hosted também é suportado via `FIRECRAWL_API_URL`. Selecionar Tavily em `hermes tools` funciona sem chave.
 
 ## Automação de browser {#browser-automation}
 

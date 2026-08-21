@@ -27,6 +27,11 @@ hermes
 # Single query mode (non-interactive)
 hermes chat -q "Hello"
 
+# Single query from a file or stdin — nothing is shell-interpreted, so
+# arbitrary text (quotes, $(...), backticks) arrives verbatim
+hermes chat --query-file prompt.txt
+hermes chat --query-file - < prompt.txt
+
 # With a specific model
 hermes chat --model "anthropic/claude-sonnet-4"
 
@@ -52,6 +57,44 @@ hermes chat --verbose
 hermes -w                         # Interactive mode in worktree
 hermes -w -z "Fix issue #123"     # Single query in worktree
 ```
+
+### Limpeza de worktree {#worktree-cleanup}
+
+Sessões `hermes -w` criam worktrees descartáveis sob `<repo>/.worktrees/`.
+Um pruner conservador roda automaticamente no startup (só remove árvores
+scratch limpas e fully-merged além de um limiar de idade), mas árvores
+preservadas e branches locais merged ainda acumulam em máquinas ocupadas.
+Recupere-as explicitamente:
+
+```bash
+hermes worktree list              # audit: age, size, verdict, reason per tree
+hermes worktree prune             # remove safe trees + delete merged branches
+hermes worktree prune --dry-run   # show the plan without changing anything
+hermes worktree prune --trees-only     # leave local branches alone
+hermes worktree prune --branches-only  # leave worktrees alone
+```
+
+Dentro de uma sessão, `/worktree prune [--dry-run]` faz o mesmo (e nunca
+toca a árvore em que a sessão está rodando).
+
+Garantias de segurança (todos os modos, qualquer idade):
+
+- Mudanças **tracked** não commitadas nunca são apagadas.
+- **Commits unpushed únicos** nunca são apagados — commits que foram
+  rebase/squash-merged upstream são detectados via equivalência de patch
+  `git cherry` e contam como merged, o que finalmente permite recuperar o
+  vazamento dominante "PR merged, árvore preservada para sempre".
+- Árvores **em uso por uma sessão hermes em execução** nunca são tocadas.
+- Scratch **só untracked** (rascunhos de body de PR, notas) é arquivado em
+  `~/.hermes/archive/worktree-prune/` antes da árvore ser removida — nunca
+  destruído.
+- Deleção de branch é gated por conteúdo, não por nome: qualquer branch
+  local cujos commits estão todos no upstream é seguro de apagar; branches
+  com trabalho único, branches checked-out e `main`/`master`/`develop`
+  são sempre mantidos.
+
+Quando `.worktrees/` passa de 10 árvores ou 5 GB, o startup imprime um aviso
+de uma linha apontando para esses comandos.
 
 ## Layout da interface
 

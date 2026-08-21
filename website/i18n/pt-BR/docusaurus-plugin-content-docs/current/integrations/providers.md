@@ -39,6 +39,7 @@ Você precisa de pelo menos uma forma de se conectar a um LLM. Use `hermes model
 | **OpenCode Zen** | `OPENCODE_ZEN_API_KEY` em `~/.hermes/.env` (provedor: `opencode-zen`) |
 | **CommandCode** | `COMMANDCODE_API_KEY` em `~/.hermes/.env` (provedor: `commandcode`, alias: `commandcode-chat`; modelos Claude via `commandcode-anthropic`, alias: `commandcode-claude`). Funciona com planos GOAT/Pro/Max/Provider (não o plano Go de $1 — sem acesso à API). |
 | **OpenCode Go** | `OPENCODE_GO_API_KEY` em `~/.hermes/.env` (provedor: `opencode-go`) |
+| **OpenCode Free** | Sem chave — não precisa de API key nem conta (provedor: `opencode-free`, aliases: `free`, `opencode_free`). Selecione via `hermes model` ou `/model free`; requisições são enviadas anonimamente |
 | **DeepSeek** | `DEEPSEEK_API_KEY` em `~/.hermes/.env` (provedor: `deepseek`) |
 | **Hugging Face** | `HF_TOKEN` em `~/.hermes/.env` (provedor: `huggingface`, aliases: `hf`) |
 | **Google / Gemini** | `GOOGLE_API_KEY` (ou `GEMINI_API_KEY`) em `~/.hermes/.env` (provedor: `gemini`) |
@@ -260,6 +261,10 @@ hermes chat --provider tencent-tokenhub --model hy3-preview
 hermes chat --provider arcee --model trinity-large-thinking
 # Requer: ARCEEAI_API_KEY em ~/.hermes/.env
 
+# Meta Model API (família Muse Spark)
+hermes chat --provider meta-ai --model muse-spark-1.2
+# Requer: MODEL_API_KEY em ~/.hermes/.env
+
 # GMI Cloud
 # Use o ID de modelo exato retornado pelo endpoint /v1/models da GMI.
 hermes chat --provider gmi --model zai-org/GLM-5.1-FP8
@@ -275,7 +280,11 @@ model:
   default: "zai-org/GLM-5.1-FP8"
 ```
 
-As URLs base podem ser sobrescritas com as variáveis de ambiente `NOVITA_BASE_URL`, `GLM_BASE_URL`, `KIMI_BASE_URL`, `MINIMAX_BASE_URL`, `MINIMAX_CN_BASE_URL`, `DASHSCOPE_BASE_URL`, `XIAOMI_BASE_URL`, `GMI_BASE_URL`, ou `TOKENHUB_BASE_URL`.
+As URLs base podem ser sobrescritas com as variáveis de ambiente `NOVITA_BASE_URL`, `GLM_BASE_URL`, `KIMI_BASE_URL`, `MINIMAX_BASE_URL`, `MINIMAX_CN_BASE_URL`, `DASHSCOPE_BASE_URL`, `XIAOMI_BASE_URL`, `GMI_BASE_URL`, `META_BASE_URL`, ou `TOKENHUB_BASE_URL`.
+
+:::note Tier de contribuidores Meta
+`muse-spark-1.2-contributor` é o tier com desconto da Meta — a Meta pode treinar com seus prompts e completions, então a [seleção interativa de modelo pede confirmação](../user-guide/configuring-models.md) antes de usá-lo. Use `muse-spark-1.2` (preço padrão, sem treinamento) para trabalho confidencial.
+:::
 
 :::note Detecção Automática de Endpoint da Z.AI
 Ao usar o provedor Z.AI / GLM, o Hermes sonda automaticamente múltiplos endpoints (variantes global, China, coding) para encontrar um que aceite sua chave de API. Você não precisa definir `GLM_BASE_URL` manualmente — o endpoint funcional é detectado e armazenado em cache automaticamente.

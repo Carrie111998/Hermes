@@ -7,8 +7,8 @@ sidebar_position: 5
 Registre todos os backends Hermes que você possui — o runtime local, gateways remotos na
 LAN ou num VPS, hosts SSH e instâncias Hermes Cloud — em um único app desktop,
 e use os agentes de todos eles lado a lado. As conexões são persistentes:
-cada source registrado disca os próprios backends e WebSockets sob demanda, e
-agentes em background continuam fazendo streaming enquanto você olha para outro source.
+cada gateway registrado disca os próprios backends e WebSockets sob demanda, e
+agentes em background continuam fazendo streaming enquanto você olha para outro gateway.
 
 Este é o complemento no desktop de
 [Executando vários gateways ao mesmo tempo](./multi-profile-gateways.md): aquela página é
@@ -17,23 +17,26 @@ falando com várias máquinas.
 
 ## Onde encontrar {#where-to-find-it}
 
-Três portas levam ao mesmo painel:
+Tudo mora na página unificada **Settings → Gateways** (builds mais antigos tinham
+páginas separadas **Gateway** e **Connections**; deep links legados de Connections
+redirecionam para lá). Três portas levam a ela:
 
-- **Settings → Connections** — o próprio painel (**Cmd/Ctrl+,**, depois
-  **Connections** na nav de settings).
+- **Settings → Gateways** — a própria página (**Cmd/Ctrl+,**, depois
+  **Gateways** na nav de settings). O registry de conexões é uma seção
+  dessa página, abaixo dos controles de connection-mode no nível da máquina.
 - **O rail de profiles da sidebar** — o botão de plugue na ponta direita do rail
   (tooltip: **"Connect another Hermes gateway…"**) faz deep-link direto para
-  Settings → Connections. Fica sempre visível, mesmo antes de você criar
+  a página Gateways. Fica sempre visível, mesmo antes de você criar
   um segundo profile ou uma segunda conexão.
-- **A command palette** — **Cmd/Ctrl+K**, depois digite *Connections* (também
-  casa com *add gateway*, *remote*, *ssh*, *instances*).
+- **A command palette** — **Cmd/Ctrl+K**, depois digite *Gateways* (também
+  casa com *connections*, *add gateway*, *remote*, *ssh*, *instances*).
 
-## O registro de conexões {#the-connection-registry}
+## O registro de gateways {#the-gateway-registry}
 
-**Settings → Connections** gerencia um registro nomeado de sources de agente. A
-introdução do painel diz direto: *"Register every place your agents live — this
-device, remote gateways on your network, and Hermes Cloud instances. All of
-them are stored here."* Cada entrada é uma *connection*:
+A seção **Registered gateways** de **Settings → Gateways** gerencia uma lista
+nomeada de gateways Hermes. A introdução diz direto: *"Manage this device and
+every Hermes gateway it can reach through remote, SSH, or Cloud connections."*
+Cada entrada é uma *connection*:
 
 | Tipo | O que é | Auth |
 |---|---|---|
@@ -48,29 +51,45 @@ Regras que vale conhecer:
   O nome aparece em todo lugar em que a instância surge — badges do roster, handles,
   resultados de update. Unicidade ignora maiúsculas/minúsculas, então `Homelab` e `homelab`
   não podem coexistir.
-- A entrada **local** é gerenciada pelo app (usa um pill **This device**)
+- A entrada **local** é gerenciada pelo app (usa um pill **App-managed**)
   e não pode ser removida. Remover qualquer outra conexão derruba os backends
   e túneis ao vivo; a instância em si não é tocada.
-- Uma conexão é sempre a **Primary** (pill na linha): ela é dona do
-  window backend gerenciado pelo app — overlay de boot e a máquina de install/update.
-  **Make primary** em qualquer linha retargeta isso; remover a primary cai de volta
-  para a entrada local.
+- Uma conexão é sempre a **Primary** (pill na linha): ela é o
+  fallback do registry para chamadas multi-gateway que não nomeiam um gateway.
+  **Make primary** não troca o workspace atual de Sessions; remover
+  a primary cai de volta para a entrada local.
+- **At startup, return to Sessions on the last-used gateway** controla qual
+  gateway Sessions abre depois de um restart completo do app. Fica off por padrão, então
+  Sessions abre no **Primary**. Ligue para retomar o gateway mais recente
+  que conectou com sucesso. Um switch que falhou nunca é lembrado, e um
+  gateway salvo removido ou indisponível cai de volta para Primary.
 - **Test** sonda as pernas HTTP *e* WebSocket da própria conexão, então um pass
   (toast *"Reachable"*) significa que o chat de fato vai funcionar — não só que o
   host pingou.
-- Entradas Cloud vêm do fluxo de sign-in/discovery do Hermes Cloud
-  (Settings → Gateway), não de uma URL digitada — por isso o editor de add-connection
-  só oferece **Remote gateway** e **SSH**.
+- **Duplicatas são rejeitadas quando você salva**: só existe uma entrada **local**;
+  entradas **remote** e **cloud** são deduplicadas na URL normalizada
+  (trimmed, trailing slashes removidos, lowercased — e entre ambos os
+  kinds, então uma entrada cloud e uma remote não podem apontar para a mesma URL);
+  entradas **SSH** são deduplicadas no `user@host:port` normalizado mais
+  o profile remoto.
+- Entradas Cloud normalmente vêm do fluxo de sign-in/discovery do Hermes Cloud no
+  topo da página Gateways — o kind **Hermes Cloud** no editor de add-connection
+  aponta você para lá.
 
-Como a própria caption do painel nota: *"Chats and the agent roster follow the
-source you pick; the app-managed window backend is still chosen in
-Settings → Gateway."*
+Troque gateways pela sidebar **Sessions**. Profiles, chats, messaging e
+cron ficam escopados àquele gateway; o window backend gerenciado pelo app ainda é escolhido
+pelos controles de connection-mode acima. **Primary** é o fallback do registry e
+não troca o workspace atual.
 
 ## Adicionando uma conexão, passo a passo {#adding-a-connection-step-by-step}
 
-1. Abra **Settings → Connections** (ou clique no plugue no rail de profiles).
+1. Abra **Settings → Gateways** e role até o registry de conexões (ou
+   clique no plugue no rail de profiles).
 2. Clique em **Add connection**.
-3. Escolha o tipo: **Remote gateway** ou **SSH**.
+3. Escolha o tipo: **Local**, **Hermes Cloud**, **Remote gateway** ou **SSH**.
+   (**Local** fica desabilitado enquanto a entrada local gerenciada pelo app existir — o que
+   é quase sempre; **Hermes Cloud** direciona você ao fluxo de sign-in/discovery
+   cloud acima.)
 4. Preencha os campos:
    - **Name** — obrigatório, único; o "device name" mostrado em todo lugar em que
      esta instância aparece (placeholder: `Homelab`). Máximo 64 caracteres.
@@ -107,53 +126,104 @@ e orientação de Tailscale.
 ### Migrando das settings de conexão única {#migrating-from-the-single-connection-settings}
 
 O primeiro launch de um build com registry importa as settings existentes
-automaticamente: o modo de conexão global e quaisquer overrides por profile de
-Settings → Gateway viram entradas nomeadas no registro (deduplicadas por URL/host).
+automaticamente: o modo de conexão global e quaisquer overrides legados por profile de
+Settings → Gateway viram entradas nomeadas no registro (deduplicadas
+por URL/host). (Builds mais novos não oferecem mais overrides por profile na
+página Gateways — conexões de gateway são no nível da máquina, e profiles
+são descobertos a partir dos gateways a que você conecta.)
 O arquivo legado de settings fica intacto, então builds mais antigos na mesma
 máquina continuam funcionando. Se um nome migrado colidiu, ganhou sufixo
 (`Homelab 2`).
 
-## Agentes entre sources {#agents-across-sources}
+## Agentes entre gateways {#agents-across-gateways}
 
 Cada [profile](./profiles.md) em cada conexão registrada é um *agent*.
-O roster união é o que as superfícies multi-source (e plugins como
-[Bot Mode](https://github.com/NousResearch/Hermes-Bot-Mode)) renderizam:
+O roster união é o que as superfícies multi-gateway (e o roster built-in do
+[Bot Mode](./bot-mode.md)) renderizam:
 
-- Quando o mesmo nome de profile existe em vários sources, os handles desambiguam
+- Quando o mesmo nome de profile existe em vários gateways, os handles desambiguam
   como **`@name-device`** — `research` no seu Homelab renderiza como
-  `@research-homelab`, enquanto um profile único em todos os sources mantém o
+  `@research-homelab`, enquanto um profile único em todos os gateways mantém o
   nome nu.
 - A enumeração é eager, mas os sockets são lazy: o app lista agentes via REST
-  sem discar o WebSocket de cada source. Um source inalcançável reporta
-  por linha em vez de quebrar o roster; sources SSH ficam connect-on-demand
-  até você abrir um agente neles pela primeira vez (sem túneis-surpresa).
-- Abrir um agente disca **o próprio source dele** — chats, sessões e memória
+  sem discar o WebSocket de cada gateway. Um gateway inalcançável reporta
+  por linha em vez de quebrar o roster; conexões SSH ficam connect-on-demand
+  até você abrir um agente nelas pela primeira vez (sem túneis-surpresa).
+- Abrir um agente disca **o próprio gateway dele** — chats, sessões e memória
   vivem na máquina que é dona do profile, exatamente como se você estivesse usando
   aquela instância direto.
 
 Cada par `(connection, profile)` ganha o próprio backend e socket, pooled
 com o mesmo idle-reaping dos backends locais por profile — agentes em background
-continuam o streaming enquanto você olha para outro source.
+continuam o streaming enquanto você olha para outro gateway.
 
 ### Alternar e escopo {#switching-and-scoping}
 
-Alternar agentes é o mesmo gesto que alternar profiles:
+O pé da sidebar segue uma hierarquia: **gateway → profile → sessions**.
+Gateways são máquinas ou backends hospedados; profiles são agentes Hermes isolados
+que vivem num gateway.
 
-- **O rail de profiles** no pé da sidebar troca o profile ativo; o
-  pill home volta ao profile default e o pill de camadas mostra a
-  view **All profiles**. **Cmd/Ctrl+1–9** trocam profiles pelo teclado.
-- A lista de sessões da sidebar, cron jobs e status de mensageria são **escopados ao
-  profile ativo** — e, para agentes em outro source, à máquina daquele source.
-  Sessões que você vê sob `@research-homelab` vivem no Homelab;
-  os cron jobs dele rodam lá; os canais de mensageria são os que o gateway
-  dele hospeda. A view **All profiles** mescla as sessões de cada profile numa
-  lista, com tags por profile.
+- Com um gateway registrado, nenhum controle de gateway é adicionado. Desktop só-local
+  mantém o mesmo rail de profiles e fluxo de teclado de antes.
+- Com vários gateways, a sidebar mostra um seletor de gateway nomeado. Seu ícone de device,
+  cloud, network ou terminal identifica o tipo de conexão; avatars de
+  profile permanecem um controle separado depois do divisor. O mesmo seletor escala
+  de dois gateways a uma frota maior sem transformar backends em glyphs estilo
+  profile nem empurrar ações de profile para fora do rail.
+- Selecionar um gateway restaura o último profile usado lá. O rail de profiles
+  então mostra só os profiles daquele gateway; o pill home volta ao default
+  dele e o pill de camadas mostra **All profiles on this gateway**.
+  **Cmd/Ctrl+1–9** continuam trocando profiles dentro do gateway ativo.
+- O gateway selecionado sobrevive a um quit e relaunch só quando **Settings →
+  Gateways → At startup, return to Sessions on the last-used gateway** está on.
+  A preferência e o id do gateway vivem no registry de user-data do app, então
+  substituir ou atualizar o application bundle não os reseta.
+- Com mais de treze profiles no gateway ativo, a faixa de avatars
+  condensa num seletor de profile nomeado. Conjuntos grandes de gateway e profile podem
+  portanto coexistir sem mudar o modelo **gateway → profile → sessions**.
+- **This device** permanece um gateway de primeira classe mesmo quando uma conexão remota é
+  Primary. Pode manter sessões locais disponíveis durante uma outage remota, mas o
+  app não o chama de "offline mode": o modelo ou tools selecionados ainda podem
+  exigir acesso à internet.
+- A lista de sessões, canais de messaging, cron jobs, settings, files e memória
+  são todos escopados ao `(gateway, profile)` ativo. Trocar de um gateway Telegram
+  para um gateway Signal não pode deixar os channel groups ou sessões do gateway
+  anterior na sidebar.
+- Meramente exibir o switcher lê o registry local de conexões do Electron.
+  Gateways remotos só são abertos quando selecionados; não há polling periódico
+  da frota.
 - Passar o mouse sobre um agente pré-aquece o backend dele para o switch não pagar cold
   boot.
+- A página **Capabilities** (Skills / Tools / MCP) tem um escopo correspondente: seu
+  seletor **Configuring** lista todo agente `(profile, device)` do
+  roster união, e escolher um lê e escreve skills, toolsets e servidores MCP
+  **daquela máquina** sem trocar o workspace de Sessions. Installs do hub,
+  env keys e setup MCP todos caem no backend do agente selecionado.
+  O botão *hot-reload into a live session* da tab MCP aparece só para agentes
+  no gateway ao qual a janela está conectada; edits em outras máquinas aplicam
+  na próxima sessão delas.
+
+Adicione, teste, renomeie ou remova gateways em **Settings → Gateways**. O botão de
+plugue ao lado das ações de profile é um atalho para essa única home de
+gerenciamento, não um segundo fluxo de add.
+
+### Sessions e Bot Mode {#sessions-and-bot-mode}
+
+Sessions intencionalmente mostram um gateway ativo de cada vez: isso mantém files,
+tools, channels, cron e histórico de sessão num contexto de execução
+compreensível. Bot Mode serve um job diferente e pode apresentar o roster união,
+agrupado por gateway, para um usuário abrir um agente num NAS e outro num VPS
+de uma superfície. Abrir um bot ainda ativa a rota exata `(gateway, profile)`
+dele.
+
+Mentions diretas de bot e delegation permanecem gateway-local por padrão. Cruzar um
+boundary de backend muda filesystem, credenciais, tools e contexto de trust, então
+execução cross-gateway deve ser uma bridge explícita em vez de um side effect
+acidental de compartilhar uma janela Desktop.
 
 ## Atualizando todas as instâncias de uma vez {#updating-every-instance-at-once}
 
-**Settings → Connections → Update all instances** (aparece quando mais de uma
+**Settings → Gateways → Update all instances** (aparece quando mais de uma
 conexão está registrada) dispara `hermes update` em paralelo para cada conexão
 elegível:
 
@@ -168,6 +238,13 @@ Cada instância reporta de forma independente, então uma caixa inalcançável n
 lote. Backends que gerenciam updates por fora (Docker, Nix) recusam educadamente
 com a própria mensagem, por linha.
 
+Você raramente precisa do botão Settings, porém: uma vez que existe mais de um alvo de
+update, as affordances regulares de update do app (**Update now** no painel About,
+⌘K **Update Hermes**, o toast update-ready) rodam o mesmo fan-out
+automaticamente — backend ativo primeiro, depois todo outro gateway elegível, depois
+o próprio app desktop por último. Veja
+[Atualização](./desktop.md#updating) no guia desktop.
+
 ## Notas de segurança {#security-notes}
 
 - **Onde os tokens vivem.** Session tokens de remote-gateway são criptografados em rest
@@ -178,7 +255,7 @@ com a própria mensagem, por linha.
   renovados automaticamente antes de expirar.
 - **Linux sem keyring.** Numa sessão Linux sem keychain usável o
   app não consegue criptografar o token; salvar um abre um diálogo explícito de opt-in
-  (o mesmo fluxo de consentimento de Settings → Gateway) antes de armazenar o
+  antes de armazenar o
   token em texto puro.
 - **O arquivo de registry** (`connections.json` no diretório de user-data
   do app) guarda labels, URLs e hosts — segredos só aparecem dentro de
@@ -189,11 +266,11 @@ com a própria mensagem, por linha.
 ## Para autores de plugin {#for-plugin-authors}
 
 O [plugin SDK](../developer-guide/desktop-plugin-sdk.md) do Desktop expõe a
-superfície multi-source direto:
+superfície multi-gateway direto:
 
 - `host.connections()` — a lista de conexões registradas (labels, kinds,
   primary; nunca bytes de token).
-- `host.agents()` — o roster união: uma linha por `(source, profile)` com
+- `host.agents()` — o roster união: uma linha por `(gateway, profile)` com
   o handle `@name-device` pré-computado.
 - `host.ensureAgent(connectionId, profile)` — ativa o gateway de um agente para
   chamadas seguintes de `host.request` baterem no backend dele.
@@ -201,7 +278,7 @@ superfície multi-source direto:
   (intenção de hover).
 
 Os quatro são feature-detected: num build mais antigo do Desktop eles estão ausentes e um
-plugin deve cair no fluxo single-source `profiles.list`. O roster multi-source do Bot Mode
+plugin deve cair no fluxo single-gateway `profiles.list`. O roster multi-gateway do Bot Mode
 é o consumidor de referência.
 
 ## Troubleshooting {#troubleshooting}
@@ -213,8 +290,8 @@ plugin deve cair no fluxo single-source `profiles.list`. O roster multi-source d
 - **Um agente aparece mas não abre** — rode **Test** na conexão dele. A
   perna WebSocket falhando enquanto o HTTP passa costuma significar proxy, firewall ou
   um guard de auth/origin do gateway bloqueando `/api/ws`.
-- **Um source remoto falta no roster** — o backend está down ou
-  inalcançável; o roster lista isso sob sources com o erro. Sources SSH
+- **Um gateway remoto falta no roster** — o backend está down ou
+  inalcançável; o roster lista isso sob gateways com o erro. Conexões SSH
   mostram *connect-on-demand* até o primeiro uso — isso é por design, não uma falha.
 - **"Update Hermes Desktop to chat with agents on other connections"** — o
   app é anterior à stack multi-connection; atualize o próprio app desktop.
