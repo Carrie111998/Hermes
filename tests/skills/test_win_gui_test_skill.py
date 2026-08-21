@@ -12,7 +12,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "optional
 from scripts.utils.config import load_config, DEFAULT_CONFIG
 from scripts.utils.screenshot import capture
 from scripts.analyzers.size_analyzer import collect_sizes, detect_inconsistencies
-from scripts.analyzers.color_analyzer import dominant_colors, detect_edge_colors
+try:
+    from scripts.analyzers.color_analyzer import dominant_colors, detect_edge_colors
+    _HAS_COLOR = True
+except ImportError:
+    _HAS_COLOR = False  # numpy not installed -> skip color tests
 
 
 class TestConfig(unittest.TestCase):
@@ -133,6 +137,7 @@ class TestSizeAnalyzer(unittest.TestCase):
         self.assertEqual(out[0]["name"], "c")
 
 
+@unittest.skipUnless(_HAS_COLOR, "color_analyzer requires numpy")
 class TestColorAnalyzer(unittest.TestCase):
     def test_dominant_colors(self):
         import numpy as np

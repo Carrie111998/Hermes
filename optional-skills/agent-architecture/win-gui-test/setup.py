@@ -6,8 +6,8 @@ setup(
     description="Windows GUI automation test & visual analysis tool",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
-    author="Hermes Agent",
-    url="https://github.com/<your-username>/win-gui-test-skill",
+    author="zty522",
+    url="https://github.com/zty522/win-gui-test-skill",
     packages=find_packages(),
     python_requires=">=3.8",
     install_requires=[

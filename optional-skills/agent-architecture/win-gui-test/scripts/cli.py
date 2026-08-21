@@ -114,7 +114,7 @@ def cmd_analyze(args) -> None:
     inconsistencies = detect_inconsistencies(elements)
 
     # Color analysis (requires screenshot)
-    shot = screenshot(title=args.title, output_dir=args.out_dir or "")
+    shot = screenshot(title=args.title, output_dir=args.out_dir or "", config=getattr(args, "cfg", None))
     color_data = {"dominant": [], "edges": {}}
     if shot.get("success"):
         try:

@@ -2,6 +2,14 @@
 name: win-gui-test
 title: Windows GUI 自动化测试 — pywinauto + OpenCV 操控原生程序
 description: 从 WSL 操控 Windows 原生 GUI 进行自动化测试与视觉分析。
+version: 1.0.0
+author: zty522
+license: Apache-2.0
+platforms: [linux, windows]
+metadata:
+  hermes:
+    tags: [windows-gui, automation, pywinauto, wsl]
+    category: agent-architecture
 ---
 
 # Windows GUI Test Skill
