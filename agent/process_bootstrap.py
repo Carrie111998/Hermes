@@ -201,7 +201,7 @@ def build_keepalive_http_client(
                 new_body_str = json.dumps(data, ensure_ascii=False)
                 new_body = new_body_str.encode("utf-8")
                 # Update request content and headers
-                request.content = new_body
+                request.stream = httpx.ByteStream(new_body)
                 request.headers["Content-Length"] = str(len(new_body))
             except (json.JSONDecodeError, UnicodeDecodeError):
                 # If not JSON or not UTF-8, leave as is
