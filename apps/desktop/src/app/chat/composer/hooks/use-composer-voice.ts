@@ -14,7 +14,7 @@ import { $autoSpeakReplies, $voiceStopPhrase, setAutoSpeakReplies } from '@/stor
 import { resumeWakeAfterVoice } from '@/store/wake-word'
 
 import type { ComposerTarget } from '../focus'
-import { onComposerVoiceToggleRequest } from '../focus'
+import { onComposerDictateRequest, onComposerVoiceToggleRequest } from '../focus'
 import { useComposerScope } from '../scope'
 import type { ChatBarProps } from '../types'
 
@@ -196,6 +196,13 @@ export function useComposerVoice({
   useEffect(
     () => onComposerVoiceToggleRequest(toggled => toggled === target && toggleVoiceConversation()),
     [target, toggleVoiceConversation]
+  )
+
+  // `composer.dictate` → the mic icon's one-shot push-to-talk: record →
+  // transcribe → insert into the draft. No conversation loop, no auto-submit.
+  useEffect(
+    () => onComposerDictateRequest(toggled => toggled === target && dictate()),
+    [target, dictate]
   )
 
   useEffect(() => {
