@@ -2528,6 +2528,69 @@ def init_db(
     return path
 
 
+def _dedupe_active_idempotency_keys(conn: sqlite3.Connection) -> None:
+    """Archive older active duplicates before creating the unique index.
+
+    Boards created before the race fix may already contain duplicate active
+    rows. Keep the row that the existing idempotency lookup resolves to and
+    retain every duplicate row and event; only its lifecycle status changes.
+    The ``archived`` event is durable migration evidence and mirrors the
+    normal archive lifecycle, including closing a leaked active run.
+    """
+    duplicate_keys = conn.execute(
+        "SELECT idempotency_key FROM tasks "
+        "WHERE idempotency_key IS NOT NULL AND TRIM(idempotency_key) != '' "
+        "AND status != 'archived' "
+        "GROUP BY idempotency_key HAVING COUNT(*) > 1"
+    ).fetchall()
+    if not duplicate_keys:
+        return
+
+    task_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+    }
+    runs_exist = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_runs'"
+    ).fetchone() is not None
+    can_close_runs = "current_run_id" in task_columns and runs_exist
+
+    for key_row in duplicate_keys:
+        key = key_row["idempotency_key"]
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "AND status != 'archived' "
+            "ORDER BY created_at DESC, id DESC",
+            (key,),
+        ).fetchall()
+        for duplicate in rows[1:]:
+            task_id = duplicate["id"]
+            run_id = None
+            if can_close_runs:
+                run_id = _end_run(
+                    conn,
+                    task_id,
+                    outcome="reclaimed",
+                    status="reclaimed",
+                    summary="task archived during idempotency-key migration",
+                )
+            conn.execute(
+                "UPDATE tasks SET status = 'archived', "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status != 'archived'",
+                (task_id,),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "archived",
+                {
+                    "reason": "duplicate_idempotency_key_migration",
+                    "idempotency_key": key,
+                },
+                run_id=run_id,
+            )
+
+
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
@@ -2688,9 +2751,6 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # (where the columns already exist from SCHEMA_SQL).
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant)")
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)"
-    )
-    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
 
@@ -2708,6 +2768,25 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "ON task_events(run_id, id)"
     )
 
+    # Adapted from upstream PR #57832: make the database, rather than the
+    # pre-check above, own the active-key invariant. Dirty boards are deduped
+    # and evidenced in the same write transaction before the index is rebuilt.
+    if "status" in cols:
+        with write_txn(conn):
+            _dedupe_active_idempotency_keys(conn)
+            conn.execute("DROP INDEX IF EXISTS idx_tasks_idempotency")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency "
+                "ON tasks(idempotency_key) "
+                "WHERE idempotency_key IS NOT NULL AND TRIM(idempotency_key) != '' "
+                "AND status != 'archived'"
+            )
+    else:
+        # Keep synthetic/very old schemas without a task status column
+        # migratable; they have no active/archive lifecycle to constrain.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)"
+        )
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
     ).fetchone() is not None
@@ -3244,6 +3323,10 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    # Empty / whitespace-only keys mean "no idempotency". Store them as NULL
+    # so repeated keyless creates remain independent under the partial index.
+    if idempotency_key is not None:
+        idempotency_key = str(idempotency_key).strip() or None
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -3395,14 +3478,14 @@ def create_task(
 
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
+    # and to avoid holding a write lock during the lookup. This is only a
+    # fast path: the UNIQUE partial index below closes the race between this
+    # SELECT and the INSERT.
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
             "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
             (idempotency_key,),
         ).fetchone()
         if row:
@@ -3556,10 +3639,28 @@ def create_task(
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as exc:
+            error_text = str(exc)
+            if "UNIQUE constraint failed: tasks.idempotency_key" in error_text:
+                # The UNIQUE partial index rejected this insert because a
+                # concurrent writer committed the same active key. The failed
+                # write transaction has rolled back, so this read sees the
+                # committed winner and preserves the create_task API.
+                winner = conn.execute(
+                    "SELECT id FROM tasks WHERE idempotency_key = ? "
+                    "AND status != 'archived' "
+                    "ORDER BY created_at DESC, id DESC LIMIT 1",
+                    (idempotency_key,),
+                ).fetchone()
+                if winner is not None:
+                    return winner["id"]
+            elif "UNIQUE constraint failed: tasks.id" not in error_text:
+                # Do not turn unrelated constraint failures into retries or
+                # incorrectly return an existing task for the same key.
+                raise
             if attempt == 1:
                 raise
-            # Retry with a fresh id.
+            # No matching key: this was a genuine task-id collision.
             continue
     raise RuntimeError("unreachable")
 
