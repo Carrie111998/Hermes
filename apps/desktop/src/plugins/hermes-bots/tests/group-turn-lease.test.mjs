@@ -170,12 +170,27 @@ function load({ failFirstSubmitWith = null, failEverySubmitWith = null, reply = 
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__lease = { runGroupChatMemberTurn, submitGroupTurnPrompt, isSessionGoneError, $groupChats };\n'
+      '\nglobalThis.__lease = { runGroupChatMemberTurn, runGroupChatRounds, submitGroupTurnPrompt, isSessionGoneError, $groupChats };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   context.plugin.register({
     storage: { get: () => null, set: () => undefined },
     register: () => undefined
+  })
+  // runGroupChatMemberTurn is an internal room-member seam. Production only
+  // calls it after the room exists; establish that invariant here too. The
+  // thread-isolation contract keys its durable session by thread + member.
+  context.__lease.$groupChats.set({
+    Room: {
+      log: [],
+      watermarks: {},
+      sessions: {},
+      sessionOwners: {},
+      stranded: {},
+      members: [LOCAL_MEMBER],
+      roomId: 'room-lease-test',
+      sessionScopeId: 'scope-lease-test'
+    }
   })
   return {
     ...context.__lease,
@@ -215,7 +230,7 @@ test('a 4001 on the first prompt.submit recovers via session.resume on the STORE
   assert.equal(gc.stats().submits, 2)
   // The recovery re-resumed the durable stored id, not the dead runtime id.
   const room = gc.$groupChats.get().Room
-  assert.ok(room.sessions.helper, 'stored session id survives in the room record')
+  assert.ok(room.sessions['t1::helper'], 'thread-scoped stored session id survives in the room record')
 })
 
 test('a persistent non-4001 submit failure is NOT retried and still surfaces', async () => {
@@ -251,6 +266,29 @@ test('the per-turn lease is released after the turn — refcount returns to zero
 
   assert.equal(gc.stats().refcount, 0)
   assert.equal(gc.stats().disposals, 1)
+})
+
+test('the production round path retains the route before ensure/create and through the turn', async () => {
+  const gc = load({ reply: '(pass)' })
+  const room = gc.$groupChats.get().Room
+  gc.$groupChats.set({
+    Room: {
+      ...room,
+      log: [{ id: 'user:1', from: { kind: 'user', name: 'You' }, text: 'hello', at: 1, thread: 't1' }]
+    }
+  })
+
+  await gc.runGroupChatRounds('Room', [ROUTED_MEMBER], 't1')
+
+  assert.equal(gc.timeline[0], 'retain')
+  const firstRelease = gc.timeline.indexOf('release')
+  assert.ok(firstRelease > gc.timeline.indexOf('session.create'), 'lease covers session creation')
+  assert.ok(firstRelease > gc.timeline.indexOf('prompt.submit'), 'lease covers prompt submit')
+  for (const rpc of gc.rpcLog) {
+    assert.ok(rpc.refcountAfter >= 1, `${rpc.method} left refcount ${rpc.refcountAfter} before turn release`)
+  }
+  assert.equal(gc.timeline.at(-1), 'release')
+  assert.equal(gc.stats().refcount, 0)
 })
 
 test('the per-turn lease is released even when the turn fails', async () => {

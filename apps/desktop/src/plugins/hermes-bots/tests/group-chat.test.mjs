@@ -8,7 +8,7 @@ const pluginSource = readFileSync(new URL('../plugin.js', import.meta.url), 'utf
 /** Load the plugin in a vm with a scripted cli.exec so member turns are
  *  deterministic. `turnScript(profile, prompt)` returns the member's reply
  *  text (or throws to simulate a failed turn). */
-function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approvalUntilResumeCall, conflictOnce = false, deferredTimers = false } = {}) {
+function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approvalUntilResumeCall, conflictOnce = false, deferredTimers = false, sessionCreateFailure = null } = {}) {
   const values = new Map()
   const atom = initial => {
     const slot = { get: () => values.get(slot), set: value => {
@@ -118,6 +118,11 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
           return { applied: { ui_meta: true, ui_meta_revisions: { ...uiMetaRevisions } } }
         }
         if (method === 'session.create') {
+          if (sessionCreateFailure?.profile === params.profile) {
+            const error = new Error(sessionCreateFailure.message || 'session create failed')
+            error.data = { reason: sessionCreateFailure.reason }
+            throw error
+          }
           sessionSequence += 1
           const stored = `sid-${params.profile}-${sessionSequence}`
           const runtime = `rt-${params.profile}-${sessionSequence}`
@@ -204,7 +209,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, groupSpeakerLabel, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, groupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupActivity, $botAttention, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, $lastRoster, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -321,6 +326,31 @@ test('failed member turn is a pass, not a room error', async () => {
   assert.equal(log.length, 1) // just the user message; no error entries
 })
 
+test('failed thread-session ensure is one typed pass and consumes the delta', async () => {
+  const gc = load(
+    () => '(pass)',
+    {
+      sessionCreateFailure: {
+        profile: 'builder',
+        reason: 'provider_auth_or_access'
+      }
+    }
+  )
+
+  const thread = gc.sendToGroupChat('Ensure failure', MEMBERS, 'anyone around?')
+  for (let i = 0; i < 200 && (gc.$groupChats.get()['Ensure failure'] || {}).running; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+
+  const room = gc.$groupChats.get()['Ensure failure']
+  assert.equal(room.watermarks[`${thread}::builder`], room.log.length)
+  const failed = gc.$groupActivity.get()['Ensure failure'].events.find(
+    event => event.kind === 'failed' && event.member === 'builder'
+  )
+  assert.equal(failed.reason, 'provider_auth_or_access')
+  assert.equal(gc.$botAttention.get().builder.reason, 'provider_auth_or_access')
+})
+
 test('delta injection: a second user send only feeds members the NEW messages', async () => {
   const prompts = []
   const gc = load((profile, prompt) => {
@@ -348,8 +378,8 @@ test('concurrent groups sharing one member keep sessions, deltas, and context is
   const sharedMember = [{ name: 'research', title: '' }]
 
   // Start both rooms without waiting for either drive to finish.
-  gc.sendToGroupChat('Alpha', sharedMember, 'ALPHA_ONLY_1')
-  gc.sendToGroupChat('Beta', sharedMember, 'BETA_ONLY_1')
+  const alphaThread = gc.sendToGroupChat('Alpha', sharedMember, 'ALPHA_ONLY_1')
+  const betaThread = gc.sendToGroupChat('Beta', sharedMember, 'BETA_ONLY_1')
   for (let i = 0; i < 400; i++) {
     const rooms = gc.$groupChats.get()
     if (!rooms.Alpha?.running && !rooms.Beta?.running) {
@@ -358,8 +388,8 @@ test('concurrent groups sharing one member keep sessions, deltas, and context is
     await new Promise(resolve => setImmediate(resolve))
   }
 
-  const alphaFirst = gc.calls.find(call => call.title === 'Group: Alpha')
-  const betaFirst = gc.calls.find(call => call.title === 'Group: Beta')
+  const alphaFirst = gc.calls.find(call => call.prompt.includes('ALPHA_ONLY_1'))
+  const betaFirst = gc.calls.find(call => call.prompt.includes('BETA_ONLY_1'))
   assert.ok(alphaFirst && betaFirst, 'the shared member took one turn in each room')
   assert.notEqual(alphaFirst.stored, betaFirst.stored, 'each room owns a distinct stored session')
   assert.notEqual(alphaFirst.runtime, betaFirst.runtime, 'each room owns a distinct runtime session')
@@ -369,14 +399,14 @@ test('concurrent groups sharing one member keep sessions, deltas, and context is
   assert.equal(betaFirst.prompt.includes('ALPHA_ONLY_1'), false)
 
   const roomsAfterFirst = gc.$groupChats.get()
-  assert.equal(roomsAfterFirst.Alpha.sessions.research, alphaFirst.stored)
-  assert.equal(roomsAfterFirst.Beta.sessions.research, betaFirst.stored)
+  assert.equal(roomsAfterFirst.Alpha.sessions[`${alphaThread}::research`], alphaFirst.stored)
+  assert.equal(roomsAfterFirst.Beta.sessions[`${betaThread}::research`], betaFirst.stored)
 
   // Interleave a second pair. Each room resumes its own session and receives
   // only its unseen room delta, never the sibling room's messages.
   const firstCallCount = gc.calls.length
-  gc.sendToGroupChat('Alpha', sharedMember, 'ALPHA_ONLY_2')
-  gc.sendToGroupChat('Beta', sharedMember, 'BETA_ONLY_2')
+  gc.sendToGroupChat('Alpha', sharedMember, 'ALPHA_ONLY_2', alphaThread)
+  gc.sendToGroupChat('Beta', sharedMember, 'BETA_ONLY_2', betaThread)
   for (let i = 0; i < 400; i++) {
     const rooms = gc.$groupChats.get()
     if (!rooms.Alpha?.running && !rooms.Beta?.running) {
@@ -386,8 +416,8 @@ test('concurrent groups sharing one member keep sessions, deltas, and context is
   }
 
   const secondCalls = gc.calls.slice(firstCallCount)
-  const alphaSecond = secondCalls.find(call => call.title === 'Group: Alpha')
-  const betaSecond = secondCalls.find(call => call.title === 'Group: Beta')
+  const alphaSecond = secondCalls.find(call => call.prompt.includes('ALPHA_ONLY_2'))
+  const betaSecond = secondCalls.find(call => call.prompt.includes('BETA_ONLY_2'))
   assert.ok(alphaSecond && betaSecond, 'both rooms resumed for the second pair')
   assert.equal(alphaSecond.stored, alphaFirst.stored)
   assert.equal(betaSecond.stored, betaFirst.stored)
@@ -402,6 +432,138 @@ test('concurrent groups sharing one member keep sessions, deltas, and context is
   const betaSession = gc.sessions.get(betaFirst.stored)
   assert.equal(alphaSession.messages.some(message => String(message.content).includes('BETA_ONLY')), false)
   assert.equal(betaSession.messages.some(message => String(message.content).includes('ALPHA_ONLY')), false)
+})
+
+test('one member in two room threads owns distinct sessions and backend transcripts', async () => {
+  const gc = load(() => '(pass)')
+  const member = { name: 'research', title: '' }
+
+  gc.updateGroupChat('Core', room => {
+    room.roomId = 'r-core'
+    room.log = [
+      { id: 'a-1', at: 1, from: { kind: 'user', name: 'You' }, text: 'THREAD_A_ONLY', thread: 'thread-a' },
+      { id: 'b-1', at: 2, from: { kind: 'user', name: 'You' }, text: 'THREAD_B_ONLY', thread: 'thread-b' }
+    ]
+    return room
+  })
+
+  await gc.runGroupChatRounds('Core', [member], 'thread-a')
+  await gc.runGroupChatRounds('Core', [member], 'thread-b')
+
+  const threadA = gc.calls.find(call => call.prompt.includes('THREAD_A_ONLY'))
+  const threadB = gc.calls.find(call => call.prompt.includes('THREAD_B_ONLY'))
+  assert.ok(threadA && threadB)
+  assert.notEqual(threadA.stored, threadB.stored)
+  assert.equal(gc.sessions.get(threadA.stored).messages.some(message => String(message.content).includes('THREAD_B_ONLY')), false)
+  assert.equal(gc.sessions.get(threadB.stored).messages.some(message => String(message.content).includes('THREAD_A_ONLY')), false)
+})
+
+test('the same room thread and member reuse one hidden session', async () => {
+  const gc = load(() => '(pass)')
+  const member = { name: 'research', title: '' }
+
+  gc.updateGroupChat('Core', room => {
+    room.roomId = 'r-core'
+    return room
+  })
+
+  const first = await gc.ensureGroupChatSession('Core', member, 'thread-a')
+  const second = await gc.ensureGroupChatSession('Core', member, 'thread-a')
+
+  assert.equal(second.stored, first.stored)
+  assert.equal(gc.requests.filter(request => request.method === 'session.create').length, 1)
+  assert.equal(gc.$groupChats.get().Core.sessions['thread-a::research'], first.stored)
+})
+
+test('a first thread session bootstraps retained history for only that thread and preserves the legacy pointer', async () => {
+  const gc = load(() => '(pass)')
+  const member = { name: 'research', title: '' }
+
+  gc.updateGroupChat('Core', room => {
+    room.roomId = 'r-core'
+    room.log = [
+      { id: 'a-1', at: 1, from: { kind: 'user', name: 'You' }, text: 'RETAINED_A', thread: 'thread-a' },
+      { id: 'b-1', at: 2, from: { kind: 'user', name: 'You' }, text: 'RETAINED_B', thread: 'thread-b' }
+    ]
+    room.watermarks = { 'thread-a::research': room.log.length }
+    room.sessions = { research: 'sid-legacy-shared' }
+    return room
+  })
+
+  await gc.runGroupChatRounds('Core', [member], 'thread-a')
+
+  const call = gc.calls.find(candidate => candidate.prompt.includes('RETAINED_A'))
+  assert.ok(call, 'the empty per-thread session receives its retained thread history')
+  assert.equal(call.prompt.includes('RETAINED_B'), false)
+  assert.equal(gc.$groupChats.get().Core.sessions.research, 'sid-legacy-shared')
+  assert.equal(gc.$groupChats.get().Core.sessions['thread-a::research'], call.stored)
+})
+
+test('concurrent ensure for one room thread and member creates one hidden session', async () => {
+  const gc = load(() => '(pass)')
+  const member = { name: 'research', title: '' }
+
+  gc.updateGroupChat('Core', room => {
+    room.roomId = 'r-core'
+    return room
+  })
+
+  const [first, second] = await Promise.all([
+    gc.ensureGroupChatSession('Core', member, 'thread-a'),
+    gc.ensureGroupChatSession('Core', member, 'thread-a')
+  ])
+
+  assert.equal(second.stored, first.stored)
+  assert.equal(gc.requests.filter(request => request.method === 'session.create').length, 1)
+  assert.equal(gc.sessions.size, 1)
+})
+
+test('thread session scope stays length-safe and stable across a room rename', async () => {
+  const gc = load(() => '(pass)')
+  const member = { name: 'research', title: '' }
+
+  gc.updateGroupChat('Long Room', room => {
+    room.roomId = 'r'.repeat(120)
+    return room
+  })
+
+  const first = await gc.ensureGroupChatSession('Long Room', member, 'thread-a')
+  const beforeRename = gc.$groupChats.get()['Long Room']
+  const scope = beforeRename.sessionScopeId
+  assert.ok(scope)
+  assert.ok(gc.sessions.get(first.stored).title.length <= 100)
+  assert.equal(gc.storageWrites.get('group-chats')['Long Room'].sessionScopeId, scope)
+
+  await gc.renameGroupChat('Long Room', 'Renamed Room', [member])
+  gc.updateGroupChat('Renamed Room', room => {
+    const sessions = { ...room.sessions }
+    delete sessions['thread-a::research']
+    room.sessions = sessions
+    return room
+  })
+
+  const resumed = await gc.ensureGroupChatSession('Renamed Room', member, 'thread-a')
+  assert.equal(gc.$groupChats.get()['Renamed Room'].sessionScopeId, scope)
+  assert.equal(resumed.stored, first.stored)
+})
+
+test('a late thread ensure cannot resurrect a disbanded room', async () => {
+  const gc = load(() => '(pass)')
+  const member = { name: 'research', title: '' }
+
+  gc.updateGroupChat('Gone', room => {
+    room.roomId = 'r'.repeat(120)
+    room.members = [member]
+    return room
+  })
+  await gc.disbandGroupChat('Gone', [member])
+
+  await assert.rejects(
+    () => gc.ensureGroupChatSession('Gone', member, 'thread-a'),
+    /no longer exists/
+  )
+  assert.equal(gc.$groupChats.get().Gone, undefined)
+  assert.equal(gc.storageWrites.get('group-chats')?.Gone, undefined)
 })
 
 test('recreating a same-name group after disband mints fresh member sessions', async () => {
@@ -577,9 +739,9 @@ test('turn transport is gateway-native (session RPCs) and hostile text rides ver
   assert.equal(call.profile, 'research')
   // Hostile text is a JSON string in an RPC param — never a shell string.
   assert.equal(call.prompt.includes('hello "there" `whoami` $(id)'), true)
-  // The per-group session is created with the room title.
+  // The per-thread session is created with stable room + thread identity.
   assert.match(pluginSource, /title,\n/)
-  assert.match(pluginSource, /const title = `Group: \$\{room\.roomId \|\| group\}`/)
+  assert.match(pluginSource, /`Group: \$\{scope\} \/ Thread: \$\{thread\}`/)
 })
 
 test('log trimming keeps watermarks consistent', () => {
@@ -1527,6 +1689,46 @@ test('stranded harvest: a timed-out turn whose reply landed late posts into the 
   assert.equal(gc.$groupChats.get().Late.stranded.research, undefined, 'marker consumed')
 })
 
+test('thread-scoped stranded harvest resumes and clears only that thread session', async () => {
+  const gc = load(() => '(pass)')
+  const member = { name: 'research', title: '' }
+
+  gc.updateGroupChat('Late', room => {
+    room.roomId = 'r-late'
+    return room
+  })
+  const threadA = await gc.ensureGroupChatSession('Late', member, 'thread-a')
+  const threadB = await gc.ensureGroupChatSession('Late', member, 'thread-b')
+  gc.sessions.get(threadA.stored).messages.push({ role: 'assistant', content: 'LATE_A_ONLY' })
+  gc.sessions.get(threadB.stored).messages.push({ role: 'assistant', content: 'LATE_B_ONLY' })
+  gc.updateGroupChat('Late', room => {
+    room.stranded = {
+      'thread-a::research': { before: 0, thread: 'thread-a', sessionKey: 'thread-a::research' },
+      'thread-b::research': { before: 0, thread: 'thread-b', sessionKey: 'thread-b::research' }
+    }
+    return room
+  })
+
+  await gc.harvestStrandedGroupReply('Late', member, 'thread-a')
+
+  const room = gc.$groupChats.get().Late
+  assert.equal(room.log.some(entry => entry.thread === 'thread-a' && entry.text === 'LATE_A_ONLY'), true)
+  assert.equal(room.log.some(entry => entry.text === 'LATE_B_ONLY'), false)
+  assert.equal(room.stranded['thread-a::research'], undefined)
+  assert.ok(room.stranded['thread-b::research'])
+})
+
+test('background stranded harvest stops when only sibling-thread markers remain', () => {
+  const start = pluginSource.indexOf('async function harvestStrandedUntilSettled')
+  const end = pluginSource.indexOf('/** User send into a group room.', start)
+  const source = pluginSource.slice(start, end)
+
+  assert.match(
+    source,
+    /if \(!members\.some\(member => hasStrandedGroupOwner\(stranded, thread, member\)\)\) \{\s*return\s*\}/
+  )
+})
+
 test('stranded + still busy: the round loop never re-submits into a member whose harvest just confirmed they are still running', async () => {
   // research is confirmed busy on exactly its first two session.resume
   // calls — the number of harvest-only touches the FIXED code makes across
@@ -1834,6 +2036,33 @@ test('syncGroupClarify mirrors, badges needs-you, and is idempotent per request'
   assert.equal(Object.keys(gc.$groupClarify.get()).length, 0)
 })
 
+test('clarify ownership is isolated by room thread and member', () => {
+  const gc = load(() => '(pass)')
+  const member = { name: 'research', title: '' }
+  gc.updateGroupChat('Core', room => {
+    room.roomId = 'r-core'
+    return room
+  })
+
+  gc.syncGroupClarify('Core', member, {
+    session_id: 'rt-a',
+    pending_clarify: { ...CLARIFY_PAYLOAD, request_id: 'req-a' }
+  }, 'thread-a')
+  gc.syncGroupClarify('Core', member, {
+    session_id: 'rt-b',
+    pending_clarify: { ...CLARIFY_PAYLOAD, request_id: 'req-b' }
+  }, 'thread-b')
+
+  const entries = Object.values(gc.$groupClarify.get())
+  assert.equal(entries.length, 2)
+  assert.deepEqual([...entries.map(entry => entry.thread)].sort(), ['thread-a', 'thread-b'])
+
+  gc.syncGroupClarify('Core', member, {}, 'thread-a')
+  const remaining = Object.values(gc.$groupClarify.get())
+  assert.equal(remaining.length, 1)
+  assert.equal(remaining[0].thread, 'thread-b')
+})
+
 test('older backends without pending_clarify never mirror a question', () => {
   const gc = load(() => '(pass)')
 
@@ -1895,7 +2124,7 @@ test('disband clears the room mirrored questions', async () => {
 
 test('source contract: room renders clarify cards and the poll gates on them', () => {
   assert.match(pluginSource, /function GroupClarifyCard\(/)
-  assert.match(pluginSource, /syncGroupClarify\(group, member, state\)/)
+  assert.match(pluginSource, /syncGroupClarify\(group, member, state, thread\)/)
   assert.match(pluginSource, /const done = !busy && !awaitingUser/)
   assert.match(pluginSource, /busy \|\| awaitingUser/)
   assert.match(pluginSource, /roomClarifies\.map\(entry =>/)

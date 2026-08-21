@@ -441,6 +441,7 @@ function focusedRosterOwner(owner) {
 /** Group-chat rooms: { [group]: { log: [{from:{kind,name},text,at}], watermarks:{[member]:idx}, epoch, running } }.
  *  Log + watermarks persist via plugin storage; epoch/running are runtime-only. */
 const $groupChats = atom({})
+const groupSessionFlights = new Map()
 /** Group whose room view is open in the Bots pane (secondary navigation
  *  inside the pane; a normal row click returns to the roster). */
 const $groupChatWorkspace = atom(null)
@@ -1047,6 +1048,7 @@ function durableGroupChatRooms(all = $groupChats.get()) {
       log: room.log,
       watermarks: room.watermarks || {},
       sessions: room.sessions || {},
+      sessionOwners: room.sessionOwners || {},
       stranded: room.stranded || {},
       members: Array.isArray(room.members) ? room.members : [],
       // Immutable room identity: without this, a room merged in via the
@@ -1055,6 +1057,7 @@ function durableGroupChatRooms(all = $groupChats.get()) {
       // name-keyed identity — same field updateGroupChat's inline map
       // already carries.
       roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
+      sessionScopeId: typeof room.sessionScopeId === 'string' && room.sessionScopeId ? room.sessionScopeId : null,
       image: room.image || null,
       syncRevision: Math.max(0, Number(room.syncRevision || 0))
     }
@@ -2306,21 +2309,26 @@ function hideOwnedBotSessions() {
         }
 
         const persisted = room?.sessionOwners?.[key]
-        const derived = (room?.members || []).find(member => groupMemberKey(member) === key)
+        const persistedKey = persisted ? groupMemberKey(persisted) : null
+        const persistedOwnsKey = persistedKey && (
+          key === persistedKey || (persisted?.threadScoped === true && key.endsWith(`::${persistedKey}`))
+        )
+        const derived = persistedOwnsKey ? null : (room?.members || []).find(member => groupMemberKey(member) === key)
         // Bare keys are legacy local rooms. A source-qualified key without its
         // immutable owner is unsafe: never let it fall through ambient routing.
-        const owner = persisted || derived || (!key.includes('::') ? { name: key } : null)
+        const owner = persistedOwnsKey ? persisted : derived || (!key.includes('::') ? { name: key } : null)
 
-        if (key.includes('::')) {
+        if (owner && (owner.sourceScoped || owner.remoteSource)) {
           const route = owner?.route
-          const sourceMarked = owner?.sourceScoped || owner?.remoteSource
           const routeKey = route?.connectionId && route?.profile
             ? `${route.connectionId}::${route.profile}`
             : ''
 
-          if (!sourceMarked || !route?.targetProfile || routeKey !== key) {
+          if (!route?.targetProfile || routeKey !== groupMemberKey(owner)) {
             return null
           }
+        } else if (!persistedOwnsKey && key.includes('::')) {
+          return null
         }
 
         return owner ? { owner, id, dedupe: `${key}\u0000${id}` } : null
@@ -5476,6 +5484,10 @@ function groupMemberKey(member) {
   return member?.sourceScoped || member?.remoteSource ? botRosterKey(member) : member?.name
 }
 
+function groupThreadMemberKey(thread, member) {
+  return `${thread}::${groupMemberKey(member)}`
+}
+
 /** Serializable immutable owner captured beside every group plumbing session. */
 function groupSessionOwner(member) {
   const route = botConnectionRoute(member)
@@ -5492,6 +5504,56 @@ function groupSessionOwner(member) {
     remoteSource: route.mode !== 'local',
     route: { ...route }
   }
+}
+
+function groupSessionScopeForRoom(room, group) {
+  const roomId = typeof room?.roomId === 'string' ? room.roomId : ''
+
+  return roomId && roomId.length <= 40
+    ? roomId
+    : (typeof room?.sessionScopeId === 'string' && room.sessionScopeId) || group
+}
+
+function ensureGroupSessionScope(group) {
+  const room = $groupChats.get()[group] || {}
+  const roomId = typeof room.roomId === 'string' ? room.roomId : ''
+
+  if (roomId && roomId.length <= 40) {
+    return roomId
+  }
+
+  if (typeof room.sessionScopeId === 'string' && room.sessionScopeId) {
+    return room.sessionScopeId
+  }
+
+  const sessionScopeId = mintGroupRoomId()
+  updateGroupChat(group, current => {
+    current.sessionScopeId ||= sessionScopeId
+    return current
+  })
+
+  return $groupChats.get()[group]?.sessionScopeId || sessionScopeId
+}
+
+function updateGroupSessionPointer(group, scope, key, stored, member) {
+  if (!stored) {
+    return
+  }
+
+  const rooms = $groupChats.get()
+  const currentGroup = rooms[group] && groupSessionScopeForRoom(rooms[group], group) === scope
+    ? group
+    : Object.keys(rooms).find(name => groupSessionScopeForRoom(rooms[name], name) === scope)
+
+  if (!currentGroup) {
+    return
+  }
+
+  updateGroupChat(currentGroup, room => {
+    room.sessions = { ...(room.sessions || {}), [key]: stored }
+    room.sessionOwners = { ...(room.sessionOwners || {}), [key]: { ...groupSessionOwner(member), threadScoped: true } }
+    return room
+  })
 }
 
 // ── alias identity for connection rows (#89131) ─────────────────────────────
@@ -6973,6 +7035,7 @@ function updateGroupChat(group, mutate, { sync = true } = {}) {
         members: Array.isArray(room.members) ? room.members : [],
         // Immutable room identity: the member-session title for new rooms.
         roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
+        sessionScopeId: typeof room.sessionScopeId === 'string' && room.sessionScopeId ? room.sessionScopeId : null,
         // Room picture (small data URL, same normalization as bot avatars).
         image: room.image || null,
         syncRevision: Math.max(0, Number(room.syncRevision || 0))
@@ -7061,6 +7124,7 @@ async function disbandGroupChat(group, members) {
           sessionOwners: room.sessionOwners || {},
           members: Array.isArray(room.members) ? room.members : [],
           roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
+          sessionScopeId: typeof room.sessionScopeId === 'string' && room.sessionScopeId ? room.sessionScopeId : null,
           image: room.image || null,
           syncRevision: Math.max(0, Number(room.syncRevision || 0))
         }
@@ -7279,19 +7343,53 @@ function uniqueGroupChatName(base, taken) {
   throw new Error('No free name for the group.')
 }
 
-/** Ensure the member's per-group session exists and return a LIVE runtime
+/** Ensure the member's per-group-thread session exists and return a LIVE runtime
  *  session id for it. Gateway-native: session.create mints the session
  *  (lazy until its first message), session.resume by stored id — or by
  *  title, which also covers rehydrated rooms whose sid was lost — reopens
  *  it after restarts. Cross-connection members route to their OWN source
  *  via requestForBot; the window's gateway never switches. */
-async function ensureGroupChatSession(group, member) {
+async function ensureGroupChatSession(group, member, thread = null) {
+  const legacyOwner = thread === null || thread === undefined
+  const normalizedThread = legacyOwner ? null : String(thread || 'legacy')
+  const room = $groupChats.get()[group]
+
+  if (!room || room.tombstone) {
+    throw new Error(`Group ${group} no longer exists`)
+  }
+
+  const scope = legacyOwner ? room.roomId || group : ensureGroupSessionScope(group)
+  const key = legacyOwner ? groupMemberKey(member) : groupThreadMemberKey(normalizedThread, member)
+  const owner = `${scope}::${key}`
+  const inflight = groupSessionFlights.get(owner)
+
+  if (inflight) {
+    return inflight
+  }
+
+  const run = ensureGroupChatSessionOnce(group, member, normalizedThread, legacyOwner, scope, key)
+    .finally(() => {
+      if (groupSessionFlights.get(owner) === run) {
+        groupSessionFlights.delete(owner)
+      }
+    })
+
+  groupSessionFlights.set(owner, run)
+
+  return run
+}
+
+async function ensureGroupChatSessionOnce(group, member, thread, legacyOwner, scope, key) {
   const room = $groupChats.get()[group] || {}
-  // New rooms title member sessions by their immutable roomId so a
-  // same-name recreate never resumes the old room's sessions by title;
-  // legacy rooms without a roomId fall back to the display name.
-  const title = `Group: ${room.roomId || group}`
-  const key = groupMemberKey(member)
+  // Calls without a thread retain the pre-thread title/pointer contract for
+  // tests and old integrations. Every live room turn passes a stable thread.
+  const title = legacyOwner
+    ? `Group: ${room.roomId || group}`
+    : `Group: ${scope} / Thread: ${thread}`
+
+  if (!legacyOwner && title.length > 100) {
+    throw new Error('Group thread session title exceeds the 100-character limit')
+  }
   const known = room.sessions && room.sessions[key]
 
   // Try resuming what we know (stored sid first, then title lookup).
@@ -7322,14 +7420,22 @@ async function ensureGroupChatSession(group, member) {
         const stored = res.session_key || known
 
         if (stored) {
-          updateGroupChat(group, current => {
-            current.sessions = { ...(current.sessions || {}), [key]: stored }
-            current.sessionOwners = { ...(current.sessionOwners || {}), [key]: groupSessionOwner(member) }
-            return current
-          })
+          if (legacyOwner) {
+            updateGroupChat(group, current => {
+              current.sessions = { ...(current.sessions || {}), [key]: stored }
+              current.sessionOwners = { ...(current.sessionOwners || {}), [key]: groupSessionOwner(member) }
+              return current
+            })
+          } else {
+            updateGroupSessionPointer(group, scope, key, stored, member)
+          }
         }
 
-        return { runtime: res.session_id, stored }
+        return {
+          runtime: res.session_id,
+          stored,
+          bootstrap: !legacyOwner && Number(res.message_count) === 0
+        }
       }
     } catch (error) {
       if (error?.code !== 4007) {
@@ -7349,14 +7455,18 @@ async function ensureGroupChatSession(group, member) {
   const stored = created?.stored_session_id || null
 
   if (stored) {
-    updateGroupChat(group, r => {
-      r.sessions = { ...(r.sessions || {}), [key]: stored }
-      r.sessionOwners = { ...(r.sessionOwners || {}), [key]: groupSessionOwner(member) }
-      return r
-    })
+    if (legacyOwner) {
+      updateGroupChat(group, r => {
+        r.sessions = { ...(r.sessions || {}), [key]: stored }
+        r.sessionOwners = { ...(r.sessionOwners || {}), [key]: groupSessionOwner(member) }
+        return r
+      })
+    } else {
+      updateGroupSessionPointer(group, scope, key, stored, member)
+    }
   }
 
-  return { runtime: created?.session_id || null, stored }
+  return { runtime: created?.session_id || null, stored, bootstrap: !legacyOwner }
 }
 
 const GROUP_TURN_TIMEOUT_MS = 180000
@@ -7465,8 +7575,10 @@ const GROUP_TURN_HARD_CAP_MS = 20 * 60000
  *  payload always sync to "no prompt". Clarify wins when both are somehow
  *  present (approvals resolve inside tool batches; clarify is the outer
  *  blocker). */
-function syncGroupClarify(group, member, state) {
-  const key = `${group}::${groupMemberKey(member)}`
+function syncGroupClarify(group, member, state, thread = 'legacy') {
+  const room = $groupChats.get()[group] || {}
+  const roomScope = groupSessionScopeForRoom(room, group)
+  const key = `${roomScope}::${groupThreadMemberKey(thread, member)}`
   const clarify = state && typeof state.pending_clarify === 'object' ? state.pending_clarify : null
   const approval = state && typeof state.pending_approval === 'object' ? state.pending_approval : null
   const pending = clarify || approval
@@ -7492,7 +7604,10 @@ function syncGroupClarify(group, member, state) {
 
   const base = {
     requestId,
+    ownerKey: key,
     group,
+    roomScope,
+    thread,
     member: member.name,
     memberKey: groupMemberKey(member),
     // approval.respond keys on the session, not just the request — carry the
@@ -7586,7 +7701,7 @@ async function answerGroupClarify(entry, member, answers) {
   }
 
   const all = $groupClarify.get()
-  const key = `${entry.group}::${entry.memberKey}`
+  const key = entry.ownerKey || `${entry.roomScope || entry.group}::${entry.thread || 'legacy'}::${entry.memberKey}`
 
   if (all[key]?.requestId === entry.requestId) {
     const next = { ...all }
@@ -7602,7 +7717,19 @@ async function answerGroupClarify(entry, member, answers) {
  *  so slow models aren't cut off mid-run. A turn that still times out
  *  records a stranded marker so the finished reply can be harvested into
  *  the room at the member's next turn instead of being lost. */
-async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
+async function runGroupChatMemberTurn(
+  group,
+  member,
+  prompt,
+  thread,
+  images,
+  ensuredSession = null,
+  routeLeaseHeld = false
+) {
+  if (routeLeaseHeld) {
+    return runGroupChatMemberTurnLeased(group, member, prompt, thread, images, ensuredSession)
+  }
+
   // #93602: hold the member's route socket for the whole turn. Without the
   // lease, every RPC below rides its own request-scoped socket lease; the
   // socket that minted `runtime` can close between RPCs, the gateway reaps
@@ -7610,14 +7737,14 @@ async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
   const releaseTurnLease = await retainGroupTurnRoute(member)
 
   try {
-    return await runGroupChatMemberTurnLeased(group, member, prompt, thread, images)
+    return await runGroupChatMemberTurnLeased(group, member, prompt, thread, images, ensuredSession)
   } finally {
     releaseTurnLease()
   }
 }
 
-async function runGroupChatMemberTurnLeased(group, member, prompt, thread, images) {
-  const { runtime, stored } = await ensureGroupChatSession(group, member)
+async function runGroupChatMemberTurnLeased(group, member, prompt, thread, images, ensuredSession = null) {
+  const { runtime, stored } = ensuredSession || await ensureGroupChatSession(group, member, thread)
 
   if (!runtime) {
     return null
@@ -7714,7 +7841,7 @@ async function runGroupChatMemberTurnLeased(group, member, prompt, thread, image
     // A clarify blocking inside the member's session is a question for the
     // HUMAN (#90694) — mirror it into the room store so a card renders, and
     // hold the turn open: the member isn't stalling, it's waiting on us.
-    const awaitingUser = syncGroupClarify(group, member, state)
+    const awaitingUser = syncGroupClarify(group, member, state, thread)
     const done = !busy && !awaitingUser
 
     if (messages.length > before && done) {
@@ -7757,9 +7884,10 @@ async function runGroupChatMemberTurnLeased(group, member, prompt, thread, image
   // (runtime-only) so the finished reply can be posted late into the RIGHT
   // thread instead of vanishing.
   recordGroupActivity(group, { kind: 'timed-out', member: member.name, thread })
-  syncGroupClarify(group, member, null)
+  syncGroupClarify(group, member, null, thread)
   updateGroupChat(group, r => {
-    r.stranded = { ...(r.stranded || {}), [groupMemberKey(member)]: { before, thread } }
+    const sessionKey = groupThreadMemberKey(thread, member)
+    r.stranded = { ...(r.stranded || {}), [sessionKey]: { before, thread, sessionKey } }
     return r
   })
 
@@ -7769,10 +7897,26 @@ async function runGroupChatMemberTurnLeased(group, member, prompt, thread, image
 /** Post a timed-out member's finished reply into the room, if it landed
  *  after we stopped waiting. Called at the member's next turn boundary and
  *  on user sends, so long-running work is delivered late rather than lost. */
-async function harvestStrandedGroupReply(group, member) {
+async function harvestStrandedGroupReply(group, member, thread = null) {
   const memberKey = groupMemberKey(member)
   const room = $groupChats.get()[group] || {}
-  const marker = room.stranded?.[memberKey]
+  const markers = Object.entries(room.stranded || {}).filter(([key]) => {
+    if (key === memberKey) {
+      return true
+    }
+
+    return key.endsWith(`::${memberKey}`)
+      && (thread === null || key === groupThreadMemberKey(thread, member))
+  })
+
+  for (const [markerKey, marker] of markers) {
+    await harvestOneStrandedGroupReply(group, member, markerKey, marker)
+  }
+}
+
+async function harvestOneStrandedGroupReply(group, member, markerKey, marker) {
+  const memberKey = groupMemberKey(member)
+  const room = $groupChats.get()[group] || {}
   // Markers were a bare number before threads; normalize both shapes.
   const strandedBefore = typeof marker === 'number' ? marker : marker?.before
   const strandedThread = (typeof marker === 'object' && marker?.thread) || 'legacy'
@@ -7784,9 +7928,14 @@ async function harvestStrandedGroupReply(group, member) {
   let state = null
 
   try {
-    const stored = room.sessions?.[memberKey]
+    const sessionKey = typeof marker === 'object' && marker?.sessionKey ? marker.sessionKey : markerKey
+    const legacyMarker = markerKey === memberKey
+    const stored = room.sessions?.[sessionKey] || (legacyMarker ? room.sessions?.[memberKey] : null)
+    const title = legacyMarker
+      ? `Group: ${room.roomId || group}`
+      : `Group: ${groupSessionScopeForRoom(room, group)} / Thread: ${strandedThread}`
     state = await requestForBot(member, 'session.resume', {
-      session_id: stored || `Group: ${room.roomId || group}`,
+      session_id: stored || title,
       profile: member.name
     })
   } catch {
@@ -7799,14 +7948,16 @@ async function harvestStrandedGroupReply(group, member) {
 
   // A stranded member blocked on a clarify is not "grinding" — surface the
   // question card (#90694) and keep the marker until it resolves.
-  if (syncGroupClarify(group, member, state)) {
+  if (syncGroupClarify(group, member, state, strandedThread)) {
     return
   }
 
   // Done (or dead): the marker is consumed either way.
   updateGroupChat(group, r => {
     const next = { ...(r.stranded || {}) }
-    delete next[memberKey]
+    if (next[markerKey] === marker) {
+      delete next[markerKey]
+    }
     r.stranded = next
     return r
   })
@@ -7845,6 +7996,13 @@ async function harvestStrandedGroupReply(group, member) {
       return
     }
   }
+}
+
+function hasStrandedGroupOwner(stranded, thread, member) {
+  const memberKey = groupMemberKey(member)
+
+  return Object.prototype.hasOwnProperty.call(stranded || {}, memberKey)
+    || Object.prototype.hasOwnProperty.call(stranded || {}, groupThreadMemberKey(thread, member))
 }
 
 // --- room-turn decision helpers (#93127) — pure, vm-sliced by tests ---
@@ -8000,7 +8158,7 @@ async function runGroupChatRounds(group, members, thread) {
           return
         }
 
-        await harvestStrandedGroupReply(group, member)
+        await harvestStrandedGroupReply(group, member, thread)
       }
 
       const roomLog = (($groupChats.get()[group] || {}).log || []).filter(e => groupThreadOf(e) === thread)
@@ -8018,7 +8176,7 @@ async function runGroupChatRounds(group, members, thread) {
       // {before, thread} post-thread.
       const strandedNow = ($groupChats.get()[group] || {}).stranded || {}
       const responders = rotateGroupSpeakers(resolveGroupResponders(roomLog, members), round)
-        .filter(member => !Object.prototype.hasOwnProperty.call(strandedNow, groupMemberKey(member)))
+        .filter(member => !hasStrandedGroupOwner(strandedNow, thread, member))
       let spokeThisRound = 0
 
       for (const member of responders) {
@@ -8033,13 +8191,8 @@ async function runGroupChatRounds(group, members, thread) {
         const memberKey = groupMemberKey(member)
         const markKey = `${thread}::${memberKey}`
         const seen = room.watermarks[markKey] || 0
-        // Delta: NEW room entries, narrowed to this thread — the member's
-        // turn sees only the conversation it's part of.
-        const delta = room.log.slice(seen).filter(e => groupThreadOf(e) === thread)
-
-        if (!delta.length) {
-          continue
-        }
+        const incrementalDelta = room.log.slice(seen).filter(e => groupThreadOf(e) === thread)
+        const bootstrapDelta = room.log.filter(e => groupThreadOf(e) === thread)
 
         // #93129: a member the user told to stop is HELD — no turn until an
         // explicit release (resume / @all resume / a direct non-stop
@@ -8049,6 +8202,10 @@ async function runGroupChatRounds(group, members, thread) {
         const heldEntry = (room.holds || {})[memberKey]
 
         if (heldEntry) {
+          if (!incrementalDelta.length) {
+            continue
+          }
+
           const advance = heldMemberWatermarkAdvance(seen, room.log.length)
 
           updateGroupChat(group, r => {
@@ -8070,49 +8227,89 @@ async function runGroupChatRounds(group, members, thread) {
           continue
         }
 
-        const prompt = buildGroupChatTurnPrompt({
-          groupName: group,
-          members,
-          viewer: member,
-          deltaLines: delta.slice(-GROUP_CHAT_HISTORY_LIMIT).map(e => formatGroupChatLine(e, member.name))
-        })
-
-        // Images riding this delta (user attachments — member entries don't
-        // carry images today, but flatMap keeps this future-proof) get staged
-        // into the member's session so the model sees the pixels, not just
-        // the transcript's [attached image: …] marker.
-        const deltaImages = delta.flatMap(e => (Array.isArray(e.images) ? e.images : []))
-
-        // Surface WHO is on turn (runtime-only, like running/epoch) so the
-        // room shows "Radar is thinking…" instead of a generic working line —
-        // long model turns otherwise read as the room being stuck.
-        updateGroupChat(group, r => {
-          r.turn = member.name
-          return r
-        })
-
+        const releaseRoundTurnLease = await retainGroupTurnRoute(member)
         let reply = null
 
         try {
-          reply = await runGroupChatMemberTurn(group, member, prompt, thread, deltaImages)
+          let ensuredSession = null
 
-          // Needs-attention hook (#93091 item 3): a turn that produced a real
-          // reply (or an explicit pass) is a good turn — clear the badge.
-          // A timed-out turn also returns null but never threw; leaving any
-          // prior badge in place there is the conservative choice.
-          if (reply !== null) {
-            clearBotAttention(groupMemberKey(member))
+          try {
+            ensuredSession = await ensureGroupChatSession(group, member, thread)
+          } catch (error) {
+            const reason = String(error?.data?.reason || '').trim()
+            recordGroupActivity(group, {
+              kind: 'failed',
+              member: member.name,
+              thread,
+              ...(reason ? { reason } : {})
+            })
+            noteBotAttention(groupMemberKey(member), reason || error?.message || error)
           }
-        } catch (error) {
-          const reason = String(error?.data?.reason || '').trim()
-          recordGroupActivity(group, {
-            kind: 'failed',
-            member: member.name,
-            thread,
-            ...(reason ? { reason } : {})
-          })
-          noteBotAttention(groupMemberKey(member), reason || error?.message || error)
-          reply = null // a failed turn is a pass, never a room error
+
+          if (ensuredSession) {
+            // A newly created (or still-empty) per-thread session has never seen
+            // this topic, even when a legacy shared-session watermark says the
+            // member already consumed it. Bootstrap from retained history for
+            // this thread only; established sessions keep the incremental delta.
+            const delta = ensuredSession.bootstrap ? bootstrapDelta : incrementalDelta
+
+            if (!delta.length) {
+              continue
+            }
+
+            const prompt = buildGroupChatTurnPrompt({
+              groupName: group,
+              members,
+              viewer: member,
+              deltaLines: delta.slice(-GROUP_CHAT_HISTORY_LIMIT).map(e => formatGroupChatLine(e, member.name))
+            })
+
+            // Images riding this delta (user attachments — member entries don't
+            // carry images today, but flatMap keeps this future-proof) get staged
+            // into the member's session so the model sees the pixels, not just
+            // the transcript's [attached image: …] marker.
+            const deltaImages = delta.flatMap(e => (Array.isArray(e.images) ? e.images : []))
+
+            // Surface WHO is on turn (runtime-only, like running/epoch) so the
+            // room shows "Radar is thinking…" instead of a generic working line —
+            // long model turns otherwise read as the room being stuck.
+            updateGroupChat(group, r => {
+              r.turn = member.name
+              return r
+            })
+
+            try {
+              reply = await runGroupChatMemberTurn(
+                group,
+                member,
+                prompt,
+                thread,
+                deltaImages,
+                ensuredSession,
+                true
+              )
+
+              // Needs-attention hook (#93091 item 3): a turn that produced a real
+              // reply (or an explicit pass) is a good turn — clear the badge.
+              // A timed-out turn also returns null but never threw; leaving any
+              // prior badge in place there is the conservative choice.
+              if (reply !== null) {
+                clearBotAttention(groupMemberKey(member))
+              }
+            } catch (error) {
+              const reason = String(error?.data?.reason || '').trim()
+              recordGroupActivity(group, {
+                kind: 'failed',
+                member: member.name,
+                thread,
+                ...(reason ? { reason } : {})
+              })
+              noteBotAttention(groupMemberKey(member), reason || error?.message || error)
+              reply = null // a failed turn is a pass, never a room error
+            }
+          }
+        } finally {
+          releaseRoundTurnLease()
         }
 
         // #93127: the turn may have finished AFTER a newer user send bumped
@@ -8211,14 +8408,14 @@ async function harvestStrandedUntilSettled(group, members, thread) {
 
     const stranded = room.stranded || {}
 
-    if (!Object.keys(stranded).length) {
+    if (!members.some(member => hasStrandedGroupOwner(stranded, thread, member))) {
       return
     }
 
     for (const member of members) {
-      if (Object.prototype.hasOwnProperty.call(stranded, groupMemberKey(member))) {
+      if (hasStrandedGroupOwner(stranded, thread, member)) {
         try {
-          await harvestStrandedGroupReply(group, member)
+          await harvestStrandedGroupReply(group, member, thread)
         } catch {
           // Best-effort: the next tick retries; the bound stops runaways.
         }
@@ -15397,6 +15594,7 @@ export default {
                   holds: room.holds && typeof room.holds === 'object' ? room.holds : {},
                   members: Array.isArray(room.members) ? room.members : [],
                   roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
+                  sessionScopeId: typeof room.sessionScopeId === 'string' && room.sessionScopeId ? room.sessionScopeId : null,
                   image: typeof room.image === 'string' && room.image ? room.image : null,
                   syncRevision: Math.max(0, Number(room.syncRevision || 0)),
                   epoch: 0,
