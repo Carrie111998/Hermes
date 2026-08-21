@@ -16248,6 +16248,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "profile": self._handle_profile_command,
                 "update": self._handle_update_command,
                 "version": self._handle_version_command,
+                "neuralwatt": self._handle_neuralwatt_command,
             }.get(name)
             if plain is not None:
                 return await plain(event)
