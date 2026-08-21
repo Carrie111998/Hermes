@@ -1039,3 +1039,65 @@ class TestWriteFileValidatedBeforeGate:
         assert result["success"] is True
         assert result["staged"] is True
         mock_stage.assert_called_once()
+
+    def test_remove_file_is_rejected_and_never_staged(self):
+        """`remove_file` stages too, so it needs the same pre-gate refusal.
+
+        Without it the caller is told the removal is staged for review and
+        only learns at apply time that the path was never removable.
+        """
+        from tools import write_approval as wa
+        with self._staging_gate(), patch.object(
+            wa, "stage_write", return_value={"id": "test-pending-1"}
+        ) as mock_stage:
+            result = json.loads(skill_manage(
+                action="remove_file",
+                name="some-skill",
+                file_path="/etc/passwd",
+            ))
+        assert result["success"] is False
+        assert "Absolute paths are not allowed" in result["error"]
+        assert not result.get("staged")
+        mock_stage.assert_not_called()
+
+    def test_an_approved_staged_write_is_revalidated_on_apply(self):
+        """Apply never trusts the staged payload.
+
+        `apply_skill_pending` replays it through `skill_manage` with the gate
+        bypassed, so it meets the pre-gate check first and `_write_file`'s own
+        `_validate_file_path` after. Two independent layers: a payload that
+        reached `pending/skills` before this fix, or through some future path
+        that stages without the pre-gate check, is still refused at apply
+        time. This pins that property, not the layer that enforces it.
+        """
+        from tools.skill_manager_tool import apply_skill_pending
+        from tools import write_approval as wa
+        with patch.object(wa, "stage_write") as mock_stage:
+            result = json.loads(apply_skill_pending({
+                "action": "write_file",
+                "name": "some-skill",
+                "file_path": "/tmp/notes.txt",
+                "file_content": "hello",
+            }))
+        assert result["success"] is False
+        assert "Absolute paths are not allowed" in result["error"]
+        mock_stage.assert_not_called()
+
+
+class TestValidateFilePathSeparators:
+    """Backslash paths are refused on both platforms, by different rules.
+
+    `has_traversal_component` splits with `pathlib.Path`, which is
+    platform-dependent: on Windows a backslash separates components and the
+    traversal check sees the `..`; on POSIX the whole string is one filename,
+    which cannot escape anything and is refused by the allowed-subdirectory
+    rule instead. Either way the answer is a refusal, which is what this pins.
+    """
+
+    def test_backslash_traversal_is_refused(self):
+        error = _validate_file_path("references\\..\\..\\etc\\passwd")
+        assert error is not None
+
+    def test_backslash_only_path_is_refused(self):
+        error = _validate_file_path("references\\guide.md")
+        assert error is not None
