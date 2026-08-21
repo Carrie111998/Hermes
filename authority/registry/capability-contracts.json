@@ -1,0 +1,90 @@
+{
+  "schema_version": "1.0",
+  "description": "Capability contracts declare what a task needs (quality floor, context, tools, modality, reasoning intent) without naming any model or vendor.",
+  "contracts": {
+    "local-deterministic": {
+      "quality": "deterministic",
+      "modality": [
+        "text",
+        "image"
+      ],
+      "tools": "none",
+      "context_class": "short",
+      "reasoning_intent": "off"
+    },
+    "fast-economy": {
+      "quality": "economy",
+      "modality": [
+        "text"
+      ],
+      "tools": "basic",
+      "context_class": "standard",
+      "reasoning_intent": "low"
+    },
+    "standard-reasoning": {
+      "quality": "standard",
+      "modality": [
+        "text"
+      ],
+      "tools": "basic",
+      "context_class": "standard",
+      "reasoning_intent": "high"
+    },
+    "complex-execution": {
+      "quality": "complex",
+      "modality": [
+        "text"
+      ],
+      "tools": "full",
+      "context_class": "standard",
+      "reasoning_intent": "deep"
+    },
+    "multimodal-extraction": {
+      "quality": "visual",
+      "modality": [
+        "image"
+      ],
+      "tools": "none",
+      "context_class": "standard",
+      "reasoning_intent": "off"
+    },
+    "high-stakes-decision": {
+      "quality": "expert",
+      "modality": [
+        "text"
+      ],
+      "tools": "full",
+      "context_class": "standard",
+      "reasoning_intent": "deep"
+    },
+    "independent-review": {
+      "quality": "review",
+      "modality": [
+        "text"
+      ],
+      "tools": "read",
+      "context_class": "standard",
+      "reasoning_intent": "deep"
+    },
+    "publishing": {
+      "quality": "publish",
+      "modality": [
+        "text"
+      ],
+      "tools": "full",
+      "context_class": "standard",
+      "reasoning_intent": "medium"
+    },
+    "routing-classifier": {
+      "quality": "classifier",
+      "modality": [
+        "text"
+      ],
+      "tools": "none",
+      "context_class": "short",
+      "reasoning_intent": "low",
+      "max_tokens": 512,
+      "timeout_ms": 6000
+    }
+  }
+}

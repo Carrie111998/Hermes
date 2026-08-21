@@ -2349,6 +2349,28 @@ class TestConcurrentToolExecution:
         ]
         assert outcome.blocked is False
 
+    def test_coordinated_route_blocks_top_level_project_tool(self, agent):
+        from agent import tool_executor
+
+        called = []
+        agent._direct_execution_guard = True
+        agent._delegate_depth = 0
+        agent._direct_execution_guard_tools = {"terminal"}
+
+        outcome = tool_executor._run_agent_tool_execution_middleware(
+            agent,
+            function_name="terminal",
+            function_args={"command": "true"},
+            effective_task_id="task-1",
+            tool_call_id="call-guarded",
+            execute=lambda args: called.append(args) or "should not run",
+        )
+
+        assert outcome.blocked is True
+        assert outcome.dispatched is False
+        assert called == []
+        assert "Delegate the step" in outcome.result
+
     def test_managed_tool_pipeline_allows_one_concurrent_dispatch(
         self,
         agent,

@@ -1,0 +1,61 @@
+{
+  "schema_version": "1.0",
+  "description": "Execution roles carry only workflow responsibility, tool permissions, and output contract. They never carry a concrete model, vendor, or thinking level.",
+  "roles": {
+    "responder": {
+      "responsibility": "top-level master answers directly",
+      "tools": "contextual",
+      "dispatch": "self",
+      "model_policy": "route"
+    },
+    "worker": {
+      "responsibility": "bounded deterministic execution",
+      "tools": "read,grep,find,ls,bash,edit,write",
+      "dispatch": "subagent",
+      "model_policy": "fast-economy"
+    },
+    "worker-pro": {
+      "responsibility": "complex implementation and analysis",
+      "tools": "read,grep,find,ls,bash,edit,write",
+      "dispatch": "subagent",
+      "model_policy": "complex-execution"
+    },
+    "planner": {
+      "responsibility": "decompose complex work into a plan",
+      "tools": "read,grep,find,ls",
+      "dispatch": "subagent",
+      "model_policy": "complex-execution"
+    },
+    "explorer": {
+      "responsibility": "read-only multimodal and evidence gathering",
+      "tools": "read,grep,find,ls",
+      "dispatch": "subagent",
+      "model_policy": "multimodal-extraction"
+    },
+    "publisher": {
+      "responsibility": "polish approved output",
+      "tools": "read,grep,find,ls",
+      "dispatch": "subagent",
+      "model_policy": "publishing"
+    },
+    "reviewer": {
+      "responsibility": "independent cross-vendor review; if no cross-vendor candidate is available, fail closed and report review-blocked; never silently use same-family review",
+      "tools": "read,grep,find,ls,bash",
+      "dispatch": "subagent",
+      "model_policy": "independent-review",
+      "read_only": true
+    },
+    "local-worker": {
+      "responsibility": "local deterministic text",
+      "tools": "none",
+      "dispatch": "local",
+      "model_policy": "local-deterministic"
+    },
+    "local-extractor": {
+      "responsibility": "local visual extraction",
+      "tools": "none",
+      "dispatch": "local",
+      "model_policy": "local-deterministic"
+    }
+  }
+}

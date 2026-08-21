@@ -432,6 +432,18 @@ class AIAgent:
         self._base_url_lower = value.lower() if value else ""
         self._base_url_hostname = base_url_hostname(value)
 
+    @property
+    def runtime_registry(self):
+        """Immutable registry activation state for this agent/session."""
+
+        return self._runtime_registry
+
+    @property
+    def runtime_snapshot(self):
+        """Immutable registry snapshot bound during agent initialization."""
+
+        return self._runtime_snapshot
+
     def __init__(
         self,
         base_url: str = None,
@@ -8361,6 +8373,22 @@ class AIAgent:
         #     gateway session the async result would route back to.
         # The schema-level `background` param is intentionally ignored here.
         _is_subagent = getattr(self, "_delegate_depth", 0) > 0
+        route_candidates = None
+        if not _is_subagent:
+            try:
+                from agent.route import get_role_candidates
+
+                route_role = getattr(self, "_route_delegate_role", None)
+                if route_role:
+                    route_candidates = get_role_candidates(
+                        route_role,
+                        config=getattr(self, "_route_config", None),
+                        bundle=getattr(
+                            getattr(self, "runtime_snapshot", None), "bundle", None
+                        ),
+                    )
+            except Exception:
+                route_candidates = None
         return _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),
@@ -8371,6 +8399,7 @@ class AIAgent:
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"),
             message=function_args.get("message"),
+            route_candidates=route_candidates,
             parent_agent=self,
         )
 

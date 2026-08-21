@@ -1,0 +1,58 @@
+{
+  "schema_version": "1.0",
+  "description": "Route states and routing policy. L0-L3 encode execution depth; risk is an independent governance axis. Fast Gate is the default path; the semantic router runs at most once and only for uncertain/multimodal/high-risk tasks.",
+  "default_route": { "level": "L1", "risk": "low" },
+  "level_contracts": {
+    "L0": "fast-economy",
+    "L1": "standard-reasoning",
+    "L2": "complex-execution",
+    "L3": "high-stakes-decision"
+  },
+  "level_workflows": {
+    "L0": "direct",
+    "L1": "standard",
+    "L2": "controlled-execution",
+    "L3": "expert-reviewed"
+  },
+  "specialized_workflows": {
+    "standalone_file_edit": {
+      "level": "L1",
+      "risk": "low",
+      "workflow": "file-edit",
+      "contract": "fast-economy"
+    },
+    "local_deterministic": {
+      "level": "L0",
+      "risk": "low",
+      "workflow": "local-deterministic",
+      "contract": "local-deterministic"
+    },
+    "local_visual_extraction": {
+      "level": "L0",
+      "risk": "low",
+      "workflow": "local-visual-extraction",
+      "contract": "local-deterministic"
+    }
+  },
+  "risk_gates": {
+    "low": { "min_workflow": null },
+    "medium": { "min_workflow": "controlled-execution" },
+    "high": { "min_workflow": "expert-reviewed", "force_review": true }
+  },
+  "semantic_router": {
+    "enabled": true,
+    "max_calls_per_task": 1,
+    "timeout_ms": 6000,
+    "model_policy": "routing-classifier",
+    "triggers": ["uncertain", "multimodal", "high_risk"],
+    "on_failure": "fast_gate_conservative",
+    "on_low_confidence": "no_upgrade"
+  },
+  "workflow_rank": {
+    "direct": 0,
+    "standard": 1,
+    "controlled-execution": 2,
+    "expert-reviewed": 3,
+    "multimodal": 2
+  }
+}

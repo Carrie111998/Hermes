@@ -1,0 +1,44 @@
+{
+  "schema_version": "1.1",
+  "description": "Workflow templates select execution stages; route level and execution role are independent. Worker selection is per step, so complex workflows may assign simple steps to worker and complex steps to worker-pro.",
+  "templates": {
+    "direct": {
+      "roles": ["responder"],
+      "verify": false
+    },
+    "standard": {
+      "roles": ["responder"],
+      "verify": false
+    },
+    "file-edit": {
+      "roles": ["worker"],
+      "verify": true,
+      "review_required": false
+    },
+    "controlled-execution": {
+      "roles": ["worker"],
+      "worker_selection": "per_step_complexity",
+      "allowed_worker_roles": ["worker", "worker-pro"],
+      "verify": true
+    },
+    "expert-reviewed": {
+      "roles": ["planner", "worker", "reviewer"],
+      "worker_selection": "per_step_complexity",
+      "allowed_worker_roles": ["worker", "worker-pro"],
+      "verify": true,
+      "review_required": true
+    },
+    "multimodal": {
+      "roles": ["explorer", "responder"],
+      "verify": false
+    },
+    "local-deterministic": {
+      "roles": ["local-worker"],
+      "verify": false
+    },
+    "local-visual-extraction": {
+      "roles": ["local-extractor"],
+      "verify": false
+    }
+  }
+}

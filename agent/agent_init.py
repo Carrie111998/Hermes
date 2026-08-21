@@ -27,7 +27,8 @@ import threading
 import time
 import uuid
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Mapping, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
@@ -92,6 +93,127 @@ def _warn_memory_provider_unavailable(name: str, reason: str = "") -> None:
         "any required variables in the service environment.%s",
         name,
         f" {reason}" if reason else "",
+    )
+
+
+def _initialize_runtime_registry(agent: Any, config: Mapping[str, Any]) -> None:
+    """Bind one registry snapshot at the agent initialization boundary.
+
+    Registry failures are deliberately isolated from provider/client setup:
+    the native runtime remains the only execution path when the control plane
+    is disabled, unapproved, or malformed.  This function is called once from
+    ``init_agent`` and has no reload or promotion behavior.
+    """
+
+    from agent.runtime_registry import (
+        RegistryLoadError,
+        RuntimeRegistryState,
+        load_registry,
+    )
+
+    routing = config.get("routing", {}) if isinstance(config, Mapping) else {}
+    if not isinstance(routing, Mapping):
+        routing = {}
+        reason = {"code": "invalid_config", "field": "routing"}
+        agent._runtime_snapshot = None
+        agent._runtime_registry = RuntimeRegistryState(
+            enabled=False,
+            mode="production",
+            status="inactive",
+            inactive_reason=reason,
+        )
+        return
+
+    enabled = routing.get("enabled", False)
+    mode = routing.get("registry_mode", "production")
+    if type(enabled) is not bool:
+        agent._runtime_snapshot = None
+        agent._runtime_registry = RuntimeRegistryState(
+            enabled=False,
+            mode="production",
+            status="inactive",
+            inactive_reason={
+                "code": "invalid_config",
+                "field": "routing.enabled",
+                "expected": "boolean",
+            },
+        )
+        return
+    if type(mode) is not str or mode not in {"production", "preview"}:
+        agent._runtime_snapshot = None
+        agent._runtime_registry = RuntimeRegistryState(
+            enabled=enabled,
+            mode="production",
+            status="inactive",
+            inactive_reason={
+                "code": "invalid_config",
+                "field": "routing.registry_mode",
+                "expected": "production or preview",
+            },
+        )
+        return
+
+    if not enabled:
+        agent._runtime_snapshot = None
+        agent._runtime_registry = RuntimeRegistryState(
+            enabled=False,
+            mode=mode,
+            status="inactive",
+            inactive_reason={"code": "disabled"},
+        )
+        return
+
+    try:
+        source_dir = routing.get("source_dir")
+        load_kwargs = {"mode": mode}
+        if isinstance(source_dir, (str, Path)):
+            load_kwargs["root"] = source_dir
+        snapshot = load_registry(**load_kwargs)
+    except RegistryLoadError as exc:
+        reason: dict[str, str] = {"code": exc.code}
+        if exc.path:
+            reason["path"] = exc.path
+        agent._runtime_snapshot = None
+        agent._runtime_registry = RuntimeRegistryState(
+            enabled=True,
+            mode=mode,
+            status="inactive",
+            inactive_reason=reason,
+        )
+        logger.warning(
+            "Runtime registry inactive: code=%s path=%s mode=%s",
+            exc.code,
+            exc.path or "",
+            mode,
+        )
+        return
+    except Exception as exc:  # fail closed without affecting native startup
+        agent._runtime_snapshot = None
+        agent._runtime_registry = RuntimeRegistryState(
+            enabled=True,
+            mode=mode,
+            status="inactive",
+            inactive_reason={
+                "code": "registry_load_failed",
+                "error_type": type(exc).__name__,
+            },
+        )
+        logger.warning(
+            "Runtime registry inactive: code=registry_load_failed error_type=%s mode=%s",
+            type(exc).__name__,
+            mode,
+        )
+        return
+
+    status = "candidate" if snapshot.is_candidate else "active"
+    agent._runtime_snapshot = snapshot
+    agent._runtime_registry = RuntimeRegistryState(
+        enabled=True,
+        mode=mode,
+        status=status,
+        version=snapshot.registry_version,
+        promotion_state=snapshot.promotion_state,
+        manifest_hash=snapshot.manifest_sha256,
     )
 
 
@@ -1749,6 +1871,8 @@ def init_agent(
     except Exception:
         _agent_cfg = {}
 
+    _initialize_runtime_registry(agent, _agent_cfg)
+
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as
     # visible mid-turn updates through the interim message path. When false,
@@ -3027,4 +3151,4 @@ def init_agent(
 
 
 
-__all__ = ["init_agent"]
+__all__ = ["_initialize_runtime_registry", "init_agent"]

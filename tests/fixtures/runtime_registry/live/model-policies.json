@@ -1,0 +1,104 @@
+{
+  "schema_version": "1.2",
+  "description": "Role-specific model policies. MiniMax remains the frequent primary for routing, fast-economy, and bounded simple execution; GPT-5.6 Luna high is the resident primary for standard reasoning; GPT-first roles do not route through MiniMax/other primary suppliers. DeepSeek official models are hard-fallback only and never resident primary tasks. Multimodal is the sole Gemini → MiniMax → GPT exception.",
+  "policies": {
+    "routing-classifier": {
+      "primary_pool": [
+        "minimax-cn/MiniMax-M3"
+      ],
+      "primary_pool_mode": "flexible_available_primary",
+      "soft_failover": [
+        "openai-codex/gpt-5.6-luna"
+      ],
+      "hard_failover": [
+        "deepseek/deepseek-v4-flash"
+      ],
+      "router_failure_action": "fast_gate_conservative"
+    },
+    "local-deterministic": {
+      "primary": "ollama/qwen3-vl:2b",
+      "soft_failover": [],
+      "hard_failover": []
+    },
+    "fast-economy": {
+      "primary_pool": [
+        "minimax-cn/MiniMax-M3"
+      ],
+      "primary_pool_mode": "flexible_available_primary",
+      "soft_failover": [
+        "openai-codex/gpt-5.6-luna"
+      ],
+      "hard_failover": [
+        "deepseek/deepseek-v4-flash"
+      ]
+    },
+    "standard-reasoning": {
+      "primary": "openai-codex/gpt-5.6-luna",
+      "soft_failover": [],
+      "hard_failover": [
+        "deepseek/deepseek-v4-flash"
+      ]
+    },
+    "complex-execution": {
+      "primary": "openai-codex/gpt-5.6-terra",
+      "soft_failover": [
+        "openai-codex/gpt-5.6-sol"
+      ],
+      "hard_failover": [
+        "deepseek/deepseek-v4-pro"
+      ]
+    },
+    "multimodal-extraction": {
+      "primary": "bboluo/[L]gemini-3.1-pro-preview",
+      "soft_failover": [
+        "minimax-cn/MiniMax-M3",
+        "openai-codex/gpt-5.6-terra",
+        "openai-codex/gpt-5.6-sol"
+      ],
+      "hard_failover": [],
+      "note": "Only exception to the normal primary→GPT soft→DeepSeek hard chain. Gemini → MiniMax M3 → GPT; DeepSeek is not a raw-image fallback."
+    },
+    "high-stakes-decision": {
+      "primary": "openai-codex/gpt-5.6-sol",
+      "soft_failover": [
+        "openai-codex/gpt-5.6-terra"
+      ],
+      "hard_failover": [
+        "deepseek/deepseek-v4-pro"
+      ]
+    },
+    "independent-review": {
+      "primary": "dynamic",
+      "failover": [],
+      "exclusion": "vendor_family",
+      "degradation": {
+        "strategy": "fail_closed_no_same_family",
+        "description": "Review is task-scoped, not resident. Select a cross-vendor reviewer; if none is available, fail closed and report review-blocked. Never silently use same-family review.",
+        "thinking_escalation": "deep"
+      },
+      "rules": {
+        "minimax": [
+          "openai-codex/gpt-5.6-sol"
+        ],
+        "openai": [
+          "minimax-cn/MiniMax-M3"
+        ],
+        "google": [
+          "openai-codex/gpt-5.6-sol"
+        ],
+        "deepseek": [
+          "openai-codex/gpt-5.6-sol"
+        ]
+      }
+    },
+    "publishing": {
+      "primary": "openai-codex/gpt-5.6-terra",
+      "soft_failover": [
+        "openai-codex/gpt-5.6-sol"
+      ],
+      "hard_failover": [
+        "deepseek/deepseek-v4-pro"
+      ]
+    }
+  }
+}

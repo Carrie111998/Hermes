@@ -1,0 +1,151 @@
+{
+  "schema_version": "1.1",
+  "description": "Only currently approved production models are routable. Profiles declare capability and thinking mappings; DeepSeek official entries are hard-fallback-only by policy.",
+  "profiles": {
+    "openai-codex/gpt-5.6-luna": {
+      "vendor_family": "openai",
+      "supported_reasoning": [
+        "off",
+        "low",
+        "medium",
+        "high"
+      ],
+      "thinking_map": {
+        "off": "off",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "deep": "high"
+      },
+      "context_window": 272000,
+      "supports_tools": true,
+      "supports_images": true
+    },
+    "openai-codex/gpt-5.6-terra": {
+      "vendor_family": "openai",
+      "supported_reasoning": [
+        "off",
+        "low",
+        "medium",
+        "high"
+      ],
+      "thinking_map": {
+        "off": "off",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "deep": "high"
+      },
+      "context_window": 272000,
+      "supports_tools": true,
+      "supports_images": true
+    },
+    "openai-codex/gpt-5.6-sol": {
+      "vendor_family": "openai",
+      "supported_reasoning": [
+        "off",
+        "low",
+        "medium",
+        "high"
+      ],
+      "thinking_map": {
+        "off": "off",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "deep": "high"
+      },
+      "context_window": 272000,
+      "supports_tools": true,
+      "supports_images": true
+    },
+    "minimax-cn/MiniMax-M3": {
+      "vendor_family": "minimax",
+      "supported_reasoning": [
+        "off",
+        "high",
+        "max"
+      ],
+      "thinking_map": {
+        "off": "off",
+        "low": "off",
+        "medium": "high",
+        "high": "high",
+        "deep": "max"
+      },
+      "context_window": 1000000,
+      "supports_tools": true,
+      "supports_images": true,
+      "capability_source": "MiniMax official M3 documentation: native multimodal, image/video input, 1M context"
+    },
+    "deepseek/deepseek-v4-flash": {
+      "vendor_family": "deepseek",
+      "supported_reasoning": [
+        "high"
+      ],
+      "thinking_map": {
+        "off": "high",
+        "low": "high",
+        "medium": "high",
+        "high": "high",
+        "deep": "high"
+      },
+      "context_window": 1000000,
+      "supports_tools": true,
+      "supports_images": false,
+      "routing_role": "hard-fallback-only"
+    },
+    "deepseek/deepseek-v4-pro": {
+      "vendor_family": "deepseek",
+      "supported_reasoning": [
+        "high",
+        "max"
+      ],
+      "thinking_map": {
+        "off": "high",
+        "low": "high",
+        "medium": "high",
+        "high": "high",
+        "deep": "max"
+      },
+      "context_window": 1000000,
+      "supports_tools": true,
+      "supports_images": false,
+      "routing_role": "hard-fallback-only"
+    },
+    "bboluo/[L]gemini-3.1-pro-preview": {
+      "vendor_family": "google",
+      "supported_reasoning": [],
+      "thinking_map": {
+        "off": "off",
+        "low": "off",
+        "medium": "off",
+        "high": "off",
+        "deep": "off"
+      },
+      "context_window": 128000,
+      "supports_tools": false,
+      "supports_images": true,
+      "routing_role": "multimodal-only"
+    },
+    "ollama/qwen3-vl:2b": {
+      "vendor_family": "local",
+      "supported_reasoning": [
+        "off"
+      ],
+      "thinking_map": {
+        "off": "off",
+        "low": "off",
+        "medium": "off",
+        "high": "off",
+        "deep": "off"
+      },
+      "context_window": 262144,
+      "supports_tools": false,
+      "supports_images": true,
+      "supports_vision": true,
+      "routing_role": "local-only",
+      "capability_source": "Local Ollama verification: text and vision; 262144 context"
+    }
+  }
+}

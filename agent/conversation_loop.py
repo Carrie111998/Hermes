@@ -1813,6 +1813,30 @@ def run_conversation(
         except Exception:
             pass
 
+    # Apply the task route before turn context and the first main-model call.
+    # Hermes remains responsible for model execution, tools, compression, and
+    # provider-failure recovery; this hook owns only the task/workflow decision.
+    if getattr(agent, "_delegate_depth", 0) == 0:
+        try:
+            from agent.route import (
+                RoutingBlockedError,
+                apply_route,
+                prepare_specialized_message,
+                specialized_system_message,
+            )
+
+            _turn_route = apply_route(agent, user_message)
+            user_message = prepare_specialized_message(user_message, _turn_route)
+            if system_message is None:
+                _local_system = specialized_system_message(_turn_route)
+                if _local_system is not None:
+                    agent._cached_system_prompt = _local_system
+                    agent._cached_system_prompt_static = None
+        except RoutingBlockedError:
+            raise
+        except Exception:
+            logger.warning("route application failed; continuing with current agent", exc_info=True)
+
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
     # uncompressed result look like a compacted transcript to gateway writers.
@@ -2482,7 +2506,9 @@ def run_conversation(
         # exactly the point the breakpoints were meant to protect. Marking
         # last also keeps breakpoints off messages that the orphan sweep or
         # the thinking-only drop is about to remove or merge away.
-        tools_for_api = agent.tools
+        tools_for_api = (
+            [] if getattr(agent, "_route_disable_tools", False) else agent.tools
+        )
         if agent._use_prompt_caching and agent.provider != "moa":
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
             _initial_cache_plan = build_prompt_cache_plan(
@@ -2536,7 +2562,7 @@ def run_conversation(
         # total_chars is a rough (~) proxy — verbose log + hook metric only.
         approx_tokens = estimate_messages_tokens_rough(api_messages)
         request_pressure_tokens = approx_tokens + (
-            _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
+            _estimate_tools_tokens_rough(tools_for_api) if tools_for_api else 0
         )
         total_chars = approx_tokens * 4
         # Stash this request's rough estimate so update_from_response() can
@@ -8410,6 +8436,17 @@ def run_conversation(
                 append_message(messages, {"role": "assistant", "content": final_response})
                 break
     
+    # Release gates belong to the route control plane and run after the model
+    # has produced a candidate but before Hermes persists/delivers it.
+    if getattr(agent, "_delegate_depth", 0) == 0:
+        from agent.route import enforce_release_gates
+
+        final_response = enforce_release_gates(
+            agent,
+            user_message=original_user_message,
+            answer=final_response,
+        )
+
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.

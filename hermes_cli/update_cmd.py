@@ -4948,6 +4948,57 @@ def _rebuild_desktop_after_update(
     return True
 
 
+def _apply_route_authority_after_update(project_root: Path) -> bool:
+    """Reapply the external route authority before post-update work continues.
+
+    The helper intentionally runs a separate stdlib-only process: this updater
+    process started from the pre-pull checkout, while the authority manager
+    validates and patches the new checkout on disk. A configured authority is
+    therefore fail-closed; an absent configuration keeps upstream behavior.
+    """
+
+    try:
+        from hermes_cli.config import load_config
+
+        routing = (load_config() or {}).get("routing", {})
+        authority_dir = routing.get("authority_dir") if isinstance(routing, dict) else None
+        if not authority_dir:
+            return True
+        authority = Path(str(authority_dir)).expanduser().resolve()
+        manager = authority / "manage.py"
+        manifest = authority / "manifest.json"
+        if not manager.is_file() or not manifest.is_file():
+            print(
+                f"✗ Route authority is configured but incomplete: {authority}",
+                file=sys.stderr,
+            )
+            return False
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(manager),
+                "apply",
+                "--manifest",
+                str(manifest),
+                "--install-root",
+                str(project_root),
+            ],
+            cwd=authority,
+            capture_output=True,
+            text=True,
+        )
+        if result.stdout.strip():
+            print(result.stdout.strip())
+        if result.returncode != 0:
+            if result.stderr.strip():
+                print(result.stderr.strip(), file=sys.stderr)
+            return False
+        return True
+    except Exception as exc:
+        print(f"✗ Route authority failed closed: {exc}", file=sys.stderr)
+        return False
+
+
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
@@ -5665,6 +5716,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         prompt_user=prompt_for_restore,
                         input_fn=gw_input_fn,
                     )
+
+        if not _apply_route_authority_after_update(_m().PROJECT_ROOT):
+            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+            print(
+                "✗ Route authority was not applied; stopping before dependency sync/build.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
         _invalidate_update_cache()
 
