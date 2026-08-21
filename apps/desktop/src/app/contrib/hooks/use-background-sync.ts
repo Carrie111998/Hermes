@@ -8,7 +8,7 @@ import { createClientSessionState } from '@/lib/chat-runtime'
 import { sessionMessagesSignature } from '@/lib/session-signatures'
 import { $changeEventsAvailable, $cronChangeTick, $sessionsChangeTick } from '@/store/live-sync'
 import { $onBattery, batteryPollInterval } from '@/store/power'
-import { refreshActiveProfile } from '@/store/profile'
+import { normalizeProfileKey, refreshActiveProfile } from '@/store/profile'
 import {
   $activeSessionId,
   $busy,
@@ -38,10 +38,24 @@ interface ActiveTranscriptSession {
 }
 
 /** Resolve an active transcript from visible rows or its unique hidden owner. */
-export function resolveActiveTranscriptSession(storedSessionId: string): ActiveTranscriptSession | undefined {
+export function resolveActiveTranscriptSession(
+  storedSessionId: string,
+  ownerProfile: string
+): ActiveTranscriptSession | undefined {
+  const owner = normalizeProfileKey(ownerProfile)
   const visible =
-    $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId)) ??
-    $messagingSessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+    $sessions
+      .get()
+      .find(
+        session =>
+          sessionMatchesStoredId(session, storedSessionId) && normalizeProfileKey(session.profile) === owner
+      ) ??
+    $messagingSessions
+      .get()
+      .find(
+        session =>
+          sessionMatchesStoredId(session, storedSessionId) && normalizeProfileKey(session.profile) === owner
+      )
 
   if (visible) {
     return { profile: visible.profile }
@@ -49,7 +63,9 @@ export function resolveActiveTranscriptSession(storedSessionId: string): ActiveT
 
   const ownerRoute = getSessionOwnerHint(storedSessionId)
 
-  return ownerRoute ? { ownerRoute, profile: ownerRoute.profile } : undefined
+  return ownerRoute && normalizeProfileKey(ownerRoute.targetProfile ?? ownerRoute.profile) === owner
+    ? { ownerRoute, profile: ownerRoute.profile }
+    : undefined
 }
 
 export interface ActiveTranscriptRefreshDeps {
@@ -57,7 +73,8 @@ export interface ActiveTranscriptRefreshDeps {
   busyRef: MutableRefObject<boolean>
   requestSequenceRef: MutableRefObject<number>
   selectedStoredSessionIdRef: MutableRefObject<string | null>
-  resolveSession: (storedSessionId: string) => ActiveTranscriptSession | null | undefined
+  selectedStoredSessionProfileRef: MutableRefObject<string | null>
+  resolveSession: (storedSessionId: string, ownerProfile: string) => ActiveTranscriptSession | null | undefined
   signatureRef: MutableRefObject<Map<string, string>>
   updateSessionState: (
     sessionId: string,
@@ -173,17 +190,19 @@ export async function reconcileActiveTranscript({
   requestSequenceRef,
   resolveSession,
   selectedStoredSessionIdRef,
+  selectedStoredSessionProfileRef,
   signatureRef,
   updateSessionState
 }: ActiveTranscriptRefreshDeps): Promise<void> {
   const storedSessionId = selectedStoredSessionIdRef.current
+  const storedSessionProfile = selectedStoredSessionProfileRef.current
   const runtimeSessionId = activeSessionIdRef.current
 
-  if (!storedSessionId || !runtimeSessionId || busyRef.current) {
+  if (!storedSessionId || !storedSessionProfile || !runtimeSessionId || busyRef.current) {
     return
   }
 
-  const stored = resolveSession(storedSessionId)
+  const stored = resolveSession(storedSessionId, storedSessionProfile)
 
   if (!stored) {
     return
@@ -206,6 +225,7 @@ export async function reconcileActiveTranscript({
       requestId !== requestSequenceRef.current ||
       busyRef.current ||
       selectedStoredSessionIdRef.current !== storedSessionId ||
+      selectedStoredSessionProfileRef.current !== storedSessionProfile ||
       activeSessionIdRef.current !== runtimeSessionId
     ) {
       return
