@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 
 import { test } from 'vitest'
 
@@ -6,6 +8,9 @@ import {
   isValidProfileName,
   resolveDesktopPrimaryProfile
 } from './desktop-primary-profile'
+
+const MAIN_TS_PATH = resolve(__dirname, 'main.ts')
+const mainSource = readFileSync(MAIN_TS_PATH, 'utf8')
 
 test('returns the desktop-stored profile when set', () => {
   assert.equal(resolveDesktopPrimaryProfile('security-analyst', 'software-engineer'), 'security-analyst')
@@ -51,4 +56,42 @@ test('rejects invalid profile names', () => {
   assert.equal(isValidProfileName('-leading-dash'), false)
   assert.equal(isValidProfileName('Has Spaces'), false)
   assert.equal(isValidProfileName('A'.repeat(65)), false)
+})
+
+// ---------------------------------------------------------------------------
+// Wiring invariants — `startHermes()` and `hermes:profile:get` must both go
+// through `primaryProfileKey()` (which already falls back through the CLI
+// sticky), not read the desktop-only preference directly. Without this the
+// backend launches into one profile while the renderer's profile switcher
+// displays another — same root cause, different symptom (#57757).
+// ---------------------------------------------------------------------------
+
+test('startHermes resolves the --profile flag via primaryProfileKey', () => {
+  // Find the startHermes body by anchoring on the --port 0 backendArgs.
+  const anchor = "const backendArgs = ['serve', '--host', '127.0.0.1', '--port', '0']"
+  const start = mainSource.indexOf(anchor)
+  assert.notEqual(start, -1, 'backendArgs anchor not found in main.ts')
+
+  const end = mainSource.indexOf("const setup = await runPrimaryBackendStartup({", start)
+  assert.notEqual(end, -1, 'runPrimaryBackendStartup call not found after anchor')
+  const body = mainSource.slice(start, end)
+
+  assert.match(
+    body,
+    /const activeProfile = primaryProfileKey\(\)/,
+    'startHermes should resolve the --profile flag through primaryProfileKey(), not readActiveDesktopProfile()'
+  )
+  assert.match(
+    body,
+    /if \(activeProfile !== 'default'\)/,
+    'startHermes should skip --profile when the resolved profile is "default" (legacy behavior)'
+  )
+})
+
+test('hermes:profile:get IPC handler reports primaryProfileKey, not just the desktop pref', () => {
+  assert.match(
+    mainSource,
+    /ipcMain\.handle\('hermes:profile:get', async \(\) => \(\{ profile: primaryProfileKey\(\) \}\)\)/,
+    'hermes:profile:get must report primaryProfileKey() so the renderer-side switcher agrees with the launched backend'
+  )
 })

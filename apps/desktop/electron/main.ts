@@ -10672,12 +10672,15 @@ async function startHermes() {
     const backendArgs = ['serve', '--host', '127.0.0.1', '--port', '0']
     // Pin the desktop's chosen profile via the global --profile flag. This is
     // deterministic (it wins over the sticky ~/.hermes/active_profile file) and
-    // resolves HERMES_HOME the same way `hermes -p <name>` does on the CLI. An
-    // unset preference keeps the legacy launch so existing installs are
-    // unaffected.
-    const activeProfile = readActiveDesktopProfile()
+    // resolves HERMES_HOME the same way `hermes -p <name>` does on the CLI.
+    // primaryProfileKey() falls back through the desktop's own preference,
+    // then the CLI's sticky active_profile, so this stays in sync with the
+    // routing decisions in ensureBackend()/resolveRemoteBackend(). Skip the
+    // flag when the resolved profile is the root 'default' so legacy
+    // launches are byte-identical for users with no preference.
+    const activeProfile = primaryProfileKey()
 
-    if (activeProfile) {
+    if (activeProfile !== 'default') {
       backendArgs.unshift('--profile', activeProfile)
     }
 
@@ -13306,7 +13309,13 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
   return sanitizeDesktopConnectionConfig(config, payload?.profile)
 })
 
-ipcMain.handle('hermes:profile:get', async () => ({ profile: readActiveDesktopProfile() }))
+// Renderer boot (use-gateway-boot.ts) calls this to learn which profile the
+// primary window backend came up as, to seed $activeGatewayProfile — the
+// switcher's displayed/highlighted profile. Must agree with primaryProfileKey()
+// (desktop preference → CLI's sticky active_profile → "default"), not just the
+// desktop's own preference, or the switcher shows "default" on first launch
+// even when the backend actually booted into the CLI's sticky profile (#57757).
+ipcMain.handle('hermes:profile:get', async () => ({ profile: primaryProfileKey() }))
 ipcMain.handle('hermes:profile:set', async (_event, name) => {
   const next = writeActiveDesktopProfile(name)
 
