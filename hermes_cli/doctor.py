@@ -1417,6 +1417,12 @@ def run_doctor(args):
                 # is exclusively ``vendor/model`` slugs (Qwen/Qwen3.5-…,
                 # meta-llama/Llama-3-…, anthropic/claude-opus-4-7, …).
                 "deepinfra",
+                # CommandCode fronts 20+ vendors and serves vendor-prefixed
+                # ids (deepseek/deepseek-v4-flash, Qwen/Qwen3.7-Max, …). The
+                # prefix is not optional: the bare name is rejected with HTTP
+                # 400 "Model is not supported on this endpoint", so warning
+                # users to drop it broke working configs (#91144).
+                "commandcode",
             }
             provider_accepts_vendor_slug = (
                 provider_policy_id in providers_accepting_vendor_slugs

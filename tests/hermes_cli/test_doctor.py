@@ -657,6 +657,94 @@ def test_run_doctor_accepts_vendor_slugs_for_named_custom_provider(monkeypatch, 
 
 
 
+def test_run_doctor_accepts_vendor_slugs_for_commandcode(monkeypatch, tmp_path):
+    """CommandCode's catalogue is natively vendor-prefixed, so no warning.
+
+    Its /v1/models serves ``deepseek/deepseek-v4-flash``, ``Qwen/Qwen3.7-Max``
+    and friends, and the endpoint rejects the bare form with HTTP 400. Doctor
+    used to tell users to drop that prefix — advice that breaks the install
+    (#91144).
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / ".env").write_text("COMMANDCODE_API_KEY=***\n", encoding="utf-8")
+    (home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: commandcode\n"
+        "  default: deepseek/deepseek-v4-flash\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    (tmp_path / "project").mkdir(exist_ok=True)
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    try:
+        from hermes_cli import auth as _auth_mod
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status_local", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_xai_oauth_auth_status", lambda: {})
+    except Exception:
+        pass
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+
+    out = buf.getvalue()
+    assert (
+        "model.default 'deepseek/deepseek-v4-flash' uses a vendor/model slug "
+        "but provider is 'commandcode'"
+        not in out
+    )
+    assert "Either set model.provider to 'openrouter', or drop the vendor prefix." not in out
+
+
+def test_run_doctor_still_flags_vendor_slugs_for_direct_providers(monkeypatch, tmp_path):
+    """The allowlist widening must not silence the warning for direct APIs."""
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / ".env").write_text("DEEPSEEK_API_KEY=***\n", encoding="utf-8")
+    (home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: deepseek\n"
+        "  default: deepseek/deepseek-v4-flash\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    (tmp_path / "project").mkdir(exist_ok=True)
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    try:
+        from hermes_cli import auth as _auth_mod
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status_local", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_xai_oauth_auth_status", lambda: {})
+    except Exception:
+        pass
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+
+    assert "uses a vendor/model slug but provider is 'deepseek'" in buf.getvalue()
+
+
 def test_run_doctor_accepts_kimi_coding_cn_provider(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir(parents=True, exist_ok=True)
