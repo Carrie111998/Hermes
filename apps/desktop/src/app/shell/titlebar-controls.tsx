@@ -3,8 +3,9 @@ import { type ComponentProps, type MouseEvent, type ReactNode, useEffect, useSta
 import { useLocation, useNavigate } from 'react-router'
 
 import { hudTargetSessionId } from '@/app/hud/handoff'
+import { createTerminal } from '@/app/right-sidebar/terminal/terminals'
 import { toggleLayoutEditMode } from '@/components/pane-shell/edit-mode'
-import { resetLayoutTree, togglePaneVisible } from '@/components/pane-shell/tree/store'
+import { isPaneVisible, resetLayoutTree, togglePaneVisible } from '@/components/pane-shell/tree/store'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
@@ -35,6 +36,7 @@ import {
   titlebarToolClusterClass
 } from './titlebar'
 import { TitlebarIcon } from './titlebar-icon'
+import { toggleTerminalFromTitlebar } from './terminal-titlebar-action'
 
 export interface TitlebarTool {
   id: string
@@ -209,7 +211,11 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
       label: 'Toggle terminal',
       onSelect: () => {
         triggerHaptic('tap')
-        togglePaneVisible('terminal')
+        toggleTerminalFromTitlebar({
+          create: () => createTerminal(),
+          isVisible: () => isPaneVisible('terminal'),
+          toggle: () => togglePaneVisible('terminal')
+        })
       }
     },
     {

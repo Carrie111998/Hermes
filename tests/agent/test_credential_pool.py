@@ -209,6 +209,40 @@ def test_anthropic_normalization_clears_duplicate_ids_preferred_markers():
 
 
 
+def test_prefer_eligible_credential_persists_only_available_entry(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {"id": "first", "priority": 0, "access_token": "one", "source": "manual"},
+                    {"id": "second", "priority": 1, "access_token": "two", "source": "manual"},
+                    {
+                        "id": "blocked",
+                        "priority": 2,
+                        "access_token": "three",
+                        "source": "manual",
+                        "last_status": "exhausted",
+                    },
+                ]
+            },
+        },
+    )
+
+    from hermes_cli.auth import prefer_eligible_credential
+
+    assert prefer_eligible_credential("openai-codex", "blocked") == "unavailable"
+    assert prefer_eligible_credential("openai-codex", "second") == "saved"
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    entries = persisted["credential_pool"]["openai-codex"]
+    assert entries[0]["id"] == "second"
+    assert entries[0]["preferred"] is True
+    assert all(entry.get("preferred") is not True for entry in entries[1:])
+
+
+
 def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     # Prevent auto-seeding from Codex CLI tokens on the host

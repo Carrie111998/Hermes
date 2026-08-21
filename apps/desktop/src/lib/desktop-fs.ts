@@ -79,6 +79,58 @@ export async function readDesktopFileText(path: string): Promise<HermesReadFileT
   return remoteFsApi<HermesReadFileTextResult>(fsPath('read-text', path))
 }
 
+export async function createDesktopEntry(parentPath: string, name: string, isDirectory: boolean): Promise<string> {
+  const rawParent = String(parentPath || '').trim()
+  const rawChild = String(name || '')
+  const child = rawChild.trim()
+  const windowsBase = child.split('.', 1)[0]?.toUpperCase()
+  const windowsReserved = /^(CON|PRN|AUX|NUL|COM(?:[1-9]|[¹²³])|LPT(?:[1-9]|[¹²³]))$/u.test(windowsBase || '')
+
+  if (
+    !rawParent ||
+    !child ||
+    child === '.' ||
+    child === '..' ||
+    child.includes('/') ||
+    child.includes('\\') ||
+    child.includes(':') ||
+    child.endsWith('.') ||
+    rawChild.endsWith('.') ||
+    rawChild.endsWith(' ') ||
+    windowsReserved
+  ) {
+    throw new Error('Invalid name')
+  }
+
+  const posixRoot = /^\/+$/u.test(rawParent)
+  const windowsRoot = /^[a-zA-Z]:[\\/]*$/u.test(rawParent)
+  const parent = posixRoot
+    ? '/'
+    : windowsRoot
+      ? `${rawParent.slice(0, 2)}\\`
+      : rawParent.replace(/[\\/]+$/, '')
+  const separator = parent.includes('\\') && !parent.includes('/') ? '\\' : '/'
+  const path = parent.endsWith('/') || parent.endsWith('\\') ? `${parent}${child}` : `${parent}${separator}${child}`
+
+  if (isDesktopFsRemoteMode()) {
+    const result = await remoteFsApi<{ ok?: boolean; path?: string }>('/api/fs/create', {
+      is_directory: isDirectory,
+      name: child,
+      parent_path: parent
+    })
+
+    return result.path || path
+  }
+
+  const desktop = bridge()
+
+  if (!desktop.createEntry) {
+    throw new Error('File creation is not available')
+  }
+
+  return (await desktop.createEntry(parent, child, isDirectory)).path
+}
+
 // Save UTF-8 text back to a file. Local writes go through the hardened Electron
 // IPC; remote writes hit the dashboard's POST /api/fs/write-text (same path
 // hardening, parent-must-exist, size cap) so the editor behaves identically in

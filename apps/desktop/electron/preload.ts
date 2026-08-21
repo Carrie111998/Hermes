@@ -270,6 +270,8 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   openDir: dirPath => ipcRenderer.invoke('hermes:fs:openDir', dirPath),
   desktopPluginsRoot: () => ipcRenderer.invoke('hermes:fs:desktopPluginsRoot'),
   agentPluginsRoot: () => ipcRenderer.invoke('hermes:fs:agentPluginsRoot'),
+  createEntry: (parentPath, name, isDirectory) =>
+    ipcRenderer.invoke('hermes:fs:createEntry', parentPath, name, isDirectory),
   renamePath: (targetPath, newName) => ipcRenderer.invoke('hermes:fs:rename', targetPath, newName),
   writeTextFile: (filePath, content) => ipcRenderer.invoke('hermes:fs:writeText', filePath, content),
   trashPath: targetPath => ipcRenderer.invoke('hermes:fs:trash', targetPath),

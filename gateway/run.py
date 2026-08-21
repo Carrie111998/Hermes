@@ -16948,8 +16948,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # can't bypass gating just because an agent happens to be busy.
             # /status above is intentionally pre-gate so users always see
             # session state. /help and /whoami fall under the always-allowed
-            # floor inside _check_slash_access.
-            if _evt_cmd and _cmd_def_inner is not None:
+            # floor inside _check_slash_access. /account owns a stricter,
+            # profile-scoped admin+DM check in its handler; the process-level
+            # gate would incorrectly deny valid secondary-profile admins.
+            if _evt_cmd and _cmd_def_inner is not None and _cmd_def_inner.name != "account":
                 _denied = self._check_slash_access(source, _cmd_def_inner.name)
                 if _denied is not None:
                     return _denied
@@ -17174,7 +17176,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # run every command. When set → non-admins can run only commands in
         # ``user_allowed_commands`` (plus the always-allowed floor: /help,
         # /whoami). Plain chat is unaffected — only slash commands gate.
-        if command and canonical and is_gateway_known_command(canonical):
+        # /account bypasses only this process-level policy because its handler
+        # enforces a mandatory admin+DM policy from the exact served profile.
+        if command and canonical and is_gateway_known_command(canonical) and canonical != "account":
             _denied = self._check_slash_access(source, canonical)
             if _denied is not None:
                 return _denied
@@ -17481,6 +17485,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "compress":
             return await self._handle_compress_command(event)
+
+        if canonical == "account":
+            return await self._handle_account_command(event)
 
         if canonical == "usage":
             return await self._handle_usage_command(event)

@@ -1712,6 +1712,42 @@ def _merge_disk_cooldown_state(
         return entry
 
 
+def prefer_eligible_credential(provider_id: str, credential_id: str) -> str:
+    """Atomically persist one eligible credential as the pool preference.
+
+    Returns ``saved``, ``missing``, or ``unavailable``. The eligibility check
+    and ordering write share the auth-store lock, so concurrent status updates
+    cannot race between validation and persistence.
+    """
+    provider = str(provider_id or "").strip()
+    wanted = str(credential_id or "").strip()
+    if not provider or not wanted:
+        return "missing"
+
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        pools = auth_store.get("credential_pool")
+        if not isinstance(pools, dict):
+            return "missing"
+        raw_entries = pools.get(provider)
+        if not isinstance(raw_entries, list):
+            return "missing"
+        entries = [dict(entry) for entry in raw_entries if isinstance(entry, dict)]
+        selected = next((entry for entry in entries if entry.get("id") == wanted), None)
+        if selected is None:
+            return "missing"
+        if str(selected.get("last_status") or "").lower() in {"dead", "exhausted"}:
+            return "unavailable"
+
+        ordered = [selected, *(entry for entry in entries if entry is not selected)]
+        for priority, entry in enumerate(ordered):
+            entry["priority"] = priority
+            entry["preferred"] = entry is selected
+        pools[provider] = [sanitize_borrowed_credential_payload(entry, provider) for entry in ordered]
+        _save_auth_store(auth_store)
+        return "saved"
+
+
 def write_credential_pool(
     provider_id: str,
     entries: List[Dict[str, Any]],

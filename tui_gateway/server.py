@@ -259,6 +259,10 @@ _LONG_HANDLERS = frozenset(
         # publish an authorization URL. Keep them off the reader thread.
         "mcp.servers.test",
         "mcp.servers.oauth.start",
+        # Provider OAuth start/submit perform remote device-code or PKCE HTTP
+        # exchanges. Keep them off the socket reader so cancel/poll remain live.
+        "auth.oauth.start",
+        "auth.oauth.submit",
         "process.list",
         # profiles.list runs list_profiles() (recursive skill-tree walk per
         # profile) and opens each profile's state.db for the last-session

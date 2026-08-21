@@ -1742,6 +1742,147 @@ def test_auth_accounts_rejects_unknown_actions():
     assert resp["error"]["code"] == 4003
 
 
+def test_auth_oauth_start_and_poll_return_only_public_flow_fields(monkeypatch):
+    sessions = {
+        "flow-1": {
+            "provider": "openai-codex",
+            "status": "pending",
+            "expires_at": 999,
+            "profile": "work",
+            "device_code": "secret-device-code",
+            "access_token": "secret-token",
+        }
+    }
+
+    async def start_device(provider_id, profile=None):
+        assert provider_id == "openai-codex"
+        assert profile == "work"
+        return {
+            "session_id": "flow-1",
+            "flow": "device_code",
+            "user_code": "ABCD-EFGH",
+            "verification_url": "https://auth.example/device",
+            "expires_in": 900,
+            "poll_interval": 5,
+            "device_code": "secret-device-code",
+        }
+
+    fake = types.SimpleNamespace(
+        _OAUTH_PROVIDER_CATALOG=[{"id": "openai-codex", "flow": "device_code"}],
+        _oauth_sessions=sessions,
+        _oauth_sessions_lock=threading.Lock(),
+        _gc_oauth_sessions=lambda: None,
+        _validate_oauth_profile=lambda profile: None,
+        _start_device_code_flow=start_device,
+    )
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server", fake)
+
+    started = _dispatch_sync(
+        {
+            "id": "o1",
+            "method": "auth.oauth.start",
+            "params": {"provider": "openai-codex", "profile": "work"},
+        }
+    )
+    polled = _dispatch_sync(
+        {
+            "id": "o2",
+            "method": "auth.oauth.poll",
+            "params": {"provider": "openai-codex", "profile": "work", "session_id": "flow-1"},
+        }
+    )
+
+    assert started is not None and polled is not None
+    assert started["result"] == {
+        "session_id": "flow-1",
+        "flow": "device_code",
+        "user_code": "ABCD-EFGH",
+        "verification_url": "https://auth.example/device",
+        "expires_in": 900,
+        "poll_interval": 5,
+    }
+    assert polled["result"] == {
+        "session_id": "flow-1",
+        "status": "pending",
+        "expires_at": 999,
+        "error_code": None,
+    }
+    assert "secret" not in str(started["result"])
+    assert "secret" not in str(polled["result"])
+
+
+def test_auth_oauth_submit_and_cancel_delegate_securely(monkeypatch):
+    submitted = []
+    sessions = {"flow-2": {"provider": "anthropic", "flow": "pkce", "profile": "work", "status": "pending"}}
+
+    def submit(session_id, code, profile):
+        submitted.append((session_id, code, profile))
+        return {"ok": True, "status": "approved", "access_token": "secret-token"}
+
+    fake = types.SimpleNamespace(
+        _OAUTH_PROVIDER_CATALOG=[{"id": "anthropic", "flow": "pkce"}],
+        _oauth_sessions=sessions,
+        _oauth_sessions_lock=threading.Lock(),
+        _gc_oauth_sessions=lambda: None,
+        _validate_oauth_profile=lambda profile: None,
+        _submit_anthropic_pkce=submit,
+    )
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server", fake)
+
+    approved = _dispatch_sync(
+        {
+            "id": "o3",
+            "method": "auth.oauth.submit",
+            "params": {
+                "provider": "anthropic",
+                "profile": "work",
+                "session_id": "flow-2",
+                "code": "user-pasted-code",
+            },
+        }
+    )
+    cancelled = _dispatch_sync(
+        {
+            "id": "o4",
+            "method": "auth.oauth.cancel",
+            "params": {"provider": "anthropic", "profile": "work", "session_id": "flow-2"},
+        }
+    )
+
+    assert approved is not None and cancelled is not None
+    assert approved["result"] == {"session_id": "flow-2", "status": "approved"}
+    assert submitted == [("flow-2", "user-pasted-code", "work")]
+    assert cancelled["result"] == {"session_id": "flow-2", "status": "cancelled"}
+    assert "flow-2" not in sessions
+    assert "secret" not in str(approved["result"])
+
+
+def test_auth_oauth_rejects_unknown_provider_and_mismatched_session(monkeypatch):
+    fake = types.SimpleNamespace(
+        _OAUTH_PROVIDER_CATALOG=[{"id": "anthropic", "flow": "pkce"}],
+        _oauth_sessions={"flow-3": {"provider": "anthropic", "flow": "pkce", "profile": "work", "status": "pending"}},
+        _oauth_sessions_lock=threading.Lock(),
+        _gc_oauth_sessions=lambda: None,
+        _validate_oauth_profile=lambda profile: None,
+    )
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server", fake)
+
+    unknown = _dispatch_sync(
+        {"id": "o5", "method": "auth.oauth.start", "params": {"provider": "evil"}}
+    )
+    mismatch = _dispatch_sync(
+        {
+            "id": "o6",
+            "method": "auth.oauth.poll",
+            "params": {"provider": "anthropic", "profile": "other", "session_id": "flow-3"},
+        }
+    )
+
+    assert unknown is not None and mismatch is not None
+    assert unknown["error"]["code"] == 4003
+    assert mismatch["error"]["code"] == 4003
+
+
 def test_config_set_battery_toggles_and_persists(monkeypatch):
     writes: dict[str, object] = {}
     monkeypatch.setattr(server, "_load_cfg", lambda: {"display": {"battery": False}})

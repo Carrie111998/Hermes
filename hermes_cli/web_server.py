@@ -1518,6 +1518,7 @@ from hermes_cli.web_models import (  # noqa: F401
     MoaPresetPayload,
     MoaConfigPayload,
     FsWriteText,
+    FsCreate,
     GitPathBody,
     GitFileBody,
     GitCommitBody,
@@ -2892,6 +2893,52 @@ async def fs_read_text(path: str):
         "text": data.decode("utf-8", errors="replace"),
         "truncated": st.st_size > _FS_TEXT_PREVIEW_MAX_BYTES,
     }
+
+
+@app.post("/api/fs/create")
+async def fs_create(payload: FsCreate):
+    """Create one empty file or directory without replacing existing data."""
+    raw_name = str(payload.name or "")
+    name = raw_name.strip()
+    windows_base = name.split(".", 1)[0].upper()
+    windows_reserved = bool(
+        re.fullmatch(r"(?:CON|PRN|AUX|NUL|COM(?:[1-9]|[¹²³])|LPT(?:[1-9]|[¹²³]))", windows_base)
+    )
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        or ":" in name
+        or name.endswith(".")
+        or raw_name.endswith(".")
+        or raw_name.endswith(" ")
+        or windows_reserved
+        or "\0" in name
+    ):
+        raise HTTPException(status_code=400, detail="Invalid name")
+
+    parent = _fs_path(payload.parent_path)
+    if not parent.is_dir():
+        raise HTTPException(status_code=404, detail="Parent directory does not exist")
+    target = parent / name
+    if os.path.lexists(target):
+        raise HTTPException(status_code=409, detail="Path already exists")
+
+    try:
+        if payload.is_directory:
+            target.mkdir()
+        else:
+            with target.open("x", encoding="utf-8"):
+                pass
+    except FileExistsError:
+        raise HTTPException(status_code=409, detail="Path already exists")
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Path is not writable")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not create path: {exc}")
+
+    return {"ok": True, "path": str(target), "isDirectory": payload.is_directory}
 
 
 @app.post("/api/fs/write-text")
@@ -10950,6 +10997,10 @@ def _gc_oauth_sessions() -> None:
     with _oauth_sessions_lock:
         stale = [sid for sid, sess in _oauth_sessions.items() if sess["created_at"] < cutoff]
         for sid in stale:
+            sess = _oauth_sessions.get(sid)
+            if sess and sess.get("status") == "pending":
+                sess["cancelled"] = True
+                sess["status"] = "expired"
             _oauth_sessions.pop(sid, None)
 
 
@@ -11089,12 +11140,19 @@ def _submit_anthropic_pkce(
     profile: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Exchange authorization code for tokens. Persists on success."""
+    requested_profile = _oauth_profile_name(profile)
     with _oauth_sessions_lock:
         sess = _oauth_sessions.get(session_id)
-    if not sess or sess["provider"] != "anthropic" or sess["flow"] != "pkce":
-        raise HTTPException(status_code=404, detail="Unknown or expired session")
-    if sess["status"] != "pending":
-        return {"ok": False, "status": sess["status"], "message": sess.get("error_message")}
+        if (
+            not sess
+            or sess["provider"] != "anthropic"
+            or sess["flow"] != "pkce"
+            or sess.get("profile") != requested_profile
+        ):
+            raise HTTPException(status_code=404, detail="Unknown or expired session")
+        session_profile = sess.get("profile")
+        if sess["status"] != "pending" or sess.get("cancelled"):
+            return {"ok": False, "status": sess["status"], "message": sess.get("error_message")}
 
     # Anthropic's redirect callback page formats the code as `<code>#<state>`.
     # Strip the state suffix if present (we already have the verifier server-side).
@@ -11149,15 +11207,21 @@ def _submit_anthropic_pkce(
         return {"ok": False, "status": "error", "message": sess["error_message"]}
 
     expires_at_ms = int(time.time() * 1000) + (expires_in * 1000)
-    try:
-        with _profile_scope(_oauth_session_profile(session_id, profile)):
-            _save_anthropic_oauth_creds(access_token, refresh_token, expires_at_ms)
-    except Exception as e:
-        with _oauth_sessions_lock:
+    # Cancellation and persistence share one critical section. A cancel that
+    # wins removes/marks the session before this block; a save that wins marks
+    # approved before cancel can claim success, so "cancelled" can never race
+    # with credentials landing on disk.
+    with _oauth_sessions_lock:
+        current = _oauth_sessions.get(session_id)
+        if current is not sess or sess.get("cancelled") or sess.get("status") != "pending":
+            return {"ok": False, "status": "cancelled", "message": None}
+        try:
+            with _profile_scope(session_profile):
+                _save_anthropic_oauth_creds(access_token, refresh_token, expires_at_ms)
+        except Exception as e:
             sess["status"] = "error"
             sess["error_message"] = f"Save failed: {e}"
-        return {"ok": False, "status": "error", "message": sess["error_message"]}
-    with _oauth_sessions_lock:
+            return {"ok": False, "status": "error", "message": sess["error_message"]}
         sess["status"] = "approved"
     _log.info("oauth/pkce: anthropic login completed (session=%s)", session_id)
     return {"ok": True, "status": "approved"}
@@ -11388,6 +11452,7 @@ def _nous_poller(session_id: str) -> None:
     if not sess:
         return
     portal_base_url = sess["portal_base_url"]
+    session_profile = sess.get("profile")
     client_id = sess["client_id"]
     device_code = sess["device_code"]
     interval = sess["interval"]
@@ -11421,15 +11486,21 @@ def _nous_poller(session_id: str) -> None:
             ),
             "expires_in": token_ttl,
         }
-        with _profile_scope(_oauth_session_profile(session_id)):
-            full_state = refresh_nous_oauth_from_state(
-                auth_state,
-                timeout_seconds=15.0,
-                force_refresh=False,
-            )
-            from hermes_cli.auth import persist_nous_credentials
-            persist_nous_credentials(full_state)
         with _oauth_sessions_lock:
+            if (
+                _oauth_sessions.get(session_id) is not sess
+                or sess.get("cancelled")
+                or sess.get("status") != "pending"
+            ):
+                return
+            with _profile_scope(session_profile):
+                full_state = refresh_nous_oauth_from_state(
+                    auth_state,
+                    timeout_seconds=15.0,
+                    force_refresh=False,
+                )
+                from hermes_cli.auth import persist_nous_credentials
+                persist_nous_credentials(full_state)
             sess["status"] = "approved"
         _log.info("oauth/device: nous login completed (session=%s)", session_id)
     except Exception as e:
@@ -11464,6 +11535,7 @@ def _minimax_poller(session_id: str) -> None:
     if not sess:
         return
     portal_base_url = sess["portal_base_url"]
+    session_profile = sess.get("profile")
     client_id = sess["client_id"]
     user_code = sess["user_code"]
     code_verifier = sess["code_verifier"]
@@ -11511,9 +11583,15 @@ def _minimax_poller(session_id: str) -> None:
             ).isoformat(),
             "expires_in": expires_in_s,
         }
-        with _profile_scope(_oauth_session_profile(session_id)):
-            _minimax_save_auth_state(auth_state)
         with _oauth_sessions_lock:
+            if (
+                _oauth_sessions.get(session_id) is not sess
+                or sess.get("cancelled")
+                or sess.get("status") != "pending"
+            ):
+                return
+            with _profile_scope(session_profile):
+                _minimax_save_auth_state(auth_state)
             sess["status"] = "approved"
         _log.info("oauth/device: minimax login completed (session=%s)", session_id)
     except Exception as e:
@@ -11538,6 +11616,7 @@ def _xai_device_poller(session_id: str) -> None:
         sess = _oauth_sessions.get(session_id)
     if not sess:
         return
+    session_profile = sess.get("profile")
     device_code = sess["device_code"]
     interval = int(sess["interval"])
     expires_in = max(60, int(sess["expires_at"] - time.time()))
@@ -11561,30 +11640,36 @@ def _xai_device_poller(session_id: str) -> None:
             "expires_in": token_data.get("expires_in"),
             "token_type": str(token_data.get("token_type") or "Bearer").strip() or "Bearer",
         }
-        with _profile_scope(_oauth_session_profile(session_id)):
-            _save_xai_oauth_tokens(
-                tokens,
-                discovery=discovery,
-                last_refresh=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                auth_mode="oauth_device_code",
-                # Persist credentials without hijacking an existing active
-                # chat provider.
-                set_active=False,
-            )
-            # Mirror `hermes auth add xai-oauth`: first credential may become
-            # active when none is set yet; never overwrite an existing choice.
-            mark_provider_active_if_unset("xai-oauth")
-            # The singleton write above is the single source of truth: the
-            # credential-pool load seeds it as the canonical ``device_code``
-            # entry. Do NOT also insert a parallel ``manual:dashboard_*`` pool
-            # entry — that duplicates the single-use refresh token across two
-            # entries and triggers rotation churn / ``refresh_token_reused``.
-            # An interactive dashboard login is also an explicit re-enable
-            # signal, so clear any ``device_code`` suppression left by a
-            # prior ``hermes auth remove xai-oauth`` (mirrors auth_add_command
-            # and the ``hermes model`` re-login path in _login_xai_oauth).
-            unsuppress_credential_source("xai-oauth", "device_code")
         with _oauth_sessions_lock:
+            if (
+                _oauth_sessions.get(session_id) is not sess
+                or sess.get("cancelled")
+                or sess.get("status") != "pending"
+            ):
+                return
+            with _profile_scope(session_profile):
+                _save_xai_oauth_tokens(
+                    tokens,
+                    discovery=discovery,
+                    last_refresh=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    auth_mode="oauth_device_code",
+                    # Persist credentials without hijacking an existing active
+                    # chat provider.
+                    set_active=False,
+                )
+                # Mirror `hermes auth add xai-oauth`: first credential may become
+                # active when none is set yet; never overwrite an existing choice.
+                mark_provider_active_if_unset("xai-oauth")
+                # The singleton write above is the single source of truth: the
+                # credential-pool load seeds it as the canonical ``device_code``
+                # entry. Do NOT also insert a parallel ``manual:dashboard_*`` pool
+                # entry — that duplicates the single-use refresh token across two
+                # entries and triggers rotation churn / ``refresh_token_reused``.
+                # An interactive dashboard login is also an explicit re-enable
+                # signal, so clear any ``device_code`` suppression left by a
+                # prior ``hermes auth remove xai-oauth`` (mirrors auth_add_command
+                # and the ``hermes model`` re-login path in _login_xai_oauth).
+                unsuppress_credential_source("xai-oauth", "device_code")
             sess["status"] = "approved"
         _log.info("oauth/device: xai login completed (session=%s)", session_id)
     except Exception as e:
@@ -11857,6 +11942,8 @@ async def poll_oauth_session(
         raise HTTPException(status_code=404, detail="Session not found or expired")
     if sess["provider"] != provider_id:
         raise HTTPException(status_code=400, detail="Provider mismatch for session")
+    if sess.get("profile") != _oauth_profile_name(profile):
+        raise HTTPException(status_code=404, detail="Session not found or expired")
     return {
         "session_id": session_id,
         "status": sess["status"],
@@ -11880,14 +11967,18 @@ async def cancel_oauth_session(
     user believed it was aborted.
     """
     _require_token(request)
+    requested_profile = _oauth_profile_name(profile)
     with _oauth_sessions_lock:
         sess = _oauth_sessions.get(session_id)
-        if sess is not None:
-            sess["cancelled"] = True
+        if sess is None or sess.get("profile") != requested_profile:
+            return {"ok": False, "message": "session not found"}
+        status = str(sess.get("status") or "pending")
+        if status != "pending":
+            return {"ok": False, "session_id": session_id, "status": status}
+        sess["cancelled"] = True
+        sess["status"] = "cancelled"
         _oauth_sessions.pop(session_id, None)
-    if sess is None:
-        return {"ok": False, "message": "session not found"}
-    return {"ok": True, "session_id": session_id}
+    return {"ok": True, "session_id": session_id, "status": "cancelled"}
 
 
 # ---------------------------------------------------------------------------
