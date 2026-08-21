@@ -51,9 +51,13 @@ def test_board_metadata_project_id_roundtrip(fresh_home):
 
 
 def test_create_board_accepts_project_id(fresh_home):
-    meta = kb.create_board("proj-board", name="Proj Board", project_id="p_xyz")
-    assert meta["project_id"] == "p_xyz"
-    assert kb.read_board_metadata("proj-board")["project_id"] == "p_xyz"
+    repo = fresh_home / "repo"
+    repo.mkdir()
+    with pdb.connect_closing() as conn:
+        project_id = pdb.create_project(conn, name="Proj", primary_path=str(repo))
+    meta = kb.create_board("proj-board", name="Proj Board", project_id=project_id)
+    assert meta["project_id"] == project_id
+    assert kb.read_board_metadata("proj-board")["project_id"] == project_id
 
 
 def test_create_task_inherits_board_project(fresh_home, tmp_path):
@@ -81,7 +85,7 @@ def test_create_task_explicit_project_beats_board(fresh_home, tmp_path):
     kb.create_board("scoped2", name="Scoped2", project_id=board_proj)
     conn = kb.connect(board="scoped2")
     try:
-        tid = kb.create_task(conn, title="explicit", board="scoped2", project_id=task_proj)
-        assert kb.get_task(conn, tid).project_id == task_proj
+        with pytest.raises(kb.BoardProjectError, match="TASK_PROJECT_MISMATCH"):
+            kb.create_task(conn, title="explicit", board="scoped2", project_id=task_proj)
     finally:
         conn.close()
