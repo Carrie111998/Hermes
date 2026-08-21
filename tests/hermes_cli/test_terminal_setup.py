@@ -61,7 +61,45 @@ def test_terminal_setup_parser_registers_a_handler():
     assert args.func is handler
 
 
-def test_terminal_setup_is_a_builtin_subcommand():
-    from hermes_cli.main import _BUILTIN_SUBCOMMANDS
+def test_terminal_setup_is_fully_registered_in_the_top_level_cli_source():
+    from pathlib import Path
+    import hermes_cli.main as main
 
-    assert "terminal-setup" in _BUILTIN_SUBCOMMANDS
+    source = Path(main.__file__).read_text(encoding="utf-8")
+    assert "from hermes_cli.subcommands.terminal_setup import build_terminal_setup_parser" in source
+    assert "def cmd_terminal_setup(args):" in source
+    assert "build_terminal_setup_parser(subparsers, cmd_terminal_setup=cmd_terminal_setup)" in source
+    assert "terminal-setup" in main._BUILTIN_SUBCOMMANDS
+
+
+def test_terminal_setup_gives_iterm2_specific_safe_instructions(monkeypatch, capsys):
+    from hermes_cli.terminal_setup import run_terminal_setup
+
+    monkeypatch.delenv("WT_SESSION", raising=False)
+    monkeypatch.setenv("TERM_PROGRAM", "iTerm.app")
+    run_terminal_setup()
+
+    output = capsys.readouterr().out
+    assert "Profiles → Keys" in output
+    assert "Report modifiers using CSI u" in output
+
+
+def test_terminal_setup_gives_vscode_settings_snippet(monkeypatch, capsys):
+    from hermes_cli.terminal_setup import run_terminal_setup
+
+    monkeypatch.delenv("WT_SESSION", raising=False)
+    monkeypatch.setenv("VSCODE_PID", "123")
+    run_terminal_setup()
+
+    assert '"terminal.integrated.enableKittyKeyboardProtocol": true' in capsys.readouterr().out
+
+
+def test_terminal_setup_scopes_windows_terminal_to_preview_kitty_support(monkeypatch, capsys):
+    from hermes_cli.terminal_setup import run_terminal_setup
+
+    monkeypatch.setenv("WT_SESSION", "session-id")
+    run_terminal_setup()
+
+    output = capsys.readouterr().out
+    assert "Windows Terminal Preview 1.25+" in output
+    assert "Kitty keyboard protocol" in output

@@ -42,6 +42,33 @@ def _terminal_label(terminal: str) -> str:
     }[terminal]
 
 
+def _terminal_guidance(terminal: str) -> tuple[str, ...]:
+    """Return safe, terminal-specific steps without mutating user settings."""
+    guidance = {
+        "iterm2": (
+            "iTerm2: open Settings → Profiles → Keys and enable ‘Report modifiers using CSI u’.",
+            "If you use a custom key mapping, ensure Shift+Return is not mapped to plain Return.",
+        ),
+        "vscode": (
+            "VS Code: open Preferences: Open User Settings (JSON) and add:",
+            '  "terminal.integrated.enableKittyKeyboardProtocol": true',
+            "Open a new integrated terminal after saving the setting.",
+        ),
+        "windows-terminal": (
+            "Windows Terminal: Kitty keyboard protocol support requires Windows Terminal Preview 1.25+.",
+            "Update to Preview and open a new tab; stable Windows Terminal cannot distinguish Shift+Enter.",
+        ),
+        "kitty": ("kitty: Kitty keyboard reporting is enabled by default; open a new shell if needed.",),
+        "wezterm": ("WezTerm: Kitty keyboard reporting is enabled by default; open a new pane if needed.",),
+        "ghostty": ("Ghostty: Kitty keyboard reporting is enabled by default; open a new terminal if needed.",),
+        "unknown": (
+            "Check the terminal’s keyboard settings for Kitty keyboard protocol or xterm modifyOtherKeys support.",
+            "If it cannot emit modified Enter sequences, use Alt+Enter or Ctrl+J instead.",
+        ),
+    }
+    return guidance[terminal]
+
+
 def run_terminal_setup(args=None) -> None:  # noqa: ARG001
     """Print non-destructive classic-CLI multiline-input guidance."""
     terminal = detect_terminal()
@@ -54,12 +81,16 @@ def run_terminal_setup(args=None) -> None:  # noqa: ARG001
     print("  • Hermes recognises Kitty CSI-u (ESC [ 13 ; 2 u) and xterm modifyOtherKeys")
     print("    (ESC [ 27 ; 2 ; 13 ~) Shift+Enter sequences.")
 
+    print()
+    print("Terminal-specific setup:")
+    for line in _terminal_guidance(terminal):
+        print(f"  • {line}")
+
     if terminal == "windows-terminal":
-        print("  • In Windows Terminal, use Ctrl+Enter for a newline if Alt+Enter is intercepted.")
+        print("  • Use Ctrl+Enter (delivered as Ctrl+J) or Ctrl+J directly for a newline.")
     else:
         print("  • Alt+Enter is the fallback newline shortcut when the terminal passes it through.")
 
     print()
-    print("If Shift+Enter submits instead, configure your terminal emulator to send one of")
-    print("the sequences above, then open a new terminal session and retry. No Hermes")
+    print("After changing settings, open a new terminal session and retry. No Hermes")
     print("configuration change is required.")
