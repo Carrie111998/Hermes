@@ -375,51 +375,53 @@ def clone_memory_provider_profile(
 ) -> object | None:
     """Run the cloned profile's configured memory-provider hook.
 
-    The provider normally comes from the source config.yaml. Legacy provider
-    installs that predate ``memory.provider`` may declare a
-    ``profile_clone_config`` marker in plugin.yaml; this keeps profile creation
-    generic while preserving their existing clone behavior.
+    The active provider comes from the source config.yaml. Providers with
+    legacy out-of-band state may also declare ``profile_clone: true`` in
+    plugin.yaml so their hook can probe that state without coupling profile
+    creation to a provider-specific filename or resolver.
     """
-    provider_name = None
+    provider_names: list[str] = []
     config_path = source_dir / "config.yaml"
     if config_path.exists():
         try:
             import yaml
 
             config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-            provider_name = cfg_get(config, "memory", "provider") or None
+            configured = cfg_get(config, "memory", "provider") or None
+            if configured:
+                provider_names.append(configured)
         except Exception:
             pass
 
-    if not provider_name:
-        for candidate, provider_dir in _iter_provider_dirs():
-            manifest_path = provider_dir / "plugin.yaml"
-            if not manifest_path.exists():
-                continue
-            try:
-                import yaml
+    for candidate, provider_dir in _iter_provider_dirs():
+        manifest_path = provider_dir / "plugin.yaml"
+        if not manifest_path.exists():
+            continue
+        try:
+            import yaml
 
-                manifest = yaml.safe_load(
-                    manifest_path.read_text(encoding="utf-8-sig")
-                ) or {}
-                marker = manifest.get("profile_clone_config")
-            except Exception:
-                continue
-            if isinstance(marker, str) and marker and (source_dir / marker).exists():
-                provider_name = candidate
-                break
+            manifest = yaml.safe_load(
+                manifest_path.read_text(encoding="utf-8-sig")
+            ) or {}
+        except Exception:
+            continue
+        if manifest.get("profile_clone") is True and candidate not in provider_names:
+            provider_names.append(candidate)
 
-    if not provider_name:
-        return None
-    provider = load_memory_provider(provider_name, register_skills=False)
-    if provider is None:
-        return None
-    return provider.clone_profile(
-        profile_name,
-        source_dir=source_dir,
-        profile_dir=profile_dir,
-        clone_all=clone_all,
-    )
+    results = []
+    for provider_name in provider_names:
+        provider = load_memory_provider(provider_name, register_skills=False)
+        if provider is None:
+            continue
+        result = provider.clone_profile(
+            profile_name,
+            source_dir=source_dir,
+            profile_dir=profile_dir,
+            clone_all=clone_all,
+        )
+        if result is not None:
+            results.append(result)
+    return results or None
 
 
 def _load_provider_from_entry_point(
