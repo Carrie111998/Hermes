@@ -212,7 +212,7 @@ def build_models_payload(
         # keep that one row visible so the UI can show the saved selection and
         # a re-auth affordance instead of appearing to jump to another provider.
         rows = list(rows) + _append_unconfigured_rows(
-            rows, ctx, current_only=True
+            rows, ctx, current_only=True, keyless_too=True
         )
 
     # --- Deduplicate: remove models from aggregators that overlap with
@@ -596,6 +596,7 @@ def _append_unconfigured_rows(
     ctx: ConfigContext,
     *,
     current_only: bool = False,
+    keyless_too: bool = False,
 ) -> list[dict]:
     """Build fallback rows for canonical providers missing from ``rows``.
 
@@ -603,6 +604,8 @@ def _append_unconfigured_rows(
     exception is the *current* configured provider: if config.yaml still points
     at it but credentials are presently unavailable, keep a visible row carrying
     the saved model so GUI pickers don't silently snap to some other provider.
+    When ``keyless_too`` is set (explicit/desktop chat pickers), keyless
+    providers are also surfaced — they need no credential and are always usable.
     """
     from hermes_cli.auth import PROVIDER_REGISTRY
     from hermes_cli.models import CANONICAL_PROVIDERS, _PROVIDER_LABELS
@@ -611,10 +614,25 @@ def _append_unconfigured_rows(
     cur = (ctx.current_provider or "").lower()
     cur_model = str(ctx.current_model or "").strip()
     extras: list[dict] = []
+    # Keyless providers (no credential to detect) carry a curated,
+    # anonymously-routable catalog we must surface in the picker. Build this
+    # slug lookup once, outside the loop, so we don't rebuild the whole
+    # provider catalog per skeleton row.
+    _keyless_by_slug: dict[str, bool] = {}
+    try:
+        from hermes_cli.provider_catalog import provider_catalog_by_slug
+
+        _keyless_by_slug = {
+            d.slug: bool(d.keyless) for d in provider_catalog_by_slug().values()
+        }
+    except Exception:
+        _keyless_by_slug = {}
     for entry in CANONICAL_PROVIDERS:
         if entry.slug.lower() in seen:
             continue
-        if current_only and entry.slug.lower() != cur:
+        if current_only and entry.slug.lower() != cur and not (
+            keyless_too and _keyless_by_slug.get(entry.slug)
+        ):
             continue
         if entry.slug.lower() == cur:
             cfg = PROVIDER_REGISTRY.get(entry.slug)
@@ -647,14 +665,28 @@ def _append_unconfigured_rows(
                 }
             )
             continue
+        # Keyless providers (e.g. opencode-free) carry no credential, so the
+        # authenticated-providers path never fills their models. Surface the
+        # curated, anonymously-routable catalog here so the desktop picker
+        # (model-options.ts: models.length === 0 -> provider hidden) shows them.
+        # _apply_picker_hints() later sets authenticated/warning from the same
+        # skeleton shape, so we only need to populate models here.
+        _models: list[str] = []
+        if _keyless_by_slug.get(entry.slug):
+            try:
+                from hermes_cli.models import cached_provider_model_ids
+
+                _models = list(cached_provider_model_ids(entry.slug) or [])
+            except Exception:
+                _models = []
         extras.append(
             {
                 "slug": entry.slug,
                 "name": _PROVIDER_LABELS.get(entry.slug, entry.label),
                 "is_current": entry.slug.lower() == cur,
                 "is_user_defined": False,
-                "models": [],
-                "total_models": 0,
+                "models": _models,
+                "total_models": len(_models),
                 "source": "canonical",
             }
         )
@@ -670,6 +702,19 @@ def _filter_explicit_provider_rows(rows: list[dict], ctx: ConfigContext) -> list
     """
     from hermes_cli.auth import is_provider_explicitly_configured
 
+    # Keyless providers (e.g. opencode-free) need no credential and no explicit
+    # config to be usable, so they always belong in an explicit picker — the
+    # same way a configured provider does. Build the slug set once.
+    _keyless_slugs: set[str] = set()
+    try:
+        from hermes_cli.provider_catalog import provider_catalog_by_slug
+
+        _keyless_slugs = {
+            d.slug.lower() for d in provider_catalog_by_slug().values() if d.keyless
+        }
+    except Exception:
+        _keyless_slugs = set()
+
     current_slug = str(ctx.current_provider or "").strip().lower()
     kept: list[dict] = []
     for row in rows:
@@ -680,6 +725,10 @@ def _filter_explicit_provider_rows(rows: list[dict], ctx: ConfigContext) -> list
             kept.append(row)
             continue
         if current_slug and slug == current_slug:
+            kept.append(row)
+            continue
+        if slug in _keyless_slugs:
+            # No credential to configure; always offer keyless providers.
             kept.append(row)
             continue
         if slug == "moa":
