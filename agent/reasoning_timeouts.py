@@ -125,6 +125,15 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
     ("grok-4.5", 300),
     ("grok-4.6", 300),
     ("grok-4-fast-non-reasoning", 180),
+    # Z.AI GLM-5 family: always-thinking on the Coding endpoint
+    # (#89241, #85904) - the thinking toggle is silently ignored, so
+    # the pre-first-token phase routinely exceeds the 90s non-stream
+    # stale default on mid-size contexts (24 kills/day reported).
+    # The family slug covers glm-5.2 / glm-5.3 via the separator
+    # right-anchor, including 5.2 requests rerouted to the 5.3
+    # backend; over-match is accepted as a patience ceiling (the
+    # table already accepts this for qwen3).
+    ("glm-5", 600),
 )
 
 
