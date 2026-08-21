@@ -294,6 +294,7 @@ import {
 } from './update-count'
 import { waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
+import { customBuildUpdateBlock } from './update-policy'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import {
   collectRelaunchArgs,
@@ -390,10 +391,11 @@ const PRELOAD_PATH = path.join(APP_ROOT, 'dist', 'electron-preload.js')
 // compositor flicker — accelerated layers can't be presented cleanly over the
 // wire, so the window flashes during scroll/streaming/animation. Local
 // Windows/macOS (and WSLg, which renders locally via vGPU) composite on the
-// GPU and never see it. Fall back to software rendering when a remote display
-// is detected; it's rock-steady over the wire and the CPU cost is negligible
-// next to the connection's latency. Must run before app `ready` — these
-// switches only apply pre-launch. Override with HERMES_DESKTOP_DISABLE_GPU
+// GPU and never see it. Fall back to software rendering only when a genuinely
+// remote display is detected. On native macOS, software compositing is costly
+// and SSH_* merely describes the parent shell, not the WindowServer display.
+// Must run before app `ready` — these switches only apply pre-launch. Override
+// with HERMES_DESKTOP_DISABLE_GPU
 // (1/true → always disable, 0/false → keep GPU on).
 const REMOTE_DISPLAY_REASON = detectRemoteDisplay()
 
@@ -2732,6 +2734,19 @@ async function resolveHealedBranch(updateRoot, branch) {
 
 async function checkUpdates() {
   const updateRoot = resolveUpdateRoot()
+  const customBlock = customBuildUpdateBlock(INSTALL_STAMP)
+
+  if (customBlock) {
+    return {
+      supported: false,
+      reason: 'protected-custom-build',
+      message: customBlock,
+      hermesRoot: updateRoot,
+      branch: INSTALL_STAMP?.branch || readDesktopUpdateConfig().branch,
+      fetchedAt: Date.now()
+    }
+  }
+
   let { branch } = readDesktopUpdateConfig()
   const gitDir = path.join(updateRoot, '.git')
 
@@ -3456,6 +3471,12 @@ async function releaseBackendLock(updateRoot, tag) {
 // Detection (checkUpdates / commit changelog / "N behind") stays in the UI;
 // only this apply action changed.
 async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
+  const customBlock = customBuildUpdateBlock(INSTALL_STAMP)
+
+  if (customBlock) {
+    throw new Error(customBlock)
+  }
+
   if (updateInFlight) {
     throw new Error('An update is already in progress.')
   }

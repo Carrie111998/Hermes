@@ -164,9 +164,35 @@ export function Intro({ personality, seed }: IntroProps) {
   const copy = resolveCopy(personality, mountSeed + (seed ?? 0))
 
   useEffect(() => {
-    if (!reducedMotion || !videoRef.current) return
+    if (!reducedMotion || !videoRef.current) {
+      return
+    }
+
     videoRef.current.pause()
     videoRef.current.currentTime = 0
+  }, [reducedMotion])
+
+  useEffect(() => {
+    const syncPlayback = () => {
+      const video = videoRef.current
+
+      if (!video || reducedMotion) {
+        return
+      }
+
+      if (globalThis.document.visibilityState === 'hidden') {
+        video.pause()
+
+        return
+      }
+
+      void video.play().catch(() => undefined)
+    }
+
+    globalThis.document.addEventListener('visibilitychange', syncPlayback)
+    syncPlayback()
+
+    return () => globalThis.document.removeEventListener('visibilitychange', syncPlayback)
   }, [reducedMotion])
 
   return (

@@ -16,6 +16,7 @@ beforeEach(() => {
     }))
   )
   vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => undefined)
+  vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
 })
 
 afterEach(() => {
@@ -38,7 +39,9 @@ describe('Intro portal figure', () => {
     expect(video?.muted).toBe(true)
     expect(video?.playsInline).toBe(true)
     expect(subtitle?.textContent).toBe('AGK {OS}')
-    expect(intro && video && wordmark ? video.compareDocumentPosition(wordmark) & Node.DOCUMENT_POSITION_FOLLOWING : 0).toBeTruthy()
+    expect(
+      intro && video && wordmark ? video.compareDocumentPosition(wordmark) & Node.DOCUMENT_POSITION_FOLLOWING : 0
+    ).toBeTruthy()
   })
 
   it('renders a static lazy-loaded frame when reduced motion is requested', () => {
@@ -58,6 +61,24 @@ describe('Intro portal figure', () => {
     expect(video?.autoplay).toBe(false)
     expect(video?.loop).toBe(false)
     expect(video?.preload).toBe('metadata')
+  })
+
+  it('pauses when mounted hidden and resumes when visible', () => {
+    let visibility: DocumentVisibilityState = 'hidden'
+    vi.spyOn(globalThis.document, 'visibilityState', 'get').mockImplementation(() => visibility)
+    const play = vi.mocked(HTMLMediaElement.prototype.play)
+    const pause = vi.mocked(HTMLMediaElement.prototype.pause)
+    play.mockClear()
+    pause.mockClear()
+
+    render(<Intro personality="default" seed={4} />)
+    expect(pause).toHaveBeenCalledOnce()
+
+    act(() => {
+      visibility = 'visible'
+      globalThis.document.dispatchEvent(new Event('visibilitychange'))
+    })
+    expect(play).toHaveBeenCalledOnce()
   })
 
   it('pauses and rewinds when reduced motion is enabled while playing', () => {
@@ -80,7 +101,11 @@ describe('Intro portal figure', () => {
     const { container } = render(<Intro personality="default" seed={3} />)
     const video = container.querySelector<HTMLVideoElement>('[data-slot="homepage-orb-video"]')
     expect(video).toBeTruthy()
-    if (!video) return
+
+    if (!video) {
+      return
+    }
+
     video.currentTime = 1.5
 
     act(() => {

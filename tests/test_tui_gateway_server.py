@@ -1561,6 +1561,10 @@ def test_system_battery_fails_open(monkeypatch):
     assert resp["result"]["percent"] is None
 
 
+def test_system_resources_runs_off_socket_reader_thread():
+    assert "system.resources" in server._LONG_HANDLERS
+
+
 def test_system_resources_returns_host_snapshot(monkeypatch):
     monkeypatch.setitem(sys.modules, "socket", types.SimpleNamespace(gethostname=lambda: "station"))
     monkeypatch.setattr(server.time, "time", lambda: 1_000.0)
@@ -1575,7 +1579,7 @@ def test_system_resources_returns_host_snapshot(monkeypatch):
         ),
     )
 
-    resp = server.dispatch({"id": "r1", "method": "system.resources", "params": {}})
+    resp = _dispatch_sync({"id": "r1", "method": "system.resources", "params": {}})
 
     assert resp is not None
     assert resp["result"] == {
@@ -1592,13 +1596,17 @@ def test_system_resources_returns_host_snapshot(monkeypatch):
 def test_system_resources_fails_open(monkeypatch):
     monkeypatch.setitem(sys.modules, "psutil", None)
 
-    resp = server.dispatch({"id": "r2", "method": "system.resources", "params": {}})
+    resp = _dispatch_sync({"id": "r2", "method": "system.resources", "params": {}})
 
     assert resp is not None
     assert resp["result"]["available"] is False
     assert resp["result"]["cpu_percent"] is None
     assert resp["result"]["memory"] is None
     assert resp["result"]["disk"] is None
+
+
+def test_account_usage_runs_off_socket_reader_thread():
+    assert "account.usage" in server._LONG_HANDLERS
 
 
 def test_account_usage_returns_redacted_runtime_snapshot(monkeypatch):
@@ -1631,7 +1639,7 @@ def test_account_usage_returns_redacted_runtime_snapshot(monkeypatch):
         ),
     )
 
-    resp = server.dispatch(
+    resp = _dispatch_sync(
         {"id": "u1", "method": "account.usage", "params": {"provider": "openai-codex"}}
     )
 
@@ -1652,7 +1660,7 @@ def test_account_usage_fails_open(monkeypatch):
         types.SimpleNamespace(resolve_runtime_provider=lambda requested=None: (_ for _ in ()).throw(RuntimeError("offline"))),
     )
 
-    resp = server.dispatch({"id": "u2", "method": "account.usage", "params": {}})
+    resp = _dispatch_sync({"id": "u2", "method": "account.usage", "params": {}})
 
     assert resp is not None
     assert resp["result"] == {
