@@ -111,7 +111,7 @@ describe('PluginsSettings', () => {
   })
 
   it('keeps using the canonical key when the backend provides one', async () => {
-    const keyedRow = { ...legacyRow, key: 'image_gen/legacy' }
+    const keyedRow = { ...legacyRow, key: 'legacy' }
 
     $agentPlugins.set([keyedRow])
     requestGateway.mockResolvedValue({ ok: true, plugin: { ...keyedRow, status: 'enabled' } })
@@ -122,31 +122,43 @@ describe('PluginsSettings', () => {
     await waitFor(() =>
       expect(requestGateway).toHaveBeenCalledWith('plugins.manage', {
         action: 'toggle',
-        key: 'image_gen/legacy',
+        key: 'legacy',
         enable: true
       })
     )
   })
 
-  it('hides repo-bundled built-ins and keeps the count pill in sync', () => {
-    // The Agent plugins section is the control panel for plugins the USER
-    // installed — built-ins (browser backends, cron providers, model
-    // providers…) ship enabled-by-default and are configured elsewhere.
+  it('shows general bundled plugins while hiding plugins owned by other settings surfaces', () => {
+    // General lifecycle plugins such as disk-cleanup and security-guidance are
+    // opt-in and have no other Desktop control surface. Provider/platform
+    // plugins remain hidden because their owning settings pages manage them.
     $agentPlugins.set([
       legacyRow,
+      { ...legacyRow, name: 'disk-cleanup', key: 'disk-cleanup', source: 'bundled', status: 'enabled' },
+      {
+        ...legacyRow,
+        name: 'security-guidance',
+        key: 'security-guidance',
+        source: 'bundled',
+        status: 'enabled'
+      },
       { ...legacyRow, name: 'browserbase', key: 'browser/browserbase', source: 'bundled' },
       { ...legacyRow, name: 'chronos', key: 'cron_providers/chronos', source: 'bundled' },
-      { ...legacyRow, name: 'deepinfra', key: 'model-providers/deepinfra', source: 'bundled' }
+      { ...legacyRow, name: 'deepinfra', key: 'image_gen/deepinfra', source: 'bundled' },
+      { ...legacyRow, name: 'discord', key: 'platforms/discord', source: 'bundled' }
     ])
 
     renderSettings()
 
     expect(screen.getByText('Legacy plugin')).toBeTruthy()
+    expect(screen.getByText('disk-cleanup')).toBeTruthy()
+    expect(screen.getByText('security-guidance')).toBeTruthy()
     expect(screen.queryByText('browserbase')).toBeNull()
     expect(screen.queryByText('chronos')).toBeNull()
     expect(screen.queryByText('deepinfra')).toBeNull()
+    expect(screen.queryByText('discord')).toBeNull()
     // Count pill reflects the filtered list, not the raw RPC row count.
-    expect(screen.getByText('1 installed', { exact: false })).toBeTruthy()
+    expect(screen.getByText('3 installed', { exact: false })).toBeTruthy()
   })
 
   it('hides legacy other-surface categories even when the backend omits source', () => {
@@ -190,7 +202,7 @@ describe('PluginsSettings', () => {
     // when the dropdown opens.
     Element.prototype.scrollIntoView = vi.fn()
 
-    const keyedRow = { ...legacyRow, key: 'image_gen/legacy' }
+    const keyedRow = { ...legacyRow, key: 'legacy' }
 
     getProfiles.mockResolvedValue({
       profiles: [
@@ -224,7 +236,7 @@ describe('PluginsSettings', () => {
     await waitFor(() =>
       expect(requestGateway).toHaveBeenCalledWith('plugins.manage', {
         action: 'toggle',
-        key: 'image_gen/legacy',
+        key: 'legacy',
         enable: true,
         profile: 'work'
       })
