@@ -6958,6 +6958,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 # green run.completed with empty output and zero usage (#90436
                 # — codex_app_server reintroduced #15561 through a second
                 # producer). Interrupted returns are handled above.
+                #
+                # Contract invariant, deliberate: ANY truthy ``error`` marks
+                # the run failed — including a result that also carries
+                # ``completed: True`` with a ``final_response`` (a
+                # "finished with warnings" shape). Runtimes that recover
+                # fully must clear ``error``; if a future producer wants
+                # recovery-with-output to stay green, that is a contract
+                # change to decide explicitly, not a shape this consumer
+                # should silently guess (review on #90436).
                 elif isinstance(result, dict) and (
                     result.get("failed")
                     or result.get("error")
