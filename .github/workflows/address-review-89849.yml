@@ -1,0 +1,115 @@
+name: Address PR 89849 review
+
+on:
+  push:
+    branches:
+      - fix/desktop-session-owner-hint
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: fix/desktop-session-owner-hint
+          fetch-depth: 0
+
+      - name: Preserve transient owner lookup failures
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              p = Path(path)
+              text = p.read_text()
+              if new in text:
+                  return
+              if text.count(old) != 1:
+                  raise SystemExit(f"Expected exactly one patch anchor in {path}; found {text.count(old)}")
+              p.write_text(text.replace(old, new, 1))
+
+          utils = 'apps/desktop/src/app/session/hooks/use-session-actions/utils.ts'
+          replace_once(
+              utils,
+              """    } catch {
+              // The caller supplied an authoritative owner. A miss there means this
+              // id is missing/stale for that profile; never hunt through unrelated
+              // profiles trying to rediscover ownership the caller already supplied.
+              return undefined
+            }
+          """,
+              """    } catch (error) {
+              // A genuine missing session ends the authoritative lookup here; a
+              // transport/gateway failure is transient and must reach the existing
+              // resume retry path instead of being misreported as a missing session.
+              if (isSessionGoneError(error)) {
+                return undefined
+              }
+
+              throw error
+            }
+          """,
+          )
+
+          tests = 'apps/desktop/src/app/session/hooks/use-session-actions/resolve-stored-session.test.ts'
+          test_path = Path(tests)
+          text = test_path.read_text()
+          anchor = """  it('scopes the first by-id lookup so a miss does not skip the active profile', async () => {
+          """
+          insert = """  it('propagates transient explicit-owner failures without scanning other profiles', async () => {
+            $profiles.set(profiles('default', 'katana', 'agency-ai-engineer'))
+            $activeGatewayProfile.set('katana')
+            mockGetSession.mockRejectedValueOnce(new Error('ECONNREFUSED: gateway restarting'))
+
+            await expect(resolveStoredSession('s1', 'katana')).rejects.toThrow('ECONNREFUSED: gateway restarting')
+            expect(mockGetSession).toHaveBeenCalledTimes(1)
+            expect(mockGetSession).toHaveBeenCalledWith('s1', 'katana')
+          })
+
+          """
+          if insert not in text:
+              if text.count(anchor) != 1:
+                  raise SystemExit(f"Expected exactly one test insertion anchor; found {text.count(anchor)}")
+              test_path.write_text(text.replace(anchor, insert + anchor, 1))
+          PY
+
+          # One-shot transport only; keep it out of the final PR tree.
+          rm -f .github/workflows/address-review-89849.yml
+
+          # Refuse any accidental scope creep.
+          mapfile -t changed < <(git status --short | awk '{print $2}' | sort -u)
+          printf 'Changed paths:\n%s\n' "${changed[*]}"
+          allowed=(
+            .github/workflows/address-review-89849.yml
+            apps/desktop/src/app/session/hooks/use-session-actions/resolve-stored-session.test.ts
+            apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
+          )
+          for path in "${changed[@]}"; do
+            ok=false
+            for expected in "${allowed[@]}"; do
+              if [[ "$path" == "$expected" ]]; then ok=true; break; fi
+            done
+            if [[ "$ok" != true ]]; then
+              echo "Unexpected changed path: $path"
+              exit 1
+            fi
+          done
+
+          grep -q "catch (error)" apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
+          grep -q "isSessionGoneError(error)" apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
+          grep -q "propagates transient explicit-owner failures" apps/desktop/src/app/session/hooks/use-session-actions/resolve-stored-session.test.ts
+          git diff --check
+
+          git add -A
+          git commit -m "fix(desktop): propagate transient owner lookup failures"
+          git push origin HEAD:fix/desktop-session-owner-hint
