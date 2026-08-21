@@ -53,6 +53,32 @@ def test_pre_user_input_route_fails_open_on_invalid_or_failed_hook(monkeypatch):
         goal_active=False, has_attachments=False,
     ) == ("hello", None)
 
+
+def test_pre_user_input_route_bypasses_ineligible_input(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        lifecycle, "invoke_hook", lambda *_args, **_kwargs: calls.append(True),
+    )
+
+    for text, goal_active, has_attachments in [
+        (None, False, False),
+        ("", False, False),
+        ("   ", False, False),
+        (" /goal status", False, False),
+        ("follow up", True, False),
+        ("caption", False, True),
+    ]:
+        assert lifecycle.route_pre_user_input(
+            surface="gateway",
+            text=text,
+            session_key="s",
+            platform="telegram",
+            goal_active=goal_active,
+            has_attachments=has_attachments,
+        ) == (text, None)
+
+    assert calls == []
+
     def boom(*_args, **_kwargs):
         raise RuntimeError("broken plugin host")
 

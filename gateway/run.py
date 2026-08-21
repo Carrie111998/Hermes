@@ -16687,24 +16687,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
 
-        # Route only real, attachment-free user text after authorization. The
-        # synchronous plugin API runs off-loop so a slow callback cannot stall
-        # gateway delivery; a rewrite can intentionally enter slash dispatch.
-        if (
-            not is_internal
-            and not getattr(source, "is_bot", False)
-            and event.message_type == MessageType.TEXT
-            and not event.media_urls
-            and not event.media_types
-            and isinstance(event.text, str)
-            and event.text.strip()
-            and not event.text.lstrip().startswith("/")
-        ):
-            try:
-                event = await self._route_pre_user_input(event)
-            except Exception:
-                logger.warning("pre_user_input_route failed", exc_info=True)
-
         # Global emergency stop (`hermes pause`): give new turns a brief
         # paused notice instead of starting an agent run. Internal events
         # (background-process completions from IN-FLIGHT work) bypass the
@@ -17255,6 +17237,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # The actual interrupt message is delivered via adapter._pending_messages
             # which is read by _run_agent. Removed to prevent unbounded growth.
             return None
+
+        # Route only real, attachment-free user text after authorization and
+        # every pending/running control guard. The synchronous plugin API runs
+        # off-loop; a rewrite can intentionally enter slash dispatch below.
+        if (
+            not is_internal
+            and not getattr(source, "is_bot", False)
+            and event.message_type == MessageType.TEXT
+            and not event.media_urls
+            and not event.media_types
+            and isinstance(event.text, str)
+            and event.text.strip()
+            and not event.text.lstrip().startswith("/")
+        ):
+            try:
+                event = await self._route_pre_user_input(event)
+            except Exception:
+                logger.warning("pre_user_input_route failed", exc_info=True)
 
         # Check for commands
         command = event.get_command()

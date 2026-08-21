@@ -12,7 +12,9 @@ from gateway.session import Platform, SessionSource
 @pytest.mark.asyncio
 async def test_gateway_input_route_rewrites_off_event_loop_and_notices(monkeypatch):
     runner = object.__new__(GatewayRunner)
-    runner.async_session_store = SimpleNamespace(
+    runner.session_store = object()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
         get_or_create_session=AsyncMock(return_value=SimpleNamespace(session_id="gateway-session"))
     )
     runner._goal_still_active_for_session = lambda _session_id: False
@@ -42,7 +44,9 @@ async def test_gateway_input_route_rewrites_off_event_loop_and_notices(monkeypat
 @pytest.mark.asyncio
 async def test_gateway_input_route_skips_active_goal(monkeypatch):
     runner = object.__new__(GatewayRunner)
-    runner.async_session_store = SimpleNamespace(
+    runner.session_store = object()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
         get_or_create_session=AsyncMock(return_value=SimpleNamespace(session_id="gateway-session"))
     )
     runner._goal_still_active_for_session = lambda _session_id: True
