@@ -150,7 +150,7 @@ def default_db_path() -> Path:
 
 def _connect_readonly(db_path: Path) -> sqlite3.Connection:
     uri = f"file:{db_path}?mode=ro"
-    return sqlite3.connect(uri, uri=True)
+    return sqlite3.connect(uri, uri=True, timeout=5)
 
 
 def _iter_terminal_calls(

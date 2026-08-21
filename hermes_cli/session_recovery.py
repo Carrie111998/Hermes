@@ -1180,7 +1180,7 @@ def _verify_recovered_database(
     if open_error is not None:
         verification["errors"].append(f"database health probe: {open_error}")
 
-    conn = sqlite3.connect(str(output), isolation_level=None)
+    conn = sqlite3.connect(str(output), isolation_level=None, timeout=5)
     try:
         integrity_rows = [
             str(row[0]) for row in conn.execute("PRAGMA integrity_check").fetchall()
@@ -1435,7 +1435,7 @@ def _recover_via_lost_and_found(
     destination_db = SessionDB(db_path=output)
     destination_db.close()
 
-    lf_conn = sqlite3.connect(str(lf_path), isolation_level=None)
+    lf_conn = sqlite3.connect(str(lf_path), isolation_level=None, timeout=5)
     destination_conn = sqlite3.connect(
         str(output), isolation_level=None, timeout=1.0
     )

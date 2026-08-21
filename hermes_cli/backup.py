@@ -370,7 +370,7 @@ def _safe_copy_db(
         # control the full locked-source deadline instead of adding the
         # connection's default timeout before each callback.
         conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=0.0)
-        backup_conn = sqlite3.connect(str(dst))
+        backup_conn = sqlite3.connect(str(dst), timeout=5)
         busy_deadline = time.monotonic() + max(0.0, timeout_seconds)
 
         def _check_backup_progress(status: int, _remaining: int, _total: int) -> None:

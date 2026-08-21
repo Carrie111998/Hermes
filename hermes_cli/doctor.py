@@ -1828,7 +1828,7 @@ def run_doctor(args):
     if state_db_path.exists():
         try:
             import sqlite3
-            conn = sqlite3.connect(str(state_db_path))
+            conn = sqlite3.connect(str(state_db_path), timeout=5)
             cursor = conn.execute("SELECT COUNT(*) FROM sessions")
             count = cursor.fetchone()[0]
             conn.close()
@@ -1889,7 +1889,7 @@ def run_doctor(args):
                     report = repair_state_db_schema(state_db_path)
                     if report.get("repaired"):
                         try:
-                            conn = sqlite3.connect(str(state_db_path))
+                            conn = sqlite3.connect(str(state_db_path), timeout=5)
                             count = conn.execute(
                                 "SELECT COUNT(*) FROM sessions"
                             ).fetchone()[0]
@@ -1966,7 +1966,7 @@ def run_doctor(args):
                 )
                 if should_fix:
                     import sqlite3
-                    conn = sqlite3.connect(str(state_db_path))
+                    conn = sqlite3.connect(str(state_db_path), timeout=5)
                     conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                     conn.close()
                     new_size = wal_path.stat().st_size if wal_path.exists() else 0

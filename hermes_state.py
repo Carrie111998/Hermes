@@ -2148,7 +2148,7 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
     through the FTS triggers — is reported as unhealthy rather than slipping
     past as a false "ok" (#50502).
     """
-    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    conn = sqlite3.connect(str(db_path), isolation_level=None, timeout=5)
     try:
         # Best-effort tokenizer load: a DB carrying the messages_fts_cjk
         # index needs the cjk_unicode61 extension before any statement can
@@ -2391,7 +2391,7 @@ def _repair_state_db_schema_locked(
     # content table. This is the recommended, least-destructive recovery for a
     # corrupt FTS index that rejects message writes while reads still succeed.
     try:
-        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        conn = sqlite3.connect(str(db_path), isolation_level=None, timeout=5)
         try:
             # The cjk index can only be rebuilt with its tokenizer loaded;
             # best-effort (a tokenizer-less host skips it at the probe below).
@@ -2427,7 +2427,7 @@ def _repair_state_db_schema_locked(
     # rows using the existing index definition, fixing the mismatch without
     # touching data or FTS schema.
     try:
-        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        conn = sqlite3.connect(str(db_path), isolation_level=None, timeout=5)
         try:
             conn.execute("REINDEX")
             conn.commit()
@@ -2445,7 +2445,7 @@ def _repair_state_db_schema_locked(
 
     # ── Strategy 1: de-duplicate sqlite_master (keeps FTS index) ──
     try:
-        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        conn = sqlite3.connect(str(db_path), isolation_level=None, timeout=5)
         try:
             conn.execute("PRAGMA writable_schema=ON")
             dupes = conn.execute(
@@ -2477,7 +2477,7 @@ def _repair_state_db_schema_locked(
 
     # ── Strategy 2: drop all FTS schema, VACUUM, rebuild on next open ──
     try:
-        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        conn = sqlite3.connect(str(db_path), isolation_level=None, timeout=5)
         try:
             conn.execute("PRAGMA writable_schema=ON")
             conn.execute("DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'")
@@ -2705,7 +2705,7 @@ def _connect_tracked_db(path, tracking_path=None, **kwargs):
             "(byte-probe guard inactive in this install)",
             path,
         )
-        return sqlite3.connect(str(path), **kwargs)
+        return sqlite3.connect(str(path), **kwargs, timeout=5)
 
     # Open through THIS module's sqlite3.connect so callers (and tests) that
     # patch hermes_state.sqlite3.connect keep control of connection creation;

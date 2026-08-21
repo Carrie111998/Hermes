@@ -74,7 +74,7 @@ def plugin_db(name: str, filename: str = "data.db") -> sqlite3.Connection:
     if Path(filename).name != filename or not filename:
         raise ValueError(f"invalid plugin db filename: {filename!r}")
 
-    conn = sqlite3.connect(plugin_data_dir(name) / filename, check_same_thread=False)
+    conn = sqlite3.connect(plugin_data_dir(name) / filename, check_same_thread=False, timeout=5)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn

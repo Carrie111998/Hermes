@@ -940,7 +940,7 @@ class ResponseStore:
                 db_path = ":memory:"
         self._db_path: Optional[str] = db_path if db_path != ":memory:" else None
         try:
-            self._conn = sqlite3.connect(db_path, check_same_thread=False)
+            self._conn = sqlite3.connect(db_path, check_same_thread=False, timeout=5)
         except Exception:
             self._conn = sqlite3.connect(":memory:", check_same_thread=False)
             self._db_path = None

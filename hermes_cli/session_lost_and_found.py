@@ -94,7 +94,7 @@ def _cli_supports_recover(binary: str) -> bool:
     scratch_dir = tempfile.mkdtemp(prefix="hermes-recover-probe-")
     scratch = Path(scratch_dir) / "probe.db"
     try:
-        conn = sqlite3.connect(str(scratch))
+        conn = sqlite3.connect(str(scratch), timeout=5)
         try:
             conn.execute("CREATE TABLE t (x)")
             conn.execute("INSERT INTO t VALUES (1)")
@@ -183,7 +183,7 @@ def _lost_and_found_db_usable(lf_path: Path) -> bool:
     if not lf_path.exists() or lf_path.stat().st_size == 0:
         return False
     try:
-        conn = sqlite3.connect(str(lf_path))
+        conn = sqlite3.connect(str(lf_path), timeout=5)
         try:
             tables = [
                 str(row[0])

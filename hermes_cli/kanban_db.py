@@ -11619,7 +11619,7 @@ def count_notify_subs(
     path = db_path if db_path is not None else kanban_db_path(board=board)
     if not path.exists():
         return 0
-    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
     try:
         try:
             owner_where, owner_params = _notify_profile_filter(
