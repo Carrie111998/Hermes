@@ -12021,10 +12021,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         try:
             from gateway.delivery_ledger import (
-                RECOVERED_MARKER,
                 ledger_enabled,
-                mark_delivered,
-                mark_failed,
                 sweep_recoverable,
             )
 
@@ -12044,6 +12041,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return 0
         if not claimed:
             return 0
+        from gateway.delivery_ledger import RECOVERED_MARKER as _MARKER
+
+        return await self._deliver_claimed_obligations(
+            claimed, marker=_MARKER, clear_resume=True
+        )
+
+    async def _deliver_claimed_obligations(
+        self, claimed, *, marker: str, clear_resume: bool
+    ) -> int:
+        """Send a batch of ledger rows already claimed by a sweep.
+
+        Shared by the crash-recovery path (``_redeliver_pending_obligations``,
+        marker = RECOVERED_MARKER, clears ``resume_pending``) and the
+        in-process retry path (``_retry_failed_obligations``, marker =
+        RETRY_MARKER, nothing to clear — that session never went pending).
+        Returns the number of confirmed deliveries.
+        """
+        from gateway.delivery_ledger import mark_delivered, mark_failed
 
         redelivered = 0
         for row in claimed:
@@ -12062,7 +12077,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             content = row["content"]
             if row.get("needs_marker"):
-                content = RECOVERED_MARKER + content
+                content = marker + content
             metadata = (
                 {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             )
@@ -12098,9 +12113,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("delivery ledger update failed", exc_info=True)
 
             # The answer reached (or was owed to) this session — don't ALSO
-            # re-run the turn via the resume path.
+            # re-run the turn via the resume path. Only the crash path needs
+            # this: a retry row belongs to a session that never went pending.
             session_key = row.get("session_key") or ""
-            if session_key:
+            if clear_resume and session_key:
                 try:
                     await self.async_session_store.clear_resume_pending(session_key)
                 except Exception:
@@ -12109,6 +12125,69 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=True,
                     )
         return redelivered
+
+    async def _retry_failed_obligations(self) -> int:
+        """Retry final responses this live process failed to deliver.
+
+        Closes the gap ``_redeliver_pending_obligations`` cannot cover: that
+        one only claims rows whose owner is DEAD, so it recovers crashes.
+        When the platform itself rejects the send (a Discord 5xx blip) the
+        gateway stays up, keeps owning the row, and nothing retries — the
+        turn's answer sits ``failed``/``attempts=0`` until someone restarts
+        the process. Observed 2026-08-21: a 503 storm on the final send left
+        a thread showing a stale progress card for ~2h with the completed
+        answer stranded in the ledger.
+
+        Backoff and the attempts cap live in the ledger; this only sends.
+        """
+        try:
+            from gateway.delivery_ledger import (
+                RETRY_MARKER,
+                ledger_enabled,
+                retry_sweep_enabled,
+                sweep_retryable,
+            )
+
+            if not await asyncio.to_thread(ledger_enabled):
+                return 0
+            if not await asyncio.to_thread(retry_sweep_enabled):
+                return 0
+            _deliverable = {getattr(p, "value", str(p)) for p in self.adapters}
+            claimed = await asyncio.to_thread(
+                sweep_retryable, None, deliverable_platforms=_deliverable
+            )
+        except Exception:
+            logger.debug("delivery ledger retry sweep failed", exc_info=True)
+            return 0
+        if not claimed:
+            return 0
+        return await self._deliver_claimed_obligations(
+            claimed, marker=RETRY_MARKER, clear_resume=False
+        )
+
+    async def _delivery_retry_watcher(self, interval: float = 30.0) -> None:
+        """Periodically retry obligations this process failed to deliver.
+
+        A permanent supervised watcher. The sweep is cheap (one indexed
+        SELECT over a table capped at 500 rows) and almost always returns
+        nothing, so a short interval costs little; the real pacing is the
+        per-row backoff in ``sweep_retryable``.
+        """
+        await asyncio.sleep(min(interval, 30.0))  # let startup settle
+        while self._running:
+            try:
+                await asyncio.sleep(interval)
+                if not self._running:
+                    return
+                sent = await self._retry_failed_obligations()
+                if sent:
+                    logger.info(
+                        "delivery retry sweep: redelivered %d obligation(s)", sent
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a watcher must never die on one bad pass
+                logger.debug("delivery retry watcher pass failed", exc_info=True)
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
@@ -13231,6 +13310,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # that session) is strictly cheaper and more correct than re-running
         # the whole turn.
         await self._redeliver_pending_obligations()
+        # Crash recovery above only covers rows owned by a DEAD process. Arm
+        # the live-process retry sweep so a transient platform rejection
+        # (Discord 5xx) self-heals instead of stranding the answer until the
+        # next restart.
+        try:
+            self._spawn_supervised(
+                self._delivery_retry_watcher, "delivery_retry_watcher"
+            )
+        except Exception:  # noqa: BLE001 - must never block startup
+            logger.debug("delivery retry watcher failed to arm", exc_info=True)
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
 
