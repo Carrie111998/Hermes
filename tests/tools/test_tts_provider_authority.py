@@ -23,6 +23,11 @@ def _fake_key(tag: str) -> str:
 def clean_env(monkeypatch):
     for key in ("OPENAI_API_KEY", "HERMES_SESSION_PLATFORM"):
         monkeypatch.delenv(key, raising=False)
+    # The ignored-override warning is once-per-process per distinct value;
+    # reset it so one test's emission never masks the next test's assertion.
+    from tools import tts_tool as _tts_mod
+
+    _tts_mod._once_warnings.clear()
 
 
 class _OpenaiBackendStub:

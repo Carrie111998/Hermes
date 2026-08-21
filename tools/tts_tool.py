@@ -3130,6 +3130,28 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 # ===========================================================================
 # Main tool function
 # ===========================================================================
+def _warn_ignored_tts_provider_override(requested: str, configured: str) -> None:
+    """Once-per-process (per distinct requested value) warning for ignored
+    per-call provider overrides — a stale session whose cached tool schema
+    still advertises the param would otherwise repeat it every call; and
+    callers with no tts config at all are silent (nothing to disagree
+    WITH — default resolution just runs). See #90109."""
+    if not configured:
+        return
+    key = ("tts_provider_override", requested)
+    if key in _once_warnings:
+        return
+    _once_warnings.add(key)
+    logger.warning(
+        "Ignoring per-call TTS provider override %r; tts.provider is %r",
+        requested,
+        configured,
+    )
+
+
+_once_warnings: set = set()
+
+
 def _text_to_speech_single(
     text: str,
     output_path: Optional[str] = None,
@@ -3172,11 +3194,7 @@ def _text_to_speech_single(
     if provider:
         requested = provider.lower().strip()
         if requested and requested != configured_provider:
-            logger.warning(
-                "Ignoring per-call TTS provider override %r; tts.provider is %r",
-                requested,
-                configured_provider,
-            )
+            _warn_ignored_tts_provider_override(requested, configured_provider)
         provider = configured_provider
     else:
         provider = configured_provider
@@ -3564,11 +3582,7 @@ def text_to_speech_tool(
     if provider:
         requested = provider.lower().strip()
         if requested and requested != configured_provider:
-            logger.warning(
-                "Ignoring per-call TTS provider override %r; tts.provider is %r",
-                requested,
-                configured_provider,
-            )
+            _warn_ignored_tts_provider_override(requested, configured_provider)
         provider = configured_provider
     else:
         provider = configured_provider
