@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 from ..db import json_dump, json_load, new_id, now
-from .models import EvidenceEnvelope, RawPage, VerificationBundle
+from .models import EvidenceEnvelope, RawPage, VerificationBundle, VerificationSource
 from .paths import tenant_research_root
 
 
@@ -82,10 +82,112 @@ class EvidenceRepository:
             ))
         return saved
 
+    @staticmethod
+    def query_fingerprint(query) -> str:
+        """Identity of the question a bundle answered.
+
+        Evidence facts are not a property of the page alone. A web verifier
+        emits `product_term` and `buyer_role` by matching *the campaign's own
+        terms* against what it fetched, so the same page yields different facts
+        under different terms — and since fit is scored on how many terms
+        matched, reusing evidence gathered under other terms would silently
+        ignore a config change. Editing a campaign and rerunning it is the
+        normal way this system gets tuned, so that cannot be allowed to look
+        like a cache hit.
+
+        Target countries are deliberately excluded: extraction keys off the
+        candidate's own country, which is fixed by the immutable corpus row, so
+        including them would fragment the cache per country for no gain.
+        """
+        material = json.dumps(
+            {
+                "sector_ids": sorted(query.sector_ids),
+                "hs_codes": sorted(query.hs_codes),
+                "buyer_types": sorted(query.buyer_types),
+            },
+            sort_keys=True,
+        ).encode()
+        return hashlib.sha256(material).hexdigest()[:16]
+
+    def reusable_bundles(
+        self, cutoff_by_source: dict[str, float], query_fingerprint: str
+    ) -> dict[tuple[str, str], VerificationBundle]:
+        """Evidence already held for a candidate, still inside its freshness window.
+
+        Verifying one candidate costs three Web Unlocker fetches, and a rerun
+        re-fetched every page it had already paid for. Evidence is immutable and
+        content-addressed, so the stored rows rebuild the same bundle the
+        provider would have returned — same provenance, same hash, same facts,
+        therefore the same claims and the same verdict.
+
+        Read once per run rather than once per candidate: this is one query
+        against what would otherwise be a query, or a scan, per candidate per
+        source.
+
+        `retrieved_at` is deliberately not touched when a bundle is reused —
+        `save_evidence` skips a row it already has — so the window expires on
+        the age of the evidence rather than on the age of the last run that
+        looked at it. Cached evidence that refreshed its own timestamp would
+        never be re-fetched again.
+        """
+        if not cutoff_by_source:
+            return {}
+        placeholders = ",".join("?" for _ in cutoff_by_source)
+        rows = self.db.all(
+            "SELECT source_id,source_record_id,provenance_url,raw_hash,payload,retrieved_at "
+            f"FROM evidence_records WHERE company_id=? AND withdrawn_at IS NULL "
+            f"AND source_id IN ({placeholders}) AND retrieved_at>=? "
+            "ORDER BY retrieved_at",
+            (self.company_id, *sorted(cutoff_by_source), min(cutoff_by_source.values())),
+        )
+        # provenance_url is the identity of a source within a bundle, so a later
+        # row for the same URL supersedes an earlier one.
+        collected: dict[tuple[str, str], dict[str, VerificationSource]] = {}
+        for row in rows:
+            if (row["retrieved_at"] or 0.0) < cutoff_by_source[row["source_id"]]:
+                continue
+            payload = json_load(row["payload"], {})
+            if payload.get("query_fingerprint") != query_fingerprint:
+                # A different question, or evidence written before fingerprints
+                # existed. Either way it cannot stand in for this run's answer.
+                continue
+            # `source_record_id` is "<candidate>:<provenance hash>"; rsplit so a
+            # candidate id containing a colon still round-trips.
+            candidate_id = str(row["source_record_id"]).rsplit(":", 1)[0]
+            try:
+                source = VerificationSource(
+                    provenance_url=row["provenance_url"] or "",
+                    raw_hash=row["raw_hash"],
+                    classification=payload.get("classification", "independent"),
+                    retrieved_via=payload.get("retrieved_via") or row["provenance_url"] or "",
+                    facts=payload.get("facts") or {},
+                )
+            except Exception:
+                # One unreadable row must not cost a run its whole cache, and it
+                # must not be silently treated as evidence either.
+                continue
+            collected.setdefault((row["source_id"], candidate_id), {})[
+                source.provenance_url
+            ] = source
+        bundles: dict[tuple[str, str], VerificationBundle] = {}
+        for (source_id, candidate_id), sources in collected.items():
+            ordered = list(sources.values())
+            independent = {
+                source.provenance_url for source in ordered
+                if source.classification == "independent"
+            }
+            bundles[(source_id, candidate_id)] = VerificationBundle(
+                candidate_source_record_id=candidate_id,
+                sources=ordered,
+                independent_source_count=len(independent),
+            )
+        return bundles
+
     def prepare_verification(
         self,
         bundle: VerificationBundle,
         source_id: str,
+        query_fingerprint: str | None = None,
     ) -> list[dict]:
         """Derive immutable evidence identities without writing tenant state."""
         prepared: list[dict] = []
@@ -112,6 +214,9 @@ class EvidenceRepository:
                     "facts": source.facts,
                     "classification": source.classification,
                     "retrieved_via": source.retrieved_via,
+                    # What question this answered. Reuse requires a match; see
+                    # `query_fingerprint`.
+                    "query_fingerprint": query_fingerprint,
                 },
             )
             prepared.append({

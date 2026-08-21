@@ -763,6 +763,60 @@ question invisible.
 Verified by reverting: three tests fail without it. 477 server tests and six
 WebUI suites pass with it.
 
+### C2. A rerun stops paying twice for evidence it already holds
+
+Verifying one candidate is three Web Unlocker fetches, and a rerun re-fetched
+every page it had already bought. `refresh.reuse_public_cache` has been in the
+config and read by nobody since it was added.
+
+Evidence is immutable and content-addressed, so the stored rows rebuild the
+bundle the provider would have returned — same provenance, same hashes, same
+facts, therefore the same claims and the same verdict. Reuse changes the cost,
+not the answer, and there is a test comparing full result rows across a reused
+rerun to say so.
+
+- **Read once per run**, not once per candidate: a single query where the naive
+  shape would be a query per candidate per source.
+- **Each source's own `freshness_days` sets its window.** TED's 7 days and a
+  customer corpus's 365 are different claims about how fast the underlying
+  record changes, and that field already says so. It had no reader before this.
+- **A reused bundle does not restamp `retrieved_at`.** `save_evidence` skips a
+  row it already has, so the window expires on the age of the evidence rather
+  than the age of the last run that looked at it. Cached evidence that
+  refreshed its own timestamp would never be re-fetched again.
+- Withdrawn evidence is never reused, so purging a source still costs its
+  evidence, and the read is tenant-scoped.
+
+**The trap this would otherwise have set, which is the real content of this
+change.** Evidence facts are not a property of the page. A web verifier emits
+`product_term` and `buyer_role` by matching *the campaign's own terms* against
+what it fetched, and after B1 fit is scored on how many matched. Caching on
+(source, candidate) alone would mean an edited campaign silently reused evidence
+extracted under its old terms — and editing a campaign then rerunning it is
+precisely how this system gets tuned, as the four bugs above this section
+record. So a bundle carries a fingerprint of the question it answered, and reuse
+requires that fingerprint to match. Term *order* does not affect it, target
+countries are excluded deliberately (extraction keys off the candidate's own
+country, fixed by the immutable corpus row), and anything that changes
+extraction — sector ids, HS codes, buyer types — does.
+
+Evidence written before this change carries no fingerprint and is never reused,
+so the cache starts cold rather than starting wrong.
+
+Known limits, both deliberate:
+
+- **Abstentions are not cached.** A source that fetched pages and found nothing
+  stored no evidence, so it is asked again next run. Caching a negative would
+  mean storing evidence of absence, which is a different contract than
+  `evidence_records` currently has.
+- **A provider swapped behind an unchanged campaign is invisible** while its
+  evidence is fresh, which is correct — but it means a test that changes a
+  verifier's behaviour has to turn the cache off, and one does.
+
+Verified by reverting: three tests fail with reuse disabled, and the
+fingerprint guard has its own test that fails when the check is removed. 492
+server tests and six WebUI suites pass.
+
 ## Carried-over risks
 
 - **Postgres paths stay under-tested.** `tests/server/` builds `Settings` with

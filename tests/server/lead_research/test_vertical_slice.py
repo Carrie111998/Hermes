@@ -537,6 +537,10 @@ def test_refresh_from_strong_fit_to_reject_hides_but_preserves_prior_leads():
     definition = fixture_definition()
     body = campaign_body()
     body["target_countries"] = ["DE"]
+    # This test swaps the verifier between runs, so the second run has to
+    # actually re-verify. Cached evidence would legitimately answer the same
+    # question and the swap would be invisible — see test_evidence_reuse.py.
+    body["refresh"] = {"schedule": "monthly", "reuse_public_cache": False}
     campaign = client.post("/api/v1/research-campaigns", headers=headers, json=body).json()
     assert start_and_settle(app, client, headers, campaign["id"])[1]["status"] == "succeeded"
     app.state.lead_research.registry.providers[definition.source_id] = RejectingRefreshVerifier(

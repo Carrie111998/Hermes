@@ -433,6 +433,36 @@ class LeadResearchService:
                 output["terminal_errors"] = list(errors)
         return errors
 
+    def _reusable_bundles(
+        self, company_id: str, config: CampaignConfig, repo: EvidenceRepository
+    ) -> dict[tuple[str, str], Any]:
+        """Cached evidence this run may stand on instead of re-fetching.
+
+        Honours `refresh.reuse_public_cache`, which the campaign editor has
+        always collected and nothing has ever read. Each source's own
+        `freshness_days` sets its window — TED's 7 days and a customer corpus's
+        365 are different claims about how fast the underlying record changes,
+        and `freshness_days` is the field that already says so.
+        """
+        if not config.refresh.get("reuse_public_cache", True):
+            return {}
+        stamp = now()
+        fingerprint = repo.query_fingerprint(DiscoveryQuery(
+            campaign_id="fingerprint",
+            seller_countries=config.seller_countries,
+            target_countries=config.target_countries,
+            sector_ids=config.sector_ids,
+            hs_codes=config.hs_codes,
+            buyer_types=config.buyer_types,
+        ))
+        cutoffs = {}
+        for source_id in config.enabled_source_ids:
+            definition = self.registry.definitions.get(source_id)
+            if definition is None:
+                continue
+            cutoffs[source_id] = stamp - definition.freshness_days * 86400
+        return repo.reusable_bundles(cutoffs, fingerprint)
+
     def _is_registry(self, source_id: str) -> bool:
         """Whether this source publishes with authority of its own.
 
@@ -764,6 +794,7 @@ class LeadResearchService:
         # Bound before the try so a campaign that fails early still reports
         # zero enrichment rather than blowing up on the way out.
         enriched = 0
+        reused_bundles = 0
         unresolved_gaps: set[str] = set()
         cancelled = False
         try:
@@ -810,6 +841,10 @@ class LeadResearchService:
                 )
             })
             metrics["attainable_dimensions"] = sorted(attainable)
+            # Evidence already paid for, still fresh enough to stand. Read once
+            # for the whole run: a rerun otherwise re-fetches every page it
+            # already holds, which is the dominant cost in the system.
+            reusable = self._reusable_bundles(company_id, config, repo)
             product_terms = self._product_terms(company_id, config)
             settled, closed_count = self._settled_identities(company_id)
             # Outside FUNNEL_KEYS on purpose: the funnel is monotonic and this
@@ -853,6 +888,18 @@ class LeadResearchService:
                         if not partition["available"]:
                             continue
                         available_source_ids.append(source_id)
+                        cached = reusable.get((source_id, candidate.source_record_id))
+                        if cached is not None:
+                            # Already paid for and still inside this source's
+                            # freshness window. Same provenance and hashes, so
+                            # the same claims and the same verdict — the only
+                            # difference is that no request is made.
+                            bundles.append((source_id, cached))
+                            partition["verified"] += 1
+                            partition["reused"] = partition.get("reused", 0) + 1
+                            partition["evidence"] += len(cached.sources)
+                            reused_bundles += 1
+                            continue
                         try:
                             bundle = providers[source_id].verify(query, candidate)
                             if bundle.candidate_source_record_id != candidate.source_record_id:
@@ -921,7 +968,9 @@ class LeadResearchService:
                         prepared_evidence = [
                             stored
                             for source_id, bundle in bundles
-                            for stored in repo.prepare_verification(bundle, source_id)
+                            for stored in repo.prepare_verification(
+                                bundle, source_id, repo.query_fingerprint(query),
+                            )
                         ]
                         stage = "claims"
                         claim_plan = self._claim_plan(prepared_evidence)
@@ -1090,6 +1139,10 @@ class LeadResearchService:
         # enrichment adds evidence to records already counted, it never moves
         # one through a stage, and that funnel has to stay monotonic.
         metrics["enriched_companies"] = enriched
+        # Outside FUNNEL_KEYS with the others: reuse changes what a stage cost,
+        # never how many records passed through it. A run that says nothing
+        # about reuse cannot be told apart from one that re-fetched everything.
+        metrics["reused_bundles"] = reused_bundles
         metrics["unresolved_gaps"] = sorted(unresolved_gaps)
 
         partition_statuses: list[str] = []
@@ -1123,6 +1176,7 @@ class LeadResearchService:
                 "selected_candidates": partition["selected"],
                 "verified_candidates": partition["verified"],
                 "enriched_candidates": partition.get("enriched", 0),
+                "reused_candidates": partition.get("reused", 0),
                 "completed_candidates": partition["completed"],
                 "evidence_records": partition["evidence"],
                 "errors": partition["errors"],
