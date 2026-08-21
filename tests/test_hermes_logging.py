@@ -253,6 +253,37 @@ class TestSessionContext:
 
 
 
+class TestRedactingFormatterMissingFields:
+    """RedactingFormatter must survive records created without Hermes'
+    record factory (e.g. after third-party code replaces the global factory
+    via logging.setLogRecordFactory)."""
+
+    def test_format_tolerates_record_without_session_tag(self):
+        """A bare LogRecord (bypassing the record factory) must format.
+
+        Regression test for the session_tag KeyError: a plugin replacing the
+        global record factory leaves records without ``session_tag``;
+        formatting them raised ``ValueError: Formatting field not found in
+        record: 'session_tag'`` and silently killed Hermes' file logging.
+        """
+        from agent.redact import RedactingFormatter
+
+        record = logging.LogRecord(
+            "test.no_factory", logging.INFO, __file__, 1, "hello %s", ("world",), None,
+        )
+        # Direct construction bypasses the record factory, so the optional
+        # session_tag field is absent -- exactly what a replaced factory yields.
+        assert not hasattr(record, "session_tag")
+
+        formatter = RedactingFormatter(
+            "%(asctime)s %(levelname)s%(session_tag)s %(name)s: %(message)s"
+        )
+        out = formatter.format(record)
+
+        assert "hello world" in out
+        assert "test.no_factory" in out
+
+
 class TestComponentFilter:
     """Unit tests for _ComponentFilter."""
 

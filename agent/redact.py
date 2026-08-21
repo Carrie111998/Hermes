@@ -1423,5 +1423,24 @@ class RedactingFormatter(logging.Formatter):
         super().__init__(fmt, datefmt, style, **kwargs)
 
     def format(self, record: logging.LogRecord) -> str:
+        self._ensure_format_fields(record)
         original = super().format(record)
         return redact_sensitive_text(original)
+
+    def _ensure_format_fields(self, record: logging.LogRecord) -> None:
+        """Default missing fields referenced by the format string.
+
+        Hermes injects optional fields such as ``session_tag`` through a
+        process-global LogRecord factory (``hermes_logging``'s
+        ``_install_session_record_factory``). Third-party code can replace
+        that factory with ``logging.setLogRecordFactory`` (e.g. a plugin
+        capturing the factory at its own module import time), after which
+        records lack the field and formatting raises ``ValueError:
+        Formatting field not found in record`` -- silently killing file
+        logging. A missing optional field must never take logging down.
+        """
+        if not isinstance(getattr(self, "_style", None), logging.PercentStyle):
+            return
+        for field in re.findall(r"%\((\w+)\)s", self._fmt or ""):
+            if not hasattr(record, field):
+                setattr(record, field, "")
