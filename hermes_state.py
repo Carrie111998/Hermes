@@ -6715,6 +6715,41 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
+    def get_active_session_turn_lease(
+        self, session_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the live cross-process turn lease for ``session_id``.
+
+        This is an observation-only counterpart to acquire/refresh/release.
+        It resolves compression descendants onto the same conversation key and
+        ignores expired leases or structured local holders whose PID is known
+        dead.  It deliberately does not mutate stale rows; the normal acquire
+        path owns reclamation.
+        """
+        if not session_id:
+            return None
+        now = time.time()
+        with self._read_ctx() as conn:
+            conversation_id = self._session_turn_lease_key_on_conn(
+                conn, session_id
+            )
+            row = conn.execute(
+                "SELECT conversation_id, holder, acquired_at, expires_at "
+                "FROM session_turn_leases WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        lease = dict(row)
+        if (
+            float(lease.get("expires_at") or 0.0) <= now
+            or _compression_lock_holder_process_is_dead(
+                str(lease.get("holder") or "")
+            )
+        ):
+            return None
+        return lease
+
     def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
         """Return the current (non-expired) holder for ``session_id``, or None.
 

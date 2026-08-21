@@ -3487,6 +3487,7 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     """Redirect the active model turn while preserving valid work/context."""
     text = (params.get("text") or "").strip()
+    client_message_id = _client_message_id(params.get("client_message_id"))
     if not text:
         return _err(rid, 4002, "text is required")
     session, err = _sess_nowait(params, rid)
@@ -3499,7 +3500,12 @@ def _(rid, params: dict) -> dict:
     # model as the next turn, instead of a misleading 4010 the client silently
     # swallows into a lost follow-up.
     if agent is None and session.get("running"):
-        _enqueue_prompt(session, text, current_transport() or _stdio_transport)
+        _enqueue_prompt(
+            session,
+            text,
+            current_transport() or _stdio_transport,
+            client_message_id=client_message_id,
+        )
         session["last_active"] = time.time()
         return _ok(rid, {"status": "queued", "text": text})
     if (
@@ -3508,6 +3514,44 @@ def _(rid, params: dict) -> dict:
         or not hasattr(agent, "redirect")
     ):
         return _err(rid, 4010, "agent does not support active-turn redirect")
+
+    # A local turn can be "running" only because it is waiting for another
+    # Hermes process to release this conversation's durable lease. There is no
+    # model request to redirect in that window, so a plain reject strands the
+    # user's correction in Desktop's renderer-only queue behind a synthetic
+    # continuation. Put it in the gateway FIFO first, then interrupt only this
+    # local waiter; the user's turn drains next and remains serialized behind
+    # the real cross-process owner.
+    with session["history_lock"]:
+        waiting_for_lease = bool(
+            session.get("running")
+            and getattr(agent, "_waiting_for_session_turn_lease", False)
+        )
+        if waiting_for_lease:
+            _enqueue_prompt(
+                session,
+                text,
+                current_transport() or _stdio_transport,
+                client_message_id=client_message_id,
+            )
+            session["last_active"] = time.time()
+    if waiting_for_lease:
+        _interrupt_busy_session(str(params.get("session_id") or ""), session, agent)
+        return _ok(rid, {"status": "queued", "text": text})
+
+    # AIAgent.redirect() deliberately degrades to steer() while tools are
+    # executing.  The correction is accepted immediately, but it cannot reach
+    # the model until that tool batch finishes.  Preserve that delivery truth
+    # for clients instead of reporting the message as already redirected.
+    native_codex_steer = (
+        getattr(agent, "api_mode", None) == "codex_app_server"
+        and callable(
+            getattr(getattr(agent, "_codex_session", None), "request_steer", None)
+        )
+    )
+    deferred_to_tool_boundary = bool(
+        getattr(agent, "_executing_tools", False) and not native_codex_steer
+    )
     try:
         accepted = agent.redirect(text)
     except Exception as exc:
@@ -3519,10 +3563,10 @@ def _(rid, params: dict) -> dict:
             # so post-turn drain cannot restart the pre-correction prompt.
             _drop_queued_duplicates_of_inflight_user(session)
             session["last_active"] = time.time()
-    return _ok(
-        rid,
-        {"status": "redirected" if accepted else "rejected", "text": text},
-    )
+    result = {"status": "redirected" if accepted else "rejected", "text": text}
+    if accepted and deferred_to_tool_boundary:
+        result.update(status="queued", delivery="tool_boundary")
+    return _ok(rid, result)
 
 
 @method("terminal.resize")

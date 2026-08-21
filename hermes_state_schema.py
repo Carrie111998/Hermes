@@ -810,6 +810,96 @@ class SessionSchemaMixin:
         finally:
             cursor.execute("PRAGMA foreign_keys=ON")
 
+    def _heal_session_turn_leases_pk(self, cursor: sqlite3.Cursor) -> None:
+        """Rebuild legacy turn-lease tables with the conversation PK.
+
+        ``_reconcile_columns()`` can add ``conversation_id`` to older stores,
+        but it cannot change the old ``session_id`` primary key.  That legacy
+        shape lets many rows exist for one conversation after compression or
+        multi-surface access, so every waiter can see a different holder and
+        remain queued behind stale work.
+
+        Turn leases are transient in-flight coordination, not transcript data,
+        but a mixed-version startup may still have an active old process. Keep
+        one deterministic candidate per conversation so a competing new holder
+        stays blocked until the existing PID/TTL reclaim path can prove the
+        candidate is stale.
+        """
+        try:
+            rows = cursor.execute(
+                'PRAGMA table_info("session_turn_leases")'
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return
+        if not rows:
+            return
+
+        def _col(row, idx, name):
+            return row[idx] if isinstance(row, (tuple, list)) else row[name]
+
+        pk_cols = [
+            _col(r, 1, "name")
+            for r in sorted(
+                (r for r in rows if _col(r, 5, "pk")),
+                key=lambda r: _col(r, 5, "pk"),
+            )
+        ]
+        if pk_cols == ["conversation_id"]:
+            return
+
+        column_names = {_col(r, 1, "name") for r in rows}
+        legacy_key = (
+            "COALESCE(conversation_id, session_id)"
+            if "session_id" in column_names
+            else "conversation_id"
+        )
+
+        logger.info(
+            "session_turn_leases has legacy primary key %r; rebuilding with "
+            "conversation_id key and collapsing duplicate lease rows",
+            pk_cols,
+        )
+        cursor.execute(
+            "ALTER TABLE session_turn_leases "
+            "RENAME TO session_turn_leases_legacy_pk"
+        )
+        cursor.execute(
+            """CREATE TABLE session_turn_leases (
+    conversation_id TEXT PRIMARY KEY,
+    holder TEXT NOT NULL,
+    acquired_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+)"""
+        )
+        cursor.execute(
+            f"""INSERT OR IGNORE INTO session_turn_leases
+               (conversation_id, holder, acquired_at, expires_at)
+               SELECT
+                   conversation_id,
+                   CASE
+                       WHEN MIN(holder) = MAX(holder) THEN MAX(holder)
+                       ELSE 'legacy-migration-blocker'
+                   END AS holder,
+                   MAX(acquired_at) AS acquired_at,
+                   MAX(expires_at) AS expires_at
+               FROM (
+                   SELECT
+                       {legacy_key} AS conversation_id,
+                       holder,
+                       acquired_at,
+                       expires_at
+                   FROM session_turn_leases_legacy_pk
+                   WHERE {legacy_key} IS NOT NULL
+                     AND {legacy_key} != ''
+               )
+               GROUP BY conversation_id"""
+        )
+        cursor.execute("DROP TABLE session_turn_leases_legacy_pk")
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_turn_leases_expires "
+            "ON session_turn_leases(expires_at)"
+        )
+
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -844,6 +934,11 @@ class SessionSchemaMixin:
         # landed — the version-gated rebuild is unreachable there, #73823).
         # Same PK-rebuild constraint as gateway_routing above.
         self._heal_session_model_usage_pk(cursor)
+
+        # Rebuild session_turn_leases if it still carries the legacy session_id
+        # primary key. Collapse duplicate legacy rows to one holder per
+        # conversation; existing PID/TTL checks reclaim stale candidates.
+        self._heal_session_turn_leases_pk(cursor)
 
         # Indexes that reference reconciler-added columns must be created
         # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL

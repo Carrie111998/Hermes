@@ -272,6 +272,7 @@ def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
+    client_message_id = _client_message_id(params.get("client_message_id"))
     # Off-screen sends (widget intents): type the persisted user row so no
     # client renders it as a bubble. Whitelisted to "hidden" — display_kind
     # is a DB-only sidecar and this RPC must not mint arbitrary kinds.
@@ -357,6 +358,7 @@ def _(rid, params: dict) -> dict:
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
+            client_message_id=client_message_id,
         )
         if busy_response is not None:
             return busy_response
@@ -721,11 +723,16 @@ def _(rid, params: dict) -> dict:
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
-        _start_inflight_turn(session, text)
+        _start_inflight_turn(session, text, client_message_id)
 
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(
-            rid, sid, session, text, display_kind=display_kind
+            rid,
+            sid,
+            session,
+            text,
+            display_kind=display_kind,
+            client_message_id=client_message_id,
         )
         if not isolated_response.get("error"):
             if survivor_user_row_ids is not None:
@@ -812,7 +819,14 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(rid, sid, session, text, display_kind=display_kind)
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            text,
+            display_kind=display_kind,
+            client_message_id=client_message_id,
+        )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
