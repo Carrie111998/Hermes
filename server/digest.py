@@ -140,8 +140,11 @@ def write_digest(db: Database, company_id: str, date: str, kind: str) -> dict[st
         return existing
     payload = BUILDERS[kind](db, company_id, date)
     db.execute(
-        "INSERT OR IGNORE INTO daily_digests(id,company_id,digest_date,kind,data,created_at) "
-        "VALUES(?,?,?,?,?,?)",
+        # ON CONFLICT, not INSERT OR IGNORE: the latter is SQLite-only syntax and
+        # this statement runs on Postgres in production. The conflict target is
+        # the table's own uniqueness — one digest per tenant, day and kind.
+        "INSERT INTO daily_digests(id,company_id,digest_date,kind,data,created_at) "
+        "VALUES(?,?,?,?,?,?) ON CONFLICT(company_id,digest_date,kind) DO NOTHING",
         (new_id("dig"), company_id, date, kind, json_dump(payload), now()),
     )
     db.activity(company_id, None, f"daily_{kind}_ready", "digest", date, {"kind": kind})

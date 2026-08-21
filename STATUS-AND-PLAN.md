@@ -11,7 +11,7 @@ they already settled. The demo does not depend on the enrichment work.
 | App | `agent-rota` (Fly, region `fra`, one machine, one volume) |
 | Host | https://agent-rota.fly.dev |
 | Release running | v11, 2026-08-20 09:15 UTC — 12 minutes after `2ec40dcad6`, so incremental selection ships in it. Only `139f23cee0` (tests) is unreleased. Image contents not grep-verified. |
-| Database | Supabase Postgres, migrations 001–009 all applied |
+| Database | Supabase Postgres, migrations 001–009 applied. **010 is new and unapplied** — the boot guard requires it, so apply it before the next deploy or the service refuses to serve. |
 | Model | `minimax/MiniMax-M3`, `MINIMAX_API_KEY` set |
 | Verifier | Bright Data Web Unlocker, zone `cli_unlocker`, `active` server-side |
 | CLI | `flyctl` now lives at `~/.fly/bin/flyctl`; the Homebrew copy is gone |
@@ -1051,14 +1051,68 @@ reach imports perfectly and is then invisible.
 Verified by reverting: five tests fail without the check. 548 server tests and
 seven WebUI suites pass.
 
+### E1. Postgres drift is guarded, and the drift it found was real
+
+`server/db.py` is applied on boot, so anything added there works in every test.
+Postgres only ever gets what a migration file writes. The two drift silently and
+in one direction: the suite stays green and production raises. Four fatal
+Postgres-only bugs had already shipped that way.
+
+`tests/server/test_postgres_parity.py` compares the two schemas as text, so it
+needs no live database and fails on the commit that introduces the drift. It
+found four things, all of them real:
+
+- **`suppressions` existed only in SQLite.** `ComplianceService` reads it before
+  every send, so on Postgres the do-not-contact check itself raised
+  `relation does not exist`. A compliance gate that fails is worse than one that
+  blocks.
+- **`daily_digests` existed only in SQLite**, so the digest scheduler could
+  never record a digest in production.
+- **`ix_research_evidence_reuse` existed only in SQLite** — the index added in C4
+  precisely to stop the evidence-reuse lookup scanning every evidence row a
+  tenant owns. Production kept scanning. **That one was mine, added this
+  session**, which is the clearest argument for the guard.
+- **`digest.py` used `INSERT OR IGNORE`**, which Postgres does not have. Now
+  `ON CONFLICT (company_id, digest_date, kind) DO NOTHING`, which both accept.
+
+Migration `010_digest_suppression_parity.sql` adds the two tables with RLS
+policies matching the established convention, plus the two missing indexes, and
+is registered in `REQUIRED_MIGRATIONS` so the boot guard demands it. A redundant
+duplicate index was removed from the SQLite schema rather than mirrored:
+`activity_log_company_time_idx` covered the same table and columns as
+`ix_activity_company`, which the migrations already carried.
+
+The guards, each verified by introducing the drift it exists to catch:
+
+| Guard | Catches |
+|---|---|
+| every SQLite table has a migration | a feature that raises in production |
+| every SQLite index has a migration | a scan only production performs |
+| every tenant table has RLS | cross-tenant readable data |
+| no module uses SQLite-only SQL | `INSERT OR IGNORE`, `json_extract`, `IFNULL`, … |
+| `?`→`$n` covers the shapes in use | the `IN (…)` and repeated-pair clauses added this session |
+| no repository SQL holds a literal `?` | the one input that would corrupt the translation |
+
+**A false alarm worth recording.** The first RLS check reported 23 of 39 tenant
+tables unprotected. That was the detector, not the schema: migration 007 enables
+RLS by looping `format()` over an array of table names rather than writing
+`alter table` per table, and matching only the second form misses it. With both
+forms handled, **all 39 tenant tables have RLS**. The lesson is in the code —
+measuring before reporting is why that did not become a security escalation.
+
+What this still does not test: connection handling, real type coercion, and
+whether RLS is actually enforced rather than merely declared. Those need a live
+Postgres, and nothing here pretends otherwise.
+
 ## Carried-over risks
 
-- **Postgres paths stay under-tested.** `tests/server/` builds `Settings` with
-  `database_path` only, so every test runs SQLite. Four fatal Postgres-only bugs
-  have shipped so far. `tests/server/test_postgres_backend.py` is where
-  contracts that need no live Postgres belong. Still unverified in that file:
-  `_sql()` rewrites every `?` to `$n` including inside string literals, and
-  `jsonb` columns are fed JSON strings rather than dicts.
+- **Postgres runs no test, but it no longer drifts unnoticed.** Every test still
+  builds `Settings` with `database_path` only, so the suite is SQLite and a live
+  Postgres would still catch things these cannot — connection behaviour, real
+  type coercion, RLS actually enforced. What is now guarded is schema and dialect
+  drift, in `tests/server/test_postgres_parity.py`; see E1 below for what it
+  found. `_sql()` rewriting a `?` inside a string literal is still true, and now
+  pinned as a known limit with a guard that no repository SQL contains one.
 - **`agent.tugrap.dev` does not exist** — no DNS, no cert. Fine while nothing
   sends, because unsubscribe URLs are baked absolute into delivered mail. Must
   be settled before the first outbound email. See `TODO.md`.

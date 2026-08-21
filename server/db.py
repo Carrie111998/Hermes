@@ -146,7 +146,6 @@ CREATE TABLE IF NOT EXISTS activity_log (
     id TEXT PRIMARY KEY, company_id TEXT, actor_id TEXT, action TEXT NOT NULL,
     entity_type TEXT, entity_id TEXT, data TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL
 );
-CREATE INDEX IF NOT EXISTS activity_log_company_time_idx ON activity_log(company_id, created_at DESC);
 -- Daily rhythm: a plan each morning, a report each evening. Stored rather than
 -- recomputed so the briefing an operator read is exactly the one that was
 -- assembled at the time, and so a late read still shows the whole day.

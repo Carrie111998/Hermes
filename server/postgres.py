@@ -141,7 +141,8 @@ class PostgresDatabase:
     REQUIRED_MIGRATIONS = ("001_initial", "002_chat_sessions", "003_lead_research",
                            "004_lead_research_rls", "005_auth_table_rls",
                            "006_message_supersession", "007_document_artifacts",
-                           "008_candidate_corpus", "009_research_results")
+                           "008_candidate_corpus", "009_research_results",
+                           "010_digest_suppression_parity")
 
     def _assert_migrations_applied(self) -> None:
         try:
