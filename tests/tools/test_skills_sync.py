@@ -16,10 +16,87 @@ from tools.skills_sync import (
     _discover_bundled_skills,
     _compute_relative_dest,
     _dir_hash,
+    _optional_skill_index,
+    _backfill_optional_provenance,
     sync_skills,
     reset_bundled_skill,
     restore_official_optional_skill,
 )
+
+
+class TestOptionalProvenance:
+    @staticmethod
+    def _write_skill(root: Path, rel_path: str, frontmatter_name: str) -> Path:
+        skill_dir = root / Path(*rel_path.split("/"))
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {frontmatter_name}\ndescription: test\n---\nBody\n",
+            encoding="utf-8",
+        )
+        return skill_dir
+
+    def test_optional_index_rejects_ambiguous_alias_but_keeps_exact_paths(
+        self, tmp_path, caplog
+    ):
+        optional_dir = tmp_path / "optional-skills"
+        self._write_skill(optional_dir, "alpha/shared", "alpha-skill")
+        self._write_skill(optional_dir, "beta/shared", "beta-skill")
+
+        with patch("tools.skills_sync._get_optional_dir", return_value=optional_dir):
+            index = _optional_skill_index()
+
+        assert "shared" not in index
+        assert index["alpha/shared"][1] == "alpha/shared"
+        assert index["beta/shared"][1] == "beta/shared"
+        assert index["alpha-skill"][1] == "alpha/shared"
+        assert index["beta-skill"][1] == "beta/shared"
+        assert "Ambiguous official optional skill alias 'shared'" in caplog.text
+
+    def test_backfill_skips_colliding_folder_names_with_warning(
+        self, tmp_path, caplog
+    ):
+        optional_dir = tmp_path / "optional-skills"
+        skills_dir = tmp_path / "skills"
+        for rel_path, frontmatter_name in (
+            ("alpha/shared", "alpha-skill"),
+            ("beta/shared", "beta-skill"),
+        ):
+            source = self._write_skill(optional_dir, rel_path, frontmatter_name)
+            destination = skills_dir / Path(*rel_path.split("/"))
+            shutil.copytree(source, destination)
+
+        with patch("tools.skills_sync._get_optional_dir", return_value=optional_dir), \
+             patch("tools.skills_sync.SKILLS_DIR", skills_dir):
+            backfilled = _backfill_optional_provenance(quiet=True)
+
+        assert backfilled == []
+        assert not (skills_dir / ".hub" / "lock.json").exists()
+        assert "Skipping ambiguous official optional skill folder 'shared'" in caplog.text
+
+    def test_backfill_atomic_failure_preserves_existing_lock(
+        self, tmp_path, monkeypatch
+    ):
+        optional_dir = tmp_path / "optional-skills"
+        skills_dir = tmp_path / "skills"
+        source = self._write_skill(optional_dir, "category/demo", "demo")
+        shutil.copytree(source, skills_dir / "category" / "demo")
+        lock_path = skills_dir / ".hub" / "lock.json"
+        lock_path.parent.mkdir(parents=True)
+        original = '{"version": 1, "installed": {"keep": {}}}\n'
+        lock_path.write_text(original, encoding="utf-8")
+
+        def fail_replace(_tmp_path, _target):
+            raise OSError("simulated replace failure")
+
+        monkeypatch.setattr("utils.atomic_replace", fail_replace)
+
+        with patch("tools.skills_sync._get_optional_dir", return_value=optional_dir), \
+             patch("tools.skills_sync.SKILLS_DIR", skills_dir), \
+             pytest.raises(OSError, match="simulated replace failure"):
+            _backfill_optional_provenance(quiet=True)
+
+        assert lock_path.read_text(encoding="utf-8") == original
+        assert list(lock_path.parent.glob(".lock_*.tmp")) == []
 
 
 class TestReadWriteManifest:
