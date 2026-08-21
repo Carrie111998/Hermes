@@ -63,6 +63,24 @@ from agent.delegation_context import (
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_CONTEXT_MAX_CHARS = 8000
+
+
+def _continuity_max_chars() -> int:
+    """Return the configured positive character cap for self-continuity."""
+    try:
+        config = load_config() or {}
+        value = int(
+            (config.get("cron") or {}).get(
+                "continuity_max_chars", _DEFAULT_CONTEXT_MAX_CHARS
+            )
+        )
+        if value > 0:
+            return value
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return _DEFAULT_CONTEXT_MAX_CHARS
+
 
 def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
     """Done-callback: close a SessionDB whose constructor finished after run_job's timeout.
@@ -3865,10 +3883,24 @@ def _build_job_prompt(
                 if not output_files:
                     continue  # silent skip — no output yet
                 latest_output = output_files[0].read_text(encoding="utf-8").strip()
-                # Truncate to 8K characters to avoid prompt bloat
-                _MAX_CONTEXT_CHARS = 8000
-                if len(latest_output) > _MAX_CONTEXT_CHARS:
-                    latest_output = latest_output[:_MAX_CONTEXT_CHARS] + "\n\n[... output truncated ...]"
+                # Keep continuity bounded while preserving the most recent
+                # report. Upstream-job context retains its historical prefix.
+                max_context_chars = (
+                    _continuity_max_chars()
+                    if is_self
+                    else _DEFAULT_CONTEXT_MAX_CHARS
+                )
+                if len(latest_output) > max_context_chars:
+                    if is_self:
+                        latest_output = (
+                            "[... output truncated ...]\n\n"
+                            + latest_output[-max_context_chars:]
+                        )
+                    else:
+                        latest_output = (
+                            latest_output[:max_context_chars]
+                            + "\n\n[... output truncated ...]"
+                        )
                 if latest_output:
                     if is_self:
                         prompt = (

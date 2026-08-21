@@ -244,6 +244,46 @@ class TestSelfContext:
         # Self-context uses continuity framing, not the upstream-job framing.
         assert f"Output from job '{job['id']}'" not in prompt
 
+    def test_self_truncation_preserves_latest_context(self, cron_env):
+        from cron.jobs import create_job, OUTPUT_DIR
+        from cron.scheduler import _build_job_prompt
+
+        job = create_job(
+            prompt="Scan for news", schedule="every 1h", context_from="self"
+        )
+        out_dir = OUTPUT_DIR / job["id"]
+        out_dir.mkdir(parents=True, exist_ok=True)
+        previous_output = "old report\n" + ("x" * 8000) + "\nlatest report"
+        (out_dir / "2026-08-01_10-00-00.md").write_text(
+            previous_output, encoding="utf-8"
+        )
+
+        prompt = _build_job_prompt(job)
+
+        assert "old report" not in prompt
+        assert "latest report" in prompt
+        assert "[... output truncated ...]" in prompt
+
+    def test_self_truncation_uses_configured_limit(self, cron_env, monkeypatch):
+        from cron.jobs import create_job, OUTPUT_DIR
+        from cron.scheduler import _build_job_prompt
+
+        job = create_job(prompt="Scan", schedule="every 1h", context_from="self")
+        out_dir = OUTPUT_DIR / job["id"]
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "2026-08-01_10-00-00.md").write_text(
+            "old" + ("x" * 64) + "latest", encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            "cron.scheduler.load_config",
+            lambda: {"cron": {"continuity_max_chars": 16}},
+        )
+
+        prompt = _build_job_prompt(job)
+
+        assert ("x" * 10) + "latest" in prompt
+        assert ("x" * 11) + "latest" not in prompt
+
     def test_self_case_insensitive(self, cron_env):
         from cron.jobs import create_job, OUTPUT_DIR
         from cron.scheduler import _build_job_prompt
