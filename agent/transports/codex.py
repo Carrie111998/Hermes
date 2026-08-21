@@ -27,6 +27,13 @@ def _cache_scope_from_session_id(session_id: Optional[str]) -> str:
     match = _CRON_SESSION_ID_RE.match(sid)
     return match.group(1) if match else sid
 
+from agent.reasoning_effort import (
+    ACTUAL_RELAY_EFFORTS,
+    XAI_GROK46_EFFORTS,
+    XAI_LEGACY_EFFORTS,
+    clamp_effort,
+    codex_supported_efforts,
+)
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
 
@@ -115,10 +122,16 @@ def _default_prompt_cache_retention_for_request(
     model: str,
     base_url: Any,
 ) -> Optional[str]:
-    """Return ``24h`` for supported models on Amazon Bedrock Mantle."""
+    """Return ``24h`` for supported hosts/models (Bedrock Mantle, Meta)."""
     from utils import base_url_hostname
 
-    hostname_parts = base_url_hostname(str(base_url or "")).split(".")
+    hostname = base_url_hostname(str(base_url or "")).lower()
+    # Meta Model API: prompt caching is opt-in via prompt_cache_retention.
+    # Measured 0% hits on /chat/completions vs 93-99% on /responses with 24h.
+    if hostname == "api.meta.ai":
+        return "24h"
+
+    hostname_parts = hostname.split(".")
     is_bedrock_mantle = (
         len(hostname_parts) == 4
         and hostname_parts[0] == "bedrock-mantle"
@@ -342,10 +355,16 @@ class ResponsesApiTransport(ProviderTransport):
         params:
             instructions: str — system prompt (extracted from messages[0] if not given)
             reasoning_config: dict | None — {effort, enabled}
-            session_id: str | None — transcript/session id; drives the xAI
-                x-grok-conv-id header and the Codex cache-scope headers, and is
-                the fallback prompt_cache_key when there is no static prefix to
-                content-address
+            session_id: str | None — transcript/session id; drives the Codex
+                ``session_id`` header, and is the cache-scope fallback when no
+                ``cache_scope_id`` is given
+            cache_scope_id: str | None — rotation-stable logical scope id
+                (compression-lineage root; see agent/prompt_cache_scope.py).
+                Preferred over session_id when deriving the prompt_cache_key
+                content hash and the xAI x-grok-conv-id header; the Codex
+                x-client-request-id header mirrors the resulting body key.
+                Keeps the cache warm across context-compression session
+                rotation (#79017)
             max_tokens: int | None — max_output_tokens
             timeout: float | None — per-request timeout forwarded to the SDK
             request_overrides: dict | None — extra kwargs merged in
@@ -420,25 +439,31 @@ class ResponsesApiTransport(ProviderTransport):
             elif reasoning_config.get("effort"):
                 reasoning_effort = reasoning_config["effort"]
 
-        _effort_clamp = {"minimal": "low"}
-        if "gpt-5.6" in (model or "").lower():
-            # Ultra is the Codex product tier; the Responses API wire value is max.
-            _effort_clamp["ultra"] = "max"
+        # Wire vocabularies are declared in agent.reasoning_effort; the shared
+        # clamp policy (nearest weaker supported level, never escalate,
+        # never invert the ladder) replaces the per-backend hand maps that
+        # repeatedly leaked internal levels like "ultra" to the wire
+        # (#89503 class) or clamped one rung below a model's real ceiling
+        # (#87279).
         if params.get("is_xai_responses", False):
             from agent.model_metadata import is_grok_46_family
 
-            # Grok 4.6 accepts xhigh as a wire value. Older Grok models top out
-            # at high, while max/ultra remain Hermes aliases for every xAI model.
-            if not is_grok_46_family(model):
-                _effort_clamp["xhigh"] = "high"
-            _effort_clamp.update({"max": "high", "ultra": "high"})
-        if (params.get("provider") or "").strip().lower() == "actual":
-            # Actual Computer relays to SGLang/vLLM backends that accept only
-            # none/low/medium/high/max for reasoning effort — a forwarded
-            # xhigh/ultra fails with a wrapped HTTP 400 ("Expecting value:
-            # line 1 column 1"). Clamp Hermes' wider set to the supported one.
-            _effort_clamp.update({"xhigh": "high", "ultra": "max"})
-        reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
+            # Grok 4.6 accepts xhigh as a wire value; older Grok tops out
+            # at high.
+            _supported = (
+                XAI_GROK46_EFFORTS if is_grok_46_family(model)
+                else XAI_LEGACY_EFFORTS
+            )
+        elif (params.get("provider") or "").strip().lower() == "actual":
+            # Actual Computer relays to SGLang/vLLM backends:
+            # none/low/medium/high/max.
+            _supported = ACTUAL_RELAY_EFFORTS
+        else:
+            # OpenAI/Codex Responses backend — per-model vocabulary
+            # (live-verified: "max" is gpt-5.6-only, "minimal" always
+            # rejected). #68365 premise confirmed.
+            _supported = codex_supported_efforts(model)
+        reasoning_effort = clamp_effort(reasoning_effort, _supported)
 
         response_tools = _responses_tools(tools)
 
@@ -512,10 +537,18 @@ class ResponsesApiTransport(ProviderTransport):
         # recurring cron jobs carry a per-fire timestamp in session_id
         # (cron_<id>_<ts>) that made every run cache-cold, so the scope strips
         # that suffix (see _cache_scope_from_session_id). session_id is left
-        # untouched for transcript isolation and the cache-scope routing
-        # headers below. Falls back to session_id when there is no static
-        # content to hash.
-        _cache_scope = _cache_scope_from_session_id(session_id)
+        # untouched for transcript isolation (the Codex ``session_id`` header
+        # below). Falls back to session_id when there is no static content to
+        # hash.
+        #
+        # cache_scope_id, when provided, is the rotation-stable logical scope
+        # (compression-lineage root — agent/prompt_cache_scope.py): legacy
+        # ``compression.in_place: false`` compaction rotates session_id
+        # mid-conversation, and scoping by the physical id went cache-cold at
+        # every rotation boundary (#79017).
+        _cache_scope = _cache_scope_from_session_id(
+            params.get("cache_scope_id") or session_id
+        )
         cache_key = _content_cache_key(
             instructions, response_tools, _cache_scope
         ) or _cache_scope
