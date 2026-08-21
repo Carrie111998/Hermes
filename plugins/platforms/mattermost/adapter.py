@@ -617,6 +617,12 @@ class MattermostAdapter(BasePlatformAdapter):
             # Thread parity with the WS path: root_id when provided. A
             # slash invocation creates no post, so there is no post-id
             # fallback — a bare command lands in the channel's main session.
+            # In reply_mode=thread the WS path falls back to thread_id=post_id
+            # for top-level posts; a slash invocation has no post (and
+            # trigger_id is not a post id — it would make reply posts carry an
+            # invalid root_id), so slash commands key to the stable per-user
+            # channel session in every mode. See
+            # tests/gateway/test_mattermost_slash_commands.py.
             thread_id = form.get("root_id") or None
 
             source = self.build_source(

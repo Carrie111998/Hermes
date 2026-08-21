@@ -82,6 +82,10 @@ class SlashAdapterHarness:
         }
         cfg_extra.update(extra or {})
         config = PlatformConfig(enabled=True, token="test-token", extra=cfg_extra)
+        # Deterministic reply mode: ambient .env may leak MATTERMOST_REPLY_MODE
+        # via `import gateway.run` in other test modules; the adapter reads it
+        # at __init__. Thread-mode behavior has its own dedicated test below.
+        monkeypatch.setenv("MATTERMOST_REPLY_MODE", "off")
         self.adapter = MattermostAdapter(config)
 
         if tokens is None:
@@ -186,8 +190,13 @@ class TestSlashCommandEndpoint:
         session keys both paths produce. require_mention is disabled so the
         WS message passes channel gating (the slash path bypasses it by
         design — explicit intent).
+
+        Parity is asserted under the default ``reply_mode=off``; thread mode
+        keys slash commands to the stable per-user channel session instead
+        (see test_thread_mode_slash_keys_to_stable_channel_session).
         """
         monkeypatch.setenv("MATTERMOST_REQUIRE_MENTION", "false")
+        monkeypatch.setenv("MATTERMOST_REPLY_MODE", "off")  # parity holds in default mode
         assert await harness.connect() is True
 
         captured = []
@@ -231,6 +240,32 @@ class TestSlashCommandEndpoint:
         assert slash_event.source.chat_type == ws_path_event.source.chat_type
         assert slash_event.source.user_name == ws_path_event.source.user_name
 
+        await harness.adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_thread_mode_slash_keys_to_stable_channel_session(self, monkeypatch):
+        """In reply_mode=thread a slash command keys to the stable per-user
+        channel session, NOT a per-invocation thread.
+
+        The WS path in thread mode treats each top-level post as its own
+        thread (thread_id = post_id) so replies can thread onto it. A slash
+        invocation creates no post, and trigger_id is not a post id — using
+        it as a thread root would give the bot's reply an invalid root_id.
+        So the slash path intentionally keys to ``…:chat:user_id`` in every
+        mode (and to the DM session for DMs).
+        """
+        monkeypatch.setenv("MATTERMOST_SLASH_TOKENS", "tokA,tokB")
+        harness = SlashAdapterHarness(monkeypatch, extra={"reply_mode": "thread"})
+        assert await harness.connect() is True
+
+        status, _ = await _post(harness, _slash_payload(command="/sethome"))
+        assert status == 200
+        event = await harness.wait_for_event()
+        assert event.source.thread_id is None
+        key = build_session_key(event.source)
+        assert key == (
+            f"agent:main:mattermost:channel:{CHANNEL_ID}:{USER_ID}"
+        )
         await harness.adapter.disconnect()
 
     @pytest.mark.asyncio
