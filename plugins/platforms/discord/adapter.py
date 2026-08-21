@@ -8099,6 +8099,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if snapshot_text_parts and not raw_content:
                 raw_content = "\n".join(snapshot_text_parts)
                 normalized_content = raw_content
+        inline_mention = self._self_is_raw_mentioned(message)
         if self._self_is_explicitly_mentioned(message):
             mention_prefix = True
             if self._client.user:
@@ -8162,7 +8163,11 @@ class DiscordAdapter(BasePlatformAdapter):
             skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
-            if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
+            # #9399 preserves unmentioned quote-replies inline. Discord can add
+            # a reply-ping to resolved mentions, so only a raw <@bot> token
+            # makes a reply a new thread-first task.
+            skip_for_reply = is_reply_message and not inline_mention
+            if auto_thread and not skip_thread and not is_voice_linked_channel and not skip_for_reply:
                 thread = await self._auto_create_thread(message)
                 if thread:
                     parent_channel_id = str(message.channel.id)
