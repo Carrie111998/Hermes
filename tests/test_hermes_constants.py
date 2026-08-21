@@ -618,23 +618,38 @@ class TestAgentBrowserRunnable:
 
 
 
-    def test_version_probe_uses_windows_hide_flags(self, tmp_path, monkeypatch):
+    def test_version_probe_delegates_to_the_bounded_helper(self, tmp_path, monkeypatch):
+        """The probe spawns through ``bounded_probe_run``, with the argv and the
+        managed-Node environment intact.
+
+        This replaces a test that asserted ``creationflags`` on the
+        ``subprocess.run`` call directly. That contract did not disappear, it
+        MOVED: the hidden-window flag is now set inside ``bounded_probe_run``
+        and is pinned by ``test_spawn_kwargs_are_platform_correct`` in that
+        helper's own suite, which is the layer that actually sets it. Asserting
+        it from here was always a little false anyway: this class is POSIX-only,
+        and on POSIX the old call passed ``creationflags=0``, a no-op. What
+        matters at THIS layer is that the probe still routes through the
+        bounded helper (#91087) instead of falling back to the unbounded
+        ``run()``, and that ``env`` survives the hand-off.
+        """
         good = self._stub(tmp_path, "agent-browser", "#!/bin/sh\necho hi\n")
         captured = []
 
-        def fake_run(cmd, **kwargs):
-            captured.append((cmd, kwargs))
-            return SimpleNamespace(returncode=0)
+        def fake_bounded(argv, **kwargs):
+            captured.append((argv, kwargs))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         import hermes_cli._subprocess_compat as subprocess_compat
-        import subprocess as subprocess_mod
 
-        monkeypatch.setattr(subprocess_compat, "windows_hide_flags", lambda: 0x08000000)
-        monkeypatch.setattr(subprocess_mod, "run", fake_run)
+        monkeypatch.setattr(subprocess_compat, "bounded_probe_run", fake_bounded)
 
         assert agent_browser_runnable(str(good)) is True
         assert captured[0][0] == [str(good), "--version"]
-        assert captured[0][1]["creationflags"] == 0x08000000
+        assert captured[0][1]["timeout"] == 10
+        # The managed Node directory has to reach the child, or a managed
+        # npm/npx shim cannot resolve its own node.
+        assert captured[0][1]["env"] == with_hermes_node_path()
 
 
 

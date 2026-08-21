@@ -27,6 +27,7 @@ import time
 
 import pytest
 
+import hermes_cli._subprocess_compat as compat
 from hermes_cli._subprocess_compat import bounded_git_probe, bounded_probe_run
 
 _PY = sys.executable
@@ -143,3 +144,49 @@ def test_env_defaults_to_inheriting_the_parent_environment():
         os.environ.pop("HERMES_PROBE_INHERIT", None)
     assert result is not None
     assert result.stdout.strip() == "inherited-91087"
+
+
+def test_spawn_kwargs_are_platform_correct(monkeypatch):
+    """The hidden-window flag on Windows / own process group on POSIX.
+
+    This is the one assertion in this file that mocks the spawn, and
+    deliberately so: unlike timeout and pipe-inheritance behaviour, a
+    ``creationflags`` value has no observable runtime effect a real subprocess
+    could report back, so there is nothing to assert against otherwise.
+
+    It lives here rather than at the call sites because this is where the flag
+    is chosen. ``hermes_constants``'s agent-browser probe used to assert
+    ``creationflags`` on its own ``subprocess.run`` call; when those probes
+    adopted this helper for #91087 the contract moved down here, and pinning it
+    at the layer that sets it means all three probes are covered by one test
+    instead of each re-asserting a spawn detail it no longer controls.
+    """
+    seen = {}
+
+    class _FakeProc:
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("", "")
+
+    def fake_popen(argv, **kwargs):
+        seen.update(kwargs)
+        return _FakeProc()
+
+    monkeypatch.setattr(compat.subprocess, "Popen", fake_popen)
+
+    result = bounded_probe_run(["irrelevant"], timeout=5)
+    assert result is not None
+
+    if sys.platform == "win32":
+        assert seen["creationflags"] == compat.windows_hide_flags()
+        assert "process_group" not in seen
+    else:
+        assert seen["process_group"] == 0
+        assert "creationflags" not in seen
+
+    # The capture contract the probes depend on, on both platforms.
+    assert seen["stdout"] is subprocess.PIPE
+    assert seen["stderr"] is subprocess.PIPE
+    assert seen["stdin"] is subprocess.DEVNULL
+    assert seen["text"] is True
