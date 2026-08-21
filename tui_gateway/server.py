@@ -1769,7 +1769,14 @@ def _compute_host_turn_frame(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    persist_user_text: str | None = None,
+    exact_admitted: bool = False,
+    exact_submission_id: str | None = None,
 ) -> dict:
+    if exact_admitted:
+        from tui_gateway.exact_admission import validate_submission_id
+
+        exact_submission_id = validate_submission_id(exact_submission_id)
     with session["history_lock"]:
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
@@ -1784,6 +1791,9 @@ def _compute_host_turn_frame(
         "request_id": rid,
         "session_key": session.get("session_key") or sid,
         "text": text,
+        **({"persist_user_text": persist_user_text} if persist_user_text is not None else {}),
+        **({"exact_admitted": True} if exact_admitted else {}),
+        **({"exact_submission_id": exact_submission_id} if exact_submission_id is not None else {}),
         **({"display_kind": display_kind} if display_kind else {}),
         "history": history,
         "history_version": history_version,
@@ -1837,7 +1847,22 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
         session["_metadata_mirror_updated_at"] = time.time()
 
 
-def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
+def _on_compute_host_turn_done(
+    rid: str,
+    sid: str,
+    session: dict,
+    frame: dict,
+    *,
+    exact_submission_id: str | None = None,
+) -> None:
+    if (
+        not isinstance(frame, dict)
+        or frame.get("type") not in {"turn.end", "turn.error"}
+        or frame.get("sid") != sid
+        or frame.get("request_id") != rid
+    ):
+        return
+    marker_key = str(session.get("session_key") or sid)
     is_error = frame.get("type") == "turn.error"
     with session["history_lock"]:
         if frame.get("session_key"):
@@ -1853,6 +1878,8 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         session["running"] = False
         session["last_active"] = time.time()
         _clear_inflight_turn(session)
+    if exact_submission_id is not None and frame.get("exact_submission_id") == exact_submission_id:
+        _retire_turn_marker(session, marker_key, submission_id=exact_submission_id)
     if is_error:
         message = str(frame.get("message") or "compute host turn failed")
         _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
@@ -1874,6 +1901,9 @@ def _submit_prompt_to_compute_host(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    persist_user_text: str | None = None,
+    exact_admitted: bool = False,
+    exact_submission_id: str | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -1884,6 +1914,9 @@ def _submit_prompt_to_compute_host(
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
         display_kind=display_kind,
+        persist_user_text=persist_user_text,
+        exact_admitted=exact_admitted,
+        exact_submission_id=exact_submission_id,
     )
 
     def _complete(done: dict) -> None:
@@ -1893,7 +1926,13 @@ def _submit_prompt_to_compute_host(
         # duplicate terminal error.
         if done.get("reason") == "send_failed":
             return
-        _on_compute_host_turn_done(rid, sid, session, done)
+        _on_compute_host_turn_done(
+            rid,
+            sid,
+            session,
+            done,
+            exact_submission_id=exact_submission_id,
+        )
 
     try:
         _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=_complete)
@@ -7982,7 +8021,11 @@ def _session_home(session: dict) -> Path:
     return Path(profile_home) if profile_home else Path(_hermes_home)
 
 
-def _retire_turn_marker(session: dict, *keys: str) -> None:
+def _retire_turn_marker(
+    session: dict,
+    *keys: str,
+    submission_id: str | None = None,
+) -> None:
     """Drop the crash marker for a turn whose outcome is about to reach the client.
 
     Called immediately before the terminal frame rather than at the end of the
@@ -7993,9 +8036,13 @@ def _retire_turn_marker(session: dict, *keys: str) -> None:
     compression rotated mid-turn.
     """
     home = _session_home(session)
+    active_submission_id = session.get("_exact_active_submission_id")
+    selected_submission_id = submission_id if submission_id is not None else active_submission_id
     for key in dict.fromkeys((*keys, str(session.get("session_key") or ""))):
         if key:
-            clear_turn_marker(home, key)
+            clear_turn_marker(home, key, selected_submission_id)
+    if selected_submission_id and active_submission_id == selected_submission_id:
+        session.pop("_exact_active_submission_id", None)
 
 
 def _auto_continue_note(prompt: str) -> str:
@@ -8031,7 +8078,7 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     if not enabled or age > freshness_secs or marker["attempts"] >= max_attempts:
         # Stale, disabled, or crash-looping: stop trying. The journal/partial
         # transcript still shows what happened; a manual message continues it.
-        clear_turn_marker(home, session_key)
+        clear_turn_marker(home, session_key, marker.get("submission_id"))
         return None
     if session.get("_auto_continue_scheduled"):
         return None
@@ -8067,6 +8114,8 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             # behind for a racing user turn to inherit.
             session["_auto_continue_attempt"] = attempt
             session["_auto_continue_prompt"] = marker["prompt"]
+            if marker.get("persist_user_text") is not None:
+                session["_auto_continue_persist_user_text"] = marker["persist_user_text"]
         try:
             _emit(
                 "status.update",
@@ -10719,7 +10768,19 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    persist_user_text: str | None = None,
+    exact_admitted: bool = False,
+    exact_submission_id: str | None = None,
 ) -> bool:
+    if exact_admitted:
+        try:
+            from tui_gateway.exact_admission import validate_submission_id
+
+            validate_submission_id(exact_submission_id)
+        except Exception:
+            with session["history_lock"]:
+                session["running"] = False
+            return False
     with session["history_lock"]:
         if session.get("_closing"):
             session["running"] = False
@@ -10800,7 +10861,7 @@ def _run_prompt_submit(
         marker_key = str(session.get("session_key") or "")
         marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
         marker_text = session.pop("_auto_continue_prompt", None) or text
-        if isinstance(marker_text, str) and marker_text.strip():
+        if not exact_admitted and isinstance(marker_text, str) and marker_text.strip():
             record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
         try:
             from tools.approval import (
@@ -11029,11 +11090,21 @@ def _run_prompt_submit(
             else:
                 agent.interim_assistant_callback = None
 
+            recovery_persist_user_text = session.pop("_auto_continue_persist_user_text", None)
+            persisted_source = (
+                persist_user_text
+                if persist_user_text is not None
+                else recovery_persist_user_text
+                if recovery_persist_user_text is not None
+                else prompt
+            )
             run_kwargs = {
                 "conversation_history": list(history),
                 "stream_callback": _stream,
                 "persist_user_message": (
-                    _build_persist_user_message(prompt, images, run_message) if images else prompt
+                    _build_persist_user_message(persisted_source, images, run_message)
+                    if images
+                    else persisted_source
                 ),
             }
             # Type a synthesized turn at turn START so the crash persist writes
