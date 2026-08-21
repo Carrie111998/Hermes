@@ -128,7 +128,12 @@ def test_clean_demo_first_research_run(
         f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers,
     )
     assert started.status_code == 202, started.text
-    assert started.json()["status"] == "succeeded"
+    assert started.json()["status"] == "queued"
+    # `/start` queues; a real client polls. Wait the way one would.
+    settled = client.app.state.lead_research.wait_until_settled(
+        company_id, campaign["id"], timeout=60
+    )
+    assert settled is not None and settled["status"] == "succeeded", settled
 
     active = client.get(
         f"/api/v1/research-campaigns/{campaign['id']}/results", headers=headers,

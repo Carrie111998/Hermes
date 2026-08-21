@@ -122,7 +122,10 @@ export async function mount(root, ctx) {
         },
       });
       await call('researchCampaigns.start', { params: { campaignId: campaign.id } });
-      toast('Search finished. Results are ranked by your weights.', 'success');
+      // Queued, not finished: the search runs in the background and each
+      // company is verified before it appears. Claiming it had finished sent
+      // people to an empty list and read as a failed search.
+      toast('Search started. Results appear as companies are verified.', 'success');
       ctx.navigate('/app/research');
     } catch (error) {
       toast(error?.message || 'The search could not start.', 'error');

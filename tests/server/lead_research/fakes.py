@@ -102,11 +102,17 @@ class DeterministicProvider:
 
     def verify(self, query, candidate) -> VerificationBundle:
         del query
+        # The role this company turns out to have, not a fixed one. A real
+        # verifier reads it off the page it fetched about this candidate, so
+        # stamping every candidate "distributor" made the fake contradict any
+        # corpus row that said otherwise — and eligibility reads observed roles.
+        roles = [str(value) for value in candidate.data.get("buyer_types") or []] or ["distributor"]
+        role_phrase = " and ".join(roles)
         official_markdown = (
-            f"{candidate.company_name} is a distributor of household appliances in {candidate.country}."
+            f"{candidate.company_name} is a {role_phrase} of household appliances in {candidate.country}."
         )
         independent_markdown = (
-            f"Registry profile for {candidate.company_name}, a household-appliances distributor."
+            f"Registry profile for {candidate.company_name}, a household-appliances {role_phrase}."
         )
         return VerificationBundle(
             candidate_source_record_id=candidate.source_record_id,
@@ -120,7 +126,7 @@ class DeterministicProvider:
                         "company_name": [candidate.company_name],
                         "country": [candidate.country],
                         "domain": [candidate.domain],
-                        "buyer_role": ["distributor"],
+                        "buyer_role": roles,
                         "product_term": ["household-appliances"],
                     },
                 ),
@@ -131,7 +137,7 @@ class DeterministicProvider:
                     retrieved_via="https://search.example.test",
                     facts={
                         "company_name": [candidate.company_name],
-                        "buyer_role": ["distributor"],
+                        "buyer_role": roles,
                         "product_term": ["household-appliances"],
                     },
                 ),

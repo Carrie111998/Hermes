@@ -146,13 +146,24 @@ export async function mount(root, ctx) {
       control.addEventListener('change', () => update({ eligibility: { [key]: control.checked } }));
       return el('label', { class: 'ifz-gate' }, control, el('span', {}, label));
     }));
+    // Enforced, so it has to be adjustable: a hidden minimum is a policy the
+    // tenant cannot see and cannot loosen. Zero switches the gate off.
+    const minimumSources = el('input', {
+      type: 'number', min: '0', max: '5', step: '1',
+      value: String(cfg.eligibility.minimum_independent_sources ?? 1),
+    });
+    minimumSources.addEventListener('change', () => update({
+      eligibility: { minimum_independent_sources: Math.max(0, Number(minimumSources.value) || 0) },
+    }));
     return el('div', { class: 'ifz-research-stack' },
       el('div', { class: 'ifz-research-step-intro' },
         el('span', { class: 'ifz-research-step-no' }, '03'),
         el('div', {}, el('h2', {}, 'Set qualification rules'),
           el('p', {}, 'Eligibility runs before scoring. Compliance gates remain explicit and non-overridable.'))),
       card({ title: 'Eligibility gates', body: el('div', {}, gateGrid,
-        el('div', { class: 'ifz-policy-lock' }, 'Sanctions and do-not-contact policies remain separate read-only gates. Research never authorizes outreach.')) }),
+        el('label', { class: 'ifz-gate' }, minimumSources,
+          el('span', {}, 'Independent sources required (0 switches this off)')),
+        el('div', { class: 'ifz-policy-lock' }, 'No sanctions screening source is connected, so compliance is reported as unknown rather than passed. Research never authorizes outreach.')) }),
       card({ title: 'Fit score', body: renderScoring(cfg.scoring, { onChange: value => update({ scoring: value }) }) }),
     );
   }
@@ -250,9 +261,10 @@ export async function mount(root, ctx) {
       actions.push(button('Start research', { kind: 'primary', onClick: async () => {
         const saved = await saveDraft({ quiet: true });
         if (!saved) return;
-        const result = await call('researchCampaigns.start', { params: { campaignId: saved.id } });
-        toast(result.status === 'partial' ? 'Campaign completed with partial source coverage' : 'Research completed',
-          result.status === 'partial' ? 'warning' : 'success');
+        await call('researchCampaigns.start', { params: { campaignId: saved.id } });
+        // `/start` queues and returns; the campaign's own page carries its
+        // status and partial-coverage notice once it settles.
+        toast('Research queued. Progress and coverage appear on the campaign.', 'success');
         ctx.navigate(`/admin/research/${saved.id}`);
       } }));
     } else {

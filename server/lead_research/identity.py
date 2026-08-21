@@ -105,6 +105,59 @@ class IdentityResolver:
         )
         return {"organization_id": organization_id, "created": False, "matched_by": matched_by}
 
+    def _match_by_verified_name(self, payload: dict, hint_country: str | None = None) -> str | None:
+        """Locate an existing identity by verified name and country.
+
+        Without this tier an identity could only be matched on a domain or a
+        registry id, and nothing supplies a registry id while a domain arrives
+        only from an official-classified page — so every company whose evidence
+        names it but does not link it created a brand-new organization on every
+        run. That duplicated the organization, duplicated its lead (leads are
+        keyed by organization), broke the result-id preservation a refresh
+        depends on, and hid the tenant's own prior claims about the company
+        from the run that needed them.
+
+        The name compared here is the one evidence stated, not the candidate
+        corpus hint: this is evidence matching evidence, which is why it may
+        match an identity rather than merely suggest one.
+        """
+        # The name must be verified. The market may come from the candidate
+        # hint: a verifier that reads a company's country off a page often
+        # cannot, while the corpus row always carries a validated ISO code, and
+        # the established rule is that a hint may locate an identity but never
+        # become a stored fact. Nothing here writes the hint country.
+        name = normalize_name(
+            payload.get("display_name") or payload.get("legal_name") or ""
+        )
+        country = (payload.get("country") or hint_country or "").strip().upper()
+        if not name or not country:
+            # A name with no market is not an identity. Two "Atlas Trading"
+            # rows in different countries are ordinarily different companies.
+            return None
+        domain = _normalize_domain(payload.get("domain"))
+        for row in self.db.all(
+            "SELECT id,domain,country FROM organizations "
+            "WHERE company_id=? AND normalized_name=?",
+            (self.company_id, name),
+        ):
+            existing_domain = _normalize_domain(row["domain"])
+            if domain and existing_domain and domain != existing_domain:
+                # Same name, two different verified domains: two companies.
+                # Merging would credit one with the other's evidence, which is
+                # worse than carrying a duplicate.
+                continue
+            existing_country = (row["country"] or "").strip().upper()
+            # Countries have to agree when both are known. When the stored side
+            # is unknown — a verifier stated a name but no market — the name is
+            # the only signal there is, and the duplicate this avoids happens on
+            # every run for every such company, while the wrong merge it risks
+            # needs the same name in two markets with the stored country still
+            # blank. Once a market is on record the strict rule applies again.
+            if existing_country and existing_country != country:
+                continue
+            return row["id"]
+        return None
+
     def resolve(self, payload: dict, source_id: str, matching_hints: dict | None = None) -> dict:
         verified_payload = dict(payload)
         verified_domain = _normalize_domain(verified_payload.get("domain"))
@@ -134,6 +187,13 @@ class IdentityResolver:
                 return self._refresh_match(
                     row["organization_id"], verified_payload, source_id, "domain_hint",
                 )
+        # Last resort before creating: a verified name in a verified market.
+        # Weaker than an identifier, so it runs after every identifier tier.
+        named = self._match_by_verified_name(
+            verified_payload, hint_country=matching_hints.get("country")
+        )
+        if named:
+            return self._refresh_match(named, verified_payload, source_id, "name_country")
         organization_id, stamp = new_id("org"), now()
         display = (
             verified_payload.get("display_name")

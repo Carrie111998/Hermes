@@ -144,15 +144,18 @@ def test_verified_web_facts_populate_only_their_supported_dimensions():
               method="observed", evidence_ids=["ev_domain"]),
     ]
 
-    assert derive_dimension_scores(claims) == {
-        "product_sector_fit": 100.0,
-        "buyer_channel_fit": 100.0,
-        "buying_intent": None,
-        "market_coverage": None,
-        "commercial_scale": None,
-        "trade_activity": None,
-        "contactability": 100.0,
+    scores = derive_dimension_scores(claims)
+
+    # Which dimensions a fact can speak for is what this pins. The scores are
+    # deliberately not 100: one value from one source is the weakest thing the
+    # evidence model can say, and how far it gets is pinned in
+    # test_fit_scoring.py.
+    assert {key for key, value in scores.items() if value is not None} == {
+        "product_sector_fit", "buyer_channel_fit", "contactability",
     }
+    assert all(0 < scores[key] < 60 for key in (
+        "product_sector_fit", "buyer_channel_fit", "contactability",
+    ))
 
 
 def test_sector_playbook_marks_store_count_not_applicable_to_industrial_machinery():

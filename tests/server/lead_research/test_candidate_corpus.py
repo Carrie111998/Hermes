@@ -263,3 +263,45 @@ def test_selection_without_exclusions_is_unchanged(db, candidate_csv):
 
     assert len(repo.select(countries=[], product_terms=[], limit=10, exclude=set())) == 2
     assert len(repo.select(countries=[], product_terms=[], limit=10)) == 2
+
+
+def test_only_the_newest_version_of_a_corpus_is_selected(db, candidate_csv):
+    """A correction ships as a new version beside the old one, not over it.
+
+    Both versions live in the same table, so without a version filter every
+    company in a corrected corpus is verified twice at full request cost, and
+    the superseded row's stale facts compete with the fix. This is how the
+    kitchen-appliance corpus kept selecting its pre-correction category.
+    """
+    repo = CandidateRepository(db)
+    repo.import_file("kitchen-appliances", "1", "candidates.csv", candidate_csv)
+    corrected = candidate_csv.replace(b"Kitchen appliances", b"Household appliances")
+    repo.import_file("kitchen-appliances", "2", "candidates.csv", corrected)
+
+    assert len(repo.select(countries=[], product_terms=[], limit=10)) == 2
+    assert len(repo.select(countries=[], product_terms=["household appliances"], limit=10)) == 2
+    assert repo.select(countries=[], product_terms=["kitchen appliances"], limit=10) == []
+    assert {r.version for r in repo.select(countries=[], product_terms=[], limit=10)} == {"2"}
+
+
+def test_a_double_digit_version_supersedes_a_single_digit_one(db, candidate_csv):
+    """Versions are free text; "10" must not sort below "9"."""
+    repo = CandidateRepository(db)
+    repo.import_file("kitchen-appliances", "9", "candidates.csv", candidate_csv)
+    repo.import_file("kitchen-appliances", "10", "candidates.csv", candidate_csv)
+
+    assert {r.version for r in repo.select(countries=[], product_terms=[], limit=10)} == {"10"}
+
+
+def test_each_dataset_keeps_its_own_newest_version(db, candidate_csv):
+    """One corpus getting a v2 must not hide another still on v1."""
+    repo = CandidateRepository(db)
+    repo.import_file("kitchen-appliances", "1", "candidates.csv", candidate_csv)
+    repo.import_file("kitchen-appliances", "2", "candidates.csv", candidate_csv)
+    other = candidate_csv.replace(b"atlas-1", b"ted-1").replace(b"north-2", b"ted-2")
+    repo.import_file("ted-appliances", "1", "candidates.csv", other)
+
+    selected = repo.select(countries=[], product_terms=[], limit=10)
+    assert {(r.dataset_id, r.version) for r in selected} == {
+        ("kitchen-appliances", "2"), ("ted-appliances", "1"),
+    }

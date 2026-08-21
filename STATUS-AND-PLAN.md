@@ -71,16 +71,39 @@ release.
    `ensure_catalog`), and Bright Data arrives `installed=1, enabled=0`
    (`default_enabled: false` in the provider catalog), so it is one **Enable**
    click. Health must read `active`.
-2. **Leave `product_ids` empty and set `sector_ids: ["kitchen-appliances"]`.**
-   This entry previously said to import a product. That is backwards, and it
-   would have produced an empty demo. See "Lead search flow" below.
-3. **Include `public procurement supplier` in `buyer_types`** when running over
-   the TED lead list, or eligibility rejects every candidate. See "The TED lead
-   list" below.
+2. **Leave `product_ids` empty and pick the sector.** This entry previously said
+   to import a product. That is backwards, and it would have produced an empty
+   demo. See "Lead search flow" below. The customer brief page already does the
+   right thing; the sector id to use is `household-appliances`.
 
 Step 1 is no longer the only path to a working demo: TED needs no credential
 and is enabled the same way, so a run can produce leads before the Bright Data
 key is in place. It just cannot produce a `strong_fit` without one.
+
+Step 3 used to read "include `public procurement supplier` in `buyer_types`".
+That was a workaround for the vocabulary trap, and it was not something the
+customer brief page could do — it derives buyer roles from the sector. The
+bridge is in `qualification.py` now, so no hand-set buyer type is needed.
+
+### Validated 2026-08-20, on local SQLite
+
+The customer path — the exact body `research-brief.js` submits — was run
+end to end over HTTP against the demo tenant, on a tenant already holding 732
+claims from an earlier campaign. Sector `household-appliances`, market RO,
+sources `customer-list-corpus` + `ted`, deep research on, limit 3:
+
+| | |
+|---|---|
+| `POST /research-campaigns` | 201 |
+| `POST .../start` | 202, `succeeded` |
+| Funnel | 9 raw → 9 named → 5 resolved → 5 eligible → 5 qualified |
+| Verdicts | 5 × `review`, fit 100 |
+| Issues | 4 — the corpus rows that abstained, correctly named |
+| `enriched_companies` | 0, correct: enrichment re-queries `web_evidence` sources only, and Bright Data is `credential_required` locally |
+
+Four bugs stood between that config and a lead; all four are described in their
+own sections below. Before them the same request returned zero at three
+different stages.
 
 ## Lead search flow
 
@@ -115,9 +138,19 @@ the corpus by:
 
 - **country** — one campaign country at a time, ISO alpha-2, indexed.
 - **product terms** — `sector_ids + hs_codes + names of the selected products`.
-- **settled identities** — country and buyer role both claimed within
-  `freshness_days`, or a `lifecycle_status` of closed. Applied before `limit`,
-  so a rerun still gets a full batch.
+- **dataset version** — only the newest version of each dataset. A corpus is
+  immutable, so a correction ships as a new version beside the old one, and
+  without this both were selected: every company in a corrected corpus was
+  verified twice at full request cost, with the superseded row's stale facts
+  competing against the fix.
+- **closed identities** — an organization whose latest `lifecycle_status` claim
+  says closed. Applied before `limit`, so a rerun still gets a full batch.
+
+Rows are ordered by `source_record_id`, not by `dataset_id`. Ordering by
+dataset let the alphabetically-first corpus consume the whole limit, so a
+tenant holding both a plain contact list and a procurement-derived corpus never
+reached the second one — and on the demo that meant a limit of 9 drew 9
+uncitable rows and verified none of them.
 
 Term matching is `all(term in searchable for term in terms)`: **AND, substring,
 against the candidate name plus its aliases and categories.** Two consequences
@@ -140,19 +173,30 @@ worth importing for outreach copy; they are just not a discovery filter.
 ### 2. Verification
 
 For each candidate, every enabled **and available** source gets
-`provider.verify(query, candidate)`. A candidate that produces no bundle is
+`provider.verify(query, candidate)`. A candidate that produces no evidence is
 recorded as `candidate_processing_failed` and dropped.
+
+**An empty bundle is an abstention, not a verification.** A provider with
+nothing to say returns a bundle carrying no sources — `CorpusProvider` does
+exactly this for a row with no citation, which is most rows in a contact-list
+import. Counting it as a bundle carried the candidate to the identity stage to
+die there on `verification returned no evidence-backed identity`: an
+internal-sounding error in place of the true one, plus a `verified` count for a
+candidate nothing had verified. Abstentions are now dropped before that, and the
+issue names the sources that abstained.
 
 Availability is stricter than enabled. `service.catalog` marks a source
 unavailable when it is retired, unhealthy, credential-gated, or —
 the case that catches people — **when the provider has no `verify` method at
 all**. `verify` is not part of the `Provider` protocol; `CatalogProvider` does
-not implement it. Of the nine catalog entries, exactly one does:
-`BrightDataVerifier`.
+not implement it.
 
-That is the real gate on the demo. Without a Bright Data credential the run
-completes, the funnel reports its candidates, and every one of them fails
-verification.
+All three surviving catalog entries implement it, but they do not cover the same
+ground. TED verifies EU public-contract winners; the corpus speaks only for rows
+carrying a `provenance_url`; Bright Data is the only one that can verify an
+arbitrary company in an arbitrary market. So on the corpus — Gulf and Asian
+traders with no citations — Bright Data is still the real gate, and without its
+credential those candidates abstain their way to zero.
 
 ### 3. Evidence to verdict
 
@@ -246,19 +290,23 @@ one independent source, and `evaluate_verdict` wants an official source and a
 second one before it calls anything strong. Bright Data is what supplies the
 second.
 
-### Two traps this run walked into
+### Two traps this run walked into — both now fixed
 
 - **Buyer-type vocabulary.** The first run qualified nothing: every candidate
   was rejected on `buyer_role` because the campaign asked for
   `distributor/importer/retailer` while the rows carry
-  `public procurement supplier`. `EligibilityService` intersects the two sets
-  and there is no synonym table. This is enrichment plan item 3, and it is not
-  theoretical.
-- **Rejected companies count as settled.** A rejected candidate still gets
-  `country` and `buyer_role` claims, so `_settled_identities` skips it on the
-  next run. Fixing the campaign config and re-running therefore skipped the 39
-  companies the bad config had rejected. Reruns are cheap by design, but a
-  config fix needs the tenant's claims cleared first.
+  `public procurement supplier`, and `EligibilityService` intersects the two
+  sets. `ROLE_EQUIVALENTS` in `qualification.py` is that bridge now: winning a
+  public supply contract proves a company resells these goods, so the term
+  answers a request for any reselling role and deliberately not for `brand` or
+  `manufacturer`, which claim production it does not evidence. The gate also
+  reads observed `buyer_role` claims and not only the corpus row's guess — a
+  contact list states no role at all, so gating on the row alone rejected every
+  company in it.
+- **Rejected companies counted as settled.** A rejected candidate still gets
+  `country` and `buyer_role` claims, so `_settled_identities` skipped it on the
+  next run. That skip is gone (see plan items 1–2), so a config fix no longer
+  needs the tenant's claims cleared first.
 
 ### A defect worth remembering
 
@@ -304,11 +352,20 @@ Three things that decide whether it does anything:
   The capability is already declared in the catalog, so this is a lookup rather
   than a hardcoded source id.
 
-The corpora now carry `household-appliances`, the canonical sector id from
+The corpora carry `household-appliances`, the canonical sector id from
 `sectors.py`. `kitchen-appliances` matched no playbook at all, so every gap
 looked closed and enrichment could never have run whatever else was fixed.
 That change alone took the same campaign from 91 qualified leads to 173,
 because the sector's buyer roles finally lined up with the eligibility gate.
+
+**`build_corpus.py` emitting the canonical id is not the same as the imported
+data carrying it.** Only `ted-appliances` v3 was re-imported at the time. The
+5,470-row `kitchen-appliances` v1 rows kept the old category, so the sector id
+the brief page offers matched 201 EU rows and **none** of the corpus — a search
+of AE or SA returned zero. Fixed by re-importing the same file as
+`kitchen-appliances` v2, which reproduces byte-for-byte (5,470 rows, AE 579,
+SA 541), and by the version filter in `select` that stops v1 and v2 both being
+selected. Anywhere the corpus is loaded from scratch, import it as v2 or later.
 
 ### The customer brief
 
@@ -371,33 +428,65 @@ nullable `campaign_id`; `organization_links` is the cross-run identity backbone;
 `_fact_matches` already emits `country` and `buyer_role` facts, so country
 validation and buyer-type tagging were already claims.
 
-### 1–2. Closed state and incremental selection — DONE, not deployed
+### 1–2. Closed state — DONE. Incremental selection — WITHDRAWN
 
-`2ec40dcad6`. Selection skips identities the tenant has settled. Settled means
-country and buyer role both claimed inside the source's declared
-`freshness_days` (30), or a `lifecycle_status` claim saying closed.
+`2ec40dcad6` added both. Closure stayed; skipping merely-validated identities
+was removed, because it never worked and it broke every campaign after the
+first.
+
+Selection now skips only identities whose latest `lifecycle_status` claim says
+closed.
 
 - Closure is read latest-first, so a later `operating` claim reopens a wrongly
   retired company. Closure is not a one-way door.
+- Closure is read tenant-wide, across campaigns: a dissolved company is
+  dissolved for every campaign, and production writes claims with a campaign
+  id.
 - The verifier emits the claim from 17 narrow multi-word phrases, gated on an
   identity match. Bare "closed" is ordinary prose ("closed on Sundays", "closed
   a funding round") and a false positive removes a live company from every
   future run.
-- Skip counts are `excluded_closed` and `skipped_validated`, deliberately
-  outside `FUNNEL_KEYS` — that funnel is monotonic and these describe work never
-  started.
+- `excluded_closed` sits outside `FUNNEL_KEYS` — that funnel is monotonic and
+  this describes work never started.
 - No migration. A new column would have duplicated `feature_claims` and lost the
   evidence binding.
 
-Two known limits. Nothing writes `operating` yet, so the reopen path needs a
-human or a future extraction — an operator override in the UI is a small
-follow-up. And closure is only detected when a campaign actually reaches a
-company, so this makes reruns cheap, not the first pass.
+**Why the validated-skip was withdrawn.** A run rebuilds its own results from
+scratch — `_run_campaign` deletes this campaign's results and claims before
+selecting — so any identity it skips is simply absent from its output. Two
+consequences, both measured on the demo tenant:
 
-### 3. Buyer-type vocabulary — NOT STARTED
+- For the case it was written for, a **rerun**, the skip set was always empty:
+  the campaign's own claims are deleted before `_settled_identities` reads them.
+  It never made a single rerun cheaper.
+- For a **new campaign**, claims written by an earlier campaign are never
+  cleared, so it skipped all 173 settled identities and reported
+  `raw_records: 0` and zero leads. That is what a demo hit.
 
-Generalised across industries, not kitchen-appliance specific: distributor, OEM,
-importer, wholesaler, retailer, HORECA supplier, contractor, e-commerce.
+Every test covered `_settled_identities` directly with claims written at
+`campaign_id = None`, a shape the production writer never produces, which is
+how it survived. Per-candidate cost is bounded by `select(limit=…)` regardless —
+the 16,500-request figure assumed an unbounded full-corpus pass that `select`
+does not perform. Making skipping sound would mean carrying a skipped
+identity's prior result and claims through the rebuild and counting them at
+every funnel stage they previously passed; worth doing if request cost bites,
+but it is a redesign of the rebuild model, not a filter.
+
+### 3. Buyer-type vocabulary — DONE for the terms in play
+
+`ROLE_EQUIVALENTS` and `satisfies_buyer_role` in `qualification.py`. Sector
+roles across `sectors.yaml` are a closed set of seven — brand, distributor,
+importer, manufacturer, procurement_organization, retailer, wholesaler — and the
+only foreign vocabulary any verifier emits is TED's
+`public procurement supplier`. Bright Data matches the campaign's own terms, so
+it never mismatches; a corpus emits whatever its file said.
+
+So the map is one entry, written out per term rather than inferred, plus role
+spelling normalised (`procurement_organization` and "Procurement Organization"
+are the same role). Add an entry when a verifier starts emitting a new term.
+
+Still open: OEM, HORECA supplier, contractor and e-commerce appear in the plan
+but in no sector and no verifier, so there is nothing yet to bridge them to.
 Country is validated but is not a tag.
 
 Blocked on a decision: `buyer_role` facts only match terms passed in through
@@ -421,6 +510,166 @@ one known address and stored as `pattern-guessed`. Decided: published +
 pattern-guessed, no licensed enrichment vendor for now.
 `skills/sales/contact-discovery/SKILL.md` already specifies this pipeline
 including verification status, and outreach already refuses to CC a guess.
+
+## Three contract fixes, 2026-08-21
+
+A review of the lead-research module found the plumbing sound and three
+contracts broken: a route that lied about being asynchronous, a policy the UI
+collected and the engine ignored, and an identity resolver that silently
+duplicated every company it could not link. All three are fixed.
+
+### A1. `/start` no longer runs the campaign in the request
+
+`POST /research-campaigns/{id}/start` declared `202` and then ran the entire
+campaign inline — hundreds of blocking Web Unlocker fetches at a 45s timeout
+each. Any proxy or worker timeout killed it mid-run and left the campaign
+`running` for good. `/cancel` wrote a status nothing read, so a cancelled run
+kept spending until the corpus ran out.
+
+`LeadResearchService.start()` now queues onto a bounded pool and returns
+`{"status": "queued"}`; `run()` is unchanged and is still the synchronous engine
+the CLI and tests drive. The shape is copied from `DocumentProcessingService`
+deliberately — same pool, same `wait_until_settled`, same `shutdown()` wired
+into the app lifespan — rather than introducing a second background mechanism.
+
+- **The status move to `queued` is the race guard.** A run deletes and rebuilds
+  its own results, so two concurrent starts would interleave deletes with
+  inserts over the same rows. The compare-and-swap makes the loser a 409.
+- **Cancellation is read once per candidate**, before verification: one indexed
+  SELECT against three HTTP fetches is free, and the alternative is a cancel
+  that does nothing until the whole batch is paid for. A cancelled run
+  terminalizes as `cancelled`, not `partial` — reporting a source failure would
+  send someone hunting a provider that was working fine.
+- **A campaign cancelled between queueing and pickup never starts.** Claiming
+  `running` first would have lost the cancellation.
+- Callers updated: the smoke script now polls `GET /research-campaigns/{id}`
+  and is the reference for how a client waits; both WebUI toasts said the
+  search had *finished*, which sent people to an empty list that read as a
+  failed search.
+
+Still open: the results page tells you research is running but does not refresh
+itself. A live progress view is a product decision, not part of this fix.
+
+### A2. The eligibility policy is the policy that runs
+
+`EligibilityService` hardcoded five gates and never read `config.eligibility`.
+The campaign editor has rendered switches for `require_official_domain`,
+`require_target_presence`, `require_buyer_role`, `exclude_inactive` and
+`minimum_independent_sources` the whole time, and flipping any of them changed
+nothing. `config.exclusions` was equally dead.
+
+- Every switch now changes the outcome, and `minimum_independent_sources` got
+  the number input it never had — it is enforced, so a hidden value would be a
+  policy the tenant cannot see or loosen. Zero switches the gate off.
+- **A gate switched off reports `not_required`, not nothing.** The stored gate
+  map is the record of why a company qualified; a gate that vanishes is
+  indistinguishable from one that passed, which makes an old verdict
+  unreadable after a policy change.
+- Source coverage moved ahead of the gate, because `require_official_domain`
+  and `minimum_independent_sources` ask about it and a gate cannot read a value
+  produced two stages later.
+- `exclusions.domains` and `exclusions.company_ids` are applied, domains
+  compared on the normalized host.
+- **Compliance now reports `unknown` instead of `pass`.** No sanctions
+  screening source is connected and nothing ever set `candidate["sanctioned"]`,
+  so a pass claimed a check nobody ran. It does not block. The editor copy
+  claimed sanctions gates existed; that copy is corrected.
+
+**This makes the default policy stricter than what shipped**, because the
+default asks for one independent source and that is now enforced. TED and the
+corpus both classify a non-self citation `independent`, so the 173-lead run
+would be unaffected; a corpus row citing only its own domain is `official`-only
+and would now be rejected. Set the minimum to 0 to get the old behaviour.
+
+### A3. An identity no longer duplicates when nothing links it
+
+`IdentityResolver` matched on `registry_id` or `domain` only. Nothing emits a
+registry id, and a domain arrives only from an official-classified page — TED
+carries one for 40 of 201 rows and classifies every source `independent`. So
+every company whose evidence named it but did not link it got a **new
+organization on every run**: duplicate orgs, duplicate leads (leads are keyed
+by organization), broken result-id preservation on refresh, and the tenant's own
+prior claims hidden from the run that needed them.
+
+A verified name plus a market now matches, after every identifier tier:
+
+- **The name must be verified**, never the corpus hint — this is evidence
+  matching evidence, which is what makes it a match rather than a suggestion.
+  The market may come from the candidate hint, since verifiers often name a
+  company without stating its country while the corpus row always carries a
+  validated ISO code. The hint is never stored as a fact.
+- **Two different verified domains under one name are two companies.** Merging
+  would credit one with the other's evidence, which is worse than a duplicate.
+- Countries must agree when both are known. While the stored market is still
+  blank the name is the only signal there is — and that duplicate happens on
+  every run, whereas the wrong merge it risks needs the same name in two
+  markets with the country still unrecorded. Once a market is on record the
+  strict rule applies again.
+- Name matching bootstraps toward strong links: the run that first learns a
+  domain writes the link, and every later run matches on that instead.
+
+Verified by reverting the fix — six tests fail without it. 436 server tests and
+the four WebUI suites pass with it.
+
+### B1. Fit separates leads instead of confirming they exist
+
+`_claim_score` returned `100.0` for any truthy claim value, and `score_lead`
+divides by the weight of the dimensions a lead actually has — so a single
+product term found in a single search snippet scored the same as a company
+corroborated across four sources, and the weighted average of a few 100s is
+100. That is exactly what both real runs showed: 91 leads and then 173 leads,
+**every one of them fit 100 and `review`**. Ranking is the product, and the
+list had nothing to rank by.
+
+A claim whose field *is* a dimension is still a provider stating that
+dimension's score, and is respected as before. Everything else — a matched
+product term, an observed buyer role — is evidence *of* a dimension and is now
+scored by degree: authority (the claim's own confidence, which is where
+official-vs-independent already lives) times a strength built from
+corroboration and breadth.
+
+Anchors, and the reasoning for each:
+
+| Evidence | Score |
+|---|---|
+| one value, one source | ~50 — a mention with nothing corroborating it |
+| one value, two sources | ~74 — corroborated but narrow |
+| two values, two sources | ~82 |
+| three or more, two sources | ~90 — the strongest this evidence model states |
+
+- **Corroboration saturates at two sources on purpose.** "An official source and
+  an independent one agreeing" is already the standard `evaluate_verdict` uses
+  for `strong_fit`; paying for a fourth would let a company with many weak
+  mentions outrank one with an official page and a registry agreeing. Above
+  that line breadth does the separating.
+- **Coverage is not double-counted.** Fit still divides by the weight of the
+  known dimensions only, because missing dimensions are already priced into
+  `evidence_confidence` through `completeness`. Fit is the quality of what is
+  known; confidence is how much is known and how well.
+- Measured spread on real evidence shapes: thin (one independent snippet) 47 /
+  band C, ordinary (official + independent, one term) 72 / band B, strong
+  (three sources, three terms, two roles) 81 / band A.
+
+**Consequences to expect.** The shared test fixture states one term and one
+role across two sources, so it now lands on `review` rather than `strong_fit` —
+which is correct, and a dedicated end-to-end test carries the `strong_fit`
+canary instead. On the 173-lead TED run, leads will spread across C and B
+rather than tying at 100; band A needs several corroborated terms, which TED
+alone does not supply. That is the precision-first stance the product already
+claims, made real.
+
+**`/leads` was not sorted by fit at all.** It ordered by `leads.created_at
+DESC`, so the customer's list arrived in the corpus's arbitrary insertion order
+while the brief page promised it was "ranked by your weights". It now orders by
+fit, then evidence confidence, with `created_at` only breaking ties so the
+order is stable across reruns. `/results` was already ordered correctly.
+
+Not done here, deliberately: magnitude is still not read for numeric evidence
+fields (`store_count`, `revenue`). No verifier emits one, so a scale curve
+would be tuned against nothing — there is a `ponytail:` marker at the spot.
+
+Verified by reverting: seven scoring tests and the ordering test fail without
+it. 456 server tests and six WebUI suites pass with it.
 
 ## Carried-over risks
 

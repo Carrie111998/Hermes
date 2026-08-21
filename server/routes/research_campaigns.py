@@ -12,6 +12,7 @@ from ..auth import Principal, company_scope, current_principal, require_admin
 from ..db import json_dump, json_load, new_id, now
 from ..lead_research.models import CampaignConfig
 from ..lead_research.sectors import load_sectors
+from ..lead_research.service import CampaignAlreadyRunning
 from ..lead_research.storage import EvidenceRepository
 
 
@@ -221,7 +222,14 @@ def start_campaign(campaign_id: str, request: Request,
     row = _row(request, company_id, campaign_id)
     if row["status"] not in {"draft", "failed", "cancelled", "partial", "completed", "succeeded"}:
         raise HTTPException(409, "Campaign cannot start from its current state")
-    return request.app.state.lead_research.run(company_id, campaign_id)
+    # Queued, not run: a campaign is hundreds of blocking HTTP fetches, so
+    # running it here held the request open for the whole campaign and any proxy
+    # timeout killed it mid-run, leaving the campaign `running` forever. Poll
+    # GET /research-campaigns/{id} for status and run_id.
+    try:
+        return request.app.state.lead_research.start(company_id, campaign_id)
+    except CampaignAlreadyRunning:
+        raise HTTPException(409, "Campaign is already queued or running")
 
 
 @router.post("/research-campaigns/{campaign_id}/cancel")
@@ -316,7 +324,12 @@ def campaign_leads(campaign_id: str, request: Request,
         "JOIN leads ON leads.id=research_results.lead_id AND leads.company_id=research_results.company_id "
         "WHERE research_results.company_id=? AND research_results.campaign_id=? "
         "AND research_results.verdict IN ('strong_fit','review') "
-        "ORDER BY leads.created_at DESC",
+        # By fit, not by insertion order. This is the list the customer works
+        # down, and the brief page promises it is ranked by their weights —
+        # ordering it by created_at handed them the corpus's arbitrary order.
+        # created_at only breaks ties, so the order stays stable across reruns.
+        "ORDER BY research_results.fit_score DESC,"
+        "research_results.evidence_confidence DESC,leads.created_at DESC",
         (company_id, campaign_id),
     )
     for row in rows:

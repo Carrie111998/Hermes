@@ -1,7 +1,9 @@
 """Campaign orchestration over candidate, verification, and verdict contracts."""
 from __future__ import annotations
 
+import threading
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import urlparse
 
@@ -24,85 +26,168 @@ def _domain(url: str) -> str:
     return (parsed.hostname or "").casefold().rstrip(".").removeprefix("www.")
 
 
+def _claimed_values(claims, field: str) -> list[str]:
+    """Observed values for one claim field. A claim value is a scalar or a list."""
+    values: list[str] = []
+    for claim in claims:
+        if claim.field != field or claim.status != "observed":
+            continue
+        raw = claim.value if isinstance(claim.value, list) else [claim.value]
+        values.extend(str(item) for item in raw if str(item).strip())
+    return list(dict.fromkeys(values))
+
+
+class CampaignAlreadyRunning(RuntimeError):
+    """A campaign cannot be queued twice; the in-flight run owns its results."""
+
+
 class LeadResearchService:
-    def __init__(self, db, registry: ProviderRegistry | None = None):
+    def __init__(self, db, registry: ProviderRegistry | None = None, *, workers: int = 2):
         self.db = db
         self.registry = registry or build_registry()
         self.candidates = CandidateRepository(db)
         self._planner = FeaturePlanner()
+        # A campaign is minutes-to-hours of blocking HTTP: three Web Unlocker
+        # fetches per candidate, hundreds of candidates. It cannot run inside a
+        # request handler, so it runs here — same shape as
+        # DocumentProcessingService, including `wait_until_settled` so a caller
+        # that genuinely needs the outcome can ask for it.
+        self._pool = ThreadPoolExecutor(
+            max_workers=max(1, int(workers)), thread_name_prefix="lead-research"
+        )
+        self._lock = threading.Lock()
+        self._settled: dict[tuple[str, str], dict] = {}
+        self._events: dict[tuple[str, str], threading.Event] = {}
+        self._closed = False
 
     def ensure_catalog(self, company_id: str) -> None:
         self.registry.ensure_tenant(self.db, company_id, now())
 
+    def start(self, company_id: str, campaign_id: str) -> dict:
+        """Queue a campaign and return without waiting for it.
+
+        The status move to `queued` is the race guard: two rapid starts would
+        otherwise both run, and a run deletes and rebuilds the campaign's own
+        results, so the two would interleave deletes with inserts over the same
+        rows. Whoever loses the compare-and-swap is told the campaign is
+        already in flight.
+        """
+        if self._closed:
+            raise RuntimeError("lead research service is shut down")
+        changed = self.db.execute(
+            "UPDATE research_campaigns SET status='queued',updated_at=? "
+            "WHERE id=? AND company_id=? AND status NOT IN ('queued','running')",
+            (now(), campaign_id, company_id),
+        )
+        if not changed:
+            raise CampaignAlreadyRunning("campaign is already queued or running")
+        key = (company_id, campaign_id)
+        with self._lock:
+            self._settled.pop(key, None)
+            self._events.setdefault(key, threading.Event()).clear()
+        self._pool.submit(self._run_settling, company_id, campaign_id)
+        return {"status": "queued", "campaign_id": campaign_id, "run_id": None, "metrics": {}}
+
+    def _run_settling(self, company_id: str, campaign_id: str) -> None:
+        """Run a queued campaign and release anyone waiting on its outcome."""
+        key = (company_id, campaign_id)
+        try:
+            result = self.run(company_id, campaign_id)
+        except Exception as exc:
+            # `run` terminalizes its own failures; reaching here means even that
+            # failed. Nothing awaits this future, so record it or it is lost.
+            diagnostic = {"stage": "dispatch", "message": str(exc)[:240]}
+            result = {
+                "status": "failed", "campaign_id": campaign_id,
+                "metrics": {}, "failed_source_ids": [], "processing_error": diagnostic,
+            }
+            self._try_save_processing_issue(
+                company_id, campaign_id, None, "campaign_processing_failed", diagnostic,
+            )
+            self._finalize_terminal_state(company_id, campaign_id, None, "failed", result)
+        with self._lock:
+            self._settled[key] = result
+            self._events.setdefault(key, threading.Event()).set()
+
+    def wait_until_settled(
+        self, company_id: str, campaign_id: str, timeout: float = 60
+    ) -> dict | None:
+        """Block until a queued campaign reaches a terminal state."""
+        key = (company_id, campaign_id)
+        with self._lock:
+            event = self._events.setdefault(key, threading.Event())
+        if not event.wait(timeout):
+            return None
+        with self._lock:
+            return self._settled.get(key)
+
+    def shutdown(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._pool.shutdown(wait=False, cancel_futures=True)
+
+    def _cancellation_requested(self, company_id: str, campaign_id: str) -> bool:
+        """Whether the tenant has asked this campaign to stop.
+
+        `/cancel` writes the campaign row, so that row is the signal. Read once
+        per candidate: one indexed SELECT against three HTTP fetches is free,
+        and the alternative is a cancel that does nothing until the whole
+        corpus has been paid for.
+        """
+        row = self.db.one(
+            "SELECT status FROM research_campaigns WHERE id=? AND company_id=?",
+            (campaign_id, company_id),
+        )
+        return bool(row) and row["status"] == "cancelled"
+
     # A claim field carrying "closed" retires a company for good; the corpus it
     # came from is immutable and shared, so the state has to live tenant-side.
     LIFECYCLE_FIELD = "lifecycle_status"
-    # What a company must already have proven for a rerun to leave it alone.
-    # Contacts are deliberately not required yet: nothing populates them for
-    # corpus candidates, so requiring one would skip nothing and mean nothing.
-    SETTLED_FIELDS = ("country", "buyer_role")
 
-    def _freshness_days(self, source_ids: list[str]) -> int:
-        windows = [
-            self.registry.definitions[source_id].freshness_days
-            for source_id in source_ids
-            if source_id in self.registry.definitions
-        ]
-        return min([window for window in windows if window] or [30])
+    def _settled_identities(self, company_id: str) -> tuple[set[tuple[str, str]], int]:
+        """Identities no campaign of this tenant should spend requests on.
 
-    def _settled_identities(
-        self, company_id: str, freshness_days: int
-    ) -> tuple[set[tuple[str, str]], int, int]:
-        """Identities a rerun should not spend requests on.
+        Closure only. Skipping merely-validated companies used to live here too
+        and was removed: a run rebuilds its own results from scratch, so any
+        identity it skips is absent from its output, and the skip therefore
+        emptied every campaign after the first instead of making reruns cheap.
+        Per-candidate cost is bounded by `select(limit=...)` regardless.
 
-        Returns the skip set plus how many were closed and how many were merely
-        already validated, so a run can say which it was instead of silently
-        shrinking its own funnel.
+        Returns the skip set and its size, so a run can report the exclusion
+        instead of silently shrinking its own funnel.
         """
         organizations = self.db.all(
             "SELECT id,normalized_name,country FROM organizations WHERE company_id=?",
             (company_id,),
         )
         if not organizations:
-            return set(), 0, 0
-        cutoff = now() - freshness_days * 86400
+            return set(), 0
         lifecycle: dict[str, tuple[float, Any]] = {}
-        fresh: dict[str, set[str]] = defaultdict(set)
         for row in self.db.all(
             "SELECT organization_id,field,value,verified_at FROM feature_claims "
-            "WHERE company_id=?",
-            (company_id,),
+            "WHERE company_id=? AND field=?",
+            (company_id, self.LIFECYCLE_FIELD),
         ):
             organization_id = row["organization_id"]
-            if row["field"] == self.LIFECYCLE_FIELD:
-                # Latest wins, so a later "operating" claim reopens a company
-                # that was wrongly retired. Closure must not be a one-way door.
-                stamp = row["verified_at"] or 0.0
-                if organization_id not in lifecycle or stamp >= lifecycle[organization_id][0]:
-                    lifecycle[organization_id] = (stamp, json_load(row["value"], None))
-            elif row["field"] in self.SETTLED_FIELDS and (row["verified_at"] or 0.0) >= cutoff:
-                fresh[organization_id].add(row["field"])
+            # Latest wins, so a later "operating" claim reopens a company
+            # that was wrongly retired. Closure must not be a one-way door.
+            stamp = row["verified_at"] or 0.0
+            if organization_id not in lifecycle or stamp >= lifecycle[organization_id][0]:
+                lifecycle[organization_id] = (stamp, json_load(row["value"], None))
 
         skip: set[tuple[str, str]] = set()
-        closed = validated = 0
-        required = set(self.SETTLED_FIELDS)
         for organization in organizations:
-            identity = (
-                organization["normalized_name"],
-                (organization["country"] or "").upper(),
-            )
             state = lifecycle.get(organization["id"])
             value = state[1] if state else None
             if isinstance(value, list):
                 value = value[0] if value else None
             if value == "closed":
-                skip.add(identity)
-                closed += 1
-                continue
-            if required <= fresh.get(organization["id"], set()):
-                skip.add(identity)
-                validated += 1
-        return skip, closed, validated
+                skip.add((
+                    organization["normalized_name"],
+                    (organization["country"] or "").upper(),
+                ))
+        return skip, len(skip)
 
     def catalog(self, company_id: str) -> list[dict]:
         self.ensure_catalog(company_id)
@@ -337,7 +422,9 @@ class LeadResearchService:
                     "UPDATE agent_runs SET status=?,output=?,completed_at=?,updated_at=? "
                     "WHERE id=? AND company_id=?",
                     (
-                        "failed" if final_status == "failed" or errors else "succeeded",
+                        "failed" if final_status == "failed" or errors
+                        else "cancelled" if final_status == "cancelled"
+                        else "succeeded",
                         json_dump(output), now(), now(), run_id, company_id,
                     ),
                 )
@@ -604,6 +691,11 @@ class LeadResearchService:
         if not row:
             raise KeyError("campaign not found")
         config = CampaignConfig.model_validate(json_load(row["config"], {}))
+        if row["status"] == "cancelled":
+            # Cancelled between queueing and pickup. Claiming it as `running`
+            # first would lose the cancellation and research the whole corpus.
+            return {"status": "cancelled", "run_id": None, "campaign_id": campaign_id,
+                    "metrics": {}, "failed_source_ids": []}
         self.ensure_catalog(company_id)
         stamp = now()
         run_id = new_id("run")
@@ -662,6 +754,7 @@ class LeadResearchService:
         # zero enrichment rather than blowing up on the way out.
         enriched = 0
         unresolved_gaps: set[str] = set()
+        cancelled = False
         try:
             catalog = {item["source_id"]: item for item in self.catalog(company_id)}
             providers = {
@@ -692,14 +785,13 @@ class LeadResearchService:
                     )
 
             product_terms = self._product_terms(company_id, config)
-            settled, closed_count, validated_count = self._settled_identities(
-                company_id, self._freshness_days(config.enabled_source_ids)
-            )
-            # Outside FUNNEL_KEYS on purpose: the funnel is monotonic and these
-            # describe work never started, not a stage that lost records.
+            settled, closed_count = self._settled_identities(company_id)
+            # Outside FUNNEL_KEYS on purpose: the funnel is monotonic and this
+            # describes work never started, not a stage that lost records.
             metrics["excluded_closed"] = closed_count
-            metrics["skipped_validated"] = validated_count
             for country in config.target_countries:
+                if cancelled:
+                    break
                 candidates = self.candidates.select(
                     countries=[country],
                     product_terms=product_terms,
@@ -721,9 +813,15 @@ class LeadResearchService:
                     max_records=config.max_qualified_leads_per_country * 3,
                 )
                 for candidate in candidates:
+                    if self._cancellation_requested(company_id, campaign_id):
+                        # Before verification, so a cancel stops spending on the
+                        # next candidate rather than the one after it.
+                        cancelled = True
+                        break
                     bundles: list[tuple[str, Any]] = []
                     verification_messages: list[str] = []
                     available_source_ids: list[str] = []
+                    abstained: list[str] = []
                     for source_id in config.enabled_source_ids:
                         partition = partitions[(source_id, country)]
                         if not partition["available"]:
@@ -733,6 +831,18 @@ class LeadResearchService:
                             bundle = providers[source_id].verify(query, candidate)
                             if bundle.candidate_source_record_id != candidate.source_record_id:
                                 raise ValueError("verifier returned evidence for a different candidate")
+                            if not bundle.sources:
+                                # An abstention, not a verification. A provider
+                                # with nothing to say returns an empty bundle
+                                # (a corpus row without a citation, say), and
+                                # counting it as a bundle used to carry the
+                                # candidate to the identity stage to die there
+                                # on "no evidence-backed identity" — an
+                                # internal-sounding error in place of the true
+                                # one, which is that no source could vouch for
+                                # this company.
+                                abstained.append(source_id)
+                                continue
                             bundles.append((source_id, bundle))
                             partition["verified"] += 1
                             partition["evidence"] += len(bundle.sources)
@@ -750,7 +860,10 @@ class LeadResearchService:
                             {
                                 "candidate_source_record_id": candidate.source_record_id,
                                 "stage": "verification",
-                                "messages": verification_messages or ["no verifier was available"],
+                                "messages": verification_messages or [
+                                    f"no evidence from {', '.join(abstained)}"
+                                    if abstained else "no verifier was available"
+                                ],
                             },
                         )
                         continue
@@ -808,9 +921,39 @@ class LeadResearchService:
                             company_id, campaign_id, organization_id, claim_plan
                         )
                         stage = "eligibility"
+                        # Coverage is computed here rather than at the verdict
+                        # stage because the eligibility policy asks about it:
+                        # `require_official_domain` and
+                        # `minimum_independent_sources` are gates, and a gate
+                        # cannot read a value produced two stages later.
+                        official_domains = {
+                            _domain(source.provenance_url)
+                            for _, bundle in bundles for source in bundle.sources
+                            if source.classification == "official" and _domain(source.provenance_url)
+                        }
+                        independent_domains = {
+                            _domain(source.provenance_url)
+                            for _, bundle in bundles for source in bundle.sources
+                            if source.classification == "independent" and _domain(source.provenance_url)
+                        }
+                        payload = self._candidate_payload(candidate, config)
+                        # The corpus row is a starting guess about the role; the
+                        # claims are what a source actually observed. Gating on
+                        # the row alone rejected every company in a corpus that
+                        # carries no buyer_types — which is most of them, since
+                        # a contact list does not state one.
                         candidate_for_gate = {
-                            **self._candidate_payload(candidate, config),
+                            **payload,
+                            "buyer_types": list(dict.fromkeys([
+                                *(payload.get("buyer_types") or []),
+                                *_claimed_values(claims, "buyer_role"),
+                            ])),
                             "organization_id": organization_id,
+                            "official_domains": sorted(official_domains),
+                            "independent_domain_count": len(independent_domains),
+                            "lifecycle_status": next(
+                                iter(_claimed_values(claims, self.LIFECYCLE_FIELD)), None
+                            ),
                         }
                         gate = eligibility.evaluate(candidate_for_gate, config)
                         if gate.eligible:
@@ -823,16 +966,6 @@ class LeadResearchService:
                         stage = "scoring"
                         score = score_lead(candidate_for_gate, claims, config.scoring)
                         stage = "verdict"
-                        official_domains = {
-                            _domain(source.provenance_url)
-                            for _, bundle in bundles for source in bundle.sources
-                            if source.classification == "official" and _domain(source.provenance_url)
-                        }
-                        independent_domains = {
-                            _domain(source.provenance_url)
-                            for _, bundle in bundles for source in bundle.sources
-                            if source.classification == "independent" and _domain(source.provenance_url)
-                        }
                         evaluated_verdict = evaluate_verdict(
                             candidate, claims, score, gate,
                             SourceCoverage(official_domains, independent_domains),
@@ -914,7 +1047,7 @@ class LeadResearchService:
                 "campaign_processing_failed", processing_error,
             )
 
-        # Outside FUNNEL_KEYS with excluded_closed and skipped_validated:
+        # Outside FUNNEL_KEYS with excluded_closed:
         # enrichment adds evidence to records already counted, it never moves
         # one through a stage, and that funnel has to stay monotonic.
         metrics["enriched_companies"] = enriched
@@ -978,7 +1111,12 @@ class LeadResearchService:
             and (contact["email"] or contact["phone"] or contact["linkedin_url"])
         })
         CampaignMetricsRecorder(self.db, company_id, campaign_id).save(metrics, now())
-        if partition_statuses and all(status == "succeeded" for status in partition_statuses):
+        if cancelled:
+            # Not "partial": a cancelled run stopped because it was told to,
+            # and reporting a source failure would send someone to look for a
+            # broken provider that was working fine.
+            final_status = "cancelled"
+        elif partition_statuses and all(status == "succeeded" for status in partition_statuses):
             final_status = "succeeded"
         elif any(status in {"succeeded", "partial"} for status in partition_statuses):
             final_status = "partial"

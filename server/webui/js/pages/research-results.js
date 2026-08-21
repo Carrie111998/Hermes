@@ -49,6 +49,16 @@ function campaignNotice(campaign) {
     title: 'A research source needs credentials',
     copy: `${missing.map(source => sentence(source)).join(', ')} cannot provide evidence until an administrator connects it.`,
   };
+  if (['queued', 'running'].includes(campaign?.status)) return {
+    tone: 'neutral',
+    title: 'Research is running',
+    copy: 'Each company is verified against its sources before it appears. Reload to see new results.',
+  };
+  if (campaign?.status === 'cancelled') return {
+    tone: 'warning',
+    title: 'Research was cancelled',
+    copy: 'Whatever had already been verified is kept and shown below.',
+  };
   if (campaign?.status === 'partial') return {
     tone: 'warning',
     title: 'Research completed with partial coverage',

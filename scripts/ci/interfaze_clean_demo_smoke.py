@@ -13,6 +13,7 @@ import argparse
 import json
 import stat
 import sys
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -95,6 +96,29 @@ def _password(path: Path) -> str:
 def _expect(status: int, expected: int, label: str) -> None:
     if status != expected:
         raise SmokeFailure(f"{label}: expected HTTP {expected}, received {status}")
+
+
+CAMPAIGN_TERMINAL = {"succeeded", "partial", "failed", "cancelled"}
+
+
+def _await_campaign(client, campaign_id: str, timeout: float = 900) -> dict:
+    """Poll a queued campaign until it settles.
+
+    `/start` queues the run and answers immediately — a campaign is hundreds of
+    blocking fetches and cannot own a request. Every client therefore polls, and
+    this is the reference for how.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        status, campaign = client.request("GET", f"/api/v1/research-campaigns/{campaign_id}")
+        _expect(status, 200, "campaign poll")
+        if campaign.get("status") in CAMPAIGN_TERMINAL:
+            return campaign
+        if time.monotonic() >= deadline:
+            raise SmokeFailure(
+                f"research campaign still {campaign.get('status')!r} after {timeout:.0f}s"
+            )
+        time.sleep(0.2)
 
 
 def _assert_empty(client: ApiClient, paths: tuple[str, ...], *, phase: str) -> None:
@@ -206,8 +230,11 @@ def run(args: argparse.Namespace) -> None:
         "POST", f"/api/v1/research-campaigns/{campaign_id}/start",
     )
     _expect(status, 202, "campaign start")
-    if started.get("status") not in {"succeeded", "partial"}:
-        raise SmokeFailure(f"research campaign ended as {started.get('status')!r}")
+    if started.get("status") != "queued":
+        raise SmokeFailure(f"campaign start returned {started.get('status')!r}, expected 'queued'")
+    settled = _await_campaign(client, campaign_id)
+    if settled.get("status") not in {"succeeded", "partial"}:
+        raise SmokeFailure(f"research campaign ended as {settled.get('status')!r}")
 
     _, active = client.request(
         "GET", f"/api/v1/research-campaigns/{campaign_id}/results",

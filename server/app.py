@@ -69,6 +69,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         run_service.pool.shutdown(wait=False, cancel_futures=True)
         # Before the database closes: an in-flight attempt still writes rows.
         document_processing.shutdown()
+        application.state.lead_research.shutdown()
         close = getattr(database, "close", None)
         if close:
             close()

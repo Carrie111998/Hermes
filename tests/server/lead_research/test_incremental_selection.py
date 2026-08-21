@@ -1,7 +1,11 @@
-"""Which companies a rerun leaves alone.
+"""Which companies a campaign leaves alone.
 
-Verifying one candidate costs three Web Unlocker fetches, so a campaign that
-re-researches everything it already settled is the dominant cost in the system.
+Verifying one candidate costs three Web Unlocker fetches, so cost matters — but
+per-candidate cost is bounded by `select(limit=...)`, and skipping an identity
+means it is absent from the run's rebuilt results. Only closure survives that
+trade: you never want to contact a dissolved company, so losing it from the
+output is the point rather than a loss.
+
 Validation state cannot live on the candidate corpus — that table is immutable
 and shared across tenants — so it is read back from tenant claims here.
 """
@@ -42,10 +46,10 @@ def _organization(db, company_id: str, name: str, country: str) -> str:
     return organization_id
 
 
-def _claim(db, company_id, organization_id, field, value, *, age_days=0.0):
+def _claim(db, company_id, organization_id, field, value, *, age_days=0.0, campaign_id=None):
     db.execute(
         "INSERT INTO feature_claims VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-        (new_id("claim"), company_id, None, organization_id, field, "observed",
+        (new_id("claim"), company_id, campaign_id, organization_id, field, "observed",
          json_dump(value), 0.9, "observed", "[]", "{}", now() - age_days * 86400),
     )
 
@@ -54,10 +58,7 @@ def test_a_closed_company_is_never_researched_again(db, service):
     organization_id = _organization(db, "cmp_1", "dead trading", "AE")
     _claim(db, "cmp_1", organization_id, "lifecycle_status", "closed")
 
-    skip, closed, validated = service._settled_identities("cmp_1", 30)
-
-    assert skip == {("dead trading", "AE")}
-    assert (closed, validated) == (1, 0)
+    assert service._settled_identities("cmp_1") == ({("dead trading", "AE")}, 1)
 
 
 def test_a_later_operating_claim_reopens_a_wrongly_closed_company(db, service):
@@ -66,46 +67,38 @@ def test_a_later_operating_claim_reopens_a_wrongly_closed_company(db, service):
     _claim(db, "cmp_1", organization_id, "lifecycle_status", "closed", age_days=5)
     _claim(db, "cmp_1", organization_id, "lifecycle_status", "operating")
 
-    skip, closed, _ = service._settled_identities("cmp_1", 30)
-
-    assert skip == set()
-    assert closed == 0
+    assert service._settled_identities("cmp_1") == (set(), 0)
 
 
-def test_a_freshly_validated_company_is_skipped(db, service):
+def test_closure_is_seen_whichever_campaign_recorded_it(db, service):
+    """Production writes claims with a campaign id; the tenant owns closure."""
+    organization_id = _organization(db, "cmp_1", "dead trading", "AE")
+    _claim(db, "cmp_1", organization_id, "lifecycle_status", "closed", campaign_id="camp_old")
+
+    assert service._settled_identities("cmp_1") == ({("dead trading", "AE")}, 1)
+
+
+def test_a_validated_company_is_still_offered_to_a_later_campaign(db, service):
+    """The regression this file exists for.
+
+    Skipping already-validated identities emptied every campaign after the
+    first: the skip was tenant-wide, a run rebuilds its results from scratch,
+    and claims written by an earlier campaign are never cleared. A second
+    campaign therefore selected nothing and reported zero leads.
+    """
     organization_id = _organization(db, "cmp_1", "known buyer", "SA")
-    _claim(db, "cmp_1", organization_id, "country", "SA")
-    _claim(db, "cmp_1", organization_id, "buyer_role", "distributor")
+    _claim(db, "cmp_1", organization_id, "country", "SA", campaign_id="camp_old")
+    _claim(db, "cmp_1", organization_id, "buyer_role", "distributor", campaign_id="camp_old")
 
-    skip, closed, validated = service._settled_identities("cmp_1", 30)
-
-    assert skip == {("known buyer", "SA")}
-    assert (closed, validated) == (0, 1)
+    assert service._settled_identities("cmp_1") == (set(), 0)
 
 
-def test_stale_validation_is_researched_again(db, service):
-    organization_id = _organization(db, "cmp_1", "stale buyer", "SA")
-    _claim(db, "cmp_1", organization_id, "country", "SA", age_days=90)
-    _claim(db, "cmp_1", organization_id, "buyer_role", "distributor", age_days=90)
+def test_another_tenants_closure_never_skips_your_candidates(db, service):
+    organization_id = _organization(db, "cmp_other", "dead trading", "AE")
+    _claim(db, "cmp_other", organization_id, "lifecycle_status", "closed")
 
-    assert service._settled_identities("cmp_1", 30)[0] == set()
-
-
-def test_partial_validation_is_researched_again(db, service):
-    """Country alone is not enough to call a company settled."""
-    organization_id = _organization(db, "cmp_1", "half known", "IQ")
-    _claim(db, "cmp_1", organization_id, "country", "IQ")
-
-    assert service._settled_identities("cmp_1", 30)[0] == set()
-
-
-def test_another_tenants_validation_never_skips_your_candidates(db, service):
-    organization_id = _organization(db, "cmp_other", "known buyer", "SA")
-    _claim(db, "cmp_other", organization_id, "country", "SA")
-    _claim(db, "cmp_other", organization_id, "buyer_role", "distributor")
-
-    assert service._settled_identities("cmp_1", 30) == (set(), 0, 0)
+    assert service._settled_identities("cmp_1") == (set(), 0)
 
 
 def test_no_organizations_means_nothing_to_skip(db, service):
-    assert service._settled_identities("cmp_1", 30) == (set(), 0, 0)
+    assert service._settled_identities("cmp_1") == (set(), 0)

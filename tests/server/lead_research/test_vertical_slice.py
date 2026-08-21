@@ -40,6 +40,28 @@ def make_research_client():
     return app, client, headers, company_id
 
 
+def start_and_settle(app, client, headers, campaign_id, expect=202):
+    """POST /start, then wait for the queued campaign to reach a terminal state.
+
+    `/start` queues the run and returns immediately — a campaign is hundreds of
+    blocking fetches and cannot own a request handler. Tests therefore have to
+    wait the way a real client does, rather than relying on the route having
+    blocked, which is what they used to assert.
+    """
+    response = client.post(
+        f"/api/v1/research-campaigns/{campaign_id}/start", headers=headers,
+    )
+    assert response.status_code == expect, response.text
+    if response.status_code != 202:
+        return response, None
+    company_id = app.state.db.one(
+        "SELECT company_id FROM research_campaigns WHERE id=?", (campaign_id,)
+    )["company_id"]
+    settled = app.state.lead_research.wait_until_settled(company_id, campaign_id, timeout=60)
+    assert settled is not None, "campaign did not reach a terminal state"
+    return response, settled
+
+
 def campaign_body(name="DACH appliance distributors"):
     return {
         "name": name,
@@ -65,18 +87,19 @@ def test_research_campaign_vertical_slice_and_tenant_scope():
     assert estimate.json()["status"] == "available"
     assert estimate.json()["qualified_range"]
 
-    started = client.post(
-        f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers,
-    )
-    assert started.status_code == 202, started.text
-    assert started.json()["status"] == "succeeded"
+    _, settled = start_and_settle(app, client, headers, campaign["id"])
+    assert settled["status"] == "succeeded"
 
     results = app.state.db.all(
         "SELECT verdict,lead_id FROM research_results WHERE company_id=? AND campaign_id=?",
         (campaign["company_id"], campaign["id"]),
     )
     assert results
-    assert {row["verdict"] for row in results} == {"strong_fit"}
+    # `review`, not `strong_fit`: this fixture states one product term and one
+    # role across two sources, which is corroborated but narrow, and fit is
+    # scored by degree now rather than by presence. What strong evidence earns
+    # is pinned in test_fit_scoring.py.
+    assert {row["verdict"] for row in results} == {"review"}
     assert all(row["lead_id"] for row in results)
 
     metrics = client.get(
@@ -111,10 +134,7 @@ def test_result_views_exports_and_claims_are_filtered_and_tenant_scoped():
     campaign = client.post(
         "/api/v1/research-campaigns", headers=headers, json=campaign_body(),
     ).json()
-    started = client.post(
-        f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers,
-    )
-    assert started.status_code == 202
+    start_and_settle(app, client, headers, campaign["id"])
 
     rows = app.state.db.all(
         "SELECT id,organization_id FROM research_results "
@@ -189,7 +209,7 @@ def test_result_views_exports_and_claims_are_filtered_and_tenant_scoped():
 
 
 def test_source_lifecycle_copy_matches_behavior_and_purge_needs_exact_name():
-    _, client, headers, _ = make_research_client()
+    app, client, headers, _ = make_research_client()
     catalog = client.get("/api/v1/data-sources/catalog", headers=headers).json()
     fixture = next(item for item in catalog if item["source_id"] == "fixture-directory")
     disabled = client.post(
@@ -201,9 +221,7 @@ def test_source_lifecycle_copy_matches_behavior_and_purge_needs_exact_name():
     )
     assert installed.status_code == 200 and installed.json()["enabled"] is True
     campaign = client.post("/api/v1/research-campaigns", headers=headers, json=campaign_body()).json()
-    assert client.post(
-        f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers,
-    ).status_code == 202
+    start_and_settle(app, client, headers, campaign["id"])
     lead_id = client.get(
         f"/api/v1/research-campaigns/{campaign['id']}/leads", headers=headers,
     ).json()[0]["id"]
@@ -225,14 +243,15 @@ def test_source_lifecycle_copy_matches_behavior_and_purge_needs_exact_name():
 def test_succeeded_campaign_can_refresh_without_duplicate_runtime_state():
     app, client, headers, _ = make_research_client()
     campaign = client.post("/api/v1/research-campaigns", headers=headers, json=campaign_body()).json()
-    first = client.post(f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers)
+    start_and_settle(app, client, headers, campaign["id"])
     first_result_ids = {
         row["id"] for row in app.state.db.all(
             "SELECT id FROM research_results WHERE campaign_id=?", (campaign["id"],)
         )
     }
-    second = client.post(f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers)
-    assert first.status_code == second.status_code == 202
+    # A settled campaign accepts a refresh; the queued-or-running guard only
+    # rejects a second start while the first is still in flight.
+    start_and_settle(app, client, headers, campaign["id"])
     metrics = client.get(
         f"/api/v1/research-campaigns/{campaign['id']}/metrics", headers=headers,
     ).json()
@@ -286,12 +305,9 @@ def test_partition_failures_preserve_candidate_diagnostics(
     body["target_countries"] = ["DE"]
     campaign = client.post("/api/v1/research-campaigns", headers=headers, json=body).json()
 
-    started = client.post(
-        f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers,
-    )
+    _, settled = start_and_settle(app, client, headers, campaign["id"])
 
-    assert started.status_code == 202
-    assert started.json()["status"] == expected_status
+    assert settled["status"] == expected_status
     source_run = client.get(
         f"/api/v1/research-campaigns/{campaign['id']}/source-runs", headers=headers,
     ).json()[0]
@@ -349,12 +365,9 @@ def test_downstream_candidate_failures_are_bounded_and_terminal(
     body["target_countries"] = ["DE"]
     campaign = client.post("/api/v1/research-campaigns", headers=headers, json=body).json()
 
-    response = client.post(
-        f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers,
-    )
+    _, settled = start_and_settle(app, client, headers, campaign["id"])
 
-    assert response.status_code == 202
-    assert response.json()["status"] == "failed"
+    assert settled["status"] == "failed"
     persisted_campaign = app.state.db.one(
         "SELECT status,run_id FROM research_campaigns WHERE id=?", (campaign["id"],)
     )
@@ -402,12 +415,9 @@ def test_diagnostic_persistence_failure_cannot_escape_candidate_boundary(monkeyp
     body["target_countries"] = ["DE"]
     campaign = client.post("/api/v1/research-campaigns", headers=headers, json=body).json()
 
-    response = client.post(
-        f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers,
-    )
+    _, settled = start_and_settle(app, client, headers, campaign["id"])
 
-    assert response.status_code == 202
-    assert response.json()["status"] == "failed"
+    assert settled["status"] == "failed"
     persisted_campaign = app.state.db.one(
         "SELECT status,run_id FROM research_campaigns WHERE id=?", (campaign["id"],)
     )
@@ -450,11 +460,9 @@ def test_terminal_updates_are_attempted_independently(monkeypatch, failing_updat
 
     monkeypatch.setattr(app.state.db, "execute", selectively_fail)
 
-    response = client.post(
-        f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers,
-    )
+    _, settled = start_and_settle(app, client, headers, campaign["id"])
+    assert settled is not None
 
-    assert response.status_code == 202
     persisted_campaign = app.state.db.one(
         "SELECT status,run_id FROM research_campaigns WHERE id=?", (campaign["id"],)
     )
@@ -486,16 +494,12 @@ def test_refresh_removes_results_for_candidates_no_longer_selected():
     body = campaign_body()
     body["target_countries"] = ["DE"]
     campaign = client.post("/api/v1/research-campaigns", headers=headers, json=body).json()
-    assert client.post(
-        f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers,
-    ).json()["status"] == "succeeded"
+    assert start_and_settle(app, client, headers, campaign["id"])[1]["status"] == "succeeded"
     app.state.lead_research.candidates = FilteringCandidates(app.state.db, {"buyer-de-2"})
 
-    refreshed = client.post(
-        f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers,
-    )
+    _, refreshed = start_and_settle(app, client, headers, campaign["id"])
 
-    assert refreshed.json()["status"] == "succeeded"
+    assert refreshed["status"] == "succeeded"
     assert app.state.db.one(
         "SELECT COUNT(*) AS n FROM research_results WHERE campaign_id=?", (campaign["id"],)
     )["n"] == 1
@@ -534,18 +538,14 @@ def test_refresh_from_strong_fit_to_reject_hides_but_preserves_prior_leads():
     body = campaign_body()
     body["target_countries"] = ["DE"]
     campaign = client.post("/api/v1/research-campaigns", headers=headers, json=body).json()
-    assert client.post(
-        f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers,
-    ).json()["status"] == "succeeded"
+    assert start_and_settle(app, client, headers, campaign["id"])[1]["status"] == "succeeded"
     app.state.lead_research.registry.providers[definition.source_id] = RejectingRefreshVerifier(
         deterministic_provider(definition)
     )
 
-    refreshed = client.post(
-        f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers,
-    )
+    _, refreshed = start_and_settle(app, client, headers, campaign["id"])
 
-    assert refreshed.json()["status"] == "succeeded"
+    assert refreshed["status"] == "succeeded"
     results = app.state.db.all(
         "SELECT verdict,lead_id FROM research_results WHERE campaign_id=?", (campaign["id"],)
     )
@@ -604,11 +604,9 @@ def test_organization_identity_is_written_from_verified_facts_not_candidate_hint
     body["target_countries"] = ["DE"]
     campaign = client.post("/api/v1/research-campaigns", headers=headers, json=body).json()
 
-    started = client.post(
-        f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers,
-    )
+    _, settled = start_and_settle(app, client, headers, campaign["id"])
 
-    assert started.json()["status"] == "succeeded"
+    assert settled["status"] == "succeeded"
     atlas = app.state.db.one(
         "SELECT display_name,domain FROM organizations WHERE display_name LIKE 'Verified Atlas%'"
     )
@@ -658,12 +656,9 @@ def test_existing_identity_match_refreshes_verified_facts_links_and_lead(match_m
     body["target_countries"] = ["DE"]
     campaign = client.post("/api/v1/research-campaigns", headers=headers, json=body).json()
 
-    response = client.post(
-        f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers,
-    )
+    _, settled = start_and_settle(app, client, headers, campaign["id"])
 
-    assert response.status_code == 202
-    assert response.json()["status"] == "succeeded"
+    assert settled["status"] == "succeeded"
     organization = app.state.db.one(
         "SELECT display_name,domain,country,data FROM organizations WHERE id=?",
         (existing["organization_id"],),

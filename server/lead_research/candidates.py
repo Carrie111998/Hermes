@@ -257,6 +257,23 @@ class CandidateRepository:
             raise
         return CandidateImportReport(dataset_id, version, len(candidates), digest)
 
+    def _current_versions(self) -> dict[str, str]:
+        """The newest version of every imported dataset, keyed by dataset id.
+
+        Versions are free text, so "10" must not sort below "9": numeric ones
+        are ordered as numbers and anything else falls back to string order,
+        with numeric versions treated as newer than named ones.
+        """
+        def rank(version: str) -> tuple[int, float, str]:
+            return (1, float(version), "") if version.isdigit() else (0, 0.0, version)
+
+        newest: dict[str, str] = {}
+        for row in self.db.all("SELECT DISTINCT dataset_id,version FROM candidate_records"):
+            dataset_id, version = row["dataset_id"], row["version"]
+            if dataset_id not in newest or rank(version) > rank(newest[dataset_id]):
+                newest[dataset_id] = version
+        return newest
+
     def select(
         self,
         *,
@@ -273,10 +290,17 @@ class CandidateRepository:
         no company_id: whose work is already done is a tenant question. The
         filter runs before ``limit`` so a run still gets a full batch of
         unsettled candidates instead of a page mostly spent on skips.
+
+        Only the newest version of each dataset is considered. A corpus is
+        immutable, so a correction ships as a new version beside the old one;
+        without this filter both would be selected and every company in a
+        corrected corpus would be verified twice, at full request cost, with
+        the superseded row's stale facts competing against the fix.
         """
         if limit < 1:
             return []
         skip = exclude or set()
+        current = self._current_versions()
         normalized_countries = {str(value).strip().upper() for value in countries if str(value).strip()}
         invalid_countries = normalized_countries - ISO_ALPHA_2
         if invalid_countries:
@@ -290,10 +314,17 @@ class CandidateRepository:
             placeholders = ",".join("?" for _ in normalized_countries)
             query += f" WHERE country IN ({placeholders})"
             params = tuple(sorted(normalized_countries))
-        query += " ORDER BY dataset_id,version,source_record_id"
+        # Not by dataset_id: that let the alphabetically-first corpus consume
+        # the whole limit, so a tenant holding both a plain contact list and a
+        # procurement-derived corpus never reached the second one. Record ids
+        # are content hashes, so this interleaves datasets evenly and stays
+        # deterministic.
+        query += " ORDER BY source_record_id,dataset_id,version"
         terms = [normalize_name(str(value)) for value in product_terms if str(value).strip()]
         results: list[CandidateRecord] = []
         for row in self.db.all(query, params):
+            if current.get(row["dataset_id"]) != row["version"]:
+                continue
             data = json_load(row["data"], {})
             searchable = " ".join([
                 row["normalized_name"],

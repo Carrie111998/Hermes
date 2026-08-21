@@ -39,8 +39,61 @@ _SUPPORTED_CLAIM_KINDS = frozenset((
 ))
 
 
+# How strongly a piece of evidence carries its dimension. Anchors, at the
+# authority a real source carries (.85 independent, .95 official, ~.90 for the
+# two agreeing):
+#
+#   one value, one source        ~50   a mention with nothing corroborating it
+#   one value, two sources       ~74   corroborated, but narrow
+#   two values, two sources      ~82   corroborated and more than incidental
+#   three or more, two sources   ~90   the strongest this evidence model states
+#
+# Corroboration saturates at two sources deliberately: "an official source and
+# an independent one agreeing" is already the standard `evaluate_verdict` uses
+# for strong_fit, so the score must not keep paying for a third. Above that
+# line it is breadth that separates one lead from another.
+CORROBORATED_SOURCES = 2
+_BASE_STRENGTH = .55
+_CORROBORATION_STRENGTH = .27
+_BREADTH_STRENGTH = .18
+_BREADTH_SATURATES_AT = 3
+
+
+def _distinct_values(claim: Claim) -> int:
+    if isinstance(claim.value, list):
+        return len({str(item) for item in claim.value if str(item).strip()})
+    return 1 if claim.value is not None and str(claim.value).strip() else 0
+
+
+def _evidence_strength(claim: Claim) -> float:
+    """Degree of support, in [BASE, 1], from corroboration and breadth."""
+    corroborated = len(set(claim.evidence_ids)) >= CORROBORATED_SOURCES
+    breadth = min(
+        1.0,
+        max(0, _distinct_values(claim) - 1) / (_BREADTH_SATURATES_AT - 1),
+    )
+    return (
+        _BASE_STRENGTH
+        + _CORROBORATION_STRENGTH * (1.0 if corroborated else 0.0)
+        + _BREADTH_STRENGTH * breadth
+    )
+
+
 def _claim_score(claim: Claim) -> float | None:
-    """Return a bounded score only when a claim supplies an observed value."""
+    """Return a bounded score only when a claim supplies an observed value.
+
+    Two different kinds of claim arrive here. A claim whose field *is* a
+    dimension is a provider stating that dimension's score, so its value is
+    respected. Everything else is evidence *of* a dimension — a matched product
+    term, an observed buyer role — and is scored by degree.
+
+    Degree is the point. This used to return 100.0 for any truthy value, so a
+    single term found in a single search snippet scored the same as a company
+    corroborated across four sources, and because `score_lead` divides by the
+    weight of the dimensions it actually has, nearly every lead came out at fit
+    100. Two real runs produced 91 and 173 leads, every one of them fit 100 and
+    `review`: a ranked list with nothing to rank by.
+    """
     if claim.value is None and claim.low is None and claim.high is None:
         return None
     if claim.field in _DIRECT_DIMENSION_FIELDS:
@@ -59,9 +112,14 @@ def _claim_score(claim: Claim) -> float | None:
     value = (claim.low + claim.high) / 2 if claim.status == "estimated_range" else claim.value
     if isinstance(value, bool):
         return 100.0 if value else 0.0
-    if isinstance(value, (int, float)):
-        return 100.0 if value > 0 else 0.0
-    return 100.0 if value else 0.0
+    if isinstance(value, (int, float)) and value <= 0:
+        return 0.0
+    if not isinstance(value, (int, float)) and not value:
+        return 0.0
+    # ponytail: magnitude is not read for numeric evidence fields (store_count,
+    # revenue) — no verifier emits one today, so a scale curve would be tuned
+    # against nothing. Add one when a provider starts supplying them.
+    return round(min(100.0, 100.0 * claim.confidence * _evidence_strength(claim)), 3)
 
 
 def derive_dimension_scores(claims: Iterable[Claim]) -> dict[str, float | None]:
