@@ -43,8 +43,8 @@ Example config::
           value: "alice"       # required for static; profile mode uses the
                                # active Hermes profile name
         session_user_id_meta_key: "nousresearch.hermes/user_id"
-                               # tools/call params._meta key for the gateway
-                               # session user id (Telegram/Discord/...). Omit
+                               # tools/call params._meta key for the qualified
+                               # gateway principal (platform/scope/user). Omit
                                # to use the default above.
         timeout: 180
         skip_preflight: true  # bypass the content-type probe for a valid
@@ -1637,21 +1637,32 @@ def _resolve_session_user_id_meta_key(
 def _mcp_session_identity_meta(
     server_name: str = "",
     config: Optional[dict] = None,
-) -> Optional[Dict[str, str]]:
-    """Return tools/call ``meta`` for the current gateway session user.
+) -> Optional[Dict[str, Any]]:
+    """Return tools/call ``meta`` for the current gateway principal.
 
-    Empty / unset session user → ``None`` so the on-wire request is
+    A bare platform-local user id is not an authorization principal: Slack
+    ids are workspace-scoped, for example. Preserve the complete identity
+    namespace so MCP servers cannot collapse callers from different tenants.
+    Empty / unset platform or user → ``None`` so non-gateway calls remain
     unchanged (CLI, cron, tests that never bound a session).
     """
     try:
         from gateway.session_context import get_session_env
     except ImportError:
         return None
+    platform = (get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip()
+    scope_id = (get_session_env("HERMES_SESSION_SCOPE_ID", "") or "").strip()
     user_id = (get_session_env("HERMES_SESSION_USER_ID", "") or "").strip()
-    if not user_id:
+    if not platform or not user_id:
         return None
     key = _resolve_session_user_id_meta_key(server_name, config)
-    return {key: user_id}
+    return {
+        key: {
+            "platform": platform,
+            "scope_id": scope_id,
+            "user_id": user_id,
+        }
+    }
 
 
 def _call_tool_accepts_meta(call_tool) -> bool:
