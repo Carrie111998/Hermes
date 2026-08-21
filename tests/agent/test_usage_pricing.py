@@ -766,3 +766,175 @@ def test_normalize_usage_nested_details_win_over_qwen_flat_top_level():
 
     assert normalized.cache_read_tokens == 900
     assert normalized.input_tokens == 1100
+
+
+# ── Cache observability: usage payloads with no cache-hit signal ─────────
+
+
+def _mimo_streaming_final_chunk_usage():
+    """Real SDK objects mirroring MiMo's documented usage shape (#89770)."""
+    from openai.types.completion_usage import CompletionUsage, PromptTokensDetails
+
+    return CompletionUsage(
+        prompt_tokens=249,
+        completion_tokens=5,
+        total_tokens=254,
+        prompt_tokens_details=PromptTokensDetails(cached_tokens=192),
+    )
+
+
+def test_normalize_usage_mimo_openai_shape_captures_cache_read():
+    """MiMo's standard OpenAI shape normalizes to cache_read_tokens > 0.
+
+    Pins the parser half of #89770: the generic branch must keep reading
+    prompt_tokens_details.cached_tokens first for OpenAI-compatible
+    providers, including real SDK typed objects from streaming chunks."""
+    normalized = normalize_usage(
+        _mimo_streaming_final_chunk_usage(),
+        provider="xiaomi",
+        api_mode="chat_completions",
+    )
+
+    assert normalized.cache_read_tokens == 192
+    # prompt_tokens includes cached; input = 249 - 192 = the miss bucket
+    assert normalized.input_tokens == 57
+    assert normalized.output_tokens == 5
+
+
+def test_normalize_usage_debug_logs_when_cache_signal_missing(caplog):
+    """A chat_completions payload with NO prompt_tokens_details and no known
+    fallback field emits one debug line naming the provider, mode, and the
+    keys it did carry — the triage signal for provider-side omission
+    (#89770): if this fires on MiMo streams, the field never arrived on the
+    wire and no Hermes-side accounting change can recover it."""
+    import logging
+
+    usage = SimpleNamespace(prompt_tokens=249, completion_tokens=5)
+    with caplog.at_level(logging.DEBUG, logger="agent.usage_pricing"):
+        normalized = normalize_usage(
+            usage, provider="xiaomi", api_mode="chat_completions"
+        )
+
+    assert normalized.cache_read_tokens == 0
+    hits = [r for r in caplog.records if "cache_observability" in r.getMessage()]
+    assert hits, "expected a cache_observability debug record"
+    message = hits[0].getMessage()
+    assert "xiaomi" in message
+    assert "chat_completions" in message
+    assert "prompt_tokens" in message  # lists the keys that WERE present
+
+
+def test_normalize_usage_quiet_when_cache_signal_present(caplog):
+    """Payloads carrying prompt_tokens_details.cached_tokens stay quiet —
+    the log is a missing-data signal, not per-call noise."""
+    import logging
+
+    with caplog.at_level(logging.DEBUG, logger="agent.usage_pricing"):
+        normalize_usage(
+            _mimo_streaming_final_chunk_usage(),
+            provider="xiaomi",
+            api_mode="chat_completions",
+        )
+
+    assert not [
+        r
+        for r in caplog.records
+        if r.name == "agent.usage_pricing" and "cache_observability" in r.getMessage()
+    ]
+
+
+def test_normalize_usage_missing_signal_not_logged_for_anthropic_mode(caplog):
+    """Anthropic-mode payloads legitimately lack prompt_tokens_details —
+    the observability log must stay scoped to the OpenAI-compatible branch."""
+    import logging
+
+    usage = SimpleNamespace(input_tokens=100, output_tokens=10)
+    with caplog.at_level(logging.DEBUG, logger="agent.usage_pricing"):
+        normalize_usage(usage, provider="anthropic", api_mode="anthropic_messages")
+
+    assert not [
+        r
+        for r in caplog.records
+        if r.name == "agent.usage_pricing" and "cache_observability" in r.getMessage()
+    ]
+
+
+def test_normalize_usage_missing_signal_not_logged_for_codex_mode(caplog):
+    """codex_responses payloads carry their cache signal in
+    input_tokens_details.cached_tokens — parsed by the Responses branch.
+    The OpenAI-compatible missing-signal log must not fire there (#89770
+    review: it would claim cache_read_tokens=0 while parsing extracted 500)."""
+    import logging
+
+    usage = SimpleNamespace(
+        input_tokens=2000,
+        output_tokens=100,
+        input_tokens_details=SimpleNamespace(cached_tokens=500),
+    )
+    with caplog.at_level(logging.DEBUG, logger="agent.usage_pricing"):
+        normalized = normalize_usage(
+            usage, provider="openai", api_mode="codex_responses"
+        )
+
+    assert normalized.cache_read_tokens == 500
+    assert not [
+        r
+        for r in caplog.records
+        if r.name == "agent.usage_pricing" and "cache_observability" in r.getMessage()
+    ]
+
+
+def test_normalize_usage_missing_signal_lists_dict_keys(caplog):
+    """Dict payloads (JSON-deserialized usage) take the .keys() branch and
+    list their keys in the log."""
+    import logging
+
+    with caplog.at_level(logging.DEBUG, logger="agent.usage_pricing"):
+        normalize_usage(
+            {"prompt_tokens": 10, "completion_tokens": 2},
+            provider="xiaomi",
+            api_mode="chat_completions",
+        )
+
+    hits = [r for r in caplog.records if "cache_observability" in r.getMessage()]
+    assert hits
+    message = hits[0].getMessage()
+    assert "prompt_tokens" in message and "completion_tokens" in message
+
+
+def test_normalize_usage_missing_signal_fires_when_nested_key_stripped(caplog):
+    """A proxy that strips only the inner cached_tokens key (leaving an
+    empty prompt_tokens_details container behind) must still fire — the
+    container-presence check alone would miss exactly this stripping
+    pattern (#89770 proxy hypothesis)."""
+    import logging
+
+    usage = SimpleNamespace(
+        prompt_tokens=249,
+        completion_tokens=5,
+        prompt_tokens_details=SimpleNamespace(),
+    )
+    with caplog.at_level(logging.DEBUG, logger="agent.usage_pricing"):
+        normalized = normalize_usage(
+            usage, provider="xiaomi", api_mode="chat_completions"
+        )
+
+    assert normalized.cache_read_tokens == 0
+    assert [r for r in caplog.records if "cache_observability" in r.getMessage()]
+
+
+def test_normalize_usage_missing_signal_quiet_for_anthropic_provider_chat_mode(caplog):
+    """provider='anthropic' on chat_completions mode enters the Anthropic
+    branch (top-level field names), so the OpenAI-shape missing-signal log
+    must stay quiet there too."""
+    import logging
+
+    usage = SimpleNamespace(input_tokens=100, output_tokens=10)
+    with caplog.at_level(logging.DEBUG, logger="agent.usage_pricing"):
+        normalize_usage(usage, provider="anthropic", api_mode="chat_completions")
+
+    assert not [
+        r
+        for r in caplog.records
+        if r.name == "agent.usage_pricing" and "cache_observability" in r.getMessage()
+    ]
