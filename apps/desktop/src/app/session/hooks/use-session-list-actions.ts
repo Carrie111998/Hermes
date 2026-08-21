@@ -36,7 +36,7 @@ import {
   setSessions,
   setSessionsLoading
 } from '@/store/session'
-import { $workingSessionIds, getRecentlySettledSessionIds } from '@/store/session-states'
+import { $workingSessionIds, getRecentlySettledSessionIds, restorePinnedSessionStates } from '@/store/session-states'
 
 import { refreshCronJobs as refreshCronJobsStore } from '../../cron/cron-actions'
 
@@ -291,6 +291,13 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
 
           return sameCronSignature(prev, next) ? prev : next
         })
+        // Re-hydrate pinned session states after the list refresh: a
+        // gateway reconnect wiped runtime state for pinned/idle sessions
+        // (detached_sessions), and $sessionStates is only repopulated by
+        // live gateway events. Without this, clicking a pinned session
+        // shows a blank chat despite the session existing in both the
+        // sidebar list and in state.db.
+        restorePinnedSessionStates($sessions.get())
         // "Is there another page?" instead of an exact total: the backend
         // reports which profiles filled their window, which costs nothing on
         // top of the rows it already read (the old exact totals ran a COUNT(*)
