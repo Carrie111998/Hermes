@@ -261,11 +261,11 @@ class TestMentionGating:
 
 
 def _tagged_event(event_id, channel, *, content, pubkey=OTHER_PUBKEY,
-                  created_at=1000, kind=9, p=None, reply_to=None):
+                  created_at=1000, kind=9, p=None, reply_to=None, root=None):
     """Event with the tag shapes observed on a live relay (h/p/e tags)."""
     tags = [["h", channel]]
-    if reply_to:
-        tags.append(["e", reply_to, "", "reply"])
+    if root:
+        tags.append(["e", root, "", "root"])
     if p:
         tags.append(["p", p])
     return {
@@ -536,5 +536,148 @@ class TestStandaloneSend:
         assert captured["input_text"] == "cron says hi"
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
+
+
+# ── Thread-root anchoring + active-thread dispatch (issue #78449) ────────
+
+
+ROOT = "8429343d" + "0" * 56   # thread root event id
+TARGET = "da0cb417" + "0" * 56  # reply inside that thread
+SENT = "4be457a1" + "0" * 56    # id the CLI mints for our own reply
+
+
+class TestThreadRootAnchoring:
+
+    @pytest.mark.asyncio
+    async def test_send_rewrites_known_reply_target_to_thread_root(self):
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._remember_thread_root(
+            _tagged_event(TARGET, CHANNEL, content="hi", root=ROOT, reply_to=SENT)
+        )
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": SENT, "message": ""})
+        adapter._run_cli = cli
+
+        await adapter.send(CHANNEL, "anchored reply", reply_to=TARGET)
+
+        args, _ = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == ROOT
+
+    @pytest.mark.asyncio
+    async def test_send_passes_unknown_target_through_unchanged(self):
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        unknown = "f" * 64
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": SENT, "message": ""})
+        adapter._run_cli = cli
+
+        await adapter.send(CHANNEL, "passthrough reply", reply_to=unknown)
+
+        args, _ = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == unknown
+
+    @pytest.mark.asyncio
+    async def test_send_records_outbound_anchor_and_marks_thread_active(self):
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._remember_thread_root(
+            _tagged_event(TARGET, CHANNEL, content="hi", root=ROOT, reply_to=SENT)
+        )
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "a" * 64, "message": ""})
+        adapter._run_cli = cli
+
+        await adapter.send(CHANNEL, "reply", reply_to=TARGET)
+
+        assert adapter._thread_roots["a" * 64] == ROOT
+        assert ROOT in adapter._replied_roots
+
+    @pytest.mark.asyncio
+    async def test_send_image_anchors_same_way(self, tmp_path):
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._remember_thread_root(
+            _tagged_event(TARGET, CHANNEL, content="hi", root=ROOT, reply_to=SENT)
+        )
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": SENT, "message": ""})
+        adapter._run_cli = cli
+
+        await adapter.send_image(CHANNEL, str(img), caption="see this", reply_to=TARGET)
+
+        args, _ = cli.calls[0]
+        assert args[args.index("--file") + 1] == str(img)
+        assert args[args.index("--reply-to") + 1] == ROOT
+
+    def test_anchor_reply_target_hit_miss_and_identity(self):
+        roots = {TARGET: ROOT}
+        assert _buzz_mod._anchor_reply_target(TARGET, roots) == ROOT
+        assert _buzz_mod._anchor_reply_target("b" * 64, roots) == "b" * 64
+        assert _buzz_mod._anchor_reply_target(TARGET, None) == TARGET
+        assert _buzz_mod._anchor_reply_target("", roots) == ""
+        assert _buzz_mod._anchor_reply_target(None, roots) is None
+
+    def test_thread_root_map_is_bounded(self):
+        adapter = _make_adapter()
+        cap = _buzz_mod._THREAD_ROOT_CAP
+        for i in range(cap + 5):
+            adapter._remember_thread_root({"id": f"{i:064x}", "tags": []})
+        assert len(adapter._thread_roots) == cap
+        assert "0" * 64 not in adapter._thread_roots      # oldest evicted
+        assert f"{cap + 4:064x}" in adapter._thread_roots  # newest kept
+        adapter._remember_replied_root(ROOT)
+        assert len(adapter._replied_roots) == 1
+
+
+class TestThreadAwareMentionGate:
+
+    @pytest.fixture
+    def adapter(self):
+        a = _make_adapter()
+        a._dispatched = []
+
+        async def capture(**kwargs):
+            a._dispatched.append(kwargs)
+
+        a._dispatch_message = capture
+        a._message_handler = AsyncMock()
+        a._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        return a
+
+    async def _poll_with(self, adapter, *events):
+        cli = _ScriptedCli()
+        cli.script("messages", "get", list(events))
+        adapter._run_cli = cli
+        await adapter._poll_channel(CHANNEL)
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_in_active_thread_dispatches_without_mention(self, adapter):
+        adapter._remember_replied_root(ROOT)
+        await self._poll_with(
+            adapter,
+            _tagged_event(TARGET, CHANNEL, content="continuing the thread",
+                          root=ROOT, reply_to=ROOT),
+        )
+        assert len(adapter._dispatched) == 1
+
+    @pytest.mark.asyncio
+    async def test_top_level_channel_message_still_gated(self, adapter):
+        adapter._remember_replied_root(ROOT)
+        await self._poll_with(adapter, _event("e1", content="just chatting", created_at=10))
+        assert adapter._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_in_unparticipated_thread_still_gated(self, adapter):
+        other_root = "9" * 64
+        await self._poll_with(
+            adapter,
+            _tagged_event(TARGET, CHANNEL, content="someone else's thread",
+                          root=other_root, reply_to=other_root),
+        )
+        assert adapter._dispatched == []
 
 

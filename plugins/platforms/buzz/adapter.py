@@ -92,6 +92,42 @@ _CHAT_KIND = 9
 _FETCH_LIMIT = 50
 # Bound on the per-channel de-dupe set (events, not bytes).
 _SEEN_CAP = 500
+# Bound on the event_id -> thread_root map and the replied-roots set.
+_THREAD_ROOT_CAP = 2048
+_REPLIED_ROOTS_CAP = 256
+
+
+def _thread_root_of_event(event: dict) -> str:
+    """NIP-10 thread root for a kind-9 event (its own id when it is a root).
+
+    First e-tag with marker "root" wins; else a lone e-tag points at the
+    root directly; else the event itself is a thread root.
+    """
+    etags = [
+        t for t in (event.get("tags") or [])
+        if isinstance(t, list) and len(t) >= 2 and t[0] == "e"
+    ]
+    for t in etags:
+        if len(t) >= 4 and t[3] == "root":
+            return str(t[1])
+    if len(etags) == 1:
+        return str(etags[0][1])
+    return str(event.get("id") or "")
+
+
+def _anchor_reply_target(reply_target, roots) -> "Optional[str]":
+    """Collapse a reply target to its thread root when known.
+
+    A cache miss (or no map at all) passes the target through unchanged —
+    a send must never block on the lookup.
+    """
+    if not reply_target:
+        return reply_target
+    if not roots:
+        return reply_target
+    return roots.get(str(reply_target), str(reply_target))
+
+
 # Re-run DM discovery (``dms list`` plus the channels-list fallback) every
 # N poll sweeps to pick up conversations opened mid-run.
 _DM_DISCOVERY_EVERY = 5
@@ -401,6 +437,12 @@ class BuzzAdapter(BasePlatformAdapter):
         ).strip().lower()
         self.transport = _transport if _transport in ("auto", "websocket", "poll") else "auto"
 
+        # event_id -> NIP-10 thread root, so outbound replies collapse to the
+        # root instead of nesting one level per exchange (issue #78449).
+        self._thread_roots: "OrderedDict[str, str]" = OrderedDict()
+        # Bounded set of thread roots this adapter has sent a message in —
+        # replies inside those threads dispatch without a fresh mention.
+        self._replied_roots: "OrderedDict[str, None]" = OrderedDict()
         # Auth: entries may be hex pubkeys or npubs; normalized to hex
         raw_allowed = os.getenv("BUZZ_ALLOWED_USERS") or extra.get("allowed_users", [])
         if isinstance(raw_allowed, str):
@@ -610,6 +652,10 @@ class BuzzAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
         reply_target = reply_to or (metadata or {}).get("thread_id")
+        # Collapse to the thread root so replies nest flat under the root
+        # instead of one level deeper per exchange (issue #78449).
+        # Unknown targets pass through unchanged — never block a send.
+        reply_target = _anchor_reply_target(reply_target, self._thread_roots)
         if reply_target:
             args += ["--reply-to", str(reply_target)]
         code, out, err = await self._run_cli(args, input_text=content)
@@ -628,6 +674,9 @@ class BuzzAdapter(BasePlatformAdapter):
             # Belt-and-braces echo suppression: the poll loop already skips
             # our own pubkey, but marking the id seen makes de-dupe explicit.
             self._mark_seen(str(chat_id), str(event_id))
+            # Map our own message to its thread root so replies to it resolve
+            # and the thread counts as one we're conversing in.
+            self._record_outbound_root(str(event_id), str(reply_target) if reply_target else "")
         return SendResult(
             success=bool(data.get("accepted", True)),
             message_id=str(event_id) if event_id else None,
@@ -681,8 +730,9 @@ class BuzzAdapter(BasePlatformAdapter):
                 "--file", str(local),
                 "--content", "-",
             ]
-            if reply_to:
-                args += ["--reply-to", str(reply_to)]
+            reply_target = _anchor_reply_target(reply_to, self._thread_roots)
+            if reply_target:
+                args += ["--reply-to", str(reply_target)]
             code, out, err = await self._run_cli(args, input_text=caption or "")
             if code != 0:
                 return SendResult(success=False, error=_cli_error_message(err, code), retryable=code == 2)
@@ -693,6 +743,7 @@ class BuzzAdapter(BasePlatformAdapter):
             event_id = data.get("event_id")
             if event_id:
                 self._mark_seen(str(chat_id), str(event_id))
+                self._record_outbound_root(str(event_id), str(reply_target) if reply_target else "")
             return SendResult(
                 success=bool(data.get("accepted", True)),
                 message_id=str(event_id) if event_id else None,
@@ -1030,11 +1081,22 @@ class BuzzAdapter(BasePlatformAdapter):
         self._maybe_latch_dm(channel_id, state, event)
 
         is_dm = state["chat_type"] == "dm"
+        # Record the thread root before gating so mention-dropped replies
+        # still populate the map (a later dispatch in the same thread can
+        # resolve its root).
+        self._remember_thread_root(event)
         # In shared channels, respond only when addressed — unless
-        # require_mention is disabled, in which case respond to every message.
-        # DMs always dispatch.
+        # require_mention is disabled, in which case respond to every
+        # message.  DMs always dispatch.  Thread replies inside a
+        # conversation this adapter has already replied in also dispatch
+        # without a fresh mention (issue #78449).
         if not is_dm and self.require_mention and not self._is_mentioned(content):
-            return
+            etags = [
+                t for t in (event.get("tags") or [])
+                if isinstance(t, list) and len(t) >= 2 and t[0] == "e"
+            ]
+            if not etags or self._thread_root_for(event_id) not in self._replied_roots:
+                return
 
         # Adapter-level allow-list (the gateway applies BUZZ_ALLOWED_USERS /
         # BUZZ_ALLOW_ALL_USERS centrally as well; empty list = no filter here).
@@ -1209,6 +1271,50 @@ class BuzzAdapter(BasePlatformAdapter):
         if state is not None:
             state["seen"][event_id] = None
             self._trim_seen(state)
+
+    # ── Thread-root tracking (issue #78449) ───────────────────────────────
+
+    def _remember_thread_root(self, event: dict) -> None:
+        """Map an inbound event id to its NIP-10 thread root (bounded LRU)."""
+        event_id = str(event.get("id") or "")
+        if not event_id:
+            return
+        self._thread_roots[event_id] = _thread_root_of_event(event)
+        self._thread_roots.move_to_end(event_id)
+        while len(self._thread_roots) > _THREAD_ROOT_CAP:
+            self._thread_roots.popitem(last=False)
+
+    def _thread_root_for(self, message_id) -> str:
+        """Thread root for a message id; the id itself on a cache miss."""
+        mid = str(message_id or "")
+        return self._thread_roots.get(mid, mid)
+
+    def _remember_replied_root(self, root: str) -> None:
+        """Mark a thread root as one this adapter has replied in (bounded)."""
+        if not root:
+            return
+        self._replied_roots[root] = None
+        self._replied_roots.move_to_end(root)
+        while len(self._replied_roots) > _REPLIED_ROOTS_CAP:
+            self._replied_roots.popitem(last=False)
+
+    def _record_outbound_root(self, sent_event_id, anchor_root) -> None:
+        """Record a sent event's thread root and mark the thread active.
+
+        A fresh-root send maps the event to itself; a reply maps to the
+        anchor root it was collapsed to.
+        """
+        sent_id = str(sent_event_id or "")
+        if not sent_id:
+            return
+        root = str(anchor_root) if anchor_root else sent_id
+        self._thread_roots[sent_id] = root
+        self._thread_roots.move_to_end(sent_id)
+        while len(self._thread_roots) > _THREAD_ROOT_CAP:
+            self._thread_roots.popitem(last=False)
+        if anchor_root:
+            self._remember_replied_root(root)
+
 
     async def _dispatch_message(
         self,
@@ -1386,6 +1492,8 @@ async def _standalone_send(
         return {"error": "Buzz standalone send: no target channel (set BUZZ_HOME_CHANNEL)"}
 
     args = ["messages", "send", "--channel", target, "--content", "-"]
+    # thread_id is already a thread root from delivery metadata; no adapter
+    # state exists out-of-process, so pass-through is deliberate.
     if thread_id:
         args += ["--reply-to", str(thread_id)]
     for path in media_files or []:
