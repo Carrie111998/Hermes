@@ -10826,7 +10826,7 @@ def _default_spawn(
 
     # Native Hermes workers retain the inherited environment from the existing
     # spawn path. Only the arbitrary profile command/supervisor gets the
-    # credential-free subprocess policy.
+    # credential-free subprocess policy and stale-Kanban scrub.
     if direct_command:
         from tools.environments.local import hermes_subprocess_env
 
@@ -10839,11 +10839,12 @@ def _default_spawn(
     from gateway.session_context import _VAR_MAP
     for key in _VAR_MAP:
         env.pop(key, None)
-    # Do not let stale parent/dispatcher Kanban values survive into a new run.
-    # Only the explicit task/run/board/workspace values below are authoritative.
-    for key in list(env):
-        if key.startswith("HERMES_KANBAN_"):
-            env.pop(key, None)
+    if direct_command:
+        # Do not let stale parent/dispatcher Kanban values reach an arbitrary
+        # profile command. Only the explicit bounded context below is passed.
+        for key in list(env):
+            if key.startswith("HERMES_KANBAN_"):
+                env.pop(key, None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -10864,7 +10865,8 @@ def _default_spawn(
         pass
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
-    env["HERMES_KANBAN_TASK_ID"] = task.id
+    if direct_command:
+        env["HERMES_KANBAN_TASK_ID"] = task.id
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
@@ -10966,7 +10968,6 @@ def _default_spawn(
         env["HERMES_KANBAN_WORKER_COMMAND"] = json.dumps(worker_command)
         cmd = [sys.executable, "-P", "-m", "hermes_cli.kanban_command_worker"]
     else:
-        env.pop("HERMES_KANBAN_WORKER_COMMAND", None)
         cmd = [
             *_resolve_hermes_argv(),
             "-p", profile_arg,
@@ -11019,23 +11020,28 @@ def _default_spawn(
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
     try:
-        popen_kwargs = (
-            subprocess_compat.windows_detach_popen_kwargs()
-            if direct_command
-            else {
-                "start_new_session": True,
-                "creationflags": subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
-            }
-        )
-        proc = subprocess.Popen(  # noqa: S603 -- argv is host/profile config
-            cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            env=env,
-            **popen_kwargs,
-        )
+        if direct_command:
+            proc = subprocess.Popen(  # noqa: S603 -- argv is host/profile config
+                cmd,
+                cwd=workspace if os.path.isdir(workspace) else None,
+                stdin=subprocess.DEVNULL,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                env=env,
+                **subprocess_compat.windows_detach_popen_kwargs(),
+            )
+        else:
+            # Keep the native Hermes worker spawn behavior identical to main.
+            proc = subprocess.Popen(  # noqa: S603 -- native Hermes argv
+                cmd,
+                cwd=workspace if os.path.isdir(workspace) else None,
+                stdin=subprocess.DEVNULL,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            )
     except FileNotFoundError:
         log_f.close()
         raise RuntimeError(
