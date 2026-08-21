@@ -6024,14 +6024,20 @@ def run_conversation(
                     # exists; otherwise "trying fallback..." is a lie and the
                     # session looks like it's recovering when it's about to
                     # abort silently (#35314, #17446).
-                    if agent._has_pending_fallback():
+                    if (
+                        classified.reason != FailoverReason.disk_space
+                        and agent._has_pending_fallback()
+                    ):
                         if classified.reason == FailoverReason.content_policy_blocked:
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
                         elif classified.reason == FailoverReason.ssl_cert_verification:
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if (
+                        classified.reason != FailoverReason.disk_space
+                        and agent._try_activate_fallback()
+                    ):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -6053,7 +6059,12 @@ def run_conversation(
                     # it verbatim (e.g. a cron failure notification dumped a
                     # ~60KB Cloudflare challenge page as 31 Discord messages).
                     _nonretryable_summary = agent._summarize_api_error(api_error)
-                    if classified.reason == FailoverReason.content_policy_blocked:
+                    if classified.reason == FailoverReason.disk_space:
+                        agent._emit_status(
+                            f"❌ Local storage is full or its disk quota is exhausted: "
+                            f"{_nonretryable_summary}"
+                        )
+                    elif classified.reason == FailoverReason.content_policy_blocked:
                         agent._emit_status(
                             f"❌ Provider safety filter blocked this request: "
                             f"{_nonretryable_summary}"
@@ -6113,8 +6124,13 @@ def run_conversation(
                             agent._vprint(f"{agent.log_prefix}      • Does your account have access to {_model}?", force=True)
                             if base_url_host_matches(str(_base), "openrouter.ai"):
                                 agent._vprint(f"{agent.log_prefix}      • Check credits: https://openrouter.ai/settings/credits", force=True)
-                    else:
+                    elif classified.reason != FailoverReason.disk_space:
                         agent._vprint(f"{agent.log_prefix}   💡 This type of error won't be fixed by retrying.", force=True)
+                    if classified.reason == FailoverReason.disk_space:
+                        agent._vprint(
+                            f"{agent.log_prefix}   💡 Free disk space or increase the disk quota on the filesystem used by Hermes, then retry.",
+                            force=True,
+                        )
                     # Content-policy blocks deserve their own actionable
                     # guidance — neither "fix your API key" nor "retry won't
                     # help" tells the user what to actually do. The provider
@@ -6180,7 +6196,11 @@ def run_conversation(
                     # Persisting the failed user message would make the
                     # session even larger, causing the same failure on the
                     # next attempt. (#1630)
-                    if status_code == 400 and (approx_tokens > 50000 or len(api_messages) > 80):
+                    if classified.reason == FailoverReason.disk_space:
+                        # Persistence is another local write and will reproduce
+                        # the same failure until storage is available again.
+                        pass
+                    elif status_code == 400 and (approx_tokens > 50000 or len(api_messages) > 80):
                         agent._vprint(
                             f"{agent.log_prefix}⚠️  Skipping session persistence "
                             f"for large failed session to prevent growth loop.",
@@ -6215,6 +6235,21 @@ def run_conversation(
                             base_url=_base,
                             model=_model,
                         )
+                    if classified.reason == FailoverReason.disk_space:
+                        _disk_space_response = (
+                            "Local storage is full or its disk quota is exhausted. "
+                            "Free disk space or increase the disk quota on the "
+                            "filesystem used by Hermes, then retry."
+                        )
+                        return {
+                            "final_response": _disk_space_response,
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "failed": True,
+                            "error": _nonretryable_summary,
+                            "failure_reason": FailoverReason.disk_space.value,
+                        }
                     return {
                         "final_response": _nonretryable_summary,
                         "messages": messages,

@@ -1,5 +1,7 @@
 """Tests for agent.error_classifier — structured API error classification."""
 
+import errno
+
 import pytest
 from agent.error_classifier import (
     ClassifiedError,
@@ -55,7 +57,7 @@ class TestFailoverReason:
         expected = {
             "auth", "auth_permanent", "billing", "rate_limit",
             "upstream_rate_limit",
-            "overloaded", "server_error", "timeout",
+            "overloaded", "server_error", "timeout", "disk_space",
             "ssl_cert_verification",
             "context_overflow", "payload_too_large", "image_too_large",
             "model_not_found", "format_error",
@@ -621,6 +623,38 @@ class TestClassifyApiError:
 
 
     # ── Transport errors ──
+
+    @pytest.mark.parametrize(
+        "error_errno,message",
+        [
+            (errno.ENOSPC, "No space left on device"),
+            (getattr(errno, "EDQUOT", 122), "Disk quota exceeded"),
+        ],
+    )
+    def test_disk_exhaustion_is_non_retryable(self, error_errno, message):
+        result = classify_api_error(OSError(error_errno, message))
+
+        assert result.reason == FailoverReason.disk_space
+        assert result.retryable is False
+        assert result.should_rotate_credential is False
+        assert result.should_fallback is False
+        assert result.should_compress is False
+
+    def test_disk_quota_message_beats_billing_patterns(self):
+        result = classify_api_error(Exception("Disk quota exceeded"))
+
+        assert result.reason == FailoverReason.disk_space
+        assert result.should_rotate_credential is False
+
+    def test_wrapped_disk_exhaustion_preserves_errno_classification(self):
+        inner = OSError(errno.ENOSPC, "No space left on device")
+        outer = RuntimeError("provider request failed")
+        outer.__cause__ = inner
+
+        result = classify_api_error(outer)
+
+        assert result.reason == FailoverReason.disk_space
+        assert result.retryable is False
 
     def test_read_timeout(self):
         e = ReadTimeout("Read timed out")
