@@ -2400,6 +2400,41 @@ class TestNewEndpoints:
     # --- Profiles ---
 
 
+    def test_profiles_list_includes_cross_source_identity_metadata(self):
+        from hermes_constants import get_hermes_home
+
+        root = get_hermes_home()
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "profile.yaml").write_text(
+            yaml.safe_dump({
+                "display_name": "Asus",
+                "ui_meta": {
+                    "hermes-bots": {
+                        "title": "Asus Bot",
+                        "color": "#abcdef",
+                    }
+                },
+            }),
+            encoding="utf-8",
+        )
+        assets = root / "assets"
+        assets.mkdir(exist_ok=True)
+        (assets / "avatar.png").write_bytes(b"avatar")
+
+        response = self.client.get("/api/profiles")
+
+        assert response.status_code == 200
+        default = next(row for row in response.json()["profiles"] if row["name"] == "default")
+        assert default["display_name"] == "Asus"
+        assert default["ui_meta"] == {
+            "hermes-bots": {
+                "title": "Asus Bot",
+                "color": "#abcdef",
+            }
+        }
+        assert default["has_avatar"] is True
+
+
 
     def test_profiles_create_builder_mcp_auth_is_profile_scoped(
         self, monkeypatch

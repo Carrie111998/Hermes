@@ -14577,8 +14577,40 @@ def _profile_attr(info, name: str, default: Any = None) -> Any:
         return default
 
 
+_PROFILE_ROSTER_UI_META_MAX_CHARS = 64 * 1024
+
+
+def _profile_roster_fields(profile_dir: Path) -> Dict[str, Any]:
+    """Return bounded presentation metadata safe for cross-source rosters."""
+    fields: Dict[str, Any] = {"has_avatar": False}
+
+    try:
+        meta_path = profile_dir / "profile.yaml"
+        if meta_path.is_file():
+            with open(meta_path, "r", encoding="utf-8") as f:
+                raw = yaml.safe_load(f) or {}
+            ui_meta = raw.get("ui_meta") if isinstance(raw, dict) else None
+            if isinstance(ui_meta, dict):
+                encoded = json.dumps(ui_meta, allow_nan=False)
+                if len(encoded) <= _PROFILE_ROSTER_UI_META_MAX_CHARS:
+                    fields["ui_meta"] = json.loads(encoded)
+    except Exception:
+        pass
+
+    try:
+        assets = profile_dir / "assets"
+        fields["has_avatar"] = any(
+            (assets / f"avatar.{ext}").is_file()
+            for ext in ("png", "jpg", "webp")
+        )
+    except Exception:
+        pass
+
+    return fields
+
+
 def _profile_to_dict(info) -> Dict[str, Any]:
-    return {
+    row = {
         "name": _profile_attr(info, "name", ""),
         "path": str(_profile_attr(info, "path", "")),
         "is_default": bool(_profile_attr(info, "is_default", False)),
@@ -14595,6 +14627,8 @@ def _profile_to_dict(info) -> Dict[str, Any]:
         "distribution_source": _profile_attr(info, "distribution_source"),
         "has_alias": _profile_attr(info, "alias_path") is not None,
     }
+    row.update(_profile_roster_fields(Path(row["path"])))
+    return row
 
 
 def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
@@ -14619,6 +14653,7 @@ def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
             "gateway_running": _safe(lambda: profiles_mod._check_gateway_running(default_home), False),
             "description": _safe(lambda: profiles_mod.read_profile_meta(default_home).get("description", ""), ""),
             "description_auto": _safe(lambda: profiles_mod.read_profile_meta(default_home).get("description_auto", False), False),
+            "display_name": _safe(lambda: profiles_mod.read_profile_meta(default_home).get("display_name", ""), ""),
             "distribution_name": None,
             "distribution_version": None,
             "distribution_source": None,
@@ -14649,11 +14684,15 @@ def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
                 "gateway_running": _safe(lambda entry=entry_path: profiles_mod._check_gateway_running(entry), False),
                 "description": _safe(lambda entry=entry_path: profiles_mod.read_profile_meta(entry).get("description", ""), ""),
                 "description_auto": _safe(lambda entry=entry_path: profiles_mod.read_profile_meta(entry).get("description_auto", False), False),
+                "display_name": _safe(lambda entry=entry_path: profiles_mod.read_profile_meta(entry).get("display_name", ""), ""),
                 "distribution_name": None,
                 "distribution_version": None,
                 "distribution_source": None,
                 "has_alias": False,
             })
+
+    for row in profiles:
+        row.update(_profile_roster_fields(Path(row["path"])))
 
     return profiles
 

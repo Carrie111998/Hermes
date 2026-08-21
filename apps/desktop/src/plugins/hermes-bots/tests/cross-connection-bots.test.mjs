@@ -73,6 +73,18 @@ test('botConnectionRoute: remote rows get a route descriptor, local rows do not'
     profile: 'dixie',
     targetProfile: 'dixie'
   })
+
+  assert.deepEqual(
+    JSON.parse(
+      JSON.stringify(botConnectionRoute({ name: 'writer', connectionId: 'local', remoteSource: true }))
+    ),
+    {
+      connectionId: 'local',
+      mode: 'local',
+      profile: 'writer',
+      targetProfile: 'writer'
+    }
+  )
 })
 
 test('requestForBot: remote members go through requestProfile, local through host.request', async () => {
