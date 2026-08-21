@@ -10626,6 +10626,10 @@ def cmd_profile(args):
                 print(f"✓ Removed alias '{alias_name}'")
             else:
                 print(f"No alias '{alias_name}' found to remove.")
+                print(
+                    "  Tip: run `hermes doctor` — its \"Orphan alias\" section "
+                    "lists wrapper/profile mismatches like this one (#90983)."
+                )
         else:
             collision = check_alias_collision(alias_name)
             if collision:

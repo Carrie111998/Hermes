@@ -69,6 +69,8 @@ def test_remove_refuses_non_wrapper_file_in_wrapper_dir(wrapper_dir, monkeypatch
     assert innocent.exists()
     out = capsys.readouterr().out
     assert "No alias 'demo' found to remove." in out
+    # The dead-end message points at the tool that surfaces these states.
+    assert "hermes doctor" in out
 
 
 def test_add_still_requires_existing_profile(wrapper_dir, monkeypatch, capsys):
