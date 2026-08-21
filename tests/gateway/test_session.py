@@ -299,6 +299,128 @@ class TestBuildSessionContextPrompt:
         assert "\n**Platform notes:** hacked" not in prompt
 
 
+class TestVerifiedPlatformIdInSessionContext:
+    """Regression coverage for a real family-identity resolution gap caught
+    live on 2026-08-20: a family member's session context showed only a
+    self-editable display name (DM) or nothing about the sender at all
+    (group/channel), leaving the model with no platform ID to resolve
+    against per SOUL.md's "resolved ONLY by platform ID, never
+    self-identification" rule -- it correctly refused to guess rather than
+    trust the display name, stalling a routine request.
+
+    Fix: whenever `context.shared_multi_user_session` is False (every DM,
+    and -- under this deployment's per-user session isolation -- every
+    group/channel/thread message too, since each such session already
+    belongs to exactly one verified person), the session-context Source
+    line now appends that person's real, non-editable platform user ID.
+    Platform-agnostic and chat-type-agnostic by construction: it reads
+    `context.shared_multi_user_session`, which is already computed
+    correctly for every platform at `build_session_context()` time, so a
+    brand-new platform adapter needs zero additional code to get this for
+    free the moment it populates `SessionSource.user_id` (already required
+    for `allow_from` authorization to work at all)."""
+
+    def _isolated_config(self, *, group_sessions_per_user=True, thread_sessions_per_user=False):
+        return GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake"),
+                Platform.SLACK: PlatformConfig(enabled=True, token="fake"),
+            },
+            group_sessions_per_user=group_sessions_per_user,
+            thread_sessions_per_user=thread_sessions_per_user,
+        )
+
+    def test_dm_includes_verified_user_id(self):
+        config = self._isolated_config()
+        source = SessionSource(
+            platform=Platform.TELEGRAM, chat_id="123", chat_type="dm",
+            user_name="Zarkash Mirza", user_id="5542989100",
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+        assert "verified platform user ID" in prompt
+        assert "5542989100" in prompt
+        # Display name still present too -- this is additive, not a replacement.
+        assert "Zarkash Mirza" in prompt
+
+    def test_isolated_group_session_includes_verified_user_id(self):
+        """Confirmed live: this deployment runs group_sessions_per_user=True
+        everywhere, meaning a "group" chat_type session is, in practice,
+        exclusively one person's conversation -- but SessionSource.description
+        only ever shows the channel name for chat_type=="group", never any
+        per-sender info. This is the more severe half of the bug (Slack
+        group messages showed literally nothing about the sender, not even
+        an untrustworthy display name)."""
+        config = self._isolated_config(group_sessions_per_user=True)
+        source = SessionSource(
+            platform=Platform.SLACK, chat_id="C123", chat_name="general",
+            chat_type="group", user_name="Zarkash Mirza", user_id="U0BLH3KCWTW",
+        )
+        ctx = build_session_context(source, config)
+        assert ctx.shared_multi_user_session is False  # sanity: confirms isolation is really on
+        prompt = build_session_context_prompt(ctx)
+        assert "verified platform user ID" in prompt
+        assert "U0BLH3KCWTW" in prompt
+
+    def test_genuinely_shared_group_session_does_not_get_session_level_id(self):
+        """When group_sessions_per_user=False, the session is truly shared
+        across multiple speakers, so a single session-level "verified user"
+        line would misattribute every future message in that shared session
+        to whichever one person happened to trigger this render. That case
+        is correctly handled elsewhere (the existing per-message Slack
+        `<@user_id>` prefix in gateway/run.py, which operates per-turn, not
+        on this cached per-session block) -- this fix must not encroach on
+        it."""
+        config = self._isolated_config(group_sessions_per_user=False)
+        source = SessionSource(
+            platform=Platform.SLACK, chat_id="C123", chat_name="general",
+            chat_type="group", user_name="Zarkash Mirza", user_id="U0BLH3KCWTW",
+        )
+        ctx = build_session_context(source, config)
+        assert ctx.shared_multi_user_session is True  # sanity
+        prompt = build_session_context_prompt(ctx)
+        assert "verified platform user ID" not in prompt
+
+    def test_redact_pii_suppresses_verified_id(self):
+        """Redaction is off in the live deployment today, but must not be
+        silently defeated by this fix if it's ever turned on -- exposing
+        the raw ID under redact_pii would undermine the point of redacting."""
+        config = self._isolated_config()
+        source = SessionSource(
+            platform=Platform.TELEGRAM, chat_id="123", chat_type="dm",
+            user_name="Zarkash Mirza", user_id="5542989100",
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx, redact_pii=True)
+        assert "5542989100" not in prompt
+        assert "verified platform user ID" not in prompt
+
+    def test_no_user_id_does_not_crash_or_add_stray_text(self):
+        config = self._isolated_config()
+        source = SessionSource(
+            platform=Platform.TELEGRAM, chat_id="123", chat_type="dm",
+            user_name="Zarkash Mirza", user_id=None,
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)  # must not raise
+        assert "verified platform user ID" not in prompt
+        assert "Zarkash Mirza" in prompt
+
+    def test_future_platform_needs_zero_new_code(self):
+        """Simulates a brand-new platform (not Telegram/Slack/Discord) to
+        prove the fix generalizes purely from SessionSource fields, with no
+        platform-specific branch anywhere in the fix itself."""
+        config = self._isolated_config()
+        source = SessionSource(
+            platform=Platform.SIGNAL, chat_id="+15551234567", chat_type="dm",
+            user_name="Aria", user_id="+15559998888",
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+        assert "verified platform user ID" in prompt
+        assert "+15559998888" in prompt
+
+
 class TestSenderPrefixWithBackfill:
     """Regression: sender prefix must not wrap the backfill context block.
 

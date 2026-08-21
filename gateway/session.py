@@ -544,6 +544,36 @@ def build_session_context_prompt(
                 desc = _cname
         else:
             desc = src.description
+            # Family-identity resolution fix (2026-08-20): whenever this
+            # session is NOT shared with anyone else -- every DM, and a
+            # group/channel/thread session under this deployment's
+            # per-user-isolation config (group_sessions_per_user /
+            # thread_sessions_per_user) -- append the platform's own
+            # verified sender ID. `desc` otherwise only ever carries a
+            # self-editable display name (DM branch of
+            # SessionSource.description) or, for a group/channel, no
+            # per-sender information at all. SOUL.md's family-identity rule
+            # requires resolution "ONLY by platform ID, never
+            # self-identification" -- without this, the model has no
+            # platform ID to actually resolve against, and correctly
+            # refuses rather than guessing from a display name (confirmed
+            # live: a family member's Gmail-triage request stalled on
+            # exactly this gap). `context.shared_multi_user_session` is
+            # already computed correctly at SessionContext construction
+            # time (see build_session_context above) from the real
+            # isolation config, so this is a single check, not a
+            # per-platform special case -- it fixes every current and
+            # future platform through this one shared function. `user_id`
+            # is the platform's own event-envelope value, not user-editable
+            # text (same reasoning as the pre-existing Slack `<@user_id>`
+            # mention fix elsewhere in this codebase), so it is
+            # interpolated directly rather than passed through
+            # _format_untrusted_prompt_value. Suppressed under redact_pii
+            # (branch above) since exposing the raw ID there would defeat
+            # the point of redaction -- resolving family identity under PII
+            # redaction is a separate, not-yet-built mechanism.
+            if not context.shared_multi_user_session and src.user_id:
+                desc = f"{desc} — verified platform user ID: {src.user_id}"
         lines.append(
             f"**Source:** {platform_name} ({_format_untrusted_prompt_value(desc)})"
         )
