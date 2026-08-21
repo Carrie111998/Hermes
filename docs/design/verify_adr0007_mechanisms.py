@@ -63,16 +63,16 @@ CREATE TRIGGER trg_run_provenance_no_update BEFORE UPDATE ON run_provenance
 BEGIN SELECT RAISE(ABORT, 'run_provenance is append-only'); END;
 CREATE TRIGGER trg_run_provenance_no_delete BEFORE DELETE ON run_provenance
 BEGIN SELECT RAISE(ABORT, 'run_provenance is append-only'); END;
-CREATE TABLE run_evidence (
+CREATE TABLE run_artifacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL,
-    task_id TEXT NOT NULL, rel_path TEXT NOT NULL, sha256 TEXT NOT NULL,
+    task_id TEXT NOT NULL, artifact_path TEXT NOT NULL, sha256 TEXT NOT NULL,
     size_bytes INTEGER NOT NULL, git_blob_oid TEXT,
     tracked INTEGER NOT NULL DEFAULT 0, clean INTEGER NOT NULL DEFAULT 0,
     declared_by TEXT NOT NULL, created_at INTEGER NOT NULL,
-    sealed INTEGER NOT NULL DEFAULT 0, UNIQUE(run_id, rel_path),
+    sealed INTEGER NOT NULL DEFAULT 0, UNIQUE(run_id, artifact_path),
     CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*')
 );
-CREATE TRIGGER trg_run_evidence_sealed BEFORE UPDATE ON run_evidence
+CREATE TRIGGER trg_run_evidence_sealed BEFORE UPDATE ON run_artifacts
 WHEN OLD.sealed = 1
 BEGIN SELECT RAISE(ABORT, 'evidence row is sealed'); END;
 
@@ -122,8 +122,8 @@ def insert_prov(run_id, outcome, subject, head, ev):
     ev_digest = None
     if ev:
         ev_digest = digest([
-            {"rel_path": e["rel_path"], "sha256": e["sha256"]}
-            for e in sorted(ev, key=lambda x: x["rel_path"])
+            {"artifact_path": e["artifact_path"], "sha256": e["sha256"]}
+            for e in sorted(ev, key=lambda x: x["artifact_path"])
         ])
     attestable = int(
         outcome == "completed" and bool(subject) and bool(head) and len(ev) > 0
@@ -147,8 +147,8 @@ def insert_prov(run_id, outcome, subject, head, ev):
 
 SHA_A = "a" * 40
 SHA_B = "b" * 40
-ev1 = [{"rel_path": "evidence/qa.json", "sha256": "c" * 64},
-       {"rel_path": "evidence/sec.json", "sha256": "d" * 64}]
+ev1 = [{"artifact_path": "evidence/qa.json", "sha256": "c" * 64},
+       {"artifact_path": "evidence/sec.json", "sha256": "d" * 64}]
 
 rd_ok = insert_prov(1, "completed", SHA_A, SHA_B, ev1)
 insert_prov(2, "blocked", SHA_A, SHA_B, ev1)
@@ -235,11 +235,11 @@ _hostile_ev_ids = itertools.count(2001)
 
 
 def evidence_sha_rejected(value):
-    """True if the run_evidence.sha256 CHECK aborts the insert."""
+    """True if the run_artifacts.sha256 CHECK aborts the insert."""
     ev_id = next(_hostile_ev_ids)
     try:
         probe.execute(
-            "INSERT INTO run_evidence (run_id,task_id,rel_path,sha256,"
+            "INSERT INTO run_artifacts (run_id,task_id,artifact_path,sha256,"
             "size_bytes,declared_by,created_at,sealed) "
             "VALUES (?,'t_hostile',?,?,10,'p',100,0)",
             (ev_id, f"evidence/h{ev_id}.json", value))
@@ -250,9 +250,9 @@ def evidence_sha_rejected(value):
 
 
 for label, value in HOSTILE_SHA256.items():
-    check(f"run_evidence.sha256 CHECK rejects {label}",
+    check(f"run_artifacts.sha256 CHECK rejects {label}",
           evidence_sha_rejected(value))
-check("run_evidence.sha256 CHECK accepts valid full lowercase 64-hex",
+check("run_artifacts.sha256 CHECK accepts valid full lowercase 64-hex",
       not evidence_sha_rejected(("0123456789abcdef" * 4)[:64]))
 probe.close()
 
@@ -283,18 +283,18 @@ check("record survives tamper attempt byte-identical",
       still["subject_sha"] == SHA_A and still["record_digest"] == rd_ok)
 
 # --- evidence sealing -------------------------------------------------
-db.execute("INSERT INTO run_evidence (run_id,task_id,rel_path,sha256,size_bytes,"
+db.execute("INSERT INTO run_artifacts (run_id,task_id,artifact_path,sha256,size_bytes,"
            "declared_by,created_at,sealed) VALUES (1,'t_demo','evidence/qa.json',?,10,"
            "'security-reviewer',100,0)", ("c" * 64,))
 db.commit()
 # unsealed: allowed
-db.execute("UPDATE run_evidence SET sha256=? WHERE run_id=1", ("f" * 64,))
+db.execute("UPDATE run_artifacts SET sha256=? WHERE run_id=1", ("f" * 64,))
 db.commit()
 check("unsealed evidence is editable", True)
-db.execute("UPDATE run_evidence SET sealed=1 WHERE run_id=1")
+db.execute("UPDATE run_artifacts SET sealed=1 WHERE run_id=1")
 db.commit()
 try:
-    db.execute("UPDATE run_evidence SET sha256=? WHERE run_id=1", ("0" * 64,))
+    db.execute("UPDATE run_artifacts SET sha256=? WHERE run_id=1", ("0" * 64,))
     db.commit()
     check("sealed evidence rejects writes", False, "write succeeded!")
 except sqlite3.IntegrityError as e:
@@ -363,14 +363,14 @@ for label, value in HOSTILE_SHA256.items():
     check(f"SHA256 regex rejects {label}", not SHA256.match(value))
 
 # --- evidence_digest is order-independent -----------------------------
-d1 = digest([{"rel_path": e["rel_path"], "sha256": e["sha256"]}
-             for e in sorted(ev1, key=lambda x: x["rel_path"])])
-d2 = digest([{"rel_path": e["rel_path"], "sha256": e["sha256"]}
-             for e in sorted(list(reversed(ev1)), key=lambda x: x["rel_path"])])
+d1 = digest([{"artifact_path": e["artifact_path"], "sha256": e["sha256"]}
+             for e in sorted(ev1, key=lambda x: x["artifact_path"])])
+d2 = digest([{"artifact_path": e["artifact_path"], "sha256": e["sha256"]}
+             for e in sorted(list(reversed(ev1)), key=lambda x: x["artifact_path"])])
 check("evidence_digest stable under input order", d1 == d2)
-ev_tampered = [ev1[0], {"rel_path": "evidence/sec.json", "sha256": "9" * 64}]
-d3 = digest([{"rel_path": e["rel_path"], "sha256": e["sha256"]}
-             for e in sorted(ev_tampered, key=lambda x: x["rel_path"])])
+ev_tampered = [ev1[0], {"artifact_path": "evidence/sec.json", "sha256": "9" * 64}]
+d3 = digest([{"artifact_path": e["artifact_path"], "sha256": e["sha256"]}
+             for e in sorted(ev_tampered, key=lambda x: x["artifact_path"])])
 check("evidence_digest changes when a hash changes", d1 != d3)
 
 # --- kernel-side hashing beats worker-declared hash -------------------

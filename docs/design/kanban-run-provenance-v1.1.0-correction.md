@@ -326,7 +326,7 @@ Proven, in order of the assertions in this document:
   described — while the normative `NOT GLOB '*[^0-9a-f]*'` CHECKs reject
   `'a'+'Z'*39`, `'a'*39+'g'`, `'A'*40`, `'aB'*20`, 39 chars, 41 chars and
   an embedded space, on **both** `subject_sha` and `verified_head_sha`,
-  and reject the 64-char equivalents on `run_evidence.sha256`. Valid
+  and reject the 64-char equivalents on `run_artifacts.sha256`. Valid
   full-length lowercase hex is still accepted in each case. The Python
   `SHA40`/`SHA256` regexes are run over the same hostile table so the two
   validation layers cannot drift.
