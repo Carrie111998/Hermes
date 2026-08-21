@@ -33,3 +33,24 @@ export function forceLoneHeaderForPanes(
 
   return shown.length === 1 && isCollapsePane(shown[0])
 }
+
+export interface ZoneHeaderVisibilityInput {
+  forceLoneHeader: boolean
+  headerVeto: boolean
+  persistedHidden?: boolean
+  sessionStrip: boolean
+  shownCount: number
+}
+
+/** Resolve header visibility without letting the chat switcher become a dead end. */
+export function resolveZoneHeaderHidden(input: ZoneHeaderVisibilityInput): boolean {
+  if (input.headerVeto) {
+    return true
+  }
+
+  if (input.sessionStrip) {
+    return false
+  }
+
+  return input.persistedHidden ?? (input.shownCount <= 1 && !input.forceLoneHeader)
+}

@@ -35,6 +35,16 @@ function terminalGroup(minimized: boolean): GroupNode {
   }
 }
 
+function workspaceGroup(): GroupNode {
+  return {
+    active: 'workspace',
+    headerHidden: true,
+    id: 'workspace-zone',
+    panes: ['workspace'],
+    type: 'group'
+  }
+}
+
 const toggle = (label: string) =>
   globalThis.document.querySelector<HTMLButtonElement>(
     `[data-tree-group="terminal-zone"] button[aria-label="${label}"]`
@@ -72,5 +82,20 @@ describe('TreeGroup', () => {
     render(<TreeGroup node={terminalGroup(true)} parentAxis="column" />)
 
     expect(toggle('Restore').querySelector('i')!.className).toContain('codicon-chevron-up')
+  })
+
+  it('keeps the session strip visible for a lone workspace with persisted hide', () => {
+    disposePane = registry.register({
+      area: 'panes',
+      data: { placement: 'main', uncloseable: true },
+      id: 'workspace',
+      render: () => <div>Workspace</div>,
+      title: 'Workspace'
+    })
+    vi.stubGlobal('CSS', { escape: (value: string) => value })
+
+    render(<TreeGroup node={workspaceGroup()} parentAxis="row" />)
+
+    expect(globalThis.document.querySelector('[data-tree-group="workspace-zone"][data-zone-header]')).not.toBeNull()
   })
 })

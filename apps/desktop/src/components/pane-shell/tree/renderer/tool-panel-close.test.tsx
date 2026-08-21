@@ -101,6 +101,7 @@ describe('right-clicking a tool panel tab', () => {
     openContextMenu(tab!)
 
     expect(await screen.findByRole('menuitem', { name: /^close$/i })).toBeTruthy()
+    expect(await screen.findByRole('menuitem', { name: /^hide header$/i })).toBeTruthy()
   })
 
   it('offers Close while the zone is MINIMIZED to its rail', async () => {
@@ -116,6 +117,18 @@ describe('right-clicking a tool panel tab', () => {
     openContextMenu(tabEl('logs')!)
 
     expect(await screen.findByRole('menuitem', { name: /^close$/i })).toBeTruthy()
+  })
+})
+
+describe('right-clicking the session workspace tab', () => {
+  it('does not offer the dead-end Hide header action', async () => {
+    declareDefaultTree(group(['workspace'], { active: 'workspace', id: 'grp-main' }))
+    render(<TreeGroup node={zoneAt(0)} parentAxis="row" />)
+
+    openContextMenu(tabEl('workspace')!)
+
+    expect(await screen.findByRole('menu')).toBeTruthy()
+    expect(screen.queryByRole('menuitem', { name: /^hide header$/i })).toBeNull()
   })
 })
 
