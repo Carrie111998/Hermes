@@ -88,44 +88,26 @@ def _format_updated_at(value: Any) -> str | None:
         return value
     try:
         return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
-        except Exception as e:
-            logger.error(
-                "ACP session failed to resolve runtime provider: %s", e, exc_info=True
-            )
-            if existing_agent is not None:
-                # Fall back to the existing agent's provider configuration
-                logger.info("ACP session falling back to existing agent's provider")
-                kwargs.update(
-                    {
-                        "provider": getattr(existing_agent, "provider", None),
-                        "api_mode": api_mode or getattr(existing_agent, "api_mode", None),
-                        "base_url": base_url or getattr(existing_agent, "base_url", None),
-                        "api_key": getattr(existing_agent, "api_key", None),
-                        "command": getattr(existing_agent, "command", None),
-                        "args": list(getattr(existing_agent, "args", []) or []),
-                    }
-                )
-            else:
-                # Re-raise the exception if no fallback agent is available
-                raise
-                "ACP session failed to resolve runtime provider: %s", e, exc_info=True
-            )
-            if existing_agent is not None:
-                # Fall back to the existing agent's provider configuration
-                logger.info("ACP session falling back to existing agent's provider")
-                kwargs.update(
-                    {
-                        "provider": getattr(existing_agent, "provider", None),
-                        "api_mode": api_mode or getattr(existing_agent, "api_mode", None),
-                        "base_url": base_url or getattr(existing_agent, "base_url", None),
-                        "api_key": getattr(existing_agent, "api_key", None),
-                        "command": getattr(existing_agent, "command", None),
-                        "args": list(getattr(existing_agent, "args", []) or []),
-                    }
-                )
-            else:
-                # Re-raise the exception if no fallback agent is available
-                raise
+    except Exception:
+        return None
+
+
+def _updated_at_sort_key(value: Any) -> float:
+    if value is None:
+        return float("-inf")
+    if isinstance(value, (int, float)):
+        return float(value)
+    raw = str(value).strip()
+    if not raw:
+        return float("-inf")
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        try:
+            return float(raw)
+        except Exception:
+            return float("-inf")
+
 
 def _acp_stderr_print(*args, **kwargs) -> None:
     """Best-effort human-readable output sink for ACP stdio sessions.
