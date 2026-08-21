@@ -10982,12 +10982,12 @@ function RoutineRow({ job, onOpen, owner }) {
 
   return jsxs('div', {
     className: cn(
-      'group grid gap-1.5 rounded-lg border border-(--ui-stroke-secondary) p-2.5 transition-colors',
+      'group grid min-w-0 gap-1.5 rounded-lg border border-(--ui-stroke-secondary) p-2.5 transition-colors',
       'hover:border-(--ui-stroke-primary, var(--ui-stroke-secondary))'
     ),
     children: [
       jsxs('div', {
-        className: 'flex items-center gap-2',
+        className: 'flex min-w-0 items-center gap-2',
         children: [
           // The row's own button, not a click handler on the card: the switch
           // and delete control are siblings, so opening the details can never
@@ -11019,7 +11019,7 @@ function RoutineRow({ job, onOpen, owner }) {
               type: 'button',
               disabled: busy,
               className:
-                'flex size-5 items-center justify-center rounded text-(--ui-text-quaternary) opacity-0 transition-opacity group-hover:opacity-100 hover:bg-(--chrome-action-hover) hover:text-foreground',
+                'flex size-5 shrink-0 items-center justify-center rounded text-(--ui-text-quaternary) opacity-0 transition-opacity group-hover:opacity-100 hover:bg-(--chrome-action-hover) hover:text-foreground',
               onClick: () => act('remove'),
               children: jsx(Codicon, { name: 'trash', className: 'text-[0.75rem]' })
             })
@@ -11027,7 +11027,7 @@ function RoutineRow({ job, onOpen, owner }) {
         ]
       }),
       jsxs('div', {
-        className: 'flex items-center justify-between gap-2 pl-3.5',
+        className: 'flex min-w-0 items-center justify-between gap-2 pl-3.5',
         children: [
           jsxs('span', {
             className:
@@ -11043,7 +11043,7 @@ function RoutineRow({ job, onOpen, owner }) {
       legacyUnsafe
         ? jsx('div', {
             className:
-              'rounded-md border border-(--ui-stroke-secondary) px-2 py-1.5 text-[0.65rem] leading-4 text-(--ui-accent)',
+              'min-w-0 rounded-md border border-(--ui-stroke-secondary) px-2 py-1.5 text-[0.65rem] leading-4 text-(--ui-accent)',
             children: 'Paused for security: delete and recreate this legacy cronjob before running it again.'
           })
         : null
