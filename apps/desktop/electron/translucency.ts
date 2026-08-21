@@ -49,6 +49,8 @@ export {
   type WindowsBackgroundMaterial
 } from '../../shared/src/translucency'
 
+// These options must be spread after any glass-capable BrowserWindow defaults
+// so the explicit Windows glass-off values can override them.
 type WindowBackingOptions = {
   backgroundColor?: string
   backgroundMaterial?: undefined
