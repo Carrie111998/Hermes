@@ -31,6 +31,7 @@ import {
 } from 'electron'
 
 import { classifyActiveRuntime } from './active-runtime-state'
+import { tryAdoptExistingLocalGateway } from './adopt-local-gateway'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
@@ -10535,6 +10536,84 @@ async function prepareProfileRenameRequest(request) {
   })
 }
 
+function pidExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error: any) {
+    return error?.code === 'EPERM'
+  }
+}
+
+async function probeLocalGatewayHttp(baseUrl: string): Promise<boolean> {
+  try {
+    await fetchPublicJson(`${String(baseUrl).replace(/\/$/, '')}/api/health`, { timeoutMs: 1500 })
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function adoptExistingLocalGatewayIfRunning() {
+  let raw: null | string = null
+  try {
+    raw = fs.readFileSync(path.join(HERMES_HOME, 'gateway.pid'), 'utf8')
+  } catch {
+    raw = null
+  }
+
+  const baseUrl = await tryAdoptExistingLocalGateway({
+    pidExists,
+    probeHttp: probeLocalGatewayHttp,
+    readPidFile: () => raw
+  })
+
+  if (!baseUrl) {
+    return null
+  }
+
+  try {
+    await waitForHermes(baseUrl, null)
+  } catch {
+    return null
+  }
+
+  let token = ''
+  try {
+    token = await adoptServedDashboardToken(baseUrl, '', {
+      childAlive: () => true,
+      label: 'existing local gateway',
+      rememberLog
+    })
+  } catch {
+    token = ''
+  }
+
+  const host = new URL(baseUrl).host
+  const wsUrl = token
+    ? `ws://${host}/api/ws?token=${encodeURIComponent(token)}`
+    : `ws://${host}/api/ws`
+  const wsProbe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket })
+
+  if (!wsProbe.ok) {
+    rememberLog(`[boot] existing local gateway at ${baseUrl} has no usable /api/ws (${wsProbe.reason}); spawning serve`)
+    return null
+  }
+
+  rememberLog(`[boot] adopting existing local gateway at ${baseUrl} instead of spawning serve`)
+
+  return {
+    authMode: 'token',
+    baseUrl,
+    logs: hermesLog.slice(-80),
+    mode: 'local',
+    source: 'local',
+    token,
+    wsUrl,
+    ...getWindowState()
+  }
+}
+
 async function startHermes() {
   // Only the single-instance lock holder may reap/spawn/claim the desktop
   // backend. A lock-losing instance must stay inert even if some path reaches
@@ -10582,6 +10661,11 @@ async function startHermes() {
 
   if (existingConnectionPromise) {
     return existingConnectionPromise
+  }
+
+  const adoptedGateway = await adoptExistingLocalGatewayIfRunning()
+  if (adoptedGateway) {
+    return adoptedGateway
   }
 
   const connectionAttempt = backendConnectionState.startAttempt()
