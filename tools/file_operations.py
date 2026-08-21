@@ -413,6 +413,27 @@ def _split_tool_diagnostics(output: str) -> tuple[str, str]:
     return '\n'.join(diagnostics), '\n'.join(payload)
 
 
+def _rg_diagnostic_requires_pcre2(diagnostics: str) -> bool:
+    """Whether rg's actual error line names a PCRE2-only construct."""
+    supported_errors = {
+        "error: look-around, including look-ahead and look-behind, is not supported",
+        "error: backreferences are not supported",
+    }
+    lines = [line.rstrip().lower() for line in diagnostics.splitlines()]
+    nonempty = [line for line in lines if line]
+    if not nonempty or nonempty[0] != "rg: regex parse error:":
+        return False
+    # Anchor the trigger inside rg's complete parser diagnostic. User-controlled
+    # patterns are indented, while path/I/O diagnostics end with their OS error
+    # rather than rg's fixed PCRE2 recommendation.
+    if nonempty[-2:] != [
+        "consider enabling pcre2 with the --pcre2 flag, which can handle backreferences",
+        "and look-around.",
+    ]:
+        return False
+    return any(line in supported_errors for line in nonempty[1:-2])
+
+
 # A real rg/grep output line starts with a path token and is followed by a
 # ``:`` (match/count), a ``-`` (context), or nothing (files_only). Tool
 # diagnostics ("rg: ...", "grep: ...", "error: ...", indented carets) never
@@ -3183,6 +3204,21 @@ class ShellFileOperations(FileOperations):
         # are interleaved with match output. Split them out: diagnostics must
         # not be parsed as matches, and on a hard error they ARE the message.
         diagnostics, payload = _split_tool_diagnostics(stdout)
+
+        # Rust regex intentionally excludes look-around and backreferences.
+        # Retry exactly once with PCRE2 only when rg's diagnostic names one of
+        # those constructs; unrelated parse errors retain the normal path.
+        if (
+            result.exit_code == 2
+            and not payload.strip()
+            and _rg_diagnostic_requires_pcre2(diagnostics)
+        ):
+            pcre_cmd_parts = list(cmd_parts)
+            pcre_cmd_parts.insert(1, "--pcre2")
+            pcre_cmd = "set -o pipefail; " + " ".join(pcre_cmd_parts)
+            result = self._exec(pcre_cmd, timeout=60)
+            stdout, limit_reason = _search_stdout_and_limit(result)
+            diagnostics, payload = _split_tool_diagnostics(stdout)
 
         # rg exit codes: 0=matches found, 1=no matches, 2=error. rg returns 2
         # even on partial errors (e.g. one unreadable file in a tree that
