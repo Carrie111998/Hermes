@@ -2382,11 +2382,16 @@ def _migrate_stale_nous_portal_url(providers: Dict[str, Any]) -> None:
 # same reasoning that made the portal allowlist accept localhost. https
 # stays required for everything off-loopback (loopback_http carve-out
 # in the validator below).
+# Loopback spellings (IPv4 + IPv6 + name) — shared by the inference host
+# allowlist and the http-scheme carve-out so the two cannot drift apart.
+# Local dev stacks routinely bind ::1 (uvicorn/FastAPI listen on both
+# families), so an IPv6-loopback endpoint is the same "bearer to your own
+# machine" non-exfiltration surface as 127.0.0.1.
+_LOOPBACK_HOSTS: FrozenSet[str] = frozenset({"localhost", "127.0.0.1", "::1"})
+
 _ALLOWED_NOUS_INFERENCE_HOSTS: FrozenSet[str] = frozenset({
     "inference-api.nousresearch.com",
-    "localhost",
-    "127.0.0.1",
-})
+}) | _LOOPBACK_HOSTS
 
 
 def _validate_nous_inference_url_from_network(url: Optional[str]) -> Optional[str]:
@@ -2426,7 +2431,7 @@ def _validate_nous_inference_url_from_network(url: Optional[str]) -> Optional[st
         return None
     if parsed.scheme != "https" and not (
         parsed.scheme == "http"
-        and parsed.hostname in {"localhost", "127.0.0.1"}
+        and parsed.hostname in _LOOPBACK_HOSTS
     ):
         logger.warning(
             "nous: refusing non-https inference URL scheme %r from Portal response "

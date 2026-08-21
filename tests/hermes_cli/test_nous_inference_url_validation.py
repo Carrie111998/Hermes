@@ -73,6 +73,17 @@ class TestValidatorRules:
             _validate_nous_inference_url_from_network("http://localhost:3114/v1")
             == "http://localhost:3114/v1"
         )
+        # IPv6 loopback: local dev stacks (uvicorn/FastAPI) listen on both
+        # families and hand out literal http://[::1]:port URLs — same
+        # "bearer to your own machine" surface as 127.0.0.1 (review on #90900).
+        assert (
+            _validate_nous_inference_url_from_network("http://[::1]:3114/v1")
+            == "http://[::1]:3114/v1"
+        )
+        assert (
+            _validate_nous_inference_url_from_network("https://[::1]:3114/v1")
+            == "https://[::1]:3114/v1"
+        )
 
 
     def test_loopback_https_accepted(self):
