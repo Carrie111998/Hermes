@@ -96,15 +96,21 @@ def _is_webhook_silence_response(content: Any) -> bool:
     """
     return is_autonomous_silence_response(content)
 
-# Terminal error placeholders that `agent/conversation_loop.py` puts in a run's
+# Terminal diagnostics that `agent/conversation_loop.py` puts in a run's
 # `final_response` when the turn ends without producing an answer (truncated
-# output, a stream that kept dropping mid tool-call, an oversized payload...).
-# They explain why the turn stopped; they are not the answer the caller asked
-# for. Every other surface shows them as an error, but a webhook route hands
-# whatever it receives to its delivery target, so the recipient gets the
-# placeholder as if it were the requested output.
-# `test_webhook_delivery_guard.py` fails if any of these drifts out of
-# conversation_loop.py, so this set cannot silently go stale.
+# output, a stream that kept dropping mid tool-call, an oversized payload,
+# compression exhausted, an invalid tool call...). They explain why the turn
+# stopped; they are not the answer the caller asked for. Every other surface
+# shows them as an error, but a webhook route hands whatever it receives to
+# its delivery target, so the recipient gets the diagnostic as if it were the
+# requested output.
+#
+# Two shapes, because that is how the loop writes them: fixed sentences, and
+# templates that interpolate a retry count, a token count or a provider
+# message. `test_webhook_delivery_guard.py` parses conversation_loop.py and
+# fails when this inventory falls behind it IN EITHER DIRECTION — a rewording
+# upstream and a newly added diagnostic both break the test rather than
+# silently narrowing the guard.
 _TERMINAL_ERROR_PLACEHOLDERS = frozenset({
     "Response truncated due to output length limit",
     "First response truncated due to output length limit",
@@ -112,12 +118,60 @@ _TERMINAL_ERROR_PLACEHOLDERS = frozenset({
     "Incomplete REASONING_SCRATCHPAD after 2 retries",
     "Codex response remained incomplete after 3 continuation attempts",
     "Request payload too large (413). Cannot compress further.",
+    "Context overflow and auto-compaction is disabled "
+    "(compression.enabled: false). Run /compress to compact manually, "
+    "/new to start fresh, or switch to a larger-context model.",
+    "max_tokens exceeds the provider's output cap for this model. "
+    "Lower model.max_tokens in config.yaml.",
+    "(empty)",
 })
+
+# Cap on the diagnostic echoed back inside the notice (the WARNING keeps
+# the full text). One templated diagnostic embeds a provider error message.
+_GUARD_REASON_MAX_CHARS = 200
+
+_TERMINAL_ERROR_PLACEHOLDER_PATTERNS = (
+    re.compile(r"\AInvalid API response after \d+ retries: "),
+    re.compile(r"\AAPI call failed after \d+ retries: "),
+    re.compile(r"\AModel generated invalid tool call: "),
+    re.compile(
+        r"\ARequest payload too large: max compression attempts \(\d+\) reached\.\Z"
+    ),
+    re.compile(
+        r"\AContext length exceeded"
+        r"(?: \([\d,]+ tokens\)\. Cannot compress further\."
+        r"|: max compression attempts \(\d+\) reached\.)\Z"
+    ),
+    # Rate limit with no fallback configured: the variable part comes first,
+    # so this one is matched on its fixed tail rather than anchored.
+    re.compile(r"No fallback provider available\. Try again after the reset,"),
+    re.compile(
+        r"\AI apologize, but I encountered "
+        r"(?:an error while processing the model response|repeated errors): "
+    ),
+)
 
 
 def _is_terminal_error_placeholder(content: Any) -> bool:
-    """True when ``content`` is a turn-ended-early placeholder, not an answer."""
-    return isinstance(content, str) and content.strip() in _TERMINAL_ERROR_PLACEHOLDERS
+    """True when ``content`` is a turn-ended-early diagnostic, not an answer."""
+    if not isinstance(content, str):
+        return False
+    text = content.strip()
+    if text in _TERMINAL_ERROR_PLACEHOLDERS:
+        return True
+    return any(p.search(text) for p in _TERMINAL_ERROR_PLACEHOLDER_PATTERNS)
+
+
+def _route_from_chat_id(chat_id: str) -> str:
+    """Route name out of a ``webhook:{route}:{delivery_id}`` session id.
+
+    Delivery entries created before the ``route`` key existed (a gateway
+    restarted into a newer build with sessions still in flight) have no key
+    to read, and the session id already carries the route.
+    """
+    head, _, rest = str(chat_id or "").partition(":")
+    route, sep, _ = rest.rpartition(":")
+    return route if head == "webhook" and sep else ""
 
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
@@ -416,8 +470,8 @@ class WebhookAdapter(BasePlatformAdapter):
         # `deliver: log`, both left untouched above. It does not hold for a
         # route configured to deliver to a human, which is what this covers.
         if _is_terminal_error_placeholder(content):
-            route = delivery.get("route") or "?"
-            reason = content.strip()
+            route = delivery.get("route") or _route_from_chat_id(chat_id) or "?"
+            reason = " ".join(content.split())
             logger.warning(
                 "[webhook] delivery-guard: session=%s route=%s produced no answer "
                 "(agent reported: %s) - delivering a notice instead",
@@ -425,6 +479,15 @@ class WebhookAdapter(BasePlatformAdapter):
                 route,
                 reason,
             )
+            # The templated diagnostics carry a provider message whose length
+            # and markup are not ours; the notice only has to say that no
+            # answer was produced, so cap it. The WARNING above keeps the
+            # untruncated text. No escaping here on purpose: the delivery
+            # target owns its own markup (the chat adapters escape on send,
+            # a GitHub comment is markdown), and pre-escaping would corrupt
+            # whichever of the two this route is not.
+            if len(reason) > _GUARD_REASON_MAX_CHARS:
+                reason = reason[:_GUARD_REASON_MAX_CHARS].rstrip() + "\u2026"
             content = (
                 f"\u26a0\ufe0f No answer was produced for this request "
                 f"(webhook route: {route}).\n"
