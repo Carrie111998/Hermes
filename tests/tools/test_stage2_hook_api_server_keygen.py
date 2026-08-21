@@ -195,6 +195,20 @@ def _sed_is_gnu() -> bool:
     return probe.returncode == 0 and "GNU sed" in probe.stdout
 
 
+def test_keygen_warns_on_weak_container_env_key(
+    stage2_text: str, tmp_path: Path
+) -> None:
+    """A container key shorter than 16 chars now means api_server DOWN, not
+    401s — the hook must say so in the boot log where the operator looks."""
+    home = tmp_path / "home"
+    home.mkdir()
+    result = _run_keygen(stage2_text, home, env_key="short-key")
+    assert result.returncode == 0, result.stderr
+    out = result.stdout + result.stderr
+    assert "shorter than 16 characters" in out
+    assert "skipping generation" in out
+
+
 def test_dockerignore_keeps_env_example_template() -> None:
     """The first-boot seed copies /opt/hermes/.env.example -> $HERMES_HOME/.env.
 

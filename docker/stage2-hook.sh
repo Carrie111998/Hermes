@@ -457,6 +457,13 @@ seed_one "SOUL.md" "docker/SOUL.md"
 # a generated key written here would silently SHADOW the operator's env
 # key and 401 every client still using the supplied credential.
 if [ -n "${API_SERVER_KEY:-}" ]; then
+    # The api_server startup guard refuses keys shorter than 16 chars; since
+    # this branch now skips generation, a weak operator key means the server
+    # stays DOWN (cron fires lost), not just 401s. Warn where the operator
+    # will look — the boot log.
+    if [ "${#API_SERVER_KEY}" -lt 16 ]; then
+        echo "[stage2] Warning: container-provided API_SERVER_KEY is shorter than 16 characters — the gateway api_server will refuse to start (cron fires unavailable). Generate a strong secret, e.g. \`openssl rand -hex 32\`."
+    fi
     if [ -f "$HERMES_HOME/.env" ] && grep -q '^API_SERVER_KEY=..*' "$HERMES_HOME/.env" 2>/dev/null; then
         echo "[stage2] Warning: API_SERVER_KEY is set in both the container environment and $HERMES_HOME/.env — the .env value wins at runtime (loaded with override=True)"
     else
