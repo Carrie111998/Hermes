@@ -5,6 +5,7 @@ import { useNavigate } from 'react-router'
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import { useOnProfileSwitch } from '@/app/hooks/use-on-profile-switch'
 import { useRouteOverlayActive } from '@/app/hooks/use-route-overlay-active'
+import { SETTINGS_ROUTE } from '@/app/routes'
 import { PetHeartField } from '@/components/chat/vibe-hearts'
 import {
   ContextMenu,
@@ -14,7 +15,6 @@ import {
   ContextMenuSeparator,
   ContextMenuTrigger
 } from '@/components/ui/context-menu'
-import { SETTINGS_ROUTE } from '@/app/routes'
 import { persistString, storedString } from '@/lib/storage'
 import { $changeEventsAvailable, $petChange } from '@/store/live-sync'
 import {
