@@ -140,7 +140,7 @@ def test_auth_bootstrap_serializes_only_after_owner_mode_is_set(
         "printf() {\n"
         '    for target in "$HERMES_HOME"/auth.json "$HERMES_HOME"/.auth.json.bootstrap.*; do\n'
         '        [ -f "$target" ] || continue\n'
-        '        mode="$(stat -f \'%Lp\' "$target" 2>/dev/null || stat -c \'%a\' "$target")"\n'
+        '        mode="$(stat -c \'%a\' "$target" 2>/dev/null || stat -f \'%Lp\' "$target")"\n'
         '        if [ "$mode" != 600 ]; then\n'
         '            command printf \'%s\\n\' "$mode" > "$MODE_LOG"\n'
         "            return 1\n"
