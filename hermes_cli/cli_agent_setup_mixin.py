@@ -753,6 +753,8 @@ class CLIAgentSetupMixin:
         from cli import CLI_CONFIG, _record_output_history_entry, _strip_reasoning_tags, _suspend_output_history
         from tools.ansi_strip import sanitize_display_text as _sanitize_display_text
         from agent.skill_commands import describe_skill_invocation
+        from agent.compaction_display import project_compaction_message_for_display
+        from agent.context_compressor import is_compaction_summary_message
         display_history = getattr(self, "_resume_display_history", self.conversation_history)
         if not display_history:
             return
@@ -774,6 +776,24 @@ class CLIAgentSetupMixin:
         _last_asst_idx = None       # index of last assistant entry
         _last_asst_full = None      # un-truncated display text for last assistant
         for msg in display_history:
+            if is_compaction_summary_message(msg):
+                # Model-only compaction carrier (handoff boilerplate,
+                # inherited tool_calls/reasoning) — every other client-facing
+                # history surface (tui_gateway, gateway/run.py, the
+                # OpenAI-compatible api_server, the dashboard) already
+                # projects this away via project_compaction_message_for_
+                # display(); this recap builds its own history independently
+                # and never picked up an equivalent projection. A standalone
+                # handoff has no real content and is dropped entirely
+                # (mirrors display_kind == "hidden" below); a merged handoff
+                # keeps only the real prior-tail content that precedes the
+                # internal summary delimiter, with inherited
+                # tool_calls/reasoning stripped.
+                projected = project_compaction_message_for_display(msg)
+                if projected is None:
+                    continue
+                msg = projected
+
             role = msg.get("role", "")
             display_kind = msg.get("display_kind")
             content = msg.get("content")
