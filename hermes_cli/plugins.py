@@ -1968,7 +1968,17 @@ class PluginContext:
         # manager's home, never the active profile's (#65593 constraint).
         return plugin_capability_granted(plugin_id, "tools.override", config=cfg)
 
-    # -- message injection --------------------------------------------------
+    # -- gateway runtime and message injection ------------------------------
+
+    @property
+    def gateway(self) -> Any | None:
+        """Return the live gateway runner, or ``None`` outside its lifetime.
+
+        The reference is published only after gateway startup has installed
+        its running loop and is withdrawn during shutdown. Plugins should
+        resolve it when needed instead of caching it across restarts.
+        """
+        return self._manager.gateway
 
     def inject_message(
         self,
@@ -3748,6 +3758,12 @@ class PluginManager:
     def has_gateway_message_injector(self) -> bool:
         """Return whether a live gateway can accept plugin-triggered turns."""
         return self._gateway_message_injector is not None
+
+    @property
+    def gateway(self) -> object | None:
+        """Return the current gateway lifecycle owner, if one is running."""
+        registered = self._gateway_message_injector
+        return registered[0] if registered is not None else None
 
     def set_gateway_message_injector(
         self,

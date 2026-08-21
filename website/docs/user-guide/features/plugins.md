@@ -700,6 +700,23 @@ In a running session, `/plugins` shows which plugins are currently loaded.
 
 ## Injecting Messages
 
+### Accessing the live gateway runtime
+
+Trusted native plugins that own background work can resolve the current
+gateway runner through `ctx.gateway`:
+
+```python
+gateway = ctx.gateway
+if gateway is None:
+    return  # CLI mode, gateway startup, or gateway shutdown
+```
+
+The property becomes non-`None` only after the gateway has installed its
+running event loop, and it returns to `None` during shutdown. Resolve it when
+needed rather than caching the runner across gateway restarts. The accessor is
+read-only, but the returned runner is a live in-process host object, so it is
+intended only for trusted native plugins that need gateway runtime services.
+
 Plugins can inject messages into a CLI conversation or a known gateway session using `ctx.inject_message()`:
 
 ```python

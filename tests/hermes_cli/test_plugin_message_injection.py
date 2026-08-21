@@ -24,6 +24,25 @@ def _write_plugin_config(tmp_path, monkeypatch, entry: dict) -> None:
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
 
+def test_gateway_accessor_is_none_without_live_gateway():
+    context, manager = _context()
+
+    assert context.gateway is None
+    assert manager.gateway is None
+
+
+def test_gateway_accessor_returns_current_lifecycle_owner():
+    context, manager = _context()
+    gateway = object()
+    manager.set_gateway_message_injector(gateway, MagicMock(return_value=True))
+
+    assert context.gateway is gateway
+    assert manager.gateway is gateway
+
+    manager.clear_gateway_message_injector(gateway)
+    assert context.gateway is None
+
+
 def test_cli_idle_injection_keeps_existing_queue_behaviour():
     context, manager = _context()
     cli = SimpleNamespace(
