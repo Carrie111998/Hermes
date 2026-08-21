@@ -37,17 +37,20 @@ _RST = "\033[0m"
 
 
 def cprint(text: str):
-    """Print ANSI-colored text through prompt_toolkit's renderer."""
-    from prompt_toolkit import print_formatted_text as _pt_print
-    from prompt_toolkit.formatted_text import ANSI as _PT_ANSI
-    try:
-        _pt_print(_PT_ANSI(text))
-    except Exception:
-        # prompt_toolkit needs a real console. On Windows, a redirected or
-        # absent stdout (pythonw.exe, CI, `hermes ... > file`) raises
-        # NoConsoleScreenBufferError from its Win32Output — display helpers
-        # must never break the caller over that, so degrade to plain print.
-        print(text)
+    """Print ANSI-colored text safely from any thread.
+
+    Compatibility wrapper around ``hermes_cli._pt_print.cprint`` — the
+    real routing logic (which checks ``get_app_or_none()`` and falls back
+    to ``run_in_terminal`` for cross-thread background emissions) lives
+    there. See that module's docstring for the rationale behind why a
+    direct ``print_formatted_text`` call from a background thread races
+    the prompt redraw and visually buries the line — that race is the
+    "third form" of issue #83969.
+    """
+    from hermes_cli._pt_print import cprint as _shared_cprint
+
+    _shared_cprint(text)
+
 
 
 def render_markup_to_ansi(text: str) -> str:
