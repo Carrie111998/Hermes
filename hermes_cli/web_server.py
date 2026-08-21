@@ -4993,7 +4993,7 @@ async def check_hermes_update(force: bool = False):
     # caches the result for 6h. ``force`` busts the cache so the "Check now"
     # button reflects reality immediately.
     try:
-        from hermes_cli.banner import check_for_updates
+        from hermes_cli.banner import UPDATE_DIVERGED, check_for_updates
 
         if force:
             try:
@@ -5011,7 +5011,7 @@ async def check_hermes_update(force: bool = False):
         payload["message"] = "Couldn't reach the update source — try again later."
     elif behind == 0:
         payload["message"] = "You're on the latest version."
-    elif behind == -2:
+    elif behind == UPDATE_DIVERGED:
         # UPDATE_DIVERGED from banner.check_for_updates (#68484)
         payload["update_available"] = True
         payload["message"] = (
