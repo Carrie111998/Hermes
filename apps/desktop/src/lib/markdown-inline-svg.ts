@@ -34,6 +34,7 @@ interface ContainerLine {
 interface FenceContainerLine {
   containers: FenceContainer[]
   content: string
+  continuationDepth: number
   end: number
   prefixLength: number
   start: number
@@ -104,10 +105,14 @@ function listMarkerEnd(line: string, start: number): number {
 // Fences can open after alternating blockquote and list containers. A list
 // marker appears only on the opening line; continuation lines replace it with
 // its visual content indent, while every blockquote marker must remain present.
-function fenceContainerPrefix(line: string): { containers: FenceContainer[]; content: string } {
+function fenceContainerPrefix(
+  line: string,
+  start = 0,
+  initialColumn = 0
+): { containers: FenceContainer[]; content: string } {
   const containers: FenceContainer[] = []
-  let column = 0
-  let cursor = 0
+  let column = initialColumn
+  let cursor = start
 
   while (cursor < line.length) {
     const segmentStart = cursor
@@ -209,23 +214,77 @@ function stripFenceContainerPrefix(
 }
 
 function continuedFenceContainerPrefix(line: string, inherited: FenceContainer[]) {
-  for (let length = inherited.length; length > 0; length -= 1) {
-    const containers = inherited.slice(0, length)
-    const continuation = stripFenceContainerPrefix(line, containers, true)
+  let column = 0
+  let cursor = 0
+  let continuationDepth = 0
 
-    if (continuation === null) {
+  for (let index = 0; index < inherited.length; index += 1) {
+    const container = inherited[index]
+    const segmentColumn = column
+    const segmentStart = cursor
+
+    if (!container) {
       continue
     }
 
-    const nested = fenceContainerPrefix(continuation)
+    if (container.kind === 'list') {
+      const indent = consumeIndent(line, cursor, column, container.indent)
 
-    return {
-      containers: [...containers, ...nested.containers],
-      content: nested.content
+      if (indent.columns !== container.indent) {
+        if (!line.slice(cursor).trim()) {
+          let implicitDepth = index
+
+          while (inherited[implicitDepth]?.kind === 'list') {
+            implicitDepth += 1
+          }
+
+          const containers = implicitDepth === inherited.length ? inherited : inherited.slice(0, implicitDepth)
+
+          return { containers, content: '', continuationDepth: implicitDepth }
+        }
+
+        break
+      }
+
+      cursor = indent.cursor
+      column += indent.columns
+      continuationDepth = index + 1
+
+      continue
     }
+
+    const leading = consumeIndent(line, cursor, column, 3)
+
+    cursor = leading.cursor
+    column += leading.columns
+
+    if (line[cursor] !== '>') {
+      cursor = segmentStart
+      column = segmentColumn
+
+      break
+    }
+
+    cursor += 1
+    column += 1
+
+    if (line[cursor] === ' ' || line[cursor] === '\t') {
+      column = nextColumn(column, line[cursor] || '')
+      cursor += 1
+    }
+
+    continuationDepth = index + 1
   }
 
-  return fenceContainerPrefix(line)
+  const nested = fenceContainerPrefix(line, cursor, column)
+
+  const continued = continuationDepth === inherited.length ? inherited : inherited.slice(0, continuationDepth)
+
+  return {
+    containers: nested.containers.length > 0 ? [...continued, ...nested.containers] : continued,
+    content: nested.content,
+    continuationDepth
+  }
 }
 
 function fenceMarker(line: string, inherited: FenceContainer[] = []): FenceMarker | null {
@@ -303,7 +362,7 @@ function collectBlockCodeRanges(text: string, includeUnclosedFence = true): Rang
       if (marker) {
         openFence = { marker, start: cursor }
       } else {
-        const content = stripBlockquotePrefix(line).content
+        const content = continuedFenceContainerPrefix(line, inheritedContainers).content
 
         if (/^(?: {4}|\t)/.test(content) && content.trim()) {
           ranges.push({ end: next, kind: 'indented', start: cursor })
@@ -376,6 +435,7 @@ export function collectIndentedCodeRanges(text: string): Array<{ end: number; st
 interface BacktickDelimiter {
   end: number
   length: number
+  scope: number
   start: number
 }
 
@@ -389,38 +449,78 @@ function backtickRun(text: string, start: number): number {
   return length
 }
 
-function collectBacktickDelimiters(text: string): BacktickDelimiter[] {
+function isIsolatedInlineBlock(content: string): boolean {
+  return (
+    /^ {0,3}#{1,6}(?:[ \t]+|$)/.test(content) ||
+    /^ {0,3}(?:`{3,}|~{3,})/.test(content) ||
+    /^ {0,3}(?:(?:\*[ \t]*){3,}|(?:_[ \t]*){3,}|(?:-[ \t]*){3,})$/.test(content) ||
+    /^ {0,3}(?:=+|-+)[ \t]*$/.test(content)
+  )
+}
+
+function collectBacktickDelimiters(text: string, lines: FenceContainerLine[]): BacktickDelimiter[] {
   const delimiters: BacktickDelimiter[] = []
-  let cursor = 0
+  let previousWasIsolated = false
+  let scope = 0
 
-  while (cursor < text.length) {
-    if (text[cursor] !== '`') {
-      cursor += 1
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const line = lines[lineIndex]
 
+    if (!line) {
       continue
     }
 
-    const length = backtickRun(text, cursor)
+    const blank = !line.content.trim()
+    const isolated = isIsolatedInlineBlock(line.content)
+    const opensContainer = lineIndex > 0 && line.continuationDepth < line.containers.length
 
-    delimiters.push({ end: cursor + length, length, start: cursor })
-    cursor += length
+    if (blank || isolated || previousWasIsolated || opensContainer) {
+      scope += 1
+    }
+
+    let cursor = line.start
+
+    while (cursor < line.end) {
+      if (text[cursor] !== '`') {
+        cursor += 1
+
+        continue
+      }
+
+      const length = backtickRun(text, cursor)
+
+      delimiters.push({ end: cursor + length, length, scope, start: cursor })
+      cursor += length
+    }
+
+    if (blank) {
+      scope += 1
+    }
+
+    previousWasIsolated = isolated
   }
 
   return delimiters
 }
 
-function collectProtectedRanges(text: string): Range[] {
+function collectProtectedRanges(text: string, containerLines: FenceContainerLine[]): Range[] {
   const blockRanges = collectBlockCodeRanges(text).sort((a, b) => a.start - b.start)
-  const delimiters = collectBacktickDelimiters(text)
+  const delimiters = collectBacktickDelimiters(text, containerLines)
   const nextMatchingDelimiter = new Array<number>(delimiters.length).fill(-1)
   const nextByLength = new Map<number, number>()
   const inlineRanges: Range[] = []
+  let delimiterScope = -1
 
   for (let index = delimiters.length - 1; index >= 0; index -= 1) {
     const delimiter = delimiters[index]
 
     if (!delimiter) {
       continue
+    }
+
+    if (delimiter.scope !== delimiterScope) {
+      nextByLength.clear()
+      delimiterScope = delimiter.scope
     }
 
     nextMatchingDelimiter[index] = nextByLength.get(delimiter.length) ?? -1
@@ -577,6 +677,7 @@ function collectFenceContainerLines(text: string): FenceContainerLine[] {
     lines.push({
       containers: container.containers,
       content: container.content,
+      continuationDepth: container.continuationDepth,
       end,
       prefixLength: line.length - container.content.length,
       start: cursor
@@ -676,8 +777,8 @@ export function fenceRawSvgBlocks(text: string): string {
     return text
   }
 
-  const protectedRanges = collectProtectedRanges(text)
   const containerLines = collectFenceContainerLines(text)
+  const protectedRanges = collectProtectedRanges(text, containerLines)
   const crossesBlankLine = createBlankLineDetector(text)
   let activeSvg: { depth: number; lastTokenEnd: number; line: FenceContainerLine; start: number } | null = null
   let output = ''
@@ -703,6 +804,17 @@ export function fenceRawSvgBlocks(text: string): string {
 
     const containerLine = containerLines[containerLineIndex]
     const protectedRange = protectedRanges[protectedIndex]
+
+    if (activeSvg && containerLine && containerLine.start > activeSvg.line.start) {
+      const physicalLine = text.slice(containerLine.start, containerLine.end)
+
+      if (stripFenceContainerPrefix(physicalLine, activeSvg.line.containers, true) === null) {
+        // A quote/list container owns only lines that continue its prefix. End
+        // the malformed candidate before interpreting this boundary line so a
+        // valid SVG that starts the outer document is considered from scratch.
+        activeSvg = null
+      }
+    }
 
     if (protectedRange && protectedRange.start < next) {
       const indentedSvgContent =

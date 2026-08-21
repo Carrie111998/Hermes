@@ -5,6 +5,22 @@ import { collectBalancedFenceRanges, fenceRawSvgBlocks } from './markdown-inline
 
 const SVG = '<svg viewBox="0 0 10 10"><circle cx="5" cy="5" r="4"/></svg>'
 
+interface MdastNode {
+  children?: MdastNode[]
+  type?: string
+  value?: string
+}
+
+function valuesOfType(node: MdastNode, type: string): string[] {
+  const values = node.type === type && node.value ? [node.value] : []
+
+  for (const child of node.children || []) {
+    values.push(...valuesOfType(child, type))
+  }
+
+  return values
+}
+
 describe('fenceRawSvgBlocks', () => {
   it('lifts a bare SVG out of surrounding prose', () => {
     expect(fenceRawSvgBlocks(`Before ${SVG} after`)).toBe(`Before \n\n\`\`\`svg\n${SVG}\n\`\`\`\n\n after`)
@@ -225,6 +241,71 @@ describe('fenceRawSvgBlocks', () => {
     expect(fenceRawSvgBlocks(input)).toBe(input)
   })
 
+  it('pairs inline-code delimiters only inside the CommonMark block that owns them', () => {
+    const input = ['`dangling opener', '', `\`${SVG}\``].join('\n')
+    const output = fenceRawSvgBlocks(input)
+    const tree = fromMarkdown(output)
+
+    expect(output).toBe(input)
+    expect(tree.children).toMatchObject([
+      { children: [{ type: 'text', value: '`dangling opener' }], type: 'paragraph' },
+      { children: [{ type: 'inlineCode', value: SVG }], type: 'paragraph' }
+    ])
+  })
+
+  it.each([
+    ['ATX heading', ['`dangling opener', '# heading', `\`${SVG}\``].join('\n')],
+    ['blockquote', ['`dangling opener', `> \`${SVG}\``].join('\n')],
+    ['sibling list item', ['- `dangling opener', `- \`${SVG}\``].join('\n')]
+  ])('does not pair backticks across an interrupting %s boundary', (_label, input) => {
+    const expectedTree = fromMarkdown(input)
+
+    expect(valuesOfType(expectedTree, 'inlineCode')).toContain(SVG)
+    expect(fenceRawSvgBlocks(input)).toBe(input)
+  })
+
+  it('keeps a valid multiline inline-code span protected', () => {
+    const input = `\`before\n${SVG}\nafter\``
+
+    expect(valuesOfType(fromMarkdown(input), 'inlineCode')).toEqual([`before\n${SVG}\nafter`])
+    expect(fenceRawSvgBlocks(input)).toBe(input)
+  })
+
+  it.each([
+    ['four-column unordered-list continuation', ['- item', `    ${SVG}`].join('\n')],
+    ['five-column ordered-list continuation', ['123. item', `     ${SVG}`].join('\n')]
+  ])('subtracts active container indentation for a %s', (_label, input) => {
+    const output = fenceRawSvgBlocks(input)
+
+    expect(output).toContain(`\`\`\`svg\n`)
+    expect(fromMarkdown(output).children).toMatchObject([
+      {
+        children: [
+          {
+            children: [
+              { children: [{ type: 'text', value: 'item' }], type: 'paragraph' },
+              { lang: 'svg', type: 'code', value: SVG }
+            ],
+            type: 'listItem'
+          }
+        ],
+        type: 'list'
+      }
+    ])
+  })
+
+  it('reprocesses a root SVG after an unterminated quoted SVG container ends', () => {
+    const rootSvg = SVG.replace('<svg ', '<svg id="root-after-quote" ')
+    const input = ['> <svg id="unterminated-quote"><path/>', '', rootSvg].join('\n')
+    const output = fenceRawSvgBlocks(input)
+
+    expect(output).toContain(`\`\`\`svg\n${rootSvg}\n\`\`\``)
+    expect(fromMarkdown(output).children).toMatchObject([
+      { type: 'blockquote' },
+      { lang: 'svg', type: 'code', value: rootSvg }
+    ])
+  })
+
   it.each([
     ['missing root close', '<svg><circle/></g>'],
     ['malformed root close', '<svg><circle/></svg trailing>'],
@@ -347,5 +428,44 @@ describe('fenceRawSvgBlocks', () => {
     }
 
     expect(backtickSearches).toBeLessThanOrEqual(runCount)
+  })
+
+  it('parses a decreasing malformed container prefix within a linear copy budget', () => {
+    const depth = 300
+    const prefix = '> '.repeat(depth)
+    const input = [`${prefix}paragraph`, SVG].join('\n')
+    const originalSlice = Array.prototype.slice
+    let copiedContainerSlots = 0
+
+    const sliceSpy = vi.spyOn(Array.prototype, 'slice').mockImplementation(function (
+      this: unknown[],
+      start?: number,
+      end?: number
+    ) {
+      const result = originalSlice.call(this, start, end)
+      const first = this[0] as { kind?: unknown } | undefined
+
+      if (first?.kind === 'blockquote' || first?.kind === 'list') {
+        copiedContainerSlots += result.length
+      }
+
+      return result
+    })
+
+    try {
+      expect(fenceRawSvgBlocks(input)).toContain(`\`\`\`svg\n${SVG}\n\`\`\``)
+    } finally {
+      sliceSpy.mockRestore()
+    }
+
+    expect(copiedContainerSlots).toBeLessThanOrEqual(depth * 8)
+  })
+
+  it('handles a large malformed nested container before a valid root SVG', () => {
+    const prefix = '> '.repeat(4_000)
+    const rootSvg = SVG.replace('<svg ', '<svg id="after-large-container" ')
+    const input = [`${prefix}<svg id="unterminated-nested">`, '', rootSvg].join('\n')
+
+    expect(fenceRawSvgBlocks(input)).toContain(`\`\`\`svg\n${rootSvg}\n\`\`\``)
   })
 })

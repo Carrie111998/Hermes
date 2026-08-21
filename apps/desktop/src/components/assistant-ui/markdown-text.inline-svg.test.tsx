@@ -139,6 +139,45 @@ describe('MarkdownTextContent raw SVG', () => {
     expect(container.querySelector('svg#raw-inline-svg')).toBeNull()
   })
 
+  it('keeps inline-code SVG inert after a dangling delimiter in an earlier paragraph', async () => {
+    const dangerous = SIMPLE_SVG.replace(
+      '<svg id="raw-inline-svg"',
+      '<svg id="inline-code-security-svg" onload="alert(1)"'
+    ).replace('<path ', '<script>alert(1)</script><path onclick="alert(1)" ')
+
+    const text = ['`dangling opener', '', `\`${dangerous.replaceAll('\n', ' ')}\``].join('\n')
+    const { container } = renderMarkdown(text)
+
+    await waitFor(() => expect(container.querySelector('code')?.textContent).toContain('<svg'))
+    expect(container.querySelector('svg#inline-code-security-svg')).toBeNull()
+    expect(container.querySelector('script')).toBeNull()
+  })
+
+  it.each([
+    [
+      'four-column unordered-list continuation',
+      ['- item', ...SIMPLE_SVG.split('\n').map(line => `    ${line}`)].join('\n')
+    ],
+    [
+      'five-column ordered-list continuation',
+      ['123. item', ...SIMPLE_SVG.split('\n').map(line => `     ${line}`)].join('\n')
+    ]
+  ])('renders raw SVG from a %s', async (_label, text) => {
+    const { container } = renderMarkdown(text)
+
+    await waitFor(() => expect(container.querySelector('svg#raw-inline-svg')).not.toBeNull())
+    expect(container.querySelector('svg#raw-inline-svg')?.closest('li')).not.toBeNull()
+  })
+
+  it('renders a root SVG after an unterminated quoted SVG container', async () => {
+    const rootSvg = SIMPLE_SVG.replace('raw-inline-svg', 'root-after-unterminated-quote')
+    const text = ['> <svg id="unterminated-quote"><path/>', '', rootSvg].join('\n')
+    const { container } = renderMarkdown(text)
+
+    await waitFor(() => expect(container.querySelector('svg#root-after-unterminated-quote')).not.toBeNull())
+    expect(container.querySelector('svg#unterminated-quote')).toBeNull()
+  })
+
   it('preserves the existing fenced SVG renderer', async () => {
     const { container } = renderMarkdown(`\`\`\`svg\n${SIMPLE_SVG}\n\`\`\``)
 
