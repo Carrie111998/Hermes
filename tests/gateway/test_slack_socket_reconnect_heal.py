@@ -295,3 +295,21 @@ class TestSocketModeRestart:
         await adapter._socket_watchdog_loop()
 
         assert reasons == ["transport disconnected"]
+
+    @pytest.mark.asyncio
+    async def test_restart_starts_replacement_when_old_handler_close_hangs(self, adapter):
+        """A wedged close_async must not wedge the reconnect lock forever."""
+        never = asyncio.Event()
+
+        async def _hang_forever():
+            await never.wait()
+
+        adapter._stop_socket_mode_handler = AsyncMock(side_effect=_hang_forever)
+        adapter._start_socket_mode_handler = MagicMock()
+        adapter._socket_stop_timeout_s = 0.01
+
+        await asyncio.wait_for(
+            adapter._restart_socket_mode("transport disconnected"), timeout=0.2
+        )
+
+        adapter._start_socket_mode_handler.assert_called_once_with()
