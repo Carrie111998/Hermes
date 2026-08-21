@@ -1269,7 +1269,15 @@ def create_profile(
         try:
             from plugins.memory.honcho.cli import clone_honcho_for_profile
 
-            clone_honcho_for_profile(canon)
+            # Full clones carry a profile-local Honcho config that wins over
+            # the shared default config at runtime. Update that copied file;
+            # config-only clones continue accumulating shared host blocks in
+            # the launch profile's config as before.
+            honcho_path = profile_dir / "honcho.json" if clone_all else None
+            clone_honcho_for_profile(
+                canon,
+                config_path=honcho_path if honcho_path and honcho_path.exists() else None,
+            )
         except Exception:
             pass  # Honcho plugin not installed or not configured
 

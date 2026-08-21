@@ -10415,7 +10415,15 @@ def cmd_profile(args):
                 try:
                     from plugins.memory.honcho.cli import cloned_profile_ai_peer
 
-                    ai_peer = cloned_profile_ai_peer(name)
+                    honcho_path = profile_dir / "honcho.json" if clone_all else None
+                    ai_peer = cloned_profile_ai_peer(
+                        name,
+                        config_path=(
+                            honcho_path
+                            if honcho_path and honcho_path.exists()
+                            else None
+                        ),
+                    )
                     if ai_peer:
                         print(f"Honcho config cloned (peer: {ai_peer})")
                 except Exception:

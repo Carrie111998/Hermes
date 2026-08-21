@@ -175,6 +175,34 @@ class TestCreateProfile:
         honcho = json.loads((default_home / "honcho.json").read_text())
         assert honcho["hosts"]["hermes_coder"]["aiPeer"] == "shared-assistant"
 
+    def test_clone_all_updates_copied_honcho_config(self, profile_env, monkeypatch):
+        default_home = profile_env / ".hermes"
+        (default_home / "honcho.json").write_text(json.dumps({
+            "apiKey": "***",
+            "shareAiPeerAcrossProfiles": True,
+            "hosts": {
+                "hermes": {
+                    "aiPeer": "shared-assistant",
+                    "peerName": "eri",
+                    "workspace": "shared",
+                },
+            },
+        }))
+        monkeypatch.setattr(
+            "plugins.memory.honcho.cli._ensure_peer_exists",
+            lambda host_key=None, **kwargs: True,
+        )
+
+        profile_dir = create_profile(
+            "coder",
+            clone_from="default",
+            clone_all=True,
+            no_alias=True,
+        )
+
+        honcho = json.loads((profile_dir / "honcho.json").read_text())
+        assert honcho["hosts"]["hermes_coder"]["aiPeer"] == "shared-assistant"
+
 
 
 
