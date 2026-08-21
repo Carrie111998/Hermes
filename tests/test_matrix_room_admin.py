@@ -38,9 +38,12 @@ def _assert_error(out, needle):
 @pytest.fixture(autouse=True)
 def _isolated_session_context(monkeypatch):
     """Reset per-task session contextvars and session/env scoping vars so each
-    test starts from "no current room bound" (the CLI/standalone case)."""
+    test starts from "no current room bound, no allowlist, no escape hatch"
+    (the strict CLI/standalone default) unless a test opts in explicitly."""
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
     monkeypatch.delenv("MATRIX_ALLOWED_ROOMS", raising=False)
+    monkeypatch.delenv("MATRIX_TOOLS_ALLOW_ANY_ROOM", raising=False)
+    monkeypatch.delenv("MATRIX_ALLOW_PUBLIC_ROOMS", raising=False)
     try:
         from gateway.session_context import reset_session_vars
 
@@ -275,9 +278,52 @@ class TestRoomAuthorization:
         _assert_error(out, "outside this turn's scope")
         assert fake.calls == []  # neither leave nor forget attempted
 
-    def test_standalone_room_allowed_without_context(self, creds, monkeypatch):
+    # --- fail-closed contract: no scope established => deny, not allow -------
+
+    def test_no_context_no_allowlist_is_denied(self, creds, monkeypatch):
         # No current room bound, no allowlist, no live adapter (cron/CLI/
-        # one-shot): nothing to scope against, so the room is permitted.
+        # one-shot): there is nothing to scope against, so a destructive
+        # action must be DENIED (fail closed), not silently allowed.
+        monkeypatch.setattr(m, "_current_room", lambda: "")
+        monkeypatch.setattr(m, "_allowed_room_ids", lambda: set())
+        monkeypatch.setattr(m, "_joined_rooms", lambda: None)
+        fake = _recorder({"leave": (200, "{}")})
+        monkeypatch.setattr(m, "_matrix_room_action", fake)
+        out = _parse(_run(m._handle_matrix_leave_room({"room_id": "!any:hs"})))
+        _assert_error(out, "MATRIX_TOOLS_ALLOW_ANY_ROOM")
+        assert fake.calls == []  # no API call once authorization fails
+
+    def test_no_context_undeclared_when_allowlist_set(self, creds, monkeypatch):
+        # A NON-empty allowlist is a whitelist: it establishes scope, so a
+        # room outside it is denied with the allowlist-specific message.
+        monkeypatch.setattr(m, "_current_room", lambda: "")
+        monkeypatch.setattr(m, "_allowed_room_ids", lambda: {"!listed:hs"})
+        monkeypatch.setattr(m, "_joined_rooms", lambda: None)
+        fake = _recorder({"leave": (200, "{}")})
+        monkeypatch.setattr(m, "_matrix_room_action", fake)
+        out = _parse(_run(m._handle_matrix_leave_room({"room_id": "!any:hs"})))
+        _assert_error(out, "MATRIX_ALLOWED_ROOMS")
+        assert fake.calls == []
+
+    def test_unavailable_adapter_does_not_widen_scope(self, creds, monkeypatch):
+        # Adapter unavailable (_joined_rooms() is None) must NOT be read as
+        # "no scope, allow": with an empty allowlist and no current room the
+        # deny must still stand.
+        monkeypatch.setattr(m, "_current_room", lambda: "")
+        monkeypatch.setattr(m, "_allowed_room_ids", lambda: set())
+        monkeypatch.setattr(m, "_joined_rooms", lambda: None)
+        assert m._authorize_room("!any:hs") is not None
+        # ...but a positive membership match still authorizes.
+        monkeypatch.setattr(m, "_joined_rooms", lambda: {"!known:hs"})
+        assert m._authorize_room("!known:hs") is None
+
+    # --- explicit opt-in escape hatch ---------------------------------------
+
+    def test_allow_any_room_flag_permits_roomless_context(self, creds, monkeypatch):
+        # The operator escape hatch: MATRIX_TOOLS_ALLOW_ANY_ROOM=true lets a
+        # room-less cron/standalone run act on an arbitrary room.
+        monkeypatch.delenv("MATRIX_TOOLS_ALLOW_ANY_ROOM", raising=False)
+        monkeypatch.setattr(m, "_allow_any_room", lambda: True)
         monkeypatch.setattr(m, "_current_room", lambda: "")
         monkeypatch.setattr(m, "_allowed_room_ids", lambda: set())
         monkeypatch.setattr(m, "_joined_rooms", lambda: None)
@@ -285,6 +331,29 @@ class TestRoomAuthorization:
         monkeypatch.setattr(m, "_matrix_room_action", fake)
         out = _parse(_run(m._handle_matrix_leave_room({"room_id": "!any:hs"})))
         assert out["success"] is True
+        assert [c["room_id"] for c in fake.calls] == ["!any:hs"]
+
+    @pytest.mark.parametrize("val,expected", [
+        ("true", True), ("1", True), ("yes", True),
+        ("", False), ("false", False), ("no", False),
+    ])
+    def test_allow_any_room_flag_truth_table(self, monkeypatch, val, expected):
+        monkeypatch.setenv("MATRIX_TOOLS_ALLOW_ANY_ROOM", val)
+        assert m._allow_any_room() is expected
+
+    def test_allow_any_room_flag_unset(self, monkeypatch):
+        monkeypatch.delenv("MATRIX_TOOLS_ALLOW_ANY_ROOM", raising=False)
+        assert m._allow_any_room() is False
+
+    def test_allow_any_room_flag_does_not_bypass_allowlist(self, creds, monkeypatch):
+        # The flag only lifts the room-less denial; a non-empty allowlist
+        # still acts as a strict whitelist.
+        monkeypatch.setattr(m, "_allow_any_room", lambda: True)
+        monkeypatch.setattr(m, "_current_room", lambda: "")
+        monkeypatch.setattr(m, "_allowed_room_ids", lambda: {"!listed:hs"})
+        monkeypatch.setattr(m, "_joined_rooms", lambda: None)
+        assert m._authorize_room("!listed:hs") is None
+        assert m._authorize_room("!other:hs") is not None
 
     def test_allowlist_set_rejects_unlisted_room(self, creds, monkeypatch):
         # An allowlist is a strict whitelist: a room not in it is rejected

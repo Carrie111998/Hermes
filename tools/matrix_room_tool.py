@@ -30,8 +30,13 @@ Implementation note — why a raw Client-Server API call and NOT
 
 Authorization: leave/forget are destructive and must respect the Matrix room
 boundary (``gateway/session.py`` — "a turn is scoped to the current Matrix
-room/thread only"). ``_require_room`` therefore refuses to act on a room the
-agent was never in, not just any non-empty id it happens to be handed.
+room/thread only"). ``_authorize_room`` therefore refuses to act on a room the
+agent was never in, not just any non-empty id it happens to be handed. It
+fails CLOSED: if no scope can be established at all (no current room bound
+AND no ``MATRIX_ALLOWED_ROOMS`` allowlist), a destructive action is denied
+rather than silently allowed — an operator who genuinely needs a room-less
+cron/standalone run to act cross-room sets ``MATRIX_TOOLS_ALLOW_ANY_ROOM=true``
+to opt in explicitly.
 
 Cache reconciliation: a raw leave/forget bypasses the sync loop, which only
 *adds* room ids to ``_joined_rooms``. After a successful leave we call
@@ -39,6 +44,7 @@ Cache reconciliation: a raw leave/forget bypasses the sync loop, which only
 ``_join_room_by_id`` re-joins rather than trusting a stale cache entry.
 """
 import os
+from typing import Optional
 
 from tools.registry import registry, tool_error, tool_result
 
@@ -195,10 +201,14 @@ def _allowed_room_ids():
     return {r.strip() for r in os.getenv("MATRIX_ALLOWED_ROOMS", "").split(",") if r.strip()}
 
 
-def _joined_rooms() -> set:
+def _joined_rooms() -> Optional[set]:
     """The set of rooms the live adapter is a member of, or None when the
     adapter isn't available. A room in this set is one the agent *was in* —
-    so it is a legitimate leave/delete target even if it isn't the current room."""
+    so it is a legitimate leave/delete target even if it isn't the current room.
+
+    ``None`` (adapter unavailable) is distinct from an *empty* set: it means we
+    have no positive membership evidence, NOT that every room is in scope.
+    Callers must treat ``None`` as "unknown", never as "allow"."""
     adapter = _live_adapter()
     if adapter is None:
         return None
@@ -208,17 +218,37 @@ def _joined_rooms() -> set:
         return None
 
 
+def _allow_any_room() -> bool:
+    """Explicit operator opt-in to act on arbitrary rooms from a room-less
+    context (``MATRIX_TOOLS_ALLOW_ANY_ROOM=true``).
+
+    Only consulted when NO scope could be established at all (no current room
+    bound AND no ``MATRIX_ALLOWED_ROOMS`` allowlist) — the otherwise
+    fail-closed path. Setting an allowlist still acts as a whitelist; this
+    flag only lifts the denial when there is nothing to scope against.
+    """
+    return os.getenv("MATRIX_TOOLS_ALLOW_ANY_ROOM", "").lower() in ("true", "1", "yes")
+
+
 def _authorize_room(room_id: str):
     """Enforce the Matrix room boundary for destructive leave/forget actions.
 
     Returns None when *room_id* is a legitimate target, or a ``tool_error``
     string when it is not. A room is legitimate when it is any of:
-      * this turn's room (``_current_room``), or
       * in the operator's ``MATRIX_ALLOWED_ROOMS`` allowlist, or
-      * a room the live adapter is still joined to (the agent was in it).
-    With a current room bound, a room matching none of the above is a
-    cross-room action on a room the agent was never in — exactly what the
-    session boundary forbids.
+      * this turn's room (``_current_room``), or
+      * a room the live adapter is still joined to (the agent was in it) —
+        a *positive* membership match, so the adapter being unavailable
+        (``_joined_rooms() is None``) never counts as "in every room".
+
+    Everything else fails CLOSED:
+      * current room bound but the room differs from it — cross-room action,
+        exactly what the session boundary forbids;
+      * an allowlist is set and the room isn't in it — strict whitelist;
+      * no current room and no allowlist (room-less cron/standalone run) —
+        denied unless ``MATRIX_TOOLS_ALLOW_ANY_ROOM=true`` is set explicitly.
+    Failing closed means a bug that unsets the session room mid-Matrix-session
+    degrades to "tool says no" rather than "tool silently acts on any room".
     """
     current = _current_room()
     allowlist = _allowed_room_ids()
@@ -239,9 +269,18 @@ def _authorize_room(room_id: str):
         return tool_error(
             f"Room {room_id} is not in MATRIX_ALLOWED_ROOMS ({sorted(allowlist)})."
         )
-    # No current room bound and no allowlist (standalone / cron / tests):
-    # nothing to scope against, so allow.
-    return None
+    # No current room bound and no allowlist: there is no scope to check
+    # against, and an unavailable adapter is no evidence of membership.
+    # Fail closed unless the operator opted in explicitly.
+    if _allow_any_room():
+        return None
+    return tool_error(
+        f"No scope established for {room_id}: this turn has no bound Matrix room "
+        "and MATRIX_ALLOWED_ROOMS is not set. Destructive room actions fail closed "
+        "without a scope. Run the tool from the room's own conversation, set "
+        "MATRIX_ALLOWED_ROOMS, or set MATRIX_TOOLS_ALLOW_ANY_ROOM=true to allow "
+        "arbitrary rooms from a room-less context."
+    )
 
 
 def _reconcile_adapter(room_id: str) -> None:
@@ -369,7 +408,7 @@ def _require_room(args):
 
 async def _handle_matrix_leave_room(args, **kwargs):
     ctx, err = _require_room(args)
-    if err is not None:
+    if err is not None or ctx is None:
         return err
     homeserver, token, room_id = ctx
     body = {"reason": str(args["reason"])} if args.get("reason") else {}
@@ -385,7 +424,7 @@ async def _handle_matrix_leave_room(args, **kwargs):
 
 async def _handle_matrix_delete_room(args, **kwargs):
     ctx, err = _require_room(args)
-    if err is not None:
+    if err is not None or ctx is None:
         return err
     homeserver, token, room_id = ctx
     body = {"reason": str(args["reason"])} if args.get("reason") else {}
