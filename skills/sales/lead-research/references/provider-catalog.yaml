@@ -38,7 +38,7 @@
   homepage: https://ted.europa.eu/
   access_tier: public
   entity_levels: [named_company, opportunity]
-  capabilities: [procurement, organizations, candidate_verification]
+  capabilities: [procurement, organizations, candidate_verification, authoritative_registry]
   countries: []
   sector_ids: []
   freshness_days: 7
@@ -49,7 +49,10 @@
   license_note: >
     Free search API, no credential. Confirms that a company won or bid for an EU
     public contract; silent everywhere else, so it complements a web verifier
-    rather than replacing one.
+    rather than replacing one. Carries `authoritative_registry`: the publisher
+    is the EU's Publications Office, so a notice satisfies a verdict's need for
+    an authoritative source even though it is not the company's own page. A
+    company with no website in the corpus has no other path to one.
 - source_id: brightdata-web
   version: '1'
   display_name: Bright Data Web Unlocker

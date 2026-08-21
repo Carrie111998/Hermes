@@ -671,6 +671,61 @@ would be tuned against nothing — there is a `ponytail:` marker at the spot.
 Verified by reverting: seven scoring tests and the ordering test fail without
 it. 456 server tests and six WebUI suites pass with it.
 
+### B2. A verdict is no longer capped by corpus metadata
+
+**The first diagnosis of this was wrong and is worth recording.** It read: TED
+classifies every source `independent` and never emits `official`, so accept two
+independent domains as sufficient for `strong_fit`. That would have lowered the
+bar for the wrong reason. TED alone, and a corpus whose rows cite the TED notice
+they came from, are **one publisher domain between them** — `ted.europa.eu` — so
+`second_source` is legitimately missing and `review` is the right answer. One
+publisher is one source.
+
+The actual defect is narrower and worse. `official` means "a page on the
+company's own domain", and that classification is only ever produced by
+fetching a domain the candidate row *already carried*: `BrightDataVerifier`
+skips the official fetch entirely without one, and `_is_official(url, None)` is
+`False` by construction. Only 40 of the 201 TED-derived rows carry a website. So
+for the other 161, `strong_fit` was unreachable **at any evidence level** — the
+verdict was capped by corpus metadata rather than by evidence.
+
+`SourceCoverage` now carries a third, orthogonal set. `official` and
+`independent` answer *who published it*; `registry` answers *what standing the
+publisher has*. A TED award notice is both independent and authoritative, and
+the two sets overlap on purpose.
+
+- **Standing is declared per source in the provider catalog**, not inferred from
+  a page or a URL. "The EU's Publications Office is authoritative" is a
+  provenance judgement about a publisher, and guessing it would be the same
+  upgrade-a-hint-into-evidence move this module refuses everywhere else. TED
+  carries `authoritative_registry`; a test pins that nothing else does, because
+  a web verifier reports whatever page it reached and reaching a page is not
+  standing.
+- **What blocks a strong verdict is now separate from what is merely absent.**
+  One authoritative publisher plus a second publisher agreeing. `missing_evidence`
+  is still reported in full — so a `strong_fit` backed by a registry notice says
+  plainly that the company's own page was never read, instead of blanking its
+  gaps the way the old code did.
+- The bar did not move: a registry notice alone is still `review` (one domain),
+  two directory listings with no authority are still `review`, a lower band is
+  never upgraded, and conflicts still block.
+
+**A second ceiling, found while testing this and deliberately not fixed.**
+`evidence_confidence` weights `completeness` at .2, and completeness divides by
+all seven scoring dimensions — but four of them (`buying_intent`,
+`market_coverage`, `commercial_scale`, `trade_activity`) have no field that any
+shipped verifier emits. So no company can exceed 3/7, a company with no website
+cannot exceed 2/7, and band A's .72 threshold is only just clearable: the
+end-to-end test needs a notice plus three corroborating pages to reach it. Every
+lead's confidence is understated by a fixed amount. Changing the denominator is a
+scoring decision rather than part of the verdict, so it is measured by
+`test_confidence_ceiling_is_set_by_dimensions_nothing_can_populate` and left for
+a decision. Either count only dimensions some enabled source can speak to, or
+drop the four from the default profile.
+
+Verified by reverting: four tests fail without it. 469 server tests and six
+WebUI suites pass with it.
+
 ## Carried-over risks
 
 - **Postgres paths stay under-tested.** `tests/server/` builds `Settings` with

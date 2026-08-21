@@ -84,7 +84,11 @@ def ted_definition() -> DatasetDefinition:
         homepage="https://ted.europa.eu/",
         access_tier="public",
         entity_levels=["named_company", "opportunity"],
-        capabilities=["procurement", "organizations", "candidate_verification"],
+        capabilities=[
+            "procurement", "organizations", "candidate_verification",
+            # The publisher is the EU's Publications Office; see the catalog entry.
+            "authoritative_registry",
+        ],
         freshness_days=7,
         adapter_mode="live",
         default_enabled=False,

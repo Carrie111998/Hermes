@@ -196,7 +196,10 @@ function evidencePanel(result, claimState) {
         : el('p', { class: 'ifz-result-none ifz-prose' }, 'No neutral claims were recorded.')),
     el('section', { class: 'ifz-result-evidence-section' },
       el('h3', {}, 'Missing evidence'),
-      textList(result.missing_evidence, 'No required evidence is marked missing.')));
+      // Not all of these disqualify a lead — a strong fit backed by a registry
+      // notice still reports that the company's own page was never read — so
+      // the empty state no longer calls them "required".
+      textList(result.missing_evidence, 'Nothing is marked missing.')));
 }
 
 function resultTable(results, selectedId, onSelect) {

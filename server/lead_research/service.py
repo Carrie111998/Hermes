@@ -433,6 +433,17 @@ class LeadResearchService:
                 output["terminal_errors"] = list(errors)
         return errors
 
+    def _is_registry(self, source_id: str) -> bool:
+        """Whether this source publishes with authority of its own.
+
+        Declared in the provider catalog, not inferred: "the EU's Publications
+        Office is authoritative" is a licensing and provenance judgement about a
+        publisher, and guessing it from a domain would be exactly the kind of
+        upgrade-a-hint-into-evidence this module refuses everywhere else.
+        """
+        definition = self.registry.definitions.get(source_id)
+        return bool(definition and "authoritative_registry" in definition.capabilities)
+
     def _candidate_payload(self, candidate: CandidateRecord, config: CampaignConfig) -> dict:
         return {
             **candidate.data,
@@ -936,6 +947,15 @@ class LeadResearchService:
                             for _, bundle in bundles for source in bundle.sources
                             if source.classification == "independent" and _domain(source.provenance_url)
                         }
+                        # Standing is a property of the publisher, declared in
+                        # the catalog, so it is read per source rather than per
+                        # page. A registry domain is also whatever its pages
+                        # classified as — these sets deliberately overlap.
+                        registry_domains = {
+                            _domain(source.provenance_url)
+                            for source_id, bundle in bundles for source in bundle.sources
+                            if self._is_registry(source_id) and _domain(source.provenance_url)
+                        }
                         payload = self._candidate_payload(candidate, config)
                         # The corpus row is a starting guess about the role; the
                         # claims are what a source actually observed. Gating on
@@ -968,7 +988,9 @@ class LeadResearchService:
                         stage = "verdict"
                         evaluated_verdict = evaluate_verdict(
                             candidate, claims, score, gate,
-                            SourceCoverage(official_domains, independent_domains),
+                            SourceCoverage(
+                                official_domains, independent_domains, registry_domains
+                            ),
                         )
                         stage = "result"
                         source_ids = list(dict.fromkeys(source_id for source_id, _ in bundles))
