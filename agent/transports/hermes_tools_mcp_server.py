@@ -153,6 +153,19 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_link",
 )
 
+# Copilot ACP disables duplicate built-in tools when this bridge is active, so
+# the ordinary Hermes file/process tools must also be available through the
+# turn-scoped MCP server. Keep EXPOSED_TOOLS unchanged for the Codex runtime,
+# where Codex's native sandboxed equivalents remain preferable.
+COPILOT_EXPOSED_TOOLS: tuple[str, ...] = EXPOSED_TOOLS + (
+    "terminal",
+    "read_file",
+    "write_file",
+    "patch",
+    "search_files",
+    "process",
+)
+
 
 def _configured_exposed_tools() -> tuple[str, ...]:
     """Return the caller-scoped tool subset, preserving the legacy default."""
@@ -166,7 +179,12 @@ def _configured_exposed_tools() -> tuple[str, ...]:
     if not isinstance(requested, list):
         return ()
     allowed = {name for name in requested if isinstance(name, str)}
-    return tuple(name for name in EXPOSED_TOOLS if name in allowed)
+    available = (
+        COPILOT_EXPOSED_TOOLS
+        if os.getenv(TOOL_SCHEMAS_ENV) is not None
+        else EXPOSED_TOOLS
+    )
+    return tuple(name for name in available if name in allowed)
 
 
 def _configured_tool_specs(

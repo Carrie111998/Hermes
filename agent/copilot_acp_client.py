@@ -34,6 +34,15 @@ from tools.environments.local import hermes_subprocess_env
 ACP_MARKER_BASE_URL = "acp://copilot"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
 
+_COPILOT_TOOLS_REPLACED_BY_HERMES_MCP = (
+    "bash",
+    "view",
+    "edit",
+    "create",
+    "grep",
+    "glob",
+)
+
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _TOOL_CALL_JSON_RE = re.compile(r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
 
@@ -234,6 +243,72 @@ def _approved_execute_option(params: Any) -> str | None:
     return None
 
 
+def _copilot_mcp_cli_config(
+    mcp_servers: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """Translate ACP MCP entries to Copilot CLI additional-MCP config."""
+    configured: dict[str, dict[str, Any]] = {}
+    for server in mcp_servers or []:
+        if not isinstance(server, dict):
+            continue
+        name = server.get("name")
+        command = server.get("command")
+        server_args = server.get("args")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if not isinstance(command, str) or not command.strip():
+            continue
+        if not isinstance(server_args, list) or not all(
+            isinstance(arg, str) for arg in server_args
+        ):
+            continue
+        server_env: dict[str, str] = {}
+        for item in server.get("env") or []:
+            if not isinstance(item, dict):
+                continue
+            env_name = item.get("name")
+            env_value = item.get("value")
+            if isinstance(env_name, str) and isinstance(env_value, str):
+                server_env[env_name] = env_value
+        configured[name.strip()] = {
+            "type": "local",
+            "command": command.strip(),
+            "args": server_args,
+            "env": server_env,
+            "tools": ["*"],
+        }
+    if not configured:
+        return None
+    return {"mcpServers": configured}
+
+
+def _copilot_args_for_hermes_mcp(
+    args: list[str],
+    *,
+    mcp_servers: list[dict[str, Any]] | None,
+) -> list[str]:
+    """Inject Hermes MCP and route duplicate Copilot tools through Hermes."""
+    effective = list(args)
+    mcp_config = _copilot_mcp_cli_config(mcp_servers)
+    if mcp_config is None:
+        return effective
+    has_explicit_tool_filter = any(
+        arg == "--available-tools"
+        or arg.startswith("--available-tools=")
+        or arg == "--excluded-tools"
+        or arg.startswith("--excluded-tools=")
+        for arg in effective
+    )
+    if not has_explicit_tool_filter:
+        effective.extend(
+            ["--excluded-tools", *_COPILOT_TOOLS_REPLACED_BY_HERMES_MCP]
+        )
+    effective.extend(
+        ["--additional-mcp-config", json.dumps(mcp_config, ensure_ascii=False)]
+    )
+    return effective
+
+
 def _hermes_tools_mcp_bridge(
     tools: list[dict[str, Any]] | None,
 ) -> tuple[list[dict[str, Any]], set[str]]:
@@ -254,11 +329,11 @@ def _hermes_tools_mcp_bridge(
 
     from agent.transports.hermes_tools_mcp_server import (
         ALLOWED_TOOLS_ENV,
-        EXPOSED_TOOLS,
+        COPILOT_EXPOSED_TOOLS,
         TOOL_SCHEMAS_ENV,
     )
 
-    native_tool_names = set(requested).intersection(EXPOSED_TOOLS)
+    native_tool_names = set(requested).intersection(COPILOT_EXPOSED_TOOLS)
     if not native_tool_names:
         return [], set()
 
@@ -532,6 +607,18 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[ChatCompletionMessage
     return extracted, cleaned
 
 
+def _strip_copilot_tool_filter_notice(text: str) -> str:
+    """Remove the deterministic CLI notice produced by our tool filter."""
+    if not isinstance(text, str):
+        return text
+    notice = "Info: Disabled tools: " + ", ".join(
+        sorted(_COPILOT_TOOLS_REPLACED_BY_HERMES_MCP)
+    )
+    if text.startswith(notice):
+        return text[len(notice):].lstrip()
+    return text
+
+
 
 def _ensure_path_within_cwd(path_text: str, cwd: str) -> Path:
     candidate = Path(path_text)
@@ -644,6 +731,7 @@ class CopilotACPClient:
             mcp_servers=mcp_servers,
         )
 
+        response_text = _strip_copilot_tool_filter_notice(response_text)
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
 
         usage = SimpleNamespace(
@@ -677,6 +765,10 @@ class CopilotACPClient:
         timeout_seconds: float,
         mcp_servers: list[dict[str, Any]] | None = None,
     ) -> tuple[str, str]:
+        effective_acp_args = _copilot_args_for_hermes_mcp(
+            self._acp_args,
+            mcp_servers=mcp_servers,
+        )
         # Fast-fail when the CLI doesn't support the ACP args we'd pass.
         # Without this guard, a CLI like Claude Code v2.x exits with
         # ``error: unknown option '--acp'`` immediately, then the parent
@@ -686,8 +778,8 @@ class CopilotACPClient:
         # ``None`` (inconclusive probe — e.g. binary missing) falls
         # through to the spawn below, which raises the established
         # "Could not start Copilot ACP command" error.
-        if _acp_supported(self._acp_command, self._acp_args) is False:
-            preview = " ".join(self._acp_args[:3]) if self._acp_args else "(none)"
+        if _acp_supported(self._acp_command, effective_acp_args) is False:
+            preview = " ".join(effective_acp_args[:3]) if effective_acp_args else "(none)"
             raise RuntimeError(
                 f"ACP transport not supported by '{self._acp_command}': "
                 f"`{preview}` is rejected as an unknown option. "
@@ -705,7 +797,7 @@ class CopilotACPClient:
             from hermes_cli._subprocess_compat import windows_hide_flags
 
             proc = subprocess.Popen(
-                [self._acp_command] + self._acp_args,
+                [self._acp_command] + effective_acp_args,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -836,7 +928,10 @@ class CopilotACPClient:
                 "session/new",
                 {
                     "cwd": self._acp_cwd,
-                    "mcpServers": mcp_servers or [],
+                    # Copilot CLI currently ignores ACP session-scoped MCP
+                    # entries, so they are injected at process startup via
+                    # --additional-mcp-config instead.
+                    "mcpServers": [],
                 },
             ) or {}
             session_id = str(session.get("sessionId") or "").strip()

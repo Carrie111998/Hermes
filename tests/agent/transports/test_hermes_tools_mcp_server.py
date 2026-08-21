@@ -118,6 +118,17 @@ class TestModuleSurface:
 
         assert m._configured_exposed_tools() == ("skills_list",)
 
+    def test_turn_scoped_schema_mode_can_expose_hermes_terminal(self, monkeypatch):
+        from agent.transports import hermes_tools_mcp_server as m
+
+        monkeypatch.setenv(
+            "HERMES_TOOLS_MCP_ALLOWED",
+            json.dumps(["skills_list", "terminal"]),
+        )
+        monkeypatch.setenv("HERMES_TOOLS_MCP_SCHEMAS", "{}")
+
+        assert m._configured_exposed_tools() == ("skills_list", "terminal")
+
     def test_missing_allowed_tools_env_preserves_existing_codex_contract(
         self, monkeypatch
     ):

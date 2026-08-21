@@ -12,6 +12,8 @@ from unittest.mock import patch
 
 from agent.copilot_acp_client import (
     CopilotACPClient,
+    _copilot_args_for_hermes_mcp,
+    _copilot_mcp_cli_config,
     _hermes_tools_mcp_bridge,
 )
 
@@ -66,7 +68,10 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
 
         servers, native_tool_names = _hermes_tools_mcp_bridge(tools)
 
-        self.assertEqual(native_tool_names, {"skills_list", "web_search"})
+        self.assertEqual(
+            native_tool_names,
+            {"skills_list", "terminal", "web_search"},
+        )
         self.assertEqual(len(servers), 1)
         server = servers[0]
         self.assertEqual(server["name"], "hermes-tools")
@@ -77,11 +82,94 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
         env = {item["name"]: item["value"] for item in server["env"]}
         self.assertEqual(
             json.loads(env["HERMES_TOOLS_MCP_ALLOWED"]),
-            ["skills_list", "web_search"],
+            ["skills_list", "terminal", "web_search"],
         )
         schemas = json.loads(env["HERMES_TOOLS_MCP_SCHEMAS"])
-        self.assertEqual(set(schemas), {"skills_list", "web_search"})
-        self.assertNotIn("terminal", schemas)
+        self.assertEqual(set(schemas), {"skills_list", "terminal", "web_search"})
+
+    def test_hermes_mcp_disables_copilot_bash_by_default(self) -> None:
+        servers, _ = _hermes_tools_mcp_bridge(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "skills_list",
+                        "description": "List skills",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+        )
+
+        effective = _copilot_args_for_hermes_mcp(
+            ["--acp", "--stdio"],
+            mcp_servers=servers,
+        )
+
+        self.assertEqual(effective[:3], ["--acp", "--stdio", "--excluded-tools"])
+        self.assertIn("bash", effective)
+        self.assertNotIn("apply_patch", effective)
+        config_index = effective.index("--additional-mcp-config") + 1
+        config = json.loads(effective[config_index])
+        self.assertEqual(
+            config["mcpServers"]["hermes-tools"]["tools"],
+            ["*"],
+        )
+        self.assertIn(
+            "HERMES_TOOLS_MCP_ALLOWED",
+            config["mcpServers"]["hermes-tools"]["env"],
+        )
+
+    def test_explicit_copilot_tool_filter_is_preserved(self) -> None:
+        args = ["--acp", "--stdio", "--excluded-tools", "shell"]
+
+        servers, _ = _hermes_tools_mcp_bridge(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "skills_list",
+                        "description": "List skills",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+        )
+
+        effective = _copilot_args_for_hermes_mcp(args, mcp_servers=servers)
+
+        self.assertEqual(effective[: len(args)], args)
+        self.assertEqual(effective.count("--excluded-tools"), 1)
+        self.assertIn("--additional-mcp-config", effective)
+
+    def test_invalid_mcp_entries_do_not_change_copilot_args(self) -> None:
+        args = ["--acp", "--stdio"]
+
+        self.assertIsNone(_copilot_mcp_cli_config([{"name": "broken"}]))
+        self.assertEqual(
+            _copilot_args_for_hermes_mcp(
+                args,
+                mcp_servers=[{"name": "broken"}],
+            ),
+            args,
+        )
+
+    def test_copilot_tool_filter_notice_is_not_returned_to_user(self) -> None:
+        notice = "Info: Disabled tools: bash, create, edit, glob, grep, view"
+        with patch.object(
+            self.client,
+            "_run_prompt",
+            return_value=(notice + "Hermes has 260 skills.", ""),
+        ):
+            completion = self.client._create_chat_completion(
+                model="copilot-acp",
+                messages=[{"role": "user", "content": "count skills"}],
+            )
+
+        self.assertEqual(
+            completion.choices[0].message.content,
+            "Hermes has 260 skills.",
+        )
 
     def test_hermes_tools_mcp_bridge_is_absent_without_matching_tools(self) -> None:
         servers, native_tool_names = _hermes_tools_mcp_bridge(
@@ -89,7 +177,7 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
                 {
                     "type": "function",
                     "function": {
-                        "name": "terminal",
+                        "name": "delegate_task",
                         "description": "",
                         "parameters": {},
                     },
