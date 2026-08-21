@@ -26,9 +26,17 @@ ambiguous sends):
 - ``attempting``  — crashed mid-await: the platform MAY already have the
   message. Redelivered WITH a visible recovered-reply marker so the
   contract is honest at-least-once, never a silent duplicate.
-- ``failed``      — definitively rejected once; the restart is a natural
-  retry boundary. Also carries the marker.
+- ``failed``      — definitively rejected once. Also carries the marker.
 - ``delivered``   — nothing to do; retention prunes.
+
+``sweep_recoverable()`` only ever claims rows whose owner is DEAD, so it
+recovers crashes and nothing else. A transient platform rejection (a Discord
+5xx) leaves a ``failed`` row owned by a gateway that is still very much
+alive: no sweep touched it, and the turn's output sat undelivered until an
+operator forced a restart. ``sweep_retryable()`` closes that hole — it claims
+``failed`` rows owned by THIS live process once their backoff has elapsed.
+The two sweeps partition the space by owner liveness (dead vs. self), so they
+can never claim the same row, and they share one ``attempts`` budget.
 
 Poison rows cannot spin: attempts are capped, stale rows expire, and both
 transition to ``abandoned`` (kept briefly for inspection, then pruned).
@@ -67,6 +75,21 @@ _MAX_ROWS = 500
 # message (crash mid-send / post-rejection retry). Honest at-least-once.
 RECOVERED_MARKER = (
     "♻️ Recovered reply — the gateway restarted during delivery, "
+    "so this may be a duplicate:\n\n"
+)
+
+# In-process retry backoff, indexed by the number of attempts already made
+# (attempts=0 -> first retry after 30s). A row whose attempts reach
+# MAX_ATTEMPTS is abandoned by the same cap the crash path uses, so the two
+# sweeps share one retry budget and a poison row still cannot spin.
+RETRY_BACKOFF_SECONDS = (30.0, 120.0, 600.0)
+
+# Marker for a live-process retry after a transient platform rejection. The
+# crash wording ("the gateway restarted") would be a lie here: the gateway
+# never went down, the platform refused the send. Still labeled, because a
+# 5xx can hide a delivery that actually landed.
+RETRY_MARKER = (
+    "♻️ Retried delivery — the first send was rejected by the platform, "
     "so this may be a duplicate:\n\n"
 )
 
@@ -320,6 +343,118 @@ def sweep_recoverable(
                     "attempts": attempts + 1,
                 })
     return claimed
+
+
+def sweep_retryable(
+    now: Optional[float] = None,
+    *,
+    deliverable_platforms: Optional[set] = None,
+) -> List[Dict[str, Any]]:
+    """Claim ``failed`` rows still owned by THIS live process, for in-process
+    retry after a transient platform rejection.
+
+    Complements ``sweep_recoverable`` (which only claims rows whose owner is
+    dead, i.e. crash recovery). Without this, a Discord 5xx during the final
+    send left the row ``failed`` with ``attempts=0`` forever: the owning
+    gateway never crashed, so nothing ever re-claimed it and the turn's
+    output was only recoverable by restarting the process.
+
+    Ownership is the partition key. A row is claimed here only when
+    ``owner_pid`` is this pid AND the recorded start time matches, so:
+
+    - rows owned by a dead process stay with ``sweep_recoverable``;
+    - rows owned by a DIFFERENT live gateway are left to that process;
+    - a recycled pid cannot be mistaken for us (start time is checked).
+
+    A row is returned only after ``RETRY_BACKOFF_SECONDS[attempts]`` has
+    elapsed since ``updated_at``, so an outage that lasts minutes is retried
+    on a widening interval rather than hammered. Rows over the attempts cap
+    or the stale cutoff transition to 'abandoned', exactly as in the crash
+    path — the retry budget is shared, never doubled.
+    """
+    now = now if now is not None else time.time()
+    pid, started = _owner_stamp()
+    claimed: List[Dict[str, Any]] = []
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT obligation_id, session_key, platform, chat_id, thread_id,
+                      content, attempts, created_at, updated_at,
+                      owner_pid, owner_started_at
+               FROM delivery_obligations
+               WHERE state='failed' AND owner_pid=?""",
+            (pid,),
+        ).fetchall()
+        for (oid, session_key, platform, chat_id, thread_id, content,
+             attempts, created_at, updated_at, owner_pid,
+             owner_started_at) in rows:
+            if (
+                started is not None
+                and owner_started_at is not None
+                and int(owner_started_at) != int(started)
+            ):
+                # Same pid number, different process (pid reuse after a
+                # crash+respawn). Not ours to retry; the crash path owns it.
+                continue
+            if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
+                conn.execute(
+                    """UPDATE delivery_obligations
+                       SET state='abandoned', updated_at=? WHERE obligation_id=?""",
+                    (now, oid),
+                )
+                continue
+            if (
+                deliverable_platforms is not None
+                and platform not in deliverable_platforms
+            ):
+                # No adapter for this platform right now — claiming would
+                # spend an attempt on a guaranteed no-op.
+                continue
+            try:
+                backoff = RETRY_BACKOFF_SECONDS[int(attempts)]
+            except (IndexError, TypeError, ValueError):
+                backoff = RETRY_BACKOFF_SECONDS[-1]
+            if (now - updated_at) < backoff:
+                continue  # still cooling down
+            cursor = conn.execute(
+                """UPDATE delivery_obligations
+                   SET state='attempting', attempts=attempts+1, updated_at=?
+                   WHERE obligation_id=? AND state='failed' AND owner_pid=?""",
+                (now, oid, pid),
+            )
+            if cursor.rowcount:
+                claimed.append({
+                    "obligation_id": oid,
+                    "session_key": session_key,
+                    "platform": platform,
+                    "chat_id": chat_id,
+                    "thread_id": thread_id,
+                    "content": content,
+                    # Always ambiguous: the platform rejected the send, but a
+                    # 5xx can hide a message that actually landed.
+                    "needs_marker": True,
+                    "attempts": attempts + 1,
+                })
+    return claimed
+
+
+def retry_sweep_enabled(config: Optional[Dict[str, Any]] = None) -> bool:
+    """Read the ``gateway.delivery_retry_sweep`` config gate (default on).
+
+    Separate from ``ledger_enabled`` so the in-process retry can be turned
+    off without losing crash-recovery redelivery.
+    """
+    try:
+        if config is None:
+            from hermes_cli.config import load_config
+
+            config = load_config()
+        gw = config.get("gateway") or {}
+        value = gw.get("delivery_retry_sweep", True)
+        if isinstance(value, str):
+            return value.strip().lower() not in {"false", "0", "no", "off"}
+        return bool(value)
+    except Exception:
+        return True
 
 
 def _prune(now: Optional[float] = None) -> None:
