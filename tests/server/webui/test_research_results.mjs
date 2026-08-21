@@ -493,3 +493,77 @@ test('each tab exports its own server-filtered result view', async () => {
   assert.ok(downloads.includes('research-rc_1-rejected.csv'));
   dispose?.();
 });
+
+test('a running campaign brings in new results without a reload', async (t) => {
+  // The results endpoint never gated on completion, so a campaign's leads were
+  // already arriving one at a time — the page just told the customer to reload
+  // to see them. A five-hundred-company run showed nothing for its whole
+  // duration unless somebody kept pressing refresh.
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  let leads = [{
+    id: 'result_first', organization_id: 'org_1', company_name: 'Atlas DE',
+    verdict: 'strong_fit', fit_score: 91, evidence_confidence: .88,
+    country: 'DE', buyer_role: 'Distributor', source_count: 2,
+    reasons: ['a_band'], conflicting_claims: [], missing_evidence: [],
+  }];
+  globalThis.fetch = async url => {
+    if (url === '/api/v1/research-campaigns') return Response.json([{
+      id: 'rc_1', name: 'DACH appliance distributors', status: 'running',
+      config: { target_countries: ['DE'], sector_ids: ['household-appliances'] },
+      updated_at: 1786900000,
+    }]);
+    if (url === '/api/v1/research-campaigns/rc_1/results?view=active') return Response.json(leads);
+    if (url.includes('/claims')) return Response.json([]);
+    throw new Error(`unstubbed request: ${url}`);
+  };
+  const { mount } = await import('../../../server/webui/js/pages/research-results.js');
+  const root = dom.document.createElement('main');
+  dom.document.body.append(root);
+
+  const dispose = await mount(root, { query: {}, params: {}, navigate() {} });
+  await nextTurn();
+  assert.match(root.textContent, /Atlas DE/);
+  assert.doesNotMatch(root.textContent, /Beacon AT/);
+
+  leads = [...leads, {
+    id: 'result_second', organization_id: 'org_3', company_name: 'Beacon AT',
+    verdict: 'review', fit_score: 67, evidence_confidence: .71,
+    country: 'AT', buyer_role: 'Importer', source_count: 1,
+    reasons: ['priority_band_b'], conflicting_claims: [], missing_evidence: [],
+  }];
+  t.mock.timers.tick(5000);
+  await nextTurn();
+  await nextTurn();
+
+  assert.match(root.textContent, /Beacon AT/);
+  // The company the customer had open stays open; a new arrival must not steal
+  // the evidence panel out from under them.
+  assert.match(root.textContent, /Atlas DE/);
+  dispose?.();
+});
+
+test('a finished campaign is not polled, and disposing stops the polling', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const requests = [];
+  globalThis.fetch = async url => {
+    requests.push(url);
+    return Response.json(responseFor(url));
+  };
+  const { mount } = await import('../../../server/webui/js/pages/research-results.js');
+  const root = dom.document.createElement('main');
+  dom.document.body.append(root);
+
+  const dispose = await mount(root, { query: {}, params: {}, navigate() {} });
+  await nextTurn();
+  const afterMount = requests.length;
+
+  // rc_1 is 'succeeded' in the shared stub, so there is nothing to wait for.
+  t.mock.timers.tick(20000);
+  await nextTurn();
+  assert.equal(requests.length, afterMount);
+
+  dispose?.();
+  t.mock.timers.tick(20000);
+  await nextTurn();
+  assert.equal(requests.length, afterMount);
+});

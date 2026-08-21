@@ -7,6 +7,16 @@ import {
 
 const itemsOf = value => Array.isArray(value) ? value : value?.items || [];
 const TERMINAL_CAMPAIGN_STATES = new Set(['succeeded', 'completed', 'partial', 'failed']);
+// States worth polling in. Deliberately not the inverse of TERMINAL: that set
+// also decides which campaign opens by default, and `cancelled` belongs in
+// neither — it is finished, so polling it would never stop.
+const LIVE_CAMPAIGN_STATES = new Set(['queued', 'running']);
+// A campaign writes one company at a time and the results endpoint never gated
+// on completion, so the data was already arriving live — the page just told the
+// customer to reload. Five seconds is slower than a company takes to verify, so
+// nothing is missed, and it is two requests per tick against a run measured in
+// minutes.
+const LIVE_REFRESH_MS = 5000;
 const SUPPORTING_CLAIM_STATUSES = new Set(['observed', 'estimated_range']);
 
 function sentence(value, fallback = 'Not known') {
@@ -52,7 +62,7 @@ function campaignNotice(campaign) {
   if (['queued', 'running'].includes(campaign?.status)) return {
     tone: 'neutral',
     title: 'Research is running',
-    copy: 'Each company is verified against its sources before it appears. Reload to see new results.',
+    copy: 'Each company is verified against its sources before it appears. New results arrive here as they qualify.',
   };
   if (campaign?.status === 'cancelled') return {
     tone: 'warning',
@@ -472,6 +482,41 @@ export async function mount(root, ctx) {
     );
   }
 
+  async function refreshLive() {
+    if (disposed || !state.campaignId) return;
+    const campaignId = state.campaignId;
+    const view = state.view;
+    try {
+      const [campaigns, results] = await Promise.all([
+        call('researchCampaigns.list'),
+        call('researchCampaigns.results', { params: { campaignId }, query: { view } }),
+      ]);
+      // The customer may have switched brief or tab while this was in flight;
+      // landing a stale list on the new selection is worse than not refreshing.
+      if (disposed || state.campaignId !== campaignId || state.view !== view) return;
+      state.campaigns = itemsOf(campaigns);
+      const viewState = state.resultStates[view];
+      if (viewState.status === 'loaded') {
+        const items = itemsOf(results);
+        state.resultStates[view] = { status: 'loaded', items };
+        // Keep whatever the customer was reading open. It only moves if the
+        // result it pointed at is gone.
+        if (!items.some(item => item.id === state.selected[view])) {
+          state.selected[view] = items[0]?.id || '';
+        }
+      }
+      render();
+    } catch {
+      // A failed tick is not an error state: the last good list stays on screen
+      // and the next tick tries again. A run should not lose its results panel
+      // to one dropped request.
+    }
+  }
+
+  const liveTimer = setInterval(() => {
+    if (LIVE_CAMPAIGN_STATES.has(campaign()?.status)) void refreshLive();
+  }, LIVE_REFRESH_MS);
+
   try {
     const response = await call('researchCampaigns.list');
     if (!disposed) {
@@ -493,6 +538,7 @@ export async function mount(root, ctx) {
 
   return () => {
     disposed = true;
+    clearInterval(liveTimer);
     pageEl.classList.remove('ifz-page--research-results');
   };
 }
