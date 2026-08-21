@@ -405,3 +405,36 @@ class TestNeuralWattCommand:
         )
         out = ncmd.handle_neuralwatt_command("bogus", surface="gateway")
         assert "Unknown subcommand" in out
+
+
+class TestCollapseModelSwitchDetector:
+    """_collapse_caused_by_model_switch — pure function, no network."""
+
+    @staticmethod
+    def _turns(models):
+        return [{"requested_model": m} for m in models]
+
+    def test_switch_detected_at_boundary(self):
+        from hermes_cli.neuralwatt_cmd import _collapse_caused_by_model_switch
+
+        turns = [{"requested_model": "deepseek-v4-flash"}] * 27 + [
+            {"requested_model": "deepseek-v4-pro"}
+        ]
+        switched, before, after = _collapse_caused_by_model_switch(turns, 28)
+        assert switched is True
+        assert (before, after) == ("deepseek-v4-flash", "deepseek-v4-pro")
+
+    def test_same_model_not_flagged(self):
+        from hermes_cli.neuralwatt_cmd import _collapse_caused_by_model_switch
+
+        turns = [{"requested_model": "deepseek-v4-flash"}] * 5
+        switched, _, _ = _collapse_caused_by_model_switch(turns, 5)
+        assert switched is False
+
+    def test_out_of_range_turn_safe(self):
+        from hermes_cli.neuralwatt_cmd import _collapse_caused_by_model_switch
+
+        turns = [{"requested_model": "deepseek-v4-flash"}] * 3
+        for at in (1, 4, 99):
+            switched, *_ = _collapse_caused_by_model_switch(turns, at)
+            assert switched is False

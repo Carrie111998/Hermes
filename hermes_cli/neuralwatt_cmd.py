@@ -239,6 +239,25 @@ def cmd_energy(profile: Any, kwargs: dict[str, Any], days: int) -> str:
     return "\n".join(lines)
 
 
+def _collapse_caused_by_model_switch(
+    turns: list[dict[str, Any]], at_turn: int
+) -> tuple[bool, str, str]:
+    """Detect whether a cache collapse at ``at_turn`` sits on a model switch.
+
+    Turns are 1-indexed (``metrics.at_turn``); compares the ``requested_model``
+    of the turn BEFORE the collapse turn against the collapse turn itself.
+    A differing pair means the prefix cache was invalidated by the model
+    change, not by prompt churn.  Returns ``(switched, before, after)``.
+    """
+    if not turns or at_turn < 2 or at_turn > len(turns):
+        return False, "", ""
+    before = str(turns[at_turn - 2].get("requested_model") or "").strip()
+    after = str(turns[at_turn - 1].get("requested_model") or "").strip()
+    if not before or not after:
+        return False, before, after
+    return before != after, before, after
+
+
 def analyze_recent(profile: Any, kwargs: dict[str, Any], n: int = 10) -> dict[str, Any]:
     """Structured analysis of recent sessions — agent-consumable."""
     sessions = (
@@ -255,6 +274,7 @@ def analyze_recent(profile: Any, kwargs: dict[str, Any], n: int = 10) -> dict[st
     flagged: list[str] = []
     last_session_id: Optional[str] = None
     flags: list[dict[str, Any]] = []
+    model_switch_collapses: list[dict[str, Any]] = []
 
     for s in sessions:
         total_cost += float(s.get("cost_usd") or 0)
@@ -281,6 +301,25 @@ def analyze_recent(profile: Any, kwargs: dict[str, Any], n: int = 10) -> dict[st
                 if str(flag.get("severity")) in {"warn", "error"}:
                     flags.append(flag)
                     flagged.append(f"{str(flag.get('headline', flag.get('code')))}")
+            # ADDITIONAL signal (does not replace the above): attribute each
+            # collapse flag to a mid-conversation model switch when the
+            # turn models differ across the collapse boundary.
+            turns = detail.get("turns") or []
+            for flag in detail.get("flags") or []:
+                metrics = flag.get("metrics") or {}
+                at_turn = int(metrics.get("at_turn") or 0)
+                switched, before, after = _collapse_caused_by_model_switch(
+                    turns, at_turn
+                )
+                if switched and str(flag.get("severity")) in {"warn", "error"}:
+                    model_switch_collapses.append({
+                        "session_id": sid,
+                        "at_turn": at_turn,
+                        "before": before,
+                        "after": after,
+                        "headline": str(flag.get("headline", flag.get("code"))),
+                        "energy_joules": float(flag.get("energy_joules") or 0),
+                    })
 
     return {
         "sessions_seen": len(sessions),
@@ -294,6 +333,7 @@ def analyze_recent(profile: Any, kwargs: dict[str, Any], n: int = 10) -> dict[st
         "pro_turns": pro_turns,
         "pro_cost_usd": pro_usage_cost,
         "flags": flagged,
+        "model_switch_collapses": model_switch_collapses,
         "last_session_id": last_session_id,
     }
 
@@ -311,6 +351,14 @@ def cmd_analyze(profile: Any, kwargs: dict[str, Any], target: Optional[str]) -> 
         lines.append("⚠️ Flags:")
         for f in a["flags"][:4]:
             lines.append(f"  — {f}")
+    if a["model_switch_collapses"]:
+        lines.append("🔄 Collapses ON MODEL SWITCH (cache was warm — switch wiped it):")
+        for msc in a["model_switch_collapses"][:4]:
+            kj = float(msc["energy_joules"]) / 1000
+            lines.append(
+                f"  — {msc['before']}→{msc['after']} @ turn {msc['at_turn']} "
+                f"({kj:.1f} kJ) — switch only at /new"
+            )
     if a["low_cache_sessions"]:
         lines.append(
             f"ℹ️ {len(a['low_cache_sessions'])} session(s) with <60% cache-hit — "
