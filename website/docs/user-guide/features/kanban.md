@@ -615,6 +615,8 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
 | `auto_subscribe_on_create` | `true` | When `kanban_create` runs inside a persistent gateway/TUI session, terminal events resume that originating agent with a synthetic status turn. Set to `false` for passive completion or to require explicit `kanban_notify-subscribe` calls. Independent of `auto_decompose`. |
 | `done_sub_retention_days` | `30` | Notify subscriptions survive `done` (reopen-safe) and are removed on `archived`. The notifier GC purges subscriptions whose task has been `done` with no new events for this many days, bounding sub-table growth on boards that never archive. `0` disables the sweep. |
+| `enhanced_telegram_notifications` | `false` | Opt in to concise Telegram lifecycle messages. Sends one start after the first actual worker spawn, `milestone:` comments as updates, and concise blocked/completed messages. Heartbeats, ordinary comments, status plumbing, task IDs, board/profile/run details, and respawn starts stay silent. Other platforms and disabled installs retain the established behavior. |
+| `telegram_notification_throttle_seconds` | `60` | Minimum interval between enhanced milestone updates for one task subscription. Exact repeats within the interval are deduplicated; the same milestone may be reported again after the window. Suppressed events still advance the durable cursor, so enabling the feature later does not replay them. |
 
 And the two auxiliary LLM slots:
 

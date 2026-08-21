@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -23,6 +24,66 @@ from agent.i18n import t
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+_INTERNAL_TELEGRAM_DETAIL_RE = re.compile(
+    r"(?:\s*\[(?:kanban|board:[^\]\n]{1,40})\]"
+    r"|\s*\b(?:profile|run|status)=[^\s]+"
+    r"|\s*\bt_[0-9a-f]{6,}\b)",
+    re.IGNORECASE,
+)
+
+
+def _telegram_plain_text(value: Any, *, limit: int = 430) -> str:
+    """Return one concise, secret-safe line without orchestration plumbing."""
+    from agent.redact import redact_sensitive_text
+
+    text = redact_sensitive_text(str(value or ""), force=True)
+    text = _INTERNAL_TELEGRAM_DETAIL_RE.sub("", text)
+    text = " ".join(text.split()).strip(" .:-")
+    if len(text) > limit:
+        text = text[: max(0, limit - 1)].rstrip() + "…"
+    return text
+
+
+def _friendly_assignee(value: Any) -> str:
+    raw = str(value or "Specialist").strip().lstrip("@").replace("-", "_")
+    aliases = {"ccreviewer": "Reviewer", "ccwriter": "Writer", "ccarchitect": "Architect"}
+    if raw.lower() in aliases:
+        return aliases[raw.lower()]
+    return " ".join(part.capitalize() for part in raw.split("_") if part) or "Specialist"
+
+
+def _format_enhanced_telegram_message(kind: str, task: Any, payload: Optional[dict]) -> str:
+    """Format an opt-in Telegram lifecycle event in concise Nexus style."""
+    payload = payload or {}
+    specialist = _friendly_assignee(getattr(task, "assignee", None))
+    if kind == "spawned":
+        msg = f"🟡 {specialist} started: {_telegram_plain_text(getattr(task, 'title', ''))}"
+    elif kind == "commented":
+        msg = f"🔵 {specialist} update: {_telegram_plain_text(payload.get('milestone'))}"
+    elif kind in ("blocked", "block_loop_detected"):
+        reason = _telegram_plain_text(payload.get("reason") or "A decision or input is needed", limit=390)
+        if re.search(r"\breply\s*:", reason, re.IGNORECASE):
+            body = reason
+        else:
+            body = f"{reason}. Reply: provide the missing decision or input"
+        msg = f"🔴 Decision needed: {body}"
+    elif kind == "completed":
+        outcome = (
+            payload.get("enhanced_run_summary")
+            or payload.get("summary")
+            or getattr(task, "result", None)
+            or getattr(task, "title", "Completed")
+        )
+        lines = [line.strip() for line in str(outcome).splitlines() if line.strip()]
+        first = _telegram_plain_text(lines[0] if lines else outcome, limit=390)
+        extra = _telegram_plain_text(lines[1], limit=90) if len(lines) > 1 else ""
+        msg = f"✅ Complete: {first}" + (f". {extra}" if extra else "")
+    else:
+        return ""
+    # Redact again at the final boundary and enforce the hard concise cap.
+    from agent.redact import redact_sensitive_text
+    return redact_sensitive_text(msg, force=True)[:500].rstrip()
 
 
 def _resolve_auto_decompose_settings(
@@ -218,6 +279,10 @@ class GatewayKanbanWatchersMixin:
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
         TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        # Always claim lifecycle rows so enabling the opt-in later cannot replay
+        # events that happened while it was disabled. Suppressed rows merely
+        # advance the durable subscription cursor.
+        CLAIM_KINDS = TERMINAL_KINDS + ("spawned", "commented")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -268,6 +333,20 @@ class GatewayKanbanWatchersMixin:
 
         while self._running:
             try:
+                try:
+                    from hermes_cli.config import load_config as _load_cfg
+                    _live_kcfg = ((_load_cfg() or {}).get("kanban") or {})
+                except Exception:
+                    _live_kcfg = {}
+                _enhanced_telegram = bool(
+                    _live_kcfg.get("enhanced_telegram_notifications", False)
+                )
+                try:
+                    _telegram_throttle = max(
+                        0, int(_live_kcfg.get("telegram_notification_throttle_seconds", 60))
+                    )
+                except (TypeError, ValueError):
+                    _telegram_throttle = 60
                 _gc_due = time.monotonic() >= _gc_next_at
                 _gc_retention_days = 30
                 if _gc_due:
@@ -438,11 +517,52 @@ class GatewayKanbanWatchersMixin:
                                         platform=sub["platform"],
                                         chat_id=sub["chat_id"],
                                         thread_id=sub.get("thread_id") or "",
-                                        kinds=TERMINAL_KINDS,
+                                        kinds=CLAIM_KINDS,
                                     )
                                     if not events:
                                         continue
                                     task = _kb.get_task(conn, sub["task_id"])
+                                    enhanced_payloads: dict[int, dict[str, Any]] = {}
+                                    if _enhanced_telegram and platform == "telegram":
+                                        try:
+                                            first_spawn = conn.execute(
+                                                "SELECT MIN(id) FROM task_events "
+                                                "WHERE task_id = ? AND kind = 'spawned' AND id > ?",
+                                                (sub["task_id"], int(sub.get("created_event_id") or 0)),
+                                            ).fetchone()[0]
+                                            for event in events:
+                                                detail = dict(event.payload or {})
+                                                if event.kind == "completed" and event.run_id:
+                                                    run_row = conn.execute(
+                                                        "SELECT summary FROM task_runs WHERE id = ?",
+                                                        (event.run_id,),
+                                                    ).fetchone()
+                                                    if run_row and run_row["summary"]:
+                                                        detail["enhanced_run_summary"] = run_row["summary"]
+                                                elif event.kind == "spawned":
+                                                    detail["first_spawn"] = event.id == first_spawn
+                                                elif event.kind == "commented":
+                                                    comment_id = detail.get("comment_id")
+                                                    if comment_id:
+                                                        row = conn.execute(
+                                                            "SELECT body, created_at FROM task_comments "
+                                                            "WHERE id = ? AND task_id = ?",
+                                                            (comment_id, sub["task_id"]),
+                                                        ).fetchone()
+                                                        if row:
+                                                            detail["comment_body"] = row["body"]
+                                                            detail["comment_created_at"] = int(row["created_at"])
+                                                enhanced_payloads[event.id] = detail
+                                        except Exception as enrich_exc:
+                                            # The cursor was claimed atomically already. Enrichment is
+                                            # optional presentation data, so degrade to legacy payloads
+                                            # instead of stranding completed/blocked events.
+                                            logger.warning(
+                                                "kanban notifier: enhanced Telegram enrichment failed "
+                                                "for %s on board %s: %s",
+                                                sub["task_id"], slug, enrich_exc,
+                                            )
+                                            enhanced_payloads = {}
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -454,6 +574,7 @@ class GatewayKanbanWatchersMixin:
                                         "events": events,
                                         "task": task,
                                         "board": slug,
+                                        "enhanced_payloads": enhanced_payloads,
                                     })
                                 except Exception as sub_exc:
                                     # Isolate per-subscription failures so one
@@ -524,14 +645,57 @@ class GatewayKanbanWatchersMixin:
                     # "Task X completed" and re-decomposes work that already
                     # exists on the board.
                     wake_handoff = ""
+                    milestone_last = getattr(self, "_kanban_telegram_milestone_last", {})
+                    self._kanban_telegram_milestone_last = milestone_last
                     for ev in d["events"]:
                         kind = ev.kind
+                        milestone_delivery: Optional[tuple[int, str]] = None
+                        enhanced = _enhanced_telegram and platform_str == "telegram"
+                        display_payload = d.get("enhanced_payloads", {}).get(ev.id, ev.payload or {})
+                        if kind in ("spawned", "commented", "heartbeat") and not enhanced:
+                            continue
+                        if enhanced and kind == "heartbeat":
+                            continue
+                        if enhanced and kind == "spawned" and not display_payload.get("first_spawn"):
+                            continue
+                        if enhanced and kind == "commented":
+                            body = str(display_payload.get("comment_body") or "")
+                            match = re.match(r"^\s*milestone\s*:\s*(.+)$", body, re.IGNORECASE | re.DOTALL)
+                            if not match:
+                                continue
+                            milestone = _telegram_plain_text(match.group(1))
+                            if not milestone:
+                                continue
+                            event_at = int(display_payload.get("comment_created_at") or ev.created_at)
+                            last_delivery = milestone_last.get(sub_key)
+                            if last_delivery is not None and event_at - last_delivery[0] < _telegram_throttle:
+                                continue
+                            milestone_delivery = (event_at, milestone)
+                            display_payload["milestone"] = milestone
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
-                        if kind == "completed":
+                        if enhanced and kind in ("spawned", "commented", "blocked", "completed", "block_loop_detected"):
+                            msg = _format_enhanced_telegram_message(kind, task, display_payload)
+                            if kind == "completed":
+                                raw_handoff = (
+                                    (ev.payload or {}).get("summary")
+                                    or (task.result if task else "")
+                                    or ""
+                                )
+                                handoff_lines = str(raw_handoff).strip().splitlines()
+                                if handoff_lines:
+                                    wake_handoff = handoff_lines[0][:200]
+                        elif enhanced and kind == "review_requested":
+                            msg = f"👀 Review ready: {_telegram_plain_text((ev.payload or {}).get('summary') or title)}"
+                        elif enhanced and kind in ("gave_up", "crashed", "timed_out"):
+                            detail = (ev.payload or {}).get("error") or "The specialist could not continue"
+                            msg = f"⚠️ Attention needed: {_telegram_plain_text(detail)}"
+                        elif enhanced and kind in ("status", "archived", "unblocked"):
+                            continue
+                        elif kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
@@ -687,6 +851,8 @@ class GatewayKanbanWatchersMixin:
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
                             )
+                            if milestone_delivery is not None:
+                                milestone_last[sub_key] = milestone_delivery
                             # After delivering the text notification, surface
                             # any artifact paths the worker referenced in
                             # ``kanban_complete(summary=..., artifacts=[...])``
@@ -729,6 +895,7 @@ class GatewayKanbanWatchersMixin:
                                 )
                                 await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
                                 sub_fail_counts.pop(sub_key, None)
+                                milestone_last.pop(sub_key, None)
                             else:
                                 await asyncio.to_thread(
                                     self._kanban_rewind,
@@ -852,6 +1019,7 @@ class GatewayKanbanWatchersMixin:
                                     )
                                     await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
                                     sub_fail_counts.pop(sub_key, None)
+                                    milestone_last.pop(sub_key, None)
                                 else:
                                     # Rewind the pre-send claim so the next
                                     # tick retries the self-post — the event
@@ -952,6 +1120,7 @@ class GatewayKanbanWatchersMixin:
                                     )
                                     await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
                                     sub_fail_counts.pop(sub_key, None)
+                                    milestone_last.pop(sub_key, None)
                                 else:
                                     # Rewind the pre-send claim so the next
                                     # tick retries the wake — the event is
@@ -1003,6 +1172,7 @@ class GatewayKanbanWatchersMixin:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
                             )
+                            milestone_last.pop(sub_key, None)
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
             # Sleep with cancellation checks.

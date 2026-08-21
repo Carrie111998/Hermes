@@ -1510,6 +1510,7 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     delivery_mode TEXT NOT NULL DEFAULT 'notify',
     delivery_metadata TEXT,
     created_at    INTEGER NOT NULL,
+    created_event_id INTEGER NOT NULL DEFAULT 0,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
@@ -2763,6 +2764,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
             )
+        if "created_event_id" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "created_event_id",
+                "created_event_id INTEGER NOT NULL DEFAULT 0",
+            )
+            conn.execute(
+                "UPDATE kanban_notify_subs SET created_event_id = last_event_id"
+            )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2889,6 +2900,7 @@ _REBUILD_SPECS = {
         " chat_type TEXT,"
         " notifier_profile TEXT, delivery_mode TEXT NOT NULL DEFAULT 'notify',"
         " delivery_metadata TEXT, created_at INTEGER NOT NULL,"
+        " created_event_id INTEGER NOT NULL DEFAULT 0,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
@@ -3612,16 +3624,17 @@ def _inherit_notify_subs(
         INSERT OR IGNORE INTO kanban_notify_subs
             (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
              chat_type, notifier_profile, delivery_mode, delivery_metadata,
-             created_at, last_event_id)
+             created_at, created_event_id, last_event_id)
         SELECT ?, platform, chat_id, thread_id, user_id, user_id_alt,
                COALESCE(chat_type, 'dm'), notifier_profile,
-               COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
+               COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?, ?
           FROM kanban_notify_subs
          WHERE task_id IN ({placeholders})
         """,
         (
             child_id,
             int(created_at if created_at is not None else time.time()),
+            cursor,
             cursor,
             *parent_ids,
         ),
@@ -3999,8 +4012,12 @@ def add_comment(
             "VALUES (?, ?, ?, ?)",
             (task_id, author.strip(), body.strip(), now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        comment_id = int(cur.lastrowid or 0)
+        _append_event(
+            conn, task_id, "commented",
+            {"comment_id": comment_id, "author": author, "len": len(body)},
+        )
+        return comment_id
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
@@ -11443,8 +11460,9 @@ def add_notify_sub(
             INSERT OR IGNORE INTO kanban_notify_subs
                 (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
                  chat_type, notifier_profile, delivery_mode, delivery_metadata,
-                 created_at, last_event_id)
+                 created_at, created_event_id, last_event_id)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0),
                     COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
             """,
             (
@@ -11459,6 +11477,7 @@ def add_notify_sub(
                 insert_mode,
                 metadata_json,
                 now,
+                task_id,
                 task_id,
             ),
         )

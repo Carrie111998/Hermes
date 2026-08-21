@@ -35,6 +35,20 @@ def _assert_inherited_notify_sub(subs: list[dict]) -> None:
     assert subs[0]["notifier_profile"] == "default"
 
 
+def test_comment_event_links_comment_without_duplicating_body(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="linked comment", assignee="worker1")
+        comment_id = kb.add_comment(conn, tid, "worker1", "Milestone: schema ready")
+        event = kb.list_events(conn, tid)[-1]
+    finally:
+        conn.close()
+
+    assert event.kind == "commented"
+    assert event.payload["comment_id"] == comment_id
+    assert "body" not in event.payload
+
+
 def test_notify_sub_delivery_mode_persists_and_last_write_wins(kanban_home):
     """delivery_mode persists; an explicit re-subscribe is last-write-wins, a
     ``None`` re-subscribe leaves the existing mode untouched, an unknown value

@@ -1488,6 +1488,13 @@ def test_default_config_kanban_block_not_dropped_by_duplicate_key():
     assert "auto_decompose" in kanban
 
 
+def test_enhanced_telegram_kanban_notifications_are_safe_by_default():
+    """Upstream installs must opt in; the throttle has a conservative default."""
+    kanban = DEFAULT_CONFIG["kanban"]
+    assert kanban["enhanced_telegram_notifications"] is False
+    assert kanban["telegram_notification_throttle_seconds"] == 60
+
+
 def test_default_config_has_no_duplicate_top_level_keys():
     """Guard against any duplicate key silently shadowing a default."""
     import ast

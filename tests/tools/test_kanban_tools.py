@@ -579,6 +579,13 @@ def test_kanban_guidance_orchestrator_decision_ownership():
     assert "workers cannot see sibling context" in KANBAN_GUIDANCE
 
 
+def test_kanban_guidance_teaches_milestone_comment_convention():
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "milestone:" in KANBAN_GUIDANCE
+    assert "kanban_comment" in KANBAN_GUIDANCE
+
+
 # ---------------------------------------------------------------------------
 # Worker task-ownership enforcement (regression tests for #19534)
 # ---------------------------------------------------------------------------

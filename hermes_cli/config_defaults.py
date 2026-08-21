@@ -2590,6 +2590,10 @@ DEFAULT_CONFIG = {
         # so stale rows don't accumulate and get scanned on every notifier
         # tick forever. Set 0 to disable the sweep.
         "done_sub_retention_days": 30,
+        # Opt-in richer Telegram lifecycle pings. Kept off so upgrades retain
+        # the established terminal-only notification behavior.
+        "enhanced_telegram_notifications": False,
+        "telegram_notification_throttle_seconds": 60,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
