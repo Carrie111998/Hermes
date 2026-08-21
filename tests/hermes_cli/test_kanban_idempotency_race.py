@@ -174,3 +174,121 @@ def test_migration_archives_duplicate_active_keys_without_losing_history(kanban_
     assert index is not None
     assert "CREATE UNIQUE INDEX" in index.upper()
     assert "status != 'archived'" in index
+
+
+@pytest.mark.parametrize(
+    "legacy_key, canonical_key",
+    [
+        ("\tkey\t", "key"),
+        ("\nkey\r\n", "key"),
+    ],
+)
+def test_legacy_whitespace_keys_share_canonical_active_task(
+    kanban_home, legacy_key, canonical_key,
+):
+    """ASCII tab/newline legacy keys dedupe without rewriting history/text."""
+    path = kb.kanban_db_path()
+
+    with kb.connect_closing() as conn:
+        conn.execute("DROP INDEX IF EXISTS idx_tasks_idempotency")
+        conn.execute("CREATE INDEX idx_tasks_idempotency ON tasks(idempotency_key)")
+        for task_id, created_at, key in (
+            ("legacy-old", 100, legacy_key),
+            ("canonical-new", 200, canonical_key),
+        ):
+            conn.execute(
+                "INSERT INTO tasks "
+                "(id, title, status, created_at, idempotency_key) "
+                "VALUES (?, ?, 'ready', ?, ?)",
+                (task_id, task_id, created_at, key),
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'legacy_history', ?, ?)",
+                (task_id, '{"source":"before-migration"}', created_at + 1),
+            )
+
+    kb.init_db(path)
+
+    with kb.connect_closing() as conn:
+        active = conn.execute(
+            "SELECT id FROM tasks "
+            f"WHERE {kb._IDEMPOTENCY_KEY_SQL_EXPR} = ? "
+            "AND status != 'archived'",
+            (canonical_key,),
+        ).fetchall()
+        archived = conn.execute(
+            "SELECT id, idempotency_key, status FROM tasks WHERE id = 'legacy-old'"
+        ).fetchone()
+        stored_keys = conn.execute(
+            "SELECT idempotency_key FROM tasks ORDER BY created_at, id"
+        ).fetchall()
+        index = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'index' AND name = 'idx_tasks_idempotency'"
+        ).fetchone()["sql"]
+
+        assert (
+            kb.create_task(conn, title="replayed", idempotency_key=canonical_key)
+            == "canonical-new"
+        )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="index 'idx_tasks_idempotency'",
+        ):
+            with kb.write_txn(conn):
+                conn.execute(
+                    "INSERT INTO tasks "
+                    "(id, title, status, created_at, idempotency_key) "
+                    "VALUES ('legacy-attempt', 'attempt', 'ready', 300, ?)",
+                    (legacy_key,),
+                )
+        old_events = kb.list_events(conn, "legacy-old")
+        new_events = kb.list_events(conn, "canonical-new")
+
+    assert [row["id"] for row in active] == ["canonical-new"]
+    assert archived["status"] == "archived"
+    assert archived["idempotency_key"] == legacy_key
+    assert [row["idempotency_key"] for row in stored_keys] == [legacy_key, canonical_key]
+    assert [event.kind for event in old_events] == ["legacy_history", "archived"]
+    assert [event.kind for event in new_events] == ["legacy_history"]
+    expected_sql_expression = (
+        "TRIM(idempotency_key, char(9) || char(10) || char(11) || "
+        "char(12) || char(13) || ' ')"
+    )
+    assert expected_sql_expression in index
+
+
+@pytest.mark.parametrize("winner_key", ("\tkey\t", "\nkey\r"))
+def test_integrity_error_recovery_uses_canonical_key(
+    kanban_home, monkeypatch, winner_key,
+):
+    """Raced tab/newline legacy keys resolve through the expression index."""
+    with kb.connect_closing() as conn, kb.connect_closing() as winner_conn:
+        def insert_winner() -> str:
+            with kb.write_txn(winner_conn):
+                winner_conn.execute(
+                    "INSERT INTO tasks "
+                    "(id, title, status, created_at, idempotency_key) "
+                    "VALUES ('spaced-winner', 'winner', 'ready', 1, ?)",
+                    (winner_key,),
+                )
+            return "losing-id"
+
+        monkeypatch.setattr(kb, "_new_task_id", insert_winner)
+        assert (
+            kb.create_task(conn, title="raced", idempotency_key="key")
+            == "spaced-winner"
+        )
+
+
+def test_unrelated_integrity_error_is_not_misclassified(kanban_home, monkeypatch):
+    """A task-id conflict is still raised instead of becoming an idempotent hit."""
+    with kb.connect_closing() as conn:
+        existing_id = kb.create_task(
+            conn, title="existing", idempotency_key="existing-key"
+        )
+        monkeypatch.setattr(kb, "_new_task_id", lambda: existing_id)
+
+        with pytest.raises(sqlite3.IntegrityError, match="tasks.id"):
+            kb.create_task(conn, title="collision", idempotency_key="new-key")
