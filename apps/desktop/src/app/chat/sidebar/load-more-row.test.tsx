@@ -37,6 +37,12 @@ describe('SidebarLoadMoreRow', () => {
     expect(button.closest('[data-slot="tooltip-trigger"]')).toBeTruthy()
   })
 
+  it('renders the count label as visible text in row variant', () => {
+    render(<SidebarLoadMoreRow onClick={vi.fn()} step={1} variant="row" />)
+
+    expect(screen.getByRole('button', { name: 'Load 1 more…' })).toHaveTextContent('Load 1 more…')
+  })
+
   it('wraps the button in a Tip with the generic label when step is 0', () => {
     render(<SidebarLoadMoreRow onClick={vi.fn()} step={0} />)
 
