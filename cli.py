@@ -4967,6 +4967,22 @@ class _VoiceInputMessage:
         return self.text
 
 
+class _SyntheticInputMessage(str):
+    """Marker for non-user text injected into the interactive input queue."""
+
+    @property
+    def text(self) -> str:
+        return str(self)
+
+
+def _is_real_user_input(value: Any) -> bool:
+    """Return whether a queued input value originated from the interactive user."""
+    return (
+        isinstance(value, (str, _VoiceInputMessage))
+        and not isinstance(value, _SyntheticInputMessage)
+    )
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -12015,7 +12031,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             retry_msg = self.retry_last()
             if retry_msg and hasattr(self, '_pending_input'):
                 # Re-queue the message so process_loop sends it to the agent
-                self._pending_input.put(retry_msg)
+                self._pending_input.put(_SyntheticInputMessage(retry_msg))
         elif canonical == "prompt":
             self._handle_prompt_compose_command(cmd_original)
         elif canonical == "undo":
@@ -12410,7 +12426,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             f"[yellow]Skipped missing skills: {', '.join(missing)}[/]"
                         )
                     if hasattr(self, '_pending_input'):
-                        self._pending_input.put(msg)
+                        self._pending_input.put(_SyntheticInputMessage(msg))
                 else:
                     ChatConsole().print(
                         f"[bold red]Failed to load bundle for {base_cmd}[/]"
@@ -12443,7 +12459,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                 f"[yellow]Skipped missing skills: {', '.join(missing)}[/]"
                             )
                         if hasattr(self, '_pending_input'):
-                            self._pending_input.put(msg)
+                            self._pending_input.put(_SyntheticInputMessage(msg))
                     else:
                         ChatConsole().print(
                             f"[bold red]Failed to load stacked skills for {base_cmd}[/]"
@@ -12457,7 +12473,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     skill_name = skill_commands[base_cmd]["name"]
                     print(f"\n⚡ Loading skill: {skill_name}")
                     if hasattr(self, '_pending_input'):
-                        self._pending_input.put(msg)
+                        self._pending_input.put(_SyntheticInputMessage(msg))
                 else:
                     ChatConsole().print(f"[bold red]Failed to load skill for {base_cmd}[/]")
             else:
@@ -12555,13 +12571,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def _route_pre_user_input(self, text: str, *, has_attachments: bool = False) -> str:
         """Let plugins rewrite one eligible interactive CLI input."""
-        goal_active = False
         manager = self._get_goal_manager()
-        if manager is not None:
-            try:
-                goal_active = manager.is_active()
-            except Exception:
-                logger.debug("pre-user-input goal check failed", exc_info=True)
+        if manager is None:
+            return text
+        try:
+            goal_active = manager.is_active()
+        except Exception:
+            logger.debug("pre-user-input goal check failed", exc_info=True)
+            return text
         if goal_active:
             return text
         try:
@@ -12572,7 +12589,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 text=text,
                 session_key=str(getattr(self, "session_id", "") or ""),
                 platform="cli",
-                goal_active=False,
+                goal_active=goal_active,
                 has_attachments=has_attachments,
             )
         except Exception:
@@ -12640,7 +12657,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             continue
                         prompt = mgr.due_prompt()
                         if prompt:
-                            self._pending_input.put(prompt)
+                            self._pending_input.put(_SyntheticInputMessage(prompt))
                     except Exception as exc:
                         logging.debug("heartbeat watchdog tick failed: %s", exc)
             finally:
@@ -12715,7 +12732,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             state = mgr.state
             tick_no = state.ticks_fired if state else "?"
             _cprint(f"  {_DIM}↻ /loop wakeup #{tick_no} firing…{_RST}")
-            self._pending_input.put(wakeup)
+            self._pending_input.put(_SyntheticInputMessage(wakeup))
         except Exception as exc:
             logging.debug("loop tick injection failed: %s", exc)
             try:
@@ -12839,7 +12856,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             claim = claim_event_delivery(event, consumer)
             if claim is None:
                 continue
-            self._pending_input.put(synthetic_message)
+            self._pending_input.put(_SyntheticInputMessage(synthetic_message))
             complete_event_delivery(event, claim)
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
@@ -12913,6 +12930,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         # unpack for inspection.
                         if isinstance(entry, tuple) and entry:
                             entry = entry[0]
+                        if isinstance(entry, _SyntheticInputMessage):
+                            continue
                         if isinstance(entry, str) and _looks_like_slash_command(entry):
                             continue
                         has_real_message = True
@@ -12989,7 +13008,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             prompt = decision.get("continuation_prompt")
             if prompt:
                 try:
-                    self._pending_input.put(prompt)
+                    self._pending_input.put(_SyntheticInputMessage(prompt))
                 except Exception as exc:
                     logging.debug("goal continuation enqueue failed: %s", exc)
 
@@ -20199,6 +20218,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
                     # Voice-transcribed messages arrive wrapped in a sentinel
                     # so only genuine STT output gets the voice prefix (#65827).
+                    is_real_user_input = _is_real_user_input(user_input)
+                    is_synthetic_input = isinstance(user_input, _SyntheticInputMessage)
+                    if is_synthetic_input:
+                        user_input = user_input.text
                     is_voice_input = isinstance(user_input, _VoiceInputMessage)
                     if is_voice_input:
                         user_input = user_input.text
@@ -20274,6 +20297,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if (
                         not _file_drop
                         and not is_voice_input
+                        and is_real_user_input
                         and not submit_images
                         and isinstance(user_input, str)
                         and user_input.strip()

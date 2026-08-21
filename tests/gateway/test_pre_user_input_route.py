@@ -17,7 +17,7 @@ async def test_gateway_input_route_rewrites_off_event_loop_and_notices(monkeypat
         _store=runner.session_store,
         get_or_create_session=AsyncMock(return_value=SimpleNamespace(session_id="gateway-session"))
     )
-    runner._goal_still_active_for_session = lambda _session_id: False
+    runner._goal_active_for_input_route = lambda _session_id: False
     runner._session_key_for_source = lambda _source: "gateway-key"
     runner._deliver_platform_notice = AsyncMock()
     caller_thread = threading.get_ident()
@@ -49,9 +49,36 @@ async def test_gateway_input_route_skips_active_goal(monkeypatch):
         _store=runner.session_store,
         get_or_create_session=AsyncMock(return_value=SimpleNamespace(session_id="gateway-session"))
     )
-    runner._goal_still_active_for_session = lambda _session_id: True
+    runner._goal_active_for_input_route = lambda _session_id: True
     runner._session_key_for_source = lambda _source: "gateway-key"
     runner._deliver_platform_notice = AsyncMock()
+    called = False
+
+    def route(**_payload):
+        nonlocal called
+        called = True
+        return "changed", None
+
+    monkeypatch.setattr("hermes_cli.lifecycle.route_pre_user_input", route)
+    event = MessageEvent(
+        text="follow up",
+        message_type=MessageType.TEXT,
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="chat", user_id="user"),
+    )
+
+    assert await runner._route_pre_user_input(event) is event
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_gateway_input_route_skips_unknown_goal_state(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = object()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(return_value=SimpleNamespace(session_id="gateway-session")),
+    )
+    runner._goal_active_for_input_route = lambda _session_id: None
     called = False
 
     def route(**_payload):

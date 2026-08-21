@@ -9074,6 +9074,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("goal continuation: active-state recheck failed: %s", exc)
             return False
 
+    def _goal_active_for_input_route(self, session_id: str) -> Optional[bool]:
+        """Return goal state for input routing, or ``None`` when unknown."""
+        if not session_id:
+            return None
+        try:
+            from hermes_cli.goals import GoalManager
+            return bool(GoalManager(session_id=session_id).is_active())
+        except Exception as exc:
+            logger.debug("pre-user-input goal check failed: %s", exc)
+            return None
+
     def _update_runtime_status(self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None) -> None:
         try:
             from gateway.status import write_runtime_status
@@ -15955,7 +15966,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source = event.source
         entry = await self.async_session_store.get_or_create_session(source)
         session_id = str(getattr(entry, "session_id", "") or "")
-        if await asyncio.to_thread(self._goal_still_active_for_session, session_id):
+        goal_active = await asyncio.to_thread(
+            self._goal_active_for_input_route, session_id,
+        )
+        if goal_active is not False:
             return event
 
         from hermes_cli.lifecycle import route_pre_user_input
@@ -15966,7 +15980,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             text=event.text,
             session_key=self._session_key_for_source(source),
             platform=source.platform.value if source.platform else "",
-            goal_active=False,
+            goal_active=goal_active,
             has_attachments=False,
         )
         if notice:
@@ -21423,6 +21437,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             source=source,
                             message_id=None,
                             channel_prompt=None,
+                            internal=True,
                         )
                         self._enqueue_fifo(quick_key, hb_event, adapter)
                     except Exception as exc:
@@ -21598,6 +21613,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source=source,
                     message_id=None,
                     channel_prompt=None,
+                    internal=True,
                 )
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
