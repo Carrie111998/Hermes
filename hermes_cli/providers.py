@@ -135,6 +135,12 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         transport="openai_chat",
         base_url_env_var="DEEPSEEK_BASE_URL",
     ),
+    "neuralwatt": HermesOverlay(
+        transport="openai_chat",
+        extra_env_vars=("NEURALWATT_API_KEY",),
+        base_url_env_var="NEURALWATT_BASE_URL",
+        base_url_override="https://api.neuralwatt.com/v1",
+    ),
     "alibaba": HermesOverlay(
         transport="openai_chat",
         base_url_env_var="DASHSCOPE_BASE_URL",
@@ -350,6 +356,10 @@ ALIASES: Dict[str, str] = {
 
     # deepseek
     "deep-seek": "deepseek",
+
+    # neuralwatt
+    "nw": "neuralwatt",
+    "neural-watt": "neuralwatt",
 
     # alibaba
     "dashscope": "alibaba",

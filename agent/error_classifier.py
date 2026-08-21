@@ -1488,6 +1488,19 @@ def _classify_400(
 ) -> ClassifiedError:
     """Classify 400 Bad Request — context overflow, format error, or generic."""
 
+    # NeuralWatt ``internal_routing_error`` — the ONE retryable 400. The
+    # request was within the model's advertised context window but landed on
+    # a server that cannot serve the full window; it usually succeeds on
+    # retry (NeuralWatt error-handling guide). Do not shorten the prompt.
+    if (
+        (provider or "").lower() in {"neuralwatt", "nw", "neural-watt"}
+        and error_code == "internal_routing_error"
+    ):
+        return result_fn(
+            FailoverReason.server_error,
+            retryable=True,
+        )
+
     # Multimodal tool content rejected from 400.  Must be checked BEFORE
     # image_too_large because the recovery is different (strip image parts
     # from tool messages, mark the model as no-list-tool-content for the
