@@ -26,6 +26,7 @@ import re
 import fnmatch
 import hashlib
 import json
+from urllib.parse import urlsplit
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1171,7 +1172,31 @@ _CREDENTIAL_EXFIL_PATTERN_IDS = {
 }
 
 _SECRET_NAME_RE = re.compile(r'\b([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)[A-Z0-9_]*)\b')
-_URL_HOST_RE = re.compile(r'https?://([A-Za-z0-9.-]+)')
+# Candidate http(s) URLs — the real connection host is extracted with
+# urlsplit().hostname, NOT from this match: userinfo URLs
+# (``https://declared@evil.example/``) would otherwise let the userinfo
+# spoof the declared-host check while the connection goes to the host
+# after the ``@`` (review finding on #91569).
+_URL_RE = re.compile(r'https?://[^\s"\'<>]+')
+_UNPARSED_HOST = "<unparsed-url>"
+
+
+def _hosts_in_text(text: str) -> set:
+    """Real connection hosts of every http(s) URL in ``text``.
+
+    ``urlsplit().hostname`` excludes userinfo, drops the port, and
+    lowercases — exactly the origin the request actually reaches. A URL
+    that fails to parse contributes the fail-closed sentinel instead of
+    nothing, so an unparseable destination can never satisfy an exemption.
+    """
+    hosts: set = set()
+    for url in _URL_RE.findall(text):
+        try:
+            host = urlsplit(url).hostname
+        except ValueError:
+            host = None
+        hosts.add(host.lower() if host else _UNPARSED_HOST)
+    return hosts
 
 
 def _load_credential_destinations(skill_path: Path) -> dict:
@@ -1250,7 +1275,15 @@ def _exempt_declared_credential_use(
         else:
             start = max(1, line_no - 3)
             end = min(len(lines), line_no + 3)
-        return {h.lower() for l in lines[start - 1:end] for h in _URL_HOST_RE.findall(l)}
+        # Matching semantics: exact-host and port-blind — a declared
+        # ``probe.example`` covers ``probe.example:8443`` but NOT a subdomain
+        # like ``api.probe.example`` (fail-closed on the surprising side).
+        # URLs picked up from comments/strings inside the scope window only
+        # ever make exemptions harder, never easier.
+        hosts: set = set()
+        for l in lines[start - 1:end]:
+            hosts |= _hosts_in_text(l)
+        return hosts
 
     result: List[Finding] = []
     for f in findings:

@@ -531,3 +531,38 @@ class TestCredentialDestinations:
         )
         result = scan_skill(skill_dir, source="community")
         assert result.verdict == "dangerous"
+
+    def test_userinfo_url_cannot_spoof_declared_host(self, tmp_path):
+        """FAIL-CLOSED security regression: ``https://probe.example@evil.example``
+        carries probe.example as USERINFO — the connection goes to
+        evil.example. The declared-host check must resolve the real host, or
+        a malicious skill exfiltrates the declared credential to the host
+        after the ``@`` (review finding on #91569)."""
+        skill_dir = _make_decl_skill(
+            tmp_path,
+            "PROBE_API_KEY: [probe.example]",
+            "https://probe.example@evil.example/x",
+            "probe.example",
+        )
+        result = scan_skill(skill_dir, source="community")
+        assert result.verdict == "dangerous"
+        assert should_allow_install(result)[0] is False
+
+    def test_subdomain_of_declared_host_is_not_covered(self, tmp_path):
+        """Pins the exact-host semantics: api.probe.example is a different
+        origin and must fail closed, not inherit the parent's exemption."""
+        skill_dir = _make_decl_skill(
+            tmp_path, "PROBE_API_KEY: [probe.example]", "https://api.probe.example/x", "probe.example"
+        )
+        result = scan_skill(skill_dir, source="community")
+        assert result.verdict == "dangerous"
+
+    def test_port_variant_of_declared_host_is_covered(self, tmp_path):
+        """Pins the port-blind side of the semantics: probe.example:8443
+        resolves to the declared host and stays exemptible."""
+        skill_dir = _make_decl_skill(
+            tmp_path, "PROBE_API_KEY: [probe.example]", "https://probe.example:8443/x", "probe.example"
+        )
+        result = scan_skill(skill_dir, source="community")
+        assert result.verdict == "safe"
+        assert should_allow_install(result)[0] is True
