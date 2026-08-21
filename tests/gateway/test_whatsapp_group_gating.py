@@ -82,7 +82,9 @@ def test_group_messages_can_require_direct_trigger_via_config():
             quotedParticipant="15551230000@lid",
         )
     ) is True
-    assert adapter._should_process_message(_group_message("/status")) is True
+    # Unlike Telegram, a WhatsApp slash command has no bot-address suffix.
+    # It must not bypass a group's explicit mention requirement.
+    assert adapter._should_process_message(_group_message("/status")) is False
 
 
 def test_regex_mention_patterns_allow_custom_wake_words():
