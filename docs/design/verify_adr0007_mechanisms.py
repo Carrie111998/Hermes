@@ -72,7 +72,7 @@ CREATE TABLE run_artifacts (
     sealed INTEGER NOT NULL DEFAULT 0, UNIQUE(run_id, artifact_path),
     CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*')
 );
-CREATE TRIGGER trg_run_evidence_sealed BEFORE UPDATE ON run_artifacts
+CREATE TRIGGER trg_run_artifacts_sealed BEFORE UPDATE ON run_artifacts
 WHEN OLD.sealed = 1
 BEGIN SELECT RAISE(ABORT, 'evidence row is sealed'); END;
 
