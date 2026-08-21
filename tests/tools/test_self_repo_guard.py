@@ -402,6 +402,22 @@ class TestWindowsQuotedNativePathResolution:
         hit, _ = _detect(command, tmp_path, repo)
         assert hit is True
 
+    def test_dash_c_echo_literal_substitution_targeting_repo(self, repo, tmp_path):
+        # Git Bash executes POSIX substitutions on Windows before launching Git.
+        command = f'git -C "$(echo {repo.as_posix()})" checkout main'
+        hit, _ = _detect(command, tmp_path, repo)
+        assert hit is True
+
+    def test_dash_c_more_than_eight_nested_echo_substitutions(self, repo, tmp_path):
+        # Nine levels cross the production evaluator's ``depth > 8`` cap and
+        # must therefore fail closed for a mutating Git subcommand.
+        substitution = f"'{repo.as_posix()}'"
+        for _ in range(9):
+            substitution = f"$(echo {substitution})"
+        command = f'git -C "{substitution}" checkout main'
+        hit, _ = _detect(command, tmp_path, repo)
+        assert hit is True
+
     def test_explicit_work_tree_targeting_repo(self, repo, tmp_path):
         command = f"git --work-tree='{repo}' checkout main"
         hit, _ = _detect(command, tmp_path, repo)
