@@ -106,9 +106,18 @@ def _redirect_uri(request: Request) -> str:
 
 
 def _client_ip(request: Request) -> str:
+    """Resolve the client IP from the request.
+
+    When an ``X-Forwarded-For`` header is present, the **rightmost**
+    address is used.  The leftmost value is the original client and is
+    trivially spoofable by the requester; the rightmost value is the
+    one appended by the nearest proxy and is harder to forge.  If no
+    header is present, the direct socket peer address is returned.
+    """
     fwd = request.headers.get("x-forwarded-for", "")
     if fwd:
-        return fwd.split(",")[0].strip()
+        # Rightmost value = added by the nearest upstream proxy.
+        return fwd.split(",")[-1].strip()
     return request.client.host if request.client else ""
 
 
