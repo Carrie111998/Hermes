@@ -314,11 +314,12 @@ def terminate_pid(pid: int, *, force: bool = False) -> None:
     Hermes gateway crashes on Windows (the parent cmd.exe wrapper dies, leaving
     child python.exe as an unreapable job-object orphan). When that happens on
     the `force=False` path, escalate to `taskkill /T /F` (the same call used
-    by the `force=True` path) so the gateway restart manager can actually
-    replace the dead instance instead of bailing out at the `return False` call
-    in `gateway/run.py` start_gateway() that follows the PermissionError catch.
-    Without this escalation, every Hermes gateway crash on Windows is
-    unrecoverable until an operator manually kills the orphan.
+    by the `force=True` path) so the gateway restart manager's `--replace`
+    path can actually replace the dead instance instead of bailing out at the
+    `return False` in `gateway/run.py` start_gateway() that follows the
+    PermissionError catch on this function. Without this escalation, every
+    Hermes gateway crash on Windows is unrecoverable until an operator manually
+    kills the orphan.
     """
     if force and _IS_WINDOWS:
         # CREATE_NO_WINDOW: terminate_pid runs from the windowless pythonw.exe
