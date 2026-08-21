@@ -114,12 +114,8 @@ def test_profile_overrides_share_capacity_across_ready_and_review(
             kb.create_task(conn, title=f"beta-{i}", assignee="beta")
             for i in range(4)
         ]
+        assert kb.claim_task(conn, running_alpha) is not None
         with kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET status = 'running', claim_lock = 'test:1' "
-                "WHERE id = ?",
-                (running_alpha,),
-            )
             conn.execute(
                 "UPDATE tasks SET status = 'review' WHERE id = ?",
                 (review_alpha,),
@@ -139,6 +135,7 @@ def test_profile_overrides_share_capacity_across_ready_and_review(
     assert ready_alpha in capped_ids
     assert review_alpha in capped_ids
     assert not {ready_alpha, review_alpha}.intersection(spawned_ids)
+    assert not [task_id for task_id, assignee, _ in res.spawned if assignee == "alpha"]
     assert len(spawned_ids.intersection(beta_ids)) == 3
 
 

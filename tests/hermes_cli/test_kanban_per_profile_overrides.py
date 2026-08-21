@@ -117,10 +117,7 @@ def test_override_counts_pre_existing_running(
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
         running_alpha = kb.create_task(conn, title="running alpha", assignee="alpha")
-        conn.execute(
-            "UPDATE tasks SET status = 'running', claim_lock = 'test:1' WHERE id = ?",
-            (running_alpha,),
-        )
+        assert kb.claim_task(conn, running_alpha) is not None
         for i in range(3):
             kb.create_task(conn, title=f"a{i}", assignee="alpha")
     with kb.connect_closing() as conn:
