@@ -36,7 +36,7 @@ CLEAR by a screen run earlier in the same session.
 ### 1. Run the screen
 
 ```bash
-contrib-screen <owner>/<repo>#<issue-number>
+contrib-screen screen <owner>/<repo>#<issue-number>
 ```
 
 This runs three checks — duplicate PR (via the issue's cross-reference
