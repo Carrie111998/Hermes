@@ -36,7 +36,6 @@ async function probeWindowsRemote(ssh, explicitHermesPath = '') {
     '$hermes=$candidates|Where-Object{Test-Path -LiteralPath $_ -PathType Leaf}|Select-Object -First 1',
     'if(-not $hermes){throw "Hermes is not installed on the remote Windows host."}',
     'if($explicit -and $hermes -ne $explicit){throw "The configured Hermes path is not an executable file."}',
-    '# Try the standard installer layout (venv\\Scripts) first, then fall back to sibling path',
     '$pythonCandidates=@()',
     '$pythonCandidates+=(Join-Path $hermesHome "hermes-agent\\venv\\Scripts\\python.exe")',
     '$pythonCandidates+=(Join-Path (Split-Path $hermes) "python.exe")',
