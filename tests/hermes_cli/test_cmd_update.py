@@ -1236,3 +1236,21 @@ class TestUpdateNodeDependencies:
         assert cwd_calls, "expected at least one npm call"
         for cwd in cwd_calls:
             assert cwd == tmp_path, f"npm must run from PROJECT_ROOT; got cwd={cwd}"
+
+
+class TestVenvPythonHoldersMessage:
+    """Regression for #90778: venv holder message derived from token, distinguishing serve and dashboard."""
+
+    def test_holder_message_distinguishes_serve_and_dashboard(self):
+        from hermes_cli.update_cmd import _format_venv_python_holders_message
+
+        matches = [
+            (1234, "python.exe", r"C:\serve_path\venv\Scripts\python.exe -m hermes_cli.main dashboard"),
+            (5678, "python.exe", r"C:\tools\hermes\venv\Scripts\python.exe serve --port 9120"),
+            (9999, "python.exe", r"C:\tools\hermes\venv\Scripts\python.exe -m gateway.run"),
+        ]
+        msg = _format_venv_python_holders_message(matches)
+        assert "← Hermes dashboard (run `hermes dashboard --stop`)" in msg
+        assert "← Hermes Desktop backend (close the desktop app)" in msg
+        assert "← gateway" in msg
+        assert "hermes dashboard --stop" in msg

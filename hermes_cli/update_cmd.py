@@ -3848,10 +3848,16 @@ def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> 
     ]
     for pid, name, cmdline in matches[:6]:
         hint = ""
-        low = cmdline.lower()
-        if "serve" in low or "dashboard" in low:
+        try:
+            argv = shlex.split(cmdline, posix=False)
+        except ValueError:
+            argv = cmdline.split()
+        tokens = {a.strip('"').lower() for a in argv}
+        if "serve" in tokens:
             hint = "  ← Hermes Desktop backend (close the desktop app)"
-        elif "gateway" in low:
+        elif "dashboard" in tokens:
+            hint = "  ← Hermes dashboard (run `hermes dashboard --stop`)"
+        elif any(t == "gateway" or t.startswith("gateway.") for t in tokens):
             hint = "  ← gateway"
         lines.append(f"  PID {pid}  {name}  {cmdline[:120]}{hint}")
     if len(matches) > 6:
@@ -3864,7 +3870,7 @@ def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> 
         "  dependency update would fail partway and leave a broken install."
     )
     lines.append(
-        "  Close the Hermes desktop app / other Hermes terminals, then re-run:"
+        "  Close the Hermes desktop app, stop the dashboard (`hermes dashboard --stop`), or close other Hermes terminals, then re-run:"
     )
     lines.append("    hermes update")
     lines.append("  (or use `hermes update --force-venv` to proceed anyway at your own risk)")
