@@ -77,7 +77,6 @@ jobs:
               restored = unpacked / packaged_executable.name
               return restored if restored.exists() else None
           '''
-          replacement = '\n'.join(line[12:] if line.startswith('            ') else line for line in replacement.splitlines()) + '\n'
           p.write_text(s[:a] + replacement + s[b:], encoding='utf-8')
           PY
           python -m py_compile hermes_cli/main.py
