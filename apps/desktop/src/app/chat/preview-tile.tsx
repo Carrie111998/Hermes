@@ -72,6 +72,14 @@ function PreviewTabLead({ tabId }: { tabId: string }) {
 
 const PREVIEW_TILE_PREFIX = 'preview-tile'
 
+export function previewTileDock(tabId: string, orderedTabIds: readonly string[]) {
+  const anchorTabId = orderedTabIds.find(id => id !== tabId)
+
+  return anchorTabId
+    ? { anchor: `${PREVIEW_TILE_PREFIX}:${anchorTabId}`, dir: 'center' as const }
+    : { anchor: 'workspace', dir: 'right' as const }
+}
+
 /** Keep pane contributions mirroring `$previewTabs`, keep the store's selection
  *  and the tree's active pane agreeing, and front a tile when its tab is
  *  selected. Call once from the root. */
@@ -124,11 +132,11 @@ const watchPreviewTileMirror = paneMirror<{ id: string }>({
   source: $previewTabs,
   key: tab => tab.id,
   prefix: PREVIEW_TILE_PREFIX,
-  // Identical to route (page) tiles: its own zone docked beside main, sized by
-  // the split weights. NOT anchored to the file tree — the old rail was a
-  // files-adjacent strip, and carrying that over welded preview into the file
-  // browser's zone, so ⌘J (toggle file browser) took the preview with it.
-  dir: () => 'right',
+  // The first preview opens beside the workspace. Every later preview center-
+  // docks into the oldest existing preview's zone, so files collect as tabs in
+  // one preview window instead of growing a new split for every double-click.
+  dir: tile => previewTileDock(tile.id, $previewTabs.get().map(tab => tab.id)).dir,
+  anchor: tile => previewTileDock(tile.id, $previewTabs.get().map(tab => tab.id)).anchor,
   minWidth: '22rem',
   title: previewTitle,
   tabLead: tabId => <PreviewTabLead tabId={tabId} />,
