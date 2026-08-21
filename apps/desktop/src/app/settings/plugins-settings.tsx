@@ -313,6 +313,12 @@ function AgentPluginsSection() {
 function PluginRow({ record }: { record: PluginRecord }) {
   const { t } = useI18n()
   const p = t.settings.plugins
+  // Bundled plugins carry their author-facing English name/description; overlay
+  // the locale copy when one is registered for the id (third-party plugins fall
+  // back to their own metadata).
+  const builtin = record.kind === 'bundled' ? p.builtin[record.id] : undefined
+  const name = builtin?.name ?? record.name
+  const description = builtin?.description ?? record.description
 
   return (
     <PluginLine
@@ -326,7 +332,7 @@ function PluginRow({ record }: { record: PluginRecord }) {
             </Tip>
           )}
           <Switch
-            aria-label={`${record.status === 'disabled' ? p.enable : p.disable} ${record.name}`}
+            aria-label={`${record.status === 'disabled' ? p.enable : p.disable} ${name}`}
             checked={record.status !== 'disabled'}
             onCheckedChange={on => {
               triggerHaptic('selection')
@@ -339,13 +345,13 @@ function PluginRow({ record }: { record: PluginRecord }) {
         record.status === 'error' ? (
           <span className="text-(--ui-danger,#f87171)">{record.error}</span>
         ) : (
-          (record.description ?? record.file ?? record.id)
+          (description ?? record.file ?? record.id)
         )
       }
       id={pluginElementId(record.id)}
       title={
         <>
-          <span>{record.name}</span>
+          <span>{name}</span>
           <Pill>{p.kinds[record.kind]}</Pill>
           {record.status === 'error' && <Pill tone="primary">{p.failed}</Pill>}
         </>

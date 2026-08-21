@@ -1052,6 +1052,64 @@ export const zhHant = defineLocale({
         failedSelect: backend => `選擇 ${backend} 失敗`,
         needsSetupHint: '現在即可選擇此後端——但在完成設定前命令將會失敗。'
       }
+    },
+    plugins: {
+      builtin: {
+        accent: {
+          name: '強調色選擇器',
+          description: '在狀態列以 OKLCH 色彩選擇器挑選主題強調色，調色盤即時重新產生。作者工具——顏色不會持久保存。'
+        },
+        'hermes-bots': {
+          name: '機器人',
+          description:
+            '機器人模式——每個代理一個聊天的話務員名冊，支援頭像、例行任務、群聊與機器人間互傳訊息。隨應用程式內建；不需要時可在此停用。'
+        },
+        kanban: {
+          name: '看板',
+          description: '多代理任務看板——看板頁面、側邊欄入口，以及狀態列中的即時進行中計數。'
+        }
+      }
+    },
+    memoryProvider: {
+      settingsTitle: label => `${label} 設定`,
+      fullConfig: '完整設定…',
+      loading: '正在載入記憶提供者設定…',
+      loadFailed: '記憶提供者設定載入失敗',
+      retry: '重試',
+      fieldSet: label => `${label} 已設定`,
+      fieldNotSet: label => `${label} 尚未設定`,
+      fullTitle: label => `${label} — 完整設定`,
+      fullEmptyDesc: (label, profile) => `為 ${profile} 設定檔設定每個${label}選項。`,
+      fullFallbackDesc: '留空則回退到已解析的主機或內建預設值。',
+      docsRef: label => `${label} 設定參考`,
+      cancel: '取消',
+      saveChanges: '儲存變更',
+      savedTitle: label => `${label} 已儲存`,
+      savedMessage: '記憶提供者設定已更新。',
+      saveFailed: label => `儲存 ${label} 設定失敗`,
+      leaveBlank: '留空以保留目前值',
+      setBadge: '已設定',
+      aboutField: label => `關於 ${label}`,
+      fieldOverrides: {
+        'hindsight.mode': '模式',
+        'hindsight.api_key': 'API 金鑰',
+        'hindsight.api_url': 'API URL',
+        'hindsight.bank_id': 'Bank ID',
+        'hindsight.recall_budget': '召回預算'
+      },
+      descOverrides: {
+        'hindsight.mode': 'Hermes 如何連線到 Hindsight。',
+        'hindsight.api_key': '用於透過 Hindsight API 進行身分驗證。'
+      },
+      placeholderOverrides: {
+        'hindsight.api_key': '輸入 Hindsight API 金鑰'
+      },
+      optionOverrides: {
+        'hindsight.mode.cloud': '雲端',
+        'hindsight.mode.cloud.desc': 'Hindsight 雲 API（輕量級，僅需 API 金鑰）',
+        'hindsight.mode.local_external': '本機外部',
+        'hindsight.mode.local_external.desc': '連線到現有的 Hindsight 實例'
+      }
     }
   },
 
@@ -1848,6 +1906,37 @@ export const zhHant = defineLocale({
     statusDivider: {
       working: '進行中',
       done: '已完成'
+    },
+    filters: {
+      grouping: '分組方式',
+      ordering: '排序方式',
+      show: '顯示',
+      filters: '篩選',
+      status: '狀態',
+      pullRequest: '拉取請求',
+      profile: '設定檔',
+      project: '專案',
+      updated: '最近更新',
+      created: '建立時間',
+      tokens: 'Token 數',
+      cost: '費用',
+      manual: '手動',
+      preview: '預覽',
+      pr: 'PR',
+      open: '開啟',
+      draft: '草稿',
+      merged: '已合併',
+      closed: '已關閉',
+      noPr: '無 PR',
+      needsInput: '需要輸入',
+      working: '進行中',
+      unread: '未讀',
+      idle: '閒置',
+      inboxStyle: '收件匣樣式',
+      archived: '已封存',
+      resetToDefaults: '恢復預設',
+      expandAll: '全部展開',
+      collapseAll: '全部摺疊'
     }
   },
 

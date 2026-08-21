@@ -1089,6 +1089,64 @@ export const ja = defineLocale({
         failedSelect: backend => `${backend} の選択に失敗しました`,
         needsSetupHint: 'このバックエンドは今すぐ選択できますが、セットアップが完了するまでコマンドは失敗します。'
       }
+    },
+    plugins: {
+      builtin: {
+        accent: {
+          name: 'アクセントピッカー',
+          description: 'ステータスバーの OKLCH カラーピッカーでテーマのアクセントカラーを選択。パレットはライブで再生成されます。作者向けツール——色は保持されません。'
+        },
+        'hermes-bots': {
+          name: 'ボット',
+          description:
+            'ボットモード——アバター、ルーティン、グループチャット、ボット間メッセージを備えた、エージェントごとに 1 チャットのロースター。アプリに同梱。不要ならここで無効化できます。'
+        },
+        kanban: {
+          name: 'カンバン',
+          description: 'マルチエージェントタスクボード——ボードページ、サイドバーエントリ、ステータスバーの実行中カウント。'
+        }
+      }
+    },
+    memoryProvider: {
+      settingsTitle: label => `${label} 設定`,
+      fullConfig: '全設定…',
+      loading: 'メモリプロバイダー設定を読み込み中…',
+      loadFailed: 'メモリプロバイダー設定の読み込みに失敗しました',
+      retry: '再試行',
+      fieldSet: label => `${label} は設定済み`,
+      fieldNotSet: label => `${label} は未設定`,
+      fullTitle: label => `${label} — 全設定`,
+      fullEmptyDesc: (label, profile) => `${profile} プロファイルのすべての${label}オプションを設定します。`,
+      fullFallbackDesc: '空欄にすると、解決済みのホストまたは内蔵デフォルトにフォールバックします。',
+      docsRef: label => `${label} 設定リファレンス`,
+      cancel: 'キャンセル',
+      saveChanges: '変更を保存',
+      savedTitle: label => `${label} を保存しました`,
+      savedMessage: 'メモリプロバイダー設定が更新されました。',
+      saveFailed: label => `${label} 設定の保存に失敗しました`,
+      leaveBlank: '空欄のままにすると現在の値が保持されます',
+      setBadge: '設定済み',
+      aboutField: label => `${label} について`,
+      fieldOverrides: {
+        'hindsight.mode': 'モード',
+        'hindsight.api_key': 'API キー',
+        'hindsight.api_url': 'API URL',
+        'hindsight.bank_id': 'Bank ID',
+        'hindsight.recall_budget': 'リコール予算'
+      },
+      descOverrides: {
+        'hindsight.mode': 'Hermes が Hindsight に接続する方法。',
+        'hindsight.api_key': 'Hindsight API との認証に使用します。'
+      },
+      placeholderOverrides: {
+        'hindsight.api_key': 'Hindsight API キーを入力'
+      },
+      optionOverrides: {
+        'hindsight.mode.cloud': 'クラウド',
+        'hindsight.mode.cloud.desc': 'Hindsight クラウド API（軽量、API キーのみで可）',
+        'hindsight.mode.local_external': 'ローカル外部',
+        'hindsight.mode.local_external.desc': '既存の Hindsight インスタンスに接続'
+      }
     }
   },
 
@@ -1910,6 +1968,37 @@ export const ja = defineLocale({
     statusDivider: {
       working: '実行中',
       done: '完了'
+    },
+    filters: {
+      grouping: 'グループ化',
+      ordering: '並び替え',
+      show: '表示',
+      filters: 'フィルター',
+      status: '状態',
+      pullRequest: 'プルリクエスト',
+      profile: 'プロファイル',
+      project: 'プロジェクト',
+      updated: '更新日時',
+      created: '作成日時',
+      tokens: 'トークン数',
+      cost: 'コスト',
+      manual: '手動',
+      preview: 'プレビュー',
+      pr: 'PR',
+      open: 'オープン',
+      draft: '下書き',
+      merged: 'マージ済み',
+      closed: 'クローズ済み',
+      noPr: 'PR なし',
+      needsInput: '入力待ち',
+      working: '実行中',
+      unread: '未読',
+      idle: 'アイドル',
+      inboxStyle: '受信トレイ風',
+      archived: 'アーカイブ済み',
+      resetToDefaults: 'デフォルトに戻す',
+      expandAll: 'すべて展開',
+      collapseAll: 'すべて折りたたむ'
     }
   },
 
