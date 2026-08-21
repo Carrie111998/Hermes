@@ -6850,6 +6850,22 @@ def _compute_config_revision(raw_config: dict) -> str:
         return "0000000000000000"
 
 
+def _protect_sensitive_config_fields(existing: dict, incoming: dict) -> None:
+    """Protect security-sensitive auth credentials from empty-string overwrites."""
+    if not isinstance(existing, dict) or not isinstance(incoming, dict):
+        return
+
+    existing_dashboard = existing.get("dashboard")
+    incoming_dashboard = incoming.get("dashboard")
+    if isinstance(existing_dashboard, dict) and isinstance(incoming_dashboard, dict):
+        existing_auth = existing_dashboard.get("basic_auth")
+        incoming_auth = incoming_dashboard.get("basic_auth")
+        if isinstance(existing_auth, dict) and isinstance(incoming_auth, dict):
+            for k, v in existing_auth.items():
+                if v and (not incoming_auth.get(k) or incoming_auth.get(k) == ""):
+                    incoming_auth[k] = v
+
+
 @app.get("/api/config")
 async def get_config(profile: Optional[str] = None):
     # _profile_scope blocks on the process-wide _SKILLS_PROFILE_LOCK and
@@ -7696,6 +7712,7 @@ async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
                 else:
                     raise HTTPException(status_code=400, detail="Either 'config' or 'patch' must be provided")
 
+                _protect_sensitive_config_fields(existing, incoming)
                 merged = _deep_merge(existing, incoming)
                 # Compare normalized approvals.mode across the in-memory
                 # documents, not config blocks and not cache re-reads: the
