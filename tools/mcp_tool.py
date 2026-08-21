@@ -601,7 +601,7 @@ class _HTTPNotificationStreamTracker:
 
     __slots__ = (
         "_grace_seconds", "_on_stalled", "_generation",
-        "_closed_generation", "_timer", "_closed",
+        "_closed_generation", "_timer", "_closed", "_owner_task",
     )
 
     def __init__(self, *, grace_seconds: float, on_stalled: Callable[[], None]):
@@ -611,6 +611,7 @@ class _HTTPNotificationStreamTracker:
         self._closed_generation: Optional[int] = None
         self._timer: Optional[asyncio.TimerHandle] = None
         self._closed = False
+        self._owner_task: Optional[asyncio.Task] = None
 
     async def response_hook(self, response: Any) -> None:
         """Track the lifecycle of a GET response carrying an SSE stream."""
@@ -619,6 +620,15 @@ class _HTTPNotificationStreamTracker:
             return
         content_type = str(getattr(response, "headers", {}).get("content-type", ""))
         if not content_type.lower().startswith("text/event-stream"):
+            return
+
+        current_task = asyncio.current_task()
+        if self._owner_task is None:
+            self._owner_task = current_task
+        elif current_task is not self._owner_task:
+            # The SDK uses the same client for finite request-resumption GETs.
+            # Its notification retries stay in one owner task, so only that
+            # task's response family represents notification-channel health.
             return
 
         self._generation += 1

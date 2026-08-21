@@ -64,6 +64,34 @@ async def test_replacement_notification_stream_cancels_full_reconnect():
 
 
 @pytest.mark.asyncio
+async def test_auxiliary_sse_get_does_not_replace_notification_stream():
+    reconnect = asyncio.Event()
+    tracker = _HTTPNotificationStreamTracker(
+        grace_seconds=0.01,
+        on_stalled=reconnect.set,
+    )
+    notification = _Response()
+    auxiliary = _Response()
+
+    await tracker.response_hook(notification)
+
+    async def finish_auxiliary_get() -> None:
+        await tracker.response_hook(auxiliary)
+        await auxiliary.aclose()
+
+    await asyncio.create_task(finish_auxiliary_get())
+    await asyncio.sleep(0.05)
+
+    assert not reconnect.is_set()
+    assert notification.close_count == 0
+    assert auxiliary.close_count == 1
+
+    await notification.aclose()
+    await asyncio.wait_for(reconnect.wait(), timeout=0.5)
+    tracker.close()
+
+
+@pytest.mark.asyncio
 async def test_non_get_or_non_sse_responses_are_not_tracked():
     reconnect = asyncio.Event()
     tracker = _HTTPNotificationStreamTracker(
