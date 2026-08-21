@@ -546,7 +546,8 @@ def _(rid, params: dict) -> dict:
         agent = session.get("agent") if session else None
         ctx = _model_picker_context(agent)
         payload = build_models_payload(
-            ctx, picker_hints=True, max_models=50,
+            ctx,
+            picker_hints=True,
         )
         provider_data = next(
             (p for p in payload["providers"] if p["slug"] == slug), None
