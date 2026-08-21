@@ -895,6 +895,7 @@ class TestProfilesEndpoint:
 
         assert body["object"] == "hermes.profile.list"
         assert body["canonical_chat_title"] == "Bot Chat"
+        assert body["bot_mode_protocol"] is False
         assert body["data"] == [
             {
                 "id": "default",

@@ -3287,9 +3287,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 "gateway_path": "" if is_default else f"/p/{name}",
             })
 
+        # Config alone is not proof that this checkout can inject the official
+        # canonical Bot Chat protocol. Older Hermes builds accept the setting
+        # but do not ship bot_mode_probe; expose the actual runtime capability.
+        try:
+            from tools.bot_mode_probe import get_bot_mode_protocol_section  # noqa: F401
+            bot_mode_protocol = True
+        except (ImportError, ModuleNotFoundError):
+            bot_mode_protocol = False
+
         return web.json_response({
             "object": "hermes.profile.list",
             "canonical_chat_title": "Bot Chat",
+            "bot_mode_protocol": bot_mode_protocol,
             "data": data,
         })
 
