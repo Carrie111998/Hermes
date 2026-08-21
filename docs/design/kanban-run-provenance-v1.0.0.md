@@ -67,7 +67,8 @@ task_events (6 cols)
 | Column | Type | Null | Writer | Notes |
 |---|---|---|---|---|
 | `subject_sha` | TEXT | yes until claim | **kernel only** | Full 40-char lowercase hex. Captured at claim from the typed task target. Never writable via the worker path. |
-| `role` | TEXT | no | **kernel only** | Enum: `implementation`, `code_review`, `qa`, `security`. Derived from dispatch, not caller-supplied. |
+| `final_candidate_sha` | TEXT | yes | **kernel only** | Full 40-char lowercase hex. The head the run's verdict binds to. Populated on **every** run type; collapses to `subject_sha` for implementation runs. See §4.1. |
+| `role` | TEXT | no | **kernel only** | Enum: `implementation`, `code_review`, `qa`, `security`. **Derived at query/export time** from a static `profile → role` lookup; see §2.3. |
 | `provenance_version` | INTEGER | no | kernel | Starts at `1`. Lets a future schema change be detected rather than silently reinterpreted. |
 | `corrects_run_id` | INTEGER | yes | kernel | FK → `task_runs(id)`. Non-null only on correction rows (§5). |
 
@@ -154,14 +155,62 @@ persisted belongs to the DSSE trust design (§7 seam), not to this schema.
 
 ---
 
+### §2.3 — `role` is derived, not stored
+
+`role` is **not** a persisted column. It is resolved at query/export time through a static
+`profile → role` map pinned in protected-base policy:
+
+```
+code-reviewer     -> code_review
+qa-verifier       -> qa
+security-reviewer -> security
+<implementer>     -> implementation
+```
+
+**Rationale (`research-scout`, `t_5247914a`):** persisting a coarser `role` alongside `profile`
+forces a data migration every time a profile is reclassified, and creates a second place where role
+can disagree with the dispatcher record. `profile` is the kernel-stamped fact; `role` is a view over
+it. Recorded as an opinion adopted, not a research finding — the memo is explicit that it only ever
+modelled `profile` / `authenticated_profile`.
+
+Consequence for §3.2: independence is asserted over **distinct `profile` values**, with the map
+applied to check role coverage. The map lives in protected-base policy so a candidate cannot
+reclassify a profile into a role it did not perform.
+
+---
+
 ## §4 — Subject SHA vs final candidate SHA
 
 | | Subject SHA | Final candidate SHA |
 |---|---|---|
-| Meaning | the commit that was reviewed | the assembled PR head |
-| Known at | claim time | after multi-commit assembly |
-| Stored | `task_runs.subject_sha` | **not stored on the run** |
-| Written by | kernel, at claim | broker, at attestation |
+| Meaning | the commit the run's work was performed against | the head the run's verdict binds to |
+| Known at | claim time | run-completion time |
+| Stored | `task_runs.subject_sha` | `task_runs.final_candidate_sha` |
+| Written by | kernel, at claim | kernel, at terminalization |
+
+### §4.1 — Both SHAs on every run (corrected)
+
+An earlier revision of this document stored **only** `subject_sha` on the run and left the final
+candidate SHA entirely to broker derivation. **That was wrong**, and `research-scout` (`t_5247914a`
+§4, §7) supplied the correction:
+
+- Carry **both** `subject_sha` and `final_candidate_sha` on **every** run, uniformly. Do **not**
+  make it conditional on run type.
+- For implementation runs the two collapse to the same value. That redundancy is harmless — special-
+  casing it costs more than it saves and creates a branch where a field can be legitimately absent.
+- For review / QA / security runs they can **legitimately diverge**: the branch may advance between
+  the commit a run reviewed and the head an attestation is later requested against.
+
+**That divergence is the tamper check, not a defect.** It is what makes the broker's fail-closed
+condition *"PR head ≠ requested `expected_head_sha`"* (`t_5247914a` §7) evaluable at all. A schema
+that stored only one SHA would have made stale-evidence rebinding undetectable at the run layer.
+
+This does **not** conflict with §5 immutability: `final_candidate_sha` is written by the kernel at
+terminalization, in the same transition that sets `ended_at`. It is never a post-terminal write.
+
+The broker still independently re-derives and binds the final candidate SHA in the attestation
+(§3.3). The run field is *provenance*; the attestation field is *authority*. They must agree, and
+the broker fails closed if they do not.
 
 **Why subject SHA must come from a kernel-captured typed task target** (not worker JSON, not the
 evidence branch HEAD): if it is read from branch HEAD, the worker chooses *what was reviewed* after
@@ -199,17 +248,46 @@ bounded.
 
 ## §6 — Export
 
-- The exporter selects terminal runs with a non-null `subject_sha` and complete `run_artifacts`.
-  **Prose is never parsed.**
-- **Detection without polling prose:** a `provenance_ready` row in `task_events` (kind is already a
-  first-class column, `idx_events_run` already exists) emitted by the kernel at terminalization.
-- **Watermark/idempotency:** the exporter tracks the highest exported `task_events.id`. Re-export of
-  an already-watermarked run is a no-op, not a duplicate.
+**Transport: push-per-terminal-run. There is no broker-facing pull surface.** (`t_5247914a` §3b,
+which rejected tunnel/always-on reachability as inverting the trust direction and coupling
+fail-closed behaviour to laptop uptime.)
+
+- The exporter watches run-completion events and **POSTs one envelope per completed gate-relevant
+  run**. The broker never reaches into local SQLite — the operator's laptop is neither reachable nor
+  an Actions runner.
+- **Idempotency key: `(repository_id, task_id, run_id)`.** The broker's insert-only mirror rejects
+  resubmission with a different outcome or SHA for the same key.
+- **The monotonic cursor is the exporter's, not the broker's.** The exporter tracks the highest
+  exported `task_events.id` **against local Kanban** so it can resume after being offline. This is
+  deliberately *not* a `give-me-everything-after-N` API the broker calls; exposing that would
+  re-create the pull surface §3b rejected.
+- **Detection without polling prose:** a `provenance_ready` row in `task_events` (`kind` is already a
+  first-class column; `idx_events_run` already exists) emitted by the kernel at terminalization.
 - **Exporter credentials must be read-only against the canonical SQLite.** An exporter that can
   rewrite the source of truth is not an exporter.
-- **Minimal export:** `{run_id, task_id, profile, role, outcome, subject_sha, artifacts[], ended_at}`.
-  No `summary`, no `error`, no `body` — those may carry paths, tokens, or user content.
-- Missing or ambiguous fields **fail closed**: no attestation.
+- If the laptop is off, only *new* runs go unmirrored and the broker fails closed for those specific
+  runs — cleanly, rather than flapping.
+
+### §6.1 — Minimal export (exclusions are normative)
+
+Exported per run: `{run_id, task_id, profile, outcome, subject_sha, final_candidate_sha,
+artifact_relative_path, sha256, completed_at}`.
+
+**Excluded — normative, not advisory:**
+
+| Excluded | Why |
+|---|---|
+| card bodies, other cards, comment text | `t_5247914a` §3b minimal-field list |
+| `summary`, `error`, `result` | may carry paths, tokens, or user content |
+| artifact **contents** | only path + digest ever crosses the wire |
+| **absolute workspace paths** | `/Users/<name>/…` leaks machine identity and OS username |
+
+The last row is an addition from `research-scout` and is worth stating explicitly because the
+earlier field list named `workspace_path` unqualified. **Only repo-relative artifact paths are
+exported.** An absolute path is both a privacy leak and useless to a broker that cannot see the
+filesystem.
+
+Missing or ambiguous fields **fail closed**: no attestation.
 
 ---
 
@@ -283,7 +361,10 @@ at attestation time (§3.3) and binds it in the attestation. Adding it to the ru
 |---|---|
 | **JSON envelope in `task_runs.metadata`** | Re-creates the parsing surface being eliminated, one layer deeper. No CHECK constraints, no FK, no uniqueness. |
 | **Fixed `artifact_1..artifact_n` columns** | Cannot express variable artifact counts; forces either truncation or a schema change per new artifact. |
-| **Final candidate SHA as a run column** | Only knowable post-assembly, i.e. post-terminal. Would require mutating an immutable row (§5). |
+| **Final candidate SHA as broker-derived only** | Rejected after `t_5247914a` §4/§7. Storing only `subject_sha` makes the *"PR head ≠ requested head"* tamper check unevaluable at the run layer. Both SHAs are carried on every run (§4.1). |
+| **`board_slug` as a provenance field** | Measured, not assumed: every repository on this host maps to exactly one board (`account-gen` → 1 board, `hermes-agent` → 1 board; no repo appears under two boards). `repository_id` (immutable numeric) is sufficient identity scoping. Revisit only if multi-board-per-repo becomes real. |
+| **`role` as a stored column** | Forces a migration whenever a profile is reclassified, and creates a second place role can disagree with the dispatcher record. Derived at query time from protected-base policy instead (§2.3). |
+| **Broker-facing pull API / tunnel** | `t_5247914a` §3a: inverts the trust direction and couples fail-closed behaviour to laptop uptime. Push-per-run with an exporter-side cursor instead (§6). |
 | **Commit-count-based role independence** | Commit count is transport, not identity. Three commits by one actor prove nothing about independence. |
 | **Branch name as identity anchor** | Worker-influenced and mutable — same class as trusting caller-supplied role JSON. |
 | **UPDATE-in-place corrections** | Destroys the audit trail and lets consumed provenance change under an emitted attestation. |
@@ -323,7 +404,13 @@ migration path and a backup verified by checksum before application. This is a
 | A9 | Duplicate `(run_id, artifact_path)` | UNIQUE violation |
 | A10 | Re-export an already-watermarked run | no-op, no duplicate attestation |
 | A11 | Run with `provenance_version = NULL` (legacy) | excluded from export, not an error |
-| A12 | Export payload inspected for `summary` / `error` / `body` | absent (§6 minimal export) |
+| A12 | Export payload inspected for `summary` / `error` / `body` | absent (§6.1) |
+| A13 | Export payload inspected for any absolute path (`/Users/…`) | absent; only repo-relative `artifact_path` (§6.1) |
+| A14 | Implementation run: `subject_sha` vs `final_candidate_sha` | equal; **not** special-cased, both populated (§4.1) |
+| A15 | Review run where branch advanced after review | `final_candidate_sha != subject_sha`; broker fails closed on `PR head != expected_head_sha` |
+| A16 | Same `(repository_id, task_id, run_id)` resubmitted with a different outcome | mirror **rejects**; first write wins (§6) |
+| A17 | Exporter restarted after downtime | resumes from its own cursor; no duplicate envelopes, no gap |
+| A18 | Profile absent from the protected-base `profile → role` map | role unresolved → gate **FAIL**, never defaulted (§2.3) |
 
 ---
 
