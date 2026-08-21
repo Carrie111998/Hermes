@@ -19854,6 +19854,23 @@ def test_profile_home_rejects_traversal_and_absolute_names(monkeypatch):
     assert calls == []
 
 
+def test_profile_home_reserved_name_rejected_by_its_own_branch(monkeypatch):
+    """Reserved names (root/hermes) are rejected by validate_profile_name's
+    reserved-word branch, a different path than the regex — pin that both
+    rejection routes fall back to the launch profile (review on #90699)."""
+    from pathlib import Path as _Path
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda n: calls.append(n) or _Path("/definitely/should-not-matter"),
+    )
+
+    assert server._profile_home("root") is None
+    assert server._profile_home("hermes") is None
+    assert calls == []
+
+
 def test_profile_home_valid_name_reaches_path_resolution(monkeypatch, tmp_path):
     """A valid profile name still goes through get_profile_dir; the
     containment check happens before, not instead of, normal resolution."""
