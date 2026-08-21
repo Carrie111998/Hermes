@@ -12,7 +12,7 @@ from typing import Callable
 
 
 def _plan_bound_update_handler(cmd_update: Callable) -> Callable:
-    """Bind update admission to the authoritative deployment plan."""
+    """Bind update admission and mutation to one deployment authority object."""
 
     @wraps(cmd_update)
     def _handler(args):
@@ -31,23 +31,32 @@ def _plan_bound_update_handler(cmd_update: Callable) -> Callable:
             is_check = bool(getattr(args, "check", False))
             is_plan = bool(getattr(args, "plan", False))
             if is_plan:
-                # Existing --plan is an observation-only inventory path. Keep it
-                # outside mutation admission just like --check; it must work for
-                # image/external/remote deployments precisely so it can explain
-                # why mutation is unavailable.
+                # Existing --plan is observation-only. It must remain usable on
+                # image/external/remote deployments so it can explain why a
+                # physical update is unavailable.
                 plan = load_deployment_plan()
                 setattr(args, "_deployment_plan", plan)
             else:
                 plan = admit_update(args)
-            # Test doubles may return None; production paths always attach a plan.
-            if plan is not None and not (is_check or is_plan):
-                enforce_legacy_update_envelope(plan)
+
+            # Test doubles may return None; production paths attach a plan.
+            if plan is None or is_check or is_plan:
+                return cmd_update(args)
+
+            enforce_legacy_update_envelope(plan)
+
+            # The legacy updater is still monolithic. Fence the whole physical
+            # mutation under one exact deployment permit instead of pretending
+            # we have stage-level proof. Phase-2 stage consumers can later carry
+            # the same permit directly without changing the authority contract.
+            from hermes_cli.deployment_transaction import run_under_deployment_authority
+
+            return run_under_deployment_authority(plan, lambda: cmd_update(args))
         except DeploymentPlanError as exc:
             print(f"✗ {exc}", file=sys.stderr)
             if exc.remediation:
                 print(f"  {exc.remediation}", file=sys.stderr)
             raise SystemExit(2) from exc
-        return cmd_update(args)
 
     return _handler
 
