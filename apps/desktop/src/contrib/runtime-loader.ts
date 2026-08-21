@@ -362,29 +362,31 @@ async function scanDiskPlugins(): Promise<void> {
         const file = root.entry(dir.path)
         seen.add(file)
 
-        if (disk.has(file)) {
-          continue
+        // loadDiskPlugin is idempotent — it calls unloadRuntimePlugin before
+        // re-registering, so reloading a known path refreshes its contributions
+        // after an atomic install replacement without orphaning the old module.
+        if (!disk.has(file)) {
+          try {
+            await desktop.readFileText(file)
+          } catch {
+            continue // No entry file (yet) — not a plugin folder for this root.
+          }
+
+          const record: DiskPlugin = {
+            defaultEnabled: root.defaultEnabled,
+            file,
+            id: null,
+            origin: dir.name,
+            watchId: null
+          }
+
+          disk.set(file, record)
         }
+
+        await loadDiskPlugin(disk.get(file)!)
 
         try {
-          await desktop.readFileText(file)
-        } catch {
-          continue // No entry file (yet) — not a plugin folder for this root.
-        }
-
-        const record: DiskPlugin = {
-          defaultEnabled: root.defaultEnabled,
-          file,
-          id: null,
-          origin: dir.name,
-          watchId: null
-        }
-
-        disk.set(file, record)
-        await loadDiskPlugin(record)
-
-        try {
-          record.watchId = (await desktop.watchPreviewFile(file)).id
+          disk.get(file)!.watchId = (await desktop.watchPreviewFile(file)).id
         } catch {
           // Unwatchable — the poll still reconciles new folders; edits need a
           // manual "Reload desktop plugins".
