@@ -26,6 +26,101 @@ def _make_event(text="/resume", platform=Platform.TELEGRAM,
     return MessageEvent(text=text, source=source)
 
 
+class TestResumeListingSemantics:
+    """F15: gateway /resume + /sessions share the CLI's listing semantics —
+    tool sessions excluded, compression chains projected to their tip, and
+    the numbered picker maps 1:1 to resolve_resume_session_id."""
+
+    @pytest.mark.asyncio
+    async def test_tool_sessions_absent_from_picker(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        event = _make_event(text="/resume")
+        lane_key = _session_key_for_event(event)
+        db.create_session(
+            "sess_user", "telegram", user_id="12345", chat_id="67890",
+            session_key=lane_key,
+        )
+        db.set_session_title("sess_user", "Real Work")
+        db.create_session("sess_tool", "tool")
+        db.set_session_title("sess_tool", "Tool Noise")
+
+        runner = _make_runner(session_db=db, event=event)
+        result = await runner._handle_resume_command(event)
+
+        assert "Real Work" in result
+        assert "Tool Noise" not in result
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_compression_chain_shows_one_numbered_entry(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        event = _make_event(text="/resume")
+        lane_key = _session_key_for_event(event)
+        db.create_session(
+            "chain_root", "telegram", user_id="12345", chat_id="67890",
+            session_key=lane_key,
+        )
+        db.set_session_title("chain_root", "Chain Alpha")
+        db.end_session("chain_root", end_reason="compression")
+        db.create_session(
+            "chain_tip", "telegram", user_id="12345", chat_id="67890",
+            parent_session_id="chain_root", session_key=lane_key,
+        )
+        # Compression copies the title forward onto the continuation, so the
+        # projected tip carries the title in real flows.
+        db.set_session_title("chain_tip", "Chain Alpha")
+
+        runner = _make_runner(session_db=db, event=event)
+        result = await runner._handle_resume_command(event)
+
+        # The chain is one logical conversation: one numbered entry, not two.
+        assert result.count("Chain Alpha") == 1
+        assert "1." in result
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_numbered_selection_maps_to_displayed_session(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        event = _make_event(text="/resume 1")
+        lane_key = _session_key_for_event(event)
+        db.create_session(
+            "chain_root", "telegram", user_id="12345", chat_id="67890",
+            session_key=lane_key,
+        )
+        db.set_session_title("chain_root", "Chain Alpha")
+        db.end_session("chain_root", end_reason="compression")
+        db.create_session(
+            "chain_tip", "telegram", user_id="12345", chat_id="67890",
+            parent_session_id="chain_root", session_key=lane_key,
+        )
+        # Compression copies the title forward onto the continuation, so the
+        # projected tip carries the title in real flows.
+        db.set_session_title("chain_tip", "Chain Alpha")
+        db.create_session(
+            "current_session_001", "telegram", user_id="12345", chat_id="67890",
+            session_key=lane_key,
+        )
+
+        runner = _make_runner(
+            session_db=db, current_session_id="current_session_001", event=event
+        )
+        result = await runner._handle_resume_command(event)
+
+        assert "Resumed" in result
+        runner.session_store.switch_session.assert_called_once()
+        call_args = runner.session_store.switch_session.call_args
+        # Picking the one displayed entry resumes the chain's live tip —
+        # exactly what resolve_resume_session_id would return for the row.
+        assert call_args[0][1] == "chain_tip"
+        db.close()
+
+
 def _session_key_for_event(event):
     """Get the session key that build_session_key produces for an event."""
     return build_session_key(event.source)
@@ -703,6 +798,50 @@ class TestHandleSessionsCommand:
         assert "secret" not in result
         db.close()
 
+
+    @pytest.mark.asyncio
+    async def test_sessions_search_lane_scoped_pool_survives_busy_platform(self, tmp_path):
+        """`/sessions search` must lane-scope the FTS5 candidate pool in SQL.
+
+        On a busy platform the caller's own lane sessions starve out of the
+        global 200-row pre-filter pool when fresher foreign matches dominate —
+        a Python post-filter cannot recover rows that were never fetched. The
+        lane-scoped pool keeps the caller's hits present among the displayed
+        results. 210 foreign sessions (each with a matching title AND message)
+        crowd the lane out of both the 200-row content pool and the 200-row
+        title pool; the lane-scoped SQL filter restores the 11 lane hits."""
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=tmp_path / "state.db")
+        event = _make_event(text="/sessions search Work")
+        lane_key = _session_key_for_event(event)
+        for i in range(11):
+            sid = f"lane_work_{i}"
+            db.create_session(
+                sid, "telegram", session_key=lane_key,
+                user_id="12345", chat_id="67890",
+            )
+            db.set_session_title(sid, f"Lane Work {i}")
+            db.append_message(
+                sid, "user", f"Work on lane task {i}", timestamp=1000.0 + i
+            )
+        for i in range(210):
+            sid = f"foreign_{i}"
+            db.create_session(
+                sid, "telegram",
+                session_key=f"agent:main:telegram:dm:foreign-{i}",
+                user_id=f"foreign-user-{i}", chat_id=f"foreign-{i}",
+            )
+            db.set_session_title(sid, f"Foreign Work {i}")
+            db.append_message(sid, "user", "Work", timestamp=2000.0 + i)
+
+        runner = _make_runner(session_db=db, event=event)
+        result = await runner._handle_sessions_command(event)
+
+        # All 10 displayed slots are the caller's own lane hits; the fresher
+        # foreign matches must not crowd them out of the fetched pool.
+        assert result.count("Lane Work") == 10
+        assert "Foreign Work" not in result
+        db.close()
 
     @pytest.mark.asyncio
     async def test_resume_persisted_fallback_fails_closed_on_user_id_alt(self, tmp_path):

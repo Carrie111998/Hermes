@@ -3421,6 +3421,11 @@ class APIServerAdapter(BasePlatformAdapter):
             # aged past the recency window is back-filled rather than dropped.
             include_pinned=True,
         )
+        # Keep tool-internal sessions out of the client-visible picker —
+        # same exclusion the CLI/gateway listing surfaces apply. Applied in
+        # Python (list_sessions_rich has no SQL-level source exclusion) and
+        # cheap at ≤200 rows.
+        sessions = [s for s in sessions if s.get("source") != "tool"]
         # Back-filled pins arrive PAST the limit, so counting them would report
         # another page that doesn't exist. Only the recency window decides.
         windowed = sum(1 for s in sessions if not s.get("pinned"))
