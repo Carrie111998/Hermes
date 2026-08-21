@@ -167,7 +167,13 @@ async def test_unauthorized_or_internal_input_never_reaches_input_router():
     runner._route_pre_user_input.assert_not_awaited()
 
     runner._is_user_authorized = lambda _source: True
-    internal = _make_event("/queue synthetic")
+    internal = _make_event("internal generated text")
     assert await runner._handle_message(internal) == {"final_response": "", "messages": []}
+    runner._route_pre_user_input.assert_not_awaited()
+
+    synthetic = _make_event("authorized generated text")
+    synthetic.internal = False
+    synthetic.synthetic = True
+    assert await runner._handle_message(synthetic) == {"final_response": "", "messages": []}
     runner._route_pre_user_input.assert_not_awaited()
     assert runner._running_agents == {}

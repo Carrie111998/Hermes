@@ -17257,6 +17257,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # off-loop; a rewrite can intentionally enter slash dispatch below.
         if (
             not is_internal
+            and not event.synthetic
             and not getattr(source, "is_bot", False)
             and event.message_type == MessageType.TEXT
             and not event.media_urls
