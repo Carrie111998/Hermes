@@ -120,13 +120,12 @@ def _base_subprocess_env() -> dict:
     env.pop("PYTHONHOME", None)
     env.setdefault("ANONYMIZED_TELEMETRY", "false")
     # Browser Use CLI 3 delegates to Browser Harness. Keep every supported
-    # telemetry alias off, avoid background recording/update traffic, and
+    # telemetry alias off, avoid background update traffic, and
     # never foreground or print a credential-bearing Cloud live-view URL.
     # Older Harness releases ignore unknown variables; 0.1.10+ honors all of
     # them, so this remains safe across the Browser Use release transition.
     env.setdefault("BH_TELEMETRY", "0")
     env.setdefault("BROWSER_HARNESS_TELEMETRY", "0")
-    env.setdefault("BH_RECORD", "0")
     env.setdefault("BH_UPDATE_CHECK", "0")
     env.setdefault("BH_OPEN_LIVE_URL", "0")
     return env

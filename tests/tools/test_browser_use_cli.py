@@ -102,7 +102,6 @@ class TestSubprocessEnvironment:
         assert env["ANONYMIZED_TELEMETRY"] == "false"
         assert env["BH_TELEMETRY"] == "0"
         assert env["BROWSER_HARNESS_TELEMETRY"] == "0"
-        assert env["BH_RECORD"] == "0"
         assert env["BH_UPDATE_CHECK"] == "0"
         assert env["BH_OPEN_LIVE_URL"] == "0"
 
