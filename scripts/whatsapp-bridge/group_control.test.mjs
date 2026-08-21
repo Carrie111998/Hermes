@@ -106,7 +106,7 @@ try {
     createGroup: async () => ({ id: 'unused@g.us' }),
   });
   assert.equal(duplicateSubject.httpStatus, 409);
-  assert.equal(duplicateSubject.body.status, 'subject-exists');
+  assert.equal(duplicateSubject.body.status, 'reserved');
 
   const uncertain = await executeGroupCreate({
     body: {
@@ -142,6 +142,52 @@ try {
   });
   assert.equal(uncertainReplay.httpStatus, 409);
   assert.equal(uncertainReplay.body.status, 'uncertain');
+
+  const uncertainNewId = await executeGroupCreate({
+    body: {
+      subject: 'Operations',
+      confirmedSubject: 'Operations',
+      operationId: 'operations-group-002',
+      participants: ['998877@lid'],
+      confirmedParticipants: ['998877@lid'],
+    },
+    allowedParticipants: allowed,
+    store,
+    now: () => now + 30_001,
+    minimumIntervalMs: 0,
+    listGroups: async () => ({}),
+    createGroup: async () => ({ id: 'must-not-run@g.us' }),
+  });
+  assert.equal(uncertainNewId.httpStatus, 409);
+  assert.equal(uncertainNewId.body.status, 'reserved');
+
+  const raceStore = new GroupOperationStore(path.join(root, 'race.json'));
+  let raceCreates = 0;
+  let releaseLists;
+  const listsReady = new Promise(resolve => { releaseLists = resolve; });
+  let listCalls = 0;
+  const attempt = operationId => executeGroupCreate({
+    body: { ...request, operationId },
+    allowedParticipants: allowed,
+    store: raceStore,
+    minimumIntervalMs: 0,
+    listGroups: async () => {
+      listCalls += 1;
+      if (listCalls === 2) releaseLists();
+      await listsReady;
+      return {};
+    },
+    createGroup: async () => {
+      raceCreates += 1;
+      return { id: '120363001234567891@g.us' };
+    },
+  });
+  const race = await Promise.all([
+    attempt('codex-blockers-race-1'),
+    attempt('codex-blockers-race-2'),
+  ]);
+  assert.equal(raceCreates, 1);
+  assert.deepEqual(race.map(result => result.httpStatus).sort(), [201, 409]);
   console.log('  ✓ duplicate subjects and uncertain operations never create twice');
 } finally {
   rmSync(root, { recursive: true, force: true });

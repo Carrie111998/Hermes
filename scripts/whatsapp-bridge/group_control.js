@@ -142,7 +142,15 @@ export class GroupOperationStore {
     const state = this.load();
     const existing = state.operations.find(item => item.operationId === request.operationId);
     if (existing) return { existing };
+    const reserved = state.operations.find(
+      item => item.subject === request.subject || item.payloadHash === request.payloadHash,
+    );
+    if (reserved) return { reserved };
     const now = this.now();
+    const recentAttempt = state.operations.find(
+      item => Number.isFinite(item.createdAt) && now - item.createdAt < request.minimumIntervalMs,
+    );
+    if (recentAttempt) return { rateLimited: true };
     const operation = {
       operationId: request.operationId,
       payloadHash: request.payloadHash,
@@ -181,6 +189,10 @@ function existingOperationResponse(existing, request) {
   return { httpStatus: 409, body: { success: false, status: 'uncertain', error: 'This operation is pending or uncertain and will not be retried automatically.' } };
 }
 
+function reservedOperationResponse() {
+  return { httpStatus: 409, body: { success: false, status: 'reserved', error: 'This group subject or participant payload is already bound to another operation and will not be retried.' } };
+}
+
 function withTimeout(promise, timeoutMs) {
   let timer;
   return Promise.race([
@@ -209,6 +221,10 @@ export async function executeGroupCreate({
   const state = store.load();
   const existing = state.operations.find(item => item.operationId === request.operationId);
   if (existing) return existingOperationResponse(existing, request);
+  const reservedOperation = state.operations.find(
+    item => item.subject === request.subject || item.payloadHash === request.payloadHash,
+  );
+  if (reservedOperation) return reservedOperationResponse();
   const recentAttempt = state.operations.find(
     item => Number.isFinite(item.createdAt) && now() - item.createdAt < minimumIntervalMs,
   );
@@ -226,8 +242,12 @@ export async function executeGroupCreate({
     return { httpStatus: 409, body: { success: false, status: 'subject-exists', error: 'A group with this exact subject already exists.' } };
   }
 
-  const reserved = store.recordPending(request);
+  const reserved = store.recordPending({ ...request, minimumIntervalMs });
   if (reserved.existing) return existingOperationResponse(reserved.existing, request);
+  if (reserved.reserved) return reservedOperationResponse();
+  if (reserved.rateLimited) {
+    return { httpStatus: 429, body: { success: false, status: 'rate-limited', error: 'Group creation is temporarily rate limited.' } };
+  }
   try {
     const created = await withTimeout(
       createGroup(request.subject, request.participants),
