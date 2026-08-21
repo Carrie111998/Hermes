@@ -88,6 +88,34 @@ class TestTirithOutputParsing:
 
         assert before.findings[0].fingerprint != after.findings[0].fingerprint
 
+    def test_v033_rule_panic_marks_scan_incomplete(self):
+        result = scan._parse_tirith_output(
+            {
+                "schema_version": 3,
+                "scanned_count": 0,
+                "panic_count": 1,
+                "panic_files": ["SOUL.md"],
+                "files": [],
+            }
+        )
+
+        assert result.incomplete_reasons == ("tirith reported 1 rule panic(s)",)
+
+    def test_current_incomplete_analysis_preserves_coverage_gap_count(self):
+        result = scan._parse_tirith_output(
+            {
+                "schema_version": 4,
+                "scanned_count": 1,
+                "analysis_incomplete": True,
+                "coverage_gaps": ["unsupported encoding", "read failure"],
+                "files": [],
+            }
+        )
+
+        assert result.incomplete_reasons == (
+            "tirith reported incomplete analysis (2 coverage gap(s))",
+        )
+
 
 class TestTirithSubprocessContract:
     def test_finding_exit_code_is_valid_and_json_is_parsed(self, tmp_path, monkeypatch):
@@ -201,6 +229,73 @@ class TestSecurityScanCommand:
 
         assert code == 2
         assert "does not exist" in capsys.readouterr().err
+
+    def test_incomplete_scan_is_operational_failure_and_does_not_update_baseline(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        home = tmp_path / "home"
+        home.mkdir()
+        baseline = tmp_path / "baseline.json"
+        monkeypatch.setattr(scan, "get_hermes_home", lambda: home)
+        payload = {
+            "schema_version": 3,
+            "scanned_count": 0,
+            "panic_count": 1,
+            "files": [],
+        }
+        _install_fake_tirith(monkeypatch, payload)
+
+        code = scan.cmd_security_scan(
+            _args(home, baseline, update_baseline=True)
+        )
+        output = json.loads(capsys.readouterr().out)
+
+        assert code == 2
+        assert output["analysis_incomplete"] is True
+        assert output["incomplete_reasons"] == ["tirith reported 1 rule panic(s)"]
+        assert output["baseline_updated"] is False
+        assert not baseline.exists()
+
+    def test_explicit_zero_timeout_is_rejected_before_scan(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(scan, "get_hermes_home", lambda: home)
+        monkeypatch.setattr(
+            "tools.tirith_security.resolve_tirith_for_scan",
+            lambda: ("tirith", {"tirith_scan_timeout": 17}),
+        )
+        calls = []
+        monkeypatch.setattr(scan, "_scan_path", lambda *args, **kwargs: calls.append(args))
+
+        code = scan.cmd_security_scan(
+            _args(home, tmp_path / "baseline.json", timeout=0)
+        )
+
+        assert code == 2
+        assert calls == []
+        assert "positive integer" in capsys.readouterr().err
+
+    def test_incomplete_scan_is_reported_in_human_output(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(scan, "get_hermes_home", lambda: home)
+        _install_fake_tirith(
+            monkeypatch,
+            {"scanned_count": 1, "truncated": True, "files": []},
+        )
+
+        code = scan.cmd_security_scan(
+            _args(home, tmp_path / "baseline.json", json=False)
+        )
+        output = capsys.readouterr().out
+
+        assert code == 2
+        assert "Scan incomplete: tirith truncated the scan." in output
+        assert "baseline was not updated" in output
 
     def test_default_baseline_is_application_owned_security_state(
         self, tmp_path, monkeypatch

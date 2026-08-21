@@ -57,6 +57,7 @@ class ConfigFinding:
 class ScanSummary:
     scanned_count: int
     findings: list[ConfigFinding]
+    incomplete_reasons: tuple[str, ...] = ()
 
 
 def _finding_fingerprint(path: str, raw: dict[str, Any]) -> str:
@@ -99,7 +100,23 @@ def _parse_tirith_output(payload: dict[str, Any]) -> ScanSummary:
 
     findings.sort(key=lambda item: (-SEVERITY_ORDER.get(item.severity, -1), item.path, item.rule_id))
     scanned_count = payload.get("scanned_count", 1 if "path" in payload else 0)
-    return ScanSummary(scanned_count=int(scanned_count or 0), findings=findings)
+    incomplete_reasons: list[str] = []
+    panic_count = payload.get("panic_count", 0)
+    if isinstance(panic_count, int) and not isinstance(panic_count, bool) and panic_count > 0:
+        incomplete_reasons.append(f"tirith reported {panic_count} rule panic(s)")
+    if payload.get("truncated") is True:
+        incomplete_reasons.append("tirith truncated the scan")
+    if payload.get("analysis_incomplete") is True:
+        reason = "tirith reported incomplete analysis"
+        coverage_gaps = payload.get("coverage_gaps")
+        if isinstance(coverage_gaps, list) and coverage_gaps:
+            reason += f" ({len(coverage_gaps)} coverage gap(s))"
+        incomplete_reasons.append(reason)
+    return ScanSummary(
+        scanned_count=int(scanned_count or 0),
+        findings=findings,
+        incomplete_reasons=tuple(incomplete_reasons),
+    )
 
 
 def _scan_path(
@@ -189,9 +206,13 @@ def _write_baseline(path: Path, findings: list[ConfigFinding]) -> None:
 def _render_human(
     *, scanned_count: int, findings: list[ConfigFinding], new_findings: list[ConfigFinding],
     baseline_path: Path, baseline_exists: bool, updated: bool,
+    incomplete_reasons: list[str],
 ) -> str:
     lines = [f"Scanned {scanned_count} file(s); tirith reported {len(findings)} finding(s)."]
-    if updated:
+    if incomplete_reasons:
+        lines.append(f"Scan incomplete: {'; '.join(incomplete_reasons)}.")
+        lines.append("The baseline was not updated; resolve the incomplete analysis and retry.")
+    elif updated:
         lines.append(f"Baseline updated with {len(findings)} finding(s): {baseline_path}")
     elif not new_findings:
         lines.append("No new findings since the accepted baseline.")
@@ -221,7 +242,8 @@ def cmd_security_scan(args: argparse.Namespace) -> int:
     if not tirith:
         print("tirith is disabled or unavailable; configure security.tirith_path", file=sys.stderr)
         return 2
-    timeout = getattr(args, "timeout", None) or cfg.get("tirith_scan_timeout", 120)
+    requested_timeout = getattr(args, "timeout", None)
+    timeout = cfg.get("tirith_scan_timeout", 120) if requested_timeout is None else requested_timeout
     if not isinstance(timeout, int) or timeout <= 0:
         print("scan timeout must be a positive integer", file=sys.stderr)
         return 2
@@ -234,8 +256,11 @@ def cmd_security_scan(args: argparse.Namespace) -> int:
         summaries = [_scan_path(tirith, path, timeout, include_patterns) for path in paths]
         findings = [finding for summary in summaries for finding in summary.findings]
         scanned_count = sum(summary.scanned_count for summary in summaries)
+        incomplete_reasons = [
+            reason for summary in summaries for reason in summary.incomplete_reasons
+        ]
         new_findings = [finding for finding in findings if finding.fingerprint not in baseline]
-        updated = bool(getattr(args, "update_baseline", False))
+        updated = bool(getattr(args, "update_baseline", False)) and not incomplete_reasons
         if updated:
             _write_baseline(baseline_path, findings)
     except (OSError, RuntimeError) as exc:
@@ -248,6 +273,8 @@ def cmd_security_scan(args: argparse.Namespace) -> int:
         "new_finding_count": len(new_findings),
         "baseline": str(baseline_path),
         "baseline_updated": updated,
+        "analysis_incomplete": bool(incomplete_reasons),
+        "incomplete_reasons": incomplete_reasons,
         "new_findings": [finding.as_dict() for finding in new_findings],
     }
     if getattr(args, "json", False):
@@ -261,9 +288,12 @@ def cmd_security_scan(args: argparse.Namespace) -> int:
                 baseline_path=baseline_path,
                 baseline_exists=baseline_exists,
                 updated=updated,
+                incomplete_reasons=incomplete_reasons,
             )
         )
 
+    if incomplete_reasons:
+        return 2
     if updated:
         return 0
     threshold = SEVERITY_ORDER[str(getattr(args, "fail_on", "high")).upper()]
