@@ -1,0 +1,254 @@
+name: One-shot endpoint-scope email app passwords
+
+on:
+  push:
+    branches:
+      - fix/email-app-password-normalization
+
+permissions:
+  contents: write
+
+concurrency:
+  group: one-shot-fix-86354
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout trigger head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: fix/email-app-password-normalization
+          fetch-depth: 0
+
+      - name: Rebuild endpoint-scoped normalization on exact current main
+        env:
+          CURRENT_MAIN: b6bcb3e791c673e63974029bbab40cc9326803ff
+          BRANCH: fix/email-app-password-normalization
+        run: |
+          set -euo pipefail
+          trigger_head="$(git rev-parse HEAD)"
+          git fetch --no-tags https://github.com/NousResearch/hermes-agent.git "${CURRENT_MAIN}"
+          test "$(git rev-parse FETCH_HEAD)" = "${CURRENT_MAIN}"
+          git reset --hard "${CURRENT_MAIN}"
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          adapter_path = Path("plugins/platforms/email/adapter.py")
+          adapter = adapter_path.read_text()
+          anchor = '''    return all([addr, pwd, imap, smtp])
+
+
+_CHARSET_ALIASES = {'''
+          replacement = '''    return all([addr, pwd, imap, smtp])
+
+
+_APP_PASSWORD_DISPLAY_RE = re.compile(
+    r"^[A-Za-z0-9]{4} [A-Za-z0-9]{4} [A-Za-z0-9]{4} [A-Za-z0-9]{4}$"
+)
+_GOOGLE_APP_PASSWORD_DOMAINS = ("gmail.com", "googlemail.com")
+
+
+def _is_google_auth_endpoint(host: str) -> bool:
+    """Return whether an IMAP/SMTP host is a Google mail endpoint.
+
+    Match on DNS-label boundaries so ``smtp.gmail.com`` and
+    ``imap.googlemail.com`` qualify, while lookalikes such as
+    ``smtp.gmail.com.evil.example`` and ``evilgmail.com`` do not.
+    """
+    normalized = str(host or "").strip().lower().rstrip(".")
+    return any(
+        normalized == domain or normalized.endswith(f".{domain}")
+        for domain in _GOOGLE_APP_PASSWORD_DOMAINS
+    )
+
+
+def _password_for_auth_endpoint(value: str, host: str) -> str:
+    """Return the wire credential authorized by the selected endpoint.
+
+    Google displays app passwords as four groups of four ASCII alphanumerics,
+    but its IMAP/SMTP LOGIN endpoints expect the compact value. Credential
+    shape alone is not mutation authority: preserve every byte for non-Google
+    endpoints and for values that are not the exact Google display form.
+    """
+    if _is_google_auth_endpoint(host) and _APP_PASSWORD_DISPLAY_RE.fullmatch(value):
+        return value.replace(" ", "")
+    return value
+
+
+_CHARSET_ALIASES = {'''
+          if adapter.count(anchor) != 1:
+              raise SystemExit("email helper insertion anchor drifted")
+          adapter = adapter.replace(anchor, replacement, 1)
+
+          imap_old = 'imap.login(self._address, self._password)'
+          imap_new = 'imap.login(\n                    self._address,\n                    _password_for_auth_endpoint(self._password, self._imap_host),\n                )'
+          if adapter.count(imap_old) != 2:
+              raise SystemExit(f"expected 2 IMAP login boundaries, found {adapter.count(imap_old)}")
+          adapter = adapter.replace(imap_old, imap_new)
+
+          smtp_old = 'smtp.login(self._address, self._password)'
+          smtp_new = 'smtp.login(\n                self._address,\n                _password_for_auth_endpoint(self._password, self._smtp_host),\n            )'
+          if adapter.count(smtp_old) != 4:
+              raise SystemExit(f"expected 4 SMTP login boundaries, found {adapter.count(smtp_old)}")
+          adapter = adapter.replace(smtp_old, smtp_new)
+
+          standalone_old = 'server.login(address, password)'
+          standalone_new = 'server.login(address, _password_for_auth_endpoint(password, smtp_host))'
+          if adapter.count(standalone_old) != 1:
+              raise SystemExit("standalone SMTP login boundary drifted")
+          adapter = adapter.replace(standalone_old, standalone_new, 1)
+          adapter_path.write_text(adapter)
+
+          tests_path = Path("tests/gateway/test_email.py")
+          tests = tests_path.read_text()
+          test_anchor = '''class TestHelperFunctions(unittest.TestCase):
+    """Test email parsing helper functions."""
+'''
+          test_block = '''class TestEndpointScopedAppPassword(unittest.TestCase):
+    """Credential mutation is authorized by the selected mail endpoint."""
+
+    def test_google_dns_label_boundaries(self):
+        from plugins.platforms.email.adapter import _is_google_auth_endpoint
+
+        accepted = (
+            "gmail.com",
+            "SMTP.GMAIL.COM",
+            "imap.gmail.com.",
+            "googlemail.com",
+            "imap.googlemail.com",
+        )
+        rejected = (
+            "evilgmail.com",
+            "gmail.com.evil.example",
+            "example.com",
+            "",
+        )
+        for host in accepted:
+            with self.subTest(host=host):
+                self.assertTrue(_is_google_auth_endpoint(host))
+        for host in rejected:
+            with self.subTest(host=host):
+                self.assertFalse(_is_google_auth_endpoint(host))
+
+    def test_exact_google_display_form_is_compacted(self):
+        from plugins.platforms.email.adapter import _password_for_auth_endpoint
+
+        raw = "abcd efgh ijkl mnop"
+        self.assertEqual(
+            _password_for_auth_endpoint(raw, "imap.gmail.com"),
+            "abcdefghijklmnop",
+        )
+        self.assertEqual(
+            _password_for_auth_endpoint(raw, "smtp.googlemail.com"),
+            "abcdefghijklmnop",
+        )
+
+    def test_non_google_same_shaped_credential_is_byte_preserved(self):
+        from plugins.platforms.email.adapter import _password_for_auth_endpoint
+
+        raw = "abcd efgh ijkl mnop"
+        self.assertEqual(_password_for_auth_endpoint(raw, "imap.example.com"), raw)
+        self.assertEqual(_password_for_auth_endpoint(raw, "smtp.gmail.com.evil"), raw)
+
+    def test_nonmatching_credentials_preserve_outer_and_inner_whitespace(self):
+        from plugins.platforms.email.adapter import _password_for_auth_endpoint
+
+        for raw in (
+            "  abcd efgh ijkl mnop  ",
+            "my pass word with spaces",
+            "\tabcd efgh ijkl mnop\n",
+        ):
+            with self.subTest(raw=repr(raw)):
+                self.assertEqual(_password_for_auth_endpoint(raw, "smtp.gmail.com"), raw)
+                self.assertEqual(_password_for_auth_endpoint(raw, "smtp.example.com"), raw)
+
+    def test_imap_and_smtp_endpoints_authorize_independently(self):
+        from plugins.platforms.email.adapter import _password_for_auth_endpoint
+
+        raw = "abcd efgh ijkl mnop"
+        self.assertEqual(
+            _password_for_auth_endpoint(raw, "imap.gmail.com"),
+            "abcdefghijklmnop",
+        )
+        self.assertEqual(
+            _password_for_auth_endpoint(raw, "smtp.example.com"),
+            raw,
+        )
+        self.assertEqual(
+            _password_for_auth_endpoint(raw, "imap.example.com"),
+            raw,
+        )
+        self.assertEqual(
+            _password_for_auth_endpoint(raw, "smtp.gmail.com"),
+            "abcdefghijklmnop",
+        )
+
+    def test_adapter_stores_credential_verbatim(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        raw = "  abcd efgh ijkl mnop  "
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@example.com",
+            "EMAIL_PASSWORD": raw,
+            "EMAIL_IMAP_HOST": "imap.gmail.com",
+            "EMAIL_SMTP_HOST": "smtp.example.com",
+        }, clear=True):
+            adapter = EmailAdapter(PlatformConfig(enabled=True))
+        self.assertEqual(adapter._password, raw)
+
+    def test_every_login_boundary_uses_endpoint_qualified_helper(self):
+        import ast
+        import inspect
+        import plugins.platforms.email.adapter as email_adapter
+
+        tree = ast.parse(inspect.getsource(email_adapter))
+        observed = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr != "login" or len(node.args) < 2:
+                continue
+            observed.append((ast.unparse(node.func.value), ast.unparse(node.args[1])))
+
+        self.assertEqual(len(observed), 7)
+        expected_hosts = {
+            "imap": "self._imap_host",
+            "smtp": "self._smtp_host",
+            "server": "smtp_host",
+        }
+        for receiver, password_expr in observed:
+            with self.subTest(receiver=receiver, expression=password_expr):
+                self.assertIn(receiver, expected_hosts)
+                self.assertEqual(
+                    password_expr,
+                    f"_password_for_auth_endpoint(self._password, {expected_hosts[receiver]})"
+                    if receiver != "server"
+                    else "_password_for_auth_endpoint(password, smtp_host)",
+                )
+
+
+class TestHelperFunctions(unittest.TestCase):
+    """Test email parsing helper functions."""
+'''
+          if tests.count(test_anchor) != 1:
+              raise SystemExit("email test insertion anchor drifted")
+          tests = tests.replace(test_anchor, test_block, 1)
+          tests_path.write_text(tests)
+          PY
+
+          python -m py_compile plugins/platforms/email/adapter.py tests/gateway/test_email.py
+          python -m pytest -q tests/gateway/test_email.py
+          git diff --check
+
+          git config user.name "andrexibiza"
+          git config user.email "84248988+andrexibiza@users.noreply.github.com"
+          git add plugins/platforms/email/adapter.py tests/gateway/test_email.py
+          git commit -m "fix(email): scope app-password normalization to Google endpoints"
+          git push \
+            --force-with-lease="refs/heads/${BRANCH}:${trigger_head}" \
+            origin "HEAD:refs/heads/${BRANCH}"
