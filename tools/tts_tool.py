@@ -1746,8 +1746,20 @@ async def _generate_edge_tts(text: str, output_path: str, tts_config: Dict[str, 
         pct = round((speed - 1.0) * 100)
         kwargs["rate"] = f"{pct:+d}%"
 
-    communicate = _edge_tts.Communicate(text, **kwargs)
-    await communicate.save(output_path)
+    try:
+        communicate = _edge_tts.Communicate(text, **kwargs)
+        await communicate.save(output_path)
+    except (ConnectionResetError, OSError):
+        # speech.platform.bing.com resets some hosts' IPv4 connections
+        # (observed on datacenter/cloud IP ranges) while IPv6 to the same
+        # endpoint succeeds. Retry once forcing IPv6 before giving up.
+        import socket
+
+        import aiohttp
+
+        connector = aiohttp.TCPConnector(family=socket.AF_INET6)
+        communicate = _edge_tts.Communicate(text, connector=connector, **kwargs)
+        await communicate.save(output_path)
     return output_path
 
 
