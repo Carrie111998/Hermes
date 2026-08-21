@@ -384,6 +384,13 @@ def _is_hermes_internal_secret(key: str) -> bool:
       (``GATEWAY_RELAY_URL``, ``GATEWAY_RELAY_PLATFORMS``, …) are NOT matched
       and remain visible.
 
+    - ``HERMES_WEBHOOK_SECRET_*`` — HMAC secrets for the webhook platform
+      adapter, referenced from ``platforms.webhook.extra`` config as
+      ``secret: ${HERMES_WEBHOOK_SECRET_<NAME>}`` and resolved from the
+      environment at adapter load time. Only consumer is the in-process
+      webhook adapter; leaking one lets the holder forge signed webhook
+      POSTs into the gateway.
+
     ``code_execution_tool.py`` already catches these via substring matching on
     ``KEY`` / ``SECRET`` / ``TOKEN``; the terminal backend's narrower name-based
     blocklist did not, which is the leak this predicate closes.
@@ -404,6 +411,11 @@ def _is_hermes_internal_secret(key: str) -> bool:
     if upper.startswith("GATEWAY_RELAY_") and (
         upper.endswith("_SECRET") or upper.endswith("_KEY") or upper.endswith("_TOKEN")
     ):
+        return True
+    if upper.startswith("HERMES_WEBHOOK_SECRET_"):
+        # P15 (F-M75-48): webhook-platform HMAC secrets referenced from
+        # config.yaml as secret: ${HERMES_WEBHOOK_SECRET_<NAME>}; stripped
+        # unconditionally on every spawn surface (see docstring).
         return True
     return False
 

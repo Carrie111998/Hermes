@@ -97,3 +97,38 @@ def test_e2e_no_scrub_child_keeps_planted_secret(tmp_path, monkeypatch):
         env=env, capture_output=True, text=True, timeout=60, check=True,
     )
     assert out.stdout.strip() == "sk-FAKE-planted"
+
+
+# ---------------------------------------------------------------------------
+# Webhook-platform HMAC secrets (${VAR} expansion support): stripped on every
+# spawn path, including the inherit_credentials=True path that skips the
+# Tier-2 provider blocklist.
+# ---------------------------------------------------------------------------
+
+def test_scrub_on_strips_hermes_webhook_secret_vars(monkeypatch):
+    monkeypatch.setenv("HERMES_WEBHOOK_SECRET_DA_PART1", "hex-secret")
+    env = build_subprocess_env()
+    assert "HERMES_WEBHOOK_SECRET_DA_PART1" not in env
+
+
+def test_webhook_secret_predicate_is_case_insensitive():
+    from tools.environments.local import _is_hermes_internal_secret
+
+    assert _is_hermes_internal_secret("HERMES_WEBHOOK_SECRET_DA_PART1")
+    assert _is_hermes_internal_secret("hermes_webhook_secret_x")
+    # No name part after the prefix -> not a webhook secret var.
+    assert not _is_hermes_internal_secret("HERMES_WEBHOOK_SECRET")
+    # Outside the convention -> untouched (users may name other vars freely).
+    assert not _is_hermes_internal_secret("MY_WEBHOOK_SECRET")
+
+
+def test_hermes_subprocess_env_strips_webhook_secret_even_with_credentials(monkeypatch):
+    from tools.environments.local import hermes_subprocess_env
+
+    monkeypatch.setenv("HERMES_WEBHOOK_SECRET_SELFTEST", "sentinel")
+    assert "HERMES_WEBHOOK_SECRET_SELFTEST" not in hermes_subprocess_env(
+        inherit_credentials=True
+    )
+    assert "HERMES_WEBHOOK_SECRET_SELFTEST" not in hermes_subprocess_env(
+        inherit_credentials=False
+    )
