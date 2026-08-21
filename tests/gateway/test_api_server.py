@@ -924,6 +924,25 @@ class TestProfilesEndpoint:
         assert "/secret/" not in serialized
         assert "has_env" not in serialized
 
+    @pytest.mark.asyncio
+    async def test_profiles_reports_bot_protocol_when_runtime_injector_exists(self, auth_adapter):
+        probe = types.ModuleType("tools.bot_mode_probe")
+        probe.get_bot_mode_protocol_section = lambda: ""
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch("hermes_cli.profiles.list_profiles", return_value=[]),
+                patch.dict(sys.modules, {"tools.bot_mode_probe": probe}),
+            ):
+                resp = await cli.get(
+                    "/api/profiles",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert resp.status == 200
+                body = await resp.json()
+
+        assert body["bot_mode_protocol"] is True
+
 
 # ---------------------------------------------------------------------------
 # /v1/capabilities endpoint
