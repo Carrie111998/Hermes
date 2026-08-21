@@ -6,7 +6,50 @@ Handler injected to avoid importing ``main``.
 
 from __future__ import annotations
 
+import sys
+from functools import wraps
 from typing import Callable
+
+
+def _plan_bound_update_handler(cmd_update: Callable) -> Callable:
+    """Bind update admission to the authoritative deployment plan."""
+
+    @wraps(cmd_update)
+    def _handler(args):
+        from hermes_cli.deployment_plan import (
+            DeploymentPlanError,
+            admit_update,
+            load_deployment_plan,
+        )
+        from hermes_cli.update_deployment_guard import (
+            enforce_legacy_update_envelope,
+            validate_update_plan_source,
+        )
+
+        try:
+            validate_update_plan_source()
+            is_check = bool(getattr(args, "check", False))
+            is_plan = bool(getattr(args, "plan", False))
+            if is_plan:
+                # Existing --plan is an observation-only inventory path. Keep it
+                # outside mutation admission just like --check; it must work for
+                # image/external/remote deployments precisely so it can explain
+                # why mutation is unavailable.
+                plan = load_deployment_plan()
+                setattr(args, "_deployment_plan", plan)
+            else:
+                plan = admit_update(args)
+            # Test doubles may return None; production paths always attach a plan.
+            if plan is not None and not (is_check or is_plan):
+                enforce_legacy_update_envelope(plan)
+        except DeploymentPlanError as exc:
+            print(f"✗ {exc}", file=sys.stderr)
+            if exc.remediation:
+                print(f"  {exc.remediation}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        return cmd_update(args)
+
+    return _handler
 
 
 def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
@@ -111,4 +154,4 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         default=False,
         help="Windows: mutate the venv even while other processes are running from its interpreter (desktop backend, gateway, terminals). Those processes keep native .pyd files locked, so the dependency sync will likely fail partway and strand the install half-updated. Use only if you know the detected holders are false positives.",
     )
-    update_parser.set_defaults(func=cmd_update)
+    update_parser.set_defaults(func=_plan_bound_update_handler(cmd_update))
