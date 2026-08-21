@@ -142,7 +142,8 @@ class PostgresDatabase:
                            "004_lead_research_rls", "005_auth_table_rls",
                            "006_message_supersession", "007_document_artifacts",
                            "008_candidate_corpus", "009_research_results",
-                           "010_digest_suppression_parity")
+                           "010_digest_suppression_parity",
+                           "011_candidate_search_text")
 
     def _assert_migrations_applied(self) -> None:
         try:

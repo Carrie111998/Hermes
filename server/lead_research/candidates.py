@@ -98,6 +98,50 @@ def _haystack(row, data: dict) -> str:
     ])
 
 
+def search_text(normalized_name: str, data: dict) -> str:
+    """The stored, match-ready form of one row's haystack.
+
+    Folded here so a run compares two already-folded strings instead of folding
+    both sides per row. Kept as a plain function because it has to produce
+    exactly what `matches_term` expects on the other side, and the import path
+    and the read-time fallback must not be able to drift apart.
+    """
+    return _fold(_haystack({"normalized_name": normalized_name}, data))
+
+
+def _row_search_text(row, data: dict) -> str:
+    """Stored match text, or computed when a corpus predates the column."""
+    try:
+        stored = row["search_text"]
+    except (KeyError, IndexError):
+        stored = None
+    return stored if stored else search_text(row["normalized_name"], data)
+
+
+_LIKE_ESCAPE = "\\"
+
+
+def like_pattern(needle: str) -> str:
+    """A LIKE pattern matching `needle` as whole words, wildcards neutralised.
+
+    Plural-folded first, because the stored text is: `household appliances` is
+    held as `household appliance`, so an unfolded pattern matches nothing.
+    `matches_term` folds both sides itself, which is why only this path needs to
+    say so.
+
+    `searchable_term` folds `_` to a space but leaves `%` alone, so a real
+    product term like `100% cotton` would otherwise reach SQL as a wildcard and
+    match the entire corpus. Escaped rather than stripped: the term has to keep
+    meaning what the customer typed.
+    """
+    escaped = (
+        _fold(needle).replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2)
+        .replace("%", _LIKE_ESCAPE + "%")
+        .replace("_", _LIKE_ESCAPE + "_")
+    )
+    return f"% {escaped} %"
+
+
 class CandidateImportValidationError(ValueError):
     """The supplied corpus is malformed; no part of it was written."""
 
@@ -374,10 +418,12 @@ class CandidateRepository:
                 for record in candidates:
                     conn.execute(
                         "INSERT INTO candidate_records("
-                        "dataset_id,version,source_record_id,company_name,normalized_name,country,domain,data) "
-                        "VALUES(?,?,?,?,?,?,?,?)",
+                        "dataset_id,version,source_record_id,company_name,normalized_name,country,domain,data,"
+                        "search_text) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)",
                         (dataset_id, version, record.source_record_id, record.company_name, record.normalized_name,
-                         record.country, record.domain, json_dump(record.data)),
+                         record.country, record.domain, json_dump(record.data),
+                         search_text(record.normalized_name, record.data)),
                     )
         except CandidateImportConflict:
             raise
@@ -393,6 +439,38 @@ class CandidateRepository:
             dataset_id, version, len(candidates), digest,
             sector_categories, unknown_categories, suggestions,
         )
+
+    def backfill_search_text(self, batch: int = 2000) -> int:
+        """Fill `search_text` for corpora imported before the column existed.
+
+        Returns how many rows were written. Selection does not need this — it
+        falls back to computing the value for a NULL row — so this is a
+        performance backfill, not a repair, and it is safe to run at any time or
+        not at all. Idempotent: a second run finds nothing to do.
+
+        Batched because a corpus can be tens of thousands of rows and one
+        transaction over all of them holds a write lock for as long as it takes.
+        """
+        written = 0
+        while True:
+            rows = self.db.all(
+                "SELECT dataset_id,version,source_record_id,normalized_name,data "
+                "FROM candidate_records WHERE search_text IS NULL LIMIT ?",
+                (int(batch),),
+            )
+            if not rows:
+                return written
+            with self.db.transaction() as conn:
+                for row in rows:
+                    conn.execute(
+                        "UPDATE candidate_records SET search_text=? WHERE "
+                        "dataset_id=? AND version=? AND source_record_id=?",
+                        (
+                            search_text(row["normalized_name"], json_load(row["data"], {})),
+                            row["dataset_id"], row["version"], row["source_record_id"],
+                        ),
+                    )
+            written += len(rows)
 
     def _current_versions(self) -> dict[str, str]:
         """The newest version of every imported dataset, keyed by dataset id.
@@ -427,7 +505,7 @@ class CandidateRepository:
             return {}
         folded = {str(term): searchable_term(term) for term in counts}
         for row, data in self._rows(countries):
-            haystack = _haystack(row, data)
+            haystack = _row_search_text(row, data)
             for term, needle in folded.items():
                 if matches_term(needle, haystack):
                     counts[term] += 1
@@ -451,7 +529,7 @@ class CandidateRepository:
         for dataset_id in sorted(current):
             params.extend((dataset_id, current[dataset_id]))
         for row in self.db.all(
-            "SELECT normalized_name,data FROM candidate_records WHERE "
+            "SELECT normalized_name,data,search_text FROM candidate_records WHERE "
             + " AND ".join(clauses),
             tuple(params),
         ):
@@ -491,8 +569,8 @@ class CandidateRepository:
         if not current:
             return []
         query = (
-            "SELECT dataset_id,version,source_record_id,company_name,normalized_name,country,domain,data "
-            "FROM candidate_records"
+            "SELECT dataset_id,version,source_record_id,company_name,normalized_name,country,domain,data,"
+            "search_text FROM candidate_records"
         )
         clauses: list[str] = []
         params: list[Any] = []
@@ -510,6 +588,32 @@ class CandidateRepository:
         )
         for dataset_id in sorted(current):
             params.extend((dataset_id, current[dataset_id]))
+        terms = _terms(product_terms)
+        if terms:
+            # Filter in the database rather than after decoding every row. Both
+            # sides are already folded and lower-cased, so LIKE behaves the same
+            # on SQLite (ASCII-insensitive) and Postgres (sensitive) — there is
+            # no case left to disagree about.
+            #
+            # `search_text IS NULL` is in the OR deliberately: a corpus imported
+            # before the column existed has nothing to match against here, and
+            # excluding those rows would silently shrink an existing tenant's
+            # candidate pool. They fall through to the Python check below, which
+            # computes what the column would have held.
+            # Padded on both sides, exactly as `matches_term` pads, so a term
+            # at the very start or end of the text still matches its word
+            # boundary. Without this, `oven` failed on `built in oven` — the
+            # word is there and has no trailing space. `||` is the concatenation
+            # both SQLite and Postgres speak.
+            like = " OR ".join(
+                [
+                    f"(' ' || search_text || ' ') LIKE ? ESCAPE '{_LIKE_ESCAPE}'"
+                    for _ in terms
+                ]
+                + ["search_text IS NULL"]
+            )
+            clauses.append(f"({like})")
+            params.extend(like_pattern(term) for term in terms)
         query += " WHERE " + " AND ".join(clauses)
         # Not by dataset_id: that let the alphabetically-first corpus consume
         # the whole limit, so a tenant holding both a plain contact list and a
@@ -517,11 +621,12 @@ class CandidateRepository:
         # are content hashes, so this interleaves datasets evenly and stays
         # deterministic.
         query += " ORDER BY source_record_id,dataset_id,version"
-        terms = _terms(product_terms)
         results: list[CandidateRecord] = []
         for row in self.db.all(query, tuple(params)):
             data = json_load(row["data"], {})
-            searchable = _haystack(row, data)
+            # Still the authority. SQL narrowed the rows; this decides them, so a
+            # corpus with no stored search text matches exactly as it always did.
+            searchable = _row_search_text(row, data)
             # Any term, not every term. A campaign's sector ids, HS codes and
             # product names are alternative descriptions of one scope, not
             # conditions to satisfy together — and no company name contains two

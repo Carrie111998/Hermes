@@ -85,6 +85,13 @@ CREATE TABLE IF NOT EXISTS candidate_records (
     country TEXT NOT NULL,
     domain TEXT,
     data TEXT NOT NULL DEFAULT '{}',
+    -- Everything a product term matches against, normalised and plural-folded
+    -- once at import. Selection used to rebuild this per row on every run — JSON
+    -- decode plus several diacritic-stripping passes — so ten campaigns into one
+    -- country did the same work ten times. NULL means a corpus imported before
+    -- this column existed; selection falls back to computing it, so a corpus
+    -- stays usable without a backfill.
+    search_text TEXT,
     PRIMARY KEY(dataset_id, version, source_record_id),
     FOREIGN KEY(dataset_id, version) REFERENCES candidate_datasets(dataset_id, version)
 );
