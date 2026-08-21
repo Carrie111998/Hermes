@@ -91,6 +91,8 @@ describe('ModelPill per-surface model label', () => {
       $busy: atom(false),
       $cwd: atom(''),
       $fast: atom(false),
+      $lastActivityAt: atom<number | null>(null),
+      $lastActivityDescription: atom(''),
       $lastVisibleIsUser: atom(false),
       $messages: atom([]),
       $messagesEmpty: atom(true),

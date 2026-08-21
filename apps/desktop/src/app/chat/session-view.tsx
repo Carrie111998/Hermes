@@ -1,4 +1,4 @@
-import { computed, type ReadableAtom } from 'nanostores'
+import { atom, computed, type ReadableAtom } from 'nanostores'
 import { createContext, useContext } from 'react'
 
 import type { ClientSessionState } from '@/app/types'
@@ -48,6 +48,8 @@ export interface SessionView {
   $busy: ReadableAtom<boolean>
   $awaitingResponse: ReadableAtom<boolean>
   $messagesEmpty: ReadableAtom<boolean>
+  $lastActivityAt: ReadableAtom<number | null>
+  $lastActivityDescription: ReadableAtom<string>
   $lastVisibleIsUser: ReadableAtom<boolean>
   /** Epoch ms this surface's current turn began, null when idle. Per-surface
    *  for the same reason $busy is: a tile's activity timer must count its own
@@ -80,6 +82,8 @@ function primaryField<T>(select: (state: ClientSessionState) => T, $draft: Reada
 }
 
 const $primaryMessages = primaryField<ChatMessage[]>(state => state.messages, $messages)
+const $draftLastActivityAt = atom<number | null>(null)
+const $draftLastActivityDescription = atom('')
 
 /**
  * Turn-busy for the workspace pane. A selected stored session that has no
@@ -98,6 +102,8 @@ export const PRIMARY_SESSION_VIEW: SessionView = {
   $busy: $primaryBusy,
   $cwd: primaryField<string>(state => state.cwd, $currentCwd),
   $fast: primaryField<boolean>(state => state.fast, $currentFastMode),
+  $lastActivityAt: primaryField<number | null>(state => state.lastActivityAt, $draftLastActivityAt),
+  $lastActivityDescription: primaryField<string>(state => state.lastActivityDescription, $draftLastActivityDescription),
   $lastVisibleIsUser: computed($primaryMessages, lastVisibleMessageIsUser),
   $messages: $primaryMessages,
   $messagesEmpty: computed($primaryMessages, messages => messages.length === 0),
