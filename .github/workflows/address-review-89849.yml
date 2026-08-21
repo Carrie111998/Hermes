@@ -34,8 +34,9 @@ jobs:
               text = p.read_text()
               if new in text:
                   return
-              if text.count(old) != 1:
-                  raise SystemExit(f"Expected exactly one patch anchor in {path}; found {text.count(old)}")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"Expected exactly one patch anchor in {path}; found {count}")
               p.write_text(text.replace(old, new, 1))
 
           utils = 'apps/desktop/src/app/session/hooks/use-session-actions/utils.ts'
@@ -49,15 +50,57 @@ jobs:
             }
           """,
               """    } catch (error) {
-              // A genuine missing session ends the authoritative lookup here; a
-              // transport/gateway failure is transient and must reach the existing
-              // resume retry path instead of being misreported as a missing session.
+              // A genuine missing session ends the authoritative lookup here. A
+              // transport/gateway failure is inconclusive: preserve the owner and
+              // let the caller arm its bounded retry instead of treating it as 404.
               if (isSessionGoneError(error)) {
                 return undefined
               }
 
               throw error
             }
+          """,
+          )
+
+          actions = 'apps/desktop/src/app/session/hooks/use-session-actions/index.ts'
+          replace_once(
+              actions,
+              """import type { SessionCreateResponse, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
+          """,
+              """import type { SessionCreateResponse, SessionInfo, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
+          """,
+          )
+          replace_once(
+              actions,
+              """      const storedForProfile = await resolveStoredSession(storedSessionId, ownerProfileHint)
+              const sessionProfile = storedForProfile?.profile
+
+              if (resumeRequestRef.current !== requestId) {
+                return
+              }
+          """,
+              """      let storedForProfile: SessionInfo | undefined
+
+              try {
+                storedForProfile = await resolveStoredSession(storedSessionId, ownerProfileHint)
+              } catch {
+                if (resumeRequestRef.current !== requestId) {
+                  return
+                }
+
+                // A non-404 owner lookup failure is transient/inconclusive. Keep the
+                // authoritative owner scoped to this request and arm the existing
+                // bounded route-resume retry instead of probing unrelated profiles.
+                setResumeFailedSessionId(storedSessionId)
+
+                return
+              }
+
+              const sessionProfile = storedForProfile?.profile
+
+              if (resumeRequestRef.current !== requestId) {
+                return
+              }
           """,
           )
 
@@ -78,19 +121,21 @@ jobs:
 
           """
           if insert not in text:
-              if text.count(anchor) != 1:
-                  raise SystemExit(f"Expected exactly one test insertion anchor; found {text.count(anchor)}")
+              count = text.count(anchor)
+              if count != 1:
+                  raise SystemExit(f"Expected exactly one test insertion anchor; found {count}")
               test_path.write_text(text.replace(anchor, insert + anchor, 1))
           PY
 
           # One-shot transport only; keep it out of the final PR tree.
           rm -f .github/workflows/address-review-89849.yml
 
-          # Refuse any accidental scope creep.
+          # Refuse accidental scope creep.
           mapfile -t changed < <(git status --short | awk '{print $2}' | sort -u)
           printf 'Changed paths:\n%s\n' "${changed[*]}"
           allowed=(
             .github/workflows/address-review-89849.yml
+            apps/desktop/src/app/session/hooks/use-session-actions/index.ts
             apps/desktop/src/app/session/hooks/use-session-actions/resolve-stored-session.test.ts
             apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
           )
@@ -105,11 +150,15 @@ jobs:
             fi
           done
 
-          grep -q "catch (error)" apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
           grep -q "isSessionGoneError(error)" apps/desktop/src/app/session/hooks/use-session-actions/utils.ts
+          grep -q "setResumeFailedSessionId(storedSessionId)" apps/desktop/src/app/session/hooks/use-session-actions/index.ts
           grep -q "propagates transient explicit-owner failures" apps/desktop/src/app/session/hooks/use-session-actions/resolve-stored-session.test.ts
           git diff --check
 
           git add -A
-          git commit -m "fix(desktop): propagate transient owner lookup failures"
+          if git diff --cached --quiet; then
+            echo "Review fix already applied; nothing to commit."
+            exit 0
+          fi
+          git commit -m "fix(desktop): retry transient owner lookup failures"
           git push origin HEAD:fix/desktop-session-owner-hint
