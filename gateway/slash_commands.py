@@ -5453,6 +5453,19 @@ class GatewaySlashCommandsMixin:
             return "\n".join(parts)
         return t("gateway.usage.no_data")
 
+    async def _handle_codex_usage_command(self, event: MessageEvent) -> str:
+        """Show ChatGPT Codex quota windows and a linear burn-rate forecast."""
+        from agent.account_usage import render_codex_usage_lines
+
+        snapshot = await asyncio.to_thread(fetch_account_usage, "openai-codex")
+        lines = render_codex_usage_lines(snapshot, markdown=True)
+        if not lines:
+            return (
+                "Codex usage is unavailable. Sign in with "
+                "`hermes auth add openai-codex` and try again."
+            )
+        return "\n".join(lines)
+
     async def _handle_insights_command(self, event: MessageEvent) -> str:
         """Handle /insights command -- show usage insights and analytics."""
         args = event.get_command_args().strip()

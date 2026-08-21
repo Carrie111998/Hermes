@@ -99,6 +99,13 @@ class TestResolveCommand:
         assert not ctx.cli_only and not ctx.gateway_only
         assert "context" in GATEWAY_KNOWN_COMMANDS
 
+    def test_codex_usage_command_is_available_everywhere(self):
+        command = resolve_command("codex-usage")
+        assert command is not None
+        assert command.name == "codex-usage"
+        assert not command.cli_only and not command.gateway_only
+        assert "codex-usage" in GATEWAY_KNOWN_COMMANDS
+
 
 
 

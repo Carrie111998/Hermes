@@ -112,6 +112,33 @@ class TestUsageCachedAgent:
 class TestUsageAccountSection:
     """Account-limits section appended to /usage output (PR #2486)."""
 
+    @pytest.mark.asyncio
+    async def test_codex_usage_command_renders_quota_and_forecast(self, monkeypatch):
+        from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow, _parse_dt
+
+        runner = _make_runner(SK)
+        snapshot = AccountUsageSnapshot(
+            provider="openai-codex",
+            source="usage_api",
+            fetched_at=_parse_dt(1_800_000_000),
+            plan="Plus",
+            windows=(
+                AccountUsageWindow(
+                    label="Session",
+                    used_percent=60,
+                    reset_at=_parse_dt(1_800_009_000),
+                    window_seconds=19_800,
+                    reset_after_seconds=9_000,
+                ),
+            ),
+        )
+        monkeypatch.setattr("gateway.slash_commands.fetch_account_usage", lambda provider: snapshot)
+
+        result = await runner._handle_codex_usage_command(MagicMock())
+
+        assert "40% remaining" in result
+        assert "exhausted in 2h 0m" in result
+
 
     @pytest.mark.asyncio
     async def test_usage_command_uses_persisted_provider_when_agent_not_running(self, monkeypatch):

@@ -28,6 +28,8 @@ class AccountUsageWindow:
     used_percent: Optional[float] = None
     reset_at: Optional[datetime] = None
     detail: Optional[str] = None
+    window_seconds: Optional[int] = None
+    reset_after_seconds: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +119,59 @@ def render_account_usage_lines(snapshot: Optional[AccountUsageSnapshot], *, mark
         lines.append(detail)
     if snapshot.unavailable_reason:
         lines.append(f"Unavailable: {snapshot.unavailable_reason}")
+    return lines
+
+
+def _format_duration(seconds: float) -> str:
+    total_minutes = max(0, int(seconds // 60))
+    hours, minutes = divmod(total_minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def render_codex_usage_lines(
+    snapshot: Optional[AccountUsageSnapshot], *, markdown: bool = False
+) -> list[str]:
+    """Render Codex limits plus a linear end-of-window usage forecast.
+
+    The forecast uses the average burn rate since the backend window began;
+    it does not claim to predict bursty future work.
+    """
+    if not snapshot:
+        return []
+    lines = render_account_usage_lines(snapshot, markdown=markdown)
+    lines[0] = f"📈 {'**' if markdown else ''}Codex usage{'**' if markdown else ''}"
+    insert_at = 3
+    for window in snapshot.windows:
+        used = window.used_percent
+        duration = window.window_seconds
+        remaining_time = window.reset_after_seconds
+        if used is None or not duration or remaining_time is None:
+            insert_at += 1
+            continue
+        elapsed = duration - remaining_time
+        if used <= 0 or elapsed <= 0:
+            insert_at += 1
+            continue
+        rate = float(used) / elapsed
+        seconds_to_exhaustion = max(0.0, (100.0 - float(used)) / rate)
+        if seconds_to_exhaustion < remaining_time:
+            forecast = (
+                "At current average pace: exhausted in "
+                f"{_format_duration(seconds_to_exhaustion)} (before reset)"
+            )
+        else:
+            projected_used = min(100.0, float(used) + rate * remaining_time)
+            forecast = (
+                "At current average pace: "
+                f"~{projected_used:.0f}% used at reset "
+                f"(~{max(0.0, 100.0 - projected_used):.0f}% remaining)"
+            )
+        # Insert directly after this window's rendered line. Account lines
+        # begin with header + provider, hence the offset of two.
+        lines.insert(insert_at, forecast)
+        insert_at += 2
     return lines
 
 
@@ -535,6 +590,16 @@ def _fetch_codex_account_usage(
                 label=label,
                 used_percent=float(used),
                 reset_at=_parse_dt(window.get("reset_at")),
+                window_seconds=(
+                    int(window["limit_window_seconds"])
+                    if isinstance(window.get("limit_window_seconds"), (int, float))
+                    else None
+                ),
+                reset_after_seconds=(
+                    int(window["reset_after_seconds"])
+                    if isinstance(window.get("reset_after_seconds"), (int, float))
+                    else None
+                ),
             )
         )
     details: list[str] = []

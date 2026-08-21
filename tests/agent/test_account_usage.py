@@ -40,6 +40,8 @@ def codex_usage_payload():
             "primary_window": {
                 "used_percent": 21,
                 "reset_at": 1779846359,
+                "limit_window_seconds": 18_000,
+                "reset_after_seconds": 9_000,
             },
             "secondary_window": {
                 "used_percent": 4,
@@ -74,8 +76,56 @@ def test_codex_usage_prefers_explicit_live_agent_credentials(monkeypatch, codex_
     assert snapshot.plan == "Plus"
     assert [w.label for w in snapshot.windows] == ["Session", "Weekly"]
     assert snapshot.windows[0].used_percent == 21
+    assert snapshot.windows[0].window_seconds == 18_000
+    assert snapshot.windows[0].reset_after_seconds == 9_000
     assert calls[0]["url"] == "https://chatgpt.com/backend-api/wham/usage"
     assert calls[0]["headers"]["Authorization"] == "Bearer live-agent-token"
+
+
+def test_codex_usage_forecast_projects_exhaustion_before_reset():
+    snapshot = account_usage.AccountUsageSnapshot(
+        provider="openai-codex",
+        source="usage_api",
+        fetched_at=account_usage._parse_dt(1_800_000_000),
+        plan="Plus",
+        windows=(
+            account_usage.AccountUsageWindow(
+                label="Session",
+                used_percent=60,
+                reset_at=account_usage._parse_dt(1_800_007_200),
+                window_seconds=19_800,
+                reset_after_seconds=9_000,
+            ),
+        ),
+    )
+
+    lines = account_usage.render_codex_usage_lines(snapshot)
+
+    assert lines[0] == "📈 Codex usage"
+    assert "Session: 40% remaining (60% used)" in lines[2]
+    assert "At current average pace: exhausted in 2h 0m" in lines[3]
+    assert "before reset" in lines[3]
+
+
+def test_codex_usage_forecast_projects_remaining_quota_at_reset():
+    snapshot = account_usage.AccountUsageSnapshot(
+        provider="openai-codex",
+        source="usage_api",
+        fetched_at=account_usage._parse_dt(1_800_000_000),
+        windows=(
+            account_usage.AccountUsageWindow(
+                label="Weekly",
+                used_percent=20,
+                reset_at=account_usage._parse_dt(1_800_009_000),
+                window_seconds=18_000,
+                reset_after_seconds=9_000,
+            ),
+        ),
+    )
+
+    lines = account_usage.render_codex_usage_lines(snapshot)
+
+    assert "~40% used at reset (~60% remaining)" in lines[3]
 
 
 def test_codex_usage_falls_back_to_native_credential_pool(monkeypatch, codex_usage_payload):

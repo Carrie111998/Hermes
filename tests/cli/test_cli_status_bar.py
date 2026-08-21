@@ -234,6 +234,32 @@ class TestCLIStatusBar:
 
 
 class TestCLIUsageReport:
+    def test_show_codex_usage_prints_forecast(self, monkeypatch, capsys):
+        from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow, _parse_dt
+
+        snapshot = AccountUsageSnapshot(
+            provider="openai-codex",
+            source="usage_api",
+            fetched_at=_parse_dt(1_800_000_000),
+            windows=(
+                AccountUsageWindow(
+                    label="Session",
+                    used_percent=60,
+                    reset_at=_parse_dt(1_800_009_000),
+                    window_seconds=19_800,
+                    reset_after_seconds=9_000,
+                ),
+            ),
+        )
+        monkeypatch.setattr("agent.account_usage.fetch_account_usage", lambda provider: snapshot)
+        cli_obj = _make_cli()
+
+        cli_obj._show_codex_usage()
+
+        output = capsys.readouterr().out
+        assert "40% remaining" in output
+        assert "exhausted in 2h 0m" in output
+
     def test_show_usage_omits_cost_reporting(self, capsys):
         cli_obj = _attach_agent(
             _make_cli(),

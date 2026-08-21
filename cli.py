@@ -12113,6 +12113,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._manual_compress(cmd_original)
         elif canonical == "usage":
             self._handle_usage_command(cmd_original)
+        elif canonical == "codex-usage":
+            self._show_codex_usage()
         elif canonical == "subscription":
             self._show_subscription()
         elif canonical == "topup":
@@ -13437,6 +13439,32 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             print(f"  Unknown /usage subcommand: {' '.join(parts[1:])}. Try /usage or /usage reset [--force].")
             return
         self._show_usage()
+
+    def _show_codex_usage(self):
+        """Show ChatGPT Codex quota windows and a linear burn-rate forecast."""
+        from agent.account_usage import (
+            fetch_account_usage,
+            render_codex_usage_lines,
+        )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            try:
+                snapshot = pool.submit(
+                    fetch_account_usage, "openai-codex"
+                ).result(timeout=15.0)
+            except Exception:
+                snapshot = None
+        lines = render_codex_usage_lines(snapshot)
+        if not lines:
+            print(
+                "  Codex usage is unavailable. Sign in with "
+                "`hermes auth add openai-codex` and try again."
+            )
+            return
+        print()
+        for line in lines:
+            print(f"  {line}")
+        print()
 
     def _usage_reset(self, force: bool = False):
         """`/usage reset [--force]` — redeem one banked Codex reset credit."""
