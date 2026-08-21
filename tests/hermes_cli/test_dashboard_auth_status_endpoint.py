@@ -67,6 +67,23 @@ def test_status_reports_auth_required_in_gated_mode(gated_client):
     assert body["auth_providers"] == ["stub"]
 
 
+def test_static_health_is_public_in_gated_mode(gated_client):
+    """Anonymous probes get the static liveness shape under the OAuth gate.
+
+    Keep this payload intentionally tiny.  ``/api/status`` is the rich probe;
+    ``/api/health`` exists so a 60-second wedge detector never triggers status
+    aggregation, a state.db query, or plugin discovery.
+    """
+    r = gated_client.get("/api/health")
+    assert r.status_code == 200
+    assert r.json() == {
+        "status": "ok",
+        "version": web_server.__version__,
+        "release_date": web_server.__release_date__,
+    }
+    assert r.headers["cache-control"] == "no-store"
+
+
 def test_status_reports_auth_disabled_in_loopback_mode(loopback_client):
     r = loopback_client.get("/api/status")
     assert r.status_code == 200
