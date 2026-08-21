@@ -2576,6 +2576,22 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             client_kwargs["default_headers"] = existing
     except Exception:
         _ra().logger.debug("Copilot default-header guard skipped", exc_info=True)
+    # xAI Grok Build proxy (cli-chat-proxy.grok.com) rejects requests without
+    # the grok-cli headers (HTTP 426). The xai-oauth bearer is the same one
+    # the official grok CLI sends there; inject the required headers whenever
+    # the target is that origin. Only ADD missing keys — never override
+    # headers a caller deliberately set (mirrors the Copilot guard above).
+    try:
+        from hermes_cli.auth import xai_grok_proxy_headers_for
+
+        _grok_headers = xai_grok_proxy_headers_for(str(client_kwargs.get("base_url", "")))
+        if _grok_headers:
+            _existing_headers = dict(client_kwargs.get("default_headers") or {})
+            for _hk, _hv in _grok_headers.items():
+                _existing_headers.setdefault(_hk, _hv)
+            client_kwargs["default_headers"] = _existing_headers
+    except Exception:
+        _ra().logger.debug("xAI Grok proxy default-header guard skipped", exc_info=True)
     # Uses the module-level `OpenAI` name, resolved lazily on first
     # access via __getattr__ below. Tests patch via `run_agent.OpenAI`.
     client = _ra().OpenAI(**client_kwargs)

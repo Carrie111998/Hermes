@@ -990,3 +990,44 @@ def test_pool_sync_back_preserves_active_provider(tmp_path, monkeypatch):
     state = raw_after["providers"]["xai-oauth"]["tokens"]
     assert state["access_token"] == new_access
     assert state["refresh_token"] == "rt-rotated"
+
+
+# ---------------------------------------------------------------------------
+# Grok Build proxy origin (SuperGrok subscription quota)
+#
+# The xai-oauth bearer carries the SuperGrok entitlement; xAI serves that
+# quota on the Grok Build proxy (cli-chat-proxy.grok.com), not on api.x.ai
+# (which applies the API free tier / pay-as-you-go billing). The env
+# override must be able to point at the proxy, and the proxy's required
+# headers must be injectable without leaking onto other origins.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_inference_base_url_accepts_grok_build_proxy():
+    assert _xai_validate_inference_base_url(
+        "https://cli-chat-proxy.grok.com/v1", fallback="https://api.x.ai/v1"
+    ) == "https://cli-chat-proxy.grok.com/v1"
+    # Third-party hosts must still be rejected (bearer-leak protection).
+    assert _xai_validate_inference_base_url(
+        "https://evil.example.com/v1", fallback="https://api.x.ai/v1"
+    ) == "https://api.x.ai/v1"
+    assert _xai_validate_inference_base_url(
+        "http://cli-chat-proxy.grok.com/v1", fallback="https://api.x.ai/v1"
+    ) == "https://api.x.ai/v1"
+
+
+def test_xai_grok_proxy_headers_are_origin_scoped():
+    from hermes_cli.auth import XAI_GROK_PROXY_REQUIRED_HEADERS, xai_grok_proxy_headers_for
+
+    h = xai_grok_proxy_headers_for("https://cli-chat-proxy.grok.com/v1")
+    assert h["X-XAI-Token-Auth"] == "xai-grok-cli"
+    assert h["x-authenticateresponse"] == "authenticate-response"
+    assert h["x-grok-client-mode"] == "headless"
+    assert h["x-grok-client-identifier"] == "grok-shell"
+    assert h["x-grok-client-version"]
+    assert set(h) == set(XAI_GROK_PROXY_REQUIRED_HEADERS)
+    # Any other origin must get nothing — the headers must not leak onto
+    # api.x.ai, third-party endpoints, or empty values.
+    assert xai_grok_proxy_headers_for("https://api.x.ai/v1") == {}
+    assert xai_grok_proxy_headers_for("https://grok.com") == {}
+    assert xai_grok_proxy_headers_for("") == {}

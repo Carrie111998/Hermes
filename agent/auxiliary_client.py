@@ -286,6 +286,21 @@ def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
     # by default and let Hermes control the budget; explicit callers can still
     # override via kwargs.
     kwargs.setdefault("max_retries", 0)
+    # xAI Grok Build proxy (cli-chat-proxy.grok.com) rejects requests without
+    # the grok-cli headers (HTTP 426); aux clients use the same OAuth bearer
+    # as the primary. Only ADD missing keys.
+    if base_url:
+        try:
+            from hermes_cli.auth import xai_grok_proxy_headers_for
+
+            _grok_headers = xai_grok_proxy_headers_for(base_url)
+            if _grok_headers:
+                _aux_headers = dict(kwargs.get("default_headers") or {})
+                for _hk, _hv in _grok_headers.items():
+                    _aux_headers.setdefault(_hk, _hv)
+                kwargs["default_headers"] = _aux_headers
+        except Exception:
+            pass
     return OpenAI(api_key=api_key, base_url=base_url, **kwargs)
 
 

@@ -122,7 +122,13 @@ ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120       # refresh 2 min before expiry
 NOUS_INVOKE_JWT_MIN_TTL_SECONDS = ACCESS_TOKEN_REFRESH_SKEW_SECONDS
 DEVICE_AUTH_POLL_INTERVAL_CAP_SECONDS = 1     # poll at most every 1s
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
-DEFAULT_XAI_OAUTH_BASE_URL = "https://api.x.ai/v1"
+# xAI serves OAuth-token inference from two origins: api.x.ai (API-key /
+# pay-as-you-go billing; OAuth tokens only get the API free tier there —
+# "free-usage-exhausted" at 500K tokens/24h) and the Grok Build proxy
+# cli-chat-proxy.grok.com, where the SuperGrok subscription quota lives (the
+# official grok CLI uses this origin with the same OAuth bearer/scope).
+# OAuth == subscription auth, so default xai-oauth to the proxy.
+DEFAULT_XAI_OAUTH_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 MINIMAX_OAUTH_CLIENT_ID = "78257093-7e40-4613-99e0-527b14b39113"
 MINIMAX_OAUTH_SCOPE = "group_id profile model.completion"
 MINIMAX_OAUTH_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:user_code"
@@ -4883,16 +4889,47 @@ def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:
             candidate, fallback,
         )
         return fallback
-    if host != "x.ai" and not host.endswith(".x.ai"):
+    if host != "x.ai" and not host.endswith(".x.ai") and not host.endswith(".grok.com"):
         logger.warning(
             "Refusing xAI base_url override %r — host %r is not on the xAI origin "
-            "(expected x.ai or a *.x.ai subdomain). The xai-oauth bearer is only "
+            "(expected x.ai, a *.x.ai subdomain, or *.grok.com — the latter is "
+            "xAI's Grok Build proxy origin). The xai-oauth bearer is only "
             "valid against xAI's inference API; sending it elsewhere would leak "
             "the credential. Falling back to %s.",
             candidate, host, fallback,
         )
         return fallback
     return candidate
+
+
+# Headers the Grok Build proxy (cli-chat-proxy.grok.com) requires on every
+# inference request. Without them it rejects with HTTP 426 ("Grok CLI version
+# (none) is outdated"). The official grok CLI sends the same set with the
+# same OAuth bearer.
+XAI_GROK_PROXY_REQUIRED_HEADERS = {
+    "X-XAI-Token-Auth": "xai-grok-cli",
+    "x-authenticateresponse": "authenticate-response",
+    "x-grok-client-mode": "headless",
+    # Bump when xAI raises the Grok CLI minimum version (proxy replies 426).
+    "x-grok-client-version": "1.0.5",
+    "x-grok-client-identifier": "grok-shell",
+}
+
+
+def xai_grok_proxy_headers_for(base_url: str) -> dict:
+    """Return the required Grok Build proxy headers when *base_url* targets it.
+
+    Matches the cli-chat-proxy.grok.com origin exactly (host only, port
+    ignored); returns ``{}`` for any other origin so the headers never leak
+    onto third-party endpoints.
+    """
+    try:
+        host = (urlparse(base_url).hostname or "").lower()
+    except Exception:
+        return {}
+    if host == "cli-chat-proxy.grok.com":
+        return dict(XAI_GROK_PROXY_REQUIRED_HEADERS)
+    return {}
 
 
 def _xai_oauth_discovery(timeout_seconds: float = 15.0) -> Dict[str, str]:
