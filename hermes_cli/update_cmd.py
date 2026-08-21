@@ -4616,6 +4616,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         else None
     )
     assume_yes = bool(getattr(args, "yes", False))
+    # --switch-branch: on a branch carrying unmerged commits, prefer switching
+    # to the update target over an in-place merge, so the branch's history is
+    # never written to by an update (#89507 review feedback).
+    switch_branch = bool(getattr(args, "switch_branch", False))
 
     # Whether this update is running without a human at the keyboard.
     # Interactive terminal updates always stash-and-ask (unchanged behavior);
@@ -4910,6 +4914,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print(
                     f"  ⚠ Checkout was parked on '{current_branch}' "
                     f"(fully merged) — switching back to {branch}..."
+                )
+            elif switch_block_reason.startswith("unmerged:") and switch_branch:
+                # --switch-branch: the operator prefers their branch left
+                # untouched over the running code advancing on it. Long-lived
+                # feature branches (a PR branch hundreds of commits deep) do
+                # not want an update-driven merge commit written into their
+                # history; switching to the target and updating there leaves
+                # the branch byte-identical. The tree is known clean here —
+                # _assess_parked_branch_switch checks dirty before cherry.
+                parked_branch_switched = True
+                _unmerged_n = switch_block_reason.split(":", 1)[1]
+                print(
+                    f"  ⚠ On branch '{current_branch}' with {_unmerged_n} "
+                    f"unmerged commit(s) — switching to {branch} "
+                    "(--switch-branch); the branch is left untouched."
                 )
             elif switch_block_reason.startswith("unmerged:"):
                 # The merge source must exist upstream; --branch typos
