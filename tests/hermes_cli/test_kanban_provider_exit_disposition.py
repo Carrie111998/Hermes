@@ -184,6 +184,99 @@ def test_transient_provider_failures_use_bounded_retry_budget(
         assert not [event for event in events if event.kind == "protocol_violation"]
 
 
+@pytest.mark.parametrize(
+    ("disposition", "classification", "status_code", "expected"),
+    [
+        ("terminal", "rate_limit", 429, "transient"),
+        ("transient", "content_policy_blocked", 400, "safety_refusal"),
+    ],
+)
+def test_inconsistent_provider_exit_envelopes_are_rejected(
+    kanban_home, disposition, classification, status_code, expected
+):
+    with kb.connect() as conn:
+        task_id, run_id, _pid = _start_run(conn)
+
+        with pytest.raises(ValueError, match=f"expected {expected!r}"):
+            kb.record_provider_exit_disposition(
+                conn,
+                task_id,
+                run_id=run_id,
+                disposition=disposition,
+                classification=classification,
+                status_code=status_code,
+                provider="openrouter",
+                model="model-a",
+            )
+
+        assert kb._provider_exit_for_run(conn, run_id) is None
+        assert kb.get_task(conn, task_id).status == "running"
+
+        fingerprint = kb._provider_route_fingerprint(
+            "openrouter", "model-a", "worker"
+        )
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ? AND task_id = ?",
+            (
+                json.dumps(
+                    {
+                        kb._PROVIDER_EXIT_METADATA_KEY: {
+                            "disposition": disposition,
+                            "classification": classification,
+                            "status_code": status_code,
+                            "provider": "openrouter",
+                            "model": "model-a",
+                            "fingerprint": fingerprint,
+                            "config_fingerprint": fingerprint,
+                        }
+                    }
+                ),
+                run_id,
+                task_id,
+            ),
+        )
+        assert kb._provider_exit_for_run(conn, run_id) is None
+
+        kb._record_worker_exit(_pid, _exited_status(0))
+        original_alive = kb._pid_alive
+        kb._pid_alive = lambda _worker_pid: False
+        try:
+            kb.detect_crashed_workers(conn)
+        finally:
+            kb._pid_alive = original_alive
+
+        events = kb.list_events(conn, task_id)
+        assert [event for event in events if event.kind == "protocol_violation"]
+        assert not [
+            event
+            for event in events
+            if event.kind
+            in {"provider_terminal", "provider_transient", "provider_safety_refusal"}
+        ]
+
+
+def test_provider_exit_record_rejects_run_from_another_task(kanban_home):
+    with kb.connect() as conn:
+        task_id, task_run_id, _pid = _start_run(conn)
+        other_task_id, other_run_id, _other_pid = _start_run(conn)
+
+        assert kb.record_provider_exit_disposition(
+            conn,
+            task_id,
+            run_id=other_run_id,
+            disposition="terminal",
+            classification="billing",
+            status_code=402,
+            provider="openrouter",
+            model="model-a",
+        ) is False
+
+        assert kb._provider_exit_for_run(conn, task_run_id) is None
+        assert kb._provider_exit_for_run(conn, other_run_id) is None
+        assert kb.get_task(conn, task_id).status == "running"
+        assert kb.get_task(conn, other_task_id).status == "running"
+
+
 def test_changed_task_provider_override_allows_one_new_run(kanban_home):
     with kb.connect() as conn:
         task_id, run_id, pid = _start_run(conn)

@@ -439,6 +439,26 @@ KANBAN_PROVIDER_TERMINAL_EXIT_CODE = 76
 _PROVIDER_EXIT_DISPOSITIONS = frozenset(
     {"terminal", "transient", "safety_refusal"}
 )
+_PROVIDER_EXIT_TERMINAL_CLASSIFICATIONS = frozenset(
+    {
+        "auth",
+        "auth_permanent",
+        "billing",
+        "model_not_found",
+        "provider_policy_blocked",
+        "format_error",
+        "ssl_cert_verification",
+    }
+)
+_PROVIDER_EXIT_TRANSIENT_CLASSIFICATIONS = frozenset(
+    {
+        "rate_limit",
+        "upstream_rate_limit",
+        "overloaded",
+        "server_error",
+        "timeout",
+    }
+)
 _PROVIDER_EXIT_METADATA_KEY = "provider_exit_disposition"
 _PROVIDER_FINGERPRINT_VERSION = "v1"
 
@@ -4473,6 +4493,25 @@ def _safe_provider_exit_field(value: Any, *, limit: int) -> Optional[str]:
     return safe[:limit] or None
 
 
+def _trusted_provider_exit_disposition(
+    classification: str, status_code: Optional[int]
+) -> Optional[str]:
+    """Derive provider-exit handling from allowlisted failure semantics."""
+    if classification == "content_policy_blocked":
+        return "safety_refusal"
+    if status_code in {401, 402, 403}:
+        return "terminal"
+    if status_code == 429 or (
+        status_code is not None and 500 <= status_code <= 599
+    ):
+        return "transient"
+    if classification in _PROVIDER_EXIT_TERMINAL_CLASSIFICATIONS:
+        return "terminal"
+    if classification in _PROVIDER_EXIT_TRANSIENT_CLASSIFICATIONS:
+        return "transient"
+    return None
+
+
 def record_provider_exit_disposition(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4505,6 +4544,19 @@ def record_provider_exit_disposition(
     safe_classification = _safe_provider_exit_field(classification, limit=80)
     if not safe_classification:
         raise ValueError("classification is required")
+    trusted_disposition = _trusted_provider_exit_disposition(
+        safe_classification, normalized_status
+    )
+    if trusted_disposition is None:
+        raise ValueError(
+            "unsupported provider exit classification/status: "
+            f"{safe_classification!r}/{normalized_status!r}"
+        )
+    if disposition != trusted_disposition:
+        raise ValueError(
+            "inconsistent provider exit disposition: "
+            f"got {disposition!r}, expected {trusted_disposition!r}"
+        )
     safe_provider = _safe_provider_exit_field(provider, limit=128)
     safe_model = _safe_provider_exit_field(model, limit=256)
     safe_session = _safe_provider_exit_field(session_id, limit=128)
@@ -4597,6 +4649,11 @@ def _provider_exit_for_run(
         envelope.get("classification"), limit=80
     )
     if not classification:
+        return None
+    trusted_disposition = _trusted_provider_exit_disposition(
+        classification, status_code
+    )
+    if trusted_disposition is None or envelope["disposition"] != trusted_disposition:
         return None
     result = {
         "disposition": envelope["disposition"],
