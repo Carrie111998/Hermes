@@ -5862,7 +5862,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         f"reconnect requested. Do NOT retry this tool "
                         f"immediately — give it a few seconds to come back."
                     )
-                    return tool_error(f"MCP server '{server_name}' is not connected")
+                return tool_error(f"MCP server '{server_name}' is not connected")
 
         # Snapshot on this thread: ``_run_on_mcp_loop`` does not copy
         # gateway session ContextVars onto the MCP loop.
