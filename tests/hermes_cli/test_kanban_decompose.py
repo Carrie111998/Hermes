@@ -8,6 +8,7 @@ and the assignee-fallback logic.
 from __future__ import annotations
 
 import json as jsonlib
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -15,6 +16,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_decompose as decomp
+from hermes_cli import projects_db as pdb
 
 
 @pytest.fixture
@@ -23,6 +25,11 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for key in tuple(os.environ):
+        if key.startswith("HERMES_KANBAN_"):
+            monkeypatch.delenv(key, raising=False)
+    kb._INITIALIZED_PATHS.clear()
+    assert kb.kanban_home().resolve().is_relative_to(home.resolve())
     kb.init_db()
     return home
 
@@ -111,6 +118,75 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     assert c1.status == "todo"
     assert c0.assignee == "researcher"
     assert c1.assignee == "engineer"
+
+
+@pytest.fixture
+def scoped_kanban_home(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for key in tuple(os.environ):
+        if key.startswith("HERMES_KANBAN_"):
+            monkeypatch.delenv(key, raising=False)
+    kb._INITIALIZED_PATHS.clear()
+
+    repo = root / "repo"
+    repo.mkdir()
+    with pdb.connect_closing() as conn:
+        project_id = pdb.create_project(
+            conn, name="Scoped Project", primary_path=str(repo)
+        )
+        project = pdb.get_project(conn, project_id)
+    assert project is not None
+    kb.create_board("scoped", project_id=project.id, legacy_unscoped=False)
+    kb.set_current_board("scoped")
+    assert kb.kanban_db_path("scoped").resolve().is_relative_to(root.resolve())
+    return project
+
+
+def test_auto_decompose_scoped_root_uses_board_snapshot(scoped_kanban_home):
+    project = scoped_kanban_home
+    assert not any(key.startswith("HERMES_KANBAN_") for key in os.environ)
+    with kb.connect(board="scoped") as conn:
+        task_id = kb.create_task(
+            conn, title="auto scoped root", board="scoped", triage=True
+        )
+        pdb.projects_db_path().unlink()
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "test auto split",
+        "tasks": [
+            {"title": "research", "body": "look it up", "assignee": "researcher", "parents": []},
+            {"title": "build", "body": "code it", "assignee": "engineer", "parents": [0]},
+        ],
+    })
+    patches = _patch_list_profiles(["orchestrator", "researcher", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(task_id, author="auto-decomposer")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.child_ids and len(outcome.child_ids) == 2
+    with kb.connect(board="scoped") as conn:
+        rows = [
+            conn.execute(
+                "SELECT project_id, legacy_unscoped, workspace_path, branch_name "
+                "FROM tasks WHERE id = ?",
+                (child_id,),
+            ).fetchone()
+            for child_id in outcome.child_ids
+        ]
+    assert [row["project_id"] for row in rows] == [project.id, project.id]
+    assert [bool(row["legacy_unscoped"]) for row in rows] == [False, False]
+    assert [row["workspace_path"] for row in rows] == [None, None]
+    assert all(row["branch_name"].startswith(f"{project.slug}/") for row in rows)
 
 
 def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):

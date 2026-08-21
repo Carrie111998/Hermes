@@ -8663,6 +8663,116 @@ def specify_triage_task(
     return True
 
 
+def _board_slug_for_connection(conn: sqlite3.Connection) -> str:
+    """Resolve the board owning an already-open connection.
+
+    Decomposition is also called directly with ``connect(board=...)`` while
+    Kanban override environment variables are intentionally absent. Looking at
+    the connection path keeps scope validation tied to the DB being mutated,
+    rather than to the process-global current-board selection.
+    """
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        raw_path = row["file"] if row is not None else None
+        connected_path = (
+            Path(raw_path).expanduser().resolve(strict=False)
+            if raw_path
+            else None
+        )
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        connected_path = None
+
+    if connected_path is not None:
+        candidates = [DEFAULT_BOARD]
+        try:
+            candidates.extend(
+                child.name
+                for child in boards_root().iterdir()
+                if child.is_dir() and child.name != "_archived"
+            )
+        except OSError:
+            pass
+        for slug in candidates:
+            try:
+                candidate_path = (
+                    kanban_home() / "kanban.db"
+                    if slug == DEFAULT_BOARD
+                    else boards_root() / slug / "kanban.db"
+                )
+                if candidate_path.resolve(strict=False) == connected_path:
+                    return slug
+            except (OSError, ValueError):
+                continue
+    return get_current_board()
+
+
+def _resolve_decomposition_scope(
+    conn: sqlite3.Connection, root_row: sqlite3.Row
+) -> tuple[Optional[str], bool, Any]:
+    """Resolve project identity and explicit legacy state for a root task.
+
+    A project-scoped root must be backed by the board's canonical snapshot (or
+    by a legacy default-board project row) before any child is inserted. A
+    missing project on a scoped board is only valid when the root explicitly
+    opted into ``legacy_unscoped`` compatibility.
+    """
+    project_id = str(root_row["project_id"] or "").strip() or None
+    legacy_unscoped = bool(root_row["legacy_unscoped"])
+    board_slug = _board_slug_for_connection(conn)
+    board_meta = read_board_metadata(board_slug)
+    snapshot: Optional[dict[str, str]] = None
+
+    if board_meta.get("project_id"):
+        try:
+            snapshot = validate_board_project_scope(board_meta)
+        except BoardProjectError:
+            # An explicit legacy root is the compatibility escape hatch; it
+            # does not need to resolve a project identity to remain unscoped.
+            if not (legacy_unscoped and project_id is None):
+                raise
+        if snapshot is not None:
+            if project_id is not None and project_id != snapshot["project_id"]:
+                raise BoardProjectError(
+                    "TASK_PROJECT_MISMATCH",
+                    f"root task project {project_id!r} differs from board "
+                    f"project {snapshot['project_id']!r}",
+                )
+            if project_id is None and not legacy_unscoped:
+                raise BoardProjectError(
+                    "UNSCOPED_TASK_ON_SCOPED_BOARD",
+                    "decomposition root has no project and is not explicitly "
+                    "legacy_unscoped",
+                )
+    elif project_id is not None and board_slug != DEFAULT_BOARD:
+        raise BoardProjectError(
+            "MISSING_PROJECT_SNAPSHOT",
+            f"scoped decomposition root on board {board_slug!r} has no "
+            "valid project snapshot",
+        )
+
+    if project_id is None:
+        return None, legacy_unscoped, None
+
+    from hermes_cli import projects_db as _pdb
+
+    if snapshot is not None:
+        project_obj = _pdb.Project(
+            id=snapshot["project_id"],
+            slug=snapshot["project_slug"],
+            name=snapshot["project_name"],
+            created_at=0,
+            primary_path=snapshot["project_primary_path"],
+        )
+    else:
+        project_obj = _resolve_local_project(project_id)
+    if project_obj is None:
+        raise BoardProjectError(
+            "UNKNOWN_PROJECT",
+            f"project {project_id!r} cannot be resolved for decomposition",
+        )
+    return project_id, legacy_unscoped, project_obj
+
+
 def decompose_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8756,7 +8866,8 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, "
+            "project_id, legacy_unscoped "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -8765,6 +8876,9 @@ def decompose_triage_task(
         if root_row["status"] != "triage":
             return None
         tenant = root_row["tenant"]
+        project_id, legacy_unscoped, project_obj = _resolve_decomposition_scope(
+            conn, root_row
+        )
         # Children inherit the root's workspace by default so a fan-out
         # of a code-gen task lands in the parent's project dir/worktree
         # rather than throwaway scratch tmp dirs. A child dict can still
@@ -8802,11 +8916,19 @@ def decompose_triage_task(
                 child_ws_path = root_ws_path
             else:
                 child_ws_path = None
+            child_branch_name = None
+            if project_obj is not None and child_ws_kind == "worktree":
+                from hermes_cli import projects_db as _pdb
+
+                child_branch_name = _pdb.branch_name_for(
+                    project_obj, new_id, title=title
+                )
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, branch_name, project_id, legacy_unscoped, "
+                " tenant, created_at, created_by) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -8814,6 +8936,9 @@ def decompose_triage_task(
                     assignee,
                     child_ws_kind,
                     child_ws_path,
+                    child_branch_name,
+                    project_id,
+                    1 if legacy_unscoped else 0,
                     tenant,
                     now,
                     (author or "decomposer"),
@@ -8821,7 +8946,13 @@ def decompose_triage_task(
             )
             _append_event(
                 conn, new_id, "created",
-                {"by": author or "decomposer", "from_decompose_of": task_id},
+                {
+                    "by": author or "decomposer",
+                    "from_decompose_of": task_id,
+                    "project_id": project_id,
+                    "legacy_unscoped": legacy_unscoped,
+                    "branch_name": child_branch_name,
+                },
             )
             _inherit_notify_subs(conn, new_id, (task_id,), created_at=now)
             child_ids.append(new_id)
