@@ -112,6 +112,33 @@ def _orphan_fts_schema(path: Path) -> None:
         conn.execute("PRAGMA writable_schema=OFF")
     finally:
         conn.close()
+
+
+def test_recovery_preserves_session_spaces_and_assignments(tmp_path: Path) -> None:
+    source = tmp_path / "spaces-state.db"
+    output = tmp_path / "spaces-recovered.db"
+    db = SessionDB(db_path=source)
+    try:
+        space = db.create_session_space(
+            "Infrastructure",
+            platform="discord",
+            chat_id="channel-1",
+        )
+        db.create_session("space-session", "discord", chat_id="channel-1")
+    finally:
+        db.close()
+
+    report = recover_session_database(source, output, work_dir=tmp_path)
+
+    assert report["complete"] is True
+    recovered = SessionDB(db_path=output)
+    try:
+        assert recovered.list_session_spaces() == [space]
+        assert recovered.get_session("space-session")["space_id"] == space["id"]
+    finally:
+        recovered.close()
+
+
 def _make_page_spanning_source(
     path: Path,
     message_count: int = 320,
