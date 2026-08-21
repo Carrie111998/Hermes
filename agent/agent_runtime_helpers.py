@@ -3485,7 +3485,7 @@ def repair_empty_non_final_messages(
             isinstance(msg, dict)
             and msg.get("role") in ("assistant", "user")
             and not _msg_has_payload(msg)
-            and (idx != last_idx or msg.get("role") == "user")
+            and (idx != last_idx or msg.get("role") == "assistant")
             # tool results are validated by their own orphan/pairing pass; an
             # empty tool result is a separate (and rarer) concern.
         ):
