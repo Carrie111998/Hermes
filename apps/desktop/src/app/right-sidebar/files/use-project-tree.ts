@@ -110,7 +110,7 @@ export interface UseProjectTreeResult {
   setNodeOpen: (id: string, open: boolean) => void
 }
 
-interface ProjectTreeState {
+export interface ProjectTreeState {
   collapseNonce: number
   cwd: string
   data: TreeNode[]
@@ -153,6 +153,27 @@ function clearProjectTree() {
   nextRootRequestId += 1
   inflight.clear()
   $projectTree.set({ ...initialState, requestId: nextRootRequestId })
+}
+
+/** True when the store belongs to no consumer: `clearProjectTree` has wiped
+ *  it and nothing has claimed a cwd since.
+ *
+ *  This is the reset contract, and it lives here rather than at the one place
+ *  that reads it so a caller never has to know *how* "unowned" is spelled.
+ *  Today it is `cwd: ''` straight out of `initialState`, which is also what
+ *  `clearProjectTree` writes -- the two cannot drift because they name the
+ *  same object. If the representation ever becomes a generation counter or an
+ *  explicit null owner, this function changes and the re-arm effect keeps
+ *  working, instead of silently going quiet again (#90229). */
+export function isUnownedProjectTree(state: ProjectTreeState): boolean {
+  return state.cwd === initialState.cwd
+}
+
+/** Read-only view of the store, exported for the reset-contract test.
+ *  The re-arm effect's correctness depends on what a reset LEAVES BEHIND, and
+ *  a test that can only see the hook's rendered output cannot assert that. */
+export function readProjectTreeState(): ProjectTreeState {
+  return $projectTree.get()
 }
 
 /** Sessions record their launch cwd; deleted worktrees and remote-backend
@@ -483,17 +504,20 @@ export function useProjectTree(cwd: string): UseProjectTreeResult {
   // `rootLoading: Boolean(cwd)` forever, which also disables the Refresh
   // button, so there is no way back (#90229).
   //
-  // Keyed on the CLEARED store (`cwd: ''`), not on any mismatch: the atom is
-  // global, so a mismatch against a different non-empty cwd means another
-  // consumer owns it, and re-claiming that would ping-pong. Converges because
+  // Keyed on the CLEARED store, not on any mismatch: the atom is global, so a
+  // mismatch against a different non-empty cwd means another consumer owns it,
+  // and re-claiming that would ping-pong. What "cleared" means is
+  // `isUnownedProjectTree`'s to say, not this effect's. Converges because
   // `loadRoot` writes its cwd into the store before its first await.
+  const treeIsUnowned = isUnownedProjectTree(state)
+
   useEffect(() => {
-    if (!cwd || state.cwd !== '') {
+    if (!cwd || !treeIsUnowned) {
       return
     }
 
     void loadRoot(cwd)
-  }, [cwd, state.cwd, state.requestId])
+  }, [cwd, treeIsUnowned, state.requestId])
 
   // Self-heal: an errored root re-probes every few seconds while the tree is
   // mounted. Each attempt bumps requestId, so a persistent error re-arms the
