@@ -1,3 +1,5 @@
+# coding: utf-8
+# flake8: noqa: E501
 """Subagent handle registry.
 
 Thread safety:
