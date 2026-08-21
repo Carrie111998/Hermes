@@ -51,6 +51,23 @@ class TestRouter:
         res = db._metadata_candidate_row_ids("an94")
         assert 1 in res.row_ids
 
+    def test_trigram_route_serves_via_fts_lane(self, db):
+        # Regression: the lane MATCH used to select a non-existent ``row_id``
+        # column (FTS5 external-content tables expose ``rowid``), so every
+        # routed query silently fell back to the LIKE lane and the indexed
+        # substrate never served. Assert the actual route, not just the
+        # result — the LIKE fallback reproduces the same row set.
+        _seed(db, [("s1", "Budget Review final", "#finance / cost", "cli")])
+        res = db._metadata_candidate_row_ids("budget")
+        assert res.path == "trigram"
+        assert res.row_ids == (1,)
+
+    def test_unicode_route_serves_via_fts_lane(self, db):
+        _seed(db, [("s1", "Exact Project", None, "cli")])
+        res = db._metadata_candidate_row_ids('"exact"')
+        assert res.path == "unicode"
+        assert res.row_ids == (1,)
+
     def test_like_fallback_on_zero(self, db):
         _seed(db, [("s1", "Alpha", None, "cli")])
         # trigram route matches nothing; the bounded LIKE lane runs once and

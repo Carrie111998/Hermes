@@ -634,7 +634,7 @@ class SessionSearchMixin:
         def _run(conn):
             try:
                 rows = conn.execute(
-                    f"SELECT row_id FROM {fts_table} "
+                    f"SELECT rowid AS row_id FROM {fts_table} "
                     f"WHERE {fts_table} MATCH ?",
                     (match_query,),
                 ).fetchall()
