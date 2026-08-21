@@ -48,6 +48,9 @@ interface HastNode {
 }
 
 function nodeText(node: HastNode): string {
+  if (!node) {
+    return ''
+  }
   if (node.type === 'text') {
     return node.value || ''
   }
@@ -55,7 +58,7 @@ function nodeText(node: HastNode): string {
   if (node.tagName === 'br') {
     return ' '
   }
-  return (node.children || []).map(nodeText).join('')
+  return (node.children || []).filter(Boolean).map(nodeText).join('')
 }
 
 /**
@@ -70,6 +73,13 @@ export function rehypeHeadingIds() {
   return (tree: HastNode) => {
     const counts = new Map<string, number>()
     const visit = (node: HastNode) => {
+      // Tolerate sparse trees: when other rehype plugins run alongside us
+      // (the preview pane pairs this with the memoized KaTeX math plugin),
+      // intermediate node lists can carry undefined holes — skipping them
+      // keeps id stamping working instead of crashing the render.
+      if (!node) {
+        return
+      }
       if (node.type === 'element' && /^h[1-6]$/.test(node.tagName || '')) {
         const base = githubSlug(nodeText(node))
         if (base) {
@@ -82,7 +92,9 @@ export function rehypeHeadingIds() {
         }
       }
       for (const child of node.children || []) {
-        visit(child)
+        if (child) {
+          visit(child)
+        }
       }
     }
     visit(tree)

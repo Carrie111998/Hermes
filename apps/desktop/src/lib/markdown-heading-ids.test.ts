@@ -71,6 +71,19 @@ describe('rehypeHeadingIds', () => {
     expect(tree.children?.[0].properties?.id).toBe('managed-tiered-kv-cache')
   })
 
+  it('tolerates undefined holes in children lists (math-plugin pipelines)', () => {
+    // When the KaTeX math plugin runs alongside us, intermediate hast
+    // children arrays can carry undefined holes; the walker must skip
+    // them rather than crash the render (#81055 follow-up).
+    const stamped = heading('h2', 'Still Slugged')
+    const tree: HastNode = {
+      type: 'root',
+      children: [undefined as unknown as HastNode, stamped, undefined as unknown as HastNode],
+    }
+    expect(() => rehypeHeadingIds()(tree)).not.toThrow()
+    expect(stamped.properties?.id).toBe('still-slugged')
+  })
+
   it('disambiguates duplicate slugs with -1 / -2 suffixes', () => {
     const tree = wrap(
       heading('h2', 'Intro'),
