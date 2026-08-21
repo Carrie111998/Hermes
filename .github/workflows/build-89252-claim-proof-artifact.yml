@@ -26,7 +26,7 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Execute the branch-stored claimant transformation
+      - name: Materialize the complete claimant-generation architecture
         run: |
           set -euo pipefail
           git fetch --no-tags origin caa2b08bcc6e7abe56736fdada36738e01f18557
@@ -46,6 +46,83 @@ jobs:
           PY
           python3 /tmp/apply-89252-claim-proof.py
           rm .github/workflows/complete-89252-claim-proof.yml
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          base = Path('gateway/platforms/base.py')
+          text = base.read_text(encoding='utf-8')
+          import_line = 'from gateway.routing_identity import routing_identity_adapter_entrypoint\n'
+          if import_line not in text:
+              marker = 'from utils import normalize_proxy_url\n'
+              if marker not in text:
+                  raise SystemExit('base.py import anchor missing')
+              text = text.replace(marker, import_line + marker, 1)
+
+          decorator = '    @routing_identity_adapter_entrypoint\n'
+          if decorator not in text:
+              pattern = re.compile(r'(?m)^(    async def handle_message\(self, event: MessageEvent\)[^\n]*\n)')
+              match = pattern.search(text)
+              if match is None:
+                  raise SystemExit('BasePlatformAdapter.handle_message anchor missing')
+              text = text[:match.start()] + decorator + text[match.start():]
+          base.write_text(text, encoding='utf-8')
+
+          claim_tests = Path('tests/gateway/test_transport_claim_generation.py')
+          text = claim_tests.read_text(encoding='utf-8')
+          if 'from gateway.platforms.base import BasePlatformAdapter\n' not in text:
+              text = text.replace(
+                  'import pytest\n\n',
+                  'import pytest\n\nfrom gateway.platforms.base import BasePlatformAdapter\n',
+                  1,
+              )
+          text = text.replace('    routing_identity_adapter_entrypoint,\n', '')
+          start_marker = '@pytest.mark.asyncio\nasync def test_adapter_entrypoint_rejects_duplicate_before_handler_state():'
+          end_marker = '\n\ndef test_current_claim_owner_mismatch_is_conflict():'
+          if start_marker in text:
+              start = text.index(start_marker)
+              end = text.index(end_marker, start)
+              replacement = '''@pytest.mark.asyncio
+async def test_base_adapter_rejects_duplicate_before_stateful_ingress():
+    primary = Adapter("shared-token")
+    secondary = Adapter("shared-token")
+    runner = Runner(primary, secondaries={"reviewer": {"discord": secondary}})
+    source = live_source(primary)
+    event = SimpleNamespace(source=source)
+
+    # Exercise the real production ingress.  Duplicate current claimants must
+    # be rejected by BasePlatformAdapter.handle_message before topic recovery,
+    # session-key construction, busy-session guards, or any other mutable state.
+    assert await BasePlatformAdapter.handle_message(primary, event) is None
+    assert source.profile_route_rejected is True
+'''
+              text = text[:start] + replacement.rstrip() + text[end:]
+          elif 'test_base_adapter_rejects_duplicate_before_stateful_ingress' not in text:
+              raise SystemExit('claim-generation test anchor missing')
+          claim_tests.write_text(text, encoding='utf-8')
+
+          integration = Path('tests/gateway/test_multiplex_routing_identity_contract.py')
+          text = integration.read_text(encoding='utf-8')
+          stale = '''    The adapter-local decorator that previously stamped identity inside
+    ``BasePlatformAdapter.handle_message`` is superseded on main (#89860
+    resolves adapter ownership at keying time via set_owner_profile/
+    _session_key_profile).  The routing-identity half that remains scopes
+    the shared gateway ingress instead — exercised here through the real
+    decorated wrapper with the same minimal runner fixture.
+'''
+          current = '''    The adapter-local gate and runner gate are deliberately layered.  The
+    adapter gate proves the live credential claimant/generation before topic
+    recovery or session-key state can be touched; the runner gate then scopes
+    the resolved identity across shared gateway ingress.  #89860 supplies the
+    owner-profile seam but does not by itself prove current credential custody.
+'''
+          if stale in text:
+              text = text.replace(stale, current, 1)
+          elif current not in text:
+              raise SystemExit('integration-contract rationale anchor missing')
+          integration.write_text(text, encoding='utf-8')
+          PY
           git diff --check
 
       - name: Install uv
@@ -53,13 +130,13 @@ jobs:
         with:
           version: "0.9.28"
 
-      - name: Format and verify claimant-generation witnesses
+      - name: Verify production ingress and claimant-generation witnesses
         run: |
           set -euo pipefail
-          uv run --with ruff==0.15.10 ruff check --fix gateway/routing_identity.py tests/gateway/test_routing_identity.py tests/gateway/test_transport_claim_generation.py
-          uv run --with ruff==0.15.10 ruff format gateway/routing_identity.py tests/gateway/test_routing_identity.py tests/gateway/test_transport_claim_generation.py
-          python -m py_compile gateway/routing_identity.py
-          uv run --with pytest==9.1.1 --with pytest-asyncio pytest -q tests/gateway/test_routing_identity.py tests/gateway/test_transport_claim_generation.py
+          uv run --with ruff==0.15.10 ruff check --fix gateway/routing_identity.py tests/gateway/test_routing_identity.py tests/gateway/test_transport_claim_generation.py tests/gateway/test_multiplex_routing_identity_contract.py
+          uv run --with ruff==0.15.10 ruff format gateway/routing_identity.py tests/gateway/test_routing_identity.py tests/gateway/test_transport_claim_generation.py tests/gateway/test_multiplex_routing_identity_contract.py
+          python -m py_compile gateway/routing_identity.py gateway/platforms/base.py
+          uv run --with pytest==9.1.1 --with pytest-asyncio pytest -q tests/gateway/test_routing_identity.py tests/gateway/test_transport_claim_generation.py tests/gateway/test_multiplex_routing_identity_contract.py
           git diff --check
 
       - name: Write exact-object receipt
@@ -70,8 +147,10 @@ jobs:
           {
             echo "source_head=${SOURCE_HEAD}"
             echo "routing_identity_sha256=$(sha256sum gateway/routing_identity.py | cut -d' ' -f1)"
+            echo "base_adapter_sha256=$(sha256sum gateway/platforms/base.py | cut -d' ' -f1)"
             echo "routing_tests_sha256=$(sha256sum tests/gateway/test_routing_identity.py | cut -d' ' -f1)"
             echo "claim_tests_sha256=$(sha256sum tests/gateway/test_transport_claim_generation.py | cut -d' ' -f1)"
+            echo "integration_tests_sha256=$(sha256sum tests/gateway/test_multiplex_routing_identity_contract.py | cut -d' ' -f1)"
             echo "focused_tests=passed"
           } > /tmp/claim-proof/verification.txt
 
@@ -81,8 +160,10 @@ jobs:
           name: pr-89252-claimant-proof-source
           path: |
             gateway/routing_identity.py
+            gateway/platforms/base.py
             tests/gateway/test_routing_identity.py
             tests/gateway/test_transport_claim_generation.py
+            tests/gateway/test_multiplex_routing_identity_contract.py
             /tmp/claim-proof/verification.txt
           retention-days: 1
           if-no-files-found: error
