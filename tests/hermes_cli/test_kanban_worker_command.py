@@ -104,6 +104,30 @@ def test_profile_command_argv_is_literal_and_replaces_only_native_worker(
     assert captured["env"]["HERMES_KANBAN_WORKER_COMPLETION_MODE"] == "exit_code"
 
 
+def test_direct_supervisor_env_restores_source_root_after_sanitization(
+    spawn_env, monkeypatch, tmp_path
+):
+    root, workspace, captured = spawn_env
+    repo_root = str(Path(__file__).parents[2].resolve())
+    user_pythonpath = str(tmp_path / "user-pythonpath")
+    monkeypatch.setenv(
+        "PYTHONPATH", os.pathsep.join((repo_root, user_pythonpath))
+    )
+    _write_profile(
+        root,
+        "engine",
+        "worker:\n  command:\n    - /bin/echo\n",
+    )
+
+    kb._default_spawn(_make_task(), str(workspace))
+
+    assert captured["cmd"] == SUPERVISOR
+    pythonpath = captured["env"]["PYTHONPATH"].split(os.pathsep)
+    assert pythonpath == [repo_root, user_pythonpath]
+    assert pythonpath.count(repo_root) == 1
+    assert pythonpath.count(user_pythonpath) == 1
+
+
 def test_profile_command_self_reported_completion_mode_reaches_supervisor(
     spawn_env,
 ):
@@ -273,9 +297,16 @@ def test_command_environment_is_sanitized_but_keeps_routing_context(
     assert env["HERMES_KANBAN_WORKSPACE"] == str(workspace)
 
 
-def test_supervisor_re_sanitizes_its_arbitrary_child_environment(monkeypatch):
+def test_supervisor_re_sanitizes_its_arbitrary_child_environment(
+    monkeypatch, tmp_path
+):
     from hermes_cli import kanban_command_worker as worker
 
+    repo_root = str(Path(__file__).parents[2].resolve())
+    user_pythonpath = str(tmp_path / "user-pythonpath")
+    monkeypatch.setenv(
+        "PYTHONPATH", os.pathsep.join((repo_root, user_pythonpath))
+    )
     monkeypatch.setenv("OPENAI_API_KEY", "parent-openai-secret")
     monkeypatch.setenv("GATEWAY_RELAY_SECRET", "parent-relay-secret")
     monkeypatch.setenv("HERMES_KANBAN_WORKER_COMMAND", "[\"/bin/echo\"]")
@@ -291,6 +322,9 @@ def test_supervisor_re_sanitizes_its_arbitrary_child_environment(monkeypatch):
     assert "HERMES_KANBAN_WORKER_COMPLETION_MODE" not in env
     assert env["HERMES_KANBAN_TASK_ID"] == "t_worker_cmd"
     assert env["HERMES_KANBAN_WORKSPACE"] == "/workspace"
+    pythonpath = env.get("PYTHONPATH", "").split(os.pathsep)
+    assert repo_root not in pythonpath
+    assert pythonpath.count(user_pythonpath) == 1
 
 
 @pytest.fixture()
