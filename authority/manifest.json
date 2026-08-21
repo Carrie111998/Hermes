@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "authority_root": "/Users/zhengsy/Documents/Hermes/2026-08-21/hermes-routing-authority/hermes-route-worktree/authority",
+  "install_root": "/Users/zhengsy/.hermes/hermes-agent",
+  "base_commit": "8794e5a21c980a0f26532cb4883284b786cb3f25",
+  "authority_commit": "6f95603d3f",
+  "patch_file": "route-authority.patch",
+  "patch_sha256": "e72b9c18c6fead8e1362800f46bd355bbf4a71f9f3ee7198a0693aabf9790dd0",
+  "registry_dir": "registry",
+  "managed_files": [
+    {
+      "path": "agent/agent_init.py",
+      "sha256": "75b88f5b0739f08217c1b44c9a9523102c162d63b43d928808dc1b49c98428c6"
+    },
+    {
+      "path": "agent/conversation_loop.py",
+      "sha256": "969db9198de1caf52b81526c91b1981ab5b788ae76d4dd9971beb43dc5677e5a"
+    },
+    {
+      "path": "agent/route.py",
+      "sha256": "ca4c9ffac0c7c1ad1f21213de4aa90101b6d507174ab46255df54c5af38d3c2b"
+    },
+    {
+      "path": "agent/runtime_registry.py",
+      "sha256": "409245342bf29fc79427a07969abbce7ce837a3d9b53ea81dd11d4ff63e7cda6"
+    },
+    {
+      "path": "agent/tool_executor.py",
+      "sha256": "cb94c65eee16dab8da6015f7166d9b373b5e4cce40d886e46470736cf829cc42"
+    },
+    {
+      "path": "hermes_cli/config_defaults.py",
+      "sha256": "68b0e4ecd8c629d96b36e137a6eeb738720ce75d477360211ce7b583af380095"
+    },
+    {
+      "path": "hermes_cli/update_cmd.py",
+      "sha256": "fcdf6143354eb519ca6405dc9f723055836995cf787733cb6a8f44ffd521c7d0"
+    },
+    {
+      "path": "run_agent.py",
+      "sha256": "ab724017f7bb98f71eae79f077082a84d976daa8af65d060d5bdbbca9e979fa8"
+    },
+    {
+      "path": "tools/delegate_tool.py",
+      "sha256": "047478909b9da91629a443d96bc09cd78edd07810fe239b156f12572d7eb4aa0"
+    }
+  ]
+}

@@ -1,0 +1,2998 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index d8a5bd75e9..f7abc7fd2f 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -27,7 +27,8 @@ import threading
+ import time
+ import uuid
+ from datetime import datetime
+-from typing import Any, Callable, Dict, List, Optional
++from pathlib import Path
++from typing import Any, Callable, Dict, List, Mapping, Optional
+ from urllib.parse import parse_qs, urlparse, urlunparse
+ 
+ from agent.context_compressor import ContextCompressor
+@@ -95,6 +96,127 @@ def _warn_memory_provider_unavailable(name: str, reason: str = "") -> None:
+     )
+ 
+ 
++def _initialize_runtime_registry(agent: Any, config: Mapping[str, Any]) -> None:
++    """Bind one registry snapshot at the agent initialization boundary.
++
++    Registry failures are deliberately isolated from provider/client setup:
++    the native runtime remains the only execution path when the control plane
++    is disabled, unapproved, or malformed.  This function is called once from
++    ``init_agent`` and has no reload or promotion behavior.
++    """
++
++    from agent.runtime_registry import (
++        RegistryLoadError,
++        RuntimeRegistryState,
++        load_registry,
++    )
++
++    routing = config.get("routing", {}) if isinstance(config, Mapping) else {}
++    if not isinstance(routing, Mapping):
++        routing = {}
++        reason = {"code": "invalid_config", "field": "routing"}
++        agent._runtime_snapshot = None
++        agent._runtime_registry = RuntimeRegistryState(
++            enabled=False,
++            mode="production",
++            status="inactive",
++            inactive_reason=reason,
++        )
++        return
++
++    enabled = routing.get("enabled", False)
++    mode = routing.get("registry_mode", "production")
++    if type(enabled) is not bool:
++        agent._runtime_snapshot = None
++        agent._runtime_registry = RuntimeRegistryState(
++            enabled=False,
++            mode="production",
++            status="inactive",
++            inactive_reason={
++                "code": "invalid_config",
++                "field": "routing.enabled",
++                "expected": "boolean",
++            },
++        )
++        return
++    if type(mode) is not str or mode not in {"production", "preview"}:
++        agent._runtime_snapshot = None
++        agent._runtime_registry = RuntimeRegistryState(
++            enabled=enabled,
++            mode="production",
++            status="inactive",
++            inactive_reason={
++                "code": "invalid_config",
++                "field": "routing.registry_mode",
++                "expected": "production or preview",
++            },
++        )
++        return
++
++    if not enabled:
++        agent._runtime_snapshot = None
++        agent._runtime_registry = RuntimeRegistryState(
++            enabled=False,
++            mode=mode,
++            status="inactive",
++            inactive_reason={"code": "disabled"},
++        )
++        return
++
++    try:
++        source_dir = routing.get("source_dir")
++        load_kwargs = {"mode": mode}
++        if isinstance(source_dir, (str, Path)):
++            load_kwargs["root"] = source_dir
++        snapshot = load_registry(**load_kwargs)
++    except RegistryLoadError as exc:
++        reason: dict[str, str] = {"code": exc.code}
++        if exc.path:
++            reason["path"] = exc.path
++        agent._runtime_snapshot = None
++        agent._runtime_registry = RuntimeRegistryState(
++            enabled=True,
++            mode=mode,
++            status="inactive",
++            inactive_reason=reason,
++        )
++        logger.warning(
++            "Runtime registry inactive: code=%s path=%s mode=%s",
++            exc.code,
++            exc.path or "",
++            mode,
++        )
++        return
++    except Exception as exc:  # fail closed without affecting native startup
++        agent._runtime_snapshot = None
++        agent._runtime_registry = RuntimeRegistryState(
++            enabled=True,
++            mode=mode,
++            status="inactive",
++            inactive_reason={
++                "code": "registry_load_failed",
++                "error_type": type(exc).__name__,
++            },
++        )
++        logger.warning(
++            "Runtime registry inactive: code=registry_load_failed error_type=%s mode=%s",
++            type(exc).__name__,
++            mode,
++        )
++        return
++
++    status = "candidate" if snapshot.is_candidate else "active"
++    agent._runtime_snapshot = snapshot
++    agent._runtime_registry = RuntimeRegistryState(
++        enabled=True,
++        mode=mode,
++        status=status,
++        version=snapshot.registry_version,
++        promotion_state=snapshot.promotion_state,
++        manifest_hash=snapshot.manifest_sha256,
++    )
++
++
+ def _ra():
+     """Lazy reference to ``run_agent`` so callers can patch
+     ``run_agent.OpenAI`` / ``run_agent.cleanup_vm`` / ... and have those
+@@ -1749,6 +1871,8 @@ def init_agent(
+     except Exception:
+         _agent_cfg = {}
+ 
++    _initialize_runtime_registry(agent, _agent_cfg)
++
+     # Codex commentary visibility (display.show_commentary, default true).
+     # When true, completed Codex phase=commentary messages are delivered as
+     # visible mid-turn updates through the interim message path. When false,
+@@ -3027,4 +3151,4 @@ def init_agent(
+ 
+ 
+ 
+-__all__ = ["init_agent"]
++__all__ = ["_initialize_runtime_registry", "init_agent"]
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 951b874701..f380dd7d85 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1813,6 +1813,30 @@ def run_conversation(
+         except Exception:
+             pass
+ 
++    # Apply the task route before turn context and the first main-model call.
++    # Hermes remains responsible for model execution, tools, compression, and
++    # provider-failure recovery; this hook owns only the task/workflow decision.
++    if getattr(agent, "_delegate_depth", 0) == 0:
++        try:
++            from agent.route import (
++                RoutingBlockedError,
++                apply_route,
++                prepare_specialized_message,
++                specialized_system_message,
++            )
++
++            _turn_route = apply_route(agent, user_message)
++            user_message = prepare_specialized_message(user_message, _turn_route)
++            if system_message is None:
++                _local_system = specialized_system_message(_turn_route)
++                if _local_system is not None:
++                    agent._cached_system_prompt = _local_system
++                    agent._cached_system_prompt_static = None
++        except RoutingBlockedError:
++            raise
++        except Exception:
++            logger.warning("route application failed; continuing with current agent", exc_info=True)
++
+     # The gateway caches agents across user turns.  Compression state is
+     # per-turn: carrying a prior in-place boundary forward would make a later
+     # uncompressed result look like a compacted transcript to gateway writers.
+@@ -2482,7 +2506,9 @@ def run_conversation(
+         # exactly the point the breakpoints were meant to protect. Marking
+         # last also keeps breakpoints off messages that the orphan sweep or
+         # the thinking-only drop is about to remove or merge away.
+-        tools_for_api = agent.tools
++        tools_for_api = (
++            [] if getattr(agent, "_route_disable_tools", False) else agent.tools
++        )
+         if agent._use_prompt_caching and agent.provider != "moa":
+             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
+             _initial_cache_plan = build_prompt_cache_plan(
+@@ -2536,7 +2562,7 @@ def run_conversation(
+         # total_chars is a rough (~) proxy — verbose log + hook metric only.
+         approx_tokens = estimate_messages_tokens_rough(api_messages)
+         request_pressure_tokens = approx_tokens + (
+-            _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
++            _estimate_tools_tokens_rough(tools_for_api) if tools_for_api else 0
+         )
+         total_chars = approx_tokens * 4
+         # Stash this request's rough estimate so update_from_response() can
+@@ -8410,6 +8436,17 @@ def run_conversation(
+                 append_message(messages, {"role": "assistant", "content": final_response})
+                 break
+     
++    # Release gates belong to the route control plane and run after the model
++    # has produced a candidate but before Hermes persists/delivers it.
++    if getattr(agent, "_delegate_depth", 0) == 0:
++        from agent.route import enforce_release_gates
++
++        final_response = enforce_release_gates(
++            agent,
++            user_message=original_user_message,
++            answer=final_response,
++        )
++
+     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
+     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
+     # result dict is returned exactly as before.
+diff --git a/agent/route.py b/agent/route.py
+new file mode 100644
+index 0000000000..2913cb437c
+--- /dev/null
++++ b/agent/route.py
+@@ -0,0 +1,1337 @@
++"""Hermes-native per-turn model routing for Hermes Agent.
++
++This module is deliberately small and declarative.  It reads the Hermes policy
++files when explicitly enabled, classifies the incoming user turn locally, and
++then uses Hermes' existing runtime-provider and model-switch machinery.  It
++never probes provider health and it never mutates conversation history.
++
++The route is applied once per user turn, after the normal Hermes fallback
++runtime has been restored and before the system prompt is built.  Provider
++failure during the turn is handled by Hermes' existing fallback loop; this
++module only supplies the ordered, role-local candidate chain.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import re
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any, Iterable, Mapping
++
++from hermes_constants import get_hermes_home
++
++logger = logging.getLogger(__name__)
++
++_DEFAULT_REGISTRY_DIR = Path.home() / ".hermes" / "workflows" / "production-registry"
++_HIGH_RISK = re.compile(
++    r"投资|金融|财务|法律|医疗|安全|不可逆|删除|生产环境|production|investment|"
++    r"financial|legal|medical|security|irreversible|delete|destroy|deploy",
++    re.IGNORECASE,
++)
++_L2 = re.compile(
++    r"代码|源码|配置|脚本|文件|目录|仓库|项目|表格|演示|文档|修改|创建|生成|"
++    r"执行|运行|安装|调试|重构|多步|分析|code|config|script|file|repo|project|"
++    r"spreadsheet|presentation|document|edit|create|generate|run|install|debug|"
++    r"refactor|multi[- ]step|analy[sz]e",
++    re.IGNORECASE,
++)
++_DEFAULT_L0 = re.compile(
++    r"^(翻译|转换|排序|去重|格式化|提取|计算|translate|convert|sort|dedupe|"
++    r"format|extract|calculate)\b",
++    re.IGNORECASE,
++)
++# A pure explanatory / advisory question (asking "why / what is / is this right /
++# what's the difference / explain ...") carries no execution intent and should be
++# answered directly at L1 — it must not be escalated to L2/L3 DAG just because the
++# words "investment", "project", or "analysis" appear in the sentence. Guarded by
++# a negative execution-verb check so genuine high-risk / L2 instructions
++# ("why ... then delete the file") still route up.
++_EXPLANATORY = re.compile(
++    r"为什么|为何|如何|怎么|是什么|什么区别|区别是|对不对|对吗|合理吗|是否正确|"
++    r"是不是|还是|理解|解释一下|讲讲|说明一下|概念|口径|原因|对吗|为啥|"
++    r"\bwhy\b|\bwhat is\b|\bexplain\b|\bdifference\b|\bconcept\b",
++    re.IGNORECASE,
++)
++_EXECUTION_VERB = re.compile(
++    r"修改|创建|生成|运行|执行|安装|调试|重构|删除|新建|部署|配置|实现|开发|"
++    r"写|改|跑|做|弄|build|create|modify|run|delete|implement|write|edit|"
++    r"install|deploy|refactor|generate",
++    re.IGNORECASE,
++)
++_FILE_EDIT_EXT = re.compile(
++    r"\.(?:xlsx?|pptx?|docx?|csv|pdf|json|md|txt)(?![A-Za-z0-9_])",
++    re.IGNORECASE,
++)
++_FILE_EDIT_INTENT = re.compile(
++    r"修改|更新|修复|编辑|重写|格式化|润色|重塑|整理|校正|改写|"
++    r"modify|update|fix|edit|rewrite|format|revise|restyle|clean",
++    re.IGNORECASE,
++)
++_FILE_DECISION_INTENT = re.compile(
++    r"投资建议|投资决策|是否值得|是否可行|该不该投|建议投资|"
++    r"investment advice|investment decision|should invest|viability|recommend",
++    re.IGNORECASE,
++)
++_HIGH_RISK_DECISION = re.compile(
++    r"投资方案|投资决策|投资建议|分析风险|风险评估|是否值得|是否可行|该不该投|"
++    r"financial decision|investment decision|risk assessment|should invest|recommend",
++    re.IGNORECASE,
++)
++_EXPLICIT_WORKFLOW_DIRECTIVE = re.compile(
++    r"(?im)(?:^|\s)@?(?:workflow|工作流)\s*[:=]\s*"
++    r"(?P<name>local[_-](?:deterministic|visual[_-]extraction))\b"
++)
++_LOCAL_IMAGE_SUFFIXES = {
++    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".heic",
++}
++_LOCAL_DETERMINISTIC_SYSTEM_MESSAGE = (
++    "You are a local deterministic worker. Follow the user's request exactly. "
++    "Do not call tools. Return only the requested result."
++)
++_LEVEL_RANK = {"L0": 0, "L1": 1, "L2": 2, "L3": 3}
++_RISK_RANK = {"low": 0, "medium": 1, "high": 2}
++_WORKFLOW_RANK = {
++    "direct": 0,
++    "standard": 1,
++    "controlled-execution": 2,
++    "expert-reviewed": 3,
++    "multimodal": 2,
++}
++
++
++class RoutingBlockedError(RuntimeError):
++    """Raised when a controlled route cannot run under the active policy."""
++
++    def __init__(self, reason: str, message: str | None = None) -> None:
++        self.reason = reason
++        super().__init__(message or reason)
++
++
++@dataclass(frozen=True)
++class RouteDecision:
++    """A serializable explanation of the route selected for one turn."""
++
++    level: str
++    risk: str
++    workflow: str
++    contract: str
++    model_policy: str
++    candidates: tuple[dict[str, str], ...] = field(default_factory=tuple)
++    selected: dict[str, str] | None = None
++    reason: str = ""
++
++    def as_dict(self) -> dict[str, Any]:
++        return {
++            "level": self.level,
++            "risk": self.risk,
++            "workflow": self.workflow,
++            "contract": self.contract,
++            "model_policy": self.model_policy,
++            "candidates": [dict(item) for item in self.candidates],
++            "selected": dict(self.selected) if self.selected else None,
++            "reason": self.reason,
++        }
++
++
++def _read_json(path: Path) -> dict[str, Any]:
++    try:
++        value = json.loads(path.read_text(encoding="utf-8"))
++    except FileNotFoundError:
++        return {}
++    except Exception as exc:  # pragma: no cover - defensive runtime path
++        logger.warning("routing layer could not read %s: %s", path, exc)
++        return {}
++    return value if isinstance(value, dict) else {}
++
++
++def _text_of(message: Any) -> str:
++    if isinstance(message, str):
++        return message
++    if isinstance(message, list):
++        parts: list[str] = []
++        for item in message:
++            if isinstance(item, str):
++                parts.append(item)
++            elif isinstance(item, Mapping):
++                value = item.get("text") or item.get("content")
++                if isinstance(value, str):
++                    parts.append(value)
++        return "\n".join(parts)
++    return str(message or "")
++
++
++def _normalize_workflow_name(value: Any) -> str:
++    return str(value or "").strip().lower().replace("-", "_")
++
++
++def _specialized_workflow_spec(
++    route_policy: Mapping[str, Any], workflow_name: Any
++) -> dict[str, Any] | None:
++    """Resolve a specialized workflow by registry key or template name."""
++    target = _normalize_workflow_name(workflow_name)
++    if not target:
++        return None
++    raw = route_policy.get("specialized_workflows")
++    specialized = raw if isinstance(raw, Mapping) else {}
++    for key, value in specialized.items():
++        if not isinstance(value, Mapping):
++            continue
++        aliases = {
++            _normalize_workflow_name(key),
++            _normalize_workflow_name(value.get("workflow")),
++        }
++        if target in aliases:
++            return dict(value)
++    return None
++
++
++def _explicit_workflow_name(message: Any) -> str:
++    """Read the narrow user-facing ``workflow: NAME`` override syntax."""
++    match = _EXPLICIT_WORKFLOW_DIRECTIVE.search(_text_of(message))
++    return str(match.group("name")) if match else ""
++
++
++def _local_image_paths(message: Any) -> list[str]:
++    """Recover local image paths retained by text-mode attachment surfaces."""
++    text = _text_of(message)
++    if not text:
++        return []
++
++    candidates: list[str] = []
++    try:
++        from agent.image_routing import extract_image_refs
++
++        candidates.extend(extract_image_refs(text)[0])
++    except Exception:
++        pass
++
++    quoted = r"`[^`\n]+`|\"[^\"\n]+\"|'[^'\n]+'"
++    patterns = (
++        re.compile(rf"(?im)@image:(?P<value>{quoted}|\S+)"),
++        re.compile(
++            rf"(?im)(?:image_url|image attached at)\s*:\s*"
++            rf"(?P<value>{quoted}|[^\]\n]+)"
++        ),
++    )
++    for pattern in patterns:
++        for match in pattern.finditer(text):
++            value = str(match.group("value") or "").strip().rstrip(".,;:!?")
++            if len(value) >= 2 and value[0] == value[-1] and value[0] in "`\"'":
++                value = value[1:-1]
++            candidates.append(value)
++
++    resolved: list[str] = []
++    seen: set[str] = set()
++    for raw in candidates:
++        path = Path(str(raw)).expanduser()
++        if path.suffix.lower() not in _LOCAL_IMAGE_SUFFIXES:
++            continue
++        try:
++            if not path.is_file():
++                continue
++        except OSError:
++            continue
++        value = str(path)
++        if value not in seen:
++            seen.add(value)
++            resolved.append(value)
++    return resolved
++
++
++def _is_standalone_file_edit(message: Any) -> bool:
++    """Detect bounded edits to an explicitly supplied standalone file.
++
++    This is an execution-shape decision, not a risk upgrade: simple file
++    edits stay at L1 but use the bounded ``worker`` role instead of the
++    top-level responder. Investment advice or other decision requests remain
++    outside this specialized path.
++    """
++    text = _text_of(message).strip()
++    if not text:
++        return False
++    return bool(
++        _FILE_EDIT_EXT.search(text)
++        and _FILE_EDIT_INTENT.search(text)
++        and not _FILE_DECISION_INTENT.search(text)
++    )
++
++
++def _routing_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
++    value = (config or {}).get("routing")
++    return value if isinstance(value, dict) else {}
++
++
++def _config_dir(config: Mapping[str, Any] | None) -> Path:
++    raw = _routing_config(config).get("source_dir") or str(_DEFAULT_REGISTRY_DIR)
++    return Path(str(raw)).expanduser()
++
++
++def _load_policy(
++    config: Mapping[str, Any] | None,
++    bundle: Mapping[str, Any] | None = None,
++) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
++    if bundle is not None:
++        return (
++            bundle.get("route_policy", {}),
++            bundle.get("capability_contracts", {}),
++            bundle.get("model_policies", {}),
++            bundle.get("execution_roles", {}),
++        )
++    directory = _config_dir(config)
++    return (
++        _read_json(directory / "route-policy.json"),
++        _read_json(directory / "capability-contracts.json"),
++        _read_json(directory / "model-policies.json"),
++        _read_json(directory / "execution-roles.json"),
++    )
++
++
++def _runtime_policy_bundle(agent: Any) -> tuple[Mapping[str, Any] | None, bool]:
++    """Return the immutable policy bundle when the runtime exposes one.
++
++    A real Hermes runtime must never fall back to raw policy files after
++    registry load failure. Small unit-test fakes without registry attributes
++    retain the fixture-based path.
++    """
++    state = getattr(agent, "runtime_registry", None)
++    if state is None:
++        return None, False
++    status = str(getattr(state, "status", "inactive") or "inactive")
++    snapshot = getattr(agent, "runtime_snapshot", None)
++    bundle = getattr(snapshot, "bundle", None) if snapshot is not None else None
++    if status not in {"active", "candidate"} or not isinstance(bundle, Mapping):
++        return None, True
++    return bundle, True
++
++
++def classify_turn(message: Any, route_policy: Mapping[str, Any], config: Mapping[str, Any] | None = None) -> tuple[str, str, str]:
++    """Classify one turn without making a model or network call."""
++    text = _text_of(message).strip()
++    routing_cfg = _routing_config(config)
++    if _is_standalone_file_edit(message):
++        # Bounded file edits remain L1 but use the worker workflow.
++        level, risk = "L1", "low"
++    elif _HIGH_RISK.search(text) and _HIGH_RISK_DECISION.search(text):
++        level, risk = "L3", "high"
++    elif _EXPLANATORY.search(text) and not _EXECUTION_VERB.search(text):
++        # Pure "why / explain / is this right" question with no execution intent:
++        # answer directly at L1 instead of spinning up the L2/L3 DAG. (A finance
++        # IRR-explanation question was being routed to L2 and returning empty when
++        # the DAG's auxiliary models all failed.)
++        level, risk = "L1", "low"
++    elif _HIGH_RISK.search(text):
++        level, risk = "L3", "high"
++    elif _L2.search(text):
++        level, risk = "L2", "medium"
++    elif (
++        bool(routing_cfg.get("enable_l0", True))
++        and len(text) <= int(routing_cfg.get("l0_max_chars", 240))
++        and _DEFAULT_L0.search(text)
++    ):
++        level, risk = "L0", "low"
++    else:
++        level, risk = "L1", "low"
++
++    workflows = route_policy.get("level_workflows")
++    if _is_standalone_file_edit(message):
++        workflow = "file-edit"
++    else:
++        workflow = workflows.get(level) if isinstance(workflows, Mapping) else None
++    return level, risk, str(workflow or {"L0": "direct", "L1": "standard", "L2": "controlled-execution", "L3": "expert-reviewed"}[level])
++
++
++def _is_multimodal(message: Any) -> bool:
++    """Detect whether a message contains images or multimodal content."""
++    if isinstance(message, list):
++        for item in message:
++            if isinstance(item, Mapping):
++                if item.get("type") == "image" or item.get("type") == "image_url":
++                    return True
++                if isinstance(item.get("image_url"), Mapping):
++                    return True
++    return False
++
++
++def prepare_specialized_message(
++    message: Any, decision: RouteDecision | Mapping[str, Any] | None
++) -> Any:
++    """Preserve pixels when a local visual workflow was selected.
++
++    Native multimodal payloads already carry their image parts unchanged. Text
++    mode surfaces retain the local path in an ``image_url:``/``@image:`` hint;
++    rehydrate those paths into OpenAI-style image parts before the Ollama call.
++    """
++    if isinstance(decision, RouteDecision):
++        workflow = decision.workflow
++    elif isinstance(decision, Mapping):
++        workflow = str(decision.get("workflow") or "")
++    else:
++        return message
++    if _normalize_workflow_name(workflow) != "local_visual_extraction":
++        return message
++    if _is_multimodal(message):
++        return message
++
++    image_paths = _local_image_paths(message)
++    if not image_paths or not isinstance(message, str):
++        return message
++    try:
++        from agent.image_routing import build_native_content_parts
++
++        parts, _skipped = build_native_content_parts(message, image_paths)
++    except Exception:
++        logger.warning("local visual workflow could not attach image paths", exc_info=True)
++        return message
++    if any(isinstance(part, Mapping) and part.get("type") == "image_url" for part in parts):
++        logger.info("local visual workflow attached %s local image(s)", len(image_paths))
++        return parts
++    return message
++
++
++def specialized_system_message(
++    decision: RouteDecision | Mapping[str, Any] | None,
++) -> str | None:
++    """Return the compact system contract for opt-in local workflows."""
++    if isinstance(decision, RouteDecision):
++        policy = decision.model_policy
++    elif isinstance(decision, Mapping):
++        policy = str(decision.get("model_policy") or decision.get("contract") or "")
++    else:
++        return None
++    if policy == "local-deterministic":
++        return _LOCAL_DETERMINISTIC_SYSTEM_MESSAGE
++    return None
++
++
++def _should_use_semantic_router(
++    message: Any, route_policy: Mapping[str, Any], config: Mapping[str, Any] | None = None
++) -> bool:
++    """Check whether the semantic router should be invoked for this turn."""
++    routing_cfg = _routing_config(config)
++    raw_sr = route_policy.get("semantic_router")
++    sr: Mapping[str, Any] = raw_sr if isinstance(raw_sr, Mapping) else {}
++    if not bool(sr.get("enabled", False)):
++        return False
++    text = _text_of(message).strip()
++    triggers = sr.get("triggers", [])
++    if not isinstance(triggers, list):
++        return False
++    # A pure explanatory / advisory question was already classified L1 by the
++    # Fast Gate; the LLM classifier tends to over-escalate it (finance words
++    # like "investment"/"IRR" read as high-risk) and spin up the DAG, which can
++    # block for minutes and return an empty response. Never re-classify these.
++    if _EXPLANATORY.search(text) and not _EXECUTION_VERB.search(text):
++        return False
++    if _is_standalone_file_edit(message):
++        return False
++    if "multimodal" in triggers and _is_multimodal(message):
++        return True
++    if "high_risk" in triggers and _HIGH_RISK.search(text):
++        return True
++    if "uncertain" in triggers:
++        # Uncertain: not clearly L0/L1/L2/L3 by Fast Gate patterns
++        is_l0 = _DEFAULT_L0.search(text) and len(text) <= 240
++        is_l2 = _L2.search(text)
++        is_l3 = _HIGH_RISK.search(text)
++        if not is_l0 and not is_l2 and not is_l3:
++            return True
++    return False
++
++
++def _conservative_route(
++    level: str,
++    risk: str,
++    workflow: str,
++    route_policy: Mapping[str, Any],
++) -> tuple[str, str, str]:
++    """Apply the registry's risk floor after any semantic-router result.
++
++    The semantic router may refine an uncertain Fast Gate result, but it may
++    never downgrade a deterministic high-risk signal or select a workflow
++    below the risk gate's minimum. This is the fail-closed boundary between
++    probabilistic classification and executable policy.
++    """
++
++    level = level if level in _LEVEL_RANK else "L1"
++    risk = risk.lower() if risk.lower() in _RISK_RANK else "low"
++    workflow = str(workflow or "standard")
++    gate_map = route_policy.get("risk_gates")
++    gates = gate_map if isinstance(gate_map, Mapping) else {}
++    gate = gates.get(risk) if isinstance(gates.get(risk), Mapping) else {}
++    minimum = str(gate.get("min_workflow") or "")
++    if minimum and _WORKFLOW_RANK.get(workflow, 0) < _WORKFLOW_RANK.get(minimum, 0):
++        workflow = minimum
++    if risk == "high":
++        level = "L3"
++        workflow = "expert-reviewed"
++    elif risk == "medium":
++        level = max((level, "L2"), key=lambda item: _LEVEL_RANK.get(item, 0))
++        if _WORKFLOW_RANK.get(workflow, 0) < _WORKFLOW_RANK["controlled-execution"]:
++            workflow = "controlled-execution"
++    return level, risk, workflow
++
++
++def _semantic_classify(
++    message: Any,
++    config: Mapping[str, Any] | None = None,
++    bundle: Mapping[str, Any] | None = None,
++) -> tuple[str, str, str] | None:
++    """Run the remote semantic classifier (routing-classifier policy).
++
++    Called only when the Fast Gate cannot determine the route with confidence.
++    On failure, returns None so the caller falls back to the Fast Gate result.
++    """
++    if config is None:
++        try:
++            from hermes_cli.config import load_config_readonly
++            config = load_config_readonly()
++        except Exception:
++            config = {}
++    directory = _config_dir(config)
++    routing_cfg = _routing_config(config)
++
++    # Load the routing-classifier policy
++    model_policies = (
++        bundle.get("model_policies", {})
++        if bundle is not None
++        else _read_json(directory / "model-policies.json")
++    )
++    policies = model_policies.get("policies") if isinstance(model_policies.get("policies"), Mapping) else {}
++    classifier_policy = policies.get("routing-classifier")
++    if not isinstance(classifier_policy, Mapping):
++        return None
++
++    provider_map = routing_cfg.get("provider_map")
++    provider_map = provider_map if isinstance(provider_map, Mapping) else {}
++    candidates = [
++        candidate
++        for model_id in _candidate_ids(classifier_policy)
++        for candidate in [_split_model_id(model_id, provider_map)]
++        if candidate is not None
++    ]
++    if not candidates:
++        return None
++
++    # Load the semantic router prompt
++    if bundle is not None:
++        prompt = str(bundle.get("semantic_router_prompt") or "")
++    else:
++        prompt = ""
++        prompt_path = directory / "semantic-router-prompt.md"
++        try:
++            prompt = prompt_path.read_text(encoding="utf-8")
++        except Exception:
++            return None
++
++    user_text = _text_of(message)[:12000]
++    full_prompt = f"{prompt}\n\nUSER REQUEST:\n{user_text}"
++
++    route_policy = (
++        bundle.get("route_policy", {})
++        if bundle is not None
++        else _read_json(directory / "route-policy.json")
++    )
++    sr_cfg = route_policy.get("semantic_router")
++    sr_cfg_map: Mapping[str, Any] = sr_cfg if isinstance(sr_cfg, Mapping) else {}
++    timeout = float(sr_cfg_map.get("timeout_ms", 6000)) / 1000.0
++
++    failures: list[str] = []
++    max_calls = 1
++    try:
++        max_calls = max(1, int(sr_cfg_map.get("max_calls_per_task", 1)))
++    except (TypeError, ValueError):
++        max_calls = 1
++
++    for candidate in candidates[:max_calls]:
++        try:
++            from agent.auxiliary_client import call_llm
++
++            response = call_llm(
++                task="semantic_router",
++                provider=candidate["provider"],
++                model=candidate["model"],
++                messages=[{"role": "user", "content": full_prompt}],
++                temperature=0.0,
++                max_tokens=512,
++                timeout=timeout,
++                route_info={},
++            )
++            choices = getattr(response, "choices", None) or []
++            if not choices:
++                failures.append(f"{candidate['provider']}/{candidate['model']}: empty")
++                continue
++            content = str(getattr(getattr(choices[0], "message", None), "content", "") or "")
++            if not content.strip():
++                failures.append(f"{candidate['provider']}/{candidate['model']}: empty_content")
++                continue
++
++            # Parse JSON response
++            import re as _re
++            json_match = _re.search(r"\{[^{}]*\}", content, _re.DOTALL)
++            if not json_match:
++                failures.append(f"{candidate['provider']}/{candidate['model']}: no_json")
++                continue
++            result = json.loads(json_match.group(0))
++            level = str(result.get("level") or "").strip()
++            risk = str(result.get("risk") or "").strip()
++            workflow = str(result.get("workflow") or "").strip()
++            if level not in ("L0", "L1", "L2", "L3"):
++                failures.append(f"{candidate['provider']}/{candidate['model']}: invalid_level")
++                continue
++            logger.info(
++                "Hermes semantic router: level=%s risk=%s workflow=%s via %s/%s",
++                level, risk, workflow, candidate["provider"], candidate["model"],
++            )
++            return level, risk, workflow
++        except Exception as exc:
++            failures.append(f"{candidate['provider']}/{candidate['model']}: {type(exc).__name__}")
++
++    logger.warning("Hermes semantic router exhausted all candidates: %s", "; ".join(failures))
++    return None
++
++
++def _role_policy_name(role: str, execution_roles: Mapping[str, Any]) -> str:
++    """Resolve a role to its model_policy from execution-roles.json.
++    
++    Falls back to the hardcoded mapping for backwards compatibility
++    when execution_roles is not available.
++    """
++    roles_map = execution_roles.get("roles") if isinstance(execution_roles.get("roles"), Mapping) else {}
++    role_def = roles_map.get(role) if isinstance(roles_map, Mapping) else None
++    if isinstance(role_def, Mapping) and role_def.get("model_policy"):
++        return str(role_def["model_policy"])
++    # Hardcoded fallback matching Hermes' canonical execution-roles.json
++    return _HARDCODED_ROLE_POLICY.get(role, "complex-execution")
++
++
++_HARDCODED_ROLE_POLICY: dict[str, str] = {
++    "responder": "route",
++    "worker": "fast-economy",
++    "worker-pro": "complex-execution",
++    "planner": "complex-execution",
++    "explorer": "multimodal-extraction",
++    "publisher": "publishing",
++    "reviewer": "independent-review",
++    "local-worker": "local-deterministic",
++    "local-extractor": "local-deterministic",
++}
++
++
++def _load_profiles(
++    config: Mapping[str, Any] | None,
++    bundle: Mapping[str, Any] | None = None,
++) -> Mapping[str, Any]:
++    if bundle is not None:
++        return bundle.get("model_profiles", {})
++    directory = _config_dir(config)
++    return _read_json(directory / "model-profiles.json")
++
++
++def resolve_thinking(
++    contract_name: str,
++    model_id: str,
++    *,
++    contracts: Mapping[str, Any],
++    profiles: Mapping[str, Any],
++) -> str:
++    """Resolve reasoning_effort through Hermes' thinking_map chain.
++
++    contract → reasoning_intent (capability-contracts.json)
++    model → thinking_map (model-profiles.json)
++    thinking_map[intent] → actual reasoning_effort
++
++    Returns the resolved reasoning level (off/low/medium/high/max), or
++    an empty string when the profile is unavailable.
++    """
++    contracts_map = contracts.get("contracts") if isinstance(contracts.get("contracts"), Mapping) else {}
++    contract = contracts_map.get(contract_name)
++    if not isinstance(contract, Mapping):
++        return ""
++    intent = str(contract.get("reasoning_intent") or "off").strip()
++    if not intent:
++        return ""
++
++    profiles_map = profiles.get("profiles") if isinstance(profiles.get("profiles"), Mapping) else {}
++    profile = profiles_map.get(model_id)
++    if not isinstance(profile, Mapping):
++        # Try to match by stripping known provider prefix
++        for key, value in profiles_map.items():
++            if isinstance(value, Mapping) and key.endswith("/" + model_id.rsplit("/", 1)[-1] if "/" in model_id else model_id):
++                profile = value
++                break
++    if not isinstance(profile, Mapping):
++        return ""
++
++    thinking_map = profile.get("thinking_map")
++    if not isinstance(thinking_map, Mapping):
++        return ""
++
++    resolved = thinking_map.get(intent)
++    if isinstance(resolved, str) and resolved.strip():
++        return resolved.strip()
++
++    # Hermes decision C: if the provider only supports one legal level, use it.
++    supported = profile.get("supported_reasoning")
++    if isinstance(supported, list) and len(supported) == 1 and isinstance(supported[0], str):
++        return supported[0]
++
++    return ""
++
++
++def get_role_candidates(
++    role: str,
++    config: Mapping[str, Any] | None = None,
++    output_vendor_family: str | None = None,
++    bundle: Mapping[str, Any] | None = None,
++) -> list[dict[str, str]]:
++    """Resolve a execution role to its ordered model candidate chain.
++
++    This is the public bridge between Hermes' role-based model selection and
++    Hermes' delegation / subagent system.  Call it from any delegation
++    path to get the correct model candidates for a given role.
++
++    Args:
++        role: execution role name (e.g. "worker-pro", "planner", "reviewer").
++        config: Optional config dict (loads from disk if None).
++        output_vendor_family: Required for "reviewer" role — the vendor family
++            of the output being reviewed (e.g. "deepseek", "openai").
++
++    Returns:
++        Ordered list of {provider, model} candidates, or empty list.
++    """
++    if config is None:
++        try:
++            from hermes_cli.config import load_config_readonly
++
++            config = load_config_readonly()
++        except Exception:
++            config = {}
++    routing_cfg = _routing_config(config)
++    directory = _config_dir(config)
++    execution_roles = (
++        bundle.get("execution_roles", {})
++        if bundle is not None
++        else _read_json(directory / "execution-roles.json")
++    )
++    policy_name = _role_policy_name(role, execution_roles)
++    if policy_name == "route":
++        return []  # "route" means follow the top-level contract, not a fixed policy
++
++    model_policies = (
++        bundle.get("model_policies", {})
++        if bundle is not None
++        else _read_json(directory / "model-policies.json")
++    )
++    policies = model_policies.get("policies") if isinstance(model_policies.get("policies"), Mapping) else {}
++    policy = policies.get(policy_name)
++    if not isinstance(policy, Mapping):
++        return []
++
++    provider_map = routing_cfg.get("provider_map")
++    provider_map = provider_map if isinstance(provider_map, Mapping) else {}
++
++    # Reviewer: cross-vendor candidates resolved from rules[output_vendor_family]
++    if role == "reviewer" and output_vendor_family:
++        rules = policy.get("rules") if isinstance(policy.get("rules"), Mapping) else {}
++        model_ids = rules.get(output_vendor_family, [])
++        if isinstance(model_ids, list):
++            return [
++                candidate
++                for model_id in model_ids
++                for candidate in [_split_model_id(str(model_id), provider_map)]
++                if candidate is not None
++            ]
++        return []
++
++    return [
++        candidate
++        for model_id in _candidate_ids(policy)
++        for candidate in [_split_model_id(model_id, provider_map)]
++        if candidate is not None
++    ]
++
++
++def _candidate_ids(policy: Mapping[str, Any]) -> list[str]:
++    values: list[str] = []
++    for key in ("primary_pool", "primary", "intermediate_failover", "soft_failover", "hard_failover", "failover"):
++        raw = policy.get(key)
++        if isinstance(raw, str):
++            raw = [raw]
++        if not isinstance(raw, Iterable) or isinstance(raw, (bytes, str, Mapping)):
++            continue
++        for value in raw:
++            if isinstance(value, str) and value.strip() and value not in values:
++                values.append(value.strip())
++    return values
++
++
++def _split_model_id(model_id: str, provider_map: Mapping[str, Any]) -> dict[str, str] | None:
++    if "/" not in model_id:
++        return None
++    provider, model = model_id.split("/", 1)
++    provider = str(provider_map.get(provider, provider)).strip()
++    model = model.strip()
++    if not provider or not model:
++        return None
++    return {"provider": provider, "model": model}
++
++
++def _build_decision(
++    message: Any,
++    config: Mapping[str, Any] | None,
++    bundle: Mapping[str, Any] | None = None,
++) -> RouteDecision | None:
++    route_policy, contracts, model_policies, _execution_roles = _load_policy(config, bundle)
++    if not route_policy or not model_policies:
++        return None
++
++    specialized = _specialized_workflow_spec(
++        route_policy, _explicit_workflow_name(message)
++    )
++    route_reason = ""
++    if specialized is not None:
++        level = str(specialized.get("level") or "L0")
++        risk = str(specialized.get("risk") or "low")
++        workflow = str(specialized.get("workflow") or "direct")
++        route_reason = "explicit_specialized_workflow"
++    else:
++        level, risk, workflow = classify_turn(message, route_policy, config)
++        fast_level, fast_risk = level, risk
++
++        # Hermes semantic router: when the Fast Gate is uncertain, multimodal,
++        # or high-risk, call the classifier for a more accurate route. A
++        # registry-declared specialized workflow selects its own contract;
++        # ordinary L0-L3 output continues through level_contracts unchanged.
++        if _should_use_semantic_router(message, route_policy, config):
++            try:
++                sr_result = _semantic_classify(message, config, bundle)
++                if sr_result is not None:
++                    sr_level, sr_risk, sr_workflow = sr_result
++                    if (sr_level, sr_risk, sr_workflow) != (level, risk, workflow):
++                        logger.info(
++                            "Hermes semantic router override: %s/%s/%s -> %s/%s/%s",
++                            level, risk, workflow, sr_level, sr_risk, sr_workflow,
++                        )
++                    semantic_specialized = _specialized_workflow_spec(
++                        route_policy, sr_workflow
++                    )
++                    if semantic_specialized is not None:
++                        specialized = semantic_specialized
++                        semantic_level = str(specialized.get("level") or sr_level or "L0")
++                        semantic_risk = str(specialized.get("risk") or sr_risk or "low")
++                        semantic_workflow = str(
++                            specialized.get("workflow") or sr_workflow or "direct"
++                        )
++                        level, risk, workflow = _conservative_route(
++                            max(
++                                (fast_level, semantic_level),
++                                key=lambda item: _LEVEL_RANK.get(item, 0),
++                            ),
++                            max(
++                                (fast_risk, semantic_risk),
++                                key=lambda item: _RISK_RANK.get(str(item).lower(), 0),
++                            ),
++                            semantic_workflow,
++                            route_policy,
++                        )
++                        route_reason = "semantic_specialized_workflow"
++                    else:
++                        level, risk, workflow = _conservative_route(
++                            max(
++                                (level, sr_level),
++                                key=lambda item: _LEVEL_RANK.get(item, 0),
++                            ),
++                            max(
++                                (risk, sr_risk),
++                                key=lambda item: _RISK_RANK.get(str(item).lower(), 0),
++                            ),
++                            sr_workflow,
++                            route_policy,
++                        )
++            except Exception:
++                logger.info("Hermes semantic router failed, falling back to Fast Gate")
++
++    contracts_map = contracts.get("contracts") if isinstance(contracts.get("contracts"), Mapping) else {}
++    use_specialized_contract = bool(
++        specialized is not None
++        and str(specialized.get("level") or "L0") == level
++        and str(specialized.get("risk") or "low").lower() == risk.lower()
++    )
++    if use_specialized_contract:
++        contract = str(specialized.get("contract") or "")
++    elif _is_standalone_file_edit(message):
++        # L1 file editing uses the bounded worker contract (MiniMax primary),
++        # not the responder's standard-reasoning contract.
++        contract = "fast-economy"
++    else:
++        level_contracts = route_policy.get("level_contracts")
++        contract = str(level_contracts.get(level) if isinstance(level_contracts, Mapping) else "")
++        if not contract:
++            contract = {"L0": "fast-economy", "L1": "standard-reasoning", "L2": "complex-execution", "L3": "high-stakes-decision"}[level]
++    if contract not in contracts_map:
++        logger.warning("routing layer contract %r is not declared", contract)
++    policies = model_policies.get("policies")
++    policy = policies.get(contract) if isinstance(policies, Mapping) else None
++    if not isinstance(policy, Mapping):
++        return RouteDecision(level, risk, workflow, contract, contract, reason="missing_model_policy")
++    provider_map = _routing_config(config).get("provider_map")
++    provider_map = provider_map if isinstance(provider_map, Mapping) else {}
++    candidates = tuple(
++        candidate
++        for model_id in _candidate_ids(policy)
++        for candidate in [_split_model_id(model_id, provider_map)]
++        if candidate is not None
++    )
++    return RouteDecision(
++        level=level,
++        risk=risk,
++        workflow=workflow,
++        contract=contract,
++        model_policy=contract,
++        candidates=candidates,
++        reason=route_reason or ("high_risk" if level == "L3" else "complex_execution" if level == "L2" else "deterministic_transform" if level == "L0" else "ordinary_turn"),
++    )
++
++
++def _runtime_for(candidate: Mapping[str, str]) -> dict[str, Any]:
++    from hermes_cli.runtime_provider import resolve_runtime_provider
++
++    return resolve_runtime_provider(
++        requested=candidate["provider"],
++        target_model=candidate["model"],
++    )
++
++
++def _provider_family(model_id: str, profiles: Mapping[str, Any]) -> str:
++    profile_map = profiles.get("profiles") if isinstance(profiles.get("profiles"), Mapping) else {}
++    profile = profile_map.get(model_id) if isinstance(profile_map, Mapping) else None
++    if isinstance(profile, Mapping):
++        family = str(profile.get("vendor_family") or "").strip()
++        if family:
++            return family
++    return model_id.split("/", 1)[0].strip()
++
++
++def review_high_risk_result(
++    route: Mapping[str, Any] | None,
++    *,
++    user_message: Any,
++    answer: str,
++    config: Mapping[str, Any] | None = None,
++    bundle: Mapping[str, Any] | None = None,
++    required: bool = False,
++) -> dict[str, Any] | None:
++    """Run the Hermes L3 reviewer synchronously, returning bounded evidence.
++
++    Review is intentionally separate from Hermes' background memory review:
++    this call is a release gate for high-risk answers, not a best-effort
++    housekeeping fork.  It is opt-in under ``routing.review.enabled``.
++    """
++    if config is None:
++        try:
++            from hermes_cli.config import load_config_readonly
++
++            config = load_config_readonly()
++        except Exception:
++            config = {}
++    routing_cfg = _routing_config(config)
++    raw_review_cfg = routing_cfg.get("review")
++    review_cfg: Mapping[str, Any] = raw_review_cfg if isinstance(raw_review_cfg, Mapping) else {}
++    if not bool(review_cfg.get("enabled", False)) and not required:
++        return None
++    if not isinstance(route, Mapping) or route.get("level") != "L3":
++        return None
++
++    directory = _config_dir(config)
++    policies = (
++        bundle.get("model_policies", {})
++        if bundle is not None
++        else _read_json(directory / "model-policies.json")
++    )
++    profiles = (
++        bundle.get("model_profiles", {})
++        if bundle is not None
++        else _read_json(directory / "model-profiles.json")
++    )
++    review_policy = (policies.get("policies") or {}).get("independent-review")
++    raw_selected = route.get("selected")
++    selected: Mapping[str, Any] = raw_selected if isinstance(raw_selected, Mapping) else {}
++    output_model_id = f"{selected.get('provider', '')}/{selected.get('model', '')}".strip("/")
++    output_family = _provider_family(output_model_id, profiles)
++    rules = review_policy.get("rules") if isinstance(review_policy, Mapping) else {}
++    model_ids = rules.get(output_family, []) if isinstance(rules, Mapping) else []
++    raw_provider_map = routing_cfg.get("provider_map")
++    provider_map: Mapping[str, Any] = raw_provider_map if isinstance(raw_provider_map, Mapping) else {}
++    candidates = [
++        candidate
++        for model_id in model_ids
++        for candidate in [_split_model_id(str(model_id), provider_map)]
++        if candidate is not None
++    ]
++    if not candidates:
++        return {
++            "status": "blocked",
++            "verdict": None,
++            "reason": "no_cross_vendor_reviewer_candidate",
++            "output_vendor_family": output_family,
++        }
++
++    prompt = (
++        "You are an independent reviewer for a high-risk answer. Review the "
++        "candidate answer against the user request. Return exactly one first-line "
++        "verdict: PASS or REVISE. Then give concise, evidence-based reasons. "
++        "Do not call tools, do not rewrite the full answer, and do not add a "
++        "verdict other than PASS or REVISE.\n\n"
++        f"USER REQUEST:\n{_text_of(user_message)[:12000]}\n\n"
++        f"CANDIDATE ANSWER:\n{str(answer)[:24000]}"
++    )
++    failures: list[str] = []
++    for candidate in candidates:
++        try:
++            from agent.auxiliary_client import call_llm
++
++            response = call_llm(
++                task="review",
++                provider=candidate["provider"],
++                model=candidate["model"],
++                messages=[{"role": "user", "content": prompt}],
++                temperature=0.0,
++                max_tokens=int(review_cfg.get("max_tokens", 1200)),
++                timeout=float(review_cfg.get("timeout", 90)),
++                route_info={},
++            )
++            content = ""
++            choices = getattr(response, "choices", None) or []
++            if choices:
++                content = str(getattr(getattr(choices[0], "message", None), "content", "") or "")
++            verdict_match = re.match(r"^\s*(PASS|REVISE)\b", content, re.IGNORECASE)
++            if not verdict_match:
++                failures.append(f"{candidate['provider']}/{candidate['model']}: invalid_verdict")
++                continue
++            verdict = verdict_match.group(1).upper()
++            return {
++                "status": "passed" if verdict == "PASS" else "revise",
++                "verdict": verdict,
++                "provider": candidate["provider"],
++                "model": candidate["model"],
++                "output_vendor_family": output_family,
++                "review": content[:8000],
++                "degraded": False,
++            }
++        except Exception as exc:  # pragma: no cover - provider-specific errors
++            failures.append(f"{candidate['provider']}/{candidate['model']}: {type(exc).__name__}")
++
++    return {
++        "status": "blocked",
++        "verdict": None,
++        "reason": "cross_vendor_review_unavailable",
++        "output_vendor_family": output_family,
++        "attempts": failures,
++    }
++
++
++def review_fail_closed(config: Mapping[str, Any] | None = None) -> bool:
++    """Return the configured L3 review gate posture (default: fail closed)."""
++    if config is None:
++        try:
++            from hermes_cli.config import load_config_readonly
++
++            config = load_config_readonly()
++        except Exception:
++            config = {}
++    routing_cfg = _routing_config(config)
++    raw_review_cfg = routing_cfg.get("review")
++    review_cfg: Mapping[str, Any] = raw_review_cfg if isinstance(raw_review_cfg, Mapping) else {}
++    return bool(review_cfg.get("fail_closed", True))
++
++
++def enforce_release_gates(
++    agent: Any,
++    *,
++    user_message: Any,
++    answer: str | None,
++    config: Mapping[str, Any] | None = None,
++) -> str | None:
++    """Enforce registry-declared review and verification before delivery."""
++
++    if answer is None:
++        return answer
++    route = getattr(agent, "_route_decision", None)
++    if not isinstance(route, Mapping):
++        return answer
++    if config is None:
++        config = getattr(agent, "_route_config", None)
++    if not isinstance(config, Mapping):
++        try:
++            from hermes_cli.config import load_config_readonly
++
++            config = load_config_readonly()
++        except Exception:
++            config = {}
++
++    if bool(getattr(agent, "_workflow_review", False)):
++        evidence = review_high_risk_result(
++            route,
++            user_message=user_message,
++            answer=answer,
++            config=config,
++            bundle=getattr(agent, "_route_policy_bundle", None),
++            required=True,
++        )
++        agent._review_evidence = evidence
++        if not evidence or evidence.get("status") != "passed":
++            reason = (evidence or {}).get("reason", "review_unavailable")
++            return (
++                "Delivery blocked: the routed high-risk workflow did not pass its "
++                f"independent review gate ({reason})."
++            )
++
++    if bool(getattr(agent, "_workflow_verify", False)):
++        changed = sorted(getattr(agent, "_turn_file_mutation_paths", set()) or [])
++        if changed:
++            try:
++                from agent.verification_evidence import verification_status
++
++                status = verification_status(
++                    session_id=getattr(agent, "session_id", None),
++                    cwd=getattr(agent, "terminal_cwd", None) or config.get("terminal", {}).get("cwd"),
++                )
++            except Exception:
++                status = {"status": "unverified"}
++            if status.get("status") in {"unverified", "stale", "failed"}:
++                return (
++                    "Delivery blocked: the routed workflow changed files but has "
++                    "no fresh passing verification evidence."
++                )
++    return answer
++
++
++def apply_route(agent: Any, message: Any, config: Mapping[str, Any] | None = None) -> RouteDecision | None:
++    """Apply one route to a live AIAgent, returning its evidence record."""
++    if config is None:
++        try:
++            from hermes_cli.config import load_config_readonly
++
++            config = load_config_readonly()
++        except Exception:
++            config = {}
++    routing_cfg = _routing_config(config)
++    policy_bundle, registry_bound = _runtime_policy_bundle(agent)
++    agent._route_policy_bundle = policy_bundle
++    agent._route_config = config
++    if not hasattr(agent, "_route_base_cached_system_prompt"):
++        agent._route_base_cached_system_prompt = getattr(
++            agent, "_cached_system_prompt", None
++        )
++        agent._route_base_cached_system_prompt_static = getattr(
++            agent, "_cached_system_prompt_static", None
++        )
++    # Restore Hermes' native prompt baseline before applying a specialized
++    # local contract for this turn. The gateway reuses the agent object.
++    agent._cached_system_prompt = getattr(
++        agent, "_route_base_cached_system_prompt", None
++    )
++    agent._cached_system_prompt_static = getattr(
++        agent, "_route_base_cached_system_prompt_static", None
++    )
++    # Per-turn request shaping; a cached agent must not carry a prior local
++    # workflow's no-tools contract into the next cloud turn.
++    agent._route_disable_tools = False
++    agent._route_decision = None
++    agent._review_evidence = None
++    agent._workflow_dag_evidence = None
++    # The gateway reuses one AIAgent across turns. Clear coordinated-workflow
++    # guards and role metadata before classifying the new turn so an earlier
++    # L2/L3 request cannot constrain a later direct L0/L1 request.
++    agent._direct_execution_guard = False
++    agent._direct_execution_guard_tools = set()
++    agent._workflow_roles = []
++    agent._workflow_verify = False
++    agent._workflow_review = False
++    agent._route_delegate_role = None
++    if not bool(routing_cfg.get("enabled", False)):
++        return None
++    # A cached gateway agent survives multiple turns; reviewer evidence belongs
++    # to exactly one turn and must never be carried into the next result.
++    agent._review_evidence = None
++    agent._workflow_dag_evidence = None
++
++    if registry_bound and policy_bundle is None:
++        raise RoutingBlockedError(
++            "runtime_registry_inactive",
++            "Route blocked because the Hermes runtime registry is inactive.",
++        )
++
++    decision = _build_decision(message, config, policy_bundle)
++    if decision is None:
++        raise RoutingBlockedError(
++            "route_policy_unavailable",
++            "Route blocked because the active registry has no usable route policy.",
++        )
++
++    contracts = _load_policy(config, policy_bundle)[1]
++    contracts_map = contracts.get("contracts") if isinstance(contracts.get("contracts"), Mapping) else {}
++    contract_def = contracts_map.get(decision.contract) if isinstance(contracts_map, Mapping) else None
++    agent._route_disable_tools = bool(
++        isinstance(contract_def, Mapping) and contract_def.get("tools") == "none"
++    )
++
++    # Load workflow templates and store the role sequence for this route.
++    # L1 standalone file edits use the bounded worker role; ordinary L1 turns
++    # remain on the top-level responder path.
++    try:
++        directory = _config_dir(config)
++        templates = (
++            policy_bundle.get("workflow_templates", {})
++            if policy_bundle is not None
++            else _read_json(directory / "workflow-templates.json")
++        )
++        templates_map = templates.get("templates") if isinstance(templates.get("templates"), Mapping) else {}
++        workflow_name = decision.workflow or {"L2": "controlled-execution", "L3": "expert-reviewed"}.get(decision.level, "standard")
++        template = templates_map.get(workflow_name)
++        agent._workflow_roles = list(template.get("roles", [])) if isinstance(template, Mapping) else []
++        agent._workflow_verify = bool(template.get("verify", False)) if isinstance(template, Mapping) else False
++        agent._workflow_review = bool(template.get("review_required", False)) if isinstance(template, Mapping) else False
++    except Exception:
++        agent._workflow_roles = []
++        agent._workflow_verify = False
++        agent._workflow_review = False
++
++    if not decision.candidates:
++        agent._route_decision = decision.as_dict()
++        logger.warning("routing layer has no usable candidates for policy %s", decision.model_policy)
++        raise RoutingBlockedError(
++            "route_candidates_unavailable",
++            f"Route blocked because policy {decision.model_policy!r} has no usable model candidates.",
++        )
++
++    # L2/L3 are coordinated workflows: the top-level responder may reason,
++    # delegate, and synthesize, but must not execute project tools directly.
++    # Worker/worker-pro subagents remain allowed to execute their assigned steps.
++    agent._direct_execution_guard = decision.level in {"L2", "L3"}
++    agent._direct_execution_guard_tools = (
++        {
++            "read_file", "search_files", "write_file", "patch", "execute_code", "terminal",
++            "computer_use", "process", "open_preview", "close_preview", "project_create",
++            "project_switch", "project_list",
++        }
++        if agent._direct_execution_guard
++        else set()
++    )
++    agent._route_delegate_role = "worker-pro" if decision.level == "L3" else "worker"
++
++    selected: dict[str, str] | None = None
++    runtime: dict[str, Any] | None = None
++    for candidate in decision.candidates:
++        try:
++            runtime = _runtime_for(candidate)
++            selected = dict(candidate)
++            break
++        except Exception as exc:
++            logger.info(
++                "routing layer candidate unavailable: %s/%s (%s)",
++                candidate["provider"],
++                candidate["model"],
++                exc,
++            )
++
++    if selected is None or runtime is None:
++        agent._route_decision = decision.as_dict()
++        logger.warning("routing layer exhausted candidates for policy %s", decision.model_policy)
++        raise RoutingBlockedError(
++            "route_candidates_unavailable",
++            f"Route blocked because all candidates for policy {decision.model_policy!r} failed runtime resolution.",
++        )
++
++    current = {
++        "provider": str(getattr(agent, "provider", "") or ""),
++        "model": str(getattr(agent, "model", "") or ""),
++    }
++    if current != selected:
++        agent.switch_model(
++            selected["model"],
++            runtime.get("provider") or selected["provider"],
++            runtime.get("api_key") or "",
++            runtime.get("base_url") or "",
++            runtime.get("api_mode") or "",
++        )
++
++    # Resolve local Ollama's request context from the selected registry profile.
++    # switch_model() normally discovers this only when Ollama was the session's
++    # startup provider; a per-turn route switch would otherwise omit num_ctx and
++    # Ollama would fall back to 4096, which cannot carry a normal image turn.
++    model_id = f"{selected['provider']}/{selected['model']}"
++    profiles = _load_profiles(config, policy_bundle)
++    if selected["provider"] == "ollama":
++        profile_map = profiles.get("profiles") if isinstance(profiles.get("profiles"), Mapping) else {}
++        profile = profile_map.get(model_id) if isinstance(profile_map, Mapping) else None
++        raw_context = profile.get("context_window") if isinstance(profile, Mapping) else None
++        try:
++            local_context = int(raw_context) if isinstance(raw_context, (int, str)) else 0
++        except ValueError:
++            local_context = 0
++        if local_context > 0:
++            agent._ollama_num_ctx = local_context
++            logger.info("local route will request Ollama num_ctx=%s", local_context)
++
++    # Resolve reasoning_effort through Hermes' thinking_map chain.
++    # contract → reasoning_intent → model.thinking_map → actual effort.
++    try:
++        contracts = _load_policy(config, policy_bundle)[1]
++        resolved_effort = resolve_thinking(
++            decision.contract,
++            model_id,
++            contracts=contracts,
++            profiles=profiles,
++        )
++        if resolved_effort and hasattr(agent, "reasoning_effort"):
++            agent.reasoning_effort = resolved_effort
++            if (
++                resolved_effort == "off"
++                and decision.model_policy == "local-deterministic"
++                and hasattr(agent, "reasoning_config")
++            ):
++                agent.reasoning_config = {"enabled": False}
++            logger.info(
++                "thinking resolution resolved: contract=%s intent→%s model=%s",
++                decision.contract,
++                resolved_effort,
++                model_id,
++            )
++    except Exception:
++        pass
++
++    # Reuse Hermes' existing real-failure fallback machinery for this route.
++    # Entries carry no credentials; the host resolves them only if a real
++    # provider failure causes a transition.
++    fallback_chain = [dict(item) for item in decision.candidates if item != selected]
++    agent._fallback_chain = fallback_chain
++    agent._fallback_index = 0
++    agent._fallback_activated = False
++    agent._fallback_model = fallback_chain[0] if fallback_chain else None
++    agent._unavailable_fallback_keys = set()
++
++    applied = RouteDecision(
++        level=decision.level,
++        risk=decision.risk,
++        workflow=decision.workflow,
++        contract=decision.contract,
++        model_policy=decision.model_policy,
++        candidates=decision.candidates,
++        selected=selected,
++        reason=decision.reason,
++    )
++    agent._route_decision = applied.as_dict()
++    logger.info(
++        "route selected: level=%s risk=%s workflow=%s policy=%s model=%s/%s candidates=%s",
++        applied.level,
++        applied.risk,
++        applied.workflow,
++        applied.model_policy,
++        selected["provider"],
++        selected["model"],
++        len(applied.candidates),
++    )
++    return applied
+diff --git a/agent/runtime_registry.py b/agent/runtime_registry.py
+new file mode 100644
+index 0000000000..e95f13127c
+--- /dev/null
++++ b/agent/runtime_registry.py
+@@ -0,0 +1,1148 @@
++"""Read-only, fail-closed loader for Hermes runtime registries.
++
++The loader deliberately has no write or promotion side effects.  A returned
++:class:`RegistrySnapshot` owns a frozen copy of every parsed payload, so later
++changes on disk cannot change an agent/session's control-plane inputs.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import re
++import stat
++from dataclasses import dataclass
++from datetime import datetime, timezone
++from pathlib import Path, PurePosixPath
++from types import MappingProxyType
++from typing import Any, Callable, Iterable, Mapping
++
++from hermes_constants import get_hermes_home
++
++SUPPORTED_MANIFEST_SCHEMA_VERSION = "hermes-workflow-registry/1.0"
++SUPPORTED_PROMOTION_STATES = frozenset(
++    {"DRAFT", "READY_FOR_REVIEW", "APPROVED", "PUBLISHED"}
++)
++PRODUCTION_PROMOTION_STATES = frozenset({"APPROVED", "PUBLISHED"})
++DEFAULT_REGISTRY_RELATIVE_PATH = Path("workflows") / "production-registry"
++EXEMPT_FILES = frozenset({"README.md"})
++
++# These are the behavior payloads in the registry contract.  The values are
++# the required top-level section in each JSON payload.  ``schema_version`` is
++# checked separately for every JSON payload.
++_REQUIRED_PAYLOAD_SECTIONS = {
++    "route-policy.json": "default_route",
++    "workflow-templates.json": "templates",
++    "execution-roles.json": "roles",
++    "model-policies.json": "policies",
++    "model-profiles.json": "profiles",
++    "capability-contracts.json": "contracts",
++}
++_REQUIRED_PAYLOAD_FILES = frozenset(
++    {*_REQUIRED_PAYLOAD_SECTIONS, "semantic-router-prompt.md"}
++)
++_REGISTRY_VERSION_RE = re.compile(r"^(?P<date>\d{4}-\d{2}-\d{2})\.(?P<revision>\d+)$")
++_PAYLOAD_SCHEMA_RE = re.compile(r"^\d+\.\d+$")
++_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
++_SUPPORTED_PAYLOAD_SCHEMA_VERSIONS = {
++    "route-policy.json": "1.0",
++    "workflow-templates.json": "1.1",
++    "execution-roles.json": "1.0",
++    "model-policies.json": "1.2",
++    "model-profiles.json": "1.1",
++    "capability-contracts.json": "1.0",
++}
++
++
++class RegistryLoadError(ValueError):
++    """Raised whenever a registry cannot be loaded without guessing.
++
++    ``code`` and ``path`` are stable machine-readable fields for a future CLI;
++    the message intentionally contains only registry-relative paths and safe
++    validation metadata.
++    """
++
++    def __init__(
++        self,
++        message: str,
++        *,
++        code: str = "invalid_registry",
++        path: str | None = None,
++    ) -> None:
++        self.code = code
++        self.path = path
++        super().__init__(message)
++
++
++@dataclass(frozen=True, slots=True)
++class BaselineTestResult:
++    """One deterministic baseline check result.
++
++    Baseline runners can supply these results to a promotion gate without
++    coupling the registry loader to a model/provider benchmark implementation.
++    """
++
++    name: str
++    passed: bool
++    detail: str = ""
++
++
++@dataclass(frozen=True, slots=True)
++class BaselineReport:
++    """Immutable aggregate returned by :func:`run_baseline_tests`."""
++
++    results: tuple[BaselineTestResult, ...]
++    passed: bool
++
++
++BaselineCheck = Callable[[], BaselineTestResult | bool]
++
++
++def run_baseline_tests(checks: Iterable[BaselineCheck] | None) -> BaselineReport:
++    """Run supplied baseline checks and fail closed on a check exception.
++
++    The loader does not invent or silently skip B01--B08 benchmark checks.
++    Callers provide the checks for the environment under test; every check is
++    represented in the returned immutable report, including failures.
++    """
++
++    results: list[BaselineTestResult] = []
++    for index, check in enumerate(checks or (), start=1):
++        try:
++            outcome = check()
++        except Exception as exc:  # pragma: no cover - exercised by callers
++            results.append(
++                BaselineTestResult(
++                    name=f"baseline-{index}",
++                    passed=False,
++                    detail=type(exc).__name__,
++                )
++            )
++            continue
++        if isinstance(outcome, BaselineTestResult):
++            results.append(outcome)
++        else:
++            results.append(
++                BaselineTestResult(name=f"baseline-{index}", passed=bool(outcome))
++            )
++    frozen = tuple(results)
++    return BaselineReport(results=frozen, passed=bool(frozen) and all(r.passed for r in frozen))
++
++
++def run_registry_integrity_baseline(
++    root: str | Path | None = None,
++    *,
++    mode: str = "preview",
++) -> BaselineReport:
++    """Run executable registry/config integrity checks only.
++
++    This is deliberately not a provider or model benchmark.  It validates the
++    control-plane artifact that the loader can actually consume, its immutable
++    bundle shape, and its manifest hash coverage.  Any failed prerequisite is
++    represented as a failed result instead of being silently omitted.
++    """
++
++    snapshot: RegistrySnapshot | None = None
++
++    def load_check() -> BaselineTestResult:
++        nonlocal snapshot
++        try:
++            snapshot = load_registry(root, mode=mode)
++        except RegistryLoadError as exc:
++            return BaselineTestResult("registry-load", False, exc.code)
++        return BaselineTestResult("registry-load", True, "registry schema/hash/reference integrity")
++
++    def bundle_check() -> BaselineTestResult:
++        if snapshot is None:
++            return BaselineTestResult("registry-bundle", False, "registry-load did not pass")
++        required = {
++            "route_policy",
++            "workflow_templates",
++            "execution_roles",
++            "model_policies",
++            "model_profiles",
++            "capability_contracts",
++            "semantic_router_prompt",
++        }
++        missing = required - set(snapshot.bundle)
++        if missing:
++            return BaselineTestResult("registry-bundle", False, "missing bundle sections")
++        return BaselineTestResult("registry-bundle", True, "required runtime bundle sections present")
++
++    def hashes_check() -> BaselineTestResult:
++        if snapshot is None:
++            return BaselineTestResult("registry-hashes", False, "registry-load did not pass")
++        declared = {
++            entry["path"]: entry["sha256"]
++            for entry in snapshot.manifest["files"]
++        }
++        if declared != dict(snapshot.payload_hashes):
++            return BaselineTestResult("registry-hashes", False, "manifest hash coverage mismatch")
++        return BaselineTestResult("registry-hashes", True, "manifest hash coverage verified")
++
++    return run_baseline_tests((load_check, bundle_check, hashes_check))
++
++
++@dataclass(frozen=True, slots=True)
++class RegistrySnapshot:
++    """Immutable registry state bound to one agent/session initialization."""
++
++    root: Path
++    registry_version: str
++    promotion_state: str
++    manifest_sha256: str
++    payload_hashes: Mapping[str, str]
++    bundle: Mapping[str, Any]
++    loaded_at: datetime
++    source: str
++    is_candidate: bool
++    manifest: Mapping[str, Any]
++
++    @property
++    def version(self) -> str:
++        """Compatibility alias for consumers that use ``version``."""
++
++        return self.registry_version
++
++    @property
++    def manifest_hash(self) -> str:
++        """Compatibility alias for the manifest digest."""
++
++        return self.manifest_sha256
++
++
++@dataclass(frozen=True, slots=True)
++class RuntimeRegistryState:
++    """Stable, read-only registry state exposed by one agent instance."""
++
++    enabled: bool
++    mode: str
++    status: str
++    version: str | None = None
++    promotion_state: str | None = None
++    manifest_hash: str | None = None
++    inactive_reason: Mapping[str, str] | None = None
++
++    def __post_init__(self) -> None:
++        if self.inactive_reason is not None and not isinstance(
++            self.inactive_reason, MappingProxyType
++        ):
++            object.__setattr__(
++                self,
++                "inactive_reason",
++                MappingProxyType(dict(self.inactive_reason)),
++            )
++
++    @property
++    def active(self) -> bool:
++        return self.status == "active"
++
++    @property
++    def candidate(self) -> bool:
++        return self.status == "candidate"
++
++    @property
++    def inactive(self) -> bool:
++        return self.status == "inactive"
++
++    @property
++    def state(self) -> str:
++        """Short alias for callers that name the activation state ``state``."""
++
++        return self.status
++
++    @property
++    def reason(self) -> Mapping[str, str] | None:
++        """Short alias for the structured inactive reason."""
++
++        return self.inactive_reason
++
++    @property
++    def registry_version(self) -> str | None:
++        """Compatibility alias matching :class:`RegistrySnapshot`."""
++
++        return self.version
++
++    @property
++    def manifest_sha256(self) -> str | None:
++        """Compatibility alias matching :class:`RegistrySnapshot`."""
++
++        return self.manifest_hash
++
++
++class RegistryLoader:
++    """Read-only loader bound to one registry root."""
++
++    def __init__(self, root: str | Path | None = None) -> None:
++        self.root = _default_registry_root() if root is None else _coerce_registry_root(root)
++
++    def load(
++        self,
++        *,
++        mode: str = "production",
++        allow_candidate: bool = False,
++    ) -> RegistrySnapshot:
++        return load_registry(
++            self.root,
++            mode=mode,
++            allow_candidate=allow_candidate,
++        )
++
++
++def _default_registry_root() -> Path:
++    """Resolve the profile-aware default without touching registry contents."""
++
++    return get_hermes_home() / DEFAULT_REGISTRY_RELATIVE_PATH
++
++
++def _coerce_registry_root(value: str | Path) -> Path:
++    """Convert a caller-supplied root without leaking path exceptions."""
++
++    if not isinstance(value, (str, os.PathLike)):
++        raise RegistryLoadError(
++            "registry root must be a path string",
++            code="invalid_root",
++            path="root",
++        )
++    try:
++        raw_value = os.fspath(value)
++        if not isinstance(raw_value, str):
++            raise TypeError("registry root path must be text")
++        if "\x00" in raw_value:
++            raise ValueError("NUL byte in registry root")
++        return Path(raw_value).expanduser()
++    except RegistryLoadError:
++        raise
++    except Exception as exc:
++        raise RegistryLoadError(
++            "registry root is not a valid path",
++            code="invalid_registry_path",
++            path="root",
++        ) from exc
++
++
++def _freeze(value: Any) -> Any:
++    """Recursively turn JSON values into immutable Python values."""
++
++    if isinstance(value, dict):
++        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
++    if isinstance(value, list):
++        return tuple(_freeze(item) for item in value)
++    if isinstance(value, set):
++        return frozenset(_freeze(item) for item in value)
++    return value
++
++
++def _schema_error(path: str, message: str, *, code: str = "invalid_schema") -> RegistryLoadError:
++    return RegistryLoadError(message, code=code, path=path)
++
++
++def _require_mapping(value: Any, path: str) -> Mapping[str, Any]:
++    if not isinstance(value, dict):
++        raise _schema_error(f"{path}", f"{path} must be an object")
++    for key in value:
++        if not isinstance(key, str) or not key:
++            raise _schema_error(f"{path}", f"{path} has an invalid key")
++    return value
++
++
++def _require_string(value: Any, path: str) -> str:
++    if not isinstance(value, str) or not value:
++        raise _schema_error(path, f"{path} must be a non-empty string")
++    return value
++
++
++def _require_bool(value: Any, path: str) -> bool:
++    if type(value) is not bool:
++        raise _schema_error(path, f"{path} must be a boolean")
++    return value
++
++
++def _require_int(value: Any, path: str) -> int:
++    if type(value) is not int:
++        raise _schema_error(path, f"{path} must be an integer")
++    return value
++
++
++def _require_list(value: Any, path: str) -> list[Any]:
++    if not isinstance(value, list):
++        raise _schema_error(path, f"{path} must be an array")
++    return value
++
++
++def _require_required_keys(value: Mapping[str, Any], path: str, keys: Iterable[str]) -> None:
++    for key in keys:
++        if key not in value:
++            raise RegistryLoadError(
++                f"missing required field {key!r} at {path}",
++                code="missing_required_field",
++                path=f"{path}.{key}",
++            )
++
++
++def _validate_string_list(value: Any, path: str, *, nonempty: bool = False) -> list[str]:
++    items = _require_list(value, path)
++    if nonempty and not items:
++        raise _schema_error(path, f"{path} must not be empty")
++    return [_require_string(item, f"{path}[{index}]") for index, item in enumerate(items)]
++
++
++def _validate_string_mapping(value: Any, path: str) -> Mapping[str, Any]:
++    mapping = _require_mapping(value, path)
++    for key, item in mapping.items():
++        _require_string(key, f"{path}.<key>")
++        _require_string(item, f"{path}.{key}")
++    return mapping
++
++
++def _validate_route_payload(value: Mapping[str, Any], path: str) -> None:
++    _require_required_keys(
++        value,
++        path,
++        (
++            "default_route",
++            "level_contracts",
++            "level_workflows",
++            "specialized_workflows",
++            "risk_gates",
++            "semantic_router",
++            "workflow_rank",
++        ),
++    )
++    default_route = _require_mapping(value["default_route"], f"{path}.default_route")
++    _require_required_keys(default_route, f"{path}.default_route", ("level", "risk"))
++    _require_string(default_route["level"], f"{path}.default_route.level")
++    _require_string(default_route["risk"], f"{path}.default_route.risk")
++    _validate_string_mapping(value["level_contracts"], f"{path}.level_contracts")
++    _validate_string_mapping(value["level_workflows"], f"{path}.level_workflows")
++    specialized = _require_mapping(value["specialized_workflows"], f"{path}.specialized_workflows")
++    for name, item in specialized.items():
++        item_path = f"{path}.specialized_workflows.{name}"
++        config = _require_mapping(item, item_path)
++        _require_required_keys(config, item_path, ("level", "risk", "workflow", "contract"))
++        for key in ("level", "risk", "workflow", "contract"):
++            _require_string(config[key], f"{item_path}.{key}")
++    risk_gates = _require_mapping(value["risk_gates"], f"{path}.risk_gates")
++    for name, item in risk_gates.items():
++        item_path = f"{path}.risk_gates.{name}"
++        gate = _require_mapping(item, item_path)
++        _require_required_keys(gate, item_path, ("min_workflow",))
++        if gate["min_workflow"] is not None:
++            _require_string(gate["min_workflow"], f"{item_path}.min_workflow")
++        if "force_review" in gate:
++            _require_bool(gate["force_review"], f"{item_path}.force_review")
++    semantic = _require_mapping(value["semantic_router"], f"{path}.semantic_router")
++    _require_required_keys(
++        semantic,
++        f"{path}.semantic_router",
++        ("enabled", "max_calls_per_task", "timeout_ms", "model_policy", "triggers", "on_failure", "on_low_confidence"),
++    )
++    _require_bool(semantic["enabled"], f"{path}.semantic_router.enabled")
++    for key in ("max_calls_per_task", "timeout_ms"):
++        if _require_int(semantic[key], f"{path}.semantic_router.{key}") <= 0:
++            raise _schema_error(f"{path}.semantic_router.{key}", "integer must be positive")
++    _require_string(semantic["model_policy"], f"{path}.semantic_router.model_policy")
++    _validate_string_list(semantic["triggers"], f"{path}.semantic_router.triggers")
++    for key in ("on_failure", "on_low_confidence"):
++        _require_string(semantic[key], f"{path}.semantic_router.{key}")
++    if "rules" in semantic:
++        rules = _require_mapping(semantic["rules"], f"{path}.semantic_router.rules")
++        for name, item in rules.items():
++            item_path = f"{path}.semantic_router.rules.{name}"
++            rule = _require_mapping(item, item_path)
++            _require_required_keys(rule, item_path, ("workflow",))
++            _require_string(rule["workflow"], f"{item_path}.workflow")
++            if "triggers" in rule:
++                _validate_string_list(rule["triggers"], f"{item_path}.triggers")
++            for key in ("level", "risk", "model_policy", "on_failure", "on_low_confidence"):
++                if key in rule:
++                    _require_string(rule[key], f"{item_path}.{key}")
++    ranks = _require_mapping(value["workflow_rank"], f"{path}.workflow_rank")
++    for name, rank in ranks.items():
++        if _require_int(rank, f"{path}.workflow_rank.{name}") < 0:
++            raise _schema_error(f"{path}.workflow_rank.{name}", "integer must not be negative")
++
++
++def _validate_workflow_payload(value: Mapping[str, Any], path: str) -> None:
++    templates = _require_mapping(value["templates"], f"{path}.templates")
++    for name, item in templates.items():
++        item_path = f"{path}.templates.{name}"
++        template = _require_mapping(item, item_path)
++        _require_required_keys(template, item_path, ("roles", "verify"))
++        _validate_string_list(template["roles"], f"{item_path}.roles", nonempty=True)
++        _require_bool(template["verify"], f"{item_path}.verify")
++        for key in ("allowed_worker_roles", "policies"):
++            if key in template:
++                _validate_string_list(template[key], f"{item_path}.{key}")
++        for key in ("worker_selection",):
++            if key in template:
++                _require_string(template[key], f"{item_path}.{key}")
++        for key in ("review_required",):
++            if key in template:
++                _require_bool(template[key], f"{item_path}.{key}")
++        for key in ("model_policy", "contract", "capability_contract"):
++            if key in template:
++                _require_string(template[key], f"{item_path}.{key}")
++
++
++def _validate_roles_payload(value: Mapping[str, Any], path: str) -> None:
++    roles = _require_mapping(value["roles"], f"{path}.roles")
++    for name, item in roles.items():
++        item_path = f"{path}.roles.{name}"
++        role = _require_mapping(item, item_path)
++        _require_required_keys(role, item_path, ("responsibility", "tools", "dispatch", "model_policy"))
++        for key in ("responsibility", "tools", "dispatch", "model_policy"):
++            _require_string(role[key], f"{item_path}.{key}")
++        if "read_only" in role:
++            _require_bool(role["read_only"], f"{item_path}.read_only")
++        for key in ("contract", "capability_contract"):
++            if key in role:
++                _require_string(role[key], f"{item_path}.{key}")
++        if "capability_contracts" in role:
++            _validate_string_list(role["capability_contracts"], f"{item_path}.capability_contracts")
++
++
++def _validate_model_policy_payload(value: Mapping[str, Any], path: str) -> None:
++    policies = _require_mapping(value["policies"], f"{path}.policies")
++    selection_fields = ("primary", "primary_pool", "soft_failover", "hard_failover", "failover")
++    for name, item in policies.items():
++        item_path = f"{path}.policies.{name}"
++        policy = _require_mapping(item, item_path)
++        if not any(key in policy for key in selection_fields):
++            raise RegistryLoadError(
++                f"missing model selection in {item_path}",
++                code="missing_required_field",
++                path=f"{item_path}.primary",
++            )
++        for key in selection_fields:
++            if key not in policy:
++                continue
++            field_path = f"{item_path}.{key}"
++            if key.endswith("pool") or key.endswith("failover") or key == "failover":
++                _validate_string_list(policy[key], field_path)
++            else:
++                _require_string(policy[key], field_path)
++        for key in ("primary_pool_mode", "router_failure_action", "exclusion", "contract", "capability_contract", "note"):
++            if key in policy:
++                _require_string(policy[key], f"{item_path}.{key}")
++        if "degradation" in policy:
++            degradation_path = f"{item_path}.degradation"
++            degradation = _require_mapping(policy["degradation"], degradation_path)
++            _require_required_keys(degradation, degradation_path, ("strategy", "description", "thinking_escalation"))
++            for key in ("strategy", "description", "thinking_escalation"):
++                _require_string(degradation[key], f"{degradation_path}.{key}")
++        if "rules" in policy:
++            rules = _require_mapping(policy["rules"], f"{item_path}.rules")
++            for vendor, models in rules.items():
++                _validate_string_list(models, f"{item_path}.rules.{vendor}")
++
++
++def _validate_model_profile_payload(value: Mapping[str, Any], path: str) -> None:
++    profiles = _require_mapping(value["profiles"], f"{path}.profiles")
++    for name, item in profiles.items():
++        item_path = f"{path}.profiles.{name}"
++        profile = _require_mapping(item, item_path)
++        _require_required_keys(
++            profile,
++            item_path,
++            ("vendor_family", "supported_reasoning", "thinking_map", "context_window", "supports_tools", "supports_images"),
++        )
++        _require_string(profile["vendor_family"], f"{item_path}.vendor_family")
++        _validate_string_list(profile["supported_reasoning"], f"{item_path}.supported_reasoning")
++        thinking_map = _validate_string_mapping(profile["thinking_map"], f"{item_path}.thinking_map")
++        if not thinking_map:
++            raise _schema_error(f"{item_path}.thinking_map", "mapping must not be empty")
++        context_window = _require_int(profile["context_window"], f"{item_path}.context_window")
++        if context_window <= 0:
++            raise _schema_error(f"{item_path}.context_window", "integer must be positive")
++        for key in ("supports_tools", "supports_images"):
++            _require_bool(profile[key], f"{item_path}.{key}")
++        if "supports_vision" in profile:
++            _require_bool(profile["supports_vision"], f"{item_path}.supports_vision")
++        for key in ("routing_role", "capability_source", "contract", "capability_contract"):
++            if key in profile:
++                _require_string(profile[key], f"{item_path}.{key}")
++
++
++def _validate_capability_payload(value: Mapping[str, Any], path: str) -> None:
++    contracts = _require_mapping(value["contracts"], f"{path}.contracts")
++    for name, item in contracts.items():
++        item_path = f"{path}.contracts.{name}"
++        contract = _require_mapping(item, item_path)
++        _require_required_keys(contract, item_path, ("quality", "modality", "tools", "context_class", "reasoning_intent"))
++        _require_string(contract["quality"], f"{item_path}.quality")
++        _validate_string_list(contract["modality"], f"{item_path}.modality", nonempty=True)
++        for key in ("tools", "context_class", "reasoning_intent"):
++            _require_string(contract[key], f"{item_path}.{key}")
++        for key in ("max_tokens", "timeout_ms"):
++            if key in contract:
++                if _require_int(contract[key], f"{item_path}.{key}") <= 0:
++                    raise _schema_error(f"{item_path}.{key}", "integer must be positive")
++
++
++def _parse_json(data: bytes, relative_path: str) -> Mapping[str, Any]:
++    try:
++        value = json.loads(data.decode("utf-8"))
++    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++        raise RegistryLoadError(
++            f"invalid JSON in {relative_path}: {type(exc).__name__}",
++            code="invalid_json",
++            path=relative_path,
++        ) from exc
++    if not isinstance(value, dict):
++        raise RegistryLoadError(
++            f"JSON payload {relative_path} must be an object",
++            code="invalid_schema",
++            path=relative_path,
++        )
++    schema_version = value.get("schema_version")
++    expected_version = _SUPPORTED_PAYLOAD_SCHEMA_VERSIONS.get(relative_path)
++    if expected_version is None:
++        raise RegistryLoadError(
++            f"unknown behavior payload: {relative_path}",
++            code="unknown_payload",
++            path=relative_path,
++        )
++    if schema_version != expected_version:
++        raise RegistryLoadError(
++            f"unsupported schema_version in {relative_path}: {schema_version!r}",
++            code="unsupported_schema_version",
++            path=relative_path,
++        )
++    required_section = _REQUIRED_PAYLOAD_SECTIONS[relative_path]
++    _require_required_keys(value, relative_path, ("description",))
++    _require_string(value["description"], f"{relative_path}.description")
++    if required_section not in value:
++        raise RegistryLoadError(
++            f"missing required section {required_section!r} in {relative_path}",
++            code="invalid_schema",
++            path=relative_path,
++        )
++    _require_required_keys(value, relative_path, ("schema_version",))
++    _require_mapping(value[required_section], f"{relative_path}.{required_section}")
++    validators = {
++        "route-policy.json": _validate_route_payload,
++        "workflow-templates.json": _validate_workflow_payload,
++        "execution-roles.json": _validate_roles_payload,
++        "model-policies.json": _validate_model_policy_payload,
++        "model-profiles.json": _validate_model_profile_payload,
++        "capability-contracts.json": _validate_capability_payload,
++    }
++    validators[relative_path](value, relative_path)
++    return value
++
++
++def _validate_manifest(manifest: Any) -> tuple[str, str, list[Mapping[str, Any]]]:
++    if not isinstance(manifest, dict):
++        raise RegistryLoadError(
++            "manifest must be a JSON object",
++            code="invalid_manifest",
++            path="manifest.json",
++        )
++
++    schema_version = manifest.get("schemaVersion")
++    if schema_version != SUPPORTED_MANIFEST_SCHEMA_VERSION:
++        raise RegistryLoadError(
++            f"unsupported schemaVersion: {schema_version!r}",
++            code="unsupported_schema_version",
++            path="manifest.json",
++        )
++
++    registry_version = manifest.get("registryVersion")
++    if not isinstance(registry_version, str):
++        raise RegistryLoadError(
++            "registryVersion must be a string",
++            code="invalid_registry_version",
++            path="manifest.json",
++        )
++    match = _REGISTRY_VERSION_RE.fullmatch(registry_version)
++    if match is None:
++        raise RegistryLoadError(
++            f"invalid registryVersion: {registry_version!r}",
++            code="invalid_registry_version",
++            path="manifest.json",
++        )
++    try:
++        datetime.strptime(match.group("date"), "%Y-%m-%d")
++    except ValueError as exc:
++        raise RegistryLoadError(
++            f"invalid registryVersion date: {registry_version!r}",
++            code="invalid_registry_version",
++            path="manifest.json",
++        ) from exc
++
++    promotion_state = manifest.get("promotionState")
++    if not isinstance(promotion_state, str) or promotion_state not in SUPPORTED_PROMOTION_STATES:
++        raise RegistryLoadError(
++            f"unsupported promotion state: {promotion_state!r}",
++            code="invalid_promotion_state",
++            path="manifest.json",
++        )
++
++    entries = manifest.get("files")
++    if not isinstance(entries, list) or not entries:
++        raise RegistryLoadError(
++            "manifest files must be a non-empty list",
++            code="invalid_manifest",
++            path="manifest.json",
++        )
++    normalized: list[Mapping[str, Any]] = []
++    seen: set[str] = set()
++    for entry in entries:
++        if not isinstance(entry, dict):
++            raise RegistryLoadError(
++                "manifest file entries must be objects",
++                code="invalid_manifest",
++                path="manifest.json",
++            )
++        raw_path = entry.get("path")
++        digest = entry.get("sha256")
++        if not isinstance(raw_path, str) or not raw_path:
++            raise RegistryLoadError(
++                "manifest file path must be a non-empty string",
++                code="invalid_manifest",
++                path="manifest.json",
++            )
++        if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
++            raise RegistryLoadError(
++                f"invalid sha256 for {raw_path!r}",
++                code="invalid_hash",
++                path=raw_path,
++            )
++        manifest_path = _safe_relative_path(raw_path)
++        if manifest_path not in _REQUIRED_PAYLOAD_FILES:
++            raise RegistryLoadError(
++                f"unknown behavior payload: {manifest_path}",
++                code="unknown_payload",
++                path=manifest_path,
++            )
++        if manifest_path in seen:
++            raise RegistryLoadError(
++                f"duplicate manifest path: {raw_path!r}",
++                code="duplicate_path",
++                path=raw_path,
++            )
++        seen.add(manifest_path)
++        normalized.append({"path": manifest_path, "sha256": digest.lower()})
++
++    missing_declarations = _REQUIRED_PAYLOAD_FILES - seen
++    if missing_declarations:
++        missing = ", ".join(sorted(missing_declarations))
++        raise RegistryLoadError(
++            f"manifest does not declare required payloads: {missing}",
++            code="invalid_manifest",
++            path="manifest.json",
++        )
++    return registry_version, promotion_state, normalized
++
++
++def _safe_relative_path(raw_path: str) -> str:
++    # Backslashes are rejected instead of normalized: accepting them would make
++    # a manifest authored on one platform mean something different on another.
++    if not isinstance(raw_path, str) or not raw_path:
++        raise RegistryLoadError(
++            "manifest payload path must be a non-empty string",
++            code="invalid_manifest",
++            path="manifest.json.files[].path",
++        )
++    if "\x00" in raw_path:
++        raise RegistryLoadError(
++            "manifest payload path contains NUL",
++            code="invalid_path",
++            path="manifest.json.files[].path",
++        )
++    if "\\" in raw_path:
++        raise RegistryLoadError(
++            f"unsafe path in manifest: {raw_path!r}",
++            code="path_traversal",
++            path=raw_path,
++        )
++    candidate = PurePosixPath(raw_path)
++    if candidate.is_absolute() or not candidate.parts or ".." in candidate.parts:
++        raise RegistryLoadError(
++            f"unsafe path in manifest: {raw_path!r}",
++            code="path_traversal",
++            path=raw_path,
++        )
++    normalized = candidate.as_posix()
++    if normalized in {"", ".", "manifest.json"}:
++        raise RegistryLoadError(
++            f"manifest cannot declare {raw_path!r}",
++            code="invalid_manifest",
++            path=raw_path,
++        )
++    return normalized
++
++
++def _read_regular_file_nofollow(
++    root: Path,
++    relative_path: str,
++    *,
++    missing_code: str,
++    unsafe_code: str,
++) -> bytes:
++    """Read a registry file through a directory-FD walk with O_NOFOLLOW."""
++
++    parts = PurePosixPath(relative_path).parts
++    root_fd = -1
++    directory_fds: list[int] = []
++    try:
++        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++        current_fd = root_fd
++        for part in parts[:-1]:
++            next_fd = os.open(
++                part,
++                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
++                dir_fd=current_fd,
++            )
++            directory_fds.append(next_fd)
++            current_fd = next_fd
++        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current_fd)
++        try:
++            file_stat = os.fstat(fd)
++            if not stat.S_ISREG(file_stat.st_mode):
++                raise RegistryLoadError(
++                    f"registry file is not a regular file: {relative_path}",
++                    code=unsafe_code,
++                    path=relative_path,
++                )
++            with os.fdopen(fd, "rb") as handle:
++                fd = -1
++                return handle.read()
++        finally:
++            if fd >= 0:
++                os.close(fd)
++    except RegistryLoadError:
++        raise
++    except FileNotFoundError as exc:
++        raise RegistryLoadError(
++            f"missing registry file: {relative_path}",
++            code=missing_code,
++            path=relative_path,
++        ) from exc
++    except OSError as exc:
++        raise RegistryLoadError(
++            f"unsafe registry file or path escapes registry root: {relative_path}",
++            code=unsafe_code,
++            path=relative_path,
++        ) from exc
++    finally:
++        for directory_fd in reversed(directory_fds):
++            os.close(directory_fd)
++        if root_fd >= 0:
++            os.close(root_fd)
++
++
++def _validate_payload_files(
++    root: Path,
++    entries: Iterable[Mapping[str, Any]],
++) -> tuple[dict[str, Any], dict[str, str]]:
++    payloads: dict[str, Any] = {}
++    payload_hashes: dict[str, str] = {}
++    declared = set()
++    for entry in entries:
++        relative_path = str(entry["path"])
++        declared.add(relative_path)
++        data = _read_regular_file_nofollow(
++            root,
++            relative_path,
++            missing_code="missing_file",
++            unsafe_code="unsafe_file",
++        )
++        actual_hash = hashlib.sha256(data).hexdigest()
++        expected_hash = str(entry["sha256"])
++        if actual_hash != expected_hash:
++            raise RegistryLoadError(
++                f"hash mismatch for {relative_path}",
++                code="hash_mismatch",
++                path=relative_path,
++            )
++        payload_hashes[relative_path] = actual_hash
++        if relative_path.endswith(".json"):
++            payloads[relative_path] = _parse_json(data, relative_path)
++        elif relative_path == "semantic-router-prompt.md":
++            try:
++                prompt = data.decode("utf-8")
++            except UnicodeDecodeError as exc:
++                raise RegistryLoadError(
++                    f"invalid UTF-8 in {relative_path}",
++                    code="invalid_payload",
++                    path=relative_path,
++                ) from exc
++            if not prompt.strip():
++                raise RegistryLoadError(
++                    f"empty payload: {relative_path}",
++                    code="invalid_payload",
++                    path=relative_path,
++                )
++            payloads[relative_path] = prompt
++        else:
++            raise RegistryLoadError(
++                f"unrecognized behavior payload: {relative_path}",
++                code="invalid_manifest",
++                path=relative_path,
++            )
++
++    for child in root.rglob("*"):
++        relative = child.relative_to(root).as_posix()
++        if relative == "manifest.json" or relative in EXEMPT_FILES:
++            continue
++        if child.is_file() or child.is_symlink():
++            if relative not in declared:
++                raise RegistryLoadError(
++                    f"unlisted behavior file: {relative}",
++                    code="unlisted_file",
++                    path=relative,
++                )
++    return payloads, payload_hashes
++
++
++def _validate_cross_file_references(payloads: Mapping[str, Any]) -> None:
++    """Validate every declared cross-file reference without skipping malformed data."""
++
++    route = payloads["route-policy.json"]
++    workflows = payloads["workflow-templates.json"]["templates"]
++    roles = payloads["execution-roles.json"]["roles"]
++    policies = payloads["model-policies.json"]["policies"]
++    profiles = payloads["model-profiles.json"]["profiles"]
++    contracts = payloads["capability-contracts.json"]["contracts"]
++
++    def require_ref(value: str, target: Mapping[str, Any], path: str, label: str) -> None:
++        if value not in target:
++            raise RegistryLoadError(
++                f"unknown {label} reference: {value!r}",
++                code="dangling_reference",
++                path=path,
++            )
++
++    default_level = route["default_route"]["level"]
++    default_risk = route["default_route"]["risk"]
++    require_ref(default_level, route["level_contracts"], "route-policy.json.default_route.level", "level")
++    require_ref(default_risk, route["risk_gates"], "route-policy.json.default_route.risk", "risk gate")
++    for level, contract in route["level_contracts"].items():
++        require_ref(contract, contracts, f"route-policy.json.level_contracts.{level}", "capability contract")
++    for level, workflow in route["level_workflows"].items():
++        require_ref(workflow, workflows, f"route-policy.json.level_workflows.{level}", "workflow")
++    for name, config in route["specialized_workflows"].items():
++        item_path = f"route-policy.json.specialized_workflows.{name}"
++        require_ref(config["level"], route["level_contracts"], f"{item_path}.level", "level")
++        require_ref(config["risk"], route["risk_gates"], f"{item_path}.risk", "risk gate")
++        require_ref(config["workflow"], workflows, f"{item_path}.workflow", "workflow")
++        require_ref(config["contract"], contracts, f"{item_path}.contract", "capability contract")
++    for name, gate in route["risk_gates"].items():
++        if gate["min_workflow"] is not None:
++            require_ref(
++                gate["min_workflow"],
++                workflows,
++                f"route-policy.json.risk_gates.{name}.min_workflow",
++                "workflow",
++            )
++
++    semantic = route["semantic_router"]
++    semantic_policy = semantic["model_policy"]
++    if semantic_policy != "route":
++        require_ref(semantic_policy, policies, "route-policy.json.semantic_router.model_policy", "model policy")
++    for name, rule in semantic.get("rules", {}).items():
++        item_path = f"route-policy.json.semantic_router.rules.{name}"
++        require_ref(rule["workflow"], workflows, f"{item_path}.workflow", "workflow")
++        if "level" in rule:
++            require_ref(rule["level"], route["level_contracts"], f"{item_path}.level", "level")
++        if "risk" in rule:
++            require_ref(rule["risk"], route["risk_gates"], f"{item_path}.risk", "risk gate")
++        if "model_policy" in rule and rule["model_policy"] != "route":
++            require_ref(rule["model_policy"], policies, f"{item_path}.model_policy", "model policy")
++
++    for workflow_name in route["workflow_rank"]:
++        require_ref(
++            workflow_name,
++            workflows,
++            f"route-policy.json.workflow_rank.{workflow_name}",
++            "workflow",
++        )
++
++    for workflow_name, template in workflows.items():
++        item_path = f"workflow-templates.json.templates.{workflow_name}"
++        for field in ("roles", "allowed_worker_roles"):
++            for index, role in enumerate(template.get(field, [])):
++                require_ref(role, roles, f"{item_path}.{field}[{index}]", "role")
++        for index, policy in enumerate(template.get("policies", [])):
++            if policy != "route":
++                require_ref(policy, policies, f"{item_path}.policies[{index}]", "model policy")
++        for field in ("contract", "capability_contract"):
++            if field in template:
++                require_ref(template[field], contracts, f"{item_path}.{field}", "capability contract")
++        if "model_policy" in template and template["model_policy"] != "route":
++            require_ref(template["model_policy"], policies, f"{item_path}.model_policy", "model policy")
++
++    for role_name, role in roles.items():
++        item_path = f"execution-roles.json.roles.{role_name}"
++        policy_name = role["model_policy"]
++        if policy_name != "route":
++            require_ref(policy_name, policies, f"{item_path}.model_policy", "model policy")
++        for field in ("contract", "capability_contract"):
++            if field in role:
++                require_ref(role[field], contracts, f"{item_path}.{field}", "capability contract")
++        for index, contract in enumerate(role.get("capability_contracts", [])):
++            require_ref(contract, contracts, f"{item_path}.capability_contracts[{index}]", "capability contract")
++
++    for policy_name, policy in policies.items():
++        item_path = f"model-policies.json.policies.{policy_name}"
++        for field in ("primary", "primary_pool", "soft_failover", "hard_failover", "failover"):
++            if field not in policy:
++                continue
++            values = [policy[field]] if field == "primary" else policy[field]
++            for index, model in enumerate(values):
++                if model == "dynamic":
++                    continue
++                model_path = f"{item_path}.{field}" if field == "primary" else f"{item_path}.{field}[{index}]"
++                require_ref(model, profiles, model_path, "model profile")
++        for field in ("contract", "capability_contract"):
++            if field in policy:
++                require_ref(policy[field], contracts, f"{item_path}.{field}", "capability contract")
++
++    for profile_name, profile in profiles.items():
++        item_path = f"model-profiles.json.profiles.{profile_name}"
++        for field in ("contract", "capability_contract"):
++            if field in profile:
++                require_ref(profile[field], contracts, f"{item_path}.{field}", "capability contract")
++
++
++def load_registry(
++    root: str | Path | None = None,
++    *,
++    mode: str = "production",
++    allow_candidate: bool = False,
++) -> RegistrySnapshot:
++    """Load and validate one immutable runtime registry snapshot.
++
++    ``mode='production'`` accepts only APPROVED/PUBLISHED.  ``mode='preview'``
++    is the explicit lab/candidate path for DRAFT and READY_FOR_REVIEW.  The
++    ``allow_candidate`` keyword is retained for the plan's test/lab API and is
++    equivalent to explicitly selecting preview mode.
++    """
++
++    if type(allow_candidate) is not bool:
++        raise RegistryLoadError(
++            "allow_candidate must be a boolean",
++            code="invalid_allow_candidate",
++            path="allow_candidate",
++        )
++    if type(mode) is not str or mode not in {"production", "preview"}:
++        raise RegistryLoadError(
++            f"unsupported load mode: {mode!r}",
++            code="invalid_mode",
++            path="mode",
++        )
++    normalized_mode = mode
++    if allow_candidate:
++        normalized_mode = "preview"
++
++    try:
++        registry_root = (
++            _default_registry_root()
++            if root is None
++            else _coerce_registry_root(root)
++        )
++        resolved_root = registry_root.resolve(strict=True)
++    except RegistryLoadError:
++        raise
++    except OSError as exc:
++        raise RegistryLoadError(
++            "registry root does not exist",
++            code="missing_root",
++            path="root",
++        ) from exc
++    except Exception as exc:
++        raise RegistryLoadError(
++            "registry root is not a valid path",
++            code="invalid_registry_path",
++            path="root",
++        ) from exc
++    if not resolved_root.is_dir():
++        raise RegistryLoadError("registry root is not a directory", code="invalid_root")
++
++    try:
++        manifest_bytes = _read_regular_file_nofollow(
++            resolved_root,
++            "manifest.json",
++            missing_code="missing_manifest",
++            unsafe_code="invalid_manifest_file",
++        )
++        manifest = json.loads(manifest_bytes.decode("utf-8"))
++    except RegistryLoadError:
++        raise
++    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++        raise RegistryLoadError(
++            f"invalid JSON in manifest.json: {type(exc).__name__}",
++            code="invalid_manifest",
++            path="manifest.json",
++        ) from exc
++
++    registry_version, promotion_state, entries = _validate_manifest(manifest)
++    if normalized_mode == "production" and promotion_state not in PRODUCTION_PROMOTION_STATES:
++        raise RegistryLoadError(
++            f"promotion state {promotion_state} is not allowed in production",
++            code="promotion_rejected",
++            path="manifest.json",
++        )
++
++    payloads, payload_hashes = _validate_payload_files(resolved_root, entries)
++    _validate_cross_file_references(payloads)
++
++    bundle = {
++        "route_policy": payloads["route-policy.json"],
++        "workflow_templates": payloads["workflow-templates.json"],
++        "execution_roles": payloads["execution-roles.json"],
++        "model_policies": payloads["model-policies.json"],
++        "model_profiles": payloads["model-profiles.json"],
++        "capability_contracts": payloads["capability-contracts.json"],
++        "semantic_router_prompt": payloads["semantic-router-prompt.md"],
++    }
++    return RegistrySnapshot(
++        root=resolved_root,
++        registry_version=registry_version,
++        promotion_state=promotion_state,
++        manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
++        payload_hashes=MappingProxyType(dict(payload_hashes)),
++        bundle=_freeze(bundle),
++        loaded_at=datetime.now(timezone.utc),
++        source=normalized_mode,
++        is_candidate=promotion_state not in PRODUCTION_PROMOTION_STATES,
++        manifest=_freeze(manifest),
++    )
++
++
++def validate_promotion_state(promotion_state: str, *, mode: str = "production") -> bool:
++    """Return whether a promotion state is loadable in the requested mode."""
++
++    if type(mode) is not str or mode not in {"production", "preview"}:
++        raise RegistryLoadError(
++            f"unsupported load mode: {mode!r}",
++            code="invalid_mode",
++            path="mode",
++        )
++    if type(promotion_state) is not str or promotion_state not in SUPPORTED_PROMOTION_STATES:
++        return False
++    return mode == "preview" or promotion_state in PRODUCTION_PROMOTION_STATES
++
++
++# Explicit public aliases make the loader/promotion seam easy for later CLI and
++# agent-init slices to consume without introducing a second implementation.
++load_runtime_registry = load_registry
++validate_registry_promotion = validate_promotion_state
++
++__all__ = [
++    "BaselineReport",
++    "BaselineTestResult",
++    "RegistryLoadError",
++    "RegistryLoader",
++    "RegistrySnapshot",
++    "RuntimeRegistryState",
++    "load_registry",
++    "load_runtime_registry",
++    "run_baseline_tests",
++    "run_registry_integrity_baseline",
++    "validate_promotion_state",
++    "validate_registry_promotion",
++]
+diff --git a/agent/tool_executor.py b/agent/tool_executor.py
+index e7bb9126db..c2545de8b1 100644
+--- a/agent/tool_executor.py
++++ b/agent/tool_executor.py
+@@ -581,6 +581,26 @@ def _run_agent_tool_execution_middleware(
+     )
+ 
+     trace = middleware_trace if middleware_trace is not None else []
++    if (
++        getattr(agent, "_direct_execution_guard", False)
++        and getattr(agent, "_delegate_depth", 0) == 0
++        and function_name in getattr(agent, "_direct_execution_guard_tools", set())
++    ):
++        logger.warning(
++            "Top-level coordinated workflow attempted direct tool %s; delegation required",
++            function_name,
++        )
++        return _ManagedToolResult(
++            result=(
++                "Execution blocked: this task is in a coordinated workflow. "
++                "Delegate the step to worker or worker-pro using delegate_task, "
++                "then synthesize and verify the returned evidence."
++            ),
++            args=function_args,
++            middleware_trace=trace,
++            blocked=True,
++            dispatched=False,
++        )
+     state = {
+         "args": function_args,
+         "middleware_trace": trace,
+@@ -1339,6 +1359,21 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
+         try:
+             try:
+                 def _execute(next_args: dict[str, Any]) -> Any:
++                    if (
++                        getattr(agent, "_direct_execution_guard", False)
++                        and getattr(agent, "_delegate_depth", 0) == 0
++                        and function_name in getattr(agent, "_direct_execution_guard_tools", set())
++                    ):
++                        logger.warning(
++                            "Top-level coordinated workflow attempted direct tool %s; delegation required",
++                            function_name,
++                        )
++                        return (
++                            "Execution blocked: this task is in a coordinated workflow. "
++                            "Do not execute project operations from the top-level responder. "
++                            "Delegate the step to worker or worker-pro using delegate_task, "
++                            "then synthesize and verify the returned evidence."
++                        )
+                     return agent._invoke_tool(
+                         function_name,
+                         next_args,
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index cf3769c0c7..d6d360acf6 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -9,6 +9,10 @@ DEFAULT_CONFIG = {
+     "providers": {},
+     "fallback_providers": [],
+     "credential_pool_strategies": {},
++    "routing": {
++        "enabled": False,
++        "registry_mode": "production",
++    },
+     "toolsets": ["hermes-cli"],
+     # SQLite journal mode used by every Hermes database opener. WAL is the
+     # normal default; set DELETE for weak-fsync/shared filesystems where WAL is
+diff --git a/hermes_cli/update_cmd.py b/hermes_cli/update_cmd.py
+index 1b8c967dd7..548fe16e3b 100644
+--- a/hermes_cli/update_cmd.py
++++ b/hermes_cli/update_cmd.py
+@@ -4948,6 +4948,57 @@ def _rebuild_desktop_after_update(
+     return True
+ 
+ 
++def _apply_route_authority_after_update(project_root: Path) -> bool:
++    """Reapply the external route authority before post-update work continues.
++
++    The helper intentionally runs a separate stdlib-only process: this updater
++    process started from the pre-pull checkout, while the authority manager
++    validates and patches the new checkout on disk. A configured authority is
++    therefore fail-closed; an absent configuration keeps upstream behavior.
++    """
++
++    try:
++        from hermes_cli.config import load_config
++
++        routing = (load_config() or {}).get("routing", {})
++        authority_dir = routing.get("authority_dir") if isinstance(routing, dict) else None
++        if not authority_dir:
++            return True
++        authority = Path(str(authority_dir)).expanduser().resolve()
++        manager = authority / "manage.py"
++        manifest = authority / "manifest.json"
++        if not manager.is_file() or not manifest.is_file():
++            print(
++                f"✗ Route authority is configured but incomplete: {authority}",
++                file=sys.stderr,
++            )
++            return False
++        result = subprocess.run(
++            [
++                sys.executable,
++                str(manager),
++                "apply",
++                "--manifest",
++                str(manifest),
++                "--install-root",
++                str(project_root),
++            ],
++            cwd=authority,
++            capture_output=True,
++            text=True,
++        )
++        if result.stdout.strip():
++            print(result.stdout.strip())
++        if result.returncode != 0:
++            if result.stderr.strip():
++                print(result.stderr.strip(), file=sys.stderr)
++            return False
++        return True
++    except Exception as exc:
++        print(f"✗ Route authority failed closed: {exc}", file=sys.stderr)
++        return False
++
++
+ def _cmd_update_impl(args, gateway_mode: bool):
+     """Body of ``cmd_update`` — kept separate so the wrapper can always
+     restore stdio even on ``sys.exit``."""
+@@ -5666,6 +5717,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
+                         input_fn=gw_input_fn,
+                     )
+ 
++        if not _apply_route_authority_after_update(_m().PROJECT_ROOT):
++            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
++            print(
++                "✗ Route authority was not applied; stopping before dependency sync/build.",
++                file=sys.stderr,
++            )
++            sys.exit(1)
++
+         _invalidate_update_cache()
+ 
+         # Verify HEAD actually moved (issue #79678). ``merge --ff-only``
+diff --git a/run_agent.py b/run_agent.py
+index f5c4de1274..305e92b237 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -432,6 +432,18 @@ class AIAgent:
+         self._base_url_lower = value.lower() if value else ""
+         self._base_url_hostname = base_url_hostname(value)
+ 
++    @property
++    def runtime_registry(self):
++        """Immutable registry activation state for this agent/session."""
++
++        return self._runtime_registry
++
++    @property
++    def runtime_snapshot(self):
++        """Immutable registry snapshot bound during agent initialization."""
++
++        return self._runtime_snapshot
++
+     def __init__(
+         self,
+         base_url: str = None,
+@@ -8361,6 +8373,22 @@ class AIAgent:
+         #     gateway session the async result would route back to.
+         # The schema-level `background` param is intentionally ignored here.
+         _is_subagent = getattr(self, "_delegate_depth", 0) > 0
++        route_candidates = None
++        if not _is_subagent:
++            try:
++                from agent.route import get_role_candidates
++
++                route_role = getattr(self, "_route_delegate_role", None)
++                if route_role:
++                    route_candidates = get_role_candidates(
++                        route_role,
++                        config=getattr(self, "_route_config", None),
++                        bundle=getattr(
++                            getattr(self, "runtime_snapshot", None), "bundle", None
++                        ),
++                    )
++            except Exception:
++                route_candidates = None
+         return _delegate_task(
+             goal=function_args.get("goal"),
+             context=function_args.get("context"),
+@@ -8371,6 +8399,7 @@ class AIAgent:
+             action=function_args.get("action"),
+             subagent_id=function_args.get("subagent_id"),
+             message=function_args.get("message"),
++            route_candidates=route_candidates,
+             parent_agent=self,
+         )
+ 
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 8699edb984..29d2ba030b 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -3605,6 +3605,7 @@ def delegate_task(
+     action: Optional[str] = None,
+     subagent_id: Optional[str] = None,
+     message: Optional[str] = None,
++    route_candidates: Optional[List[Dict[str, str]]] = None,
+     parent_agent=None,
+ ) -> str:
+     """
+@@ -3700,7 +3701,12 @@ def delegate_task(
+     # used by CLI/gateway startup.  When unconfigured, returns None values so
+     # children inherit from the parent.
+     try:
+-        creds = _resolve_delegation_credentials(cfg, parent_agent)
++        if route_candidates:
++            creds = _resolve_route_delegation_credentials(
++                route_candidates, parent_agent
++            )
++        else:
++            creds = _resolve_delegation_credentials(cfg, parent_agent)
+     except ValueError as exc:
+         return tool_error(str(exc))
+ 
+@@ -4414,6 +4420,45 @@ def _resolve_child_credential_pool(
+     return None
+ 
+ 
++def _resolve_route_delegation_credentials(
++    candidates: List[Dict[str, str]], parent_agent
++) -> dict:
++    """Resolve the first active role candidate supplied by the route bridge."""
++
++    from hermes_cli.runtime_provider import resolve_runtime_provider
++
++    failures = []
++    for candidate in candidates:
++        provider = str(candidate.get("provider") or "").strip()
++        model = str(candidate.get("model") or "").strip()
++        if not provider or not model:
++            continue
++        try:
++            runtime = resolve_runtime_provider(
++                requested=provider,
++                target_model=model,
++            )
++            return {
++                "model": model,
++                "provider": runtime.get("provider") or provider,
++                "base_url": runtime.get("base_url"),
++                # A same-provider child can inherit the parent's key. A
++                # provider-specific runtime key wins when one is available.
++                "api_key": runtime.get("api_key") or None,
++                "api_mode": runtime.get("api_mode"),
++                "request_overrides": dict(runtime.get("request_overrides") or {}),
++                "max_output_tokens": runtime.get("max_output_tokens"),
++                "command": runtime.get("command"),
++                "args": list(runtime.get("args") or []),
++            }
++        except Exception as exc:
++            failures.append(f"{provider}/{model}: {type(exc).__name__}")
++    raise ValueError(
++        "Routed delegation has no usable role candidate: "
++        + (", ".join(failures) or "empty candidate list")
++    )
++
++
+ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+     """Resolve credentials for subagent delegation.
+ 
