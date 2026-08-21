@@ -527,8 +527,16 @@ def _resolve_runtime_from_pool_entry(
             entry_url_is_default = (
                 not base_url or base_url.rstrip("/") == OPENROUTER_BASE_URL.rstrip("/")
             )
+            # https-only: the pooled OpenRouter credential rides this URL,
+            # so an explicit plaintext-http override is never honored.
+            # Bare hosts (no scheme) stay honored — every client treats a
+            # scheme-less base_url as https.
+            cfg_scheme_or = (
+                urlparse(cfg_base_url_or).scheme.lower() if "://" in cfg_base_url_or else ""
+            )
             if (
                 cfg_base_url_or
+                and cfg_scheme_or in {"", "https"}
                 and entry_url_is_default
                 and base_url_host_matches(cfg_base_url_or, "openrouter.ai")
             ):
