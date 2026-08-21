@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import { useDebounced } from '@/app/hooks/use-debounced'
 import { LanguageSwitcher } from '@/components/language-switcher'
@@ -17,7 +17,7 @@ import { $backdrop, setBackdrop } from '@/store/backdrop'
 import { $composerPopoutGesturesEnabled, setComposerPopoutGesturesEnabled } from '@/store/composer-popout'
 import { $embedAllowed, $embedMode, clearEmbedAllowed, type EmbedMode, setEmbedMode } from '@/store/embed-consent'
 import { $introSplash, setIntroSplash } from '@/store/intro-splash'
-import { beginOverlayPeek, endOverlayPeek, pulseOverlayPeek, resetOverlayPeek } from '@/store/overlay-peek'
+import { beginOverlayPeek, pulseOverlayPeek, resetOverlayPeek } from '@/store/overlay-peek'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
 import { $reactionsEnabled, setReactionsEnabled } from '@/store/reactions-enabled'
 import { $reasoningCollapsedByDefault, setReasoningCollapsedByDefault } from '@/store/reasoning-disclosure'
@@ -287,6 +287,19 @@ interface TranslucencySliderProps {
  * any residual hold.
  */
 function TranslucencySlider({ label, onChange, value }: TranslucencySliderProps) {
+  const releasePeek = useRef<null | (() => void)>(null)
+
+  const beginPeek = () => {
+    releasePeek.current ??= beginOverlayPeek()
+  }
+
+  const endPeek = () => {
+    releasePeek.current?.()
+    releasePeek.current = null
+  }
+
+  useEffect(() => endPeek, [])
+
   return (
     <>
       <input
@@ -294,7 +307,7 @@ function TranslucencySlider({ label, onChange, value }: TranslucencySliderProps)
         className="h-1 w-40 cursor-pointer appearance-none rounded-full bg-(--ui-stroke-tertiary)"
         max={TRANSLUCENCY_MAX}
         min={TRANSLUCENCY_MIN}
-        onBlur={endOverlayPeek}
+        onBlur={endPeek}
         onChange={event => {
           triggerHaptic('selection')
           onChange(Number(event.target.value))
@@ -304,9 +317,10 @@ function TranslucencySlider({ label, onChange, value }: TranslucencySliderProps)
             pulseOverlayPeek()
           }
         }}
-        onLostPointerCapture={endOverlayPeek}
-        onPointerDown={beginOverlayPeek}
-        onPointerUp={endOverlayPeek}
+        onLostPointerCapture={endPeek}
+        onPointerCancel={endPeek}
+        onPointerDown={beginPeek}
+        onPointerUp={endPeek}
         step={TRANSLUCENCY_STEP}
         style={{ accentColor: 'var(--dt-primary)' }}
         type="range"
@@ -356,8 +370,8 @@ export function AppearanceSettings() {
   const a = t.settings.appearance
 
   // A held preview control can unmount before pointerup/keyup (Escape or a
-  // route change), which would strand the shared counter and ghost the NEXT
-  // settings overlay. Unmount drops every outstanding hold and pulse.
+  // route change), which would strand an owner and ghost the NEXT settings
+  // overlay. Unmount drops every outstanding hold and pulse.
   useEffect(() => resetOverlayPeek, [])
 
   // Shared by the mode/frost/area pickers: apply the choice, then show it

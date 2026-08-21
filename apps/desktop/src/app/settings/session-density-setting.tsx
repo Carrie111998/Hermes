@@ -7,7 +7,7 @@ import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { Eye } from '@/lib/icons'
-import { beginOverlayPeek, endOverlayPeek, pulseOverlayPeek } from '@/store/overlay-peek'
+import { beginOverlayPeek, pulseOverlayPeek } from '@/store/overlay-peek'
 import { $sessionListDensity, type SessionListDensity, setSessionListDensity } from '@/store/session-list-density'
 
 import { ListRow } from './primitives'
@@ -20,9 +20,9 @@ export function SessionDensitySetting() {
   const { t } = useI18n()
   const copy = t.settings.appearance
   const density = useStore($sessionListDensity)
-  const holding = useRef(false)
   const keyboardStartedAt = useRef<null | number>(null)
   const pointerStartedAt = useRef<null | number>(null)
+  const releaseHold = useRef<null | (() => void)>(null)
   const suppressNextSemanticClick = useRef(false)
 
   const options = [
@@ -32,21 +32,16 @@ export function SessionDensitySetting() {
   ] as const satisfies readonly { id: SessionListDensity; label: string }[]
 
   const beginHold = () => {
-    if (holding.current) {
+    if (releaseHold.current) {
       return
     }
 
-    holding.current = true
-    beginOverlayPeek()
+    releaseHold.current = beginOverlayPeek()
   }
 
   const endHold = () => {
-    if (!holding.current) {
-      return
-    }
-
-    holding.current = false
-    endOverlayPeek()
+    releaseHold.current?.()
+    releaseHold.current = null
   }
 
   const cancelPointerHold = () => {
