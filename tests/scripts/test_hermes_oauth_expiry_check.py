@@ -223,6 +223,115 @@ def _patch_common(mod, monkeypatch, *, check_ok: bool, auth_url: str = "https://
     return sent
 
 
+def _patch_common_failing_send(mod, monkeypatch, *, check_ok: bool, auth_url: str = "https://accounts.google.com/fake-auth"):
+    """Like _patch_common, but send_telegram_message always reports failure
+    -- used to prove a failed delivery never gets treated as "sent"."""
+    attempts = []
+
+    monkeypatch.setattr(mod, "check_auth_live", lambda hermes_home, identity: check_ok)
+    monkeypatch.setattr(mod, "fetch_fresh_auth_url", lambda hermes_home, identity: auth_url)
+    monkeypatch.setattr(mod, "stage_reminder", lambda identity, *, kind, expiry: f"pend-{identity}-{kind}")
+
+    def _failing_send(chat_id, message):
+        attempts.append((chat_id, message))
+        return False, "Telegram send failed: simulated failure"
+
+    monkeypatch.setattr(mod, "send_telegram_message", _failing_send)
+    return attempts
+
+
+class TestSendFailureDoesNotMarkAsSent:
+    """Regression test for a real bug caught in production on 2026-08-20:
+    a failed Telegram send was still marking a non-primary identity's
+    one-time flag as sent, permanently blocking any retry that cycle even
+    though the person never actually received the reminder."""
+
+    def test_failed_reactive_expired_once_does_not_set_state(self, mod, hermes_home, vault_root, monkeypatch):
+        entry_dir = hermes_home / "family_credentials" / "family_person"
+        now = datetime.now(timezone.utc)
+        entry = {"credentials_dir": entry_dir}
+        # No sidecar -> fallback reactive mode.
+        _write_profile(vault_root, "family_person", "222")
+        attempts = _patch_common_failing_send(mod, monkeypatch, check_ok=False)  # revoked
+
+        state: dict = {}
+        logs = mod.process_identity(
+            "family_person", entry, hermes_home=hermes_home, vault_root=vault_root,
+            now=now, state=state,
+        )
+        assert len(attempts) == 1  # a send was actually attempted
+        assert any("FAILED" in line for line in logs)
+        # The critical assertion: the one-time flag must NOT be set on a
+        # failed send, or this identity can never be retried this cycle.
+        assert state["family_person"]["expired_sent_at"] is None
+
+        # A subsequent run (e.g. after the delivery issue is fixed) must
+        # retry, not skip with "already sent".
+        attempts2 = _patch_common(mod, monkeypatch, check_ok=False)
+        logs2 = mod.process_identity(
+            "family_person", entry, hermes_home=hermes_home, vault_root=vault_root,
+            now=now, state=state,
+        )
+        assert len(attempts2) == 1
+        assert any("sent reactive_expired_once" in line for line in logs2)
+        assert state["family_person"]["expired_sent_at"] is not None
+
+    def test_failed_heads_up_does_not_set_state(self, mod, hermes_home, vault_root, monkeypatch):
+        entry_dir = hermes_home / "family_credentials" / "family_person"
+        now = datetime.now(timezone.utc)
+        recorded_at = (now - timedelta(days=6)).timestamp()  # in the 2-day window
+        _write_sidecar(entry_dir, recorded_at, identity="family_person")
+        entry = {"credentials_dir": entry_dir}
+        _write_profile(vault_root, "family_person", "222")
+        attempts = _patch_common_failing_send(mod, monkeypatch, check_ok=True)  # not revoked -> heads_up path
+
+        state: dict = {}
+        logs = mod.process_identity(
+            "family_person", entry, hermes_home=hermes_home, vault_root=vault_root,
+            now=now, state=state,
+        )
+        assert len(attempts) == 1
+        assert any("FAILED" in line for line in logs)
+        assert state["family_person"]["heads_up_sent_at"] is None
+
+    def test_failed_expired_in_warning_window_does_not_set_state(self, mod, hermes_home, vault_root, monkeypatch):
+        entry_dir = hermes_home / "family_credentials" / "family_person"
+        now = datetime.now(timezone.utc)
+        recorded_at = (now - timedelta(days=6)).timestamp()  # in the 2-day window
+        _write_sidecar(entry_dir, recorded_at, identity="family_person")
+        entry = {"credentials_dir": entry_dir}
+        _write_profile(vault_root, "family_person", "222")
+        attempts = _patch_common_failing_send(mod, monkeypatch, check_ok=False)  # revoked -> expired path
+
+        state: dict = {}
+        logs = mod.process_identity(
+            "family_person", entry, hermes_home=hermes_home, vault_root=vault_root,
+            now=now, state=state,
+        )
+        assert len(attempts) == 1
+        assert any("FAILED" in line for line in logs)
+        assert state["family_person"]["expired_sent_at"] is None
+
+    def test_send_and_stage_returns_false_on_dry_run(self, mod, monkeypatch):
+        logs: list = []
+        result = mod._send_and_stage(
+            "someone", "111", Path("/tmp/nonexistent-hermes-home"),
+            kind="heads_up", expiry=None, logs=logs, dry_run=True,
+        )
+        assert result is False
+
+    def test_send_and_stage_returns_true_on_success(self, mod, monkeypatch):
+        monkeypatch.setattr(mod, "fetch_fresh_auth_url", lambda hermes_home, identity: "https://fake")
+        monkeypatch.setattr(mod, "stage_reminder", lambda identity, *, kind, expiry: "pend-1")
+        monkeypatch.setattr(mod, "send_telegram_message", lambda chat_id, message: (True, "ok"))
+        logs: list = []
+        result = mod._send_and_stage(
+            "someone", "111", Path("/tmp/nonexistent-hermes-home"),
+            kind="heads_up", expiry=None, logs=logs, dry_run=False,
+        )
+        assert result is True
+
+
 class TestPrimaryVsFamilyMemberDifferentiation:
     """Uses synthetic identity names ("admin_person" / "family_person") to
     prove the daily-vs-one-time split is driven by is_primary_identity()'s

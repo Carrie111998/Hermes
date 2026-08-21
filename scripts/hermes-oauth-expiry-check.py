@@ -512,26 +512,38 @@ def _send_and_stage(
     expiry: Optional[datetime],
     logs: List[str],
     dry_run: bool,
-) -> None:
+) -> bool:
+    """Returns True only when the reminder was actually delivered.
+
+    Callers that track one-time "already sent" state for a non-primary
+    identity MUST only set that flag when this returns True — a failed
+    send (bad chat_id at delivery time, Telegram API error, etc.) must
+    never be treated as "sent," or that person's cycle can go permanently
+    silent even though they never actually received the message. This is
+    also why a failed send's pending record is deliberately left staged
+    rather than discarded: nothing to reply to if the reminder never
+    arrived, but nothing wrongly claims it did either.
+    """
     if dry_run:
         logs.append(f"{identity}: [dry-run] would send kind={kind}")
-        return
+        return False
     auth_url = fetch_fresh_auth_url(hermes_home, identity)
     if auth_url is None:
         logs.append(
             f"{identity}: could not generate a fresh auth URL (client secret "
             "missing or setup.py error) — skipping send this run"
         )
-        return
+        return False
     pending_id = stage_reminder(identity, kind=kind, expiry=expiry)
     message = build_reminder_message(pending_id, auth_url, kind=kind, expiry=expiry)
     ok, detail = send_telegram_message(chat_id, message)
     if ok:
         logs.append(f"{identity}: sent {kind} reminder (pending={pending_id})")
-    else:
-        logs.append(
-            f"{identity}: FAILED to send {kind} reminder (pending={pending_id}): {detail}"
-        )
+        return True
+    logs.append(
+        f"{identity}: FAILED to send {kind} reminder (pending={pending_id}): {detail}"
+    )
+    return False
 
 
 def process_identity(
@@ -595,11 +607,11 @@ def process_identity(
                 kind="reactive_daily", expiry=None, logs=logs, dry_run=dry_run,
             )
         elif identity_state.get("expired_sent_at") is None:
-            _send_and_stage(
+            sent_ok = _send_and_stage(
                 identity, chat_id, hermes_home,
                 kind="reactive_expired_once", expiry=None, logs=logs, dry_run=dry_run,
             )
-            if not dry_run:
+            if sent_ok:
                 identity_state["expired_sent_at"] = now.timestamp()
         else:
             logs.append(
@@ -632,20 +644,20 @@ def process_identity(
         # fires once Part 3 records a fresh re-auth).
     elif revoked:
         if identity_state.get("expired_sent_at") is None:
-            _send_and_stage(
+            sent_ok = _send_and_stage(
                 identity, chat_id, hermes_home,
                 kind="expired", expiry=expiry, logs=logs, dry_run=dry_run,
             )
-            if not dry_run:
+            if sent_ok:
                 identity_state["expired_sent_at"] = now.timestamp()
         else:
             logs.append(f"{identity}: already sent one-time EXPIRED notice this cycle")
     elif identity_state.get("heads_up_sent_at") is None:
-        _send_and_stage(
+        sent_ok = _send_and_stage(
             identity, chat_id, hermes_home,
             kind="heads_up", expiry=expiry, logs=logs, dry_run=dry_run,
         )
-        if not dry_run:
+        if sent_ok:
             identity_state["heads_up_sent_at"] = now.timestamp()
     else:
         logs.append(f"{identity}: already sent one-time heads-up this cycle")
