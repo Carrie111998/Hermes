@@ -12,6 +12,7 @@ stale-run fence.
 from __future__ import annotations
 
 import json
+import logging
 import ntpath
 import os
 import signal
@@ -22,6 +23,7 @@ import time
 
 _TERM_GRACE_SECONDS = 3.0
 _WAIT_POLL_SECONDS = 0.2
+_log = logging.getLogger(__name__)
 _CHILD_KANBAN_ENV = frozenset(
     {
         "HERMES_KANBAN_TASK_ID",
@@ -38,7 +40,7 @@ _CHILD_KANBAN_ENV = frozenset(
 
 
 def _fail(message: str) -> int:
-    print(f"kanban_command_worker: {message}", file=sys.stderr, flush=True)
+    _log.error("kanban_command_worker: %s", message)
     return 1
 
 

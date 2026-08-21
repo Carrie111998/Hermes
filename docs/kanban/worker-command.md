@@ -9,7 +9,7 @@ dependencies, wakeups, reclaim/retry accounting, logs, and `max_runtime`.
 # ~/.hermes/profiles/engine/config.yaml
 worker:
   command:
-    - /home/david/bin/codex-sub
+    - /absolute/path/to/worker-launcher
     - luna
     - --
     - "Work the Kanban task identified by HERMES_KANBAN_TASK_ID."

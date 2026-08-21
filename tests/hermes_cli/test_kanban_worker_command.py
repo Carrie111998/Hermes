@@ -286,6 +286,33 @@ def _run_supervisor(home: Path, task_id: str, run_id: int, argv: list[str]):
     )
 
 
+def _start_supervisor(home: Path, task_id: str, run_id: int, argv: list[str]):
+    env = os.environ.copy()
+    repo_root = str(Path(__file__).parents[2])
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (repo_root, env.get("PYTHONPATH", "")) if part
+    )
+    env.update(
+        {
+            "HERMES_HOME": str(home),
+            "HERMES_KANBAN_DB": str(kb.kanban_db_path()),
+            "HERMES_KANBAN_BOARD": "default",
+            "HERMES_KANBAN_TASK_ID": task_id,
+            "HERMES_KANBAN_TASK": task_id,
+            "HERMES_KANBAN_RUN_ID": str(run_id),
+            "HERMES_KANBAN_WORKER_COMMAND": json.dumps(argv),
+        }
+    )
+    return subprocess.Popen(
+        SUPERVISOR,
+        cwd=str(Path(__file__).parents[2]),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
 def test_supervisor_maps_exit_code_to_canonical_transition(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="ok", assignee="engine")
@@ -297,30 +324,40 @@ def test_supervisor_maps_exit_code_to_canonical_transition(kanban_home):
         assert kb.get_task(conn, task_id).status == "done"
 
 
-def test_supervisor_nonzero_blocks_but_expected_run_id_preserves_prior_transition(
-    kanban_home,
-):
+def test_stale_supervisor_cannot_overwrite_a_later_run(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="fail", assignee="engine")
-        run_id = _claim_with_run(conn, task_id)
+        first_run_id = _claim_with_run(conn, task_id)
 
-    proc = _run_supervisor(
+    proc = _start_supervisor(
         kanban_home,
         task_id,
-        run_id,
-        [sys.executable, "-c", "import sys; sys.exit(3)"],
+        first_run_id,
+        [sys.executable, "-c", "import sys, time; time.sleep(1); sys.exit(3)"],
     )
-    assert proc.returncode == 0, proc.stderr
     with kb.connect() as conn:
-        assert kb.get_task(conn, task_id).status == "blocked"
-
-        # A stale supervisor cannot overwrite a later canonical transition.
-        assert not kb.complete_task(
+        assert kb.block_task(
             conn,
             task_id,
-            summary="stale",
-            expected_run_id=run_id,
+            reason="replace first run",
+            expected_run_id=first_run_id,
         )
+        assert kb.unblock_task(conn, task_id)
+        second_run_id = _claim_with_run(conn, task_id)
+        assert second_run_id != first_run_id
+
+    try:
+        stdout, stderr = proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+    assert proc.returncode == 0, stderr
+    assert not stdout
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task.status == "running"
+        assert task.current_run_id == second_run_id
 
 
 def test_missing_command_reports_no_canonical_outcome(kanban_home, tmp_path):
