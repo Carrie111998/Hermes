@@ -188,35 +188,23 @@ class TestAncestorExclusion:
     ancestor-exclusion must not hide the gateway from the scan entirely:
     the gateway must still be visible to the pause machinery."""
 
-    def test_gateway_parent_visible_to_child_scan(self, tmp_path):
-        # Simulate the /update topology: parent (gateway-argv process) spawns
-        # a child python that runs the REAL detection and reports whether it
-        # can see its gateway parent. The child's code lives in a FILE so the
-        # parent's cmdline stays realistic (a real gateway's argv is clean
-        # `... -m hermes_cli.main gateway run`, not a multi-line -c blob).
-        child_file = tmp_path / "child_scan.py"
-        child_file.write_text(
-            "import json, os, sys\n"
+    def test_gateway_parent_visible_to_child_scan(self):
+        # Simulate the /update topology: parent (fake gateway) spawns a
+        # child python that runs the REAL detection and reports whether it
+        # can see its gateway parent.
+        child_code = (
+            "import json, sys\n"
             f"sys.path.insert(0, {str(PROJECT_ROOT)!r})\n"
             "from hermes_cli.update_cmd import _detect_venv_python_processes\n"
-            "import psutil\n"
-            "from gateway.status import looks_like_gateway_command_line\n"
-            "# The venv shim makes every spawn a launcher/worker CHAIN, so the\n"
-            "# gateway is an ANCESTOR, not necessarily the direct parent —\n"
-            "# find it the same way the pause machinery would: by argv.\n"
-            "gw = [int(a.pid) for a in psutil.Process().parents()\n"
-            "      if looks_like_gateway_command_line(' '.join(a.cmdline() or []))]\n"
+            "import os\n"
             "matches = _detect_venv_python_processes()\n"
-            "print(json.dumps({'gateway_ancestors': gw,"
-            " 'pids': [p for p, _, _ in matches]}))\n",
-            encoding="utf-8",
+            "print(json.dumps({'ppid': os.getppid(), 'pids': [p for p, _, _ in matches]}))\n"
         )
-        parent_oneliner = (
-            "import subprocess, sys;"
-            f" r = subprocess.run([sys.executable, {str(child_file)!r}],"
-            f" capture_output=True, text=True, cwd={str(PROJECT_ROOT)!r});"
-            " print(r.stdout.strip());"
-            " sys.stderr.write(r.stderr[-500:])"
+        parent_code = (
+            "import subprocess, sys\n"
+            f"out = subprocess.run([sys.executable, '-c', {child_code!r}],"
+            " capture_output=True, text=True, cwd=" + repr(str(PROJECT_ROOT)) + ")\n"
+            "print(out.stdout.strip())\n"
         )
         # The parent's argv carries `gateway run` so it IS a gateway to any
         # cmdline classifier; it runs the child synchronously.
@@ -224,7 +212,7 @@ class TestAncestorExclusion:
             [
                 sys.executable,
                 "-c",
-                parent_oneliner,
+                parent_code,
                 "-m",
                 "hermes_cli.main",
                 "gateway",
@@ -240,13 +228,9 @@ class TestAncestorExclusion:
         line = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else "{}"
         payload = json.loads(line)
         assert payload, f"child scan produced no output: {result.stderr[-500:]}"
-        assert payload["gateway_ancestors"], (
-            f"harness broke: no gateway-argv ancestor found: {payload}"
-        )
-        # The gateway ancestor must be visible to the scan so the pause
-        # machinery can stop it (#87594). Blanket ancestor-exclusion hid it.
-        visible = set(payload["gateway_ancestors"]) & set(payload["pids"])
-        assert visible, (
+        # The gateway parent must be visible to the scan so the pause
+        # machinery can stop it (#87594). Plain ancestor-exclusion hides it.
+        assert payload["ppid"] in payload["pids"], (
             "gateway ancestor invisible to venv scan — /update from the "
             f"gateway can never pause it (#87594): {payload}"
         )
