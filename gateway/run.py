@@ -21974,6 +21974,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # authoritative one for that surface; the gateway has no way to know
         # whether the client spoke, so it must stay out of the way (#90297).
         if event.source.platform.value == "desktop":
+            logger.debug(
+                "Auto voice reply skipped: desktop surface speaks locally (mode=%s chat=%s)",
+                voice_mode, chat_id,
+            )
             return False
 
         # Dedup: agent already called TTS tool in THIS turn only

@@ -14,7 +14,6 @@ platform object whose ``.value`` is ``"desktop"`` — exactly the comparison
 ``_should_send_voice_reply`` performs.
 """
 
-from types import SimpleNamespace  # noqa: F401  (docstring reference only)
 from unittest.mock import MagicMock
 
 from gateway.config import Platform
