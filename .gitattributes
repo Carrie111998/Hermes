@@ -32,3 +32,5 @@ docker/entrypoint.sh text eol=lf
 *.html  text eol=lf
 *.svg   text eol=lf
 *.ps1   text eol=crlf
+
+test.txt filter=lfs diff=lfs merge=lfs -text
