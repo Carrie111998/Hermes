@@ -547,7 +547,10 @@ class TestRequestShape:
             lambda requested: {
                 "name": "codex-passive",
                 "base_url": "https://gw.example/codex",
-                "extra_headers": {"ChatGPT-Account-ID": "from-entry"},
+                "extra_headers": {
+                    "ChatGPT-Account-ID": "from-entry",
+                    "X-Entry-Route": "preserved",
+                },
             },
         )
         monkeypatch.setattr(
@@ -565,7 +568,10 @@ class TestRequestShape:
         ) == codex_plugin._CodexImageAuth(
             "static-key",
             "https://gw.example/codex",
-            {"ChatGPT-Account-ID": "from-runtime"},
+            {
+                "X-Entry-Route": "preserved",
+                "ChatGPT-Account-ID": "from-runtime",
+            },
         )
 
     def test_open_endpoint_sentinel_is_not_treated_as_a_credential(self, monkeypatch):

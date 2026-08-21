@@ -297,7 +297,7 @@ def _resolve_named_provider_auth(provider_name: str) -> _CodexImageAuth:
         base_url = str(runtime.get("base_url") or base_url).strip().rstrip("/")
         runtime_headers = normalize_extra_headers(runtime.get("extra_headers"))
         if runtime_headers:
-            extra_headers = runtime_headers
+            extra_headers = _merge_request_headers(extra_headers, runtime_headers)
 
     # "no-key-required" is the resolver's sentinel for an open endpoint. The
     # Codex Responses route is never open, so treat it as "no credential".
