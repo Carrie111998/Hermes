@@ -35,6 +35,7 @@ import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } f
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
+import { describeBackendExitHint } from './backend-exit-diagnosis'
 import { isReauthRequiredError, waitForHermesReady } from './backend-health'
 import { backendCommandMatches, createBackendOwnership, createBackendShutdownCoordinator } from './backend-ownership'
 import {
@@ -10800,7 +10801,9 @@ async function startHermes() {
       sendBackendExit({ code, signal })
 
       if (!backendReady) {
-        const message = `Hermes backend exited before it became ready (${signal || code}).`
+        const logTail = recentHermesLog()
+        const hint = describeBackendExitHint(logTail)
+        const message = `Hermes backend exited before it became ready (${signal || code}).${hint ? ` ${hint}` : ''}`
         updateBootProgress(
           {
             error: message,
@@ -10810,11 +10813,7 @@ async function startHermes() {
           },
           { allowDecrease: true }
         )
-        rejectBackendStart?.(
-          new Error(
-            `Hermes backend exited before it became ready (${signal || code}). Log: ${DESKTOP_LOG_PATH}\n${recentHermesLog()}`
-          )
-        )
+        rejectBackendStart?.(new Error(`${message} Log: ${DESKTOP_LOG_PATH}\n${logTail}`))
       }
     })
 

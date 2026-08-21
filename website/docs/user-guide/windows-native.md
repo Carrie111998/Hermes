@@ -311,6 +311,9 @@ The installer provisions Node 26 at `%LOCALAPPDATA%\hermes\node` but your PATH m
 **Chinese / Japanese / Arabic characters show as `?` in the CLI.**
 The UTF-8 stdio shim didn't activate. Check that `HERMES_DISABLE_WINDOWS_UTF8` is NOT set (`Get-ChildItem env:HERMES_DISABLE_WINDOWS_UTF8`). If it's empty and you still see `?`, the console host (very old `cmd.exe`) may not support UTF-8 at all — switch to Windows Terminal.
 
+**"Hermes couldn't start" with `DLL load failed while importing _sqlite3` in the log, only when Smart App Control is on.**
+Windows Smart App Control blocks unsigned binaries with no cloud reputation, and Hermes's bundled Python interpreter's `.pyd` extension DLLs (e.g. `_sqlite3.pyd`) aren't code-signed. Unlike Defender, SAC has no exclusion list, and once enabled it can't be turned back off without resetting Windows — so this isn't something Hermes can work around at runtime. Until the bundled Python is signed, SAC and Hermes Desktop are incompatible: turn Smart App Control off before installing, or use [WSL2](./windows-wsl-quickstart.md) instead, which isn't subject to SAC's native-binary checks.
+
 **Gateway can't send Telegram photos — "`BadRequest: payload contains invalid characters`".**
 This is unrelated to Windows but sometimes surfaces first there. Usually it means your file path contains unescaped backslashes in a JSON body. Telegram should be receiving paths Hermes normalizes, not raw Windows paths — if you're seeing this inside a custom plugin, make sure you're passing the Hermes-provided path, not `str(Path(...))` from user input.
 
