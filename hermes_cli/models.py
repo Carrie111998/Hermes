@@ -133,6 +133,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     # OpenRouter routers
     ("openrouter/pareto-code",                 "auto-routes to cheapest coder meeting openrouter.min_coding_score"),
     # Free tier
+    ("stealth/ox-alpha",                       "free"),
     ("openrouter/elephant-alpha",              "free"),
     ("poolside/laguna-m.1:free",               "free"),
     ("tencent/hy3:free",                       "free"),
