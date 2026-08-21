@@ -8544,9 +8544,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """All agent work the gateway must expose and drain as one total."""
         return (
             self._running_agent_count()
+            + self._active_async_delegation_count()
             + self._active_cron_job_count()
             + self._active_api_run_count()
         )
+
+    def _active_async_delegation_count(self) -> int:
+        """Count detached delegate_task units outside chat turn slots."""
+        try:
+            from tools.async_delegation import active_count
+
+            return max(0, int(active_count()))
+        except Exception:
+            return 0
 
     def _active_cron_job_count(self) -> int:
         """Count of cron jobs currently executing, from the cron scheduler's
@@ -10596,25 +10606,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> tuple[Dict[str, Any], bool]:
         snapshot = self._snapshot_running_agents()
         last_active_count = self._running_agent_count()
+        last_async_count = self._active_async_delegation_count()
         last_cron_count = self._active_cron_job_count()
         last_api_count = self._active_api_run_count()
         last_status_at = 0.0
 
         def _maybe_update_status(force: bool = False) -> None:
-            nonlocal last_active_count, last_cron_count, last_api_count, last_status_at
+            nonlocal last_active_count, last_async_count, last_cron_count, last_api_count, last_status_at
             now = asyncio.get_running_loop().time()
             active_count = self._running_agent_count()
+            async_count = self._active_async_delegation_count()
             cron_count = self._active_cron_job_count()
             api_count = self._active_api_run_count()
             if (
                 force
                 or active_count != last_active_count
+                or async_count != last_async_count
                 or cron_count != last_cron_count
                 or api_count != last_api_count
                 or (now - last_status_at) >= 1.0
             ):
                 self._update_runtime_status("draining")
                 last_active_count = active_count
+                last_async_count = async_count
                 last_cron_count = cron_count
                 last_api_count = api_count
                 last_status_at = now
@@ -10625,7 +10639,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # or a cron job's tool work gets killed with zero warning the
         # instant it's the only active thing running (#60432).
         # API-server / desk sessions have the same structural gap (#63529).
-        if not self._running_agents and last_cron_count == 0 and last_api_count == 0:
+        if (
+            not self._running_agents
+            and last_async_count == 0
+            and last_cron_count == 0
+            and last_api_count == 0
+        ):
             _maybe_update_status(force=True)
             return snapshot, False
 
@@ -10646,7 +10665,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         def _still_draining() -> bool:
             now = loop.time()
             if (
-                len(self._running_agents) or self._active_api_run_count()
+                len(self._running_agents)
+                or self._active_async_delegation_count()
+                or self._active_api_run_count()
             ) and now < deadline:
                 return True
             return bool(self._active_cron_job_count()) and now < cron_deadline
@@ -10660,6 +10681,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await asyncio.sleep(0.1)
         timed_out = (
             bool(len(self._running_agents))
+            or bool(self._active_async_delegation_count())
             or bool(self._active_cron_job_count())
             or bool(self._active_api_run_count())
         )
@@ -14616,7 +14638,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "restart_requested": bool(self._restart_requested),
                     "draining": bool(self._draining),
                     "running": bool(self._running),
-                    "active_agents": self._running_agent_count(),
+                    "active_agents": self._active_work_count(),
+                    "active_async_delegations": self._active_async_delegation_count(),
                     "active_cron_jobs": self._active_cron_job_count(),
                     "active_api_runs": self._active_api_run_count(),
                     "restart_drain_timeout": self._restart_drain_timeout,
@@ -14693,6 +14716,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("pre-drain mark_resume_pending failed for %s: %s", _sk, _e)
 
             _cron_at_start = self._active_cron_job_count()
+            _async_at_start = self._active_async_delegation_count()
             _api_at_start = self._active_api_run_count()
             # In-flight cron work gets its own floor, clamped to the watchdog
             # leash we're already running under so the extra wait can never
@@ -14727,6 +14751,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.info(
                 "Shutdown phase: drain done at +%.2fs (drain took %.2fs, "
                 "timed_out=%s, active_at_start=%d, active_now=%d, "
+                "async_at_start=%d, async_now=%d, "
                 "cron_at_start=%d, cron_now=%d, "
                 "api_at_start=%d, api_now=%d)",
                 _phase_elapsed(),
@@ -14734,6 +14759,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 timed_out,
                 len(active_agents),
                 self._running_agent_count(),
+                _async_at_start,
+                self._active_async_delegation_count(),
                 _cron_at_start,
                 self._active_cron_job_count(),
                 _api_at_start,
@@ -14757,10 +14784,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if timed_out:
                 logger.warning(
                     "Gateway drain timed out after %.1fs with %d active agent(s), "
-                    "%d in-flight cron job(s), and %d api_server run(s); "
+                    "%d background delegation(s), %d in-flight cron job(s), "
+                    "and %d api_server run(s); "
                     "interrupting remaining work.",
                     _drain_elapsed,
                     self._running_agent_count(),
+                    self._active_async_delegation_count(),
                     self._active_cron_job_count(),
                     self._active_api_run_count(),
                 )

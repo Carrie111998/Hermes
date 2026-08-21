@@ -1623,7 +1623,7 @@ class GatewaySlashCommandsMixin:
             return ""
 
         if self._restart_requested or self._draining:
-            count = self._running_agent_count()
+            count = self._active_work_count()
             if count:
                 return t("gateway.draining", count=count)
             return EphemeralReply(t("gateway.restart.in_progress"))
@@ -1686,7 +1686,7 @@ class GatewaySlashCommandsMixin:
         except Exception as e:
             logger.debug("Failed to write restart dedup marker: %s", e)
 
-        active_agents = self._running_agent_count()
+        active_agents = self._active_work_count()
         # When running under a service manager (systemd/launchd) or inside a
         # Docker/Podman container, use the service restart path: exit with
         # code 75 so the service manager / container restart policy restarts
