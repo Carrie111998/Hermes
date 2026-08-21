@@ -134,6 +134,15 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# SQLite-expressie-indexen kunnen Python's Unicode-whitespace-semantiek niet
+# veilig persistent maken. Deze vaste ASCII-set is daarom het contract voor
+# zowel de Python-normalisatie als alle SQLite-canonicalisatie.
+_IDEMPOTENCY_KEY_WHITESPACE = " \t\n\r\v\f"
+_IDEMPOTENCY_KEY_SQL_EXPR = (
+    "TRIM(idempotency_key, char(9) || char(10) || char(11) || "
+    "char(12) || char(13) || ' ')"
+)
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -2538,10 +2547,10 @@ def _dedupe_active_idempotency_keys(conn: sqlite3.Connection) -> None:
     normal archive lifecycle, including closing a leaked active run.
     """
     duplicate_keys = conn.execute(
-        "SELECT idempotency_key FROM tasks "
-        "WHERE idempotency_key IS NOT NULL AND TRIM(idempotency_key) != '' "
+        f"SELECT {_IDEMPOTENCY_KEY_SQL_EXPR} AS canonical_key FROM tasks "
+        f"WHERE idempotency_key IS NOT NULL AND {_IDEMPOTENCY_KEY_SQL_EXPR} != '' "
         "AND status != 'archived' "
-        "GROUP BY idempotency_key HAVING COUNT(*) > 1"
+        f"GROUP BY {_IDEMPOTENCY_KEY_SQL_EXPR} HAVING COUNT(*) > 1"
     ).fetchall()
     if not duplicate_keys:
         return
@@ -2555,9 +2564,9 @@ def _dedupe_active_idempotency_keys(conn: sqlite3.Connection) -> None:
     can_close_runs = "current_run_id" in task_columns and runs_exist
 
     for key_row in duplicate_keys:
-        key = key_row["idempotency_key"]
+        key = key_row["canonical_key"]
         rows = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            f"SELECT id FROM tasks WHERE {_IDEMPOTENCY_KEY_SQL_EXPR} = ? "
             "AND status != 'archived' "
             "ORDER BY created_at DESC, id DESC",
             (key,),
@@ -2772,20 +2781,25 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # pre-check above, own the active-key invariant. Dirty boards are deduped
     # and evidenced in the same write transaction before the index is rebuilt.
     if "status" in cols:
-        with write_txn(conn):
+        # Legacy ALTER/UPDATE steps may have opened SQLite's implicit
+        # transaction already. A savepoint preserves the direct-helper
+        # contract in that case; without an outer transaction write_txn still
+        # provides the production BEGIN IMMEDIATE/COMMIT atomic boundary.
+        with write_txn(conn, allow_nested=True):
             _dedupe_active_idempotency_keys(conn)
             conn.execute("DROP INDEX IF EXISTS idx_tasks_idempotency")
             conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency "
-                "ON tasks(idempotency_key) "
-                "WHERE idempotency_key IS NOT NULL AND TRIM(idempotency_key) != '' "
+                f"CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency "
+                f"ON tasks({_IDEMPOTENCY_KEY_SQL_EXPR}) "
+                f"WHERE idempotency_key IS NOT NULL AND {_IDEMPOTENCY_KEY_SQL_EXPR} != '' "
                 "AND status != 'archived'"
             )
     else:
         # Keep synthetic/very old schemas without a task status column
         # migratable; they have no active/archive lifecycle to constrain.
+        conn.execute("DROP INDEX IF EXISTS idx_tasks_idempotency")
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)"
+            f"CREATE INDEX idx_tasks_idempotency ON tasks({_IDEMPOTENCY_KEY_SQL_EXPR})"
         )
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -2854,7 +2868,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
     ).fetchone() is not None
     if runs_exist:
-        with write_txn(conn):
+        with write_txn(conn, allow_nested=True):
             inflight = conn.execute(
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
                 "       max_runtime_seconds, last_heartbeat_at, started_at "
@@ -3234,6 +3248,13 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _canonical_idempotency_key(value: Optional[str]) -> Optional[str]:
+    """Normalize supported ASCII surrounding whitespace, preserving other text."""
+    if value is None:
+        return None
+    return str(value).strip(_IDEMPOTENCY_KEY_WHITESPACE) or None
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3275,6 +3296,10 @@ def create_task(
     same key already exists, returns the existing task's id instead of
     creating a duplicate. Useful for retried webhooks / automation that
     should not double-write.
+
+    Surrounding key whitespace is limited to ASCII space, tab, LF, CR, VT,
+    and FF so the Python and persistent SQLite index semantics remain exact;
+    other whitespace is part of the key.
 
     ``max_runtime_seconds`` caps how long a worker may run before the
     dispatcher SIGTERMs (then SIGKILLs after a grace window) and
@@ -3325,8 +3350,7 @@ def create_task(
         raise ValueError("branch_name is only valid for worktree workspaces")
     # Empty / whitespace-only keys mean "no idempotency". Store them as NULL
     # so repeated keyless creates remain independent under the partial index.
-    if idempotency_key is not None:
-        idempotency_key = str(idempotency_key).strip() or None
+    idempotency_key = _canonical_idempotency_key(idempotency_key)
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -3483,7 +3507,7 @@ def create_task(
     # SELECT and the INSERT.
     if idempotency_key:
         row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            f"SELECT id FROM tasks WHERE {_IDEMPOTENCY_KEY_SQL_EXPR} = ? "
             "AND status != 'archived' "
             "ORDER BY created_at DESC, id DESC LIMIT 1",
             (idempotency_key,),
@@ -3641,13 +3665,17 @@ def create_task(
             return task_id
         except sqlite3.IntegrityError as exc:
             error_text = str(exc)
-            if "UNIQUE constraint failed: tasks.idempotency_key" in error_text:
+            idempotency_conflict = (
+                "UNIQUE constraint failed: index 'idx_tasks_idempotency'"
+                in error_text
+            )
+            if idempotency_conflict:
                 # The UNIQUE partial index rejected this insert because a
                 # concurrent writer committed the same active key. The failed
                 # write transaction has rolled back, so this read sees the
                 # committed winner and preserves the create_task API.
                 winner = conn.execute(
-                    "SELECT id FROM tasks WHERE idempotency_key = ? "
+                    f"SELECT id FROM tasks WHERE {_IDEMPOTENCY_KEY_SQL_EXPR} = ? "
                     "AND status != 'archived' "
                     "ORDER BY created_at DESC, id DESC LIMIT 1",
                     (idempotency_key,),
