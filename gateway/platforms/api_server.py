@@ -2186,6 +2186,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/health/detailed", self._handle_health_detailed),
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/v1/models", self._handle_models),
+            ("GET", "/api/profiles", self._handle_profiles),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
             # Authenticated browser-control surface: POST registration
@@ -3236,6 +3237,61 @@ class APIServerAdapter(BasePlatformAdapter):
             })
 
         return web.json_response({"object": "list", "data": models})
+
+    async def _handle_profiles(self, request: "web.Request") -> "web.Response":
+        """GET /api/profiles — authenticated, read-only Bot Mode roster.
+
+        The response intentionally omits filesystem paths, credential presence,
+        and every secret-bearing field. Named entries are addressable through
+        the existing multiplex ``/p/<profile>`` route; selecting one does not
+        require a client to switch machines or mutate its project context.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            from hermes_cli import profiles as profiles_mod
+
+            profiles = await asyncio.to_thread(profiles_mod.list_profiles)
+        except Exception:
+            logger.exception("[%s] GET /api/profiles failed", self.name)
+            return web.json_response(
+                _openai_error(
+                    "Failed to list Hermes profiles.",
+                    code="profiles_list_failed",
+                ),
+                status=500,
+            )
+
+        data = []
+        for info in profiles:
+            name = str(getattr(info, "name", "") or "").strip()
+            if not name:
+                continue
+            is_default = bool(getattr(info, "is_default", False))
+            title = (
+                "Hermes"
+                if is_default
+                else " ".join(part.capitalize() for part in re.split(r"[-_]", name) if part)
+            )
+            data.append({
+                "id": name,
+                "name": name,
+                "title": title or name,
+                "description": str(getattr(info, "description", "") or ""),
+                "model": getattr(info, "model", None),
+                "provider": getattr(info, "provider", None),
+                "skill_count": int(getattr(info, "skill_count", 0) or 0),
+                "is_default": is_default,
+                "gateway_path": "" if is_default else f"/p/{name}",
+            })
+
+        return web.json_response({
+            "object": "hermes.profile.list",
+            "canonical_chat_title": "Bot Chat",
+            "data": data,
+        })
 
     async def _handle_model_options(self, request: "web.Request") -> "web.Response":
         """GET /api/model/options — return Hermes provider/model inventory.

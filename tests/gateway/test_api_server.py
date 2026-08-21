@@ -308,6 +308,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/health/detailed", adapter._handle_health_detailed)
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
+    app.router.add_get("/api/profiles", adapter._handle_profiles)
     app.router.add_get("/api/model/options", adapter._handle_model_options)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/skills", adapter._handle_skills)
@@ -843,6 +844,84 @@ class TestModelsEndpoint:
             "include_unconfigured": True,
             "refresh": True,
         }
+
+
+# ---------------------------------------------------------------------------
+# /api/profiles endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestProfilesEndpoint:
+    @pytest.mark.asyncio
+    async def test_profiles_requires_bearer_auth(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/profiles")
+            assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_profiles_returns_safe_bot_roster(self, auth_adapter):
+        profiles = [
+            types.SimpleNamespace(
+                name="default",
+                is_default=True,
+                model="kimi-code-k3",
+                provider="openrouter",
+                description="General operator",
+                skill_count=12,
+                path="/secret/default",
+                has_env=True,
+            ),
+            types.SimpleNamespace(
+                name="realestate",
+                is_default=False,
+                model="gpt-5.6-sol",
+                provider="openai",
+                description="Real-estate acquisition specialist",
+                skill_count=7,
+                path="/secret/profiles/realestate",
+                has_env=True,
+            ),
+        ]
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("hermes_cli.profiles.list_profiles", return_value=profiles):
+                resp = await cli.get(
+                    "/api/profiles",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert resp.status == 200
+                body = await resp.json()
+
+        assert body["object"] == "hermes.profile.list"
+        assert body["canonical_chat_title"] == "Bot Chat"
+        assert body["data"] == [
+            {
+                "id": "default",
+                "name": "default",
+                "title": "Hermes",
+                "description": "General operator",
+                "model": "kimi-code-k3",
+                "provider": "openrouter",
+                "skill_count": 12,
+                "is_default": True,
+                "gateway_path": "",
+            },
+            {
+                "id": "realestate",
+                "name": "realestate",
+                "title": "Realestate",
+                "description": "Real-estate acquisition specialist",
+                "model": "gpt-5.6-sol",
+                "provider": "openai",
+                "skill_count": 7,
+                "is_default": False,
+                "gateway_path": "/p/realestate",
+            },
+        ]
+        serialized = json.dumps(body)
+        assert "/secret/" not in serialized
+        assert "has_env" not in serialized
 
 
 # ---------------------------------------------------------------------------
