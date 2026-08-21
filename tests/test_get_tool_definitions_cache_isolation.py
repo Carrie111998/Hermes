@@ -41,26 +41,39 @@ class TestQuietModeCacheIsolation:
         """A content edit must invalidate the quiet-mode cache even when a
         writer preserves both the config file's size and nanosecond mtime."""
         config_file = tmp_path / "config.yaml"
-        config_file.write_text("toolsets:\n  - file\n", encoding="utf-8")
+        config_file.write_text(
+            "delegation:\n"
+            "  max_concurrent_children: 4\n"
+            "code_execution:\n"
+            "  mode: project\n",
+            encoding="utf-8",
+        )
         original_stat = config_file.stat()
         monkeypatch.setattr(
             "hermes_cli.config.get_config_path", lambda: config_file
         )
 
-        calls = 0
-        original_compute = model_tools._compute_tool_definitions
-
-        def compute(*args, **kwargs):
-            nonlocal calls
-            calls += 1
-            return original_compute(*args, **kwargs)
-
-        monkeypatch.setattr(model_tools, "_compute_tool_definitions", compute)
-
-        model_tools.get_tool_definitions(
-            enabled_toolsets=["file"], quiet_mode=True
+        initial = model_tools.get_tool_definitions(
+            enabled_toolsets=["delegation", "code_execution"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
         )
-        config_file.write_text("toolsets:\n  - test\n", encoding="utf-8")
+        initial_by_name = {tool["function"]["name"]: tool for tool in initial}
+        assert "up to 4" in initial_by_name["delegate_task"]["function"][
+            "parameters"
+        ]["properties"]["tasks"]["description"]
+        assert (
+            "session's working directory"
+            in initial_by_name["execute_code"]["function"]["description"]
+        )
+
+        config_file.write_text(
+            "delegation:\n"
+            "  max_concurrent_children: 7\n"
+            "code_execution:\n"
+            "  mode: strict \n",
+            encoding="utf-8",
+        )
         os.utime(
             config_file,
             ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
@@ -68,11 +81,20 @@ class TestQuietModeCacheIsolation:
         assert config_file.stat().st_size == original_stat.st_size
         assert config_file.stat().st_mtime_ns == original_stat.st_mtime_ns
 
-        model_tools.get_tool_definitions(
-            enabled_toolsets=["file"], quiet_mode=True
+        refreshed = model_tools.get_tool_definitions(
+            enabled_toolsets=["delegation", "code_execution"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
         )
+        refreshed_by_name = {tool["function"]["name"]: tool for tool in refreshed}
 
-        assert calls == 2
+        assert "up to 7" in refreshed_by_name["delegate_task"]["function"][
+            "parameters"
+        ]["properties"]["tasks"]["description"]
+        assert (
+            "own temp dir"
+            in refreshed_by_name["execute_code"]["function"]["description"]
+        )
 
     def test_first_uncached_call_returns_fresh_list(self):
         """The first quiet_mode call must not alias the cached object \u2014

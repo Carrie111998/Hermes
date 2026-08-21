@@ -368,6 +368,7 @@ def get_tool_definitions(
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
     cache_key = None
+    cfg_path = None
     if quiet_mode:
         try:
             from hermes_cli.config import get_config_path
@@ -399,6 +400,14 @@ def get_tool_definitions(
             # Return a shallow copy of the list but share the dict references —
             # schemas are treated as read-only by all known callers.
             return list(cached)
+
+    if quiet_mode and cache_key is not None and cfg_path is not None:
+        # A content-fingerprint miss can coexist with a metadata-cache hit in
+        # the config layer when a writer preserves both size and mtime. Ensure
+        # dynamic schemas rebuild from disk, scoped to this profile only.
+        from hermes_cli.config import invalidate_config_read_caches
+
+        invalidate_config_read_caches(cfg_path)
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                        skip_tool_search_assembly=skip_tool_search_assembly)
