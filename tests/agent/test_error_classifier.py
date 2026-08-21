@@ -640,11 +640,23 @@ class TestClassifyApiError:
         assert result.should_fallback is False
         assert result.should_compress is False
 
-    def test_disk_quota_message_beats_billing_patterns(self):
-        result = classify_api_error(Exception("Disk quota exceeded"))
+    def test_disk_quota_oserror_message_beats_billing_patterns(self):
+        result = classify_api_error(OSError("Disk quota exceeded"))
 
         assert result.reason == FailoverReason.disk_space
         assert result.should_rotate_credential is False
+
+    def test_remote_disk_quota_message_remains_provider_error(self):
+        error = MockAPIError(
+            "Disk quota exceeded",
+            status_code=507,
+            body={"error": {"message": "Disk quota exceeded"}},
+        )
+
+        result = classify_api_error(error)
+
+        assert result.reason == FailoverReason.server_error
+        assert result.retryable is True
 
     def test_wrapped_disk_exhaustion_preserves_errno_classification(self):
         inner = OSError(errno.ENOSPC, "No space left on device")

@@ -700,21 +700,22 @@ _DISK_SPACE_PATTERNS = (
 )
 
 
-def _is_disk_space_error(error: Exception, error_msg: str) -> bool:
+def _is_disk_space_error(error: Exception) -> bool:
     """Detect local filesystem exhaustion before generic message matching."""
     current: Optional[BaseException] = error
     seen = set()
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if (
-            isinstance(current, OSError)
-            and getattr(current, "errno", None) in _DISK_SPACE_ERRNOS
-        ):
-            return True
+        if isinstance(current, OSError):
+            if getattr(current, "errno", None) in _DISK_SPACE_ERRNOS:
+                return True
+            current_msg = str(current).lower()
+            if any(pattern in current_msg for pattern in _DISK_SPACE_PATTERNS):
+                return True
         current = getattr(current, "__cause__", None) or getattr(
             current, "__context__", None
         )
-    return any(pattern in error_msg for pattern in _DISK_SPACE_PATTERNS)
+    return False
 
 # Server disconnect patterns (no status code, but transport-level).
 # These are the "ambiguous" patterns — a plain connection close could be
@@ -927,7 +928,7 @@ def classify_api_error(
     # storage. It must beat billing's generic "quota" patterns and OSError's
     # generic transport classification: credential rotation, provider
     # fallback, compression, and retry all repeat the same failed local write.
-    if _is_disk_space_error(error, error_msg):
+    if _is_disk_space_error(error):
         return _result(FailoverReason.disk_space, retryable=False)
 
     # ── 1. Provider-specific patterns (highest priority) ────────────
