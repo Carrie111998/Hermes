@@ -42,7 +42,14 @@ class CampaignAlreadyRunning(RuntimeError):
 
 
 class LeadResearchService:
-    def __init__(self, db, registry: ProviderRegistry | None = None, *, workers: int = 2):
+    def __init__(
+        self,
+        db,
+        registry: ProviderRegistry | None = None,
+        *,
+        workers: int = 2,
+        verify_workers: int = 4,
+    ):
         self.db = db
         self.registry = registry or build_registry()
         self.candidates = CandidateRepository(db)
@@ -59,6 +66,11 @@ class LeadResearchService:
         self._settled: dict[tuple[str, str], dict] = {}
         self._events: dict[tuple[str, str], threading.Event] = {}
         self._closed = False
+        # Candidates are verified concurrently; each source additionally caps
+        # itself. 1 restores the old strictly-sequential behaviour.
+        self.verify_workers = max(1, int(verify_workers))
+        self._gates: dict[str, threading.Semaphore] = {}
+        self._gate_lock = threading.Lock()
 
     def ensure_catalog(self, company_id: str) -> None:
         self.registry.ensure_tenant(self.db, company_id, now())
@@ -463,6 +475,119 @@ class LeadResearchService:
             cutoffs[source_id] = stamp - definition.freshness_days * 86400
         return repo.reusable_bundles(cutoffs, fingerprint)
 
+    def _source_gate(self, source_id: str) -> threading.Semaphore:
+        """How many candidates may hit one source at once.
+
+        A property of the upstream, declared per source. Without it, adding
+        concurrency would have made TED strictly worse: it answers 429 readily
+        enough that its adapter already carries a backoff, so four workers
+        hitting it at once converts a working free source into a failing one.
+        Shared across campaigns, because the limit protects the upstream rather
+        than any one run.
+        """
+        with self._gate_lock:
+            gate = self._gates.get(source_id)
+            if gate is None:
+                definition = self.registry.definitions.get(source_id)
+                gate = threading.Semaphore(definition.max_concurrency if definition else 1)
+                self._gates[source_id] = gate
+        return gate
+
+    def _collect_bundles(
+        self,
+        candidate: CandidateRecord,
+        query: DiscoveryQuery,
+        source_ids: list[str],
+        providers: dict,
+        reusable: dict,
+    ) -> dict:
+        """Verify one candidate against every available source. Network only.
+
+        This is the part that costs seconds, and it runs on a worker thread — so
+        it deliberately touches nothing shared. Partition counters, issue rows
+        and every other write are applied by the caller on the campaign's own
+        thread, which is what keeps identity resolution and the funnel free of
+        races and keeps all database work single-threaded.
+        """
+        outcome: dict = {
+            "bundles": [], "reused": [], "abstained": [], "errors": [], "requests": {},
+        }
+        for source_id in source_ids:
+            cached = reusable.get((source_id, candidate.source_record_id))
+            if cached is not None:
+                outcome["bundles"].append((source_id, cached))
+                outcome["reused"].append(source_id)
+                continue
+            try:
+                with self._source_gate(source_id):
+                    bundle = providers[source_id].verify(query, candidate)
+                if bundle.candidate_source_record_id != candidate.source_record_id:
+                    raise ValueError("verifier returned evidence for a different candidate")
+                # Counted before anything decides whether to keep the bundle: an
+                # abstention still fetched its pages, and dropping the count with
+                # the bundle would make the cheapest-looking runs the ones that
+                # found nothing.
+                outcome["requests"][source_id] = (
+                    outcome["requests"].get(source_id, 0) + bundle.requests
+                )
+                if not bundle.sources:
+                    # An abstention, not a verification. A provider with nothing
+                    # to say returns an empty bundle (a corpus row without a
+                    # citation, say), and counting it as a bundle used to carry
+                    # the candidate to the identity stage to die there on "no
+                    # evidence-backed identity" — an internal-sounding error in
+                    # place of the true one, which is that no source could vouch
+                    # for this company.
+                    outcome["abstained"].append(source_id)
+                    continue
+                outcome["bundles"].append((source_id, bundle))
+            except Exception as exc:
+                outcome["errors"].append((source_id, str(exc)[:240]))
+        return outcome
+
+    def _verify_batch(
+        self,
+        batch: list[CandidateRecord],
+        query: DiscoveryQuery,
+        source_ids: list[str],
+        providers: dict,
+        reusable: dict,
+        pool: ThreadPoolExecutor | None,
+    ) -> list[tuple[CandidateRecord, dict]]:
+        """Verify a batch concurrently, returned in candidate order.
+
+        Order is restored deliberately. Concurrency must not reach the parts of
+        a run that have to be reproducible: results are rebuilt in a stable
+        order, and identity resolution reads before it writes, so two candidates
+        resolving to one company have to arrive one after the other.
+        """
+        if pool is None or len(batch) == 1:
+            return [
+                (candidate, self._collect_bundles(
+                    candidate, query, source_ids, providers, reusable,
+                ))
+                for candidate in batch
+            ]
+        futures = [
+            pool.submit(
+                self._collect_bundles, candidate, query, source_ids, providers, reusable,
+            )
+            for candidate in batch
+        ]
+        outcomes: list[tuple[CandidateRecord, dict]] = []
+        for candidate, future in zip(batch, futures):
+            try:
+                outcomes.append((candidate, future.result()))
+            except Exception as exc:
+                # `_collect_bundles` handles a provider raising, so reaching here
+                # is a fault in our own code. One candidate must not take the
+                # batch down with it.
+                outcomes.append((candidate, {
+                    "bundles": [], "reused": [], "abstained": [], "requests": {},
+                    "errors": [(source_ids[0] if source_ids else "unknown", str(exc)[:240])],
+                }))
+        return outcomes
+
     def _is_registry(self, source_id: str) -> bool:
         """Whether this source publishes with authority of its own.
 
@@ -790,6 +915,12 @@ class LeadResearchService:
             ),
         )
 
+        verify_pool = (
+            ThreadPoolExecutor(
+                max_workers=self.verify_workers, thread_name_prefix="lead-verify",
+            )
+            if self.verify_workers > 1 else None
+        )
         repo = EvidenceRepository(self.db, company_id)
         resolver = IdentityResolver(self.db, company_id)
         eligibility = EligibilityService()
@@ -879,263 +1010,243 @@ class LeadResearchService:
                     buyer_types=config.buyer_types,
                     max_records=config.max_qualified_leads_per_country * 3,
                 )
-                for candidate in candidates:
+                available_source_ids = [
+                    source_id for source_id in config.enabled_source_ids
+                    if partitions[(source_id, country)]["available"]
+                ]
+                # Verified in bounded batches rather than one candidate at a
+                # time: three fetches at a 45-second timeout, serially, made a
+                # 150-candidate market ~450 sequential round trips. Each batch
+                # is fetched concurrently and then consumed in candidate order,
+                # so every database write — identity resolution above all —
+                # still happens on this one thread, in a deterministic order.
+                for start in range(0, len(candidates), self.verify_workers):
+                    batch = candidates[start:start + self.verify_workers]
                     if self._cancellation_requested(company_id, campaign_id):
-                        # Before verification, so a cancel stops spending on the
-                        # next candidate rather than the one after it.
+                        # Checked per batch, so a cancel costs at most the batch
+                        # already in flight instead of the whole market.
                         cancelled = True
                         break
-                    bundles: list[tuple[str, Any]] = []
-                    verification_messages: list[str] = []
-                    available_source_ids: list[str] = []
-                    abstained: list[str] = []
-                    for source_id in config.enabled_source_ids:
-                        partition = partitions[(source_id, country)]
-                        if not partition["available"]:
-                            continue
-                        available_source_ids.append(source_id)
-                        cached = reusable.get((source_id, candidate.source_record_id))
-                        if cached is not None:
-                            # Already paid for and still inside this source's
-                            # freshness window. Same provenance and hashes, so
-                            # the same claims and the same verdict — the only
-                            # difference is that no request is made.
-                            bundles.append((source_id, cached))
-                            partition["verified"] += 1
-                            partition["reused"] = partition.get("reused", 0) + 1
-                            partition["evidence"] += len(cached.sources)
-                            reused_bundles += 1
-                            continue
-                        try:
-                            bundle = providers[source_id].verify(query, candidate)
-                            if bundle.candidate_source_record_id != candidate.source_record_id:
-                                raise ValueError("verifier returned evidence for a different candidate")
-                            # Counted before anything decides whether to keep
-                            # the bundle: an abstention still fetched its pages,
-                            # and dropping the count with the bundle would make
-                            # the cheapest-looking runs the ones that found
-                            # nothing.
-                            provider_requests += bundle.requests
-                            partition["requests"] = (
-                                partition.get("requests", 0) + bundle.requests
-                            )
-                            if not bundle.sources:
-                                # An abstention, not a verification. A provider
-                                # with nothing to say returns an empty bundle
-                                # (a corpus row without a citation, say), and
-                                # counting it as a bundle used to carry the
-                                # candidate to the identity stage to die there
-                                # on "no evidence-backed identity" — an
-                                # internal-sounding error in place of the true
-                                # one, which is that no source could vouch for
-                                # this company.
-                                abstained.append(source_id)
-                                continue
-                            bundles.append((source_id, bundle))
+                    outcomes = self._verify_batch(
+                        batch, query, available_source_ids, providers, reusable, verify_pool,
+                    )
+                    for candidate, outcome in outcomes:
+                        bundles: list[tuple[str, Any]] = list(outcome["bundles"])
+                        verification_messages: list[str] = []
+                        abstained: list[str] = list(outcome["abstained"])
+                        reused_sources = set(outcome["reused"])
+                        for source_id, bundle in bundles:
+                            partition = partitions[(source_id, country)]
                             partition["verified"] += 1
                             partition["evidence"] += len(bundle.sources)
-                        except Exception as exc:
-                            message = str(exc)[:240]
+                            if source_id in reused_sources:
+                                partition["reused"] = partition.get("reused", 0) + 1
+                                reused_bundles += 1
+                        for source_id, spent in outcome["requests"].items():
+                            partition = partitions[(source_id, country)]
+                            partition["requests"] = partition.get("requests", 0) + spent
+                            provider_requests += spent
+                        for source_id, message in outcome["errors"]:
                             verification_messages.append(message)
-                            partition["errors"].append({
+                            partitions[(source_id, country)]["errors"].append({
                                 "candidate_source_record_id": candidate.source_record_id,
                                 "stage": "verification",
                                 "message": message,
                             })
-                    if not bundles:
-                        self._try_save_processing_issue(
-                            company_id, campaign_id, None, "candidate_processing_failed",
-                            {
-                                "candidate_source_record_id": candidate.source_record_id,
-                                "stage": "verification",
-                                "messages": verification_messages or [
-                                    f"no evidence from {', '.join(abstained)}"
-                                    if abstained else "no verifier was available"
-                                ],
-                            },
-                        )
-                        continue
-
-                    # A source match says the company exists and is roughly
-                    # right. It does not say whether it is worth contacting, and
-                    # the sector playbook knows what else to look for — so ask
-                    # again, aimed at what is still unknown, before scoring.
-                    if (config.enrichment.research_each_lead
-                            and enriched < config.enrichment.max_companies):
-                        extra, still_missing, enrichment_requests = self._enrich_candidate(
-                            config, query, candidate, providers, available_source_ids, bundles,
-                        )
-                        provider_requests += enrichment_requests
-                        if extra:
-                            enriched += 1
-                            bundles.extend(extra)
-                            for source_id, bundle in extra:
-                                partition = partitions[(source_id, country)]
-                                partition["enriched"] = partition.get("enriched", 0) + 1
-                                partition["evidence"] += len(bundle.sources)
-                        if still_missing:
-                            unresolved_gaps.update(still_missing)
-
-                    organization_id: str | None = None
-                    evaluated_verdict = None
-                    stage = "evidence"
-                    try:
-                        stage = "evidence"
-                        prepared_evidence = [
-                            stored
-                            for source_id, bundle in bundles
-                            for stored in repo.prepare_verification(
-                                bundle, source_id, repo.query_fingerprint(query),
-                            )
-                        ]
-                        stage = "claims"
-                        claim_plan = self._claim_plan(prepared_evidence)
-                        stage = "identity"
-                        identity_payload = self._identity_payload(prepared_evidence)
-                        if not identity_payload:
-                            raise RuntimeError("verification returned no evidence-backed identity")
-                        resolved = resolver.resolve(
-                            identity_payload,
-                            bundles[0][0],
-                            matching_hints={
-                                "display_name": candidate.company_name,
-                                "domain": candidate.domain,
-                                "country": candidate.country,
-                            },
-                        )
-                        organization_id = resolved["organization_id"]
-                        metrics["resolved_organizations"] += 1
-                        stage = "evidence"
-                        repo.save_verification(prepared_evidence, campaign_id, organization_id)
-                        stage = "claims"
-                        claims = self._save_claim_plan(
-                            company_id, campaign_id, organization_id, claim_plan
-                        )
-                        stage = "eligibility"
-                        # Coverage is computed here rather than at the verdict
-                        # stage because the eligibility policy asks about it:
-                        # `require_official_domain` and
-                        # `minimum_independent_sources` are gates, and a gate
-                        # cannot read a value produced two stages later.
-                        official_domains = {
-                            _domain(source.provenance_url)
-                            for _, bundle in bundles for source in bundle.sources
-                            if source.classification == "official" and _domain(source.provenance_url)
-                        }
-                        independent_domains = {
-                            _domain(source.provenance_url)
-                            for _, bundle in bundles for source in bundle.sources
-                            if source.classification == "independent" and _domain(source.provenance_url)
-                        }
-                        # Standing is a property of the publisher, declared in
-                        # the catalog, so it is read per source rather than per
-                        # page. A registry domain is also whatever its pages
-                        # classified as — these sets deliberately overlap.
-                        registry_domains = {
-                            _domain(source.provenance_url)
-                            for source_id, bundle in bundles for source in bundle.sources
-                            if self._is_registry(source_id) and _domain(source.provenance_url)
-                        }
-                        payload = self._candidate_payload(candidate, config)
-                        # The corpus row is a starting guess about the role; the
-                        # claims are what a source actually observed. Gating on
-                        # the row alone rejected every company in a corpus that
-                        # carries no buyer_types — which is most of them, since
-                        # a contact list does not state one.
-                        candidate_for_gate = {
-                            **payload,
-                            "buyer_types": list(dict.fromkeys([
-                                *(payload.get("buyer_types") or []),
-                                *_claimed_values(claims, "buyer_role"),
-                            ])),
-                            "organization_id": organization_id,
-                            "official_domains": sorted(official_domains),
-                            "independent_domain_count": len(independent_domains),
-                            "lifecycle_status": next(
-                                iter(_claimed_values(claims, self.LIFECYCLE_FIELD)), None
-                            ),
-                        }
-                        gate = eligibility.evaluate(candidate_for_gate, config)
-                        if gate.eligible:
-                            metrics["eligible_companies"] += 1
-                        else:
+                        if not bundles:
                             self._try_save_processing_issue(
-                                company_id, campaign_id, organization_id,
-                                "eligibility_failed", {"reasons": gate.reasons},
+                                company_id, campaign_id, None, "candidate_processing_failed",
+                                {
+                                    "candidate_source_record_id": candidate.source_record_id,
+                                    "stage": "verification",
+                                    "messages": verification_messages or [
+                                        f"no evidence from {', '.join(abstained)}"
+                                        if abstained else "no verifier was available"
+                                    ],
+                                },
                             )
-                        stage = "scoring"
-                        score = score_lead(
-                            candidate_for_gate, claims, config.scoring, attainable,
-                        )
-                        stage = "verdict"
-                        evaluated_verdict = evaluate_verdict(
-                            candidate, claims, score, gate,
-                            SourceCoverage(
-                                official_domains, independent_domains, registry_domains
-                            ),
-                        )
-                        stage = "result"
-                        source_ids = list(dict.fromkeys(source_id for source_id, _ in bundles))
-                        result_data = ResearchResultData(
-                            reasons=evaluated_verdict.reasons,
-                            missing_evidence=evaluated_verdict.missing_evidence,
-                            conflicting_claims=evaluated_verdict.conflicting_claims,
-                            source_ids=source_ids,
-                            official_domains=sorted(official_domains),
-                            independent_domains=sorted(independent_domains),
-                            score_dimensions=score.dimensions,
-                            confidence_factors=score.confidence_factors,
-                        ).model_dump(mode="json")
-                        previous = prior_results.get(organization_id)
-                        result_identity = {
-                            "result_id": previous["id"] if previous else None,
-                            "created_at": previous["created_at"] if previous else None,
-                        }
-                        repo.upsert_result(
-                            campaign_id=campaign_id,
-                            organization_id=organization_id,
-                            lead_id=None,
-                            verdict=evaluated_verdict.kind,
-                            fit_score=score.fit_score,
-                            evidence_confidence=score.evidence_confidence,
-                            data=result_data,
-                            **result_identity,
-                        )
-                        if evaluated_verdict.kind in {"strong_fit", "review"}:
-                            stage = "lead"
-                            lead_id = self._upsert_lead(
-                                company_id, campaign_id, organization_id, config,
-                                score, gate, evaluated_verdict, source_ids,
-                                sorted(official_domains | independent_domains), claims,
+                            continue
+
+                        # A source match says the company exists and is roughly
+                        # right. It does not say whether it is worth contacting, and
+                        # the sector playbook knows what else to look for — so ask
+                        # again, aimed at what is still unknown, before scoring.
+                        if (config.enrichment.research_each_lead
+                                and enriched < config.enrichment.max_companies):
+                            extra, still_missing, enrichment_requests = self._enrich_candidate(
+                                config, query, candidate, providers, available_source_ids, bundles,
                             )
-                            metrics["qualified_leads"] += 1
+                            provider_requests += enrichment_requests
+                            if extra:
+                                enriched += 1
+                                bundles.extend(extra)
+                                for source_id, bundle in extra:
+                                    partition = partitions[(source_id, country)]
+                                    partition["enriched"] = partition.get("enriched", 0) + 1
+                                    partition["evidence"] += len(bundle.sources)
+                            if still_missing:
+                                unresolved_gaps.update(still_missing)
+
+                        organization_id: str | None = None
+                        evaluated_verdict = None
+                        stage = "evidence"
+                        try:
+                            stage = "evidence"
+                            prepared_evidence = [
+                                stored
+                                for source_id, bundle in bundles
+                                for stored in repo.prepare_verification(
+                                    bundle, source_id, repo.query_fingerprint(query),
+                                )
+                            ]
+                            stage = "claims"
+                            claim_plan = self._claim_plan(prepared_evidence)
+                            stage = "identity"
+                            identity_payload = self._identity_payload(prepared_evidence)
+                            if not identity_payload:
+                                raise RuntimeError("verification returned no evidence-backed identity")
+                            resolved = resolver.resolve(
+                                identity_payload,
+                                bundles[0][0],
+                                matching_hints={
+                                    "display_name": candidate.company_name,
+                                    "domain": candidate.domain,
+                                    "country": candidate.country,
+                                },
+                            )
+                            organization_id = resolved["organization_id"]
+                            metrics["resolved_organizations"] += 1
+                            stage = "evidence"
+                            repo.save_verification(prepared_evidence, campaign_id, organization_id)
+                            stage = "claims"
+                            claims = self._save_claim_plan(
+                                company_id, campaign_id, organization_id, claim_plan
+                            )
+                            stage = "eligibility"
+                            # Coverage is computed here rather than at the verdict
+                            # stage because the eligibility policy asks about it:
+                            # `require_official_domain` and
+                            # `minimum_independent_sources` are gates, and a gate
+                            # cannot read a value produced two stages later.
+                            official_domains = {
+                                _domain(source.provenance_url)
+                                for _, bundle in bundles for source in bundle.sources
+                                if source.classification == "official" and _domain(source.provenance_url)
+                            }
+                            independent_domains = {
+                                _domain(source.provenance_url)
+                                for _, bundle in bundles for source in bundle.sources
+                                if source.classification == "independent" and _domain(source.provenance_url)
+                            }
+                            # Standing is a property of the publisher, declared in
+                            # the catalog, so it is read per source rather than per
+                            # page. A registry domain is also whatever its pages
+                            # classified as — these sets deliberately overlap.
+                            registry_domains = {
+                                _domain(source.provenance_url)
+                                for source_id, bundle in bundles for source in bundle.sources
+                                if self._is_registry(source_id) and _domain(source.provenance_url)
+                            }
+                            payload = self._candidate_payload(candidate, config)
+                            # The corpus row is a starting guess about the role; the
+                            # claims are what a source actually observed. Gating on
+                            # the row alone rejected every company in a corpus that
+                            # carries no buyer_types — which is most of them, since
+                            # a contact list does not state one.
+                            candidate_for_gate = {
+                                **payload,
+                                "buyer_types": list(dict.fromkeys([
+                                    *(payload.get("buyer_types") or []),
+                                    *_claimed_values(claims, "buyer_role"),
+                                ])),
+                                "organization_id": organization_id,
+                                "official_domains": sorted(official_domains),
+                                "independent_domain_count": len(independent_domains),
+                                "lifecycle_status": next(
+                                    iter(_claimed_values(claims, self.LIFECYCLE_FIELD)), None
+                                ),
+                            }
+                            gate = eligibility.evaluate(candidate_for_gate, config)
+                            if gate.eligible:
+                                metrics["eligible_companies"] += 1
+                            else:
+                                self._try_save_processing_issue(
+                                    company_id, campaign_id, organization_id,
+                                    "eligibility_failed", {"reasons": gate.reasons},
+                                )
+                            stage = "scoring"
+                            score = score_lead(
+                                candidate_for_gate, claims, config.scoring, attainable,
+                            )
+                            stage = "verdict"
+                            evaluated_verdict = evaluate_verdict(
+                                candidate, claims, score, gate,
+                                SourceCoverage(
+                                    official_domains, independent_domains, registry_domains
+                                ),
+                            )
                             stage = "result"
+                            source_ids = list(dict.fromkeys(source_id for source_id, _ in bundles))
+                            result_data = ResearchResultData(
+                                reasons=evaluated_verdict.reasons,
+                                missing_evidence=evaluated_verdict.missing_evidence,
+                                conflicting_claims=evaluated_verdict.conflicting_claims,
+                                source_ids=source_ids,
+                                official_domains=sorted(official_domains),
+                                independent_domains=sorted(independent_domains),
+                                score_dimensions=score.dimensions,
+                                confidence_factors=score.confidence_factors,
+                            ).model_dump(mode="json")
+                            previous = prior_results.get(organization_id)
+                            result_identity = {
+                                "result_id": previous["id"] if previous else None,
+                                "created_at": previous["created_at"] if previous else None,
+                            }
                             repo.upsert_result(
                                 campaign_id=campaign_id,
                                 organization_id=organization_id,
-                                lead_id=lead_id,
+                                lead_id=None,
                                 verdict=evaluated_verdict.kind,
                                 fit_score=score.fit_score,
                                 evidence_confidence=score.evidence_confidence,
                                 data=result_data,
                                 **result_identity,
                             )
-                        for source_id, _ in bundles:
-                            partitions[(source_id, country)]["completed"] += 1
-                    except Exception as exc:
-                        diagnostic = {
-                            "candidate_source_record_id": candidate.source_record_id,
-                            "stage": stage,
-                            "message": str(exc)[:240],
-                        }
-                        if evaluated_verdict is not None:
-                            diagnostic["evaluated_verdict"] = evaluated_verdict.kind
-                        for source_id, _ in bundles:
-                            partitions[(source_id, country)]["errors"].append(diagnostic)
-                        self._try_save_processing_issue(
-                            company_id, campaign_id, organization_id,
-                            "candidate_processing_failed", diagnostic,
-                        )
+                            if evaluated_verdict.kind in {"strong_fit", "review"}:
+                                stage = "lead"
+                                lead_id = self._upsert_lead(
+                                    company_id, campaign_id, organization_id, config,
+                                    score, gate, evaluated_verdict, source_ids,
+                                    sorted(official_domains | independent_domains), claims,
+                                )
+                                metrics["qualified_leads"] += 1
+                                stage = "result"
+                                repo.upsert_result(
+                                    campaign_id=campaign_id,
+                                    organization_id=organization_id,
+                                    lead_id=lead_id,
+                                    verdict=evaluated_verdict.kind,
+                                    fit_score=score.fit_score,
+                                    evidence_confidence=score.evidence_confidence,
+                                    data=result_data,
+                                    **result_identity,
+                                )
+                            for source_id, _ in bundles:
+                                partitions[(source_id, country)]["completed"] += 1
+                        except Exception as exc:
+                            diagnostic = {
+                                "candidate_source_record_id": candidate.source_record_id,
+                                "stage": stage,
+                                "message": str(exc)[:240],
+                            }
+                            if evaluated_verdict is not None:
+                                diagnostic["evaluated_verdict"] = evaluated_verdict.kind
+                            for source_id, _ in bundles:
+                                partitions[(source_id, country)]["errors"].append(diagnostic)
+                            self._try_save_processing_issue(
+                                company_id, campaign_id, organization_id,
+                                "candidate_processing_failed", diagnostic,
+                            )
         except Exception as exc:
             processing_error = {
                 "stage": "campaign_processing",
@@ -1150,6 +1261,11 @@ class LeadResearchService:
                 company_id, campaign_id, None,
                 "campaign_processing_failed", processing_error,
             )
+        finally:
+            # Before the metrics write, and on every path out including a
+            # cancellation: a leaked pool holds threads for the process's life.
+            if verify_pool is not None:
+                verify_pool.shutdown(wait=True)
 
         # Outside FUNNEL_KEYS with excluded_closed:
         # enrichment adds evidence to records already counted, it never moves

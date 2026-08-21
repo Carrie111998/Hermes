@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
@@ -25,6 +26,9 @@ from .base import CatalogProvider
 
 
 UNLOCKER_ENDPOINT = "https://api.brightdata.com/request"
+# Retried once, matching the TED adapter: these say "not now", not "not here".
+RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+RETRY_PAUSE_SECONDS = 2.0
 MAX_SEARCH_PAGES = 3
 MAX_RESULTS_PER_PAGE = 5
 MAX_TERM_LENGTH = 80
@@ -192,20 +196,40 @@ class BrightDataVerifier(CatalogProvider):
     def health(self) -> ProviderHealth:
         return ProviderHealth(status="active", message="Candidate verifier is configured")
 
-    def _fetch_markdown(self, url: str) -> str:
-        response = self.client.post(
-            UNLOCKER_ENDPOINT,
-            headers={"Authorization": f"Bearer {self._api_key}"},
-            json={
-                "url": url,
-                "zone": self.zone,
-                "format": "raw",
-                "data_format": "markdown",
-            },
-            timeout=45.0,
-        )
+    def _fetch_markdown(self, url: str) -> tuple[str, int]:
+        """Fetch one page, and report how many requests that took.
+
+        Retries once on the failures that are about the moment rather than the
+        page — rate limiting and the upstream's own 5xx. Without it a single 429
+        in a batch lost the whole candidate, and a candidate is the unit a
+        campaign reports on, so one transient refusal read as "no source could
+        vouch for this company".
+
+        The attempt count is returned rather than assumed to be one: every
+        attempt is a billable request, and metering that guessed would
+        understate spend exactly when a run was struggling.
+        """
+        attempts = 0
+        for attempt in (0, 1):
+            response = self.client.post(
+                UNLOCKER_ENDPOINT,
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                json={
+                    "url": url,
+                    "zone": self.zone,
+                    "format": "raw",
+                    "data_format": "markdown",
+                },
+                timeout=45.0,
+            )
+            attempts += 1
+            if response.status_code in RETRY_STATUSES and attempt == 0:
+                time.sleep(RETRY_PAUSE_SECONDS)
+                continue
+            response.raise_for_status()
+            return response.text, attempts
         response.raise_for_status()
-        return response.text
+        return response.text, attempts
 
     def _search_urls(
         self,
@@ -256,8 +280,8 @@ class BrightDataVerifier(CatalogProvider):
 
         if candidate_domain:
             official_url = f"https://{candidate_domain}"
-            markdown = self._fetch_markdown(official_url)
-            requests += 1
+            markdown, spent = self._fetch_markdown(official_url)
+            requests += spent
             if markdown.strip():
                 sources.append(self._source(
                     official_url,
@@ -271,8 +295,8 @@ class BrightDataVerifier(CatalogProvider):
                 seen_urls.add(official_url)
 
         for search_url in self._search_urls(query, candidate, buyer_terms, product_terms):
-            markdown = self._fetch_markdown(search_url)
-            requests += 1
+            markdown, spent = self._fetch_markdown(search_url)
+            requests += spent
             digest = hashlib.sha256(markdown.encode()).hexdigest()
             matches = list(MARKDOWN_LINK.finditer(markdown))
             for index, match in enumerate(matches[:MAX_RESULTS_PER_PAGE]):

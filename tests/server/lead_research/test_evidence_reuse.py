@@ -151,7 +151,10 @@ def test_a_rerun_does_not_re_verify_what_it_already_holds(harness):
     calls_after_first = list(verifier.calls)
     second = service.run("cmp_1", "camp_1")
 
-    assert calls_after_first == ["buyer-de-1", "buyer-de-2"]
+    # Sorted: candidates in a batch are verified concurrently, so the order
+    # they reach a provider in is not a contract. Which ones, and how many
+    # times, is.
+    assert sorted(calls_after_first) == ["buyer-de-1", "buyer-de-2"]
     assert verifier.calls == calls_after_first, "the rerun re-fetched pages it already had"
     assert second["metrics"]["reused_bundles"] == 2
     assert first["metrics"]["reused_bundles"] == 0
@@ -189,7 +192,7 @@ def test_a_second_campaign_reuses_the_first_campaign_evidence(harness):
     service.run("cmp_1", "camp_1")
     service.run("cmp_1", "camp_2")
 
-    assert verifier.calls == ["buyer-de-1", "buyer-de-2"]
+    assert sorted(verifier.calls) == ["buyer-de-1", "buyer-de-2"]
 
 
 def test_reuse_is_reported_per_partition(harness):
@@ -228,8 +231,8 @@ def test_changing_the_campaign_terms_re_verifies(harness):
     service.run("cmp_1", "camp_1")
     service.run("cmp_1", "camp_2")
 
-    assert verifier.calls == [
-        "buyer-de-1", "buyer-de-2", "buyer-de-1", "buyer-de-2",
+    assert sorted(verifier.calls) == [
+        "buyer-de-1", "buyer-de-1", "buyer-de-2", "buyer-de-2",
     ], "a campaign asking a different question reused the old answer"
 
 

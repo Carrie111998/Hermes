@@ -8,9 +8,12 @@ stop kept spending until the corpus ran out.
 """
 from __future__ import annotations
 
+import json
 import threading
 
 import pytest
+
+from server.lead_research.candidates import CandidateRepository
 
 from server.lead_research.registry import ProviderRegistry
 from server.lead_research.service import LeadResearchService
@@ -43,13 +46,36 @@ class BlockingVerifier:
         return self.provider.verify(query, candidate)
 
 
-def _blocking_client():
+def _blocking_client(*, verify_workers=1, extra_candidates=0):
+    """A campaign whose verifier stalls, so an in-flight run can be inspected.
+
+    `verify_workers` defaults to 1 here so most of these tests read against
+    strictly serial verification. Batching is what the cancellation test is
+    about, and it sets its own.
+    """
     app, client, headers, company_id = make_research_client()
     definition = fixture_definition()
     verifier = BlockingVerifier(deterministic_provider(definition))
     app.state.lead_research = LeadResearchService(
-        app.state.db, registry=ProviderRegistry([definition], {definition.source_id: verifier})
+        app.state.db,
+        registry=ProviderRegistry([definition], {definition.source_id: verifier}),
+        verify_workers=verify_workers,
     )
+    if extra_candidates:
+        CandidateRepository(app.state.db).import_file(
+            "extra-buyers", "1", "candidates.jsonl",
+            b"\n".join(
+                json.dumps({
+                    "source_record_id": f"extra-de-{index}",
+                    "company_name": f"Extra {index} DE",
+                    "country": "DE",
+                    "domain": f"https://extra{index}.example.test",
+                    "categories": ["household-appliances"],
+                    "buyer_types": ["distributor"],
+                }).encode()
+                for index in range(extra_candidates)
+            ),
+        )
     body = campaign_body()
     body["target_countries"] = ["DE"]
     campaign = client.post("/api/v1/research-campaigns", headers=headers, json=body).json()
@@ -95,8 +121,17 @@ def test_a_second_start_while_in_flight_is_refused():
     app.state.lead_research.wait_until_settled(campaign["company_id"], campaign["id"])
 
 
-def test_cancelling_stops_before_the_next_candidate_is_verified():
-    app, client, headers, _, campaign, verifier = _blocking_client()
+def test_cancelling_stops_the_batches_that_have_not_started():
+    """What a cancel guarantees now that candidates are verified in batches.
+
+    Work already dispatched finishes — a fetch in flight cannot be unsent — but
+    nothing new starts. The cost of a cancel is therefore bounded by one batch
+    rather than by the whole market, which is the trade concurrency buys: it used
+    to be bounded by one candidate.
+    """
+    app, client, headers, _, campaign, verifier = _blocking_client(
+        verify_workers=2, extra_candidates=6,
+    )
     client.post(f"/api/v1/research-campaigns/{campaign['id']}/start", headers=headers)
     assert verifier.entered.wait(10), "campaign never reached the worker"
 
@@ -110,8 +145,9 @@ def test_cancelling_stops_before_the_next_candidate_is_verified():
     )
 
     assert settled is not None and settled["status"] == "cancelled"
-    # Two candidates exist in DE; the second was never paid for.
-    assert verifier.seen == ["buyer-de-1"]
+    # Eight candidates in DE, two per batch: only the batch already in flight
+    # was paid for.
+    assert len(verifier.seen) == 2, verifier.seen
     assert app.state.db.one(
         "SELECT status FROM research_campaigns WHERE id=?", (campaign["id"],)
     )["status"] == "cancelled"

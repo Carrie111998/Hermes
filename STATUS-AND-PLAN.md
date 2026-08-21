@@ -865,6 +865,59 @@ actually stores, including the new per-partition reuse and request counts.
 Verified by reverting: three tests fail without it. 504 server tests and six
 WebUI suites pass.
 
+### C3. Candidates are verified concurrently; everything else stays serial
+
+Three fetches per candidate at a 45-second timeout, one candidate at a time,
+made a 150-candidate market roughly 450 sequential round trips. That was the
+dominant wall-clock cost in the system.
+
+**Concurrency is confined to the network.** `_collect_bundles` is the only thing
+that runs on a worker thread, and it deliberately touches nothing shared: it
+returns pure data, and the caller applies every partition counter and every
+write on the campaign's own thread. So all database work stays single-threaded,
+and identity resolution — which reads before it writes, so two candidates
+resolving to one company must arrive one after the other — is untouched.
+
+Candidates are fetched in batches of `verify_workers` (default 4) and then
+consumed **in candidate order**. Order is restored deliberately: a run rebuilds
+its results from scratch, so their creation order decides which row identities a
+refresh preserves. `verify_workers=1` restores strictly serial behaviour, and a
+test pins that a concurrent run and a serial one reach identical results.
+
+**A per-source cap, because concurrency would otherwise have broken TED.** TED
+answers 429 readily enough that its adapter already carries a backoff; four
+workers hitting it at once converts a working free source into a failing one. So
+`max_concurrency` is declared per source in the provider catalog — a property of
+the upstream, not of our appetite — and enforced by a semaphore shared across
+campaigns, since the limit protects the upstream rather than any one run. TED
+declares 1; a web unlocker is sold for concurrent use and declares 4. A test
+proves a capped source is never entered twice at once *and* that it does not
+serialise the uncapped source behind it.
+
+**Bright Data now retries once**, on the statuses that are about the moment
+rather than the page — 429 and the upstream's own 5xx, matching what the TED
+adapter already did. A single 429 used to lose the whole candidate, and a
+candidate is the unit a campaign reports on, so one transient refusal read as
+"no source could vouch for this company". A 404 is not retried: that is about
+the page. `_fetch_markdown` returns its attempt count rather than assuming one,
+because every attempt is billable and metering that guessed would understate
+spend exactly when a run was struggling.
+
+**The trade this buys, stated plainly: a cancel is now bounded by one batch
+rather than one candidate.** Work already dispatched finishes — a fetch in
+flight cannot be unsent — so up to `verify_workers` candidates continue after a
+cancel instead of one. That is at most a batch's worth of requests against a
+market's worth, and the test says so in its name.
+
+Also fixed: several tests asserted an ordered list of the candidates a provider
+had been asked about. Order is no longer a contract, so those now compare
+sorted — a latent flake removed rather than discovered later.
+
+Verified by reverting: forcing verification serial deadlocks the two barrier
+tests, which is the point of using barriers rather than timing observations.
+515 server tests pass, four consecutive full runs with no flake, plus six WebUI
+suites.
+
 ## Carried-over risks
 
 - **Postgres paths stay under-tested.** `tests/server/` builds `Settings` with

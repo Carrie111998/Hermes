@@ -304,3 +304,56 @@ def test_the_tenant_rollup_keeps_requests_and_model_spend_apart(harness, tmp_pat
     assert row["provider_requests_metered"] is True
     # Model spend is still not measured, and still says so rather than claiming 0.
     assert row["metering_enabled"] is False
+
+
+# ── retry, and what it costs ──────────────────────────────────────────────────
+
+def _unlocker_responses(responses: list[httpx.Response]) -> BrightDataVerifier:
+    remaining = list(responses)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return remaining.pop(0) if remaining else httpx.Response(200, text="nothing")
+
+    return BrightDataVerifier(
+        "key", "zone", client=httpx.Client(transport=httpx.MockTransport(handler))
+    )
+
+
+def test_a_rate_limited_page_is_retried_once(monkeypatch):
+    """One 429 used to lose the whole candidate.
+
+    A candidate is the unit a campaign reports on, so a single transient refusal
+    read as "no source could vouch for this company".
+    """
+    monkeypatch.setattr("server.lead_research.providers.bright_data.time.sleep", lambda _s: None)
+    body = "Atlas Handel is a distributor of household-appliances in DE."
+    verifier = _unlocker_responses([
+        httpx.Response(429),
+        httpx.Response(200, text=body),
+        httpx.Response(200, text=body),
+        httpx.Response(200, text=body),
+        httpx.Response(200, text=body),
+    ])
+
+    bundle = verifier.verify(_query(), _candidate())
+
+    assert bundle.sources, "the retry did not recover the candidate"
+    # Five HTTP calls for four pages: the retry is itself a billable request.
+    assert bundle.requests == 5
+
+
+def test_a_page_that_is_simply_missing_is_not_retried(monkeypatch):
+    """404 is about the page, not the moment. Retrying it buys nothing."""
+    monkeypatch.setattr("server.lead_research.providers.bright_data.time.sleep", lambda _s: None)
+    verifier = _unlocker_responses([httpx.Response(404)])
+
+    with pytest.raises(httpx.HTTPStatusError):
+        verifier.verify(_query(), _candidate())
+
+
+def test_a_persistent_failure_still_raises_after_its_retry(monkeypatch):
+    monkeypatch.setattr("server.lead_research.providers.bright_data.time.sleep", lambda _s: None)
+    verifier = _unlocker_responses([httpx.Response(503), httpx.Response(503)])
+
+    with pytest.raises(httpx.HTTPStatusError):
+        verifier.verify(_query(), _candidate())

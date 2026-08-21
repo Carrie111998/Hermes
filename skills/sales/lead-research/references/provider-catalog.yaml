@@ -45,6 +45,10 @@
   # about the company's size, footprint or trade volume, and nothing here
   # pretends otherwise.
   emits: [company_name, country, domain, buyer_role, product_term]
+  # One at a time: TED answers 429 readily enough that the adapter carries a
+  # backoff for it, and verifying candidates concurrently against it would
+  # convert a working free source into a failing one.
+  max_concurrency: 1
   countries: []
   sector_ids: []
   freshness_days: 7

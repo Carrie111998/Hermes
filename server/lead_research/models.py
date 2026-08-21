@@ -37,6 +37,12 @@ class DatasetDefinition(ApiModel):
     # against a lead's completeness, and this is what makes that knowable.
     # Empty means undeclared, which is treated as "no information", not "none".
     emits: list[str] = Field(default_factory=list)
+    # How many candidates may be verified against this source at once. Declared
+    # per source because it is a property of the upstream, not of our appetite:
+    # TED rate-limits hard enough that its adapter already carries a 429
+    # backoff, so verifying it concurrently would turn a working source into a
+    # failing one. A web unlocker is sold for concurrent use.
+    max_concurrency: int = Field(default=4, ge=1)
     countries: list[str] = Field(default_factory=list)
     sector_ids: list[str] = Field(default_factory=list)
     freshness_days: int = Field(default=180, ge=1)
