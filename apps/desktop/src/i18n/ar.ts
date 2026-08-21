@@ -2433,6 +2433,7 @@ export const ar = defineLocale({
       moreActions: 'إجراءات إضافية',
       branchNewChat: 'تفريع إلى محادثة جديدة',
       react: 'تفاعل',
+      quoteInNewMessage: 'اقتباس في رسالة جديدة',
       dismissError: 'تجاهل الخطأ',
       filesChanged: count => `${count} ملفات تم تغييرها`,
       reviewChanges: 'مراجعة',
