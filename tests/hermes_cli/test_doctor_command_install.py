@@ -149,7 +149,7 @@ class TestDoctorCommandInstallation:
         assert "Command Installation" in out
         assert "$PREFIX/bin" in out
 
-    @pytest.mark.skipif(sys.platform != "win32", reason="Windows command install tests")
+    @pytest.mark.windows_only
     def test_windows_command_install_fix_and_verify(self, monkeypatch, tmp_path):
         home = tmp_path / ".hermes"
         home.mkdir(parents=True, exist_ok=True)

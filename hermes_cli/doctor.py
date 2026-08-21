@@ -2003,9 +2003,10 @@ def run_doctor(args):
             if _norm_bin in _path_dirs:
                 check_ok("Launcher directory is on PATH")
             else:
+                _ps_hint = f"[Environment]::SetEnvironmentVariable('Path', $env:Path + ';{_bin_dir}', 'User')"
                 check_warn(
                     f"Launcher directory not on PATH: {_bin_dir}",
-                    "(run in PowerShell: [Environment]::SetEnvironmentVariable('Path', $env:Path + ';" + str(_bin_dir).replace('\\', '\\\\') + "', 'User'))"
+                    f"(run in PowerShell: {_ps_hint})"
                 )
                 manual_issues.append(f"Add {_bin_dir} to your User PATH")
 
