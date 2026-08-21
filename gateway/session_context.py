@@ -141,6 +141,17 @@ _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_P
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
 
+# Scheduler-owned attestation.  These are deliberately separate from the
+# ordinary session identity: an execution UUID/classification is a claim about
+# how a cron turn was admitted, not about who sent a message.  They are bridged
+# to child processes only by tools/environments/local.py; no process-global
+# mirror is ever written.
+_CRON_EXECUTION_ID: ContextVar = ContextVar("HERMES_CRON_EXECUTION_ID", default=_UNSET)
+_CRON_INVOCATION_KIND: ContextVar = ContextVar("HERMES_CRON_INVOCATION_KIND", default=_UNSET)
+_CRON_ATTESTATION_TOKEN: ContextVar = ContextVar(
+    "HERMES_CRON_ATTESTATION_TOKEN", default=_UNSET
+)
+
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
     "HERMES_SESSION_SOURCE": _SESSION_SOURCE,
@@ -163,7 +174,35 @@ _VAR_MAP = {
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
+    "HERMES_CRON_EXECUTION_ID": _CRON_EXECUTION_ID,
+    "HERMES_CRON_INVOCATION_KIND": _CRON_INVOCATION_KIND,
+    "HERMES_CRON_ATTESTATION_TOKEN": _CRON_ATTESTATION_TOKEN,
 }
+
+
+def bind_cron_execution_context(
+    execution_id: str,
+    invocation_kind: str,
+    attestation_token: str | None = None,
+) -> tuple:
+    """Bind scheduler attestation values and return ContextVar reset tokens."""
+    return (
+        _CRON_EXECUTION_ID.set(str(execution_id or "")),
+        _CRON_INVOCATION_KIND.set(str(invocation_kind or "UNKNOWN")),
+        _CRON_ATTESTATION_TOKEN.set(
+            str(attestation_token) if attestation_token else _UNSET
+        ),
+    )
+
+
+def reset_cron_execution_context(tokens: tuple) -> None:
+    """Restore the prior attestation context, including on cancellation."""
+    if not tokens:
+        return
+    if len(tokens) >= 3:
+        _CRON_ATTESTATION_TOKEN.reset(tokens[2])
+    _CRON_INVOCATION_KIND.reset(tokens[1])
+    _CRON_EXECUTION_ID.reset(tokens[0])
 
 
 def set_current_session_id(session_id: str) -> None:
@@ -327,6 +366,9 @@ def clear_session_vars(tokens: list) -> None:
         _BROWSER_CONTROL_PRINCIPAL,
         _BROWSER_CONTROL_TRANSPORT_FAMILY,
         _CRON_SESSION,
+        _CRON_EXECUTION_ID,
+        _CRON_INVOCATION_KIND,
+        _CRON_ATTESTATION_TOKEN,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a

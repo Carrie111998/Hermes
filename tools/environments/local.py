@@ -461,6 +461,15 @@ def _inject_session_context_env(env: dict) -> None:
         if value is not _UNSET:
             # Explicitly bound (including "") — authoritative for this task.
             env[var_name] = "" if value is None else str(value)
+        elif var_name in {
+            "HERMES_CRON_EXECUTION_ID",
+            "HERMES_CRON_INVOCATION_KIND",
+            "HERMES_CRON_ATTESTATION_TOKEN",
+        }:
+            # Scheduler attestation is never inherited from a caller's
+            # process environment.  A user-supplied value must not be able to
+            # manufacture provenance for an interactive/manual subprocess.
+            env.pop(var_name, None)
         elif _engaged:
             # Unset for THIS task while a concurrent host is engaged: drop any
             # inherited global so a sibling session's value can't leak in.
@@ -731,6 +740,11 @@ def build_subprocess_env(
         apply_subprocess_home_env(env)
     if extra:
         env.update(extra)
+    # Attestation is task-local even on the intentional no-scrub path.  Apply
+    # it after caller extras so an interactive caller cannot fabricate a cron
+    # execution identity, while a bound scheduler turn still reaches its
+    # child process.
+    _inject_session_context_env(env)
     return env
 
 
