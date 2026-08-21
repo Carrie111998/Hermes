@@ -20,9 +20,28 @@ from typing import Any, Callable, Optional
 
 from agent.i18n import t
 
+_KANBAN_BOARD_ROTATION = 0
+
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+
+def _rotate_boards_for_dispatch(boards: list[dict]) -> list[dict]:
+    """Rotate stable board order so the shared host cap is distributed."""
+    if len(boards) <= 1:
+        return boards
+    global _KANBAN_BOARD_ROTATION
+    _KANBAN_BOARD_ROTATION = (_KANBAN_BOARD_ROTATION + 1) % len(boards)
+    offset = _KANBAN_BOARD_ROTATION
+    return boards[offset:] + boards[:offset]
+
+
+def _dispatch_skip_counts(result: object) -> tuple[int, int]:
+    """Return nonspawnable and unassigned skip counts for tick telemetry."""
+    nonspawnable = getattr(result, "skipped_nonspawnable", None) or []
+    unassigned = getattr(result, "skipped_unassigned", None) or []
+    return len(nonspawnable), len(unassigned)
 
 
 def _resolve_auto_decompose_settings(
@@ -1530,6 +1549,7 @@ class GatewayKanbanWatchersMixin:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            boards = _rotate_boards_for_dispatch(boards)
             out: list[tuple[str, "Optional[object]"]] = []
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
@@ -1708,20 +1728,32 @@ class GatewayKanbanWatchersMixin:
                     results = await asyncio.to_thread(_tick_once)
                     any_spawned = False
                     for slug, res in (results or []):
-                        if res is not None and getattr(res, "spawned", None):
-                            any_spawned = True
+                        if res is not None:
+                            skipped_nonspawnable, skipped_unassigned = (
+                                _dispatch_skip_counts(res)
+                            )
+                            spawned = getattr(res, "spawned", None) or []
+                            if spawned:
+                                any_spawned = True
+                            if not (spawned or skipped_nonspawnable or skipped_unassigned):
+                                continue
                             # Quiet by default — only log when something actually
-                            # happened, so an idle gateway stays silent.
+                            # happened or a task was deliberately skipped, so an
+                            # entirely idle gateway stays silent while skip
+                            # telemetry remains visible.
                             logger.info(
                                 "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-                                "crashed=%d timed_out=%d promoted=%d auto_blocked=%d",
+                                "crashed=%d timed_out=%d promoted=%d auto_blocked=%d "
+                                "skipped_nonspawnable=%d skipped_unassigned=%d",
                                 slug,
-                                len(res.spawned),
+                                len(spawned),
                                 res.reclaimed,
                                 len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
                                 len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
                                 res.promoted,
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
+                                skipped_nonspawnable,
+                                skipped_unassigned,
                             )
                     # Health telemetry (aggregate across boards)
                     ready_pending = await asyncio.to_thread(_ready_nonempty)

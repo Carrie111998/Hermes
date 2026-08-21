@@ -736,6 +736,7 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     assert cmd.index("--accept-hooks") < cmd.index("chat"), (
         f"--accept-hooks must come before 'chat' in argv: {cmd}"
     )
+    assert "-Q" in cmd, f"every kanban worker must use the exit contract: {cmd}"
     # Assignee + task env are still present
     assert "some-profile" in cmd
     env = captured["env"]
@@ -1193,7 +1194,6 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
 
 
 
-
 # ---------------------------------------------------------------------------
 # Recovery helpers (reclaim + reassign)
 # ---------------------------------------------------------------------------
@@ -1406,5 +1406,4 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
 
