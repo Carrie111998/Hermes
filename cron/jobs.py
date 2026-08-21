@@ -3193,14 +3193,12 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             # External/manual runs own fire_claim rather than the built-in
             # ticker's run_claim. run_one_job heartbeats fire_claim every
             # minute, so a fresh lease is durable proof that another process
-            # is still executing this one-shot. Honor it before evaluating the
-            # finite dispatch limit; otherwise a sibling scheduler can delete
-            # the record after claim_dispatch() increments repeat.completed.
+            # is still executing this job. Honor it for every schedule kind:
+            # recurring jobs can become due again while a long external run is
+            # still active, and one-shots can otherwise be deleted after
+            # claim_dispatch() increments repeat.completed.
             external_claim = job.get("fire_claim")
-            if (
-                external_claim
-                and job.get("schedule", {}).get("kind") == "once"
-            ):
+            if external_claim:
                 try:
                     claimed_at = _ensure_aware(
                         datetime.fromisoformat(external_claim["at"])
