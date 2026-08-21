@@ -116,7 +116,12 @@ export function setAppearance(appearance: Appearance): void {
 
 /** The resolved state for the painted appearance — the shape every consumer reads. */
 export const $translucency = computed([$translucencyBook, $appearance], (book, appearance) =>
-  resolveTranslucency(book, appearance, GLASS_IS_WINDOWS)
+  // The third argument selects the DEFAULTS table (windows vs mac), so it must
+  // be the platform family, not GLASS_IS_WINDOWS: on Windows 10 glass is
+  // unsupported and that flag is false, which dealt Win10 the macOS defaults
+  // (light intensity 66) — with the mode forced to 'clear' there, that reads
+  // as a ~70%-opaque window.
+  resolveTranslucency(book, appearance, isWindowsPlatform())
 )
 
 /** Write an edit against the appearance being painted. */
