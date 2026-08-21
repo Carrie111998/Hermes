@@ -1,0 +1,3 @@
+Trigger the trusted base-branch workflow for the guarded bot activity transcript patch.
+Rerun after normalizing the VM assertion and adding group-chat regression coverage.
+Rerun against the clean upstream base workflow.
