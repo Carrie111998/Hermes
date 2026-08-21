@@ -102,6 +102,20 @@ class TestDetectToolFailureStructured:
         })
         assert _detect_tool_failure("web_extract", result) == (False, "")
 
+    def test_null_error_field_with_json_whitespace_not_flagged(self):
+        result = '{"results":[{"error": \n\t null,"content":"short page"}]}'
+        assert _detect_tool_failure("web_extract", result) == (False, "")
+
+    def test_other_structured_failure_markers_keep_legacy_fallback(self):
+        results = (
+            '{"results":[{"error":"timeout"}]}',
+            '{"error":null,"results":[{"error":"timeout"}]}',
+            '{"failed":1}',
+            '{"failed":0}',
+        )
+        for result in results:
+            assert _detect_tool_failure("web_extract", result) == (True, " [error]")
+
     def test_unstructured_error_text_still_flagged(self):
         assert _detect_tool_failure("web_extract", 'request {"error"} occurred') == (
             True,

@@ -1312,6 +1312,7 @@ class KawaiiSpinner:
 # =========================================================================
 
 _ERROR_SUFFIX_MAX_LEN = 48
+_NULL_ERROR_FIELD_RE = re.compile(r'"error"\s*:\s*null\b', re.IGNORECASE)
 
 
 def _trim_error(msg: str) -> str:
@@ -1370,17 +1371,16 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
         if err and (data.get("success") is False or "error" in data):
             return True, f" [{_trim_error(str(err))}]"
 
-    # A successfully parsed structured result has already been classified
-    # above. Do not let field names such as `"error": null` override it.
-    if isinstance(data, (dict, list)):
-        return False, ""
-
     # Generic heuristic for non-terminal tools
     # Multimodal tool results (dicts with _multimodal=True) are not strings —
     # treat them as successes since failures would be JSON-encoded strings.
     if not isinstance(result, str):
         return False, ""
     lower = result[:500].lower()
+    if isinstance(data, (dict, list)):
+        # Ignore only the parsed success shape from #91166. Keep the legacy
+        # fallback for every other error/failed key and value.
+        lower = _NULL_ERROR_FIELD_RE.sub("", lower)
     if '"error"' in lower or '"failed"' in lower or result.startswith("Error"):
         return True, " [error]"
 
