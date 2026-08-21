@@ -16,6 +16,7 @@ import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { H2 } from "@nous-research/ui/ui/components/typography/h2";
 import { api } from "@/lib/api";
 import type { WebhookRoute, WebhooksResponse } from "@/lib/api";
+import { copyTextToClipboard } from "@/lib/clipboard";
 import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
 import { useConfirmDelete } from "@nous-research/ui/hooks/use-confirm-delete";
@@ -37,13 +38,11 @@ function CopyButton({ value }: { value: string }) {
   const { t } = useI18n();
   const [copied, setCopied] = useState(false);
   const handleCopy = useCallback(() => {
-    navigator.clipboard
-      .writeText(value)
-      .then(() => {
+    void copyTextToClipboard(value).then((copied) => {
+      if (!copied) return;
         setCopied(true);
         window.setTimeout(() => setCopied(false), 1500);
-      })
-      .catch(() => {});
+    });
   }, [value]);
   return (
     <Button

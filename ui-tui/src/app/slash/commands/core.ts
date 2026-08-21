@@ -244,7 +244,7 @@ export const coreCommands: SlashCommand[] = [
         )
       }
 
-      if (NO_CONFIRM_DESTRUCTIVE) {
+      if (NO_CONFIRM_DESTRUCTIVE || !ctx.ui.destructiveSlashConfirm) {
         return commit()
       }
 

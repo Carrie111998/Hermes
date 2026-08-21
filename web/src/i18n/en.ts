@@ -120,7 +120,17 @@ export const en: Translations = {
     managingProfile: 'Managing profile',
     currentProfileOption: 'this dashboard ({name})',
     managingProfileBanner:
-      'Managing profile \u201c{name}\u201d \u2014 config, keys, skills, MCPs, model, and new chats apply to that profile.'
+      'Managing profile \u201c{name}\u201d \u2014 config, keys, skills, MCPs, model, and new chats apply to that profile.',
+    memoryOomRestartBanner:
+      'Your agent restarted unexpectedly, most likely because it ran out of memory. Long sessions and many concurrent tasks increase memory use.',
+    memoryCriticalBanner:
+      'Your agent is almost out of memory and may restart. Consider closing idle sessions or upgrading its memory.',
+    memoryElevatedBanner: 'Your agent is running low on memory.',
+    diskCriticalBanner:
+      "Your agent's disk is almost full. New messages, memories, and settings may fail to save.",
+    diskElevatedBanner:
+      "Your agent's disk is filling up. Consider clearing old sessions or expanding its storage.",
+    dismiss: 'Dismiss'
   },
 
   chatSidebar: {
@@ -164,7 +174,11 @@ export const en: Translations = {
     websocketUnavailable: 'Chat websocket unavailable on this server.',
     websocketUnavailableReason: 'Chat websocket unavailable: {reason}.',
     localClientRefused: "Refused: your client isn't permitted (server bound to localhost only).",
-    localClientRefusedReason: 'Refused: {reason}.'
+    localClientRefusedReason: 'Refused: {reason}.',
+    showSidePanelTitle: 'Show side panel (model + sessions)',
+    showSidePanelAria: 'Show chat side panel',
+    collapseSidePanelTitle: 'Collapse side panel',
+    collapseSidePanelAria: 'Collapse chat side panel'
   },
 
   modelPicker: {
@@ -308,6 +322,7 @@ export const en: Translations = {
     exportFailed: 'Failed to export session',
     invalidPruneDays: 'Enter a valid number of days',
     pruned: 'Pruned {count} session(s)',
+    pruneSkippedOpen: 'Skipped {count} open session(s); prune only removes ended sessions.',
     pruneFailed: 'Failed to prune sessions',
     pruneDescription:
       'Permanently remove archived sessions whose last activity is older than the given number of days. Active sessions are never pruned.',
@@ -686,6 +701,9 @@ export const en: Translations = {
     repeatForever: 'forever',
     repeatTimes: '{count} times',
     fallbackJobTitle: 'Cron job',
+    continuityDescription:
+      "continuity: each run sees the previous run's output (dedupe, pick up where it left off)",
+    missedScheduledFire: 'missed scheduled fire ({time}):',
     views: {
       jobs: 'Jobs',
       blueprints: 'Blueprints'
@@ -2231,6 +2249,10 @@ export const en: Translations = {
     confirmArchive: 'Archive this task? It disappears from the default board view.',
     confirmBlocked: "Mark this task as blocked? The worker's claim is released.",
     confirmScheduled: 'Move this task to Scheduled? Use this for known time delays rather than human blockers.',
+    confirmDoneMany:
+      "Mark {n} tasks as done? The workers' claims are released and dependent children become ready.",
+    confirmArchiveMany: 'Archive {n} tasks? They disappear from the default board view.',
+    confirmBlockedMany: "Mark {n} tasks as blocked? The workers' claims are released.",
     completionSummary: 'Completion summary for {label}. This is stored as the task result.',
     completionSummaryThisTask: 'this task',
     completionSummarySelectedTasks: '{count} selected task(s)',
@@ -2296,6 +2318,8 @@ export const en: Translations = {
     trash: {
       confirm: 'Permanently delete this task? This cannot be undone.',
       confirmMany: 'Permanently delete {n} selected tasks? This cannot be undone.',
+      confirmTitle: 'Delete task?',
+      confirmManyTitle: 'Delete {n} tasks?',
       dropHint: 'Drop to delete'
     },
     hints: {

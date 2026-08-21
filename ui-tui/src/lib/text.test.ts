@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
-import { formatAbandonedClarify, stripTrailingPasteNewlines } from './text.js'
+import {
+  clarifyBatchRevisitState,
+  formatAbandonedClarify,
+  formatAbandonedClarifyBatch,
+  stripTrailingPasteNewlines
+} from './text.js'
 
 describe('stripTrailingPasteNewlines', () => {
   it('removes trailing newline runs from pasted text', () => {
@@ -55,5 +60,59 @@ describe('formatAbandonedClarify', () => {
     const out = formatAbandonedClarify('范围？', ['A'], 'timedOut', 'zh')
 
     expect(out).toBe(['询问：范围？', '  1. A', '  （已超时，未选择）'].join('\n'))
+  })
+})
+
+describe('formatAbandonedClarifyBatch', () => {
+  it('shows locked answers and marks unanswered questions', () => {
+    const out = formatAbandonedClarifyBatch(
+      [
+        { qid: 'q0', question: 'One?' },
+        { qid: 'q1', question: 'Two?' }
+      ],
+      { q0: 'alpha' },
+      'timedOut'
+    )
+
+    expect(out).toBe(['ask (2 questions)', '  ✓ One? → alpha', '  · Two? (no answer)', '  (timed out)'].join('\n'))
+  })
+
+  it('treats an empty locked answer as unanswered in the record', () => {
+    const out = formatAbandonedClarifyBatch([{ qid: 'q0', question: 'One?' }], { q0: '' }, 'cancelled')
+
+    expect(out).toContain('· One? (no answer)')
+  })
+
+  it('localizes framework-owned batch chrome without translating dynamic content', () => {
+    const out = formatAbandonedClarifyBatch(
+      [
+        { qid: 'q0', question: '范围？' },
+        { qid: 'q1', question: '模式？' }
+      ],
+      { q0: 'A' },
+      'timedOut',
+      'zh'
+    )
+
+    expect(out).toBe(['询问（2 个问题）', '  ✓ 范围？ → A', '  · 模式？（未回答）', '  （已超时）'].join('\n'))
+  })
+})
+
+describe('clarifyBatchRevisitState', () => {
+  it('restores the cursor onto a choice answer', () => {
+    expect(clarifyBatchRevisitState(['red', 'blue'], 'blue')).toEqual({ custom: '', sel: 1 })
+  })
+
+  it('stages a typed answer on the Other row for editing', () => {
+    expect(clarifyBatchRevisitState(['red', 'blue'], 'chartreuse')).toEqual({ custom: 'chartreuse', sel: 2 })
+  })
+
+  it('stages a typed answer for an open-ended question (no choices)', () => {
+    expect(clarifyBatchRevisitState([], 'free text')).toEqual({ custom: 'free text', sel: 0 })
+  })
+
+  it('resets cleanly for unanswered and empty answers', () => {
+    expect(clarifyBatchRevisitState(['red'], undefined)).toEqual({ custom: '', sel: 0 })
+    expect(clarifyBatchRevisitState(['red'], '')).toEqual({ custom: '', sel: 0 })
   })
 })

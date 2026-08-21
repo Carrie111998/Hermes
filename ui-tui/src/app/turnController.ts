@@ -267,6 +267,14 @@ class TurnController {
 
   endReasoningPhase() {
     this.reasoningStreamingTimer = clear(this.reasoningStreamingTimer)
+
+    // Seal any open reasoning segment so its isLiveReasoning flag drops the
+    // moment the reasoning phase ends — the panel must stop tracking the
+    // turn's global reasoningActive, not stay "live" for the rest of the turn.
+    if (this.reasoningSegmentIndex !== null) {
+      this.syncReasoningSegment(false)
+    }
+
     patchTurnState({ reasoningActive: false, reasoningStreaming: false })
   }
 
@@ -362,7 +370,7 @@ class TurnController {
     })
   }
 
-  private syncReasoningSegment() {
+  private syncReasoningSegment(live = true) {
     const thinking = this.activeReasoningText.trim()
 
     if (!thinking) {
@@ -375,7 +383,8 @@ class TurnController {
       text: '',
       thinking,
       thinkingTokens: estimateTokensRough(thinking),
-      toolTokens: this.toolTokenAcc || undefined
+      toolTokens: this.toolTokenAcc || undefined,
+      ...(live ? { isLiveReasoning: true } : {})
     }
 
     if (this.reasoningSegmentIndex === null) {
@@ -389,7 +398,7 @@ class TurnController {
   }
 
   private closeReasoningSegment() {
-    this.syncReasoningSegment()
+    this.syncReasoningSegment(false)
     this.activeReasoningText = ''
     this.reasoningSegmentIndex = null
   }

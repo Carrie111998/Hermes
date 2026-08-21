@@ -129,6 +129,12 @@ export interface Translations {
     managingProfile: string
     currentProfileOption: string
     managingProfileBanner: string
+    memoryOomRestartBanner: string
+    memoryCriticalBanner: string
+    memoryElevatedBanner: string
+    diskCriticalBanner: string
+    diskElevatedBanner: string
+    dismiss: string
   }
 
   // ── Chat sidebar ──
@@ -174,6 +180,10 @@ export interface Translations {
     websocketUnavailableReason: string
     localClientRefused: string
     localClientRefusedReason: string
+    showSidePanelTitle: string
+    showSidePanelAria: string
+    collapseSidePanelTitle: string
+    collapseSidePanelAria: string
   }
 
   // ── Model picker dialog ──
@@ -313,6 +323,7 @@ export interface Translations {
     exportFailed: string
     invalidPruneDays: string
     pruned: string
+    pruneSkippedOpen: string
     pruneFailed: string
     pruneDescription: string
     olderThanDays: string
@@ -654,6 +665,8 @@ export interface Translations {
     repeatForever: string
     repeatTimes: string
     fallbackJobTitle: string
+    continuityDescription: string
+    missedScheduledFire: string
     views: {
       jobs: string
       blueprints: string
@@ -1905,6 +1918,9 @@ export interface Translations {
     confirmArchive: string
     confirmBlocked: string
     confirmScheduled: string
+    confirmDoneMany: string
+    confirmArchiveMany: string
+    confirmBlockedMany: string
     completionSummary: string
     completionSummaryThisTask: string
     completionSummarySelectedTasks: string
@@ -1966,6 +1982,8 @@ export interface Translations {
     trash: {
       confirm: string
       confirmMany: string
+      confirmTitle: string
+      confirmManyTitle: string
       dropHint: string
     }
     hints: {

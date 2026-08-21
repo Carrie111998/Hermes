@@ -6,7 +6,7 @@ import {
   VERBOSE_TRAIL_MAX_LINES
 } from '../config/limits.js'
 import { VERBS } from '../content/verbs.js'
-import { TRAIL_PATTERNS, translate, type Locale } from '../i18n/index.js'
+import { type Locale, TRAIL_PATTERNS, translate } from '../i18n/index.js'
 import type { ThinkingMode } from '../types.js'
 
 const ESC = String.fromCharCode(27)
@@ -103,9 +103,7 @@ export const pasteTokenLabel = (text: string, lineCount: number, locale: Locale 
 
   const [head = preview, tail = ''] = preview.split('.. ', 2)
 
-  return tail
-    ? `[[ ${head.trimEnd()}.. [${lineLabel}] .. ${tail.trimStart()} ]]`
-    : `[[ ${preview} [${lineLabel}] ]]`
+  return tail ? `[[ ${head.trimEnd()}.. [${lineLabel}] .. ${tail.trimStart()} ]]` : `[[ ${preview} [${lineLabel}] ]]`
 }
 
 const THINKING_STATUS_RE = new RegExp(`^(?:${VERBS.join('|')})\\.{0,3}$`, 'i')
@@ -178,11 +176,10 @@ const boundedRenderText = (
   const omittedLines = countNewlines(text, start)
   const omittedChars = Math.max(0, text.length - tail.length)
 
-  const label = translate(
-    locale,
-    omittedLines > 0 ? 'liveRender.omittedLines' : 'liveRender.omittedChars',
-    { chars: fmtK(omittedChars), lines: fmtK(omittedLines) }
-  )
+  const label = translate(locale, omittedLines > 0 ? 'liveRender.omittedLines' : 'liveRender.omittedChars', {
+    chars: fmtK(omittedChars),
+    lines: fmtK(omittedLines)
+  })
 
   return `${label}${tail}`
 }
@@ -236,10 +233,14 @@ const verboseToolBlock = (label: string, text: string | undefined, locale: Local
   // budget) so a large tool output can't balloon the Ink render tree and
   // silently OOM-kill the TUI. See VERBOSE_TRAIL_MAX_CHARS (#34095).
   return body
-    ? `${label}:\n${boundedLiveRenderText(body, {
-        maxChars: VERBOSE_TRAIL_MAX_CHARS,
-        maxLines: VERBOSE_TRAIL_MAX_LINES
-      }, locale)}`
+    ? `${label}:\n${boundedLiveRenderText(
+        body,
+        {
+          maxChars: VERBOSE_TRAIL_MAX_CHARS,
+          maxLines: VERBOSE_TRAIL_MAX_LINES
+        },
+        locale
+      )}`
     : ''
 }
 
@@ -400,12 +401,61 @@ export const formatAbandonedClarify = (
 ) => {
   const head = translate(locale, 'clarify.question', { question: question.trim() })
   const opts = (choices ?? []).map((c, i) => `  ${i + 1}. ${c}`)
-  const reasonText = translate(
-    locale,
-    reason === 'cancelled' ? 'clarify.reason.cancelled' : 'clarify.reason.timedOut'
-  )
+  const reasonText = translate(locale, reason === 'cancelled' ? 'clarify.reason.cancelled' : 'clarify.reason.timedOut')
 
   return [head, ...opts, `  ${translate(locale, 'clarify.noSelection', { reason: reasonText })}`].join('\n')
+}
+
+/**
+ * Batch counterpart of `formatAbandonedClarify`: every question on its own
+ * line, answered ones keeping their locked answer (partials survive a
+ * timeout server-side, so the record must show what was actually sent).
+ */
+export const formatAbandonedClarifyBatch = (
+  questions: { qid: string; question: string }[],
+  answers: Record<string, string>,
+  reason: 'cancelled' | 'timedOut',
+  locale: Locale = 'en'
+) => {
+  const lines = questions.map(q => {
+    const answer = answers[q.qid]
+
+    return answer
+      ? `  ${translate(locale, 'clarify.batchAnswered', { question: q.question, answer })}`
+      : `  ${translate(locale, 'clarify.batchUnanswered', { question: q.question })}`
+  })
+
+  const reasonText = translate(locale, reason === 'cancelled' ? 'clarify.reason.cancelled' : 'clarify.reason.timedOut')
+
+  return [
+    translate(locale, 'clarify.batchHeading', { count: questions.length }),
+    ...lines,
+    `  ${translate(locale, 'clarify.batchReason', { reason: reasonText })}`
+  ].join('\n')
+}
+
+/**
+ * Cursor/draft restore for re-visiting an answered batch clarify question
+ * (Tab/Shift-Tab): a choice answer puts the cursor back on its row; an
+ * answer that matches no choice was typed via Other, so the cursor lands on
+ * the Other row (index = choices.length) with the text staged for editing.
+ * Unanswered questions restore to a clean cursor.
+ */
+export const clarifyBatchRevisitState = (
+  choices: readonly string[],
+  answer: string | undefined
+): { custom: string; sel: number } => {
+  if (answer === undefined || answer === '') {
+    return { custom: '', sel: 0 }
+  }
+
+  const choiceIndex = choices.indexOf(answer)
+
+  if (choiceIndex >= 0) {
+    return { custom: '', sel: choiceIndex }
+  }
+
+  return { custom: answer, sel: choices.length > 0 ? choices.length : 0 }
 }
 
 export const flat = (r: Record<string, string[]>) => Object.values(r).flat()

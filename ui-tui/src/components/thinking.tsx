@@ -42,6 +42,7 @@ import type {
 const THINK: BrailleSpinnerName[] = ['helix', 'breathe', 'orbit', 'dna', 'waverows', 'snake', 'pulse']
 const TOOL: BrailleSpinnerName[] = ['cascade', 'scan', 'diagswipe', 'fillsweep', 'rain', 'columns', 'sparkle']
 const DELEGATE_TOOL_LABEL = toolTrailLabel('delegate_task')
+
 const isDelegateToolCall = (label: string) =>
   label === DELEGATE_TOOL_LABEL || label.startsWith(`${DELEGATE_TOOL_LABEL}(`)
 
@@ -638,6 +639,7 @@ export const Thinking = memo(function Thinking({
   t: Theme
 }) {
   const { locale } = useI18n()
+
   const preview = useMemo(() => {
     const raw = thinkingPreview(reasoning, mode, THINKING_COT_MAX)
 
@@ -695,6 +697,7 @@ export const ToolTrail = memo(function ToolTrail({
   commandOverride = false,
   detailsMode = 'collapsed',
   outcome = '',
+  preferExpandedThinking = false,
   reasoningActive = false,
   reasoning = '',
   reasoningAlwaysVisible = false,
@@ -712,6 +715,7 @@ export const ToolTrail = memo(function ToolTrail({
   commandOverride?: boolean
   detailsMode?: DetailsMode
   outcome?: string
+  preferExpandedThinking?: boolean
   reasoningActive?: boolean
   reasoning?: string
   // MoA reference blocks (see Msg.isMoaReference) stay visible even when
@@ -739,6 +743,10 @@ export const ToolTrail = memo(function ToolTrail({
   )
 
   const { locale, t: ti } = useI18n()
+
+  const thinkingDefaultExpanded =
+    visible.thinking === 'expanded' && (preferExpandedThinking || commandOverride || sections?.thinking === 'expanded')
+
   const [now, setNow] = useState(() => Date.now())
   // Local toggles own the open state once mounted.  Init from the resolved
   // section visibility so default-expanded sections (thinking/tools) render
@@ -753,7 +761,7 @@ export const ToolTrail = memo(function ToolTrail({
   // label. This only affects the initial mount value; the re-sync effect
   // below deliberately does NOT re-apply it, so a manual collapse still
   // sticks (see the no-OR-at-effect-time warning above, #14968).
-  const [openThinking, setOpenThinking] = useState(visible.thinking === 'expanded' || reasoningAlwaysVisible)
+  const [openThinking, setOpenThinking] = useState(thinkingDefaultExpanded || reasoningAlwaysVisible)
   const [openTools, setOpenTools] = useState(visible.tools === 'expanded')
   const [openSubagents, setOpenSubagents] = useState(visible.subagents === 'expanded')
   const [deepSubagents, setDeepSubagents] = useState(visible.subagents === 'expanded')
@@ -784,11 +792,25 @@ export const ToolTrail = memo(function ToolTrail({
       return
     }
 
-    setOpenThinking(visible.thinking === 'expanded')
+    setOpenThinking(thinkingDefaultExpanded)
     setOpenTools(visible.tools === 'expanded')
     setOpenSubagents(visible.subagents === 'expanded')
     setOpenMeta(visible.activity === 'expanded')
-  }, [visible])
+  }, [thinkingDefaultExpanded, visible])
+
+  // `collapsed` is an auto preference: keep the panel open while reasoning
+  // is live (stream pulses keep `reasoningActive` true) and collapse it the
+  // moment the reasoning phase ends (`endReasoningPhase` flips it false).
+  // `expanded` stays fully manual, `hidden` never renders content, and MoA
+  // reference panels (reasoningAlwaysVisible) are left alone.
+  const thinkingAuto = visible.thinking === 'collapsed' && !reasoningAlwaysVisible
+  useEffect(() => {
+    if (!thinkingAuto) {
+      return
+    }
+
+    setOpenThinking(reasoningActive)
+  }, [thinkingAuto, reasoningActive])
 
   const cot = useMemo(() => thinkingPreview(reasoning, 'full', THINKING_COT_MAX), [reasoning])
 
@@ -936,6 +958,7 @@ export const ToolTrail = memo(function ToolTrail({
 
   const totalTokensLabel =
     tokenCount > 0 && toolTokenCount > 0 ? ti('tool.totalTokenCount', { count: fmtK(totalTokenCount) }) : null
+
   const delegateGroups = groups.filter(g => g.isDelegate)
   const inlineDelegateKey = hasSubagents && delegateGroups.length === 1 ? delegateGroups[0]!.key : null
 

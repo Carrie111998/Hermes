@@ -118,7 +118,13 @@ export const zh: TranslationOverlay = {
     loadingChat: '正在加载对话…',
     managingProfile: '正在管理配置档案',
     currentProfileOption: '当前管理面板（{name}）',
-    managingProfileBanner: '正在管理配置档案「{name}」：配置、密钥、技能、MCP、模型和新对话都会应用到该档案。'
+    managingProfileBanner: '正在管理配置档案「{name}」：配置、密钥、技能、MCP、模型和新对话都会应用到该档案。',
+    memoryOomRestartBanner: '智能体意外重启，最可能是内存不足。长会话和大量并发任务会增加内存占用。',
+    memoryCriticalBanner: '智能体内存即将耗尽，可能会重启。请考虑关闭空闲会话或增加可用内存。',
+    memoryElevatedBanner: '智能体可用内存偏低。',
+    diskCriticalBanner: '智能体磁盘空间即将耗尽，新消息、记忆和设置可能无法保存。',
+    diskElevatedBanner: '智能体磁盘空间正在减少，请考虑清理旧会话或扩充存储空间。',
+    dismiss: '关闭'
   },
 
   chatSidebar: {
@@ -162,7 +168,11 @@ export const zh: TranslationOverlay = {
     websocketUnavailable: '此服务器未提供对话 WebSocket。',
     websocketUnavailableReason: '对话 WebSocket 不可用：{reason}。',
     localClientRefused: '请求被拒绝：服务器仅允许本机客户端访问。',
-    localClientRefusedReason: '请求被拒绝：{reason}。'
+    localClientRefusedReason: '请求被拒绝：{reason}。',
+    showSidePanelTitle: '显示侧栏（模型和会话）',
+    showSidePanelAria: '显示对话侧栏',
+    collapseSidePanelTitle: '折叠侧栏',
+    collapseSidePanelAria: '折叠对话侧栏'
   },
 
   modelPicker: {
@@ -302,6 +312,7 @@ export const zh: TranslationOverlay = {
     exportFailed: '导出会话失败',
     invalidPruneDays: '请输入有效的天数',
     pruned: '已清理 {count} 个会话',
+    pruneSkippedOpen: '已跳过 {count} 个仍打开的会话；清理操作只会删除已结束的会话。',
     pruneFailed: '清理会话失败',
     pruneDescription: '永久删除最后活动时间早于指定天数的已归档会话；活动会话不会被清理。',
     olderThanDays: '早于（天）',
@@ -658,6 +669,8 @@ export const zh: TranslationOverlay = {
     repeatForever: '永久',
     repeatTimes: '{count} 次',
     fallbackJobTitle: '定时任务',
+    continuityDescription: '连续运行：每次运行都能看到上一次的输出（用于去重或从中断处继续）',
+    missedScheduledFire: '错过计划触发（{time}）：',
     views: {
       jobs: '任务',
       blueprints: '蓝图'
@@ -2072,6 +2085,9 @@ export const zh: TranslationOverlay = {
     confirmArchive: '归档此任务？它将从默认看板视图中消失。',
     confirmBlocked: '将此任务标记为阻塞？工作进程将被释放。',
     confirmScheduled: '将此任务移至「已调度」？适用于已知的时间延迟，而非人工阻塞。',
+    confirmDoneMany: '将 {n} 个任务标记为完成？工作进程将被释放，依赖这些任务的子任务将变为就绪。',
+    confirmArchiveMany: '归档 {n} 个任务？它们将从默认看板视图中消失。',
+    confirmBlockedMany: '将 {n} 个任务标记为阻塞？工作进程将被释放。',
     completionSummary: '{label} 的完成摘要。这将作为任务结果存储。',
     completionSummaryThisTask: '此任务',
     completionSummarySelectedTasks: '选中的 {count} 个任务',
@@ -2134,6 +2150,8 @@ export const zh: TranslationOverlay = {
     trash: {
       confirm: '永久删除此任务？此操作无法撤销。',
       confirmMany: '永久删除选中的 {n} 个任务？此操作无法撤销。',
+      confirmTitle: '删除任务？',
+      confirmManyTitle: '删除 {n} 个任务？',
       dropHint: '拖放到此处删除'
     },
     hints: {

@@ -1,4 +1,8 @@
-import { useCallback, useEffect, useLayoutEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  type CronTriggerController,
+  createCronTriggerController,
+} from "@hermes/shared";
 import { Clock, Pause, Pencil, Play, Trash2, X, Zap } from "lucide-react";
 import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Button } from "@nous-research/ui/ui/components/button";
@@ -142,6 +146,7 @@ function emptyCronJobForm(): CronJobEditorState {
     script: "",
     no_agent: false,
     context_from: "",
+    continuity: false,
     enabled_toolsets: [],
     workdir: "",
     scheduleState: { ...DEFAULT_SCHEDULE_STATE },
@@ -290,6 +295,16 @@ function CronAdvancedFields({
             placeholder={t.cron.workdirPlaceholder}
           />
         </div>
+
+        <label className="flex items-center gap-2 text-xs text-muted-foreground">
+          <input
+            type="checkbox"
+            className="accent-foreground"
+            checked={form.continuity}
+            onChange={(e) => update("continuity", e.target.checked)}
+          />
+          {t.cron.continuityDescription}
+        </label>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div className="grid gap-1">
@@ -520,6 +535,27 @@ const STATUS_TONE: Record<string, "success" | "warning" | "destructive"> = {
 
 export default function CronPage() {
   const [jobs, setJobs] = useState<CronJob[]>([]);
+  const [triggeringJobKeys, setTriggeringJobKeys] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const triggerControllerRef = useRef<CronTriggerController | null>(null);
+
+  useEffect(() => {
+    const controller = createCronTriggerController((key, running) => {
+      if (triggerControllerRef.current !== controller) return;
+      setTriggeringJobKeys((current) => {
+        const next = new Set(current);
+        if (running) next.add(key);
+        else next.delete(key);
+        return next;
+      });
+    });
+    triggerControllerRef.current = controller;
+
+    return () => {
+      triggerControllerRef.current = null;
+    };
+  }, []);
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   const [selectedProfile, setSelectedProfile] = useState("all");
   const [view, setView] = useState<"jobs" | "blueprints">("jobs");
@@ -579,13 +615,38 @@ export default function CronPage() {
     setEditForm(editorFormFromJob(job));
   }, []);
 
-  const loadJobs = useCallback(() => {
+  const selectedProfileRef = useRef(selectedProfile);
+  const jobsRequestGenerationRef = useRef(0);
+  const jobsActiveRef = useRef(false);
+
+  const loadJobs = useCallback((profile: string) => {
+    if (!jobsActiveRef.current || selectedProfileRef.current !== profile) return;
+
+    const generation = ++jobsRequestGenerationRef.current;
+
     api
-      .getCronJobs(selectedProfile)
-      .then(setJobs)
-      .catch(() => showToast(t.common.loading, "error"))
-      .finally(() => setLoading(false));
-  }, [selectedProfile, showToast, t.common.loading]);
+      .getCronJobs(profile)
+      .then((nextJobs) => {
+        if (
+          jobsRequestGenerationRef.current === generation &&
+          selectedProfileRef.current === profile
+        ) setJobs(nextJobs);
+      })
+      .catch(() => {
+        if (
+          jobsRequestGenerationRef.current === generation &&
+          selectedProfileRef.current === profile
+        ) {
+          showToast(t.common.loading, "error");
+        }
+      })
+      .finally(() => {
+        if (
+          jobsRequestGenerationRef.current === generation &&
+          selectedProfileRef.current === profile
+        ) setLoading(false);
+      });
+  }, [showToast, t.common.loading]);
 
   useEffect(() => {
     api
@@ -607,8 +668,15 @@ export default function CronPage() {
   }, []);
 
   useEffect(() => {
-    loadJobs();
-  }, [loadJobs]);
+    jobsActiveRef.current = true;
+    selectedProfileRef.current = selectedProfile;
+    loadJobs(selectedProfile);
+
+    return () => {
+      jobsActiveRef.current = false;
+      jobsRequestGenerationRef.current += 1;
+    };
+  }, [loadJobs, selectedProfile]);
 
   // Load resources from the profile the create/edit form actually targets.
   // Pass "default" explicitly so the global dashboard profile switch cannot
@@ -649,7 +717,7 @@ export default function CronPage() {
       showToast(t.cron.created, "success");
       setCreateForm(emptyCronJobForm());
       setCreateModalOpen(false);
-      loadJobs();
+      loadJobs(selectedProfile);
     } catch (e) {
       showToast(
         format(t.common.messageWithDetail, {
@@ -686,7 +754,7 @@ export default function CronPage() {
       );
       showToast(t.cron.savedChanges, "success");
       setEditJob(null);
-      loadJobs();
+      loadJobs(selectedProfile);
     } catch (e) {
       showToast(
         format(t.common.messageWithDetail, {
@@ -723,7 +791,7 @@ export default function CronPage() {
           "success",
         );
       }
-      loadJobs();
+      loadJobs(selectedProfile);
     } catch (e) {
       showToast(
         format(t.common.messageWithDetail, {
@@ -736,24 +804,49 @@ export default function CronPage() {
   };
 
   const handleTrigger = async (job: CronJob) => {
+    const jobKey = getJobKey(job);
+    const viewProfile = selectedProfile;
+    const controller = triggerControllerRef.current;
+
+    if (!controller) return;
+
     try {
-      await api.triggerCronJob(job.id, getJobProfile(job));
+      // No pre-request toast: the controller's running state already gives
+      // immediate in-progress feedback (disabled + spinning action), and a
+      // success-styled toast before the HTTP response would claim a result
+      // the request has not produced yet. Terminal feedback only.
+      const result = await controller.run(
+        jobKey,
+        () => api.triggerCronJob(job.id, getJobProfile(job)),
+      );
+
+      if (
+        triggerControllerRef.current !== controller ||
+        selectedProfileRef.current !== viewProfile ||
+        !result.started
+      ) return;
+
       showToast(
-        format(t.cron.jobAction, {
+        `${format(t.cron.jobAction, {
           action: t.cron.triggerNow,
           title: truncateText(getJobTitle(job, t.cron.fallbackJobTitle), 30),
-        }),
+        })} ✓`,
         "success",
       );
-      loadJobs();
+      loadJobs(viewProfile);
     } catch (e) {
-      showToast(
-        format(t.common.messageWithDetail, {
-          message: t.status.error,
-          detail: String(e),
-        }),
-        "error",
-      );
+      if (
+        triggerControllerRef.current === controller &&
+        selectedProfileRef.current === viewProfile
+      ) {
+        showToast(
+          format(t.common.messageWithDetail, {
+            message: t.status.error,
+            detail: String(e),
+          }),
+          "error",
+        );
+      }
     }
   };
 
@@ -773,7 +866,7 @@ export default function CronPage() {
             }),
             "success",
           );
-          loadJobs();
+          loadJobs(selectedProfile);
         } catch (e) {
           showToast(
             format(t.common.messageWithDetail, {
@@ -785,7 +878,7 @@ export default function CronPage() {
           throw e;
         }
       },
-      [format, jobs, loadJobs, showToast, t],
+      [format, jobs, loadJobs, selectedProfile, showToast, t],
     ),
   });
 
@@ -837,7 +930,7 @@ export default function CronPage() {
       {view === "blueprints" && (
         <AutomationBlueprints
           profile={selectedProfile === "all" ? "default" : selectedProfile}
-          onCreated={loadJobs}
+          onCreated={() => loadJobs(selectedProfile)}
         />
       )}
 
@@ -1126,6 +1219,14 @@ export default function CronPage() {
                       {t.cron.deliveryLabel} {job.last_delivery_error}
                     </p>
                   )}
+                  {job.last_fire_error?.detail && (
+                    <p className="text-xs text-destructive mt-1">
+                      {format(t.cron.missedScheduledFire, {
+                        time: formatTime(job.last_fire_error.at ?? null),
+                      })}{" "}
+                      {job.last_fire_error.detail}
+                    </p>
+                  )}
                   {job.last_error && (
                     <p className="text-xs text-destructive mt-1">
                       {job.last_error}
@@ -1152,11 +1253,12 @@ export default function CronPage() {
                   <Button
                     ghost
                     size="icon"
+                    disabled={triggeringJobKeys.has(jobKey)}
                     title={t.cron.triggerNow}
                     aria-label={t.cron.triggerNow}
                     onClick={() => handleTrigger(job)}
                   >
-                    <Zap />
+                    {triggeringJobKeys.has(jobKey) ? <Spinner /> : <Zap />}
                   </Button>
 
                   <Button
