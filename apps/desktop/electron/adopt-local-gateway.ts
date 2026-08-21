@@ -20,10 +20,15 @@ export function parseGatewayPidRecord(raw: string): null | { pid: number } {
   }
 
   try {
-    const parsed = JSON.parse(text) as { pid?: unknown }
-    const pid = Number(parsed?.pid)
-    if (Number.isInteger(pid) && pid > 0) {
-      return { pid }
+    const parsed = JSON.parse(text) as { pid?: unknown } | number
+    if (typeof parsed === 'number' && Number.isInteger(parsed) && parsed > 0) {
+      return { pid: parsed }
+    }
+    if (parsed && typeof parsed === 'object') {
+      const pid = Number((parsed as { pid?: unknown }).pid)
+      if (Number.isInteger(pid) && pid > 0) {
+        return { pid }
+      }
     }
   } catch {
     const pid = Number(text)
@@ -58,6 +63,9 @@ export async function tryAdoptExistingLocalGateway(deps: {
 }): Promise<null | string> {
   const record = parseGatewayPidRecord(deps.readPidFile() ?? '')
   const pidLive = Boolean(record && gatewayPidLooksLive(record.pid, deps.pidExists))
+  if (!pidLive) {
+    return null
+  }
 
   for (const baseUrl of deps.baseUrls ?? DEFAULT_LOCAL_GATEWAY_BASE_URLS) {
     const httpReachable = await deps.probeHttp(baseUrl)

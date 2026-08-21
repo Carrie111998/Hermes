@@ -10581,6 +10581,8 @@ async function adoptExistingLocalGatewayIfRunning() {
   let token = ''
   try {
     token = await adoptServedDashboardToken(baseUrl, '', {
+      // Intended attach: this gateway is not our child. childAlive true
+      // disables the foreign-token throw so we can use its served session.
       childAlive: () => true,
       label: 'existing local gateway',
       rememberLog
@@ -10663,11 +10665,6 @@ async function startHermes() {
     return existingConnectionPromise
   }
 
-  const adoptedGateway = await adoptExistingLocalGatewayIfRunning()
-  if (adoptedGateway) {
-    return adoptedGateway
-  }
-
   const connectionAttempt = backendConnectionState.startAttempt()
   const primaryProfile = primaryProfileKey()
 
@@ -10681,6 +10678,25 @@ async function startHermes() {
   let attemptedRemote = primaryBackendIsRemote()
 
   const connectionPromise = (async () => {
+    // Local-only: a live scheduled-task gateway already owns MCP. Attach
+    // instead of spawning a second serve (#91564). Remote boots never adopt.
+    if (!attemptedRemote) {
+      const adoptedGateway = await adoptExistingLocalGatewayIfRunning()
+      if (adoptedGateway) {
+        if (!backendConnectionState.isCurrentAttempt(connectionAttempt)) {
+          throw new Error('Hermes backend start was superseded by a newer connection attempt.')
+        }
+        updateBootProgress({
+          phase: 'backend.ready',
+          message: 'Existing local gateway is ready',
+          progress: 94,
+          running: true,
+          error: null
+        })
+        return adoptedGateway
+      }
+    }
+
     const connectRemote = async remote => {
       // resolveRemote() may take arbitrarily long (settings resolve / ws-ticket
       // mint). If a newer attempt started meanwhile (e.g. the user switched

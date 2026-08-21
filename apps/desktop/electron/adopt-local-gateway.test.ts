@@ -13,6 +13,7 @@ import {
 test('parseGatewayPidRecord reads JSON pid records from gateway.pid', () => {
   assert.deepEqual(parseGatewayPidRecord('{"pid":14504,"kind":"gateway"}'), { pid: 14504 })
   assert.deepEqual(parseGatewayPidRecord('  42  '), { pid: 42 })
+  assert.deepEqual(parseGatewayPidRecord('42'), { pid: 42 })
   assert.equal(parseGatewayPidRecord(''), null)
   assert.equal(parseGatewayPidRecord('{'), null)
   assert.equal(parseGatewayPidRecord('{"pid":"nope"}'), null)
@@ -41,14 +42,19 @@ test('tryAdoptExistingLocalGateway skips spawn when the scheduled gateway is liv
   assert.equal(adopted, 'http://127.0.0.1:8642')
 })
 
-test('tryAdoptExistingLocalGateway falls through to spawn when the pid file is stale', async () => {
+test('tryAdoptExistingLocalGateway does not probe HTTP when the pid is dead', async () => {
+  let probed = 0
   const adopted = await tryAdoptExistingLocalGateway({
     readPidFile: () => '{"pid":14504}',
     pidExists: () => false,
-    probeHttp: async () => true
+    probeHttp: async () => {
+      probed += 1
+      return true
+    }
   })
 
   assert.equal(adopted, null)
+  assert.equal(probed, 0)
 })
 
 test('tryAdoptExistingLocalGateway falls through when HTTP is down even if pid is live', async () => {
