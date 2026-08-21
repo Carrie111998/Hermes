@@ -231,6 +231,7 @@ RUN cd plugins/platforms/photon/sidecar && \
 # empty placeholder — the real README is restored by `COPY . .` below.
 #
 # `uv sync --frozen --no-install-project --extra all --extra messaging --extra otlp`
+#  RUN uv pip install --no-cache-dir google-cloud-pubsub
 # installs the deps reachable through the composite `[all]` extra
 # (handpicked set intended for the production image — excludes `[dev]`),
 # plus gateway messaging adapters that should work in the published image
