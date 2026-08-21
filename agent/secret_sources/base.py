@@ -288,6 +288,10 @@ def run_secret_cli(
 
     * argv list only — never ``shell=True``.  Callers pass user-supplied
       reference strings AFTER a ``--`` option terminator in their argv.
+      (The one deliberate exception is ``agent/command_token_source.py``,
+      which runs the operator's OWN ``key_cmd`` config via ``shell=True``
+      by design — it is the user's own credential helper, not a
+      subprocess-driven secret backend, so the no-shell rule does not apply.)
     * The child gets ``PATH``/``HOME``/locale basics plus only the env
       vars named in ``allow_env`` (auth/session vars) and ``extra_env``
       — never a copy of the full post-dotenv ``os.environ``, which by
