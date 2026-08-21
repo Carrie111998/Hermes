@@ -18,6 +18,8 @@ from unittest.mock import patch, MagicMock
 import pytest
 import yaml
 
+import plugins.memory.honcho.cli as honcho_cli
+
 from hermes_cli import profiles
 from hermes_cli.profiles import (
     normalize_profile_name,
@@ -166,7 +168,7 @@ class TestCreateProfile:
             },
         }))
         monkeypatch.setattr(
-            "plugins.memory.honcho.cli._ensure_peer_exists",
+            honcho_cli, "_ensure_peer_exists",
             lambda host_key=None: True,
         )
 
@@ -189,7 +191,7 @@ class TestCreateProfile:
             },
         }))
         monkeypatch.setattr(
-            "plugins.memory.honcho.cli._ensure_peer_exists",
+            honcho_cli, "_ensure_peer_exists",
             lambda host_key=None, **kwargs: True,
         )
 
@@ -214,7 +216,7 @@ class TestCreateProfile:
             "hosts": {"hermes": {"aiPeer": "shared-assistant"}},
         }))
         monkeypatch.setattr(
-            "plugins.memory.honcho.cli._ensure_peer_exists",
+            honcho_cli, "_ensure_peer_exists",
             lambda host_key=None: True,
         )
 
