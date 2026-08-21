@@ -138,6 +138,7 @@ def test_unacknowledged_interrupt_message_is_requeued_not_dropped():
          patch.object(cli, "_init_agent", return_value=True):
         cli.chat("original")
 
+    assert cli._last_run_result["final_response"] == "turn finished normally"
     # The interrupt fired against the agent...
     assert agent.interrupt_calls == ["urgent new message"]
     # ...the turn result never acknowledged it, so the message must be
