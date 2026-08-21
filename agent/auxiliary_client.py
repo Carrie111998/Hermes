@@ -261,6 +261,10 @@ def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
         # Availability probe: credentials/base_url resolved — that is the
         # answer. Skip the openai import + httpx/SSL construction entirely.
         return _AuxProbeClientStub(api_key=api_key, base_url=base_url)
+    if base_url_host_matches(base_url, "openrouter.ai"):
+        headers = build_or_headers()
+        headers.update(kwargs.get("default_headers") or {})
+        kwargs["default_headers"] = headers
     kwargs = {**_openai_http_client_kwargs(base_url), **kwargs}
     # OpenCode Zen free tier: the keyless placeholder must never reach the
     # wire — the Zen relay serves free models anonymously but 401s any
@@ -6560,9 +6564,7 @@ def resolve_provider_client(
             _clean_base, _dq = _extract_url_query_params(custom_base)
             if _dq:
                 extra["default_query"] = _dq
-            if base_url_host_matches(custom_base, "openrouter.ai"):
-                extra["default_headers"] = build_or_headers()
-            elif base_url_host_matches(custom_base, "api.kimi.com"):
+            if base_url_host_matches(custom_base, "api.kimi.com"):
                 extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
             elif base_url_host_matches(custom_base, "githubcopilot.com"):
                 from hermes_cli.copilot_auth import copilot_request_headers
@@ -6857,9 +6859,7 @@ def resolve_provider_client(
 
         # Provider-specific headers
         headers = {}
-        if base_url_host_matches(base_url, "openrouter.ai"):
-            headers.update(build_or_headers())
-        elif base_url_host_matches(base_url, "api.kimi.com"):
+        if base_url_host_matches(base_url, "api.kimi.com"):
             headers["User-Agent"] = "claude-code/0.1.0"
         elif base_url_host_matches(base_url, "githubcopilot.com"):
             from hermes_cli.copilot_auth import copilot_request_headers
