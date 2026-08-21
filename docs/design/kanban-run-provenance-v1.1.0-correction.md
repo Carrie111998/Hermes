@@ -38,7 +38,7 @@ header. All "comment 573 §N" references resolve to that attachment, not
 to a cross-board CLI lookup.
 
 **Executable evidence:** `verify_adr0007_mechanisms.py` (this directory),
-86/86 checks passing. See §C.
+85/85 checks passing. See §C.
 
 ---
 
@@ -308,13 +308,22 @@ against real SQLite and real git, so the claims above are demonstrated
 rather than asserted:
 
 ```
-python3 verify_adr0007_mechanisms.py     ->  86/86 checks passed
+python3 verify_adr0007_mechanisms.py     ->  85/85 checks passed
 ```
 
-The count rose from 36 to 86 in this revision: the B2 correction added
+The count rose from 36 to 85 in this revision: the B2 correction added
 hostile-input cases against both SQL CHECKs and the Python regexes, and
-B3/N2 and the artifact vocabulary alignment added structural assertions
-about which tables and columns must and must not exist.
+B3/N2 added structural assertions about which columns must and must not
+exist.
+
+**The verifier's SQL is a fixture, not the contract.** Its `CREATE TABLE`
+statements are illustrative scaffolding chosen to exercise the mechanisms
+under test; they carry additional columns that this contract does not
+declare and does not require. Only the columns declared normatively — §2.2
+(`id`, `run_id`, `artifact_path`, `sha256`, `created_at`) plus `sealed`
+(§B) — are part of the contract. An assertion that compared the fixture's
+schema to a hardcoded copy of itself would restate the fixture rather than
+verify the contract, and no such assertion is made.
 
 Proven, in order of the assertions in this document:
 
@@ -330,8 +339,6 @@ Proven, in order of the assertions in this document:
   full-length lowercase hex is still accepted in each case. The Python
   `SHA40`/`SHA256` regexes are run over the same hostile table so the two
   validation layers cannot drift.
-- **v1.0.0 §2.2 specifically:** the executable artifact-table schema matches
-  the complete declared column set, including `artifact_path` and `sha256`.
 - UPDATE and DELETE on the provenance table abort with
   `sqlite3.IntegrityError: run_provenance is append-only`, and the
   record survives the tamper attempt byte-identical (§B).
