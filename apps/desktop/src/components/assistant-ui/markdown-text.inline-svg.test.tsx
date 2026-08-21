@@ -178,6 +178,44 @@ describe('MarkdownTextContent raw SVG', () => {
     expect(container.querySelector('svg#unterminated-quote')).toBeNull()
   })
 
+  it('does not render a root SVG closed from a later blockquote after a blank boundary', async () => {
+    const text = '<svg id="borrowed-root"><path/>\n\n> </svg>'
+    const { container } = renderMarkdown(text)
+
+    await waitFor(() => expect(container.querySelector('blockquote')).not.toBeNull())
+    expect(container.querySelector('svg#borrowed-root')).toBeNull()
+    expect(container.querySelectorAll('blockquote')).toHaveLength(1)
+  })
+
+  it.each([
+    {
+      containerSelector: 'blockquote',
+      id: 'quoted-sibling',
+      label: 'blockquote',
+      sibling: SIMPLE_SVG.replace('raw-inline-svg', 'quoted-sibling')
+        .split('\n')
+        .map(line => `> ${line}`)
+        .join('\n')
+    },
+    {
+      containerSelector: 'li',
+      id: 'list-sibling',
+      label: 'list',
+      sibling: SIMPLE_SVG.replace('raw-inline-svg', 'list-sibling')
+        .split('\n')
+        .map((line, index) => `${index === 0 ? '- ' : '  '}${line}`)
+        .join('\n')
+    }
+  ])('renders a sibling SVG after a root-to-$label block transition', async ({ containerSelector, id, sibling }) => {
+    const text = ['<svg id="abandoned-root"><path/>', '', sibling].join('\n')
+    const { container } = renderMarkdown(text)
+
+    await waitFor(() => expect(container.querySelector(`svg#${id}`)).not.toBeNull())
+    expect(container.querySelector('svg#abandoned-root')).toBeNull()
+    expect(container.querySelector(`svg#${id}`)?.closest(containerSelector)).not.toBeNull()
+    expect(container.querySelectorAll('svg[id]')).toHaveLength(1)
+  })
+
   it('preserves the existing fenced SVG renderer', async () => {
     const { container } = renderMarkdown(`\`\`\`svg\n${SIMPLE_SVG}\n\`\`\``)
 

@@ -306,6 +306,100 @@ describe('fenceRawSvgBlocks', () => {
     ])
   })
 
+  it('does not borrow a root SVG closer from a blockquote after a blank block boundary', () => {
+    const input = '<svg id="borrowed-root"><path/>\n\n> </svg>'
+    const output = fenceRawSvgBlocks(input)
+    const tree = fromMarkdown(output)
+
+    expect(output).toBe(input)
+    expect(tree.children).toMatchObject([
+      {
+        children: [
+          { type: 'html', value: '<svg id="borrowed-root">' },
+          { type: 'html', value: '<path/>' }
+        ],
+        type: 'paragraph'
+      },
+      { children: [{ type: 'html', value: '</svg>' }], type: 'blockquote' }
+    ])
+    expect(valuesOfType(tree, 'code')).toEqual([])
+  })
+
+  it('does not borrow a root SVG closer from a heading after a blank block boundary', () => {
+    const input = '<svg id="heading-borrow"><path/>\n\n# </svg>'
+    const output = fenceRawSvgBlocks(input)
+    const tree = fromMarkdown(output)
+
+    expect(output).toBe(input)
+    expect(tree.children).toMatchObject([
+      {
+        children: [
+          { type: 'html', value: '<svg id="heading-borrow">' },
+          { type: 'html', value: '<path/>' }
+        ],
+        type: 'paragraph'
+      },
+      { children: [{ type: 'html', value: '</svg>' }], depth: 1, type: 'heading' }
+    ])
+    expect(valuesOfType(tree, 'code')).toEqual([])
+  })
+
+  it('preserves a legitimate multiline root SVG across an internal blank line', () => {
+    const svg = '<svg id="blank-line-svg">\n\n  <path d="M0 0h1"/>\n</svg>'
+    const output = fenceRawSvgBlocks(svg)
+
+    expect(output).toBe(`\`\`\`svg\n${svg}\n\`\`\``)
+    expect(fromMarkdown(output).children).toMatchObject([{ lang: 'svg', type: 'code', value: svg }])
+  })
+
+  it.each([
+    {
+      expectedSibling: {
+        children: [{ lang: 'svg', type: 'code', value: '<svg id="quoted-sibling"><circle/></svg>' }],
+        type: 'blockquote'
+      },
+      generated: '> ```svg\n> <svg id="quoted-sibling"><circle/></svg>\n> ```',
+      label: 'blockquote',
+      sibling: '> <svg id="quoted-sibling"><circle/></svg>'
+    },
+    {
+      expectedSibling: {
+        children: [
+          {
+            children: [{ lang: 'svg', type: 'code', value: '<svg id="list-sibling"><circle/></svg>' }],
+            type: 'listItem'
+          }
+        ],
+        type: 'list'
+      },
+      generated: '- ```svg\n  <svg id="list-sibling"><circle/></svg>\n  ```',
+      label: 'list',
+      sibling: '- <svg id="list-sibling"><circle/></svg>'
+    }
+  ])(
+    'reprocesses a sibling root-to-$label transition after a blank boundary',
+    ({ expectedSibling, generated, label, sibling }) => {
+      const input = ['<svg id="abandoned-root"><path/>', '', sibling].join('\n')
+      const output = fenceRawSvgBlocks(input)
+      const tree = fromMarkdown(output)
+
+      expect(output).toBe(['<svg id="abandoned-root"><path/>', '', generated].join('\n'))
+      expect(tree.children).toMatchObject([
+        {
+          children: [
+            { type: 'html', value: '<svg id="abandoned-root">' },
+            { type: 'html', value: '<path/>' }
+          ],
+          type: 'paragraph'
+        },
+        expectedSibling
+      ])
+      expect(valuesOfType(tree, 'code')).toEqual([
+        label === 'blockquote' ? '<svg id="quoted-sibling"><circle/></svg>' : '<svg id="list-sibling"><circle/></svg>'
+      ])
+    }
+  )
+
   it.each([
     ['missing root close', '<svg><circle/></g>'],
     ['malformed root close', '<svg><circle/></svg trailing>'],

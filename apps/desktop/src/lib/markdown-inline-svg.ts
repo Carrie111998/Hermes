@@ -807,11 +807,18 @@ export function fenceRawSvgBlocks(text: string): string {
 
     if (activeSvg && containerLine && containerLine.start > activeSvg.line.start) {
       const physicalLine = text.slice(containerLine.start, containerLine.end)
+      const leavesOpeningContainer = stripFenceContainerPrefix(physicalLine, activeSvg.line.containers, true) === null
 
-      if (stripFenceContainerPrefix(physicalLine, activeSvg.line.containers, true) === null) {
-        // A quote/list container owns only lines that continue its prefix. End
-        // the malformed candidate before interpreting this boundary line so a
-        // valid SVG that starts the outer document is considered from scratch.
+      const entersSeparateBlock =
+        crossesBlankLine(activeSvg.lastTokenEnd, containerLine.start) &&
+        (containerLine.continuationDepth < containerLine.containers.length ||
+          isIsolatedInlineBlock(containerLine.content))
+
+      if (leavesOpeningContainer || entersSeparateBlock) {
+        // A candidate cannot cross the CommonMark boundary that ends its
+        // quote/list or starts a new container/block after a blank line. Clear
+        // it before interpreting this line so the boundary is reprocessed and
+        // can start an independent SVG candidate.
         activeSvg = null
       }
     }
