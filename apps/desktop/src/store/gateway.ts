@@ -1520,7 +1520,12 @@ export function acquireGatewayRequestLease(gateway: HermesGateway, profile: stri
   const key = normKey(profile)
   const secondary =
     [...g.secondaries.values()].find(entry => entry.gateway === gateway && normKey(entry.profile) === key) ?? null
-  const ownsPrimary = !secondary && g.primaryGateway === gateway && g.primaryProfile === key
+  // Shared-primary commands may bind a logical profile that differs from the
+  // primary's physical route. Snapshot the physical owner so a later re-home
+  // cannot let this lease reconnect or retry on the wrong backend.
+  const primaryOwnerProfile = g.primaryProfile
+  const primaryOwnerConnectionId = g.primaryConnectionId
+  const ownsPrimary = !secondary && g.primaryGateway === gateway
 
   if (!secondary && !ownsPrimary) {
     throw new Error('Hermes source gateway unavailable')
@@ -1535,7 +1540,9 @@ export function acquireGatewayRequestLease(gateway: HermesGateway, profile: stri
     !released &&
     (secondary
       ? secondary.wantOpen && g.secondaries.get(secondary.scope) === secondary && secondary.gateway === gateway
-      : g.primaryGateway === gateway && g.primaryProfile === key)
+      : g.primaryGateway === gateway &&
+        g.primaryProfile === primaryOwnerProfile &&
+        g.primaryConnectionId === primaryOwnerConnectionId)
 
   const recover = async (): Promise<boolean> => {
     if (!stillRegistered()) {

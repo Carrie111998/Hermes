@@ -100,6 +100,7 @@ const DEFAULT_HEARTBEAT_DEADLINE_MS = 45_000
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000
 
 export class JsonRpcGatewayClient {
+  private cancelConnect: ((error: Error) => void) | null = null
   private nextId = 0
   private pending = new Map<GatewayRequestId, PendingCall>()
   private socket: WebSocketLike | null = null
@@ -214,6 +215,7 @@ export class JsonRpcGatewayClient {
     await new Promise<void>((resolve, reject) => {
       let settled = false
       let timer: ReturnType<typeof setTimeout> | undefined
+      let cancelConnect: (error: Error) => void = () => undefined
 
       const cleanup = () => {
         if (timer !== undefined) {
@@ -222,7 +224,29 @@ export class JsonRpcGatewayClient {
 
         socket.removeEventListener('open', onOpen)
         socket.removeEventListener('error', onError)
+
+        if (this.cancelConnect === cancelConnect) {
+          this.cancelConnect = null
+        }
       }
+
+      const rejectConnect = (error: Error, state?: ConnectionState) => {
+        if (settled) {
+          return
+        }
+
+        settled = true
+        cleanup()
+
+        if (state) {
+          this.setState(state)
+        }
+
+        reject(error)
+      }
+
+      cancelConnect = error => rejectConnect(error)
+      this.cancelConnect = cancelConnect
 
       const onOpen = () => {
         if (settled || this.socket !== socket) {
@@ -244,10 +268,7 @@ export class JsonRpcGatewayClient {
           return
         }
 
-        settled = true
-        cleanup()
-        this.setState('error')
-        reject(new Error(this.options.connectErrorMessage))
+        rejectConnect(new Error(this.options.connectErrorMessage), 'error')
       }
 
       socket.addEventListener('open', onOpen, { once: true })
@@ -259,23 +280,22 @@ export class JsonRpcGatewayClient {
             return
           }
 
-          settled = true
-          cleanup()
-
-          // Drop the half-open socket so the next connect() starts clean
-          // instead of short-circuiting on a zombie 'connecting' state.
-          if (this.socket === socket) {
-            try {
-              socket.close()
-            } catch {
-              // ignore
-            }
-
-            this.socket = null
-            this.setState('error')
+          if (this.socket !== socket) {
+            rejectConnect(new Error(this.options.closedErrorMessage))
+            return
           }
 
-          reject(new Error(this.options.connectErrorMessage))
+          // Invalidate the attempt before closing: a synchronous close event
+          // must not race this timeout into a second state transition.
+          this.socket = null
+
+          try {
+            socket.close()
+          } catch {
+            // ignore
+          }
+
+          rejectConnect(new Error(this.options.connectErrorMessage), 'error')
         }, this.options.connectTimeoutMs)
       }
     })
@@ -288,11 +308,16 @@ export class JsonRpcGatewayClient {
       return
     }
 
+    // Invalidate all socket listeners and settle a pending connect immediately.
+    // A later timeout from the old attempt must not overwrite a newer socket's
+    // open state when callers reuse this client after a soft switch.
+    this.socket = null
+
     try {
       socket.close()
     } finally {
-      this.socket = null
       this.stopHeartbeat()
+      this.cancelConnect?.(new Error(this.options.closedErrorMessage))
       this.setState('closed')
       this.rejectAllPending(new Error(this.options.closedErrorMessage))
     }
