@@ -132,3 +132,58 @@ def test_hermes_subprocess_env_strips_webhook_secret_even_with_credentials(monke
     assert "HERMES_WEBHOOK_SECRET_SELFTEST" not in hermes_subprocess_env(
         inherit_credentials=False
     )
+
+
+# ---------------------------------------------------------------------------
+# Secrets referenced under a name no static rule knows.
+#
+# Route secrets are operator-chosen: ``secret: ${WEBHOOK_HMAC}`` is as valid as
+# the conventional ``${HERMES_WEBHOOK_SECRET_X}``. Such a name matches neither
+# the prefix rule above nor the substring KEY/SECRET/TOKEN filter used by
+# code_execution_tool.py, so without registration it would reach subprocesses.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def clean_secret_registry():
+    """Keep the append-only registry from leaking between tests."""
+    from tools.environments import local as _local
+
+    before = set(_local._RESOLVED_SECRET_ENV_NAMES)
+    yield
+    _local._RESOLVED_SECRET_ENV_NAMES.clear()
+    _local._RESOLVED_SECRET_ENV_NAMES.update(before)
+
+
+def test_unregistered_unconventional_name_is_not_stripped(clean_secret_registry):
+    from tools.environments.local import _is_hermes_internal_secret
+
+    # Baseline: without registration the name is ordinary, and the test below
+    # would pass vacuously if this were not true.
+    assert not _is_hermes_internal_secret("WEBHOOK_HMAC")
+
+
+def test_registered_unconventional_name_is_stripped(monkeypatch, clean_secret_registry):
+    from tools.environments.local import (
+        _is_hermes_internal_secret,
+        hermes_subprocess_env,
+        register_resolved_secret_env_name,
+    )
+
+    monkeypatch.setenv("WEBHOOK_HMAC", "sentinel-value")
+    register_resolved_secret_env_name("WEBHOOK_HMAC")
+
+    assert _is_hermes_internal_secret("WEBHOOK_HMAC")
+    assert "WEBHOOK_HMAC" not in build_subprocess_env()
+    assert "WEBHOOK_HMAC" not in hermes_subprocess_env(inherit_credentials=True)
+    assert "WEBHOOK_HMAC" not in hermes_subprocess_env(inherit_credentials=False)
+
+
+def test_resolving_a_template_registers_the_name(monkeypatch, clean_secret_registry):
+    """Resolution and stripping must not drift apart: resolving IS registering."""
+    from gateway.platforms.webhook import _resolve_secret_template
+    from tools.environments.local import _is_hermes_internal_secret
+
+    monkeypatch.setenv("WEBHOOK_HMAC", "sentinel-value")
+    assert _resolve_secret_template("${WEBHOOK_HMAC}", "route 'x'") == "sentinel-value"
+    assert _is_hermes_internal_secret("WEBHOOK_HMAC")
+    assert "WEBHOOK_HMAC" not in build_subprocess_env()

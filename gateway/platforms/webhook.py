@@ -205,7 +205,27 @@ def _resolve_secret_template(value: str, where: str) -> str:
     if not match:
         return value
     name = match.group(1)
-    resolved = os.environ.get(name, "")
+    # Route through gateway.config._getenv, not os.environ: under multiplexed
+    # profile startup a per-profile secret scope is installed, and the scoped
+    # value is the correct one. Imported lazily to keep this module importable
+    # without the gateway config package.
+    try:
+        from gateway.config import _getenv
+
+        resolved = _getenv(name, "") or ""
+    except Exception:
+        resolved = os.environ.get(name, "")
+    if resolved:
+        # Whatever name the operator chose now holds a live HMAC secret in the
+        # gateway process environment. Register it so the terminal/subprocess
+        # filters strip it; the static HERMES_WEBHOOK_SECRET_* rule only covers
+        # the conventional spelling.
+        try:
+            from tools.environments.local import register_resolved_secret_env_name
+
+            register_resolved_secret_env_name(name)
+        except Exception:
+            pass
     if not resolved:
         raise ValueError(
             f"[webhook] {where} references ${{{name}}} but that environment "
@@ -237,7 +257,7 @@ class WebhookAdapter(BasePlatformAdapter):
         _cfg_host = config.extra.get("host", DEFAULT_HOST)
         self._host: Optional[str] = _cfg_host or None
         self._port: int = int(config.extra.get("port", DEFAULT_PORT))
-        # P15 (F-M75-48): ${VAR} secret templates resolve once, at load
+        # ${VAR} secret templates resolve once, at load
         # time. Resolution failures are RECORDED, not raised: __init__
         # runs outside the try-block that guards connect() in
         # gateway/run.py, so raising here would kill the whole gateway
@@ -326,7 +346,7 @@ class WebhookAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
-        # P15 (F-M75-48): fail-closed for ${VAR} secrets that did not
+        # Fail-closed for ${VAR} secrets that did not
         # resolve at load time. Recorded in __init__ (NOT guarded by the
         # startup try-block) and re-raised here (guarded), so an
         # unresolved secret takes down the webhook platform only,
