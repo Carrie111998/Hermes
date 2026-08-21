@@ -122,6 +122,34 @@ Replies are sent via SMTP with proper email threading:
 - **Message-ID** generated with the agent's domain
 - Responses are sent as plain text (UTF-8)
 
+#### Optional reply-all and always-Cc policy
+
+Replies target only the sender by default. Opt into preserving participants
+from the incoming message with `reply_all`, and/or add addresses that must
+always be copied with `reply_cc`:
+
+```yaml
+platforms:
+  email:
+    extra:
+      reply_all: true
+      reply_cc:
+        - operator@example.com
+```
+
+`reply_all` copies the incoming message's To/Cc participants. `reply_cc` is
+applied even when `reply_all` is off, but only to replies with inbound thread
+context; proactive sends and cron deliveries are unchanged. The agent's own
+address and the primary reply recipient are excluded automatically, and
+duplicate addresses are removed case-insensitively. Both settings are opt-in
+so existing installations keep their current privacy behaviour.
+
+:::warning
+`reply_all` trusts the incoming To/Cc headers. Enable it only when
+`EMAIL_ALLOWED_USERS` contains trusted senders who are allowed to choose the
+reply audience. Use `reply_cc` alone when you only need a fixed operator copy.
+:::
+
 ### File Attachments
 
 The agent can send file attachments in replies. Include `MEDIA:/path/to/file` in the response and the file is attached to the outgoing email.

@@ -18,6 +18,8 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
+from email.utils import getaddresses
+
 from unittest.mock import patch, MagicMock, AsyncMock, ANY
 
 from gateway.platforms.base import SendResult
@@ -84,6 +86,35 @@ class TestHelperFunctions(unittest.TestCase):
         self.assertIn("world", result)
         self.assertNotIn("<p>", result)
         self.assertNotIn("<b>", result)
+
+
+class TestReplyAllRecipientParsing(unittest.TestCase):
+    """Incoming To/Cc participants are preserved for reply-all policy."""
+
+    def test_parse_fetched_message_extracts_to_and_cc_addresses(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }):
+            adapter = EmailAdapter(PlatformConfig(enabled=True))
+
+        msg = MIMEText("Hello", "plain", "utf-8")
+        msg["From"] = "CEO <ceo@test.com>"
+        msg["To"] = "Hermes <hermes@test.com>, Pico <pico@test.com>"
+        msg["Cc"] = "Other <other@test.com>, PICO@test.com"
+        msg["Subject"] = "Team thread"
+        msg["Message-ID"] = "<original@test.com>"
+
+        parsed = adapter._parse_fetched_message(b"1", msg.as_bytes())
+
+        assert parsed is not None
+        self.assertEqual(parsed["to_addrs"], ["hermes@test.com", "pico@test.com"])
+        self.assertEqual(parsed["cc_addrs"], ["other@test.com", "pico@test.com"])
 
 
 class TestExtractTextBody(unittest.TestCase):
@@ -348,7 +379,7 @@ class TestThreadContext(unittest.TestCase):
         else:
             os.environ["EMAIL_ALLOW_ALL_USERS"] = self._prev_allow_all
 
-    def _make_adapter(self):
+    def _make_adapter(self, extra=None):
         from gateway.config import PlatformConfig
         with patch.dict(os.environ, {
             "EMAIL_ADDRESS": "hermes@test.com",
@@ -357,7 +388,7 @@ class TestThreadContext(unittest.TestCase):
             "EMAIL_SMTP_HOST": "smtp.test.com",
         }):
             from plugins.platforms.email.adapter import EmailAdapter
-            adapter = EmailAdapter(PlatformConfig(enabled=True))
+            adapter = EmailAdapter(PlatformConfig(enabled=True, extra=extra or {}))
         return adapter
 
 
@@ -381,6 +412,87 @@ class TestThreadContext(unittest.TestCase):
             self.assertEqual(send_call["In-Reply-To"], "<original@test.com>")
             self.assertEqual(send_call["References"], "<original@test.com>")
             self.assertIn("Date", send_call)
+
+    def test_reply_all_preserves_participants_and_configured_cc(self):
+        adapter = self._make_adapter({
+            "reply_all": True,
+            "reply_cc": ["pico@test.com", "hermes@test.com", "ceo@test.com"],
+        })
+        adapter._thread_context["ceo@test.com"] = {
+            "subject": "Team question",
+            "message_id": "<team@test.com>",
+            "to_addrs": ["hermes@test.com", "pico@test.com"],
+            "cc_addrs": ["other@test.com", "PICO@test.com"],
+        }
+
+        mock_server = MagicMock()
+        with patch.object(adapter, "_connect_smtp", return_value=mock_server):
+            adapter._send_email("ceo@test.com", "Concise answer.", None)
+
+        sent = mock_server.send_message.call_args[0][0]
+        cc_addresses = [
+            address.lower()
+            for _, address in getaddresses(sent.get_all("Cc", []))
+        ]
+        self.assertEqual(sent["To"], "ceo@test.com")
+        self.assertEqual(cc_addresses, ["pico@test.com", "other@test.com"])
+        self.assertNotIn("hermes@test.com", cc_addresses)
+        self.assertNotIn("ceo@test.com", cc_addresses)
+
+    def test_reply_all_string_false_keeps_dynamic_cc_disabled(self):
+        adapter = self._make_adapter({"reply_all": "false"})
+        adapter._thread_context["ceo@test.com"] = {
+            "subject": "Private question",
+            "message_id": "<private@test.com>",
+            "to_addrs": ["hermes@test.com", "pico@test.com"],
+            "cc_addrs": ["other@test.com"],
+        }
+
+        mock_server = MagicMock()
+        with patch.object(adapter, "_connect_smtp", return_value=mock_server):
+            adapter._send_email("ceo@test.com", "Private answer.", None)
+
+        sent = mock_server.send_message.call_args[0][0]
+        self.assertIsNone(sent.get("Cc"))
+
+    def test_configured_cc_does_not_apply_without_reply_context(self):
+        adapter = self._make_adapter({"reply_cc": ["pico@test.com"]})
+
+        mock_server = MagicMock()
+        with patch.object(adapter, "_connect_smtp", return_value=mock_server):
+            adapter._send_email("ceo@test.com", "Proactive brief.", None)
+
+        sent = mock_server.send_message.call_args[0][0]
+        self.assertIsNone(sent.get("Cc"))
+
+    def test_attachment_reply_applies_configured_cc(self):
+        import tempfile
+
+        adapter = self._make_adapter({"reply_cc": ["pico@test.com"]})
+        adapter._thread_context["ceo@test.com"] = {
+            "subject": "Attached report",
+            "message_id": "<attachment@test.com>",
+        }
+
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as handle:
+            handle.write(b"report")
+            file_path = handle.name
+
+        try:
+            mock_server = MagicMock()
+            with patch.object(adapter, "_connect_smtp", return_value=mock_server):
+                adapter._send_email_with_attachment(
+                    "ceo@test.com", "See attached.", file_path
+                )
+
+            sent = mock_server.send_message.call_args[0][0]
+            cc_addresses = [
+                address.lower()
+                for _, address in getaddresses(sent.get_all("Cc", []))
+            ]
+            self.assertEqual(cc_addresses, ["pico@test.com"])
+        finally:
+            os.unlink(file_path)
 
 
 class TestSendMethods(unittest.TestCase):

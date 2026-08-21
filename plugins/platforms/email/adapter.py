@@ -33,7 +33,7 @@ from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
-from email.utils import formatdate
+from email.utils import formatdate, getaddresses
 from email import encoders
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -558,6 +558,24 @@ class EmailAdapter(BasePlatformAdapter):
         self._smtp_port = _esecret_int("EMAIL_SMTP_PORT", 587)
         self._poll_interval = _esecret_int("EMAIL_POLL_INTERVAL", 15)
 
+        # Optional reply-all policy. Disabled by default to preserve existing
+        # privacy semantics. ``reply_cc`` is always applied when configured;
+        # ``reply_all`` additionally preserves To/Cc participants from the
+        # incoming message. The agent and primary recipient are excluded and
+        # addresses are deduplicated case-insensitively.
+        self._reply_all = is_truthy_value(extra.get("reply_all"), default=False)
+        raw_reply_cc = extra.get("reply_cc", [])
+        if isinstance(raw_reply_cc, str):
+            raw_reply_cc = [raw_reply_cc]
+        self._reply_cc: List[str] = []
+        seen_reply_cc: set[str] = set()
+        if isinstance(raw_reply_cc, (list, tuple, set)):
+            for _, address in getaddresses([str(value) for value in raw_reply_cc]):
+                normalized = address.strip().lower()
+                if normalized and normalized not in seen_reply_cc:
+                    seen_reply_cc.add(normalized)
+                    self._reply_cc.append(normalized)
+
         # Skip attachments — configured via config.yaml:
         #   platforms:
         #     email:
@@ -602,8 +620,8 @@ class EmailAdapter(BasePlatformAdapter):
         self._last_fetch_failed: bool = False
         self._last_fetch_error: str = ""
 
-        # Map chat_id (sender email) -> last subject + message-id for threading
-        self._thread_context: Dict[str, Dict[str, str]] = {}
+        # Map chat_id (sender email) -> subject/message-id/recipient context.
+        self._thread_context: Dict[str, Dict[str, Any]] = {}
 
         logger.info("[Email] Adapter initialized for %s", self._address)
 
@@ -949,6 +967,19 @@ class EmailAdapter(BasePlatformAdapter):
         subject = _decode_header_value(msg.get("Subject", "(no subject)"))
         message_id = msg.get("Message-ID", "")
         in_reply_to = msg.get("In-Reply-To", "")
+
+        def _recipient_addresses(header: str) -> List[str]:
+            addresses: List[str] = []
+            seen: set[str] = set()
+            for _, address in getaddresses(msg.get_all(header, [])):
+                normalized = address.strip().lower()
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    addresses.append(normalized)
+            return addresses
+
+        to_addrs = _recipient_addresses("To")
+        cc_addrs = _recipient_addresses("Cc")
         # Skip automated/noreply senders before any processing
         msg_headers = dict(msg.items())
         if _is_automated_sender(sender_addr, msg_headers):
@@ -975,6 +1006,8 @@ class EmailAdapter(BasePlatformAdapter):
             "subject": subject,
             "message_id": message_id,
             "in_reply_to": in_reply_to,
+            "to_addrs": to_addrs,
+            "cc_addrs": cc_addrs,
             "body": body,
             "attachments": attachments,
             "date": msg.get("Date", ""),
@@ -1104,6 +1137,8 @@ class EmailAdapter(BasePlatformAdapter):
         self._thread_context[sender_addr] = {
             "subject": subject,
             "message_id": msg_data["message_id"],
+            "to_addrs": list(msg_data.get("to_addrs", [])),
+            "cc_addrs": list(msg_data.get("cc_addrs", [])),
         }
 
         source = self.build_source(
@@ -1155,6 +1190,35 @@ class EmailAdapter(BasePlatformAdapter):
             return self._address.rsplit("@", 1)[-1] or "localhost"
         return "localhost"
 
+    def _reply_cc_addresses(self, to_addr: str) -> List[str]:
+        """Return policy-approved reply Cc recipients for ``to_addr``."""
+        ctx = self._thread_context.get(to_addr, {})
+        if not ctx:
+            return []
+        candidates: List[str] = []
+        if self._reply_all:
+            candidates.extend(ctx.get("to_addrs", []))
+            candidates.extend(ctx.get("cc_addrs", []))
+        candidates.extend(self._reply_cc)
+
+        excluded = {self._address.strip().lower(), to_addr.strip().lower()}
+        recipients: List[str] = []
+        seen: set[str] = set()
+        for _, address in getaddresses([str(value) for value in candidates]):
+            normalized = address.strip().lower()
+            if not normalized or normalized in excluded or normalized in seen:
+                continue
+            seen.add(normalized)
+            recipients.append(normalized)
+        return recipients
+
+    def _apply_reply_recipients(self, msg: MIMEMultipart, to_addr: str) -> None:
+        """Set primary and optional Cc recipients on an outgoing reply."""
+        msg["To"] = to_addr
+        cc_addrs = self._reply_cc_addresses(to_addr)
+        if cc_addrs:
+            msg["Cc"] = ", ".join(cc_addrs)
+
     def _send_email(
         self,
         to_addr: str,
@@ -1164,7 +1228,7 @@ class EmailAdapter(BasePlatformAdapter):
         """Send an email via SMTP. Runs in executor thread."""
         msg = MIMEMultipart()
         msg["From"] = self._address
-        msg["To"] = to_addr
+        self._apply_reply_recipients(msg, to_addr)
 
         # Thread context for reply
         ctx = self._thread_context.get(to_addr, {})
@@ -1279,7 +1343,7 @@ class EmailAdapter(BasePlatformAdapter):
         """Send an email with multiple file attachments via SMTP."""
         msg = MIMEMultipart()
         msg["From"] = self._address
-        msg["To"] = to_addr
+        self._apply_reply_recipients(msg, to_addr)
 
         ctx = self._thread_context.get(to_addr, {})
         subject = ctx.get("subject", "Hermes Agent")
@@ -1359,7 +1423,7 @@ class EmailAdapter(BasePlatformAdapter):
         """Send an email with a file attachment via SMTP."""
         msg = MIMEMultipart()
         msg["From"] = self._address
-        msg["To"] = to_addr
+        self._apply_reply_recipients(msg, to_addr)
 
         ctx = self._thread_context.get(to_addr, {})
         subject = ctx.get("subject", "Hermes Agent")
