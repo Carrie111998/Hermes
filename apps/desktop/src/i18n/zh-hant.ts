@@ -862,7 +862,8 @@ export const zhHant = defineLocale({
         approval: { label: '核准', hint: '智慧自動核准' },
         mcp: { label: 'MCP', hint: 'MCP 工具路由' },
         title_generation: { label: '標題生成', hint: '工作階段標題' },
-        curator: { label: '策展器', hint: '技能使用審查' }
+        curator: { label: '策展器', hint: '技能使用審查' },
+        memory_extraction: { label: '記憶提取', hint: '逐輪記憶事實提取' }
       }
     },
     providers: {

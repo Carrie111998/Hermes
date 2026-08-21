@@ -890,7 +890,8 @@ export const ja = defineLocale({
         approval: { label: '承認', hint: 'スマート自動承認' },
         mcp: { label: 'MCP', hint: 'MCP ツールルーティング' },
         title_generation: { label: 'タイトル生成', hint: 'セッションタイトル' },
-        curator: { label: 'キュレーター', hint: 'スキル使用レビュー' }
+        curator: { label: 'キュレーター', hint: 'スキル使用レビュー' },
+        memory_extraction: { label: 'メモリ抽出', hint: 'ターンごとの記憶ファクト抽出' }
       }
     },
     providers: {

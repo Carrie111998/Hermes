@@ -865,7 +865,8 @@ export const en: Translations = {
         approval: { label: 'Approval', hint: 'Smart auto-approve' },
         mcp: { label: 'MCP', hint: 'MCP tool routing' },
         title_generation: { label: 'Title gen', hint: 'Session titles' },
-        curator: { label: 'Curator', hint: 'Skill-usage review' }
+        curator: { label: 'Curator', hint: 'Skill-usage review' },
+        memory_extraction: { label: 'Memory extraction', hint: 'Per-turn memory fact extraction' }
       }
     },
     providers: {
