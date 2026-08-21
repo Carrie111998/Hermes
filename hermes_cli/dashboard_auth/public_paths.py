@@ -31,6 +31,14 @@ the SPA should bootstrap it after login instead.
 from __future__ import annotations
 
 PUBLIC_API_PATHS: frozenset[str] = frozenset({
+    # Static liveness probe. Returns only {"status","version",
+    # "release_date"} from module constants — no aggregation, no state.db,
+    # no plugin discovery — so it answers in milliseconds even cold. It is
+    # the cheap counterpart to /api/status, added so laptop-monitor's
+    # bound-but-HTTP-dead ("wedge") detector can probe every 60s pass
+    # instead of once per 5 minutes. Strictly less information than
+    # /api/status, which is already public.
+    "/api/health",
     # Liveness probe target. Returns version, gateway state, active
     # session count, and the dashboard auth-gate shape. No bodies, no
     # session content, no secrets. Documented as the portal's wildcard

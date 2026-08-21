@@ -2865,6 +2865,40 @@ def _collect_profile_gateway_topology() -> Dict[str, Any]:
     return {"profiles": profile_names, "gateway_mode": mode, "gateways": gateways}
 
 
+@app.get("/api/health")
+async def get_health():
+    """Static liveness probe — deliberately does NO work.
+
+    ``/api/status`` is the RICH liveness probe: it aggregates component
+    status, enumerates per-profile gateways and counts active sessions,
+    which legitimately takes 12-16s. That cost forced laptop-monitor's
+    wedge detector (``Test-DashboardHttpAlive`` in ``laptop-monitor.ps1``)
+    to throttle itself to one probe per 5 minutes behind a 25s timeout and
+    a 2-strike hysteresis — giving the bound-but-HTTP-dead axis up to ~10
+    minutes of detection latency BY DESIGN.
+
+    This endpoint exists so that detector can run on EVERY 60s pass. It
+    must therefore stay trivially cheap: no component aggregation, no
+    ``state.db`` query, no plugin discovery, no filesystem walk, no await
+    on anything. It answers from module-level constants only, so a cold
+    process answers in milliseconds. If it ever gets slow, the wedge
+    detector silently regains the latency this was built to remove.
+
+    A 200 here proves exactly one thing — the ASGI app is accepting and
+    servicing requests. That is precisely the wedge signal: the FastAPI
+    handler pool can wedge (observed 2026-07-09: MemoryError serialising
+    ``/api/status`` under a pressure storm) while the socket stays bound,
+    which ``Test-Port`` alone cannot see.
+
+    Public by design; listed in ``PUBLIC_API_PATHS``. It exposes only the
+    build version/date already returned by the public ``/api/status``.
+    """
+    return JSONResponse(
+        {"status": "ok", "version": __version__, "release_date": __release_date__},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.get("/api/status")
 async def get_status(profile: Optional[str] = None):
     status_scope = None
