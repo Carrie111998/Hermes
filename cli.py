@@ -20822,21 +20822,31 @@ def _record_kanban_provider_exit(cli: "HermesCLI", result: Any) -> bool:
         conn.close()
 
 
-def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
+def _run_kanban_goal_loop_q(
+    cli: "HermesCLI",
+    first_response: str,
+    *,
+    first_result: Any = None,
+) -> Any:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
     Called from the quiet single-query path AFTER the worker's first turn,
     only when ``HERMES_KANBAN_GOAL_MODE`` is set (dispatcher-spawned
-    goal_mode card). Wires the worker's ``run_conversation`` and the kanban
-    DB into ``goals.run_kanban_goal_loop``. All errors are swallowed by the
-    caller — a broken goal loop must never wedge a worker, the dispatcher's
-    claim TTL / crash detection is the backstop.
+    goal_mode card). Provider failures are staged before any judge call. A
+    structured failure from a continuation turn is likewise staged and
+    returned to the caller so the quiet process can preserve its exit-code
+    contract. All other errors are swallowed by the caller — a broken goal
+    loop must never wedge a worker, the dispatcher's claim TTL / crash
+    detection is the backstop.
     """
     import os as _os
 
     task_id = (_os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not task_id:
         return
+    if isinstance(first_result, dict) and first_result.get("failed"):
+        _record_kanban_provider_exit(cli, first_result)
+        return first_result
     worker_run_id = None
     raw_run_id = (_os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
     if raw_run_id:
@@ -20870,7 +20880,13 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
 
     max_turns = task.goal_max_turns or _DEF_TURNS
 
+    provider_failure_result = None
+
+    class _ProviderFailureStoppedGoalLoop(Exception):
+        pass
+
     def _run_turn(prompt: str) -> str:
+        nonlocal provider_failure_result
         result = cli.agent.run_conversation(
             user_message=prompt,
             conversation_history=cli.conversation_history,
@@ -20884,6 +20900,10 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
         if resp:
             print(resp)
+        if isinstance(result, dict) and result.get("failed"):
+            _record_kanban_provider_exit(cli, result)
+            provider_failure_result = result
+            raise _ProviderFailureStoppedGoalLoop()
         return resp or ""
 
     def _task_status() -> "str | None":
@@ -20921,6 +20941,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         first_response=first_response or "",
         log=lambda m: logger.info("%s", m),
     )
+    return provider_failure_result
 
 
 def main(
@@ -21456,9 +21477,16 @@ def main(
                         # out (→ sticky block). Gated on the env vars the
                         # dispatcher sets in `_default_spawn`; a no-op for every
                         # normal worker and every non-kanban `-q` run.
+                        _goal_provider_failure = None
                         if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
                             try:
-                                _run_kanban_goal_loop_q(cli, response)
+                                _goal_provider_failure = _run_kanban_goal_loop_q(
+                                    cli,
+                                    response,
+                                    first_result=result,
+                                )
+                                if _goal_provider_failure is not None:
+                                    result = _goal_provider_failure
                             except Exception as _goal_exc:
                                 logger.debug("kanban goal loop failed: %s", _goal_exc)
 
@@ -21476,7 +21504,8 @@ def main(
                         if isinstance(result, dict) and result.get("failed"):
                             _exit_code = 1
                             _provider_disposition = _provider_exit_disposition(result)
-                            _record_kanban_provider_exit(cli, result)
+                            if _goal_provider_failure is None:
+                                _record_kanban_provider_exit(cli, result)
                             if (
                                 os.environ.get("HERMES_KANBAN_TASK")
                                 and _provider_disposition == "transient"

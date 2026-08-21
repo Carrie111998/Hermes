@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -10,15 +12,61 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+def _prepare_isolated_kanban_home(tmp_path, monkeypatch):
+    for key in tuple(os.environ):
+        if key.startswith("HERMES_KANBAN_"):
+            monkeypatch.delenv(key, raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    db_path = home / "kanban-test.db"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    assert kb.kanban_db_path().resolve() == db_path.resolve()
+    assert kb.kanban_db_path().resolve().is_relative_to(tmp_path.resolve())
+    probe = sqlite3.connect(db_path)
+    try:
+        attached = Path(probe.execute("PRAGMA database_list").fetchone()[2]).resolve()
+        assert attached == db_path.resolve()
+        assert attached.is_relative_to(tmp_path.resolve())
+    finally:
+        probe.close()
+    kb.init_db()
+    return home, db_path
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    home, db_path = _prepare_isolated_kanban_home(tmp_path, monkeypatch)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
-    kb.init_db()
+    with kb.connect() as conn:
+        attached = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
+        assert attached == db_path.resolve()
+        assert attached.is_relative_to(tmp_path.resolve())
     return home
+
+
+def test_ambient_kanban_db_cannot_capture_synthetic_tasks(tmp_path, monkeypatch):
+    ambient_db = tmp_path / "ambient-live-board" / "kanban.db"
+    kb.init_db(db_path=ambient_db)
+    with kb.connect(db_path=ambient_db) as conn:
+        sentinel_id = kb.create_task(conn, title="sentinel", assignee="operator")
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(ambient_db))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "hermes-agent")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", "/live/worktree")
+    _home, isolated_db = _prepare_isolated_kanban_home(tmp_path / "isolated", monkeypatch)
+
+    with kb.connect() as conn:
+        attached = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
+        assert attached == isolated_db.resolve()
+        synthetic_id = kb.create_task(conn, title="synthetic", assignee="worker")
+        assert kb.get_task(conn, synthetic_id) is not None
+
+    with kb.connect(db_path=ambient_db) as conn:
+        assert [task.id for task in kb.list_tasks(conn)] == [sentinel_id]
+        assert kb.get_task(conn, synthetic_id) is None
 
 
 def _exited_status(code: int) -> int:
