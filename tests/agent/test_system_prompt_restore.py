@@ -36,6 +36,7 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     # reconstruction is gated on _use_prompt_caching, so default it off
     # for the legacy restore tests (the reconstruction tests enable it).
     agent._use_prompt_caching = False
+    agent._bot_mode_gateway_session = False
     agent._build_system_prompt = MagicMock(return_value=prebuilt_prompt)
     return agent
 
@@ -112,6 +113,108 @@ class TestStoredPromptReuse:
             agent.session_id, agent._cached_system_prompt
         )
         assert any("stale runtime identity" in r.getMessage() for r in caplog.records)
+
+    def test_legacy_routed_topic_prompt_rebuilds_without_renaming_session(self, tmp_path):
+        """A pre-protocol routed topic adopts Bot Mode on its next turn."""
+        home = tmp_path / ".hermes"
+        managed = home / "profiles" / "builder"
+        managed.mkdir(parents=True)
+        (managed / "profile.yaml").write_text(
+            "ui_meta:\n  hermes-bots:\n    title: Builder\n", encoding="utf-8"
+        )
+        (home / "config.yaml").write_text(
+            "gateway:\n"
+            "  multiplex_profiles: true\n"
+            "  profile_routes:\n"
+            "    - name: hermes-topic\n"
+            "      platform: telegram\n"
+            "      chat_id: '42'\n"
+            "      thread_id: '100'\n"
+            "      profile: default\n",
+            encoding="utf-8",
+        )
+
+        db = MagicMock()
+        db.db_path = home / "state.db"
+        db.get_session.return_value = {
+            "system_prompt": "Stored prompt from before routed Bot Mode support"
+        }
+        db.get_session_title.return_value = "Hermes topic"
+        agent = _make_agent(session_db=db, prebuilt_prompt="UPGRADED_PROMPT")
+        agent.platform = "telegram"
+        agent._bot_mode_protocol = True
+        agent._bot_mode_gateway_session = True
+        agent._session_title_hint = ""
+        agent._gateway_session_key = "agent:main:telegram:group:42:100"
+
+        from tools.bot_mode_probe import _reset_cache_for_tests
+
+        _reset_cache_for_tests()
+        _restore_or_build_system_prompt(
+            agent, None, [{"role": "user", "content": "continue"}]
+        )
+
+        assert agent._cached_system_prompt == "UPGRADED_PROMPT"
+        assert agent._bot_capability_refreshed is True
+        assert agent._session_title_hint == ""
+        agent._build_system_prompt.assert_called_once_with(None)
+        db.update_system_prompt.assert_called_once_with(
+            agent.session_id, "UPGRADED_PROMPT"
+        )
+
+    @pytest.mark.parametrize(
+        ("gateway_state", "expect_rebuild"),
+        [(False, True), (None, False)],
+        ids=["route-removed", "route-probe-indeterminate"],
+    )
+    def test_stamped_topic_prompt_respects_route_state(
+        self, tmp_path, gateway_state, expect_rebuild
+    ):
+        """Remove on a known route change; preserve on an unknown probe state."""
+        home = tmp_path / ".hermes"
+        managed = home / "profiles" / "builder"
+        managed.mkdir(parents=True)
+        (managed / "profile.yaml").write_text(
+            "ui_meta:\n  hermes-bots:\n    title: Builder\n", encoding="utf-8"
+        )
+        (home / "config.yaml").write_text(
+            "gateway:\n  multiplex_profiles: true\n  profile_routes: []\n",
+            encoding="utf-8",
+        )
+
+        from tools.bot_mode_probe import _reset_cache_for_tests, epoch_line
+
+        _reset_cache_for_tests()
+        stored = (
+            "Stored routed topic prompt\n\n"
+            "## Messaging other agents\nold injected protocol\n\n"
+            f"{epoch_line(home)}"
+        )
+        db = MagicMock()
+        db.db_path = home / "state.db"
+        db.get_session.return_value = {"system_prompt": stored}
+        db.get_session_title.return_value = "Former routed topic"
+        agent = _make_agent(session_db=db, prebuilt_prompt="PROMPT_WITHOUT_PROTOCOL")
+        agent.platform = "telegram"
+        agent._bot_mode_protocol = True
+        agent._bot_mode_gateway_session = gateway_state
+        agent._session_title_hint = ""
+        agent._gateway_session_key = "agent:main:telegram:group:42:100"
+
+        _restore_or_build_system_prompt(
+            agent, None, [{"role": "user", "content": "continue"}]
+        )
+
+        if expect_rebuild:
+            assert agent._cached_system_prompt == "PROMPT_WITHOUT_PROTOCOL"
+            agent._build_system_prompt.assert_called_once_with(None)
+            db.update_system_prompt.assert_called_once_with(
+                agent.session_id, "PROMPT_WITHOUT_PROTOCOL"
+            )
+        else:
+            assert agent._cached_system_prompt == stored
+            agent._build_system_prompt.assert_not_called()
+            db.update_system_prompt.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

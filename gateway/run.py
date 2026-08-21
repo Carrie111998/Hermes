@@ -5787,6 +5787,9 @@ class TurnRunner:
                 # a single small file, not part of the expensive walk.
                 load_soul_identity=True,
             )
+            agent._bot_mode_gateway_session = (
+                self._runner._bot_mode_gateway_entry_state(ctx.source)
+            )
             if _cache_lock and _cache is not None:
                 with _cache_lock:
                     # Record the session_id the snapshot was taken for
@@ -27920,6 +27923,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
             )
+
+    def _bot_mode_gateway_entry_state(
+        self, source: SessionSource
+    ) -> Optional[bool]:
+        """Whether ``source`` is an exact routed Telegram topic.
+
+        Uses the gateway's already-loaded canonical config and real source
+        metadata. ``None`` means route matching failed unexpectedly; prompt
+        restore treats that as indeterminate and preserves stored bytes.
+        """
+        config = getattr(self, "config", None)
+        if (
+            not getattr(config, "multiplex_profiles", False)
+            or source.platform != Platform.TELEGRAM
+            or not source.chat_id
+            or not source.thread_id
+        ):
+            return False
+        routes = getattr(config, "profile_routes", None)
+        if not routes:
+            return False
+        from gateway.profile_routing import match_profile_route
+
+        try:
+            matched = match_profile_route(
+                routes,
+                platform=source.platform.value,
+                guild_id=getattr(source, "guild_id", None),
+                chat_id=source.chat_id,
+                thread_id=source.thread_id,
+                parent_chat_id=getattr(source, "parent_chat_id", None),
+            )
+        except Exception:
+            logger.warning(
+                "Bot Mode Telegram topic route probe failed for %s/%s",
+                source.chat_id,
+                source.thread_id,
+                exc_info=True,
+            )
+            return None
+        if not matched or not matched.chat_id or not matched.thread_id:
+            return False
+        routed_profile = str(getattr(source, "profile", "") or "").strip()
+        return not routed_profile or routed_profile == matched.profile
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.

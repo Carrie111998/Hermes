@@ -1,15 +1,17 @@
-"""Bot Mode roster probe — canonical Bot Chat system prompt section.
+"""Bot Mode roster probe — canonical and routed system-prompt section.
 
 When the desktop's Bot Mode manages this install (any profile carries a
 ``ui_meta['hermes-bots']`` block in its profile.yaml), a bot's canonical
-"Bot Chat" session — and ONLY that session — gets a short "Messaging other
-agents" section so the bot can receive teammate DMs, reply with attribution,
-and hand off @mentions.  Regular sessions never carry the section; the
-desktop's composer middleware owns the @mention send path there.
+"Bot Chat" session — plus explicitly routed Telegram topic entry points —
+gets a short "Messaging other agents" section so the bot can receive teammate
+DMs, reply with attribution, and hand off @mentions. Regular sessions never
+carry the section; the desktop's composer middleware owns the @mention send
+path there.
 
-The caller (agent/system_prompt.py) enforces the session-title gate against
-``BOT_CHAT_TITLE``; this module answers "is this install Bot-Mode-managed,
-and what should the section say for this profile".
+The gateway's canonical profile router marks eligible topics before prompt build;
+the caller (agent/system_prompt.py) accepts either ``BOT_CHAT_TITLE`` or that
+marker. This module answers "is this install Bot-Mode-managed, and what should
+the section say for this profile".
 
 This replaces the plugin-side SOUL.md backfill: the protocol is injected by
 the core at prompt-build time instead of appended to user-authored SOUL
@@ -35,9 +37,9 @@ from pathlib import Path
 
 _PROTOCOL_HEADING = "## Messaging other agents"
 
-# The canonical per-bot conversation title — the only session shape that
-# receives the protocol section. Must match the desktop plugin's
-# createCanonicalChat title and the `-c "Bot Chat"` resume target.
+# The canonical per-bot conversation title. Must match the desktop plugin's
+# createCanonicalChat title and the `-c "Bot Chat"` resume target. Explicitly
+# routed Telegram topics are the other supported Bot Mode entry point.
 BOT_CHAT_TITLE = "Bot Chat"
 
 _lock = threading.Lock()
@@ -292,15 +294,15 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
 
 
 def epoch_line(home: str | os.PathLike | None = None) -> str:
-    """The epoch stamp appended to a Bot Chat prompt."""
+    """The epoch stamp appended to a Bot Mode entry-point prompt."""
     return f"{_EPOCH_PREFIX}{capability_fingerprint(home)}"
 
 
 def stored_prompt_capability_stale(stored_prompt: str, home: str | os.PathLike | None = None) -> bool:
-    """True when ``stored_prompt`` is a Bot Chat prompt whose embedded
+    """True when ``stored_prompt`` is a Bot Mode prompt whose embedded
     capability epoch no longer matches the current disk state.
 
-    Non-Bot-Chat prompts (no epoch stamp) are never stale by this check.
+    Other prompts (no epoch stamp) are never stale by this check.
     Fails closed to "not stale" — a broken probe must never turn into a
     rebuild-every-turn cache burner.
     """
@@ -318,19 +320,32 @@ def stored_prompt_capability_stale(stored_prompt: str, home: str | os.PathLike |
         return False
 
 
-def stored_bot_chat_prompt_needs_upgrade(stored_prompt: str, home: str | os.PathLike | None = None) -> bool:
-    """True when a Bot Chat session's stored prompt PREDATES this feature.
+def stored_prompt_has_bot_mode_stamp(stored_prompt: str) -> bool:
+    """Return whether a prompt carries the core-injected Bot Mode section."""
+    import re
 
-    Legacy Bot Chats (created before bundling / this epoch mechanism)
+    try:
+        return bool(
+            _PROTOCOL_HEADING in (stored_prompt or "")
+            and re.search(_EPOCH_RE_TEXT, stored_prompt or "")
+        )
+    except Exception:
+        return False
+
+
+def stored_bot_chat_prompt_needs_upgrade(stored_prompt: str, home: str | os.PathLike | None = None) -> bool:
+    """True when an eligible Bot Mode entry point predates this feature.
+
+    Legacy Bot Chats and routed topics created before this epoch mechanism
     persisted prompts with no protocol section and no epoch stamp; without
     an explicit upgrade they would be stranded forever — the staleness check
     above only fires on stamped prompts. This is a one-time migration per
-    legacy session: the caller must only invoke it for sessions titled
-    "Bot Chat", and only rebuilds when the probe would actually emit a
-    section (a profile whose SOUL.md already carries the legacy plugin-side
-    append keeps its protocol-free prompt — rebuilding those would loop,
+    legacy session: the caller must only invoke it for a canonical ``Bot Chat``
+    or an exact routed topic, and it only rebuilds when the probe would actually
+    emit a section. A profile whose SOUL.md already carries the legacy plugin-
+    side append keeps its protocol-free prompt — rebuilding those would loop,
     since the probe stays silent and the rebuilt prompt would be unstamped
-    again). Fails closed to "no upgrade".
+    again. Fails closed to "no upgrade".
     """
     try:
         if _EPOCH_PREFIX in (stored_prompt or ""):
