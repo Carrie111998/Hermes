@@ -6880,7 +6880,24 @@ class DiscordAdapter(BasePlatformAdapter):
         if chan_name:
             own_keys.add(chan_name)
             own_keys.add(f"#{chan_name}")
-        return own_keys
+        # Also drop any own-key that *collides* with a parent-derived key.
+        # Thread names are user-controlled: without this, anyone can name a
+        # new forum thread exactly after its parent channel and the
+        # name-form key re-inherits the parent's free-response entry,
+        # restoring the very bypass this method exists to close (only
+        # matters when free_response_channels is configured by name rather
+        # than by snowflake ID, which is a documented, supported form).
+        # The thread's own snowflake ID stays as the explicit escape hatch.
+        parent_keys: set[str] = set()
+        parent_id = getattr(channel, "parent_id", None)
+        if parent_id is not None:
+            parent_keys.add(str(parent_id))
+        parent_channel = getattr(channel, "parent", None)
+        parent_name = str(getattr(parent_channel, "name", "")).strip() if parent_channel else ""
+        if parent_name:
+            parent_keys.add(parent_name)
+            parent_keys.add(f"#{parent_name}")
+        return own_keys - parent_keys
 
     def _discord_history_backfill(self) -> bool:
         """Return whether history backfill is enabled for shared sessions."""
