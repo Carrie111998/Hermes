@@ -439,6 +439,7 @@ class FeishuAdapterSettings:
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
+    max_message_age_seconds: int = _DEFAULT_MAX_MESSAGE_AGE_SECONDS
 
 
 @dataclass
@@ -2623,13 +2624,17 @@ class FeishuAdapter(BasePlatformAdapter):
         if create_time_ms:
             max_age = self._max_message_age_seconds
             if max_age > 0:
-                msg_age = time.time() - (int(create_time_ms) / 1000)
-                if msg_age > max_age:
-                    logger.warning(
-                        "[Feishu] Dropping stale message: id=%s age=%.1fs max=%ds",
-                        message_id, msg_age, max_age,
-                    )
-                    return
+                try:
+                    msg_age = time.time() - (int(create_time_ms) / 1000)
+                except (TypeError, ValueError):
+                    logger.debug("[Feishu] Non-numeric create_time=%r, skipping staleness check", create_time_ms)
+                else:
+                    if msg_age > max_age:
+                        logger.warning(
+                            "[Feishu] Dropping stale message: id=%s age=%.1fs max=%ds",
+                            message_id, msg_age, max_age,
+                        )
+                        return
 
         if not message_id or self._is_duplicate(message_id):
             logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
