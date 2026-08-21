@@ -1299,9 +1299,12 @@ class TestDelegateHeartbeat(unittest.TestCase):
                 parent_agent=parent,
             )
 
-        self.assertGreater(
+        # Provider wait heartbeats are not meaningful model/tool progress;
+        # the local watchdog must eventually stop refreshing the parent and
+        # classify this synthetic blocked request as stalled.
+        self.assertLessEqual(
             len(touch_calls), 2,
-            f"Heartbeat stopped too early while child was waiting on the model; "
+            f"Provider wait heartbeat incorrectly kept a blocked child alive; "
             f"got {len(touch_calls)} touches",
         )
 

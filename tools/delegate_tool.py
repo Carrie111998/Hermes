@@ -36,6 +36,13 @@ from urllib.parse import urlsplit, urlunsplit
 
 from toolsets import TOOLSETS
 from agent.interrupt_compat import request_hard_interrupt
+from tools.worker_lifecycle import (
+    WorkerLifecycle,
+    WorkerState,
+    activity_signature,
+    meaningful_activity_token,
+    meaningful_activity_advanced,
+)
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -1126,6 +1133,54 @@ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during de
 _HEARTBEAT_STALE_CYCLES_IDLE = 15  # 15 * 30s = 450s idle between turns → stale
 _HEARTBEAT_STALE_CYCLES_IN_TOOL = 40  # 40 * 30s = 1200s stuck on same tool → stale
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
+
+
+def _get_sync_watchdog_settings() -> tuple[float, float, float, float, float]:
+    """Return local watchdog settings for the synchronous child path.
+
+    The watchdog is deliberately independent from ``child_timeout_seconds``.
+    The latter is a compatibility emergency cap; these values decide whether
+    an otherwise unbounded child is actually inactive.
+    """
+    cfg = _load_config().get("delegation", {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    def configured(key: str, stock: float, runtime_value: float) -> float:
+        raw = cfg.get(key, os.environ.get("HERMES_" + key.upper()))
+        try:
+            value = float(raw) if raw is not None else stock
+        except (TypeError, ValueError):
+            value = stock
+        if value == stock and runtime_value != stock:
+            value = runtime_value
+        return max(0.01, value)
+
+    interval = configured("watchdog_interval_seconds", 30.0, float(_HEARTBEAT_INTERVAL))
+    idle = configured(
+        "watchdog_inactivity_seconds",
+        float(_HEARTBEAT_STALE_CYCLES_IDLE * 30),
+        float(_HEARTBEAT_STALE_CYCLES_IDLE * _HEARTBEAT_INTERVAL),
+    )
+    tool_idle = configured(
+        "watchdog_tool_inactivity_seconds",
+        float(_HEARTBEAT_STALE_CYCLES_IN_TOOL * 30),
+        float(_HEARTBEAT_STALE_CYCLES_IN_TOOL * _HEARTBEAT_INTERVAL),
+    )
+    grace = configured("cancellation_grace_seconds", 120.0, 120.0)
+    raw_ceiling = cfg.get(
+        "emergency_safety_ceiling_seconds",
+        os.environ.get("HERMES_EMERGENCY_SAFETY_CEILING_SECONDS"),
+    )
+    try:
+        ceiling = max(0.0, float(raw_ceiling)) if raw_ceiling is not None else 0.0
+    except (TypeError, ValueError):
+        ceiling = 0.0
+    return interval, idle, tool_idle, grace, ceiling
+
+
+class _WorkerStalled(RuntimeError):
+    """Internal marker: cancellation was requested but termination unproven."""
 
 
 # ---------------------------------------------------------------------------
@@ -2439,6 +2494,41 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+    _logical_task_id = str(
+        getattr(child, "_delegation_id", None)
+        or getattr(child, "_subagent_id", None)
+        or f"child-{task_index}-{id(child)}"
+    )
+    _lifecycle = WorkerLifecycle(logical_task_id=_logical_task_id)
+    _lifecycle.mark_model_wait("child.run_conversation")
+    _mutation_tools = {
+        "write_file", "patch", "terminal", "git", "github", "browser_file_upload",
+        "deploy", "restart_service", "database_mutation",
+    }
+
+    def _observe_child_tool_event(event_type: Any, tool_name: Any = None, *args, **kwargs) -> None:
+        """Feed host tool boundaries into the attempt fence without content."""
+        text = str(event_type or "")
+        name = str(tool_name or "")
+        started = text in {"tool.started", "delegate.tool_started"}
+        completed = text in {"tool.completed", "delegate.tool_completed"}
+        if not (started or completed):
+            return
+        _lifecycle.note_tool_event(
+            text,
+            name,
+            completed=completed,
+            mutating=name in _mutation_tools,
+        )
+
+    _original_progress_callback = getattr(child, "tool_progress_callback", None)
+    if callable(_original_progress_callback):
+        def _lifecycle_progress_callback(event_type: Any, tool_name: Any = None, *args, **kwargs):
+            _observe_child_tool_event(event_type, tool_name, *args, **kwargs)
+            return _original_progress_callback(event_type, tool_name, *args, **kwargs)
+        child.tool_progress_callback = _lifecycle_progress_callback
+    else:
+        child.tool_progress_callback = _observe_child_tool_event
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -2473,18 +2563,20 @@ def _run_single_child(
     # Different thresholds for idle vs in-tool (see _HEARTBEAT_STALE_CYCLES_*).
     # last_activity_ts is the same liveness signal the async stall monitor
     # already uses (streamed chunks + direct_api_call mid-wait heartbeats).
+    _last_seen_signature: List[Any] = [None]
     _last_seen_iter = [0]
     _last_seen_tool = [None]  # type: list
     _last_seen_activity_ts = [None]  # type: list
     _stale_count = [0]
+    _watchdog_stall = threading.Event()
+    _watchdog_reason = [None]
 
     def _heartbeat_loop():
-        while not _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
-            if parent_agent is None:
-                continue
-            touch = getattr(parent_agent, "_touch_activity", None)
-            if not touch:
-                continue
+        watchdog_interval, idle_threshold, tool_idle_threshold, _grace, emergency_ceiling = (
+            _get_sync_watchdog_settings()
+        )
+        while not _heartbeat_stop.wait(watchdog_interval):
+            touch = getattr(parent_agent, "_touch_activity", None) if parent_agent is not None else None
             # Pull detail from the child's own activity tracker
             desc = f"delegate_task: subagent {task_index} working"
             try:
@@ -2493,6 +2585,7 @@ def _run_single_child(
                 child_iter = child_summary.get("api_call_count", 0)
                 child_max = child_summary.get("max_iterations", 0)
                 child_activity_ts = child_summary.get("last_activity_ts")
+                _lifecycle.observe_activity(child_summary, now=time.time())
 
                 # Stale detection: count cycles where iteration, current_tool,
                 # AND last_activity_ts are all frozen. A child running a
@@ -2500,20 +2593,18 @@ def _run_single_child(
                 # child waiting on a slow model refreshes last_activity_ts
                 # via direct_api_call's activity heartbeat — neither should
                 # look stale at the idle threshold.
-                iter_advanced = child_iter > _last_seen_iter[0]
-                tool_changed = child_tool != _last_seen_tool[0]
-                activity_advanced = (
-                    child_activity_ts is not None
-                    and (
-                        _last_seen_activity_ts[0] is None
-                        or child_activity_ts > _last_seen_activity_ts[0]
-                    )
+                signature = activity_signature(child_summary)
+                previous_signature = _last_seen_signature[0]
+                # Tool starts and provider wait heartbeats do not refresh the
+                # watchdog. A meaningful stream/completion boundary does.
+                meaningful = previous_signature is None or meaningful_activity_advanced(
+                    child_summary, previous_signature
                 )
-                if iter_advanced or tool_changed or activity_advanced:
-                    _last_seen_iter[0] = child_iter
+                if meaningful:
+                    _last_seen_signature[0] = signature
+                    _last_seen_iter[0] = signature[0]
                     _last_seen_tool[0] = child_tool
-                    if child_activity_ts is not None:
-                        _last_seen_activity_ts[0] = child_activity_ts
+                    _last_seen_activity_ts[0] = signature[1]
                     _stale_count[0] = 0
                 else:
                     _stale_count[0] += 1
@@ -2523,20 +2614,37 @@ def _run_single_child(
                 # cover legitimately slow tools; idle threshold stays
                 # tight so the gateway timeout can fire on a truly wedged
                 # child.
-                stale_limit = (
-                    _HEARTBEAT_STALE_CYCLES_IN_TOOL
-                    if child_tool
-                    else _HEARTBEAT_STALE_CYCLES_IDLE
+                configured_limit = tool_idle_threshold if child_tool else idle_threshold
+                stale_limit = max(
+                    1,
+                    int(configured_limit / max(watchdog_interval, 0.01) + 0.999),
                 )
-                if _stale_count[0] >= stale_limit:
+                emergency_hit = bool(
+                    emergency_ceiling
+                    and time.time() - child_start >= emergency_ceiling
+                )
+                if _stale_count[0] >= stale_limit or emergency_hit:
+                    _watchdog_reason[0] = (
+                        "emergency_safety_ceiling" if emergency_hit else "inactivity"
+                    )
+                    _lifecycle.transition(WorkerState.STALLED)
+                    _lifecycle.request_cancellation()
+                    _watchdog_stall.set()
+                    try:
+                        request_hard_interrupt(child)
+                    except Exception:
+                        try:
+                            child._interrupt_requested = True
+                        except Exception:
+                            pass
                     logger.warning(
-                        "Subagent %d appears stale (no progress for %d "
+                        "Subagent %d appears stalled (no progress for %d "
                         "heartbeat cycles, tool=%s) — stopping heartbeat",
                         task_index,
                         _stale_count[0],
                         child_tool or "<none>",
                     )
-                    break  # stop touching parent, let gateway timeout fire
+                    break
 
                 if child_tool:
                     desc = (
@@ -2552,10 +2660,11 @@ def _run_single_child(
                         )
             except Exception:
                 pass
-            try:
-                touch(desc)
-            except Exception:
-                pass
+            if touch:
+                try:
+                    touch(desc)
+                except Exception:
+                    pass
 
     _heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
 
@@ -2751,10 +2860,15 @@ def _run_single_child(
             list(file_state.known_reads(parent_task_id)) if parent_task_id else []
         )
 
-        # Run child with an optional hard timeout (off by default —
-        # result(timeout=None) blocks until the child finishes). Stuck-child
-        # protection comes from the heartbeat staleness monitor instead.
+        # Run child with an optional emergency/legacy hard ceiling. The normal
+        # lifecycle decision is always the local progress watchdog; a non-zero
+        # value here is an explicit failsafe, never an ordinary task deadline.
         child_timeout = _get_child_timeout()
+        if child_timeout is not None:
+            logger.warning(
+                "Using configured emergency child ceiling %.1fs; this is not an inactivity timeout",
+                child_timeout,
+            )
         # Daemon worker (tools.daemon_pool): a timed-out child is abandoned
         # below; a stdlib non-daemon worker would then block interpreter
         # exit at atexit-join time if the child never unwinds.
@@ -2800,7 +2914,34 @@ def _run_single_child(
             _run_with_thread_capture,
         )
         try:
-            result = _child_future.result(timeout=child_timeout)
+            _lifecycle.mark_model_wait("child.run_conversation")
+            if child_timeout is None:
+                # There is no ordinary wall-clock deadline. Poll the local
+                # Future only to observe completion or the deterministic
+                # watchdog event; no provider/LLM probe is sent.
+                watchdog_interval, _idle, _tool_idle, cancellation_grace, _ceiling = (
+                    _get_sync_watchdog_settings()
+                )
+                while True:
+                    try:
+                        result = _child_future.result(timeout=watchdog_interval)
+                        break
+                    except FuturesTimeoutError:
+                        if not _watchdog_stall.is_set():
+                            continue
+                        # Give cooperative cancellation a bounded chance to
+                        # unwind. If it does not, return CANCELLATION_PENDING;
+                        # the caller must not launch a replacement attempt.
+                        try:
+                            result = _child_future.result(timeout=cancellation_grace)
+                            break
+                        except FuturesTimeoutError as _stalled_exc:
+                            raise _WorkerStalled(
+                                "worker cancellation remains pending after "
+                                f"{cancellation_grace}s grace"
+                            ) from _stalled_exc
+            else:
+                result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
             # No consumer boundary remains once this owner stops waiting for
             # the child. Close acceptance before any completion callback and
@@ -2808,7 +2949,10 @@ def _run_single_child(
             _late_pending_steer = (
                 _close_subagent_steering(_subagent_id, child) if _subagent_id else None
             )
-            # Signal the child to stop so its thread can exit cleanly.
+            # Signal the child to stop so its thread can exit cleanly. This
+            # request is cooperative; the result remains fenced until the
+            # worker actually returns or the owning lifecycle records a safe
+            # terminal boundary.
             try:
                 interrupted = child is not None and request_hard_interrupt(child)
                 if not interrupted and child is not None and hasattr(child, "_interrupt_requested"):
@@ -2816,7 +2960,19 @@ def _run_single_child(
             except Exception:
                 pass
 
-            is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
+            is_stall = isinstance(_timeout_exc, _WorkerStalled)
+            is_timeout = (
+                isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
+                and not is_stall
+            )
+            if is_timeout:
+                _lifecycle.transition(WorkerState.STALLED)
+                _lifecycle.request_cancellation()
+                _lifecycle.mark_cancellation_pending()
+            elif is_stall:
+                _lifecycle.transition(WorkerState.STALLED)
+                _lifecycle.request_cancellation()
+                _lifecycle.mark_cancellation_pending()
             duration = round(time.monotonic() - child_start, 2)
             logger.warning(
                 "Subagent %d %s after %.1fs",
@@ -2893,10 +3049,10 @@ def _run_single_child(
 
             _error_entry = {
                 "task_index": task_index,
-                "status": "timeout" if is_timeout else "error",
+                "status": "stalled" if is_stall else "timeout" if is_timeout else "error",
                 "summary": None,
                 "error": _err,
-                "exit_reason": "timeout" if is_timeout else "error",
+                "exit_reason": "stalled" if is_stall else "timeout" if is_timeout else "error",
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
                 "timeout_seconds": child_timeout if is_timeout else None,
@@ -2908,7 +3064,10 @@ def _run_single_child(
                 ),
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
+                "stall_reason": _watchdog_reason[0] if is_stall else None,
+                "cancellation_pending": is_stall,
             }
+            _error_entry.update(_lifecycle.snapshot())
             if _late_pending_steer:
                 _error_entry["missed_steer"] = _late_pending_steer
                 _error_entry["error"] += (
@@ -2942,15 +3101,27 @@ def _run_single_child(
             _schema_valid, _schema_errors = validate_output(
                 _first_text, _output_schema
             )
+            _mutation_possible = bool(_lifecycle.snapshot().get("mutation_possible"))
             if (
                 not _schema_valid
                 and _first_text.strip()
                 and not result.get("interrupted", False)
+                and not _mutation_possible
             ):
                 # Exactly one retry turn, carrying the validation errors
                 # verbatim (no schema re-paste — the child already holds
-                # the contract in its context).
+                # the contract in its context). A child that may have crossed
+                # a mutating tool boundary is fail-closed: schema correction
+                # is not an authorization to repeat side effects.
                 _schema_retries = 1
+            elif not _schema_valid and _mutation_possible:
+                _schema_errors = list(_schema_errors) + [
+                    "schema retry suppressed: mutation reconciliation required"
+                ]
+                _schema_retries = 0
+            if _schema_retries:
+                # Exactly one retry turn, carrying the validation errors.
+                # The child already holds the output contract in context.
                 _retry_result = None
                 try:
                     _retry_result = child.run_conversation(
@@ -3027,6 +3198,19 @@ def _run_single_child(
             # tells the parent *how* the task ended.
             status = "completed"
         else:
+            status = "failed"
+
+        # Linearize result acceptance with the watchdog. A child that returns
+        # during cancellation grace is useful late work, not an ordinary
+        # success; it is accepted only for this generation and cannot overwrite
+        # a later authoritative attempt.
+        _accepted_state = _lifecycle.accept_result(
+            generation=_lifecycle.snapshot()["execution_generation"],
+            success=status == "completed",
+        )
+        if _accepted_state == WorkerState.LATE_SUCCESS:
+            status = "late_success"
+        elif _accepted_state in {WorkerState.SUPERSEDED, WorkerState.FAILED}:
             status = "failed"
 
         # Build tool trace from conversation messages (already in memory).
@@ -3127,6 +3311,8 @@ def _run_single_child(
         # Mirrors _child_cost_usd (which is stripped pre-serialization and
         # only feeds the parent session rollup).
         # Inspired by: Perplexity Agent API result shape (idea-level).
+        _lifecycle.confirm_termination()
+        entry.update(_lifecycle.snapshot())
         entry["cost_usd"] = round(entry["_child_cost_usd"], 6)
         _cost_status = getattr(child, "session_cost_status", None)
         entry["cost_status"] = (
@@ -3140,8 +3326,7 @@ def _run_single_child(
         # requested, so legacy (schema-less) payloads keep their exact shape.
         if isinstance(_output_schema, dict):
             entry["schema_valid"] = bool(_schema_valid)
-            if _schema_retries:
-                entry["schema_retries"] = _schema_retries
+            entry["schema_retries"] = _schema_retries
             if not _schema_valid and _schema_errors:
                 entry["schema_errors"] = _schema_errors
 
@@ -3283,6 +3468,9 @@ def _run_single_child(
             "duration_seconds": duration,
             "_child_role": getattr(child, "_delegate_role", None),
         }
+        _lifecycle.transition(WorkerState.FAILED)
+        _lifecycle.confirm_termination()
+        _error_entry.update(_lifecycle.snapshot())
         if _late_pending_steer:
             _error_entry["missed_steer"] = _late_pending_steer
             _error_entry["error"] += (
@@ -4228,11 +4416,13 @@ def delegate_task(
                 try:
                     _summary = _c.get_activity_summary()
                     _tool = _summary.get("current_tool")
+                    _progress = meaningful_activity_token(_summary)
                     parts.append(
                         (
-                            _summary.get("api_call_count", 0),
+                            _progress[0],
                             _tool,
-                            _summary.get("last_activity_ts"),
+                            _progress[1],
+                            _progress[1] is not None,
                         )
                     )
                     in_tool = in_tool or bool(_tool)

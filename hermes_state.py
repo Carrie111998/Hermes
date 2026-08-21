@@ -7936,6 +7936,92 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
         return dict(row) if row else None
 
+    def aggregate_session_usage(self, session_id: str) -> Dict[str, Any]:
+        """Aggregate direct parent and immediate delegated-child usage.
+
+        This is a read-only reporting view. It preserves raw sessions and
+        session_model_usage rows and separates parent consumption from child
+        consumption so a caller can compute dispatch, consumption, and
+        accepted-work metrics without treating API calls as useful work.
+        """
+        if not session_id:
+            return {"parent": {}, "children": [], "totals": {}}
+        self.flush_token_counts()
+        fields = (
+            "api_calls", "input_tokens", "output_tokens", "cache_read_tokens",
+            "cache_write_tokens", "reasoning_tokens", "estimated_cost_usd",
+        )
+        def zero() -> Dict[str, Any]:
+            return {field: 0 for field in fields}
+        def add(target: Dict[str, Any], values: Dict[str, Any]) -> None:
+            for field in fields:
+                target[field] += values.get(field, 0)
+
+        parent = zero()
+        parent_by_model: Dict[str, Dict[str, Any]] = {}
+        with self._read_ctx() as conn:
+            if conn is None:
+                return {"parent": parent, "children": [], "totals": dict(parent)}
+            rows = conn.execute(
+                """SELECT s.id, s.api_call_count,
+                          s.input_tokens, s.output_tokens, s.cache_read_tokens,
+                          s.cache_write_tokens, s.reasoning_tokens,
+                          s.estimated_cost_usd, u.model AS usage_model,
+                          u.billing_provider AS usage_provider,
+                          u.api_call_count AS u_api_calls,
+                          u.input_tokens AS u_input_tokens,
+                          u.output_tokens AS u_output_tokens,
+                          u.cache_read_tokens AS u_cache_read_tokens,
+                          u.cache_write_tokens AS u_cache_write_tokens,
+                          u.reasoning_tokens AS u_reasoning_tokens,
+                          u.estimated_cost_usd AS u_estimated_cost_usd
+                     FROM sessions s
+                LEFT JOIN session_model_usage u ON u.session_id = s.id
+                    WHERE s.id = ? OR s.parent_session_id = ?
+                 ORDER BY s.id""",
+                (session_id, session_id),
+            ).fetchall()
+        children: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            is_parent = row["id"] == session_id
+            bucket = parent_by_model if is_parent else children.setdefault(
+                row["id"], {"session_id": row["id"], "usage": zero(), "by_model": {}}
+            )["by_model"]
+            target = parent if is_parent else children[row["id"]]["usage"]
+            if row["usage_model"] is None:
+                if any(target.values()):
+                    continue
+                values = {
+                    "api_calls": row["api_call_count"] or 0,
+                    "input_tokens": row["input_tokens"] or 0,
+                    "output_tokens": row["output_tokens"] or 0,
+                    "cache_read_tokens": row["cache_read_tokens"] or 0,
+                    "cache_write_tokens": row["cache_write_tokens"] or 0,
+                    "reasoning_tokens": row["reasoning_tokens"] or 0,
+                    "estimated_cost_usd": row["estimated_cost_usd"] or 0.0,
+                }
+                model_key = "session_summary"
+            else:
+                values = {
+                    "api_calls": row["u_api_calls"] or 0,
+                    "input_tokens": row["u_input_tokens"] or 0,
+                    "output_tokens": row["u_output_tokens"] or 0,
+                    "cache_read_tokens": row["u_cache_read_tokens"] or 0,
+                    "cache_write_tokens": row["u_cache_write_tokens"] or 0,
+                    "reasoning_tokens": row["u_reasoning_tokens"] or 0,
+                    "estimated_cost_usd": row["u_estimated_cost_usd"] or 0.0,
+                }
+                model_key = f"{row['usage_model']}@{row['usage_provider'] or ''}"
+            model_target = bucket.setdefault(model_key, zero())
+            add(model_target, values)
+            add(target, values)
+        parent["by_model"] = parent_by_model
+        child_list = list(children.values())
+        totals = zero()
+        for source in [parent] + [child["usage"] for child in child_list]:
+            add(totals, source)
+        return {"parent": parent, "children": child_list, "totals": totals}
+
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
 

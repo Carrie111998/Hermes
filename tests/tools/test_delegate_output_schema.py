@@ -225,6 +225,23 @@ class TestRunSingleChildSchemaValidation:
         # exactly ONE retry — bounded
         assert len(child.calls) == 2
 
+    def test_mutating_child_does_not_take_schema_retry_without_reconciliation(self):
+        class MutatingStub(_StubChild):
+            def run_conversation(self, user_message, task_id=None, **kwargs):
+                if not self.calls:
+                    callback = getattr(self, "tool_progress_callback", None)
+                    if callback:
+                        callback("tool.started", "write_file")
+                        callback("tool.completed", "write_file")
+                return super().run_conversation(user_message, task_id=task_id, **kwargs)
+
+        child = MutatingStub(["not json at all", '{"city": "should-not-run"}'])
+        child._delegate_output_schema = ADDRESS_SCHEMA
+        entry = _run(child)
+        assert entry["schema_valid"] is False
+        assert entry["schema_retries"] == 0
+        assert len(child.calls) == 1
+
     def test_retry_exception_degrades_to_invalid(self):
         child = _StubChild(["nope"])
         child._delegate_output_schema = ADDRESS_SCHEMA

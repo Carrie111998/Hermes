@@ -298,6 +298,8 @@ def test_stalled_runner_is_interrupted_then_finalized(monkeypatch):
         assert evt["delegation_id"] == res["delegation_id"]
         assert evt["api_calls"] == 0
         assert "stalled" in evt["error"]
+        assert evt["worker_state"] == "cancellation_confirmed"
+        assert evt["cancellation_state"] == "confirmed"
         # Interrupt was requested BEFORE force-finalization (grace window).
         assert interrupted["count"] >= 1
         assert ad.active_count() == 0
@@ -471,6 +473,15 @@ def test_list_async_delegations_exposes_live_activity(monkeypatch):
         assert not any(k.startswith("_") for k in item)
     finally:
         gate.set()
+
+
+def test_tool_start_does_not_advance_structured_progress_token():
+    """Changing only the current tool is not meaningful worker progress."""
+    assert ad._canonical_progress_token(
+        ((0, None, None, False),)
+    ) == ad._canonical_progress_token(
+        ((0, "terminal", None, False),)
+    )
 
 
 def test_in_tool_stall_uses_higher_threshold(monkeypatch):

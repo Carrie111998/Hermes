@@ -195,21 +195,34 @@ delegate_task(
 )
 ```
 
-## Child Timeout
+## Progress-Aware Child Lifecycle
 
-By default there is **no wall-clock timeout** on subagents. Children fail only from what they're actually doing — API errors, tool errors, or hitting their iteration budget — never from a delegation-level stopwatch. Earlier releases shipped a hard cap (300s, later 600s), which kept killing legitimately busy children mid-task: deep code reviews, large research fan-outs, and slow reasoning models routinely need more than 10 minutes while making steady progress the whole time.
+Subagents use a deterministic, local progress watchdog rather than treating a
+fixed lifetime as failure. A child that continues to complete model calls,
+stream output, complete tools, or produce result fragments may run beyond the
+old 120-second boundary. Luna is not called to poll the child.
 
-Genuinely stuck children are still detected: the heartbeat staleness monitor stops refreshing the parent's activity when a child makes no progress (no API calls, no tool starts, and no activity-timestamp ticks), letting the gateway inactivity timeout fire on a truly wedged worker. An in-flight model wait still counts as progress — subagents refresh the activity clock while waiting on the provider, so a slow local / long-prefill completion is not treated as stalled.
+Genuinely stalled children are detected from frozen progress metadata. A tool
+starting is not itself progress, and an idle provider socket does not reset the
+watchdog. The runtime requests cooperative cancellation, waits through a
+bounded grace period, and only then publishes a stalled result. It does not
+launch a replacement while the old attempt is still uncontrolled.
 
-If you want a hard cap anyway (e.g. cost control on unattended cron-driven delegation), opt in per-install:
+Configuration:
 
 ```yaml
 delegation:
   child_timeout_seconds: 0     # default: 0 = no timeout
-  # child_timeout_seconds: 1800  # opt-in hard cap (floor 30s)
+  watchdog_interval_seconds: 30
+  watchdog_inactivity_seconds: 450
+  cancellation_grace_seconds: 120
+  emergency_safety_ceiling_seconds: 0  # 0 = disabled
 ```
 
-A positive value enforces a hard wall-clock limit on each child; `0` or a negative value disables it.
+`child_timeout_seconds` is retained only as a compatibility opt-in emergency
+wall-clock cap; it is not the normal completion deadline. The watchdog's
+inactivity threshold is the ordinary stall detector. An emergency ceiling, if
+enabled, is reported separately from inactivity.
 
 When a configured cap fires, the child's result carries structured timeout
 metadata alongside the error message so parents and hooks can distinguish a
@@ -226,9 +239,8 @@ With a hard cap configured, if a subagent times out having made **zero** API cal
 ## Stall Detection for Background Subagents
 
 Background delegations (`delegate_task(background=true)`) are watched by a
-**progress-based stall monitor** — on by default, zero config. Unlike a
-wall-clock timeout, it never touches a child that is making progress, no
-matter how long it runs.
+**progress-based stall monitor** — on by default. Unlike a wall-clock timeout,
+it never touches a child that is making progress, no matter how long it runs.
 
 The monitor samples each detached child's progress signals — API-call count,
 current tool, and last-activity timestamp (which ticks on **every streamed
@@ -237,10 +249,8 @@ long response always counts as alive):
 
 1. **Progressing children are never touched.** Any advancing signal resets
    the clock.
-2. A child whose progress is completely frozen past the stale threshold
-   (450s idle, 1200s while inside a tool — legitimately slow terminal
-   commands and web fetches get the higher ceiling) is **interrupted** and
-   given a 120s grace window. A child that unwinds in time delivers its
+2. A child whose progress is completely frozen past the configured stale
+   threshold is **interrupted** and given the configured grace window. A child that unwinds in time delivers its
    partial results through the normal completion path.
 3. A child that never returns is force-finalized with a terminal `stalled`
    completion event, so the owning session hears an outcome instead of
@@ -248,7 +258,19 @@ long response always counts as alive):
 
 The `stalled` event carries structured metadata mirroring the sync-path
 timeout fields: `stalled_after_quiet_seconds`, `stall_threshold_seconds`,
-`stall_phase` (`idle` / `in_tool`), and `stall_grace_seconds`.
+`stall_phase` (`idle` / `in_tool`), `stall_reason`, and
+`stall_grace_seconds`, plus the logical task and execution generation.
+
+This lifecycle does not automatically redispatch a stalled worker. It cancels
+and fences the failed attempt, then leaves any deliberate redispatch decision
+to the parent/orchestrator. Because this change never creates a replacement
+execution, normal runtime records use `execution_generation=1` and
+`attempt_number=1`; the lifecycle state machine still rejects stale or late
+results if future code creates a superseding generation.
+
+Lifecycle records also distinguish `RUNNING`, `PROGRESSING`,
+`WAITING_ON_MODEL`, `WAITING_ON_TOOL`, `STALLED`, cancellation-pending and
+confirmed states, `SUCCESS`, `FAILED`, `LATE_SUCCESS`, and `SUPERSEDED`.
 
 This closed a long-standing failure mode where a wedged background child
 left its session looking dead until a process restart. The underlying wedge

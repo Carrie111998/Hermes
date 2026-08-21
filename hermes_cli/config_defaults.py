@@ -1935,11 +1935,17 @@ DEFAULT_CONFIG = {
         # budget still applies.
         "max_summary_chars": 24000,
 
-        "child_timeout_seconds": 0,  # optional wall-clock cap per child agent. 0 (default)
-                                     # = no timeout: children fail only from real errors
-                                     # (API, tools, iteration budget), never a delegation
-                                     # stopwatch. Set a positive number of seconds
-                                     # (floor 30s) to enforce a hard cap.
+        "child_timeout_seconds": 0,  # compatibility emergency cap only; 0 disables it
+                                     # and does not impose a normal child lifetime.
+        # Detached-child watchdog. These are local runtime checks, not model
+        # polling. A progressing child may run beyond any wall-clock boundary;
+        # only a frozen progress signal reaches the cancellation path.
+        "watchdog_interval_seconds": 30,
+        "watchdog_inactivity_seconds": 450,
+        "cancellation_grace_seconds": 120,
+        # 0 disables the emergency absolute ceiling. If enabled, this is a
+        # last-resort runaway guard and is reported separately from inactivity.
+        "emergency_safety_ceiling_seconds": 0,
         "reasoning_effort": "",  # subagent effort: "ultra", "max", "xhigh", "high",
                                  # "medium", "low", "minimal", "none" (empty = inherit)
         "max_concurrent_children": 10,  # unified concurrency cap: max parallel children per batch

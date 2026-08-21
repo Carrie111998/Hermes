@@ -38,11 +38,19 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+
+from tools.worker_lifecycle import (
+    LifecycleWatchdog,
+    WorkerLifecycle,
+    WorkerState,
+    meaningful_activity_token,
+)
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
@@ -111,10 +119,58 @@ _DB_LOCK = threading.Lock()
 # delegate_tool: idle (not inside a tool) stays tight so a wedged first API
 # call is caught quickly; in-tool is much higher so legitimately slow tools
 # (long terminal commands, big fetches) get time to finish.
-_STALE_CHECK_INTERVAL = 30.0  # seconds between monitor sweeps
-_STALE_IDLE_SECONDS = 450.0  # no progress, no current tool → stalled
-_STALE_IN_TOOL_SECONDS = 1200.0  # no progress while inside a tool → stalled
-_STALL_GRACE_SECONDS = 120.0  # after interrupt, time for the runner to return
+_STALE_CHECK_INTERVAL = 30.0  # local watchdog sweep interval
+_STALE_IDLE_SECONDS = 450.0  # no meaningful progress while idle
+_STALE_IN_TOOL_SECONDS = 1200.0  # no meaningful progress in a tool
+_STALL_GRACE_SECONDS = 120.0  # bounded cooperative-cancellation grace
+
+
+def _watchdog_settings() -> tuple[float, float, float, float, float]:
+    """Read watchdog settings without invoking a model or touching secrets."""
+    cfg: Dict[str, Any] = {}
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = (load_config_readonly().get("delegation") or {})
+    except Exception:
+        pass
+
+    def number(key: str, default: float, minimum: float = 0.01) -> float:
+        value = cfg.get(key, os.environ.get("HERMES_" + key.upper()))
+        try:
+            return max(minimum, float(value)) if value is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    def configured(key: str, stock: float, runtime_value: float) -> float:
+        # load_config_readonly() supplies merged defaults. Treat a merged stock
+        # value as non-explicit so tests/embedders can tune the runtime constants;
+        # a real non-stock config value remains authoritative.
+        raw = cfg.get(key, os.environ.get("HERMES_" + key.upper()))
+        try:
+            value = float(raw) if raw is not None else stock
+        except (TypeError, ValueError):
+            value = stock
+        if value == stock and runtime_value != stock:
+            value = runtime_value
+        return max(0.01, value)
+
+    interval = configured("watchdog_interval_seconds", 30.0, _STALE_CHECK_INTERVAL)
+    idle = configured("watchdog_inactivity_seconds", 450.0, _STALE_IDLE_SECONDS)
+    grace = configured("cancellation_grace_seconds", 120.0, _STALL_GRACE_SECONDS)
+    tool_idle = configured("watchdog_tool_inactivity_seconds", 1200.0, _STALE_IN_TOOL_SECONDS)
+    raw_ceiling = cfg.get("emergency_safety_ceiling_seconds", os.environ.get("HERMES_EMERGENCY_SAFETY_CEILING_SECONDS"))
+    try:
+        ceiling = max(0.0, float(raw_ceiling)) if raw_ceiling is not None else 0.0
+    except (TypeError, ValueError):
+        ceiling = 0.0
+    return interval, idle, grace, ceiling, tool_idle
+
+
+def _lifecycle_metadata(record: Dict[str, Any], *, now: Optional[float] = None) -> Dict[str, Any]:
+    lifecycle = record.get("lifecycle")
+    if not isinstance(lifecycle, WorkerLifecycle):
+        return {}
+    return lifecycle.snapshot(now=now)
 
 _monitor_lock = threading.Lock()
 _monitor_thread: Optional[threading.Thread] = None
@@ -163,7 +219,15 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             task_json TEXT,
             delivery_claim TEXT,
             delivery_claimed_at REAL,
-            origin_session_id TEXT NOT NULL DEFAULT ''
+            origin_session_id TEXT NOT NULL DEFAULT '',
+            logical_task_id TEXT,
+            execution_generation INTEGER NOT NULL DEFAULT 1,
+            attempt_number INTEGER NOT NULL DEFAULT 1,
+            worker_state TEXT,
+            last_progress_at REAL,
+            last_progress_kind TEXT,
+            cancellation_state TEXT,
+            stall_reason TEXT
         )"""
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
@@ -178,6 +242,14 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         # completions recovered after a process restart are unroutable on
         # api_server (the in-memory record that carried it is gone).
         ("origin_session_id", "TEXT"),
+        ("logical_task_id", "TEXT"),
+        ("execution_generation", "INTEGER NOT NULL DEFAULT 1"),
+        ("attempt_number", "INTEGER NOT NULL DEFAULT 1"),
+        ("worker_state", "TEXT"),
+        ("last_progress_at", "REAL"),
+        ("last_progress_kind", "TEXT"),
+        ("cancellation_state", "TEXT"),
+        ("stall_reason", "TEXT"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
@@ -257,13 +329,20 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
-                owner_started_at, task_json, origin_session_id)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                owner_started_at, task_json, origin_session_id,
+                logical_task_id, execution_generation, attempt_number,
+                worker_state, last_progress_at, last_progress_kind,
+                cancellation_state, stall_reason)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (record["delegation_id"], record.get("session_key", ""),
              record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
              record["dispatched_at"], now, __import__("os").getpid(),
              owner_started_at, json.dumps(task_payload),
-             record.get("origin_session_id", "")),
+             record.get("origin_session_id", ""), record.get("logical_task_id"),
+             record.get("execution_generation", 1), record.get("attempt_number", 1),
+             record.get("worker_state"), record.get("last_progress_at"),
+             record.get("last_progress_kind"), record.get("cancellation_state"),
+             record.get("stall_reason")),
         )
     _prune_durable_records()
 
@@ -317,10 +396,15 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
-               event_json=?, result_json=?, delivery_state='pending'
+               event_json=?, result_json=?, delivery_state='pending',
+               worker_state=?, last_progress_at=?, last_progress_kind=?,
+               cancellation_state=?, stall_reason=?
                WHERE delegation_id=?""",
             (event.get("status", "completed"), event.get("completed_at", now), now,
-             json.dumps(event), json.dumps(result), event["delegation_id"]),
+             json.dumps(event), json.dumps(result), event.get("worker_state"),
+             event.get("last_progress_at"), event.get("last_progress_kind"),
+             event.get("cancellation_state"), event.get("stall_reason"),
+             event["delegation_id"]),
         )
 
 
@@ -810,6 +894,7 @@ def dispatch_async_delegation(
     """
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
+    lifecycle = WorkerLifecycle(logical_task_id=delegation_id)
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
         "goal": goal,
@@ -831,6 +916,10 @@ def dispatch_async_delegation(
         "_progress_token": None,
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
+        "logical_task_id": delegation_id,
+        "execution_generation": 1,
+        "attempt_number": 1,
+        "lifecycle": lifecycle,
     }
     # Capacity check and record insert under ONE lock hold — checking
     # active_count() separately would let two concurrent dispatches (e.g.
@@ -904,6 +993,22 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         return
     event_record, _interrupt_fn = claimed
 
+    lifecycle = event_record.get("lifecycle")
+    if isinstance(lifecycle, WorkerLifecycle):
+        generation = int(event_record.get("execution_generation", 1) or 1)
+        accepted = lifecycle.accept_result(
+            generation=generation,
+            authoritative_generation=generation,
+            success=status in {"completed", "success"},
+        )
+        if accepted == WorkerState.LATE_SUCCESS:
+            status = "late_success"
+        elif accepted == WorkerState.SUPERSEDED:
+            status = "superseded"
+        elif accepted == WorkerState.FAILED and status in {"completed", "success"}:
+            status = "failed"
+        result = dict(result)
+        result.update(lifecycle.snapshot(now=event_record.get("completed_at") or time.time()))
     _push_completion_event(event_record, result, status)
     _finish_finalization(delegation_id, status)
 
@@ -985,6 +1090,18 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
+    lifecycle = record.get("lifecycle")
+    if isinstance(lifecycle, WorkerLifecycle):
+        # A returned child is a confirmed termination boundary. Do this before
+        # publication so a watchdog race cannot classify one attempt twice.
+        lifecycle.confirm_termination(now=completed_at)
+        result = dict(result)
+        result.update(lifecycle.snapshot(now=completed_at))
+    # Metadata may be present in the result but must not be allowed to replace
+    # the authoritative execution identity held by the registry record.
+    for key in ("logical_task_id", "execution_generation", "attempt_number"):
+        if key in record:
+            result[key] = record[key]
     # Routing origin captured at dispatch (see _capture_routing_origin):
     # additive, lets the gateway reconstruct a full SessionSource (incl.
     # scope_id for relay tenant egress) when its own caches are cold.
@@ -998,6 +1115,14 @@ def _push_completion_event(
         "stall_threshold_seconds",
         "stall_phase",
         "stall_grace_seconds",
+        "logical_task_id",
+        "execution_generation",
+        "attempt_number",
+        "worker_state",
+        "cancellation_state",
+        "last_progress_at",
+        "last_progress_kind",
+        "stall_reason",
     ):
         if _k in result:
             evt[_k] = result[_k]
@@ -1052,6 +1177,7 @@ def dispatch_async_delegation_batch(
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)
+    lifecycle = WorkerLifecycle(logical_task_id=delegation_id)
     # A combined goal label for status listings / the completion header.
     combined_goal = (
         goals[0] if n == 1 else f"{n} parallel subagents: " + "; ".join(g[:40] for g in goals)
@@ -1078,6 +1204,10 @@ def dispatch_async_delegation_batch(
         "_progress_token": None,
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
+        "logical_task_id": delegation_id,
+        "execution_generation": 1,
+        "attempt_number": 1,
+        "lifecycle": lifecycle,
     }
     with _records_lock:
         running = sum(
@@ -1154,6 +1284,22 @@ def _finalize_batch(
         return
     event_record, _interrupt_fn = claimed
 
+    lifecycle = event_record.get("lifecycle")
+    if isinstance(lifecycle, WorkerLifecycle):
+        generation = int(event_record.get("execution_generation", 1) or 1)
+        accepted = lifecycle.accept_result(
+            generation=generation,
+            authoritative_generation=generation,
+            success=status in {"completed", "success"},
+        )
+        if accepted == WorkerState.LATE_SUCCESS:
+            status = "late_success"
+        elif accepted == WorkerState.SUPERSEDED:
+            status = "superseded"
+        elif accepted == WorkerState.FAILED and status in {"completed", "success"}:
+            status = "failed"
+        combined = dict(combined)
+        combined.update(lifecycle.snapshot(now=event_record.get("completed_at") or time.time()))
     _push_batch_completion_event(event_record, combined, status)
     _finish_finalization(delegation_id, status)
 
@@ -1212,6 +1358,14 @@ def _push_batch_completion_event(
         "stall_threshold_seconds",
         "stall_phase",
         "stall_grace_seconds",
+        "logical_task_id",
+        "execution_generation",
+        "attempt_number",
+        "worker_state",
+        "cancellation_state",
+        "last_progress_at",
+        "last_progress_kind",
+        "stall_reason",
     ):
         if _k in combined:
             evt[_k] = combined[_k]
@@ -1246,6 +1400,27 @@ def _ensure_stale_monitor() -> None:
         _monitor_thread.start()
 
 
+def _canonical_progress_token(token: Any) -> Any:
+    """Remove non-progress fields before comparing monitor samples.
+
+    ``_batch_progress`` includes the current tool and an in-tool marker so the
+    monitor can choose its threshold. A tool start may change those fields
+    without producing meaningful work, so they must not refresh the progress
+    clock. The threshold signal remains returned separately by ``progress_fn``.
+    """
+    try:
+        parts = list(token)
+    except TypeError:
+        return token
+    canonical = []
+    for part in parts:
+        if isinstance(part, (tuple, list)) and len(part) >= 3:
+            canonical.append((part[0], part[2]))
+        else:
+            canonical.append(part)
+    return tuple(canonical)
+
+
 def _stale_monitor_loop() -> None:
     """Sweep running delegations for stalled progress.
 
@@ -1263,7 +1438,8 @@ def _stale_monitor_loop() -> None:
       the owning session hears an outcome and the async slot frees. A late
       runner return after that is ignored by ``_begin_finalization``.
     """
-    while not _monitor_stop.wait(_STALE_CHECK_INTERVAL):
+    interval, idle_threshold, grace_seconds, emergency_ceiling, tool_idle_threshold = _watchdog_settings()
+    while not _monitor_stop.wait(interval):
         now = time.time()
         stalled: List[tuple] = []  # (delegation_id, is_batch, quiet_for, in_tool)
         expired: List[str] = []  # stalling past grace → force-finalize
@@ -1274,7 +1450,10 @@ def _stale_monitor_loop() -> None:
                 if status == "stalling":
                     any_monitorable = True
                     interrupted_at = record.get("_interrupted_at") or now
-                    if now - interrupted_at >= _STALL_GRACE_SECONDS:
+                    lifecycle = record.get("lifecycle")
+                    if isinstance(lifecycle, WorkerLifecycle):
+                        lifecycle.mark_cancellation_pending()
+                    if now - interrupted_at >= grace_seconds:
                         expired.append(record["delegation_id"])
                     continue
                 if status != "running":
@@ -1284,28 +1463,67 @@ def _stale_monitor_loop() -> None:
                     continue
                 any_monitorable = True
                 try:
-                    token, in_tool = progress_fn()
+                    raw_token, in_tool = progress_fn()
+                    if isinstance(raw_token, tuple) and raw_token and isinstance(raw_token[0], (tuple, list)):
+                        token = raw_token
+                    else:
+                        token = meaningful_activity_token({
+                            "api_call_count": raw_token[0] if isinstance(raw_token, tuple) and raw_token else 0,
+                            "last_activity_ts": (
+                                raw_token[2] if isinstance(raw_token, tuple) and len(raw_token) >= 3 else None
+                            ),
+                            "last_activity_desc": "receiving stream response" if isinstance(raw_token, tuple) and len(raw_token) >= 3 else "",
+                            "current_tool": raw_token[1] if isinstance(raw_token, tuple) and len(raw_token) >= 2 else None,
+                        })
                 except Exception:
                     # An unreadable child must not look permanently healthy —
                     # keep the last timestamp running instead of refreshing it.
                     token, in_tool = record.get("_progress_token"), False
-                if token != record.get("_progress_token"):
-                    record["_progress_token"] = token
+                # A first observation establishes the baseline; it is not
+                # proof that the child made progress. Provider-wait samples
+                # remain frozen until a completion/chunk boundary appears.
+                canonical_token = _canonical_progress_token(token)
+                previous_token = record.get("_progress_token")
+                if previous_token is None:
+                    record["_progress_token"] = canonical_token
+                    continue
+                if canonical_token != previous_token and canonical_token != (0, None):
+                    record["_progress_token"] = canonical_token
                     record["_progress_ts"] = now
+                    lifecycle = record.get("lifecycle")
+                    if isinstance(lifecycle, WorkerLifecycle):
+                        lifecycle.record_progress("activity_sample", now=now)
                     continue
                 quiet_for = now - (record.get("_progress_ts") or now)
-                limit = (
-                    _STALE_IN_TOOL_SECONDS if in_tool else _STALE_IDLE_SECONDS
+                lifecycle = record.get("lifecycle")
+                limit = idle_threshold
+                if in_tool:
+                    # The explicit configured inactivity threshold is the
+                    # watchdog contract for every operation; the historical
+                    # in-tool constant is only a safe fallback when the
+                    # operator left the configured default untouched.
+                    limit = tool_idle_threshold
+                emergency_hit = bool(
+                    emergency_ceiling
+                    and now - (record.get("dispatched_at") or now) >= emergency_ceiling
                 )
+                if emergency_hit:
+                    limit = 0.0
                 if quiet_for >= limit:
                     record["status"] = "stalling"
                     record["_interrupted_at"] = now
+                    if isinstance(lifecycle, WorkerLifecycle):
+                        lifecycle.transition(WorkerState.STALLED, now=now)
+                        lifecycle.request_cancellation(now=now)
                     # Structured stall context for the terminal event and
                     # status listings (#51690): how long progress was frozen,
                     # which threshold applied, and whether the child was
                     # inside a tool when it went quiet.
                     record["_stall_quiet_seconds"] = round(quiet_for, 2)
                     record["_stall_threshold_seconds"] = limit
+                    record["_stall_reason"] = (
+                        "emergency_safety_ceiling" if emergency_hit else "inactivity"
+                    )
                     record["_stall_in_tool"] = bool(in_tool)
                     stalled.append(
                         (
@@ -1344,8 +1562,15 @@ def _finalize_stalled(delegation_id: str) -> None:
     if claimed is None:
         return
     event_record, _interrupt_fn = claimed
+    lifecycle = event_record.get("lifecycle")
 
     completed_at = event_record.get("completed_at") or time.time()
+    if isinstance(lifecycle, WorkerLifecycle):
+        # This is an observability fence only. The detached runner may still be
+        # inside provider/tool I/O; do not call it termination confirmation and
+        # do not permit a replacement attempt from this record.
+        lifecycle.fence(now=completed_at)
+        lifecycle.mark_cancellation_pending()
     duration = round(
         completed_at - (event_record.get("dispatched_at") or completed_at),
         2,
@@ -1378,8 +1603,14 @@ def _finalize_stalled(delegation_id: str) -> None:
             else "idle" if stall_in_tool is not None
             else None
         ),
-        "stall_grace_seconds": _STALL_GRACE_SECONDS,
+        "stall_grace_seconds": _watchdog_settings()[2],
+        "stall_reason": event_record.get("_stall_reason", "inactivity"),
+        "logical_task_id": event_record.get("logical_task_id"),
+        "execution_generation": event_record.get("execution_generation", 1),
+        "attempt_number": event_record.get("attempt_number", 1),
     }
+    if isinstance(lifecycle, WorkerLifecycle):
+        stall_meta.update(lifecycle.snapshot(now=completed_at))
     if event_record.get("is_batch"):
         _push_batch_completion_event(
             event_record,
@@ -1463,6 +1694,9 @@ def list_async_delegations() -> List[Dict[str, Any]]:
                 if k not in {"interrupt_fn", "progress_fn"}
                 and not k.startswith("_")
             }
+            lifecycle = r.get("lifecycle")
+            if isinstance(lifecycle, WorkerLifecycle):
+                item.update(lifecycle.snapshot(now=now))
             status = r.get("status")
             if status in ("running", "stalling"):
                 ts = r.get("_progress_ts")
@@ -1489,10 +1723,10 @@ def list_async_delegations() -> List[Dict[str, Any]]:
         if fn is None:
             continue
         try:
-            token, in_tool = fn()
+            raw_token, in_tool = fn()
         except Exception:
             continue
-        activity = _children_activity_from_token(token, now)
+        activity = _children_activity_from_token(raw_token, now)
         if activity is not None:
             item["children_activity"] = activity
         item["in_tool"] = bool(in_tool)
