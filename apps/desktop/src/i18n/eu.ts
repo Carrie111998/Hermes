@@ -2332,4 +2332,28 @@ export const eu = defineLocale({
     startChatting: 'Hasi',
     docs: provider => `${provider} dokumentazioa`
   },
+
+  modelPicker: {
+    title: 'Aldatu modeloa',
+    current: 'unekoa:',
+    unknown: '(ezezaguna)',
+    search: 'Iragazi hornitzaileak eta modeloak...',
+    noModels: 'Ez da modelorik aurkitu.',
+    addProvider: 'Gehitu hornitzailea',
+    loadFailed: 'Ezin izan dira modeloak kargatu',
+    noAuthenticatedProviders: 'Ez dago autentifikatutako hornitzailerik.',
+    pro: 'Pro',
+    proNeedsSubscription: 'Pro modeloek Nous harpidetza ordaindua behar dute.',
+    free: 'Doan',
+    freeTier: 'Doako maila',
+    priceTitle: 'Sarrera / irteera prezioa milioi token bakoitzeko',
+    wasPrice: 'Zena'
+  },
+
+  modelVisibility: {
+    title: 'Modeloak',
+    search: 'Bilatu modeloak',
+    noAuthenticatedProviders: 'Ez dago autentifikatutako hornitzailerik.',
+    addProvider: 'Gehitu hornitzailea…'
+  },
 })
