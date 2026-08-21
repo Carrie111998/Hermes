@@ -74,6 +74,7 @@ interface Option<T extends string = string> {
 const GROUPINGS: Option<SidebarGrouping>[] = [
   { icon: 'clock', id: 'date', label: 'Updated' },
   { icon: 'root-folder', id: 'project', label: 'Project' },
+  { icon: 'symbol-namespace', id: 'space', label: 'Space' },
   { icon: 'pulse', id: 'status', label: 'Status' },
   { icon: 'account', id: 'profile', label: 'Profile' }
 ]
@@ -238,7 +239,7 @@ export function SidebarFilterMenu({ className }: { className?: string }) {
                 onValueChange={value => setSidebarGrouping(value as SidebarGrouping)}
                 value={grouping}
               >
-                {GROUPINGS.map(option => (
+                {GROUPINGS.filter(option => option.id !== 'space' || !showAllProfiles).map(option => (
                   <OptionRadio key={option.id} option={option} />
                 ))}
               </DropdownMenuRadioGroup>

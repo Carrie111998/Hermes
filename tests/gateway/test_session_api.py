@@ -43,6 +43,10 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/api/sessions", adapter._handle_list_sessions)
     app.router.add_post("/api/sessions", adapter._handle_create_session)
+    app.router.add_get("/api/session-spaces", adapter._handle_list_session_spaces)
+    app.router.add_post("/api/session-spaces", adapter._handle_create_session_space)
+    app.router.add_patch("/api/session-spaces/{space_id}", adapter._handle_patch_session_space)
+    app.router.add_delete("/api/session-spaces/{space_id}", adapter._handle_delete_session_space)
     app.router.add_get("/api/sessions/{session_id}", adapter._handle_get_session)
     app.router.add_patch("/api/sessions/{session_id}", adapter._handle_patch_session)
     app.router.add_delete("/api/sessions/{session_id}", adapter._handle_delete_session)
@@ -80,6 +84,33 @@ async def test_capabilities_advertises_session_control_surface(adapter):
         "method": "POST",
         "path": "/v1/runs/{run_id}/steer",
     }
+
+
+@pytest.mark.asyncio
+async def test_session_space_api_assigns_session_and_rejects_duplicate_binding(adapter, session_db):
+    session_db.create_session("gateway-row", "discord", chat_id="channel-1")
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        created = await cli.post(
+            "/api/session-spaces",
+            json={"name": "Infrastructure", "platform": "discord", "chat_id": "channel-1"},
+        )
+        assert created.status == 201
+        space = (await created.json())["space"]
+
+        duplicate = await cli.post(
+            "/api/session-spaces",
+            json={"name": "Other", "platform": "discord", "chat_id": "channel-1"},
+        )
+        assert duplicate.status == 400
+
+        patched = await cli.patch("/api/sessions/gateway-row", json={"space_id": None})
+        assert patched.status == 200
+        assert (await patched.json())["session"]["space_id"] is None
+
+        listed = await cli.get("/api/session-spaces")
+        assert (await listed.json())["spaces"] == [space]
 
 
 @pytest.mark.asyncio

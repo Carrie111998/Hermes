@@ -552,6 +552,60 @@ async def get_session_stats(profile: Optional[str] = None):
         db.close()
 
 
+@manage_router.get("/api/session-spaces")
+async def list_session_spaces_endpoint(profile: Optional[str] = None):
+    db = _open_session_db_for_profile(profile, read_only=True)
+    try:
+        return {"spaces": db.list_session_spaces()}
+    finally:
+        db.close()
+
+
+@manage_router.post("/api/session-spaces", status_code=201)
+async def create_session_space_endpoint(body: Dict[str, Any]):
+    payload = dict(body)
+    profile = payload.pop("profile", None)
+    db = _open_session_db_for_profile(profile, read_only=False)
+    try:
+        try:
+            return {"space": db.create_session_space(
+                payload.pop("name", None),
+                space_id=payload.pop("id", None),
+                **payload,
+            )}
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        db.close()
+
+
+@manage_router.patch("/api/session-spaces/{space_id}")
+async def patch_session_space_endpoint(space_id: str, body: Dict[str, Any]):
+    payload = dict(body)
+    profile = payload.pop("profile", None)
+    db = _open_session_db_for_profile(profile, read_only=False)
+    try:
+        try:
+            return {"space": db.update_session_space(space_id, **payload)}
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Session space not found")
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        db.close()
+
+
+@manage_router.delete("/api/session-spaces/{space_id}")
+async def delete_session_space_endpoint(space_id: str, profile: Optional[str] = None):
+    db = _open_session_db_for_profile(profile, read_only=False)
+    try:
+        if not db.delete_session_space(space_id):
+            raise HTTPException(status_code=404, detail="Session space not found")
+        return {"ok": True}
+    finally:
+        db.close()
+
+
 @manage_router.get("/api/sessions/{session_id}")
 async def get_session_detail(session_id: str, profile: Optional[str] = None):
     db = _open_session_db_for_profile(profile, read_only=True)
@@ -703,10 +757,11 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
             and body.archived is None
             and body.pinned is None
             and body.unread is None
+            and "space_id" not in body.model_fields_set
         ):
             raise HTTPException(
                 status_code=400,
-                detail="Nothing to update; provide 'title', 'archived', 'pinned', and/or 'unread'.",
+                detail="Nothing to update; provide session metadata to change.",
             )
         if body.title is not None:
             try:
@@ -720,6 +775,11 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
             db.set_session_pinned(sid, body.pinned)
         if body.unread is not None:
             db.set_session_read(sid, read=not body.unread)
+        if "space_id" in body.model_fields_set:
+            try:
+                db.set_session_space(sid, body.space_id)
+            except KeyError:
+                raise HTTPException(status_code=404, detail="Session space not found")
         result = {"ok": True, "title": db.get_session_title(sid) or ""}
         if body.archived is not None:
             result["archived"] = bool(body.archived)
@@ -727,6 +787,8 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
             result["pinned"] = bool(body.pinned)
         if body.unread is not None:
             result["unread"] = bool(body.unread)
+        if "space_id" in body.model_fields_set:
+            result["space_id"] = body.space_id
         return result
     finally:
         db.close()

@@ -13658,6 +13658,23 @@ def main():
     sessions_rename.add_argument("session_id", help="Session ID to rename")
     sessions_rename.add_argument("title", nargs="+", help="New title for the session")
 
+    sessions_subparsers.add_parser("spaces", help="List cwd-independent session spaces")
+    sessions_space_create = sessions_subparsers.add_parser(
+        "space-create", help="Create a session space"
+    )
+    sessions_space_create.add_argument("name", help="Space name")
+    sessions_space_create.add_argument("--platform", help="Gateway platform to bind")
+    sessions_space_create.add_argument("--chat-id", help="Gateway chat/channel ID to bind")
+    sessions_space_assign = sessions_subparsers.add_parser(
+        "space-assign", help="Assign or unassign a session space"
+    )
+    sessions_space_assign.add_argument("session_id", help="Session ID or unique prefix")
+    sessions_space_assign.add_argument("space", help="Space ID/name, or 'none' to unassign")
+    sessions_space_delete = sessions_subparsers.add_parser(
+        "space-delete", help="Delete a space and unassign its sessions"
+    )
+    sessions_space_delete.add_argument("space", help="Space ID or name")
+
     sessions_pin = sessions_subparsers.add_parser(
         "pin",
         help="Pin session(s) — durable keep flag, exempt from auto-archive",

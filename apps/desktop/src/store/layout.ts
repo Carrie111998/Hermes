@@ -238,7 +238,7 @@ export const $sidebarAgentsGrouped: ReadableAtom<boolean> = computed(
 /** How the recents list is divided. `date` is the sidebar's long-standing
  *  default (Today / Yesterday / Last week dividers). `profile` only means
  *  anything while the sidebar is showing every profile at once. */
-export type SidebarGrouping = 'date' | 'profile' | 'project' | 'status'
+export type SidebarGrouping = 'date' | 'profile' | 'project' | 'space' | 'status'
 /** What ranks rows within whatever grouping is active. */
 export type SidebarOrdering = 'cost' | 'created' | 'manual' | 'status' | 'tokens' | 'updated'
 /** The sort keys the menu offers; `manual` is entered by dragging, not picked. */
@@ -273,7 +273,7 @@ export const SIDEBAR_SORT_KEYS: readonly SidebarSortKey[] = ['updated', 'created
 const $sidebarFlatGrouping = persistentAtom<SidebarGrouping>(
   SIDEBAR_GROUPING_STORAGE_KEY,
   'date',
-  oneOf(['date', 'status'], 'date')
+  oneOf(['date', 'space', 'status'], 'date')
 )
 
 // All-profiles keeps its own grouping: `profile` only means anything there, and

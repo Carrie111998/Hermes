@@ -126,6 +126,7 @@ import {
   setCurrentCwd
 } from '@/store/session'
 import { $sessionDotStateById, sessionStatusBucket } from '@/store/session-dot-state'
+import { $sessionSpacesByScope, refreshSessionSpaces, sessionSpacesScopeKey } from '@/store/session-spaces'
 import { $focusedStoredSessionId, $workingSessionIds, type SplitDir } from '@/store/session-states'
 import { ackAllSessionsRead } from '@/store/session-unread'
 import { markSessionUnread } from '@/store/session-unread-remote'
@@ -411,6 +412,17 @@ export function ChatSidebar({
   // otherwise be stuck in the grouped view with no way out.
   const showAllProfiles = multiProfile && profileScope === ALL_PROFILES
   const messagingProfile = sidebarProfileForScope(profileScope)
+  const sessionSpacesByScope = useStore($sessionSpacesByScope)
+  const sessionSpaces = sessionSpacesByScope[sessionSpacesScopeKey(messagingProfile, activeConnectionId)] ?? []
+
+  useEffect(() => {
+    if (showAllProfiles) {
+      return
+    }
+
+    void refreshSessionSpaces(messagingProfile).catch(() => undefined)
+  }, [activeConnectionId, messagingProfile, showAllProfiles])
+
   const agentOrderIds = useStore($sidebarSessionOrderIds)
   const agentOrderManual = useStore($sidebarSessionOrderManual)
   const workspaceOrderIds = useStore($sidebarWorkspaceOrderIds)
@@ -1274,6 +1286,36 @@ export function ChatSidebar({
     )
   }, [profileGrouped, agentSessions, profileColors])
 
+  const spaceGroups = useMemo<SidebarSessionGroup[] | undefined>(() => {
+    if (showAllProfiles || grouping !== 'space') {
+      return undefined
+    }
+
+    const names = new Map(sessionSpaces.map(space => [space.id, space]))
+    const groups = new Map<string, SidebarSessionGroup>()
+
+    for (const session of agentSessions) {
+      const id = session.space_id || '__unassigned__'
+      const space = session.space_id ? names.get(session.space_id) : undefined
+
+      const group = groups.get(id) ?? {
+        color: space?.color,
+        id,
+        label: space?.name || 'Unassigned',
+        mode: 'profile',
+        path: null,
+        sessions: []
+      }
+
+      group.sessions.push(session)
+      groups.set(id, group)
+    }
+
+    return [...groups.values()].sort((a, b) =>
+      a.id === '__unassigned__' ? 1 : b.id === '__unassigned__' ? -1 : a.label.localeCompare(b.label)
+    )
+  }, [agentSessions, grouping, sessionSpaces, showAllProfiles])
+
   // The flat Sessions list always shows ALL recent sessions; Projects is a
   // parallel grouped view, not a filter on this one — nothing is hidden here.
   const displayAgentSessions = agentSessions
@@ -1350,7 +1392,7 @@ export function ChatSidebar({
   // state-based keys stay bucketed, where they read correctly per day.
   const rankedGlobally = ordering === 'cost' || ordering === 'tokens'
 
-  const displayAgentGroups = profileGroups
+  const displayAgentGroups = spaceGroups ?? profileGroups
 
   // The recents list owns its own (virtualized) scroll container only when it's a
   // long flat list. In that case it must keep its scroller even in short mode, so
