@@ -3160,7 +3160,8 @@ class SessionBridgeStore:
                 state_rows = conn.execute(
                     """SELECT state, COUNT(*) AS count
                        FROM session_claude_visibility_jobs AS job
-                       WHERE NOT EXISTS (
+                       WHERE job.operator_cleared_at IS NULL
+                         AND NOT EXISTS (
                            SELECT 1
                            FROM session_claude_visibility_characterization_events AS event
                            WHERE event.job_id = job.id
