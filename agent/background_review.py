@@ -927,6 +927,18 @@ def _record_review_usage_to_parent(
     Best-effort by contract: accounting must never fail the review.
     """
     try:
+        # Count this fork's tokens toward the parent's per-session token
+        # budget (#91713), independent of DB persistence: the guard is a live
+        # in-memory counter, so aux spend must register even when the parent
+        # runs without a session_db. session_total_tokens deliberately excludes
+        # aux, so the budget reads this side-counter instead.
+        try:
+            parent_agent.session_aux_tokens_for_budget = int(
+                getattr(parent_agent, "session_aux_tokens_for_budget", 0) or 0
+            ) + int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
+        except Exception:
+            pass
+
         session_db = getattr(parent_agent, "_session_db", None)
         session_id = getattr(parent_agent, "session_id", None)
         if session_db is None or not session_id:

@@ -88,6 +88,7 @@ from agent.retry_utils import (
     zai_coding_overload_retry_ceiling,
 )
 from agent.repetition_guard import is_repetition_dominated
+from agent import session_budget as _session_budget
 from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
@@ -1973,7 +1974,52 @@ def run_conversation(
             if not agent.quiet_mode:
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break
-        
+
+        # Per-session cumulative token budget guard (#91713). Checked before
+        # each API call so an exhausted budget refuses the *next* call — this
+        # runs on the first iteration too, so a session already over budget
+        # from a prior turn is refused before spending anything. `abort` ends
+        # the turn (and, because the used>=cap condition persists, every later
+        # turn) until the user raises/clears the cap; `warn` fires once and
+        # continues. No-op when no budget is set.
+        _budget_action = _session_budget.evaluate_breach(agent)
+        if _budget_action == "abort":
+            _turn_exit_reason = "session_budget_exhausted"
+            _budget_msg = _session_budget.budget_exhausted_message(agent)
+            logger.warning(
+                "Session token budget exhausted: %d/%s tokens after %d calls",
+                _session_budget.budget_used_tokens(agent),
+                agent.session_budget_tokens,
+                agent.session_api_calls,
+            )
+            if not agent.quiet_mode:
+                agent._safe_print(f"\n{_budget_msg}")
+            agent._cleanup_task_resources(effective_task_id)
+            agent._persist_session(messages, conversation_history)
+            return {
+                "final_response": final_response or _budget_msg,
+                "messages": messages,
+                "api_calls": api_call_count,
+                "completed": False,
+                "failed": True,
+                "error": f"session_budget_exhausted: {_budget_msg}",
+            }
+        elif _budget_action == "warn":
+            # warn: emit once (evaluate_breach latched it), then keep going.
+            logger.warning(
+                "Session token budget reached (warn): %d/%s tokens after %d calls",
+                _session_budget.budget_used_tokens(agent),
+                agent.session_budget_tokens,
+                agent.session_api_calls,
+            )
+            if not agent.quiet_mode:
+                agent._safe_print(
+                    f"\n⚠️  session token budget reached "
+                    f"({_session_budget.budget_used_tokens(agent):,}/"
+                    f"{agent.session_budget_tokens:,} tokens after "
+                    f"{agent.session_api_calls} calls) — continuing (warn mode)."
+                )
+
         api_call_count += 1
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")

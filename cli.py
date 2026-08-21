@@ -13577,6 +13577,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         print(f"  Prompt tokens (total):     {prompt:>10,}")
         print(f"  Completion tokens:         {completion:>10,}")
         print(f"  Total tokens:              {total:>10,}")
+        from agent.session_budget import (
+            budget_remaining_tokens as _budget_remaining,
+        )
+        _sb_remaining = _budget_remaining(agent)
+        if _sb_remaining is not None:
+            print(
+                f"  Session budget remaining:  {_sb_remaining:>10,}"
+                f"  / {agent.session_budget_tokens:,} ({agent.session_budget_action})"
+            )
         print(f"  API calls:                 {calls:>10,}")
         print(f"  Session duration:          {elapsed:>10}")
         print(f"  {'─' * 40}")

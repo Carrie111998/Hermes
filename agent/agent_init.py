@@ -1981,6 +1981,20 @@ def init_agent(
             _agent_section.get("run_budget_seconds")
         )
 
+    # Cumulative per-session token budget (#91713). null/0/invalid keeps the
+    # guard dormant (unlimited) — zero behavior change in the default path.
+    from agent.session_budget import (
+        normalize_budget_action,
+        normalize_budget_tokens,
+    )
+
+    agent.session_budget_tokens = normalize_budget_tokens(
+        _agent_section.get("session_budget_tokens")
+    )
+    agent.session_budget_action = normalize_budget_action(
+        _agent_section.get("session_budget_action")
+    )
+
     # Empty-response retry guard config (NS-503): additive
     # ``agent.empty_response_guard`` subsection. Resolution is tolerant —
     # a malformed section falls back to the schema defaults (guard on,

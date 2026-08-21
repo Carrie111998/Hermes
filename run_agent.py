@@ -785,6 +785,15 @@ class AIAgent:
         self.session_cache_write_tokens = 0
         self.session_reasoning_tokens = 0
         self.session_api_calls = 0
+        # Auxiliary tokens (background-review forks) counted toward the
+        # per-session token budget but NOT part of session_total_tokens
+        # (which the aux path deliberately leaves untouched). See
+        # agent/session_budget.py (#91713).
+        self.session_aux_tokens_for_budget = 0
+        # One-shot latch for the `warn` breach action, so a session over its
+        # token budget warns once rather than every turn. Reset with the
+        # session counters (a new session re-arms the warning).
+        self._session_budget_warned = False
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
