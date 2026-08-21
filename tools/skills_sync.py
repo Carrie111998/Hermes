@@ -399,18 +399,36 @@ def restore_official_optional_skill(name: str, *, restore: bool = False) -> dict
     """
     index = _optional_skill_index()
     if not index:
-        return {"ok": False, "message": "No official optional skills directory found.", "restored": [], "backfilled": [], "backed_up": []}
+        return {
+            "ok": False,
+            "changed": False,
+            "message": "No official optional skills directory found.",
+            "restored": [],
+            "backfilled": [],
+            "backed_up": [],
+        }
 
-    targets = sorted(set(index.values()), key=lambda item: item[1]) if name in {"all", "*"} else []
+    targets = (
+        sorted(set(index.values()), key=lambda item: item[1])
+        if name == "all"
+        else []
+    )
     if not targets:
         target = index.get(name)
         if target is None:
-            return {"ok": False, "message": f"Official optional skill not found: {name}", "restored": [], "backfilled": [], "backed_up": []}
+            return {
+                "ok": False,
+                "changed": False,
+                "message": f"Official optional skill not found: {name}",
+                "restored": [],
+                "backfilled": [],
+                "backed_up": [],
+            }
         targets = [target]
 
     restored: List[str] = []
     backed_up: List[str] = []
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
     backup_root = _skills_dir() / ".restore-backups" / f"official-optional-{timestamp}"
 
     for folder_name, install_path, src in targets:
@@ -451,9 +469,18 @@ def restore_official_optional_skill(name: str, *, restore: bool = False) -> dict
             continue
 
     backfilled = _backfill_optional_provenance(quiet=True)
+    changed = bool(restored or backfilled or backed_up)
     return {
         "ok": True,
-        "message": "Official optional skill repair complete.",
+        "changed": changed,
+        "message": (
+            "Official optional skill repair complete."
+            if changed
+            else (
+                "No repair needed; official optional skill is already canonical "
+                "and provenance is current."
+            )
+        ),
         "restored": restored,
         "backfilled": backfilled,
         "backed_up": backed_up,

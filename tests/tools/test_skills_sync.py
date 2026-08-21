@@ -4,9 +4,11 @@ import shutil
 import json
 import os
 import stat
-import pytest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from tools.skills_sync import (
     _get_bundled_dir,
@@ -97,6 +99,72 @@ class TestOptionalProvenance:
 
         assert lock_path.read_text(encoding="utf-8") == original
         assert list(lock_path.parent.glob(".lock_*.tmp")) == []
+
+    def test_restore_backup_roots_include_microseconds(self, tmp_path):
+        optional_dir = tmp_path / "optional-skills"
+        skills_dir = tmp_path / "skills"
+        self._write_skill(optional_dir, "category/demo", "demo")
+        destination = skills_dir / "category" / "demo"
+        destination.mkdir(parents=True)
+        (destination / "SKILL.md").write_text("first local edit", encoding="utf-8")
+        moments = [
+            datetime(2026, 8, 22, 12, 30, 45, 111111, tzinfo=timezone.utc),
+            datetime(2026, 8, 22, 12, 30, 45, 222222, tzinfo=timezone.utc),
+        ]
+
+        with patch("tools.skills_sync._get_optional_dir", return_value=optional_dir), \
+             patch("tools.skills_sync.SKILLS_DIR", skills_dir), \
+             patch("tools.skills_sync.datetime") as mock_datetime:
+            mock_datetime.now.side_effect = moments
+            first = restore_official_optional_skill("demo", restore=True)
+            (destination / "SKILL.md").write_text(
+                "second local edit", encoding="utf-8"
+            )
+            second = restore_official_optional_skill("demo", restore=True)
+
+        assert first["backup_dir"] != second["backup_dir"]
+        assert "111111" in first["backup_dir"]
+        assert "222222" in second["backup_dir"]
+
+    def test_restore_reports_no_change_when_canonical_and_recorded(self, tmp_path):
+        from tools.skills_hub import HubLockFile
+
+        optional_dir = tmp_path / "optional-skills"
+        skills_dir = tmp_path / "skills"
+        source = self._write_skill(optional_dir, "category/demo", "demo")
+        shutil.copytree(source, skills_dir / "category" / "demo")
+        HubLockFile(path=skills_dir / ".hub" / "lock.json").record_install(
+            name="demo",
+            source="official",
+            identifier="official/category/demo",
+            trust_level="builtin",
+            scan_verdict="pass",
+            skill_hash="hash",
+            install_path="category/demo",
+            files=["SKILL.md"],
+        )
+
+        with patch("tools.skills_sync._get_optional_dir", return_value=optional_dir), \
+             patch("tools.skills_sync.SKILLS_DIR", skills_dir):
+            result = restore_official_optional_skill("demo")
+
+        assert result["ok"] is True
+        assert result["changed"] is False
+        assert result["restored"] == []
+        assert result["backfilled"] == []
+        assert result["backed_up"] == []
+        assert "No repair needed" in result["message"]
+
+    def test_restore_rejects_undocumented_star_alias(self, tmp_path):
+        optional_dir = tmp_path / "optional-skills"
+        self._write_skill(optional_dir, "category/demo", "demo")
+
+        with patch("tools.skills_sync._get_optional_dir", return_value=optional_dir):
+            result = restore_official_optional_skill("*")
+
+        assert result["ok"] is False
+        assert result["changed"] is False
+        assert "not found" in result["message"]
 
 
 class TestReadWriteManifest:
