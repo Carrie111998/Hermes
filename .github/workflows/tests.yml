@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   generate:
-    name: "Generate slices"
+    name: 'Generate slices'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -78,7 +78,7 @@ jobs:
           # fetching a manifest from raw.githubusercontent.com on EVERY job —
           # a transient fetch failure fails the whole job (2026-07-28 slice-5
           # incident). Pinned, the binary downloads directly; no manifest hop.
-          version: "0.9.28"
+          version: '0.9.28'
           # Persist uv's download/wheel cache (~/.cache/uv) across runs.
           # Keyed on the dependency manifests, so the cache is reused until
           # pyproject.toml or uv.lock changes. `uv sync` still runs every
@@ -129,12 +129,18 @@ jobs:
         # re-ran LPT independently — redundant N times.
         run: |
           source .venv/bin/activate
-          scripts/run_tests.sh --files '${{ matrix.slice.files }}'
+          UNSHARE=$(command -v unshare)
+          exec "$UNSHARE" --net --ipc -r /bin/bash -c '
+            export MGS_NETNS_ACTIVE=1
+            ip link set up lo
+            exec unshare --user -- scripts/run_tests.sh --files "$TEST_FILES"
+          '
         env:
+          TEST_FILES: ${{ matrix.slice.files }}
           # Ensure tests don't accidentally call real APIs
-          OPENROUTER_API_KEY: ""
-          OPENAI_API_KEY: ""
-          NOUS_API_KEY: ""
+          OPENROUTER_API_KEY: ''
+          OPENAI_API_KEY: ''
+          NOUS_API_KEY: ''
 
       - name: Upload per-slice durations
         # Advisory artifact (feeds slice balancing) — a transient artifact-
@@ -212,7 +218,7 @@ jobs:
           # fetching a manifest from raw.githubusercontent.com on EVERY job —
           # a transient fetch failure fails the whole job (2026-07-28 slice-5
           # incident). Pinned, the binary downloads directly; no manifest hop.
-          version: "0.9.28"
+          version: '0.9.28'
           # Persist uv's download/wheel cache (~/.cache/uv) across runs.
           # Keyed on the dependency manifests, so the cache is reused until
           # pyproject.toml or uv.lock changes. `uv sync` still runs every
@@ -250,6 +256,6 @@ jobs:
           source .venv/bin/activate
           python -m pytest tests/e2e/ -v --tb=short
         env:
-          OPENROUTER_API_KEY: ""
-          OPENAI_API_KEY: ""
-          NOUS_API_KEY: ""
+          OPENROUTER_API_KEY: ''
+          OPENAI_API_KEY: ''
+          NOUS_API_KEY: ''
