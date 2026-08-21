@@ -108,6 +108,19 @@ function listMarkerEnd(line: string, start: number): number {
   return cursor > start && (line[cursor] === '.' || line[cursor] === ')') ? cursor + 1 : start
 }
 
+function terminalListSuffixEnd(containers: FenceContainer[], start: number): number {
+  let end = start
+
+  // Keep the suffix traversal behind one narrow property-read seam. The
+  // cached terminal-list boundary avoids this fallback on ordinary blanks;
+  // tests can count these exact reads without changing the public parser API.
+  while ((Reflect.get(containers, end) as FenceContainer | undefined)?.kind === 'list') {
+    end += 1
+  }
+
+  return end
+}
+
 // Fences can open after alternating blockquote and list containers. A list
 // marker appears only on the opening line; continuation lines replace it with
 // its visual content indent, while every blockquote marker must remain present.
@@ -246,11 +259,7 @@ function continuedFenceContainerPrefix(line: string, inherited: FenceContainerSt
             }
           }
 
-          let implicitDepth = index
-
-          while (inherited.containers.at(implicitDepth)?.kind === 'list') {
-            implicitDepth += 1
-          }
+          const implicitDepth = terminalListSuffixEnd(inherited.containers, index)
 
           return {
             containers: inherited.containers.slice(0, implicitDepth),

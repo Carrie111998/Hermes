@@ -576,43 +576,44 @@ describe('fenceRawSvgBlocks', () => {
   })
 
   it('continues deep list blanks within a linear container-operation budget', () => {
-    const originalAt = Array.prototype.at
-    let containerLookups = 0
+    const originalGet = Reflect.get
+    let suffixReads = 0
 
-    const atSpy = vi.spyOn(Array.prototype, 'at').mockImplementation(function (this: unknown[], index: number) {
-      const first = this[0] as { kind?: unknown } | undefined
+    const getSpy = vi.spyOn(Reflect, 'get').mockImplementation((target, propertyKey, receiver?) => {
+      const first = Array.isArray(target) ? (target[0] as { kind?: unknown } | undefined) : undefined
 
-      if (first?.kind === 'blockquote' || first?.kind === 'list') {
-        containerLookups += 1
+      if ((first?.kind === 'blockquote' || first?.kind === 'list') && typeof propertyKey === 'number') {
+        suffixReads += 1
       }
 
-      return originalAt.call(this, index)
+      return receiver === undefined ? originalGet(target, propertyKey) : originalGet(target, propertyKey, receiver)
     })
 
     const measure = (depth: number, blankLines: number): number => {
-      const before = containerLookups
+      const before = suffixReads
       const input = `${'- '.repeat(depth)}item\n${'\n'.repeat(blankLines)}${SVG}`
 
       expect(fenceRawSvgBlocks(input)).toContain(`\`\`\`svg\n${SVG}\n\`\`\``)
 
-      return containerLookups - before
+      return suffixReads - before
     }
 
-    let moderateLookups = 0
-    let stressLookups = 0
+    let moderateReads = 0
+    let stressReads = 0
 
     try {
-      moderateLookups = measure(150, 150)
-      stressLookups = measure(300, 300)
+      moderateReads = measure(150, 150)
+      stressReads = measure(300, 300)
     } finally {
-      atSpy.mockRestore()
+      getSpy.mockRestore()
     }
 
-    // Array.at is the inherited-container read seam. Replacing the cached
-    // terminal-list boundary with a suffix walk makes this grow quadratically.
-    expect(moderateLookups).toBeLessThanOrEqual((150 + 150) * 2 + 4)
-    expect(stressLookups).toBeLessThanOrEqual((300 + 300) * 2 + 4)
-    expect(stressLookups).toBeLessThanOrEqual(moderateLookups * 2 + 4)
+    // These are the direct property reads performed by the terminal-list
+    // suffix fallback itself. Disabling the cached boundary makes every blank
+    // traverse the full depth and exceeds these linear budgets quadratically.
+    expect(moderateReads).toBeLessThanOrEqual(150 * 2)
+    expect(stressReads).toBeLessThanOrEqual(300 * 2)
+    expect(stressReads).toBeLessThanOrEqual(moderateReads * 2 + 2)
   })
 
   it('handles a large malformed nested container before a valid root SVG', () => {
