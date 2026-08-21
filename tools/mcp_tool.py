@@ -3886,6 +3886,14 @@ class MCPServerTask:
                 # served >=1 successful tool call (_mark_session_proven).
                 if self._session_proven:
                     self._reconnect_retries = 0
+                    # A proven session also refunds the initial-connect
+                    # budget: after the teardown below clears _ready, the
+                    # next cycle's failures count as "initial" again, and
+                    # without this reset the counter leaks across flap
+                    # cycles until one burst parks on its very first
+                    # attempt (observed: park 242ms after keepalive
+                    # failure, one attempt into a 3-attempt ladder).
+                    initial_retries = 0
                     backoff = reconnect_backoff
                 else:
                     # Unproven session: charge the rapid-drop budget so a
