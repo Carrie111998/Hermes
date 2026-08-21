@@ -2178,4 +2178,80 @@ export const eu = defineLocale({
       noReturn: 'Backend-a ez da berriro martxan jarri. Eguneraketa agian ez da osatu — egiaztatu backend-aren ostalaria.'
     }
   },
+
+  install: {
+    stageStates: {
+      pending: 'Zain',
+      running: 'Instalatzen',
+      succeeded: 'Eginda',
+      skipped: 'Saltatuta',
+      failed: 'Huts egin du'
+    },
+    oneTimeTitle: 'Hermes-ek behin bakarrik instalatu behar du',
+    unsupportedDesc: platform =>
+      `Lehen abiarazteko instalazio automatikoa ez dago eskuragarri ${platform}-en oraindik. Ireki terminala eta exekutatu beheko komandoa; ondoren berriro abiarazi aplikazio hau. Hurrengo abiarazteetan urrats hau saltatuko da.`,
+    installCommand: 'Instalazio-komandoa',
+    copyCommand: 'Kopiatu komandoa',
+    viewDocs: 'Ikusi instalazio-dokumentazioa',
+    installTo: 'Hemen instalatuko da',
+    retryAfterRun: 'Exekutatu dut -- saiatu berriro',
+    setupChoiceTitle: 'Konfiguratu Hermes Desktop',
+    setupChoiceDesc:
+      'Konektatu aplikazio hau jada exekutatzen duzun Hermes gateway batera, edo instalatu Hermes lokalean ordenagailu honetan.',
+    connectExistingTitle: 'Konektatu lehendik dagoen Hermes-era',
+    connectExistingShort: 'Konektatu lehendik dagoena',
+    connectExistingDesc:
+      'Erabili urruneko backend bat saio-token batekin edo nabigatzailean saioa hasita. Ez da instalazio lokalik abiatuko.',
+    installLocalTitle: 'Instalatu Hermes lokalean',
+    installLocalDesc:
+      'Deskargatu Hermes, sortu bere Python ingurunea eta exekutatu backend-a ordenagailu honetan.',
+    localStartUnavailable: 'Ezin izan da instalazio lokala abiarazi. Berrabiarazi Hermes Desktop eta saiatu berriro.',
+    remoteSetupTitle: 'Konektatu lehendik dagoen Hermes-era',
+    remoteSetupDesc:
+      'Sartu zure gateway-aren URLa. Hermes Desktop-ek detektatuko du token bat edo nabigatzaileko saio-hasiera behar duen.',
+    remoteUrlTitle: 'Gateway-aren URLa',
+    remoteUrlDesc: 'Erabili Hermes gateway-aren oinarrizko URLa; https:// barne urrunekoa denean.',
+    remoteUrlPlaceholder: 'https://gateway.example.com/hermes',
+    probing: 'Gateway-aren autentifikazioa detektatzen...',
+    probeError: 'Ezin izan da Hermes gateway horretara iritsi.',
+    identityProvider: 'zure identitate-hornitzailea',
+    authTitle: 'Autentifikazioa',
+    authNeedsOauth: provider => `Hasi saioa ${provider}-rekin gateway hau probatu aurretik.`,
+    authSignedIn: 'Nabigatzailean saioa hasi da.',
+    connected: 'Konektatuta',
+    signIn: 'Hasi saioa',
+    signInWith: provider => `Hasi saioa ${provider}-rekin`,
+    enterUrlFirst: 'Sartu gateway-aren URL bat lehenengo.',
+    signInIncomplete: 'Saioa hasteko leihoa itxi da autentifikazioa amaitu aurretik.',
+    tokenTitle: 'Saio-tokena',
+    tokenDesc: 'Itsatsi saio-tokena urruneko gateway-aren .env fitxategitik.',
+    pasteSessionToken: 'Itsatsi saio-tokena',
+    incompleteSignInTest: 'Hasi saioa OAuth-ek babestutako gateway hau probatu aurretik.',
+    incompleteTokenTest: 'Sartu saio-token bat gateway hau probatu aurretik.',
+    testConnection: 'Probatu konexioa',
+    testSucceeded: (baseUrl, version) => `Konektatuta ${baseUrl}-ra${version ? ` (${version})` : ''}.`,
+    applyRemote: 'Aplikatu eta berriro konektatu',
+    backToSetup: 'Atzera',
+    failedTitle: 'Instalazioak huts egin du',
+    settingUpTitle: 'Hermes Agent konfiguratzen',
+    finishingTitle: 'Amaitzen',
+    failedDesc:
+      'Instalazio-urratsetako batek huts egin du. Windows-en hau gerta daiteke beste Hermes CLI edo mahaigaineko instantzia bat martxan badago. Gelditu exekutatzen ari diren Hermes instantziak eta gero saiatu berriro. Egiaztatu beheko xehetasunak edo mahaigaineko log-a transkripzio osoa lortzeko.',
+    activeDesc:
+      'Behin bakarrik egiten den konfigurazioa da. Hermes instalatzaileak menpekotasunak deskargatzen eta zure makina konfiguratzen ari da. Hurrengo abiarazteetan urrats hau saltatuko da.',
+    progress: (completed, total) => `${completed} / ${total} urrats eginda`,
+    currentStage: stage => ` -- orain: ${stage}`,
+    fetchingManifest: 'Instalatzailearen manifestua eskuratzen...',
+    error: 'Errorea',
+    hideOutput: 'Ezkutatu instalatzailearen irteera',
+    showOutput: 'Erakutsi instalatzailearen irteera',
+    lines: count => `${count} lerro`,
+    noOutput: 'Oraindik ez dago irteerarik.',
+    cancelling: 'Bertan behera uzten…',
+    cancelInstall: 'Utzi instalazioa',
+    transcriptSaved: 'Transkripzio osoa hemen gorde da',
+    copiedOutput: 'Kopiatuta!',
+    copyOutput: 'Kopiatu irteera',
+    reloadRetry: 'Berriro kargatu eta saiatu berriro'
+  },
 })
