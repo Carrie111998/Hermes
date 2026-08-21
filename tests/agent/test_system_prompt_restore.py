@@ -379,5 +379,77 @@ class TestReconstructStaticPrefixMemoization:
         assert getattr(agent, "_static_rebuild_failed_for", None) is None
 
 
+class TestSessionStartObservationPayload:
+    """The on_session_start hook carries a minimal observation record.
+
+    External observers (e.g. Bifrost) record an observed material fact:
+    native session id, model, the effective reasoning effort (or the
+    literal ``"unknown"``), and the UTC time Hermes first observed the
+    session-start boundary.  No system/base-prompt content is included.
+    """
+
+    def _patch_hook(self, monkeypatch):
+        import hermes_cli.lifecycle as lifecycle
+
+        calls = []
+        monkeypatch.setattr(
+            lifecycle,
+            "invoke_hook",
+            lambda *a, **kw: calls.append((a, kw)) or [],
+        )
+        return calls
+
+    def test_fresh_build_fires_with_full_observation_payload(self, monkeypatch):
+        from datetime import datetime, timedelta, timezone
+
+        calls = self._patch_hook(monkeypatch)
+        before = datetime.now(timezone.utc)
+        agent = _make_agent(session_db=None)
+        agent.reasoning_config = {"enabled": True, "effort": "high"}
+
+        _restore_or_build_system_prompt(agent, None, [])
+
+        assert len(calls) == 1
+        _, kwargs = calls[0]
+        assert kwargs["session_id"] == "test-session-id"
+        assert kwargs["model"] == "test-model"
+        assert kwargs["platform"] == "cli"
+        assert kwargs["reasoning_effort"] == "high"
+        observed = datetime.fromisoformat(kwargs["observed_at"])
+        assert observed.tzinfo is not None
+        assert observed.utcoffset() == timedelta(0), "observed_at must be UTC"
+        assert before <= observed <= datetime.now(timezone.utc)
+
+    def test_unset_reasoning_config_reports_unknown(self, monkeypatch):
+        calls = self._patch_hook(monkeypatch)
+        agent = _make_agent(session_db=None)
+        agent.reasoning_config = None
+
+        _restore_or_build_system_prompt(agent, None, [])
+
+        assert calls[0][1]["reasoning_effort"] == "unknown"
+
+    def test_disabled_reasoning_reports_none(self, monkeypatch):
+        calls = self._patch_hook(monkeypatch)
+        agent = _make_agent(session_db=None)
+        agent.reasoning_config = {"enabled": False}
+
+        _restore_or_build_system_prompt(agent, None, [])
+
+        assert calls[0][1]["reasoning_effort"] == "none"
+
+    def test_restore_does_not_fire_on_session_start(self, monkeypatch):
+        """Continuation sessions reuse the stored prompt — the hook is
+        deliberately not re-fired (it is a new-session boundary only)."""
+        calls = self._patch_hook(monkeypatch)
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": "Stored prompt"}
+        agent = _make_agent(session_db=db)
+
+        _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+
+        assert calls == []
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

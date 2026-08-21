@@ -166,7 +166,13 @@ _DEFAULT_PAYLOADS = {
         "final_response": "All done — the change is applied.",
         "changed_paths": ["src/app.tsx"],
     },
-    "on_session_start": {"session_id": "test-session"},
+    "on_session_start": {
+        "session_id": "test-session",
+        "model": "gpt-4",
+        "platform": "cli",
+        "reasoning_effort": "unknown",
+        "observed_at": "2026-08-21T12:00:00+00:00",
+    },
     "on_session_end": {
         "session_id": "test-session",
         "task_id": "test-task",

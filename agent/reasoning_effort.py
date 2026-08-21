@@ -225,3 +225,36 @@ def requested_effort(reasoning_config: Optional[dict]) -> Optional[str]:
         return None
     effort = str(reasoning_config.get("effort") or "").strip().lower()
     return effort or None
+
+
+#: Literal label emitted when Hermes exposes no effective reasoning-effort
+#: setting at an observed boundary (e.g. the server default applies).  It is
+#: an explicit "unknown" — never an inference about a provider default.
+UNKNOWN_REASONING_EFFORT = "unknown"
+
+
+def effective_reasoning_effort(reasoning_config: Optional[dict]) -> str:
+    """Return the effective reasoning-effort label for an observer.
+
+    Maps a Hermes reasoning config to the effort that was actually in force
+    when the config was applied — the label an external observer should
+    record:
+
+    * ``{"enabled": False}``                    → ``"none"``
+    * ``{"enabled": True, "effort": "high"}``   → ``"high"``
+    * ``None`` / empty / malformed              → ``"unknown"``
+
+    ``"unknown"`` means Hermes did not expose an effective setting at the
+    boundary; it is never an inference about a provider default.  Unlike
+    :func:`requested_effort`, an explicit disable is reported as ``"none"``
+    rather than folded into ``None``, so observers can tell "turned off"
+    from "not configured".
+    """
+    if not isinstance(reasoning_config, dict):
+        return UNKNOWN_REASONING_EFFORT
+    effort = str(reasoning_config.get("effort") or "").strip().lower()
+    if effort:
+        return effort
+    if reasoning_config.get("enabled") is False:
+        return "none"
+    return UNKNOWN_REASONING_EFFORT

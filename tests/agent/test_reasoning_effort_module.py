@@ -25,6 +25,7 @@ from agent.reasoning_effort import (
     KIMI_K3_OVERRIDES,
     OPENAI_COMPAT_WIRE_EFFORTS,
     clamp_effort,
+    effective_reasoning_effort,
     kimi_supported_efforts,
     requested_effort,
 )
@@ -171,3 +172,37 @@ class TestRequestedEffort:
         assert requested_effort({"enabled": False, "effort": "high"}) is None
         assert requested_effort("not-a-dict") is None
         assert requested_effort({"effort": ""}) is None
+
+
+class TestEffectiveReasoningEffort:
+    """Observer-facing label — distinguishes "turned off" from "unset".
+
+    ``effective_reasoning_effort`` is what lifecycle observers (e.g. the
+    ``on_session_start`` payload) record: the effort that was actually in
+    force when the config was applied.  The literal ``"unknown"`` means
+    Hermes exposed no effective setting (the provider default applies) —
+    it is never an inference about a default.
+    """
+
+    def test_explicit_effort_passes_through_normalized(self):
+        assert effective_reasoning_effort({"enabled": True, "effort": "High"}) == "high"
+        assert effective_reasoning_effort({"enabled": True, "effort": "medium"}) == "medium"
+        assert effective_reasoning_effort({"effort": "ultra"}) == "ultra"
+
+    def test_disabled_is_none_not_unknown(self):
+        """An explicit disable is an effective setting ("none"), not
+        "unknown" — observers can tell turned-off from not-configured."""
+        assert effective_reasoning_effort({"enabled": False}) == "none"
+        assert effective_reasoning_effort({"enabled": False, "effort": ""}) == "none"
+
+    def test_unset_or_malformed_is_unknown(self):
+        assert effective_reasoning_effort(None) == "unknown"
+        assert effective_reasoning_effort({}) == "unknown"
+        assert effective_reasoning_effort({"enabled": True}) == "unknown"
+        assert effective_reasoning_effort("not-a-dict") == "unknown"
+
+    def test_unknown_constant_is_the_literal_string(self):
+        from agent.reasoning_effort import UNKNOWN_REASONING_EFFORT
+
+        assert UNKNOWN_REASONING_EFFORT == "unknown"
+        assert effective_reasoning_effort(None) is UNKNOWN_REASONING_EFFORT

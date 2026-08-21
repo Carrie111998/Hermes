@@ -111,6 +111,11 @@ emitted by each built-in hook site.
 
     model           – model name (e.g. "claude-sonnet-4-20250514")
     platform        – platform identifier (e.g. "cli", "whatsapp")
+    reasoning_effort – effective reasoning effort ("none", "minimal", "low",
+                      "medium", "high", "xhigh", "max", "ultra"), or the
+                      literal "unknown" when no effective setting was exposed
+    observed_at     – UTC ISO-8601 timestamp of when Hermes first observed
+                      the session-start boundary (not session creation time)
 
 ``on_session_end`` (emitted from ``agent/turn_finalizer.py``)::
 

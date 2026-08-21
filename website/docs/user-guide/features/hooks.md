@@ -454,7 +454,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `on_stream_end` | Observer | Dispatched when a streaming response finishes or errors, after the stream closes; return ignored. | `final_text`, `finished`, `error`, `turn_id`, `iteration`, `session_id`, `model`, `provider`, `surface` | Full assembled response text; error text may include provider data. |
 | `on_interim_message` | Observer | Dispatched when a mid-loop assistant message is surfaced before the final answer (streaming or non-streaming); return ignored. | `text`, `already_streamed`, `turn_id`, `iteration`, `session_id`, `model`, `provider`, `surface` | Full interim assistant text. |
 | `transform_api_error_classification` | Transform | On each failed provider attempt, at the top of the built-in classifier; all callbacks run, then the first dict with a valid `reason` wins (run-all-then-pick-first), and skipped valid results log a runtime warning. Python plugins only. | `provider`, `model`, `status_code`, `error_type`, `error_code`, `error_message`, `error_body`, `error`, `approx_tokens`, `context_length`, `num_messages` | `error_message` and `error_body` may contain raw provider/user data. |
-| `on_session_start` | Observer | First turn of a new session; return ignored. | `session_id`, `model`, `platform` | Identifiers and routing metadata only. |
+| `on_session_start` | Observer | First turn of a new session; return ignored. | `session_id`, `model`, `platform`, `reasoning_effort` (`"unknown"` when unset), `observed_at` (UTC first-observed session-start time) | Identifiers, routing metadata, and effective reasoning effort — no prompt content. |
 | `on_session_end` | Observer | Canonically at each turn finalization; CLI/TUI exits have additional reduced legacy shapes. Return ignored. | Canonical: `session_id`, `task_id`, `turn_id`, `completed`, `failed`, `interrupted`, `turn_exit_reason`, `model`, `platform`; exit paths may add `reason`/`api_request_id` and omit fields. | IDs, model/platform, and outcome; canonical payload has no message body. |
 | `on_session_finalize` | Observer | CLI/TUI/gateway teardown through `finalize_session`; gateway shutdown or expiry may finalize without a reset. Return ignored. | Surface-dependent `session_id`, `platform`, optionally `reason`, `old_session_id`, `new_session_id` | Session and routing identifiers. |
 | `on_session_reset` | Observer | CLI/TUI session boundary and gateway after the replacement session exists; return ignored. | CLI: `session_id`, `platform`, `reason`; TUI: `session_id`, `platform`; gateway: those plus `reason`, `old_session_id`, `new_session_id` | Session and routing identifiers. |
@@ -887,7 +887,7 @@ Fires **once** when a brand-new session is created. Does **not** fire on session
 **Callback signature:**
 
 ```python
-def my_callback(session_id: str, model: str, platform: str, **kwargs):
+def my_callback(session_id: str, model: str, platform: str, reasoning_effort: str, observed_at: str, **kwargs):
 ```
 
 | Parameter | Type | Description |
@@ -895,25 +895,26 @@ def my_callback(session_id: str, model: str, platform: str, **kwargs):
 | `session_id` | `str` | Unique identifier for the new session |
 | `model` | `str` | The model identifier |
 | `platform` | `str` | Where the session is running |
+| `reasoning_effort` | `str` | The effective reasoning effort (`"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`, `"ultra"`), or the literal `"unknown"` when Hermes exposed no effective setting (e.g. the provider default applies). `"unknown"` is not an inferred default. |
+| `observed_at` | `str` | UTC ISO-8601 timestamp of when Hermes **first observed** the session-start boundary — not session creation time. |
 
-**Fires:** In `run_agent.py`, inside `run_conversation()`, during the first turn of a new session — specifically after the system prompt is built but before the tool loop starts. The check is `if not conversation_history` (no prior messages = new session).
+**Fires:** In `agent/conversation_loop.py`, inside `_restore_or_build_system_prompt()`, during the first turn of a new session — specifically after the system prompt is built but before the tool loop starts. The payload never carries system/base-prompt content; it is a minimal observation record (identity, model, effective reasoning effort, first-observed time).
 
 **Return value:** Ignored.
 
 **Use cases:** Initializing session-scoped state, warming caches, registering the session with an external service, logging session starts.
 
-**Example — initialize a session cache:**
+**Example — register a session with an external observer:**
 
 ```python
-_session_caches = {}
-
-def init_session(session_id, model, platform, **kwargs):
-    _session_caches[session_id] = {
+def init_session(session_id, model, platform, reasoning_effort, observed_at, **kwargs):
+    observer_client.record_session_start({
+        "session_id": session_id,
         "model": model,
         "platform": platform,
-        "tool_calls": 0,
-        "started": __import__("datetime").datetime.now().isoformat(),
-    }
+        "reasoning_effort": reasoning_effort,
+        "observed_at": observed_at,
+    })
 
 def register(ctx):
     ctx.register_hook("on_session_start", init_session)

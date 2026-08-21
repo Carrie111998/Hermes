@@ -988,13 +988,27 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this
     # to initialise session-scoped state (e.g. warm a memory cache).
+    # The payload is a minimal observation record for external
+    # observers: session identity, model, the effective reasoning
+    # effort (or the literal "unknown" when no effective setting was
+    # exposed), and the UTC time the session-start boundary was first
+    # observed.  It deliberately never carries system/base-prompt
+    # content.  Additive and backward compatible: new kwargs only.
     try:
+        from datetime import datetime, timezone
+
+        from agent.reasoning_effort import effective_reasoning_effort
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+
         _invoke_hook(
             "on_session_start",
             session_id=agent.session_id,
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
+            reasoning_effort=effective_reasoning_effort(
+                getattr(agent, "reasoning_config", None)
+            ),
+            observed_at=datetime.now(timezone.utc).isoformat(),
         )
     except Exception as exc:
         logger.warning("on_session_start hook failed: %s", exc)
