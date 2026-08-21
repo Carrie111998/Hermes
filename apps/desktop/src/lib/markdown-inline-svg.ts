@@ -4,9 +4,16 @@ interface Range {
   start: number
 }
 
-interface FenceMarker {
-  character: '`' | '~'
+interface FenceContainerState {
   containers: FenceContainer[]
+  // First container in the trailing all-list suffix, or containers.length
+  // when the prefix ends in a blockquote. Blank continuations use this cached
+  // boundary instead of walking the inherited suffix for every empty line.
+  terminalListStart: number
+}
+
+interface FenceMarker extends FenceContainerState {
+  character: '`' | '~'
   length: number
 }
 
@@ -31,8 +38,7 @@ interface ContainerLine {
   content: string
 }
 
-interface FenceContainerLine {
-  containers: FenceContainer[]
+interface FenceContainerLine extends FenceContainerState {
   content: string
   continuationDepth: number
   end: number
@@ -105,14 +111,11 @@ function listMarkerEnd(line: string, start: number): number {
 // Fences can open after alternating blockquote and list containers. A list
 // marker appears only on the opening line; continuation lines replace it with
 // its visual content indent, while every blockquote marker must remain present.
-function fenceContainerPrefix(
-  line: string,
-  start = 0,
-  initialColumn = 0
-): { containers: FenceContainer[]; content: string } {
+function fenceContainerPrefix(line: string, start = 0, initialColumn = 0): FenceContainerState & { content: string } {
   const containers: FenceContainer[] = []
   let column = initialColumn
   let cursor = start
+  let terminalListStart = 0
 
   while (cursor < line.length) {
     const segmentStart = cursor
@@ -124,6 +127,7 @@ function fenceContainerPrefix(
 
     if (line[cursor] === '>') {
       containers.push({ kind: 'blockquote' })
+      terminalListStart = containers.length
       cursor += 1
       column += 1
 
@@ -155,19 +159,19 @@ function fenceContainerPrefix(
     containers.push({ indent: column - segmentColumn, kind: 'list' })
   }
 
-  return { containers, content: line.slice(cursor) }
+  return { containers, content: line.slice(cursor), terminalListStart }
 }
 
 function stripFenceContainerPrefix(
   line: string,
-  containers: FenceContainer[],
+  state: FenceContainerState,
   allowUnindentedListBlank = false
 ): string | null {
   let column = 0
   let cursor = 0
 
-  for (let index = 0; index < containers.length; index += 1) {
-    const container = containers[index]
+  for (let index = 0; index < state.containers.length; index += 1) {
+    const container = state.containers.at(index)
 
     if (!container) {
       continue
@@ -177,9 +181,7 @@ function stripFenceContainerPrefix(
       const indent = consumeIndent(line, cursor, column, container.indent)
 
       if (indent.columns !== container.indent) {
-        const remainingContainersAreLists = containers.slice(index).every(candidate => candidate.kind === 'list')
-
-        if (allowUnindentedListBlank && remainingContainersAreLists && !line.slice(cursor).trim()) {
+        if (allowUnindentedListBlank && index >= state.terminalListStart && !line.slice(cursor).trim()) {
           return ''
         }
 
@@ -213,13 +215,14 @@ function stripFenceContainerPrefix(
   return line.slice(cursor)
 }
 
-function continuedFenceContainerPrefix(line: string, inherited: FenceContainer[]) {
+function continuedFenceContainerPrefix(line: string, inherited: FenceContainerState) {
   let column = 0
   let cursor = 0
   let continuationDepth = 0
+  let continuedTerminalListStart = 0
 
-  for (let index = 0; index < inherited.length; index += 1) {
-    const container = inherited[index]
+  for (let index = 0; index < inherited.containers.length; index += 1) {
+    const container = inherited.containers.at(index)
     const segmentColumn = column
     const segmentStart = cursor
 
@@ -232,15 +235,29 @@ function continuedFenceContainerPrefix(line: string, inherited: FenceContainer[]
 
       if (indent.columns !== container.indent) {
         if (!line.slice(cursor).trim()) {
+          if (index >= inherited.terminalListStart) {
+            // The entire remaining suffix is known to be lists. Preserve the
+            // same state so runs of unindented blank lines stay O(1) per line.
+            return {
+              containers: inherited.containers,
+              content: '',
+              continuationDepth: inherited.containers.length,
+              terminalListStart: inherited.terminalListStart
+            }
+          }
+
           let implicitDepth = index
 
-          while (inherited[implicitDepth]?.kind === 'list') {
+          while (inherited.containers.at(implicitDepth)?.kind === 'list') {
             implicitDepth += 1
           }
 
-          const containers = implicitDepth === inherited.length ? inherited : inherited.slice(0, implicitDepth)
-
-          return { containers, content: '', continuationDepth: implicitDepth }
+          return {
+            containers: inherited.containers.slice(0, implicitDepth),
+            content: '',
+            continuationDepth: implicitDepth,
+            terminalListStart: continuedTerminalListStart
+          }
         }
 
         break
@@ -274,21 +291,46 @@ function continuedFenceContainerPrefix(line: string, inherited: FenceContainer[]
     }
 
     continuationDepth = index + 1
+    continuedTerminalListStart = continuationDepth
   }
 
   const nested = fenceContainerPrefix(line, cursor, column)
 
-  const continued = continuationDepth === inherited.length ? inherited : inherited.slice(0, continuationDepth)
+  const continued =
+    continuationDepth === inherited.containers.length
+      ? inherited
+      : {
+          containers: inherited.containers.slice(0, continuationDepth),
+          terminalListStart: continuedTerminalListStart
+        }
+
+  if (nested.containers.length === 0) {
+    return {
+      containers: continued.containers,
+      content: nested.content,
+      continuationDepth,
+      terminalListStart: continued.terminalListStart
+    }
+  }
+
+  const containers = [...continued.containers, ...nested.containers]
+
+  const terminalListStart =
+    nested.terminalListStart === 0 && continued.terminalListStart < continued.containers.length
+      ? continued.terminalListStart
+      : nested.terminalListStart < nested.containers.length
+        ? continued.containers.length + nested.terminalListStart
+        : containers.length
 
   return {
-    containers: nested.containers.length > 0 ? [...continued, ...nested.containers] : continued,
+    containers,
     content: nested.content,
-    continuationDepth
+    continuationDepth,
+    terminalListStart
   }
 }
 
-function fenceMarker(line: string, inherited: FenceContainer[] = []): FenceMarker | null {
-  const container = continuedFenceContainerPrefix(line, inherited)
+function fenceMarker(container: ReturnType<typeof continuedFenceContainerPrefix>): FenceMarker | null {
   const match = /^ {0,3}(`{3,}|~{3,})/.exec(container.content)
 
   if (!match) {
@@ -300,12 +342,13 @@ function fenceMarker(line: string, inherited: FenceContainer[] = []): FenceMarke
   return {
     character: marker[0] as FenceMarker['character'],
     containers: container.containers,
-    length: marker.length
+    length: marker.length,
+    terminalListStart: container.terminalListStart
   }
 }
 
 function isFenceClose(line: string, marker: FenceMarker): boolean {
-  const content = stripFenceContainerPrefix(line, marker.containers)
+  const content = stripFenceContainerPrefix(line, marker)
 
   if (content === null) {
     return false
@@ -329,7 +372,7 @@ function isFenceClose(line: string, marker: FenceMarker): boolean {
 function collectBlockCodeRanges(text: string, includeUnclosedFence = true): Range[] {
   const ranges: Range[] = []
   let cursor = 0
-  let inheritedContainers: FenceContainer[] = []
+  let inheritedContainers: FenceContainerState = { containers: [], terminalListStart: 0 }
   let openFence: { marker: FenceMarker; start: number } | null = null
 
   while (cursor < text.length) {
@@ -338,14 +381,14 @@ function collectBlockCodeRanges(text: string, includeUnclosedFence = true): Rang
     const next = end < text.length ? end + 1 : end
 
     if (openFence) {
-      const continuation = stripFenceContainerPrefix(line, openFence.marker.containers, true)
+      const continuation = stripFenceContainerPrefix(line, openFence.marker, true)
 
       if (continuation === null) {
         // CommonMark closes a fenced block with its container. The first line
         // that no longer continues every required quote/list belongs to the
         // outer document and must be parsed again as a possible new block.
         ranges.push({ end: cursor, kind: 'fence', start: openFence.start })
-        inheritedContainers = continuedFenceContainerPrefix(line, openFence.marker.containers).containers
+        inheritedContainers = continuedFenceContainerPrefix(line, openFence.marker)
         openFence = null
 
         continue
@@ -353,22 +396,21 @@ function collectBlockCodeRanges(text: string, includeUnclosedFence = true): Rang
 
       if (isFenceClose(line, openFence.marker)) {
         ranges.push({ end: next, kind: 'fence', start: openFence.start })
-        inheritedContainers = openFence.marker.containers
+        inheritedContainers = openFence.marker
         openFence = null
       }
     } else {
-      const marker = fenceMarker(line, inheritedContainers)
+      const container = continuedFenceContainerPrefix(line, inheritedContainers)
+      const marker = fenceMarker(container)
 
       if (marker) {
         openFence = { marker, start: cursor }
       } else {
-        const content = continuedFenceContainerPrefix(line, inheritedContainers).content
-
-        if (/^(?: {4}|\t)/.test(content) && content.trim()) {
+        if (/^(?: {4}|\t)/.test(container.content) && container.content.trim()) {
           ranges.push({ end: next, kind: 'indented', start: cursor })
         }
 
-        inheritedContainers = continuedFenceContainerPrefix(line, inheritedContainers).containers
+        inheritedContainers = container
       }
     }
 
@@ -667,7 +709,7 @@ function createBlankLineDetector(text: string): (start: number, end: number) => 
 function collectFenceContainerLines(text: string): FenceContainerLine[] {
   const lines: FenceContainerLine[] = []
   let cursor = 0
-  let inherited: FenceContainer[] = []
+  let inherited: FenceContainerState = { containers: [], terminalListStart: 0 }
 
   while (cursor < text.length) {
     const end = lineEnd(text, cursor)
@@ -680,9 +722,10 @@ function collectFenceContainerLines(text: string): FenceContainerLine[] {
       continuationDepth: container.continuationDepth,
       end,
       prefixLength: line.length - container.content.length,
-      start: cursor
+      start: cursor,
+      terminalListStart: container.terminalListStart
     })
-    inherited = container.containers
+    inherited = container
     cursor = end < text.length ? end + 1 : end
   }
 
@@ -703,7 +746,7 @@ function svgWithoutContainerPrefixes(
   text: string,
   start: number,
   end: number,
-  containers: FenceContainer[]
+  state: FenceContainerState
 ): string | null {
   const firstEnd = lineEnd(text, start)
   let svg = text.slice(start, Math.min(firstEnd, end))
@@ -713,7 +756,7 @@ function svgWithoutContainerPrefixes(
     const nextStart = cursor + 1
     const nextEnd = lineEnd(text, nextStart)
     const line = text.slice(nextStart, nextEnd)
-    const content = stripFenceContainerPrefix(line, containers, true)
+    const content = stripFenceContainerPrefix(line, state, true)
 
     if (content === null) {
       return null
@@ -807,7 +850,7 @@ export function fenceRawSvgBlocks(text: string): string {
 
     if (activeSvg && containerLine && containerLine.start > activeSvg.line.start) {
       const physicalLine = text.slice(containerLine.start, containerLine.end)
-      const leavesOpeningContainer = stripFenceContainerPrefix(physicalLine, activeSvg.line.containers, true) === null
+      const leavesOpeningContainer = stripFenceContainerPrefix(physicalLine, activeSvg.line, true) === null
 
       const entersSeparateBlock =
         crossesBlankLine(activeSvg.lastTokenEnd, containerLine.start) &&
@@ -873,7 +916,7 @@ export function fenceRawSvgBlocks(text: string): string {
       activeSvg.lastTokenEnd = token.end
 
       if (activeSvg.depth === 0) {
-        const svg = svgWithoutContainerPrefixes(text, activeSvg.start, token.end, activeSvg.line.containers)
+        const svg = svgWithoutContainerPrefixes(text, activeSvg.start, token.end, activeSvg.line)
         const fence = svg ? fenceFor(svg) : null
 
         if (fence && svg) {

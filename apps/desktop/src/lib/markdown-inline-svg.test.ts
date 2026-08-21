@@ -203,6 +203,26 @@ describe('fenceRawSvgBlocks', () => {
   })
 
   it.each([
+    ['nested list suffix', ['- - ~~~html', '', '    code', '    ~~~'].join('\n')],
+    ['quoted nested list suffix', ['> - ~~~html', '>', '>   code', '>   ~~~'].join('\n')]
+  ])('keeps a fence open across a blank that continues its %s', (_label, input) => {
+    expect(collectBalancedFenceRanges(input)).toEqual([{ end: input.length, start: 0 }])
+  })
+
+  it('does not treat a list before a terminal blockquote as an implicit blank continuation', () => {
+    const input = ['- > ~~~html', '', '  > code', '  > ~~~'].join('\n')
+
+    expect(collectBalancedFenceRanges(input)).toEqual([{ end: input.indexOf('\n\n') + 1, start: 0 }])
+  })
+
+  it('merges inherited and newly nested terminal list suffixes', () => {
+    const input = ['- outer', '  - ~~~html', '', '    code', '    ~~~'].join('\n')
+    const start = input.indexOf('  - ~~~html')
+
+    expect(collectBalancedFenceRanges(input)).toEqual([{ end: input.length, start }])
+  })
+
+  it.each([
     ['list continuation', `- item\n    ~~~~html\n  ${SVG}\n  ~~~~`],
     ['nested list continuation', `- outer\n  - inner\n      ~~~~html\n    ${SVG}\n    ~~~~`],
     ['blockquoted nested list continuation', `> - outer\n>   - inner\n>       ~~~~html\n>     ${SVG}\n>     ~~~~`]
@@ -553,6 +573,46 @@ describe('fenceRawSvgBlocks', () => {
     }
 
     expect(copiedContainerSlots).toBeLessThanOrEqual(depth * 8)
+  })
+
+  it('continues deep list blanks within a linear container-operation budget', () => {
+    const originalAt = Array.prototype.at
+    let containerLookups = 0
+
+    const atSpy = vi.spyOn(Array.prototype, 'at').mockImplementation(function (this: unknown[], index: number) {
+      const first = this[0] as { kind?: unknown } | undefined
+
+      if (first?.kind === 'blockquote' || first?.kind === 'list') {
+        containerLookups += 1
+      }
+
+      return originalAt.call(this, index)
+    })
+
+    const measure = (depth: number, blankLines: number): number => {
+      const before = containerLookups
+      const input = `${'- '.repeat(depth)}item\n${'\n'.repeat(blankLines)}${SVG}`
+
+      expect(fenceRawSvgBlocks(input)).toContain(`\`\`\`svg\n${SVG}\n\`\`\``)
+
+      return containerLookups - before
+    }
+
+    let moderateLookups = 0
+    let stressLookups = 0
+
+    try {
+      moderateLookups = measure(150, 150)
+      stressLookups = measure(300, 300)
+    } finally {
+      atSpy.mockRestore()
+    }
+
+    // Array.at is the inherited-container read seam. Replacing the cached
+    // terminal-list boundary with a suffix walk makes this grow quadratically.
+    expect(moderateLookups).toBeLessThanOrEqual((150 + 150) * 2 + 4)
+    expect(stressLookups).toBeLessThanOrEqual((300 + 300) * 2 + 4)
+    expect(stressLookups).toBeLessThanOrEqual(moderateLookups * 2 + 4)
   })
 
   it('handles a large malformed nested container before a valid root SVG', () => {
