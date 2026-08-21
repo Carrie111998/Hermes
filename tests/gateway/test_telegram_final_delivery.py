@@ -1,7 +1,7 @@
 """Regression coverage for Telegram final delivery after streamed edit failure."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -137,5 +137,79 @@ async def test_telegram_long_flood_result_keeps_retry_after():
     assert result.success is False
     assert result.error == "flood_control:30.0"
     assert result.retry_after == 30.0
+
+
+@pytest.mark.asyncio
+async def test_telegram_send_long_flood_fails_closed_without_inline_sleep():
+    """The send path mirrors the edit path's flood gate (#89962).
+
+    A server-announced penalty past the short-wait threshold must not be
+    slept inline: a ~1000s RetryAfter used to pin the sending worker for
+    the whole penalty (and a gateway restart during the sleep SIGKILLed it,
+    with the new process immediately re-poking the still-open window). The
+    send must fail closed with the same "flood_control:<wait>" shape and
+    retry_after the edit path already returns, so callers can queue or
+    coalesce instead of blocking.
+    """
+    import asyncio as _asyncio
+
+    class FloodError(Exception):
+        retry_after = 1090.0
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(side_effect=FloodError("Retry after 1090"))
+
+    real_sleep = _asyncio.sleep
+    slept: list[float] = []
+
+    async def _spy_sleep(delay, *args, **kwargs):
+        slept.append(float(delay))
+        return await real_sleep(0)
+
+    with patch.object(_asyncio, "sleep", _spy_sleep):
+        result = await adapter.send("123", "hello")
+
+    assert result.success is False
+    assert result.error == "flood_control:1090.0"
+    assert result.retry_after == 1090.0
+    # The long penalty was never slept inline.
+    assert slept == []
+
+
+@pytest.mark.asyncio
+async def test_telegram_send_short_flood_still_retries_inline():
+    """Short flood waits (<= 5s) keep the existing inline retry — the fail
+    closed gate only covers penalties long enough to pin the worker."""
+    import asyncio as _asyncio
+
+    attempts: list[int] = []
+
+    class FloodError(Exception):
+        retry_after = 2.0
+
+    ok_message = MagicMock()
+    ok_message.message_id = 777
+
+    async def _send_message(**_kwargs):
+        attempts.append(1)
+        if len(attempts) < 2:
+            raise FloodError("Retry after 2")
+        return ok_message
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(side_effect=_send_message)
+
+    real_sleep = _asyncio.sleep
+
+    async def _fast_sleep(delay, *args, **kwargs):
+        return await real_sleep(0)
+
+    with patch.object(_asyncio, "sleep", _fast_sleep):
+        result = await adapter.send("123", "hello")
+
+    assert result.success is True
+    assert len(attempts) == 2
 
 

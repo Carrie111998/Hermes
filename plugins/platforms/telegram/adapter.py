@@ -5387,8 +5387,30 @@ class TelegramAdapter(BasePlatformAdapter):
                     except Exception as send_err:
                         retry_after = getattr(send_err, "retry_after", None)
                         if retry_after is not None or "retry after" in str(send_err).lower():
+                            wait = float(retry_after) if retry_after is not None else 1.0
+                            # Mirror the edit path's flood gate: a penalty the
+                            # server says to wait out (anything past a few
+                            # seconds) must not be slept inline. A ~1000s
+                            # RetryAfter pinned the sending worker and every
+                            # co-routine behind it for the whole penalty, and a
+                            # gateway restart during the sleep SIGKILLs the
+                            # worker only for the new process to re-poke the
+                            # still-open window (#89962). Fail closed with the
+                            # same "flood_control:<wait>" shape the edit path
+                            # already returns so callers can queue/coalesce.
+                            if wait > 5.0:
+                                safe_send_error = _redact_telegram_error_text(send_err)
+                                logger.warning(
+                                    "[%s] Telegram flood control on send: long penalty "
+                                    "(%.1fs) — failing closed instead of sleeping inline: %s",
+                                    self.name, wait, safe_send_error,
+                                )
+                                return SendResult(
+                                    success=False,
+                                    error=f"flood_control:{wait}",
+                                    retry_after=wait,
+                                )
                             if _send_attempt < 2:
-                                wait = float(retry_after) if retry_after is not None else 1.0
                                 safe_send_error = _redact_telegram_error_text(send_err)
                                 logger.warning(
                                     "[%s] Telegram flood control on send (attempt %d/3), retrying in %.1fs: %s",
