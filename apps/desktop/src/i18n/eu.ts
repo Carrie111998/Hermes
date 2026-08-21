@@ -50,6 +50,9 @@ export const eu = defineLocale({
     revealInSidebar: 'Fitxategi-zuhaitzean erakutsi',
     copyPath: 'Bidea kopiatu',
     copyRelativePath: 'Bide erlatiboa kopiatu',
+    download: 'Deskargatu',
+    downloadSaved: 'Gordeta',
+    downloadFailed: 'Deskargak huts egin du',
     rename: 'Berrizendatu…',
     delete: 'Ezabatu',
     renameTitle: 'Berrizendatu',
@@ -66,6 +69,7 @@ export const eu = defineLocale({
       connectingGateway: 'Zuzeneko gateway-a konektatzen',
       loadingSettings: 'Hermes ezarpenak kargatzen',
       loadingSessions: 'Azken saioak kargatzen',
+      retryingRemoteBackend: 'Urruneko Hermes backend-a berriro konektatzen…',
       startingDesktopConnection: 'Mahaigaineko konexioa abiarazten',
       startingHermesDesktop: 'Hermes Desktop abiarazten…'
     },
@@ -126,10 +130,20 @@ export const eu = defineLocale({
     updateHermes: 'Eguneratu Hermes',
     updateReadyTitle: 'Eguneraketa prest',
     updateReadyMessage: count => `${count} aldaketa berri eskuragarri.`,
+    updateReadyMessageUnknown: 'Eguneraketa berri bat dago erabilgarri.',
     seeWhatsNew: 'Ikusi zer berri dagoen',
+    mcp: {
+      needsAuthTitle: 'MCP zerbitzariak berriro autentifikazioa behar du',
+      needsAuthMessage: name => `${name} MCP-ak berriro autentifikazioa behar du.`,
+      errorTitle: 'MCP zerbitzaria ez dago eskuragarri',
+      errorMessage: name => `${name} MCP-ren osasun-egiaztapenak huts egin du.`,
+      signIn: 'Hasi saioa',
+      view: 'Ikusi'
+    },
     errors: {
       elevenLabsNeedsKey: 'ElevenLabs STT-ek ELEVENLABS_API_KEY behar du.',
       elevenLabsRejectedKey: 'ElevenLabs-ek API gakoa baztertu du (401).',
+      diskFull: 'Diskoa beteta — askatu leku pixka bat, eta gero saiatu berriro.',
       gatewayAuthFailed: 'Gateway autentifikazioak huts egin du — egiaztatu zure API_SERVER_KEY.',
       methodNotAllowed:
         'Mahaigaineko backend-ak eskaera hori baztertu du (405 Method Not Allowed). Saiatu Hermes Desktop berrabiarazten.',
@@ -195,13 +209,15 @@ export const eu = defineLocale({
     swapSidebarSides: 'Trukatu alboko barraren aldeak',
     hideRightSidebar: 'Ezkutatu eskuineko alboko barra',
     showRightSidebar: 'Erakutsi eskuineko alboko barra',
+    unreadSessions: count => `${count} irakurri gabeko saio`,
     muteHaptics: 'Isilarazi haptikoak',
     unmuteHaptics: 'Aktibatu haptikoak',
     openSettings: 'Ireki ezarpenak',
     openStarmap: 'Ireki memoria grafoa',
-    openKeybinds: 'Teklatu lasterbideak',
+    enterHud: 'HUD modua',
+    exitHud: 'Irten HUD modutik',
     layoutEditor: 'Diseinu editorea',
-    layoutEditorTitle: 'Diseinu editorea — ⌘-klikak diseinua berrezartzen du'
+    layoutEditorTitle: (modifier: string) => `Diseinu editorea — ${modifier}-klikak diseinua berrezartzen du`
   },
 
   keybinds: {
@@ -248,7 +264,9 @@ export const eu = defineLocale({
       'session.slot.9': 'Aldatu 9. saio berrira',
       'session.focusSearch': 'Bilatu saioak',
       'session.togglePin': 'Ainguratu / desainguratu saioa',
+      'session.archive': 'Artxibatu uneko saioa',
       'workspace.newWorktree': 'Lan-zuhaitz berria',
+      'workspace.openFolder': 'Ireki karpeta proiektu gisa',
       'composer.focus': 'Fokuratu konpositorea',
       'composer.modelPicker': 'Ireki modelo-hautatzailea',
       'composer.voice': 'Hasi / gelditu ahots-elkarrizketa',
@@ -257,6 +275,9 @@ export const eu = defineLocale({
       'view.toggleReview': 'Txandakatu berrikuspen-panela',
       'view.toggleStatusbar': 'Txandakatu egoera-barra',
       'view.showFiles': 'Erakutsi fitxategi-nabigatzailea',
+      'view.showBrowser': 'Ireki nabigatzailea',
+      'view.toggleHud': 'Txandakatu HUD modua',
+      'hud.snapToPointer': 'Eraman HUD kurtsoreraino (globala, HUD irekita dagoen bitartean)',
       'view.showTerminal': 'Txandakatu terminala',
       'view.newTerminal': 'Terminal berria',
       'view.nextTerminal': 'Hurrengo terminala',
@@ -359,7 +380,54 @@ export const eu = defineLocale({
       disable: 'Desgaitu',
       failed: 'huts egin du',
       empty: 'Oraindik ez dago mahaigaineko plugin-ik instalatuta.',
-      kinds: { bundled: 'paketatua', disk: 'diskoan', runtime: 'exekuzioan' }
+      kinds: { bundled: 'paketatua', disk: 'diskoan', runtime: 'exekuzioan' },
+      agent: {
+        title: 'Agente-plugin-ak',
+        blurb:
+          'Hermes backend-ean instalatu dituzun plugin-ak — tresnak, skills, MCP zerbitzariak, hook-ak eta slash komandoak. Eramangarriak direnak Agent Plugins paketeak dira (beste agente batzuetan ere funtzionatzen duten skills + MCP bildumak). Aldaketa-lasterbideak saio berriei aplikatzen zaizkie.',
+        appliesTo: 'Non aplikatzen den:',
+        empty: 'Oraindik ez dago agente-plugin-ik instalatuta.',
+        loadFailed: 'Ezin izan dira agente-plugin-ak kargatu',
+        portable: 'eramangarria',
+        search: 'Bilatu plugin-ak…',
+        noMatches: 'Ez dago pluginik zure bilaketarekin bat egiten duenik.',
+        toggleFailed: (name: string) => `Ezin izan da ${name} aktibatu/desaktibatu`,
+        updateBackendToManage: 'Eguneratu Hermes backend-a plugin hau Desktop-etik kudeatzeko.',
+        sources: { bundled: 'paketatua', user: 'erabiltzailea', git: 'git', project: 'proiektua', entrypoint: 'pip' }
+      },
+      installModal: {
+        title: 'Instalatu plugina',
+        description: 'Berrikusi biltegi honek zer duen ezer instalatu aurretik.',
+        repoLabel: 'Biltegia',
+        includesHeading: 'Pakete honek barne hartzen du',
+        agentLabel: 'Agente-plugina',
+        desktopLabel: 'Mahaigaineko UIa',
+        agentTargetLocal: profile => `${profile} backend-ean instalatzen da (~/.hermes/plugins/)`,
+        agentTargetRemote: profile => `Konektatutako ${profile} backend-ean instalatzen da`,
+        desktopTarget: "Aplikazio honen tokiko desktop-plugins karpetan instalatzen da",
+        desktopOnlyNote: 'Mahaigaineko soilik diren paketeek ez dute backend agente-pluginik instalatzen.',
+        insecureWarning: 'URL honek ziurgabeko edo tokiko eskema bat erabiltzen du. Lehenetsi https:// edo git@ produkzio-instalazioetarako.',
+        securityHeading: 'Instalatu aurretik',
+        securityIntro:
+          'Instalatu soilik konfiantzazko iturrietatik — berrikusi beheko biltegia zer gehituko den ikusi nahi baduzu.',
+        sourceHeading: 'Iturburu-kodea',
+        viewRepository: 'Ikusi biltegia',
+        viewPluginFiles: 'Ikusi plugin-fitxategiak',
+        gitCloneLabel: 'Git clone URLa',
+        enableAgent: 'Gaitu agente-plugina instalatu ondoren',
+        forceReinstall: 'Behartu berriro instalatzea (jada instalatuta badago ordeztu)',
+        install: 'Instalatu',
+        installing: 'Instalatzen…',
+        probing: 'Biltegia aztertzen…',
+        probeUnavailable: 'Pluginaren azterketa ez dago erabilgarri ingurune honetan.',
+        desktopUnavailable: 'Mahaigaineko pluginaren instalazioa ez dago erabilgarri ingurune honetan.',
+        selectComponent: 'Hautatu gutxienez osagai bat instalatzeko.',
+        agentSuccess: name => `${name} agente-plugina instalatuta`,
+        desktopSuccess: name => `${name} mahaigaineko plugina instalatuta`,
+        agentFailed: 'Agente-pluginaren instalazioak huts egin du',
+        desktopFailed: 'Mahaigaineko pluginaren instalazioak huts egin du',
+        missingEnv: vars => `Falta diren env aldagaiak: ${vars}. Gehitu Ezarpenak → Gakoak atalean.`
+      }
     },
     notifications: {
       title: 'Jakinarazpenak',
@@ -391,6 +459,10 @@ export const eu = defineLocale({
         credits: {
           label: 'Kreditu alertak',
           description: 'Kredituetarako sarbidea pausatu edo berreskuratu da.'
+        },
+        plugin: {
+          label: 'Plugin jakinarazpenak',
+          description: 'Mahaigaineko plugin batek jakinarazpen bat bidali du Hermes atzean zegoen bitartean.'
         }
       },
       test: 'Bidali probako jakinarazpena',
@@ -435,10 +507,47 @@ export const eu = defineLocale({
       uiScaleTitle: 'UI eskala',
       uiScaleDesc: (percent: number) =>
         `Testua eta kontrolak aplikazio osoan eskalatzen ditu. Cmd/Ctrl +, - eta 0 ere funtzionatzen du. Orain: ${percent}%.`,
+      reasoningCollapsedTitle: 'Tolestu pentsamendua lehenetsita',
+      reasoningCollapsedDesc: 'Mantendu erreproduzitutako arrazoiketa erabilgarri, ireki arte zabaldu gabe.',
+      sessionDensityTitle: 'Saio-zerrendaren dentsitatea',
+      sessionDensityDesc: 'Aukeratu zenbat testuinguru agertzen den saio-izenburuen azpian alboko barran.',
+      sessionDensityCompact: 'Konpaktua',
+      sessionDensityComfortable: 'Erosoa',
+      sessionDensityDetailed: 'Zehatz',
+      terminalFontTitle: 'Terminalaren letra-tipoa',
+      terminalFontDesc:
+        'Aukeratu instalatutako letra-tipo bat Desktop terminaletarako. Nerd Fonts-ek Powerlevel10k eta shell ikonoak errendatzen dituzte; utzi hutsik JetBrains Mono paketatua erabiltzeko.',
+      terminalFontPlaceholder: 'MesloLGS NF edo CSS letra-tipo pilo bat',
+      terminalFontPreview: 'Glifo-aurrebista',
+      terminalFontReset: 'Erabili lehenetsia',
       translucencyTitle: 'Leihoaren gardentasuna',
       translucencyDesc: 'Ikusi mahaigaina leihoan zehar. macOS eta Windows soilik.',
+      translucencyGlassDesc:
+        'Beira matea: mahaigainak lausotze leun gisa agertzen da testua zorrotz mantenduz. Argirako eta ilunerako bereiz doitzen da.',
+      translucencyModeClear: 'Garbia',
+      translucencyModeGlass: 'Beira',
+      translucencyTintTitle: 'Kolore-ukitua',
+      translucencyFadeTitle: 'Desagertzea',
+      translucencyFrostTitle: 'Izoztea',
+      translucencyFrost: {
+        'under-window': 'Sakona',
+        popover: 'Leuna',
+        titlebar: 'Distiratsua',
+        header: 'Distira'
+      },
+      translucencyScopeTitle: 'Eremua',
+      translucencyScope: {
+        window: 'Leiho osoa',
+        sidebar: 'Alboko barra soilik'
+      },
       backdropTitle: 'Txataren atzeko planoa',
       backdropDesc: 'Elkarrizketaren atzean dagoen estatua irudi lausoa.',
+      introSplashTitle: 'Hasierako pantaila',
+      introSplashDesc: 'Txat huts batean erakusten den logotipoa eta testua.',
+      reactionsTitle: 'Mezu-erreakzioak',
+      reactionsDesc: 'iMessage estiloko emoji tapback-ak — erreakzionatu mezuei, eta Hermes-ek zureei erantzun diezaieke.',
+      composerPopoutTitle: 'Konpositore flotatzailea',
+      composerPopoutDesc: 'Baimendu konpositorea bere atxikitze-lekutik askatzen eta flotatzen. Itzali behean itsatsita mantentzeko.',
       embedsTitle: 'Txertaketa integratuak',
       embedsDesc:
         'Aurrebista aberatsak hirugarrenen gunetik kargatzen dira (YouTube, X, …). Galdetuak leku-marka bat erakusten du bakoitza baimendu arte; Beti-k automatikoki kargatzen ditu; Itzalita-k lotura soilak mantentzen ditu.',
@@ -507,6 +616,10 @@ export const eu = defineLocale({
       heading: 'Hermes Desktop',
       version: value => `${value} bertsioa`,
       versionUnavailable: 'Bertsioa ez dago erabilgarri',
+      bundleOutOfSync: 'Aplikazioaren eraikuntza zaharkituta',
+      bundleOutOfSyncDesc:
+        'Hermes runtime-a eguneratu da, baina mahaigaineko aplikazioa bera oraindik eraikuntza zaharragoa da — interfaze-ezaugarri berriak (Bot Mode adibidez) eguneratu arte faltan egongo dira. Exekutatu beheko eguneraketa aplikazioa berreraikitzeko. Abisua ez bada garbitzen, berriro instalatu azken mahaigaineko instalatzailetik.',
+      bundleOutOfSyncAction: 'Lortu instalatzailea',
       updates: 'Eguneraketak',
       checkNow: 'Egiaztatu orain',
       checking: 'Egiaztatzen…',
@@ -519,6 +632,7 @@ export const eu = defineLocale({
       cantReach: 'Ezin izan gara eguneraketa-zerbitzarira iritsi.',
       tapCheck: 'Sakatu "Egiaztatu orain" eguneraketak bilatzeko.',
       updateReady: count => `Eguneraketa berri bat prest dago (aldaketa ${count} barne).`,
+      updateReadyUnknown: 'Eguneraketa berri bat prest dago.',
       lastChecked: age => `Azken egiaztapena ${age}`,
       justNowSuffix: ' · oraintxe bertan',
       automaticUpdates: 'Eguneraketa automatikoak',
@@ -547,8 +661,12 @@ export const eu = defineLocale({
       autosaveFailed: 'Automatikoki gordetzeak huts egin du',
       imported: 'Konfigurazioa inportatuta',
       invalidJson: 'Konfigurazio JSON baliogabea',
+      toolsetsWipeConfirm:
+        'Kendu gaitu diren tresna-multzo guztiak? Honek memoria, terminala, web bilaketa, delegazioa eta beste tresna gehienak desgaitzen ditu berriro gaitu arte.',
       keepAwakeTitle: 'Ordenagailua esna mantendu',
       keepAwakeDesc: 'Eten makina hau loak har dezan gau osoan edo exekuzio luzeetan zehar. Pantailak ilundu daiteke oraindik.',
+      disableF12Title: 'Desgaitu F12 DevTools',
+      disableF12Desc: 'Blokeatu F12-k Garapen Tresnak irekitzea. Ctrl+Shift+I (edo Cmd+Opt+I Mac-en) oraindik funtzionatzen du.',
       attachmentSizeTitle: 'Aurrebista / irudi kargaren gehienezko tamaina',
       attachmentSizeDesc:
         'Zenbat MB-ko fitxategi lokal kargatuko dituen Desktop-ek aurrebista eta irudiak atxikitzeko. Lehenetsia 16 da. Urruneko irudi ez diren eranskinek 256 MB-ko muga bereizia dute. Oso altua jartzeak fitxategi osoa memorian kargatzen du eta aplikazioa izoztu edo huts egin dezake.',
@@ -585,6 +703,68 @@ export const eu = defineLocale({
       set: 'Ezarri',
       clear: 'Garbitu'
     },
+    connections: {
+      title: 'Erregistratutako gateway-ak',
+      intro: 'Kudeatu gailu hau eta iritsi dezakeen Hermes gateway bakoitza urruneko, SSH edo Cloud konexioen bidez.',
+      stagedNote:
+        'Aldatu gateway-ak Saioak ataletik. Profilak, txatak, mezularitza eta cron lanak beren gateway-arekin geratzen dira; beste gateway batzuetako lana martxan jarraitzen du.',
+      launchModeTitle: 'Abiaraztean, itzuli Saioetara azken erabilitako gateway-ean',
+      launchModeDesc: 'Itzalita dagoenean, Saioak Primary gateway-ean irekitzen dira.',
+      searchPlaceholder: 'Bilatu gateway-ak…',
+      noSearchResults: 'Ez dago gateway-rik zure bilaketarekin bat egiten duenik.',
+      loadFailed: 'Ezin izan dira konexioak kargatu',
+      currentPill: 'Oraina',
+      primaryPill: 'Nagusia',
+      managedPill: 'Aplikazioak kudeatua',
+      addConnection: 'Gehitu konexioa',
+      editConnection: 'Editatu',
+      removeConnection: 'Kendu',
+      removeConfirmTitle: 'Kendu konexio hau?',
+      removeConfirmDesc: (label: string) =>
+        `"${label}" aplikazio honetatik kenduko da. Instantzia bera ez da ukitzen — edonoiz berriro gehi dezakezu.`,
+      makePrimary: 'Egin nagusi',
+      testConnection: 'Probatu',
+      testOk: 'Iristeko moduan',
+      testFailed: 'Konexio-probak huts egin du',
+      saveFailed: 'Ezin izan da konexioa gorde',
+      removeFailed: 'Ezin izan da konexioa kendu',
+      updateAll: 'Eguneratu instantzia guztiak',
+      updateAllRunning: 'Instantzia guztiak eguneratzen…',
+      updateAllDone: 'Eguneraketak bidalita',
+      updateAllFailed: 'Eguneraketa-hedapenak huts egin du',
+      updateSkippedCloud: 'Hermes Cloud-ek kudeatzen du',
+      kindLocal: 'Lokala',
+      kindRemote: 'Urruneko gateway-a',
+      kindCloud: 'Hermes Cloud',
+      kindSsh: 'SSH',
+      kindLocalDesc: 'Aplikazio honek kudeatzen duen Hermes runtime-a.',
+      kindRemoteDesc: 'HTTP(S) bidez iristeko moduan dagoen Hermes gateway-a — LAN, Tailscale edo internet.',
+      kindCloudDesc: 'Zure Hermes Cloud kontutik aurkitutako ostatatutako instantzia.',
+      kindSshDesc: 'SSH bidez iritsitako Hermes instalazioa.',
+      labelTitle: 'Izena',
+      labelDesc: 'Beharrezkoa. Instantzia hau agertzen den leku guztietan erakusten da; bakarra izan behar du (adb. "Homelab", "Laneko portatila").',
+      labelPlaceholder: 'Homelab',
+      urlTitle: 'Gateway URLa',
+      sshHostTitle: 'SSH ostalaria',
+      headersTitle: 'Gateway goiburu gehigarriak',
+      headersDesc:
+        'Gateway honetara egindako HTTP eta WebSocket eskaera guztiekin bidaltzen dira — Cloudflare Access bezalako sarbide-proxietarako (CF-Access-Client-Id / CF-Access-Client-Secret). Balioak zifratuta gordetzen dira. Hermes-ek kudeatzen dituen goiburuak (Authorization, Cookie, Host…) ez dira kontuan hartzen.',
+      headerValuePlaceholder: 'Balioa',
+      headerValueSaved: 'Gordeta — utzi hutsik mantentzeko',
+      headerAdd: 'Gehitu goiburua',
+      headerRemove: 'Kendu',
+      duplicateLocal: 'Aplikazio honek jada kudeatzen du tokiko konexio bat — bat bakarra egon daiteke.',
+      duplicateUrl: (label: string) => `Gateway URL honetarako konexio bat jada existitzen da ("${label}").`,
+      duplicateSsh: (label: string) => `SSH ostalari honetarako konexio bat jada existitzen da ("${label}").`,
+      sameBackendHint: (label: string) => `"${label}"-ren backend bera`,
+      localAddHint: 'Lokala ez dago erabilgarri: kudeatutako konexio lokala jada existitzen da (beti bakarra da).',
+      cloudAddHint:
+        'Aholkua: goiko Hermes Cloud-en saioa hasteak zure agenteak automatikoki aurkitzen ditu — erabili formulario hau ezagutzen duzun instantzia baten URL-a eskuz erregistratzeko soilik.',
+      save: 'Gorde konexioa',
+      saving: 'Gordetzen…',
+      cancel: 'Utzi',
+      empty: 'Oraindik ez dago erregistratutako konexiorik.'
+    },
     gateway: {
       loading: 'Gateway ezarpenak kargatzen...',
       unavailableTitle: 'Gateway ezarpenak ez daude erabilgarri',
@@ -593,19 +773,12 @@ export const eu = defineLocale({
       envOverride: 'env override-a',
       intro:
         'Lokala lehenetsia. Erabili urrunekoa aplikazio honek Hermes backend-a beste nonbait gidatu behar duenean. Profil bakoitzeko override-ak behean.',
-      appliesTo: 'Non aplikatzen den',
-      allProfiles: 'Profil guztiak',
-      defaultConnection: 'Override-ik ez duen profil bakoitzarentzako konexio lehenetsia.',
-      profileConnection: profile =>
-        `"${profile}" profila aktibo dagoenean soilik erabiltzen den konexioa. Aukeratu Erabili gateway lehenetsia bere override-a kentzeko.`,
       envOverrideTitle: 'env aldagaiek mahaigaineko saio hau kontrolatzen ari dira.',
       envOverrideDesc:
         'Kendu HERMES_DESKTOP_REMOTE_URL eta HERMES_DESKTOP_REMOTE_TOKEN beheko env ezarpena erabiltzeko.',
       modeTitle: 'Konexio-modua',
       localTitle: 'Gateway lokala',
       localDesc: 'Hasi Hermes backend pribatu bat localhost-en. Hau da lehenetsia eta lineaz kanpo funtzionatzen du.',
-      inheritTitle: 'Erabili gateway lehenetsia',
-      inheritDesc: "Kendu profil honen override-a eta erabili konexio lehenetsia.",
       remoteTitle: 'Urruneko gateway-a',
       remoteDesc: 'Konektatu mahaigaineko shell hau urruneko Hermes backend batera.',
       remoteAuthHint: 'Ostalatutako gateway-ek OAuth edo erabiltzaile-izena eta pasahitza erabiltzen dituzte; auto-ostatatutakoek saio-token bat erabil dezakete.',
@@ -659,6 +832,13 @@ export const eu = defineLocale({
       existingToken: value => `${value} token existitzen da`,
       savedToken: 'gordeta',
       pasteSessionToken: 'Itsatsi saio-tokena',
+      plainTextConfirmTitle: 'Gateway tokena testu soilean gorde?',
+      plainTextConfirmDesc:
+        'Ez da OS gako-sorta zerbitzurik aurkitu makina honetan, beraz tokena zifratu gabe gordeko litzateke aplikazioaren konexio-ezarpenen fitxategian, erabiltzaile honen moduan exekutatzen den edozein prozesuk irakur dezakeelarik. Instalatu edo gaitu GNOME Keyring edo KWallet biltegiratze zifraturarako.',
+      plainTextConfirmAction: 'Gorde testu soilean',
+      plainTextStoredTitle: 'Tokena testu soilean gordeta',
+      plainTextStoredDesc:
+        'Biltegiratze segurua ez dago erabilgarri, beraz gordetako tokena zifratu gabe gordetzen da makina honetako aplikazioaren konexio-ezarpenen fitxategian. Instalatu edo gaitu GNOME Keyring edo KWallet zifratzeko.',
       testRemote: 'Probatu urrunekoa',
       saveForRestart: 'Gorde hurrengo berrabiarazterako',
       saveAndReconnect: 'Gorde eta berriro konektatu',
@@ -728,6 +908,14 @@ export const eu = defineLocale({
       failedLoad: 'API gakoak kargatzeak huts egin du',
       empty: 'Oraindik ez dago ezer konfiguratuta kategoria honetan.'
     },
+    search: {
+      placeholder: 'Bilatu ezarpen guztiak…',
+      pill: 'Bilatu'
+    },
+    profileScope: {
+      appliesTo: 'Non aplikatzen den',
+      editsProfile: profile => `Orrialde honetako aldaketak "${profile}" profilari aplikatzen zaizkio.`
+    },
     mcp: {
       loading: 'MCP zerbitzariak kargatzen...',
       failedLoad: 'MCP konfigurazioa kargatzeak huts egin du',
@@ -780,6 +968,9 @@ export const eu = defineLocale({
       catalogEnvRequired: 'Bete beharrezko balioak instalatu aurretik.',
       capabilitySummary: (tools, prompts, resources) =>
         `${[`${tools} tresnak`, ...(prompts ? [`${prompts} prompt-ak`] : []), ...(resources ? [`${resources} baliabideak`] : [])].join(', ')} gaituta`,
+      costTokens: tokens => `~${tokens} tok/deialdi`,
+      usage30d: uses => `${uses} erabilera/30e`,
+      unusedPill: 'erabili gabea',
       statusConnecting: 'Konektatzen…',
       statusNeedsAuth: 'Autentifikazioa behar du',
       statusError: 'Errorea',
@@ -792,7 +983,26 @@ export const eu = defineLocale({
       unsavedConnect: 'Gorde gabe — gorde mcp.json konektatzeko.',
       enableTool: tool => `Gaitu ${tool}`,
       disableTool: tool => `Desgaitu ${tool}`,
-      noOutput: 'Oraindik ez dago irteerarik.'
+      noOutput: 'Oraindik ez dago irteerarik.',
+      deepLinkTitle: 'MCP zerbitzaria gehitu?',
+      deepLinkDescription:
+        'Esteka batek MCP zerbitzari hau Hermes-era gehitzea eskatu du. Berrikusi beheko konfigurazio zehatza — estekatik dator, ez Hermes-etik.',
+      deepLinkStdioWarning:
+        'Zerbitzari honek tokiko prozesu bat exekutatzen du zure makinan, behean erakusten den komandoarekin. Jarraitu soilik bere iturria fidagarria bada.',
+      deepLinkConfirm: 'Gehitu zerbitzaria',
+      deepLinkNameInvalid: 'Izenek 1-64 letra, digitu, puntu, marratxo edo azpimarra erabil ditzakete.',
+      deepLinkNameConflict: name => `${name} izeneko zerbitzari bat jada existitzen da — aukeratu beste izen bat edo utzi.`,
+      deepLinkErrorTitle: 'MCP instalazio-esteka baztertuta',
+      deepLinkErrorName: 'Estekaren zerbitzari-izena falta da edo baliogabea da.',
+      deepLinkErrorConfig: 'Estekaren konfigurazioa ez da base64-ko JSON baliogabea.',
+      deepLinkErrorShape: 'Konfigurazioa JSON objektu bat izan behar da, `url` edo `command` testu-eremu batekin.',
+      deepLinkErrorUrl: 'http:// eta https:// zerbitzari URLak soilik onartzen dira.',
+      deepLinkErrorTooLarge: 'Konfigurazio-kargak 32KB-ko muga gainditzen du.',
+      importButton: 'Inportatu',
+      importPlaceholder: 'Itsatsi mcp.json zati bat, npx/docker komandoa, claude mcp add lerroa, URL edo Cursor esteka…',
+      importNoMatch: 'Ez da zerbitzari-konfiguraziorik ezagutu itsatsitako testuan.',
+      importConfirm: 'Gehitu mcp.json-era',
+      importConfirmMany: count => `Gehitu ${count} zerbitzari mcp.json-era`
     },
     model: {
       loading: 'Modeloaren konfigurazioa kargatzen...',
@@ -969,9 +1179,9 @@ export const eu = defineLocale({
 
   skills: {
     tabSkills: 'Trebetasunak',
+    configuringProfile: 'Konfiguratzen:',
     tabToolsets: 'Tresnak',
     tabMcp: 'MCP',
-    tabHub: 'Arakatu Hub-a',
     all: 'Denak',
     searchSkills: 'Bilatu trebetasunak...',
     searchToolsets: 'Bilatu tresnak...',
@@ -1069,7 +1279,12 @@ export const eu = defineLocale({
       loadFailed: 'Skill hub-a kargatzeak huts egin du',
       previewFailed: 'Trebetasunaren aurrebistak huts egin du',
       scanFailed: 'Segurtasun-eskaneatzeak huts egin du',
-      searchFailed: 'Hub bilaketak huts egin du'
+      searchFailed: 'Hub bilaketak huts egin du',
+      alreadyInstalled: (name: string) => `"${name}" jada instalatuta dago`,
+      pickerTitle: 'Skills Hub-a',
+      pickerBrowse: 'Arakatu hub osoa',
+      pickerHide: 'Ezkutatu hub-aren arakatzailea',
+      pickerHint: 'Sakatu "+ Gehitu agente honi" edozein trebetasunean — instalatu eta goiko zerrendan agertzen da.'
     }
   },
 
@@ -1141,6 +1356,10 @@ export const eu = defineLocale({
     goTo: 'Joan hona',
     goToSession: 'Joan saiora',
     branches: 'Adarrak',
+    projects: 'Proiektuak',
+    openFolder: 'Ireki karpeta proiektu gisa…',
+    openFolderAt: path => `Ireki karpeta proiektu gisa — ${path}`,
+    newSessionInProject: project => `Saio berria ${project}-en`,
     commands: 'Komandoak',
     startInBranch: branch => `Elkarrizketa berria ${branch}-en`,
     commandCenter: 'Komando-zentroa',
@@ -1160,7 +1379,8 @@ export const eu = defineLocale({
       installed: 'Instalatuta',
       generatedTag: 'Sortua',
       adoptFailed: 'Ezin izan da maskota hori adoptatu.',
-      toggleFailed: 'Ezin izan da maskota txandakatu.',
+      toggleFailed: (enabled: boolean) =>
+        enabled ? 'Ezin izan da maskota piztu.' : 'Ezin izan da maskota itzali.',
       noneAvailable: 'Ez dago maskotarik erabilgarri — aukeratu bat behean instalatzeko.'
     },
     generatePet: {
@@ -1241,8 +1461,10 @@ export const eu = defineLocale({
     gatewayStopped: 'Mezularitza-gateway-a geldituta',
     hermesActiveSessions: (version, count) => `Hermes ${version} · ${count} saio aktibo`,
     restartGateway: 'Berrabiarazi gateway-a',
+    openBrowser: 'Ireki nabigatzailea',
     gatewayRestartFailed: 'Gateway-aren berrabiarazteak huts egin du.',
     updateHermes: 'Eguneratu Hermes',
+    reloadWindow: 'Kargatu leihoa berriro',
     actionRunning: 'martxan',
     actionDone: 'eginda',
     actionFailed: 'huts egin du',
@@ -1365,6 +1587,23 @@ export const eu = defineLocale({
     failedUpdate: name => `${name} eguneratzeak huts egin du`,
     failedSave: name => `${name} gordetzeak huts egin du`,
     failedClear: key => `${key} garbitzeak huts egin du`,
+    pendingRequests: count => `Itxaroten dauden eskaerak (${count})`,
+    pendingAria: count => `${count} itxaroten dauden parekatze-eskaera`,
+    approvedUsers: count => `Onartutako erabiltzaileak (${count})`,
+    approve: 'Onartu',
+    approving: 'Onartzen...',
+    revoke: 'Kendu baimena',
+    revoking: 'Baimena kentzen...',
+    revokeAria: name => `Kendu ${name}-ren baimena`,
+    revokeTitle: 'Kendu sarbidea',
+    revokeDesc: (name: string) => `${name}-k sarbidea galduko du eta ez da ezagutuko bere hurrengo mezuarekin.`,
+    approvedUser: name => `${name} onartuta`,
+    approvedHint: 'Automatikoki ezagutzen da bere hurrengo mezuarekin.',
+    revokedUser: name => `${name}-ren baimena kenduta`,
+    failedApprove: name => `${name} onartzeak huts egin du`,
+    failedRevoke: name => `${name}-ri baimena kentzeak huts egin du`,
+    pairingLockedOut: 'Onarpen-porrot gehiegi — plataforma hau blokeatuta dago. Saiatu berriro geroago.',
+    waitingSince: minutes => (minutes < 1 ? 'oraintxe bertan' : `duela ${minutes}m`),
     fieldCopy: {
       TELEGRAM_BOT_TOKEN: {
         label: 'Bot tokena',
@@ -1524,10 +1763,19 @@ export const eu = defineLocale({
     search: 'Bilatu profilak...',
     loading: 'Profilak kargatzen...',
     newProfile: 'Profil berria',
+    importProfile: 'Inportatu profila…',
+    exportProfile: 'Esportatu profila…',
+    imported: 'Profila inportatuta',
+    exported: 'Profila esportatuta',
+    failedImport: 'Profila inportatzeak huts egin du',
+    failedExport: 'Profila esportatzeak huts egin du',
     allProfiles: 'Profil guztiak',
     showAllProfiles: 'Erakutsi profil guztiak',
     switchToProfile: name => `Aldatu ${name}-ra`,
+    switchToConnection: name => `Aldatu ${name}-ra`,
+    switchConnectionFailed: name => `Ezin izan da ${name}-(e)kin konektatu`,
     manageProfiles: 'Kudeatu profilak…',
+    connectGateway: 'Kudeatu gateway-ak…',
     actions: 'Ekintzak',
     color: 'Kolorea…',
     colorFor: 'Kolorea',
@@ -1579,6 +1827,9 @@ export const eu = defineLocale({
     renameDescPrefix: 'Berrizendatzeak profilaren direktorioa eta ',
     renameDescSuffix: '-ko wrapper script-ak eguneratzen ditu.',
     newNameLabel: 'Izen berria',
+    displayNameTitle: 'Izena eman agente honi',
+    displayNameDesc: 'Aplikazio osoan erakusten den bistaratze-izena ezartzen du. Barneko profil IDa "default" izaten jarraitzen du.',
+    displayNameLabel: 'Bistaratze-izena',
     renaming: 'Berrizendatzen...',
     created: 'Profila sortuta',
     renamed: 'Profila berrizendatuta',
@@ -1598,6 +1849,13 @@ export const eu = defineLocale({
     close: 'Itxi cron-a',
     title: 'Programatutako lanak',
     count: count => `${count} lan`,
+    modelImpact: {
+      title: 'Programatutako lanek berrikuspena behar dute',
+      message: count => `${count} programatutako lan saltatuko da/dira modeloen ezarpenak berrikusi arte.`,
+      detailMore: (names, remaining) => `${names} eta ${remaining} gehiago`,
+      review: 'Berrikusi programatutako lanak',
+      saveFailed: 'Hermes-ek ez du modelo-aldaketa hori gorde.'
+    },
     search: 'Bilatu cron lanak...',
     loading: 'Cron lanak kargatzen...',
     states: {
@@ -1789,7 +2047,8 @@ export const eu = defineLocale({
       'new-session': 'Saio berria',
       skills: 'Gaitasunak',
       messaging: 'Mezularitza',
-      artifacts: 'Artifact-ak'
+      artifacts: 'Artifact-ak',
+      cron: 'Programatutako lanak'
     },
     searchAria: 'Bilatu saioak',
     searchPlaceholder: 'Bilatu saioak…',
@@ -1810,6 +2069,7 @@ export const eu = defineLocale({
     noWorkspace: 'Ez dago lan-eremurik',
     projectEmpty: 'Oraindik ez dago saiorik',
     noSessions: 'Oraindik ez dago saiorik',
+    noFilterMatches: 'Ez dago saiorik iragazki hauekin bat egiten duenik',
     projects: {
       sectionLabel: 'Proiektuak',
       home: 'Hasiera',
@@ -1837,9 +2097,20 @@ export const eu = defineLocale({
       menuAddFolder: 'Gehitu karpeta',
       menuSetActive: 'Ezarri aktibo',
       menuDelete: 'Ezabatu',
+      moveToProject: 'Mugitu proiektura',
+      movedTo: name => `${name}-ra mugituta`,
+      moveFailed: 'Ezin izan da saioa mugitu',
+      moveNoFolder: 'Proiektu horrek ez du saioa mugitzeko karpetarik',
+      moveNoProjects: 'Ez dago beste proiekturik',
       reveal: 'Erakutsi karpetan',
       copyPath: 'Kopiatu bidea',
       removeFromSidebar: 'Ezkutatu alboko barratik',
+      worktreeStaleBackend:
+        'Eguneratu Hermes backend-a lan-zuhaitzak urruneko konexio honetan sortzeko — git worktree APIa baino zaharragoa da.',
+      worktreeProjectLabel: 'Proiektua',
+      worktreeProjectPlaceholder: 'Bilatu proiektuak…',
+      worktreeProjectNone: 'Ez dago karpetadun proiekturik',
+      branchTrackRemote: 'urrunekoa jarraitu',
       createFailed: 'Ezin izan da proiektua sortu',
       staleBackend:
         'Eguneratu Hermes backend-a proiektuak sortzeko — zure backend-a mahaigaineko aplikazio hau baino zaharragoa da (Ezarpenak → Eguneraketak → Backend-a).',
@@ -1879,6 +2150,8 @@ export const eu = defineLocale({
     loading: 'Kargatzen…',
     loadMore: 'Kargatu gehiago',
     loadCount: step => `Kargatu ${step} gehiago`,
+    messageCount: count => `${count} mezu`,
+    toolCallCount: count => `${count} tresna-dei`,
     row: {
       pin: 'Ainguratu',
       unpin: 'Desainguratu',
@@ -1898,13 +2171,24 @@ export const eu = defineLocale({
       waitingForAnswer: 'Zure erantzunaren zain',
       finishedUnread: 'Amaituta — irakurri gabe',
       backgroundRunning: 'Atzeko zeregina martxan',
+      draftSession: 'Zirriborroa — oraindik ezer ez bidalita',
       handoffOrigin: platform => `${platform}-tik eman da`,
+      markUnread: 'Markatu irakurri gabe gisa',
+      markRead: 'Markatu irakurrita gisa',
+      unreadFailed: 'Ezin izan da irakurketa-egoera eguneratu',
+      openInTerminal: 'Ireki terminalean',
       ownedByProfile: profile => `Profila: ${profile}`,
       renamed: 'Berrizendatuta',
       renameFailed: 'Berrizendatzeak huts egin du',
       renameTitle: 'Berrizendatu saioa',
       renameDesc: 'Utzi hutsik garbitzeko.',
       untitledPlaceholder: 'Izenik gabeko saioa',
+      deleteTitle: 'Ezabatu saioa?',
+      deleteDesc: title => `Honek "${title}" betirako ezabatuko du. Hau ezin da desegin.`,
+      deleting: 'Ezabatzen…',
+      deleted: 'Saioa ezabatuta',
+      messageCount: count => `${count} mezu`,
+      todoProgress: 'Zereginak osatuta',
       untitledChat: id => `${id}. txata`,
       ageNow: 'orain',
       ageDay: 'e',
@@ -1917,7 +2201,12 @@ export const eu = defineLocale({
       thisWeek: 'Aste honetan lehenago',
       lastWeek: 'Iazko astean',
       thisMonth: 'Hilabete honetan lehenago'
-    }
+    },
+    statusDivider: {
+      working: 'Lanean',
+      done: 'Eginda'
+    },
+    markAllRead: 'Markatu guztiak irakurrita'
   },
 
   composer: {
@@ -1945,6 +2234,7 @@ export const eu = defineLocale({
       'Egokitu edo jarraitu'
     ],
     startVoice: 'Hasi ahots-elkarrizketa',
+    openDirective: 'Ireki',
     queueMessage: 'Ilaran jarri mezua',
     steer: 'Bideratu uneko exekuzioa',
     stop: 'Gelditu',
@@ -1960,6 +2250,7 @@ export const eu = defineLocale({
     stopShort: 'Gelditu',
     endConversation: 'Amaitu ahots-elkarrizketa',
     endShort: 'Amaitu',
+    voiceControls: 'Ahotsa',
     stopDictation: 'Gelditu diktaketa',
     transcribingDictation: 'Diktaketa transkribatzen',
     voiceDictation: 'Ahots-diktaketa',
@@ -2006,6 +2297,7 @@ export const eu = defineLocale({
     editingInComposer: 'Composer-ean editatzen',
     editingQueuedInComposer: 'Composer-ean ilaran dagoen txanda editatzen',
     queueEdit: 'Editatu',
+    queueSteer: 'Gidatu — bideratu uneko txanda orain',
     queueSendNext: 'Hurrengoa',
     queueSend: 'Bidali',
     queueDelete: 'Ezabatu',
@@ -2038,6 +2330,43 @@ export const eu = defineLocale({
     snippetsDesc: 'Aukeratu hasierako prompt bat composer-ean jartzeko.',
     dropFiles: 'Jaregin fitxategiak eransteko',
     dropSession: 'Jaregin txat hau lotzeko',
+    mcpSuggestions: {
+      label: server => `Gehitu ${server}`,
+      tip: keyword => `Iradokitakoa "${keyword}" aipatu duzulako — sakatu konektatzeko`,
+      connecting: server => `${server} konektatzen…`,
+      cancelTip: 'Sakatu bertan behera uzteko',
+      added: server => `${server} gehituta`,
+      addedTip: 'Konektatuta — bere tresnak txat honetan prest daude',
+      connectFailed: server => `Ezin izan da ${server} konektatu`
+    },
+    skillSuggestions: {
+      label: skill => `Erabili skill-a: ${skill}`,
+      tip: skill => `"${skill}" aipatu duzu — sakatu skill horrekin hasteko`,
+      done: skill => `/${skill} gehituta`,
+      doneTip: 'Skill-a bidaltzean kargatzen da'
+    },
+    githubSuggestions: {
+      label: 'Konfiguratu GitHub',
+      tip: 'GitHub-ek hemen dauden gh CLI skill-en bidez funtzionatzen du — sakatu zure kontua konektatzeko',
+      done: '/github-auth gehituta',
+      doneTip: 'Bidali mezua eta agenteak GitHub saio-hasiera gidatzen zaitu'
+    },
+    repairSuggestions: {
+      label: server => `Berriro konektatu ${server}`,
+      tip: server => `${server} dei batek huts egin du konexio-errore batekin`,
+      working: server => `${server} berriro konektatzen…`,
+      workingTip: 'Sakatu bertan behera uzteko',
+      done: server => `${server} berriro konektatuta`,
+      doneTip: 'Kredentzial freskoak txat honetan daude aktibo',
+      failed: server => `Ezin izan da ${server} berriro konektatu`
+    },
+    cronSuggestions: {
+      label: 'Programatu hau',
+      tip: phrase => `"${phrase}" errepikakorra dirudi — exekutatu egutegi batean ordez`,
+      prefix: 'Konfiguratu hau programatutako lan gisa:',
+      done: 'Programatzeko markatuta',
+      doneTip: 'Bidali eta agenteak lana sortzen du'
+    },
     snippets: {
       codeReview: {
         label: 'Kodearen berrikuspena',
@@ -2100,13 +2429,14 @@ export const eu = defineLocale({
       scopeLastTurn: 'Azken txanda',
       commit: 'Commit',
       commitAndPush: 'Commit eta push',
-      commitPlaceholder: 'Mezua (⌘↵ kommitatzeko)',
+      commitPlaceholder: (shortcut: string) => `Mezua (${shortcut} kommitatzeko)`,
       generateCommitMessage: 'Sortu commit mezua',
       stopGenerating: 'Gelditu sortzen',
       createPr: 'Sortu PR',
       openPr: 'Ireki PR',
       ghMissing: 'Instalatu GitHub CLI (gh) eta hasi saioa PR-ak irekitzeko',
       agentShip: 'Eskatu Hermes-i PR-a irekitzeko',
+      agentShipUnavailable: "Aldaketa hauek dituen txata ez dago pantailan.",
       agentShipPrompt:
         'Berrikusi uneko aldaketak, komitatu itzazu conventional-commit mezu argi batekin, bultzatu adarra eta ireki pull request bat.',
       newBranch: 'Adar berria',
@@ -2168,6 +2498,28 @@ export const eu = defineLocale({
       'Leiho hau itxiko da eguneraketa exekutatzen den bitartean, eta gero Hermes-ek bere kasa irekitzen du.',
     errorTitle: 'Eguneraketa ez da amaitu',
     errorBody: 'Lasai — ez da ezer galdu. Orain saia zaitezke berriro.',
+    blockerTitle: 'Itxi tokiko aurrebistak Hermes eguneratzeko?',
+    blockerBody:
+      'Hermes-ek tokiko aurrebista hauek gelditu behar ditu eguneratu aurretik. Honek ez du zure fitxategiak aldatu edo ezabatuko.',
+    foreignBlockerTitle: 'Itxi beste prozesu batzuk Hermes eguneratzeko',
+    foreignBlockerBody:
+      'Hermes-ek ezin ditu prozesu hauek segurtasunez itxi automatikoki. Itxi bakoitza duen aplikazioa, terminala edo zerbitzua, eta gero saiatu eguneraketa berriro.',
+    mixedBlockerBody:
+      'Hermes-ek behean zerrendatutako tokiko aurrebistak itxi ditzake. Beste prozesuak eskuz itxi behar dira eguneraketak jarraitu ahal izateko.',
+    closePreviewsAndUpdate: 'Itxi aurrebistak eta eguneratu',
+    closePreviewsAndCheckAgain: 'Itxi aurrebistak eta egiaztatu berriro',
+    localPreview: 'Tokiko aurrebista',
+    portLabel: port => `${port} ataka`,
+    pidLabel: pid => `${pid} PID`,
+    technicalDetails: 'Xehetasun teknikoak',
+    clientAlsoBehindTitle: 'Mahaigaineko aplikazioa atzeratuta dago',
+    clientAlsoBehindMessage:
+      'Backend-a eguneratuta dago, baina mahaigaineko aplikazio hau oraindik bertsio zaharrago batean dago. Eguneratu azken konponketak jasotzeko.',
+    clientAlsoBehindAction: 'Eguneratu mahaigaineko aplikazioa',
+    everythingDispatched: 'Eguneraketa bidalita',
+    everythingSkipped: 'Saltatuta',
+    everythingRowFailed: 'Eguneraketak huts egin du',
+    everythingFanoutFailedTitle: 'Ezin izan dira beste instantziak eguneratu',
     notNow: 'Orain ez',
     applyStatus: {
       preparing: 'Backend-a eguneratzen…',
@@ -2393,6 +2745,7 @@ export const eu = defineLocale({
       inferenceNotReady: 'Inferentzia ez dago prest',
       checkingInference: 'Inferentzia egiaztatzen',
       disconnected: 'Deskonektatuta',
+      reconnectGateway: 'Berriro konektatu gateway-a',
       openSystem: 'Ireki sistema-panela',
       connection: label => `Konexioa: ${label}`,
       recentActivity: 'Azken jarduera',
@@ -2440,6 +2793,7 @@ export const eu = defineLocale({
       gatewayRestarting: 'berrabiarazten…',
       gatewayTitle: 'Gateway',
       customizeTitle: 'Erakutsi egoera-barran',
+      resetStatusbar: 'Berrezarri lehenetsietara',
       hideStatusbar: 'Ezkutatu egoera-barra',
       toggleApprovalMode: 'Onarpenak',
       toggleBackendVersion: 'Backend-aren bertsioa',
@@ -2533,10 +2887,6 @@ export const eu = defineLocale({
 
   preview: {
     tab: 'Aurrebista',
-    closeTab: label => `Itxi ${label}`,
-    closeOthers: 'Itxi besteak',
-    closeToRight: 'Itxi eskuinekoak',
-    closeAll: 'Itxi guztiak',
     closePane: 'Itxi aurrebista-panela',
     loading: 'Aurrebista kargatzen',
     unavailable: 'Aurrebista ez dago erabilgarri',
@@ -2590,6 +2940,8 @@ export const eu = defineLocale({
     web: {
       appFailedToBoot: 'Aurrebista-aplikazioak huts egin du abiaraztean',
       serverNotFound: 'Ez da zerbitzaria aurkitu',
+      remoteLoopback:
+        'Helbide honek zure agentea exekutatzen duen makinarantz apuntatzen du, ez honetara. Nabigatzaile-panelak orriak lokalean kargatzen ditu, beraz urruneko dev zerbitzari batek ataka-aurreratzea edo helbide iristeko moduko bat behar du.',
       failedToLoad: 'Aurrebista ezin izan da kargatu',
       tryAgain: 'Saiatu berriro',
       restarting: 'Hermes berrabiarazten ari da...',
@@ -2603,6 +2955,12 @@ export const eu = defineLocale({
       showConsole: 'Erakutsi aurrebista-kontsola',
       hideDevTools: 'Ezkutatu aurrebistaren DevTools',
       openDevTools: 'Ireki aurrebistaren DevTools',
+      goBack: 'Atzera',
+      goForward: 'Aurrera',
+      reload: 'Kargatu orria berriro',
+      address: 'Helbidea',
+      addressPlaceholder: 'Sartu helbidea',
+      blankPageBody: 'Idatzi helbide bat goian arakatzeko, edo eskatu Hermes-i orri bat irekitzeko.',
       finishedRestarting: message =>
         `Hermes-ek aurrebista-zerbitzaria berrabiaraztea amaitu du${message ? `: ${message}` : ''}`,
       failedRestarting: message => `Zerbitzariaren berrabiarazteak huts egin du: ${message}`,
@@ -2629,7 +2987,13 @@ export const eu = defineLocale({
   zones: {
     showHeader: 'Erakutsi goiburua',
     hideHeader: 'Ezkutatu goiburua',
+    showStripTab: title => `Erakutsi ${title}`,
+    hideStripTab: title => `Ezkutatu ${title}`,
+    lastTabKeptTitle: 'Azken fitxa geratzen da',
+    lastTabKeptBody: 'Zona honek gutxienez fitxa ikusgarri bat behar du. Erakutsi beste fitxa bat lehenengo, edo tolestu alboko barra osoa.',
+    toggleStripTab: title => `Txandakatu ${title} fitxa`,
     minimize: 'Txikitu',
+    reload: 'Kargatu berriro',
     restore: 'Berrezarri',
     closeRunningTitle: 'Itxi martxan dagoen fitxa?',
     closeRunningBody:
@@ -2639,12 +3003,6 @@ export const eu = defineLocale({
     closeToRight: 'Itxi eskuinekoak',
     closeAll: 'Itxi guztiak',
     newSessionTab: 'Saio-fitxa berria',
-    split: dir => `Zatitu ${dir}`,
-    move: dir => `Mugitu ${dir}`,
-    dirUp: 'gora',
-    dirDown: 'behera',
-    dirLeft: 'ezkerrera',
-    dirRight: 'eskuinera',
     pluginDisabled: pluginId => `"${pluginId}" plugina desgaituta`,
     pluginDisabledBody: 'Gaitu berriro Ezarpenak → Pluginak atalean panela itzultzeko.',
     missingPane: paneId => `panela falta da: ${paneId}`,
@@ -2670,7 +3028,8 @@ export const eu = defineLocale({
     layoutNamePlaceholder: fallback => `Diseinuaren izena (${fallback})`,
     saveApply: 'Gorde eta aplikatu',
     notExpressible: 'antolaketa hau elkarri lotuta dago (pinwheel) — ezin da oraindik habiaratutako zatiketa gisa adierazi',
-    zoneCount: count => `${count} zona`
+    zoneCount: count => `${count} zona`,
+    tabCount: count => `${count} fitxa`
   },
 
   assistant: {
@@ -2711,7 +3070,11 @@ export const eu = defineLocale({
       restoreNext: 'Berrezarri hurrengo checkpoint-a',
       goForward: 'Aurrera joan',
       sendEdited: 'Bidali editatutako mezua',
-      attachingFile: 'Erantsitzen…'
+      attachingFile: 'Erantsitzen…',
+      turnDuration: duration => `Txanda honek ${duration} iraun du`,
+      react: 'Erreakzionatu',
+      filesChanged: count => `${count} fitxategi aldatu dira`,
+      reviewChanges: 'Berrikusi'
     },
     approval: {
       gatewayDisconnected: 'Hermes gateway ez dago konektatuta',
@@ -2738,9 +3101,34 @@ export const eu = defineLocale({
       skip: 'Saltatu',
       skipped: 'Saltatuta',
       continueLabel: 'Jarraitu',
+      confirmAndContinueLabel: 'Berretsi eta jarraitu',
+      answeredBadge: 'Erantzunda',
+      questionProgress: (answered, total) => `${answered} / ${total} erantzunda`,
       lateAnswer: (question, choice) => `"${question}"-ri buruz — nire erantzuna: ${choice}`,
       lateAnswerTip: 'Idatzi erantzun hau jarraipen-mezu gisa',
       lateAnswerHint: 'Prompt hau ez dago jada zain. Aukeratu aukera bat jarraipen-mezu gisa idazteko.'
+    },
+    mcpSetup: {
+      installTitle: server => `Gehitu ${server} MCP zerbitzaria?`,
+      enableTitle: server => `Gaitu ${server} MCP zerbitzaria?`,
+      authorizeTitle: server => `Baimendu ${server} MCP zerbitzaria?`,
+      installAction: 'Instalatu',
+      enableAction: 'Gaitu',
+      authorizeAction: 'Baimendu',
+      decline: 'Orain ez',
+      declined: 'Baztertuta',
+      installed: server => `${server} instalatuta`,
+      enabled: server => `${server} gaituta`,
+      authorized: server => `${server} baimenduta`,
+      failed: server => `${server}-ren konfigurazioak huts egin du`,
+      unanswered: 'Erantzunik ez',
+      toolCount: count => `${count} tresna`,
+      notInCatalog: server => `"${server}" ez dago MCP katalogoan`,
+      catalogSource: 'Nous-ek onartutako katalogotik',
+      envRequired: 'Bete beharrezko kredentzialak lehenengo',
+      sendFailed: 'Ezin izan da MCP konfigurazio-erantzuna bidali',
+      reloadFailed: 'Zerbitzaria gordeta, baina MCP tresnak birkargatzeak huts egin du — hurrengo saioan kargatzen dira',
+      gatewayDisconnected: 'Hermes gateway ez dago konektatuta'
     },
     tool: {
       copyCode: 'Kopiatu kodea',
@@ -2764,6 +3152,7 @@ export const eu = defineLocale({
       statusError: 'Errorea',
       statusRecovered: 'Berreskuratuta',
       statusDone: 'Eginda',
+      memoryWriteNoted: 'Memoria-idazketa oharrean jasota',
       actions: {
         read: 'Irakurri',
         reading: 'Irakurtzen',
@@ -2867,6 +3256,7 @@ export const eu = defineLocale({
     stopFailed: 'Gelditzeak huts egin du',
     regenerateFailed: 'Berriro sortzeak huts egin du',
     editFailed: 'Editatzeak huts egin du',
+    editTurnUnavailable: 'Txanda hau ez dago jada zerbitzariaren historian (konprimitua izan daiteke).',
     resumeFailed: 'Jarraitzeak huts egin du',
     resumeStrandedTitle: 'Ezin izan da saio hau kargatu',
     resumeStrandedBody:
@@ -2936,7 +3326,7 @@ export const eu = defineLocale({
     sidebar: {
       title: 'Alboko barra',
       description: 'Alboko barra mugikorra erakusten du.',
-      toggle: 'Txandakatu alboko barra'
+      toggle: (open: boolean) => (open ? 'Ezkutatu alboko barra' : 'Erakutsi alboko barra')
     }
   }
 })

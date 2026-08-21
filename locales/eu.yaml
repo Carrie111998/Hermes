@@ -142,7 +142,7 @@ gateway:
     no_goal_set:           "Ez dago helbururik ezarrita."
     paused:                "⏸ Helburua pausatuta: {goal}"
     no_resume:             "Ez dago berrekiteko helbururik."
-    resumed:               "▶ Helburua berrekin da: {goal}\nBidali edozein mezu jarraitzeko, edo itxaron — hurrengo txandan hurrengo pausoa egingo dut."
+    resumed:               "▶ Helburua berrekin da: {goal}\nOrain jarraitzen dut — hurrengo pausoa berehala egingo dut."
     invalid:               "Helburu baliogabea: {error}"
     set:                   "⊙ Helburua ezarrita ({budget}-txandako aurrekontua): {goal}\nHelburua amaitu, pausatu/ezabatu edo aurrekontua agortu arte lanean jarraituko dut.\nKontrolak: /goal status · /goal pause · /goal resume · /goal clear"
 
@@ -169,6 +169,8 @@ gateway:
       status_default:      "egoera aldatu da"
       status_joiner:       ", "
       message:             "[kanban] {task_id} lana {status}.\nIzenburua: {title}\nArduraduna: @{assignee}\nMahaia: {board}\n\nEgiaztatu emaitza edo erabaki hurrengo pausoa."
+      handoff:             "Emaitza: {summary}"
+      guidance:            "Lanaren egoeraren jakinarazpen automatikoa da hau, ez eskaera lana berriro zatitzeko. Ikuskatu uneko mahaia jarraipen-lanak sortu aurretik; ez berriro sortu jada existitzen diren lanak edo grafikoak."
 
   personality:
     none_configured:       "Ez dago pertsonalitaterik konfiguratuta `{path}/config.yaml`-n"
@@ -274,6 +276,7 @@ gateway:
     none_found:            "Ez da checkpoint-ik aurkitu {cwd} helbidean"
     invalid_number:        "Checkpoint-zenbaki baliogabea. Erabili 1-{max}."
     restored:              "✅ {hash} checkpoint-era berrezarrita: {reason}\nAurre-rollback argazki bat automatikoki gorde da."
+    kept_user_edits:       "↷ Zure eskuzko edizioak gordeta: {files}\nErabili /rollback <N> --all hauek ere berreskuratzeko."
     restore_failed:        "❌ {error}"
 
   diff:
