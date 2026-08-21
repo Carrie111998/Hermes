@@ -135,16 +135,19 @@ class TestWindowsAncestorSuppression:
     dropped by the old blanket ancestor exclusion (#13242 changed by #87594)."""
 
     def _run_scan(self, monkeypatch, entries: dict, ancestor_pids: set):
-        monkeypatch.setattr(gateway_mod, "is_windows", lambda: True)
-        monkeypatch.setattr(gateway_mod, "is_macos", lambda: False)
-        monkeypatch.setattr(
-            gateway_mod, "_get_ancestor_pids", lambda: set(ancestor_pids)
-        )
-        with (
-            patch("shutil.which", return_value=r"C:\Windows\System32\wbem\wmic.exe"),
-            patch("subprocess.run", return_value=_wmic_result(entries)),
-        ):
-            return gateway_mod._scan_gateway_pids(set(), all_profiles=True)
+            monkeypatch.setattr(gateway_mod, "is_windows", lambda: True)
+            monkeypatch.setattr(gateway_mod, "is_macos", lambda: False)
+            monkeypatch.setattr(
+                gateway_mod, "_get_ancestor_pids", lambda: set(ancestor_pids)
+            )
+            with (
+                patch("shutil.which", return_value=r"C:\Windows\System32\wbem\wmic.exe"),
+                patch(
+                    "hermes_cli._subprocess_compat.bounded_probe_run",
+                    return_value=_wmic_result(entries),
+                ),
+            ):
+                return gateway_mod._scan_gateway_pids(set(), all_profiles=True)
 
     def test_gateway_runtime_ancestor_is_kept(self, monkeypatch):
         """The gateway launcher sits in our ancestry with a ``gateway run``
