@@ -150,6 +150,8 @@ const SESSIONS_LIST_TICK_GAP_MS = 10_000
 interface LiveSessionStatusItem {
   id?: string
   last_active?: number
+  last_activity_at?: number | null
+  last_activity_description?: string
   session_key?: string
   status?: 'idle' | 'starting' | 'waiting' | 'working'
 }
@@ -195,6 +197,23 @@ export function rehydrateLiveSessionStatuses(
     seen.add(runtimeSessionId)
 
     const existing = $sessionStates.get()[runtimeSessionId]
+    const hasActivityAt = Object.prototype.hasOwnProperty.call(session, 'last_activity_at')
+    const hasActivityDescription = Object.prototype.hasOwnProperty.call(session, 'last_activity_description')
+    const rawActivityAt = Number(session.last_activity_at)
+
+    const lastActivityAt = !working
+      ? null
+      : hasActivityAt
+        ? Number.isFinite(rawActivityAt) && rawActivityAt > 0
+          ? rawActivityAt * 1000
+          : null
+        : (existing?.lastActivityAt ?? null)
+
+    const lastActivityDescription = !working
+      ? ''
+      : hasActivityDescription
+        ? String(session.last_activity_description ?? '')
+        : (existing?.lastActivityDescription ?? '')
 
     // A turn we just submitted is not yet running as far as the backend is
     // concerned, so the snapshot honestly reports it idle — but the local
@@ -211,11 +230,15 @@ export function rehydrateLiveSessionStatuses(
       !existing ||
       existing.storedSessionId !== storedSessionId ||
       existing.busy !== busy ||
-      existing.needsInput !== needsInput
+      existing.needsInput !== needsInput ||
+      existing.lastActivityAt !== lastActivityAt ||
+      existing.lastActivityDescription !== lastActivityDescription
     ) {
       publishSessionState(runtimeSessionId, {
         ...(existing ?? createClientSessionState(storedSessionId)),
         busy,
+        lastActivityAt,
+        lastActivityDescription,
         needsInput,
         storedSessionId
       })
