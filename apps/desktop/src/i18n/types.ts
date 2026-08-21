@@ -1752,6 +1752,38 @@ export interface Translations {
     projectEmpty: string
     noSessions: string
     noFilterMatches: string
+    filterMenu: {
+      grouping: string
+      ordering: string
+      show: string
+      filters: string
+      status: string
+      pullRequest: string
+      profile: string
+      project: string
+      archived: string
+      inboxStyle: string
+      resetToDefaults: string
+      expandAll: string
+      collapseAll: string
+      markAllAsRead: string
+      updated: string
+      created: string
+      tokens: string
+      cost: string
+      manual: string
+      preview: string
+      pr: string
+      open: string
+      draft: string
+      merged: string
+      closed: string
+      noPr: string
+      needsInput: string
+      working: string
+      unread: string
+      idle: string
+    }
     projects: {
       sectionLabel: string
       home: string
