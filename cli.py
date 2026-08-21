@@ -4280,7 +4280,10 @@ def _enable_extended_enter_keys(output=None, env: Optional[Mapping[str, str]] = 
     for terminals where the re-encoding is not decodable — CJK IME
     composition under WezTerm/WSL2 commits two characters at a time and
     arrow keys stop moving the cursor (#91624); same mechanism family as
-    the unmapped CSI-u reports (#86866, #87631, #88221, #90640).
+    the unmapped CSI-u reports (#86866, #87631, #88221, #90640). Truthy
+    spellings are ``1/true/yes/on`` (case-insensitive); any other value —
+    including ``0``, ``false``, ``off``, and empty — deliberately does NOT
+    opt out, unlike tools that treat any non-empty value as true.
     """
     if env is None:
         env = os.environ
