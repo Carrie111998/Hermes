@@ -43,6 +43,12 @@ from tui_gateway.turn_marker import (
     read_turn_marker,
     record_turn_start,
 )
+from tui_gateway.turn_receipts import (
+    claim_turn,
+    finish_turn,
+    get_turn_status,
+    prepare_turn,
+)
 from tui_gateway.transport import (
     StdioTransport,
     Transport,
@@ -1831,6 +1837,18 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
 
 def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
     is_error = frame.get("type") == "turn.error"
+    frame_status = str(frame.get("status") or "")
+    receipt_state = (
+        "failed"
+        if is_error
+        else "interrupted" if frame_status == "interrupted" else "committed"
+    )
+    turn_id = _finish_inflight_turn_receipt(
+        session,
+        receipt_state,
+        status=frame_status or ("error" if is_error else "complete"),
+        error=(frame.get("message") if is_error else None),
+    )
     with session["history_lock"]:
         if frame.get("session_key"):
             session["session_key"] = str(frame.get("session_key"))
@@ -1847,7 +1865,10 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         _clear_inflight_turn(session)
     if is_error:
         message = str(frame.get("message") or "compute host turn failed")
-        _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
+        payload = {"text": f"Error: {message}", "status": "error"}
+        if turn_id:
+            payload["turn_id"] = turn_id
+        _emit("message.complete", sid, payload)
     _apply_compute_host_metadata_mirror(session, frame)
     try:
         info = _session_info(session.get("agent"), session)
@@ -7639,7 +7660,14 @@ def _inflight_text(value: Any) -> str:
     return _content_display_text(value).strip()
 
 
-def _start_inflight_turn(session: dict, text: Any) -> None:
+def _start_inflight_turn(
+    session: dict,
+    text: Any,
+    *,
+    turn_id: str | None = None,
+    execution_token: str | None = None,
+    receipt_session_key: str | None = None,
+) -> None:
     now = time.time()
     session["inflight_turn"] = {
         "assistant": "",
@@ -7647,6 +7675,9 @@ def _start_inflight_turn(session: dict, text: Any) -> None:
         "streaming": True,
         "updated_at": now,
         "user": _inflight_text(text),
+        **({"turn_id": turn_id} if turn_id else {}),
+        **({"execution_token": execution_token} if execution_token else {}),
+        **({"receipt_session_key": receipt_session_key} if receipt_session_key else {}),
     }
 
 
@@ -7695,6 +7726,49 @@ def _record_inflight_correction(session: dict, text: Any) -> None:
 
 def _clear_inflight_turn(session: dict) -> None:
     session["inflight_turn"] = None
+
+
+def _finish_inflight_turn_receipt(
+    session: dict,
+    state: str,
+    *,
+    status: str | None = None,
+    error: Any = None,
+) -> str:
+    """Fence and persist a terminal receipt; return its public turn id.
+
+    Callers invoke this before clearing ``inflight_turn`` and before emitting
+    the terminal event, so a client that loses that event can query the same
+    authoritative outcome after reconnecting.
+    """
+    turn = session.get("inflight_turn")
+    if not isinstance(turn, dict):
+        return ""
+    turn_id = str(turn.get("turn_id") or "")
+    token = str(turn.get("execution_token") or "")
+    session_key = str(
+        turn.get("receipt_session_key") or session.get("session_key") or ""
+    )
+    if not turn_id or not token or not session_key:
+        return turn_id
+    receipt = {"status": status or state}
+    if error:
+        receipt["error"] = str(error)
+    if not finish_turn(
+        _session_home(session),
+        session_key,
+        turn_id,
+        token,
+        state,
+        receipt,
+    ):
+        logger.error(
+            "turn receipt fence refused terminal write: session=%s turn=%s state=%s",
+            session_key,
+            turn_id,
+            state,
+        )
+    return turn_id
 
 
 def _fail_inflight_turn(session: dict, error: Any) -> None:
@@ -8256,6 +8330,8 @@ def _inflight_snapshot(session: dict) -> dict | None:
         "streaming": streaming,
         "user": user,
     }
+    if turn.get("turn_id"):
+        snapshot["turn_id"] = str(turn["turn_id"])
     raw_corrections = turn.get("corrections") or []
     raw_offsets = turn.get("correction_offsets") or []
     correction_pairs = [
@@ -8315,6 +8391,11 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
         rendered = ""
     if rendered:
         payload["rendered"] = rendered
+    turn_id = _finish_inflight_turn_receipt(
+        session, "failed", status="error", error=message
+    )
+    if turn_id:
+        payload["turn_id"] = turn_id
     _retire_turn_marker(session)
     _emit("message.complete", sid, payload)
 
@@ -10526,7 +10607,11 @@ def _run_prompt_submit(
         len(text) if isinstance(text, str) else "-",
         len(images),
     )
-    _emit("message.start", sid)
+    _turn_id = ""
+    with session["history_lock"]:
+        if isinstance(session.get("inflight_turn"), dict):
+            _turn_id = str(session["inflight_turn"].get("turn_id") or "")
+    _emit("message.start", sid, {"turn_id": _turn_id} if _turn_id else None)
 
     def run():
         # The conversation runs on a fresh thread, so ContextVars from the RPC
@@ -11028,6 +11113,19 @@ def _run_prompt_submit(
             rendered = render_message(raw, cols)
             if rendered:
                 payload["rendered"] = rendered
+            receipt_state = (
+                "interrupted"
+                if status == "interrupted"
+                else "failed" if status == "error" else "committed"
+            )
+            turn_id = _finish_inflight_turn_receipt(
+                session,
+                receipt_state,
+                status=status,
+                error=(result.get("error") if isinstance(result, dict) else None),
+            )
+            if turn_id:
+                payload["turn_id"] = turn_id
             with session["history_lock"]:
                 if status == "error":
                     # Returned-error result (provider 4xx, budget, etc.): retain

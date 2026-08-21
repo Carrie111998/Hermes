@@ -265,6 +265,61 @@ def _pending_reaction_notes(session: dict) -> str:
     return "\n".join(notes)
 
 
+def _turn_session_key(session: dict, sid: str) -> str:
+    physical = str(session.get("session_key") or sid or "")
+    if not physical:
+        return ""
+    try:
+        with _session_db(session) as db:
+            lineage = db.get_compression_lineage(physical) if db is not None else []
+        if isinstance(lineage, (list, tuple)) and lineage and isinstance(lineage[0], str):
+            return lineage[0] or physical
+    except Exception:
+        logger.debug("turn receipt lineage resolution failed", exc_info=True)
+    return physical
+
+
+@method("turn.prepare")
+def _(rid, params: dict) -> dict:
+    """Mint a turn identity inside the request's authenticated session bind."""
+    sid = str(params.get("session_id") or "")
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    try:
+        return _ok(
+            rid,
+            prepare_turn(_session_home(session), _turn_session_key(session, sid)),
+        )
+    except Exception as exc:
+        logger.warning("turn.prepare failed for session %s: %s", sid, exc, exc_info=True)
+        return _err(rid, 5072, f"turn receipt storage unavailable: {exc}")
+
+
+@method("turn.status")
+def _(rid, params: dict) -> dict:
+    """Return the target's durable fact for a server-issued turn id."""
+    sid = str(params.get("session_id") or "")
+    turn_id = str(params.get("turn_id") or "").strip()
+    if not turn_id:
+        return _err(rid, 4004, "turn_id required")
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    try:
+        return _ok(
+            rid,
+            get_turn_status(
+                _session_home(session),
+                _turn_session_key(session, sid),
+                turn_id,
+            ),
+        )
+    except Exception as exc:
+        logger.warning("turn.status failed for session %s: %s", sid, exc, exc_info=True)
+        return _err(rid, 5072, f"turn receipt storage unavailable: {exc}")
+
+
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
@@ -276,6 +331,7 @@ def _(rid, params: dict) -> dict:
     # client renders it as a bubble. Whitelisted to "hidden" — display_kind
     # is a DB-only sidecar and this RPC must not mint arbitrary kinds.
     display_kind = "hidden" if params.get("display_kind") == "hidden" else None
+    requested_turn_id = str(params.get("turn_id") or "").strip()
     # Typed bare stop phrase while backend voice mode is active ends the
     # voice chat instead of sending "stop" to the agent — the typed twin of
     # the spoken stop phrase (PR #73106), applied at the ONE server-side
@@ -328,6 +384,10 @@ def _(rid, params: dict) -> dict:
         or params.get("truncate_before_row_id") is not None
         or params.get("truncate_before_message_id") is not None
     )
+    if requested_turn_id and has_truncation:
+        # Rewind is a destructive transcript rewrite, not an ordinary replayable
+        # turn. It needs its own operation receipt before it can share this id.
+        return _err(rid, 4004, "turn_id is not supported with transcript truncation")
     if has_truncation and isinstance(text, str):
         # A rewind/regenerate replays a turn from what the transcript shows. A
         # skill turn shows its invocation, so re-expand it here — otherwise
@@ -354,6 +414,18 @@ def _(rid, params: dict) -> dict:
                 busy_transport = t or session.get("transport")
             else:
                 break
+        if requested_turn_id:
+            status = get_turn_status(
+                _session_home(session),
+                _turn_session_key(session, sid),
+                requested_turn_id,
+            )
+            return _err(
+                rid,
+                4009,
+                "session busy; prepared turn was not admitted",
+                data={"turn": status},
+            )
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
@@ -705,16 +777,40 @@ def _(rid, params: dict) -> dict:
                     _message_row_id(truncated[i])
                     for i in _history_user_indices(truncated)
                 ]
+        execution_token = None
+        if requested_turn_id:
+            execution_token, turn_status = claim_turn(
+                _session_home(session),
+                _turn_session_key(session, sid),
+                requested_turn_id,
+            )
+            if execution_token is None:
+                return _err(
+                    rid,
+                    4091,
+                    "turn was not admitted; inspect turn.status before retrying",
+                    data={"turn": turn_status},
+                )
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
-        _start_inflight_turn(session, text)
+        _start_inflight_turn(
+            session,
+            text,
+            turn_id=requested_turn_id or None,
+            execution_token=execution_token,
+            receipt_session_key=(
+                _turn_session_key(session, sid) if requested_turn_id else None
+            ),
+        )
 
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(
             rid, sid, session, text, display_kind=display_kind
         )
         if not isolated_response.get("error"):
+            if requested_turn_id:
+                isolated_response["result"]["turn_id"] = requested_turn_id
             if survivor_user_row_ids is not None:
                 # The truncation already happened inline above (memory + DB),
                 # before compute-host dispatch — the rebind payload applies to
@@ -740,6 +836,9 @@ def _(rid, params: dict) -> dict:
     except Exception as exc:
         from hermes_state import is_disk_full_error
 
+        _finish_inflight_turn_receipt(
+            session, "failed", status="error", error=exc
+        )
         with session["history_lock"]:
             session["running"] = False
             session["last_active"] = time.time()
@@ -781,6 +880,9 @@ def _(rid, params: dict) -> dict:
             return
         with session["history_lock"]:
             if session.get("_turn_cancel_requested") or not session.get("running"):
+                _finish_inflight_turn_receipt(
+                    session, "interrupted", status="interrupted"
+                )
                 session["running"] = False
                 _clear_inflight_turn(session)
                 # Surface the cancellation to the client. Without this emit the
@@ -810,6 +912,7 @@ def _(rid, params: dict) -> dict:
         rid,
         {
             "status": "streaming",
+            **({"turn_id": requested_turn_id} if requested_turn_id else {}),
             **(
                 {"survivor_user_row_ids": survivor_user_row_ids}
                 if survivor_user_row_ids is not None
@@ -1523,6 +1626,7 @@ def register(server) -> None:
         _coerce_truncate_int,
         _reconcile_client_ordinal,
         _pending_reaction_notes,
+        _turn_session_key,
     ):
         setattr(
             server,
