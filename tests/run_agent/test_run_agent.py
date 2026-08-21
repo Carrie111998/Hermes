@@ -3067,6 +3067,48 @@ class TestRunConversation:
             (hook_events[0]["api_request_id"], "success")
         ]
 
+    def test_kanban_content_filter_does_not_call_cross_provider_fallback(
+        self, agent, monkeypatch
+    ):
+        self._setup_agent(agent)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_safety")
+        agent.api_mode = "codex_responses"
+        agent.provider = "openai-codex"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "chatgpt.com"
+        agent.model = "gpt-5.5"
+        agent._fallback_chain = [
+            {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.7"},
+        ]
+        agent._fallback_index = 0
+        content_filter_response = SimpleNamespace(
+            status="incomplete",
+            incomplete_details=SimpleNamespace(reason="content_filter"),
+            output=[],
+            output_text="",
+            model="gpt-5.5",
+            usage=None,
+        )
+
+        with (
+            patch.object(agent, "_create_request_openai_client", return_value=MagicMock()),
+            patch.object(agent, "_close_request_openai_client"),
+            patch.object(agent, "_run_codex_stream", return_value=content_filter_response) as request,
+            patch.object(agent, "_try_activate_fallback") as activate_fallback,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("summarize this large Slack thread")
+
+        assert request.call_count == 1
+        activate_fallback.assert_not_called()
+        assert result["failed"] is True
+        assert result["provider_failure"]["classification"] == "content_policy_blocked"
+        assert result["provider_failure"]["provider"] == "openai-codex"
+        assert result["provider_failure"]["model"] == "gpt-5.5"
+
     def test_ollama_small_runtime_context_fails_before_api_call(self, agent, caplog):
         self._setup_agent(agent)
         agent.model = "qwen3.5:9b"

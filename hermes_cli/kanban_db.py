@@ -429,6 +429,39 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
+# Corroborating hint for a deterministic provider/configuration failure. The
+# structured disposition persisted on the active run is authoritative; this
+# code only preserves the failure class when a supervisor can see the process
+# status but not the run row. Never repurpose 75: historical runs persist its
+# rate-limit meaning.
+KANBAN_PROVIDER_TERMINAL_EXIT_CODE = 76
+
+_PROVIDER_EXIT_DISPOSITIONS = frozenset(
+    {"terminal", "transient", "safety_refusal"}
+)
+_PROVIDER_EXIT_TERMINAL_CLASSIFICATIONS = frozenset(
+    {
+        "auth",
+        "auth_permanent",
+        "billing",
+        "model_not_found",
+        "provider_policy_blocked",
+        "format_error",
+        "ssl_cert_verification",
+    }
+)
+_PROVIDER_EXIT_TRANSIENT_CLASSIFICATIONS = frozenset(
+    {
+        "rate_limit",
+        "upstream_rate_limit",
+        "overloaded",
+        "server_error",
+        "timeout",
+    }
+)
+_PROVIDER_EXIT_METADATA_KEY = "provider_exit_disposition"
+_PROVIDER_FINGERPRINT_VERSION = "v1"
+
 
 def _resolve_crash_grace_seconds() -> int:
     """Return the crash-detection grace period in seconds.
@@ -3763,7 +3796,8 @@ def set_model_override(
         provider = None
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, assignee, model_override, provider_override "
+            "FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if not row:
             return False
@@ -3777,6 +3811,48 @@ def set_model_override(
             conn, task_id, "model_override_set",
             {"model": model, "provider": provider},
         )
+        if row["status"] == "blocked":
+            latest_terminal = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'provider_terminal' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            try:
+                terminal_payload = (
+                    json.loads(latest_terminal["payload"])
+                    if latest_terminal and latest_terminal["payload"] else {}
+                )
+            except (TypeError, ValueError):
+                terminal_payload = {}
+            old_fingerprint = _task_provider_config_fingerprint(
+                provider_override=row["provider_override"],
+                model_override=row["model_override"],
+                account_scope=row["assignee"],
+            )
+            new_fingerprint = _task_provider_config_fingerprint(
+                provider_override=provider,
+                model_override=model,
+                account_scope=row["assignee"],
+            )
+            if (
+                terminal_payload.get("config_fingerprint") == old_fingerprint
+                and new_fingerprint != old_fingerprint
+            ):
+                conn.execute(
+                    "UPDATE tasks SET status = 'ready', consecutive_failures = 0, "
+                    "last_failure_error = NULL WHERE id = ? AND status = 'blocked'",
+                    (task_id,),
+                )
+                _append_event(
+                    conn,
+                    task_id,
+                    "provider_failure_config_changed",
+                    {
+                        "previous_fingerprint": old_fingerprint,
+                        "fingerprint": new_fingerprint,
+                    },
+                )
     # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
     notify_task_updated(conn, task_id, ("model_override", "provider_override"))
     return True
@@ -4385,6 +4461,215 @@ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
 
 
+def _provider_route_fingerprint(
+    provider: Optional[str], model: Optional[str], account_scope: Optional[str]
+) -> str:
+    """Return a versioned, non-reversible provider-route fingerprint."""
+    material = "\x1f".join(
+        (str(provider or ""), str(model or ""), str(account_scope or ""))
+    ).encode("utf-8", errors="replace")
+    digest = hashlib.sha256(material).hexdigest()
+    return f"{_PROVIDER_FINGERPRINT_VERSION}:{digest}"
+
+
+def _task_provider_config_fingerprint(
+    *,
+    provider_override: Optional[str],
+    model_override: Optional[str],
+    account_scope: Optional[str],
+) -> str:
+    """Fingerprint the task-scoped provider/model configuration."""
+    return _provider_route_fingerprint(
+        provider_override, model_override, account_scope
+    )
+
+
+def _safe_provider_exit_field(value: Any, *, limit: int) -> Optional[str]:
+    if value is None:
+        return None
+    from agent.redact import redact_sensitive_text
+
+    safe = redact_sensitive_text(str(value), force=True).strip()
+    return safe[:limit] or None
+
+
+def _trusted_provider_exit_disposition(
+    classification: str, status_code: Optional[int]
+) -> Optional[str]:
+    """Derive provider-exit handling from allowlisted failure semantics."""
+    if classification == "content_policy_blocked":
+        return "safety_refusal"
+    if status_code in {401, 402, 403}:
+        return "terminal"
+    if status_code == 429 or (
+        status_code is not None and 500 <= status_code <= 599
+    ):
+        return "transient"
+    if classification in _PROVIDER_EXIT_TERMINAL_CLASSIFICATIONS:
+        return "terminal"
+    if classification in _PROVIDER_EXIT_TRANSIENT_CLASSIFICATIONS:
+        return "transient"
+    return None
+
+
+def record_provider_exit_disposition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: int,
+    disposition: str,
+    classification: str,
+    status_code: Optional[int],
+    provider: Optional[str],
+    model: Optional[str],
+    session_id: Optional[str] = None,
+) -> bool:
+    """Stage a sanitized provider failure envelope on the active worker run.
+
+    The worker supplies only the classifier output and route identity. The
+    dispatcher consumes this untrusted envelope and atomically writes the
+    authoritative terminal/transient event while closing the run. Raw provider
+    bodies, prompts, balances, tokens, and credentials have no parameter here
+    and therefore cannot enter durable board state through this boundary.
+    """
+    if disposition not in _PROVIDER_EXIT_DISPOSITIONS:
+        raise ValueError(f"invalid provider exit disposition: {disposition!r}")
+    try:
+        normalized_status = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError) as exc:
+        raise ValueError("status_code must be an integer or None") from exc
+    if normalized_status is not None and not 100 <= normalized_status <= 599:
+        raise ValueError("status_code must be an HTTP status between 100 and 599")
+
+    safe_classification = _safe_provider_exit_field(classification, limit=80)
+    if not safe_classification:
+        raise ValueError("classification is required")
+    trusted_disposition = _trusted_provider_exit_disposition(
+        safe_classification, normalized_status
+    )
+    if trusted_disposition is None:
+        raise ValueError(
+            "unsupported provider exit classification/status: "
+            f"{safe_classification!r}/{normalized_status!r}"
+        )
+    if disposition != trusted_disposition:
+        raise ValueError(
+            "inconsistent provider exit disposition: "
+            f"got {disposition!r}, expected {trusted_disposition!r}"
+        )
+    safe_provider = _safe_provider_exit_field(provider, limit=128)
+    safe_model = _safe_provider_exit_field(model, limit=256)
+    safe_session = _safe_provider_exit_field(session_id, limit=128)
+
+    with write_txn(conn):
+        task_row = conn.execute(
+            "SELECT current_run_id, assignee, provider_override, model_override "
+            "FROM tasks WHERE id = ? AND status = 'running'",
+            (task_id,),
+        ).fetchone()
+        if not task_row or int(task_row["current_run_id"] or 0) != int(run_id):
+            return False
+        run_row = conn.execute(
+            "SELECT metadata FROM task_runs "
+            "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+            (int(run_id), task_id),
+        ).fetchone()
+        if not run_row:
+            return False
+        try:
+            metadata = json.loads(run_row["metadata"] or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        account_scope = task_row["assignee"]
+        envelope = {
+            "disposition": disposition,
+            "classification": safe_classification,
+            "provider": safe_provider,
+            "model": safe_model,
+            "status_code": normalized_status,
+            "fingerprint": _provider_route_fingerprint(
+                provider, model, account_scope
+            ),
+            "config_fingerprint": _task_provider_config_fingerprint(
+                provider_override=task_row["provider_override"],
+                model_override=task_row["model_override"],
+                account_scope=account_scope,
+            ),
+        }
+        if safe_session:
+            envelope["session_id"] = safe_session
+        metadata[_PROVIDER_EXIT_METADATA_KEY] = envelope
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? "
+            "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+            (json.dumps(metadata, ensure_ascii=False), int(run_id), task_id),
+        )
+    return True
+
+
+def _provider_exit_for_run(
+    conn: sqlite3.Connection, run_id: Optional[int]
+) -> Optional[dict]:
+    if not run_id:
+        return None
+    row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ? AND ended_at IS NULL",
+        (int(run_id),),
+    ).fetchone()
+    if not row or not row["metadata"]:
+        return None
+    try:
+        metadata = json.loads(row["metadata"])
+    except (TypeError, ValueError):
+        return None
+    envelope = metadata.get(_PROVIDER_EXIT_METADATA_KEY) if isinstance(metadata, dict) else None
+    if not isinstance(envelope, dict):
+        return None
+    if envelope.get("disposition") not in _PROVIDER_EXIT_DISPOSITIONS:
+        return None
+    fingerprint_re = re.compile(r"^v1:[0-9a-f]{64}$")
+    fingerprint = str(envelope.get("fingerprint") or "")
+    config_fingerprint = str(envelope.get("config_fingerprint") or "")
+    if not fingerprint_re.fullmatch(fingerprint) or not fingerprint_re.fullmatch(
+        config_fingerprint
+    ):
+        return None
+    try:
+        status_code = (
+            int(envelope["status_code"])
+            if envelope.get("status_code") is not None else None
+        )
+    except (TypeError, ValueError):
+        return None
+    if status_code is not None and not 100 <= status_code <= 599:
+        return None
+    classification = _safe_provider_exit_field(
+        envelope.get("classification"), limit=80
+    )
+    if not classification:
+        return None
+    trusted_disposition = _trusted_provider_exit_disposition(
+        classification, status_code
+    )
+    if trusted_disposition is None or envelope["disposition"] != trusted_disposition:
+        return None
+    result = {
+        "disposition": envelope["disposition"],
+        "classification": classification,
+        "provider": _safe_provider_exit_field(envelope.get("provider"), limit=128),
+        "model": _safe_provider_exit_field(envelope.get("model"), limit=256),
+        "status_code": status_code,
+        "fingerprint": fingerprint,
+        "config_fingerprint": config_fingerprint,
+    }
+    session_id = _safe_provider_exit_field(envelope.get("session_id"), limit=128)
+    if session_id:
+        result["session_id"] = session_id
+    return result
+
+
 def _synthesize_ended_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4471,11 +4756,16 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ("
+        "'blocked', 'unblocked', 'provider_terminal', "
+        "'provider_safety_refusal', 'provider_failure_config_changed'"
+        ") "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return bool(row) and row["kind"] in {
+        "blocked", "provider_terminal", "provider_safety_refusal"
+    }
 
 
 def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
@@ -6896,13 +7186,47 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     the leaked run is closed as ``reclaimed`` inside the same txn so the
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
+
+    A deterministic provider-terminal block is deliberately not reset while
+    its task-scoped provider/model fingerprint is unchanged. Use
+    :func:`set_model_override` to select a different route; that transition
+    permits exactly one fresh run. Safety-refusal blocks remain separate and
+    retain the ordinary explicit-unblock behavior.
     """
     now = int(time.time())
     with write_txn(conn):
         current = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, assignee, model_override, provider_override "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        if current and current["status"] == "blocked":
+            terminal = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'provider_terminal' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            try:
+                terminal_payload = (
+                    json.loads(terminal["payload"])
+                    if terminal and terminal["payload"] else {}
+                )
+            except (TypeError, ValueError):
+                terminal_payload = {}
+            current_fingerprint = _task_provider_config_fingerprint(
+                provider_override=current["provider_override"],
+                model_override=current["model_override"],
+                account_scope=current["assignee"],
+            )
+            if terminal_payload.get("config_fingerprint") == current_fingerprint:
+                _append_event(
+                    conn,
+                    task_id,
+                    "provider_failure_unblock_rejected",
+                    {"fingerprint": current_fingerprint},
+                )
+                return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if current and current["status"] == "blocked"
@@ -8155,6 +8479,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_PROVIDER_TERMINAL_EXIT_CODE:
+                return ("provider_terminal_hint", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -8879,6 +9205,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    provider_terminal: list[str] = []
+    provider_transient: list[str] = []
+    provider_transient_details: list[tuple[str, int, str, str]] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -8892,7 +9221,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     exited_hook_payloads: list[dict] = []
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, claim_lock, started_at, assignee, "
+            "current_run_id "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -8916,7 +9246,42 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
-            if kind == "clean_exit":
+            provider_exit = _provider_exit_for_run(conn, row["current_run_id"]) or {}
+            provider_disposition = (
+                provider_exit.get("disposition") if provider_exit else None
+            )
+            provider_managed_exit = provider_disposition in _PROVIDER_EXIT_DISPOSITIONS
+            if provider_managed_exit:
+                # The worker-supplied envelope is deliberately narrow and
+                # sanitized. The dispatcher makes it authoritative only here,
+                # while atomically closing the matching active run.
+                protocol_violation = False
+                event_payload = {
+                    **provider_exit,
+                    "provider_terminal": provider_disposition == "terminal",
+                    "failure_reason": provider_exit.get("classification"),
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                    "run_id": row["current_run_id"],
+                    "log_path": str(worker_log_path(row["id"])),
+                }
+                status = provider_exit.get("status_code")
+                classification = provider_exit.get("classification") or "provider_error"
+                provider_name = provider_exit.get("provider") or "unknown"
+                model_name = provider_exit.get("model") or "unknown"
+                error_text = (
+                    f"provider failure: {provider_name}/{model_name} "
+                    f"status={status if status is not None else '?'} "
+                    f"classification={classification}"
+                )
+                if provider_disposition == "terminal":
+                    event_kind = "provider_terminal"
+                elif provider_disposition == "safety_refusal":
+                    event_kind = "provider_safety_refusal"
+                else:
+                    event_kind = "provider_transient"
+            elif kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
                 # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
@@ -8979,18 +9344,30 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             retry_status = _retry_status_for_run(conn, row["id"])
             event_payload["retry_status"] = retry_status
+            target_status = (
+                "blocked"
+                if provider_disposition in {"terminal", "safety_refusal"}
+                else retry_status
+            )
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, row["id"], pid, row["claim_lock"]),
+                (target_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
                 # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                if provider_disposition == "terminal":
+                    _run_outcome = "provider_terminal"
+                elif provider_disposition == "safety_refusal":
+                    _run_outcome = "provider_safety_refusal"
+                elif provider_disposition == "transient":
+                    _run_outcome = "provider_transient"
+                else:
+                    _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -9010,9 +9387,24 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "exit_kind": kind,
                     "exit_code": code,
                     "outcome": _run_outcome,
-                    "retry_status": retry_status,
+                    "retry_status": target_status,
                 })
-                if rate_limited_exit:
+                if provider_disposition in {"terminal", "safety_refusal"}:
+                    conn.execute(
+                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                        (error_text[:500], row["id"]),
+                    )
+                    provider_terminal.append(row["id"])
+                elif provider_disposition == "transient":
+                    conn.execute(
+                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                        (error_text[:500], row["id"]),
+                    )
+                    provider_transient.append(row["id"])
+                    provider_transient_details.append(
+                        (row["id"], pid, row["claim_lock"], error_text)
+                    )
+                elif rate_limited_exit:
                     # Stamp the failure-error column so ``check_respawn_guard``
                     # recognizes this as a quota blocker and defers the
                     # respawn until the window clears — WITHOUT touching
@@ -9058,6 +9450,18 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # top precedence it has for every other failure kind. Systemic same-error
     # crashes still trip immediately.
     auto_blocked: list[str] = []
+    for tid, pid, claimer, error_text in provider_transient_details:
+        tripped = _record_task_failure(
+            conn,
+            tid,
+            error=error_text,
+            outcome="provider_transient",
+            release_claim=False,
+            end_run=False,
+            event_payload_extra={"pid": pid, "claimer": claimer},
+        )
+        if tripped:
+            auto_blocked.append(tid)
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
@@ -9132,6 +9536,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_provider_terminal = provider_terminal  # type: ignore[attr-defined]
+    detect_crashed_workers._last_provider_transient = provider_transient  # type: ignore[attr-defined]
     # Worker-lifecycle observer (RFC #58548): exit events are tick-derived
     # from this reclaim pass — fired only now, after the main reclaim txn
     # AND the breaker accounting above have committed, so subscribers always
