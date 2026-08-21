@@ -13472,14 +13472,20 @@ def test_no_due_cycle_advances_empty_for_zero_or_visible_only_rows(
     assert status["last_empty_cycle"] == {"tracked": True, "value": 100.0}
 
 
-def test_no_due_cycle_advances_empty_after_operator_dismissal(db: SessionDB) -> None:
+def test_no_due_cycle_advances_empty_after_multiple_operator_dismissals(
+    db: SessionDB,
+) -> None:
     store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
-    stuck = _claude_visibility_identity("dismissed-empty")
-    _enqueue_claude_visibility_job(store, *stuck)
-    _fail_claude_visibility_job(db, stuck[1].job_id)
-    store.dismiss_claude_visibility_job(
-        job_id=stuck[1].job_id, expected_error_code="max_attempts_exhausted"
-    )
+    stuck_jobs = [
+        _claude_visibility_identity("dismissed-empty-first"),
+        _claude_visibility_identity("dismissed-empty-second"),
+    ]
+    for stuck in stuck_jobs:
+        _enqueue_claude_visibility_job(store, *stuck)
+        _fail_claude_visibility_job(db, stuck[1].job_id)
+        store.dismiss_claude_visibility_job(
+            job_id=stuck[1].job_id, expected_error_code="max_attempts_exhausted"
+        )
 
     store.record_claude_visibility_cycle(
         status="no_due_job", error_code=None, registrar_result=False
