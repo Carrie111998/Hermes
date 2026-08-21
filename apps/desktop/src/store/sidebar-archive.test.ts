@@ -6,7 +6,7 @@ import { listEveryArchivedSession } from './sidebar-archive'
 
 const listAllProfileSessions = vi.hoisted(() => vi.fn())
 
-vi.mock('@/hermes', () => ({
+vi.mock('@/api/sessions', () => ({
   listAllProfileSessions
 }))
 
