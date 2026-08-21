@@ -5,7 +5,12 @@ import type { HermesReadDirResult } from '@/global'
 import { $connection } from '@/store/session'
 
 import { clearProjectDirCache, readProjectDir } from './ipc'
-import { resetProjectTreeState, useProjectTree } from './use-project-tree'
+import {
+  isUnownedProjectTree,
+  readProjectTreeState,
+  resetProjectTreeState,
+  useProjectTree
+} from './use-project-tree'
 
 const readDir = vi.fn<(path: string) => Promise<HermesReadDirResult>>()
 
@@ -347,5 +352,31 @@ describe('useProjectTree', () => {
 
     expect(readDir.mock.calls.length).toBe(settled)
     expect(second.result.current.data.map(n => n.name)).toEqual(['in-/b'])
+  })
+})
+
+describe('the reset contract', () => {
+  // The re-arm effect fires on "the store is unowned". Nothing else in the
+  // module asserts that a reset actually PRODUCES an unowned store, so a
+  // change to how the reset represents that state would disarm the re-arm
+  // and every behavioural test above would still pass: they all reset first,
+  // so they would agree with each other about a broken shape.
+  it('leaves the store unowned', () => {
+    resetProjectTreeState()
+
+    expect(isUnownedProjectTree(readProjectTreeState())).toBe(true)
+  })
+
+  it('does not call a store owned by a live cwd unowned', async () => {
+    readDir.mockResolvedValue(ok([]))
+
+    const view = renderHook(() => useProjectTree('/repo'))
+
+    await waitFor(() => {
+      expect(view.result.current.rootLoading).toBe(false)
+    })
+
+    expect(readProjectTreeState().cwd).toBe('/repo')
+    expect(isUnownedProjectTree(readProjectTreeState())).toBe(false)
   })
 })
