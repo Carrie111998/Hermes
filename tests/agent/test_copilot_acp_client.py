@@ -10,7 +10,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent.copilot_acp_client import CopilotACPClient
+from agent.copilot_acp_client import (
+    CopilotACPClient,
+    _hermes_tools_mcp_bridge,
+)
 
 
 class _FakeProcess:
@@ -51,6 +54,84 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
             {"path": "README.md"},
         )
         self.assertEqual(chunks[1].choices, [])
+
+    def test_hermes_tools_mcp_bridge_exposes_only_requested_safe_tools(self) -> None:
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": name, "description": "", "parameters": {}},
+            }
+            for name in ("skills_list", "web_search", "terminal", "unknown_tool")
+        ]
+
+        servers, native_tool_names = _hermes_tools_mcp_bridge(tools)
+
+        self.assertEqual(native_tool_names, {"skills_list", "web_search"})
+        self.assertEqual(len(servers), 1)
+        server = servers[0]
+        self.assertEqual(server["name"], "hermes-tools")
+        self.assertEqual(
+            server["args"],
+            ["-m", "agent.transports.hermes_tools_mcp_server"],
+        )
+        env = {item["name"]: item["value"] for item in server["env"]}
+        self.assertEqual(
+            json.loads(env["HERMES_TOOLS_MCP_ALLOWED"]),
+            ["skills_list", "web_search"],
+        )
+        schemas = json.loads(env["HERMES_TOOLS_MCP_SCHEMAS"])
+        self.assertEqual(set(schemas), {"skills_list", "web_search"})
+        self.assertNotIn("terminal", schemas)
+
+    def test_hermes_tools_mcp_bridge_is_absent_without_matching_tools(self) -> None:
+        servers, native_tool_names = _hermes_tools_mcp_bridge(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "description": "",
+                        "parameters": {},
+                    },
+                }
+            ]
+        )
+
+        self.assertEqual(servers, [])
+        self.assertEqual(native_tool_names, set())
+
+    def test_native_mcp_tools_are_not_duplicated_as_xml_tool_specs(self) -> None:
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "skills_list",
+                    "description": "List Hermes skills",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+        with patch.object(
+            self.client,
+            "_run_prompt",
+            return_value=("260 skills", ""),
+        ) as run_prompt:
+            self.client._create_chat_completion(
+                model="copilot-acp",
+                messages=[{"role": "user", "content": "count skills"}],
+                tools=tools,
+            )
+
+        prompt_text = run_prompt.call_args.args[0]
+        self.assertIn("skills_list", prompt_text)
+        self.assertIn("MUST use it", prompt_text)
+        self.assertIn("authoritative", prompt_text)
+        self.assertNotIn('"name": "skills_list"', prompt_text)
+        self.assertEqual(
+            run_prompt.call_args.kwargs["mcp_servers"][0]["name"],
+            "hermes-tools",
+        )
 
     def _dispatch(self, message: dict, *, cwd: str) -> dict:
         process = _FakeProcess()

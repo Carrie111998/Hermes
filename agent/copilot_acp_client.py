@@ -14,6 +14,7 @@ import queue
 import re
 import shlex
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -233,16 +234,71 @@ def _approved_execute_option(params: Any) -> str | None:
     return None
 
 
+def _hermes_tools_mcp_bridge(
+    tools: list[dict[str, Any]] | None,
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """Build a turn-scoped ACP MCP server for supported Hermes tools."""
+    if not isinstance(tools, list) or not tools:
+        return [], set()
+
+    requested: dict[str, dict[str, Any]] = {}
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") or {}
+        if not isinstance(function, dict):
+            continue
+        name = function.get("name")
+        if isinstance(name, str) and name.strip():
+            requested[name.strip()] = function
+
+    from agent.transports.hermes_tools_mcp_server import (
+        ALLOWED_TOOLS_ENV,
+        EXPOSED_TOOLS,
+        TOOL_SCHEMAS_ENV,
+    )
+
+    native_tool_names = set(requested).intersection(EXPOSED_TOOLS)
+    if not native_tool_names:
+        return [], set()
+
+    allowed = sorted(native_tool_names)
+    return [
+        {
+            "name": "hermes-tools",
+            "command": sys.executable,
+            "args": ["-m", "agent.transports.hermes_tools_mcp_server"],
+            "env": [
+                {
+                    "name": ALLOWED_TOOLS_ENV,
+                    "value": json.dumps(allowed),
+                },
+                {
+                    "name": TOOL_SCHEMAS_ENV,
+                    "value": json.dumps(
+                        {name: requested[name] for name in allowed},
+                        ensure_ascii=False,
+                    ),
+                }
+            ],
+        }
+    ], native_tool_names
+
+
 def _format_messages_as_prompt(
     messages: list[dict[str, Any]],
     model: str | None = None,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
+    native_tool_names: set[str] | None = None,
 ) -> str:
+    native_tool_names = native_tool_names or set()
     sections: list[str] = [
         "You are being used as the active ACP agent backend for Hermes.",
         "Use ACP capabilities to complete tasks.",
-        "IMPORTANT: If you take an action with a tool, you MUST output tool calls using <tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape.",
+        "For native ACP/MCP tools, call the tool directly and continue from its result. "
+        "For prompt-described Hermes tools, output tool calls using "
+        "<tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape.",
         "If no tool is needed, answer normally.",
     ]
     if model:
@@ -259,6 +315,8 @@ def _format_messages_as_prompt(
             name = fn.get("name")
             if not isinstance(name, str) or not name.strip():
                 continue
+            if name.strip() in native_tool_names:
+                continue
             tool_specs.append(
                 {
                     "name": name.strip(),
@@ -273,6 +331,15 @@ def _format_messages_as_prompt(
                 "containing id/type/function{name,arguments}. arguments must be a JSON string.\n"
                 + json.dumps(tool_specs, ensure_ascii=False)
             )
+
+    if native_tool_names:
+        sections.append(
+            "Native Hermes MCP tools available in this ACP session: "
+            + ", ".join(sorted(native_tool_names))
+            + ". When one matches the user's request, you MUST use it instead of "
+            "substituting shell commands or filesystem inspection. Treat its result as "
+            "authoritative. Call it directly; do not print an XML tool_call for it."
+        )
 
     if tool_choice is not None:
         sections.append(f"Tool choice hint: {json.dumps(tool_choice, ensure_ascii=False)}")
@@ -547,11 +614,13 @@ class CopilotACPClient:
         stream: bool = False,
         **_: Any,
     ) -> Any:
+        mcp_servers, native_tool_names = _hermes_tools_mcp_bridge(tools)
         prompt_text = _format_messages_as_prompt(
             messages or [],
             model=model,
             tools=tools,
             tool_choice=tool_choice,
+            native_tool_names=native_tool_names,
         )
         # Normalise timeout: run_agent.py may pass an httpx.Timeout object
         # (used natively by the OpenAI SDK) rather than a plain float.
@@ -572,6 +641,7 @@ class CopilotACPClient:
         response_text, reasoning_text = self._run_prompt(
             prompt_text,
             timeout_seconds=_effective_timeout,
+            mcp_servers=mcp_servers,
         )
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
@@ -600,7 +670,13 @@ class CopilotACPClient:
             return _completion_to_stream_chunks(completion)
         return completion
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+    def _run_prompt(
+        self,
+        prompt_text: str,
+        *,
+        timeout_seconds: float,
+        mcp_servers: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, str]:
         # Fast-fail when the CLI doesn't support the ACP args we'd pass.
         # Without this guard, a CLI like Claude Code v2.x exits with
         # ``error: unknown option '--acp'`` immediately, then the parent
@@ -760,7 +836,7 @@ class CopilotACPClient:
                 "session/new",
                 {
                     "cwd": self._acp_cwd,
-                    "mcpServers": [],
+                    "mcpServers": mcp_servers or [],
                 },
             ) or {}
             session_id = str(session.get("sessionId") or "").strip()
