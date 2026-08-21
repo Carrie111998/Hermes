@@ -20,6 +20,8 @@ from agent.reasoning_effort import (
     EFFORT_LADDER,
     GLM52_EFFORTS,
     GLM52_OVERRIDES,
+    GLM53_EFFORTS,
+    GLM53_OVERRIDES,
     KIMI_K2_EFFORTS,
     KIMI_K3_EFFORTS,
     KIMI_K3_OVERRIDES,
@@ -133,6 +135,22 @@ class TestGlm52Vocabulary:
         # GLM's floor is high — weaker asks land there.
         assert clamp_effort("low", GLM52_EFFORTS, GLM52_OVERRIDES) == "high"
         assert clamp_effort("medium", GLM52_EFFORTS, GLM52_OVERRIDES) == "high"
+
+
+class TestGlm53Vocabulary:
+    """GLM-5.3's graded ladder, live-verified 2026-08-21 (issue #91789)."""
+
+    def test_graded_set_passes_verbatim(self):
+        for level in ("low", "medium", "high", "max"):
+            assert clamp_effort(level, GLM53_EFFORTS, GLM53_OVERRIDES) == level
+
+    def test_stronger_asks_round_up_to_max(self):
+        assert clamp_effort("ultra", GLM53_EFFORTS, GLM53_OVERRIDES) == "max"
+        assert clamp_effort("xhigh", GLM53_EFFORTS, GLM53_OVERRIDES) == "max"
+
+    def test_minimal_rounds_to_low(self):
+        # nearest weaker level below "minimal" in GLM-5.3's ladder is "low"
+        assert clamp_effort("minimal", GLM53_EFFORTS, GLM53_OVERRIDES) == "low"
 
 
 class TestCodexVocabulary:

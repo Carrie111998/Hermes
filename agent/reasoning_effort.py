@@ -117,6 +117,14 @@ KIMI_K3_OVERRIDES: dict[str, str] = {"medium": "high", "xhigh": "max"}
 GLM52_EFFORTS: tuple[str, ...] = ("high", "max")
 GLM52_OVERRIDES: dict[str, str] = {"xhigh": "max"}
 
+#: GLM-5.3 native reasoning_effort knob: the full graded ladder low through
+#: max, live-verified on the OpenAI-compatible endpoint 2026-08-21 (issue
+#: #91789): every level accepted, no HTTP 400, monotonic reasoning-token
+#: scaling (low 4 / medium 11 / high 98 / max 125 vs. 69 unset). ``xhigh``
+#: requests the top tier.
+GLM53_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "max")
+GLM53_OVERRIDES: dict[str, str] = {"xhigh": "max"}
+
 #: DeepSeek V4 OpenAI-compat endpoint: low/medium/high/max; ``xhigh``
 #: requests the top tier (matches the shipped profile mapping).
 DEEPSEEK_V4_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "max")
