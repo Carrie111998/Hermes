@@ -89,3 +89,31 @@ async def test_all_refs_failing_still_returns_result(tmp_path):
         url_fetcher=fetcher,
     )
     assert sum("boom" in w for w in res.warnings) == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_ref_propagates_cancellation(tmp_path, monkeypatch):
+    """A CancelledError outcome (BaseException, not Exception on 3.8+) must
+    propagate instead of falling into the (warning, block) unpack — which
+    would raise an unrelated TypeError and corrupt the batch."""
+    import asyncio
+
+    real_expand = cr._expand_reference
+
+    async def cancelled_expand(ref, cwd, **kwargs):
+        if "bad" in (ref.target or ""):
+            raise asyncio.CancelledError()
+        return await real_expand(ref, cwd, **kwargs)
+
+    monkeypatch.setattr(cr, "_expand_reference", cancelled_expand)
+
+    async def fetcher(url: str) -> str:
+        return f"CONTENT[{url}]"
+
+    with pytest.raises(asyncio.CancelledError):
+        await preprocess_context_references_async(
+            "@url:https://good.example/x @url:https://bad.example/y",
+            cwd=tmp_path,
+            context_length=100_000,
+            url_fetcher=fetcher,
+        )

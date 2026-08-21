@@ -282,12 +282,16 @@ async def preprocess_context_references_async(
         return_exceptions=True,
     )
     for ref, outcome in zip(refs, gathered):
-        # Exception only — CancelledError/KeyboardInterrupt must keep
-        # propagating (cancellation is not a ref failure).
-        if isinstance(outcome, Exception):
+        # Exception only — CancelledError/KeyboardInterrupt (BaseException,
+        # not Exception, on Python 3.8+) must keep propagating: cancellation
+        # is not a ref failure, and letting one fall through to the tuple
+        # unpack below would raise an unrelated TypeError instead.
+        if isinstance(outcome, BaseException):
+            if not isinstance(outcome, Exception):
+                raise outcome
             warnings.append(
-                f"@{ref.kind}: expansion failed ({outcome.__class__.__name__}); "
-                "reference was not injected."
+                f"@{ref.kind}: expansion failed ({outcome.__class__.__name__}: "
+                f"{str(outcome)[:200]}); reference was not injected."
             )
             continue
         warning, block = outcome
