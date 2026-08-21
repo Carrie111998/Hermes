@@ -1,3 +1,4 @@
+import { fromMarkdown } from 'mdast-util-from-markdown'
 import { describe, expect, it, vi } from 'vitest'
 
 import { collectBalancedFenceRanges, fenceRawSvgBlocks } from './markdown-inline-svg'
@@ -62,9 +63,11 @@ describe('fenceRawSvgBlocks', () => {
 
     expect(collectBalancedFenceRanges(matching)).toEqual([{ end: matching.length, start: 0 }])
     expect(collectBalancedFenceRanges(mismatchedThenMatching)).toEqual([
-      { end: mismatchedThenMatching.length, start: 0 }
+      { end: mismatchedThenMatching.indexOf('\n> ```') + 1, start: 0 }
     ])
-    expect(collectBalancedFenceRanges(mismatchedOnly)).toEqual([])
+    expect(collectBalancedFenceRanges(mismatchedOnly)).toEqual([
+      { end: mismatchedOnly.indexOf('\n> ```') + 1, start: 0 }
+    ])
   })
 
   it('requires matching list indentation and blockquote containers around a fence', () => {
@@ -74,9 +77,113 @@ describe('fenceRawSvgBlocks', () => {
 
     expect(collectBalancedFenceRanges(matching)).toEqual([{ end: matching.length, start: 0 }])
     expect(collectBalancedFenceRanges(mismatchedThenMatching)).toEqual([
-      { end: mismatchedThenMatching.length, start: 0 }
+      { end: mismatchedThenMatching.indexOf('> ~~~'), start: 0 },
+      { end: mismatchedThenMatching.length, start: mismatchedThenMatching.indexOf('> ~~~') }
     ])
-    expect(collectBalancedFenceRanges(mismatchedOnly)).toEqual([])
+    expect(collectBalancedFenceRanges(mismatchedOnly)).toEqual([{ end: mismatchedOnly.indexOf('> ~~~'), start: 0 }])
+  })
+
+  it('ends a container fence when its prefix disappears and reprocesses the boundary line', () => {
+    const input = ['> ```html', '> quoted code', 'root prose', `> > ${SVG}`].join('\n')
+    const output = fenceRawSvgBlocks(input)
+    const tree = fromMarkdown(output)
+
+    expect(collectBalancedFenceRanges(input)).toEqual([{ end: input.indexOf('root prose'), start: 0 }])
+    expect(tree.children).toMatchObject([
+      { children: [{ lang: 'html', type: 'code', value: 'quoted code' }], type: 'blockquote' },
+      { children: [{ type: 'text', value: 'root prose' }], type: 'paragraph' },
+      {
+        children: [
+          {
+            children: [{ lang: 'svg', type: 'code', value: SVG }],
+            type: 'blockquote'
+          }
+        ],
+        type: 'blockquote'
+      }
+    ])
+  })
+
+  it.each([
+    {
+      expected: {
+        children: [
+          {
+            children: [
+              { children: [{ type: 'text', value: 'outer' }], type: 'paragraph' },
+              { children: [{ lang: 'svg', type: 'code', value: SVG }], type: 'blockquote' }
+            ],
+            type: 'listItem'
+          }
+        ],
+        type: 'list'
+      },
+      generated: `  > \`\`\`svg\n  > ${SVG}\n  > \`\`\``,
+      input: ['- outer', `  > ${SVG}`].join('\n'),
+      label: 'list continuation followed by a blockquote'
+    },
+    {
+      expected: {
+        children: [
+          {
+            children: [
+              {
+                children: [
+                  {
+                    children: [{ lang: 'svg', type: 'code', value: SVG }],
+                    type: 'listItem'
+                  }
+                ],
+                type: 'list'
+              }
+            ],
+            type: 'blockquote'
+          }
+        ],
+        type: 'blockquote'
+      },
+      generated: `> > 1. \`\`\`svg\n> >    ${SVG}\n> >    \`\`\``,
+      input: `> > 1. ${SVG}`,
+      label: 'nested blockquotes followed by an ordered list'
+    }
+  ])('keeps generated SVG fences inside the active containers for $label', ({ expected, generated, input }) => {
+    const output = fenceRawSvgBlocks(input)
+
+    expect(fromMarkdown(output).children).toMatchObject([expected])
+    expect(output).toContain(generated)
+  })
+
+  it('does not balance an SVG across a terminated container', () => {
+    const input = ['> <svg viewBox="0 0 1 1">', '<path d="M0 0h1"/>', '> </svg>'].join('\n')
+
+    expect(fenceRawSvgBlocks(input)).toBe(input)
+  })
+
+  it('retains surviving outer containers when an inner quote fence terminates', () => {
+    const input = ['- > ```html', '  > code', '', `  > ${SVG}`].join('\n')
+    const output = fenceRawSvgBlocks(input)
+
+    expect(fromMarkdown(output).children).toMatchObject([
+      {
+        children: [
+          {
+            children: [
+              { children: [{ lang: 'html', type: 'code', value: 'code' }], type: 'blockquote' },
+              { children: [{ lang: 'svg', type: 'code', value: SVG }], type: 'blockquote' }
+            ],
+            type: 'listItem'
+          }
+        ],
+        type: 'list'
+      }
+    ])
+  })
+
+  it('allows an unindented blank line to continue a list-contained fence', () => {
+    const input = ['- ```html', '', `  ${SVG}`, '  ```'].join('\n')
+
+    expect(collectBalancedFenceRanges(input)).toEqual([{ end: input.length, start: 0 }])
+    expect(fenceRawSvgBlocks(input)).toBe(input)
   })
 
   it.each([

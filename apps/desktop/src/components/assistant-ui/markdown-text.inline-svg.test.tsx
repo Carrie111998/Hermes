@@ -22,6 +22,44 @@ describe('MarkdownTextContent raw SVG', () => {
     expect(container.textContent).toContain('After')
   })
 
+  it('reprocesses text after a terminated quoted fence and renders a later nested-quote SVG', async () => {
+    const text = [
+      '> ```html',
+      '> quoted code',
+      'root prose',
+      ...SIMPLE_SVG.split('\n').map(line => `> > ${line}`)
+    ].join('\n')
+
+    const { container } = renderMarkdown(text)
+
+    await waitFor(() => expect(container.querySelector('svg#raw-inline-svg')).not.toBeNull())
+    expect(container.textContent).toContain('root prose')
+
+    const svg = container.querySelector('svg#raw-inline-svg')
+    const innerQuote = svg?.closest('blockquote')
+
+    expect(innerQuote?.parentElement?.closest('blockquote')).not.toBeNull()
+  })
+
+  it('keeps and sanitizes a generated SVG fence inside nested list and quote containers', async () => {
+    const dangerous = SIMPLE_SVG.replace(
+      '<svg id="raw-inline-svg"',
+      '<svg id="nested-container-svg" onload="alert(1)"'
+    ).replace('<path ', '<script>alert(1)</script>\n  <path onclick="alert(1)" ')
+
+    const text = ['- outer', ...dangerous.split('\n').map(line => `  > ${line}`)].join('\n')
+    const { container } = renderMarkdown(text)
+
+    await waitFor(() => expect(container.querySelector('svg#nested-container-svg')).not.toBeNull())
+
+    const svg = container.querySelector('svg#nested-container-svg')
+
+    expect(svg?.closest('blockquote')?.closest('li')).not.toBeNull()
+    expect(svg?.hasAttribute('onload')).toBe(false)
+    expect(svg?.querySelector('script')).toBeNull()
+    expect(svg?.querySelector('path')?.hasAttribute('onclick')).toBe(false)
+  })
+
   it('sanitizes active content and dangerous URLs from an unfenced SVG', async () => {
     const dangerous = `<svg id="sanitized-inline-svg" viewBox="0 0 24 24" onload="alert(1)">
   <script>alert(1)</script>

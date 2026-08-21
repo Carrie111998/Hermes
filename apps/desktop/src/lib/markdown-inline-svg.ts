@@ -31,6 +31,14 @@ interface ContainerLine {
   content: string
 }
 
+interface FenceContainerLine {
+  containers: FenceContainer[]
+  content: string
+  end: number
+  prefixLength: number
+  start: number
+}
+
 function stripBlockquotePrefix(line: string): ContainerLine {
   let blockquoteDepth = 0
   let cursor = 0
@@ -145,15 +153,31 @@ function fenceContainerPrefix(line: string): { containers: FenceContainer[]; con
   return { containers, content: line.slice(cursor) }
 }
 
-function stripFenceContainerPrefix(line: string, containers: FenceContainer[]): string | null {
+function stripFenceContainerPrefix(
+  line: string,
+  containers: FenceContainer[],
+  allowUnindentedListBlank = false
+): string | null {
   let column = 0
   let cursor = 0
 
-  for (const container of containers) {
+  for (let index = 0; index < containers.length; index += 1) {
+    const container = containers[index]
+
+    if (!container) {
+      continue
+    }
+
     if (container.kind === 'list') {
       const indent = consumeIndent(line, cursor, column, container.indent)
 
       if (indent.columns !== container.indent) {
+        const remainingContainersAreLists = containers.slice(index).every(candidate => candidate.kind === 'list')
+
+        if (allowUnindentedListBlank && remainingContainersAreLists && !line.slice(cursor).trim()) {
+          return ''
+        }
+
         return null
       }
 
@@ -187,7 +211,7 @@ function stripFenceContainerPrefix(line: string, containers: FenceContainer[]): 
 function continuedFenceContainerPrefix(line: string, inherited: FenceContainer[]) {
   for (let length = inherited.length; length > 0; length -= 1) {
     const containers = inherited.slice(0, length)
-    const continuation = stripFenceContainerPrefix(line, containers)
+    const continuation = stripFenceContainerPrefix(line, containers, true)
 
     if (continuation === null) {
       continue
@@ -255,6 +279,19 @@ function collectBlockCodeRanges(text: string, includeUnclosedFence = true): Rang
     const next = end < text.length ? end + 1 : end
 
     if (openFence) {
+      const continuation = stripFenceContainerPrefix(line, openFence.marker.containers, true)
+
+      if (continuation === null) {
+        // CommonMark closes a fenced block with its container. The first line
+        // that no longer continues every required quote/list belongs to the
+        // outer document and must be parsed again as a possible new block.
+        ranges.push({ end: cursor, kind: 'fence', start: openFence.start })
+        inheritedContainers = continuedFenceContainerPrefix(line, openFence.marker.containers).containers
+        openFence = null
+
+        continue
+      }
+
       if (isFenceClose(line, openFence.marker)) {
         ranges.push({ end: next, kind: 'fence', start: openFence.start })
         inheritedContainers = openFence.marker.containers
@@ -272,9 +309,7 @@ function collectBlockCodeRanges(text: string, includeUnclosedFence = true): Rang
           ranges.push({ end: next, kind: 'indented', start: cursor })
         }
 
-        if (line.trim()) {
-          inheritedContainers = continuedFenceContainerPrefix(line, inheritedContainers).containers
-        }
+        inheritedContainers = continuedFenceContainerPrefix(line, inheritedContainers).containers
       }
     }
 
@@ -529,20 +564,89 @@ function createBlankLineDetector(text: string): (start: number, end: number) => 
   }
 }
 
-function separatorBefore(value: string): string {
+function collectFenceContainerLines(text: string): FenceContainerLine[] {
+  const lines: FenceContainerLine[] = []
+  let cursor = 0
+  let inherited: FenceContainer[] = []
+
+  while (cursor < text.length) {
+    const end = lineEnd(text, cursor)
+    const line = text.slice(cursor, end)
+    const container = continuedFenceContainerPrefix(line, inherited)
+
+    lines.push({
+      containers: container.containers,
+      content: container.content,
+      end,
+      prefixLength: line.length - container.content.length,
+      start: cursor
+    })
+    inherited = container.containers
+    cursor = end < text.length ? end + 1 : end
+  }
+
+  return lines
+}
+
+function continuationPrefixFor(containers: FenceContainer[]): string {
+  let prefix = ''
+
+  for (const container of containers) {
+    prefix += container.kind === 'blockquote' ? '> ' : ' '.repeat(container.indent)
+  }
+
+  return prefix
+}
+
+function svgWithoutContainerPrefixes(
+  text: string,
+  start: number,
+  end: number,
+  containers: FenceContainer[]
+): string | null {
+  const firstEnd = lineEnd(text, start)
+  let svg = text.slice(start, Math.min(firstEnd, end))
+  let cursor = firstEnd
+
+  while (cursor < end) {
+    const nextStart = cursor + 1
+    const nextEnd = lineEnd(text, nextStart)
+    const line = text.slice(nextStart, nextEnd)
+    const content = stripFenceContainerPrefix(line, containers, true)
+
+    if (content === null) {
+      return null
+    }
+
+    const prefixLength = line.length - content.length
+    const contentEnd = Math.max(0, Math.min(end, nextEnd) - nextStart - prefixLength)
+
+    svg += `\n${content.slice(0, contentEnd)}`
+    cursor = nextEnd
+  }
+
+  return svg
+}
+
+function separatorBeforeContainer(value: string, blankPrefix: string): string {
   if (!value || value.endsWith('\n\n')) {
     return ''
   }
 
-  return value.endsWith('\n') ? '\n' : '\n\n'
+  return value.endsWith('\n') ? `${blankPrefix}\n` : `\n${blankPrefix}\n`
 }
 
-function separatorAfter(text: string, offset: number): string {
+function separatorAfterContainer(
+  text: string,
+  offset: number,
+  blankPrefix: string,
+  continuationPrefix: string
+): string {
   if (offset >= text.length || text.startsWith('\n\n', offset)) {
     return ''
   }
 
-  return text[offset] === '\n' ? '\n' : '\n\n'
+  return text[offset] === '\n' ? `\n${blankPrefix}` : `\n${blankPrefix}\n${continuationPrefix}`
 }
 
 function fenceFor(svg: string): string | null {
@@ -573,12 +677,14 @@ export function fenceRawSvgBlocks(text: string): string {
   }
 
   const protectedRanges = collectProtectedRanges(text)
+  const containerLines = collectFenceContainerLines(text)
   const crossesBlankLine = createBlankLineDetector(text)
-  let activeSvg: { depth: number; lastTokenEnd: number; start: number } | null = null
+  let activeSvg: { depth: number; lastTokenEnd: number; line: FenceContainerLine; start: number } | null = null
   let output = ''
   let copiedThrough = 0
   let cursor = 0
   let protectedIndex = 0
+  let containerLineIndex = 0
 
   while (cursor < text.length) {
     while (protectedRanges[protectedIndex] && protectedRanges[protectedIndex].end <= cursor) {
@@ -591,6 +697,11 @@ export function fenceRawSvgBlocks(text: string): string {
       break
     }
 
+    while (containerLines[containerLineIndex] && containerLines[containerLineIndex].end < next) {
+      containerLineIndex += 1
+    }
+
+    const containerLine = containerLines[containerLineIndex]
     const protectedRange = protectedRanges[protectedIndex]
 
     if (protectedRange && protectedRange.start < next) {
@@ -635,24 +746,39 @@ export function fenceRawSvgBlocks(text: string): string {
       if (activeSvg) {
         activeSvg.depth += 1
         activeSvg.lastTokenEnd = token.end
-      } else if (!isEscaped(text, next)) {
-        activeSvg = { depth: 1, lastTokenEnd: token.end, start: next }
+      } else if (!isEscaped(text, next) && containerLine) {
+        activeSvg = { depth: 1, lastTokenEnd: token.end, line: containerLine, start: next }
       }
     } else if (token.kind === 'svg-close' && activeSvg) {
       activeSvg.depth -= 1
       activeSvg.lastTokenEnd = token.end
 
       if (activeSvg.depth === 0) {
-        const svg = text.slice(activeSvg.start, token.end)
-        const fence = fenceFor(svg)
+        const svg = svgWithoutContainerPrefixes(text, activeSvg.start, token.end, activeSvg.line.containers)
+        const fence = svg ? fenceFor(svg) : null
 
-        if (fence) {
-          const before = text.slice(copiedThrough, activeSvg.start)
+        if (fence && svg) {
+          const continuationPrefix = continuationPrefixFor(activeSvg.line.containers)
+          const blankPrefix = continuationPrefix.replace(/[ \t]+$/, '')
+          const contentBeforeSvg = text.slice(activeSvg.line.start + activeSvg.line.prefixLength, activeSvg.start)
+          const startsLineContent = !contentBeforeSvg.trim()
+          const replacementStart = startsLineContent ? activeSvg.line.start : activeSvg.start
+
+          const openingPrefix = startsLineContent
+            ? text.slice(activeSvg.line.start, activeSvg.start)
+            : continuationPrefix
+
+          const prefixedSvg = svg
+            .split('\n')
+            .map(line => `${continuationPrefix}${line}`)
+            .join('\n')
+
+          const before = text.slice(copiedThrough, replacementStart)
 
           output += before
-          output += separatorBefore(output)
-          output += `${fence}svg\n${svg}\n${fence}`
-          output += separatorAfter(text, token.end)
+          output += separatorBeforeContainer(output, blankPrefix)
+          output += `${openingPrefix}${fence}svg\n${prefixedSvg}\n${continuationPrefix}${fence}`
+          output += separatorAfterContainer(text, token.end, blankPrefix, continuationPrefix)
           copiedThrough = token.end
         }
 

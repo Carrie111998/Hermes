@@ -118,19 +118,20 @@ describe('preprocessMarkdown', () => {
     expect(output).not.toContain('```svg')
   })
 
-  it('preserves a nested-blockquote fence through its matching-depth close', () => {
-    const input = ['> > ```html', '> > <svg viewBox="0 0 1 1"></svg>', '> ```', '> > ```'].join('\n')
+  it('terminates a nested-blockquote fence before reprocessing shallower fence lines', () => {
+    const svg = '> > <svg viewBox="0 0 1 1"></svg>'
+    const input = ['> > ```html', svg, '> ```', '> > ```'].join('\n')
 
-    expect(preprocessMarkdown(input)).toBe(input)
+    expect(preprocessMarkdown(input)).toBe(['> > ```html', svg, '>', '> > '].join('\n'))
   })
 
-  it('fails closed when a nested-blockquote fence has only a mismatched-depth close', () => {
-    const input = ['> > ```html', '> > <svg viewBox="0 0 1 1"></svg>', '> ```'].join('\n')
+  it('preserves a container-terminated fence while removing the reprocessed empty fence', () => {
+    const svg = '> > <svg viewBox="0 0 1 1"></svg>'
+    const input = ['> > ```html', svg, '> ```'].join('\n')
     const output = preprocessMarkdown(input)
 
-    expect(output).not.toContain('```')
+    expect(output).toBe(['> > ```html', svg, '> '].join('\n'))
     expect(output).not.toContain('```svg')
-    expect(output).toContain('<svg viewBox="0 0 1 1"></svg>')
   })
 
   it('keeps dangling real code fences during streaming', () => {
