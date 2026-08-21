@@ -167,10 +167,12 @@ export const sessionCommands: SlashCommand[] = [
       const trimmed = arg.trim()
       const [subcommand] = trimmed.toLowerCase().split(/\s+/, 1)
 
-      // Keep the interactive picker for bare `/sessions`, but send the CLI
-      // session-management subcommands to the slash worker. Otherwise the TUI
-      // mistakes `/sessions delete …` for a session title and resumes it.
-      if (cmd.startsWith('/sessions ') && ['delete', 'list', 'prune', 'rename'].includes(subcommand)) {
+      // Keep the interactive picker for a bare command, but send every
+      // session-manager spelling (including aliases) to the slash worker.
+      // The Python CLI accepts list/ls/browse, so do not treat those as IDs.
+      const managerSubcommands = ['delete', 'list', 'ls', 'browse', 'prune', 'rename']
+      if (managerSubcommands.includes(subcommand)) {
+        const canonicalCommand = `/sessions ${trimmed}`
         const destructive = subcommand === 'delete' || subcommand === 'prune'
         const confirmed = /(?:^|\s)(?:--yes|-y|now)(?:$|\s)/i.test(trimmed)
 
@@ -179,7 +181,7 @@ export const sessionCommands: SlashCommand[] = [
         }
 
         ctx.gateway.gw
-          .request<SlashExecResponse>('slash.exec', { command: cmd.slice(1), session_id: ctx.sid })
+          .request<SlashExecResponse>('slash.exec', { command: canonicalCommand.slice(1), session_id: ctx.sid })
           .then(
             ctx.guarded<SlashExecResponse>(r => {
               const body = r.output || '/sessions: no output'
