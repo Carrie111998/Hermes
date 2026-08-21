@@ -28,6 +28,8 @@ jobs:
 
       - name: Execute the branch-stored claimant transformation
         run: |
+          set -euo pipefail
+          git show caa2b08bcc6e7abe56736fdada36738e01f18557:.github/workflows/complete-89252-claim-proof.yml > /tmp/original-89252-carrier.yml
           python3 - <<'PY'
           from pathlib import Path
           from textwrap import dedent
@@ -41,6 +43,7 @@ jobs:
           code = dedent(text[start:end])
           exec(compile(code, str(workflow) + ':embedded-transform', 'exec'), {})
           PY
+          python3 /tmp/apply-89252-claim-proof.py
           rm .github/workflows/complete-89252-claim-proof.yml
           git diff --check
 
