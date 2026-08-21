@@ -7936,6 +7936,218 @@ def admin_archive_graph(
     return result
 
 
+_ARCHIVE_EVENT_KINDS = ("admin_archived", "archived")
+
+
+def _latest_archive_event(conn: sqlite3.Connection, task_id: str):
+    """Return the most recent archiving event row for ``task_id``.
+
+    Archive events are ``task_events`` rows whose ``kind`` is
+    ``admin_archived`` or ``archived``, ordered by event id ascending;
+    the "latest" is the highest event id. Returns a row with ``id``,
+    ``kind`` and ``payload``, or ``None`` if the task was never archived.
+    """
+    return conn.execute(
+        "SELECT id, kind, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN (?, ?) "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, *_ARCHIVE_EVENT_KINDS),
+    ).fetchone()
+
+
+def _parse_payload(raw) -> Optional[dict]:
+    """Parse an event payload column into a dict, or ``None`` if invalid."""
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _direct_restore_plan(conn, task_ids, actor_s):
+    """Validate a direct unarchive request; return ``(restores, invalid)``.
+
+    All-or-nothing: every id must exist, currently be archived, and have a
+    latest archive event that is an ``admin_archived`` event whose payload
+    parses and carries ``archive_group_id`` and ``prior_status``. Any
+    violation lands the id in ``invalid`` (with a reason) and nothing is
+    written. ``restores`` carries ``(task_id, prior_status, group,
+    workspace_path)`` for the valid subset.
+    """
+    existing = {
+        row["id"] for row in conn.execute("SELECT id FROM tasks").fetchall()
+    }
+    restores = []
+    invalid = []
+    for tid in sorted(set(task_ids)):
+        if tid not in existing:
+            invalid.append((tid, "unknown task id"))
+            continue
+        row = conn.execute(
+            "SELECT status, workspace_path FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        if row["status"] != "archived":
+            invalid.append((tid, "not currently archived"))
+            continue
+        ev = _latest_archive_event(conn, tid)
+        if ev is None:
+            invalid.append((tid, "no archive event"))
+            continue
+        if ev["kind"] != "admin_archived":
+            invalid.append((tid, "latest archive event is not admin_archived"))
+            continue
+        payload = _parse_payload(ev["payload"])
+        if not payload:
+            invalid.append((tid, "malformed admin_archived payload"))
+            continue
+        if "archive_group_id" not in payload or "prior_status" not in payload:
+            invalid.append((tid, "admin_archived payload missing required keys"))
+            continue
+        restores.append(
+            (tid, payload["prior_status"], payload["archive_group_id"],
+             row["workspace_path"])
+        )
+    return restores, invalid
+
+
+def _group_restore_plan(conn, group, actor_s):
+    """Plan a group unarchive; return ``(restores, skipped)``.
+
+    Finds every task ever carrying an ``admin_archived`` event for
+    ``group``. A member is restored only when it is currently archived and
+    its latest archive event is that same group's admin event; every other
+    member (already unarchived, individually re-archived, or archived under
+    a later group) is skipped untouched. Raises ``ValueError`` for an
+    unknown group (no task ever carried an ``admin_archived`` for it).
+    ``restores`` carries ``(task_id, prior_status, group, workspace_path)``.
+    """
+    members = set()
+    for row in conn.execute(
+        "SELECT task_id, payload FROM task_events "
+        "WHERE kind = 'admin_archived'"
+    ).fetchall():
+        payload = _parse_payload(row["payload"])
+        if payload and payload.get("archive_group_id") == group:
+            members.add(row["task_id"])
+    if not members:
+        raise ValueError(f"unknown archive group: {group}")
+    restores = []
+    skipped = []
+    for tid in sorted(members):
+        row = conn.execute(
+            "SELECT status, workspace_path FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        if row is None or row["status"] != "archived":
+            skipped.append(tid)
+            continue
+        ev = _latest_archive_event(conn, tid)
+        payload = _parse_payload(ev["payload"]) if ev is not None else None
+        if (
+            ev is None or ev["kind"] != "admin_archived"
+            or not payload or payload.get("archive_group_id") != group
+        ):
+            skipped.append(tid)
+            continue
+        restores.append(
+            (tid, payload.get("prior_status"), group, row["workspace_path"])
+        )
+    return restores, skipped
+
+
+def admin_unarchive(conn, task_ids=None, *, group_id=None, actor) -> dict:
+    """Transactionally restore tasks archived via ``admin_archive_graph``.
+
+    Exactly one mode is allowed: a non-empty ``task_ids`` iterable (direct,
+    all-or-nothing) or a single non-empty ``group_id`` (group mode).
+    ``actor`` is required and stripped. All validation happens before any
+    write; refusals raise ``ValueError`` with zero writes and no recompute.
+
+    Restored tasks return to their pre-archive status (``running`` becomes
+    ``ready``), have their claim/run pointers cleared, and get an
+    ``admin_unarchived`` event carrying ``archive_group_id``, ``actor`` and
+    ``restored_status``. Comments, prior events, attachments, links, runs and
+    workspace data/directories are preserved. Missing nonempty workspace
+    paths are reported without being recreated.
+
+    Returns the fixed dict with keys ``group_id``, ``restored_ids``,
+    ``skipped_ids`` and ``missing_workspaces`` (all lists sorted).
+    """
+    actor_s = (actor or "").strip()
+    if not actor_s:
+        raise ValueError("actor must be non-empty")
+
+    direct_ids = list(task_ids) if task_ids is not None else None
+    group_s = (group_id or "").strip() if group_id is not None else None
+
+    if direct_ids is not None and group_s is not None:
+        raise ValueError("specify exactly one of task_ids or group_id, not both")
+    if direct_ids is not None:
+        if not direct_ids:
+            raise ValueError("task_ids must be non-empty")
+        for tid in direct_ids:
+            if not isinstance(tid, str) or not tid.strip():
+                raise ValueError("task_ids must be non-empty strings")
+    elif group_s is not None:
+        if not group_s:
+            raise ValueError("group_id must be non-empty")
+    else:
+        raise ValueError("specify exactly one of task_ids or group_id")
+
+    # Read-only planning before any write.
+    if direct_ids is not None:
+        restores, invalid = _direct_restore_plan(conn, direct_ids, actor_s)
+        if invalid:
+            reasons = "; ".join(f"{tid} ({why})" for tid, why in invalid)
+            raise ValueError(
+                f"nothing unarchived, invalid task(s): {reasons}"
+            )
+        skipped = []
+    else:
+        restores, skipped = _group_restore_plan(conn, group_s, actor_s)
+
+    missing_workspaces = sorted(
+        str(ws) for (_, _, _, ws) in restores
+        if ws and not Path(ws).exists()
+    )
+    restored_ids = []
+    if restores:
+        with write_txn(conn):
+            for tid, prior_status, grp, _ws in restores:
+                restored_status = (
+                    prior_status if prior_status != "running" else "ready"
+                )
+                conn.execute(
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, "
+                    "current_run_id = NULL WHERE id = ?",
+                    (restored_status, tid),
+                )
+                _append_event(
+                    conn,
+                    tid,
+                    "admin_unarchived",
+                    {
+                        "archive_group_id": grp,
+                        "actor": actor_s,
+                        "restored_status": restored_status,
+                    },
+                )
+                restored_ids.append(tid)
+    # Recompute exactly once after the commit (group success included),
+    # never on refusal. Restored parents are ``ready`` (not ``done``), so
+    # gating keeps their children in ``todo``.
+    recompute_ready(conn)
+
+    return {
+        "group_id": group_s if group_s is not None else None,
+        "restored_ids": sorted(restored_ids),
+        "skipped_ids": sorted(skipped),
+        "missing_workspaces": missing_workspaces,
+    }
+
+
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Permanently remove an already-archived task and its related rows.
 
