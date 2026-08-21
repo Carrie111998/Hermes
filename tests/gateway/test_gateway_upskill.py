@@ -96,9 +96,9 @@ async def test_upskill_rewrites_event_text_and_falls_through(monkeypatch):
     runner = _make_runner()
     # If the rewrite/fall-through is broken, the event.text would either stay
     # "/upskill" (reaching the unknown guard) or the branch would return the
-    # "Could not start" error. We assert the rewrite happened and the agent
-    # path runs instead.
-    runner._run_agent = AsyncMock(return_value="agent-ran")
+    # "Could not start" error. We assert the rewrite happened AND that the
+    # agent path actually ran (await asserted) — honest fall-through proof.
+    runner._run_agent = AsyncMock(return_value={"final_response": "ok"})
 
     monkeypatch.setattr(
         gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
@@ -114,6 +114,8 @@ async def test_upskill_rewrites_event_text_and_falls_through(monkeypatch):
     assert result is not None
     assert "Unknown command" not in repr(result)
     assert "Could not start /upskill" not in str(result)
+    # Positive proof of fall-through: the agent path was actually invoked.
+    runner._run_agent.assert_awaited()
 
 
 @pytest.mark.asyncio
