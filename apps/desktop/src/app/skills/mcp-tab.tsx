@@ -6,12 +6,15 @@ import { type CodeEditorApi } from '@/components/chat/code-editor'
 import { JsonDocumentEditor } from '@/components/chat/json-document-editor'
 import { LogTail } from '@/components/chat/log-tail'
 import { PageLoader } from '@/components/page-loader'
+import { AvatarChip } from '@/components/ui/avatar-chip'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { ErrorBanner } from '@/components/ui/error-state'
 import { Input } from '@/components/ui/input'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Switch } from '@/components/ui/switch'
 import { TextTab } from '@/components/ui/text-tab'
+import { Textarea } from '@/components/ui/textarea'
 import { Tip } from '@/components/ui/tooltip'
 import {
   authMcpServer,
@@ -24,21 +27,24 @@ import {
   installMcpCatalogEntry,
   type McpCatalogEntry,
   type McpTestResult,
+  type ProfileScope,
+  profileScopeKey,
   saveMcpServers,
   testMcpServer
 } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
 import { compactNumber } from '@/lib/format'
-import { brandFor, brandGlyphStyle } from '@/lib/mcp-brands'
+import { brandFor } from '@/lib/mcp-brands'
 import { estimateServerTokens, serverUsageCount } from '@/lib/mcp-cost'
 import { completeMcpDesktopOAuth } from '@/lib/mcp-dashboard-oauth'
+import { type McpImportEntry, parseMcpImport } from '@/lib/mcp-import'
 import { NEEDS_AUTH_RE, PROBE_TTL_MS, probeCache, probeKey, serverFingerprint } from '@/lib/mcp-probe-cache'
+import { getServers, isServerShape, type McpServers, normalizeEntry } from '@/lib/mcp-servers'
 import { countEnabledTools, isToolEnabled, toggleToolInServer } from '@/lib/mcp-tool-filter'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $activeSessionId } from '@/store/session'
-import type { HermesConfigRecord } from '@/types/hermes'
 
 import { hermesConfigCacheWriter, useHermesConfigRecord } from '../hooks/use-config-record'
 import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
@@ -46,8 +52,6 @@ import { DetailPane, ICON_BUTTON, MASTER_DETAIL_WIDE_COLS } from '../master-deta
 import { PanelAddButton, PanelEmpty } from '../overlays/panel'
 import { prettyName } from '../settings/helpers'
 import { useDeepLinkHighlight } from '../settings/use-deep-link-highlight'
-
-type McpServers = Record<string, Record<string, unknown>>
 
 // The editor always speaks the ecosystem's mcp.json document format — names
 // are the JSON keys, transport is inferred from `command` vs `url` — so any
@@ -57,21 +61,6 @@ const STARTER_ENTRY = { command: 'npx', args: ['-y', '@modelcontextprotocol/serv
 
 const pretty = (value: unknown) => JSON.stringify(value, null, 2)
 const wrapDoc = (entries: McpServers) => pretty({ mcpServers: entries })
-
-const isServerShape = (value: Record<string, unknown>) =>
-  typeof value.command === 'string' || typeof value.url === 'string'
-
-// Cursor/Claude write `type`; Hermes reads `transport`. Normalize on the way
-// in so pasted configs behave identically under the CLI/TUI loader.
-function normalizeEntry(entry: Record<string, unknown>): Record<string, unknown> {
-  if (typeof entry.type === 'string' && entry.transport === undefined) {
-    const { type, ...rest } = entry
-
-    return { ...rest, transport: type }
-  }
-
-  return entry
-}
 
 /** Accepts `{"mcpServers": {...}}` (ecosystem), a bare name→config map, or throws. */
 function parseServersDoc(raw: string): McpServers {
@@ -93,12 +82,6 @@ function parseServersDoc(raw: string): McpServers {
     wrapper && typeof wrapper === 'object' && !Array.isArray(wrapper) ? (wrapper as McpServers) : (doc as McpServers)
 
   return Object.fromEntries(Object.entries(map).map(([name, entry]) => [name, normalizeEntry(entry)]))
-}
-
-function getServers(config: HermesConfigRecord | null): McpServers {
-  const raw = config?.mcp_servers
-
-  return raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as McpServers) : {}
 }
 
 // The runtime gate is `enabled: false` — the same flag `hermes mcp` and the
@@ -127,7 +110,7 @@ interface ServerCost {
 const MCP_USAGE_TTL_MS = 10 * 60_000
 const mcpUsageCache = new Map<string, { at: number; value: Record<string, number> }>()
 
-async function loadMcpUsage(scopeKey: string, scopeProfile: null | string): Promise<null | Record<string, number>> {
+async function loadMcpUsage(scopeKey: string, scopeProfile: ProfileScope): Promise<null | Record<string, number>> {
   const cached = mcpUsageCache.get(scopeKey)
 
   if (cached && Date.now() - cached.at < MCP_USAGE_TTL_MS) {
@@ -364,7 +347,7 @@ function scanServerBlocks(text: string): ServerBlock[] {
   return blocks
 }
 
-export function McpTab({ gateway, profile }: { gateway: HermesGateway | null; profile?: null | string }) {
+export function McpTab({ gateway, profile }: { gateway: HermesGateway | null; profile?: ProfileScope }) {
   const { t } = useI18n()
   const m = t.settings.mcp
   const activeSessionId = useStore($activeSessionId)
@@ -376,7 +359,7 @@ export function McpTab({ gateway, profile }: { gateway: HermesGateway | null; pr
   // profile's servers (AGENTS.md scope-in-key). When no override is passed this
   // resolves to $activeGatewayProfile, so behavior is identical to before.
   const appProfile = useStore($activeGatewayProfile)
-  const scopeProfileKey = normalizeProfileKey(profile ?? appProfile)
+  const scopeProfileKey = profile != null ? profileScopeKey(profile) : normalizeProfileKey(appProfile)
 
   // Shared config cache (see use-config-record): revisiting the tab paints the
   // cached record instantly; mutations write through `setConfig` and stay
@@ -925,6 +908,53 @@ export function McpTab({ gateway, profile }: { gateway: HermesGateway | null; pr
     }
   }
 
+  // Paste-anything import: merge parsed entries into the draft exactly like
+  // addServer seeds its starter — dirty draft, unique keys, focus the first
+  // new block. Saving stays an explicit step, so the user can fix placeholder
+  // env values (YOUR_KEY, …) in the editor first.
+  const importServers = (entries: McpImportEntry[]) => {
+    if (profilePending || entries.length === 0) {
+      return
+    }
+
+    let base: McpServers
+
+    try {
+      base = parseServersDoc(draft)
+    } catch {
+      base = { ...servers }
+    }
+
+    let firstKey: null | string = null
+
+    for (const entry of entries) {
+      let key = entry.name
+
+      for (let i = 2; key in base; i++) {
+        key = `${entry.name}-${i}`
+      }
+
+      base = { ...base, [key]: entry.config }
+      firstKey ??= key
+    }
+
+    const nextDraft = wrapDoc(base)
+    setDraft(nextDraft)
+    setDirty(true)
+    setDocVersion(version => version + 1)
+
+    if (firstKey) {
+      const from = nextDraft.indexOf(`"${firstKey}"`)
+
+      if (from >= 0) {
+        requestAnimationFrame(() => {
+          editorApi.current?.setCursor(from + 1)
+          setCursor(from + 1)
+        })
+      }
+    }
+  }
+
   const saveDoc = async () => {
     if (profilePending) {
       return
@@ -1041,7 +1071,8 @@ export function McpTab({ gateway, profile }: { gateway: HermesGateway | null; pr
                   lands on the exact line the sort link occupies in the
                   Skills/Tools views. */}
               <div className="mb-1 flex h-6 shrink-0 items-center pl-2 pr-1">
-                <span className="text-[0.72rem] font-medium text-(--ui-text-tertiary)">{m.tabServers}</span>
+                <span className="flex-1 text-[0.72rem] font-medium text-(--ui-text-tertiary)">{m.tabServers}</span>
+                <McpImportButton disabled={profilePending} onImport={importServers} />
               </div>
               {names.length === 0 ? (
                 <PanelEmpty
@@ -1398,6 +1429,86 @@ function ServerIconActions({
   )
 }
 
+// Paste-anything import: a compact popover on the Servers header. Paste any
+// README shape — mcp.json snippet, npx/docker command line, `claude mcp add`,
+// a bare URL, or a Cursor deeplink — see the inferred name + config, then
+// merge it into the editor draft (unsaved, like the "+" starter entry).
+function McpImportButton({ disabled, onImport }: { disabled: boolean; onImport: (entries: McpImportEntry[]) => void }) {
+  const { t } = useI18n()
+  const m = t.settings.mcp
+  const [open, setOpen] = useState(false)
+  const [text, setText] = useState('')
+
+  const entries = useMemo(() => parseMcpImport(text), [text])
+
+  const reset = () => {
+    setText('')
+  }
+
+  const confirm = () => {
+    if (!entries) {
+      return
+    }
+
+    onImport(entries)
+    setOpen(false)
+    reset()
+  }
+
+  return (
+    <Popover
+      onOpenChange={next => {
+        setOpen(next)
+
+        if (!next) {
+          reset()
+        }
+      }}
+      open={open}
+    >
+      <PopoverTrigger asChild>
+        <Button className="h-5 px-1 text-[0.68rem]" disabled={disabled} size="xs" variant="text">
+          <Codicon name="clippy" size="0.75rem" />
+          {m.importButton}
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-80">
+        <div className="flex flex-col gap-2">
+          <Textarea
+            aria-label={m.importButton}
+            autoFocus
+            className="max-h-40 min-h-20 font-mono text-[0.68rem]"
+            onChange={event => setText(event.currentTarget.value)}
+            placeholder={m.importPlaceholder}
+            value={text}
+          />
+          {entries ? (
+            <div className="flex max-h-40 flex-col gap-1 overflow-y-auto">
+              {entries.map((entry, index) => (
+                <div className="rounded-md bg-(--ui-bg-tertiary) px-2 py-1.5" key={`${entry.name}-${index}`}>
+                  <span className="block truncate text-[0.72rem] font-medium text-foreground/85">{entry.name}</span>
+                  <span className="block truncate font-mono text-[0.62rem] text-muted-foreground/60">
+                    {typeof entry.config.url === 'string'
+                      ? entry.config.url
+                      : [entry.config.command, ...((entry.config.args as string[]) ?? [])].join(' ')}
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            text.trim() && <p className="px-0.5 text-[0.62rem] text-muted-foreground/60">{m.importNoMatch}</p>
+          )}
+          <div className="flex justify-end">
+            <Button disabled={!entries} onClick={confirm} size="xs">
+              {entries && entries.length > 1 ? m.importConfirmMany(entries.length) : m.importConfirm}
+            </Button>
+          </div>
+        </div>
+      </PopoverContent>
+    </Popover>
+  )
+}
+
 // Small gray attribute chip (transport / auth / needs-build), matching the
 // catalog's flat row treatment.
 function CatalogTag({ children }: { children: string }) {
@@ -1420,7 +1531,7 @@ function McpCatalog({
   entries: McpCatalogEntry[]
   loading: boolean
   onInstalled: () => void
-  profile?: null | string
+  profile?: ProfileScope
 }) {
   const { t } = useI18n()
   const m = t.settings.mcp
@@ -1647,41 +1758,28 @@ function McpLogs({
 // Avatars + list rows
 // ---------------------------------------------------------------------------
 
-// Brand glyphs for well-known MCP providers, exactly the Messaging avatar
-// treatment (simpleicons on a 16% brand tint) — shared with the composer
-// suggestion pills and inline setup card via lib/mcp-brands. Unknown servers
-// fall back to the same letter monogram Messaging uses.
-
-// PlatformAvatar (messaging), copied 1:1 — same size, radius, type scale, and
-// brand-tint treatment — plus a status dot overlay. Identity ladder: curated
-// brand glyph → letter monogram. We deliberately do NOT fetch remote favicons:
-// a configured MCP URL can be a private/internal host, and hitting Google's
-// favicon service for it would leak that hostname off-box.
+// The shared identity chip (`ui/avatar-chip`) plus a status dot. Identity
+// ladder: curated brand glyph (lib/mcp-brands, shared with the composer
+// suggestion pills and the inline setup card) → letter monogram. Nothing here
+// reaches the network for a mark: a configured MCP URL can be a private host,
+// and the connector card's favicon rung only ever reads a public site's own
+// markup, never a third-party icon service.
 function McpAvatar({ className, name, status }: { className?: string; name: string; status: ServerStatus }) {
-  const brand = brandFor(name)
-
   return (
-    <span
-      className={cn(
-        'relative inline-grid size-6 shrink-0 place-items-center rounded-md text-[length:var(--conversation-caption-font-size)] font-medium',
-        !brand && 'bg-(--ui-bg-tertiary) text-(--ui-text-tertiary)',
-        className
-      )}
-      style={brand ? { backgroundColor: `color-mix(in srgb, ${brand.color} 16%, transparent)` } : undefined}
-    >
-      {brand ? (
-        <brand.Icon aria-hidden className="size-3.5" style={brandGlyphStyle(brand)} />
-      ) : (
-        name.charAt(0).toUpperCase()
-      )}
-      <span
-        aria-hidden
-        className={cn(
-          'absolute -bottom-0.5 -right-0.5 size-2 rounded-full ring-2 ring-(--ui-chat-surface-background)',
-          STATUS_DOT[status]
-        )}
-      />
-    </span>
+    <AvatarChip
+      brand={brandFor(name)}
+      className={className}
+      name={name}
+      overlay={
+        <span
+          aria-hidden
+          className={cn(
+            'absolute -bottom-0.5 -right-0.5 size-2 rounded-full ring-2 ring-(--ui-chat-surface-background)',
+            STATUS_DOT[status]
+          )}
+        />
+      }
+    />
   )
 }
 
