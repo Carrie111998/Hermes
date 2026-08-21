@@ -24669,6 +24669,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         seen = set()
         audio_paths = [p for p in audio_paths if p not in seen and not seen.add(p)]
+        # Content-identity dedup (#91513): the same physical voice can enter
+        # one turn through BOTH the current-media and replied-to-media routes,
+        # each download getting its own local cache path — so path identity
+        # misses it and the STT provider is billed twice for the same bytes.
+        # Hash the file contents (order-preserving first-wins); an unreadable
+        # path falls back to path identity and never collapses with another
+        # unreadable path.
+        import hashlib
+
+        content_seen: set = set()
+        content_deduped: List[str] = []
+        for p in audio_paths:
+            try:
+                h = hashlib.sha256()
+                with open(p, "rb") as f:
+                    for chunk in iter(lambda: f.read(65536), b""):
+                        h.update(chunk)
+                key = ("sha256", h.hexdigest())
+            except OSError:
+                key = ("path", p)
+            if key in content_seen:
+                logger.debug(
+                    "Skipping duplicate audio content (same bytes via a "
+                    "different cache path): %s", p,
+                )
+                continue
+            content_seen.add(key)
+            content_deduped.append(p)
+        audio_paths = content_deduped
         if not getattr(self.config, "stt_enabled", True):
             notes = []
             for path in audio_paths:
