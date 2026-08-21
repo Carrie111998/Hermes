@@ -1961,6 +1961,9 @@ REMOTE_MEDIA_TAG_RE = re.compile(
     r'''MEDIA:\s*(?P<url>https?://[^\s<>"'`]+)''',
     re.IGNORECASE,
 )
+_REMOTE_MEDIA_IMAGE_EXTS = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".svg",
+})
 
 # Paths NOT covered by MEDIA_TAG_CLEANUP_RE's extension alternation — both
 # extension-less files (Caddyfile, Dockerfile, Makefile) and files with an
@@ -5101,7 +5104,7 @@ class BasePlatformAdapter(ABC):
             if (
                 parsed.scheme.lower() not in {"http", "https"}
                 or not parsed.netloc
-                or Path(parsed.path).suffix.lower() not in MEDIA_DELIVERY_EXTS
+                or Path(parsed.path).suffix.lower() not in _REMOTE_MEDIA_IMAGE_EXTS
                 or not is_safe_url(url)
             ):
                 continue
@@ -6636,7 +6639,7 @@ class BasePlatformAdapter(ABC):
                 )
                 if callable(atomic_file_sender):
                     from typing import cast
-                    from urllib.parse import unquote as _unquote
+                    from urllib.parse import unquote as _unquote, urlsplit as _urlsplit
 
                     atomic_file_sender = cast(
                         Callable[..., Awaitable[SendResult]], atomic_file_sender
@@ -6661,8 +6664,9 @@ class BasePlatformAdapter(ABC):
                     for image_url, alt_text in images:
                         if image_url.startswith("file://"):
                             atomic_paths.append(_unquote(image_url[7:]))
-                        elif supports_file_urls and image_url.startswith(
-                            ("http://", "https://")
+                        elif (
+                            supports_file_urls
+                            and _urlsplit(image_url).scheme.lower() in {"http", "https"}
                         ):
                             atomic_urls.append(image_url)
                         else:

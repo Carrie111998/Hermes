@@ -148,6 +148,33 @@ def test_remote_media_url_uses_one_atomic_text_and_filepart_uri_send():
     assert adapter.outcomes == [ProcessingOutcome.SUCCESS]
 
 
+def test_uppercase_https_remote_media_stays_atomic():
+    url = "HTTPS://files-cdn.x.ai/generated/hugin-raven.png"
+    adapter = _AtomicAdapter()
+    adapter.set_message_handler(
+        AsyncMock(return_value=f"Her er billedet. MEDIA:{url}")
+    )
+    event = _event()
+
+    asyncio.run(
+        adapter._process_message_background(event, build_session_key(event.source))
+    )
+
+    assert len(adapter.atomic_calls) == 1
+    assert adapter.atomic_calls[0]["file_urls"] == [url]
+    assert adapter.text_calls == []
+    assert adapter.image_calls == []
+
+
+def test_non_image_remote_media_stays_visible():
+    content = "Her er rapporten. MEDIA:https://files-cdn.x.ai/report.pdf"
+
+    urls, cleaned = BasePlatformAdapter.extract_remote_media_urls(content)
+
+    assert urls == []
+    assert cleaned == content
+
+
 def test_private_remote_media_url_stays_visible_and_is_not_delivered():
     content = "MEDIA:http://127.0.0.1/private/image.png"
 
