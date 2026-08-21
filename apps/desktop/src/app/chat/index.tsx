@@ -241,16 +241,20 @@ function ChatRuntimeBoundary({
 
   const [windowPages, setWindowPages] = useState(1)
   const [windowSessionKey, setWindowSessionKey] = useState(runtimeId)
+  const [expandingWindow, setExpandingWindow] = useState(false)
   // Sticky-cut continuity across flushes (advanceTranscriptWindow). A ref, not
   // state: it is derived from `messages` and must never trigger a render.
   const windowStateRef = useRef<null | TranscriptWindowState>(null)
 
   // Reset the window on session swap during RENDER, so a large expand from the
-  // previous chat can't leak into the next one's first paint (#55191).
+  // previous chat can't leak into the next one's first paint (#55191). A
+  // backfill still in flight for the PREVIOUS session must not paint this
+  // one's button as loading either.
   if (windowSessionKey !== runtimeId) {
     setWindowSessionKey(runtimeId)
     setWindowPages(1)
     windowStateRef.current = null
+    setExpandingWindow(false)
   }
 
   const { messages: windowedMessages, windowed } = useMemo(() => {
@@ -277,6 +281,13 @@ function ChatRuntimeBoundary({
     // something older to show. Fire-and-forget: the prepend lands through the
     // session-state write path and re-renders this boundary.
     if (!windowStateRef.current?.window.windowed && runtimeId && storedId && transcriptBackfillAvailable(storedId)) {
+      // Loading state for the click itself: fire-and-forget otherwise leaves
+      // a click that resolves to "nothing more" indistinguishable from a
+      // dead control — the request completes, possiblyTruncated corrects
+      // itself, and the button just vanishes with no sign anything happened
+      // (#90473). Tracked here, not in transcript-backfill.ts: it is about
+      // THIS click's affordance, not the fetch itself.
+      setExpandingWindow(true)
       void backfillOlderTranscriptPage({
         storedSessionId: storedId,
         // Stale-response guard: a session switch remounts/re-keys this view;
@@ -290,7 +301,7 @@ function ChatRuntimeBoundary({
             return merged === state.messages ? state : { ...state, messages: merged }
           })
         }
-      })
+      }).finally(() => setExpandingWindow(false))
     }
 
     setWindowPages(pages => pages + 1)
@@ -298,7 +309,10 @@ function ChatRuntimeBoundary({
 
   const olderAvailable = windowed || restBackfillAvailable
 
-  const transcriptWindow = useMemo(() => ({ olderAvailable, expandWindow }), [expandWindow, olderAvailable])
+  const transcriptWindow = useMemo(
+    () => ({ olderAvailable, expandWindow, expandingWindow }),
+    [expandWindow, olderAvailable, expandingWindow]
+  )
 
   const runtime = useIncrementalExternalStoreRuntime<ThreadMessage>({
     messageRepository: runtimeMessageRepository,

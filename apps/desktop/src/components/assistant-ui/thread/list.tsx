@@ -19,6 +19,7 @@ import { type GetTargetScrollTop, useStickToBottom } from 'use-stick-to-bottom'
 
 import { usePaneLifecycle } from '@/components/pane-shell/pane-visibility'
 import { useI18n } from '@/i18n'
+import { Loader2 } from '@/lib/icons'
 import { messagePaintWeight } from '@/lib/render-weight'
 import { cn } from '@/lib/utils'
 import {
@@ -397,7 +398,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     targetScrollTop: resolveThreadScrollTarget
   })
 
-  const { olderAvailable, expandWindow } = useTranscriptWindow()
+  const { olderAvailable, expandWindow, expandingWindow } = useTranscriptWindow()
 
   useEffect(() => {
     $mountedTranscriptPanes.set($mountedTranscriptPanes.get() + 1)
@@ -776,11 +777,18 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
           >
             {(hiddenCount > 0 || olderAvailable) && (
               <button
-                className="mx-auto mb-(--conversation-turn-gap) rounded-full border border-border/65 bg-(--composer-fill) px-3 py-1 text-xs text-muted-foreground hover:text-foreground"
+                aria-busy={expandingWindow}
+                // Loading swaps the visible label for a spinner (matches
+                // mcp-setup-tool.tsx's working-state buttons) — kept as the
+                // accessible name in both states so a screen reader doesn't
+                // read this control as unlabeled while it fetches.
+                aria-label={t.assistant.thread.showEarlier}
+                className="mx-auto mb-(--conversation-turn-gap) rounded-full border border-border/65 bg-(--composer-fill) px-3 py-1 text-xs text-muted-foreground hover:text-foreground disabled:opacity-70"
+                disabled={expandingWindow}
                 onClick={showEarlier}
                 type="button"
               >
-                {t.assistant.thread.showEarlier}
+                {expandingWindow ? <Loader2 aria-hidden className="mx-auto size-3 animate-spin" /> : t.assistant.thread.showEarlier}
               </button>
             )}
             {rows}

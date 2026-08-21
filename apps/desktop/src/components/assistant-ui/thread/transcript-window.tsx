@@ -5,11 +5,18 @@ export interface TranscriptWindowValue {
   olderAvailable: boolean
   /** Pull one more page of older messages out of the session store. */
   expandWindow: () => void
+  /** A REST backfill triggered by expandWindow() is in flight. The DOM-budget
+   *  path (already-materialized content) never sets this — only the fetch. A
+   *  click that resolves to "nothing more" is otherwise silent (#90473): the
+   *  request completes, the flag that made the control visible corrects
+   *  itself, and the button just vanishes with no sign a click did anything. */
+  expandingWindow: boolean
 }
 
 const TranscriptWindowContext = createContext<TranscriptWindowValue>({
   olderAvailable: false,
-  expandWindow: () => {}
+  expandWindow: () => {},
+  expandingWindow: false
 })
 
 export function TranscriptWindowProvider({ children, value }: { children: ReactNode; value: TranscriptWindowValue }) {
