@@ -1561,6 +1561,187 @@ def test_system_battery_fails_open(monkeypatch):
     assert resp["result"]["percent"] is None
 
 
+def test_system_resources_returns_host_snapshot(monkeypatch):
+    monkeypatch.setitem(sys.modules, "socket", types.SimpleNamespace(gethostname=lambda: "station"))
+    monkeypatch.setattr(server.time, "time", lambda: 1_000.0)
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        types.SimpleNamespace(
+            boot_time=lambda: 100.0,
+            cpu_percent=lambda interval=None: 12.5,
+            disk_usage=lambda _path: types.SimpleNamespace(total=1_000, used=400, percent=40.0),
+            virtual_memory=lambda: types.SimpleNamespace(total=2_000, available=1_500, percent=25.0),
+        ),
+    )
+
+    resp = server.dispatch({"id": "r1", "method": "system.resources", "params": {}})
+
+    assert resp is not None
+    assert resp["result"] == {
+        "available": True,
+        "hostname": "station",
+        "platform": server.sys.platform,
+        "cpu_percent": 12.5,
+        "memory": {"total": 2_000, "used": 500, "percent": 25.0},
+        "disk": {"total": 1_000, "used": 400, "percent": 40.0},
+        "uptime_seconds": 900,
+    }
+
+
+def test_system_resources_fails_open(monkeypatch):
+    monkeypatch.setitem(sys.modules, "psutil", None)
+
+    resp = server.dispatch({"id": "r2", "method": "system.resources", "params": {}})
+
+    assert resp is not None
+    assert resp["result"]["available"] is False
+    assert resp["result"]["cpu_percent"] is None
+    assert resp["result"]["memory"] is None
+    assert resp["result"]["disk"] is None
+
+
+def test_account_usage_returns_redacted_runtime_snapshot(monkeypatch):
+    calls = {}
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.runtime_provider",
+        types.SimpleNamespace(
+            resolve_runtime_provider=lambda requested=None: {
+                "provider": requested or "openai-codex",
+                "base_url": "https://example.test",
+                "api_key": "secret-never-returned",
+            }
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.account_usage",
+        types.SimpleNamespace(
+            fetch_account_usage=lambda provider, base_url=None, api_key=None: calls.update(
+                provider=provider, base_url=base_url, api_key=api_key
+            )
+            or object(),
+            account_usage_to_dict=lambda _snapshot: {
+                "available": True,
+                "provider": "openai-codex",
+                "source": "credential_pool",
+                "windows": [{"label": "Session", "remaining_percent": 82.0}],
+            },
+        ),
+    )
+
+    resp = server.dispatch(
+        {"id": "u1", "method": "account.usage", "params": {"provider": "openai-codex"}}
+    )
+
+    assert resp is not None
+    assert resp["result"]["windows"][0]["remaining_percent"] == 82.0
+    assert "api_key" not in resp["result"]
+    assert calls == {
+        "provider": "openai-codex",
+        "base_url": "https://example.test",
+        "api_key": "secret-never-returned",
+    }
+
+
+def test_account_usage_fails_open(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.runtime_provider",
+        types.SimpleNamespace(resolve_runtime_provider=lambda requested=None: (_ for _ in ()).throw(RuntimeError("offline"))),
+    )
+
+    resp = server.dispatch({"id": "u2", "method": "account.usage", "params": {}})
+
+    assert resp is not None
+    assert resp["result"] == {
+        "available": False,
+        "provider": None,
+        "windows": [],
+        "details": [],
+        "unavailable_reason": "usage_unavailable",
+    }
+
+
+def test_auth_accounts_lists_redacted_entries_and_prioritizes(monkeypatch):
+    entries = [
+        types.SimpleNamespace(
+            id="work",
+            label="Work",
+            auth_type="oauth",
+            priority=0,
+            source="manual:device_code",
+            last_status="ok",
+            last_error_reason=None,
+        ),
+        types.SimpleNamespace(
+            id="personal",
+            label="Personal",
+            auth_type="oauth",
+            priority=1,
+            source="manual:device_code",
+            last_status="exhausted",
+            last_error_reason="rate_limit",
+        ),
+    ]
+
+    class Pool:
+        def entries(self):
+            return list(entries)
+
+        def prioritize(self, credential_id):
+            selected = next((entry for entry in entries if entry.id == credential_id), None)
+            if selected is None:
+                return False
+            entries.remove(selected)
+            entries.insert(0, selected)
+            for index, entry in enumerate(entries):
+                entry.priority = index
+            return True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.credential_pool",
+        types.SimpleNamespace(load_pool=lambda provider: Pool()),
+    )
+
+    listed = server.dispatch(
+        {"id": "a1", "method": "auth.accounts", "params": {"action": "list", "provider": "openai-codex"}}
+    )
+    switched = server.dispatch(
+        {
+            "id": "a2",
+            "method": "auth.accounts",
+            "params": {"action": "use", "provider": "openai-codex", "credential_id": "personal"},
+        }
+    )
+
+    assert listed is not None and switched is not None
+    assert listed["result"]["accounts"][0] == {
+        "id": "work",
+        "label": "Work",
+        "auth_type": "oauth",
+        "priority": 0,
+        "source": "manual:device_code",
+        "status": "ok",
+        "error_reason": None,
+        "preferred": True,
+    }
+    assert "access_token" not in str(listed["result"])
+    assert switched["result"]["accounts"][0]["id"] == "personal"
+    assert switched["result"]["accounts"][0]["preferred"] is True
+
+
+def test_auth_accounts_rejects_unknown_actions():
+    resp = server.dispatch(
+        {"id": "a3", "method": "auth.accounts", "params": {"action": "delete", "provider": "anthropic"}}
+    )
+
+    assert resp is not None
+    assert resp["error"]["code"] == 4003
+
+
 def test_config_set_battery_toggles_and_persists(monkeypatch):
     writes: dict[str, object] = {}
     monkeypatch.setattr(server, "_load_cfg", lambda: {"display": {"battery": False}})

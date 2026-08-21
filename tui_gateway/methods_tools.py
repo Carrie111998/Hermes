@@ -36,6 +36,144 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"available": False, "percent": None, "plugged": None, "category": "dim"})
 
 
+@method("system.resources")
+def _(rid, params: dict) -> dict:
+    """Return a small, read-only host resource snapshot for connected UI surfaces.
+
+    The handler executes on the owning Hermes backend, so a Desktop window sees
+    the selected local/VPS machine rather than accidentally sampling the Mac.
+    No process list, paths, usernames, or credential material cross the RPC.
+    """
+    import os
+    import sys
+    import time
+
+    try:
+        import psutil
+        from socket import gethostname
+
+        memory = psutil.virtual_memory()
+        disk = psutil.disk_usage(os.path.abspath(os.sep))
+        uptime_seconds = max(0, int(time.time() - psutil.boot_time()))
+        return _ok(
+            rid,
+            {
+                "available": True,
+                "hostname": gethostname(),
+                "platform": sys.platform,
+                "cpu_percent": float(psutil.cpu_percent(interval=0.1)),
+                "memory": {
+                    "total": int(memory.total),
+                    "used": int(memory.total - memory.available),
+                    "percent": float(memory.percent),
+                },
+                "disk": {
+                    "total": int(disk.total),
+                    "used": int(disk.used),
+                    "percent": float(disk.percent),
+                },
+                "uptime_seconds": uptime_seconds,
+            },
+        )
+    except Exception:
+        return _ok(
+            rid,
+            {
+                "available": False,
+                "hostname": None,
+                "platform": sys.platform,
+                "cpu_percent": None,
+                "memory": None,
+                "disk": None,
+                "uptime_seconds": None,
+            },
+        )
+
+
+@method("account.usage")
+def _(rid, params: dict) -> dict:
+    """Return provider quota windows for the backend's credential-pool account.
+
+    Runtime credentials are resolved and used only inside the backend process.
+    The result is a redacted snapshot with percentages, reset times, labels, and
+    plan metadata; tokens/API keys are never part of the RPC contract.
+    """
+    provider = str(params.get("provider") or "").strip() or None
+    try:
+        from agent.account_usage import account_usage_to_dict, fetch_account_usage
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(requested=provider)
+        resolved_provider = str(runtime.get("provider") or provider or "").strip()
+        snapshot = fetch_account_usage(
+            resolved_provider,
+            base_url=runtime.get("base_url"),
+            api_key=runtime.get("api_key"),
+        )
+        if snapshot is None:
+            return _ok(
+                rid,
+                {
+                    "available": False,
+                    "provider": resolved_provider or provider,
+                    "windows": [],
+                    "details": [],
+                    "unavailable_reason": "usage_not_supported",
+                },
+            )
+        return _ok(rid, account_usage_to_dict(snapshot))
+    except Exception:
+        return _ok(
+            rid,
+            {
+                "available": False,
+                "provider": provider,
+                "windows": [],
+                "details": [],
+                "unavailable_reason": "usage_unavailable",
+            },
+        )
+
+
+@method("auth.accounts")
+def _(rid, params: dict) -> dict:
+    """List or prioritize redacted credential-pool entries for one provider."""
+    action = str(params.get("action") or "list").strip().lower()
+    provider = str(params.get("provider") or "").strip()
+    if action not in {"list", "use"}:
+        return _err(rid, 4003, "action must be list or use")
+    if not provider:
+        return _err(rid, 4003, "provider required")
+    try:
+        from agent.credential_pool import load_pool
+
+        pool = load_pool(provider)
+        if action == "use":
+            credential_id = str(params.get("credential_id") or "").strip()
+            if not credential_id:
+                return _err(rid, 4003, "credential_id required")
+            if not pool.prioritize(credential_id):
+                return _err(rid, 4044, "credential not found")
+
+        entries = sorted(pool.entries(), key=lambda entry: entry.priority)
+        accounts = [
+            {
+                "id": entry.id,
+                "label": entry.label,
+                "auth_type": entry.auth_type,
+                "priority": int(entry.priority),
+                "source": entry.source,
+                "status": entry.last_status or "ok",
+                "error_reason": entry.last_error_reason,
+                "preferred": index == 0,
+            }
+            for index, entry in enumerate(entries)
+        ]
+        return _ok(rid, {"provider": provider, "accounts": accounts})
+    except Exception:
+        return _ok(rid, {"provider": provider, "accounts": [], "unavailable": True})
+
+
 @method("process.stop")
 def _(rid, params: dict) -> dict:
     try:

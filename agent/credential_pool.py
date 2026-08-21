@@ -730,6 +730,26 @@ class CredentialPool:
         with self._lock:
             return list(self._entries)
 
+    def prioritize(self, credential_id: str) -> bool:
+        """Persist one credential as the provider's first selection candidate.
+
+        This changes ordering only. Exhausted/dead credentials remain ineligible
+        until their normal recovery or an explicit reset/re-auth, so a UI switch
+        cannot accidentally revive a revoked token.
+        """
+        wanted = str(credential_id or "").strip()
+        if not wanted:
+            return False
+        with self._lock:
+            selected = next((entry for entry in self._entries if entry.id == wanted), None)
+            if selected is None:
+                return False
+            ordered = [selected, *(entry for entry in self._entries if entry.id != wanted)]
+            self._entries = [replace(entry, priority=index) for index, entry in enumerate(ordered)]
+            self._current_id = wanted
+            self._persist()
+            return True
+
     def _current_unlocked(self) -> Optional[PooledCredential]:
         if not self._current_id:
             return None

@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from agent.account_usage import (
     AccountUsageSnapshot,
     AccountUsageWindow,
+    account_usage_to_dict,
     fetch_account_usage,
     render_account_usage_lines,
 )
@@ -93,6 +94,40 @@ def test_fetch_account_usage_codex(monkeypatch):
     assert snapshot.windows[0].used_percent == 15.0
     assert snapshot.windows[0].reset_at == datetime.fromtimestamp(1_900_000_000, tz=timezone.utc)
     assert "Credits balance: $12.50" in snapshot.details
+
+
+def test_account_usage_to_dict_is_json_safe_and_reports_remaining():
+    fetched = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    reset = datetime(2026, 8, 21, 17, 0, tzinfo=timezone.utc)
+    snapshot = AccountUsageSnapshot(
+        provider="openai-codex",
+        source="credential_pool",
+        fetched_at=fetched,
+        title="ChatGPT limits",
+        plan="Pro",
+        windows=(AccountUsageWindow(label="Session", used_percent=18.0, reset_at=reset),),
+        details=("Credits balance: $4.00",),
+    )
+
+    assert account_usage_to_dict(snapshot) == {
+        "available": True,
+        "provider": "openai-codex",
+        "source": "credential_pool",
+        "fetched_at": fetched.isoformat(),
+        "title": "ChatGPT limits",
+        "plan": "Pro",
+        "windows": [
+            {
+                "label": "Session",
+                "used_percent": 18.0,
+                "remaining_percent": 82.0,
+                "reset_at": reset.isoformat(),
+                "detail": None,
+            }
+        ],
+        "details": ["Credits balance: $4.00"],
+        "unavailable_reason": None,
+    }
 
 
 def test_render_account_usage_lines_includes_reset_and_provider():

@@ -39,6 +39,49 @@ def _jwt_with_claims(claims: dict) -> str:
 
 
 
+def test_prioritize_moves_selected_credential_first_and_persists(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: None)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "work",
+                        "label": "Work",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "«redacted:key-work»",
+                    },
+                    {
+                        "id": "personal",
+                        "label": "Personal",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "«redacted:key-personal»",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("anthropic")
+    assert pool.prioritize("personal") is True
+    assert [(entry.id, entry.priority) for entry in pool.entries()] == [
+        ("personal", 0),
+        ("work", 1),
+    ]
+    assert load_pool("anthropic").entries()[0].id == "personal"
+    assert pool.prioritize("missing") is False
+
+
+
 def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     # Prevent auto-seeding from Codex CLI tokens on the host
