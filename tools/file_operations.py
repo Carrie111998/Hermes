@@ -404,7 +404,7 @@ def _split_tool_diagnostics(output: str) -> tuple[str, str]:
         # with no tool prefix; neither matches a search-output shape, so they
         # fall through to diagnostics.
         #   match / count : "<path>:<...>"   (has a colon; rg -c uses path:count)
-        #   files_only    : "<path>"         (no whitespace, no leading colon)
+        #   files_only    : "<path>"         (no leading colon — spaces allowed)
         #   context line  : "<path>-<line>-" or the "--" group separator
         if line == "--" or _SEARCH_OUTPUT_RE.match(line):
             payload.append(line)
@@ -415,10 +415,14 @@ def _split_tool_diagnostics(output: str) -> tuple[str, str]:
 
 # A real rg/grep output line starts with a path token and is followed by a
 # ``:`` (match/count), a ``-`` (context), or nothing (files_only). Tool
-# diagnostics ("rg: ...", "grep: ...", "error: ...", indented carets) never
-# match because the path token forbids whitespace and a leading tool prefix
-# like "rg" is followed by ": " (space) which the negated class rejects.
-_SEARCH_OUTPUT_RE = re.compile(r'^([A-Za-z]:)?[^\s:][^\n]*?[:\-]\d|^[^\s:][^\s]*$')
+# diagnostics never match: "rg: ..."/"grep: ..." are caught by the explicit
+# prefix check above, indented caret lines by the non-whitespace anchor, and
+# rg's trailing "error: ..." line by the lookahead. The files_only branch
+# must accept interior spaces — paths may legitimately contain them, and
+# the old whitespace-free class silently dropped every such file (#91698).
+_SEARCH_OUTPUT_RE = re.compile(
+    r'^([A-Za-z]:)?[^\s:][^\n]*?[:\-]\d|^(?!error: )[^\s:][^\n]*$'
+)
 
 
 def _parse_search_context_line(line: str) -> tuple[str, int, str] | None:

@@ -130,3 +130,56 @@ class TestSplitToolDiagnostics:
         assert diagnostics == ""
         assert "--" in payload
         assert "a.py-6-after" in payload
+
+    def test_files_only_line_with_spaces_is_payload(self):
+        """A files_only path may contain spaces (#91698).
+
+        The old whitespace-free class classified every spaced path as a tool
+        diagnostic, silently dropping it from search_files output.
+        """
+        out = "plain.md\nmy vault/note with space.md\n"
+        diagnostics, payload = _split_tool_diagnostics(out)
+        assert diagnostics == ""
+        assert "my vault/note with space.md" in payload
+        assert "plain.md" in payload
+
+    def test_error_prefix_line_stays_diagnostics_after_space_relaxation(self):
+        """rg's trailing "error: ..." line must not leak into payload (#91698)."""
+        out = "plain.md\nerror: unclosed character class\n"
+        diagnostics, payload = _split_tool_diagnostics(out)
+        assert "error: unclosed character class" in diagnostics
+        assert payload.strip() == "plain.md"
+
+
+@pytest.fixture
+def spaced_tree(tmp_path):
+    """A tree whose matches all live under a space-containing directory."""
+    vault = tmp_path / "Obsidian Vault"
+    vault.mkdir()
+    (vault / "note with space.md").write_text("needle in vault\n")
+    (tmp_path / "plain.md").write_text("needle plain\n")
+    return tmp_path
+
+
+@pytest.mark.parametrize("method", _METHODS)
+class TestFilesOnlySpacedPaths:
+    """Regression tests for #91698 — files_only must not drop spaced paths."""
+
+    def test_files_only_lists_spaced_paths(self, method, spaced_tree):
+        res = _search(_ops(spaced_tree), method, "needle", spaced_tree,
+                      output_mode="files_only")
+        assert res.error is None
+        assert res.total_count == 2
+        assert any("note with space.md" in f for f in res.files)
+        assert any(f.endswith("plain.md") for f in res.files)
+
+    def test_files_only_all_spaced_directory_not_zero(self, method, tmp_path):
+        vault = tmp_path / "all spaced"
+        vault.mkdir()
+        for i in range(3):
+            (vault / f"note {i}.md").write_text("needle\n")
+        res = _search(_ops(tmp_path), method, "needle", tmp_path,
+                      output_mode="files_only")
+        assert res.error is None
+        assert res.total_count == 3
+        assert len(res.files) == 3
