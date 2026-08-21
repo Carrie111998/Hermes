@@ -60,6 +60,16 @@ def partial_error_tree(tmp_path):
     os.chmod(locked, 0o755)  # let pytest clean up tmp_path
 
 
+@pytest.fixture
+def spaced_name_tree(tmp_path):
+    """A tree whose match lives only under space-containing names (#91698)."""
+    spaced_dir = tmp_path / "Obsidian Vault"
+    spaced_dir.mkdir()
+    (spaced_dir / "file with space.md").write_text("needle\n")
+    (tmp_path / "plain.md").write_text("needle\n")
+    return tmp_path
+
+
 # Run every test once per available backend method.
 _METHODS = ["_search_with_grep"]
 if shutil.which("rg"):
@@ -94,6 +104,17 @@ class TestSearchErrorGuard:
                       partial_error_tree, output_mode="count")
         assert res.error is None
         assert res.total_count >= 4
+
+    def test_files_only_lists_spaced_paths(self, method, spaced_name_tree):
+        # #91698: rg -l/grep -l emit one bare path per line and POSIX paths
+        # may contain spaces. The splitter must keep them all in the payload —
+        # dropping every spaced path made a fully-spaced result set read as
+        # "no matches" with no error.
+        res = _search(_ops(spaced_name_tree), method, "needle",
+                      spaced_name_tree, output_mode="files_only")
+        assert res.error is None
+        assert res.total_count == 2
+        assert any(" " in f for f in res.files), f"spaced path dropped: {res.files}"
 
 
 class TestSearchContentNewlineWarning:
@@ -130,3 +151,39 @@ class TestSplitToolDiagnostics:
         assert diagnostics == ""
         assert "--" in payload
         assert "a.py-6-after" in payload
+
+
+class TestSplitToolDiagnosticsFilesOnly:
+    """Unit coverage for the mode-aware splitter rule (#91698)."""
+
+    def test_files_only_keeps_paths_with_spaces(self):
+        out = "/tmp/sf_repro/file with space.md\n/tmp/sf_repro/plain.md\n"
+        diagnostics, payload = _split_tool_diagnostics(out, output_mode="files_only")
+        assert diagnostics == ""
+        assert "file with space.md" in payload
+        assert "plain.md" in payload
+
+    def test_files_only_still_folds_error_blocks_into_diagnostics(self):
+        out = (
+            "rg: regex parse error:\n"
+            "    (?:[\n"
+            "       ^\n"
+            "error: unclosed character class\n"
+        )
+        diagnostics, payload = _split_tool_diagnostics(out, output_mode="files_only")
+        assert payload.strip() == ""
+        assert "regex parse error" in diagnostics
+
+    def test_content_mode_still_rejects_prose_lines_with_spaces(self):
+        # The default (content) classification is unchanged: a whitespace-
+        # bearing line that is not a match/context shape stays a diagnostic.
+        out = "some random prose line\na.py:5:hit\n"
+        diagnostics, payload = _split_tool_diagnostics(out)
+        assert "prose line" in diagnostics
+        assert "a.py:5:hit" in payload
+
+    def test_default_output_mode_keeps_call_sites_compatible(self):
+        out = "/tmp/plain.md\n"
+        diagnostics, payload = _split_tool_diagnostics(out)
+        assert diagnostics == ""
+        assert payload == "/tmp/plain.md"
