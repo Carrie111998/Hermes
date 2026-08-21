@@ -1707,10 +1707,20 @@ class _CuaDriverSession:
             return await session.send_request(
                 _mcp_types.ListToolsRequest(params=None), _LooseListToolsResult
             )
-        except Exception:
+        except Exception as exc:
             # Any mismatch in SDK request shapes, pagination needs, or the
             # request itself falls back to the SDK's own listing — the
-            # original best-effort behavior (empty capability sets).
+            # original best-effort behavior (empty capability sets). A
+            # future SDK generation making a mirrored field required
+            # without a default would land here too, silently reverting
+            # this fix — log so that no-op regression stays diagnosable
+            # in the field (review follow-up on #89531).
+            logger.debug(
+                "tools/list vendor-field mirror failed (%s: %s); falling "
+                "back to the SDK listing — capability sets will be empty "
+                "if the driver relies on vendor fields",
+                type(exc).__name__, exc,
+            )
             return await session.list_tools()
 
     async def _populate_capabilities(self, session: Any) -> None:
