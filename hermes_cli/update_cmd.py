@@ -3181,7 +3181,7 @@ def _ensure_fhs_path_guard() -> None:
         print("    (reload your shell or run 'source ~/.bashrc' to pick it up)")
 
 def _ensure_acp_launcher() -> None:
-    """Self-heal: install a ``hermes-acp`` launcher next to the ``hermes`` one.
+    """Self-heal the launchers exposed on the user's PATH.
 
     Mirrors the launcher block in ``scripts/install.sh`` so existing installs
     gain the ACP command on ``hermes update`` without a reinstall.  ACP hosts
@@ -3195,14 +3195,34 @@ def _ensure_acp_launcher() -> None:
     (venv wrapper, FHS symlink, pipx/pip console script) without having to
     reconstruct interpreter/entrypoint paths.
 
-    No-op on Windows (install.ps1 copies ``hermes.exe`` + ``hermes-acp.exe``
-    into ``$InstallDir\bin`` and puts THAT on the user PATH — never the whole
-    ``venv\Scripts`` dir, which would shadow the user's ``python`` (#83797) —
-    so ``hermes-acp.exe`` already resolves) and wherever a ``hermes-acp`` is
-    already present next to the ``hermes`` command.  Unwritable directories
-    (e.g. ``/usr/local/bin`` as non-root) are skipped silently.  Idempotent.
+    On Windows, mirror ``install.ps1`` by copying ``hermes.exe`` and
+    ``hermes-acp.exe`` from the project venv into ``$InstallDir\bin``.  The
+    installer puts that dedicated directory on PATH instead of the whole
+    ``venv\Scripts`` directory, which would shadow the user's ``python``
+    (#83797).  Updates refresh the venv without rerunning the installer's PATH
+    setup, so recreate or refresh those copies here.
+
+    On POSIX, install the ``hermes-acp`` delegating shim wherever a ``hermes``
+    command is already present.  Unwritable directories are skipped silently.
+    Idempotent on every platform.
     """
     if _m().sys.platform == "win32":
+        scripts_dir = _m()._venv_scripts_dir()
+        if scripts_dir is None:
+            return
+        bin_dir = _m().PROJECT_ROOT / "bin"
+        try:
+            bin_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        for name in ("hermes.exe", "hermes-acp.exe"):
+            source = scripts_dir / name
+            target = bin_dir / name
+            try:
+                if source.is_file():
+                    shutil.copy2(source, target)
+            except OSError:
+                continue
         return
     for bin_dir in (Path.home() / ".local" / "bin", Path("/usr/local/bin")):
         hermes_cmd = bin_dir / "hermes"
