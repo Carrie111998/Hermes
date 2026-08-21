@@ -3909,8 +3909,9 @@ class CuaDriverBackend(ComputerUseBackend):
             return
         # Modern cua-driver releases expose element_token in the live input
         # schema but do not necessarily repeat it as a custom capability
-        # string. Treat either signal as authoritative. The schema check
-        # keeps this safe for older drivers with additionalProperties=false.
+        # string. Treat either signal as authoritative to preserve the
+        # existing capability-based path. When that capability is absent,
+        # the schema check remains fail-closed for strict older drivers.
         supports_token = self._session.supports_capability(
             "accessibility.element_tokens", tool=tool
         ) or self._session.supports_input_property(tool, "element_token")
