@@ -4741,14 +4741,57 @@ def generate_launchd_plist() -> str:
 """
 
 
+def _plist_bytes_as_xml_text(raw: bytes) -> str | None:
+    """Re-render plist bytes as XML text, or None when they don't parse."""
+    import plistlib
+
+    try:
+        return plistlib.dumps(plistlib.loads(raw), fmt=plistlib.FMT_XML).decode("utf-8")
+    except Exception:
+        return None
+
+
+def _launchd_plist_comparison_pair(raw: bytes, expected: str) -> tuple[str, str] | None:
+    """Return (installed, expected) as comparable text, or None if unreadable.
+
+    launchctl is free to rewrite an installed plist into Apple's binary format
+    (``bplist00…``) during bootstrap/bootout cycles or after a reboot, and that
+    magic is not valid UTF-8 — decoding it strictly crashed every path gated on
+    the staleness check (#90606).
+
+    A binary plist is therefore parsed and re-rendered as XML, and the expected
+    plist is pushed through the *same* round-trip so the two sides are compared
+    in one canonical serialization. Comparing re-rendered XML against the
+    generated text directly would differ on formatting alone, report the plist
+    stale on every call, and rewrite it — which launchctl may re-binarize, an
+    endless refresh loop.
+    """
+    if raw.startswith(b"bplist00"):
+        installed_xml = _plist_bytes_as_xml_text(raw)
+        expected_xml = _plist_bytes_as_xml_text(expected.encode("utf-8"))
+        if installed_xml is None or expected_xml is None:
+            return None
+        return installed_xml, expected_xml
+
+    try:
+        return raw.decode("utf-8"), expected
+    except UnicodeDecodeError:
+        return None
+
+
 def launchd_plist_is_current() -> bool:
     """Check if the installed launchd plist matches the currently generated one."""
     plist_path = get_launchd_plist_path()
     if not plist_path.exists():
         return False
 
-    installed = plist_path.read_text(encoding="utf-8")
     expected = generate_launchd_plist()
+    # An unreadable plist counts as stale so the caller reinstalls it, rather
+    # than raising out of `hermes gateway status` / `install`.
+    pair = _launchd_plist_comparison_pair(plist_path.read_bytes(), expected)
+    if pair is None:
+        return False
+    installed, expected = pair
     return _normalize_launchd_plist_for_comparison(
         installed
     ) == _normalize_launchd_plist_for_comparison(expected)
