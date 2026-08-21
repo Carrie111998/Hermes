@@ -232,10 +232,10 @@ SKILLS_GUIDANCE = (
     "Skills that aren't maintained become liabilities.\n"
     "\n"
     "## Skill Safety Rule\n"
-    "1. **UNAVAILABLE** — If a skill placeholder contains `[SKILL_PRUNED]`, the skill content was lost in compression and is inaccessible.\n"
-    "2. **RELOAD** — Before performing any action that depends on a skill, re-check its content with `skill_view(name='...')` if it shows `[SKILL_PRUNED]`.\n"
+    "1. **UNAVAILABLE** — If a skill placeholder contains `[SKILL_PRUNED: content lost in compression; reload with skill_view(name='...')]`, the skill content was lost in compression and is inaccessible.\n"
+    "2. **RELOAD** — Before performing any other action, reload every skill named by that marker with `skill_view(name='...')`.\n"
     "3. **WAIT** — If a skill is loading or was just pruned, wait for the reload confirmation before proceeding.\n"
-    "4. **DEDUP** — After reloading a pruned skill, **ignore any remaining `[SKILL_PRUNED]` markers for that same skill** — they are historical artifacts from previous compactions and do not need further action."
+    "4. **DEDUP** — After reloading a pruned skill, ignore remaining markers for that same skill until its content is pruned again."
 )
 
 KANBAN_GUIDANCE = (

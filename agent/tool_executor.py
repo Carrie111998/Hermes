@@ -55,6 +55,130 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def _pending_skill_reload_lock(agent) -> threading.RLock:
+    """Return the per-agent lock protecting pending skill reload state."""
+    return vars(agent).setdefault("_pending_skill_reload_lock", threading.RLock())
+
+
+def _message_text(message: dict[str, Any]) -> str:
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    try:
+        return json.dumps(content, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(content or "")
+
+
+def refresh_pending_skill_reloads(agent, messages: list[dict[str, Any]]) -> list[str]:
+    """Rebuild the bounded pending-reload list from a transcript.
+
+    Canonical prune markers add a skill. A later successful ``skill_view``
+    result clears it, so markers retained by a subsequent compaction remain
+    historical rather than re-arming the guard. If that reloaded body is pruned
+    later, its new marker occurs after the successful result and adds it again.
+    """
+    from agent.context_compressor import (
+        _MAX_PRUNED_SKILL_MARKERS,
+        _extract_pruned_skill_names,
+    )
+
+    pending: list[str] = []
+    skill_calls: dict[str, str] = {}
+
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+
+        if message.get("role") == "assistant":
+            for tool_call in message.get("tool_calls") or []:
+                if isinstance(tool_call, dict):
+                    call_id = str(tool_call.get("id") or "")
+                    function = tool_call.get("function") or {}
+                    function_name = (
+                        function.get("name") if isinstance(function, dict) else None
+                    )
+                    arguments = (
+                        function.get("arguments")
+                        if isinstance(function, dict)
+                        else None
+                    )
+                else:
+                    call_id = str(getattr(tool_call, "id", "") or "")
+                    function = getattr(tool_call, "function", None)
+                    function_name = getattr(function, "name", None)
+                    arguments = getattr(function, "arguments", None)
+                if function_name != "skill_view" or not call_id:
+                    continue
+                try:
+                    parsed = (
+                        json.loads(arguments or "{}")
+                        if isinstance(arguments, str)
+                        else arguments
+                    )
+                except (TypeError, ValueError):
+                    parsed = None
+                if isinstance(parsed, dict) and isinstance(parsed.get("name"), str):
+                    skill_calls[call_id] = parsed["name"]
+
+        text = _message_text(message)
+        for name in _extract_pruned_skill_names(text):
+            if name not in pending and len(pending) < _MAX_PRUNED_SKILL_MARKERS:
+                pending.append(name)
+
+        if message.get("role") != "tool":
+            continue
+        skill_name = skill_calls.get(str(message.get("tool_call_id") or ""))
+        if not skill_name or skill_name not in pending:
+            continue
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("success") is True:
+            pending.remove(skill_name)
+
+    with _pending_skill_reload_lock(agent):
+        agent._pending_skill_reloads = pending
+        return list(pending)
+
+
+def _pending_skill_reload_block(agent, function_name: str) -> str | None:
+    """Block non-reload tools while canonical prune markers remain pending."""
+    if function_name == "skill_view":
+        return None
+    with _pending_skill_reload_lock(agent):
+        pending = list(getattr(agent, "_pending_skill_reloads", []))
+    if not pending:
+        return None
+    calls = "; ".join(f"skill_view(name='{name}')" for name in pending)
+    return (
+        "Skill instructions were pruned during compression. Reload every pending "
+        f"skill before calling {function_name}: {calls}"
+    )
+
+
+def _record_successful_skill_reload(
+    agent, function_name: str, function_args: dict[str, Any], result: Any
+) -> None:
+    """Clear one pending name only after its ``skill_view`` succeeds."""
+    if function_name != "skill_view":
+        return
+    skill_name = function_args.get("name")
+    if not isinstance(skill_name, str) or not skill_name:
+        return
+    try:
+        payload = json.loads(result) if isinstance(result, str) else result
+    except (TypeError, ValueError):
+        return
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        return
+    with _pending_skill_reload_lock(agent):
+        pending = getattr(agent, "_pending_skill_reloads", [])
+        if skill_name in pending:
+            pending.remove(skill_name)
+
+
 def _record_persisted_path_for_stub(agent, tool_call_id: str, function_result) -> None:
     """Tell the stall guards where a persisted result's full content lives.
 
@@ -616,8 +740,11 @@ def _run_agent_tool_execution_middleware(
                 return
             begin_execution(callback)
 
-        block_message = scope_block
-        block_error_type = "tool_scope_block"
+        block_message = _pending_skill_reload_block(agent, function_name)
+        block_error_type = "skill_reload_block"
+        if block_message is None:
+            block_message = scope_block
+            block_error_type = "tool_scope_block"
         if block_message is None:
             block_error_type = "plugin_block"
 
@@ -709,7 +836,11 @@ def _run_agent_tool_execution_middleware(
         )
         _hb_thread.start()
         try:
-            return execute(final_args)
+            result = execute(final_args)
+            _record_successful_skill_reload(
+                agent, function_name, final_args, result
+            )
+            return result
         finally:
             _hb_stop.set()
             _hb_thread.join(timeout=2.0)

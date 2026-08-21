@@ -791,6 +791,9 @@ class AIAgent:
         
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
+        # Compression markers are session-scoped; rebuild from persisted history
+        # at the next turn boundary.
+        self._pending_skill_reloads = []
 
         # Copilot x-initiator: True for the first API call of a user turn,
         # False for tool-loop follow-ups (#3040).
@@ -8058,6 +8061,18 @@ class AIAgent:
             )
             self._active_compression_commit_fence = active_fence
         try:
+            def _record_pending_reloads(result):
+                try:
+                    from agent.tool_executor import refresh_pending_skill_reloads
+
+                    refresh_pending_skill_reloads(self, result[0])
+                except Exception:
+                    logger.debug(
+                        "post-compression skill reload scan failed",
+                        exc_info=True,
+                    )
+                return result
+
             def _run(fence=None, target_messages=None):
                 return compress_context(
                     self,
@@ -8075,11 +8090,11 @@ class AIAgent:
             # Callers that already own a progress-aware wait (gateway session
             # hygiene) pass commit_fence and must not be double-wrapped.
             if commit_fence is not None:
-                return _run(active_fence)
+                return _record_pending_reloads(_run(active_fence))
 
             idle_timeout, total_ceiling = resolve_context_compression_timeouts()
             if idle_timeout <= 0:
-                return _run(active_fence)
+                return _record_pending_reloads(_run(active_fence))
 
             def _snapshot_worker(fence=None):
                 # #76354 review F3: the pooled worker must NEVER share the
@@ -8223,7 +8238,7 @@ class AIAgent:
                     "post-compression session ContextVar rebind failed",
                     exc_info=True,
                 )
-            return result
+            return _record_pending_reloads(result)
         finally:
             with fence_registration_lock:
                 if previous_fence is missing_fence:

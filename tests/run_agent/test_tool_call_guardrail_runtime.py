@@ -5,6 +5,12 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent.context_compressor import (
+    _MAX_PRUNED_SKILL_MARKERS,
+    _skill_pruned_marker,
+    _summarize_tool_result,
+)
+from agent.tool_executor import refresh_pending_skill_reloads
 from run_agent import AIAgent
 
 
@@ -342,6 +348,97 @@ def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     mock_hfc.assert_not_called()
     assert "plugin policy" in messages[0]["content"]
     assert agent._tool_guardrails.before_call("web_search", args).action == "allow"
+
+
+def test_pruned_skill_blocks_other_tools_before_dispatch():
+    agent = _make_agent("skill_view", "web_search")
+    refresh_pending_skill_reloads(
+        agent,
+        [
+            {
+                "role": "tool",
+                "content": _summarize_tool_result(
+                    "skill_view", '{"name":"pdf"}', "x" * 6000
+                ),
+            }
+        ],
+    )
+    tc = _mock_tool_call("web_search", json.dumps({"query": "blocked"}), "c-pruned")
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as dispatch:
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1"
+        )
+
+    dispatch.assert_not_called()
+    assert "skill_view(name='pdf')" in messages[0]["content"]
+    assert agent._pending_skill_reloads == ["pdf"]
+
+
+def test_successful_skill_view_roundtrip_clears_pending_reload_but_failure_does_not():
+    agent = _make_agent("skill_view", "web_search")
+    markers = [
+        {"role": "user", "content": _skill_pruned_marker(f"skill-{i}")}
+        for i in range(_MAX_PRUNED_SKILL_MARKERS + 3)
+    ]
+    refresh_pending_skill_reloads(agent, markers)
+    assert len(agent._pending_skill_reloads) == _MAX_PRUNED_SKILL_MARKERS
+    assert agent._pending_skill_reloads[0] == "skill-0"
+
+    failed = _mock_tool_call(
+        "skill_view", json.dumps({"name": "skill-0"}), "c-reload-failed"
+    )
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=json.dumps({"success": False, "error": "missing"}),
+    ):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[failed]), [], "task-1"
+        )
+    assert agent._pending_skill_reloads[0] == "skill-0"
+
+    loaded = _mock_tool_call(
+        "skill_view", json.dumps({"name": "skill-0"}), "c-reload-ok"
+    )
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=json.dumps({"success": True, "name": "skill-0", "content": "rules"}),
+    ):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[loaded]), [], "task-1"
+        )
+
+    assert "skill-0" not in agent._pending_skill_reloads
+    assert agent._pending_skill_reloads[0] == "skill-1"
+
+    # Rebuilding state on the next turn treats the retained marker as
+    # historical because the later persisted skill_view result succeeded.
+    history = [
+        {"role": "user", "content": _skill_pruned_marker("skill-0")},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "c-persisted-reload",
+                "type": "function",
+                "function": {
+                    "name": "skill_view",
+                    "arguments": json.dumps({"name": "skill-0"}),
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "c-persisted-reload",
+            "content": json.dumps({"success": True, "name": "skill-0"}),
+        },
+    ]
+    assert refresh_pending_skill_reloads(agent, history) == []
+
+    # A later compaction marker for the same skill re-arms the guard.
+    history.append({"role": "user", "content": _skill_pruned_marker("skill-0")})
+    assert refresh_pending_skill_reloads(agent, history) == ["skill-0"]
 
 
 def test_default_run_conversation_warns_without_guardrail_halt():
