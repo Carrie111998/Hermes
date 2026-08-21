@@ -1771,6 +1771,16 @@ def _compute_host_turn_frame(
     with session["history_lock"]:
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
+        inflight = session.get("inflight_turn")
+        receipt_fields = (
+            {
+                key: str(inflight[key])
+                for key in ("turn_id", "execution_token", "receipt_session_key")
+                if inflight.get(key)
+            }
+            if isinstance(inflight, dict)
+            else {}
+        )
         attached_images = (
             list(image_paths)
             if image_paths is not None
@@ -1794,6 +1804,7 @@ def _compute_host_turn_frame(
         "source": _session_source(session),
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,
+        **receipt_fields,
     }
 
 
@@ -1843,12 +1854,32 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         if is_error
         else "interrupted" if frame_status == "interrupted" else "committed"
     )
-    turn_id = _finish_inflight_turn_receipt(
-        session,
-        receipt_state,
-        status=frame_status or ("error" if is_error else "complete"),
-        error=(frame.get("message") if is_error else None),
-    )
+    with session["history_lock"]:
+        inflight = session.get("inflight_turn")
+        turn_id = str(inflight.get("turn_id") or "") if isinstance(inflight, dict) else ""
+        receipt_session_key = (
+            str(inflight.get("receipt_session_key") or session.get("session_key") or "")
+            if isinstance(inflight, dict)
+            else ""
+        )
+    # A successful compute-host turn persists its receipt in the child before
+    # forwarding message.complete. The later turn.end callback must preserve
+    # that immutable result rather than attempting a second fenced write.
+    terminal_already_persisted = False
+    if turn_id and receipt_session_key:
+        try:
+            terminal_already_persisted = get_turn_status(
+                _session_home(session), receipt_session_key, turn_id
+            ).get("state") in {"committed", "failed", "interrupted"}
+        except Exception:
+            logger.debug("compute-host terminal receipt lookup failed", exc_info=True)
+    if not terminal_already_persisted:
+        turn_id = _finish_inflight_turn_receipt(
+            session,
+            receipt_state,
+            status=frame_status or ("error" if is_error else "complete"),
+            error=(frame.get("message") if is_error else None),
+        )
     with session["history_lock"]:
         if frame.get("session_key"):
             session["session_key"] = str(frame.get("session_key"))
@@ -10720,14 +10751,12 @@ def _run_prompt_submit(
                     context_length=ctx_len,
                 )
                 if ctx.blocked:
-                    _emit(
-                        "error",
+                    _emit_terminal_turn_error(
                         sid,
-                        {
-                            "message": "\n".join(ctx.warnings)
-                            or "Context injection refused."
-                        },
+                        session,
+                        "\n".join(ctx.warnings) or "Context injection refused.",
                     )
+                    turn_error_retained = True
                     return
                 prompt = ctx.message
 

@@ -187,3 +187,133 @@ def test_unknown_turn_is_distinct_from_prepared_turn(monkeypatch, tmp_path):
         assert prepared["state"] == "did_not_run"
     finally:
         server._sessions.pop("ui-session", None)
+
+
+def test_compute_host_frame_carries_receipt_fence(monkeypatch, tmp_path):
+    session = _session(tmp_path)
+    session["cwd"] = str(tmp_path)
+    prepared = prepare_turn(tmp_path, "durable-session")
+    token, _running = claim_turn(
+        tmp_path, "durable-session", prepared["turn_id"]
+    )
+    server._start_inflight_turn(
+        session,
+        "ship it",
+        turn_id=prepared["turn_id"],
+        execution_token=token,
+        receipt_session_key="durable-session",
+    )
+    monkeypatch.setattr(server, "_session_source", lambda _session: "desktop")
+
+    frame = server._compute_host_turn_frame(
+        "request", "ui-session", session, "ship it"
+    )
+
+    assert frame["turn_id"] == prepared["turn_id"]
+    assert frame["execution_token"] == token
+    assert frame["receipt_session_key"] == "durable-session"
+
+
+def test_compute_host_callback_preserves_child_terminal_receipt(monkeypatch, tmp_path):
+    session = _session(tmp_path)
+    prepared = prepare_turn(tmp_path, "durable-session")
+    token, _running = claim_turn(
+        tmp_path, "durable-session", prepared["turn_id"]
+    )
+    server._start_inflight_turn(
+        session,
+        "ship it",
+        turn_id=prepared["turn_id"],
+        execution_token=token,
+        receipt_session_key="durable-session",
+    )
+    assert finish_turn(
+        tmp_path,
+        "durable-session",
+        prepared["turn_id"],
+        token,
+        "committed",
+        {"status": "complete"},
+    )
+    duplicate_writes = []
+    monkeypatch.setattr(
+        server,
+        "_finish_inflight_turn_receipt",
+        lambda *_args, **_kwargs: duplicate_writes.append(True) or prepared["turn_id"],
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_args: False)
+
+    server._on_compute_host_turn_done(
+        "request",
+        "ui-session",
+        session,
+        {"type": "turn.end", "status": "complete"},
+    )
+
+    assert duplicate_writes == []
+    assert get_turn_status(
+        tmp_path, "durable-session", prepared["turn_id"]
+    )["state"] == "committed"
+
+
+def test_context_refusal_terminalizes_admitted_turn(monkeypatch, tmp_path):
+    class BlockedContext:
+        blocked = True
+        warnings = ["context too large"]
+
+    class Agent:
+        session_id = "durable-session"
+        model = "test-model"
+        base_url = ""
+        api_key = ""
+        provider = ""
+        _config_context_length = 1000
+        interim_assistant_callback = None
+
+        def clear_interrupt(self):
+            pass
+
+    session = _session(tmp_path)
+    session.update({"agent": Agent(), "cwd": str(tmp_path), "transport": None})
+    prepared = prepare_turn(tmp_path, "durable-session")
+    token, _running = claim_turn(
+        tmp_path, "durable-session", prepared["turn_id"]
+    )
+    server._start_inflight_turn(
+        session,
+        "Review @file:large.txt",
+        turn_id=prepared["turn_id"],
+        execution_token=token,
+        receipt_session_key="durable-session",
+    )
+    session["running"] = True
+    emitted = []
+    monkeypatch.setattr(
+        "agent.context_references.preprocess_context_references",
+        lambda *_args, **_kwargs: BlockedContext(),
+    )
+    monkeypatch.setattr(server, "_emit", lambda event, _sid, payload=None: emitted.append((event, payload)))
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args: None)
+    monkeypatch.setattr(server, "_sync_bot_capabilities", lambda *_args: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
+    monkeypatch.setattr(server, "record_turn_start", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_retire_turn_marker", lambda *_args: None)
+    monkeypatch.setattr(server, "_emit_settled_session_info", lambda *_args: None)
+    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_args: False)
+    monkeypatch.setattr(server, "render_message", lambda text, _cols: text)
+
+    assert server._run_prompt_submit(
+        "request", "ui-session", session, "Review @file:large.txt"
+    )
+    session["_run_thread"].join(timeout=5)
+
+    terminal = get_turn_status(
+        tmp_path, "durable-session", prepared["turn_id"]
+    )
+    assert terminal["state"] == "failed"
+    assert terminal["receipt"]["status"] == "error"
+    complete = [payload for event, payload in emitted if event == "message.complete"]
+    assert complete[-1]["turn_id"] == prepared["turn_id"]
