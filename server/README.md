@@ -143,6 +143,20 @@ Importing candidates alone creates no tenant leads, countries, campaigns, or
 research results. A campaign materializes only evidence-backed results after a
 configured verifier succeeds.
 
+Import computes each row's `search_text` — the normalised string a product term
+matches against — so selection reads it instead of rebuilding it per row on
+every run. A corpus imported before that column existed still selects correctly,
+by computing the value at read time; it just does not get the speedup. Fill it in
+once, on the application host:
+
+```bash
+python -m server backfill-candidate-search
+```
+
+Idempotent and safe to skip: it buys speed, never correctness. It prints counts
+only, never corpus rows. Add `--batch` to shrink the transaction size on a very
+large corpus.
+
 Bright Data is the optional live verifier. Put its API key in the deployment
 secret manager as `BRIGHTDATA_API_KEY`; enable it and select its non-secret
 zone in `interfaze_server` config:

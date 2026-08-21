@@ -103,6 +103,15 @@ def main(argv=None) -> None:
     candidates.add_argument("--dataset-id", required=True)
     candidates.add_argument("--version", required=True)
     candidates.add_argument("--file", type=Path, required=True)
+    backfill = sub.add_parser(
+        "backfill-candidate-search",
+        help="Fill search_text for corpora imported before that column existed",
+    )
+    backfill.add_argument(
+        "--batch", type=int, default=2000,
+        help="Rows per transaction; a corpus can be large and one transaction "
+             "over all of it holds a write lock for as long as it takes",
+    )
     args = parser.parse_args(argv)
 
     if args.command == "serve":
@@ -130,6 +139,33 @@ def main(argv=None) -> None:
                 company_profile=company_profile,
                 onboarding_sources=onboarding_sources,
             ))
+        finally:
+            close = getattr(db, "close", None)
+            if close:
+                close()
+        return
+
+    if args.command == "backfill-candidate-search":
+        settings = Settings.load()
+        db = create_database(settings)
+        try:
+            if args.batch < 1:
+                raise SystemExit("--batch must be at least 1")
+            filled = CandidateRepository(db).backfill_search_text(batch=args.batch)
+            remaining = db.one(
+                "SELECT COUNT(*) AS n FROM candidate_records WHERE search_text IS NULL"
+            )["n"]
+            # Counts only. Candidate rows are never echoed, here or anywhere
+            # else in this CLI.
+            print(json.dumps({"filled": filled, "remaining": remaining}))
+            # Safe to re-run and safe to skip: selection computes the value for a
+            # row that lacks it, so this only ever buys speed. Saying so on
+            # stderr because a bare `{"filled": 0}` reads like a failure.
+            if not filled:
+                print(
+                    "note: nothing to backfill; every corpus row already has "
+                    "search text", file=sys.stderr,
+                )
         finally:
             close = getattr(db, "close", None)
             if close:
