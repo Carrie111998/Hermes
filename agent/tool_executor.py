@@ -60,6 +60,15 @@ def _pending_skill_reload_lock(agent) -> threading.RLock:
     return vars(agent).setdefault("_pending_skill_reload_lock", threading.RLock())
 
 
+@dataclass
+class _PendingSkillReloadScanState:
+    """Append-only transcript watermark plus unresolved reload call ids."""
+
+    message_count: int
+    last_message_id: int | None
+    skill_calls: dict[str, str]
+
+
 def _pending_skill_reload_snapshot(agent) -> tuple[str, ...]:
     """Fix pending names for one model-emitted tool batch.
 
@@ -108,77 +117,111 @@ def _successful_tool_payload(text: str) -> dict[str, Any] | None:
     return None
 
 
-def refresh_pending_skill_reloads(agent, messages: list[dict[str, Any]]) -> list[str]:
-    """Rebuild the bounded pending-reload list from a transcript.
+def refresh_pending_skill_reloads(
+    agent,
+    messages: list[dict[str, Any]],
+    *,
+    force_full: bool = False,
+) -> list[str]:
+    """Refresh pending reloads from only the transcript's appended tail.
 
     Canonical prune markers add a skill. A later successful ``skill_view``
     result clears it, so markers retained by a subsequent compaction remain
     historical rather than re-arming the guard. If that reloaded body is pruned
     later, its new marker occurs after the successful result and adds it again.
+
+    A message-count + last-message identity watermark makes ordinary turn
+    boundaries O(appended tail). Compression/reset callers invalidate the
+    append-only assumption with ``force_full=True`` (or by clearing the scan
+    state); replaced/truncated transcripts are detected and rescanned in full.
     """
     from agent.context_compressor import (
         _MAX_PRUNED_SKILL_MARKERS,
         _extract_pruned_skill_names,
     )
 
-    pending: list[str] = []
-    skill_calls: dict[str, str] = {}
-
-    for message in messages or []:
-        if not isinstance(message, dict):
-            continue
-
-        if message.get("role") == "assistant":
-            for tool_call in message.get("tool_calls") or []:
-                if isinstance(tool_call, dict):
-                    call_id = str(tool_call.get("id") or "")
-                    function = tool_call.get("function") or {}
-                    function_name = (
-                        function.get("name") if isinstance(function, dict) else None
-                    )
-                    arguments = (
-                        function.get("arguments")
-                        if isinstance(function, dict)
-                        else None
-                    )
-                else:
-                    call_id = str(getattr(tool_call, "id", "") or "")
-                    function = getattr(tool_call, "function", None)
-                    function_name = getattr(function, "name", None)
-                    arguments = getattr(function, "arguments", None)
-                if function_name != "skill_view" or not call_id:
-                    continue
-                try:
-                    parsed = (
-                        json.loads(arguments or "{}")
-                        if isinstance(arguments, str)
-                        else arguments
-                    )
-                except (TypeError, ValueError):
-                    parsed = None
-                if (
-                    isinstance(parsed, dict)
-                    and isinstance(parsed.get("name"), str)
-                    and not parsed.get("file_path")
-                ):
-                    skill_calls[call_id] = parsed["name"]
-
-        text = _message_text(message)
-        for name in _extract_pruned_skill_names(text):
-            if name not in pending and len(pending) < _MAX_PRUNED_SKILL_MARKERS:
-                pending.append(name)
-
-        if message.get("role") != "tool":
-            continue
-        skill_name = skill_calls.get(str(message.get("tool_call_id") or ""))
-        if not skill_name or skill_name not in pending:
-            continue
-        payload = _successful_tool_payload(text)
-        if payload is not None and isinstance(payload.get("content"), str):
-            pending.remove(skill_name)
-
+    transcript = messages or []
     with _pending_skill_reload_lock(agent):
+        state = getattr(agent, "_pending_skill_reload_scan_state", None)
+        can_resume = (
+            not force_full
+            and isinstance(state, _PendingSkillReloadScanState)
+            and state.message_count <= len(transcript)
+            and (
+                state.message_count == 0
+                or id(transcript[state.message_count - 1]) == state.last_message_id
+            )
+        )
+        if can_resume:
+            assert isinstance(state, _PendingSkillReloadScanState)
+            start = state.message_count
+            pending = list(getattr(agent, "_pending_skill_reloads", []))
+            skill_calls = dict(state.skill_calls)
+        else:
+            start = 0
+            pending = []
+            skill_calls = {}
+
+        for message in transcript[start:]:
+            if not isinstance(message, dict):
+                continue
+
+            if message.get("role") == "assistant":
+                for tool_call in message.get("tool_calls") or []:
+                    if isinstance(tool_call, dict):
+                        call_id = str(tool_call.get("id") or "")
+                        function = tool_call.get("function") or {}
+                        function_name = (
+                            function.get("name") if isinstance(function, dict) else None
+                        )
+                        arguments = (
+                            function.get("arguments")
+                            if isinstance(function, dict)
+                            else None
+                        )
+                    else:
+                        call_id = str(getattr(tool_call, "id", "") or "")
+                        function = getattr(tool_call, "function", None)
+                        function_name = getattr(function, "name", None)
+                        arguments = getattr(function, "arguments", None)
+                    if function_name != "skill_view" or not call_id:
+                        continue
+                    try:
+                        parsed = (
+                            json.loads(arguments or "{}")
+                            if isinstance(arguments, str)
+                            else arguments
+                        )
+                    except (TypeError, ValueError):
+                        parsed = None
+                    if (
+                        isinstance(parsed, dict)
+                        and isinstance(parsed.get("name"), str)
+                        and not parsed.get("file_path")
+                    ):
+                        skill_calls[call_id] = parsed["name"]
+
+            text = _message_text(message)
+            for name in _extract_pruned_skill_names(text):
+                if name not in pending and len(pending) < _MAX_PRUNED_SKILL_MARKERS:
+                    pending.append(name)
+
+            if message.get("role") != "tool":
+                continue
+            call_id = str(message.get("tool_call_id") or "")
+            skill_name = skill_calls.pop(call_id, None)
+            if not skill_name or skill_name not in pending:
+                continue
+            payload = _successful_tool_payload(text)
+            if payload is not None and isinstance(payload.get("content"), str):
+                pending.remove(skill_name)
+
         agent._pending_skill_reloads = pending
+        agent._pending_skill_reload_scan_state = _PendingSkillReloadScanState(
+            message_count=len(transcript),
+            last_message_id=id(transcript[-1]) if transcript else None,
+            skill_calls=skill_calls,
+        )
         return list(pending)
 
 

@@ -23,6 +23,7 @@ from hermes_constants import (
 from typing import List, Optional
 
 from agent.runtime_cwd import resolve_agent_cwd
+from agent.context_compressor import _skill_pruned_marker
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS,
     ORG_ACTIVE_MARKER,
@@ -232,7 +233,7 @@ SKILLS_GUIDANCE = (
     "Skills that aren't maintained become liabilities.\n"
     "\n"
     "## Skill Safety Rule\n"
-    "1. **UNAVAILABLE** — If a skill placeholder contains `[SKILL_PRUNED: content lost in compression; reload with skill_view(name='...')]`, the skill content was lost in compression and is inaccessible.\n"
+    f"1. **UNAVAILABLE** — If a skill placeholder contains `{_skill_pruned_marker('x')}`, the skill content was lost in compression and is inaccessible.\n"
     "2. **RELOAD** — Before performing any other action, reload every skill named by that marker with `skill_view(name='...')`.\n"
     "3. **WAIT** — If a skill is loading or was just pruned, wait for the reload confirmation before proceeding.\n"
     "4. **DEDUP** — After reloading a pruned skill, ignore remaining markers for that same skill until its content is pruned again."

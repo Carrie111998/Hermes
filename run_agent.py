@@ -794,6 +794,7 @@ class AIAgent:
         # Compression markers are session-scoped; rebuild from persisted history
         # at the next turn boundary.
         self._pending_skill_reloads = []
+        self._pending_skill_reload_scan_state = None
 
         # Copilot x-initiator: True for the first API call of a user turn,
         # False for tool-loop follow-ups (#3040).
@@ -8060,19 +8061,8 @@ class AIAgent:
                 "_active_compression_commit_fence", missing_fence
             )
             self._active_compression_commit_fence = active_fence
+        reload_scan_messages = messages
         try:
-            def _record_pending_reloads(result):
-                try:
-                    from agent.tool_executor import refresh_pending_skill_reloads
-
-                    refresh_pending_skill_reloads(self, result[0])
-                except Exception:
-                    logger.debug(
-                        "post-compression skill reload scan failed",
-                        exc_info=True,
-                    )
-                return result
-
             def _run(fence=None, target_messages=None):
                 return compress_context(
                     self,
@@ -8090,11 +8080,15 @@ class AIAgent:
             # Callers that already own a progress-aware wait (gateway session
             # hygiene) pass commit_fence and must not be double-wrapped.
             if commit_fence is not None:
-                return _record_pending_reloads(_run(active_fence))
+                result = _run(active_fence)
+                reload_scan_messages = result[0]
+                return result
 
             idle_timeout, total_ceiling = resolve_context_compression_timeouts()
             if idle_timeout <= 0:
-                return _record_pending_reloads(_run(active_fence))
+                result = _run(active_fence)
+                reload_scan_messages = result[0]
+                return result
 
             def _snapshot_worker(fence=None):
                 # #76354 review F3: the pooled worker must NEVER share the
@@ -8212,6 +8206,7 @@ class AIAgent:
                 fence=active_fence,
                 telemetry_agent=self,
             )
+            reload_scan_messages = result[0]
             # compress_context ran on a daemon pool worker thread; the session
             # id rotation updated hermes_logging._session_context (a
             # threading.local) on the WORKER thread, not this one. Propagate
@@ -8238,8 +8233,22 @@ class AIAgent:
                     "post-compression session ContextVar rebind failed",
                     exc_info=True,
                 )
-            return _record_pending_reloads(result)
+            return result
         finally:
+            # One exit funnel for direct, timeout/fallback, and exceptional
+            # compression paths. Compression may replace or mutate transcript
+            # rows, so invalidate the append-only scan watermark every time.
+            try:
+                from agent.tool_executor import refresh_pending_skill_reloads
+
+                refresh_pending_skill_reloads(
+                    self, reload_scan_messages, force_full=True
+                )
+            except Exception:
+                logger.debug(
+                    "post-compression skill reload scan failed",
+                    exc_info=True,
+                )
             with fence_registration_lock:
                 if previous_fence is missing_fence:
                     vars(self).pop("_active_compression_commit_fence", None)

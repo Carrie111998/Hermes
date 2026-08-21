@@ -553,6 +553,133 @@ def test_successful_skill_view_roundtrip_clears_pending_reload_but_failure_does_
     assert refresh_pending_skill_reloads(agent, history) == ["skill-0"]
 
 
+def test_pending_reload_refresh_scans_only_appended_tail_and_replaced_history():
+    agent = _make_agent("skill_view")
+    history = [{"role": "user", "content": _skill_pruned_marker("pdf")}]
+
+    with patch("agent.tool_executor._message_text", wraps=lambda msg: msg["content"]) as text:
+        assert refresh_pending_skill_reloads(agent, history) == ["pdf"]
+        assert text.call_count == 1
+
+        text.reset_mock()
+        assert refresh_pending_skill_reloads(agent, history) == ["pdf"]
+        text.assert_not_called()
+
+        history.append({"role": "user", "content": "appended tail"})
+        text.reset_mock()
+        assert refresh_pending_skill_reloads(agent, history) == ["pdf"]
+        assert text.call_count == 1
+
+        replacement = [dict(message) for message in history]
+        replacement[0]["content"] = _skill_pruned_marker("xlsx")
+        text.reset_mock()
+        assert refresh_pending_skill_reloads(agent, replacement) == ["xlsx"]
+        assert text.call_count == len(replacement)
+
+
+def test_pending_reload_refresh_force_full_rescans_after_compression():
+    agent = _make_agent("skill_view")
+    history = [{"role": "user", "content": _skill_pruned_marker("pdf")}]
+    assert refresh_pending_skill_reloads(agent, history) == ["pdf"]
+
+    # Compression may rewrite a retained row in place, preserving both list
+    # length and object identity. Its caller must explicitly invalidate the
+    # append-only watermark so the rewritten marker is observed.
+    history[0]["content"] = _skill_pruned_marker("xlsx")
+    assert refresh_pending_skill_reloads(agent, history) == ["pdf"]
+    assert refresh_pending_skill_reloads(agent, history, force_full=True) == ["xlsx"]
+
+    history[0]["content"] = _skill_pruned_marker("docx")
+    agent.reset_session_state()
+    assert refresh_pending_skill_reloads(agent, history) == ["docx"]
+
+
+def test_pending_reload_tail_scan_matches_skill_call_to_later_result():
+    agent = _make_agent("skill_view")
+    history = [
+        {"role": "user", "content": _skill_pruned_marker("pdf")},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "c-tail-reload",
+                    "type": "function",
+                    "function": {
+                        "name": "skill_view",
+                        "arguments": json.dumps({"name": "pdf"}),
+                    },
+                }
+            ],
+        },
+    ]
+    assert refresh_pending_skill_reloads(agent, history) == ["pdf"]
+
+    history.append(
+        {
+            "role": "tool",
+            "tool_call_id": "c-tail-reload",
+            "content": json.dumps(
+                {"success": True, "name": "pdf", "content": "rules"}
+            ),
+        }
+    )
+    assert refresh_pending_skill_reloads(agent, history) == []
+
+
+def test_compression_exception_refreshes_pending_reloads_from_mutated_transcript():
+    agent = _make_agent("skill_view")
+    messages = [{"role": "user", "content": "before compression"}]
+    assert refresh_pending_skill_reloads(agent, messages) == []
+
+    def fail_after_mutating_transcript(*args, **kwargs):
+        del args, kwargs
+        messages[0]["content"] = _skill_pruned_marker("pdf")
+        raise RuntimeError("synthetic compression failure")
+
+    with (
+        patch(
+            "agent.conversation_compression.compress_context",
+            side_effect=fail_after_mutating_transcript,
+        ),
+        patch(
+            "agent.conversation_compression.resolve_context_compression_timeouts",
+            return_value=(0, 0),
+        ),
+    ):
+        try:
+            agent._compress_context(messages, "system prompt", force=True)
+        except RuntimeError as exc:
+            assert str(exc) == "synthetic compression failure"
+        else:
+            raise AssertionError("compression failure was not propagated")
+
+    assert agent._pending_skill_reloads == ["pdf"]
+
+
+def test_malformed_successful_skill_view_body_keeps_reload_guard_armed():
+    agent = _make_agent("skill_view")
+    refresh_pending_skill_reloads(
+        agent, [{"role": "user", "content": _skill_pruned_marker("pdf")}]
+    )
+    loaded = _mock_tool_call(
+        "skill_view", json.dumps({"name": "pdf"}), "c-malformed-reload"
+    )
+    messages = []
+
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=json.dumps(
+            {"success": True, "name": "pdf", "content": ["not", "a", "string"]}
+        ),
+    ):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[loaded]), messages, "task-1"
+        )
+
+    assert agent._pending_skill_reloads == ["pdf"]
+
+
 def test_support_file_view_does_not_clear_live_or_rehydrated_main_reload(
     tmp_path: Path, monkeypatch
 ):
