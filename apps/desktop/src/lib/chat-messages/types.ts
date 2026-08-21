@@ -17,6 +17,13 @@ export type ChatMessage = {
   id: string
   role: SessionMessage['role']
   parts: ChatMessagePart[]
+  /** Client-side delivery truth for an optimistic user bubble. Cleared once
+   *  the gateway starts that exact message; absent on durable history. */
+  deliveryState?: 'failed' | 'queued' | 'sending'
+  /** A mid-tool redirect has been accepted but cannot reach the model until
+   *  the current tool batch ends. Cleared with deliveryState on the first
+   *  subsequent model-originated event for this session. */
+  deliveryClearsOnProgress?: boolean
   timestamp?: number
   completedAt?: number
   pending?: boolean
@@ -71,6 +78,8 @@ export type GatewayEventPayload = {
   yolo?: boolean
   running?: boolean
   turn_started_at?: number | null
+  last_activity_at?: number | null
+  last_activity_description?: string
   cwd?: string
   branch?: string
   terminal_backend?: string
@@ -164,4 +173,7 @@ export type GatewayEventPayload = {
   // with FailoverReason.billing (shape mirrors @hermes/shared BillingBlock).
   billing?: BillingBlock
   failure_reason?: string
+  /** Correlates message.start with the optimistic user bubble that produced
+   *  the turn. Older gateways omit it. */
+  client_message_id?: string
 }

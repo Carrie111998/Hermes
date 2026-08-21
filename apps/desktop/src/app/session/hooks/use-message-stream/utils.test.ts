@@ -38,6 +38,26 @@ describe('sessionInfoStatePatch / hasSessionInfoStatePatch', () => {
     expect(hasSessionInfoStatePatch(patch)).toBe(true)
     expect(hasSessionInfoStatePatch(sessionInfoStatePatch(payload({})))).toBe(false)
   })
+
+  it('converts and clears durable activity fields', () => {
+    expect(
+      sessionInfoStatePatch(
+        payload({
+          last_activity_at: 10,
+          last_activity_description: 'executing tool: terminal'
+        })
+      )
+    ).toMatchObject({
+      lastActivityAt: 10_000,
+      lastActivityDescription: 'executing tool: terminal'
+    })
+
+    expect(
+      sessionInfoStatePatch(
+        payload({ last_activity_at: null, last_activity_description: '' })
+      )
+    ).toMatchObject({ lastActivityAt: null, lastActivityDescription: '' })
+  })
 })
 
 describe('delegateTaskPayloads', () => {

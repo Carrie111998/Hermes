@@ -344,6 +344,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         id: optimisticId,
         role: 'user',
         parts: [textPart(bubbleText || (attachmentRefs.length ? '' : attachments.map(a => a.label).join(', ')))],
+        deliveryState: 'sending',
         timestamp: submittedAt,
         attachmentRefs
       })
@@ -417,6 +418,18 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           state => ({
             ...state,
             messages: state.messages.map(message => (message.id === optimisticId ? buildUserMessage() : message))
+          }),
+          targetStoredSessionId
+        )
+
+      const setOptimisticDeliveryState = (sid: string, deliveryState: ChatMessage['deliveryState']) =>
+        updateSessionState(
+          sid,
+          state => ({
+            ...state,
+            messages: state.messages.map(message =>
+              message.id === optimisticId ? { ...message, deliveryState } : message
+            )
           }),
           targetStoredSessionId
         )
@@ -694,6 +707,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         const submitParams = (targetId: string) => ({
           session_id: targetId,
           text,
+          client_message_id: optimisticId,
           ...(interrupted && { interrupted }),
           // Off-screen widget intent: the gateway types the persisted user
           // row display_kind=hidden so no client renders it as a bubble.
@@ -720,17 +734,36 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         try {
           const recoverStoredSessionId = targetStoredSessionId ?? selectedStoredSessionIdRef.current
 
-          await withSessionNotFoundResume(
+          const submitted = await withSessionNotFoundResume(
             sessionId,
             recoverStoredSessionId,
             liveId =>
               withSessionBusyRetry(() =>
-                requestGateway('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+                requestGateway<{ status?: string }>(
+                  'prompt.submit',
+                  submitParams(liveId),
+                  PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
+                )
               ),
             {
               requestGateway,
               driftReason: sessionDriftReason,
               onRecovered: recoveredId => {
+                const staleSessionId = sessionId
+
+                if (staleSessionId !== recoveredId) {
+                  // The retry will stream against the recovered runtime, so
+                  // move the optimistic row there before it can acknowledge.
+                  // Keeping the same optimistic id preserves the gateway's
+                  // client_message_id correlation across both attempts.
+                  dropOptimistic(staleSessionId)
+                  seedOptimistic(recoveredId)
+                }
+
+                // Update this inside the recovery callback so a failed retry
+                // is also surfaced on the recovered runtime, not the stale id.
+                sessionId = recoveredId
+
                 if (targetIsCurrentView()) {
                   activeSessionIdRef.current = recoveredId
                   setActiveSessionId(recoveredId)
@@ -742,6 +775,9 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             // instead of erroring out and losing the session binding.
             { alsoTimeout: true }
           )
+
+          sessionId = submitted.sessionId
+          setOptimisticDeliveryState(submitted.sessionId, submitted.result?.status === 'queued' ? 'queued' : undefined)
         } catch (firstErr) {
           if (firstErr instanceof SessionRecoveryAborted) {
             console.warn('[submit-drift-abort]', firstErr.reason, { phase: 'post-resume-retry' })
@@ -778,6 +814,8 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         if (options?.fromQueue && isSessionBusyError(err)) {
           return false
         }
+
+        setOptimisticDeliveryState(sessionId, 'failed')
 
         const message = inlineErrorMessage(err, copy.promptFailed)
         const occurredAt = Date.now() / 1000

@@ -1,7 +1,7 @@
 import { registryBackendScopeKey } from '@hermes/shared'
 import { useCallback, useEffect, useRef } from 'react'
 
-import type { GatewayEventPayload } from '@/lib/chat-messages'
+import type { ChatMessage, GatewayEventPayload } from '@/lib/chat-messages'
 import {
   approvalReplaySessionId,
   resolveGatewayEventSessionId,
@@ -77,6 +77,50 @@ const PROVIDER_WAIT_SUPERSEDING_EVENT_TYPES = new Set([
   'tool.progress',
   'tool.start'
 ])
+
+/**
+ * A redirect accepted while a tool batch is executing is not visible to the
+ * model until that batch reaches its safe boundary. The gateway marks that
+ * acknowledgement as `delivery=tool_boundary`; the first later event that
+ * can only come from another model step proves the correction was consumed.
+ *
+ * Deliberately exclude tool.progress/tool.complete: concurrent tools from the
+ * original batch can keep emitting both before the boundary is crossed.
+ */
+const DEFERRED_REDIRECT_PROGRESS_EVENT_TYPES = new Set([
+  'message.complete',
+  'message.delta',
+  'message.interim',
+  'message.start',
+  'moa.aggregating',
+  'moa.phase',
+  'moa.progress',
+  'moa.reference',
+  'reasoning.available',
+  'reasoning.delta',
+  'thinking.delta',
+  'tool.generating'
+])
+
+function settleDeferredRedirects(messages: ChatMessage[]): ChatMessage[] {
+  let changed = false
+
+  const next = messages.map(message => {
+    if (!message.deliveryClearsOnProgress) {
+      return message
+    }
+
+    changed = true
+
+    return {
+      ...message,
+      deliveryState: undefined,
+      deliveryClearsOnProgress: undefined
+    }
+  })
+
+  return changed ? next : messages
+}
 
 // Ordered family handlers; each consumes its own event types and reports
 // whether it did, so dispatch stops at the first taker.
@@ -194,6 +238,19 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       }
 
       const isActiveEvent = !!sessionId && sessionId === activeSessionIdRef.current
+
+      const hasDeferredRedirect =
+        !!sessionId &&
+        DEFERRED_REDIRECT_PROGRESS_EVENT_TYPES.has(event.type) &&
+        sessionStateByRuntimeIdRef.current.get(sessionId)?.messages.some(message => message.deliveryClearsOnProgress)
+
+      if (sessionId && hasDeferredRedirect) {
+        deps.updateSessionState(sessionId, state => {
+          const messages = settleDeferredRedirects(state.messages)
+
+          return messages === state.messages ? state : { ...state, messages }
+        })
+      }
 
       const replaySessionId = approvalReplaySessionId(event.type, activeSessionIdRef.current, sessionId)
 
