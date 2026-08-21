@@ -59,6 +59,49 @@ class TestCodexBuildKwargs:
         assert pck.startswith("pck_")
         assert pck != "cron_job42_20260624_143000"
 
+    def test_ollama_cloud_reasoning_effort_max_stays_max(self, transport):
+        """Ollama Cloud's OpenAI-compatible endpoint accepts 'max' but rejects
+        'xhigh'. The codex transport must use the Ollama Cloud effort vocabulary
+        so a configured reasoning_effort of max is not downgraded to xhigh."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="deepseek-v4-flash",
+            messages=messages,
+            tools=[],
+            reasoning_config={"enabled": True, "effort": "max"},
+            provider="ollama-cloud",
+            base_url="https://ollama.com/v1",
+        )
+        assert kw.get("reasoning") == {"effort": "max", "summary": "auto"}
+
+    def test_ollama_cloud_reasoning_effort_xhigh_clamps_to_max(self, transport):
+        """xhigh is not in Ollama Cloud's accepted effort set; it must be clamped
+        to the strongest accepted level, which is max."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="deepseek-v4-flash",
+            messages=messages,
+            tools=[],
+            reasoning_config={"enabled": True, "effort": "xhigh"},
+            provider="ollama-cloud",
+            base_url="https://ollama.com/v1",
+        )
+        assert kw.get("reasoning") == {"effort": "max", "summary": "auto"}
+
+    def test_ollama_cloud_reasoning_effort_high_stays_high(self, transport):
+        """A supported effort level within Ollama Cloud's vocabulary passes through
+        unchanged."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="deepseek-v4-flash",
+            messages=messages,
+            tools=[],
+            reasoning_config={"enabled": True, "effort": "high"},
+            provider="ollama-cloud",
+            base_url="https://ollama.com/v1",
+        )
+        assert kw.get("reasoning") == {"effort": "high", "summary": "auto"}
+
     def test_cache_key_stable_across_session_ids(self, transport):
         """Same static prefix + different session_id (e.g. two cron fires of the
         same job) must yield the same prompt_cache_key — the whole point of the

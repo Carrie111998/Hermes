@@ -29,6 +29,8 @@ def _cache_scope_from_session_id(session_id: Optional[str]) -> str:
 
 from agent.reasoning_effort import (
     ACTUAL_RELAY_EFFORTS,
+    OLLAMA_CLOUD_EFFORTS,
+    OLLAMA_CLOUD_OVERRIDES,
     XAI_GROK46_EFFORTS,
     XAI_LEGACY_EFFORTS,
     clamp_effort,
@@ -495,6 +497,7 @@ class ResponsesApiTransport(ProviderTransport):
         # repeatedly leaked internal levels like "ultra" to the wire
         # (#89503 class) or clamped one rung below a model's real ceiling
         # (#87279).
+        provider_lower = (params.get("provider") or "").strip().lower()
         if params.get("is_xai_responses", False):
             from agent.model_metadata import is_grok_46_family
 
@@ -504,16 +507,26 @@ class ResponsesApiTransport(ProviderTransport):
                 XAI_GROK46_EFFORTS if is_grok_46_family(model)
                 else XAI_LEGACY_EFFORTS
             )
-        elif (params.get("provider") or "").strip().lower() == "actual":
+            _overrides = None
+        elif provider_lower == "actual":
             # Actual Computer relays to SGLang/vLLM backends:
             # none/low/medium/high/max.
             _supported = ACTUAL_RELAY_EFFORTS
+            _overrides = None
+        elif provider_lower == "ollama-cloud":
+            # Ollama Cloud's OpenAI-compatible endpoint accepts
+            # none/low/medium/high/max and rejects xhigh. Use its declared
+            # vocabulary plus xhigh→max override so reasoning_effort=max
+            # is not downgraded to xhigh and then rejected.
+            _supported = OLLAMA_CLOUD_EFFORTS
+            _overrides = OLLAMA_CLOUD_OVERRIDES
         else:
             # OpenAI/Codex Responses backend — per-model vocabulary
             # (live-verified: "max" is gpt-5.6-only, "minimal" always
             # rejected). #68365 premise confirmed.
             _supported = codex_supported_efforts(model)
-        reasoning_effort = clamp_effort(reasoning_effort, _supported)
+            _overrides = None
+        reasoning_effort = clamp_effort(reasoning_effort, _supported, _overrides)
 
         response_tools = _responses_tools(tools)
 
