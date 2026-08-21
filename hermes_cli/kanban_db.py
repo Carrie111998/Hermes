@@ -1334,6 +1334,78 @@ def release_stale_claims(conn: sqlite3.Connection) -> int:
     return reclaimed
 
 
+def _profile_quiet_mode(profile: str) -> tuple[str, str] | None:
+    """Return an assignee quiet-mode marker and reason, if the profile is paused."""
+    from hermes_constants import get_hermes_home
+
+    marker = get_hermes_home() / "profiles" / profile / ".quiet_mode"
+    try:
+        if not marker.is_file():
+            return None
+        reason = marker.read_text(encoding="utf-8").strip() or "quiet mode marker present"
+        return str(marker), reason[:1000]
+    except OSError:
+        return None
+
+
+def release_task_for_retry(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    summary: str | None = None,
+    metadata: dict | None = None,
+) -> bool:
+    """Close a running worker attempt and make the task dispatchable again."""
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'ready', claim_lock = NULL, claim_expires = NULL,
+                   worker_pid = NULL
+             WHERE id = ? AND status = 'running'
+            """,
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id, outcome="released", status="released", summary=summary,
+            error=reason, metadata=metadata,
+        )
+        _append_event(conn, task_id, "released", {"reason": reason, **(metadata or {})}, run_id=run_id)
+        return True
+
+
+def record_worker_child_crash(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    error: str,
+    metadata: dict | None = None,
+) -> bool:
+    """Record a child exit as a terminal attempt and release it for retry."""
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'ready', claim_lock = NULL, claim_expires = NULL,
+                   worker_pid = NULL
+             WHERE id = ? AND status = 'running'
+            """,
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id, outcome="crashed", status="crashed", error=error,
+            summary="Worker child exited before completing the task; released for retry.",
+            metadata=metadata,
+        )
+        _append_event(conn, task_id, "crashed", {"error": error, **(metadata or {})}, run_id=run_id)
+        return True
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,

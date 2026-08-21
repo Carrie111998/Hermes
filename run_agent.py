@@ -5838,10 +5838,11 @@ class AIAgent:
                             )
                     final_response = stream.get_final_response()
                     # PATCH: ChatGPT Codex backend streams valid output items
-                    # but get_final_response() can return an empty output list.
-                    # Backfill from collected items or synthesize from deltas.
+                    # but get_final_response() can return an empty output list
+                    # — or, on aicodemirror, a None output. Backfill from
+                    # collected items or synthesize from deltas in either case.
                     _out = getattr(final_response, "output", None)
-                    if isinstance(_out, list) and not _out:
+                    if _out is None or (isinstance(_out, list) and not _out):
                         if collected_output_items:
                             final_response.output = list(collected_output_items)
                             logger.debug(
@@ -5879,6 +5880,22 @@ class AIAgent:
                 return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
             except RuntimeError as exc:
                 err_text = str(exc)
+                codex_rate_limits_before_created = (
+                    "codex.rate_limits" in err_text
+                    and "response.created" in err_text
+                )
+                delta_before_created = (
+                    "response.output_text.delta" in err_text
+                    and "response.created" in err_text
+                )
+                if codex_rate_limits_before_created or delta_before_created:
+                    logger.warning(
+                        "Codex Responses stream lifecycle event arrived out of order; "
+                        "falling back to create(stream=True). %s error=%s",
+                        self._client_log_context(),
+                        exc,
+                    )
+                    return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
                 missing_completed = "response.completed" in err_text
                 if missing_completed and attempt < max_stream_retries:
                     logger.debug(
@@ -5895,6 +5912,43 @@ class AIAgent:
                     )
                     return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
                 raise
+            except TypeError as exc:
+                # Patched 2026-05-27: aicodemirror (and other Codex-compatible
+                # backends) occasionally emit a `response.completed` event
+                # whose `response.output` field is `null` instead of a list.
+                # The OpenAI SDK's accumulate_event → parse_response path
+                # iterates `response.output` without a None guard
+                # (openai/lib/_parsing/_responses.py line ~61), raising
+                # "TypeError: 'NoneType' object is not iterable" mid-stream.
+                # We have streamed deltas / collected items in hand — recover
+                # by synthesizing a final_response from them, or fall back to
+                # the non-streaming create() path which has its own backfill.
+                if "iterable" not in str(exc) and "output" not in str(exc):
+                    raise
+                streamed_chars = sum(len(p) for p in self._codex_streamed_text_parts)
+                logger.warning(
+                    "Codex Responses stream: SDK parse failed with NoneType.output "
+                    "(backend sent malformed response.completed). "
+                    "Recovered chars=%d items=%d. Falling back to create(stream=True). %s",
+                    streamed_chars, len(collected_output_items),
+                    self._client_log_context(),
+                )
+                if collected_output_items or streamed_chars > 0:
+                    synthesized = SimpleNamespace(
+                        output=list(collected_output_items) if collected_output_items else [
+                            SimpleNamespace(
+                                type="message", role="assistant", status="completed",
+                                content=[SimpleNamespace(
+                                    type="output_text",
+                                    text="".join(self._codex_streamed_text_parts),
+                                )],
+                            )
+                        ],
+                        status="completed",
+                        output_text="".join(self._codex_streamed_text_parts) or None,
+                    )
+                    return synthesized
+                return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
 
     def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
         """Fallback path for stream completion edge cases on Codex-style Responses backends."""
@@ -5941,9 +5995,11 @@ class AIAgent:
                 if terminal_response is None and isinstance(event, dict):
                     terminal_response = event.get("response")
                 if terminal_response is not None:
-                    # Backfill empty output from collected stream events
+                    # Backfill empty output from collected stream events.
+                    # Patched 2026-05-27: also treat output=None as empty
+                    # (aicodemirror sometimes returns null instead of []).
                     _out = getattr(terminal_response, "output", None)
-                    if isinstance(_out, list) and not _out:
+                    if _out is None or (isinstance(_out, list) and not _out):
                         if collected_output_items:
                             terminal_response.output = list(collected_output_items)
                             logger.debug(
@@ -7707,10 +7763,12 @@ class AIAgent:
 
     # Which error types indicate a transient transport failure worth
     # one more attempt with a rebuilt client / connection pool.
+    # APITimeoutError removed — timeouts should fallback immediately rather than
+    # rebuilding the client and retrying the same slow/overloaded provider.
     _TRANSIENT_TRANSPORT_ERRORS = frozenset({
         "ReadTimeout", "ConnectTimeout", "PoolTimeout",
         "ConnectError", "RemoteProtocolError",
-        "APIConnectionError", "APITimeoutError",
+        "APIConnectionError",
     })
 
     def _try_recover_primary_transport(
@@ -8280,12 +8338,18 @@ class AIAgent:
             )
             is_xai_responses = self.provider == "xai" or self._base_url_hostname == "api.x.ai"
             _msgs_for_codex = self._prepare_messages_for_non_vision_model(api_messages)
+            codex_session_id = getattr(self, "session_id", None)
+            if (
+                self.provider == "aicodemirror"
+                or self._base_url_hostname == "api.aicodemirror.com"
+            ):
+                codex_session_id = None
             return _ct.build_kwargs(
                 model=self.model,
                 messages=_msgs_for_codex,
                 tools=self.tools,
                 reasoning_config=self.reasoning_config,
-                session_id=getattr(self, "session_id", None),
+                session_id=codex_session_id,
                 max_tokens=self.max_tokens,
                 request_overrides=self.request_overrides,
                 is_github_responses=is_github_responses,
@@ -10651,6 +10715,11 @@ class AIAgent:
         truncated_response_prefix = ""
         compression_attempts = 0
         _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+        # Provider recovery may culminate in the visible `(empty)` sentinel.
+        # It must remain distinguishable from a successfully completed user turn.
+        _turn_failed = False
+        _needs_session_reset = False
+        _failure_code = None
         
         # Record the execution thread so interrupt()/clear_interrupt() can
         # scope the tool-level interrupt signal to THIS agent's thread only.
@@ -12547,6 +12616,21 @@ class AIAgent:
                         # ssl.SSLError explicitly so the error classifier's
                         # retryable=True mapping takes effect instead.
                         and not isinstance(api_error, ssl.SSLError)
+                        # Patched 2026-05-27: a TypeError raised mid-stream after
+                        # fallback activation is overwhelmingly an SDK/transport
+                        # mismatch with leftover state (e.g. reasoning items from
+                        # the primary model, an empty Codex output list, a None
+                        # tool_calls field on a SimpleNamespace).  These are
+                        # recoverable by retrying with another fallback or fresh
+                        # request — they are NOT local programming bugs in the
+                        # agent's own code.  Treating them as non-retryable
+                        # caused 6+ hours of cron-spam on 2026-05-27.  When
+                        # fallback is active, demote TypeError to a retryable
+                        # transport-class error.
+                        and not (
+                            isinstance(api_error, TypeError)
+                            and getattr(self, "_fallback_activated", False)
+                        )
                     )
                     is_client_error = (
                         is_local_validation_error
@@ -12600,7 +12684,7 @@ class AIAgent:
                                     self._vprint(f"{self.log_prefix}      • Check credits: https://openrouter.ai/settings/credits", force=True)
                         else:
                             self._vprint(f"{self.log_prefix}   💡 This type of error won't be fixed by retrying.", force=True)
-                        logging.error(f"{self.log_prefix}Non-retryable client error: {api_error}")
+                        logging.error(f"{self.log_prefix}Non-retryable client error: {api_error}", exc_info=True)
                         # Skip session persistence when the error is likely
                         # context-overflow related (status 400 + large session).
                         # Persisting the failed user message would make the
@@ -12681,6 +12765,7 @@ class AIAgent:
                             "%sAPI call failed after %s retries. %s | provider=%s model=%s msgs=%s tokens=~%s",
                             self.log_prefix, max_retries, _final_summary,
                             _provider, _model, len(api_messages), f"{approx_tokens:,}",
+                            exc_info=True,
                         )
                         if api_kwargs is not None:
                             self._dump_api_request_debug(
@@ -13486,7 +13571,10 @@ class AIAgent:
                         # Exhausted retries and fallback chain (or no
                         # fallback configured).  Fall through to the
                         # "(empty)" terminal.
-                        _turn_exit_reason = "empty_response_exhausted"
+                        _turn_exit_reason = "provider_empty_response"
+                        _turn_failed = True
+                        _needs_session_reset = True
+                        _failure_code = "provider_empty_response"
                         reasoning_text = self._extract_reasoning(assistant_message)
                         assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
                         assistant_msg["content"] = "(empty)"
@@ -13650,7 +13738,11 @@ class AIAgent:
             final_response = self._handle_max_iterations(messages, api_call_count)
         
         # Determine if conversation completed successfully
-        completed = final_response is not None and api_call_count < self.max_iterations
+        completed = (
+            final_response is not None
+            and api_call_count < self.max_iterations
+            and not _turn_failed
+        )
 
         # Save trajectory if enabled.  ``user_message`` may be a multimodal
         # list of parts; the trajectory format wants a plain string.
@@ -13710,7 +13802,7 @@ class AIAgent:
         # Fired once per turn after the tool-calling loop completes.
         # Plugins can use this to persist conversation data (e.g. sync
         # to an external memory system).
-        if final_response and not interrupted:
+        if final_response and not interrupted and not _turn_failed:
             try:
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
                 _invoke_hook(
@@ -13740,6 +13832,9 @@ class AIAgent:
             "api_calls": api_call_count,
             "completed": completed,
             "turn_exit_reason": _turn_exit_reason,
+            "failed": _turn_failed,
+            "failure_code": _failure_code,
+            "needs_session_reset": _needs_session_reset,
             "partial": False,  # True only when stopped due to invalid tool calls
             "interrupted": interrupted,
             "response_previewed": getattr(self, "_response_was_previewed", False),
@@ -13788,15 +13883,16 @@ class AIAgent:
             self._iters_since_skill = 0
 
         # External memory provider: sync the completed turn + queue next prefetch.
-        self._sync_external_memory_for_turn(
-            original_user_message=original_user_message,
-            final_response=final_response,
-            interrupted=interrupted,
-        )
+        if not _turn_failed:
+            self._sync_external_memory_for_turn(
+                original_user_message=original_user_message,
+                final_response=final_response,
+                interrupted=interrupted,
+            )
 
         # Background memory/skill review — runs AFTER the response is delivered
         # so it never competes with the user's task for model attention.
-        if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+        if final_response and not interrupted and not _turn_failed and (_should_review_memory or _should_review_skills):
             try:
                 self._spawn_background_review(
                     messages_snapshot=list(messages),

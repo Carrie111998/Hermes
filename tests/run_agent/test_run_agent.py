@@ -2416,8 +2416,11 @@ class TestRunConversation:
             result = agent.run_conversation("hello", conversation_history=prefill)
 
         mock_compress.assert_not_called()  # no compression triggered
-        assert result["completed"] is True
+        assert result["completed"] is False
         assert result["final_response"] == "(empty)"
+        assert result["turn_exit_reason"] == "provider_empty_response"
+        assert result["failure_code"] == "provider_empty_response"
+        assert result["needs_session_reset"] is True
         assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
 
     def test_reasoning_only_response_prefill_then_empty(self, agent):
@@ -2436,8 +2439,11 @@ class TestRunConversation:
             patch.object(agent, "_cleanup_task_resources"),
         ):
             result = agent.run_conversation("answer me")
-        assert result["completed"] is True
+        assert result["completed"] is False
         assert result["final_response"] == "(empty)"
+        assert result["turn_exit_reason"] == "provider_empty_response"
+        assert result["failure_code"] == "provider_empty_response"
+        assert result["needs_session_reset"] is True
         assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
 
     def test_reasoning_only_prefill_succeeds_on_continuation(self, agent):
@@ -2483,8 +2489,12 @@ class TestRunConversation:
             patch.object(agent, "_cleanup_task_resources"),
         ):
             result = agent.run_conversation("answer me")
-        assert result["completed"] is True
+        assert result["completed"] is False
         assert result["final_response"] == "(empty)"
+        assert result["turn_exit_reason"] == "provider_empty_response"
+        assert result["failed"] is True
+        assert result["failure_code"] == "provider_empty_response"
+        assert result["needs_session_reset"] is True
         assert result["api_calls"] == 4  # 1 original + 3 retries
 
     def test_truly_empty_response_succeeds_on_nudge(self, agent):
@@ -2579,8 +2589,11 @@ class TestRunConversation:
             patch.object(agent, "_try_activate_fallback", side_effect=_mock_fallback),
         ):
             result = agent.run_conversation("answer me")
-        assert result["completed"] is True
+        assert result["completed"] is False
         assert result["final_response"] == "(empty)"
+        assert result["turn_exit_reason"] == "provider_empty_response"
+        assert result["failure_code"] == "provider_empty_response"
+        assert result["needs_session_reset"] is True
 
     def test_empty_response_emits_status_for_gateway(self, agent):
         """_emit_status is called during empty retries so gateway users see feedback."""
