@@ -11236,6 +11236,41 @@ def _is_electron_packaged_web_dist(path: str) -> bool:
     return "app.asar" in path.replace("\\", "/")
 
 
+def _serve_should_force_headless(headless_backend: bool, env=None) -> bool:
+    """True when ``hermes serve`` must disable the browser SPA.
+
+    ``serve`` is the headless backend: a standalone `hermes serve` is not a
+    dashboard, so it forces ``HERMES_SERVE_HEADLESS=1`` and ``mount_spa()``
+    404s every frontend route.
+
+    The one exception is a desktop-spawned backend that was handed a dist to
+    serve (#91495). Electron spawns `hermes serve` with ``HERMES_DESKTOP=1``
+    and ``HERMES_WEB_DIST`` pointing at its own packaged dist, and the env
+    sanitizer in ``cmd_dashboard`` deliberately keeps that dist for exactly
+    this process ("The desktop-spawned backend itself (HERMES_DESKTOP=1) keeps
+    its dist"). Forcing headless then 404s the dist we just went out of our way
+    to preserve, so the desktop shell cannot load its own embedded renderer.
+
+    BOTH markers are required, not just ``HERMES_DESKTOP``. The desktop also
+    spawns remote backends over SSH as ``env HERMES_DESKTOP=1 hermes serve
+    --isolated`` with no dist (``apps/desktop/electron/remote-lifecycle.ts``);
+    there the renderer is local and the remote is purely an API server, so it
+    must stay headless -- and exempting it would fall through to the branch
+    that runs ``_build_web_ui(..., fatal=True)`` on the remote host. Reading
+    ``HERMES_WEB_DIST`` here is also read-after-sanitize: the sanitizer above
+    has already dropped an Electron-packaged dist inherited from someone
+    else's environment, so this sees only a dist meant for this process.
+
+    Pure so the decision is testable without booting a server.
+    """
+    if not headless_backend:
+        return False
+    env = os.environ if env is None else env
+    if env.get("HERMES_DESKTOP") != "1":
+        return True
+    return not (env.get("HERMES_WEB_DIST") or "").strip()
+
+
 def cmd_dashboard(args):
     """Start the web UI server, or (with --stop/--status) manage running ones."""
     _token_file = getattr(args, "ssh_session_token_file", None)
@@ -11444,10 +11479,24 @@ def cmd_dashboard(args):
         logger.debug("terminal config → env bridge failed for dashboard/serve",
                      exc_info=True)
 
-    if _headless_backend:
+    if _serve_should_force_headless(_headless_backend):
         # Don't build the SPA, and tell mount_spa() (read at web_server import
         # below) to disable it even if a stray dist exists. Set it first.
+        #
+        # A desktop-spawned backend carrying its own HERMES_WEB_DIST is the one
+        # exemption (#91495): the sanitizer above deliberately KEEPS that dist
+        # for this process, and 404ing it here contradicts that. See
+        # _serve_should_force_headless for why both markers are required.
         os.environ["HERMES_SERVE_HEADLESS"] = "1"
+    elif _headless_backend:
+        # Desktop-exempt `serve`. Declining to SET the flag is not enough: the
+        # sanitizer's pop above is gated on `not _headless_backend`, so it never
+        # runs on this path, and an inherited HERMES_SERVE_HEADLESS=1 (exported
+        # in the user's shell, then handed to the backend by Electron's
+        # `...process.env` spawn) would still reach mount_spa and 404 the dist.
+        # The exemption has to be authoritative to be worth anything.
+        # Credit to @Enough1122, who raised this on #84444.
+        os.environ.pop("HERMES_SERVE_HEADLESS", None)
     elif "HERMES_WEB_DIST" not in os.environ and not getattr(args, "skip_build", False):
         if not _build_web_ui(PROJECT_ROOT / "web", fatal=True):
             sys.exit(1)
