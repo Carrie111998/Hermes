@@ -1321,11 +1321,15 @@ export async function resolveStoredSession(
       upsertResolvedSession(session, storedSessionId)
 
       return session
-    } catch {
-      // The caller supplied an authoritative owner. A miss there means this
-      // id is missing/stale for that profile; never hunt through unrelated
-      // profiles trying to rediscover ownership the caller already supplied.
-      return undefined
+    } catch (error) {
+      // A genuine missing session ends the authoritative lookup here. A
+      // transport/gateway failure is inconclusive: preserve the owner and
+      // let the caller arm its bounded retry instead of treating it as 404.
+      if (isSessionGoneError(error)) {
+        return undefined
+      }
+
+      throw error
     }
   }
 

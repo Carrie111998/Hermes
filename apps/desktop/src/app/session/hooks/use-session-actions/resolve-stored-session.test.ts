@@ -96,6 +96,16 @@ describe('resolveStoredSession profile ownership', () => {
     expect(mockGetSession).toHaveBeenCalledWith('s1', 'katana')
   })
 
+  it('propagates transient explicit-owner failures without scanning other profiles', async () => {
+    $profiles.set(profiles('default', 'katana', 'agency-ai-engineer'))
+    $activeGatewayProfile.set('katana')
+    mockGetSession.mockRejectedValueOnce(new Error('ECONNREFUSED: gateway restarting'))
+
+    await expect(resolveStoredSession('s1', 'katana')).rejects.toThrow('ECONNREFUSED: gateway restarting')
+    expect(mockGetSession).toHaveBeenCalledTimes(1)
+    expect(mockGetSession).toHaveBeenCalledWith('s1', 'katana')
+  })
+
   it('scopes the first by-id lookup so a miss does not skip the active profile', async () => {
     $activeGatewayProfile.set('brain')
     $profiles.set(profiles('default', 'brain'))
