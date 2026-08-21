@@ -518,6 +518,17 @@ async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
   await removeLockfile(ssh, ownershipId)
 }
 
+async function disconnect(ssh, ownershipId) {
+  const lock = await readLockfile(ssh, ownershipId)
+
+  if (!lock) {
+    return
+  }
+
+  const pidAlive = await remotePidAlive(ssh, lock.pid)
+  await cleanupStale(ssh, ownershipId, lock, pidAlive)
+}
+
 // Detach so the backend survives the SSH channel closing: setsid (Linux)
 // starts a new session; macOS has no setsid, so fall back to nohup (HUP-immune;
 // fd-detachment is already handled by </dev/null + redirect + &).
@@ -960,6 +971,7 @@ export {
   cleanupStale,
   connect,
   DEFAULT_READY_TIMEOUT_MS,
+  disconnect,
   expandRemotePath,
   fingerprintToken,
   isForwardBindCollision,

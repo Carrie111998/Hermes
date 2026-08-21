@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 
-import { test } from 'vitest'
+import { expect, test, vi } from 'vitest'
 
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 
@@ -127,6 +127,24 @@ test('cancelAll invalidates every pending scope and exposes promises for quit', 
   gates.forEach(gate => gate.resolve())
   const results = await Promise.allSettled(promises)
   assert.ok(results.every(result => result.status === 'rejected' && (result.reason as any).kind === 'superseded'))
+})
+
+test('shutdown cancels active bootstraps and permanently rejects respawn attempts', async () => {
+  const coordinator = createBootstrapCoordinator()
+  const gate = deferred()
+
+  const active = coordinator.start('primary', 'old', async lease => {
+    await gate.promise
+    lease.assertCurrent()
+  })
+
+  coordinator.shutdown()
+  gate.resolve()
+
+  await expect(active).rejects.toMatchObject({ kind: 'superseded' })
+  const run = vi.fn(async () => undefined)
+  await expect(coordinator.start('primary', 'new', run)).rejects.toMatchObject({ kind: 'superseded' })
+  expect(run).not.toHaveBeenCalled()
 })
 
 test('cancelAndWait drains only the requested scope', async () => {

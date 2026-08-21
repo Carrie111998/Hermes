@@ -54,4 +54,26 @@ async function resolveTerminalConnection(getTarget, ensureBackend) {
   return target
 }
 
-export { applyConnectionChange, commitConnectionFailure, resolveTerminalConnection }
+async function teardownSshState(state, { cleanupRemote }) {
+  try {
+    await cleanupRemote(state.ssh, state.ownershipId)
+  } catch {
+    // Remote teardown is best-effort; always release the local tunnel and SSH transport.
+  }
+
+  try {
+    if (state.localPort && state.remotePort) {
+      await state.ssh.cancelForward(state.localPort, state.remotePort)
+    }
+  } catch {
+    // Best effort; closing the transport below drops any remaining forwards.
+  }
+
+  try {
+    await state.ssh.close()
+  } catch {
+    // The app must still be able to quit when SSH teardown fails.
+  }
+}
+
+export { applyConnectionChange, commitConnectionFailure, resolveTerminalConnection, teardownSshState }
