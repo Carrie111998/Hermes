@@ -40,6 +40,7 @@ import { $previewTarget } from '@/store/preview'
 import {
   $activeGatewayProfile,
   $freshSessionRequest,
+  $newChatProfile,
   $profileScope,
   ALL_PROFILES,
   ensureGatewayProfile,
