@@ -118,6 +118,16 @@ class TestPerJobToolsetMcpMerge:
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
 
+    def test_resolver_malformed_platform_toolsets_fails_closed(self):
+        # F7/P4: a malformed platform_toolsets.cron value (unparseable
+        # quoted-JSON list literal) must NOT silently widen the cron toolset
+        # back to the full default. The resolver raises ValueError (fail
+        # closed) instead of returning None (which AIAgent reads as
+        # "full default toolset").
+        cfg = {"platform_toolsets": {"cron": "[broken"}}
+        with pytest.raises(ValueError):
+            _resolve_cron_enabled_toolsets({"enabled_toolsets": None}, cfg)
+
 
 class TestResolveOrigin:
     def test_full_origin(self):

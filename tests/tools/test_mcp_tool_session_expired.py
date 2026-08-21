@@ -144,6 +144,15 @@ def test_call_tool_handler_rebuilds_configured_server_transport(
     from tools.mcp_tool import MCPServerTask, _make_tool_handler
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    # This test exercises transport recovery, not the independent F5 approval
+    # gate. Production registration records trust metadata before handlers run.
+    monkeypatch.setitem(
+        mcp_tool._server_trust_levels,
+        mcp_tool._mcp_scope_key("resumed"),
+        "full",
+    )
+
     mcp_tool._ensure_mcp_loop()
     transport_ready = threading.Event()
     routes = []
@@ -220,6 +229,14 @@ def test_session_expired_retry_waits_for_new_session(monkeypatch, tmp_path):
 
     from tools import mcp_tool
     from tools.mcp_tool import _make_tool_handler
+
+    # Keep this focused on session-expiry recovery; production registration
+    # installs the server's trust decision before exposing its handlers.
+    monkeypatch.setitem(
+        mcp_tool._server_trust_levels,
+        mcp_tool._mcp_scope_key("hindsight"),
+        "full",
+    )
 
     mcp_tool._ensure_mcp_loop()
     server = MagicMock()

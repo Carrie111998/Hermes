@@ -73,16 +73,21 @@ def fake_session():
 def _clean_trust_state():
     """Isolate the module-level trust metadata between tests."""
     with patch.dict(mcp_tool._server_trust_levels, {}, clear=True), \
-         patch.dict(mcp_tool._tool_read_only_hints, {}, clear=True):
+         patch.dict(mcp_tool._tool_read_only_hints, {}, clear=True), \
+         patch.dict(mcp_tool._lazy_server_configs, {}, clear=True), \
+         patch.dict(mcp_tool._lazy_server_fingerprints, {}, clear=True), \
+         patch.dict(mcp_tool._lazy_server_tool_names, {}, clear=True):
         yield
 
 
 def _set_trust(server: str, trust: str):
-    mcp_tool._server_trust_levels[server] = trust
+    mcp_tool._server_trust_levels[mcp_tool._mcp_scope_key(server)] = trust
 
 
 def _set_read_only(server: str, tool: str, value: bool):
-    mcp_tool._tool_read_only_hints.setdefault(server, {})[tool] = value
+    mcp_tool._tool_read_only_hints.setdefault(
+        mcp_tool._mcp_scope_key(server), {}
+    )[tool] = value
 
 
 class TestTrustGateAtCallTime:
@@ -117,24 +122,28 @@ class TestTrustGateAtCallTime:
         assert "error" in json.loads(raw)
         assert "did not approve" in json.loads(raw)["error"]
 
-    def test_read_only_tool_on_untrusted_server_skips_approval(
+    def test_read_only_hint_on_untrusted_server_still_gated(
         self, fake_session
     ):
-        """readOnlyHint=True tools pass without consulting approval."""
+        """F5/P2: readOnlyHint is a SELF-declaration from the (potentially
+        hostile) server — it must NOT skip approval. An untrusted server can
+        declare its write tools read-only to bypass the gate."""
         _set_trust("srv", "untrusted")
         _set_read_only("srv", "list_repos", True)
         handler = mcp_tool._make_tool_handler("srv", "list_repos", 30.0)
         with patch(
-            "tools.approval.request_elicitation_consent"
+            "tools.approval.request_elicitation_consent",
+            return_value="decline",
         ) as consent:
             raw = handler({})
-        consent.assert_not_called()
-        assert json.loads(raw) == {"result": "ok"}
+        consent.assert_called_once()
+        fake_session.call_tool.assert_not_awaited()
+        assert "did not approve" in json.loads(raw)["error"]
 
     def test_trusted_server_skips_approval_for_write_tools(
         self, fake_session
     ):
-        """trust: full (and the default) never consults approval."""
+        """trust: full never consults approval."""
         _set_trust("srv", "full")
         handler = mcp_tool._make_tool_handler("srv", "delete_repo", 30.0)
         with patch(
@@ -144,15 +153,22 @@ class TestTrustGateAtCallTime:
         consent.assert_not_called()
         assert json.loads(raw) == {"result": "ok"}
 
-    def test_unconfigured_server_defaults_to_full_trust(self, fake_session):
-        """Backward compat: servers with no trust key behave as before."""
+    def test_unconfigured_server_defaults_to_untrusted(self, fake_session):
+        """F5: servers with no trust key default to UNTRUSTED (fail closed).
+
+        A server added without an explicit trust decision must not
+        silently get write-capable tools past approval. Operators opt into
+        ungated access with ``trust: full``.
+        """
         handler = mcp_tool._make_tool_handler("srv", "delete_repo", 30.0)
         with patch(
-            "tools.approval.request_elicitation_consent"
+            "tools.approval.request_elicitation_consent",
+            return_value="decline",
         ) as consent:
             raw = handler({"repo": "x"})
-        consent.assert_not_called()
-        assert json.loads(raw) == {"result": "ok"}
+        consent.assert_called_once()
+        fake_session.call_tool.assert_not_awaited()
+        assert "did not approve" in json.loads(raw)["error"]
 
     def test_read_only_false_hint_is_gated(self, fake_session):
         """An explicit readOnlyHint=False is write-capable."""
@@ -189,8 +205,8 @@ class TestTrustNormalization:
         assert mcp_tool._normalize_server_trust("full") == "full"
         assert mcp_tool._normalize_server_trust("UNTRUSTED") == "untrusted"
         assert mcp_tool._normalize_server_trust("  Full ") == "full"
-        # Missing key → default full (backward compatible; documented).
-        assert mcp_tool._normalize_server_trust(None) == "full"
+        # Missing key → default untrusted (fail closed, F5).
+        assert mcp_tool._normalize_server_trust(None) == "untrusted"
 
 
 class TestAnnotationCaptureAtDiscovery:
@@ -202,7 +218,10 @@ class TestAnnotationCaptureAtDiscovery:
             annotations=annotations,
         )
 
-    def test_registration_records_hints_and_trust(self):
+    def test_registration_clears_hints_for_untrusted(self):
+        """F5/P2: readOnlyHint is a SELF-declaration from the (untrusted)
+        server — the metadata must NOT be recorded, so the gate can never
+        skip approval on a server-declared hint."""
         from tools.registry import ToolRegistry
 
         server = mcp_tool.MCPServerTask("srv")
@@ -224,8 +243,39 @@ class TestAnnotationCaptureAtDiscovery:
              patch("tools.mcp_tool._track_mcp_tool_server"):
             mcp_tool._register_server_tools("srv", server, config)
 
-        assert mcp_tool._server_trust_levels["srv"] == "untrusted"
-        hints = mcp_tool._tool_read_only_hints["srv"]
+        assert mcp_tool._server_trust_levels[mcp_tool._mcp_scope_key("srv")] == "untrusted"
+        # No hints recorded for untrusted servers — a self-declared hint
+        # must never bypass approval.
+        assert mcp_tool._tool_read_only_hints.get(
+            mcp_tool._mcp_scope_key("srv"), {}
+        ) == {}
+
+    def test_registration_records_hints_for_trusted(self):
+        """F5/P2: hints are recorded only for TRUSTED servers (where the
+        gate is off anyway) — the metadata stays available for tool UI."""
+        from tools.registry import ToolRegistry
+
+        server = mcp_tool.MCPServerTask("srv")
+        server.session = MagicMock()
+        server._tools = [
+            self._make_tool(
+                "list_repos", SimpleNamespace(readOnlyHint=True)
+            ),
+            self._make_tool(
+                "delete_repo", SimpleNamespace(readOnlyHint=False)
+            ),
+            self._make_tool("no_annotations", None),
+        ]
+        config = {
+            "trust": "full",
+            "tools": {"resources": False, "prompts": False},
+        }
+        with patch("tools.registry.registry", ToolRegistry()), \
+             patch("tools.mcp_tool._track_mcp_tool_server"):
+            mcp_tool._register_server_tools("srv", server, config)
+
+        assert mcp_tool._server_trust_levels[mcp_tool._mcp_scope_key("srv")] == "full"
+        hints = mcp_tool._tool_read_only_hints[mcp_tool._mcp_scope_key("srv")]
         assert hints.get("list_repos") is True
         # Anything not exactly True is write-capable.
         assert not hints.get("delete_repo")
@@ -245,3 +295,382 @@ class TestAnnotationCaptureAtDiscovery:
         assert mcp_tool._annotation_read_only_hint(
             SimpleNamespace()
         ) is False
+
+
+class TestProfileScopedTrust:
+    """F5: MCP trust state is keyed by (profile home, server name). The same
+    server name in two profiles is two different servers — separate
+    credentials, separate trust decisions. Profile A marking the server
+    ``trust: full`` must not lift the approval gate for profile B's calls on
+    the same name, and a profile that never configured the name stays
+    fail-closed untrusted."""
+
+    def test_opposite_trust_across_profiles_keeps_boundary(
+        self, fake_session, monkeypatch
+    ):
+        """Profile A trusts the server; profile B (same name) never did.
+        B's write-capable calls still consult approval; A's stay ungated."""
+        homes = {"current": "profile-A"}
+        monkeypatch.setattr(mcp_tool, "_mcp_current_home", lambda: homes["current"])
+
+        # Profile A registers 'srv' with trust: full.
+        mcp_tool._record_tool_trust_metadata("srv", {"trust": "full"}, [])
+
+        # Profile B's session: same server name, no trust decision of its own.
+        homes["current"] = "profile-B"
+        handler = mcp_tool._make_tool_handler("srv", "delete_repo", 30.0)
+        with patch(
+            "tools.approval.request_elicitation_consent",
+            return_value="decline",
+        ) as consent:
+            raw = handler({"repo": "x"})
+        # B's approval gate fires — A's 'full' did NOT leak across profiles.
+        consent.assert_called_once()
+        fake_session.call_tool.assert_not_awaited()
+        assert "did not approve" in json.loads(raw)["error"]
+
+        # Profile A's own calls remain ungated.
+        homes["current"] = "profile-A"
+        with patch("tools.approval.request_elicitation_consent") as consent2:
+            raw2 = handler({"repo": "x"})
+        consent2.assert_not_called()
+        assert json.loads(raw2) == {"result": "ok"}
+
+    def test_unconfigured_profile_defaults_untrusted_for_same_name(
+        self, fake_session, monkeypatch
+    ):
+        """Even when another profile trusted the name, a profile that never
+        configured it gets the fail-closed untrusted default."""
+        homes = {"current": "profile-A"}
+        monkeypatch.setattr(mcp_tool, "_mcp_current_home", lambda: homes["current"])
+        mcp_tool._record_tool_trust_metadata("srv", {"trust": "full"}, [])
+
+        homes["current"] = "profile-B"
+        handler = mcp_tool._make_tool_handler("srv", "delete_repo", 30.0)
+        with patch(
+            "tools.approval.request_elicitation_consent",
+            return_value="decline",
+        ) as consent:
+            handler({"repo": "x"})
+        consent.assert_called_once()
+        fake_session.call_tool.assert_not_awaited()
+
+    def test_same_profile_reuses_its_own_decision(self, fake_session, monkeypatch):
+        """Same profile, same name: the recorded trust decision applies."""
+        homes = {"current": "profile-A"}
+        monkeypatch.setattr(mcp_tool, "_mcp_current_home", lambda: homes["current"])
+        mcp_tool._record_tool_trust_metadata("srv", {"trust": "full"}, [])
+        handler = mcp_tool._make_tool_handler("srv", "delete_repo", 30.0)
+        with patch("tools.approval.request_elicitation_consent") as consent:
+            handler({"repo": "x"})
+        consent.assert_not_called()
+
+    def test_opposite_untrusted_profile_does_not_block_trusted_profile(
+        self, fake_session, monkeypatch
+    ):
+        """The converse: profile B marking the name untrusted must not flip
+        profile A's trusted decision."""
+        homes = {"current": "profile-A"}
+        monkeypatch.setattr(mcp_tool, "_mcp_current_home", lambda: homes["current"])
+        mcp_tool._record_tool_trust_metadata("srv", {"trust": "full"}, [])
+        homes["current"] = "profile-B"
+        mcp_tool._record_tool_trust_metadata("srv", {"trust": "untrusted"}, [])
+        homes["current"] = "profile-A"
+        handler = mcp_tool._make_tool_handler("srv", "delete_repo", 30.0)
+        with patch("tools.approval.request_elicitation_consent") as consent:
+            handler({"repo": "x"})
+        consent.assert_not_called()
+
+    def test_lazy_config_isolation_across_profiles(self, monkeypatch):
+        """F5/P4: the lazy (schema-cache) server config carries the
+        command/credentials/trust used for the first-use connect. It is
+        keyed by (profile home, server name) — profile B must NOT see or
+        consume profile A's lazy config for a same-named server, or B's
+        first call would spawn/connect using A's command/credentials."""
+        homes = {"current": "profile-A"}
+        monkeypatch.setattr(mcp_tool, "_mcp_current_home", lambda: homes["current"])
+
+        # Profile A registers the lazy entry for 'srv' (schema-cache path).
+        key_a = mcp_tool._mcp_scope_key("srv")
+        assert key_a == ("profile-A", "srv")
+        mcp_tool._lazy_server_configs[key_a] = {
+            "command": "node",
+            "args": ["/a/server.js"],
+            "env": {"API_KEY": "profile-A-secret"},
+        }
+        mcp_tool._lazy_server_fingerprints[key_a] = "fp-a"
+        mcp_tool._lazy_server_tool_names[key_a] = ["srv_util"]
+
+        # Profile B, same server name: its scope key differs, so the lazy
+        # config, fingerprint and tool-name entries are all absent.
+        homes["current"] = "profile-B"
+        key_b = mcp_tool._mcp_scope_key("srv")
+        assert key_b == ("profile-B", "srv")
+        assert key_b not in mcp_tool._lazy_server_configs, (
+            "profile B must not inherit profile A's lazy config (F5)"
+        )
+        assert mcp_tool._lazy_server_configs.get(key_b) is None
+        assert mcp_tool._lazy_server_fingerprints.get(key_b) is None
+        assert mcp_tool._lazy_server_tool_names.get(key_b) is None
+
+        # The is_lazy check (first-use connect trigger) is scoped too.
+        assert mcp_tool._mcp_scope_key("srv") not in mcp_tool._lazy_server_configs
+
+        # Profile A's entry remains intact under its own scope.
+        homes["current"] = "profile-A"
+        assert mcp_tool._lazy_server_configs[key_a]["env"]["API_KEY"] == (
+            "profile-A-secret"
+        )
+        assert mcp_tool._lazy_server_tool_names[key_a] == ["srv_util"]
+
+    def test_profile_b_accept_never_reaches_profile_a_live_session(
+        self, monkeypatch
+    ):
+        """F5 (exact-head re-review): the LIVE-transport boundary. Profile A
+        owns a live 'srv' connection; profile B uses the same server name and
+        ACCEPTS the trust prompt — yet neither ``call_tool`` nor
+        ``read_resource`` (nor the other generated utility handlers) may be
+        invoked on A's session, and ``_make_check_fn`` under B must report
+        the server unavailable. The pre-change code returned A's live server
+        on the non-lazy paths with no owner comparison, so an accept in B
+        proceeded straight through A's session and credentials."""
+        homes = {"current": "profile-A"}
+        monkeypatch.setattr(mcp_tool, "_mcp_current_home", lambda: homes["current"])
+        mcp_tool._record_tool_trust_metadata("srv", {"trust": "full"}, [])
+
+        # A live A-owned connection, recorded the way the real connect path
+        # (_discover_and_register_server) records ownership.
+        session_a = MagicMock()
+        session_a.call_tool = AsyncMock(
+            return_value=_FakeCallToolResult(content=[_FakeContentBlock("ok")])
+        )
+        session_a.read_resource = AsyncMock(
+            return_value=SimpleNamespace(contents=[])
+        )
+        session_a.list_resources = AsyncMock(return_value=[])
+        session_a.list_prompts = AsyncMock(return_value=SimpleNamespace(prompts=[]))
+        session_a.get_prompt = AsyncMock(return_value=SimpleNamespace(description=""))
+        server_a = SimpleNamespace(session=session_a, _rpc_lock=None)
+
+        with patch.dict(mcp_tool._servers, {"srv": server_a}), \
+             patch.dict(mcp_tool._server_home, {"srv": "profile-A"}), \
+             patch(
+                 "tools.mcp_tool._run_on_mcp_loop",
+                 side_effect=_fake_run_on_mcp_loop,
+             ), \
+             patch.dict(mcp_tool._server_error_counts, {}, clear=True):
+
+            # Profile B, same server name: the prompt is ACCEPTED — the gate
+            # must not be the thing that saves us; the transport boundary
+            # must refuse before any RPC reaches A's session.
+            homes["current"] = "profile-B"
+            handler = mcp_tool._make_tool_handler("srv", "delete_repo", 30.0)
+            with patch(
+                "tools.approval.request_elicitation_consent",
+                return_value="accept",
+            ) as consent:
+                raw = handler({"repo": "x"})
+            consent.assert_called_once()
+            session_a.call_tool.assert_not_awaited()
+            assert "error" in json.loads(raw)
+
+            # Generated utility handlers cannot cross the boundary either.
+            res_handler = mcp_tool._make_read_resource_handler("srv", 30.0)
+            raw_res = res_handler({"uri": "file:///secret"})
+            session_a.read_resource.assert_not_awaited()
+            assert "error" in json.loads(raw_res)
+
+            list_res_handler = mcp_tool._make_list_resources_handler("srv", 30.0)
+            raw_list = list_res_handler({})
+            session_a.list_resources.assert_not_awaited()
+            assert "error" in json.loads(raw_list)
+
+            list_prompts_handler = mcp_tool._make_list_prompts_handler("srv", 30.0)
+            raw_prompts = list_prompts_handler({})
+            session_a.list_prompts.assert_not_awaited()
+            assert "error" in json.loads(raw_prompts)
+
+            get_prompt_handler = mcp_tool._make_get_prompt_handler("srv", 30.0)
+            raw_prompt = get_prompt_handler({"name": "x"})
+            session_a.get_prompt.assert_not_awaited()
+            assert "error" in json.loads(raw_prompt)
+
+            # The tool surface under B must not advertise A's live server.
+            assert mcp_tool._make_check_fn("srv")() is False
+
+            # Control: back in profile A, the same handlers reach A's
+            # session (trust full — no approval consulted).
+            homes["current"] = "profile-A"
+            with patch(
+                "tools.approval.request_elicitation_consent"
+            ) as consent_a:
+                raw_a = handler({"repo": "x"})
+            consent_a.assert_not_called()
+            assert json.loads(raw_a) == {"result": "ok"}
+
+            raw_res_a = res_handler({"uri": "file:///pub"})
+            assert json.loads(raw_res_a) == {"result": ""}
+            session_a.read_resource.assert_awaited_once()
+            assert mcp_tool._make_check_fn("srv")() is True
+
+    def test_wrong_profile_refusals_do_not_trip_owner_circuit_breaker(
+        self, monkeypatch
+    ):
+        """A colliding profile may be refused, but its calls must not poison
+        the raw-name circuit breaker used by the profile that owns the live
+        transport. Otherwise B can deny A's MCP access without reaching A's
+        session or credentials."""
+        homes = {"current": "profile-A"}
+        monkeypatch.setattr(mcp_tool, "_mcp_current_home", lambda: homes["current"])
+        mcp_tool._record_tool_trust_metadata("srv", {"trust": "full"}, [])
+
+        session_a = MagicMock()
+        session_a.call_tool = AsyncMock(
+            return_value=_FakeCallToolResult(content=[_FakeContentBlock("ok")])
+        )
+        server_a = SimpleNamespace(session=session_a, _rpc_lock=None)
+
+        with patch.dict(mcp_tool._servers, {"srv": server_a}), \
+             patch.dict(mcp_tool._server_home, {"srv": "profile-A"}), \
+             patch(
+                 "tools.mcp_tool._run_on_mcp_loop",
+                 side_effect=_fake_run_on_mcp_loop,
+             ), \
+             patch.dict(mcp_tool._server_error_counts, {}, clear=True), \
+             patch.dict(mcp_tool._server_breaker_opened_at, {}, clear=True):
+            handler = mcp_tool._make_tool_handler("srv", "delete_repo", 30.0)
+
+            homes["current"] = "profile-B"
+            with patch(
+                "tools.approval.request_elicitation_consent",
+                return_value="accept",
+            ):
+                for _ in range(mcp_tool._CIRCUIT_BREAKER_THRESHOLD):
+                    raw_b = handler({"repo": "x"})
+                    assert "error" in json.loads(raw_b)
+
+            session_a.call_tool.assert_not_awaited()
+            assert mcp_tool._server_error_counts.get("srv", 0) == 0
+
+            homes["current"] = "profile-A"
+            raw_a = handler({"repo": "x"})
+            assert json.loads(raw_a) == {"result": "ok"}
+            session_a.call_tool.assert_awaited_once()
+
+    def test_collided_registration_does_not_mutate_owner_runtime_state(
+        self, monkeypatch
+    ):
+        """Refusing B's same-name registration must also leave A's parked
+        reconnect state and parallel-scheduling flag untouched."""
+        homes = {"current": "profile-B"}
+        monkeypatch.setattr(mcp_tool, "_mcp_current_home", lambda: homes["current"])
+        server_a = SimpleNamespace(session=None, _registered_tool_names=[])
+
+        with patch("tools.mcp_tool._ensure_mcp_sdk", return_value=True), \
+             patch(
+                 "tools.mcp_tool._filter_suspicious_mcp_servers",
+                 side_effect=lambda value: value,
+             ), \
+             patch.dict(mcp_tool._servers, {"srv": server_a}), \
+             patch.dict(mcp_tool._server_home, {"srv": "profile-A"}), \
+             patch.object(mcp_tool, "_parallel_safe_servers", {"srv"}), \
+             patch("tools.mcp_tool._signal_reconnect") as reconnect:
+            mcp_tool.register_mcp_servers(
+                {"srv": {"supports_parallel_tool_calls": False}}
+            )
+
+            assert "srv" in mcp_tool._parallel_safe_servers
+            reconnect.assert_not_called()
+
+    def test_lazy_connect_race_rechecks_owner_before_return(self, monkeypatch):
+        """If another profile wins the lazy-connect race, B must not receive
+        the newly installed A-owned transport after the initial empty lookup."""
+        homes = {"current": "profile-B"}
+        monkeypatch.setattr(mcp_tool, "_mcp_current_home", lambda: homes["current"])
+        server_a = SimpleNamespace(session=MagicMock())
+        lazy_key = ("profile-B", "srv")
+
+        def install_profile_a_server(_name):
+            mcp_tool._servers["srv"] = server_a
+            mcp_tool._server_home["srv"] = "profile-A"
+
+        with patch.dict(mcp_tool._servers, {}, clear=True), \
+             patch.dict(mcp_tool._server_home, {}, clear=True), \
+             patch.dict(
+                 mcp_tool._lazy_server_configs,
+                 {lazy_key: {"command": "profile-b-server"}},
+                 clear=True,
+             ), \
+             patch(
+                 "tools.mcp_tool._ensure_lazy_server_connected",
+                 side_effect=install_profile_a_server,
+             ):
+            assert mcp_tool._get_connected_server_for_call("srv") is None
+
+    def test_owner_check_rejects_stale_instance_after_name_rebind(self, monkeypatch):
+        """Ownership of the current raw name must not authorize a stale local
+        server object captured before another same-name installation won."""
+        monkeypatch.setattr(mcp_tool, "_mcp_current_home", lambda: "profile-B")
+        server_a = SimpleNamespace(session=MagicMock())
+        server_b = SimpleNamespace(session=MagicMock())
+        with patch.dict(mcp_tool._servers, {"srv": server_b}, clear=True), \
+             patch.dict(mcp_tool._server_home, {"srv": "profile-B"}, clear=True):
+            assert not mcp_tool._server_instance_owned_by_current_home(
+                "srv", server_a
+            )
+            assert mcp_tool._server_instance_owned_by_current_home(
+                "srv", server_b
+            )
+
+    def test_wrong_profile_cannot_signal_owner_recycled_transport(self, monkeypatch):
+        """The reconnect primitive itself must enforce ownership, not rely on
+        every caller to perform the check first."""
+        monkeypatch.setattr(mcp_tool, "_mcp_current_home", lambda: "profile-B")
+        server_a = SimpleNamespace(
+            session=None,
+            _is_recycled_stdio=lambda: True,
+            _ready=MagicMock(),
+            _reconnect_event=MagicMock(),
+        )
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        with patch.dict(mcp_tool._servers, {"srv": server_a}, clear=True), \
+             patch.dict(mcp_tool._server_home, {"srv": "profile-A"}, clear=True), \
+             patch.object(mcp_tool, "_mcp_loop", loop), \
+             patch("tools.mcp_tool._run_on_mcp_loop", return_value=True):
+            assert mcp_tool._request_lazy_reconnect("srv", server_a) is False
+            loop.call_soon_threadsafe.assert_not_called()
+
+    def test_public_reconnect_refuses_wrong_profile_owner(self, monkeypatch):
+        """OAuth/UI reconnect entry points must not signal a same-named
+        transport owned by another profile."""
+        monkeypatch.setattr(mcp_tool, "_mcp_current_home", lambda: "profile-B")
+        server_a = SimpleNamespace(session=MagicMock())
+        with patch.dict(mcp_tool._servers, {"srv": server_a}, clear=True), \
+             patch.dict(mcp_tool._server_home, {"srv": "profile-A"}, clear=True), \
+             patch("tools.mcp_tool._signal_reconnect", return_value=True) as signal:
+            assert mcp_tool.reconnect_mcp_server("srv") is False
+            signal.assert_not_called()
+
+    def test_wrong_profile_cannot_signal_reconnect_and_wait(self, monkeypatch):
+        """Auth/session retry's shared reconnect-and-wait primitive must
+        reject a same-named transport owned by another profile."""
+        monkeypatch.setattr(mcp_tool, "_mcp_current_home", lambda: "profile-B")
+        server_a = SimpleNamespace(
+            session=MagicMock(),
+            _ready=MagicMock(),
+            _reconnect_event=MagicMock(),
+        )
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        with patch.dict(mcp_tool._servers, {"srv": server_a}, clear=True), \
+             patch.dict(mcp_tool._server_home, {"srv": "profile-A"}, clear=True), \
+             patch.object(mcp_tool, "_mcp_loop", loop), \
+             patch(
+                 "tools.mcp_tool._wait_for_server_session_ready",
+                 return_value=True,
+             ):
+            assert mcp_tool._signal_reconnect_and_wait(
+                "srv", server_a, op_description="test", timeout=0.1
+            ) is False
+            loop.call_soon_threadsafe.assert_not_called()

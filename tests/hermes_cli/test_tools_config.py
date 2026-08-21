@@ -74,6 +74,166 @@ def test_partially_valid_platform_toolsets_no_runtime_warning(caplog):
     assert not any("#38798" in r.getMessage() for r in caplog.records)
 
 
+# ── F7: quoted-JSON / empty-list restriction values fail CLOSED ──────────────
+
+
+def test_quoted_json_platform_toolsets_string_parses_to_list():
+    """F7: a quoted-JSON string saved by a JSON-mode editor
+    (``platform_toolsets.cli: '["file","web"]'``) must be recovered to the
+    intended list — NOT silently ignored (which fell back to the FULL default
+    toolset, failing open)."""
+    config = {"platform_toolsets": {"cli": '["web", "time"]'}}
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+    assert "web" in enabled and "time" in enabled
+
+
+def test_malformed_quoted_json_platform_toolsets_fails_closed():
+    """F7: a restriction value that LOOKS like a list but is not valid
+    JSON/Python is a configuration error — refuse to resolve (fail closed)
+    instead of silently enabling the full default toolset."""
+    config = {"platform_toolsets": {"cli": '["web", time]'}}
+    with pytest.raises(ValueError, match="fail closed"):
+        _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+
+
+def test_dict_platform_toolsets_value_fails_closed():
+    """F7/P4 (exact-head re-review): a dict value like ``{cli: {web:
+    true}}`` (reachable because validate_platform_toolsets only logs on
+    schema mismatch) must NOT be coerced to a junk single name and mixed
+    with real tools — it is a configuration error, fail closed."""
+    config = {"platform_toolsets": {"cli": {"web": True}}}
+    with pytest.raises(ValueError, match="fail closed"):
+        _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+
+
+def test_empty_platform_toolsets_list_means_disable_all():
+    """F7: an explicitly saved EMPTY toolset list means NO toolsets for the
+    platform (disable all / fail closed) — not \"no restriction\", which
+    previously fell back to the full default composite + recovery pass."""
+    config = {"platform_toolsets": {"cli": []}}
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+    assert enabled == set()
+
+
+def test_empty_platform_toolsets_with_unseen_plugin_stays_empty():
+    """F7 (plugin auto-enable door): an explicitly saved EMPTY toolset list
+    must not be reopened by a newly discovered plugin toolset. Previously
+    the plugin block auto-enabled unknown plugins unconditionally, so
+    ``platform_toolsets: {cli: []}`` could still resolve to a nonempty tool
+    surface (the operator explicitly removed them). With [], plugin
+    toolsets only appear once the operator opts in via `hermes tools`."""
+    import hermes_cli.tools_config as _tc
+
+    with patch.object(
+        _tc, "_get_plugin_toolset_keys", return_value={"brand-new-plugin-ts"}
+    ):
+        config = {"platform_toolsets": {"cli": []}}
+        enabled = _get_platform_tools(
+            config, "cli", include_default_mcp_servers=False
+        )
+    assert enabled == set()
+
+
+def test_unseen_plugin_still_autoenables_for_nonempty_explicit_list():
+    """F7 control: the explicit-empty guard must NOT change the documented
+    behavior for non-empty explicit configs — a newly discovered plugin
+    toolset still auto-enables there (opt-out remains `hermes tools`)."""
+    import hermes_cli.tools_config as _tc
+
+    with patch.object(
+        _tc, "_get_plugin_toolset_keys", return_value={"brand-new-plugin-ts"}
+    ):
+        config = {"platform_toolsets": {"cli": ["web"]}}
+        enabled = _get_platform_tools(
+            config, "cli", include_default_mcp_servers=False
+        )
+    assert "web" in enabled
+    assert "brand-new-plugin-ts" in enabled
+
+
+def test_unset_platform_toolsets_still_applies_defaults():
+    """F7 control: a genuinely UNSET restriction value keeps the historical
+    default resolution — only explicit values are fail-closed."""
+    config = {}  # no platform_toolsets at all
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+    # Default composite resolution yields the platform's default toolset.
+    assert "hermes-cli" in enabled or bool(enabled)
+
+
+def test_scalar_platform_toolsets_string_is_single_name():
+    """F7/P2: a bare SCALAR restriction value is a single-name list, NOT
+    "unset" — it must not fall back to the FULL default toolset (fail open)."""
+    config = {"platform_toolsets": {"cli": "web"}}
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+    assert "web" in enabled
+
+
+def test_empty_string_platform_toolsets_disables_all():
+    """F7/P2: an explicitly saved EMPTY STRING restriction means disable all
+    (fail closed) — not "no restriction" (which fell back to the full
+    default toolset)."""
+    config = {"platform_toolsets": {"cli": ""}}
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+    assert enabled == set()
+
+
+def test_empty_list_with_default_mcp_servers_stays_exactly_empty():
+    """F7 (exact-head re-review): an explicit ``[]`` must stay EXACTLY empty
+    even at the production default call site (``include_default_mcp_servers
+    =True``). The MCP block used to re-add every globally enabled server when
+    no server was explicitly named and ``no_mcp`` was absent — the existing
+    explicit-empty tests all pass ``include_default_mcp_servers=False``,
+    which never reaches that branch. With a live server ``srv`` enabled, the
+    operator's ``[] = disable all`` must still hold."""
+    import hermes_cli.tools_config as _tc
+
+    with patch.object(_tc, "enabled_mcp_server_names", return_value={"srv"}):
+        config = {"platform_toolsets": {"cli": []}}
+        enabled = _get_platform_tools(config, "cli")
+    assert enabled == set()
+
+
+def test_empty_string_with_nondefault_context_engine_stays_exactly_empty():
+    """F7 (exact-head re-review): an explicitly saved empty STRING (raw value
+    ``""``, normalized to ``[]``) with a NON-default context engine must stay
+    EXACTLY empty at the default call site. The context-engine block checked
+    ``isinstance(platform_toolsets.get(platform), list)`` against the RAW
+    config value — a string is not a list, so ``explicit_empty_selection``
+    was False and ``context_engine`` (plus every default MCP server) was
+    re-added. Neither the engine nor MCP servers nor plugins may reappear."""
+    import hermes_cli.tools_config as _tc
+
+    with patch.object(_tc, "enabled_mcp_server_names", return_value={"srv"}):
+        config = {
+            "platform_toolsets": {"cli": ""},
+            "context": {"engine": "claude_code"},
+        }
+        enabled = _get_platform_tools(config, "cli")
+    assert enabled == set()
+
+
+def test_numeric_platform_toolsets_value_never_default():
+    """F7/P2: a numeric restriction value (YAML parses bare numbers as int)
+    is EXPLICIT, not unset — the full default toolset must not reappear."""
+    config = {"platform_toolsets": {"cli": 12306}}
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+    assert "web" not in enabled
+
+
+def test_quoted_json_disabled_toolsets_recovered_and_empty_means_none_disabled():
+    """F7: quoted-JSON ``agent.disabled_toolsets`` strings are recovered to
+    lists (so the restriction applies), while an empty list means nothing is
+    disabled — matching the unset default. Only a MALFORMED structured string
+    fails closed."""
+    from agent.skill_utils import parse_config_string_list
+
+    assert parse_config_string_list('["memory", "web"]') == ["memory", "web"]
+    assert parse_config_string_list("[]") == []
+    assert parse_config_string_list(None) == []
+    with pytest.raises(ValueError, match="fail closed"):
+        parse_config_string_list('["memory", web]')
+
+
 
 
 

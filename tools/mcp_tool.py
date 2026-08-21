@@ -4216,11 +4216,15 @@ _servers: Dict[str, MCPServerTask] = {}
 _server_connecting: set[str] = set()
 _server_connect_errors: Dict[str, str] = {}
 # Lazy MCP startup (#56832): servers whose tools were registered from the
-# on-disk schema cache without spawning/connecting. Keyed by server name;
-# entries are popped once a real connection is established on first use.
-_lazy_server_configs: Dict[str, dict] = {}
-_lazy_server_fingerprints: Dict[str, str] = {}
-_lazy_server_tool_names: Dict[str, List[str]] = {}
+# on-disk schema cache without spawning/connecting. Keyed by the SAME
+# (profile home, server name) scope key as trust/ownership (F5/P4): the
+# lazy config carries the command/credentials/trust for the first-use
+# connect, so a second profile with a same-named server must never consume
+# the first profile's config. Entries are popped once a real connection is
+# established on first use.
+_lazy_server_configs: Dict[tuple, dict] = {}
+_lazy_server_fingerprints: Dict[tuple, str] = {}
+_lazy_server_tool_names: Dict[tuple, List[str]] = {}
 # Discovery installs a task-local claim before calling ``_connect_server`` so
 # it can retain a recoverable parked task without making standalone probe calls
 # publish failed servers into module-global ownership.
@@ -4323,17 +4327,50 @@ _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 #   skipping approval for calls the operator was already warned about when
 #   they marked the server untrusted. It can never widen access on top of
 #   the approval a write-capable tool would otherwise need.
-# - Default trust for servers with NO ``trust`` key is ``full`` (gate off)
-#   for backward compatibility — existing configs keep working unchanged.
-#   Operators opt servers into gating explicitly with ``trust: untrusted``.
+# - Default trust for servers with NO ``trust`` key is ``untrusted``
+#   (gate on, fail closed): a server added without an explicit trust
+#   decision must not silently get write-capable tools past approval
+#   (F5). Operators opt servers into ungated access explicitly with
+#   ``trust: full``. This changed from the historical ``full`` default —
+#   existing configs that relied on the implicit default (e.g.
+#   cua-driver, penpot) must add ``trust: full`` to keep their previous
+#   behavior.
 # - Any unrecognized ``trust`` value normalizes to ``untrusted``
 #   (fail closed): a typo must never silently disable the gate.
 #
 # Classification happens at CALL TIME from data captured at DISCOVERY —
 # no toolset or schema mutation, so the conversation's toolset stays
 # byte-stable and prompt caching is preserved.
-_server_trust_levels: Dict[str, str] = {}
-_tool_read_only_hints: Dict[str, Dict[str, bool]] = {}
+_server_trust_levels: Dict[tuple, str] = {}
+_tool_read_only_hints: Dict[tuple, Dict[str, bool]] = {}
+# Which profile home owns the live connection for a server name. One live
+# connection per name exists in a process (the tool namespace is global), so
+# a second profile requesting the same name must never silently attach to
+# the first profile's connection/credentials (F5).
+_server_home: Dict[str, str] = {}
+
+
+def _mcp_current_home() -> str:
+    """Return the current profile/home identity for MCP scope, best-effort."""
+    try:
+        from hermes_constants import get_hermes_home
+        return str(get_hermes_home())
+    except Exception:
+        return ""
+
+
+def _mcp_scope_key(server_name: str) -> tuple:
+    """Return the (profile/home identity, server name) scope key.
+
+    The same server name in two profiles is two different servers — separate
+    credentials, separate trust decisions. Keying MCP ownership/trust state
+    by raw server name lets the first registered profile's trust tier (e.g.
+    ``trust: full``) silently apply to the second profile's calls, bypassing
+    the second profile's ``trust: untrusted`` decision (F5). All trust and
+    ownership state uses this key so each profile's approval boundary is
+    evaluated under its own identity.
+    """
+    return (_mcp_current_home(), server_name)
 
 _TRUST_FULL = "full"
 _TRUST_UNTRUSTED = "untrusted"
@@ -4342,12 +4379,12 @@ _TRUST_UNTRUSTED = "untrusted"
 def _normalize_server_trust(value: Any) -> str:
     """Normalize a config ``trust`` value to ``full`` or ``untrusted``.
 
-    Missing (None) → ``full`` (backward-compatible default, documented
-    above). Any string other than the two known tiers → ``untrusted``:
-    a misspelled tier must fail closed, never silently disable gating.
+    Missing (None) → ``untrusted`` (fail-closed default, F5). Any string
+    other than the two known tiers → ``untrusted``: a misspelled tier must
+    fail closed, never silently disable gating.
     """
     if value is None:
-        return _TRUST_FULL
+        return _TRUST_UNTRUSTED
     text = str(value).strip().lower()
     if text == _TRUST_FULL:
         return _TRUST_FULL
@@ -4381,12 +4418,25 @@ def _annotation_read_only_hint(mcp_tool: Any) -> bool:
 def _record_tool_trust_metadata(
     server_name: str, config: dict, tools: List[Any]
 ) -> None:
-    """Capture per-server trust and per-tool readOnlyHint at discovery."""
+    """Capture per-server trust and per-tool readOnlyHint at discovery.
+
+    Keyed by (profile home, server name) so one profile's trust decision can
+    never leak into another profile's approval gate for a same-named server
+    (F5).
+    """
+    key = _mcp_scope_key(server_name)
     with _lock:
-        _server_trust_levels[server_name] = _normalize_server_trust(
+        _server_trust_levels[key] = _normalize_server_trust(
             (config or {}).get("trust")
         )
-        hints = _tool_read_only_hints.setdefault(server_name, {})
+        hints = _tool_read_only_hints.setdefault(key, {})
+        # F5/P2: readOnlyHint is a SELF-declaration from the server. It is
+        # only meaningful on trusted servers (where the gate is off anyway);
+        # for untrusted servers the hint must never bypass approval, so we
+        # do not record it at all.
+        if _server_trust_levels[key] == _TRUST_UNTRUSTED:
+            hints.clear()
+            return
         for tool in tools:
             name = getattr(tool, "name", None)
             if name:
@@ -4399,12 +4449,24 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
     Returns None when the call may proceed, or an error string (already
     formatted via ``tool_error``) when the call is blocked. Fail-closed:
     approval-system errors block the call.
+
+    The trust decision is resolved under the CALLER's profile home: a server
+    name trusted by another profile is still UNTRUSTED here until THIS
+    profile's config says otherwise (F5). A profile that never configured the
+    server gets the fail-closed untrusted default.
     """
-    trust = _server_trust_levels.get(server_name, _TRUST_FULL)
+    trust = _server_trust_levels.get(
+        _mcp_scope_key(server_name), _TRUST_UNTRUSTED
+    )
     if trust != _TRUST_UNTRUSTED:
         return None
-    if _tool_read_only_hints.get(server_name, {}).get(tool_name) is True:
-        return None
+    # F5/P2 (Purple round 2): readOnlyHint is supplied by the server itself
+    # — the same party we marked untrusted. A self-declared read-only hint
+    # must NOT skip the approval gate: an untrusted server can declare its
+    # destructive tools read-only to bypass approval. Every tool on an
+    # untrusted server consults approval.
+    # (Hints are recorded only for trusted servers — see
+    # _record_tool_trust_metadata — so none can appear here for untrusted.)
 
     # Lazy import mirrors the elicitation handler's pattern: tools.approval
     # routes the prompt to whichever surface owns the session (CLI, TUI,
@@ -4415,8 +4477,8 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
         answer = request_elicitation_consent(
             (
                 f"MCP tool '{tool_name}' on UNTRUSTED server "
-                f"'{server_name}' wants to run. This tool is write-capable "
-                f"(no readOnlyHint=true annotation) and may modify external "
+                f"'{server_name}' wants to run. This tool is not "
+                f"operator-confirmed read-only and may modify external "
                 f"state."
             ),
             (
@@ -4502,11 +4564,13 @@ def _signal_reconnect(server: Any) -> bool:
 
 
 def reconnect_mcp_server(server_name: str) -> bool:
-    """Ask a currently-live MCP server to rebuild after external re-auth."""
+    """Ask a same-profile live MCP server to rebuild after external re-auth."""
     with _lock:
         server = _servers.get(server_name)
-    if server is None:
-        return False
+        if server is None or not _server_instance_owned_by_current_home(
+            server_name, server
+        ):
+            return False
     return _signal_reconnect(server)
 
 
@@ -4568,6 +4632,16 @@ def _signal_reconnect_and_wait(
     failures in long-lived gateway sessions even though a fresh CLI process
     could connect successfully.
     """
+    with _lock:
+        if not _server_instance_owned_by_current_home(server_name, srv):
+            logger.warning(
+                "MCP server '%s': %s reconnect refused for profile home %s; "
+                "transport owner is %s (F5).",
+                server_name, op_description, _mcp_current_home(),
+                _server_home.get(server_name, "?"),
+            )
+            return False
+
     loop = _mcp_loop
     if loop is None or not loop.is_running():
         return False
@@ -5600,6 +5674,15 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
 
 def _request_lazy_reconnect(server_name: str, server: MCPServerTask) -> bool:
     """Wake a recycled stdio server and wait briefly for a fresh session."""
+    with _lock:
+        if not _server_instance_owned_by_current_home(server_name, server):
+            logger.warning(
+                "MCP server '%s' reconnect refused for profile home %s; "
+                "the recycled transport is owned by profile home %s (F5).",
+                server_name, _mcp_current_home(),
+                _server_home.get(server_name, "?"),
+            )
+            return False
     if not server._is_recycled_stdio():
         return False
 
@@ -5654,8 +5737,20 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     with _lock:
         server = _servers.get(server_name)
         if server is not None and server.session is not None:
-            return True
-        config = _lazy_server_configs.get(server_name)
+            # F5: the live connection is owned by a profile home. Reuse it
+            # only for the SAME home — a different profile must never run its
+            # calls against another profile's connection and credentials.
+            if _server_home.get(server_name) == _mcp_current_home():
+                return True
+            logger.warning(
+                "MCP server '%s' is already connected for profile home %s; "
+                "refusing to attach this profile's calls to that connection "
+                "(different credentials/trust — F5). Rename the server in "
+                "one profile to resolve the collision.",
+                server_name, _server_home.get(server_name, "?"),
+            )
+            return False
+        config = _lazy_server_configs.get(_mcp_scope_key(server_name))
         if not config:
             return False
         if _connect_cooldown_active(server_name):
@@ -5688,9 +5783,10 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     with _lock:
         _server_connecting.discard(server_name)
         _clear_connect_failure(server_name)
-        _lazy_server_configs.pop(server_name, None)
-        stale_fingerprint = _lazy_server_fingerprints.pop(server_name, None)
-        cached_names = _lazy_server_tool_names.pop(server_name, None) or []
+        _scope_key = _mcp_scope_key(server_name)
+        _lazy_server_configs.pop(_scope_key, None)
+        stale_fingerprint = _lazy_server_fingerprints.pop(_scope_key, None)
+        cached_names = _lazy_server_tool_names.pop(_scope_key, None) or []
         server = _servers.get(server_name)
         live_names = set(
             getattr(server, "_registered_tool_names", []) or []
@@ -5714,6 +5810,41 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     return server is not None and server.session is not None
 
 
+def _server_owned_by_current_home(server_name: str) -> bool:
+    """Whether a live server entry, if any, is owned by the current profile home.
+
+    F5: every live connection records its owning profile home at connect
+    time (``_discover_and_register_server``). A connection recorded for a
+    DIFFERENT home carries that profile's credentials and trust decisions
+    and must never be handed to this profile's calls. A live entry with no
+    recorded owner predates the F5 owner-tracking; treat it as owned by the
+    current home so pre-F5 / injected connections keep working (production
+    always records the owner).
+
+    Callers must hold ``_lock``.
+    """
+    server = _servers.get(server_name)
+    if server is None:
+        return True
+    owner = _server_home.get(server_name)
+    return owner is None or owner == _mcp_current_home()
+
+
+def _server_instance_owned_by_current_home(
+    server_name: str, server: Any
+) -> bool:
+    """Whether *server* is the current same-home entry for ``server_name``.
+
+    Callers must hold ``_lock``. Checking the raw-name owner alone is
+    insufficient after connect/reconnect races: the name can be rebound to a
+    current-home object while a caller still holds a stale foreign object.
+    """
+    if _servers.get(server_name) is not server:
+        return False
+    owner = _server_home.get(server_name)
+    return owner is None or owner == _mcp_current_home()
+
+
 def _get_connected_server_for_call(server_name: str) -> Optional[MCPServerTask]:
     """Return a connected server, lazily reconnecting recycled stdio state.
 
@@ -5723,16 +5854,46 @@ def _get_connected_server_for_call(server_name: str) -> Optional[MCPServerTask]:
     """
     with _lock:
         server = _servers.get(server_name)
-        is_lazy = server_name in _lazy_server_configs
+        is_lazy = _mcp_scope_key(server_name) in _lazy_server_configs
+        # F5: the ownership boundary applies FIRST, on every path (live,
+        # parked, recycled, lazy). A live connection owned by another
+        # profile home is never returned to this profile's calls — it
+        # carries the other profile's credentials and trust decisions.
+        owner_conflict = (
+            server is not None and not _server_owned_by_current_home(server_name)
+        )
+    if owner_conflict:
+        logger.warning(
+            "MCP server '%s' is already connected for profile home %s; "
+            "refusing this profile's call on that connection (different "
+            "credentials/trust — F5). Rename the server in one profile "
+            "to resolve the collision.",
+            server_name, _server_home.get(server_name, "?"),
+        )
+        return None
     if is_lazy and (server is None or server.session is None):
         _ensure_lazy_server_connected(server_name)
         with _lock:
             server = _servers.get(server_name)
-        return server
     if server is not None and server.session is None and server._is_recycled_stdio():
         _request_lazy_reconnect(server_name, server)
         with _lock:
             server = _servers.get(server_name)
+    # Re-check after lazy connect/recycled reconnect. Another profile can win
+    # the same-name installation race after the initial empty/parked lookup;
+    # never return that newly installed foreign transport to this caller.
+    with _lock:
+        owner_conflict = (
+            server is not None
+            and not _server_instance_owned_by_current_home(server_name, server)
+        )
+    if owner_conflict:
+        logger.warning(
+            "MCP server '%s' connected for profile home %s during reconnect; "
+            "refusing this profile's call on that connection (F5).",
+            server_name, _server_home.get(server_name, "?"),
+        )
+        return None
     return server
 
 
@@ -5758,6 +5919,20 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         gate_error = _trust_gate_check(server_name, tool_name)
         if gate_error is not None:
             return gate_error
+
+        # A same-named live transport owned by another profile is an ownership
+        # refusal, not a transport failure. Keep it out of the raw-name circuit
+        # breaker or repeated calls from profile B can deny profile A's healthy
+        # server for the cooldown window.
+        with _lock:
+            owner_conflict = (
+                _servers.get(server_name) is not None
+                and not _server_owned_by_current_home(server_name)
+            )
+        if owner_conflict:
+            return tool_error(
+                f"MCP server '{server_name}' is not connected for the current profile"
+            )
 
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
@@ -6262,13 +6437,20 @@ def _make_check_fn(server_name: str):
     def _check() -> bool:
         with _lock:
             server = _servers.get(server_name)
+            # F5: a live connection owned by ANOTHER profile home is not
+            # part of this profile's tool surface — report it unavailable
+            # instead of letting a same-named server appear ready here.
+            if server is not None and not _server_owned_by_current_home(server_name):
+                return False
             if server is not None and (
                 server.session is not None or server._is_recycled_stdio()
             ):
                 return True
             # Lazy (schema-cache registered) servers are available: the
-            # first real call spawns/connects them (#56832).
-            return server_name in _lazy_server_configs
+            # first real call spawns/connects them (#56832). Scoped by
+            # (profile home, server name) so a same-named server in another
+            # profile does not appear available here (F5).
+            return _mcp_scope_key(server_name) in _lazy_server_configs
 
     return _check
 
@@ -6736,11 +6918,13 @@ def _existing_tool_names() -> List[str]:
             schema = _convert_mcp_schema(server.name, mcp_tool)
             names.append(schema["name"])
     # Lazy servers registered from the schema cache have no MCPServerTask
-    # yet — their tools live in the registry only (#56832).
+    # yet — their tools live in the registry only (#56832). Keys are
+    # (profile home, server name) scope keys (F5); filter by the server
+    # name part.
     with _lock:
         lazy_names = [
             n
-            for sname, tool_names in _lazy_server_tool_names.items()
+            for (_scope_home, sname), tool_names in _lazy_server_tool_names.items()
             if sname not in _servers
             for n in tool_names
         ]
@@ -7146,9 +7330,10 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
     if registered_names:
         registry.register_toolset_alias(name, toolset_name)
         with _lock:
-            _lazy_server_configs[name] = dict(config)
-            _lazy_server_fingerprints[name] = fingerprint
-            _lazy_server_tool_names[name] = list(registered_names)
+            _scope_key = _mcp_scope_key(name)
+            _lazy_server_configs[_scope_key] = dict(config)
+            _lazy_server_fingerprints[_scope_key] = fingerprint
+            _lazy_server_tool_names[_scope_key] = list(registered_names)
         logger.info(
             "MCP server '%s' (lazy): registered %d tool(s) from schema cache",
             name, len(registered_names),
@@ -7194,6 +7379,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
             # self-probe, so adopt it into the registry for shutdown/revival.
             with _lock:
                 _servers[name] = server
+                _server_home[name] = _mcp_current_home()
         elif server is not None:
             await server.shutdown()
         raise
@@ -7204,6 +7390,9 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         _server_connecting.discard(name)
         _server_connect_errors.pop(name, None)
         _servers[name] = server
+        # F5: record which profile home owns this live connection so another
+        # profile requesting the same name can never silently attach to it.
+        _server_home[name] = _mcp_current_home()
 
     registered_names = _register_server_tools(name, server, config)
     server._registered_tool_names = list(registered_names)
@@ -7248,14 +7437,38 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     # from multiple entry-points before the first batch finishes (#58862).
     with _lock:
         connecting = set(_server_connecting)
+        # F5: the same-name owner-mismatch collision check runs BEFORE the
+        # ``k not in _servers`` idempotency filter below — the filter
+        # previously proved every name absent from ``_servers``, making the
+        # refusal unreachable. A live connection owned by another profile
+        # home carries that profile's credentials/trust; this profile's
+        # registration must be refused up front, not silently inherited.
+        _current_home = _mcp_current_home()
+        collided = {
+            k
+            for k in servers
+            if k in _servers and not _server_owned_by_current_home(k)
+        }
+        for _name in sorted(collided):
+            logger.warning(
+                "MCP server '%s' is already connected for profile home "
+                "%s; not registering this profile's '%s' (different "
+                "credentials/trust — F5). Rename the server in one "
+                "profile to resolve the collision.",
+                _name, _server_home.get(_name, "?"), _name,
+            )
         new_servers = {
             k: v
             for k, v in servers.items()
-            if k not in _servers
+            if k not in collided
+            and k not in _servers
             and k not in connecting
             # Servers already lazily registered from the schema cache are
             # not re-registered; they connect on first tool use (#56832).
-            and k not in _lazy_server_configs
+            # Scoped by (profile home, server name): a same-named server
+            # lazily registered under ANOTHER home is a different server
+            # and must be registered here (F5).
+            and _mcp_scope_key(k) not in _lazy_server_configs
             and _parse_boolish(v.get("enabled", True), default=True)
             # Skip a server still serving its post-failure backoff. Without
             # this, a server that fails to connect (and is therefore never
@@ -7273,13 +7486,17 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         stale_cached = [
             _servers[k]
             for k in servers
-            if k in _servers and getattr(_servers[k], "session", None) is None
+            if k not in collided
+            and k in _servers
+            and getattr(_servers[k], "session", None) is None
         ]
         _server_connecting.update(new_servers)
         for srv_name in new_servers:
             _server_connect_errors.pop(srv_name, None)
         # Track which servers opt-in to parallel tool calls (idempotent).
         for srv_name, srv_cfg in servers.items():
+            if srv_name in collided:
+                continue
             if _parse_boolish(srv_cfg.get("supports_parallel_tool_calls", False), default=False):
                 _parallel_safe_servers.add(srv_name)
             else:
