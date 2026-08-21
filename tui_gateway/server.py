@@ -8769,6 +8769,7 @@ def _live_session_payload(
         "message_count": len(history),
         "messages": [] if omit_messages else _history_to_messages(history),
         "messages_omitted": omit_messages,
+        "required_prompt_handler": session.get("required_prompt_handler"),
         "running": running,
         "turn_started_at": turn_started_at,
         "session_id": sid,

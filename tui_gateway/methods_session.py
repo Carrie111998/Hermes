@@ -136,6 +136,7 @@ def _(rid, params: dict) -> dict:
         {
             "session_id": sid,
             "stored_session_id": key,
+            "required_prompt_handler": required_prompt_handler,
             "message_count": len(history),
             "messages": _history_to_messages(history),
             "info": {
@@ -676,6 +677,7 @@ def _(rid, params: dict) -> dict:
             payload = {
                 "session_id": sid,
                 "resumed": target,
+                "required_prompt_handler": required_prompt_handler,
                 "message_count": len(raw_history) if omit_messages else len(messages),
                 "messages": messages,
                 "messages_omitted": omit_messages,

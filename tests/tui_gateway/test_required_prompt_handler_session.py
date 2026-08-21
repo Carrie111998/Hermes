@@ -61,12 +61,31 @@ def test_session_create_retains_required_prompt_handler(monkeypatch, tmp_path):
         {
             "source": "ios",
             "profile": "router",
-            "required_prompt_handler": "hoppe_ocr_approval",
+            "required_prompt_handler": "  hoppe_ocr_approval  ",
         },
     )
     sid = response["result"]["session_id"]
     try:
         assert server._sessions[sid]["required_prompt_handler"] == "hoppe_ocr_approval"
+        assert response["result"]["required_prompt_handler"] == "hoppe_ocr_approval"
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_session_create_reports_no_required_prompt_handler(monkeypatch, tmp_path):
+    """An omitted create policy must be acknowledged explicitly as absent."""
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
+    monkeypatch.setattr(server, "_completion_cwd", lambda _params=None: str(tmp_path))
+
+    response = server._methods["session.create"](
+        "create-without-required-handler",
+        {"source": "ios", "profile": "router"},
+    )
+    sid = response["result"]["session_id"]
+    try:
+        assert response["result"]["required_prompt_handler"] is None
     finally:
         server._sessions.pop(sid, None)
 
@@ -82,12 +101,26 @@ def test_cold_session_resume_retains_required_prompt_handler(monkeypatch, tmp_pa
             "session_id": target,
             "source": "ios",
             "profile": "router",
-            "required_prompt_handler": "hoppe_ocr_approval",
+            "required_prompt_handler": "  hoppe_ocr_approval  ",
         },
     )
 
     sid = response["result"]["session_id"]
     assert server._sessions[sid]["required_prompt_handler"] == "hoppe_ocr_approval"
+    assert response["result"]["required_prompt_handler"] == "hoppe_ocr_approval"
+
+
+def test_cold_session_resume_reports_no_required_prompt_handler(monkeypatch, tmp_path):
+    """Cold resume must distinguish an omitted policy from an old backend."""
+    target = "stored-ios-without-handler"
+    _prepare_resume(monkeypatch, tmp_path, target)
+
+    response = server._methods["session.resume"](
+        "resume-without-required-handler",
+        {"session_id": target, "source": "ios", "profile": "router"},
+    )
+
+    assert response["result"]["required_prompt_handler"] is None
 
 
 @pytest.mark.parametrize(
@@ -140,12 +173,35 @@ def test_live_session_resume_refreshes_required_prompt_handler(monkeypatch, tmp_
             "session_id": target,
             "source": "ios",
             "profile": "router",
-            "required_prompt_handler": "hoppe_ocr_approval",
+            "required_prompt_handler": "  hoppe_ocr_approval  ",
         },
     )
 
     assert response["result"]["session_id"] == "live-ios-ui"
     assert record["required_prompt_handler"] == "hoppe_ocr_approval"
+    assert response["result"]["required_prompt_handler"] == "hoppe_ocr_approval"
+
+
+def test_live_session_resume_reports_no_required_prompt_handler(monkeypatch, tmp_path):
+    """Live resume must explicitly confirm that no policy was requested."""
+    target = "stored-ios-live-without-handler"
+    _prepare_resume(monkeypatch, tmp_path, target)
+    record = server._deferred_session_record(
+        target,
+        cols=80,
+        cwd=str(tmp_path),
+        history=[],
+        lease=None,
+        source="ios",
+    )
+    server._sessions["live-ios-ui"] = record
+
+    response = server._methods["session.resume"](
+        "resume-live-without-required-handler",
+        {"session_id": target, "source": "ios", "profile": "router"},
+    )
+
+    assert response["result"]["required_prompt_handler"] is None
 
 
 def test_eager_session_constructor_retains_required_prompt_handler(monkeypatch, tmp_path):
