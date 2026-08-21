@@ -458,6 +458,21 @@ class TestTelegramNotifier:
         assert "2. Contacted by Recruiter" in body
         assert "[" not in body  # not a repr of the list
 
+    def test_blocked_question_does_not_hide_tail_options(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        event = Event.create(
+            EventType.APPLICATION_BLOCKED, "applier",
+            {"company": "Acme", "question": "Choose a source",
+             "options": ["choice%d" % i for i in range(60)]},
+        )
+        body = notifier._format_payload(event)
+        assert "60. choice59" in body
+        assert "more (see" not in body
+
     def test_blocked_question_without_options_lists_no_choices(
         self, bus, topics_config, verbosity_config,
     ):

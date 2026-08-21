@@ -321,11 +321,13 @@ class MailboxTranslator(BaseSubscriber):
             payload["question"] = _blocked_question_text(inner)
 
         # The ATS's own option labels, carried in their own key so they survive
-        # `question`'s 200-char summary budget. Set only when there is something
-        # to choose from: every renderer treats absent and empty alike, and an
-        # empty list would show up in the TelegramNotifier generic fallback.
+        # `question`'s 200-char summary budget. Preserve the producer's three
+        # states: absent means the popup was never observed, [] means it was
+        # observed and offered nothing, and a non-empty list is the exact set of
+        # labels. Renderers may present the first two alike, but downstream code
+        # must still be able to tell those claims apart.
         options = _blocked_question_options(inner)
-        if options:
+        if options is not None:
             payload["options"] = options
 
         return payload
@@ -755,7 +757,7 @@ def _question_labels(value: Any) -> List[str]:
     return labels
 
 
-def _blocked_question_options(inner: Dict[str, Any]) -> List[str]:
+def _blocked_question_options(inner: Dict[str, Any]) -> Optional[List[str]]:
     """The tenant's own listbox labels for the blocked question.
 
     A Workday listbox answer is matched against the tenant's OWN option text,
@@ -769,16 +771,17 @@ def _blocked_question_options(inner: Dict[str, Any]) -> List[str]:
     MailboxWatcher._summarize caps at 200 chars and the real Capital One list
     measured exactly 200 with no margin.
 
-    The producer's flat list wins; the per-question lists in
-    `questions[i].options` are the fallback for the notifier-bridge envelope
-    and for a replay of an envelope written before the flat key existed. As
-    with `question`, that means a fixed producer passes through untouched and
-    a stale one is still salvaged.
+    The producer's flat list wins, including an explicitly empty list. The
+    per-question lists in `questions[i].options` are the fallback for the
+    notifier-bridge envelope and for a replay of an envelope written before
+    the flat key existed. As with `question`, that means a fixed producer
+    passes through untouched and a stale one is still salvaged.
 
-    Flat by contract, so it is the FIRST question that offers any -- matching
-    the applier helper of the same name. Absent stays absent: nothing to
-    choose from is not the same claim as "the ATS offers nothing", and a
-    free-text answer must remain possible either way.
+    The return value is deliberately three-state. ``None`` means no option
+    popup was observed; ``[]`` means a popup was observed and offered nothing;
+    a non-empty list contains the exact labels. Among per-question entries, a
+    later observed non-empty list wins over an earlier observed-empty list,
+    matching the applier's ``question_options`` helper.
     """
     def _labels(value: Any) -> List[str]:
         if not isinstance(value, (list, tuple)):
@@ -790,19 +793,27 @@ def _blocked_question_options(inner: Dict[str, Any]) -> List[str]:
                 out.append(label)
         return out
 
-    direct = _labels(inner.get("options"))
-    if direct:
-        return direct
+    if "options" in inner:
+        value = inner.get("options")
+        # A malformed top-level key is not authoritative. Salvage a valid
+        # per-question capture if one exists; otherwise this remains absent.
+        if isinstance(value, (list, tuple)):
+            return _labels(value)
 
     questions = inner.get("questions") or inner.get("unansweredQuestions")
+    observed_empty = False
     if isinstance(questions, list):
         for entry in questions:
-            if not isinstance(entry, dict):
+            if not isinstance(entry, dict) or "options" not in entry:
                 continue
-            labels = _labels(entry.get("options"))
+            value = entry.get("options")
+            if not isinstance(value, (list, tuple)):
+                continue
+            labels = _labels(value)
             if labels:
                 return labels
-    return []
+            observed_empty = True
+    return [] if observed_empty else None
 
 
 def _blocked_question_text(inner: Dict[str, Any]) -> str:

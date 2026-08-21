@@ -1336,15 +1336,53 @@ class TestBlockedQuestionOptions:
         assert self._blocked(bus)["options"] == ["Internet"]
 
     def test_free_text_question_carries_no_options_key(self, bus):
-        """Absent is not the same claim as "the ATS offers nothing to pick";
-        a free-text answer has to stay possible, and an empty list would reach
-        the TelegramNotifier generic fallback as `options: []`."""
+        """Absent means no popup was observed; a free-text fallback remains
+        possible and downstream code can distinguish it from observed-empty."""
         _mailbox_event(bus, "BLOCKED_QUESTION", {
             "job_key": "j1",
             "questions": [{"label": "Why do you want this role?", "type": "text"}],
         })
         _translate(bus)
         assert "options" not in self._blocked(bus)
+
+    def test_explicit_flat_empty_list_is_preserved(self, bus):
+        """[] is a positive observation: the popup opened and offered nothing."""
+        _mailbox_event(bus, "BLOCKED_QUESTION", {
+            "job_key": "j1", "options": [],
+        })
+        _translate(bus)
+        out = self._blocked(bus)
+        assert "options" in out
+        assert out["options"] == []
+
+    def test_per_question_empty_list_is_preserved(self, bus):
+        _mailbox_event(bus, "BLOCKED_QUESTION", {
+            "job_key": "j1",
+            "questions": [{"label": "Source?", "options": []}],
+        })
+        _translate(bus)
+        assert self._blocked(bus)["options"] == []
+
+    def test_later_observed_labels_win_over_earlier_observed_empty(self, bus):
+        """Matches the applier helper: [] is retained only if no list has labels."""
+        _mailbox_event(bus, "BLOCKED_QUESTION", {
+            "job_key": "j1",
+            "questions": [
+                {"label": "Source?", "options": []},
+                {"label": "State?", "options": ["Florida", "Georgia"]},
+            ],
+        })
+        _translate(bus)
+        assert self._blocked(bus)["options"] == ["Florida", "Georgia"]
+
+    def test_flat_empty_list_wins_over_per_question_labels(self, bus):
+        """A producer-supplied flat key is authoritative even when empty."""
+        _mailbox_event(bus, "BLOCKED_QUESTION", {
+            "job_key": "j1", "options": [],
+            "questions": [{"label": "State?", "options": ["Florida"]}],
+        })
+        _translate(bus)
+        assert self._blocked(bus)["options"] == []
 
     def test_blank_and_duplicate_labels_are_dropped(self, bus):
         _mailbox_event(bus, "BLOCKED_QUESTION", {
@@ -1359,3 +1397,11 @@ class TestBlockedQuestionOptions:
             "job_key": "j1", "options": "Internet, Job Fair"})
         _translate(bus)
         assert "options" not in self._blocked(bus)
+
+    def test_malformed_flat_options_does_not_hide_per_question_labels(self, bus):
+        _mailbox_event(bus, "BLOCKED_QUESTION", {
+            "job_key": "j1", "options": "Internet, Job Fair",
+            "questions": [{"label": "Source?", "options": ["Internet"]}],
+        })
+        _translate(bus)
+        assert self._blocked(bus)["options"] == ["Internet"]

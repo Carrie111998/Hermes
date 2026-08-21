@@ -958,10 +958,7 @@ def boot_summary_body(payload: dict, *, max_listed: int = 5) -> str:
 # is not cosmetic: `question` is capped at MailboxWatcher._summarize's 200
 # chars, and the Capital One list measured exactly 200 inside it -- one longer
 # tenant list and the tail is lost to an ellipsis.
-BLOCKED_QUESTION_MAX_OPTIONS = 12
-
-
-def blocked_question_options(payload: Mapping, *, max_listed: int = BLOCKED_QUESTION_MAX_OPTIONS):
+def blocked_question_options(payload: Mapping, *, max_listed: int | None = None):
     """(shown, hidden) -- the option labels to print and how many were dropped.
 
     Tolerant of a producer that sends non-strings: the labels are clicked as
@@ -1009,13 +1006,16 @@ def blocked_question_line(payload: Mapping) -> str:
 
 
 def blocked_question_options_block(
-    payload: Mapping, *, max_listed: int = BLOCKED_QUESTION_MAX_OPTIONS
+    payload: Mapping, *, max_listed: int | None = None
 ) -> str:
     """The numbered choice list appended to every blocked-question rendering.
 
     Empty string when the envelope offers nothing to choose from -- a free-text
     question, or an older producer that never emitted `options`. Both surfaces
-    lead with their own sentence, so this is only the block.
+    lead with their own sentence, so this is only the block. By default every
+    tenant label is shown: hiding a tail choice makes the required verbatim
+    answer impossible to send. ``max_listed`` remains available only for callers
+    that have another complete source of labels to point at.
     """
     shown, hidden = blocked_question_options(payload, max_listed=max_listed)
     if not shown:

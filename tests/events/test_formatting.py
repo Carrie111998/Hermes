@@ -1283,7 +1283,13 @@ class TestBlockedQuestionOptionsBlock:
         assert self._block({"options": []}) == ""
         assert self._block({"options": "Internet, Job Fair"}) == ""
 
-    def test_long_lists_are_capped_and_say_so(self):
+    def test_default_renders_every_label(self):
+        """A hidden tail cannot be answered verbatim, so no surface may cap it."""
+        block = self._block({"options": ["opt%d" % i for i in range(60)]})
+        assert "60. opt59" in block
+        assert "more" not in block
+
+    def test_an_explicit_cap_is_supported_and_announced(self):
         block = self._block({"options": ["opt%d" % i for i in range(20)]},
                             max_listed=5)
         assert "5. opt4" in block

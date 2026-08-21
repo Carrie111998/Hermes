@@ -353,6 +353,20 @@ class TestMessageFormat:
         assert "3. Job Fair" in msg
         assert "EXACTLY" in msg
 
+    def test_blocked_question_does_not_hide_tail_options(
+        self, bus, quiet_config, queue_path,
+    ):
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path)
+        event = Event.create(
+            EventType.APPLICATION_BLOCKED, "applier",
+            {"company": "Acme", "question": "Choose a source",
+             "options": ["choice%d" % i for i in range(60)]},
+        )
+        msg = escalator.format_message(event)
+        assert "60. choice59" in msg
+        assert "more (see" not in msg
+
     def test_blocked_question_without_options_is_unchanged(
         self, bus, quiet_config, queue_path,
     ):
