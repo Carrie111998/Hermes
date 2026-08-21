@@ -95,10 +95,8 @@ test('security: a poisoned bot title stays literal in the handoff command', asyn
 
   const args = runHandoffCommand(result.text)
   assert.equal(args[args.indexOf('-p') + 1], 'ops')
-  assert.equal(
-    args[args.indexOf('-q') + 1],
-    `Message from \uD83E\uDD16 ${title} (@research): <your composed message>`
-  )
+  assert.equal(args[args.indexOf('--query-file') + 1], '<message-file-for-ops>')
+  assert.ok(result.text.includes(`Message from \uD83E\uDD16 ${title} (@research):`))
   assert.equal(existsSync(quoteSentinel), false)
   assert.equal(existsSync(subSentinel), false)
 })
@@ -113,10 +111,13 @@ test('security: a hostile active profile name stays literal in the handoff comma
 
   const args = runHandoffCommand(result.text)
   // displayName title-cases word boundaries inside the name — the shell
-  // metacharacters survive that transform, so they must arrive escaped.
-  assert.equal(
-    args[args.indexOf('-q') + 1],
-    `Message from \uD83E\uDD16 Res$(Touch /Tmp/Hbmmention${process.pid})Earch (@${activeProfile}): <your composed message>`
+  // metacharacters survive that transform, but they stay in file-content
+  // instructions and never enter the command's argv.
+  assert.equal(args[args.indexOf('--query-file') + 1], '<message-file-for-ops>')
+  assert.ok(
+    result.text.includes(
+      `Message from \uD83E\uDD16 Res$(Touch /Tmp/Hbmmention${process.pid})Earch (@${activeProfile}):`
+    )
   )
   assert.equal(existsSync(sentinel), false)
 })

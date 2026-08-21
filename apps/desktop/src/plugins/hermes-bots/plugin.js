@@ -5996,23 +5996,25 @@ function messagingProtocolSection(name, roster) {
     'You work alongside other named agents. Every agent (including you) has',
     'ONE canonical conversation titled "Bot Chat" — created with the agent,',
     'so it always exists. Agent-to-agent messages are delivered straight',
-    'into it, like a DM. To message a teammate, run:',
+    'into it, like a DM. To message a teammate, write the COMPLETE message',
+    'to a temporary file with the file tool FIRST — never inline message text',
+    'in a shell command. The file must open with the',
+    '"Message from \uD83E\uDD16 ' + handle + ' (@' + handle + '):" prefix. Then run:',
     '',
     '```',
-    'hermes -p <agent-name> chat --in ~ -c "Bot Chat" --create-if-missing -Q -q "Message from \uD83E\uDD16 ' + handle + ' (@' + handle + '): your message"',
-    '',
-    'Run the send with background=true and notify_on_complete=true on the',
-    'terminal tool, then finish your turn — the reply arrives later as a',
-    'background process notification. Never block waiting for it.',
+    'hermes -p <agent-name> chat --in ~ -c "Bot Chat" --create-if-missing -Q --query-file \'<message-file>\'',
     '```',
+    '',
+    'Use the exact file path from the file tool, shell-quoted as shown. Run the',
+    'send with background=true and notify_on_complete=true on the terminal',
+    'tool, then finish your turn — the reply arrives later as a background',
+    'process notification. Never block waiting for it.',
     '',
     '(`--in ~ -c "Bot Chat" --create-if-missing` resumes their canonical',
     'conversation in the home workspace, creating it if the target has no',
-    '"Bot Chat" yet. `-Q` keeps output clean. Always open with the',
-    '"Message from \uD83E\uDD16 ' + handle + ' (@' + handle + '):" prefix so they know',
-    'who is talking (the @handle lets the app show your avatar to them).',
-    'Their reply prints to stdout — relay the relevant part back to the',
-    'user, and say which agent it came from.)',
+    '"Bot Chat" yet. `-Q` keeps output clean. `--query-file` keeps the message',
+    'body out of shell parsing. Their reply prints to stdout — relay the',
+    'relevant part back to the user, and say which agent it came from.)',
     '',
     'If a message in YOUR chat starts with "Message from \uD83E\uDD16 <name>", it is',
     'a teammate messaging you, not the user. Answer it directly — your reply',
@@ -8549,13 +8551,6 @@ function normalizedProfileName(profile) {
 
 function shellQuote(value) {
   return `'${String(value).replaceAll("'", "'\"'\"'")}'`
-}
-
-/** Escape for interpolation INSIDE an existing double-quoted shell string:
- *  keeps ", `, $, and \ literal so free-text titles (which sync from ui_meta)
- *  and gateway profile names can't expand or break out of the quotes. */
-function shellDoubleQuote(value) {
-  return String(value).replace(/[\\"`$]/g, ch => '\\' + ch)
 }
 
 function routineInputError(title, instruction) {
@@ -11978,9 +11973,9 @@ export default {
           if (localMentions.length) {
             note +=
               '\n\n[@mention handoff — for each mentioned agent (' + localMentions.map(bot => botHandle(bot.name, bot)).join(', ') + '): ' +
-              'COMPOSE a message from you (' + senderName + ') to that agent conveying what the user wants — do not forward this text verbatim (avoid double quotes in your composed message). Send it with exactly one terminal call, run with background=true AND notify_on_complete=true (the recipient may take minutes; the user must not be blocked):\n' +
-              localMentions.map(bot => '`hermes -p ' + shellQuote(bot.name) + ' chat --in ~ -c "Bot Chat" --create-if-missing -Q -q "Message from 🤖 ' + shellDoubleQuote(senderName) + ' (@' + shellDoubleQuote(botHandle(live.name)) + '): <your composed message>"`').join('\n') +
-              '\nAfter dispatching, tell the user the message was sent and END YOUR TURN — do not wait or poll; when the background process completes, its notification carries the reply — relay it then, attributed to that agent. ' +
+              'COMPOSE a message from you (' + senderName + ') to that agent conveying what the user wants — do not forward this text verbatim. Write the COMPLETE message to a temporary file with the file tool FIRST; never inline the message body in a shell command. The file must begin with "Message from 🤖 ' + senderName + ' (@' + botHandle(live.name) + '):". Then send it with exactly one terminal call, run with background=true AND notify_on_complete=true (the recipient may take minutes; the user must not be blocked):\n' +
+              localMentions.map(bot => '`hermes -p ' + shellQuote(bot.name) + ' chat --in ~ -c "Bot Chat" --create-if-missing -Q --query-file ' + shellQuote(`<message-file-for-${botHandle(bot.name, bot)}>`) + '`').join('\n') +
+              '\nUse the exact file path from the file tool in place of the shell-quoted placeholder. After dispatching, tell the user the message was sent and END YOUR TURN — do not wait or poll; when the background process completes, its notification carries the reply — relay it then, attributed to that agent. ' +
               'Relay the reply back to the user, attributed to that agent.]'
           }
 
