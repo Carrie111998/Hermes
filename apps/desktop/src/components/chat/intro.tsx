@@ -1,5 +1,6 @@
-import { type CSSProperties, useState } from 'react'
+import { type CSSProperties, useEffect, useRef, useState } from 'react'
 
+import { useMediaQuery } from '@/hooks/use-media-query'
 import { capitalize, normalize } from '@/lib/text'
 
 import introCopyJsonl from './intro-copy.jsonl?raw'
@@ -158,7 +159,15 @@ function resolveCopy(personality?: string, seed?: number): IntroCopy {
 
 export function Intro({ personality, seed }: IntroProps) {
   const [mountSeed] = useState(() => Math.floor(Math.random() * 100000))
+  const reducedMotion = useMediaQuery('(prefers-reduced-motion: reduce)')
+  const videoRef = useRef<HTMLVideoElement>(null)
   const copy = resolveCopy(personality, mountSeed + (seed ?? 0))
+
+  useEffect(() => {
+    if (!reducedMotion || !videoRef.current) return
+    videoRef.current.pause()
+    videoRef.current.currentTime = 0
+  }, [reducedMotion])
 
   return (
     <div
@@ -167,14 +176,15 @@ export function Intro({ personality, seed }: IntroProps) {
     >
       <video
         aria-hidden="true"
-        autoPlay
+        autoPlay={!reducedMotion}
         className="mb-5 h-[min(27vh,15rem)] w-auto max-w-[min(27vw,15rem)] shrink-0 object-contain object-bottom opacity-95 [filter:saturate(0.94)_contrast(1.02)] motion-reduce:[animation:none]"
         data-slot="homepage-orb-video"
-        loop
+        loop={!reducedMotion}
         muted
         playsInline
-        preload="auto"
-        src="/portal-figure-orb.webm"
+        preload={reducedMotion ? 'metadata' : 'auto'}
+        ref={videoRef}
+        src="./portal-figure-orb.webm"
       />
       <div className="w-full min-w-0 translate-y-1.5">
         <p
