@@ -279,8 +279,10 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     runtimeIdByStoredSessionIdRef,
     selectedStoredSessionIdRef,
     selectedStoredSessionProfileRef,
+    sessionStateHasOwner,
     sessionStateByRuntimeIdRef,
     syncSessionStateToView,
+    updateOwnedSessionState,
     updateSessionState
   } = useSessionStateCache({
     activeSessionId,
@@ -376,7 +378,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     activeSessionIdRef,
     selectedStoredSessionIdRef,
     selectedStoredSessionProfileRef,
-    updateSessionState
+    sessionStateHasOwner,
+    updateOwnedSessionState
   })
 
   // Refresh any active transcript changed by another process. Signature-gated
@@ -390,10 +393,18 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         resolveSession: resolveActiveTranscriptSession,
         selectedStoredSessionIdRef,
         selectedStoredSessionProfileRef,
+        sessionStateHasOwner,
         signatureRef: activeTranscriptSignatureRef,
-        updateSessionState
+        updateOwnedSessionState
       }),
-    [activeSessionIdRef, busyRef, selectedStoredSessionIdRef, selectedStoredSessionProfileRef, updateSessionState]
+    [
+      activeSessionIdRef,
+      busyRef,
+      selectedStoredSessionIdRef,
+      selectedStoredSessionProfileRef,
+      sessionStateHasOwner,
+      updateOwnedSessionState
+    ]
   )
 
   const { handleGatewayEvent } = useMessageStream({
@@ -988,8 +999,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onThreadMessagesChange: handleThreadMessagesChange,
     onToggleSelectedPin: toggleSelectedPin,
     onTranscribeAudio: transcribeVoiceAudio,
-    onTriggerCronJob: jobId =>
-      triggerAndRefreshCronJobs(jobId, profileScope === ALL_PROFILES ? 'all' : profileScope)
+    onTriggerCronJob: (jobId, profile) =>
+      triggerAndRefreshCronJobs(jobId, profileScope === ALL_PROFILES ? 'all' : profileScope, profile)
         .then(() => undefined)
         .catch(() => undefined),
     getGateway: () => gatewayRef.current,
