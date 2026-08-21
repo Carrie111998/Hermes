@@ -507,7 +507,7 @@ def _ensure_windows_gateway_venv_imports() -> None:
         os.environ["VIRTUAL_ENV"] = str(resolved_venv)
         pythonpath = [project_entry, site_entry]
         if os.environ.get("PYTHONPATH"):
-            pythonpath.append(os.environ["PYTHONPATH"])
+            pythonpath.extend(os.environ["PYTHONPATH"].split(os.pathsep))
         os.environ["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(pythonpath))
         return
 
@@ -11392,7 +11392,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 watcher_env["VIRTUAL_ENV"] = str(venv_dir)
                 pythonpath = [str(project_root), str(site_packages)]
                 if watcher_env.get("PYTHONPATH"):
-                    pythonpath.append(watcher_env["PYTHONPATH"])
+                    pythonpath.extend(watcher_env["PYTHONPATH"].split(os.pathsep))
                 watcher_env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(pythonpath))
             watcher_argv = [
                 watcher_python,
