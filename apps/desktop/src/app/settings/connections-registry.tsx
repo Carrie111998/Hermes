@@ -119,35 +119,16 @@ export function sshCompositeKey(composite: string): string {
   return `${user}@${host}:${port}`
 }
 
-const CONNECTION_TEST_IPC_ERROR_PREFIX = "Error invoking remote method 'hermes:connections:test': Error: "
-
-const WS_TICKET_AUTH_REJECTION_MESSAGE =
-  'Reached the gateway over HTTP, but the OAuth session was rejected while minting a WebSocket ticket. ' +
-  'Open Settings → Gateway and sign in again.'
-
-/**
- * Electron's invoke bridge preserves a main-process throw as a renderer Error
- * message (for example, `Error invoking remote method '…': Error: 401: …`),
- * but does not preserve custom Error fields. Accept the field when present in
- * direct/test callers; otherwise match a leading serialized status or the
- * complete Electron-wrapped WebSocket-ticket auth rejection.
- */
 export function isConnectionAuthRejection(error: unknown): boolean {
+  const kind =
+    error && typeof error === 'object' && 'kind' in error ? (error as { kind?: unknown }).kind : null
+
   const statusCode =
     error && typeof error === 'object' && 'statusCode' in error
       ? Number((error as { statusCode?: unknown }).statusCode)
       : null
 
-  if (statusCode === 401 || statusCode === 403) {
-    return true
-  }
-
-  const message = error instanceof Error ? error.message : typeof error === 'string' ? error : ''
-
-  return (
-    /^(?:Error invoking remote method 'hermes:connections:test': Error: )?(?:401|403):(?:\s|$)/.test(message) ||
-    message === `${CONNECTION_TEST_IPC_ERROR_PREFIX}${WS_TICKET_AUTH_REJECTION_MESSAGE}`
-  )
+  return kind === 'auth-required' || statusCode === 401 || statusCode === 403
 }
 
 /**
@@ -275,9 +256,28 @@ export function ConnectionsRegistrySection() {
   const [authProbeGeneration, setAuthProbeGeneration] = useState<null | number>(null)
   const [authReadyGeneration, setAuthReadyGeneration] = useState<null | number>(null)
   const [authScope, setAuthScope] = useState<null | string>(null)
-  const authScopeRef = useRef<{ owned: boolean; scope: null | string }>({ owned: false, scope: null })
-  const authDraftPromise = useRef<null | Promise<null | string>>(null)
+
+  const authScopeRef = useRef<{
+    editorGeneration: number
+    normalizedUrl: string
+    owned: boolean
+    scope: null | string
+  }>({ editorGeneration: 0, normalizedUrl: '', owned: false, scope: null })
+
+  const authDraftPromises = useRef(
+    new Set<{
+      cleanupUrl: string
+      editorGeneration: number
+      normalizedUrl: string
+      promise: Promise<null | string>
+    }>()
+  )
+
+  const authTargetConnectionId = useRef<null | string>(null)
   const authGeneration = useRef(0)
+  const editorRef = useRef<EditorState | null>(null)
+  editorRef.current = editor
+  const authReadinessCapability = useRef<null | string>(null)
   const [reauthIds, setReauthIds] = useState<Set<string>>(() => new Set())
   const authProbeSeq = useRef(0)
   const searchInputRef = useRef<HTMLInputElement>(null)
@@ -367,22 +367,29 @@ export function ConnectionsRegistrySection() {
     void load()
   }, [load])
 
-  const editorAuthHeaders = (current: EditorState): Record<string, string> =>
+  const editorAuthHeaders = (current: EditorState): Record<string, null | string> =>
     Object.fromEntries(
       current.headers
-        .map(row => [row.name.trim(), row.value.trim()] as const)
-        .filter(([name, value]) => Boolean(name && value))
+        .map(row => [row.name.trim(), row.value.trim() || (row.stored ? null : '')] as const)
+        .filter(([name]) => Boolean(name))
     )
 
-  const setAuthScopeState = (scope: null | string, owned: boolean) => {
-    authScopeRef.current = { owned, scope }
+  const setAuthScopeState = (
+    scope: null | string,
+    owned: boolean,
+    normalizedUrl = normalizeGatewayUrl(editorRef.current?.url || ''),
+    editorGeneration = authGeneration.current
+  ) => {
+    authScopeRef.current = { editorGeneration, normalizedUrl, owned, scope }
     setAuthScope(scope)
   }
 
   const invalidateReadiness = (clearProbe = false) => {
     authGeneration.current += 1
+    authReadinessCapability.current = null
     setAuthReadyGeneration(null)
     setAuthError(null)
+    authScopeRef.current = { ...authScopeRef.current, editorGeneration: authGeneration.current }
 
     if (clearProbe) {
       authProbeSeq.current += 1
@@ -395,6 +402,7 @@ export function ConnectionsRegistrySection() {
   const resetEditorAuth = useCallback((signedIn = false) => {
     authProbeSeq.current += 1
     authGeneration.current += 1
+    authReadinessCapability.current = null
     setAuthProbe(null)
     setAuthProbeGeneration(null)
     setAuthProbeBusy(false)
@@ -405,53 +413,97 @@ export function ConnectionsRegistrySection() {
     setAuthReadyGeneration(null)
   }, [])
 
-  const clearOwnedDraft = async (url: string) => {
-    const current = authScopeRef.current
-
-    if (!current.owned || !current.scope) {
+  const clearDraft = async (
+    draft: Pick<typeof authScopeRef.current, 'normalizedUrl' | 'owned' | 'scope'>,
+    fallbackUrl = ''
+  ) => {
+    if (!draft.owned || !draft.scope) {
       return
     }
 
-    setAuthScopeState(null, false)
+    if (authScopeRef.current.scope === draft.scope) {
+      setAuthScopeState(null, false)
+    }
 
-    if (url.trim()) {
-      await bridge?.auth.clear({ scope: current.scope, url, headers: {} })
+    const url = draft.normalizedUrl || normalizeGatewayUrl(fallbackUrl)
+
+    if (url) {
+      await bridge?.auth.clear({ scope: draft.scope, url, headers: {} })
     }
   }
 
-  const createOwnedDraft = async () => {
-    if (authScopeRef.current.owned && authScopeRef.current.scope) {
-      return authScopeRef.current.scope
+  const clearOwnedDraft = async (fallbackUrl: string) => clearDraft(authScopeRef.current, fallbackUrl)
+
+  const createOwnedDraft = async (
+    ownerConnectionId?: string,
+    normalizedUrl = normalizeGatewayUrl(editorRef.current?.url || ''),
+    editorGeneration = authGeneration.current
+  ) => {
+    const current = authScopeRef.current
+
+    if (
+      current.owned &&
+      current.scope &&
+      current.editorGeneration === editorGeneration &&
+      current.normalizedUrl === normalizedUrl
+    ) {
+      return current.scope
     }
 
-    if (authDraftPromise.current) {
-      return authDraftPromise.current
+    const existingPending = [...authDraftPromises.current].find(
+      pending => pending.editorGeneration === editorGeneration && pending.normalizedUrl === normalizedUrl
+    )
+
+    if (existingPending) {
+      return existingPending.promise
     }
 
-    const pending = (async () => {
-      const result = await bridge?.auth.createDraft()
+    const pending = {
+      cleanupUrl: '',
+      editorGeneration,
+      normalizedUrl,
+      promise: Promise.resolve<null | string>(null)
+    }
 
-      if (result?.ok) {
-        setAuthScopeState(result.scope, true)
+    pending.promise = (async () => {
+      const result = await bridge?.auth.createDraft(ownerConnectionId ? { ownerConnectionId } : undefined)
 
-        return result.scope
+      if (!result?.ok) {
+        if (result && editorGeneration === authGeneration.current) {
+          setAuthError(result.error)
+        }
+
+        return null
       }
 
-      if (result && !result.ok) {
-        setAuthError(result.error)
+      const currentEditor = editorRef.current
+
+      const stillCurrent =
+        editorGeneration === authGeneration.current &&
+        currentEditor?.kind === 'remote' &&
+        normalizeGatewayUrl(currentEditor.url) === normalizedUrl
+
+      if (!stillCurrent) {
+        await clearDraft(
+          { normalizedUrl: pending.cleanupUrl || normalizedUrl, owned: true, scope: result.scope },
+          currentEditor?.url || ''
+        )
+
+        return null
       }
 
-      return null
+      setAuthScopeState(result.scope, true, normalizedUrl, editorGeneration)
+      authTargetConnectionId.current = result.targetConnectionId
+
+      return result.scope
     })()
 
-    authDraftPromise.current = pending
+    authDraftPromises.current.add(pending)
 
     try {
-      return await pending
+      return await pending.promise
     } finally {
-      if (authDraftPromise.current === pending) {
-        authDraftPromise.current = null
-      }
+      authDraftPromises.current.delete(pending)
     }
   }
 
@@ -473,54 +525,70 @@ export function ConnectionsRegistrySection() {
     if (result.ok) {
       setAuthSignedIn(result.connected)
     } else {
+      setAuthSignedIn(false)
       setAuthError(result.error)
     }
   }
 
   const openEditor = (next: EditorState | null) => {
-    const previousUrl = editor?.url || ''
+    const previous = authScopeRef.current
+    const previousUrl = editorRef.current?.url || ''
     setDupeError(null)
-    void clearOwnedDraft(previousUrl)
     resetEditorAuth()
-    setAuthScopeState(null, false)
+    editorRef.current = next
+    setAuthScopeState(null, false, normalizeGatewayUrl(next?.url || ''))
+    authTargetConnectionId.current = null
     setEditor(next)
+    void clearDraft(previous, previousUrl)
+
+    for (const pending of authDraftPromises.current) {
+      pending.cleanupUrl ||= normalizeGatewayUrl(previousUrl || next?.url || '')
+    }
 
     if (!next || next.kind !== 'remote') {
       return
     }
 
     if (next.id) {
-      setAuthScopeState(next.id, false)
+      setAuthScopeState(next.id, false, normalizeGatewayUrl(next.url))
+      authTargetConnectionId.current = next.id
       const seq = authGeneration.current
       void readDurableAuthStatus(next, seq)
     } else {
-      void createOwnedDraft()
+      void createOwnedDraft(undefined, normalizeGatewayUrl(next.url), authGeneration.current)
     }
   }
 
   const ensureScopeForUrl = async (current: EditorState, nextUrl: string) => {
-    if (!current.id) {
-      return authScopeRef.current.scope || createOwnedDraft()
-    }
+    const previousNormalizedUrl = normalizeGatewayUrl(current.url)
+    const normalizedUrl = normalizeGatewayUrl(nextUrl)
 
-    const original = registry?.connections.find(connection => connection.id === current.id)?.url || ''
-    const changed = normalizeGatewayUrl(nextUrl) !== normalizeGatewayUrl(original)
-
-    if (changed) {
-      if (!authScopeRef.current.owned) {
-        setAuthScopeState(null, false)
-
-        return createOwnedDraft()
-      }
-
+    if (normalizedUrl === previousNormalizedUrl) {
       return authScopeRef.current.scope
     }
 
-    if (authScopeRef.current.owned) {
-      await clearOwnedDraft(current.url)
+    const previous = authScopeRef.current
+
+    for (const pending of authDraftPromises.current) {
+      pending.cleanupUrl ||= previousNormalizedUrl || normalizedUrl
     }
 
-    setAuthScopeState(current.id, false)
+    void clearDraft(previous, previousNormalizedUrl || normalizedUrl)
+    setAuthScopeState(null, false, normalizedUrl)
+
+    if (!current.id) {
+      return createOwnedDraft(undefined, normalizedUrl, authGeneration.current)
+    }
+
+    const original = registry?.connections.find(connection => connection.id === current.id)?.url || ''
+    const changed = normalizedUrl !== normalizeGatewayUrl(original)
+
+    if (changed) {
+      return createOwnedDraft(current.id, normalizedUrl, authGeneration.current)
+    }
+
+    setAuthScopeState(current.id, false, normalizedUrl)
+    authTargetConnectionId.current = current.id
     const seq = authGeneration.current
     void readDurableAuthStatus({ ...current, url: nextUrl }, seq)
 
@@ -618,6 +686,7 @@ export function ConnectionsRegistrySection() {
       }
 
       if (!result.ok) {
+        authReadinessCapability.current = null
         setAuthReadyGeneration(null)
         setAuthError(result.error)
 
@@ -629,11 +698,13 @@ export function ConnectionsRegistrySection() {
         return false
       }
 
+      authReadinessCapability.current = result.readinessCapability
       setAuthReadyGeneration(generation)
 
       return true
     } catch (err) {
       if (generation === authGeneration.current) {
+        authReadinessCapability.current = null
         setAuthReadyGeneration(null)
         setAuthError(err instanceof Error ? err.message : s.testFailed)
       }
@@ -744,6 +815,18 @@ export function ConnectionsRegistrySection() {
         return
       }
 
+      if (
+        !allowPlainTextToken &&
+        registry?.secureTokenStorage === false &&
+        editor.kind === 'remote' &&
+        editor.authMode === 'token' &&
+        editor.token.trim()
+      ) {
+        setPlainTextConfirm(true)
+
+        return
+      }
+
       setDupeError(null)
       setSaving(true)
 
@@ -755,6 +838,8 @@ export function ConnectionsRegistrySection() {
 
         if (editor.id) {
           payload.id = editor.id
+        } else if (editor.kind === 'remote' && authTargetConnectionId.current) {
+          payload.id = authTargetConnectionId.current
         }
 
         if (editor.kind === 'remote' || editor.kind === 'cloud') {
@@ -763,6 +848,10 @@ export function ConnectionsRegistrySection() {
 
           if (authScopeRef.current.owned && authScopeRef.current.scope) {
             payload.authDraftScope = authScopeRef.current.scope
+          }
+
+          if (editor.kind === 'remote' && authReadinessCapability.current) {
+            payload.authReadinessCapability = authReadinessCapability.current
           }
 
           if (editor.token.trim()) {
@@ -774,17 +863,16 @@ export function ConnectionsRegistrySection() {
           }
 
           // Authoritative header map: typed value → new secret; empty value on
-          // a stored row → null (keep saved secret); a removed row is simply
-          // absent, which clears it server-side.
+          // a stored row → null (keep saved secret); a removed or blank-name row
+          // is absent. Always send the map (including {}) so Electron cannot
+          // inherit credentials from the previously stored connection.
           const headerEntries = editor.headers
             .map(row => ({ name: row.name.trim(), stored: row.stored, value: row.value.trim() }))
             .filter(row => row.name)
 
-          if (headerEntries.length > 0 || editor.headers.length === 0) {
-            payload.headers = Object.fromEntries(
-              headerEntries.map(row => [row.name, row.value ? row.value : row.stored ? null : ''])
-            )
-          }
+          payload.headers = Object.fromEntries(
+            headerEntries.map(row => [row.name, row.value ? row.value : row.stored ? null : ''])
+          )
         } else if (editor.kind === 'ssh') {
           // The composite host string (user@host:port) is the single source
           // of truth — never send separate user/port (see editorFromConnection).
@@ -792,6 +880,10 @@ export function ConnectionsRegistrySection() {
           payload.keyPath = editor.keyPath || undefined
         }
 
+        // Readiness proof is one-shot renderer state: forward the value captured
+        // above exactly once and burn the local copy before crossing IPC.
+        authReadinessCapability.current = null
+        setAuthReadyGeneration(null)
         const result = await bridge.save(payload)
         publishRegistry(result.registry)
         setAuthScopeState(null, false)
@@ -799,21 +891,6 @@ export function ConnectionsRegistrySection() {
         setEditor(null)
         setPlainTextConfirm(false)
       } catch (err) {
-        // Keyring-less machine and the user hasn't consented to plain-text
-        // storage yet: raise the same opt-in dialog the connection-mode form
-        // uses instead of dead-ending the save.
-        if (
-          !allowPlainTextToken &&
-          registry?.secureTokenStorage === false &&
-          editor.kind === 'remote' &&
-          editor.authMode === 'token' &&
-          editor.token.trim()
-        ) {
-          setPlainTextConfirm(true)
-
-          return
-        }
-
         notifyError(err, s.saveFailed)
       } finally {
         setSaving(false)
@@ -895,7 +972,7 @@ export function ConnectionsRegistrySection() {
         if (reachable) {
           notify({ title: conn.label, message: s.testOk })
         } else {
-          if (result.kind === 'auth-required') {
+          if (isConnectionAuthRejection(result)) {
             setReauthIds(current => new Set(current).add(conn.id))
           }
 
@@ -1115,14 +1192,20 @@ export function ConnectionsRegistrySection() {
                 key={kind}
                 onClick={() => {
                   const next = { ...editor, kind }
+                  const previous = authScopeRef.current
                   setDupeError(null)
-                  void clearOwnedDraft(editor.url)
                   resetEditorAuth()
-                  setAuthScopeState(null, false)
+                  editorRef.current = next
+                  setAuthScopeState(null, false, normalizeGatewayUrl(next.url))
                   setEditor(next)
+                  void clearDraft(previous, editor.url)
+
+                  for (const pending of authDraftPromises.current) {
+                    pending.cleanupUrl ||= normalizeGatewayUrl(editor.url)
+                  }
 
                   if (kind === 'remote') {
-                    void createOwnedDraft()
+                    void createOwnedDraft(undefined, normalizeGatewayUrl(next.url), authGeneration.current)
                   }
                 }}
                 size="sm"
@@ -1159,6 +1242,7 @@ export function ConnectionsRegistrySection() {
                     const next = { ...editor, url }
                     setDupeError(null)
                     resetEditorAuth()
+                    editorRef.current = next
                     setEditor(next)
                     void ensureScopeForUrl(editor, url)
                   }}

@@ -21,7 +21,13 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import { type NativeTokenSet, parseStoredTokenSet, parseTokenResponse } from './native-oauth'
-import { loadNativeTokenSet, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
+import {
+  loadNativeTokenSet,
+  type NativeTokenStoreIo,
+  persistNativeTokenSet,
+  restoreNativeTokenSecret,
+  snapshotNativeTokenSecret
+} from './native-token-store'
 
 const GATEWAY = 'https://gw.example.com'
 
@@ -284,28 +290,128 @@ test('a non-Error decryption failure keeps its detail in the log', () => {
   assert.match(disk.logs[0], /keychain exploded/)
 })
 
-test('an unwritable store file is logged rather than thrown', () => {
+test('an unwritable store file propagates failure to the transaction boundary', () => {
   const disk = createFakeDisk(null, {
     writeStoreText: () => {
       throw new Error('EACCES: permission denied')
     }
   })
 
-  assert.doesNotThrow(() => persistNativeTokenSet(GATEWAY, TOKENS, disk.io))
+  assert.throws(() => persistNativeTokenSet(GATEWAY, TOKENS, disk.io), /EACCES: permission denied/)
   assert.match(disk.logs[0], /failed to persist tokens: EACCES/)
 })
 
-test('a non-Error write failure keeps its detail in the log', () => {
+test('a non-Error write failure is logged and propagated intact', () => {
   const disk = createFakeDisk(null, {
     writeStoreText: () => {
       throw 'disk went away'
     }
   })
 
-  // `(error as Error).message` on a thrown string reads as undefined and loses
-  // the only diagnostic there was.
-  assert.doesNotThrow(() => persistNativeTokenSet(GATEWAY, TOKENS, disk.io))
+  assert.throws(
+    () => persistNativeTokenSet(GATEWAY, TOKENS, disk.io),
+    error => error === 'disk went away'
+  )
   assert.equal(disk.logs[0], '[native-oauth] failed to persist tokens: disk went away')
+})
+
+test('an encrypted token envelope snapshots and restores exactly without decrypting it', () => {
+  const original = { encoding: 'safeStorage', value: 'opaque-original-bytes' }
+  const replacement = { encoding: 'safeStorage', value: 'opaque-replacement-bytes' }
+  const disk = createFakeDisk(JSON.stringify({ [GATEWAY]: original }))
+
+  const snapshot = snapshotNativeTokenSecret(GATEWAY, disk.io)
+  restoreNativeTokenSecret(GATEWAY, replacement, disk.io)
+  restoreNativeTokenSecret(GATEWAY, snapshot, disk.io)
+
+  assert.deepEqual(JSON.parse(disk.fileText()!)[GATEWAY], original)
+})
+
+test('restoring an encrypted envelope propagates persistence failure', () => {
+  const disk = createFakeDisk('{}', {
+    writeStoreText: () => {
+      throw new Error('restore write failed')
+    }
+  })
+
+  assert.throws(
+    () => restoreNativeTokenSecret(GATEWAY, { encoding: 'safeStorage', value: 'opaque' }, disk.io),
+    /restore write failed/
+  )
+})
+
+test('transactional restore does not write when the authoritative store read fails', () => {
+  const before = JSON.stringify({
+    'registry:gateway-b': { encoding: 'safeStorage', value: 'unrelated-opaque-envelope' }
+  })
+
+  const disk = createFakeDisk(before)
+  let readInjected = false
+  let writes = 0
+
+  const io: NativeTokenStoreIo = {
+    ...disk.io,
+    readStoreText: () => {
+      readInjected = true
+      throw new Error('EIO: token store unavailable')
+    },
+    writeStoreText: () => {
+      writes += 1
+    }
+  }
+
+  assert.throws(
+    () => restoreNativeTokenSecret('registry:gateway-a', { encoding: 'safeStorage', value: 'restored' }, io),
+    /EIO: token store unavailable/
+  )
+  assert.equal(readInjected, true, 'the injected authoritative read failure must execute')
+  assert.equal(writes, 0, 'restore must not truncate or replace the store after an unreadable snapshot')
+  assert.equal(disk.fileText(), before, 'the unrelated gateway entry must remain byte-for-byte intact')
+})
+
+test('transactional restore does not truncate a malformed store or invent an empty replacement', () => {
+  const malformed = '{not json'
+  const disk = createFakeDisk(malformed)
+  let writes = 0
+
+  const io: NativeTokenStoreIo = {
+    ...disk.io,
+    writeStoreText: () => {
+      writes += 1
+    }
+  }
+
+  assert.throws(
+    () => restoreNativeTokenSecret('registry:gateway-a', undefined, io),
+    /Unexpected token|JSON/i
+  )
+  assert.equal(writes, 0, 'malformed authoritative state must never be replaced with an empty map')
+  assert.equal(disk.fileText(), malformed)
+})
+
+test('ordinary startup load remains tolerant of native-token store I/O failure', () => {
+  let readInjected = false
+
+  const disk = createFakeDisk('{}', {
+    readStoreText: () => {
+      readInjected = true
+      throw new Error('EIO: token store unavailable')
+    }
+  })
+
+  assert.equal(loadNativeTokenSet(GATEWAY, disk.io), null)
+  assert.equal(readInjected, true, 'the injected tolerant startup read must execute')
+  assert.deepEqual(disk.logs, [])
+})
+
+test('an authoritative envelope snapshot propagates store read failure', () => {
+  const disk = createFakeDisk('{}', {
+    readStoreText: () => {
+      throw new Error('EIO: token store unavailable')
+    }
+  })
+
+  assert.throws(() => snapshotNativeTokenSecret(GATEWAY, disk.io), /EIO: token store unavailable/)
 })
 
 test('an unusable keychain fails the write loudly and writes nothing', () => {

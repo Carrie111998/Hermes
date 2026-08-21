@@ -140,13 +140,12 @@ declare global {
       connections: {
         list: () => Promise<DesktopConnectionsRegistry>
         auth: {
-          createDraft: () => Promise<DesktopRegistryAuthDraftResult>
+          createDraft: (payload?: { ownerConnectionId?: string }) => Promise<DesktopRegistryAuthDraftResult>
           probe: (payload: DesktopRegistryAuthScopeRequest) => Promise<DesktopRegistryAuthProbeResult>
           login: (payload: DesktopRegistryAuthScopeRequest) => Promise<DesktopRegistryAuthSessionResult>
           verify: (payload: DesktopRegistryAuthVerifyRequest) => Promise<DesktopRegistryAuthVerifyResult>
           status: (payload: DesktopRegistryAuthScopeRequest) => Promise<DesktopRegistryAuthSessionResult>
           clear: (payload: DesktopRegistryAuthScopeRequest) => Promise<DesktopRegistryAuthSessionResult>
-          promote: (payload: DesktopRegistryAuthPromotionRequest) => Promise<DesktopRegistryAuthPromotionResult>
         }
         save: (
           payload: DesktopRegistryConnectionInput
@@ -801,6 +800,7 @@ export interface DesktopConnectionTestResult {
     | null
   error?: string | null
   kind?: 'auth-required' | 'transport-error'
+  statusCode?: number | null
   host?: string
   remoteHermesPath?: string
   remoteHermesVersion?: string
@@ -868,6 +868,8 @@ export interface DesktopRegistryConnectionInput {
   allowPlainTextToken?: boolean
   // Owned draft scope promoted atomically before the registry row is persisted.
   authDraftScope?: string
+  // Opaque, one-time proof returned by auth.verify for this exact candidate.
+  authReadinessCapability?: string
   // Extra gateway headers for remote/cloud entries (access proxies such as
   // Cloudflare Access). The map is authoritative when present: name → new
   // plaintext value (encrypted at rest), or null to keep the stored secret
@@ -931,7 +933,7 @@ export interface DesktopSshHostsResult {
 export interface DesktopRegistryAuthScopeRequest {
   scope: string
   url: string
-  headers?: Record<string, string>
+  headers?: Record<string, null | string>
 }
 
 export interface DesktopRegistryAuthVerifyRequest extends DesktopRegistryAuthScopeRequest {
@@ -940,19 +942,17 @@ export interface DesktopRegistryAuthVerifyRequest extends DesktopRegistryAuthSco
   token?: string
 }
 
-export interface DesktopRegistryAuthPromotionRequest {
-  connectionId: string
-  draftScope: string
-  url: string
-}
 
 export interface DesktopRegistryAuthFailure {
   error: string
   kind: 'auth-required' | 'transport-error'
   ok: false
+  statusCode: number | null
 }
 
-export type DesktopRegistryAuthDraftResult = { ok: true; scope: string } | DesktopRegistryAuthFailure
+export type DesktopRegistryAuthDraftResult =
+  | { ok: true; scope: string; targetConnectionId: string }
+  | DesktopRegistryAuthFailure
 export type DesktopRegistryAuthProbeResult =
   | (DesktopConnectionProbeResult & { scope: string })
   | DesktopRegistryAuthFailure
@@ -960,10 +960,7 @@ export type DesktopRegistryAuthSessionResult =
   | { baseUrl: string; connected: boolean; ok: true }
   | DesktopRegistryAuthFailure
 export type DesktopRegistryAuthVerifyResult =
-  | { baseUrl: string; ok: true; version: string | null }
-  | DesktopRegistryAuthFailure
-export type DesktopRegistryAuthPromotionResult =
-  | { baseUrl: string; ok: true; scope: string }
+  | { baseUrl: string; ok: true; readinessCapability: string; version: string | null }
   | DesktopRegistryAuthFailure
 
 export interface DesktopAuthProvider {

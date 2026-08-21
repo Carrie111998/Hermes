@@ -27,6 +27,33 @@ const authVerify = vi.fn()
 const authStatus = vi.fn()
 const authClear = vi.fn()
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let consumed = false
+
+  const promise = new Promise<T>(resolvePromise => {
+    resolve = resolvePromise
+  })
+
+  return {
+    consume: () => {
+      consumed = true
+
+      return promise
+    },
+    resolve,
+    wasConsumed: () => consumed
+  }
+}
+
+function draftResult(index: number) {
+  return {
+    ok: true as const,
+    scope: `draft-00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+    targetConnectionId: `gateway-00000000-0000-4000-8000-${String(index).padStart(12, '0')}`
+  }
+}
+
 const registry: DesktopConnectionsRegistry = {
   connections: [
     { id: 'local', kind: 'local', label: 'This device', tokenPreview: null, tokenSet: false },
@@ -65,7 +92,11 @@ beforeEach(() => {
   setPrimary.mockResolvedValue({ ok: true, registry: { ...registry, primary: 'homelab' } })
   test.mockResolvedValue({ ok: true, reachable: true })
 
-  createDraft.mockResolvedValue({ ok: true, scope: 'draft-76f9d14d-2f10-4ccb-9bb8-089935501512' })
+  createDraft.mockResolvedValue({
+    ok: true,
+    scope: 'draft-76f9d14d-2f10-4ccb-9bb8-089935501512',
+    targetConnectionId: 'gateway-76f9d14d-2f10-4ccb-9bb8-089935501512'
+  })
   authProbe.mockResolvedValue({
     authMode: 'token',
     baseUrl: 'http://homelab.lan:9119',
@@ -76,7 +107,12 @@ beforeEach(() => {
     version: '0.20.4'
   })
   authLogin.mockResolvedValue({ baseUrl: 'http://homelab.lan:9119', connected: true, ok: true })
-  authVerify.mockResolvedValue({ baseUrl: 'http://homelab.lan:9119', ok: true, version: '0.20.4' })
+  authVerify.mockResolvedValue({
+    baseUrl: 'http://homelab.lan:9119',
+    ok: true,
+    readinessCapability: 'readiness-capability-1',
+    version: '0.20.4'
+  })
   authStatus.mockResolvedValue({ baseUrl: 'http://homelab.lan:9119', connected: false, ok: true })
   authClear.mockResolvedValue({ baseUrl: 'http://homelab.lan:9119', connected: false, ok: true })
   Object.defineProperty(window, 'hermesDesktop', {
@@ -244,6 +280,8 @@ describe('ConnectionsRegistrySection', () => {
       expect(save).toHaveBeenCalledWith(
         expect.objectContaining({
           authMode: 'oauth',
+          authReadinessCapability: 'readiness-capability-1',
+          id: 'gateway-76f9d14d-2f10-4ccb-9bb8-089935501512',
           kind: 'remote',
           label: 'PopCorn VPS',
           url: 'http://100.110.110.95:9119'
@@ -502,6 +540,65 @@ describe('ConnectionsRegistrySection', () => {
     await waitFor(() => expect(saveButton.disabled).toBe(false))
   })
 
+  it('preflights plaintext consent without spending the readiness capability', async () => {
+    list.mockResolvedValueOnce({ ...registry, secureTokenStorage: false })
+    authProbe.mockResolvedValueOnce({
+      authMode: 'token',
+      baseUrl: 'https://keyringless.example.test',
+      error: null,
+      providers: [],
+      reachable: true,
+      scope: 'draft-76f9d14d-2f10-4ccb-9bb8-089935501512',
+      version: '0.20.4'
+    })
+    render(<ConnectionsRegistrySection />)
+
+    await waitFor(() => expect(screen.getByText('Homelab')).toBeTruthy())
+    fireEvent.click(screen.getByText('Add connection'))
+    fireEvent.change(screen.getByPlaceholderText('Homelab'), { target: { value: 'Keyringless gateway' } })
+    fireEvent.change(screen.getByPlaceholderText('http://homelab.lan:9119'), {
+      target: { value: 'https://keyringless.example.test' }
+    })
+    fireEvent.change(screen.getByPlaceholderText('Paste session token'), { target: { value: 'candidate-token' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Detect authentication' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Verify connection' }))
+    await waitFor(
+      () => expect((screen.getByRole('button', { name: 'Save connection' }) as HTMLButtonElement).disabled).toBe(false)
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save connection' }))
+
+    expect(await screen.findByRole('button', { name: 'Save as plain text' })).toBeTruthy()
+    expect(save).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save as plain text' }))
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1))
+    expect(save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        allowPlainTextToken: true,
+        authReadinessCapability: 'readiness-capability-1',
+        token: 'candidate-token'
+      })
+    )
+  })
+
+  it('saves a label-only existing remote edit without verification or a readiness capability', async () => {
+    render(<ConnectionsRegistrySection />)
+
+    await waitFor(() => expect(screen.getByText('Homelab')).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    fireEvent.change(screen.getByDisplayValue('Homelab'), { target: { value: 'Renamed homelab' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save connection' }))
+
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1))
+    expect(save).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'homelab', kind: 'remote', label: 'Renamed homelab' })
+    )
+    expect(save.mock.calls[0][0]).not.toHaveProperty('authReadinessCapability')
+    expect(save.mock.calls[0][0]).not.toHaveProperty('token')
+    expect(authVerify).not.toHaveBeenCalled()
+  })
+
   it('offers every kind on create and disables Local while the managed entry exists', async () => {
     render(<ConnectionsRegistrySection />)
 
@@ -752,6 +849,231 @@ describe('ConnectionsRegistrySection', () => {
     )
   })
 
+  it('clears a late draft result after cancel instead of adopting it', async () => {
+    const pendingDraft = deferred<ReturnType<typeof draftResult>>()
+    createDraft.mockImplementationOnce(() => pendingDraft.consume())
+    render(<ConnectionsRegistrySection />)
+
+    await screen.findByText('Homelab')
+    fireEvent.click(screen.getByText('Add connection'))
+    expect(createDraft).toHaveBeenCalledTimes(1)
+    expect(pendingDraft.wasConsumed()).toBe(true)
+    fireEvent.change(screen.getByPlaceholderText('http://homelab.lan:9119'), {
+      target: { value: 'https://gateway-a.example.test' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+
+    await act(async () => pendingDraft.resolve(draftResult(1)))
+
+    await waitFor(() =>
+      expect(authClear).toHaveBeenCalledWith(
+        expect.objectContaining({ scope: draftResult(1).scope, url: 'https://gateway-a.example.test' })
+      )
+    )
+    expect(screen.queryByRole('button', { name: 'Save connection' })).toBeNull()
+  })
+
+  it('clears the A draft when switching to B and gives B a distinct scope', async () => {
+    const pendingA = deferred<ReturnType<typeof draftResult>>()
+    createDraft
+      .mockImplementationOnce(() => pendingA.consume())
+      .mockResolvedValueOnce(draftResult(2))
+      .mockResolvedValueOnce(draftResult(3))
+    render(<ConnectionsRegistrySection />)
+
+    await screen.findByText('Homelab')
+    fireEvent.click(screen.getByText('Add connection'))
+    const urlInput = screen.getByPlaceholderText('http://homelab.lan:9119')
+    fireEvent.change(urlInput, { target: { value: 'https://gateway-a.example.test' } })
+    expect(createDraft).toHaveBeenCalledTimes(2)
+    expect(pendingA.wasConsumed()).toBe(true)
+    fireEvent.change(urlInput, { target: { value: 'https://gateway-b.example.test' } })
+
+    await act(async () => pendingA.resolve(draftResult(1)))
+
+    await waitFor(() => expect(createDraft).toHaveBeenCalledTimes(3))
+    await waitFor(() =>
+      expect(authClear).toHaveBeenCalledWith(
+        expect.objectContaining({ scope: draftResult(1).scope, url: 'https://gateway-a.example.test' })
+      )
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Detect authentication' }))
+    await waitFor(() =>
+      expect(authProbe).toHaveBeenCalledWith(
+        expect.objectContaining({ scope: draftResult(3).scope, url: 'https://gateway-b.example.test' })
+      )
+    )
+  })
+
+  it('rotates draft ownership for every A to B to A endpoint generation', async () => {
+    createDraft
+      .mockResolvedValueOnce(draftResult(1))
+      .mockResolvedValueOnce(draftResult(2))
+      .mockResolvedValueOnce(draftResult(3))
+      .mockResolvedValueOnce(draftResult(4))
+    render(<ConnectionsRegistrySection />)
+
+    await screen.findByText('Homelab')
+    fireEvent.click(screen.getByText('Add connection'))
+    await waitFor(() => expect(createDraft).toHaveBeenCalledTimes(1))
+    const urlInput = screen.getByPlaceholderText('http://homelab.lan:9119')
+    fireEvent.change(urlInput, { target: { value: 'https://gateway-a.example.test' } })
+    await waitFor(() => expect(createDraft).toHaveBeenCalledTimes(2))
+    fireEvent.change(urlInput, { target: { value: 'https://gateway-b.example.test' } })
+    await waitFor(() => expect(createDraft).toHaveBeenCalledTimes(3))
+    fireEvent.change(urlInput, { target: { value: 'https://gateway-a.example.test' } })
+    await waitFor(() => expect(createDraft).toHaveBeenCalledTimes(4))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Detect authentication' }))
+    await waitFor(() =>
+      expect(authProbe).toHaveBeenCalledWith(
+        expect.objectContaining({ scope: draftResult(4).scope, url: 'https://gateway-a.example.test' })
+      )
+    )
+    expect(authClear).toHaveBeenCalledWith(expect.objectContaining({ scope: draftResult(2).scope }))
+    expect(authClear).toHaveBeenCalledWith(expect.objectContaining({ scope: draftResult(3).scope }))
+  })
+
+  it('invalidates readiness and rotates the draft across a same-host port change', async () => {
+    createDraft
+      .mockResolvedValueOnce(draftResult(1))
+      .mockResolvedValueOnce(draftResult(2))
+      .mockResolvedValueOnce(draftResult(3))
+    authProbe.mockResolvedValueOnce({
+      authMode: 'token',
+      baseUrl: 'https://same.example.test:9119',
+      error: null,
+      providers: [],
+      reachable: true,
+      scope: draftResult(2).scope,
+      version: '0.20.4'
+    })
+    render(<ConnectionsRegistrySection />)
+
+    await screen.findByText('Homelab')
+    fireEvent.click(screen.getByText('Add connection'))
+    fireEvent.change(screen.getByPlaceholderText('Homelab'), { target: { value: 'Port gateway' } })
+    const urlInput = screen.getByPlaceholderText('http://homelab.lan:9119')
+    fireEvent.change(urlInput, { target: { value: 'https://same.example.test:9119' } })
+    await waitFor(() => expect(createDraft).toHaveBeenCalledTimes(2))
+    fireEvent.change(screen.getByPlaceholderText('Paste session token'), { target: { value: 'candidate' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Detect authentication' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Verify connection' }))
+    await waitFor(() =>
+      expect((screen.getByRole('button', { name: 'Save connection' }) as HTMLButtonElement).disabled).toBe(false)
+    )
+
+    fireEvent.change(urlInput, { target: { value: 'https://same.example.test:9120' } })
+
+    await waitFor(() => expect(createDraft).toHaveBeenCalledTimes(3))
+    expect((screen.getByRole('button', { name: 'Save connection' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(authClear).toHaveBeenCalledWith(expect.objectContaining({ scope: draftResult(2).scope }))
+  })
+
+  it('does not let a stale verify result restore readiness after an auth mutation', async () => {
+    const pendingVerify = deferred<Awaited<ReturnType<typeof window.hermesDesktop.connections.auth.verify>>>()
+    authVerify.mockImplementationOnce(() => pendingVerify.consume())
+    authProbe.mockResolvedValueOnce({
+      authMode: 'token',
+      baseUrl: 'https://stale.example.test',
+      error: null,
+      providers: [],
+      reachable: true,
+      scope: draftResult(2).scope,
+      version: '0.20.4'
+    })
+    render(<ConnectionsRegistrySection />)
+
+    await screen.findByText('Homelab')
+    fireEvent.click(screen.getByText('Add connection'))
+    fireEvent.change(screen.getByPlaceholderText('Homelab'), { target: { value: 'Stale verify' } })
+    fireEvent.change(screen.getByPlaceholderText('http://homelab.lan:9119'), {
+      target: { value: 'https://stale.example.test' }
+    })
+    fireEvent.change(screen.getByPlaceholderText('Paste session token'), { target: { value: 'first-token' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Detect authentication' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Verify connection' }))
+    await waitFor(() =>
+      expect(authVerify).toHaveBeenCalledWith(
+        expect.objectContaining({
+          scope: 'draft-76f9d14d-2f10-4ccb-9bb8-089935501512',
+          token: 'first-token',
+          url: 'https://stale.example.test'
+        })
+      )
+    )
+    expect(authVerify).toHaveBeenCalledTimes(1)
+    expect(pendingVerify.wasConsumed()).toBe(true)
+
+    fireEvent.change(screen.getByPlaceholderText('Paste session token'), { target: { value: 'second-token' } })
+    await act(async () =>
+      pendingVerify.resolve({
+        baseUrl: 'https://stale.example.test',
+        ok: true,
+        readinessCapability: 'stale-capability',
+        version: '0.20.4'
+      })
+    )
+
+    expect((screen.getByRole('button', { name: 'Save connection' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(save).not.toHaveBeenCalled()
+  })
+
+  it('clears the sole stored access header name authoritatively in probe, verify, and save', async () => {
+    const oldHeaderName = 'CF-Access-Client-Secret'
+    list.mockResolvedValueOnce({
+      ...registry,
+      connections: [registry.connections[0], { ...registry.connections[1], headerNames: [oldHeaderName] }]
+    })
+    render(<ConnectionsRegistrySection />)
+
+    await screen.findByText('Homelab')
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    await waitFor(() => expect(authStatus).toHaveBeenCalledTimes(1))
+    fireEvent.change(screen.getByDisplayValue(oldHeaderName), { target: { value: '' } })
+    fireEvent.change(screen.getByPlaceholderText('Paste session token'), { target: { value: 'replacement-token' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Detect authentication' }))
+    await waitFor(() => expect(authProbe).toHaveBeenCalledTimes(1))
+    expect(authProbe.mock.calls[0][0].headers).toEqual({})
+    expect(authProbe.mock.calls[0][0].headers).not.toHaveProperty(oldHeaderName)
+    fireEvent.click(await screen.findByRole('button', { name: 'Verify connection' }))
+
+    await waitFor(() => expect(authVerify).toHaveBeenCalledTimes(1))
+    expect(authVerify.mock.calls[0][0].headers).toEqual({})
+    expect(authVerify.mock.calls[0][0].headers).not.toHaveProperty(oldHeaderName)
+    fireEvent.click(screen.getByRole('button', { name: 'Save connection' }))
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1))
+    expect(save.mock.calls[0][0].headers).toEqual({})
+    expect(save.mock.calls[0][0].headers).not.toHaveProperty(oldHeaderName)
+  })
+
+  it('renames a stored header authoritatively for verification and save', async () => {
+    list.mockResolvedValueOnce({
+      ...registry,
+      connections: [registry.connections[0], { ...registry.connections[1], headerNames: ['X-Old-Access'] }]
+    })
+    render(<ConnectionsRegistrySection />)
+
+    await screen.findByText('Homelab')
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    await waitFor(() => expect(authStatus).toHaveBeenCalledTimes(1))
+    fireEvent.change(screen.getByDisplayValue('X-Old-Access'), { target: { value: 'X-New-Access' } })
+    fireEvent.change(screen.getByPlaceholderText('Saved — leave blank to keep'), {
+      target: { value: 'replacement-secret' }
+    })
+    fireEvent.change(screen.getByPlaceholderText('Paste session token'), { target: { value: 'replacement-token' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Detect authentication' }))
+    await waitFor(() => expect(authProbe).toHaveBeenCalledTimes(1))
+    expect(authProbe.mock.calls[0][0].headers).toEqual({ 'X-New-Access': 'replacement-secret' })
+    fireEvent.click(await screen.findByRole('button', { name: 'Verify connection' }))
+
+    await waitFor(() => expect(authVerify).toHaveBeenCalledTimes(1))
+    expect(authVerify.mock.calls[0][0].headers).toEqual({ 'X-New-Access': 'replacement-secret' })
+    fireEvent.click(screen.getByRole('button', { name: 'Save connection' }))
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1))
+    expect(save.mock.calls[0][0].headers).toEqual({ 'X-New-Access': 'replacement-secret' })
+  })
+
   it('tests a connection through the bridge', async () => {
     render(<ConnectionsRegistrySection />)
 
@@ -763,38 +1085,23 @@ describe('ConnectionsRegistrySection', () => {
 })
 
 describe('connection auth rejection classification', () => {
-  it('matches direct and Electron-serialized 401/403 errors only', () => {
+  it('uses structured kind and statusCode fields without inspecting renderer error prose', () => {
+    expect(isConnectionAuthRejection({ kind: 'auth-required' })).toBe(true)
     expect(isConnectionAuthRejection({ statusCode: 401 })).toBe(true)
     expect(isConnectionAuthRejection({ statusCode: 403 })).toBe(true)
     expect(
       isConnectionAuthRejection(
         new Error("Error invoking remote method 'hermes:connections:test': Error: 401: Authentication required")
       )
-    ).toBe(true)
-    expect(
-      isConnectionAuthRejection(
-        new Error("Error invoking remote method 'hermes:connections:test': Error: 403: Forbidden")
-      )
-    ).toBe(true)
+    ).toBe(false)
     expect(
       isConnectionAuthRejection(
         new Error(
           "Error invoking remote method 'hermes:connections:test': Error: Reached the gateway over HTTP, but the OAuth session was rejected while minting a WebSocket ticket. Open Settings → Gateway and sign in again."
         )
       )
-    ).toBe(true)
-    expect(
-      isConnectionAuthRejection(
-        new Error("Error invoking remote method 'hermes:connections:test': Error: 500: unavailable")
-      )
     ).toBe(false)
-    expect(
-      isConnectionAuthRejection(
-        new Error(
-          "Error invoking remote method 'hermes:connections:test': Error: 500: upstream echoed: OAuth session was rejected while minting a WebSocket ticket"
-        )
-      )
-    ).toBe(false)
+    expect(isConnectionAuthRejection({ kind: 'transport-error', statusCode: 500 })).toBe(false)
     expect(isConnectionAuthRejection(new Error('Timed out connecting to Hermes backend after 8000ms'))).toBe(false)
   })
 })
