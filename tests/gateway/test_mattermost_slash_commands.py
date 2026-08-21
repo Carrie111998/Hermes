@@ -17,6 +17,9 @@ Covered here:
 5. Wrong method / path / content-type → 404.
 6. connect → disconnect → connect rebinds the same port (no leak).
 7. The HTTP ack returns without waiting for the agent pipeline.
+8. Confirmed-missing thread roots (HTTP 400/404 on GET posts/{id}) resolve
+   to "" so replies post flat on the first try — no invalid root_id POST
+   and no "⚠️ thread delivery failed" banner (the trigger_id path).
 """
 
 import asyncio
@@ -38,6 +41,10 @@ BOT_USERNAME = "hermesbot"
 CHANNEL_ID = "ch22222222222222222222222222"
 USER_ID = "u3333333333333333333333333333"
 USER_NAME = "alice"
+POST_ID = "post55555555555555555555555555"
+ROOT_ID = "root66666666666666666666666666"
+TRIGGER_ID = "trig7777777777777777777777777"
+NEW_POST_ID = "newpost8888888888888888888888888"
 
 
 def _free_port() -> int:
@@ -401,3 +408,100 @@ class TestSlashCommandEndpoint:
         # ...but the injection does eventually complete.
         await asyncio.wait_for(pipeline_done.wait(), 5.0)
         await h.adapter.disconnect()
+
+
+class TestThreadRootConfirmedMissing:
+    """_resolve_root_id / send() when the thread root is CONFIRMED missing.
+
+    In reply_mode=thread, slash-command replies carry reply_to=trigger_id
+    (not a post id), and WS replies can target since-deleted roots — the
+    GET posts/{id} lookup comes back 400/404. A confirmed-missing root must
+    resolve to "" so send() posts flat on the FIRST attempt: no invalid
+    root_id POST, no "⚠️ Mattermost thread delivery failed" banner. A
+    transient/unknown GET failure (e.g. 500) keeps the legacy post_id
+    passthrough so _post_preserving_thread remains the safety net for
+    genuine races.
+    """
+
+    def _make_adapter(self, monkeypatch, extra=None):
+        from plugins.platforms.mattermost.adapter import MattermostAdapter
+
+        cfg_extra = {"url": "https://mm.example.com"}
+        cfg_extra.update(extra or {})
+        # Deterministic reply mode even here: ambient .env may leak
+        # MATTERMOST_REPLY_MODE; extra={"reply_mode": ...} wins over env.
+        monkeypatch.setenv("MATTERMOST_REPLY_MODE", "off")
+        return MattermostAdapter(
+            PlatformConfig(enabled=True, token="test-token", extra=cfg_extra)
+        )
+
+    def _stub_get(self, adapter, status, data):
+        """Stub _api_get the way the real one behaves: record the HTTP
+        status on adapter._last_get_status, return {} on failure."""
+
+        async def fake_api_get(path):
+            adapter._last_get_status = status
+            return data
+
+        adapter._api_get = fake_api_get
+
+    @pytest.mark.asyncio
+    async def test_resolve_root_id_404_returns_empty(self, monkeypatch):
+        """GET posts/{id} → 404 → "" (post flat; trigger_id path)."""
+        adapter = self._make_adapter(monkeypatch)
+        self._stub_get(adapter, 404, {})
+        assert await adapter._resolve_root_id(TRIGGER_ID) == ""
+
+    @pytest.mark.asyncio
+    async def test_resolve_root_id_400_returns_empty(self, monkeypatch):
+        adapter = self._make_adapter(monkeypatch)
+        self._stub_get(adapter, 400, {})
+        assert await adapter._resolve_root_id(TRIGGER_ID) == ""
+
+    @pytest.mark.asyncio
+    async def test_resolve_root_id_existing_reply_returns_root(self, monkeypatch):
+        """Post exists and is a thread reply → its root_id."""
+        adapter = self._make_adapter(monkeypatch)
+        self._stub_get(adapter, 200, {"id": POST_ID, "root_id": ROOT_ID})
+        assert await adapter._resolve_root_id(POST_ID) == ROOT_ID
+
+    @pytest.mark.asyncio
+    async def test_resolve_root_id_top_level_post_returns_itself(self, monkeypatch):
+        """Post exists and is a top-level post → the post_id itself."""
+        adapter = self._make_adapter(monkeypatch)
+        self._stub_get(adapter, 200, {"id": POST_ID, "root_id": ""})
+        assert await adapter._resolve_root_id(POST_ID) == POST_ID
+
+    @pytest.mark.asyncio
+    async def test_resolve_root_id_500_keeps_legacy_passthrough(self, monkeypatch):
+        """Unknown/transient failure → post_id unchanged (no flat guess)."""
+        adapter = self._make_adapter(monkeypatch)
+        self._stub_get(adapter, 500, {})
+        assert await adapter._resolve_root_id(POST_ID) == POST_ID
+
+    @pytest.mark.asyncio
+    async def test_resolve_root_id_network_error_keeps_legacy_passthrough(self, monkeypatch):
+        """Network error never sets a status (None) → legacy passthrough."""
+        adapter = self._make_adapter(monkeypatch)
+        self._stub_get(adapter, None, {})
+        assert await adapter._resolve_root_id(POST_ID) == POST_ID
+
+    @pytest.mark.asyncio
+    async def test_send_with_confirmed_missing_root_posts_flat_once(self, monkeypatch):
+        """Regression guard for the trigger_id path: reply_to that is not a
+        post id → ONE POST call, no root_id key, no ⚠️ banner."""
+        adapter = self._make_adapter(monkeypatch, extra={"reply_mode": "thread"})
+        self._stub_get(adapter, 404, {})
+
+        adapter._api_post = AsyncMock(return_value={"id": NEW_POST_ID})
+
+        result = await adapter.send(CHANNEL_ID, "final reply", reply_to=TRIGGER_ID)
+        assert result.success is True
+        assert result.message_id == NEW_POST_ID
+
+        adapter._api_post.assert_called_once()
+        path, payload = adapter._api_post.call_args.args
+        assert path == "posts"
+        assert "root_id" not in payload
+        assert "final reply" in payload["message"]
+        assert "⚠️" not in payload["message"]

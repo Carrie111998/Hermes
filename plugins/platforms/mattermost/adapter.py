@@ -163,6 +163,7 @@ class MattermostAdapter(BasePlatformAdapter):
 
         self._last_post_status: Optional[int] = None
         self._last_post_error: str = ""
+        self._last_get_status: Optional[int] = None
 
         # Dedup cache (prevent reprocessing)
         self._dedup = MessageDeduplicator()
@@ -187,12 +188,14 @@ class MattermostAdapter(BasePlatformAdapter):
     async def _api_get(self, path: str) -> Dict[str, Any]:
         """GET /api/v4/{path}."""
         import aiohttp
+        self._last_get_status = None
         if ".." in path:
             logger.error("MM API path traversal blocked: %s", path)
             return {}
         url = f"{self._base_url}/api/v4/{path.lstrip('/')}"
         try:
             async with self._session.get(url, headers=self._headers(), timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                self._last_get_status = resp.status
                 if resp.status >= 400:
                     body = await resp.text()
                     logger.error("MM API GET %s → %s: %s", path, resp.status, body[:200])
@@ -670,9 +673,15 @@ class MattermostAdapter(BasePlatformAdapter):
             return post_id
         # Check if this post has a root_id (meaning it's a reply)
         data = await self._api_get(f"posts/{post_id}")
-        if data and data.get("root_id"):
-            return data["root_id"]
-        return post_id
+        if data:
+            return data["root_id"] if data.get("root_id") else post_id
+        if self._last_get_status in (400, 404):
+            logger.warning(
+                "Mattermost: thread root %s not found (HTTP %s) — posting flat instead",
+                post_id, self._last_get_status,
+            )
+            return ""
+        return post_id  # transient/unknown error — keep legacy behavior
 
     async def send(
         self,
