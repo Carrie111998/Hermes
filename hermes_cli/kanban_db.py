@@ -8403,9 +8403,16 @@ def _terminate_reclaimed_worker(
         return info
     info["host_local"] = True
 
-    kill = signal_fn if signal_fn is not None else (
-        os.kill if hasattr(os, "kill") else None
-    )
+    if signal_fn is not None:
+        kill = signal_fn
+    elif hasattr(os, "kill"):
+        from hermes_cli import _subprocess_compat as subprocess_compat
+
+        def kill(target_pid, signum):
+            force = signum == getattr(signal, "SIGKILL", object())
+            subprocess_compat.terminate_process_tree(target_pid, force=force)
+    else:
+        kill = None
     if kill is None:
         return info
 
@@ -8598,9 +8605,16 @@ def enforce_max_runtime(
         # want a cleaner shutdown can install their own SIGTERM handler
         # before the grace expires.
         killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
-        )
+        if signal_fn is not None:
+            kill = signal_fn
+        elif hasattr(os, "kill"):
+            from hermes_cli import _subprocess_compat as subprocess_compat
+
+            def kill(target_pid, signum):
+                force = signum == getattr(signal, "SIGKILL", object())
+                subprocess_compat.terminate_process_tree(target_pid, force=force)
+        else:
+            kill = None
         if kill is not None:
             try:
                 kill(pid, signal.SIGTERM)
@@ -10809,6 +10823,74 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _resolve_worker_command(hermes_home: Optional[str]) -> Optional[list[str]]:
+    """Resolve a named profile's fixed ``worker.command`` argv.
+
+    The profile config is read directly so malformed YAML cannot be swallowed
+    by the normal config loader and silently fall back to a native agent.  A
+    command is deliberately profile-scoped and absolute-only: card content,
+    task fields, and the task workspace never participate in executable
+    selection.  The parsed list is passed literally; Hermes performs no shell,
+    environment-variable, or backslash expansion.
+    """
+    if not hermes_home:
+        return None
+    config_path = os.path.join(hermes_home, "config.yaml")
+    try:
+        with open(config_path, "r", encoding="utf-8") as config_file:
+            raw_text = config_file.read()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError(
+            f"worker.command: profile config {config_path!r} is unreadable: {exc}"
+        ) from exc
+
+    from utils import fast_safe_load
+
+    try:
+        parsed = fast_safe_load(raw_text)
+    except Exception as exc:
+        raise RuntimeError(
+            f"worker.command: {config_path!r} does not parse as YAML; refusing "
+            "to fall back to the native agent"
+        ) from exc
+    if not isinstance(parsed, dict):
+        return None
+    worker_cfg = parsed.get("worker")
+    raw = worker_cfg.get("command") if isinstance(worker_cfg, dict) else None
+    if raw is None:
+        return None
+
+    home_real = os.path.realpath(hermes_home)
+    if os.path.basename(os.path.dirname(home_real)) != "profiles":
+        raise RuntimeError(
+            "worker.command must be declared in a named profile's config.yaml, "
+            "not the root config"
+        )
+    if (
+        not isinstance(raw, list)
+        or not raw
+        or not all(isinstance(part, str) and part for part in raw)
+    ):
+        raise RuntimeError(
+            "worker.command must be a non-empty list of non-empty argv strings"
+        )
+    head = raw[0]
+    if not os.path.isabs(head):
+        raise RuntimeError(
+            "worker.command argv[0] must be an absolute executable path; "
+            f"relative or bare value {head!r} is not trusted"
+        )
+    if not os.path.isfile(head) or (
+        not _IS_WINDOWS and not os.access(head, os.X_OK)
+    ):
+        raise RuntimeError(
+            f"worker.command executable is missing or not executable: {head!r}"
+        )
+    return list(raw)
+
+
 _retagged_workspace_roots: set[str] = set()
 
 
@@ -10854,6 +10936,7 @@ def _default_spawn(
     from. Workers cannot accidentally see other boards.
     """
     import subprocess
+    from hermes_cli import _subprocess_compat as subprocess_compat
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
@@ -10862,13 +10945,34 @@ def _default_spawn(
     profile_arg = normalize_profile_name(task.assignee)
 
     prompt = f"work kanban task {task.id}"
-    env = dict(os.environ)
+    from hermes_cli.profiles import resolve_profile_env
+    try:
+        profile_home = resolve_profile_env(profile_arg)
+    except FileNotFoundError:
+        profile_home = os.environ.get("HERMES_HOME") or None
+    worker_command = _resolve_worker_command(profile_home)
+    direct_command = worker_command is not None
+
+    # Native Hermes workers retain the inherited environment from the existing
+    # spawn path. Only the arbitrary profile command/supervisor gets the
+    # credential-free subprocess policy.
+    if direct_command:
+        from tools.environments.local import hermes_subprocess_env
+
+        env = hermes_subprocess_env(inherit_credentials=False)
+    else:
+        env = dict(os.environ)
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
     # session binds ContextVars in this process.
     from gateway.session_context import _VAR_MAP
     for key in _VAR_MAP:
         env.pop(key, None)
+    # Do not let stale parent/dispatcher Kanban values survive into a new run.
+    # Only the explicit task/run/board/workspace values below are authoritative.
+    for key in list(env):
+        if key.startswith("HERMES_KANBAN_"):
+            env.pop(key, None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -10879,7 +10983,6 @@ def _default_spawn(
     # back to Path.home() / ".hermes" (the DEFAULT profile root), ignoring the
     # profile-specific config entirely.  Fixes profile-scoped fallback_providers
     # being invisible to kanban workers.
-    from hermes_cli.profiles import resolve_profile_env
     try:
         env["HERMES_HOME"] = resolve_profile_env(profile_arg)
     except FileNotFoundError:
@@ -10890,6 +10993,7 @@ def _default_spawn(
         pass
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
+    env["HERMES_KANBAN_TASK_ID"] = task.id
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
@@ -10967,52 +11071,70 @@ def _default_spawn(
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = [
-        *_resolve_hermes_argv(),
-        "-p", profile_arg,
-        "--cli",
-        # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
-        # so they see that profile's shell-hook allowlist instead of the
-        # dispatcher's root allowlist. Pass --accept-hooks explicitly so
-        # profile-local worker sessions still register configured hooks.
-        "--accept-hooks",
-    ]
-    # Per-task force-loaded skills. Each name goes in its own
-    # `--skills X` pair rather than a single comma-joined arg: the CLI
-    # accepts both forms (action='append' + comma-split), but
-    # per-name pairs are easier to read in `ps` output and avoid any
-    # quoting ambiguity if a skill name ever contains unusual chars.
-    if task.skills:
-        for sk in task.skills:
-            if sk:
-                cmd.extend(["--skills", sk])
-    if task.model_override:
-        cmd.extend(["-m", task.model_override])
-        # Pin the provider too when the override names one, so the worker
-        # resolves the model against the intended backend instead of the
-        # profile's configured provider (mixing model X with provider Y is
-        # the classic mis-set that stalls a board).
-        if task.provider_override:
-            cmd.extend(["--provider", task.provider_override])
-    # Per-task thinking depth. Independent of the model override — a task can
-    # run the profile's own model at a different depth — so this is its own
-    # branch, not a nested one.
-    if task.reasoning_effort:
-        cmd.extend(["--reasoning", task.reasoning_effort])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
-    if worker_toolsets:
-        cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend([
-        "chat",
-        "-q", prompt,
-    ])
-    if task.goal_mode:
-        # Goal-mode workers must take the fully-quiet single-query path:
-        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
-        # cli.py's quiet branch. Without -Q the worker gets exactly one
-        # turn, prints text, exits rc=0, and the dispatcher records a
-        # protocol violation (incident 2026-06-09 t_d9cbe312).
-        cmd.append("-Q")
+    if direct_command:
+        # Agent-only task controls intentionally do not cross into a fixed
+        # profile command. The card can select work, never executable argv.
+        ignored = [
+            name
+            for name, value in (
+                ("skills", task.skills),
+                ("model_override", task.model_override),
+                ("provider_override", task.provider_override),
+                ("reasoning_effort", task.reasoning_effort),
+                ("goal_mode", task.goal_mode),
+            )
+            if value
+        ]
+        if ignored:
+            _log.warning(
+                "kanban worker: task %s runs a direct command; agent-only "
+                "settings ignored: %s",
+                task.id,
+                ", ".join(ignored),
+            )
+        env["HERMES_KANBAN_WORKER_COMMAND"] = json.dumps(worker_command)
+        cmd = [sys.executable, "-P", "-m", "hermes_cli.kanban_command_worker"]
+    else:
+        env.pop("HERMES_KANBAN_WORKER_COMMAND", None)
+        cmd = [
+            *_resolve_hermes_argv(),
+            "-p", profile_arg,
+            "--cli",
+            # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
+            # so they see that profile's shell-hook allowlist instead of the
+            # dispatcher's root allowlist. Pass --accept-hooks explicitly so
+            # profile-local worker sessions still register configured hooks.
+            "--accept-hooks",
+        ]
+        # Per-task force-loaded skills. Each name goes in its own
+        # `--skills X` pair rather than a single comma-joined arg: the CLI
+        # accepts both forms (action='append' + comma-split), but
+        # per-name pairs are easier to read in `ps` output and avoid any
+        # quoting ambiguity if a skill name ever contains unusual chars.
+        if task.skills:
+            for sk in task.skills:
+                if sk:
+                    cmd.extend(["--skills", sk])
+        if task.model_override:
+            cmd.extend(["-m", task.model_override])
+            # Pin the provider too when the override names one, so the worker
+            # resolves the model against the intended backend instead of the
+            # profile's configured provider (mixing model X with provider Y is
+            # the classic mis-set that stalls a board).
+            if task.provider_override:
+                cmd.extend(["--provider", task.provider_override])
+        # Per-task thinking depth. Independent of the model override — a task
+        # can run the profile's own model at a different depth, so this is its
+        # own branch, not a nested one.
+        if task.reasoning_effort:
+            cmd.extend(["--reasoning", task.reasoning_effort])
+        worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+        if worker_toolsets:
+            cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+        cmd.extend(["chat", "-q", prompt])
+        if task.goal_mode:
+            # Goal-mode workers must take the fully-quiet single-query path.
+            cmd.append("-Q")
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
@@ -11026,15 +11148,22 @@ def _default_spawn(
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
     try:
-        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
+        popen_kwargs = (
+            subprocess_compat.windows_detach_popen_kwargs()
+            if direct_command
+            else {
+                "start_new_session": True,
+                "creationflags": subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            }
+        )
+        proc = subprocess.Popen(  # noqa: S603 -- argv is host/profile config
             cmd,
             cwd=workspace if os.path.isdir(workspace) else None,
             stdin=subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,
             env=env,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            **popen_kwargs,
         )
     except FileNotFoundError:
         log_f.close()
