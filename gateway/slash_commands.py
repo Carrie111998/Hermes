@@ -2750,9 +2750,14 @@ class GatewaySlashCommandsMixin:
             # and pause/clear's stale-continuation cleanup recognizes it.
             prompt = mgr.next_continuation_prompt()
             try:
-                adapter = self.adapters.get(event.source.platform) if event.source else None
+                adapter = self._adapter_for_source(event.source) if event.source else None
                 _quick_key = self._session_key_for_source(event.source) if event.source else None
                 if prompt and adapter and _quick_key:
+                    adapter_key = self._adapter_key_for_source(
+                        adapter,
+                        event.source,
+                        fallback=_quick_key,
+                    )
                     cont_event = MessageEvent(
                         text=prompt,
                         message_type=MessageType.TEXT,
@@ -2760,7 +2765,12 @@ class GatewaySlashCommandsMixin:
                         message_id=None,
                         channel_prompt=None,
                     )
-                    self._enqueue_fifo(_quick_key, cont_event, adapter)
+                    self._enqueue_fifo(
+                        _quick_key,
+                        cont_event,
+                        adapter,
+                        adapter_key=adapter_key,
+                    )
             except Exception as exc:
                 logger.debug("goal resume: continuation enqueue failed: %s", exc)
             return t("gateway.goal.resumed", goal=state.goal)
