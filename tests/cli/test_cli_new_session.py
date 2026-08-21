@@ -252,7 +252,7 @@ def test_clear_command_suppresses_banner_when_disabled(tmp_path):
     cli.process_command("/clear")
 
     cli.console.clear.assert_called_once()
-    cli.show_banner.assert_not_called()
+    cli.show_banner.assert_called_once_with(show_chrome=False)
 
 
 def test_new_session_resets_token_counters(tmp_path):

@@ -8364,8 +8364,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             ).strip()
             self.preloaded_skills = loaded_skills
 
-    def show_banner(self):
-        """Display the welcome banner in Claude Code style."""
+    def show_banner(self, *, show_chrome: bool = True):
+        """Display welcome chrome and always surface operational notices."""
+        if not show_chrome:
+            self._show_startup_notices()
+            return
+
         self.console.clear()
         ctx_len = None
         if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
@@ -8475,6 +8479,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 except Exception:
                     logger.debug("banner snapshot save failed", exc_info=True)
         
+        self._show_startup_notices(ctx_len)
+
+    def _show_startup_notices(self, ctx_len=None):
+        """Surface startup warnings independently of optional welcome chrome."""
+        if ctx_len is None and hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
+            ctx_len = self.agent.context_compressor.context_length
+
         # Tool discovery is intentionally deferred on the Termux bare prompt
         # path; availability warnings are shown once tools are initialized.
         # On the snapshot fast path (warm launch), the check walks every
@@ -11908,8 +11919,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 except Exception:
                     pass
             else:
-                if self.banner_enabled:
-                    self.show_banner()
+                self.show_banner(show_chrome=self.banner_enabled)
                 print("  ✨ (◕‿◕)✨ Fresh start! Screen cleared and conversation reset.\n")
                 # Show a random tip on new session
                 try:
@@ -17371,7 +17381,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-            self.show_banner()
+        self.show_banner(show_chrome=self.banner_enabled)
         # Surface any active supply-chain security advisories right after the
         # welcome banner. Quiet/single-query paths call this themselves.
         self._show_security_advisories()

@@ -59,6 +59,28 @@ class TestLowContextWarning:
         minimum_calls = [c for c in calls if f"{MINIMUM_CONTEXT_LENGTH:,}" in c]
         assert minimum_calls
 
+    def test_disabled_banner_keeps_operational_warnings(self, cli_obj):
+        """Banner suppression hides chrome, not tool/model/runtime warnings."""
+        cli_obj.agent.context_compressor.context_length = 32768
+
+        with patch.object(cli_obj, "_show_tool_availability_warnings") as tool_warnings, \
+             patch("cli.build_welcome_banner") as welcome_banner, \
+             patch("hermes_cli.model_switch.is_nous_hermes_non_agentic", return_value=True), \
+             patch("agent.skill_utils.get_project_skills_dirs", return_value=[]), \
+             patch(
+                 "agent.skill_utils.get_untrusted_project_skills_root",
+                 return_value=("/repo/.hermes/skills", 2),
+             ):
+            cli_obj.show_banner(show_chrome=False)
+
+        tool_warnings.assert_called_once_with()
+        welcome_banner.assert_not_called()
+        cli_obj.console.clear.assert_not_called()
+        output = "\n".join(str(call) for call in cli_obj.console.print.call_args_list)
+        assert "too low" in output
+        assert "NOT agentic" in output
+        assert "hermes skills trust" in output
+
 
     def test_warning_for_2048_context(self, cli_obj):
         """Warning shown for 2048 tokens (common LM Studio default)."""
