@@ -37,6 +37,16 @@ def test_env_can_disable(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=[]) is None
 
 
+def test_delegated_child_does_not_receive_worker_stop_nudge(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_parent")
+    with patch(
+        "agent.delegation_context.is_dispatcher_owned_worker_context",
+        return_value=False,
+    ):
+        assert kanban_stop_nudge_enabled() is False
+        assert build_kanban_stop_nudge(messages=[]) is None
+
+
 def test_dispatcher_run_terminal_only_after_run_ends(clear_kanban_env):
     clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_owned")
     clear_kanban_env.setenv("HERMES_KANBAN_RUN_ID", "42")
