@@ -150,6 +150,12 @@ class TestToolSurfaceSwap:
         assert "browser_exec" in _HERMES_CORE_TOOLS
         assert "browser_exec" in TOOLSETS["browser"]["tools"]
         assert "browser_exec" in TOOLSETS["coding"]["tools"]
+        assert TOOLSETS["browser-use"]["tools"] == ["browser_exec"]
+
+    def test_browser_use_toolset_validates_before_plugin_discovery(self):
+        from hermes_cli.oneshot import _validate_explicit_toolsets
+
+        assert _validate_explicit_toolsets("browser-use") == (["browser-use"], None)
 
     def test_browser_exec_stripped_without_terminal(self, monkeypatch):
         """Sessions without the terminal surface must not regain host code
