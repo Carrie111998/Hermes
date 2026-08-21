@@ -1,0 +1,36 @@
+name: Validate committed bot-scoped activity transcripts
+
+on:
+  pull_request:
+    branches:
+      - main
+      - codex/bot-activity-clean-base
+    paths:
+      - .github/workflows/codex-bot-activity-validate.yml
+      - apps/desktop/src/plugins/hermes-bots/plugin.js
+      - apps/desktop/src/plugins/hermes-bots/tests/**
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/bot-scoped-activity-transcripts
+          fetch-depth: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Parse plugin
+        run: node --check apps/desktop/src/plugins/hermes-bots/plugin.js
+      - name: Run focused transcript and group-chat regressions
+        run: |
+          node --test \
+            apps/desktop/src/plugins/hermes-bots/tests/group-activity-transcript.test.mjs \
+            apps/desktop/src/plugins/hermes-bots/tests/group-activity.test.mjs \
+            apps/desktop/src/plugins/hermes-bots/tests/group-chat.test.mjs \
+            apps/desktop/src/plugins/hermes-bots/tests/group-room-ux.test.mjs \
+            apps/desktop/src/plugins/hermes-bots/tests/group-mention-composer.test.mjs
