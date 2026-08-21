@@ -710,20 +710,57 @@ the two sets overlap on purpose.
   two directory listings with no authority are still `review`, a lower band is
   never upgraded, and conflicts still block.
 
-**A second ceiling, found while testing this and deliberately not fixed.**
-`evidence_confidence` weights `completeness` at .2, and completeness divides by
-all seven scoring dimensions — but four of them (`buying_intent`,
-`market_coverage`, `commercial_scale`, `trade_activity`) have no field that any
-shipped verifier emits. So no company can exceed 3/7, a company with no website
-cannot exceed 2/7, and band A's .72 threshold is only just clearable: the
-end-to-end test needs a notice plus three corroborating pages to reach it. Every
-lead's confidence is understated by a fixed amount. Changing the denominator is a
-scoring decision rather than part of the verdict, so it is measured by
-`test_confidence_ceiling_is_set_by_dimensions_nothing_can_populate` and left for
-a decision. Either count only dimensions some enabled source can speak to, or
-drop the four from the default profile.
-
 Verified by reverting: four tests fail without it. 469 server tests and six
+WebUI suites pass with it.
+
+### B3. Completeness is measured against what the sources can supply
+
+Found while testing B2: fixing the verdict left the same company blocked one
+step later. `evidence_confidence` weights `completeness` at .2 and completeness
+divided by all seven scoring dimensions — but four of them (`buying_intent`,
+`market_coverage`, `commercial_scale`, `trade_activity`) have **no field that
+any shipped verifier emits**. No company could exceed 3/7, a company with no
+website could not exceed 2/7, and every lead's confidence was understated by the
+same fixed amount. Because the understatement was uniform it never changed the
+*ordering* — it just sat every lead lower against band thresholds that had
+plainly been calibrated for a metric able to approach 1.
+
+A source now declares the claim fields it can produce, and completeness is
+measured against the dimensions those fields can reach.
+
+- **Declared per source, not inferred.** Capabilities are too coarse to answer
+  this: `candidate_verification` says a source verifies companies, not that it
+  can ever speak to their store count. `DatasetDefinition.emits` carries the
+  fields, populated for all three sources from what their verifiers actually
+  emit, and the in-code fallback definitions are kept in step with the catalog.
+- **Availability, not just enablement.** A credential-gated source emits
+  nothing, so counting its fields would understate completeness exactly as the
+  fixed denominator did.
+- **An undeclared fact can only help.** The denominator is the declared set
+  unioned with what was actually found, so a source emitting something it never
+  declared adds to both sides instead of being dropped from the numerator —
+  otherwise a lead would score worse for carrying extra evidence.
+- **An empty declaration falls back to all seven.** Undeclared means nobody
+  said, not nothing is reachable; treating it as the denominator would score a
+  lead with one claim as fully complete.
+- A gap the sources *could* have filled still costs. A company with no website
+  is missing `contactability`, and every source declares a domain, so that is a
+  real gap at 2/3 rather than an excused one.
+
+Measured effect, with TED and Bright Data enabled — fit is untouched, and the
+tiers still separate C / B / A:
+
+| Lead | Before | After |
+|---|---|---|
+| no website, notice + two pages | conf .713, band B | conf .789, band A |
+| website, notice + two pages | conf .766, band A | conf .880, band A |
+| one thin snippet | conf .677, band C | conf .753, band C |
+
+`attainable_dimensions` is also recorded in the run metrics, so a campaign says
+which dimensions its sources could speak to at all instead of leaving the
+question invisible.
+
+Verified by reverting: three tests fail without it. 477 server tests and six
 WebUI suites pass with it.
 
 ## Carried-over risks

@@ -42,6 +42,10 @@ def bright_data_definition() -> DatasetDefinition:
         access_tier="credentialed_public",
         entity_levels=["named_company"],
         capabilities=["candidate_verification", "web_evidence"],
+        emits=[
+            "company_name", "country", "domain", "buyer_role", "product_term",
+            "lifecycle_status",
+        ],
         freshness_days=30,
         adapter_mode="credential_required",
         default_enabled=False,

@@ -260,3 +260,104 @@ def test_the_customer_lead_list_is_ordered_by_fit(tmp_path):
     assert scores == sorted(scores, reverse=True), scores
     assert len(set(scores)) > 1, "the fixture must produce distinguishable leads"
     assert leads[0]["company_name"] == "Atlas DE", "the best-evidenced lead comes first"
+
+
+# ── completeness measures what the sources could supply ──────────────────────
+
+ATTAINABLE = {"product_sector_fit", "buyer_channel_fit", "contactability"}
+
+
+def test_a_dimension_no_source_can_reach_does_not_cost_confidence():
+    """The regression: completeness divided by all seven dimensions.
+
+    Four of the seven have no field any shipped verifier emits, so no company
+    could exceed 3/7 and every lead's confidence was understated by the same
+    fixed amount — enough that band A's threshold was only just clearable.
+    """
+    claims = _ordinary()
+
+    fixed_denominator = score_lead({}, claims, ScoringProfile())
+    attainable = score_lead({}, claims, ScoringProfile(), ATTAINABLE)
+
+    assert attainable.evidence_confidence > fixed_denominator.evidence_confidence
+    assert attainable.confidence_factors["completeness"] == 1.0
+    assert fixed_denominator.confidence_factors["completeness"] < .5
+
+
+def test_fit_is_untouched_by_the_completeness_denominator():
+    """Coverage belongs to confidence. Fit must not move."""
+    claims = _ordinary()
+
+    assert (
+        score_lead({}, claims, ScoringProfile(), ATTAINABLE).fit_score
+        == score_lead({}, claims, ScoringProfile()).fit_score
+    )
+
+
+def test_a_missing_but_reachable_dimension_still_costs_confidence():
+    """The fix must not excuse a gap the sources could actually have filled.
+
+    A company with no website is missing `contactability`, and these sources can
+    supply a domain — so it is a real gap, not an unreachable one.
+    """
+    without_domain = [claim for claim in _ordinary() if claim.field != "domain"]
+
+    partial = score_lead({}, without_domain, ScoringProfile(), ATTAINABLE)
+
+    assert partial.confidence_factors["completeness"] == round(2 / 3, 3)
+    assert partial.evidence_confidence < score_lead(
+        {}, _ordinary(), ScoringProfile(), ATTAINABLE
+    ).evidence_confidence
+
+
+def test_the_three_tiers_still_land_in_different_bands_under_the_new_denominator():
+    bands = [
+        score_lead({}, claims, ScoringProfile(), ATTAINABLE).priority_band
+        for claims in (_thin(), _ordinary(), _strong())
+    ]
+
+    assert bands == ["C", "B", "A"]
+
+
+def test_one_weak_mention_is_not_promoted_by_the_new_denominator():
+    """Raising everyone's confidence must not let thin evidence reach the top."""
+    single = [_claim("product_term", ["ovens"], evidence=("ev_1",))]
+
+    assert score_lead({}, single, ScoringProfile(), ATTAINABLE).priority_band != "A"
+
+
+def test_an_undeclared_fact_can_only_help():
+    """A source emitting something it never declared must not be penalised.
+
+    Dropping it from the numerator while it sat outside the denominator would
+    make a lead score *worse* for carrying extra evidence.
+    """
+    # `locations` reaches market_coverage, which these sources never declared.
+    with_extra = [*_ordinary(), _claim("locations", ["Cluj", "Iasi"], evidence=("ev_o", "ev_i"))]
+
+    score = score_lead({}, with_extra, ScoringProfile(), ATTAINABLE)
+
+    assert score.confidence_factors["completeness"] == 1.0
+
+
+def test_no_declaration_falls_back_to_the_full_set():
+    """Undeclared means "nobody said", not "nothing is reachable".
+
+    Treating an empty declaration as the denominator would score a lead with one
+    claim as fully complete.
+    """
+    single = [_claim("product_term", ["ovens"], evidence=("ev_1",))]
+
+    score = score_lead({}, single, ScoringProfile(), set())
+
+    assert score.confidence_factors["completeness"] < .2
+
+
+def test_attainable_dimensions_are_derived_from_declared_fields():
+    from server.lead_research.scoring import attainable_dimensions
+
+    assert attainable_dimensions(["product_term"]) == {"product_sector_fit"}
+    assert attainable_dimensions(["store_count"]) == {"commercial_scale"}
+    assert attainable_dimensions([]) == set()
+    # lifecycle_status is real evidence but speaks to no scoring dimension.
+    assert attainable_dimensions(["lifecycle_status"]) == set()

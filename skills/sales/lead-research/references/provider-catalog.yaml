@@ -18,6 +18,8 @@
   access_tier: customer_upload
   entity_levels: [named_company]
   capabilities: [organizations, candidate_verification]
+  # Only for rows carrying a provenance_url; the rest abstain.
+  emits: [company_name, country, domain, buyer_role, product_term]
   countries: []
   sector_ids: []
   freshness_days: 365
@@ -39,6 +41,10 @@
   access_tier: public
   entity_levels: [named_company, opportunity]
   capabilities: [procurement, organizations, candidate_verification, authoritative_registry]
+  # A notice names the winner, its country and what it supplied. It says nothing
+  # about the company's size, footprint or trade volume, and nothing here
+  # pretends otherwise.
+  emits: [company_name, country, domain, buyer_role, product_term]
   countries: []
   sector_ids: []
   freshness_days: 7
@@ -63,6 +69,8 @@
   access_tier: credentialed_public
   entity_levels: [named_company]
   capabilities: [candidate_verification, web_evidence]
+  # Substring matches against fetched pages, plus the closure phrases.
+  emits: [company_name, country, domain, buyer_role, product_term, lifecycle_status]
   countries: []
   sector_ids: []
   freshness_days: 30

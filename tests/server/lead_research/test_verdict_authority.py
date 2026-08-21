@@ -280,14 +280,11 @@ def test_a_company_with_no_website_can_now_be_a_strong_fit_end_to_end(tmp_path):
 
     No domain on the candidate row, so nothing can ever be classified
     `official`, and this was permanently `review` at any evidence level. An EU
-    notice plus three corroborating third-party pages now reaches it.
+    notice plus corroborating third-party pages now reaches it.
 
-    It takes that much because `evidence_confidence` is a second, independent
-    ceiling: `completeness` divides by all seven scoring dimensions and four of
-    them have no verifier that emits their fields, so a domain-less company
-    cannot exceed 2/7 there and needs near-complete corroboration to clear
-    band A. That ceiling is a separate defect from the one this file fixes —
-    see test_confidence_ceiling_is_set_by_dimensions_nothing_can_populate.
+    The fixtures here declare what they emit, so `completeness` is measured
+    against what these two sources could establish rather than against all seven
+    scoring dimensions — see test_fit_scoring.py for that on its own.
     """
     import json
     from server.db import Database, json_dump, now
@@ -348,34 +345,24 @@ def test_a_company_with_no_website_can_now_be_a_strong_fit_end_to_end(tmp_path):
     assert "official_source" in _json.loads(row["data"])["missing_evidence"]
 
 
-def test_confidence_ceiling_is_set_by_dimensions_nothing_can_populate():
-    """A separate ceiling, found while fixing the verdict. Not fixed here.
+def test_a_dimension_no_source_can_reach_no_longer_caps_this_verdict():
+    """The ceiling that used to sit behind this fix.
 
-    `evidence_confidence` weights `completeness` at .2, and completeness divides
-    by all seven scoring dimensions. Four of them — buying_intent,
-    market_coverage, commercial_scale, trade_activity — have no field that any
-    shipped verifier emits, so no company can exceed 3/7 however well
-    researched, and a company with no website cannot exceed 2/7.
-
-    The effect is that band A's .72 confidence threshold is only just clearable
-    and every lead's confidence is understated by a fixed amount. This test
-    exists so the ceiling is measured rather than rediscovered; changing the
-    denominator is a scoring decision, not part of the verdict fix.
+    `completeness` divided by all seven scoring dimensions, and four of them
+    have no field any shipped verifier emits, so a domain-less company could not
+    exceed 2/7 and could not clear band A however well corroborated. Fixing the
+    verdict alone would have left it blocked one step later.
     """
-    from server.lead_research.scoring import DIMENSION_CLAIM_FIELDS, SCORE_DIMENSIONS
+    from server.lead_research.registry import build_registry
+    from server.lead_research.scoring import attainable_dimensions
 
-    emitted_by_a_shipped_verifier = {
-        "company_name", "country", "domain", "buyer_role", "product_term",
-        "lifecycle_status",
-    }
-    unreachable = {
-        dimension for dimension in SCORE_DIMENSIONS
-        if not set(DIMENSION_CLAIM_FIELDS[dimension]) & emitted_by_a_shipped_verifier
-    }
+    definitions = build_registry().definitions
+    reachable = attainable_dimensions({
+        field for definition in definitions.values() for field in definition.emits
+    })
 
-    assert unreachable == {
-        "buying_intent", "market_coverage", "commercial_scale", "trade_activity",
-    }, (
-        "if a verifier now emits one of these, the completeness denominator "
-        "deserves revisiting — see STATUS-AND-PLAN.md"
+    assert reachable == {"product_sector_fit", "buyer_channel_fit", "contactability"}
+    assert "commercial_scale" not in reachable, (
+        "if a verifier starts emitting revenue or store counts, this widens on "
+        "its own — that is the point of declaring emitted fields per source"
     )

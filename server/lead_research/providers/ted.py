@@ -89,6 +89,7 @@ def ted_definition() -> DatasetDefinition:
             # The publisher is the EU's Publications Office; see the catalog entry.
             "authoritative_registry",
         ],
+        emits=["company_name", "country", "domain", "buyer_role", "product_term"],
         freshness_days=7,
         adapter_mode="live",
         default_enabled=False,

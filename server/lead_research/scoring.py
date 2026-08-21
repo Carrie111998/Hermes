@@ -152,7 +152,31 @@ def derive_dimension_scores(claims: Iterable[Claim]) -> dict[str, float | None]:
     }
 
 
-def score_lead(candidate, claims: Iterable[Claim], profile: ScoringProfile) -> LeadScore:
+def attainable_dimensions(emitted_fields: Iterable[str]) -> set[str]:
+    """Dimensions the configured sources could speak to at all.
+
+    Derived from what each source declares it emits, so a dimension nothing can
+    reach is not counted against a lead. Four of the seven dimensions —
+    buying_intent, market_coverage, commercial_scale, trade_activity — have no
+    field that any shipped verifier produces, so with a fixed denominator of
+    seven no company could exceed 3/7 completeness and every lead's confidence
+    was understated by the same fixed amount. Band A's threshold was then only
+    just clearable, and a company with no website could not clear it at all.
+    """
+    fields = set(emitted_fields)
+    return {
+        dimension
+        for dimension, dimension_fields in DIMENSION_CLAIM_FIELDS.items()
+        if fields.intersection(dimension_fields)
+    }
+
+
+def score_lead(
+    candidate,
+    claims: Iterable[Claim],
+    profile: ScoringProfile,
+    attainable: set[str] | None = None,
+) -> LeadScore:
     del candidate
     claims = list(claims)
     dimensions = derive_dimension_scores(claims)
@@ -174,7 +198,14 @@ def score_lead(candidate, claims: Iterable[Claim], profile: ScoringProfile) -> L
         sum(1 for claim in supported_claims if claim.status == "estimated_range") / len(supported_claims)
         if supported_claims else 0.0
     )
-    completeness = len(known) / len(SCORE_DIMENSIONS)
+    # Measured against what the configured sources could supply, not against all
+    # seven dimensions. `known` is unioned in so a source emitting something it
+    # never declared can only ever help: an undeclared fact adds to both sides
+    # rather than being dropped from the numerator. An empty declaration means
+    # nobody said anything, which falls back to the full set rather than
+    # silently scoring a lead as complete on the strength of one claim.
+    denominator = (attainable | set(known)) if attainable else set(SCORE_DIMENSIONS)
+    completeness = len(known) / len(denominator) if denominator else 0.0
     confidence = max(0, min(
         1,
         authority * .45 + corroboration * .15 + freshness * .2 + completeness * .2

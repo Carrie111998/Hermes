@@ -30,6 +30,13 @@ class DatasetDefinition(ApiModel):
     access_tier: Literal["public", "credentialed_public", "licensed", "customer_upload", "retired"]
     entity_levels: list[Literal["market", "named_company", "opportunity", "event"]]
     capabilities: list[str] = Field(default_factory=list)
+    # The claim fields this source's verifier can actually produce. Coarse
+    # capabilities cannot answer that: "candidate_verification" says a source
+    # verifies companies, not that it can ever speak to their store count. A
+    # scoring dimension no configured source can reach must not be counted
+    # against a lead's completeness, and this is what makes that knowable.
+    # Empty means undeclared, which is treated as "no information", not "none".
+    emits: list[str] = Field(default_factory=list)
     countries: list[str] = Field(default_factory=list)
     sector_ids: list[str] = Field(default_factory=list)
     freshness_days: int = Field(default=180, ge=1)

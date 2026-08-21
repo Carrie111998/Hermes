@@ -39,6 +39,7 @@ def corpus_definition() -> DatasetDefinition:
         access_tier="customer_upload",
         entity_levels=["named_company"],
         capabilities=["organizations", "candidate_verification"],
+        emits=["company_name", "country", "domain", "buyer_role", "product_term"],
         freshness_days=365,
         adapter_mode="live",
         default_enabled=False,

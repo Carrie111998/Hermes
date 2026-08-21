@@ -15,7 +15,7 @@ from .metrics import CampaignMetricsRecorder, FUNNEL_KEYS, estimate_campaign
 from .models import CampaignConfig, Claim, DiscoveryQuery, ResearchResultData
 from .qualification import EligibilityService
 from .registry import ProviderRegistry, build_registry
-from .scoring import score_lead
+from .scoring import attainable_dimensions, score_lead
 from .sectors import load_sectors
 from .storage import EvidenceRepository
 from .verdicts import SourceCoverage, evaluate_verdict
@@ -795,6 +795,21 @@ class LeadResearchService:
                         ),
                     )
 
+            # What this run's sources could establish at all, so a dimension
+            # none of them can reach is not held against a lead's confidence.
+            # Availability matters, not just enablement: a credential-gated
+            # source emits nothing, so counting its fields would understate
+            # completeness exactly as the fixed denominator used to.
+            attainable = attainable_dimensions({
+                field
+                for source_id in config.enabled_source_ids
+                if catalog.get(source_id, {}).get("available")
+                for field in (
+                    self.registry.definitions[source_id].emits
+                    if source_id in self.registry.definitions else []
+                )
+            })
+            metrics["attainable_dimensions"] = sorted(attainable)
             product_terms = self._product_terms(company_id, config)
             settled, closed_count = self._settled_identities(company_id)
             # Outside FUNNEL_KEYS on purpose: the funnel is monotonic and this
@@ -984,7 +999,9 @@ class LeadResearchService:
                                 "eligibility_failed", {"reasons": gate.reasons},
                             )
                         stage = "scoring"
-                        score = score_lead(candidate_for_gate, claims, config.scoring)
+                        score = score_lead(
+                            candidate_for_gate, claims, config.scoring, attainable,
+                        )
                         stage = "verdict"
                         evaluated_verdict = evaluate_verdict(
                             candidate, claims, score, gate,
