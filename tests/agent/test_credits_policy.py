@@ -313,6 +313,28 @@ class TestDepletedFreeModelSuppression:
 
 class TestIsFreeTierModel:
 
+    def test_nous_stealth_preview_is_free_without_pricing_cache(self, monkeypatch):
+        from agent.credits_tracker import is_free_tier_model
+        import hermes_cli.models as models_mod
+
+        monkeypatch.setattr(models_mod, "_pricing_cache", {})
+
+        assert is_free_tier_model(
+            "stealth/ox-alpha",
+            "https://inference-api.nousresearch.com/v1",
+        ) is True
+
+    def test_stealth_prefix_is_not_trusted_on_other_endpoints(self, monkeypatch):
+        from agent.credits_tracker import is_free_tier_model
+        import hermes_cli.models as models_mod
+
+        monkeypatch.setattr(models_mod, "_pricing_cache", {})
+
+        assert is_free_tier_model(
+            "stealth/paid-model",
+            "https://inference.example.com/v1",
+        ) is False
+
 
     def test_pricing_cache_peek_zero_priced_model(self, monkeypatch):
         from agent.credits_tracker import is_free_tier_model

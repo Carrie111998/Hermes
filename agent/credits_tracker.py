@@ -221,12 +221,16 @@ class AgentNotice:
 def is_free_tier_model(model: str, base_url: str = "") -> bool:
     """Return True when *model* is a Nous free-tier model, using ONLY local data.
 
-    Two signals, both zero-network:
+    Three signals, all zero-network:
 
     1. The ``:free`` suffix — the canonical Nous free SKU marker (e.g.
        ``nvidia/nemotron-3-ultra:free``). Free by construction on the API side
        (spend is forced to 0 for ``:free`` ids).
-    2. A peek into the in-process pricing cache in ``hermes_cli.models``
+    2. The ``stealth/`` namespace on Nous' canonical inference endpoint. These
+       are free preview SKUs but intentionally omit the public ``:free`` suffix.
+       Restricting this signal to the Nous endpoint avoids trusting a model name
+       controlled by an unrelated OpenAI-compatible provider.
+    3. A peek into the in-process pricing cache in ``hermes_cli.models``
        (populated when the model picker fetched ``/v1/models`` pricing for
        *base_url*). PEEK ONLY — a cache miss never triggers a fetch. This is
        CLI/TUI-session best-effort: gateway sessions never run the picker's
@@ -243,15 +247,17 @@ def is_free_tier_model(model: str, base_url: str = "") -> bool:
         return True
     if not base_url:
         return False
+    key = base_url.rstrip("/")
+    if key.endswith("/v1"):
+        key = key[:-3].rstrip("/")
+    if model.startswith("stealth/") and key == "https://inference-api.nousresearch.com":
+        return True
     try:
         from hermes_cli.models import _is_model_free, _pricing_cache
 
         # Mirror get_pricing_for_provider's key normalization: the agent's
         # Nous base_url is /v1-suffixed (https://inference-api.nousresearch.com/v1)
         # but the picker keys _pricing_cache on the pre-/v1 root.
-        key = base_url.rstrip("/")
-        if key.endswith("/v1"):
-            key = key[:-3].rstrip("/")
         pricing = _pricing_cache.get(key)
         if not pricing:
             return False
