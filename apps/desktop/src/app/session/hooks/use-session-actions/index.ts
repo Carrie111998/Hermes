@@ -713,7 +713,7 @@ export function useSessionActions({
         const cwd =
           options?.cwd === null ? '' : typeof options?.cwd === 'string' ? options.cwd.trim() : resolveNewSessionCwd()
 
-        const params = {
+        const params: Record<string, unknown> = {
           ...(await desktopSessionCreateParams(cwd, capturedRoute)),
           ...(workspaceScope.workspaceMode === 'bots' ? { hidden: true } : {})
         }
@@ -826,12 +826,14 @@ export function useSessionActions({
     async (storedSessionId: string, replaceRoute = false, capturedOwner?: SessionOwnerScope) => {
       const requestId = resumeRequestRef.current + 1
       resumeRequestRef.current = requestId
+
       const requestedOwnerProfile =
         typeof capturedOwner === 'string'
           ? normalizeProfileKey(capturedOwner)
           : capturedOwner
             ? normalizeProfileKey(capturedOwner.profile)
             : null
+
       let resumeOwnerProfile = requestedOwnerProfile
 
       const resumedSameSelectedSession =
@@ -903,7 +905,10 @@ export function useSessionActions({
         dropSessionState(runtimeId)
       }
 
-      const takeWarmCache = (profile?: string): { runtimeId: string; state: ClientSessionState } | null => {
+      const takeWarmCache = (
+        profile?: string,
+        allowUnqualified = false
+      ): { runtimeId: string; state: ClientSessionState } | null => {
         const expectedProfile = profile?.trim() ? normalizeProfileKey(profile) : null
         let runtimeId: string | undefined
         let state: ClientSessionState | undefined
@@ -916,8 +921,9 @@ export function useSessionActions({
           for (const [candidateRuntimeId, candidateState] of sessionStateByRuntimeIdRef.current.entries()) {
             if (
               candidateState.storedSessionId === storedSessionId &&
-              candidateState.profile !== null &&
-              normalizeProfileKey(candidateState.profile) === expectedProfile
+              (candidateState.profile !== null
+                ? normalizeProfileKey(candidateState.profile) === expectedProfile
+                : allowUnqualified && runtimeIdByStoredSessionIdRef.current.get(storedSessionId) === candidateRuntimeId)
             ) {
               runtimeId = candidateRuntimeId
               state = candidateState
@@ -943,7 +949,9 @@ export function useSessionActions({
         return { runtimeId, state }
       }
 
-      if (!takeWarmCache(requestedOwnerProfile ?? undefined)) {
+      if (
+        !takeWarmCache(requestedOwnerProfile ?? undefined, Boolean(capturedOwner && typeof capturedOwner === 'object'))
+      ) {
         setActiveSessionId(null)
         activeSessionIdRef.current = null
         // History load is not turn-busy. Drop the previous session's leftover
@@ -974,6 +982,7 @@ export function useSessionActions({
         ambientConnection?.mode === 'remote' ? ambientConnection.connectionId?.trim() || '' : ''
 
       const storedForProfile = await resolveStoredSession(storedSessionId, hintedOwner)
+
       const sessionProfile =
         typeof hintedOwner === 'string' ? hintedOwner.trim() || storedForProfile?.profile : storedForProfile?.profile
 
@@ -1043,7 +1052,7 @@ export function useSessionActions({
       // Re-check after the profile-resolve / gateway-swap awaits above: the
       // cache may have changed, and takeWarmCache re-validates belongs-to and
       // purges a cross-wired mapping before we trust the fast-path.
-      const warmHit = takeWarmCache(sessionProfile)
+      const warmHit = takeWarmCache(sessionProfile, Boolean(ownerRoute))
 
       if (warmHit) {
         const cachedRuntimeId = warmHit.runtimeId
@@ -2261,7 +2270,7 @@ export function useSessionActions({
         dropTranscriptTailEverywhere(storedSessionId)
         // Only after the RPC lands — the optimistic eviction above can roll
         // back, and a rolled-back row must keep its watermark/marker.
-        forgetSessionUnread(removedIds, removed?.profile)
+        forgetSessionUnread(removedIds, profile)
         clearQueuedPrompts(storedSessionId)
 
         if (closingRuntimeId) {

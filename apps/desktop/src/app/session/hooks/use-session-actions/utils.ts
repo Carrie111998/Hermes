@@ -37,11 +37,7 @@ import type { SessionProfileRoute } from '@/store/session-request-router'
 // Re-exported for the many session-actions/tile call sites that already import
 // it from here; the canonical definition lives in @/store/session.
 export { sessionMatchesStoredId }
-import {
-  isSessionOwnerRoute,
-  sessionOwnerRouteFromRow,
-  type SessionOwnerScope
-} from '@/store/session-request-router'
+import { isSessionOwnerRoute, sessionOwnerRouteFromRow, type SessionOwnerScope } from '@/store/session-request-router'
 import { reportBackendContract, reportInstallMethodWarning } from '@/store/updates'
 import type { SessionCreateResponse, SessionInfo, SessionResumeResponse, SessionRuntimeInfo } from '@/types/hermes'
 
@@ -1397,6 +1393,7 @@ export async function resolveStoredSession(
 ): Promise<SessionInfo | undefined> {
   const ownerRoute = isSessionOwnerRoute(owner) ? owner : undefined
   const requestedOwner = typeof owner === 'string' && owner.trim() ? normalizeProfileKey(owner) : undefined
+
   const cached = [...$sessions.get(), ...$cronSessions.get(), ...$messagingSessions.get()].find(
     session =>
       sessionMatchesStoredId(session, storedSessionId) &&

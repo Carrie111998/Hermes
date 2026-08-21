@@ -196,6 +196,7 @@ export function useRouteResume({
 
         const ownerRoute =
           sessionResumeRequest?.sessionId === routedSessionId ? sessionResumeRequest.ownerRoute : undefined
+
         const resumeOwner = ownerRoute ?? routeOwnerProfile ?? undefined
 
         if (resumeOwner) {
