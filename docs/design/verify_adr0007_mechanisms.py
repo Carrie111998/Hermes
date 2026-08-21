@@ -480,6 +480,17 @@ for label, value in HOSTILE_SHA40.items():
     check(f"finalization refuses verified_head_sha {label}",
           not finalizable(dict(good, verified_head_sha=value))[0])
 
+# --- v1.0.0 §2.2: artifact schema uses the normative vocabulary --------
+artifact_cols = {
+    r[1] for r in db.execute("PRAGMA table_info(run_artifacts)")
+}
+check("run_artifacts schema matches the declared artifact contract",
+      artifact_cols == {
+          "id", "run_id", "task_id", "artifact_path", "sha256", "size_bytes",
+          "git_blob_oid", "tracked", "clean", "declared_by", "created_at",
+          "sealed",
+      }, str(sorted(artifact_cols)))
+
 # --- v1.1.0 §A.4: final_candidate_sha is NOT a Kanban column ----------
 prov_cols = {r[1] for r in db.execute("PRAGMA table_info(run_provenance)")}
 check("no final_candidate_sha / final_sha column exists",
