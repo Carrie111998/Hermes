@@ -121,6 +121,15 @@ class VerificationBundle(ApiModel):
     candidate_source_record_id: str
     sources: list[VerificationSource] = Field(default_factory=list)
     independent_source_count: int = Field(default=0, ge=0)
+    # Outbound requests this bundle cost. Reported by the provider because only
+    # it knows: one `verify` can be zero fetches for a local corpus or four for
+    # a web verifier, and a caller cannot count what happens inside. A bundle
+    # rebuilt from stored evidence therefore reports 0, which is exactly true.
+    #
+    # A `verify` that raises after spending is not counted — the bundle never
+    # returns — so a run's total is a floor. Failures are recorded per
+    # partition, so an unusually cheap run with errors is legible as one.
+    requests: int = Field(default=0, ge=0)
 
 
 class EvidenceEnvelope(ApiModel):

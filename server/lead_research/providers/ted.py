@@ -200,22 +200,29 @@ class TedVerifier(CatalogProvider):
     def health(self) -> ProviderHealth:
         return ProviderHealth(status="active", message="TED search API needs no credential")
 
-    def _search(self, term: str, country: str) -> list[dict]:
+    def _search(self, term: str, country: str) -> tuple[list[dict], int]:
+        """Notices for a candidate, and how many HTTP calls that took.
+
+        The 429 backoff makes a second call, and it is a real request against
+        TED's rate limit, so it is counted rather than assumed away.
+        """
         query = f'winner-name ~ ("{term}")'
         alpha3 = [a3 for a3, a2 in ALPHA3_TO_ALPHA2.items() if a2 == country.upper()]
         if alpha3:
             query += f' AND winner-country IN ("{alpha3[0]}")'
         payload = {"query": query, "limit": MAX_NOTICES, "fields": FIELDS}
+        requests = 0
         for attempt in (0, 1):
             response = self.client.post(SEARCH_ENDPOINT, json=payload, timeout=45.0)
+            requests += 1
             # 429 is routine here, not exceptional. One backoff, then give up and
             # let the campaign record a verification error for this candidate.
             if response.status_code == 429 and attempt == 0:
                 time.sleep(RETRY_PAUSE_SECONDS)
                 continue
             response.raise_for_status()
-            return response.json().get("notices") or []
-        return []
+            return response.json().get("notices") or [], requests
+        return [], requests
 
     def _source(
         self,
@@ -286,7 +293,8 @@ class TedVerifier(CatalogProvider):
 
         sources: list[VerificationSource] = []
         seen: set[str] = set()
-        for notice in self._search(term, candidate.country):
+        notices, requests = self._search(term, candidate.country)
+        for notice in notices:
             names = _names(notice.get("winner-name"))
             matched = _identity_match(candidate, names)
             if not matched:
@@ -301,4 +309,5 @@ class TedVerifier(CatalogProvider):
             candidate_source_record_id=candidate.source_record_id,
             sources=sources,
             independent_source_count=len(sources),
+            requests=requests,
         )

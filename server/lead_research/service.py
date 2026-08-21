@@ -524,11 +524,12 @@ class LeadResearchService:
         providers: dict,
         available_source_ids: list[str],
         bundles: list,
-    ) -> tuple[list, list[str]]:
+    ) -> tuple[list, list[str], int]:
         """Re-verify a candidate against the gaps its first pass left open.
 
-        Returns the extra bundles plus the playbook fields still missing after
-        them, so a run can say what it looked for and whether it found it.
+        Returns the extra bundles, the playbook fields still missing after them,
+        and the requests they cost — so a run can say what it looked for,
+        whether it found it, and what looking was worth.
         """
         fact_fields = {
             field
@@ -544,11 +545,11 @@ class LeadResearchService:
             )
         ]
         if not missing:
-            return [], []
+            return [], [], 0
 
         gap_query = self._enrichment_query(query, config)
         if gap_query is None:
-            return [], missing
+            return [], missing, 0
 
         # Only ask sources whose answer can actually change with the terms.
         # TED retrieves by winner name and country, so a re-query returns the
@@ -561,8 +562,9 @@ class LeadResearchService:
                                   if source_id in self.registry.definitions else [])
         ]
         if not searchable:
-            return [], missing
+            return [], missing, 0
 
+        spent = 0
         seen = {
             source.provenance_url
             for _, bundle in bundles for source in bundle.sources
@@ -575,6 +577,9 @@ class LeadResearchService:
                 # A failed enrichment must never lose the first pass's evidence.
                 # The candidate keeps whatever it already had.
                 continue
+            # Spend first: the pages were fetched whether or not anything
+            # in them turns out to be new.
+            spent += bundle.requests
             if bundle.candidate_source_record_id != candidate.source_record_id:
                 continue
             fresh = [source for source in bundle.sources if source.provenance_url not in seen]
@@ -597,7 +602,7 @@ class LeadResearchService:
                 config.sector_ids,
             )
         ]
-        return extra, still_missing
+        return extra, still_missing, spent
 
     def _product_terms(self, company_id: str, config: CampaignConfig) -> list[str]:
         terms = [*config.sector_ids, *config.hs_codes]
@@ -795,6 +800,7 @@ class LeadResearchService:
         # zero enrichment rather than blowing up on the way out.
         enriched = 0
         reused_bundles = 0
+        provider_requests = 0
         unresolved_gaps: set[str] = set()
         cancelled = False
         try:
@@ -904,6 +910,15 @@ class LeadResearchService:
                             bundle = providers[source_id].verify(query, candidate)
                             if bundle.candidate_source_record_id != candidate.source_record_id:
                                 raise ValueError("verifier returned evidence for a different candidate")
+                            # Counted before anything decides whether to keep
+                            # the bundle: an abstention still fetched its pages,
+                            # and dropping the count with the bundle would make
+                            # the cheapest-looking runs the ones that found
+                            # nothing.
+                            provider_requests += bundle.requests
+                            partition["requests"] = (
+                                partition.get("requests", 0) + bundle.requests
+                            )
                             if not bundle.sources:
                                 # An abstention, not a verification. A provider
                                 # with nothing to say returns an empty bundle
@@ -947,9 +962,10 @@ class LeadResearchService:
                     # again, aimed at what is still unknown, before scoring.
                     if (config.enrichment.research_each_lead
                             and enriched < config.enrichment.max_companies):
-                        extra, still_missing = self._enrich_candidate(
+                        extra, still_missing, enrichment_requests = self._enrich_candidate(
                             config, query, candidate, providers, available_source_ids, bundles,
                         )
+                        provider_requests += enrichment_requests
                         if extra:
                             enriched += 1
                             bundles.extend(extra)
@@ -1143,6 +1159,10 @@ class LeadResearchService:
         # never how many records passed through it. A run that says nothing
         # about reuse cannot be told apart from one that re-fetched everything.
         metrics["reused_bundles"] = reused_bundles
+        # The number the 16,500-request estimate in the plan was guessing at.
+        # A floor, not an exact figure: a verify that raises after spending
+        # never returns its bundle, so its requests are not counted.
+        metrics["provider_requests"] = provider_requests
         metrics["unresolved_gaps"] = sorted(unresolved_gaps)
 
         partition_statuses: list[str] = []
@@ -1177,6 +1197,7 @@ class LeadResearchService:
                 "verified_candidates": partition["verified"],
                 "enriched_candidates": partition.get("enriched", 0),
                 "reused_candidates": partition.get("reused", 0),
+                "provider_requests": partition.get("requests", 0),
                 "completed_candidates": partition["completed"],
                 "evidence_records": partition["evidence"],
                 "errors": partition["errors"],

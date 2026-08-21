@@ -53,14 +53,29 @@ export async function mount(root, ctx) {
         el('div', { class: 'ifz-funnel-bar' }, el('span', { style: { transform: `scaleX(${Math.max(0.02, Number(metrics[key] || 0) / first)})` } })))) ) });
   }
 
+  function runCost() {
+    return card({ title: 'What this run cost', body: el('div', {},
+      kv([
+        ['Provider requests', metrics.provider_requests ?? '—'],
+        ['Bundles reused', metrics.reused_bundles ?? '—'],
+        ['Companies enriched', metrics.enriched_companies ?? '—'],
+      ]),
+      el('p', { class: 'ifz-hint' },
+        'A paid fetch per page, so requests are the bill. Reused bundles are evidence still inside its source freshness window and cost nothing.')) });
+  }
+
   function sourceProgress() {
     return card({ title: 'Source progress', flush: true, body: dataTable({
       columns: [
         { key: 'source_id', label: 'Source' }, { key: 'target_country', label: 'Partition' },
         { key: 'status', label: 'Status', render: row => badge(row.status) },
-        { key: 'records', label: 'Records', render: row => row.metrics?.records ?? '—' },
-        { key: 'normalized', label: 'Normalized', render: row => row.metrics?.normalized ?? '—' },
-        { key: 'eligible', label: 'Eligible', render: row => row.metrics?.eligible ?? '—' },
+        // These read the keys the run actually writes. They previously read
+        // records/normalized/eligible, which nothing has ever stored, so every
+        // cell in this table rendered as a dash.
+        { key: 'selected', label: 'Selected', render: row => row.metrics?.selected_candidates ?? '—' },
+        { key: 'verified', label: 'Verified', render: row => row.metrics?.verified_candidates ?? '—' },
+        { key: 'reused', label: 'Reused', render: row => row.metrics?.reused_candidates ?? '—' },
+        { key: 'requests', label: 'Requests', render: row => row.metrics?.provider_requests ?? '—' },
         { key: 'error_category', label: 'Coverage note', render: row => row.error_category?.replace(/_/g, ' ') || '—' },
       ], rows: sources,
       empty: emptyState({ icon: 'clock', title: 'No source runs yet', hint: 'Start this campaign to create bounded provider partitions.' }),
@@ -98,7 +113,14 @@ export async function mount(root, ctx) {
     return card({ title: 'Effective configuration', body: el('pre', { class: 'ifz-research-config' }, JSON.stringify(campaign.config, null, 2)) });
   }
 
-  const views = { overview, funnel, leads: leadTable, sources: sourceProgress, issues: issueTable, configuration };
+  const views = {
+    overview,
+    // Cost sits beside the funnel: what the run moved, and what moving it
+    // was worth. It is not a funnel stage — that list is monotonic and its
+    // bars are scaled against raw_records.
+    funnel: () => el('div', { class: 'ifz-research-stack' }, funnel(), runCost()),
+    leads: leadTable, sources: sourceProgress, issues: issueTable, configuration,
+  };
   function render() {
     tabHost.replaceWith(tabHost = tabs([
       ['overview', 'Overview'], ['funnel', 'Funnel'], ['leads', `Leads (${leads.length})`],

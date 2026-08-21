@@ -248,10 +248,16 @@ class BrightDataVerifier(CatalogProvider):
         ])
         sources: list[VerificationSource] = []
         seen_urls: set[str] = set()
+        # Every _fetch_markdown is one billable Web Unlocker request. Counted
+        # here rather than on the instance: providers are shared singletons and
+        # campaigns run concurrently, so an instance counter would misattribute
+        # one tenant's spend to another.
+        requests = 0
 
         if candidate_domain:
             official_url = f"https://{candidate_domain}"
             markdown = self._fetch_markdown(official_url)
+            requests += 1
             if markdown.strip():
                 sources.append(self._source(
                     official_url,
@@ -266,6 +272,7 @@ class BrightDataVerifier(CatalogProvider):
 
         for search_url in self._search_urls(query, candidate, buyer_terms, product_terms):
             markdown = self._fetch_markdown(search_url)
+            requests += 1
             digest = hashlib.sha256(markdown.encode()).hexdigest()
             matches = list(MARKDOWN_LINK.finditer(markdown))
             for index, match in enumerate(matches[:MAX_RESULTS_PER_PAGE]):
@@ -308,6 +315,7 @@ class BrightDataVerifier(CatalogProvider):
             candidate_source_record_id=candidate.source_record_id,
             sources=sources,
             independent_source_count=len(independent_domains - {None}),
+            requests=requests,
         )
 
     @staticmethod

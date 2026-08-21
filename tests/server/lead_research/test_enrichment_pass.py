@@ -42,12 +42,17 @@ def candidate() -> CandidateRecord:
 
 
 class Bundle:
-    def __init__(self, sources, record_id="rec-1"):
+    def __init__(self, sources, record_id="rec-1", requests=0):
         self.sources = sources
         self.candidate_source_record_id = record_id
+        # What the bundle cost. A real verifier reports this so a run can meter
+        # its own spend; the enrichment pass has to carry it back out.
+        self.requests = requests
 
     def model_copy(self, update):
-        return Bundle(update["sources"], self.candidate_source_record_id)
+        return Bundle(
+            update["sources"], self.candidate_source_record_id, self.requests,
+        )
 
 
 class Source:
@@ -85,7 +90,7 @@ def svc():
 # terms are phrased, so re-querying it buys nothing and costs a request.
 def test_a_source_that_does_not_search_terms_is_not_asked_twice(svc):
     provider = Provider(Bundle([Source("https://e.example/5", {"store_count": ["3"]})]))
-    extra, missing = svc._enrich_candidate(
+    extra, missing, spent = svc._enrich_candidate(
         config(enabled_source_ids=["ted"]), query(), candidate(),
         {"ted": provider}, ["ted"],
         [("ted", Bundle([Source("https://a.example/1", {"company_name": ["Acme"]})]))],
@@ -108,7 +113,7 @@ def test_a_candidate_with_no_open_gaps_costs_no_second_request(svc):
         "store_count", "relevant_import_value", "brands_carried",
     )}
     provider = Provider(Bundle([Source("https://a.example/1", {})]))
-    extra, missing = svc._enrich_candidate(
+    extra, missing, spent = svc._enrich_candidate(
         config(), query(), candidate(), {"brightdata-web": provider}, ["brightdata-web"],
         [("brightdata-web", Bundle([Source("https://a.example/0", full)]))],
     )
@@ -119,7 +124,7 @@ def test_a_candidate_with_no_open_gaps_costs_no_second_request(svc):
 
 def test_the_second_pass_searches_the_sector_vocabulary_not_the_first_query(svc):
     provider = Provider(Bundle([Source("https://b.example/2", {"store_count": ["12"]})]))
-    extra, _ = svc._enrich_candidate(
+    extra, _, spent = svc._enrich_candidate(
         config(), query(), candidate(), {"brightdata-web": provider}, ["brightdata-web"],
         [("brightdata-web", Bundle([Source("https://a.example/1", {"company_name": ["Acme Handel"]})]))],
     )
@@ -135,7 +140,7 @@ def test_the_second_pass_searches_the_sector_vocabulary_not_the_first_query(svc)
 # nothing new, so a repeat citation is dropped rather than double-counted.
 def test_evidence_already_cited_is_not_counted_twice(svc):
     repeated = Provider(Bundle([Source("https://a.example/1", {"store_count": ["9"]})]))
-    extra, _ = svc._enrich_candidate(
+    extra, _, spent = svc._enrich_candidate(
         config(), query(), candidate(), {"brightdata-web": repeated}, ["brightdata-web"],
         [("brightdata-web", Bundle([Source("https://a.example/1", {"company_name": ["Acme"]})]))],
     )
@@ -145,7 +150,7 @@ def test_evidence_already_cited_is_not_counted_twice(svc):
 def test_a_failing_enrichment_never_costs_the_first_pass_its_evidence(svc):
     broken = Provider(error=RuntimeError("upstream 500"))
     first = [("brightdata-web", Bundle([Source("https://a.example/1", {"company_name": ["Acme"]})]))]
-    extra, missing = svc._enrich_candidate(
+    extra, missing, spent = svc._enrich_candidate(
         config(), query(), candidate(), {"brightdata-web": broken}, ["brightdata-web"], first,
     )
     assert extra == []
@@ -155,7 +160,7 @@ def test_a_failing_enrichment_never_costs_the_first_pass_its_evidence(svc):
 
 def test_a_bundle_answering_for_a_different_candidate_is_discarded(svc):
     liar = Provider(Bundle([Source("https://c.example/3", {"store_count": ["4"]})], "somebody-else"))
-    extra, _ = svc._enrich_candidate(
+    extra, _, spent = svc._enrich_candidate(
         config(), query(), candidate(), {"brightdata-web": liar}, ["brightdata-web"],
         [("brightdata-web", Bundle([Source("https://a.example/1", {"company_name": ["Acme"]})]))],
     )
@@ -164,7 +169,7 @@ def test_a_bundle_answering_for_a_different_candidate_is_discarded(svc):
 
 def test_an_unknown_sector_has_no_vocabulary_so_no_second_request(svc):
     provider = Provider(Bundle([Source("https://d.example/4", {})]))
-    extra, _ = svc._enrich_candidate(
+    extra, _, spent = svc._enrich_candidate(
         config(sector_ids=["kitchen-appliances"]), query(), candidate(),
         {"brightdata-web": provider}, ["brightdata-web"],
         [("brightdata-web", Bundle([Source("https://a.example/1", {"company_name": ["Acme"]})]))],

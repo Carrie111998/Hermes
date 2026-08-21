@@ -382,16 +382,43 @@ def admin_integrations(request: Request, _: Principal = Depends(require_admin)):
 
 @router.get("/admin/analytics/costs")
 def admin_costs(request: Request, _: Principal = Depends(require_admin)):
-    """Per-tenant model spend.
+    """Per-tenant spend, in the two units this system actually spends in.
 
-    `agent_runs.cost` is never written today: the run executor shells out to the
-    hermes CLI and does not parse token accounting back out of it. Every total
-    is therefore structurally 0. `metering_enabled` says so explicitly, because
-    a bare 0.0 reads as "this tenant cost nothing" rather than "not measured".
-    Populate it in AgentRunService before flipping the flag.
+    `total_cost` is model spend and is still structurally 0: the run executor
+    shells out to the hermes CLI and does not parse token accounting back out of
+    it. `metering_enabled` says so explicitly, because a bare 0.0 reads as "this
+    tenant cost nothing" rather than "not measured". Populate it in
+    AgentRunService before flipping the flag.
+
+    `provider_requests` is metered, and for lead research it is the bill that
+    actually arrives: a Web Unlocker fetch is a paid request and one candidate
+    costs several. It is deliberately a separate field rather than added into
+    `total_cost` — requests and tokens are different units, and a single number
+    summing both would mean nothing. It is a floor: a verify that raises after
+    spending never reports what it spent.
     """
-    return [{**dict(row), "metering_enabled": False} for row in request.app.state.db.all(
-        "SELECT company_id,SUM(cost) AS total_cost FROM agent_runs GROUP BY company_id")]
+    # Summed in Python, not with json_extract: that function is spelled
+    # differently on Postgres (`->>`) and this table holds one row per campaign
+    # per dimension, so there is nothing to gain by pushing it into SQL.
+    requests_by_company: dict[str, int] = {}
+    for row in request.app.state.db.all(
+        "SELECT company_id,metrics FROM campaign_metrics WHERE dimension='overall'"
+    ):
+        spent = json_load(row["metrics"], {}).get("provider_requests") or 0
+        requests_by_company[row["company_id"]] = (
+            requests_by_company.get(row["company_id"], 0) + int(spent)
+        )
+    return [
+        {
+            **dict(row),
+            "metering_enabled": False,
+            "provider_requests": requests_by_company.get(row["company_id"], 0),
+            "provider_requests_metered": True,
+        }
+        for row in request.app.state.db.all(
+            "SELECT company_id,SUM(cost) AS total_cost FROM agent_runs GROUP BY company_id"
+        )
+    ]
 
 
 EXPORT_TABLES = {

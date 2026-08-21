@@ -817,6 +817,54 @@ Verified by reverting: three tests fail with reuse disabled, and the
 fingerprint guard has its own test that fails when the check is removed. 492
 server tests and six WebUI suites pass.
 
+### C1. A run says what it spent
+
+Nothing counted an outbound request. `agent_runs.cost` was inserted as 0 and
+never updated, while this document reasons about 90 requests versus 16,500 and
+the entire cost model of the system is Web Unlocker fetches. A run could not
+answer the one question an operator has about it.
+
+**The provider reports its own spend**, on the bundle, because only the provider
+knows: one `verify` is zero fetches for a local corpus, one search for TED, two
+when TED backs off a 429, and up to four for Bright Data (an official page plus
+three searches). Reported per call rather than counted on the instance —
+providers are shared singletons and campaigns run concurrently, so an instance
+counter would attribute one tenant's spend to another.
+
+- **A bundle rebuilt from stored evidence reports 0**, which is exactly true, so
+  the saving from C2 shows up as a number instead of a claim. There is a test
+  that a reused rerun reports zero spend.
+- **An abstention still reports what it spent.** The pages were fetched whether
+  or not anything in them was usable; counting only successful bundles would
+  make the runs that found nothing look like the cheapest ones.
+- **The enrichment pass is counted too**, including bundles whose sources were
+  all already cited — those pages were still fetched.
+- Reported per run (`provider_requests`) and per partition, so spend can be
+  attributed to the source that incurred it.
+
+**`agent_runs.cost` is deliberately left alone.** That column is model spend, and
+`/admin/analytics/costs` documents itself as such. Requests and tokens are
+different units and a single number summing both would mean nothing, so the
+endpoint gained a separate `provider_requests` field with its own
+`provider_requests_metered: true`, beside the existing `metering_enabled: false`
+that still honestly reports token spend as unmeasured. The rollup sums in Python
+rather than with `json_extract`, matching two existing comments in this codebase
+about that function being spelled differently on Postgres.
+
+A run's total is a **floor**: a `verify` that raises after spending never
+returns its bundle, so those requests are not counted. Failures are recorded per
+partition, so an unusually cheap run with errors is legible as one.
+
+Two UI fixes came with it. The campaign page now has a "What this run cost" card
+beside the funnel — requests are not a funnel stage, that list is monotonic and
+its bars are scaled against `raw_records`. And the Source progress table was
+reading `records`, `normalized` and `eligible`, **keys nothing has ever
+written**, so every cell in it rendered as a dash; it now reads the keys the run
+actually stores, including the new per-partition reuse and request counts.
+
+Verified by reverting: three tests fail without it. 504 server tests and six
+WebUI suites pass.
+
 ## Carried-over risks
 
 - **Postgres paths stay under-tested.** `tests/server/` builds `Settings` with
