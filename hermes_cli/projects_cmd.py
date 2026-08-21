@@ -211,6 +211,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if proj is None:
         print("project: vanished after create", file=sys.stderr)
         return 2
+    if args.board:
+        _sync_board_binding(proj, args.board, bound=True)
     print(f"Created project {proj.slug} ({pid})")
     _print_project(proj)
     return 0

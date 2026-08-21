@@ -101,5 +101,22 @@ def test_bind_board_updates_both_sides_and_unbind_preserves_board(tmp_path):
     assert metadata["description"] == "Keep me"
 
 
+def test_create_with_board_updates_reciprocal_metadata(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    kb.create_board("widget")
+
+    assert _run(["create", "Widget", str(repo), "--board", "widget"]) == 0
+
+    with pdb.connect_closing() as conn:
+        project = pdb.get_project(conn, "widget")
+        assert project is not None
+        assert project.board_slug == "widget"
+
+    metadata = kb.read_board_metadata("widget")
+    assert metadata["project_id"] == project.id
+    assert metadata["default_workdir"] == str(repo)
+
+
 
 
