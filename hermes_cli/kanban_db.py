@@ -10991,6 +10991,19 @@ def _default_spawn(
         from tools.environments.local import hermes_subprocess_env
 
         env = hermes_subprocess_env(inherit_credentials=False)
+        # The trusted internal supervisor may import Hermes from this source
+        # checkout. It re-sanitizes its environment in _child_env() before
+        # launching the arbitrary profile command, so Hermes-owned PYTHONPATH
+        # still cannot reach that untrusted execution boundary.
+        repo_root = str(Path(__file__).resolve().parents[1])
+        pythonpath = (
+            env.get("PYTHONPATH", "").split(os.pathsep)
+            if "PYTHONPATH" in env
+            else []
+        )
+        if repo_root not in pythonpath:
+            pythonpath.insert(0, repo_root)
+        env["PYTHONPATH"] = os.pathsep.join(pythonpath)
     else:
         env = dict(os.environ)
     # The dispatcher is detached from every conversation. Its worker must never
