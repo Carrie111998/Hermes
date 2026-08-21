@@ -484,9 +484,11 @@ elif ! grep -q '^API_SERVER_KEY=..*' "$HERMES_HOME/.env" 2>/dev/null; then
         if [ ! -f "$HERMES_HOME/.env" ]; then
             # Create an empty, owner-only .env so the append below (and any
             # later runtime save_env_value writes) have a durable target.
-            # The chown/chmod block below re-tightens perms every boot.
-            as_hermes touch "$HERMES_HOME/.env" 2>/dev/null || true
-            chmod 600 "$HERMES_HOME/.env" 2>/dev/null || true
+            # Created under a restrictive umask so the file is 0600 from the
+            # first instant — no touch→chmod window, and no dependence on a
+            # silenced chmod succeeding. The chown/chmod block below still
+            # re-tightens perms every boot.
+            (umask 077 && as_hermes touch "$HERMES_HOME/.env") 2>/dev/null || true
         fi
         if [ -f "$HERMES_HOME/.env" ]; then
             _gen_key=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
