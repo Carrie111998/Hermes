@@ -29,7 +29,8 @@ jobs:
       - name: Execute the branch-stored claimant transformation
         run: |
           set -euo pipefail
-          git show caa2b08bcc6e7abe56736fdada36738e01f18557:.github/workflows/complete-89252-claim-proof.yml > /tmp/original-89252-carrier.yml
+          git fetch --no-tags origin caa2b08bcc6e7abe56736fdada36738e01f18557
+          git show FETCH_HEAD:.github/workflows/complete-89252-claim-proof.yml > /tmp/original-89252-carrier.yml
           python3 - <<'PY'
           from pathlib import Path
           from textwrap import dedent
