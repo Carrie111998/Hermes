@@ -272,6 +272,28 @@ class TestExtractRescue:
         assert out[1]["metadata"]["rescued_from"] == "tavily"
         ring.assert_called_once_with("tavily", ["https://ok.test"])
 
+    def test_parity_loss_skips_rescue(self, monkeypatch):
+        blocked = {
+            "url": "https://blocked.test",
+            "title": "",
+            "content": "",
+            "error": "Blocked by website policy",
+            "blocked_by_policy": {
+                "host": "blocked.test",
+                "rule": "blocked.test",
+                "source": "config",
+            },
+        }
+        with patch.object(keyless_mcp, "extract_with_failover") as ring:
+            out = web_tools._rescue_extract(
+                "tavily",
+                ["https://blocked.test", "https://missing.test"],
+                [blocked],
+            )
+
+        assert out == [blocked]
+        ring.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_partial_failure_not_rescued(self, monkeypatch):
         class _Partial(_KeyedBoomProvider):
