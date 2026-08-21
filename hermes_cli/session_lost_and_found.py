@@ -295,6 +295,31 @@ def _heuristic_started_at(cells: tuple[Any, ...]) -> float:
     return 0.0
 
 
+def _strip_rowid_prefix(
+    cells: tuple[Any, ...],
+    nfield: int,
+) -> tuple[tuple[Any, ...], int]:
+    """Strip a leading NULL ``row_id`` cell from a salvaged sessions record.
+
+    ``sessions`` now leads with ``row_id INTEGER PRIMARY KEY AUTOINCREMENT``
+    (#128). A page-level salvage of a current-layout row stores that
+    rowid-alias as NULL in the first cell, followed by the logical ``id`` and
+    ``source`` — exactly the shape ``classify_lost_and_found_row`` used to
+    treat as "rowid-alias table" (messages). Distinguish by the third cell:
+    a source string means sessions (strip the NULL so the rest of the
+    pipeline sees ``id`` first); a message role means messages (leave as-is).
+    """
+    if (
+        len(cells) >= 3
+        and cells[0] is None
+        and _is_session_id(cells[1])
+        and cells[2] not in MESSAGE_ROLES
+        and _looks_like_source(cells[2])
+    ):
+        return cells[1:], nfield - 1
+    return cells, nfield
+
+
 def _insert_prefix_row(
     dest: sqlite3.Connection,
     table: str,
@@ -399,6 +424,18 @@ def map_lost_and_found_rows(
             for index in protected:
                 defaults.pop(index, None)
 
+        # ``sessions`` now leads with a named ``row_id INTEGER PRIMARY KEY
+        # AUTOINCREMENT`` (#128). Lost-and-found cells start at the logical
+        # ``id`` — the row_id is an auto-allocated storage identity, never a
+        # salvaged value — so drop it from the prefix map and shift the
+        # NOT NULL substitute indices to match the reduced column list.
+        if sessions_columns and sessions_columns[0] == "row_id":
+            sessions_columns = sessions_columns[1:]
+            sessions_defaults = {
+                index - 1: value for index, value in sessions_defaults.items()
+                if index > 0
+            }
+
         lf_tables = [
             str(row[0])
             for row in lf_conn.execute(
@@ -420,6 +457,7 @@ def map_lost_and_found_rows(
                     continue
                 lf_rowid = row[3]
                 cells = tuple(row[4 : 4 + max(nfield, 0)])
+                cells, nfield = _strip_rowid_prefix(cells, nfield)
                 kind = classify_lost_and_found_row(nfield, cells)
                 if kind is None:
                     report["unmapped_rows"] += 1
