@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import sys
+import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
@@ -142,19 +143,52 @@ def _get_proxy_for_base_url(base_url: Optional[str]) -> Optional[str]:
     return proxy
 
 
+def validate_proxy_url(proxy_url: str) -> str:
+    """Normalize and validate an explicit model proxy URL, failing closed."""
+    normalized = normalize_proxy_url(proxy_url)
+    if not normalized:
+        raise ValueError("model.proxy_url must not be empty")
+    parsed = urllib.parse.urlsplit(normalized)
+    if parsed.scheme.lower() not in {"http", "https", "socks4", "socks5", "socks5h"}:
+        raise ValueError(
+            "model.proxy_url must use http, https, socks4, socks5, or socks5h"
+        )
+    if not parsed.hostname:
+        raise ValueError("model.proxy_url must include a hostname")
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("model.proxy_url contains an invalid port") from exc
+    return normalized
+
+
+def configured_model_proxy_url() -> Optional[str]:
+    """Return the active profile's validated ``model.proxy_url``."""
+    from hermes_cli.config import load_config_readonly
+
+    config = load_config_readonly() or {}
+    model_config = config.get("model") if isinstance(config, dict) else None
+    if not isinstance(model_config, dict):
+        return None
+    proxy_url = str(model_config.get("proxy_url") or "").strip()
+    return validate_proxy_url(proxy_url) if proxy_url else None
+
+
 def build_keepalive_http_client(
     base_url: str = "",
     *,
     async_mode: bool = False,
     verify: Any = True,
+    proxy_url: Optional[str] = None,
 ) -> Optional[Any]:
-    """Build an httpx client for OpenAI SDK calls with env-only proxy policy.
+    """Build an httpx client for OpenAI SDK calls with explicit or env proxy policy.
 
-    Uses explicit ``HTTPS_PROXY`` / ``NO_PROXY`` env vars via
-    ``_get_proxy_for_base_url``. Plain no-proxy mounts disable httpx's default
-    ``trust_env`` proxy path, so macOS system proxy settings from
-    ``urllib.request.getproxies()`` (which omit the ExceptionsList) are not
-    applied. Mirrors ``AIAgent._build_keepalive_http_client``.
+    ``proxy_url`` takes precedence when supplied by model configuration;
+    otherwise HTTPS_PROXY / HTTP_PROXY / ALL_PROXY and NO_PROXY apply.
+    Plain no-proxy mounts disable httpx's default ``trust_env`` proxy path,
+    so macOS system proxy settings from ``urllib.request.getproxies()`` (which
+    omit the ExceptionsList) are not applied. Mirrors
+    ``AIAgent._build_keepalive_http_client``.
 
     Connection lifecycle is managed at the HTTP pool layer
     (``keepalive_expiry=20.0`` reaps idle connections before reverse proxies'
@@ -169,10 +203,11 @@ def build_keepalive_http_client(
     client uses. It is passed on the client AND on the plain no-proxy mounts
     (a mounted transport owns the SSL context for its scheme).
     """
+    explicit_proxy = validate_proxy_url(proxy_url) if proxy_url else None
     try:
         import httpx
 
-        proxy = _get_proxy_for_base_url(base_url)
+        proxy = explicit_proxy or _get_proxy_for_base_url(base_url)
 
         limits = httpx.Limits(
             max_keepalive_connections=20,
@@ -223,5 +258,7 @@ __all__ = [
     "_install_safe_stdio",
     "_get_proxy_from_env",
     "_get_proxy_for_base_url",
+    "configured_model_proxy_url",
+    "validate_proxy_url",
     "build_keepalive_http_client",
 ]

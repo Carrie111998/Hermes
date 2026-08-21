@@ -13,7 +13,9 @@ custom socket-options transport is used (default httpx transport).
 from unittest.mock import patch
 
 import httpx
+import pytest
 
+from agent.process_bootstrap import build_keepalive_http_client
 from run_agent import AIAgent, _get_proxy_from_env, _get_proxy_for_base_url
 
 
@@ -52,12 +54,83 @@ def test_get_proxy_from_env_prefers_https_then_http_then_all(monkeypatch):
 
 
 
+def test_build_keepalive_http_client_uses_explicit_proxy_without_env(monkeypatch):
+    """A config-resolved proxy must work without mutating process env vars."""
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+                "https_proxy", "http_proxy", "all_proxy"):
+        monkeypatch.delenv(key, raising=False)
+
+    client = build_keepalive_http_client(
+        "https://chatgpt.com/backend-api/codex",
+        proxy_url="http://127.0.0.1:7897",
+    )
+    assert isinstance(client, httpx.Client)
+    proxied_pools = [
+        type(pool).__name__
+        for mount in client._mounts.values()
+        if mount is not None
+        for pool in [getattr(mount, "_pool", None)]
+        if pool is not None
+    ]
+    assert "HTTPProxy" in proxied_pools
+    client.close()
+
+
+def test_explicit_proxy_rejects_malformed_url_instead_of_falling_back_direct():
+    with pytest.raises(ValueError, match="model.proxy_url"):
+        build_keepalive_http_client(
+            "https://chatgpt.com/backend-api/codex",
+            proxy_url="not-a-proxy-url",
+        )
+
+    with pytest.raises(ValueError, match="model.proxy_url"):
+        AIAgent._build_keepalive_http_client(
+            "https://chatgpt.com/backend-api/codex",
+            proxy_url="http://127.0.0.1:not-a-port",
+        )
+
+
 def test_get_proxy_from_env_normalizes_socks_alias(monkeypatch):
     for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
                 "https_proxy", "http_proxy", "all_proxy"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("ALL_PROXY", "socks://127.0.0.1:1080/")
     assert _get_proxy_from_env() == "socks5://127.0.0.1:1080/"
+
+
+@patch("run_agent.OpenAI")
+def test_create_openai_client_routes_via_model_proxy_config(mock_openai, monkeypatch):
+    """model.proxy_url must route the main provider without proxy env vars."""
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+                "https_proxy", "http_proxy", "all_proxy"):
+        monkeypatch.delenv(key, raising=False)
+
+    agent = _make_agent()
+    monkeypatch.setattr(
+        agent,
+        "_configured_model_proxy_url",
+        lambda: "http://127.0.0.1:7897",
+    )
+    agent._create_openai_client(
+        {
+            "api_key": "test-key",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+        },
+        reason="test",
+        shared=False,
+    )
+
+    http_client = _extract_http_client(mock_openai.call_args.kwargs)
+    assert isinstance(http_client, httpx.Client)
+    proxied_pools = [
+        type(pool).__name__
+        for mount in http_client._mounts.values()
+        if mount is not None
+        for pool in [getattr(mount, "_pool", None)]
+        if pool is not None
+    ]
+    assert "HTTPProxy" in proxied_pools
+    http_client.close()
 
 
 @patch("run_agent.OpenAI")
@@ -89,9 +162,11 @@ def test_create_openai_client_routes_via_proxy_when_env_set(mock_openai, monkeyp
     # Verify a proxy mount exists. httpx Client(proxy=...) rewrites _mounts so
     # the proxied pool (HTTPProxy) sits alongside the base transport.
     proxied_pools = [
-        type(mount._pool).__name__
+        type(pool).__name__
         for mount in http_client._mounts.values()
-        if mount is not None and hasattr(mount, "_pool")
+        if mount is not None
+        for pool in [getattr(mount, "_pool", None)]
+        if pool is not None
     ]
     assert "HTTPProxy" in proxied_pools, (
         "Expected httpx.Client to route through HTTPProxy when HTTPS_PROXY is "

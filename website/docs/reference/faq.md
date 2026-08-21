@@ -77,6 +77,15 @@ model:
 
 Hermes persists the endpoint, provider, and base URL in `config.yaml` so it survives restarts. If your local server has exactly one model loaded, `/model custom` auto-detects it. You can also set `provider: custom` in config.yaml — it's a first-class provider, not an alias for anything else.
 
+If the model endpoint must use an HTTP proxy, set it on the model block instead of process-wide proxy environment variables:
+
+```yaml
+model:
+  proxy_url: http://127.0.0.1:7897
+```
+
+This proxy applies to main and auxiliary model HTTP clients. It does not proxy messaging platforms, MCP servers, or unrelated tools. Remove the key or set it to an empty string to restore the existing `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` and `NO_PROXY` behavior.
+
 This works with Ollama, vLLM, llama.cpp server, SGLang, LocalAI, and others. See the [Configuration guide](../user-guide/configuration.md) for details.
 
 :::tip Ollama users

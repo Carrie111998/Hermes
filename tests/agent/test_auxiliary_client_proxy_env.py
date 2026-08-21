@@ -44,6 +44,27 @@ def test_create_openai_client_routes_via_env_proxy(mock_openai, monkeypatch):
 
 
 
+@patch("agent.auxiliary_client.OpenAI")
+def test_create_openai_client_routes_via_model_proxy_config(mock_openai, monkeypatch):
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+                "https_proxy", "http_proxy", "all_proxy", "NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(key, raising=False)
+
+    with patch(
+        "agent.process_bootstrap.configured_model_proxy_url",
+        return_value="http://127.0.0.1:7897",
+    ):
+        _create_openai_client(
+            api_key="test-key",
+            base_url="https://chatgpt.com/backend-api/codex",
+        )
+
+    http_client = mock_openai.call_args.kwargs.get("http_client")
+    assert isinstance(http_client, httpx.Client)
+    assert "HTTPProxy" in _pool_types(http_client)
+    http_client.close()
+
+
 def test_get_proxy_for_base_url_respects_no_proxy(monkeypatch):
     for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
                 "https_proxy", "http_proxy", "all_proxy", "NO_PROXY", "no_proxy"):

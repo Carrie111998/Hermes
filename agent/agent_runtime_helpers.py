@@ -2507,7 +2507,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             }
             if "http_client" not in safe_kwargs:
                 keepalive_http = agent._build_keepalive_http_client(
-                    base_url, verify=httpx_verify,
+                    base_url,
+                    verify=httpx_verify,
+                    proxy_url=agent._configured_model_proxy_url(),
                 )
                 if keepalive_http is not None:
                     safe_kwargs["http_client"] = keepalive_http
@@ -2538,7 +2540,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # ``tests/run_agent/test_sequential_chats_live.py`` pin this invariant.
     if "http_client" not in client_kwargs:
         keepalive_http = agent._build_keepalive_http_client(
-            client_kwargs.get("base_url", ""), verify=httpx_verify,
+            client_kwargs.get("base_url", ""),
+            verify=httpx_verify,
+            proxy_url=agent._configured_model_proxy_url(),
         )
         if keepalive_http is not None:
             client_kwargs["http_client"] = keepalive_http

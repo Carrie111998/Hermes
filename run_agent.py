@@ -113,6 +113,8 @@ from agent.process_bootstrap import (
     OpenAI,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.OpenAI")
     _SafeWriter,  # noqa: F401  # re-exported for tests that `from run_agent import _SafeWriter`
     _get_proxy_for_base_url,
+    configured_model_proxy_url,
+    validate_proxy_url,
 )
 from agent.iteration_budget import IterationBudget
 from agent.interrupt_compat import request_hard_interrupt
@@ -5088,7 +5090,14 @@ class AIAgent:
         return False
 
     @staticmethod
-    def _build_keepalive_http_client(base_url: str = "", *, verify: Any = True) -> Any:
+    def _configured_model_proxy_url() -> Optional[str]:
+        """Return profile-local ``model.proxy_url`` without mutating process env."""
+        return configured_model_proxy_url()
+
+    @staticmethod
+    def _build_keepalive_http_client(
+        base_url: str = "", *, verify: Any = True, proxy_url: Optional[str] = None,
+    ) -> Any:
         """Build an httpx.Client with proactive idle-connection reaping.
 
         Previously this method injected a custom ``httpx.HTTPTransport``
@@ -5113,12 +5122,13 @@ class AIAgent:
         the plain no-proxy mounts (a mounted transport owns the SSL context
         for its scheme).
         """
+        explicit_proxy = validate_proxy_url(proxy_url) if proxy_url else None
         try:
             import httpx as _httpx
 
-            # Explicitly read proxy settings so requests route through
-            # HTTP_PROXY / HTTPS_PROXY / NO_PROXY correctly.
-            _proxy = _get_proxy_for_base_url(base_url)
+            # Model config takes precedence without mutating process-wide env;
+            # otherwise preserve the existing env + NO_PROXY behaviour.
+            _proxy = explicit_proxy or _get_proxy_for_base_url(base_url)
 
             # Proactive pool reaping: close idle connections at 20 s,
             # before reverse proxies (30–60 s typical) send FIN and

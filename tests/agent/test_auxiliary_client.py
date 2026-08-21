@@ -2601,6 +2601,28 @@ class TestAuxiliaryAuthRefreshRetry:
 
 
 
+    def test_resolve_provider_client_vertex_uses_shared_proxy_aware_factory(self):
+        sentinel = MagicMock()
+        with (
+            patch("agent.vertex_adapter.has_vertex_credentials", return_value=True),
+            patch(
+                "agent.vertex_adapter.get_vertex_config",
+                return_value=("ya29.token", "https://aiplatform.googleapis.com/v1beta1/openapi"),
+            ),
+            patch("agent.auxiliary_client._create_openai_client", return_value=sentinel) as factory,
+        ):
+            client, model = resolve_provider_client(
+                "vertex", "google/gemini-3-flash-preview"
+            )
+
+        assert client is sentinel
+        assert model == "google/gemini-3-flash-preview"
+        factory.assert_called_once_with(
+            api_key="ya29.token",
+            base_url="https://aiplatform.googleapis.com/v1beta1/openapi",
+        )
+
+
 class TestAuxiliaryPoolRotationRetry:
     def test_call_llm_rotates_explicit_codex_pool_on_429(self):
         rate_err = Exception("usage limit reached")

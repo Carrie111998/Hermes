@@ -223,13 +223,17 @@ def _openai_http_client_kwargs(
     *,
     async_mode: bool = False,
 ) -> Dict[str, Any]:
-    """Inject keepalive httpx client with env-only proxy (not macOS system proxy)."""
+    """Inject keepalive httpx client with config or env proxy policy."""
     try:
-        from agent.process_bootstrap import build_keepalive_http_client
+        from agent.process_bootstrap import (
+            build_keepalive_http_client,
+            configured_model_proxy_url,
+        )
         client = build_keepalive_http_client(
             str(base_url or ""),
             async_mode=async_mode,
             verify=_resolve_aux_verify(base_url),
+            proxy_url=configured_model_proxy_url(),
         )
     except (ImportError, AttributeError):
         # Version-skewed installs (#64333): a process whose sys.path resolves
@@ -6979,8 +6983,7 @@ def resolve_provider_client(
         default_model = "google/gemini-3-flash-preview"
         final_model = _normalize_resolved_model(model or default_model, provider)
         try:
-            from openai import OpenAI
-            client = OpenAI(api_key=token, base_url=base_url)
+            client = _create_openai_client(api_key=token, base_url=base_url)
         except Exception as exc:
             logger.warning("resolve_provider_client: cannot create Vertex "
                            "client: %s", exc)
