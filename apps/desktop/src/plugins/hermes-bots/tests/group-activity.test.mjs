@@ -21,6 +21,7 @@ function load(turnScript = () => '(pass)') {
     return slot
   }
   const calls = []
+  const interrupts = []
   const sessions = new Map()
   const runtimeToStored = new Map()
   const titleToStored = new Map()
@@ -42,6 +43,10 @@ function load(turnScript = () => '(pass)') {
     document: { getElementById: () => null, createElement: () => ({}), head: { appendChild: () => undefined } },
     host: {
       request: async (method, params) => {
+        if (method === 'session.interrupt') {
+          interrupts.push({ ...params })
+          return { ok: true }
+        }
         if (method === 'session.create') {
           sessionSequence += 1
           const stored = `sid-${params.profile}-${sessionSequence}`
@@ -98,7 +103,7 @@ function load(turnScript = () => '(pass)') {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__ga = { sendToGroupChat, recordGroupActivity, currentGroupActivity, groupActivityLabel, updateGroupChat, $groupChats, $groupActivity, GROUP_ACTIVITY_LIMIT };\n'
+      '\nglobalThis.__ga = { sendToGroupChat, cancelGroupChatRun, recordGroupActivity, currentGroupActivity, groupActivityLabel, updateGroupChat, $groupChats, $groupActivity, GROUP_ACTIVITY_LIMIT };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -106,7 +111,7 @@ function load(turnScript = () => '(pass)') {
     storage: { get: () => null, set: (key, value) => storageWrites.set(key, value) },
     register: () => undefined
   })
-  return { ...context.__ga, calls, sessions, storageWrites }
+  return { ...context.__ga, calls, interrupts, sessions, storageWrites }
 }
 
 const MEMBERS = [{ name: 'research', title: '' }, { name: 'builder', title: '' }, { name: 'ops', title: 'The Ops' }]
@@ -156,6 +161,27 @@ test('a failed member turn records failed instead of a phantom reply', async () 
 
   const events = feed(gc, 'Flaky')
   assert.equal(events.some(e => e.kind === 'failed' && e.member === 'builder'), true)
+})
+
+test('stop interrupts the live member session and retires the room run immediately', async () => {
+  const neverFinishes = new Promise(() => {})
+  const gc = load(() => neverFinishes)
+  const members = [{ name: 'research', title: '' }]
+
+  gc.sendToGroupChat('Busy', members, 'long running request')
+  for (let i = 0; i < 50 && gc.calls.length < 1; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+
+  assert.equal(gc.calls.length, 1, 'the member turn is in flight')
+  assert.equal(gc.$groupChats.get().Busy.running, true)
+
+  await gc.cancelGroupChatRun('Busy', members)
+
+  assert.deepEqual(gc.interrupts, [{ session_id: gc.calls[0].runtime }])
+  assert.equal(gc.$groupChats.get().Busy.running, false)
+  assert.equal(gc.$groupChats.get().Busy.turn, null)
+  assert.equal(gc.currentGroupActivity('Busy').at(-1).kind, 'cancelled')
 })
 
 test('a newer send interrupts the previous run and records cancelled in the CURRENT epoch', async () => {
@@ -247,6 +273,7 @@ test('labels read like a person wrote them, with settled/cancelled as room-level
   assert.equal(gc.groupActivityLabel({ kind: 'replied', member: 'research' }), 'research replied')
   assert.equal(gc.groupActivityLabel({ kind: 'timed-out', member: 'ops' }), 'ops took too long')
   assert.equal(gc.groupActivityLabel({ kind: 'cancelled', member: null }), 'turn interrupted by a newer message')
+  assert.equal(gc.groupActivityLabel({ kind: 'cancelled', member: null, reason: 'user' }), 'turn stopped by you')
   assert.equal(gc.groupActivityLabel({ kind: 'settled', member: null }), 'turn settled')
 })
 

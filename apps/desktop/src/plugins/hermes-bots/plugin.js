@@ -260,6 +260,10 @@ function groupActivityLabel(event) {
   const kind = event?.kind
   const base = GROUP_ACTIVITY_LABELS[kind] || kind || 'did something'
 
+  if (kind === 'cancelled' && event?.reason === 'user') {
+    return 'turn stopped by you'
+  }
+
   if (kind === 'cancelled' || kind === 'settled') {
     return base
   }
@@ -5425,6 +5429,66 @@ async function ensureGroupChatSession(group, member) {
   return { runtime: created?.session_id || null, stored }
 }
 
+let groupTurnSequence = 0
+
+function clearGroupActiveTurn(group, memberKey, token) {
+  updateGroupChat(group, room => {
+    if (room.activeTurns?.[memberKey]?.token !== token) {
+      return room
+    }
+
+    const activeTurns = { ...room.activeTurns }
+    delete activeTurns[memberKey]
+    room.activeTurns = activeTurns
+
+    return room
+  })
+}
+
+/** Stop the current room drive and cooperatively interrupt every member RPC
+ * that is already in flight. The epoch bump retires the orchestration loop
+ * immediately; session.interrupt stops the actual backend turns instead of
+ * merely hiding their progress in the room. */
+async function cancelGroupChatRun(group, members) {
+  const room = $groupChats.get()[group]
+
+  if (!room?.running) {
+    return false
+  }
+
+  const activeTurns = Object.values(room.activeTurns || {})
+  const byKey = new Map((members || []).map(member => [groupMemberKey(member), member]))
+
+  updateGroupChat(group, current => {
+    current.epoch = (current.epoch || 0) + 1
+    current.running = false
+    current.turn = null
+    current.activeTurns = {}
+    return current
+  })
+  clearGroupClarify(group)
+  recordGroupActivity(group, { kind: 'cancelled', member: null, reason: 'user' })
+
+  const results = await Promise.allSettled(
+    activeTurns.map(active => {
+      const member = active.member || byKey.get(active.memberKey)
+
+      if (!member || !active.runtime) {
+        return Promise.resolve()
+      }
+
+      return requestForBot(member, 'session.interrupt', { session_id: active.runtime })
+    })
+  )
+  const failure = results.find(result => result.status === 'rejected')
+
+  if (failure) {
+    throw failure.reason
+  }
+
+  return true
+}
+
 const GROUP_TURN_TIMEOUT_MS = 180000
 const GROUP_TURN_POLL_MS = 2000
 // A member turn that is VISIBLY still working (session reports
@@ -5580,10 +5644,11 @@ async function answerGroupClarify(entry, member, answers) {
  *  so slow models aren't cut off mid-run. A turn that still times out
  *  records a stranded marker so the finished reply can be harvested into
  *  the room at the member's next turn instead of being lost. */
-async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
+async function runGroupChatMemberTurn(group, member, prompt, thread, images, epoch) {
+  const isCurrent = () => (($groupChats.get()[group] || {}).epoch || 0) === epoch
   const { runtime, stored } = await ensureGroupChatSession(group, member)
 
-  if (!runtime) {
+  if (!runtime || !isCurrent()) {
     return null
   }
 
@@ -5651,13 +5716,37 @@ async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
     ? `${prompt}\n\nAttached files staged in your session workspace:\n${fileRefs.join('\n')}`
     : prompt
 
-  await requestForBot(member, 'prompt.submit', { session_id: runtime, text: turnText })
+  if (!isCurrent()) {
+    return null
+  }
+
+  const memberKey = groupMemberKey(member)
+  const token = ++groupTurnSequence
+  updateGroupChat(group, room => {
+    room.activeTurns = {
+      ...(room.activeTurns || {}),
+      [memberKey]: { member, memberKey, runtime, token }
+    }
+    return room
+  })
+
+  try {
+    await requestForBot(member, 'prompt.submit', { session_id: runtime, text: turnText })
+  } catch (error) {
+    clearGroupActiveTurn(group, memberKey, token)
+    throw error
+  }
 
   const started = Date.now()
   let deadline = started + GROUP_TURN_TIMEOUT_MS
 
   while (Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, GROUP_TURN_POLL_MS))
+
+    if (!isCurrent()) {
+      clearGroupActiveTurn(group, memberKey, token)
+      return null
+    }
 
     let state = null
 
@@ -5696,11 +5785,14 @@ async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
             thread
           })
 
+          clearGroupActiveTurn(group, memberKey, token)
+
           return replyText
         }
       }
 
       recordGroupActivity(group, { kind: 'passed', member: member.name, thread })
+      clearGroupActiveTurn(group, memberKey, token)
 
       return null
     }
@@ -5723,6 +5815,7 @@ async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
     r.stranded = { ...(r.stranded || {}), [groupMemberKey(member)]: { before, thread } }
     return r
   })
+  clearGroupActiveTurn(group, memberKey, token)
 
   return null
 }
@@ -5808,6 +5901,16 @@ async function harvestStrandedGroupReply(group, member) {
   }
 }
 
+function recordGroupRunSuperseded(group, thread) {
+  const userStopped = currentGroupActivity(group).some(
+    event => event.kind === 'cancelled' && event.reason === 'user'
+  )
+
+  if (!userStopped) {
+    recordGroupActivity(group, { kind: 'cancelled', member: null, thread })
+  }
+}
+
 /** Drive one bounded round-robin turn for ONE THREAD. Serial — one member at
  *  a time. A newer user send bumps the room epoch; this loop notices at the
  *  next member boundary, bails, and the newest send's own loop takes over.
@@ -5825,7 +5928,7 @@ async function runGroupChatRounds(group, members, thread) {
       // late, never lost.
       for (const member of members) {
         if (!isCurrent()) {
-          recordGroupActivity(group, { kind: 'cancelled', member: null, thread })
+          recordGroupRunSuperseded(group, thread)
           return
         }
 
@@ -5853,7 +5956,7 @@ async function runGroupChatRounds(group, members, thread) {
       for (const member of responders) {
         if (!isCurrent() || posted >= GROUP_CHAT_MAX_MESSAGES) {
           if (!isCurrent()) {
-            recordGroupActivity(group, { kind: 'cancelled', member: null, thread })
+            recordGroupRunSuperseded(group, thread)
           }
           return
         }
@@ -5894,10 +5997,15 @@ async function runGroupChatRounds(group, members, thread) {
         let reply = null
 
         try {
-          reply = await runGroupChatMemberTurn(group, member, prompt, thread, deltaImages)
+          reply = await runGroupChatMemberTurn(group, member, prompt, thread, deltaImages, startEpoch)
         } catch {
           recordGroupActivity(group, { kind: 'failed', member: member.name, thread })
           reply = null // a failed turn is a pass, never a room error
+        }
+
+        if (!isCurrent()) {
+          recordGroupRunSuperseded(group, thread)
+          return
         }
 
         // The member has now seen everything up to the pre-reply log length.
@@ -10923,13 +11031,29 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
               jsx(GroupClarifyCard, { entry, members }, `clarify:${entry.memberKey}:${entry.requestId}`)
             ),
             room.running
-              ? jsx('div', {
-                  className: 'px-2 py-1 text-[0.7rem] italic text-(--ui-text-quaternary)',
-                  children: roomClarifies.length
-                    ? 'Waiting for your answer…'
-                    : room.turn
-                      ? `${groupSpeakerLabel(room.turn)} is thinking…`
-                      : 'The room is working…'
+              ? jsxs('div', {
+                  className: 'flex items-center gap-2 px-2 py-1',
+                  children: [
+                    jsx('span', {
+                      className: 'min-w-0 flex-1 truncate text-[0.7rem] italic text-(--ui-text-quaternary)',
+                      children: roomClarifies.length
+                        ? 'Waiting for your answer…'
+                        : room.turn
+                          ? `${groupSpeakerLabel(room.turn)} is thinking…`
+                          : 'The room is working…'
+                    }),
+                    jsx(Button, {
+                      type: 'button',
+                      variant: 'ghost',
+                      size: 'sm',
+                      className: 'shrink-0 text-destructive hover:text-destructive',
+                      title: 'Stop every running agent turn in this room',
+                      onClick: () => void cancelGroupChatRun(group, memberDescriptors()).catch(error => {
+                        host.notifyError?.(error, 'Could not stop the group turn')
+                      }),
+                      children: 'Stop'
+                    })
+                  ]
                 }, 'working')
               : null,
             // Scroll anchor (#89835): rooms opened at scroll position 0, mid-
