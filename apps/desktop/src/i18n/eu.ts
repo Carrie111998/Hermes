@@ -2254,4 +2254,82 @@ export const eu = defineLocale({
     copyOutput: 'Kopiatu irteera',
     reloadRetry: 'Berriro kargatu eta saiatu berriro'
   },
+
+  onboarding: {
+    headerTitle: 'Konfigura dezagun Hermes Agent',
+    headerDesc: 'Konektatu modelo-hornitzaile bat txateatzen hasteko. Aukera gehienek klik bakar bat behar dute.',
+    preparingInstall: 'Hermes instalazioa amaitzen ari da. Normalean minutu bat baino gutxiago behar du lehen exekuzioan.',
+    starting: 'Hermes abiarazten…',
+    lookingUpProviders: 'Hornitzaileak bilatzen...',
+    collapse: 'Tolestu',
+    otherProviders: 'Beste hornitzaileak',
+    haveApiKey: 'API gakoa daukat',
+    chooseLater: 'Hornitzailea geroago aukeratuko dut',
+    recommended: 'Gomendatua',
+    connected: 'Konektatuta',
+    featuredPitch: 'Harpidetza bakar bat, 300+ fronte-modelo — Hermes exekutatzeko modu gomendatua',
+    fireworksPitch: 'Modelo-API zuzena — Fireworks-ek ostatatutako fronte-modeloak',
+    openRouterPitch: 'Gako bat, ehunka modelo — aukera sendoa',
+    apiKeyOptions: {
+      fireworks: {
+        short: 'modelo-API zuzena',
+        description: 'Fireworks AI-k ostatatutako modeloetara sarbide zuzena.'
+      },
+      openrouter: {
+        short: 'gako bat, modelo asko',
+        description: 'Gako bakar baten atzean ehunka modelo ditu. Aukera ona instalazio berrietarako.'
+      },
+      openai: { short: 'GPT motako modeloak', description: 'OpenAI modeloetara sarbide zuzena.' },
+      gemini: { short: 'Gemini modeloak', description: 'Google Gemini modeloetara sarbide zuzena.' },
+      xai: { short: 'Grok modeloak', description: 'xAI Grok modeloetara sarbide zuzena.' },
+      local: {
+        short: 'auto-ostatatua',
+        description:
+          'Zuzendu Hermes OpenAI-rekin bateragarria den endpoint lokal edo auto-ostatatu batera (vLLM, llama.cpp, Ollama, etab.).'
+      }
+    },
+    backToSignIn: 'Itzuli saio-hasierara',
+    getKey: 'Lortu gako bat',
+    replaceCurrent: 'Ordeztu uneko balioa',
+    pasteApiKey: 'Itsatsi API gakoa',
+    localApiKeyPlaceholder: 'API gakoa (aukerakoa — zure endpoint-ak behar badu soilik)',
+    couldNotSave: 'Ezin izan da kredentziala gorde.',
+    connecting: 'Konektatzen',
+    update: 'Eguneratu',
+    flowSubtitles: {
+      pkce: 'Zure nabigatzailea irekitzen du saioa hasteko, eta gero hemen jarraitzen du',
+      device_code: 'Egiaztapen-orri bat irekitzen du zure nabigatzailean — Hermes automatikoki konektatzen da',
+      external: 'Hasi saioa behin zure terminalean, eta gero itzuli txateatzera'
+    },
+    startingSignIn: provider => `Saio-hasiera abiarazten ${provider}-rentzat...`,
+    verifyingCode: provider => `Zure kodea egiaztatzen ${provider}-rekin...`,
+    connectedProvider: provider => `${provider} konektatuta`,
+    connectedPicking: provider => `${provider} konektatuta. Lehenetsitako modeloa aukeratzen...`,
+    signInFailed: 'Saio-hasierak huts egin du. Saiatu berriro.',
+    pickDifferentProvider: 'Aukeratu beste hornitzaile bat',
+    signInWith: provider => `Hasi saioa ${provider}-rekin`,
+    openedBrowser: provider => `${provider} ireki dugu zure nabigatzailean.`,
+    authorizeThere: 'Baimendu Hermes han.',
+    copyAuthCode: 'Kopiatu baimen-kodea eta itsatsi behean.',
+    pasteAuthCode: 'Itsatsi baimen-kodea',
+    reopenAuthPage: 'Ireki berriro baimen-orria',
+    autoBrowser: provider =>
+      `${provider} ireki dugu zure nabigatzailean. Baimendu Hermes han eta automatikoki konektatuta egongo zara — ez dago ezer kopiatu edo itsatsi beharrik.`,
+    reopenSignInPage: 'Ireki berriro saio-hasiera orria',
+    waitingAuthorize: 'Baimendu arte itxaroten...',
+    externalPending: provider =>
+      `${provider}-k bere CLI bidez egiten du saioa. Exekutatu komando hau terminal batean, eta gero itzuli eta aukeratu "Saioa hasi dut":`,
+    signedIn: 'Saioa hasi dut',
+    deviceCodeOpened: provider => `${provider} ireki dugu zure nabigatzailean. Sartu kode hau han:`,
+    reopenVerification: 'Ireki berriro egiaztapen-orria',
+    copy: 'Kopiatu',
+    defaultModel: 'Lehenetsitako modeloa',
+    freeTier: 'Doako maila',
+    pro: 'Pro',
+    free: 'Doan',
+    price: (input, output) => `${input} sarrera / ${output} irteera Mtok bakoitzeko`,
+    change: 'Aldatu',
+    startChatting: 'Hasi',
+    docs: provider => `${provider} dokumentazioa`
+  },
 })
