@@ -338,6 +338,48 @@ class TestRedactingFormatter:
         assert "abc123def456" not in result
         assert "sk-pro" in result
 
+    def test_missing_session_tag_field_does_not_crash(self):
+        """A third-party logging.setLogRecordFactory() chain that drops
+        Hermes' session_tag injector must not crash every record: the
+        shared formats hardcode %(session_tag)s and stdlib formatting
+        raises ValueError on a missing field (#91348)."""
+        fmt = (
+            "%(asctime)s %(levelname)s%(session_tag)s %(name)s: %(message)s"
+        )
+        formatter = RedactingFormatter(fmt)
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="hello without a session",
+            args=(),
+            exc_info=None,
+        )
+        # No session_tag attribute — as if the factory chain was replaced.
+        assert not hasattr(record, "session_tag")
+        result = formatter.format(record)  # must not raise ValueError
+        assert "hello without a session" in result
+        # The default restores the factory's no-session shape: no tag text.
+        assert " test:" in result
+
+    def test_existing_session_tag_preserved(self):
+        """Records that DO carry a session_tag keep it — the fallback only
+        fills in the missing case."""
+        fmt = "%(levelname)s%(session_tag)s %(message)s"
+        formatter = RedactingFormatter(fmt)
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="with session",
+            args=(),
+            exc_info=None,
+        )
+        record.session_tag = " [abc123]"
+        assert formatter.format(record) == "INFO [abc123] with session"
+
 
 class TestPrintenvSimulation:
     """Simulate what happens when the agent runs `env` or `printenv`."""

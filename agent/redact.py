@@ -1423,5 +1423,14 @@ class RedactingFormatter(logging.Formatter):
         super().__init__(fmt, datefmt, style, **kwargs)
 
     def format(self, record: logging.LogRecord) -> str:
+        # Third-party code can replace the global LogRecord factory
+        # (logging.setLogRecordFactory) with a chain that drops Hermes'
+        # session_tag injector. ``%(session_tag)s`` is hardcoded in the
+        # shared log formats, and ``logging.Formatter.format()`` raises
+        # ValueError for a missing field — crashing EVERY record. Restore
+        # the field's factory default (empty string = no active session)
+        # so formatting stays robust regardless of who owns the record
+        # factory (#91348).
+        record.__dict__.setdefault("session_tag", "")
         original = super().format(record)
         return redact_sensitive_text(original)
