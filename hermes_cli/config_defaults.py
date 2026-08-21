@@ -720,13 +720,6 @@ DEFAULT_CONFIG = {
             # review batches in one CLI/gateway task share one session; the
             # per-turn cap alone cannot stop a multi-hour review→patch→review
             # fan-out. 0 = unlimited.
-            # Decision (#91040): session-lifetime fail-closed defaults.
-            # Incident was 17 batches / 35 children / 1,268 child API calls.
-            # These sit below that runaway: 16 children, 4 batches, 80 child
-            # API calls, 8M child tokens. Users override in config.yaml;
-            # 0 disables a cap. require_delegate_batch_checkpoint is on so
-            # a second batch needs an explicit yes-style reply. Codex weekly
-            # breaker trips at 90% (0 = off).
             "max_subagents_per_session": 16,
             "max_delegate_batches_per_session": 4,
             "max_child_api_calls_per_session": 80,

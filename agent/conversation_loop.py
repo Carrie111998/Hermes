@@ -2941,37 +2941,52 @@ def run_conversation(
                                 request_hard_interrupt(agent, _codex_msg)
                             except Exception:
                                 agent._interrupt_requested = True
-                            _fallback_ok = False
                             if agent._try_activate_fallback():
                                 from agent.account_usage import allow_non_codex_weekly_fallback
-                                if allow_non_codex_weekly_fallback(
+                                if not allow_non_codex_weekly_fallback(
                                     getattr(agent, "provider", "")
                                 ):
-                                    _fallback_ok = True
-                                    active_system_prompt = _sync_failover_system_message(
-                                        agent, api_messages, active_system_prompt)
-                                    retry_count = 0
-                                    compression_attempts = 0
-                                    _retry.primary_recovery_attempted = False
-                                    _retry.restart_with_rebuilt_messages = True
-                                    break
-                            if not _fallback_ok:
-                                agent._flush_status_buffer()
-                                agent._persist_session(messages, conversation_history)
-                                return {
-                                    "final_response": (
-                                        f"⏳ {_codex_msg}\n\n"
-                                        "No non-Codex fallback provider available. "
-                                        "Wait for the weekly reset, redeem a "
-                                        "Codex reset credit, or add a fallback "
-                                        "provider in config.yaml."
-                                    ),
-                                    "messages": messages,
-                                    "api_calls": api_call_count,
-                                    "completed": False,
-                                    "failed": True,
-                                    "error": _codex_msg,
-                                }
+                                    agent._flush_status_buffer()
+                                    agent._persist_session(
+                                        messages, conversation_history
+                                    )
+                                    return {
+                                        "final_response": (
+                                            f"⏳ {_codex_msg}\n\n"
+                                            "No non-Codex fallback provider available. "
+                                            "Wait for the weekly reset, redeem a "
+                                            "Codex reset credit, or add a fallback "
+                                            "provider in config.yaml."
+                                        ),
+                                        "messages": messages,
+                                        "api_calls": api_call_count,
+                                        "completed": False,
+                                        "failed": True,
+                                        "error": _codex_msg,
+                                    }
+                                active_system_prompt = _sync_failover_system_message(
+                                    agent, api_messages, active_system_prompt)
+                                retry_count = 0
+                                compression_attempts = 0
+                                _retry.primary_recovery_attempted = False
+                                _retry.restart_with_rebuilt_messages = True
+                                break
+                            agent._flush_status_buffer()
+                            agent._persist_session(messages, conversation_history)
+                            return {
+                                "final_response": (
+                                    f"⏳ {_codex_msg}\n\n"
+                                    "No non-Codex fallback provider available. "
+                                    "Wait for the weekly reset, redeem a "
+                                    "Codex reset credit, or add a fallback "
+                                    "provider in config.yaml."
+                                ),
+                                "messages": messages,
+                                "api_calls": api_call_count,
+                                "completed": False,
+                                "failed": True,
+                                "error": _codex_msg,
+                            }
                 except Exception:
                     agent._interrupt_requested = True
 

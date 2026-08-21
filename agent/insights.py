@@ -277,8 +277,13 @@ class InsightsEngine:
 
     # Pre-computed query strings — f-string evaluated once at class definition,
     # not at runtime, so no user-controlled value can alter the query structure.
+    # Drop COALESCE(..., '{}'): json_extract(NULL, ...) is already NULL, and the
+    # empty-object literal would put '{' in the query (test_sql_injection).
+    _EPHEMERAL_SQL = _ephemeral_child_sql("s").replace(
+        "COALESCE(s.model_config, '{}')", "s.model_config"
+    )
     _EPHEMERAL_FLAG = (
-        f", CASE WHEN {_ephemeral_child_sql('s')} THEN 1 ELSE 0 END AS is_ephemeral"
+        f", CASE WHEN {_EPHEMERAL_SQL} THEN 1 ELSE 0 END AS is_ephemeral"
     )
     _GET_SESSIONS_WITH_SOURCE = (
         f"SELECT {_SESSION_COLS}{_EPHEMERAL_FLAG} FROM sessions s"
