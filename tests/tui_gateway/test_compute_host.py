@@ -4,11 +4,152 @@ import queue
 import subprocess
 import sys
 import threading
+import types
 from pathlib import Path
 
 import pytest
 
 from tui_gateway.compute_host import ComputeHost, HostSession
+
+
+def test_compute_host_fallback_preserves_empty_attribution(monkeypatch):
+    host = ComputeHost(
+        stdout=types.SimpleNamespace(write=lambda *_: None, flush=lambda: None)
+    )
+    agent = types.SimpleNamespace()
+    server = types.SimpleNamespace(
+        _sessions={},
+        _make_agent=lambda *_args, **_kwargs: agent,
+        _transfer_db_to_agent=lambda *_args: False,
+        _init_session=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("boom")
+        ),
+        _load_show_reasoning=lambda: False,
+        _load_tool_progress_mode=lambda: "compact",
+        _current_profile_name=lambda: "default",
+        _sanitize_client_source=lambda source: source,
+    )
+    monkeypatch.setattr("tui_gateway.transport.bind_transport", lambda _transport: None)
+    monkeypatch.setattr("tui_gateway.transport.reset_transport", lambda _token: None)
+
+    session = host._ensure_server_session(
+        server,
+        {"sid": "s1", "session_key": "durable-s1", "cwd": ""},
+    )
+
+    assert session["cwd"] == ""
+    assert session["profile_name"] == ""
+    host.close()
+
+
+def test_compute_host_forwards_profile_to_session_registration(monkeypatch):
+    host = ComputeHost(
+        stdout=types.SimpleNamespace(write=lambda *_: None, flush=lambda: None),
+        heartbeat_secs=0,
+    )
+    captured = {}
+    agent = types.SimpleNamespace()
+
+    def _init_session(*_args, **kwargs):
+        captured.update(kwargs)
+        server._sessions["s1"] = {"agent": agent, "session_key": "durable-s1"}
+
+    server = types.SimpleNamespace(
+        _sessions={},
+        _make_agent=lambda *_args, **_kwargs: agent,
+        _transfer_db_to_agent=lambda *_args: False,
+        _init_session=_init_session,
+    )
+    monkeypatch.setattr("tui_gateway.transport.bind_transport", lambda _transport: None)
+    monkeypatch.setattr("tui_gateway.transport.reset_transport", lambda _token: None)
+
+    host._ensure_server_session(
+        server,
+        {
+            "sid": "s1",
+            "session_key": "durable-s1",
+            "cwd": "/workspace",
+            "profile_name": "reviewer",
+        },
+    )
+
+    assert captured["cwd"] == "/workspace"
+    assert captured["profile_name"] == "reviewer"
+    host.close()
+
+
+def test_compute_host_forwards_explicit_empty_attribution(monkeypatch):
+    host = ComputeHost(
+        stdout=types.SimpleNamespace(write=lambda *_: None, flush=lambda: None),
+        heartbeat_secs=0,
+    )
+    captured = {}
+    agent = types.SimpleNamespace()
+
+    def _init_session(*_args, **kwargs):
+        captured.update(kwargs)
+        server._sessions["s1"] = {
+            "agent": agent,
+            "session_key": "durable-s1",
+            "profile_home": "/stale/profile-home",
+            "profile_name": "stale-profile",
+        }
+
+    server = types.SimpleNamespace(
+        _sessions={},
+        _make_agent=lambda *_args, **_kwargs: agent,
+        _transfer_db_to_agent=lambda *_args: False,
+        _init_session=_init_session,
+    )
+    monkeypatch.setattr("tui_gateway.transport.bind_transport", lambda _transport: None)
+    monkeypatch.setattr("tui_gateway.transport.reset_transport", lambda _token: None)
+
+    host._ensure_server_session(
+        server,
+        {
+            "sid": "s1",
+            "session_key": "durable-s1",
+            "cwd": "",
+            "profile_home": "",
+            "profile_name": "",
+        },
+    )
+
+    assert captured["cwd"] == ""
+    assert captured["profile_name"] is None
+    assert server._sessions["s1"]["profile_home"] is None
+    assert server._sessions["s1"]["profile_name"] == ""
+    host.close()
+
+
+def test_compute_host_cached_session_clears_explicit_empty_attribution():
+    host = ComputeHost(
+        stdout=types.SimpleNamespace(write=lambda *_: None, flush=lambda: None),
+        heartbeat_secs=0,
+    )
+    session = {
+        "session_key": "durable-s1",
+        "cwd": "/stale/workspace",
+        "profile_home": "/stale/profile-home",
+        "profile_name": "stale-profile",
+    }
+    server = types.SimpleNamespace(_sessions={"s1": session})
+
+    result = host._ensure_server_session(
+        server,
+        {
+            "sid": "s1",
+            "session_key": "durable-s1",
+            "cwd": "",
+            "profile_home": "",
+            "profile_name": "",
+        },
+    )
+
+    assert result["cwd"] == ""
+    assert result["profile_home"] is None
+    assert result["profile_name"] == ""
+    host.close()
 
 
 def _stdout_queue(proc: subprocess.Popen) -> queue.Queue[dict]:

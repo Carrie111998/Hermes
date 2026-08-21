@@ -7,6 +7,14 @@ from typing import Any, List
 
 logger = logging.getLogger(__name__)
 
+# Machine-readable producer seal for governed plugins. Consumers must inspect
+# this exact production module rather than inferring support from hook names or
+# scanning tests for keyword-shaped decoys.
+CORTEX_PLUGIN_PRODUCER_CONTRACT = (
+    "pre_llm.authoritative_workspace.v1",
+    "session_reset.explicit_edge.v1",
+)
+
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     """Notify first-party observers, then invoke compatibility plugin hooks."""
@@ -51,10 +59,15 @@ def finalize_session(**kwargs: Any) -> List[Any]:
         try:
             from agent import relay_runtime
 
-            relay_runtime.SESSION_COORDINATOR.finalize_conversation(
-                profile_key=relay_runtime.current_profile_key(),
-                session_id=session_id,
-            )
+            profile_name = str(kwargs.get("profile_name") or "")
+            if profile_name:
+                from hermes_cli.profiles import get_profile_dir
+
+                profile_key = str(get_profile_dir(profile_name).expanduser().resolve())
+                relay_runtime.SESSION_COORDINATOR.finalize_conversation(
+                    profile_key=profile_key,
+                    session_id=session_id,
+                )
         except Exception:
             logger.warning("Core Relay session finalization failed", exc_info=True)
 

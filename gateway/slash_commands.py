@@ -245,6 +245,12 @@ class GatewaySlashCommandsMixin:
         # cleared via _clear_conversation_scope above.)
 
         _old_sid = old_entry.session_id if old_entry else None
+        try:
+            from agent.runtime_cwd import authoritative_session_cwd
+
+            _session_cwd = authoritative_session_cwd()
+        except Exception:
+            _session_cwd = ""
 
         # Fire plugin on_session_finalize hook (session boundary).
         # Off-loop + bounded: finalize hooks can block arbitrarily
@@ -257,6 +263,12 @@ class GatewaySlashCommandsMixin:
                 reason="new_session",
                 old_session_id=_old_sid,
                 new_session_id=new_entry.session_id if new_entry else None,
+                cwd=_session_cwd,
+                **(
+                    {"profile_name": source.profile}
+                    if getattr(source, "profile", None)
+                    else {}
+                ),
             )
         except Exception:
             pass
@@ -330,14 +342,18 @@ class GatewaySlashCommandsMixin:
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _new_sid = new_entry.session_id if new_entry else None
-            _invoke_hook(
-                "on_session_reset",
-                session_id=_new_sid,
-                platform=source.platform.value if source.platform else "",
-                reason="new_session",
-                old_session_id=_old_sid,
-                new_session_id=_new_sid,
-            )
+            _reset_context = {
+                "session_id": _new_sid,
+                "platform": source.platform.value if source.platform else "",
+                "reason": "new_session",
+                "old_session_id": _old_sid,
+                "new_session_id": _new_sid,
+                "cwd": _session_cwd,
+            }
+            _profile_name = getattr(source, "profile", None)
+            if _profile_name:
+                _reset_context["profile_name"] = _profile_name
+            _invoke_hook("on_session_reset", **_reset_context)
         except Exception:
             pass
 

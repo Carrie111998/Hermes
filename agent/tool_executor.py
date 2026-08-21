@@ -577,6 +577,7 @@ def _run_agent_tool_execution_middleware(
     from agent import relay_tools
     from hermes_cli.middleware import (
         apply_tool_request_middleware,
+        is_classic_cli_runtime,
         run_tool_execution_middleware,
     )
 
@@ -724,6 +725,7 @@ def _run_agent_tool_execution_middleware(
             tool_call_id=tool_call_id or "",
             turn_id=getattr(agent, "_current_turn_id", "") or "",
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+            classic_cli=is_classic_cli_runtime(agent),
         )
         request_args = (
             request_result.payload
@@ -744,6 +746,7 @@ def _run_agent_tool_execution_middleware(
             tool_call_id=tool_call_id or "",
             turn_id=getattr(agent, "_current_turn_id", "") or "",
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+            classic_cli=is_classic_cli_runtime(agent),
         )
 
     result, _relay_args = relay_tools.execute(

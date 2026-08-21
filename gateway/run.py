@@ -10979,7 +10979,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
     async def _finalize_shutdown_agents(self, active_agents: Dict[str, Any]) -> None:
-        for agent in active_agents.values():
+        for session_key, agent in active_agents.items():
             # Persist any in-flight transcript to the SQLite session store
             # before teardown (#13121).  An agent forcibly interrupted by the
             # drain-timeout escalation may never reach
@@ -11043,10 +11043,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # multi-day 4.7G session — heartbeats froze and the process was
             # SIGKILLed mid-export. Same class as the memory-provider hang
             # below (#53175).
+            _profile_name = None
+            try:
+                with self.session_store._lock:
+                    _entry = self.session_store._entries.get(session_key)
+                _profile_name = (
+                    _entry.origin.profile
+                    if _entry is not None and _entry.origin is not None
+                    else None
+                )
+            except Exception:
+                pass
             await self._finalize_session_off_loop(
                 session_id=getattr(agent, "session_id", None),
                 platform="gateway",
                 reason="shutdown",
+                old_session_id=getattr(agent, "session_id", None),
+                cwd="",
+                **({"profile_name": _profile_name} if _profile_name else {}),
             )
             # Off-loop + bounded: a wedged memory provider here used to hang
             # the whole shutdown so SIGTERM never completed (#53175).
@@ -13776,10 +13790,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             # Off-loop + bounded: plugin finalize hooks can
                             # block arbitrarily (see _finalize_session_off_loop)
                             # and this watcher runs on the gateway event loop.
+                            _profile_name = (
+                                entry.origin.profile if entry.origin else None
+                            )
                             await self._finalize_session_off_loop(
                                 session_id=entry.session_id,
                                 platform=_platform,
                                 reason="session_expired",
+                                old_session_id=entry.session_id,
+                                cwd="",
+                                **(
+                                    {"profile_name": _profile_name}
+                                    if _profile_name
+                                    else {}
+                                ),
                             )
                         except Exception:
                             pass
@@ -24441,8 +24465,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_name=str(context.source.user_name) if context.source.user_name else "",
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
             session_key=context.session_key,
+            session_id=context.session_id,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            # Gateway has no durable per-session workspace today. Bind empty
+            # explicitly so attribution cannot inherit process TERMINAL_CWD.
+            cwd="",
             async_delivery=_async_delivery,
             cron_session="",
         )

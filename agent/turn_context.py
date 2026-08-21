@@ -25,6 +25,7 @@ move-and-name refactor with no semantic change.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 import uuid
@@ -49,6 +50,62 @@ from agent.model_metadata import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _plugin_hook_cwd(
+    task_id: str,
+    *,
+    allow_cli_fallback: bool = False,
+) -> str:
+    """Return the task registry's authoritative workspace for plugin hooks.
+
+    Empty means Hermes has no session-scoped workspace proof. Never substitute
+    the host process cwd: one TUI/Gateway process can serve many workspaces.
+    """
+    try:
+        from tools.file_tools import _registered_task_cwd_override
+        from tools.terminal_tool import get_session_cwd, resolve_task_overrides
+
+        terminal_cwd = get_session_cwd(task_id)
+        overrides = resolve_task_overrides(task_id)
+        if overrides.get("cwd_source") == "process":
+            terminal_cwd = ""
+            registered_cwd = ""
+        else:
+            registered_cwd = _registered_task_cwd_override(task_id)
+        bound = terminal_cwd or registered_cwd or ""
+        if bound:
+            return bound
+    except Exception:
+        pass
+    if allow_cli_fallback:
+        configured = str(os.environ.get("TERMINAL_CWD") or "").strip()
+        if configured:
+            resolved = os.path.abspath(os.path.expanduser(configured))
+            if os.path.isdir(resolved):
+                return resolved
+    return ""
+
+
+def _plugin_hook_profile_name(*, allow_process_fallback: bool = False) -> str:
+    """Resolve profile identity without leaking process state into multiplexed turns."""
+    try:
+        from gateway.session_context import get_session_env
+
+        if profile := str(
+            get_session_env("HERMES_SESSION_PROFILE", "") or ""
+        ).strip():
+            return profile
+    except Exception:
+        pass
+    if not allow_process_fallback:
+        return ""
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return str(get_active_profile_name() or "default").strip() or "default"
+    except Exception:
+        return "default"
 
 
 def compose_user_api_content(
@@ -1232,19 +1289,32 @@ def build_turn_context(
     plugin_user_context = ""
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _pre_results = _invoke_hook(
-            "pre_llm_call",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            user_message=original_user_message,
-            conversation_history=list(messages),
-            is_first_turn=(not bool(conversation_history)),
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-            parent_session_id=getattr(agent, "_parent_session_id", None) or "",
-            sender_id=getattr(agent, "_user_id", None) or "",
+        from hermes_cli.middleware import is_classic_cli_runtime
+
+        _hook_platform = getattr(agent, "platform", None) or ""
+        _allow_process_fallback = is_classic_cli_runtime(agent)
+        _pre_hook_context = {
+            "session_id": agent.session_id,
+            "task_id": effective_task_id,
+            "cwd": _plugin_hook_cwd(
+                effective_task_id,
+                allow_cli_fallback=_allow_process_fallback,
+            ),
+            "turn_id": turn_id,
+            "user_message": original_user_message,
+            "conversation_history": list(messages),
+            "is_first_turn": not bool(conversation_history),
+            "model": agent.model,
+            "platform": _hook_platform,
+            "parent_session_id": getattr(agent, "_parent_session_id", None) or "",
+            "sender_id": getattr(agent, "_user_id", None) or "",
+        }
+        _hook_profile_name = _plugin_hook_profile_name(
+            allow_process_fallback=_allow_process_fallback
         )
+        if _hook_profile_name:
+            _pre_hook_context["profile_name"] = _hook_profile_name
+        _pre_results = _invoke_hook("pre_llm_call", **_pre_hook_context)
         _ctx_parts: list[str] = []
         # Spill oversized per-hook context to disk so a runaway plugin
         # can't inflate every subsequent turn's prompt. Ported from

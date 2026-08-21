@@ -85,6 +85,15 @@ export const signalFreshSessionBoundary = (
   return true
 }
 
+export const sessionCreateParams = (
+  cols: number,
+  previousSid: null | string,
+  keepCurrent: boolean
+) => ({
+  cols,
+  ...(!keepCurrent && previousSid ? { replace_session_id: previousSid } : {})
+})
+
 const trimTail = (items: Msg[]) => {
   const q = [...items]
 
@@ -196,11 +205,10 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
       const previousSid = getUiState().sid
 
-      if (!keepCurrent) {
-        await closeSession(previousSid)
-      }
-
-      const r = await rpc<SessionCreateResponse>('session.create', { cols: colsRef.current })
+      const r = await rpc<SessionCreateResponse>(
+        'session.create',
+        sessionCreateParams(colsRef.current, previousSid, keepCurrent)
+      )
 
       if (!r) {
         patchUiState({ status: 'ready' })

@@ -898,7 +898,11 @@ from rich.text import Text as _RichText
 def AIAgent(*args, **kwargs):
     from run_agent import AIAgent as _AIAgent
 
-    return _AIAgent(*args, **kwargs)
+    agent = _AIAgent(*args, **kwargs)
+    # Only this classic single-session CLI wrapper mints process cwd/profile
+    # fallback authority. Platform/source labels may be caller-influenced.
+    agent._classic_cli_runtime = True
+    return agent
 
 
 def get_tool_definitions(*args, **kwargs):
@@ -1243,6 +1247,9 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
                     session_id=cleanup_session_id,
                     platform="cli",
                     reason="shutdown",
+                    classic_cli=bool(
+                        getattr(_active_agent_ref, "_classic_cli_runtime", False)
+                    ),
                 )
         try:
             if _active_agent_ref and hasattr(_active_agent_ref, 'shutdown_memory_provider'):
@@ -1306,13 +1313,23 @@ def _notify_session_finalize(
     session_id: str | None,
     platform: str = "cli",
     reason: str = "shutdown",
+    classic_cli: bool = False,
 ) -> None:
     try:
+        from agent.turn_context import _plugin_hook_cwd, _plugin_hook_profile_name
         from hermes_cli.lifecycle import finalize_session
+
         finalize_session(
             session_id=session_id,
             platform=platform,
             reason=reason,
+            old_session_id=session_id,
+            cwd=_plugin_hook_cwd(
+                session_id or "default", allow_cli_fallback=classic_cli
+            ),
+            profile_name=_plugin_hook_profile_name(
+                allow_process_fallback=classic_cli
+            ),
         )
     except Exception:
         pass
@@ -1373,6 +1390,9 @@ def _notify_single_query_session_finalize(cli, *, reason: str = "shutdown") -> N
             session_id=session_id,
             platform=getattr(agent, "platform", None) or "cli",
             reason=reason,
+            classic_cli=bool(
+                getattr(agent, "_classic_cli_runtime", False)
+            ),
         )
     finally:
         _single_query_finalize_attempted_session_ids.add(session_id)
@@ -9696,23 +9716,52 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         flush_tool_summary()
         _cli_visible_print()
     
-    def _notify_session_boundary(self, event_type: str) -> None:
+    def _notify_session_boundary(
+        self,
+        event_type: str,
+        *,
+        old_session_id: str | None = None,
+        new_session_id: str | None = None,
+        cwd: str | None = None,
+        profile_name: str | None = None,
+    ) -> None:
         """Fire a session-boundary plugin hook (on_session_finalize or on_session_reset).
 
         Non-blocking — errors are caught and logged.  Safe to call from any
         lifecycle point (shutdown, /new, /reset).
         """
         try:
+            from agent.turn_context import (
+                _plugin_hook_cwd,
+                _plugin_hook_profile_name,
+            )
             from hermes_cli.lifecycle import finalize_session, invoke_hook
 
+            is_rotation = bool(old_session_id and new_session_id)
+            boundary_cwd = (
+                cwd
+                if cwd is not None
+                else _plugin_hook_cwd(
+                    old_session_id or new_session_id or "default",
+                    allow_cli_fallback=True,
+                )
+            )
+            boundary_profile = (
+                str(profile_name or "").strip()
+                or _plugin_hook_profile_name(allow_process_fallback=True)
+            )
             context = {
-                "session_id": self.agent.session_id if self.agent else None,
-                "platform": getattr(self, "platform", None) or "cli",
-                "reason": (
-                    "new_session"
-                    if event_type == "on_session_reset"
-                    else "session_boundary"
+                "session_id": (
+                    old_session_id
+                    if event_type == "on_session_finalize" and old_session_id
+                    else new_session_id or (self.agent.session_id if self.agent else None)
                 ),
+                "platform": getattr(self, "platform", None) or "cli",
+                "reason": "new_session" if is_rotation else "session_boundary",
+                "old_session_id": old_session_id,
+                "new_session_id": new_session_id,
+                "cwd": boundary_cwd,
+                "profile_name": boundary_profile,
             }
             if event_type == "on_session_finalize":
                 finalize_session(**context)
@@ -9797,7 +9846,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def new_session(self, silent=False, title=None):
         """Start a fresh session with a new session ID and cleared agent state."""
-        old_session_id = self.session_id
+        old_session_id = (
+            getattr(getattr(self, "agent", None), "session_id", None)
+            or self.session_id
+        )
+        next_session_start = datetime.now()
+        next_timestamp = next_session_start.strftime("%Y%m%d_%H%M%S")
+        next_session_id = f"{next_timestamp}_{uuid.uuid4().hex[:6]}"
+        try:
+            from agent.turn_context import (
+                _plugin_hook_cwd,
+                _plugin_hook_profile_name,
+            )
+
+            session_cwd = _plugin_hook_cwd(
+                old_session_id or "default",
+                allow_cli_fallback=True,
+            )
+            session_profile_name = _plugin_hook_profile_name(
+                allow_process_fallback=True
+            )
+        except Exception:
+            session_cwd = ""
+            session_profile_name = "default"
         _boundary_snapshot = None
         if self.agent and self.conversation_history:
             # Deliver the context-engine boundary synchronously and get back
@@ -9808,10 +9879,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 list(self.conversation_history),
                 session_id=old_session_id,
             )
-            self._notify_session_boundary("on_session_finalize")
+            self._notify_session_boundary(
+                "on_session_finalize",
+                old_session_id=old_session_id,
+                new_session_id=next_session_id,
+                cwd=session_cwd,
+                profile_name=session_profile_name,
+            )
         elif self.agent:
             # First session or empty history — still finalize the old session
-            self._notify_session_boundary("on_session_finalize")
+            self._notify_session_boundary(
+                "on_session_finalize",
+                old_session_id=old_session_id,
+                new_session_id=next_session_id,
+                cwd=session_cwd,
+                profile_name=session_profile_name,
+            )
 
         if self._session_db and old_session_id:
             # Flush any un-persisted messages from the current turn to the
@@ -9835,10 +9918,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # /resume and `hermes sessions list` (gemini-cli#27770 port).
             self._discard_session_if_empty(old_session_id)
 
-        self.session_start = datetime.now()
-        timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
-        short_uuid = uuid.uuid4().hex[:6]
-        self.session_id = f"{timestamp_str}_{short_uuid}"
+        self.session_start = next_session_start
+        self.session_id = next_session_id
         getattr(self, "_write_terminal_breadcrumb", lambda: None)()
         self.conversation_history = []
         self._pending_title = None
@@ -9995,7 +10076,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         )
             except Exception:
                 pass
-            self._notify_session_boundary("on_session_reset")
+            self._notify_session_boundary(
+                "on_session_reset",
+                old_session_id=old_session_id,
+                new_session_id=self.session_id,
+                cwd=session_cwd,
+                profile_name=session_profile_name,
+            )
 
         if not silent:
             if title:

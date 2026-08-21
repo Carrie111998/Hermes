@@ -262,10 +262,15 @@ def test_resume_keeps_profile_db_open_after_ownership_transfer(profile_dbs, monk
     def _fake_init_session(sid, key, agent, history, session_db=None, **_kwargs):
         captured["init_db"] = session_db
 
+    def _fake_set_session_context(target, **kwargs):
+        captured["context_target"] = target
+        captured["context_profile"] = kwargs.get("profile_name")
+        return []
+
     monkeypatch.setattr("hermes_state.SessionDB", _factory)
     monkeypatch.setattr(server, "_make_agent", _fake_make_agent)
     monkeypatch.setattr(server, "_init_session", _fake_init_session)
-    monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
+    monkeypatch.setattr(server, "_set_session_context", _fake_set_session_context)
     monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
     monkeypatch.setattr(server, "_stored_session_runtime_overrides", lambda _found: {})
     monkeypatch.setattr(server, "_session_info", lambda agent, *a: {"model": "test"})
@@ -277,6 +282,8 @@ def test_resume_keeps_profile_db_open_after_ownership_transfer(profile_dbs, monk
     # The agent and the live session both took THIS handle...
     assert captured["agent_db"] is db
     assert captured["init_db"] is db
+    assert captured["context_target"] == "s1"
+    assert captured["context_profile"] == "work"
     # ...so the handler must have released ownership instead of closing it.
     assert db.closed == 0
 
@@ -312,7 +319,7 @@ def test_resume_drops_half_built_session_when_init_session_raises(
         server, "_make_agent", lambda *a, **k: types.SimpleNamespace(model="test")
     )
     monkeypatch.setattr(server, "_init_session", _fake_init_session)
-    monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
+    monkeypatch.setattr(server, "_set_session_context", lambda _target, **_kwargs: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
     monkeypatch.setattr(server, "_stored_session_runtime_overrides", lambda _found: {})
 

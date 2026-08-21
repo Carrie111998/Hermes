@@ -158,6 +158,7 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     class FakeAgent:
         def __init__(self, **kwargs):
             captured.update(kwargs)
+            captured["agent"] = self
             self.suppress_status_output = False
             self.stream_delta_callback = object()
             self.tool_gen_callback = object()
@@ -214,6 +215,7 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     assert captured["session_db"] is sentinel_db
     assert captured["enabled_toolsets"] == ["session_search"]
     assert captured["prompt"] == "recall this"
+    assert getattr(captured["agent"], "_classic_cli_runtime", False) is True
 
 
 def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):

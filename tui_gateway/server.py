@@ -565,23 +565,34 @@ def _load_interim_assistant_messages() -> bool:
 
 
 def _notify_session_boundary(
-    event_type: str, session_id: str | None, platform: str | None = None
+    event_type: str,
+    session_id: str | None,
+    platform: str | None = None,
+    *,
+    reason: str = "session_boundary",
+    old_session_id: str | None = None,
+    new_session_id: str | None = None,
+    cwd: str = "",
+    profile_name: str | None = None,
 ) -> None:
     """Fire session lifecycle hooks with CLI parity."""
     try:
         from hermes_cli.lifecycle import finalize_session, invoke_hook
 
+        context = {
+            "session_id": session_id,
+            "platform": _resolve_agent_platform(platform),
+            "reason": reason,
+            "old_session_id": old_session_id,
+            "new_session_id": new_session_id,
+            "cwd": cwd,
+        }
+        if profile_name is not None:
+            context["profile_name"] = profile_name
         if event_type == "on_session_finalize":
-            finalize_session(
-                session_id=session_id,
-                platform=_resolve_agent_platform(platform),
-            )
+            finalize_session(**context)
         else:
-            invoke_hook(
-                event_type,
-                session_id=session_id,
-                platform=_resolve_agent_platform(platform),
-            )
+            invoke_hook(event_type, **context)
     except Exception:
         pass
 
@@ -735,7 +746,13 @@ def _is_gateway_owned_source(source: str) -> bool:
         return False
 
 
-def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> None:
+def _finalize_session(
+    session: dict | None,
+    end_reason: str = "tui_close",
+    *,
+    new_session_id: str | None = None,
+    new_session: dict | None = None,
+) -> None:
     """Best-effort finalize hook + memory commit for a session.
 
     Fires ``on_session_end`` plugin hook and attempts to persist any
@@ -813,7 +830,30 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
 
     session_key = session.get("session_key")
     session_id = getattr(agent, "session_id", None) or session_key
-    _notify_session_boundary("on_session_finalize", session_id, _session_source(session))
+    profile_name = str(session.get("profile_name") or "") or None
+    _notify_session_boundary(
+        "on_session_finalize",
+        session_id,
+        _session_source(session),
+        old_session_id=session_id,
+        new_session_id=new_session_id,
+        reason=end_reason,
+        cwd=_session_cwd(session),
+        profile_name=profile_name,
+    )
+    if end_reason == "new_session" and new_session_id:
+        reset_session = new_session or session
+        reset_profile_name = str(reset_session.get("profile_name") or "") or None
+        _notify_session_boundary(
+            "on_session_reset",
+            new_session_id,
+            _session_source(reset_session),
+            old_session_id=session_id,
+            new_session_id=new_session_id,
+            reason="new_session",
+            cwd=_session_cwd(reset_session),
+            profile_name=reset_profile_name,
+        )
 
     # Mark session ended in DB so it doesn't linger as a ghost row in /resume.
     # Use session_id (from agent.session_id) not session_key — after compression,
@@ -918,7 +958,13 @@ def _announce_session_reclaimed(session: dict, end_reason: str) -> None:
         logger.debug("session.reclaimed broadcast failed", exc_info=True)
 
 
-def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") -> None:
+def _teardown_session(
+    session: dict | None,
+    *,
+    end_reason: str = "tui_close",
+    new_session_id: str | None = None,
+    new_session: dict | None = None,
+) -> None:
     """Fully tear down a session: finalize, unregister, close agent + worker.
 
     Shared by ``session.close`` and the orphaned-WS-session reaper. The
@@ -930,7 +976,15 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
     """
     if not session:
         return
-    _finalize_session(session, end_reason=end_reason)
+    if new_session_id is None:
+        _finalize_session(session, end_reason=end_reason)
+    else:
+        _finalize_session(
+            session,
+            end_reason=end_reason,
+            new_session_id=new_session_id,
+            new_session=new_session,
+        )
     _announce_session_reclaimed(session, end_reason)
     try:
         from tools.approval import unregister_gateway_notify
@@ -987,7 +1041,11 @@ def _pop_session_by_id(sid: str) -> dict | None:
 
 
 def _teardown_popped_session(
-    session: dict | None, *, end_reason: str = "tui_close"
+    session: dict | None,
+    *,
+    end_reason: str = "tui_close",
+    new_session_id: str | None = None,
+    new_session: dict | None = None,
 ) -> bool:
     """Finish a close after the caller has atomically detached the session."""
     if session is None:
@@ -1008,7 +1066,15 @@ def _teardown_popped_session(
                 )
         except Exception:
             logger.debug("failed waiting for session turn thread", exc_info=True)
-    _teardown_session(session, end_reason=end_reason)
+    if new_session_id is None:
+        _teardown_session(session, end_reason=end_reason)
+    else:
+        _teardown_session(
+            session,
+            end_reason=end_reason,
+            new_session_id=new_session_id,
+            new_session=new_session,
+        )
     return True
 
 
@@ -1507,6 +1573,16 @@ def _response_profile_name(profile: str | None = None) -> str:
     return _current_profile_name()
 
 
+def _requested_profile_name(profile: str | None = None) -> str:
+    """Return only profile authority explicitly supplied by a session creator."""
+    name = (profile or "").strip()
+    if not name:
+        return ""
+    if name == _current_profile_name() or _profile_home(name) is not None:
+        return name
+    return ""
+
+
 def _db_unavailable_error(rid, *, code: int):
     detail = _db_error or "state.db unavailable"
     return _err(rid, code, f"state.db unavailable: {detail}")
@@ -1789,6 +1865,7 @@ def _compute_host_turn_frame(
         "cols": int(session.get("cols", 80) or 80),
         "cwd": _session_cwd(session),
         "profile_home": session.get("profile_home") or "",
+        "profile_name": str(session.get("profile_name") or ""),
         "model_override": session.get("model_override"),
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
@@ -2458,8 +2535,6 @@ def _start_agent_build(sid: str, session: dict) -> None:
             with _sessions_lock:
                 if sid in _sessions:
                     _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
-            _notify_session_boundary("on_session_reset", key, _session_source(current))
-
             info = _session_info(agent, current)
             cfg_warn = _probe_config_health(_load_cfg())
             if cfg_warn:
@@ -2581,6 +2656,7 @@ def _completion_cwd(params: dict | None = None) -> str:
     raw = (
         params.get("cwd")
         or _sessions.get(params.get("session_id") or "", {}).get("cwd")
+        or _sessions.get(params.get("session_id") or "", {}).get("execution_cwd")
         # A session bound to another profile resolves its workspace from THAT
         # profile's config before falling back to the launch profile's env var.
         or _profile_configured_cwd(_profile_home(params.get("profile")))
@@ -2679,9 +2755,10 @@ _resolve_cwd_git = git_probe.resolve
 
 
 def _session_cwd(session: dict | None) -> str:
+    """Return only the session's authoritative workspace attribution."""
     if session and session.get("cwd"):
         return str(session["cwd"])
-    return _completion_cwd()
+    return ""
 
 
 # Sources whose launch directory is an artifact of how the app was started, not
@@ -3422,6 +3499,7 @@ def _set_session_context(
     cwd: str | None = None,
     *,
     ui_session_id: str = "",
+    profile_name: str | None = None,
 ) -> list:
     try:
         from gateway.session_context import set_session_vars
@@ -3442,10 +3520,12 @@ def _set_session_context(
         # fall back to the session_key (matching the id derivation used at
         # session-finalize), so an identified session is never left blank.
         session_id = session_key
+        resolved_profile_name = str(profile_name or "")
         with _sessions_lock:
             for sess in list(_sessions.values()):
                 if sess.get("session_key") == session_key:
                     source = _session_source(sess)
+                    resolved_profile_name = str(sess.get("profile_name") or "")
                     session_id = (
                         getattr(sess.get("agent"), "session_id", None) or session_key
                     )
@@ -3454,6 +3534,7 @@ def _set_session_context(
             session_key=session_key,
             session_id=session_id,
             source=source,
+            profile=resolved_profile_name,
             cwd=resolved,
             ui_session_id=ui_session_id,
             cron_session="",
@@ -7219,6 +7300,7 @@ def _init_session(
     session_db=None,
     source: str | None = None,
     profile_home: str | None = None,
+    profile_name: str | None = None,
 ):
     now = time.time()
     with _sessions_lock:
@@ -7234,7 +7316,7 @@ def _init_session(
             "running": False,
             "attached_images": [],
             "image_counter": 0,
-            "cwd": cwd or _completion_cwd(),
+            "cwd": _completion_cwd() if cwd is None else cwd,
             "cols": cols,
             "slash_worker": None,
             "show_reasoning": _load_show_reasoning(),
@@ -7242,10 +7324,11 @@ def _init_session(
             "tool_progress_mode": _load_tool_progress_mode(),
             "edit_snapshots": {},
             "tool_started_at": {},
-            # Profile-scoped HERMES_HOME for app-global remote mode; None =
-            # launch profile. SessionBranch copies the parent's value so the
-            # child stays on the same state.db.
+            # Profile-scoped HERMES_HOME for app-global remote mode. A missing
+            # home may use launch-profile execution config, but profile_name
+            # remains sparse attribution. SessionBranch copies both fields.
             "profile_home": profile_home,
+            "profile_name": str(profile_name or ""),
             # Per-session model override set by an in-session /model switch.
             # Honored on rebuild (/new, resume) so a switch in THIS session
             # never leaks into siblings via process-global env vars.
@@ -7270,7 +7353,7 @@ def _init_session(
     try:
         if db is not None:
             row = db.get_session(key) if hasattr(db, "get_session") else None
-            if row and row.get("cwd"):
+            if cwd is None and row and row.get("cwd"):
                 with _sessions_lock:
                     if sid in _sessions:
                         _sessions[sid]["cwd"] = row["cwd"]
@@ -7324,7 +7407,6 @@ def _init_session(
     with _sessions_lock:
         if sid in _sessions:
             _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
-    _notify_session_boundary("on_session_reset", key, _session_source(_sessions.get(sid, {})))
     _emit("session.info", sid, _session_info(agent, _sessions.get(sid, {})))
     _schedule_mcp_late_refresh(sid, agent)
 
@@ -8577,6 +8659,7 @@ def _deferred_session_record(
     close_on_disconnect: bool = False,
     display_history_prefix: list | None = None,
     profile_home: Path | None = None,
+    profile_name: str | None = None,
     lazy: bool = False,
     model_override=None,
     resume_runtime_overrides: dict | None = None,
@@ -8607,6 +8690,7 @@ def _deferred_session_record(
         "model_override": model_override,
         "pending_title": None,
         "profile_home": str(profile_home) if profile_home is not None else None,
+        "profile_name": str(profile_name or ""),
         "resume_runtime_overrides": resume_runtime_overrides,
         "resume_session_id": session_key,
         "running": False,

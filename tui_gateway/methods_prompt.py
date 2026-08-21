@@ -1227,7 +1227,11 @@ def _(rid, params: dict) -> dict:
     task_id = f"bg_{uuid.uuid4().hex[:6]}"
 
     def run():
-        session_tokens = _set_session_context(task_id, cwd=_session_cwd(session))
+        session_tokens = _set_session_context(
+            task_id,
+            cwd=_session_cwd(session),
+            profile_name=str(session.get("profile_name") or "") or None,
+        )
         try:
             from run_agent import AIAgent
 
@@ -1340,7 +1344,11 @@ def _(rid, params: dict) -> dict:
     def run():
         # Pin the validated preview cwd, else the parent workspace — never an
         # invalid client path, which would silently fall back to the launch dir.
-        session_tokens = _set_session_context(task_id, cwd=(preview_cwd or _session_cwd(session)))
+        session_tokens = _set_session_context(
+            task_id,
+            cwd=(preview_cwd or _session_cwd(session)),
+            profile_name=str(session.get("profile_name") or "") or None,
+        )
         try:
             from run_agent import AIAgent
             from tools.terminal_tool import register_task_env_overrides
