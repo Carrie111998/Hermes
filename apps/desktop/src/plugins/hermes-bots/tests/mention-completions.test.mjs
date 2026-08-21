@@ -39,6 +39,9 @@ function loadProvide({ roster, active = 'default', meta = {} } = {}) {
     document: { getElementById: () => null, createElement: () => ({}), head: { appendChild: () => undefined } },
     queryClient: {
       getQueryData: () => roster,
+      // Roster snapshots live under connection-scoped keys ([ID,'roster',conn]);
+      // the middleware/completions read them via prefix-matching getQueriesData.
+      getQueriesData: () => [[['hermes-bots', 'roster', 'local'], roster]],
       invalidateQueries: () => undefined,
       setQueryData: () => undefined
     },

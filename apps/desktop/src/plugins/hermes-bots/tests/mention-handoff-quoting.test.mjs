@@ -124,18 +124,30 @@ test('behavior: @dixie on a Connections bot stays in this chat and does not herm
     PALETTE_AREA: 'palette',
     COMPOSER_AREAS: { middleware: 'middleware' },
     queryClient: {
-      getQueryData: () => ({
-        profiles: [
-          { name: 'default', connectionId: 'local' },
+      // REAL TanStack semantics (regression for the shipped bug): useRoster
+      // stores snapshots under connection-scoped keys ([ID,'roster',conn]) and
+      // getQueryData matches keys EXACTLY — so the bare [ID,'roster'] read the
+      // middleware used to make always missed, and Connections bots (dixie
+      // here) could never be @-mentioned. cachedRoster() must read via the
+      // prefix-matching getQueriesData instead.
+      getQueryData: () => undefined,
+      getQueriesData: () => [
+        [
+          ['hermes-bots', 'roster', 'local'],
           {
-            name: 'dixie',
-            connectionId: 'mac-mini',
-            connectionLabel: 'Mac Mini',
-            handle: 'dixie',
-            remoteSource: true
+            profiles: [
+              { name: 'default', connectionId: 'local' },
+              {
+                name: 'dixie',
+                connectionId: 'mac-mini',
+                connectionLabel: 'Mac Mini',
+                handle: 'dixie',
+                remoteSource: true
+              }
+            ]
           }
         ]
-      })
+      ]
     },
     document: { getElementById: () => null, createElement: () => ({}), head: { appendChild: () => undefined } },
     host: {

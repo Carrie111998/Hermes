@@ -144,7 +144,14 @@ test('composer autocomplete offers the renamed tag and matches on the display na
       removeEventListener: () => undefined
     },
     document: { getElementById: () => null, createElement: () => ({}), head: { appendChild: () => undefined } },
-    queryClient: { getQueryData: () => roster, invalidateQueries: () => undefined, setQueryData: () => undefined },
+    queryClient: {
+      getQueryData: () => roster,
+      // Roster snapshots live under connection-scoped keys ([ID,'roster',conn]);
+      // the middleware reads them via prefix-matching getQueriesData.
+      getQueriesData: () => [[['hermes-bots', 'roster', 'local'], roster]],
+      invalidateQueries: () => undefined,
+      setQueryData: () => undefined
+    },
     host: {
       state: { profile: { get: () => 'default', listen: () => () => undefined }, gateway: { get: () => null, listen: () => () => undefined } },
       request: async () => ({}),

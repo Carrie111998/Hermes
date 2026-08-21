@@ -84,6 +84,27 @@ const createBudgetedLoop = typeof sdk === 'undefined' ? undefined : sdk.createBu
 
 const ID = 'hermes-bots'
 const ROSTER_KEY = [ID, 'roster']
+
+/** Roster snapshots are stored per active connection — useRoster keys them
+ *  [ID, 'roster', connectionId]. TanStack matches query keys EXACTLY, so
+ *  getQueryData([ID, 'roster']) always misses and the @-mention middleware /
+ *  completions silently degraded to the active gateway's local-only
+ *  profiles.list fallback — bots on other Connections could never be
+ *  @-mentioned (remoteSource rows were unreachable). Read across the
+ *  connection-scoped snapshots and take the freshest. */
+function cachedRoster() {
+  if (typeof queryClient === 'undefined' || !queryClient || typeof queryClient.getQueriesData !== 'function') {
+    return null
+  }
+
+  return (
+    queryClient
+      .getQueriesData({ queryKey: ROSTER_KEY })
+      .map(([, data]) => data)
+      .filter(data => data && Array.isArray(data.profiles))
+      .sort((a, b) => (b?.fetchedAt || 0) - (a?.fetchedAt || 0))[0] || null
+  )
+}
 const ROUTINES_KEY = [ID, 'routines']
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
 
@@ -10501,7 +10522,7 @@ export default {
       area: COMPOSER_AREAS.atCompletions,
       data: {
         provide: query => {
-          const roster = queryClient.getQueryData(ROSTER_KEY)
+          const roster = cachedRoster()
           const profiles = Array.isArray(roster?.profiles) ? roster.profiles : []
 
           if (!profiles.length) {
@@ -10811,9 +10832,7 @@ export default {
             name: (host.state.profile.get() || 'default').trim() || 'default',
             connectionId: String(host.state.connectionId?.get?.() || host.activeConnectionId?.() || 'local')
           }
-          const cached = typeof queryClient !== 'undefined' && queryClient && typeof queryClient.getQueryData === 'function'
-            ? queryClient.getQueryData(ROSTER_KEY)
-            : null
+          const cached = cachedRoster()
           const roster = Array.isArray(cached?.profiles) ? cached.profiles : null
           let mentionedBots = roster ? resolveRosterMentions(text, roster, live) : []
 
