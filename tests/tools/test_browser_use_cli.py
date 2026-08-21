@@ -799,12 +799,6 @@ class TestSkillTextDescription:
         ):
             assert helper in bu_cli._HELPERS_DIGEST
 
-    def test_native_vision_requires_final_screenshot_verification(self, monkeypatch):
-        monkeypatch.setattr(
-            "tools.vision_tools._should_use_native_vision_fast_path", lambda: True
-        )
-        assert "fresh final screenshot" in bu_cli._description_header()
-
     def test_static_fallback_carries_digest_and_install_hint(self):
         desc = bu_cli.BROWSER_EXEC_SCHEMA["description"]
         assert bu_cli._HELPERS_DIGEST in desc

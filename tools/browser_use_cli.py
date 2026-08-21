@@ -716,9 +716,7 @@ _HEADER_VISION = (
     " Screenshots are attached to your context automatically: when the exec "
     "output contains a capture_screenshot() path, the image arrives with "
     "this tool's result and you inspect it directly with your own vision — "
-    "never send browser screenshots to a separate vision tool. Inspect a "
-    "screenshot before coordinate-based actions, then capture and inspect a "
-    "fresh final screenshot before claiming the requested end state."
+    "never send browser screenshots to a separate vision tool."
 )
 
 _HEADER_TEXT_ONLY = (
