@@ -202,7 +202,7 @@ test('shape: Hidden section renders only when recovery is relevant', () => {
 test('shape: revealed hidden rows are flagged and can be restored', () => {
   const botRow = pluginSource.slice(pluginSource.indexOf('function BotRow('), pluginSource.indexOf('// ── model picker'))
   assert.match(botRow, /name: 'eye-closed'/)
-  assert.match(botRow, /children: hidden \? 'Unhide' : 'Hide'/)
+  assert.match(botRow, /children: hidden \? k\.menu\.unhideBot : k\.menu\.hideBot/)
   assert.match(botRow, /saveBotMeta\(bot, \{ hidden: !hidden \}\)/)
 })
 
