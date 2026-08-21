@@ -513,7 +513,9 @@ def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
 
     Returns a shallow copy with multimodal tool results replaced by their
     text_summary, and image parts in content lists replaced by
-    `[screenshot]` placeholders. Keeps the message schema otherwise intact.
+    `[image not retained]` placeholders (self-naming storage artifact, see
+    #91548 — the old `[screenshot]` read like client-sent content). Keeps
+    the message schema otherwise intact.
     """
     if not isinstance(msg, dict):
         return msg
@@ -524,7 +526,7 @@ def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
         cleaned = []
         for p in content:
             if isinstance(p, dict) and p.get("type") in {"image", "image_url", "input_image"}:
-                cleaned.append({"type": "text", "text": "[screenshot]"})
+                cleaned.append({"type": "text", "text": "[image not retained]"})
             else:
                 cleaned.append(p)
         return {**msg, "content": cleaned}

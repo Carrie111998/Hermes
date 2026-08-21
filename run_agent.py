@@ -2313,13 +2313,18 @@ class AIAgent:
                 if _is_multimodal_tool_result(content):
                     content = _multimodal_text_summary(content)
                 elif isinstance(content, list):
-                    # List of OpenAI-style content parts: strip images, keep text.
+                    # List of OpenAI-style content parts: strip images, keep
+                    # text. The placeholder must NAME ITSELF as a storage
+                    # artifact — "[screenshot]" read like something the
+                    # client sent, misleading every transcript consumer
+                    # (history renderers, exports, later turns) into hunting
+                    # for an image the store never kept (#91548).
                     _txt = []
                     for p in content:
                         if isinstance(p, dict) and p.get("type") == "text":
                             _txt.append(str(p.get("text", "")))
                         elif isinstance(p, dict) and p.get("type") in {"image", "image_url", "input_image"}:
-                            _txt.append("[screenshot]")
+                            _txt.append("[image not retained]")
                     content = "\n".join(_txt) if _txt else None
                 tool_calls_data = None
                 if hasattr(msg, "tool_calls") and isinstance(msg.tool_calls, list) and msg.tool_calls:
