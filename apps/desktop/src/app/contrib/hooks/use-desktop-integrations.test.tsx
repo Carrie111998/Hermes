@@ -45,6 +45,7 @@ describe('useDesktopIntegrations', () => {
 
   beforeEach(() => {
     window.localStorage.clear()
+    window.sessionStorage.clear()
     _resetLegacyDiscardForTests()
     vi.mocked(requestMcpInstallFromDeepLink).mockClear()
     navigate = vi.fn()
@@ -145,6 +146,20 @@ describe('useDesktopIntegrations', () => {
       render({ profileReady: true, sessions })
 
       expect(navigate).toHaveBeenCalledWith('/remembered-session', { replace: true })
+    })
+
+    it('does not restore again when the hook remounts after a reconnect', () => {
+      window.localStorage.setItem('hermes.desktop.lastRoute.profile.default', '/embedded-session')
+      const sessions = [session({ id: 'embedded-session', profile: 'default' })]
+
+      const first = render({ profileReady: true, sessions })
+      expect(navigate).toHaveBeenCalledTimes(1)
+
+      first.unmount()
+      navigate.mockClear()
+      render({ profileReady: true, sessions })
+
+      expect(navigate).not.toHaveBeenCalled()
     })
 
     it('restores remembered session id when no remembered route exists', () => {

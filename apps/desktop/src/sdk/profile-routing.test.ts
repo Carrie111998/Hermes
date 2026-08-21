@@ -22,16 +22,23 @@ vi.mock('@/store/session', async () => {
 
   return {
     $activeSessionId: atom(null),
+    $busy: atom(false),
     $connection: atom(null),
+    $cronSessions: atom([]),
     $currentCwd: atom(''),
     $currentModel: atom(''),
     $gatewayState: atom('open'),
     $messages: atom([]),
+    $messagingSessions: atom([]),
     $selectedStoredSessionId: atom(null),
     $sessions: atom([]),
+    $workspaceCwdOwner: atom(null),
     rememberedSessionProfile: (_sessions: unknown, _sessionId: null | string, activeProfile: null | string) =>
       (activeProfile ?? '').trim() || 'default',
     requestSessionResume: vi.fn(),
+    setAwaitingResponse: vi.fn(),
+    setBusy: vi.fn(),
+    setMessages: vi.fn(),
     setResumeExhaustedSessionId: vi.fn()
   }
 })
@@ -64,6 +71,7 @@ vi.mock('@/store/profile', async () => {
     $activeGatewayProfile: atom('remote-worker'),
     $gatewaySwapTarget: atom(null),
     $profiles: profiles,
+    $showAllProfiles: atom(false),
     ensureGatewayAgent: vi.fn(),
     ensureGatewayProfile: vi.fn(),
     newSessionInProfile: vi.fn(),
@@ -79,6 +87,7 @@ vi.mock('@/store/gateway', async () => {
 
   return {
     $gateway: atom(null),
+    activeGateway: vi.fn(() => null),
     ensureGatewayForAgent: vi.fn(),
     openGatewayForAgent: vi.fn(),
     openGatewayForProfile: vi.fn(),

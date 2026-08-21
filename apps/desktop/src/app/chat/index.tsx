@@ -78,6 +78,7 @@ import {
 import { advanceTranscriptWindow, type TranscriptWindowState } from './transcript-window'
 
 interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
+  focusOnSessionChange?: boolean
   gateway: HermesGateway | null
   modelMenuContent?: React.ReactNode
   onToggleSelectedPin: () => void
@@ -335,6 +336,7 @@ export const ChatView = memo(function ChatView(props: ChatViewProps) {
 
 const ChatViewContent = memo(function ChatViewContent({
   className,
+  focusOnSessionChange = true,
   gateway,
   modelMenuContent,
   onToggleSelectedPin,
@@ -679,7 +681,7 @@ const ChatViewContent = memo(function ChatViewContent({
               busy={busy}
               cwd={currentCwd}
               disabled={!gatewayOpen}
-              focusKey={activeSessionId}
+              focusKey={focusOnSessionChange ? activeSessionId : null}
               gateway={gateway}
               maxRecordingSeconds={maxVoiceRecordingSeconds}
               onAddContextRef={onAddContextRef}

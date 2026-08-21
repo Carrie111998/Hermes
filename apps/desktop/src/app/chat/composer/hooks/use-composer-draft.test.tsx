@@ -25,14 +25,15 @@ vi.mock('@assistant-ui/react', () => ({
 
 interface ProbeHarnessProps {
   activeQueueSessionKey: string | null
+  focusKey?: string | null
   onLayoutSnapshot: (attachments: ComposerAttachment[]) => void
   sessionId: string
 }
 
-function ProbeHarness({ activeQueueSessionKey, onLayoutSnapshot, sessionId }: ProbeHarnessProps) {
+function ProbeHarness({ activeQueueSessionKey, focusKey = null, onLayoutSnapshot, sessionId }: ProbeHarnessProps) {
   useComposerDraft({
     activeQueueSessionKey,
-    focusKey: null,
+    focusKey,
     inputDisabled: false,
     queueEditRef: { current: null as QueueEditState | null },
     sessionId
@@ -264,6 +265,7 @@ describe('useComposerDraft — a closing composer hands the focus-bus key back',
       <ComposerScopeProvider value={scope}>
         <ProbeHarness
           activeQueueSessionKey="session-tile"
+          focusKey={target}
           onLayoutSnapshot={() => undefined}
           sessionId="session-tile"
         />

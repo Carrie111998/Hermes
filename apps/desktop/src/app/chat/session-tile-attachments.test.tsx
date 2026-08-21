@@ -87,11 +87,13 @@ function installDelegate(): void {
   }
 
   setSessionTileDelegate({
+    adoptSurface: vi.fn(async () => RUNTIME_ID),
     archiveSession: vi.fn(async () => undefined),
     branchSession: vi.fn(async () => undefined),
     deleteSession: vi.fn(async () => undefined),
     executeSlash: vi.fn(async () => undefined),
     interruptSession: vi.fn(async () => undefined),
+    resumeSurface: vi.fn(async () => RUNTIME_ID),
     resumeTile: vi.fn(async () => RUNTIME_ID),
     submitToSession: vi.fn(async () => undefined),
     updateSession
@@ -152,7 +154,7 @@ describe('session tile attachment occurrence ownership', () => {
     scope.attachments.add(original)
 
     const { result } = renderHook(() =>
-      useSessionTileActions({ runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
+      useSessionTileActions({ requestGateway, runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
     )
 
     let submitted!: Promise<boolean>
@@ -198,7 +200,7 @@ describe('session tile attachment occurrence ownership', () => {
     scope.attachments.add(original)
 
     const { result } = renderHook(() =>
-      useSessionTileActions({ runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
+      useSessionTileActions({ requestGateway, runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
     )
 
     let submitted!: Promise<boolean>
@@ -236,7 +238,7 @@ describe('session tile attachment occurrence ownership', () => {
     scope.attachments.add(original)
 
     const { result } = renderHook(() =>
-      useSessionTileActions({ runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
+      useSessionTileActions({ requestGateway, runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
     )
 
     let submitted!: Promise<boolean>
@@ -273,7 +275,7 @@ describe('session tile attachment occurrence ownership', () => {
     scope.attachments.add(original)
 
     const { result } = renderHook(() =>
-      useSessionTileActions({ runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
+      useSessionTileActions({ requestGateway, runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
     )
 
     let submitted!: Promise<boolean>
@@ -314,7 +316,7 @@ describe('session tile attachment occurrence ownership', () => {
     scope.attachments.add(original)
 
     const { result } = renderHook(() =>
-      useSessionTileActions({ runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
+      useSessionTileActions({ requestGateway, runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
     )
 
     await act(async () => {
