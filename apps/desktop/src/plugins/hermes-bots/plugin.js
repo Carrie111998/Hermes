@@ -6009,10 +6009,12 @@ function messagingProtocolSection(name, roster) {
     'You work alongside other named agents. Every agent (including you) has',
     'ONE canonical conversation titled "Bot Chat" — created with the agent,',
     'so it always exists. Agent-to-agent messages are delivered straight',
-    'into it, like a DM. To message a teammate, run:',
+    'into it, like a DM. To message a teammate, FIRST write your message to',
+    '`/tmp/dm.txt` with the file tool (never inline it into the command —',
+    'quotes truncate it and `$( )` would execute). Then run:',
     '',
     '```',
-    'hermes -p <agent-name> chat --in ~ -c "Bot Chat" --create-if-missing -Q -q "Message from \uD83E\uDD16 ' + handle + ' (@' + handle + '): your message"',
+    'hermes -p <agent-name> chat --in ~ -c "Bot Chat" --create-if-missing -Q --query-file /tmp/dm.txt',
     '',
     'Run the send with background=true and notify_on_complete=true on the',
     'terminal tool, then finish your turn — the reply arrives later as a',
@@ -6021,13 +6023,13 @@ function messagingProtocolSection(name, roster) {
     '',
     '(`--in ~ -c "Bot Chat" --create-if-missing` resumes their canonical',
     'conversation in the home workspace, creating it if the target has no',
-    '"Bot Chat" yet. `-Q` keeps output clean. Always open with the',
-    '"Message from \uD83E\uDD16 ' + handle + ' (@' + handle + '):" prefix so they know',
-    'who is talking (the @handle lets the app show your avatar to them).',
+    '"Bot Chat" yet. `-Q` keeps output clean. The file must open with the',
+    '"Message from 🤖 <name> (@<handle>):" prefix so they know who is talking',
+    '(the @handle lets the app show your avatar to them).',
     'Their reply prints to stdout — relay the relevant part back to the',
     'user, and say which agent it came from.)',
     '',
-    'If a message in YOUR chat starts with "Message from \uD83E\uDD16 <name>", it is',
+    'If a message in YOUR chat starts with "Message from 🤖 <name>", it is',
     'a teammate messaging you, not the user. Answer it directly — your reply',
     'reaches them via their own delivery — and use the same command if you',
     'need to start a conversation yourself.',
@@ -11991,9 +11993,9 @@ export default {
           if (localMentions.length) {
             note +=
               '\n\n[@mention handoff — for each mentioned agent (' + localMentions.map(bot => botHandle(bot.name, bot)).join(', ') + '): ' +
-              'COMPOSE a message from you (' + senderName + ') to that agent conveying what the user wants — do not forward this text verbatim (avoid double quotes in your composed message). Send it with exactly one terminal call, run with background=true AND notify_on_complete=true (the recipient may take minutes; the user must not be blocked):\n' +
-              localMentions.map(bot => '`hermes -p ' + shellQuote(bot.name) + ' chat --in ~ -c "Bot Chat" --create-if-missing -Q -q "Message from 🤖 ' + shellDoubleQuote(senderName) + ' (@' + shellDoubleQuote(botHandle(live.name)) + '): <your composed message>"`').join('\n') +
-              '\nAfter dispatching, tell the user the message was sent and END YOUR TURN — do not wait or poll; when the background process completes, its notification carries the reply — relay it then, attributed to that agent. ' +
+              'COMPOSE a message from you (' + senderName + ') to that agent conveying what the user wants — do not forward this text verbatim. FIRST write your message to `/tmp/dm.txt` with the file tool (never inline it into the command — quotes truncate it and `$( )` would execute). Then send it with exactly one terminal call, run with background=true AND notify_on_complete=true (the recipient may take minutes; the user must not be blocked):\n' +
+              localMentions.map(bot => '`hermes -p ' + shellQuote(bot.name) + ' chat --in ~ -c "Bot Chat" --create-if-missing -Q --query-file /tmp/dm.txt`').join('\n') +
+              '\nThe file must open with the "Message from 🤖 ' + shellDoubleQuote(senderName) + ' (@' + shellDoubleQuote(botHandle(live.name)) + '):" prefix so they know who is talking. After dispatching, tell the user the message was sent and END YOUR TURN — do not wait or poll; when the background process completes, its notification carries the reply — relay it then, attributed to that agent. ' +
               'Relay the reply back to the user, attributed to that agent.]'
           }
 

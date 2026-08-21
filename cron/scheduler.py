@@ -3574,8 +3574,8 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
             ]
             existing_pythonpath = os.environ.get("PYTHONPATH", "")
             if existing_pythonpath:
-                pythonpath_entries.append(existing_pythonpath)
-            env_overlay["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+                pythonpath_entries.extend(existing_pythonpath.split(os.pathsep))
+            env_overlay["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(pythonpath_entries))
 
     return str(interpreter), env_overlay
 
