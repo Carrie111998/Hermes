@@ -4470,12 +4470,32 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     for that path.
     """
     row = conn.execute(
-        "SELECT kind FROM task_events "
+        "SELECT kind, payload FROM task_events "
         "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    if not row or row["kind"] != "blocked":
+        return False
+    # Payload-aware: a ``blocked`` event that records only a durable
+    # resumption phase (``resume_status`` / ``retry_status`` /
+    # ``source_status``) and carries no ``reason`` is a dependency or review
+    # resumption, not a worker/operator handoff, so ``recompute_ready`` may
+    # auto-recover it. A reason-bearing worker/operator block (and an
+    # event with no recognizable payload) remains sticky, preserving the
+    # historical behavior for true sticky blocks.
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    if "reason" not in payload and any(
+        key in payload
+        for key in ("resume_status", "retry_status", "source_status")
+    ):
+        return False
+    return True
 
 
 def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
@@ -7642,22 +7662,6 @@ def _task_would_promote(conn, task_id, closure) -> bool:
     return True
 
 
-def _empty_admin_graph_result(roots, dry_run) -> dict:
-    return {
-        "dry_run": bool(dry_run),
-        "archive_group_id": None,
-        "root_ids": sorted(roots),
-        "tasks": [],
-        "skipped_archived": [],
-        "internal_edges": [],
-        "external_edges": [],
-        "would_promote": [],
-        "active_runs": [],
-        "archived_ids": [],
-        "warnings": [],
-    }
-
-
 def _admin_refuse(result, message) -> dict:
     out = dict(result)
     out["error"] = message
@@ -7665,22 +7669,32 @@ def _admin_refuse(result, message) -> dict:
     return out
 
 
-def admin_archive_graph(
+def _plan_admin_archive_graph(
     conn,
     root_ids,
     *,
     reason,
     actor,
-    dry_run=False,
-    allow_promotions=False,
-    force_running=False,
-) -> dict:
-    """Safely archive a dominated closure of tasks under ``root_ids``.
+) -> tuple:
+    """Build the dominated-closure admin archive plan without writing.
 
-    Returns a structured report dict (see the card contract). Refusals
-    (unknown ids, a promotion hazard without ``allow_promotions``, or a
-    live run without ``force_running``) return an error-carrying dict and
-    write nothing.
+    Read-only planning shared by both the dry-run and the execution paths.
+    Returns ``(result, statuses, to_archive)``:
+
+    * ``result`` — the report dict carrying only the fixed public keys
+      (``dry_run``, ``archive_group_id``, ``root_ids``, ``tasks``,
+      ``skipped_archived``, ``internal_edges``, ``external_edges``,
+      ``would_promote``, ``active_runs``, ``archived_ids``, ``warnings``).
+      ``archived_ids`` is always ``[]`` here; only a successful write sets it.
+    * ``statuses`` — maps every task id in the board to its current status.
+    * ``to_archive`` — the ordered (sorted) list of closure tasks not yet
+      archived.
+
+    Validation happens here, before any write: non-empty ``root_ids``,
+      stripped non-empty ``reason``/``actor``, and every root id a non-empty
+      string.  Unknown root ids raise ``ValueError``.  The planner never
+      mutates the DB, never generates a group id, never calls
+      termination/recompute, and never touches the filesystem.
     """
     if not root_ids:
         raise ValueError("root_ids must be non-empty")
@@ -7690,16 +7704,17 @@ def admin_archive_graph(
         raise ValueError("reason must be non-empty")
     if not actor_s:
         raise ValueError("actor must be non-empty")
-
+    for rid in root_ids:
+        if not isinstance(rid, str) or not rid.strip():
+            raise ValueError("root_ids must be non-empty strings")
     roots = sorted(set(root_ids))
     existing = {
         row["id"] for row in conn.execute("SELECT id FROM tasks").fetchall()
     }
     missing = [rid for rid in roots if rid not in existing]
     if missing:
-        return _admin_refuse(
-            _empty_admin_graph_result(roots, bool(dry_run)),
-            f"unknown task id(s), nothing archived: {sorted(missing)}",
+        raise ValueError(
+            f"unknown task id(s), nothing archived: {sorted(missing)}"
         )
 
     closure, statuses = _dominated_closure(conn, roots)
@@ -7786,7 +7801,7 @@ def admin_archive_graph(
     )
 
     result = {
-        "dry_run": bool(dry_run),
+        "dry_run": False,
         "archive_group_id": None,
         "root_ids": roots,
         "tasks": tasks_rows,
@@ -7798,26 +7813,55 @@ def admin_archive_graph(
         "archived_ids": [],
         "warnings": warnings,
     }
+    return result, statuses, to_archive
+
+
+def admin_archive_graph(
+    conn,
+    root_ids,
+    *,
+    reason,
+    actor,
+    dry_run=False,
+    allow_promotions=False,
+    force_running=False,
+) -> dict:
+    """Safely archive a dominated closure of tasks under ``root_ids``.
+
+    Returns a structured report dict (see the card contract). Refusals
+    (unknown ids, a promotion hazard without ``allow_promotions``, or a
+    live run without ``force_running``) return an error-carrying dict and
+    write nothing.
+    """
+    # Read-only planning is shared by the dry-run and execution paths.  The
+    # planner performs all validation and may raise ``ValueError`` (empty
+    # roots / reason / actor, or unknown root ids) before any write.
+    result, statuses, to_archive = _plan_admin_archive_graph(
+        conn, root_ids, reason=reason, actor=actor
+    )
+    reason_s = (reason or "").strip()
+    actor_s = (actor or "").strip()
 
     if dry_run:
+        result["dry_run"] = True
         return result
 
-    if would_promote and not allow_promotions:
+    if result["would_promote"] and not allow_promotions:
         return _admin_refuse(
             result,
             "graph would promote detached boundary task(s); pass "
-            f"--allow-promotions to proceed: {would_promote}",
+            f"--allow-promotions to proceed: {result['would_promote']}",
         )
-    if active_runs and not force_running:
+    if result["active_runs"] and not force_running:
         return _admin_refuse(
             result,
             "closure contains active run(s); pass --force-running to "
-            f"terminate and archive: {active_runs}",
+            f"terminate and archive: {result['active_runs']}",
         )
 
-    if active_runs:
+    if result["active_runs"]:
         survivors = []
-        for tid in active_runs:
+        for tid in result["active_runs"]:
             prow = conn.execute(
                 "SELECT worker_pid, claim_lock FROM tasks WHERE id = ?", (tid,)
             ).fetchone()
@@ -7875,7 +7919,7 @@ def admin_archive_graph(
                 },
                 run_id=run_id,
             )
-        for rid in roots:
+        for rid in result["root_ids"]:
             body = f"Admin-archived graph {group_id} ({n} tasks): {reason_s}"
             add_comment(conn, rid, actor_s, body)
 
