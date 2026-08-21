@@ -3807,10 +3807,26 @@ def check_all_command_guards(command: str, env_type: str,
     is_cli = _is_interactive_cli()
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
+    # Detached Desktop delegation workers intentionally shed request transport
+    # context. Their live, non-serializable delegated authority is validated by
+    # the parent lane below, so it must reach that lane instead of taking the
+    # legacy non-interactive auto-approve return here.
+    try:
+        from agent.delegation_context import get_delegated_approval_authority
+        from tools.delegated_approval import DelegatedApprovalAuthority
+
+        _delegated_parent_context = get_delegated_approval_authority()
+        _has_delegated_parent_context = (
+            isinstance(_delegated_parent_context, DelegatedApprovalAuthority)
+            and _delegated_parent_context.parent_lane_enabled
+        )
+    except Exception:
+        _has_delegated_parent_context = False
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
-    # flows, we do not block on approvals and we skip external guard work.
-    if not is_cli and not is_gateway and not is_ask:
+    # flows and an opaque delegated-parent context, we do not block on approvals
+    # and we skip external guard work.
+    if not is_cli and not is_gateway and not is_ask and not _has_delegated_parent_context:
         # Cron sessions: respect cron_mode config
         if _is_cron_approval_context():
             if _get_cron_approval_mode() == "deny":

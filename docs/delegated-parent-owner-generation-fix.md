@@ -1,43 +1,57 @@
-# Delegated Parent Desktop Owner-Generation Fix Evidence
+# Delegated Parent Desktop Async Resolver Successor Evidence
 
 Date: 2026-08-21
 Branch: `fix/delegated-parent-approval-resolver`
-Baseline commit: `a30085516b79a59849751bf8480bab9ba3f06237`
-Baseline tree: `f7a666ef96f4ab495486251f96254324b84a0ea0`
+Original security baseline: `a30085516b79a59849751bf8480bab9ba3f06237`
+Original baseline tree: `f7a666ef96f4ab495486251f96254324b84a0ea0`
+Rejected owner-generation candidate / successor parent: `f70b453274d7d5f37aa6176701e7546841eae543`
+Successor-parent tree: `0c9c780f8ae3965a71e9ec30355436be8d4ec5cc`
 
 ## Scope and safety
 
-Isolated worktree only. No live service, profile, LaunchAgent, configuration, or provider action is part of this correction. No real delegated command is used for verification.
+This correction was finalized only in the isolated worktree. No live service, profile, LaunchAgent, configuration, provider, credential, network, push, merge, or activation action was performed. The integration test uses a non-effectful fake executor; it does not execute the command under review.
 
 ## Authentic defect evidence
 
-- Live delegation: `deleg_6106f041`
-- Transcript: `/Users/jarvis/.hermes/cache/delegation/live/deleg_6106f041/task-0.log`
-- Exact command executed without an approval event: `python3 -c 'print(6 * 7)'`
-- Transcript result: exit 0, stdout `42`, and the child reported no approval interruption/resumption.
+- Live delegation: `deleg_6106f041`.
+- Transcript: `/Users/jarvis/.hermes/cache/delegation/live/deleg_6106f041/task-0.log`.
+- Exact command that previously executed without an approval event: `python3 -c 'print(6 * 7)'`.
+- Transcript result: exit 0, stdout `42`, and no child approval interruption/resumption.
 - Read-only durable record: `origin_ui_session_id=0bf83aec`, `origin_session=20260810_073448_b3e778`, `parent_session_id=20260810_073448_b3e778`, state `completed`.
-- The UI owner id therefore survived into async delegation metadata; the missing boundary is the opaque in-memory owner transport/session-generation capture, not UI-id propagation.
+- The UI owner id survived into async delegation metadata. The first missing boundary was the opaque in-memory owner transport/session-generation capture, not UI-id propagation.
 
-## Root-cause trace
+## Two-part root cause and minimal correction
 
-`tools/delegate_tool.py` creates `DelegatedApprovalAuthority` only when `_has_live_owner_generation` is true. `_capture_gateway_steer_authority()` currently requires request/turn `ContextVar` transport authority. A Desktop tool/delegation worker can retain the trusted parent agent and `HERMES_UI_SESSION_ID` while lacking that request transport context. The live UI id is then present but capture returns `(None, None)`, `_has_live_owner_generation` is false, no delegated approval context is installed, and the inline-review augmentation in `tools/approval.py` is never reached.
+1. `tools/delegate_tool.py` creates `DelegatedApprovalAuthority` only when a live owner generation is captured. Desktop async workers can retain the trusted parent-agent object and `HERMES_UI_SESSION_ID` after request transport context is intentionally shed. The predecessor capture path required request/turn transport authority, so the owner-generation candidate `f70b453` added an identity-bound fallback through the live Desktop/TUI session record. It accepts only the record whose exact `agent` object is the injected parent agent and retains the exact transport and record objects for later generation checks.
+2. Authentic dispatch then exposed a second root cause in `tools/approval.py`: the legacy noninteractive fast return occurred before delegated inline-review augmentation and the existing parent lane. Even a valid live `DelegatedApprovalAuthority` therefore auto-approved without emitting an event. The successor lets only an actual, enabled `DelegatedApprovalAuthority` bypass that one early return. Serialized dictionaries, lookalike objects, disabled authorities, and authority-lookup exceptions cannot cross the `isinstance`/enabled-context boundary. All existing parent-lane eligibility, request identity, owner identity, session-record identity, transport identity, decision, revocation, and timeout checks remain unchanged and fail closed.
 
-The safe recovery seam is the live TUI/Desktop session registry: resolve only when the session record's exact `agent` object is the injected `parent_agent`, then capture the record's exact transport and record identities. Subsequent validation must continue to require the same transport and record objects in the same live session generation.
+## Authentic RED/GREEN proof
 
-## TDD and verification log
+- RED on unchanged `f70b453`: the new suite drove actual `delegate_tool._handle_delegate_task()` async dispatch, deliberately removed request transport, entered the real background child worker, and called the real command guard. The exact-owner test failed because no `delegated_approval_request` event was emitted; the fake executor observed the legacy silent approval path.
+- GREEN after the minimal `tools/approval.py` correction: the same exact-owner flow emitted the full approval event, rejected a same-session-id impostor parent, accepted the exact owner once, resumed the same child once on the same worker thread, invoked the fake executor exactly once, and rejected a duplicate decision as unavailable.
+- Fail-closed cases: no decision timed out with zero execution; replacing the live Desktop session record, transport, or agent made resolution unavailable with zero execution. Added adversarial coverage proves serialized, lookalike, disabled, and exception-producing authority contexts cannot bypass legacy noninteractive behavior.
 
-- RED: `scripts/run_tests.sh tests/tools/test_delegated_parent_approval.py::test_desktop_child_binds_live_owner_generation_from_parent_agent_identity -v` exited nonzero before the implementation. The canonical runner converted the node id to the named `-k` selector, and the new Desktop owner-generation contract failed.
-- GREEN: the same command passed after the narrow identity-bound capture was implemented: `1 passed, 0 failed`.
-- Post-correction resolver suite: `scripts/run_tests.sh tests/tools/test_delegated_parent_approval.py -q` => `60 passed, 0 failed`.
+## Verification log
+
+Completed before final successor commit:
+
+- New authentic Desktop async integration suite: `scripts/run_tests.sh tests/tools/test_delegated_parent_approval_desktop_async.py -q` => `9 passed, 0 failed` (five async dispatch cases plus four authority-boundary parameter cases).
+- Resolver suite: `scripts/run_tests.sh tests/tools/test_delegated_parent_approval.py -q` => `60 passed, 0 failed`.
 - Subagent steering: `scripts/run_tests.sh tests/tools/test_subagent_steer.py -q` => `30 passed, 0 failed`.
-- Desktop/TUI gateway: `scripts/run_tests.sh tests/test_tui_gateway_server.py -q` => `518 passed, 1 failed`; the one failure was the documented pre-existing suite-order flake `test_write_json_serializes_concurrent_writes`, which passed alone (`1 passed`).
-- Completion delivery: `scripts/run_tests.sh tests/gateway/test_completion_delivery.py -q` => `11 passed, 0 failed` after the canonical runner's automatic retry. Its first attempt hit a timing-only completion observation failure under concurrent suite load; the exact selector then passed five consecutive standalone runs.
-- Canonical relevant config/delegate/gap suite: `scripts/run_tests.sh tests/hermes_cli/test_config.py tests/hermes_cli/test_config_validation.py tests/tools/test_delegate.py tests/tools/test_delegated_parent_approval_gap.py -q` => `146 passed, 0 failed`.
-- `python -m py_compile` for all four modified Python paths and `git diff --check HEAD` passed.
-- Added-line static scan found no hardcoded secret, shell injection, `eval`/`exec`, pickle, SQL-formatting, or debug-print pattern.
+- Async delegation plus delegate suite: `scripts/run_tests.sh tests/tools/test_async_delegation.py tests/tools/test_delegate.py -q` => `83 passed, 0 failed`.
+- Completion delivery: `scripts/run_tests.sh tests/gateway/test_completion_delivery.py -q` => `11 passed, 0 failed`.
+- Config/config-validation/gap suite: `scripts/run_tests.sh tests/hermes_cli/test_config.py tests/hermes_cli/test_config_validation.py tests/tools/test_delegated_parent_approval_gap.py -q` => `73 passed, 0 failed`.
+- Desktop/TUI full file on the candidate: `518 passed, 1 failed`.
+- The same Desktop/TUI full-file result reproduced on detached parent baseline `a30085516b79a59849751bf8480bab9ba3f06237`: `518 passed, 1 failed`, with the same pre-existing suite-order flake `test_write_json_serializes_concurrent_writes`.
+- That flaky node passed five consecutive standalone runs; the related integration selector also passed five consecutive standalone runs. No bytes affecting the TUI implementation changed after that comparison, so the 500-test file was not rerun.
+- Final noninteractive and authentic async authority checks: `scripts/run_tests.sh tests/tools/test_delegated_parent_approval_desktop_async.py -q` => `9 passed, 0 failed`.
+- Final cron guard checks: `scripts/run_tests.sh tests/tools/test_cron_approval_mode.py -q` => `30 passed, 0 failed`.
+- Final approval/gateway guard checks: `scripts/run_tests.sh tests/tools/test_approval.py -q` => `96 passed, 0 failed`.
+- `.venv/bin/python -m py_compile tools/approval.py tests/tools/test_delegated_parent_approval_desktop_async.py` and `git diff --check` passed.
+- The final staged added-line scan found no hardcoded-secret assignment, shell injection, dangerous `eval`/`exec`, unsafe pickle deserialization, SQL-formatting injection, or debug-print pattern.
 
 ## Rollback
 
-Before commit: `git restore --source=a30085516b79a59849751bf8480bab9ba3f06237 -- <changed paths>`.
+Before successor commit: restore tracked paths from `f70b453274d7d5f37aa6176701e7546841eae543` and remove only `tests/tools/test_delegated_parent_approval_desktop_async.py`.
 
-After commit: `git revert <fix-commit>`; no activation is implied by the commit.
+After successor commit: `git revert <successor-commit>`. Reverting or committing does not activate, deploy, push, merge, or restart anything.
