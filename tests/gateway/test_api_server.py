@@ -983,7 +983,8 @@ class TestCronJobsBotOwnership:
             _api_request_profile.reset(token)
 
         assert body["scoped"] == "researcher"
-        assert body["jobs"][0]["bot_owner"] == "researcher"
+        assert body["bot_owner"] == "researcher"
+        assert body["jobs"] == [stored_job]
         assert "bot_owner" not in stored_job
 
 

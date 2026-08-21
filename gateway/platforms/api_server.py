@@ -6602,11 +6602,10 @@ class APIServerAdapter(BasePlatformAdapter):
             include_disabled = request.query.get("include_disabled", "").lower() in {"true", "1"}
             jobs = _cron_list(include_disabled=include_disabled)
             owner = self._bot_owner_for_request()
-            owned_jobs = [
-                {**job, "bot_owner": owner} if isinstance(job, dict) else job
-                for job in jobs
-            ]
-            return web.json_response({"jobs": owned_jobs, "scoped": owner})
+            # Preserve the established jobs payload exactly; clients may compare
+            # or cache those objects. Ownership is authoritative for the whole
+            # profile-scoped response, so report it once at the envelope level.
+            return web.json_response({"jobs": jobs, "scoped": owner, "bot_owner": owner})
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
