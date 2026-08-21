@@ -20,6 +20,7 @@ Public API (signatures preserved from the original 2,400-line version):
     check_tool_availability(quiet) -> tuple
 """
 
+import hashlib
 import os
 import json
 import re
@@ -312,6 +313,15 @@ _tool_defs_cache_lock = threading.Lock()
 _TOOL_DEFS_CACHE_MAX = 8
 
 
+def _config_content_fingerprint(config_path) -> bytes:
+    """Return a bounded-memory content fingerprint for a config file."""
+    digest = hashlib.sha256()
+    with config_path.open("rb") as config_file:
+        for chunk in iter(lambda: config_file.read(64 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
+
+
 def _clear_tool_defs_cache() -> None:
     """Drop memoized get_tool_definitions() results. Called when dynamic
     schema dependencies change (e.g. discord capability cache reset,
@@ -348,7 +358,7 @@ def get_tool_definitions(
     # The cache key captures every argument-level input; the registry
     # generation captures registry mutations (MCP refresh, plugin load).
     # check_fn results are TTL-cached one level down, inside
-    # registry.get_definitions. The config-mtime fingerprint below captures
+    # registry.get_definitions. The config-content fingerprint below captures
     # user-visible config edits that affect dynamic schemas (execute_code
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
@@ -357,8 +367,7 @@ def get_tool_definitions(
         try:
             from hermes_cli.config import get_config_path
             cfg_path = get_config_path()
-            cfg_stat = cfg_path.stat()
-            cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
+            cfg_fp = _config_content_fingerprint(cfg_path)
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
         profile_scope = check_fn_cache_scope()

@@ -17,6 +17,8 @@ These tests pin:
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import os
+from pathlib import Path
 from threading import Barrier
 
 import pytest
@@ -33,6 +35,62 @@ def _clear_cache():
 
 
 class TestQuietModeCacheIsolation:
+
+    def test_same_size_same_mtime_config_rewrite_recomputes_definitions(
+        self, tmp_path, monkeypatch
+    ):
+        """A content edit must invalidate the quiet-mode cache even when a
+        writer preserves both the config file's size and nanosecond mtime."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("toolsets:\n  - file\n", encoding="utf-8")
+        original_stat = config_file.stat()
+        monkeypatch.setattr(
+            "hermes_cli.config.get_config_path", lambda: config_file
+        )
+
+        calls = 0
+        original_compute = model_tools._compute_tool_definitions
+
+        def compute(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original_compute(*args, **kwargs)
+
+        monkeypatch.setattr(model_tools, "_compute_tool_definitions", compute)
+
+        model_tools.get_tool_definitions(
+            enabled_toolsets=["file"], quiet_mode=True
+        )
+        config_file.write_text("toolsets:\n  - test\n", encoding="utf-8")
+        os.utime(
+            config_file,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+        )
+        assert config_file.stat().st_size == original_stat.st_size
+        assert config_file.stat().st_mtime_ns == original_stat.st_mtime_ns
+
+        model_tools.get_tool_definitions(
+            enabled_toolsets=["file"], quiet_mode=True
+        )
+
+        assert calls == 2
+
+    def test_config_fingerprint_reads_in_bounded_chunks(self, tmp_path, monkeypatch):
+        """The hot cache path must not allocate the entire config file."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("toolsets:\n  - file\n", encoding="utf-8")
+        monkeypatch.setattr(
+            "hermes_cli.config.get_config_path", lambda: config_file
+        )
+
+        def fail_read_bytes(_path):
+            raise AssertionError("cache fingerprint must not use Path.read_bytes()")
+
+        monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+
+        assert model_tools.get_tool_definitions(
+            enabled_toolsets=["file"], quiet_mode=True
+        )
 
     def test_first_uncached_call_returns_fresh_list(self):
         """The first quiet_mode call must not alias the cached object \u2014
