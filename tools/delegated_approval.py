@@ -419,11 +419,15 @@ def _active_authority_matches(authority: DelegatedApprovalAuthority) -> bool:
         return False
     if authority.owner_session_id:
         try:
-            from tui_gateway.server import _current_session_steer_authority
-            transport, session_record = _current_session_steer_authority(authority.owner_session_id)
+            from tui_gateway.server import _session_generation_matches
         except Exception:
             return False
-        if transport is not authority.owner_transport or session_record is not authority.owner_session_record:
+        if not _session_generation_matches(
+            authority.owner_session_id,
+            authority.owner_transport,
+            authority.owner_session_record,
+            authority.owner_agent,
+        ):
             return False
     return True
 

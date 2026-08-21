@@ -6,6 +6,7 @@ import json
 import threading
 import time
 from dataclasses import FrozenInstanceError
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -17,6 +18,7 @@ from tools.delegate_tool import (
     _active_subagents,
     _active_subagents_lock,
     _handle_delegate_task,
+    _run_single_child,
 )
 from tools.process_registry import format_process_notification
 
@@ -57,6 +59,87 @@ def _authority(*, command: str = "python -c 'print(1)'", ui: bool = False):
             "accepting_steer": True,
         }
     return parent, child, authority
+
+
+def test_desktop_child_binds_live_owner_generation_from_parent_agent_identity():
+    """A worker-retained UI id + parent object must recover the exact generation."""
+    import tui_gateway.server as server
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tui_gateway.transport import bind_transport, reset_transport
+
+    owner_transport = object()
+    parent = MagicMock()
+    parent.session_id = "parent-desktop"
+    owner_record = {
+        "agent": parent,
+        "session_key": parent.session_id,
+        "transport": owner_transport,
+    }
+    child = MagicMock()
+    child._subagent_id = "subagent-desktop-owner"
+    child._delegate_depth = 1
+    child._parent_subagent_id = None
+    child._delegated_approval_metadata = {
+        "enabled": True,
+        "session_key": parent.session_id,
+        "delegation_id": "deleg-desktop-owner",
+        "parent_task_id": "parent-task",
+        "delegated_goal": "closed local expression",
+    }
+    child.session_id = "child-desktop"
+    child.model = "test-model"
+    observed = {}
+
+    def run_conversation(**_kwargs):
+        observed["authority"] = get_delegated_approval_authority()
+        return {
+            "final_response": "done",
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+    child.run_conversation.side_effect = run_conversation
+    server._sessions["ui-desktop-owner"] = owner_record
+    from tools.delegate_tool import _capture_gateway_steer_authority
+
+    assert _capture_gateway_steer_authority(
+        "ui-desktop-owner", object()
+    ) == (None, None)
+    session_tokens = set_session_vars(
+        source="desktop",
+        session_key=parent.session_id,
+        session_id=parent.session_id,
+        ui_session_id="ui-desktop-owner",
+    )
+    transport_token = bind_transport(None)
+    try:
+        _run_single_child(0, "closed local expression", child=child, parent_agent=parent)
+    finally:
+        reset_transport(transport_token)
+        clear_session_vars(session_tokens)
+        server._sessions.pop("ui-desktop-owner", None)
+
+    authority = observed["authority"]
+    assert isinstance(authority, da.DelegatedApprovalAuthority)
+    assert authority.owner_agent is parent
+    assert authority.child_agent is child
+    assert authority.owner_session_id == "ui-desktop-owner"
+    assert authority.owner_transport is owner_transport
+    assert authority.owner_session_record is owner_record
+    replacement = {
+        "agent": parent,
+        "session_key": parent.session_id,
+        "transport": owner_transport,
+    }
+    server._sessions["ui-desktop-owner"] = replacement
+    try:
+        assert not server._session_generation_matches(
+            "ui-desktop-owner", owner_transport, owner_record, parent
+        )
+    finally:
+        server._sessions.pop("ui-desktop-owner", None)
 
 
 @pytest.fixture(autouse=True)
@@ -522,8 +605,13 @@ def test_expiry_revocation_and_transport_generation_replacement_fail_closed(monk
     command = "python -m pytest tests/safe.py"
     parent, _, authority = _authority(command=command, ui=True)
     monkeypatch.setattr(
-        "tui_gateway.server._current_session_steer_authority",
-        lambda _sid: (authority.owner_transport, authority.owner_session_record),
+        "tui_gateway.server._session_generation_matches",
+        lambda sid, transport, record, owner: (
+            sid == authority.owner_session_id
+            and transport is authority.owner_transport
+            and record is authority.owner_session_record
+            and owner is authority.owner_agent
+        ),
     )
     monkeypatch.setattr(da, "_publish_parent_event", lambda event: None)
     thread, outcome, approval_id = _start_wait(authority, command, timeout=0.03)
@@ -533,8 +621,8 @@ def test_expiry_revocation_and_transport_generation_replacement_fail_closed(monk
 
     thread, outcome, approval_id = _start_wait(authority, command)
     monkeypatch.setattr(
-        "tui_gateway.server._current_session_steer_authority",
-        lambda _sid: (object(), object()),
+        "tui_gateway.server._session_generation_matches",
+        lambda _sid, _transport, _record, _owner: False,
     )
     thread.join(1)
     assert not thread.is_alive()

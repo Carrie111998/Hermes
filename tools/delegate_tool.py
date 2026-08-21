@@ -325,6 +325,7 @@ def steer_subagent(
 
 def _capture_gateway_steer_authority(
     owner_session_id: Optional[str],
+    owner_agent: Any = None,
 ) -> tuple[Any, Any]:
     """Capture exact request transport + live session generation, if any.
 
@@ -336,7 +337,14 @@ def _capture_gateway_steer_authority(
     try:
         from tui_gateway.server import _current_session_steer_authority
 
-        return _current_session_steer_authority(owner_session_id)
+        authority = _current_session_steer_authority(owner_session_id)
+        if authority != (None, None):
+            return authority
+        if owner_agent is not None:
+            from tui_gateway.server import _capture_agent_session_generation
+
+            return _capture_agent_session_generation(owner_session_id, owner_agent)
+        return None, None
     except Exception:
         return None, None
 
@@ -2456,7 +2464,7 @@ def _run_single_child_in_profile_scope(
             owner_transport is None or owner_session_record is None
         ):
             owner_transport, owner_session_record = (
-                _capture_gateway_steer_authority(owner_session_id)
+                _capture_gateway_steer_authority(owner_session_id, parent_agent)
             )
         _raw_depth = getattr(child, "_delegate_depth", 1)
         _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
@@ -3688,7 +3696,7 @@ def delegate_task(
     except Exception:
         _origin_ui_session_id = ""
     _origin_owner_transport, _origin_owner_session_record = (
-        _capture_gateway_steer_authority(_origin_ui_session_id)
+        _capture_gateway_steer_authority(_origin_ui_session_id, parent_agent)
     )
 
     # Build all child agents on the main thread (thread-safe construction).

@@ -1931,6 +1931,48 @@ def _current_session_steer_authority(
         return transport, session
 
 
+def _capture_agent_session_generation(
+    session_id: str,
+    owner_agent: Any,
+) -> tuple[Transport | None, dict | None]:
+    """Capture the exact live UI generation owned by ``owner_agent``.
+
+    Tool workers can retain the injected parent-agent object and UI session id
+    after the request transport ContextVar has been shed.  The public id remains
+    only a lookup hint: authority comes from exact identity with the live
+    session record's agent and transport objects.
+    """
+    if not session_id or owner_agent is None:
+        return None, None
+    with _sessions_lock:
+        session = _sessions.get(session_id)
+        if session is None or session.get("agent") is not owner_agent:
+            return None, None
+        transport = session.get("transport")
+        if transport is None:
+            return None, None
+        return transport, session
+
+
+def _session_generation_matches(
+    session_id: str,
+    transport: Any,
+    session_record: Any,
+    owner_agent: Any,
+) -> bool:
+    """Validate an opaque captured owner generation without ambient context."""
+    if not session_id or transport is None or session_record is None or owner_agent is None:
+        return False
+    with _sessions_lock:
+        session = _sessions.get(session_id)
+        if session is not session_record or not isinstance(session, dict):
+            return False
+        return (
+            session.get("transport") is transport
+            and session.get("agent") is owner_agent
+        )
+
+
 def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
     """Route inbound RPCs — long handlers to the pool, everything else inline.
 
