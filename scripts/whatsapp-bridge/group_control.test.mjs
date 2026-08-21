@@ -22,7 +22,7 @@ const request = {
   confirmedParticipants: ['15550001111:2@c.us'],
 };
 
-const token = '0123456789abcdef0123456789abcdef';
+const token = '0123456789abcdef'.repeat(2);
 assert.equal(authorizeGroupControl(`Bearer ${token}`, token), true);
 assert.equal(authorizeGroupControl('Bearer short', 'short'), false);
 assert.equal(authorizeGroupControl('', token), false);
