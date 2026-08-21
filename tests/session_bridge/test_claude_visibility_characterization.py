@@ -5,6 +5,7 @@ from datetime import timezone
 import json
 import os
 from pathlib import Path
+import subprocess
 import threading
 import time
 from typing import Any, Mapping
@@ -1703,10 +1704,7 @@ def test_claude_preflight_missing_global_config_fails_closed(tmp_path: Path) -> 
         )
         is None
     )
-    assert calls == [
-        ["claude", "--version"],
-        ["claude", "auth", "status", "--json"],
-    ]
+    assert calls == []
 
 
 def test_claude_preflight_surrogate_auth_output_fails_closed(tmp_path: Path) -> None:
@@ -3584,6 +3582,43 @@ def test_preflight_detail_names_command_error(tmp_path: Path) -> None:
 
     assert detail.startup is None
     assert detail.failure_code == "claude_visibility_preflight_failed_command_error"
+
+
+@pytest.mark.parametrize(
+    ("timed_out_argv", "expected_stage"),
+    [
+        (("claude", "--version"), "version"),
+        (("claude", "auth", "status", "--json"), "auth_status"),
+    ],
+)
+def test_preflight_detail_logs_the_timed_out_command_without_output(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    timed_out_argv: tuple[str, ...],
+    expected_stage: str,
+) -> None:
+    from session_bridge.cli import _claude_visibility_preflight_detail
+
+    global_config, user_settings = _preflight_state(tmp_path)
+    secret = "auth-output-must-not-reach-the-log"
+
+    def runner(argv: list[str], **_kwargs: Any) -> Any:
+        if tuple(argv) == timed_out_argv:
+            raise subprocess.TimeoutExpired(argv, 15.0, output=secret)
+        return _preflight_runner()(argv)
+
+    detail = _claude_visibility_preflight_detail(
+        ("claude",),
+        runner=runner,
+        global_config_path=global_config,
+        user_settings_path=user_settings,
+    )
+
+    assert detail.startup is None
+    assert detail.failure_code == "claude_visibility_preflight_failed_command_error"
+    assert f"stage={expected_stage}" in caplog.text
+    assert "kind=timeout" in caplog.text
+    assert secret not in caplog.text
 
 
 def test_preflight_detail_names_auth_output_too_large(tmp_path: Path) -> None:

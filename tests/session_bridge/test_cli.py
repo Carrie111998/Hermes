@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import subprocess
 from dataclasses import dataclass, field, replace
 from datetime import timezone
 from pathlib import Path
@@ -4775,7 +4776,340 @@ def test_claude_visibility_runtime_passes_only_preflight_theme_to_registrar(
 
     events.clear()
     assert backend._claude_visibility_runtime() is coordinator
-    assert events == ["resolve_executable", ("preflight", ("claude",))]
+    assert events == ["resolve_executable"]
+
+
+def test_claude_visibility_runtime_caches_only_successful_command_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = BridgeConfig()
+    backend = ProductionBackend(
+        replace(
+            config, claude_visibility=replace(config.claude_visibility, enabled=True)
+        )
+    )
+    now = [100.0]
+    command = ["claude"]
+    calls: list[tuple[str, ...]] = []
+    coordinator = object()
+
+    monkeypatch.setattr(cli_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable", lambda _name: tuple(command)
+    )
+
+    def command_preflight(command_value: tuple[str, ...]) -> Any:
+        calls.append(command_value)
+        if len(calls) > 1:
+            return cli_module._ClaudeVisibilityPreflight(
+                None, "claude_visibility_preflight_failed_command_error"
+            )
+        return cli_module._ClaudeVisibilityPreflight(
+            {
+                "version": "2.1.216",
+                "authentication": "available",
+                "theme": "light",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(
+        "session_bridge.cli._claude_visibility_preflight_detail", command_preflight
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli._claude_visibility_local_preflight_detail",
+        lambda: cli_module._ClaudeVisibilityPreflight(
+            {
+                "version": "2.1.216",
+                "authentication": "available",
+                "theme": "light",
+            },
+            None,
+        ),
+        raising=False,
+    )
+    backend._claude_visibility_coordinator = coordinator  # type: ignore[assignment]
+    backend._claude_visibility_startup_identity = (("claude",), "light")
+
+    assert backend._claude_visibility_runtime() is coordinator
+    now[0] += cli_module._CLAUDE_VISIBILITY_PREFLIGHT_TTL_SECONDS - 1.0
+    assert backend._claude_visibility_runtime() is coordinator
+    assert calls == [("claude",)]
+
+    now[0] += 2.0
+    with pytest.raises(
+        ProviderDegraded,
+        match="claude_visibility_preflight_failed_command_error",
+    ):
+        backend._claude_visibility_runtime()
+    assert calls == [("claude",), ("claude",)]
+
+
+def test_claude_visibility_preflight_failures_are_never_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(BridgeConfig())
+    calls = 0
+
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable", lambda _name: ("claude",)
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli._claude_visibility_local_preflight_detail",
+        lambda: cli_module._ClaudeVisibilityPreflight(
+            {
+                "version": "2.1.216",
+                "authentication": "available",
+                "theme": "light",
+            },
+            None,
+        ),
+    )
+
+    def preflight(_command: tuple[str, ...]) -> Any:
+        nonlocal calls
+        calls += 1
+        return cli_module._ClaudeVisibilityPreflight(
+            None, "claude_visibility_preflight_failed_command_error"
+        )
+
+    monkeypatch.setattr(
+        "session_bridge.cli._claude_visibility_preflight_detail", preflight
+    )
+
+    for _ in range(2):
+        with pytest.raises(ProviderDegraded):
+            backend._claude_visibility_runtime()
+    assert calls == 2
+
+
+def test_claude_visibility_command_change_invalidates_cached_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(BridgeConfig())
+    command = ["claude-a"]
+    calls: list[tuple[str, ...]] = []
+    coordinator = object()
+
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable", lambda _name: tuple(command)
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli._claude_visibility_local_preflight_detail",
+        lambda: cli_module._ClaudeVisibilityPreflight(
+            {
+                "version": "2.1.216",
+                "authentication": "available",
+                "theme": "light",
+            },
+            None,
+        ),
+    )
+
+    def preflight(command_value: tuple[str, ...]) -> Any:
+        calls.append(command_value)
+        if command_value == ("claude-b",):
+            return cli_module._ClaudeVisibilityPreflight(
+                None, "claude_visibility_preflight_failed_command_error"
+            )
+        return cli_module._ClaudeVisibilityPreflight(
+            {
+                "version": "2.1.216",
+                "authentication": "available",
+                "theme": "light",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(
+        "session_bridge.cli._claude_visibility_preflight_detail", preflight
+    )
+    backend._claude_visibility_coordinator = coordinator  # type: ignore[assignment]
+    backend._claude_visibility_startup_identity = (("claude-a",), "light")
+
+    assert backend._claude_visibility_runtime() is coordinator
+    command[0] = "claude-b"
+    with pytest.raises(
+        ProviderDegraded,
+        match="claude_visibility_preflight_failed_command_error",
+    ):
+        backend._claude_visibility_runtime()
+    assert calls == [("claude-a",), ("claude-b",)]
+
+
+def test_claude_visibility_theme_change_rebuilds_cached_coordinator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(BridgeConfig())
+    theme = ["light"]
+    command_preflights = 0
+    coordinators = [object(), object()]
+    coordinator_calls = 0
+
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable", lambda _name: ("claude",)
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli._claude_visibility_local_preflight_detail",
+        lambda: cli_module._ClaudeVisibilityPreflight(
+            {
+                "version": "2.1.216",
+                "authentication": "available",
+                "theme": theme[0],
+            },
+            None,
+        ),
+    )
+
+    def preflight(_command: tuple[str, ...]) -> Any:
+        nonlocal command_preflights
+        command_preflights += 1
+        return cli_module._ClaudeVisibilityPreflight(
+            {
+                "version": "2.1.216",
+                "authentication": "available",
+                "theme": theme[0],
+            },
+            None,
+        )
+
+    def coordinator_factory(**_kwargs: Any) -> object:
+        nonlocal coordinator_calls
+        coordinator = coordinators[coordinator_calls]
+        coordinator_calls += 1
+        return coordinator
+
+    monkeypatch.setattr(
+        "session_bridge.cli._claude_visibility_preflight_detail", preflight
+    )
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"m" * 32)
+    monkeypatch.setattr("session_bridge.cli.ClaudeSourceAdapter", lambda *_a, **_k: object())
+    monkeypatch.setattr("session_bridge.cli.ClaudeNativeRegistrar", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeVisibilityCoordinator", coordinator_factory
+    )
+    monkeypatch.setattr(backend, "_require_store", object)
+
+    assert backend._claude_visibility_runtime() is coordinators[0]
+    theme[0] = "dark"
+    assert backend._claude_visibility_runtime() is coordinators[1]
+    assert command_preflights == 1
+    assert backend._claude_visibility_startup_identity == (("claude",), "dark")
+
+
+def test_claude_visibility_close_clears_cached_preflight() -> None:
+    backend = ProductionBackend(BridgeConfig())
+    backend._claude_visibility_preflight_command = ("claude",)
+    backend._claude_visibility_preflight_at = 100.0
+
+    backend.close()
+
+    assert backend._claude_visibility_preflight_command is None
+    assert backend._claude_visibility_preflight_at is None
+
+
+@pytest.mark.parametrize(
+    "failure_code",
+    [
+        "claude_visibility_preflight_failed_config_dir_override",
+        "claude_visibility_preflight_failed_forced_onboarding",
+        "claude_visibility_preflight_failed_onboarding_incomplete",
+        "claude_visibility_preflight_failed_theme_unavailable",
+    ],
+)
+def test_claude_visibility_warm_cache_still_enforces_local_gates(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_code: str,
+) -> None:
+    backend = ProductionBackend(BridgeConfig())
+    backend._claude_visibility_preflight_command = ("claude",)
+    backend._claude_visibility_preflight_at = time.monotonic()
+
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable", lambda _name: ("claude",)
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli._claude_visibility_local_preflight_detail",
+        lambda: cli_module._ClaudeVisibilityPreflight(None, failure_code),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli._claude_visibility_preflight_detail",
+        lambda _command: (_ for _ in ()).throw(AssertionError("external preflight")),
+    )
+
+    with pytest.raises(ProviderDegraded, match=failure_code):
+        backend._claude_visibility_runtime()
+
+
+def test_bounded_run_reaps_direct_child_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+
+    class Stream:
+        def readline(self) -> str:
+            return ""
+
+        def close(self) -> None:
+            events.append("stream_closed")
+
+    class Process:
+        pid = 123
+        stdout = Stream()
+        stderr = Stream()
+        returncode = None
+
+        def wait(self, timeout: float) -> int:
+            events.append(("wait", timeout))
+            if timeout == 1.0:
+                raise subprocess.TimeoutExpired(["claude"], timeout)
+            self.returncode = -1
+            return -1
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: Process())
+    def kill_tree(pid: int) -> bool:
+        events.append(("kill_tree", pid))
+        return True
+
+    monkeypatch.setattr(cli_module, "_kill_process_tree", kill_tree)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        cli_module._bounded_run(["claude"], timeout=1.0)
+
+    waits_and_kill = [event for event in events if event != "stream_closed"]
+    assert waits_and_kill == [("wait", 1.0), ("kill_tree", 123), ("wait", 2.0)]
+    assert events.count("stream_closed") == 2
+
+
+def test_bounded_run_logs_incomplete_timeout_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class Stream:
+        def readline(self) -> str:
+            return ""
+
+        def close(self) -> None:
+            pass
+
+    class Process:
+        pid = 456
+        stdout = Stream()
+        stderr = Stream()
+        returncode = None
+
+        def wait(self, timeout: float) -> int:
+            raise subprocess.TimeoutExpired(["claude"], timeout)
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: Process())
+    monkeypatch.setattr(cli_module, "_kill_process_tree", lambda _pid: False)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        cli_module._bounded_run(["claude"], timeout=1.0)
+
+    assert "bounded subprocess cleanup incomplete" in caplog.text
+    assert "tree_killed=False" in caplog.text
+    assert "reaped=False" in caplog.text
 
 
 def test_claude_visibility_inventory_reuses_indexed_codex_and_fast_state_db(

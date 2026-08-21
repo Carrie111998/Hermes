@@ -165,6 +165,7 @@ _CLAUDE_FORCED_ONBOARDING_ENVIRONMENTS = (
 _MAX_CLAUDE_AUTH_STATUS_BYTES = 16_384
 _MAX_CLAUDE_GLOBAL_CONFIG_BYTES = 4 * 1024 * 1024
 _MAX_CLAUDE_USER_SETTINGS_BYTES = 4 * 1024 * 1024
+_CLAUDE_VISIBILITY_PREFLIGHT_TTL_SECONDS = 300.0
 _CLAUDE_CHARACTERIZATION_SYNC_LIMIT = 100
 _SIDEBAR_CREATE_RESERVATION_CUTOVER_STATE_KEY = (
     "session-bridge:sidebar:create-reservation-cutover:v1"
@@ -248,11 +249,11 @@ def _run_continuous_sidebar_recovery_worker(
         close()
 
 
-def _kill_process_tree(pid: int) -> None:
+def _kill_process_tree(pid: int) -> bool:
     """Kill a process AND its descendants. Best-effort; never raises."""
     try:
         if os.name == "nt":
-            subprocess.run(
+            completed = subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -260,10 +261,11 @@ def _kill_process_tree(pid: int) -> None:
                 timeout=10.0,
                 check=False,
             )
-        else:  # pragma: no cover - posix path
-            os.killpg(os.getpgid(pid), 9)
+            return completed.returncode == 0
+        os.killpg(os.getpgid(pid), 9)  # pragma: no cover - posix path
+        return True  # pragma: no cover - posix path
     except Exception:
-        pass
+        return False
 
 
 def _bounded_run(
@@ -343,7 +345,20 @@ def _bounded_run(
     try:
         returncode = proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        _kill_process_tree(proc.pid)
+        tree_killed = _kill_process_tree(proc.pid)
+        reaped = False
+        try:
+            proc.wait(timeout=2.0)
+            reaped = True
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if not tree_killed or not reaped:
+            _LOG.warning(
+                "bounded subprocess cleanup incomplete pid=%s tree_killed=%s reaped=%s",
+                proc.pid,
+                tree_killed,
+                reaped,
+            )
         raise
     finally:
         # Bounded: a leaked grandchild handle must not strand the caller.
@@ -374,6 +389,90 @@ class _ClaudeVisibilityPreflight(NamedTuple):
     failure_code: str | None
 
 
+def _claude_visibility_local_preflight_detail(
+    *,
+    global_config_path: Path | str | None = None,
+    user_settings_path: Path | str | None = None,
+) -> _ClaudeVisibilityPreflight:
+    """Recheck cheap local startup gates without launching Claude."""
+
+    def _refused(code: str) -> _ClaudeVisibilityPreflight:
+        return _ClaudeVisibilityPreflight(None, code)
+
+    if "CLAUDE_CONFIG_DIR" in os.environ:
+        return _refused("claude_visibility_preflight_failed_config_dir_override")
+    if any(
+        os.environ.get(name) in _CLAUDE_FORCED_ONBOARDING
+        for name in _CLAUDE_FORCED_ONBOARDING_ENVIRONMENTS
+    ):
+        return _refused("claude_visibility_preflight_failed_forced_onboarding")
+    selected_config = (
+        Path(global_config_path)
+        if global_config_path is not None
+        else _resolve_default_claude_global_config_path()
+    )
+    if not _read_claude_completed_onboarding(selected_config):
+        return _refused("claude_visibility_preflight_failed_onboarding_incomplete")
+    selected_settings = (
+        Path(user_settings_path)
+        if user_settings_path is not None
+        else Path.home() / ".claude" / "settings.json"
+    )
+    theme = _read_claude_startup_theme(selected_settings)
+    if theme is None:
+        return _refused("claude_visibility_preflight_failed_theme_unavailable")
+    return _ClaudeVisibilityPreflight(
+        {
+            "version": _CLAUDE_VISIBILITY_PINNED_VERSION,
+            "authentication": "available",
+            "theme": theme,
+        },
+        None,
+    )
+
+
+def _run_claude_preflight_command(
+    stage: str,
+    argv: Sequence[str],
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+    child_env: Mapping[str, str],
+) -> subprocess.CompletedProcess[str] | None:
+    started = time.monotonic()
+    try:
+        completed = runner(
+            list(argv),
+            capture_output=True,
+            text=True,
+            timeout=15.0,
+            stdin=subprocess.DEVNULL,
+            shell=False,
+            check=False,
+            env=child_env,
+        )
+    except subprocess.TimeoutExpired:
+        _LOG.warning(
+            "Claude visibility preflight command failed stage=%s kind=timeout elapsed_ms=%d",
+            stage,
+            round((time.monotonic() - started) * 1000),
+        )
+        return None
+    except (OSError, subprocess.SubprocessError):
+        _LOG.warning(
+            "Claude visibility preflight command failed stage=%s kind=subprocess_error elapsed_ms=%d",
+            stage,
+            round((time.monotonic() - started) * 1000),
+        )
+        return None
+    _LOG.debug(
+        "Claude visibility preflight command completed stage=%s returncode=%d elapsed_ms=%d",
+        stage,
+        completed.returncode,
+        round((time.monotonic() - started) * 1000),
+    )
+    return completed
+
+
 def _claude_visibility_preflight_detail(
     command: Sequence[str],
     *,
@@ -393,38 +492,30 @@ def _claude_visibility_preflight_detail(
 
     # Transcript discovery is fixed to ~/.claude/projects. An alternate config
     # root would make the startup state and transcript roots disagree.
-    if "CLAUDE_CONFIG_DIR" in os.environ:
-        return _refused("claude_visibility_preflight_failed_config_dir_override")
-    if any(
-        os.environ.get(name) in _CLAUDE_FORCED_ONBOARDING
-        for name in _CLAUDE_FORCED_ONBOARDING_ENVIRONMENTS
-    ):
-        return _refused("claude_visibility_preflight_failed_forced_onboarding")
+    local = _claude_visibility_local_preflight_detail(
+        global_config_path=global_config_path,
+        user_settings_path=user_settings_path,
+    )
+    if local.startup is None:
+        return local
 
     child_env = os.environ.copy()
     child_env["DISABLE_UPDATES"] = "1"
-    try:
-        version = runner(
-            [*command, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=15.0,
-            stdin=subprocess.DEVNULL,
-            shell=False,
-            check=False,
-            env=child_env,
-        )
-        authentication = runner(
-            [*command, "auth", "status", "--json"],
-            capture_output=True,
-            text=True,
-            timeout=15.0,
-            stdin=subprocess.DEVNULL,
-            shell=False,
-            check=False,
-            env=child_env,
-        )
-    except (OSError, subprocess.SubprocessError):
+    version = _run_claude_preflight_command(
+        "version",
+        [*command, "--version"],
+        runner=runner,
+        child_env=child_env,
+    )
+    if version is None:
+        return _refused("claude_visibility_preflight_failed_command_error")
+    authentication = _run_claude_preflight_command(
+        "auth_status",
+        [*command, "auth", "status", "--json"],
+        runner=runner,
+        child_env=child_env,
+    )
+    if authentication is None:
         return _refused("claude_visibility_preflight_failed_command_error")
     auth_output = authentication.stdout
     if type(auth_output) is not str:
@@ -447,21 +538,7 @@ def _claude_visibility_preflight_detail(
         return _refused("claude_visibility_preflight_failed_auth_output_invalid")
     if auth_status.get("loggedIn") is not True:
         return _refused("claude_visibility_preflight_failed_not_logged_in")
-    selected_config = (
-        Path(global_config_path)
-        if global_config_path is not None
-        else _resolve_default_claude_global_config_path()
-    )
-    if not _read_claude_completed_onboarding(selected_config):
-        return _refused("claude_visibility_preflight_failed_onboarding_incomplete")
-    selected_settings = (
-        Path(user_settings_path)
-        if user_settings_path is not None
-        else Path.home() / ".claude" / "settings.json"
-    )
-    theme = _read_claude_startup_theme(selected_settings)
-    if theme is None:
-        return _refused("claude_visibility_preflight_failed_theme_unavailable")
+    theme = cast(dict[str, str], local.startup)["theme"]
     return _ClaudeVisibilityPreflight(
         {
             "version": _CLAUDE_VISIBILITY_PINNED_VERSION,
@@ -901,6 +978,8 @@ class ProductionBackend:
         self._claude_visibility_startup_identity: tuple[tuple[str, ...], str] | None = (
             None
         )
+        self._claude_visibility_preflight_command: tuple[str, ...] | None = None
+        self._claude_visibility_preflight_at: float | None = None
         self._codex_client: RecoveringCodexAppServerClient | None = None
         self._sidebar_codex_client: CodexAppServerClient | None = None
         self._sidebar_registration_codex_client: CodexAppServerClient | None = None
@@ -925,6 +1004,8 @@ class ProductionBackend:
         self._coordinator = None
         self._claude_visibility_coordinator = None
         self._claude_visibility_startup_identity = None
+        self._claude_visibility_preflight_command = None
+        self._claude_visibility_preflight_at = None
 
         first_error: BaseException | None = None
         closed_clients: set[int] = set()
@@ -2898,10 +2979,26 @@ class ProductionBackend:
             raise
         except Exception as exc:
             raise ProviderDegraded("claude_visibility_runtime_unavailable") from exc
-        preflight = _claude_visibility_preflight_detail(claude_command)
-        if preflight.startup is None:
-            raise ProviderDegraded(cast(str, preflight.failure_code))
-        startup = preflight.startup
+        local = _claude_visibility_local_preflight_detail()
+        if local.startup is None:
+            raise ProviderDegraded(cast(str, local.failure_code))
+        now = time.monotonic()
+        command_identity = tuple(claude_command)
+        cached_at = self._claude_visibility_preflight_at
+        command_evidence_is_fresh = (
+            self._claude_visibility_preflight_command == command_identity
+            and cached_at is not None
+            and now - cached_at < _CLAUDE_VISIBILITY_PREFLIGHT_TTL_SECONDS
+        )
+        if command_evidence_is_fresh:
+            startup = cast(dict[str, str], local.startup)
+        else:
+            preflight = _claude_visibility_preflight_detail(claude_command)
+            if preflight.startup is None:
+                raise ProviderDegraded(cast(str, preflight.failure_code))
+            startup = preflight.startup
+            self._claude_visibility_preflight_command = command_identity
+            self._claude_visibility_preflight_at = now
         startup_identity = (tuple(claude_command), startup["theme"])
         if (
             self._claude_visibility_coordinator is not None
