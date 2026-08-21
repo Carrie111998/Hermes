@@ -15,7 +15,10 @@ Runs on any host: psutil interactions go through a fake module.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
+import textwrap
+import time
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -179,6 +182,103 @@ def test_corrupt_ledger_quarantined_not_rewritten_blind(tmp_path):
     assert parked.read_text(encoding="utf-8") == "{ not json"
     entries = json.loads(ledger.read_text(encoding="utf-8"))
     assert [e["pid"] for e in entries] == [999]
+
+
+def test_register_self_serializes_real_interpreter_ledger_writes(tmp_path):
+    """A second process cannot read a stale ledger while the first writes it."""
+    ledger = tmp_path / "spawn-ledger.json"
+    sync = tmp_path / "sync"
+    sync.mkdir()
+    child_script = textwrap.dedent(
+        """
+        import os
+        import sys
+        import time
+        from pathlib import Path
+
+        from hermes_cli import process_identity as pi
+
+        ledger = Path(sys.argv[1])
+        sync = Path(sys.argv[2])
+        name = sys.argv[3]
+        original_read = pi._read_ledger
+
+        def coordinated_read(path):
+            entries = original_read(path)
+            (sync / (name + ".read")).write_text("ready", encoding="utf-8")
+            while not (sync / "release").exists():
+                time.sleep(0.01)
+            return entries
+
+        pi._ledger_path = lambda: ledger
+        pi._read_ledger = coordinated_read
+        pi._own_create_time = lambda: float(os.getpid())
+        pi._pid_alive_matches = lambda _pid, _create: True
+        (sync / (name + ".started")).write_text("started", encoding="utf-8")
+        while not (sync / ("go-" + name)).exists():
+            time.sleep(0.01)
+        if not pi.register_self("serve", project_root=ledger.parent):
+            raise SystemExit(2)
+        (sync / (name + ".done")).write_text("done", encoding="utf-8")
+        while not (sync / "finish").exists():
+            time.sleep(0.01)
+        """
+    )
+
+    def wait_for(path, timeout=10.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if path.exists():
+                return True
+            time.sleep(0.01)
+        return path.exists()
+
+    root = Path(__file__).resolve().parents[2]
+
+    def launch(name):
+        return subprocess.Popen(
+            [sys.executable, "-c", child_script, str(ledger), str(sync), name],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    children = []
+    try:
+        first = launch("first")
+        children.append(first)
+        assert wait_for(sync / "first.started")
+        (sync / "go-first").write_text("go", encoding="utf-8")
+        assert wait_for(sync / "first.read")
+
+        second = launch("second")
+        children.append(second)
+        assert wait_for(sync / "second.started")
+        (sync / "go-second").write_text("go", encoding="utf-8")
+
+        # The first child has already read an empty ledger and remains paused.
+        # Without an interprocess lock, the second child reaches the same read
+        # barrier before release; with one it blocks until the first replaces
+        # the ledger. This is a state handshake, not a sleep-only race.
+        second_read_before_release = wait_for(sync / "second.read", timeout=1.0)
+        (sync / "release").write_text("release", encoding="utf-8")
+        assert wait_for(sync / "first.done")
+        assert wait_for(sync / "second.done")
+
+        pids = {entry["pid"] for entry in json.loads(ledger.read_text(encoding="utf-8"))}
+        assert pids == {first.pid, second.pid}
+        assert not second_read_before_release
+    finally:
+        (sync / "release").touch()
+        (sync / "finish").touch()
+        for child in children:
+            try:
+                stdout, stderr = child.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                stdout, stderr = child.communicate()
+            assert child.returncode == 0, stdout + stderr
 
 
 def test_ledger_entries_filters_dead_reused_and_foreign(tmp_path):
