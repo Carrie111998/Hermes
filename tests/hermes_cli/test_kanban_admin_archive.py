@@ -906,10 +906,8 @@ class TestAdminArchiveGraph:
             kb.recompute_ready(db2)
         oracle = {key: kb.get_task(db2, built2[key]).status
                   for key in built2 if key not in ("r", "d")}
-        promoted_oracle = sorted(
-            built2[key] for key, status in oracle.items()
-            if status in ("ready", "review")
-        )
+        promoted_keys = {key for key, status in oracle.items()
+                         if status in ("ready", "review")}
         db2.close()
 
         db = make_conn(board)
@@ -930,7 +928,12 @@ class TestAdminArchiveGraph:
         assert result["would_promote"] == sorted(
             children[key] for key in ("c1", "c4", "c7", "c8")
         )
-        assert set(result["would_promote"]) == set(promoted_oracle)
+        # The kernel board's random task ids can never equal the oracle
+        # board's random ids (each board generates an independent id space),
+        # so compare promoted fixture KEYS instead: the canonical set is
+        # exactly {c1, c4, c7, c8}.
+        id_to_key = {tid: key for key, tid in children.items()}
+        assert {id_to_key[tid] for tid in result["would_promote"]} == promoted_keys
         statuses = _statuses(db)
         assert statuses[r] == "archived"
         for key in ("c1", "c4", "c5", "c6", "c7", "c8"):
