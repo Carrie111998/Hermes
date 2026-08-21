@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json as jsonlib
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -61,17 +62,26 @@ def _patch_list_profiles(names: list[str]):
     profiles_mod.list_profiles() to build the roster + valid-set, and
     profiles_mod.profile_exists() to resolve orchestrator/default."""
     from types import SimpleNamespace
+
     fake_profiles = [
         SimpleNamespace(
-            name=n, is_default=(i == 0), description=f"desc for {n}",
-            description_auto=False, model="m", provider="p", skill_count=1,
+            name=n,
+            is_default=(i == 0),
+            description=f"desc for {n}",
+            description_auto=False,
+            model="m",
+            provider="p",
+            skill_count=1,
         )
         for i, n in enumerate(names)
     ]
     return [
         patch("hermes_cli.profiles.list_profiles", return_value=fake_profiles),
         patch("hermes_cli.profiles.profile_exists", side_effect=lambda x: x in names),
-        patch("hermes_cli.profiles.get_active_profile_name", return_value=names[0] if names else "default"),
+        patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            return_value=names[0] if names else "default",
+        ),
     ]
 
 
@@ -83,8 +93,18 @@ def test_decompose_with_fanout_creates_children(kanban_home):
         "fanout": True,
         "rationale": "test split",
         "tasks": [
-            {"title": "research", "body": "look it up", "assignee": "researcher", "parents": []},
-            {"title": "build", "body": "code it", "assignee": "engineer", "parents": [0]},
+            {
+                "title": "research",
+                "body": "look it up",
+                "assignee": "researcher",
+                "parents": [],
+            },
+            {
+                "title": "build",
+                "body": "code it",
+                "assignee": "engineer",
+                "parents": [0],
+            },
         ],
     })
 
@@ -129,9 +149,13 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
     for p in patches:
         p.start()
     try:
-        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
-            "hermes_cli.kanban_decompose._load_config",
-            return_value={"kanban": {"default_assignee": "fallback"}},
+        with (
+            _patch_aux_client(llm_payload),
+            _patch_extra_body(),
+            patch(
+                "hermes_cli.kanban_decompose._load_config",
+                return_value={"kanban": {"default_assignee": "fallback"}},
+            ),
         ):
             outcome = decomp.decompose_task(tid, author="me")
     finally:
@@ -161,3 +185,111 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_decompose_suppresses_dirty_persistent_git_workspace_before_llm(
+    kanban_home, tmp_path
+):
+    workspace = tmp_path / "partial-work"
+    workspace.mkdir()
+    subprocess = __import__("subprocess")
+    subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(workspace),
+            "-c",
+            "user.name=Tests",
+            "-c",
+            "user.email=tests@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "baseline",
+        ],
+        check=True,
+    )
+    (workspace / "partial.py").write_text("unfinished = True\n", encoding="utf-8")
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="continue partial work",
+            triage=True,
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
+        outcome = decomp.decompose_task(tid, author="dispatcher")
+
+    assert outcome.ok is False
+    assert outcome.reason == "persistent Git workspace contains partial dirty work"
+    call_llm.assert_not_called()
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "triage"
+    assert (workspace / "partial.py").read_text(
+        encoding="utf-8"
+    ) == "unfinished = True\n"
+
+
+def test_partial_workspace_guard_ignores_clean_git_and_non_git_paths(tmp_path):
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    subprocess = __import__("subprocess")
+    subprocess.run(["git", "init", "-q", str(clean)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(clean),
+            "-c",
+            "user.name=Tests",
+            "-c",
+            "user.email=tests@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "baseline",
+        ],
+        check=True,
+    )
+    non_git = tmp_path / "non-git"
+    non_git.mkdir()
+
+    assert (
+        decomp._persistent_workspace_has_partial_work(
+            SimpleNamespace(workspace_kind="dir", workspace_path=str(clean))
+        )
+        is False
+    )
+    assert (
+        decomp._persistent_workspace_has_partial_work(
+            SimpleNamespace(workspace_kind="dir", workspace_path=str(non_git))
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize("failure", ["error", "timeout"])
+def test_partial_workspace_guard_fails_closed_for_unreadable_git_metadata(
+    tmp_path, monkeypatch, failure
+):
+    workspace = tmp_path / "unreadable-git"
+    workspace.mkdir()
+    (workspace / ".git").mkdir()
+
+    def fail_status(argv, **_kwargs):
+        if failure == "timeout":
+            raise decomp.subprocess.TimeoutExpired(["git", "status"], timeout=5)
+        return decomp.subprocess.CompletedProcess(argv, 128, b"", b"fatal")
+
+    monkeypatch.setattr(decomp.subprocess, "run", fail_status)
+
+    assert (
+        decomp._persistent_workspace_has_partial_work(
+            SimpleNamespace(workspace_kind="dir", workspace_path=str(workspace))
+        )
+        is True
+    )
