@@ -5502,6 +5502,27 @@ async function answerGroupClarify(entry, member, answers) {
   }
 }
 
+/** Submit one closed-set approval choice immediately. The ref-backed lock is
+ *  taken before the RPC starts, so two clicks in the same React render cannot
+ *  emit duplicate approval.respond requests. A failed request releases the
+ *  lock without clearing the mirrored card, allowing an explicit retry. */
+async function submitGroupApprovalChoice(entry, member, choice, pendingRef, onSending) {
+  if (!member || pendingRef.current) {
+    return false
+  }
+
+  pendingRef.current = true
+  onSending(true)
+
+  try {
+    await answerGroupClarify(entry, member, choice)
+    return true
+  } finally {
+    pendingRef.current = false
+    onSending(false)
+  }
+}
+
 /** One member turn, gateway-native: submit the room delta as a prompt into
  *  the member's per-group session, then poll the session until a NEW
  *  assistant message lands (or timeout → pass). While the session visibly
@@ -10016,6 +10037,7 @@ function GroupClarifyCard({ entry, members }) {
   const [drafts, setDrafts] = useState({})
   const [picked, setPicked] = useState({})
   const [sending, setSending] = useState(false)
+  const approvalPendingRef = useRef(false)
   const questions = entry.questions && entry.questions.length
     ? entry.questions.map((q, i) => ({
         qid: q?.qid ?? q?.id ?? `q${i}`,
@@ -10037,15 +10059,29 @@ function GroupClarifyCard({ entry, members }) {
 
   const allAnswered = questions.every(q => answerFor(q))
 
-  const submit = async () => {
-    if (!member || sending || !allAnswered) {
+  const submit = async approvalChoice => {
+    if (!member || (!isApproval && (sending || !allAnswered))) {
       return
     }
 
-    setSending(true)
+    if (!isApproval) {
+      setSending(true)
+    }
 
     try {
-      if (isApproval || !(entry.questions && entry.questions.length)) {
+      if (isApproval) {
+        const submitted = await submitGroupApprovalChoice(
+          entry,
+          member,
+          approvalChoice,
+          approvalPendingRef,
+          setSending
+        )
+
+        if (!submitted) {
+          return
+        }
+      } else if (!(entry.questions && entry.questions.length)) {
         await answerGroupClarify(entry, member, answerFor(questions[0]))
       } else {
         const answers = {}
@@ -10059,7 +10095,7 @@ function GroupClarifyCard({ entry, members }) {
 
       // Echo the exchange into the room log so the thread reads complete.
       const summary = isApproval
-        ? `${answerFor(questions[0])} — ${entry.command || entry.question || 'command approval'}`
+        ? `${approvalChoice} — ${entry.command || entry.question || 'command approval'}`
         : questions
             .map(q => (questions.length > 1 ? `${q.question}: ${answerFor(q)}` : answerFor(q)))
             .join('\n')
@@ -10067,7 +10103,9 @@ function GroupClarifyCard({ entry, members }) {
     } catch (err) {
       host.notify({ kind: 'error', message: `Could not send the answer to @${botHandle(entry.member, member)}: ${err?.message || err}` })
     } finally {
-      setSending(false)
+      if (!isApproval) {
+        setSending(false)
+      }
     }
   }
 
@@ -10114,8 +10152,16 @@ function GroupClarifyCard({ entry, members }) {
                         'h-6 px-2 text-[0.7rem]',
                         isApproval && choice === 'deny' && !chosen && 'text-destructive'
                       ),
+                      disabled: sending || !member,
                       onClick: () => {
                         setDrafts(prev => ({ ...prev, [q.qid]: '' }))
+
+                        if (isApproval) {
+                          setPicked(prev => ({ ...prev, [q.qid]: [choice] }))
+                          void submit(choice)
+                          return
+                        }
+
                         setPicked(prev => {
                           const current = prev[q.qid] || []
                           const next = q.multiSelect
@@ -10157,15 +10203,17 @@ function GroupClarifyCard({ entry, members }) {
           ]
         }, `q:${q.qid}`)
       ),
-      jsx('div', {
-        className: 'flex justify-end',
-        children: jsx(Button, {
-          size: 'sm',
-          disabled: sending || !allAnswered || !member,
-          onClick: () => void submit(),
-          children: sending ? 'Sending…' : isApproval ? 'Respond' : 'Answer'
-        })
-      })
+      isApproval
+        ? null
+        : jsx('div', {
+            className: 'flex justify-end',
+            children: jsx(Button, {
+              size: 'sm',
+              disabled: sending || !allAnswered || !member,
+              onClick: () => void submit(),
+              children: sending ? 'Sending…' : 'Answer'
+            })
+          })
     ]
   })
 }

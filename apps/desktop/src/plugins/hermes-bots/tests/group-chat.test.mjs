@@ -196,7 +196,7 @@ function load(turnScript, { busyUntilResumeCall, clarifyUntilResumeCall, approva
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
+      '\nglobalThis.__gc = { sendToGroupChat, runGroupChatRounds, harvestStrandedGroupReply, resolveGroupResponders, parseGroupChatMentions, rotateGroupSpeakers, isGroupPassText, formatGroupChatLine, buildGroupChatTurnPrompt, trimGroupChatLog, groupChatSyncSnapshot, groupChatGatewayJsonSize, mergeGroupChatSyncSnapshots, mergeRemoteGroupChatSnapshotIntoRooms, scheduleGroupChatServerSync, disbandGroupChat, renameGroupChat, updateGroupChat, durableGroupChatRooms, persistGroupChatRooms, ensureGroupChatSession, uniqueGroupChatName, liveGroupChatNames, openGroupChat, closeGroupChatMainTab, shouldRenderGroupChatInPane, syncGroupClarify, clearGroupClarify, answerGroupClarify, submitGroupApprovalChoice: typeof submitGroupApprovalChoice === "function" ? submitGroupApprovalChoice : undefined, $groupClarify, $groupChats, $groupNeedsYou, $groupChatWorkspace, $groupMainTabsRev, $botMeta, GROUP_CHAT_MAX_ROUNDS, GROUP_CHAT_MAX_MESSAGES };\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -1809,6 +1809,120 @@ test('answerGroupClarify routes approvals through approval.respond with session 
   )
   assert.equal(gc.clarifyResponds.length, 0, 'approvals never touch the clarify wire')
   assert.equal(Object.keys(gc.$groupClarify.get()).length, 0)
+})
+
+test('approval choices submit immediately for every server choice', async () => {
+  for (const choice of ['once', 'session', 'always', 'deny']) {
+    const gc = load(() => '(pass)')
+    const member = { name: 'research', title: '' }
+
+    gc.syncGroupClarify('Core', member, {
+      session_id: 'rt-research-1',
+      pending_approval: { ...APPROVAL_PAYLOAD, choices: ['once', 'session', 'always', 'deny'] }
+    })
+    const entry = Object.values(gc.$groupClarify.get())[0]
+
+    const submitted = await gc.submitGroupApprovalChoice(entry, member, choice, { current: false }, () => undefined)
+
+    assert.equal(submitted, true)
+    assert.deepEqual(gc.approvalResponds, [
+      { session_id: 'rt-research-1', request_id: 'req-approval-1', choice }
+    ])
+  }
+})
+
+test('approval submission locks before the RPC so duplicate clicks send exactly once', async () => {
+  const gc = load(() => '(pass)')
+  const member = { name: 'research', title: '' }
+  let release
+  const response = new Promise(resolve => {
+    release = resolve
+  })
+
+  gc.host.request = async (method, params) => {
+    if (method === 'approval.respond') {
+      gc.approvalResponds.push({ ...params })
+      return response
+    }
+    return {}
+  }
+  gc.syncGroupClarify('Core', member, { session_id: 'rt-research-1', pending_approval: APPROVAL_PAYLOAD })
+  const entry = Object.values(gc.$groupClarify.get())[0]
+  const pending = { current: false }
+  const sending = []
+
+  const first = gc.submitGroupApprovalChoice(entry, member, 'once', pending, value => sending.push(value))
+  const duplicate = await gc.submitGroupApprovalChoice(entry, member, 'once', pending, value => sending.push(value))
+
+  assert.equal(duplicate, false)
+  assert.equal(gc.approvalResponds.length, 1)
+  assert.equal(pending.current, true)
+  release({ resolved: true })
+  assert.equal(await first, true)
+  assert.equal(pending.current, false)
+  assert.deepEqual(sending, [true, false])
+})
+
+test('failed approval submission unlocks and keeps the card retryable', async () => {
+  const gc = load(() => '(pass)')
+  const member = { name: 'research', title: '' }
+  let attempts = 0
+
+  gc.host.request = async (method, params) => {
+    if (method !== 'approval.respond') {
+      return {}
+    }
+    attempts += 1
+    gc.approvalResponds.push({ ...params })
+    if (attempts === 1) {
+      throw new Error('request expired')
+    }
+    return { resolved: true }
+  }
+  gc.syncGroupClarify('Core', member, { session_id: 'rt-research-1', pending_approval: APPROVAL_PAYLOAD })
+  const entry = Object.values(gc.$groupClarify.get())[0]
+  const pending = { current: false }
+
+  await assert.rejects(
+    gc.submitGroupApprovalChoice(entry, member, 'deny', pending, () => undefined),
+    /request expired/
+  )
+  assert.equal(pending.current, false)
+  assert.equal(Object.keys(gc.$groupClarify.get()).length, 1, 'failed response leaves the pending card intact')
+
+  assert.equal(await gc.submitGroupApprovalChoice(entry, member, 'deny', pending, () => undefined), true)
+  assert.equal(attempts, 2)
+  assert.equal(Object.keys(gc.$groupClarify.get()).length, 0)
+})
+
+test('remote member approval submits through that member source', async () => {
+  const gc = load(() => '(pass)')
+  const member = { name: 'research', remoteSource: true, connectionId: 'gw-remote' }
+  const remoteRequests = []
+
+  gc.host.requestProfile = async (route, method, params) => {
+    remoteRequests.push({ route, method, params })
+    return { resolved: true }
+  }
+  gc.syncGroupClarify('Core', member, { session_id: 'rt-remote-1', pending_approval: APPROVAL_PAYLOAD })
+  const entry = Object.values(gc.$groupClarify.get())[0]
+
+  assert.equal(
+    await gc.submitGroupApprovalChoice(entry, member, 'session', { current: false }, () => undefined),
+    true
+  )
+  assert.equal(remoteRequests.length, 1)
+  assert.equal(remoteRequests[0].route.connectionId, 'gw-remote')
+  assert.equal(remoteRequests[0].route.profile, 'research')
+  assert.equal(remoteRequests[0].method, 'approval.respond')
+  assert.equal(
+    JSON.stringify(remoteRequests[0].params),
+    JSON.stringify({
+      session_id: 'rt-remote-1',
+      request_id: 'req-approval-1',
+      choice: 'session'
+    })
+  )
 })
 
 test('clarify outranks approval when a snapshot carries both', () => {
