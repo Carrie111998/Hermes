@@ -2988,8 +2988,13 @@ class FeishuAdapter(BasePlatformAdapter):
 
     def _event_identity_scope(self, data: Any) -> str:
         """Return the app-and-tenant namespace for an inbound Feishu event."""
-        header = getattr(data, "header", None)
-        tenant_key = str(getattr(header, "tenant_key", "") or "").strip()
+        header = data.get("header") if isinstance(data, dict) else getattr(data, "header", None)
+        tenant_key = (
+            header.get("tenant_key")
+            if isinstance(header, dict)
+            else getattr(header, "tenant_key", "")
+        )
+        tenant_key = str(tenant_key or "").strip()
         app_id = str(getattr(self, "_app_id", "") or "").strip()
         return ":".join(part for part in (app_id, tenant_key) if part)
 

@@ -78,3 +78,10 @@ def test_inbound_source_is_scoped_by_app_and_tenant():
     assert adapter.build_source.call_args.kwargs["scope_id"] == "cli_app:tenant_a"
 
 
+def test_identity_scope_accepts_mapping_event_payload():
+    adapter = _build_adapter()
+    assert adapter._event_identity_scope(
+        {"header": {"tenant_key": "tenant_b"}}
+    ) == "cli_app:tenant_b"
+
+
