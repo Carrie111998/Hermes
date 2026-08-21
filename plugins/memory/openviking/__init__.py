@@ -4445,6 +4445,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 payload_messages.append(payload_message("assistant", pending_tool_parts))
                 pending_tool_parts = []
 
+        skip_tool_outputs = _skip_tool_outputs()
+
         for message in messages:
             if not isinstance(message, dict):
                 continue
@@ -4464,7 +4466,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     "tool_id": tool_id,
                     "tool_name": tool_name,
                     "tool_input": prior_call.get("tool_input", {}),
-                    "tool_output": "" if _skip_tool_outputs() else cls._message_text(message.get("content")),
+                    "tool_output": "" if skip_tool_outputs else cls._message_text(message.get("content")),
                     "tool_status": cls._tool_result_status(message),
                 }
                 pending_tool_parts.append(tool_part)
