@@ -4,7 +4,7 @@
 #          .venv python 3.12, Windows. pyproject addopts supply
 #          --timeout=30 --timeout-method=thread. 9434 collected every run.
 #
-# STABLE CORE: 246 failures across 60 files. DIFF AGAINST THIS.
+# STABLE CORE: 227 failures across 58 files. DIFF AGAINST THIS.
 #
 # AMENDED 2026-08-20 (0a5e268a96): 248 -> 246 across 60 files. Removed the two
 # test_kanban_reclaim_claim_lock_guard.py rows. They were never product
@@ -15,6 +15,27 @@
 # no PATH lookup, so they pass in-sweep. Collection is unchanged at 9434 -- the
 # two tests still run, they just no longer fail. Everything else below is still
 # the frozen db0977b4c0 core.
+#
+# AMENDED 2026-08-20 (c0008fb8ad): 246 -> 227 across 58 files. A clean,
+# single-process resweep removed 19 rows: all 16 test_gui_command.py failures
+# and all 3 test_dashboard_auth_password_login.py failures. These were
+# order-pollution victims, not product regressions. The app-state leak fix at
+# 73bab4a7c7 and the sys.modules restoration at c42235e8a1 landed after the
+# db0977b4c0 freeze; the full sweep, rather than the earlier file pairings, is
+# the authority for exactly which frozen rows cleared. No new failure nodeid
+# appeared. Four test files added since the freeze contributed 65 collected
+# tests, all passing.
+#
+# Clean resweep evidence: detached worktree pinned at c0008fb8ad, Git-Bash,
+# PYTHONPATH=C:\Users\diego\.hermes\ops, PYTEST_ADDOPTS='-p pytest_fd_guard',
+# -p no:cacheprovider -p no:randomly --timeout=300 -rf. Host scans before and
+# after found no python.exe running pytest or run_tests_parallel.py; START_SHA
+# and END_SHA matched; the worktree stayed clean; grep found zero occurrences
+# of 3221225794 / 0xC0000142. Nodeids came only from run.txt `FAILED ` lines:
+#   227 failed, 9174 passed, 102 skipped, 12 warnings in 6343.83s (1:45:43)
+#   FDGUARD-SUMMARY collected=9500 exitstatus=1 CLEAN
+# The earlier 321F/9071P/102S/9E run at the same SHA is preserved but rejected:
+# a concurrent heavyweight pytest caused 253 STATUS_DLL_INIT_FAILED occurrences.
 #
 # Evidence: 9 independent full runs. Every one printed a summary line and
 # reported FDGUARD-SUMMARY collected=9434 CLEAN. The core was set-identical
@@ -118,9 +139,6 @@ tests/hermes_cli/test_container_boot.py::test_starting_state_does_not_autostart
 tests/hermes_cli/test_container_boot.py::test_startup_failed_does_not_autostart
 tests/hermes_cli/test_container_boot.py::test_stopped_profile_is_registered_but_not_started
 tests/hermes_cli/test_copilot_in_model_list.py::test_copilot_picker_uses_live_catalog_when_available
-tests/hermes_cli/test_dashboard_auth_password_login.py::TestPasswordLoginRoute::test_oauth_provider_rejects_password_login_with_404
-tests/hermes_cli/test_dashboard_auth_password_login.py::TestPasswordSessionRefresh::test_expired_access_token_refreshes_via_rt_cookie
-tests/hermes_cli/test_dashboard_auth_password_login.py::TestProviderListFlag::test_oauth_provider_reports_false
 tests/hermes_cli/test_debug.py::TestCaptureLogSnapshot::test_keeps_first_line_when_truncation_on_boundary
 tests/hermes_cli/test_ensure_hermes_home_uid_34107.py::TestChownToHermesUid::test_attributeerror_swallowed_for_windows_compat
 tests/hermes_cli/test_ensure_hermes_home_uid_34107.py::TestChownToHermesUid::test_calls_os_chown_when_both_set
@@ -151,22 +169,6 @@ tests/hermes_cli/test_gateway_linger.py::test_systemd_install_calls_linger_helpe
 tests/hermes_cli/test_gateway_s6_dispatch.py::test_block_until_terminated_installs_sigterm_handler_and_blocks
 tests/hermes_cli/test_gateway_wsl.py::TestSupportsSystemdServicesWSL::test_native_linux
 tests/hermes_cli/test_gateway_wsl.py::TestSupportsSystemdServicesWSL::test_wsl_with_systemd
-tests/hermes_cli/test_gui_command.py::test_desktop_build_stamp_skips_build_when_up_to_date
-tests/hermes_cli/test_gui_command.py::test_desktop_force_build_overrides_stamp
-tests/hermes_cli/test_gui_command.py::test_gui_does_not_override_user_electron_mirror
-tests/hermes_cli/test_gui_command.py::test_gui_does_not_retry_after_packaged_executable_exists
-tests/hermes_cli/test_gui_command.py::test_gui_exits_when_npm_missing
-tests/hermes_cli/test_gui_command.py::test_gui_forwards_desktop_environment_overrides
-tests/hermes_cli/test_gui_command.py::test_gui_install_env_prepends_managed_node_on_bare_path
-tests/hermes_cli/test_gui_command.py::test_gui_install_failure_hard_fails_when_electron_dist_exists
-tests/hermes_cli/test_gui_command.py::test_gui_install_failure_hard_fails_when_electron_not_staged
-tests/hermes_cli/test_gui_command.py::test_gui_install_failure_self_heals_electron_and_continues
-tests/hermes_cli/test_gui_command.py::test_gui_installs_packages_and_launches_desktop_app
-tests/hermes_cli/test_gui_command.py::test_gui_linux_falls_back_to_no_sandbox_when_userns_is_restricted
-tests/hermes_cli/test_gui_command.py::test_gui_redownloads_electron_via_mirror_then_repacks
-tests/hermes_cli/test_gui_command.py::test_gui_retries_pack_once_after_purging_build_cache
-tests/hermes_cli/test_gui_command.py::test_gui_retries_pack_under_mirror_even_when_prefetch_blocked
-tests/hermes_cli/test_gui_command.py::test_gui_source_mode_uses_renderer_build_and_electron
 tests/hermes_cli/test_hooks_cli.py::TestHooksDoctor::test_clean_script_runs
 tests/hermes_cli/test_hooks_cli.py::TestHooksDoctor::test_flags_invalid_json
 tests/hermes_cli/test_hooks_cli.py::TestHooksDoctor::test_flags_missing_exec_bit
