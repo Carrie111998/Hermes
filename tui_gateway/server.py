@@ -5039,6 +5039,9 @@ def _apply_model_switch(
             confirm_msg = warning.message
             if result.warning_message:
                 confirm_msg = f"{confirm_msg}\n\n{result.warning_message}"
+            # Same contract as the deferred branch below: confirm_message is
+            # canonical, warning is the pre-confirm-era alias. Identical by
+            # design, not by accident.
             return {
                 "value": result.new_model,
                 "warning": confirm_msg,
@@ -12010,6 +12013,14 @@ def _(rid, params: dict) -> dict:
                                 {
                                     "key": key,
                                     "value": pending_model,
+                                    # `confirm_message` is the field to read.
+                                    # `warning` carries the same text only so
+                                    # clients written before the confirm
+                                    # round-trip existed still show something;
+                                    # `_apply_pending_model_switch` already
+                                    # prefers confirm_message and falls back to
+                                    # warning. Keep them identical or drop
+                                    # `warning` -- do not let them diverge.
                                     "warning": pending_warning,
                                     "confirm_required": True,
                                     "confirm_message": pending_warning,

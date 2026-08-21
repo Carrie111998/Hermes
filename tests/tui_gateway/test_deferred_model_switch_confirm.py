@@ -175,3 +175,41 @@ class TestHelperContract:
 
         assert message is not None
         assert "CONTRIBUTOR TIER" in message
+
+    def test_an_explicit_provider_reaches_the_guards(self, monkeypatch):
+        """Provider-keyed guards are useless if the provider is dropped here.
+
+        The docstring promises the early call can only under-fire relative to
+        the resolved one, and that only holds if what the caller DID say is
+        forwarded. Asserting on a guarded model id would pass even with
+        ``provider`` dropped, so record the kwargs instead.
+        """
+        seen = {}
+
+        def _fake(model, provider=None, **kwargs):
+            seen["model"] = model
+            seen["provider"] = provider
+            return None
+
+        import hermes_cli.model_selection_guards as guards
+
+        monkeypatch.setattr(guards, "combined_selection_warning", _fake)
+        server._pending_switch_selection_warning(UNGUARDED_MODEL, "openrouter")
+
+        assert seen == {"model": UNGUARDED_MODEL, "provider": "openrouter"}
+
+    def test_an_empty_provider_is_normalised_to_none(self, monkeypatch):
+        """`provider or None` is load-bearing: "" is not "no provider" to a
+        guard that does an `is None` check, and the TUI sends "" for unset."""
+        seen = {}
+
+        def _fake(model, provider=None, **kwargs):
+            seen["provider"] = provider
+            return None
+
+        import hermes_cli.model_selection_guards as guards
+
+        monkeypatch.setattr(guards, "combined_selection_warning", _fake)
+        server._pending_switch_selection_warning(UNGUARDED_MODEL, "")
+
+        assert seen == {"provider": None}
