@@ -609,3 +609,58 @@ def test_chat_messages_to_responses_input_to_preflight_roundtrip():
 
     assert [i["type"] for i in normalized] == ["message", "message", "message", "message"]
     assert [i["role"] for i in normalized] == ["user", "assistant", "user", "assistant"]
+
+
+def test_preflight_codex_input_items_rejects_system_role_typed_message():
+    # Widening typed-message acceptance to user/assistant must not silently
+    # admit system-role items.
+    with pytest.raises(ValueError):
+        _preflight_codex_input_items(
+            [{"type": "message", "role": "system", "content": "be nice"}]
+        )
+
+
+def test_preflight_codex_input_items_rejects_non_text_non_list_content():
+    # typed-message content is a string or a list of content parts; anything
+    # else is a malformed wire that must be surfaced at preflight.
+    with pytest.raises(ValueError):
+        _preflight_codex_input_items(
+            [{"type": "message", "role": "assistant", "content": 42}]
+        )
+
+
+def test_preflight_codex_input_items_rejects_user_item_with_empty_content_list():
+    # Empty assistant content is a valid reasoning-following item; empty USER
+    # content is a malformed wire.
+    with pytest.raises(ValueError):
+        _preflight_codex_input_items(
+            [{"type": "message", "role": "user", "content": []}]
+        )
+
+
+def test_preflight_codex_input_items_user_items_carry_no_status_field():
+    # status is an assistant-output-only field; user input items must never
+    # carry it, while assistant status is preserved for replay.
+    normalized = _preflight_codex_input_items(
+        [
+            {"type": "message", "role": "user", "content": "ping"},
+            {"type": "message", "role": "assistant", "content": "pong",
+             "status": "in_progress"},
+        ]
+    )
+
+    assert "status" not in normalized[0]
+    assert normalized[1]["status"] == "in_progress"
+
+
+def test_preflight_codex_input_items_preserves_id_and_phase_on_role_items():
+    # Replayed history riding id/phase must survive preflight normalization
+    # instead of being silently dropped (context loss downstream).
+    normalized = _preflight_codex_input_items(
+        [
+            {"role": "user", "content": "ping", "id": "msg_1", "phase": "raw"},
+        ]
+    )
+
+    assert normalized[0]["id"] == "msg_1"
+    assert normalized[0]["phase"] == "raw"
