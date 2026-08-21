@@ -130,7 +130,8 @@ def _browser_dialog_check() -> bool:
     except Exception as exc:  # pragma: no cover — defensive
         logger.debug("browser_dialog check: browser_cdp_tool import failed: %s", exc)
         return False
-    return _browser_cdp_check()
+    result = _browser_cdp_check()
+    return result[0] if isinstance(result, tuple) else bool(result)
 
 
 registry.register(

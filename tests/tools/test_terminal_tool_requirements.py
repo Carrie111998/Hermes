@@ -89,10 +89,10 @@ class TestCheckFnTransientFailureSuppression:
         t = {"now": 1000.0}
         monkeypatch.setattr(reg.time, "monotonic", lambda: t["now"])
 
-        assert reg._check_fn_cached(flaky) is True  # records last-good
+        assert reg._check_fn_cached(flaky)[0] is True  # records last-good
         t["now"] += reg._CHECK_FN_TTL_SECONDS + 1  # expire the TTL cache
         # Within grace window of the success → flake suppressed, stays True.
-        assert reg._check_fn_cached(flaky) is True
+        assert reg._check_fn_cached(flaky)[0] is True
         assert calls["n"] == 2  # the probe actually ran (not just cached)
 
     def test_persistent_failure_after_grace_is_honored(self, monkeypatch):
@@ -107,11 +107,11 @@ class TestCheckFnTransientFailureSuppression:
         t = {"now": 1000.0}
         monkeypatch.setattr(reg.time, "monotonic", lambda: t["now"])
 
-        assert reg._check_fn_cached(good) is True
+        assert reg._check_fn_cached(good)[0] is True
         # Advance past the failure grace window, then fail.
         t["now"] += reg._CHECK_FN_FAILURE_GRACE_SECONDS + 1
         # Different fn so last-good for `good` doesn't apply; bad has no success.
-        assert reg._check_fn_cached(bad) is False
+        assert reg._check_fn_cached(bad)[0] is False
 
 
     def test_grace_expiry_lets_real_outage_through(self, monkeypatch):
@@ -125,14 +125,14 @@ class TestCheckFnTransientFailureSuppression:
         t = {"now": 1000.0}
         monkeypatch.setattr(reg.time, "monotonic", lambda: t["now"])
 
-        assert reg._check_fn_cached(probe) is True
+        assert reg._check_fn_cached(probe)[0] is True
         state["ok"] = False
         # Just past TTL, within grace → flake suppressed.
         t["now"] += reg._CHECK_FN_TTL_SECONDS + 1
-        assert reg._check_fn_cached(probe) is True
+        assert reg._check_fn_cached(probe)[0] is True
         # Now move well past the grace window since the last success → honored.
         t["now"] += reg._CHECK_FN_FAILURE_GRACE_SECONDS + 1
-        assert reg._check_fn_cached(probe) is False
+        assert reg._check_fn_cached(probe)[0] is False
 
     def test_profile_scoped_availability_does_not_cross_multiplex_profiles(
         self, tmp_path
@@ -224,8 +224,8 @@ class TestCheckFnTransientFailureSuppression:
         set_multiplex_active(True)
         monkeypatch.setattr(model_tools, "_compute_tool_definitions", compute_definitions)
         try:
-            assert reg._check_fn_cached(probe) is True
-            assert reg._check_fn_cached(probe) is False
+            assert reg._check_fn_cached(probe)[0] is True
+            assert reg._check_fn_cached(probe)[0] is False
             assert not reg._check_fn_cache
 
             model_tools.get_tool_definitions(quiet_mode=True)
@@ -248,7 +248,7 @@ class TestCheckFnTransientFailureSuppression:
             return True
 
         for _ in range(1_000):
-            assert reg._check_fn_cached(available) is True
+            assert reg._check_fn_cached(available)[0] is True
 
         assert len(reg._check_fn_cache) <= reg._CHECK_FN_CACHE_MAX
         assert len(reg._check_fn_last_good) <= reg._CHECK_FN_CACHE_MAX
