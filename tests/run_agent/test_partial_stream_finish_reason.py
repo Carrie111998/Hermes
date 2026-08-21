@@ -495,6 +495,43 @@ class TestContentFilterStallActivatesFallback:
         assert result["final_response"] == "Done on the fallback provider."
         assert result["completed"] is True
 
+    def test_kanban_tagged_stub_stops_without_fallback_or_continuation(
+        self, loop_agent, monkeypatch
+    ):
+        from tests.run_agent.test_run_agent import _mock_assistant_msg
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_safety")
+        stub = SimpleNamespace(
+            id=PARTIAL_STREAM_STUB_ID,
+            model="minimax/MiniMax-M2.7",
+            choices=[SimpleNamespace(
+                index=0,
+                message=_mock_assistant_msg(content="Writing the file..."),
+                finish_reason=FINISH_REASON_LENGTH,
+            )],
+            usage=None,
+            _dropped_tool_names=["write_file"],
+            _content_filter_terminated=True,
+        )
+        loop_agent.client.chat.completions.create.return_value = stub
+        loop_agent._fallback_chain = [
+            {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.7"},
+        ]
+        loop_agent._fallback_index = 0
+
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+            patch.object(loop_agent, "_try_activate_fallback") as activate_fallback,
+        ):
+            result = loop_agent.run_conversation("write me a long file")
+
+        assert loop_agent.client.chat.completions.create.call_count == 1
+        activate_fallback.assert_not_called()
+        assert result["failed"] is True
+        assert result["provider_failure"]["classification"] == "content_policy_blocked"
+
 
 
 class TestEmptyPartialStreamStubNotPersisted:

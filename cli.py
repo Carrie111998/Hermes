@@ -20737,6 +20737,91 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 # Main Entry Point
 # ============================================================================
 
+
+_KANBAN_PROVIDER_TERMINAL_REASONS = frozenset({
+    "auth",
+    "auth_permanent",
+    "billing",
+    "model_not_found",
+    "provider_policy_blocked",
+    "format_error",
+    "ssl_cert_verification",
+})
+_KANBAN_PROVIDER_TRANSIENT_REASONS = frozenset({
+    "rate_limit",
+    "upstream_rate_limit",
+    "overloaded",
+    "server_error",
+    "timeout",
+})
+
+
+def _provider_exit_disposition(result: Any) -> Optional[str]:
+    """Classify a structured provider failure for Kanban supervision."""
+    if not isinstance(result, dict) or not result.get("failed"):
+        return None
+    failure = result.get("provider_failure")
+    if not isinstance(failure, dict):
+        return None
+    reason = str(failure.get("classification") or "")
+    if reason == "content_policy_blocked":
+        return "safety_refusal"
+    try:
+        status_code = int(failure["status_code"]) \
+            if failure.get("status_code") is not None else None
+    except (TypeError, ValueError):
+        status_code = None
+    if status_code in {401, 402, 403}:
+        return "terminal"
+    if status_code == 429 or (
+        status_code is not None and 500 <= status_code <= 599
+    ):
+        return "transient"
+    if reason in _KANBAN_PROVIDER_TERMINAL_REASONS:
+        return "terminal"
+    if reason in _KANBAN_PROVIDER_TRANSIENT_REASONS:
+        return "transient"
+    if reason and failure.get("retryable") is False:
+        return "terminal"
+    return None
+
+
+def _record_kanban_provider_exit(cli: "HermesCLI", result: Any) -> bool:
+    """Stage a sanitized provider-exit envelope for the dispatcher."""
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    disposition = _provider_exit_disposition(result)
+    if not task_id or disposition is None or not isinstance(result, dict):
+        return False
+    failure = result.get("provider_failure")
+    if not isinstance(failure, dict):
+        return False
+    try:
+        run_id = int((os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip())
+    except ValueError:
+        return False
+    from hermes_cli import kanban_db as _kb
+
+    conn = _kb.connect()
+    try:
+        agent = getattr(cli, "agent", None)
+        return _kb.record_provider_exit_disposition(
+            conn,
+            task_id,
+            run_id=run_id,
+            disposition=disposition,
+            classification=str(failure.get("classification") or "provider_error"),
+            status_code=failure.get("status_code"),
+            provider=(failure.get("provider") or getattr(agent, "provider", None)),
+            model=(failure.get("model") or getattr(agent, "model", None)),
+            session_id=getattr(cli, "session_id", None),
+        )
+    except Exception:
+        logger.warning("failed to record Kanban provider exit disposition", exc_info=True)
+        return False
+    finally:
+        conn.close()
+
+
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
@@ -21382,27 +21467,36 @@ def main(
 
                         # Ensure proper exit code for automation wrappers.
                         #
-                        # Kanban workers get a special case: when the run failed
-                        # purely because the provider rate-limited / exhausted
-                        # quota (not because the task itself is broken), exit with
-                        # the EX_TEMPFAIL sentinel instead of the generic 1. The
-                        # dispatcher's reap classifier maps that code to a
-                        # ``rate_limited`` exit and releases the task back to
-                        # ``ready`` WITHOUT incrementing the failure counter, so a
-                        # 5-hour quota window can't trip the circuit breaker and
-                        # permanently block the card. Non-kanban runs keep the
-                        # plain 0/1 contract automation wrappers expect.
+                        # Kanban workers stage a sanitized provider disposition
+                        # on the active run before exiting. The dispatcher owns
+                        # the resulting board transition; exit codes are only
+                        # corroborating hints. Non-kanban automation keeps its
+                        # existing plain 0/1 contract.
                         _exit_code = 0
                         if isinstance(result, dict) and result.get("failed"):
                             _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
-                                "failure_reason"
-                            ) in ("rate_limit", "billing"):
+                            _provider_disposition = _provider_exit_disposition(result)
+                            _record_kanban_provider_exit(cli, result)
+                            if (
+                                os.environ.get("HERMES_KANBAN_TASK")
+                                and _provider_disposition == "transient"
+                            ):
                                 try:
                                     from hermes_cli.kanban_db import (
                                         KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
                                     )
                                     _exit_code = _RL_CODE
+                                except Exception:
+                                    _exit_code = 1
+                            elif (
+                                os.environ.get("HERMES_KANBAN_TASK")
+                                and _provider_disposition == "terminal"
+                            ):
+                                try:
+                                    from hermes_cli.kanban_db import (
+                                        KANBAN_PROVIDER_TERMINAL_EXIT_CODE as _TERM_CODE,
+                                    )
+                                    _exit_code = _TERM_CODE
                                 except Exception:
                                     _exit_code = 1
                         sys.exit(_exit_code)

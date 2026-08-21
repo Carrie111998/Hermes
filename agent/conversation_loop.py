@@ -718,6 +718,22 @@ def _billing_terminal_label(summary: str, unverified: bool) -> str:
     return f"Billing or credits exhausted: {summary}"
 
 
+def _provider_failure_descriptor(
+    classified,
+    *,
+    provider: Optional[str],
+    model: Optional[str],
+) -> Dict[str, Any]:
+    """Return the allowlisted provider-failure fields used by supervisors."""
+    return {
+        "classification": classified.reason.value,
+        "status_code": classified.status_code,
+        "retryable": bool(classified.retryable),
+        "provider": provider,
+        "model": model,
+    }
+
+
 def _billing_failure_result(
     *,
     classified,
@@ -755,6 +771,9 @@ def _billing_failure_result(
         "failed": True,
         "error": summary,
         "failure_reason": classified.reason.value,
+        "provider_failure": _provider_failure_descriptor(
+            classified, provider=provider, model=model
+        ),
         # The billing verdict may rest on an ambiguous body (#82154) — carry
         # that through the structured result, not just the prose.
         "billing_unverified": unverified,
@@ -1199,6 +1218,31 @@ _CONTENT_POLICY_RECOVERY_HINT = (
     "Try rephrasing the request, narrowing the context, or "
     "adding a fallback provider with `hermes fallback add`."
 )
+_KANBAN_CONTENT_POLICY_RECOVERY_HINT = (
+    "This Kanban worker will not route a safety refusal to another provider. "
+    "A human must explicitly review, rephrase, or rescope the card."
+)
+
+
+def _kanban_safety_refusal_blocks_fallback() -> bool:
+    """True only for the dispatcher-owned Kanban worker execution."""
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return False
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        return is_dispatcher_owned_worker_context()
+    except Exception:
+        # Fail closed for safety: an owned worker is the normal context when
+        # the marker is present; delegated/cron contexts explicitly install
+        # the predicate and return False above.
+        return True
+
+
+def _content_policy_recovery_hint() -> str:
+    if _kanban_safety_refusal_blocks_fallback():
+        return _KANBAN_CONTENT_POLICY_RECOVERY_HINT
+    return _CONTENT_POLICY_RECOVERY_HINT
 
 
 # Memo for the send-path tool-call argument canonicalization inside
@@ -1380,6 +1424,7 @@ def _content_policy_blocked_result(
     *,
     final_response: str,
     error_detail: str,
+    provider_failure: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build the terminal turn result for a content-policy block.
 
@@ -1389,6 +1434,14 @@ def _content_policy_blocked_result(
     turn carrying the user-facing message and a ``content_policy_blocked:``
     prefixed error — so they funnel through this one builder.
     """
+    if provider_failure is None:
+        provider_failure = {
+            "classification": FailoverReason.content_policy_blocked.value,
+            "status_code": None,
+            "retryable": False,
+            "provider": None,
+            "model": None,
+        }
     return {
         "final_response": final_response,
         "messages": messages,
@@ -1396,6 +1449,8 @@ def _content_policy_blocked_result(
         "completed": False,
         "failed": True,
         "error": f"content_policy_blocked: {error_detail}",
+        "failure_reason": FailoverReason.content_policy_blocked.value,
+        "provider_failure": provider_failure,
     }
 
 
@@ -3538,9 +3593,10 @@ def run_conversation(
                 # through to the empty-response / invalid-response retry loops
                 # and is mis-surfaced as "rate limited" / "no content after
                 # retries" — burning paid attempts reproducing a deterministic
-                # refusal. Surface it clearly and stop. Mirrors the
-                # exception-based ``content_policy_blocked`` recovery: try a
-                # configured fallback once, otherwise return the refusal.
+                # refusal. Surface it clearly and stop. Interactive sessions
+                # may try a configured fallback once; dispatcher-owned Kanban
+                # workers must return the refusal without cross-provider
+                # routing so the board can require explicit human review.
                 if finish_reason == "content_filter":
                     _refusal_transport = agent._get_transport()
                     if agent.api_mode == "anthropic_messages":
@@ -3577,21 +3633,24 @@ def run_conversation(
                     if agent.thinking_callback:
                         agent.thinking_callback("")
 
-                    # Deterministic for the unchanged prompt — never retry.
-                    # Try a configured fallback once (a different model may not
-                    # refuse); otherwise surface the refusal terminally.
-                    if agent._has_pending_fallback():
-                        agent._buffer_status(
-                            "⚠️ Model declined to respond (safety refusal) — trying fallback..."
-                        )
-                    if agent._try_activate_fallback():
-                        active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt)
-                        retry_count = 0
-                        compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
-                        _retry.restart_with_rebuilt_messages = True
-                        break
+                    # Interactive sessions retain configured fallback behavior.
+                    # Dispatcher-owned Kanban workers must not route around a
+                    # safety refusal: surface the original provider/model and
+                    # let the board record a sticky human-review handoff.
+                    _suppress_safety_fallback = _kanban_safety_refusal_blocks_fallback()
+                    if not _suppress_safety_fallback:
+                        if agent._has_pending_fallback():
+                            agent._buffer_status(
+                                "⚠️ Model declined to respond (safety refusal) — trying fallback..."
+                            )
+                        if agent._try_activate_fallback():
+                            active_system_prompt = _sync_failover_system_message(
+                                agent, api_messages, active_system_prompt)
+                            retry_count = 0
+                            compression_attempts = 0
+                            _retry.primary_recovery_attempted = False
+                            _retry.restart_with_rebuilt_messages = True
+                            break
 
                     agent._flush_status_buffer()
                     _refusal_log = (
@@ -3618,7 +3677,7 @@ def run_conversation(
                         "⚠️  The model declined to respond to this request "
                         "(safety refusal — not a Hermes/gateway failure).\n\n"
                         f"{_refusal_detail}\n\n"
-                        f"{_CONTENT_POLICY_RECOVERY_HINT}"
+                        f"{_content_policy_recovery_hint()}"
                     )
 
                     agent._cleanup_task_resources(effective_task_id)
@@ -3628,6 +3687,13 @@ def run_conversation(
                         api_call_count,
                         final_response=_refusal_response,
                         error_detail=_refusal_text or "model declined (content_filter)",
+                        provider_failure={
+                            "classification": FailoverReason.content_policy_blocked.value,
+                            "status_code": None,
+                            "retryable": False,
+                            "provider": agent.provider,
+                            "model": agent.model,
+                        },
                     )
 
                 if finish_reason == "length":
@@ -3796,6 +3862,30 @@ def run_conversation(
                         _cf_terminated = getattr(
                             response, "_content_filter_terminated", False
                         )
+                        if (
+                            _cf_terminated
+                            and _kanban_safety_refusal_blocks_fallback()
+                        ):
+                            _policy_response = (
+                                "⚠️  The model provider's safety filter "
+                                "terminated this response.\n\n"
+                                f"{_content_policy_recovery_hint()}"
+                            )
+                            agent._cleanup_task_resources(effective_task_id)
+                            agent._persist_session(messages, conversation_history)
+                            return _content_policy_blocked_result(
+                                messages,
+                                api_call_count,
+                                final_response=_policy_response,
+                                error_detail="content filter terminated stream",
+                                provider_failure={
+                                    "classification": FailoverReason.content_policy_blocked.value,
+                                    "status_code": None,
+                                    "retryable": False,
+                                    "provider": agent.provider,
+                                    "model": agent.model,
+                                },
+                            )
                         if (
                             _cf_terminated
                             and agent._fallback_index < len(agent._fallback_chain)
@@ -6043,27 +6133,29 @@ def run_conversation(
                             )
                             retry_count = 0
                             continue
-                    # Try fallback before aborting — a different provider may
-                    # not have the same issue (rate limit, auth, etc.). Only
-                    # announce the attempt when a fallback chain actually
-                    # exists; otherwise "trying fallback..." is a lie and the
-                    # session looks like it's recovering when it's about to
-                    # abort silently (#35314, #17446).
-                    if agent._has_pending_fallback():
-                        if classified.reason == FailoverReason.content_policy_blocked:
-                            agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
-                        elif classified.reason == FailoverReason.ssl_cert_verification:
-                            agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
-                        else:
-                            agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
-                        active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt)
-                        retry_count = 0
-                        compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
-                        _retry.restart_with_rebuilt_messages = True
-                        break
+                    _suppress_safety_fallback = (
+                        classified.reason == FailoverReason.content_policy_blocked
+                        and _kanban_safety_refusal_blocks_fallback()
+                    )
+                    # Interactive sessions may use their configured fallback.
+                    # Kanban safety refusals are a human-review boundary and
+                    # must surface before any second provider sees the prompt.
+                    if not _suppress_safety_fallback:
+                        if agent._has_pending_fallback():
+                            if classified.reason == FailoverReason.content_policy_blocked:
+                                agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
+                            elif classified.reason == FailoverReason.ssl_cert_verification:
+                                agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
+                            else:
+                                agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
+                        if agent._try_activate_fallback():
+                            active_system_prompt = _sync_failover_system_message(
+                                agent, api_messages, active_system_prompt)
+                            retry_count = 0
+                            compression_attempts = 0
+                            _retry.primary_recovery_attempted = False
+                            _retry.restart_with_rebuilt_messages = True
+                            break
                     if api_kwargs is not None:
                         agent._dump_api_request_debug(
                             api_kwargs, reason="non_retryable_client_error", error=api_error,
@@ -6154,14 +6246,15 @@ def run_conversation(
                             f"{agent.log_prefix}      • Try rephrasing the request, narrowing the context, or splitting into smaller steps.",
                             force=True,
                         )
-                        agent._vprint(
-                            f"{agent.log_prefix}      • Configure a fallback provider so future blocks route automatically:",
-                            force=True,
-                        )
-                        agent._vprint(
-                            f"{agent.log_prefix}        hermes fallback add   (interactive picker — same as `hermes model`)",
-                            force=True,
-                        )
+                        if not _suppress_safety_fallback:
+                            agent._vprint(
+                                f"{agent.log_prefix}      • Configure a fallback provider so future blocks route automatically:",
+                                force=True,
+                            )
+                            agent._vprint(
+                                f"{agent.log_prefix}        hermes fallback add   (interactive picker — same as `hermes model`)",
+                                force=True,
+                            )
                     # TLS certificate failures are environment problems, not
                     # provider/prompt problems — tell the user exactly which
                     # knobs fix each common cause. Inspired by Claude Code
@@ -6218,13 +6311,16 @@ def run_conversation(
                             "⚠️  The model provider's safety filter blocked this request "
                             "(not a Hermes/gateway failure).\n\n"
                             f"Provider message: {_nonretryable_summary}\n\n"
-                            f"{_CONTENT_POLICY_RECOVERY_HINT}"
+                            f"{_content_policy_recovery_hint()}"
                         )
                         return _content_policy_blocked_result(
                             messages,
                             api_call_count,
                             final_response=_policy_response,
                             error_detail=_nonretryable_summary,
+                            provider_failure=_provider_failure_descriptor(
+                                classified, provider=_provider, model=_model
+                            ),
                         )
                     # Billing walls are the common non-retryable abort: enrich
                     # the result with the same structured recovery descriptor as
@@ -6247,6 +6343,10 @@ def run_conversation(
                         "completed": False,
                         "failed": True,
                         "error": _nonretryable_summary,
+                        "failure_reason": classified.reason.value,
+                        "provider_failure": _provider_failure_descriptor(
+                            classified, provider=_provider, model=_model
+                        ),
                     }
 
                 if retry_count >= max_retries:
@@ -6464,6 +6564,9 @@ def run_conversation(
                         # different exit code. ``rate_limit`` / ``billing`` here
                         # mean "quota wall, not a task error".
                         "failure_reason": classified.reason.value,
+                        "provider_failure": _provider_failure_descriptor(
+                            classified, provider=_provider, model=_model
+                        ),
                         # True when the billing verdict rests on an ambiguous
                         # body (#82154) — may be a content-filter rejection.
                         "billing_unverified": _billing_unverified,

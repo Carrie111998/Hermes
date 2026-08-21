@@ -127,3 +127,31 @@ def test_non_retryable_failure_error_is_summarized_not_raw_html():
     # The original page was tens of kilobytes; a summary is short.
     assert len(error) < 500
     assert len(error) < len(_CLOUDFLARE_CHALLENGE_HTML)
+
+
+def test_kanban_policy_exception_does_not_activate_fallback(monkeypatch):
+    agent = _make_agent()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_safety")
+    agent._fallback_chain = [
+        {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.7"},
+    ]
+    agent._fallback_index = 0
+    agent.client.chat.completions.create.side_effect = Exception(
+        "This content was flagged for possible cybersecurity risk. "
+        "Try rephrasing your request."
+    )
+
+    with (
+        patch.object(agent, "_try_activate_fallback") as activate_fallback,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("review this request")
+
+    assert agent.client.chat.completions.create.call_count == 1
+    activate_fallback.assert_not_called()
+    assert result["failed"] is True
+    assert result["provider_failure"]["classification"] == "content_policy_blocked"
+    assert result["provider_failure"]["provider"] == "openai"
+    assert result["provider_failure"]["model"] == "gpt-5.5"
