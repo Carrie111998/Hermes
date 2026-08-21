@@ -6508,10 +6508,20 @@ def resolve_provider_client(
             custom_base = _to_openai_base_url(explicit_base_url).strip()
             if api_mode == "anthropic_messages":
                 wrap_base = (explicit_base_url or "").strip().rstrip("/")
+            # Precedence: explicit key > host-matched custom_providers key >
+            # OPENAI_API_KEY (OpenAI hosts only) > no-key. Two rules the old
+            # chain broke: (1) a generic env var must not shadow a host-specific
+            # configured key — a profile .env exporting OPENAI_API_KEY sent the
+            # OpenAI key to api.fireworks.ai and every custom-endpoint call 401'd
+            # even though a valid Fireworks key was configured; (2) the env var
+            # must only go to authoritative OpenAI hosts — otherwise it leaks as
+            # a Bearer token to any host a custom endpoint names. Mirrors the
+            # #28660 host gating in hermes_cli/runtime_provider.py.
+            _custom_is_openai_url = base_url_host_matches(custom_base, "openai.com") or base_url_host_matches(custom_base, "openai.azure.com")
             custom_key = (
                 (explicit_api_key or "").strip()
-                or _scoped_key_env("OPENAI_API_KEY")
                 or _read_main_api_key_if_same_host(custom_base)
+                or (_scoped_key_env("OPENAI_API_KEY") if _custom_is_openai_url else "")
                 or "no-key-required"  # local servers don't need auth
             )
             if not custom_base:

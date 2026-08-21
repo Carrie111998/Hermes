@@ -4620,3 +4620,86 @@ class TestFastModelTier:
             _FAST_MODEL_TASKS
         )
         assert not overlap
+
+
+class TestCustomEndpointOpenAIKeyGating:
+    """resolve_provider_client("custom", explicit_base_url=...) must not send
+    OPENAI_API_KEY to non-OpenAI hosts, and a host-matched configured key must
+    beat the generic env var. Regression coverage for the shadowing bug where a
+    profile .env exporting OPENAI_API_KEY caused every custom-endpoint call
+    (e.g. api.fireworks.ai) to 401 with "The API key you provided is invalid."
+    Mirrors the #28660 host gating in hermes_cli/runtime_provider.py.
+    """
+
+    def _resolve(self, base_url, *, explicit_key="", env_key="", main_key=""):
+        from agent.auxiliary_client import resolve_provider_client
+
+        with (
+            patch(
+                "agent.auxiliary_client._scoped_key_env",
+                side_effect=lambda name: env_key if name == "OPENAI_API_KEY" else "",
+            ),
+            patch(
+                "agent.auxiliary_client._read_main_api_key_if_same_host",
+                return_value=main_key,
+            ),
+        ):
+            client, _model = resolve_provider_client(
+                "custom",
+                "some-model",
+                explicit_base_url=base_url,
+                explicit_api_key=explicit_key,
+            )
+        assert client is not None
+        return getattr(client, "api_key", None)
+
+    def test_env_openai_key_not_sent_to_non_openai_host(self):
+        """The core regression: Fireworks endpoint + OPENAI_API_KEY in env +
+        host-matched configured key -> the configured key wins."""
+        key = self._resolve(
+            "https://api.fireworks.ai/inference/v1",
+            env_key="sk-openai-should-not-leak",
+            main_key="fw-configured-key",
+        )
+        assert key == "fw-configured-key"
+
+    def test_explicit_key_wins_over_env_and_config(self):
+        key = self._resolve(
+            "https://api.fireworks.ai/inference/v1",
+            explicit_key="explicit-key",
+            env_key="sk-openai",
+            main_key="fw-configured-key",
+        )
+        assert key == "explicit-key"
+
+    def test_env_openai_key_used_for_openai_host(self):
+        key = self._resolve(
+            "https://api.openai.com/v1",
+            env_key="sk-openai",
+        )
+        assert key == "sk-openai"
+
+    def test_env_openai_key_used_for_openai_azure_host(self):
+        key = self._resolve(
+            "https://myresource.openai.azure.com/openai/v1",
+            env_key="sk-openai",
+        )
+        assert key == "sk-openai"
+
+    def test_host_suffix_spoofing_rejected(self):
+        for hostile in (
+            "https://api.openai.com.evil.test/v1",
+            "https://evilopenai.com/v1",
+            "https://openai.azure.com.evil.test/v1",
+        ):
+            key = self._resolve(hostile, env_key="sk-openai")
+            assert key == "no-key-required", hostile
+
+    def test_generic_proxy_does_not_get_openai_key(self):
+        """An OpenAI-compatible proxy that is not an OpenAI host must not
+        receive OPENAI_API_KEY implicitly — configure a key explicitly."""
+        key = self._resolve(
+            "https://proxy.example.com/v1",
+            env_key="sk-openai",
+        )
+        assert key == "no-key-required"

@@ -177,6 +177,17 @@ Custom endpoint pools are stored in `auth.json` under `credential_pool` with a `
 }
 ```
 
+### Which key does a custom endpoint use?
+
+For `provider: custom` calls (auxiliary tasks, delegation subagents), Hermes resolves the key in this order:
+
+1. An explicit `api_key` on the request or model entry.
+2. The host-matched configured key (a `providers:`/`custom_providers` entry or the main model's key, when the endpoint shares that host).
+3. `OPENAI_API_KEY` from the environment — **only when the endpoint host matches OpenAI-owned host suffixes** (`openai.com` and `openai.azure.com`, including subdomains; suffix-spoofing such as `api.openai.com.evil.test` does not match). The variable is never sent to third-party or self-hosted endpoints, so it cannot shadow your configured key or leak to a mistyped host.
+4. `no-key-required` (local servers).
+
+If you run an OpenAI-compatible proxy that expects your OpenAI key, set `api_key` explicitly on the endpoint — implicit env-var fallback no longer covers non-OpenAI hosts.
+
 ## Auto-Discovery
 
 Hermes automatically discovers credentials from multiple sources and seeds the pool on startup:
