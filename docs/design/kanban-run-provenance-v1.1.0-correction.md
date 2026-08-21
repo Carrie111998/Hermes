@@ -4,13 +4,31 @@
   sha256 `38d66a972800f501b6a6e776ea3076b0d1d12e51804a64c4171e9426ced741bd`)
 - **Status:** Proposed — security review is still a required, un-run gate
 - **Author:** `solution-architect`, card `t_8c86298c`, run 8
-- **Scope:** v1.0.0 remains in force **except** for §A and §B below.
+- **Revision:** review corrections B1–B4 / N1–N2 applied on card
+  `t_81217a6a`, against reviewed head `1ba7a03a` of PR #91194
+- **Scope:** v1.0.0 remains in force **except** where §A and §B below
+  supersede it. §A.4.1 enumerates the superseded v1.0.0 text exactly.
 
-This is a correction, not a replacement. v1.0.0 §0–§4, §6, §8–§11 stand
-as written. Two changes are made, each for a stated cause: one is a
-binding director ruling that closes a seam v1.0.0 deliberately left
-open; the other is an enforceability defect I found in the live source
-after v1.0.0 was frozen.
+This is a correction, not a replacement. v1.0.0 §0–§3, §5–§6, §9–§11
+stand as written; §2.1, §2.2, §4, §6.1, §8 and §10 are amended only where
+§A.4.1 lists them.
+
+Two substantive changes were made in the original v1.1.0, each for a
+stated cause: one is a binding director ruling that closes a seam v1.0.0
+deliberately left open (§A); the other is an enforceability defect found
+in the live source after v1.0.0 was frozen (§B).
+
+Four further corrections were then applied after formal code review of
+PR #91194 at `1ba7a03a` (findings B1–B4, N1–N2 on card `t_7b608af5`):
+
+| Finding | Resolution |
+|---|---|
+| B1 — ruff/UTF-8 errors in the verifier | verifier rewritten; clean under the repo ruff config and under `--select E,F,I,W` |
+| B2 — `GLOB '[0-9a-f]*'` validated only the first character | §A.5: negated-GLOB CHECKs, with hostile cases executed |
+| B3 — `final_candidate_sha` contradiction across §2.1/§4.1/§4 | §A.4: one normative three-SHA model; §A.4.1 enumerates superseded text |
+| B4 — §C.1 renumbering collided with v1.0.0 A13–A18 | §C.1: v1.1.0 additions start at A19; v1.0.0 A1–A18 preserved |
+| N1 — verifier docstring cited a nonexistent §5.5 | corrected to §A.1 |
+| N2 — verifier `board` column contradicted v1.0.0 §8 | §A.6: column removed; absence asserted |
 
 **Contract source for the security design:** attachment id 3,
 `security-design-t_8513bc6e-comment-573.md` (12,212 bytes). Verified
@@ -19,8 +37,8 @@ whitespace normalization, differing only by a 67-character provenance
 header. All "comment 573 §N" references resolve to that attachment, not
 to a cross-board CLI lookup.
 
-**Executable evidence:** attachment `verify_adr0007_mechanisms.py`,
-36/36 checks passing. See §C.
+**Executable evidence:** `verify_adr0007_mechanisms.py` (this directory),
+85/85 checks passing. See §C.
 
 ---
 
@@ -100,18 +118,117 @@ Neither is worker-writable, and neither is parsed from prose.
 
 ### §A.3 What did NOT change
 
-`final_candidate_sha` is still **not stored** on the run. v1.0.0 §4's
-reasoning is untouched and correct: it is knowable only after assembly,
-i.e. after the run is terminal, and storing it would require the
-mutation §5 prohibits. The director's ruling lists it among the
-attestation's mandatory fields — that is a requirement on the **DSSE
-attestation the broker assembles**, not on the Kanban record. Kanban
-supplies the two SHAs it can honestly witness (`subject_sha` at claim,
-and the head it actually verified); the broker derives the third.
+The seam closed here is repository binding only. v1.0.0's trust semantics
+(§3.1, §3.2), role derivation (§2.3), export exclusions (§6.1), and the
+append-only correction model (§5) are untouched.
 
-A Kanban column named `final_sha` would invite exactly the false
-equivalence this contract exists to prevent. Acceptance test A17 below
-guards against a future implementer helpfully adding one.
+### §A.4 `final_candidate_sha`: the single normative model (resolves B3)
+
+**This subsection is normative and overrides every other statement about
+`final_candidate_sha` in either document.** The reviewed revision of v1.0.0
+was internally inconsistent: §2.1 listed `final_candidate_sha` as a
+`task_runs` column, §4.1 instructed implementers to carry it on every run,
+and the closing paragraph of §4 said it is *not* a run field. An
+implementer could have built either schema from that text.
+
+**There are three SHAs, at two layers.**
+
+| SHA | Layer | Storage | Written by |
+|---|---|---|---|
+| `subject_sha` | Kanban run | `task_runs.subject_sha` (40-char lowercase hex) | kernel, at claim |
+| `verified_head_sha` | Kanban run | `task_runs.verified_head_sha` (40-char lowercase hex) | kernel, at terminalization |
+| final candidate SHA | DSSE attestation | **no Kanban column** | broker, at attestation time |
+
+Normative rules:
+
+1. Kanban stores exactly the two SHAs the kernel can **honestly witness**:
+   what the run started from, and what it had verified when it closed.
+   Both are populated on **every** run type; for implementation runs they
+   are equal, and that equality is not special-cased.
+2. **No table in this contract may define a column named
+   `final_candidate_sha` or `final_sha`.** The final candidate SHA is
+   derived and bound by the broker at attestation time. A Kanban column of
+   that name would assert authority the kernel does not have, and — since
+   it is knowable only after the run is terminal — writing it would require
+   the very post-terminal mutation v1.0.0 §5 forbids.
+3. The broker compares its derived final candidate SHA against the exported
+   `verified_head_sha` and **fails closed** on disagreement. That
+   comparison is the stale-evidence tamper check; it is only possible
+   because the run carries a witnessed head at all.
+4. Divergence between `subject_sha` and `verified_head_sha` on a review /
+   QA / security run is **legitimate** (the branch advanced), and is
+   evidence, not a defect.
+
+Acceptance test A25 below guards rule 2 against a future implementer
+helpfully adding the column back; the verifier asserts it directly.
+
+#### §A.4.1 Exactly which v1.0.0 text is superseded
+
+Enumerated so nothing is left to inference:
+
+| v1.0.0 location | Superseded text | Replaced by |
+|---|---|---|
+| §2.1 column table | the `final_candidate_sha` row and the `role` row | `verified_head_sha` row; `role` stays derived per §2.3 |
+| §2.1 CHECK block | `CHECK (subject_sha ... GLOB '[0-9a-f]*')` and `CHECK (role IN (...))` | negated-GLOB CHECKs on `subject_sha` and `verified_head_sha` (see §A.5) |
+| §2.2 | `CHECK (length(sha256) = 64 AND sha256 GLOB '[0-9a-f]*')` | `... AND sha256 NOT GLOB '*[^0-9a-f]*'` (§A.5) |
+| §4 heading + comparison table | two-column "Subject SHA vs Final candidate SHA" table storing `final_candidate_sha` on the run | three-SHA table in §4, matching the table above |
+| §4.1 | every occurrence of `final_candidate_sha` as a run field | `verified_head_sha` |
+| §4 closing paragraph | *"Why final candidate SHA is not a run field"* stated **after** §2.1/§4.1 said it was one | §4's *"Why the final candidate SHA is not a run column"*, now the only claim in force |
+| §6.1 export field list | `final_candidate_sha` in the exported envelope | `verified_head_sha` |
+| §8 | row *"Final candidate SHA as broker-derived only"* (which read as rejecting the model now adopted) | two rows: *"A run-level `final_candidate_sha` column"* (rejected) and *"Storing only `subject_sha`"* (rejected) |
+| §10 A14, A15 | `final_candidate_sha` in the expectations | `verified_head_sha` |
+
+Everything else in v1.0.0 §4 — the reasoning for capturing the subject at
+claim, and for carrying two SHAs rather than one — is **retained
+unchanged**. This corrects the naming and the layer, not the analysis.
+
+### §A.5 Hex validation must check every character (resolves B2)
+
+v1.0.0's CHECK constraints used `sha GLOB '[0-9a-f]*'`. In SQLite that
+pattern anchors only the **first** character: the trailing `*` then matches
+any 39 remaining characters, uppercase and non-hex included. Demonstrated
+executably (§C): `'a' + 'Z'*39` and `'a'*39 + 'g'` are both **accepted**.
+
+The normative form negates the complement class instead, so a character
+outside `[0-9a-f]` at *any* position aborts the write:
+
+```sql
+CHECK (subject_sha IS NULL OR (length(subject_sha) = 40
+       AND subject_sha NOT GLOB '*[^0-9a-f]*'))
+CHECK (verified_head_sha IS NULL OR (length(verified_head_sha) = 40
+       AND verified_head_sha NOT GLOB '*[^0-9a-f]*'))
+CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*')
+```
+
+The explicit `length()` term is still required — GLOB alone cannot express
+"exactly 40". Hostile inputs are enumerated in v1.0.0 §10 A5/A5b and are
+executed by the verifier against both the SQL CHECKs and the Python
+`SHA40`/`SHA256` regexes, so the two layers cannot drift apart.
+
+### §A.6 No `board` column anywhere (resolves N2)
+
+The reviewed `verify_adr0007_mechanisms.py` declared
+`board TEXT NOT NULL` on `run_provenance` and carried `"board":
+"hermes-agent"` in the hashed record body. That **contradicted** v1.0.0 §8,
+which rejects board slug as a provenance field.
+
+Resolved in favour of §8: **the column is removed**, from the verifier DDL
+and from the record body it digests. Two reasons, both structural rather
+than stylistic:
+
+1. Kanban is already sharded per board on disk
+   (`~/.hermes/kanban/boards/<board>/kanban.db`), so a `board` column inside
+   one of those files stores a value that is constant for the whole file.
+   It is a label, not an identifier.
+2. §8's measurement stands: every repository on this host maps to exactly
+   one board, so board slug adds no identity scoping that
+   `repo_github_id` does not already provide — while adding a
+   human-renameable string to a record whose purpose is immutable identity.
+
+Consequently the §D open item *"whether board slug is acceptable in the
+export payload or must be an opaque id"* is **withdrawn, not deferred**:
+no board slug is exported, so security-reviewer has no such question to
+answer. Acceptance test A26 and a verifier check assert the absence.
 
 ---
 
@@ -186,19 +303,33 @@ local-only and the broker must never reach into it.
 
 ## §C — Executable verification performed
 
-`verify_adr0007_mechanisms.py` (attached) exercises these mechanisms
+`verify_adr0007_mechanisms.py` (this directory) exercises these mechanisms
 against real SQLite and real git, so the claims above are demonstrated
 rather than asserted:
 
 ```
-python3 verify_adr0007_mechanisms.py     ->  36/36 checks passed
+python3 verify_adr0007_mechanisms.py     ->  85/85 checks passed
 ```
+
+The count rose from 36 to 85 in this revision: the B2 correction added
+hostile-input cases against both SQL CHECKs and the Python regexes, and
+B3/N2 added structural assertions about which columns must and must not
+exist.
 
 Proven, in order of the assertions in this document:
 
 - A row is written for **every** terminal outcome (completed, blocked,
   crashed) — absence of a record can never itself be read as evidence;
   only completed+SHAs+artifacts is `attestable=1`.
+- **§A.5 specifically (B2):** the superseded `GLOB '[0-9a-f]*'` pattern is
+  shown **accepting** `'a'+'Z'*39` — the defect, demonstrated rather than
+  described — while the normative `NOT GLOB '*[^0-9a-f]*'` CHECKs reject
+  `'a'+'Z'*39`, `'a'*39+'g'`, `'A'*40`, `'aB'*20`, 39 chars, 41 chars and
+  an embedded space, on **both** `subject_sha` and `verified_head_sha`,
+  and reject the 64-char equivalents on `run_evidence.sha256`. Valid
+  full-length lowercase hex is still accepted in each case. The Python
+  `SHA40`/`SHA256` regexes are run over the same hostile table so the two
+  validation layers cannot drift.
 - UPDATE and DELETE on the provenance table abort with
   `sqlite3.IntegrityError: run_provenance is append-only`, and the
   record survives the tamper attempt byte-identical (§B).
@@ -209,7 +340,6 @@ Proven, in order of the assertions in this document:
 - Re-export from a watermark yields nothing; export digests unique.
 - A `mode=ro` connection raises `attempt to write a readonly database`,
   confirming v1.0.0 §6's read-only exporter requirement is achievable.
-- Abbreviated (`a1b2c3d`) and uppercase SHAs rejected; 40-hex required.
 - Artifact digest is stable under input ordering and changes when any
   hash changes.
 - A real file digest differs from a worker-claimed one — i.e. the kernel
@@ -217,12 +347,16 @@ Proven, in order of the assertions in this document:
 - `git rev-parse` yields full 40-hex for HEAD and for tracked blobs; a
   non-git scratch dir yields nothing, so scratch runs are structurally
   non-attestable.
-- **§A specifically:** a complete gated run finalizes; a non-gated run
+- **§A.1 specifically:** a complete gated run finalizes; a non-gated run
   with NULL repo fields is legal but never finalizes; finalization fails
   closed *naming the offending field* for each of the five mandatory
   fields individually; a remote-string repo id, a malformed event
   locator, an abbreviated SHA, and an unresolved correction chain are
-  each refused; and no `final_candidate_sha`/`final_sha` column exists.
+  each refused. Every hostile SHA above is also refused by the
+  finalization gate, not only by the SQL layer.
+- **§A.4 specifically (B3):** no `final_candidate_sha` / `final_sha`
+  column exists, and both `subject_sha` and `verified_head_sha` do.
+- **§A.6 specifically (N2):** no `board` / `board_slug` column exists.
 
 This is a mechanism probe against a model of the schema. It is **not** a
 substitute for the acceptance tests, which must run against the real
@@ -230,22 +364,51 @@ kernel and belong to the implementer.
 
 ### §C.1 Additional acceptance tests (extend v1.0.0 §10)
 
-v1.0.0 A1–A12 stand. Add:
+**v1.0.0 A1–A18 all stand unchanged and are NOT renumbered.** A previous
+revision of this section reused the numbers A13–A20, colliding with v1.0.0
+A13–A18 and silently displacing six still-valid tests (absolute-path
+exclusion, implementation-run SHA equality, review-run SHA divergence,
+idempotent resubmission, exporter restart, and the profile→role map).
+That collision is corrected here: **v1.1.0 additions start at A19.**
+
+Numbering is global across both documents. A new test appends to the end;
+no existing number is ever reused for a different test.
 
 | # | Test | Expected |
 |---|---|---|
-| A13 | Non-gated run with NULL `repo_github_id`/`event_locator` | completes normally, `export_finalized=0`, never exported |
-| A14 | Finalization attempted with any one mandatory field missing | refused, fails closed, offending field named |
-| A15 | `origin` remote renamed | `repo_github_id` unchanged; remote string never accepted as identity |
-| A16 | Finalization performed | original provenance row byte-identical, digest unchanged |
-| A17 | Schema inspected for `final_candidate_sha` / `final_sha` | absent (guards §A.3) |
-| A18 | `edit_completed_task_result` called on a completed run | `summary`/`metadata` may change; provenance record digest **unchanged** |
-| A19 | Direct UPDATE/DELETE on provenance table | raises `sqlite3.IntegrityError` |
-| A20 | Runs terminating out of `run_id` order | export `seq` still ascending |
+| A19 | Non-gated run with NULL `repo_github_id`/`event_locator` | completes normally, `export_finalized=0`, never exported |
+| A20 | Finalization attempted with any one mandatory field missing | refused, fails closed, offending field named |
+| A21 | `origin` remote renamed | `repo_github_id` unchanged; remote string never accepted as identity |
+| A22 | Finalization performed | original provenance row byte-identical, digest unchanged |
+| A23 | Direct UPDATE/DELETE on provenance table | raises `sqlite3.IntegrityError` |
+| A24 | `edit_completed_task_result` called on a completed run | `summary`/`metadata` may change; provenance record digest **unchanged** |
+| A25 | Schema inspected for `final_candidate_sha` / `final_sha` | absent (guards §A.4 rule 2) |
+| A26 | Schema inspected for `board` / `board_slug` | absent (guards v1.0.0 §8; see §A.6) |
+| A27 | Runs terminating out of `run_id` order | export `seq` still ascending |
 
-A18 is the regression test for the §B defect specifically: the existing
+A24 is the regression test for the §B defect specifically: the existing
 post-completion mutation path must remain functional for its own purpose
 while being provably unable to touch provenance.
+
+Cross-reference for readers of the superseded numbering. **These are not
+test definitions** — the left column is a retired v1.1.0-draft label, the
+right column is the number now in force (defined in the table above):
+
+| retired draft label | number now in force |
+|---|---|
+| draft-A13 | A19 |
+| draft-A14 | A20 |
+| draft-A15 | A21 |
+| draft-A16 | A22 |
+| draft-A17 (final_sha guard) | A25 |
+| draft-A18 (`edit_completed_task_result`) | A24 |
+| draft-A19 (UPDATE/DELETE) | A23 |
+| draft-A20 (seq ordering) | A27 |
+
+The labels `A13`–`A18` without the `draft-` prefix belong to **v1.0.0 §10**
+and always did; that is the collision this correction removes.
+
+A26 is new in this correction (N2). v1.0.0 A5b is likewise new (B2).
 
 ---
 
@@ -253,26 +416,30 @@ while being provably unable to touch provenance.
 
 - **security-reviewer** (required next gate, has NOT occurred): sign-off
   on §B's trigger-based immutability and its stated residual risk;
-  whether board slug is acceptable in the export payload or must be an
-  opaque id; sign-off on §A.1's nullable-vs-required split.
+  sign-off on §A.1's nullable-vs-required split.
 - **platform-engineer**: implementation.
-- **broker / research-scout**: `final_candidate_sha` derivation stays
-  broker-side, out of scope here.
+- **broker / research-scout**: final candidate SHA derivation stays
+  broker-side, out of scope here (§A.4).
 
 Resolved, no longer open: repository id and PR number (§A, director
-ruling); DSSE source reference (attachment id 3, verified above).
+ruling); DSSE source reference (attachment id 3, verified above); board
+slug in the export payload (§A.6 — withdrawn, nothing to sign off);
+`final_candidate_sha` storage model (§A.4); hex CHECK strictness (§A.5).
 
 ## §E — Limitations of this document
 
 1. **Not security-approved.** v1.0.0 §11's warning stands unchanged.
 2. §C is a probe against a schema model, not the live kernel. The
    §C.1/§10 tests must be run against the real kernel before
-   implementation is considered verified.
+   implementation is considered verified. The B2 corrections narrow this
+   gap for hex validation only: the CHECK constraints are now exercised
+   as real SQLite CHECKs, but still on a model table.
 3. `repo_github_id` resolution assumes an authenticated GitHub API path
    exists in the kernel for that lookup. I did not verify one exists;
    if it does not, that is implementation work platform-engineer must
    scope, and until then no run is finalizable.
 4. The §B residual risk (trigger-droppable by a local root actor) is
    accepted-by-default here and explicitly routed to security-reviewer.
-5. I did not modify the Hermes repository, the live Kanban DB, or any
-   profile, per card scope.
+5. No change was made to Hermes source, the live Kanban DB, or any
+   profile. This revision touches only the three documents in
+   `docs/design/` named in §A.4.1 and this file's own header.

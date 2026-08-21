@@ -67,20 +67,37 @@ task_events (6 cols)
 | Column | Type | Null | Writer | Notes |
 |---|---|---|---|---|
 | `subject_sha` | TEXT | yes until claim | **kernel only** | Full 40-char lowercase hex. Captured at claim from the typed task target. Never writable via the worker path. |
-| `final_candidate_sha` | TEXT | yes | **kernel only** | Full 40-char lowercase hex. The head the run's verdict binds to. Populated on **every** run type; collapses to `subject_sha` for implementation runs. See §4.1. |
-| `role` | TEXT | no | **kernel only** | Enum: `implementation`, `code_review`, `qa`, `security`. **Derived at query/export time** from a static `profile → role` lookup; see §2.3. |
+| `verified_head_sha` | TEXT | yes | **kernel only** | Full 40-char lowercase hex. The head the run actually verified, stamped at terminalization. For implementation runs it equals `subject_sha`. **This is the run-level SHA pair; it is *not* `final_candidate_sha`.** See §4 and the normative resolution in v1.1.0 §A.4. |
 | `provenance_version` | INTEGER | no | kernel | Starts at `1`. Lets a future schema change be detected rather than silently reinterpreted. |
 | `corrects_run_id` | INTEGER | yes | kernel | FK → `task_runs(id)`. Non-null only on correction rows (§5). |
+
+> **⚠ Corrected by v1.1.0 §A.4 (B3).** An earlier revision of this table listed a
+> `final_candidate_sha` column and a stored `role` column. **Neither is part of the normative
+> schema.** `final_candidate_sha` is an attestation-layer field the broker derives (§4, v1.1.0
+> §A.4); the run stores `verified_head_sha` instead. `role` is derived at query time from
+> `profile` (§2.3) and is not persisted. The rows above are the complete, normative column list.
 
 `profile`, `outcome`, `ended_at` are **existing** columns and are reused as-is. `completed_at` for
 export purposes is `ended_at`; no new column.
 
 **CHECK constraints (fail-closed at write time):**
 ```sql
-CHECK (subject_sha IS NULL OR (length(subject_sha) = 40 AND subject_sha GLOB '[0-9a-f]*'))
-CHECK (role IN ('implementation','code_review','qa','security'))
+CHECK (subject_sha IS NULL OR (length(subject_sha) = 40
+       AND subject_sha NOT GLOB '*[^0-9a-f]*'))
+CHECK (verified_head_sha IS NULL OR (length(verified_head_sha) = 40
+       AND verified_head_sha NOT GLOB '*[^0-9a-f]*'))
 CHECK (provenance_version >= 1)
 ```
+
+> **⚠ Corrected (B2). The pattern `sha GLOB '[0-9a-f]*'` is WRONG and must not be implemented.**
+> A leading `[0-9a-f]` character class followed by `*` anchors only the **first** character; the
+> `*` then matches any remaining 39 characters, including uppercase and non-hex. Demonstrated
+> against real SQLite (`verify_adr0007_mechanisms.py`, table `legacy_sha_check`): `'a' + 'Z'*39`
+> and `'a'*39 + 'g'` are both **accepted** by the old pattern and both **rejected** by the
+> `NOT GLOB '*[^0-9a-f]*'` form above. The negated form is normative: it rejects any character
+> outside `[0-9a-f]` at any position. Length is still checked separately because GLOB alone
+> cannot express "exactly 40". Hostile cases are executable — see A5 and §10.
+
 
 ### §2.2 New table `run_artifacts`
 
@@ -92,10 +109,13 @@ CREATE TABLE run_artifacts (
   sha256        TEXT    NOT NULL,
   created_at    INTEGER NOT NULL,
   UNIQUE(run_id, artifact_path),
-  CHECK (length(sha256) = 64 AND sha256 GLOB '[0-9a-f]*')
+  CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*')
 );
 CREATE INDEX idx_run_artifacts_run ON run_artifacts(run_id);
 ```
+
+The `sha256` CHECK uses the same negated-GLOB form as §2.1 and for the same reason (B2):
+`sha256 GLOB '[0-9a-f]*'` would validate only the first of the 64 characters.
 
 One-to-many, per `platform-engineer`'s constraint. `UNIQUE(run_id, artifact_path)` is deliberate:
 double-recording an artifact becomes an error rather than a silent duplicate, closing one of the
@@ -179,47 +199,55 @@ reclassify a profile into a role it did not perform.
 
 ---
 
-## §4 — Subject SHA vs final candidate SHA
+## §4 — Subject SHA vs verified head SHA vs final candidate SHA
 
-| | Subject SHA | Final candidate SHA |
-|---|---|---|
-| Meaning | the commit the run's work was performed against | the head the run's verdict binds to |
-| Known at | claim time | run-completion time |
-| Stored | `task_runs.subject_sha` | `task_runs.final_candidate_sha` |
-| Written by | kernel, at claim | kernel, at terminalization |
+> **⚠ Normative resolution of the v1.0.0 `final_candidate_sha` contradiction (B3).**
+> An earlier revision of this section was internally inconsistent: §2.1 listed
+> `final_candidate_sha` as a run column, §4.1 said to carry both SHAs on every run, and the
+> closing paragraph of §4 said it is *not* a run field. **The single normative model is the
+> three-SHA model below**, stated in full in v1.1.0 §A.4. Exact superseded text is enumerated
+> in v1.1.0 §A.4.1. Where any older wording survives elsewhere, §A.4 wins.
 
-### §4.1 — Both SHAs on every run (corrected)
+**Three distinct SHAs. Two live on the run; the third is an attestation-layer field.**
 
-An earlier revision of this document stored **only** `subject_sha` on the run and left the final
-candidate SHA entirely to broker derivation. **That was wrong**, and `research-scout` (`t_5247914a`
-§4, §7) supplied the correction:
+| | Subject SHA | Verified head SHA | Final candidate SHA |
+|---|---|---|---|
+| Meaning | the commit the run's work was performed against | the head the run actually verified when it terminated | the head the **attestation** binds its verdict to |
+| Known at | claim time | run-completion time | attestation-assembly time (after the run) |
+| Stored | `task_runs.subject_sha` | `task_runs.verified_head_sha` | **not a Kanban column** — broker-derived |
+| Written by | kernel, at claim | kernel, at terminalization | broker, at attestation time |
 
-- Carry **both** `subject_sha` and `final_candidate_sha` on **every** run, uniformly. Do **not**
+### §4.1 — Both *witnessed* SHAs on every run; the final candidate stays broker-side
+
+Kanban records only what the kernel can **honestly witness**:
+
+- Carry **both** `subject_sha` and `verified_head_sha` on **every** run, uniformly. Do **not**
   make it conditional on run type.
-- For implementation runs the two collapse to the same value. That redundancy is harmless — special-
-  casing it costs more than it saves and creates a branch where a field can be legitimately absent.
-- For review / QA / security runs they can **legitimately diverge**: the branch may advance between
-  the commit a run reviewed and the head an attestation is later requested against.
+- For implementation runs the two collapse to the same value. That redundancy is harmless —
+  special-casing it costs more than it saves and creates a branch where a field can be
+  legitimately absent.
+- For review / QA / security runs they can **legitimately diverge**: the branch may advance
+  between the commit a run reviewed and the head an attestation is later requested against.
 
 **That divergence is the tamper check, not a defect.** It is what makes the broker's fail-closed
 condition *"PR head ≠ requested `expected_head_sha`"* (`t_5247914a` §7) evaluable at all. A schema
 that stored only one SHA would have made stale-evidence rebinding undetectable at the run layer.
 
-This does **not** conflict with §5 immutability: `final_candidate_sha` is written by the kernel at
+This does **not** conflict with §5 immutability: `verified_head_sha` is written by the kernel at
 terminalization, in the same transition that sets `ended_at`. It is never a post-terminal write.
 
-The broker still independently re-derives and binds the final candidate SHA in the attestation
-(§3.3). The run field is *provenance*; the attestation field is *authority*. They must agree, and
-the broker fails closed if they do not.
+**Why the final candidate SHA is *not* a run column.** It is knowable only after assembly — i.e.
+after the run is terminal — and §5 makes terminal runs immutable. Storing it on the run would
+require exactly the mutation this contract prohibits, and a Kanban column named
+`final_candidate_sha` / `final_sha` would invite a false equivalence between *"the head this run
+verified"* and *"the head the attestation binds"*. The broker derives and binds it (§3.3); the run
+field is *provenance*, the attestation field is *authority*. They must agree on `verified_head_sha`,
+and the broker fails closed if they do not.
 
 **Why subject SHA must come from a kernel-captured typed task target** (not worker JSON, not the
 evidence branch HEAD): if it is read from branch HEAD, the worker chooses *what was reviewed* after
 review happened. Capturing at claim makes the subject an **input** to the work rather than an
 **output** of it.
-
-**Why final candidate SHA is not a run field:** it is only knowable after assembly — i.e. after the
-run is terminal — and §5 makes terminal runs immutable. Storing it on the run would require exactly
-the mutation this contract prohibits.
 
 ---
 
@@ -270,8 +298,12 @@ fail-closed behaviour to laptop uptime.)
 
 ### §6.1 — Minimal export (exclusions are normative)
 
-Exported per run: `{run_id, task_id, profile, outcome, subject_sha, final_candidate_sha,
+Exported per run: `{run_id, task_id, profile, outcome, subject_sha, verified_head_sha,
 artifact_relative_path, sha256, completed_at}`.
+
+The export carries `verified_head_sha`, **not** `final_candidate_sha` — the broker derives the
+final candidate SHA itself (§4, v1.1.0 §A.4) and fails closed if it disagrees with the exported
+`verified_head_sha`.
 
 **Excluded — normative, not advisory:**
 
@@ -361,8 +393,10 @@ at attestation time (§3.3) and binds it in the attestation. Adding it to the ru
 |---|---|
 | **JSON envelope in `task_runs.metadata`** | Re-creates the parsing surface being eliminated, one layer deeper. No CHECK constraints, no FK, no uniqueness. |
 | **Fixed `artifact_1..artifact_n` columns** | Cannot express variable artifact counts; forces either truncation or a schema change per new artifact. |
-| **Final candidate SHA as broker-derived only** | Rejected after `t_5247914a` §4/§7. Storing only `subject_sha` makes the *"PR head ≠ requested head"* tamper check unevaluable at the run layer. Both SHAs are carried on every run (§4.1). |
-| **`board_slug` as a provenance field** | Measured, not assumed: every repository on this host maps to exactly one board (`account-gen` → 1 board, `hermes-agent` → 1 board; no repo appears under two boards). `repository_id` (immutable numeric) is sufficient identity scoping. Revisit only if multi-board-per-repo becomes real. |
+| **A run-level `final_candidate_sha` column** | Only knowable after the run is terminal, so writing it would require the mutation §5 prohibits, and it invites a false equivalence with the head the run actually verified. The run carries `subject_sha` + `verified_head_sha` (§4.1); the broker derives the final candidate SHA. |
+| **Storing only `subject_sha` on the run** | Rejected after `t_5247914a` §4/§7. One SHA makes the *"PR head ≠ requested head"* tamper check unevaluable at the run layer. Both **witnessed** SHAs are carried on every run (§4.1). |
+| **`board_slug` as a provenance field** | Measured, not assumed: every repository on this host maps to exactly one board (`account-gen` → 1 board, `hermes-agent` → 1 board; no repo appears under two boards). Each board additionally has its own `kanban.db` file, so a board column inside that file is a constant. `repository_id` (immutable numeric) is sufficient identity scoping. **No `board` or `board_slug` column appears in any table in this contract**, and `verify_adr0007_mechanisms.py` asserts its absence (N2). Revisit only if multi-board-per-repo becomes real. |
+| **`sha GLOB '[0-9a-f]*'` for hex validation** | Anchors only the first character; `'a'+'Z'*39` passes. Superseded by `NOT GLOB '*[^0-9a-f]*'` (§2.1, §2.2), demonstrated in `verify_adr0007_mechanisms.py`. |
 | **`role` as a stored column** | Forces a migration whenever a profile is reclassified, and creates a second place role can disagree with the dispatcher record. Derived at query time from protected-base policy instead (§2.3). |
 | **Broker-facing pull API / tunnel** | `t_5247914a` §3a: inverts the trust direction and couples fail-closed behaviour to laptop uptime. Push-per-run with an exporter-side cursor instead (§6). |
 | **Commit-count-based role independence** | Commit count is transport, not identity. Three commits by one actor prove nothing about independence. |
@@ -391,14 +425,18 @@ migration path and a backup verified by checksum before application. This is a
 
 ## §10 — Acceptance tests (executable)
 
+**Numbering is stable and global across v1.0.0 and v1.1.0.** A1–A18 below are owned by this
+document. v1.1.0 §C.1 adds A19 and upward; it does **not** renumber anything here.
+
 | # | Test | Expected |
 |---|---|---|
 | A1 | Worker attempts to write `role` or `profile` on its own run | rejected; kernel value unchanged |
 | A2 | Worker supplies `{path, sha256}`; kernel stamps `created_at` | row present, hash matches recomputed digest |
 | A3 | Same profile produces `code_review` and `security` terminal runs | evaluator **FAIL** (§3.2) |
 | A4 | Three distinct profiles across the three required roles | evaluator **PASS** |
-| A5 | `subject_sha` of 39 chars, uppercase, or non-hex | CHECK rejects |
-| A6 | UPDATE any field on a terminal run | rejected |
+| A5 | `subject_sha` / `verified_head_sha` hostile values: `'a'+'Z'*39`, `'a'*39+'g'`, `'A'*40`, `'aB'*20`, 39 chars, 41 chars, embedded space | CHECK rejects **every** case (§2.1; `GLOB '[0-9a-f]*'` would accept the first two) |
+| A5b | `run_artifacts.sha256` hostile values: `'c'*63+'Z'`, `'c'+'Z'*63`, `'C'*64`, 63 chars | CHECK rejects every case (§2.2) |
+| A6 | UPDATE any field on a terminal run | rejected — see v1.1.0 §B for the enforcing mechanism (a documented prohibition alone does not reject it) |
 | A7 | Two correction rows target the same `corrects_run_id` | broker **fails closed**, no export |
 | A8 | `corrects_run_id` points at a non-existent row | broker **fails closed** |
 | A9 | Duplicate `(run_id, artifact_path)` | UNIQUE violation |
@@ -406,11 +444,14 @@ migration path and a backup verified by checksum before application. This is a
 | A11 | Run with `provenance_version = NULL` (legacy) | excluded from export, not an error |
 | A12 | Export payload inspected for `summary` / `error` / `body` | absent (§6.1) |
 | A13 | Export payload inspected for any absolute path (`/Users/…`) | absent; only repo-relative `artifact_path` (§6.1) |
-| A14 | Implementation run: `subject_sha` vs `final_candidate_sha` | equal; **not** special-cased, both populated (§4.1) |
-| A15 | Review run where branch advanced after review | `final_candidate_sha != subject_sha`; broker fails closed on `PR head != expected_head_sha` |
+| A14 | Implementation run: `subject_sha` vs `verified_head_sha` | equal; **not** special-cased, both populated (§4.1) |
+| A15 | Review run where branch advanced after review | `verified_head_sha != subject_sha`; broker fails closed on `PR head != expected_head_sha` |
 | A16 | Same `(repository_id, task_id, run_id)` resubmitted with a different outcome | mirror **rejects**; first write wins (§6) |
 | A17 | Exporter restarted after downtime | resumes from its own cursor; no duplicate envelopes, no gap |
 | A18 | Profile absent from the protected-base `profile → role` map | role unresolved → gate **FAIL**, never defaulted (§2.3) |
+
+v1.1.0 §C.1 continues this table at **A19**. A13–A18 above remain in force and are **not**
+superseded by it.
 
 ---
 
@@ -418,7 +459,7 @@ migration path and a backup verified by checksum before application. This is a
 
 Design constraints in §3.2, §3.3 and §4 were supplied by `platform-engineer` (card `t_8c86298c`
 consultation) and **corrected two errors** in the author's earlier model: commit-level rather than
-run-level independence, and final candidate SHA held as a run column. Both are recorded in §8 as
+run-level independence, and a final-candidate SHA held as a run column. Both are recorded in §8 as
 rejected alternatives so the reasoning survives the decision.
 
 Schema facts in §1 were read from the live database, not recalled.
