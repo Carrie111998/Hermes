@@ -39,3 +39,19 @@ def test_save_cfg_writes_override_home_not_launch_home(tmp_path, monkeypatch):
     launch = yaml.safe_load((launch_home / "config.yaml").read_text(encoding="utf-8"))
     assert profile["model"]["default"] == "updated-profile"
     assert launch["model"]["default"] == "launch-model"
+
+
+def test_cfg_home_and_watcher_home_share_override(tmp_path, monkeypatch):
+    launch_home = tmp_path / "launch"
+    profile_home = tmp_path / "profile"
+    launch_home.mkdir()
+    profile_home.mkdir()
+    monkeypatch.setattr(server, "_hermes_home", launch_home)
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        assert server._cfg_home() == profile_home
+        assert server._watcher_home() == profile_home
+    finally:
+        reset_hermes_home_override(token)
+    assert server._cfg_home() == launch_home
+    assert server._watcher_home() == launch_home
