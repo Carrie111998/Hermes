@@ -3948,6 +3948,11 @@ def _spawn_swr_refresh(cache_key: str, refresh_fn=None) -> None:
             entry = (refresh_fn or _default_refresh)()
             if entry:
                 cache = _load_provider_models_cache()
+                # Skip the disk write when nothing actually changed — every
+                # --refresh picker open lands here, and rewriting an identical
+                # catalog just churns the file's mtime (review on #89874).
+                if cache.get(cache_key) == entry:
+                    return
                 cache[cache_key] = entry
                 _save_provider_models_cache(cache)
         except Exception:
