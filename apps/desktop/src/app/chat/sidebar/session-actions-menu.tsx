@@ -33,7 +33,7 @@ import { exportSession } from '@/lib/session-export'
 import type { HermesGitWorktree } from '@/global'
 import { activeGateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
-import { $projectTree, moveSessionToProject, projectRootCwd, refreshProjectTree } from '@/store/projects'
+import { $projectTree, moveSessionToProject, projectIdForCwd, projectRootCwd, refreshProjectTree } from '@/store/projects'
 import {
   $activeSessionId,
   $connection,
