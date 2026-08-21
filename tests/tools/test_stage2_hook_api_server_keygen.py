@@ -55,7 +55,10 @@ def _run_keygen(
     else:
         env_setup = f'API_SERVER_KEY="{env_key}"\n'
     script = (
-        "set -u\n"
+        # Production runs the hook under `set -eu` (docker/stage2-hook.sh
+        # shebang block) — the sandbox must match, or the tests cannot see
+        # unguarded-command defects that would abort a real container boot.
+        "set -eu\n"
         f"{env_setup}"
         f'HERMES_HOME="{home}"\n'
         # In tests we run unprivileged; as_hermes is a passthrough then.
@@ -193,6 +196,36 @@ def _sed_is_gnu() -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return False
     return probe.returncode == 0 and "GNU sed" in probe.stdout
+
+
+def test_keygen_readonly_env_degrades_to_warning_not_boot_abort(
+    stage2_text: str, tmp_path: Path
+) -> None:
+    """A keyless .env on a read-only volume must not abort stage2.
+
+    The hook runs under `set -eu`; an unguarded failing append would kill the
+    whole cont-init phase and the container boot. It must instead warn that
+    the api_server will be unavailable and exit 0.
+    """
+    import os
+
+    if os.geteuid() == 0:
+        pytest.skip("running as root — file write perms are not enforced")
+    home = tmp_path / "home"
+    home.mkdir()
+    env_path = home / ".env"
+    env_path.write_text("OTHER=1\n")
+    env_path.chmod(0o444)
+    try:
+        result = _run_keygen(stage2_text, home)
+        assert result.returncode == 0, (
+            f"stage2 keygen must not abort the boot on a read-only .env:\n"
+            f"{result.stderr}"
+        )
+        assert "could not write API_SERVER_KEY" in (result.stdout + result.stderr)
+        assert env_path.read_text() == "OTHER=1\n"
+    finally:
+        env_path.chmod(0o644)
 
 
 def test_keygen_warns_on_weak_container_env_key(

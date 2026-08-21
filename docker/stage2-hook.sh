@@ -494,10 +494,15 @@ elif ! grep -q '^API_SERVER_KEY=..*' "$HERMES_HOME/.env" 2>/dev/null; then
             _gen_key=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
             if [ -n "$_gen_key" ]; then
                 # Drop an empty assignment line if the seed left one behind,
-                # then append the generated key.
+                # then append the generated key. The append is guarded: on a
+                # read-only volume / full disk it must degrade to the warning
+                # below, not abort the whole stage2 hook under `set -e`.
                 sed -i '/^API_SERVER_KEY=$/d' "$HERMES_HOME/.env" 2>/dev/null || true
-                printf 'API_SERVER_KEY=%s\n' "$_gen_key" >> "$HERMES_HOME/.env"
-                echo "[stage2] Generated API_SERVER_KEY for the loopback gateway api_server"
+                if printf 'API_SERVER_KEY=%s\n' "$_gen_key" >> "$HERMES_HOME/.env" 2>/dev/null; then
+                    echo "[stage2] Generated API_SERVER_KEY for the loopback gateway api_server"
+                else
+                    echo "[stage2] Warning: could not write API_SERVER_KEY to $HERMES_HOME/.env (read-only volume?) — gateway api_server (cron fires) will be unavailable"
+                fi
             fi
             unset _gen_key
         else
