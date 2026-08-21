@@ -729,6 +729,8 @@ export const en: Translations = {
         `“${label}” will be removed from this app. The instance itself is not touched — you can add it again any time.`,
       makePrimary: 'Make primary',
       testConnection: 'Test',
+      detectAuthentication: 'Detect authentication',
+      signInFailed: 'Gateway sign-in failed',
       testOk: 'Reachable',
       testFailed: 'Connection test failed',
       saveFailed: 'Could not save the connection',

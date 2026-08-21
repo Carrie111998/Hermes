@@ -6,6 +6,7 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Input } from '@/components/ui/input'
 import type {
   DesktopConnectionKind,
+  DesktopConnectionProbeResult,
   DesktopConnectionsRegistry,
   DesktopRegistryConnection,
   DesktopRegistryConnectionInput
@@ -16,6 +17,7 @@ import {
   connectionMatchesQuery,
   sortConnectionsForDisplay
 } from '@/lib/connection-display'
+import { deriveRemoteAuthProviderShape } from '@/lib/desktop-remote-auth'
 import { triggerHaptic } from '@/lib/haptics'
 import { Cloud, Globe, Loader2, Monitor, Pencil, Plus, RefreshCw, SearchIcon, Terminal, Trash2 } from '@/lib/icons'
 import { $activeConnectionId, setConnectionsRegistry } from '@/store/connections'
@@ -115,6 +117,37 @@ export function sshCompositeKey(composite: string): string {
   }
 
   return `${user}@${host}:${port}`
+}
+
+const CONNECTION_TEST_IPC_ERROR_PREFIX = "Error invoking remote method 'hermes:connections:test': Error: "
+
+const WS_TICKET_AUTH_REJECTION_MESSAGE =
+  'Reached the gateway over HTTP, but the OAuth session was rejected while minting a WebSocket ticket. ' +
+  'Open Settings → Gateway and sign in again.'
+
+/**
+ * Electron's invoke bridge preserves a main-process throw as a renderer Error
+ * message (for example, `Error invoking remote method '…': Error: 401: …`),
+ * but does not preserve custom Error fields. Accept the field when present in
+ * direct/test callers; otherwise match a leading serialized status or the
+ * complete Electron-wrapped WebSocket-ticket auth rejection.
+ */
+export function isConnectionAuthRejection(error: unknown): boolean {
+  const statusCode =
+    error && typeof error === 'object' && 'statusCode' in error
+      ? Number((error as { statusCode?: unknown }).statusCode)
+      : null
+
+  if (statusCode === 401 || statusCode === 403) {
+    return true
+  }
+
+  const message = error instanceof Error ? error.message : typeof error === 'string' ? error : ''
+
+  return (
+    /^(?:Error invoking remote method 'hermes:connections:test': Error: )?(?:401|403):(?:\s|$)/.test(message) ||
+    message === `${CONNECTION_TEST_IPC_ERROR_PREFIX}${WS_TICKET_AUTH_REJECTION_MESSAGE}`
+  )
 }
 
 /**
@@ -233,6 +266,20 @@ export function ConnectionsRegistrySection() {
   const [launchModeBusy, setLaunchModeBusy] = useState(false)
   const [updatingAll, setUpdatingAll] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
+  const [authProbe, setAuthProbe] = useState<DesktopConnectionProbeResult | null>(null)
+  const [authProbeBusy, setAuthProbeBusy] = useState(false)
+  const [authSignedIn, setAuthSignedIn] = useState(false)
+  const [authSigningIn, setAuthSigningIn] = useState(false)
+  const [authVerifying, setAuthVerifying] = useState(false)
+  const [authError, setAuthError] = useState<null | string>(null)
+  const [authProbeGeneration, setAuthProbeGeneration] = useState<null | number>(null)
+  const [authReadyGeneration, setAuthReadyGeneration] = useState<null | number>(null)
+  const [authScope, setAuthScope] = useState<null | string>(null)
+  const authScopeRef = useRef<{ owned: boolean; scope: null | string }>({ owned: false, scope: null })
+  const authDraftPromise = useRef<null | Promise<null | string>>(null)
+  const authGeneration = useRef(0)
+  const [reauthIds, setReauthIds] = useState<Set<string>>(() => new Set())
+  const authProbeSeq = useRef(0)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const pendingSearchTopRef = useRef<null | number>(null)
   // Inline duplicate rejection from the save path (dedupe is also enforced in
@@ -241,7 +288,57 @@ export function ConnectionsRegistrySection() {
 
   const bridge = window.hermesDesktop?.connections
 
+  const { isPassword: isPasswordProvider, providerLabel } = deriveRemoteAuthProviderShape(
+    authProbe?.providers,
+    t.install.identityProvider
+  )
+
   const hasLocal = Boolean(registry?.connections.some(c => c.kind === 'local'))
+
+  const editingExistingTokenEntry = Boolean(
+    editor?.id &&
+      registry?.connections.some(
+        connection =>
+          connection.id === editor.id && connection.kind === 'remote' && (connection.authMode ?? 'token') === 'token'
+      )
+  )
+
+  const originalEditorConnection = editor?.id
+    ? registry?.connections.find(connection => connection.id === editor.id)
+    : undefined
+
+  const remoteEndpointChanged = Boolean(
+    editor?.kind === 'remote' &&
+      editor.id &&
+      normalizeGatewayUrl(editor.url) !== normalizeGatewayUrl(originalEditorConnection?.url || '')
+  )
+
+  const headersChanged = Boolean(
+    editor?.kind === 'remote' &&
+      (editor.headers.some(row => row.value.trim()) ||
+        editor.headers.map(row => row.name.trim()).filter(Boolean).join('\n') !==
+          (originalEditorConnection?.headerNames || []).join('\n'))
+  )
+
+  const remoteAuthChanged = Boolean(
+    editor?.kind === 'remote' &&
+      (editor.token.trim() ||
+        editor.authMode !== (originalEditorConnection?.authMode || 'token') ||
+        headersChanged)
+  )
+
+  const remoteNeedsReadiness = Boolean(
+    editor?.kind === 'remote' && (!editor.id || remoteEndpointChanged || remoteAuthChanged)
+  )
+
+  const authProbeIsCurrent = Boolean(
+    editor?.kind === 'remote' &&
+      authProbe?.reachable &&
+      authProbeGeneration === authGeneration.current &&
+      normalizeGatewayUrl(authProbe.baseUrl) === normalizeGatewayUrl(editor.url)
+  )
+
+  const authReady = authProbeIsCurrent && authReadyGeneration === authGeneration.current
 
   const publishRegistry = useCallback((next: DesktopConnectionsRegistry) => {
     setRegistry(next)
@@ -270,9 +367,358 @@ export function ConnectionsRegistrySection() {
     void load()
   }, [load])
 
+  const editorAuthHeaders = (current: EditorState): Record<string, string> =>
+    Object.fromEntries(
+      current.headers
+        .map(row => [row.name.trim(), row.value.trim()] as const)
+        .filter(([name, value]) => Boolean(name && value))
+    )
+
+  const setAuthScopeState = (scope: null | string, owned: boolean) => {
+    authScopeRef.current = { owned, scope }
+    setAuthScope(scope)
+  }
+
+  const invalidateReadiness = (clearProbe = false) => {
+    authGeneration.current += 1
+    setAuthReadyGeneration(null)
+    setAuthError(null)
+
+    if (clearProbe) {
+      authProbeSeq.current += 1
+      setAuthProbe(null)
+      setAuthProbeGeneration(null)
+      setAuthProbeBusy(false)
+    }
+  }
+
+  const resetEditorAuth = useCallback((signedIn = false) => {
+    authProbeSeq.current += 1
+    authGeneration.current += 1
+    setAuthProbe(null)
+    setAuthProbeGeneration(null)
+    setAuthProbeBusy(false)
+    setAuthSignedIn(signedIn)
+    setAuthSigningIn(false)
+    setAuthVerifying(false)
+    setAuthError(null)
+    setAuthReadyGeneration(null)
+  }, [])
+
+  const clearOwnedDraft = async (url: string) => {
+    const current = authScopeRef.current
+
+    if (!current.owned || !current.scope) {
+      return
+    }
+
+    setAuthScopeState(null, false)
+
+    if (url.trim()) {
+      await bridge?.auth.clear({ scope: current.scope, url, headers: {} })
+    }
+  }
+
+  const createOwnedDraft = async () => {
+    if (authScopeRef.current.owned && authScopeRef.current.scope) {
+      return authScopeRef.current.scope
+    }
+
+    if (authDraftPromise.current) {
+      return authDraftPromise.current
+    }
+
+    const pending = (async () => {
+      const result = await bridge?.auth.createDraft()
+
+      if (result?.ok) {
+        setAuthScopeState(result.scope, true)
+
+        return result.scope
+      }
+
+      if (result && !result.ok) {
+        setAuthError(result.error)
+      }
+
+      return null
+    })()
+
+    authDraftPromise.current = pending
+
+    try {
+      return await pending
+    } finally {
+      if (authDraftPromise.current === pending) {
+        authDraftPromise.current = null
+      }
+    }
+  }
+
+  const readDurableAuthStatus = async (next: EditorState, seq: number) => {
+    if (!next.id || next.kind !== 'remote') {
+      return
+    }
+
+    const result = await bridge?.auth.status({
+      scope: next.id,
+      url: next.url,
+      headers: editorAuthHeaders(next)
+    })
+
+    if (seq !== authGeneration.current || !result) {
+      return
+    }
+
+    if (result.ok) {
+      setAuthSignedIn(result.connected)
+    } else {
+      setAuthError(result.error)
+    }
+  }
+
   const openEditor = (next: EditorState | null) => {
+    const previousUrl = editor?.url || ''
     setDupeError(null)
+    void clearOwnedDraft(previousUrl)
+    resetEditorAuth()
+    setAuthScopeState(null, false)
     setEditor(next)
+
+    if (!next || next.kind !== 'remote') {
+      return
+    }
+
+    if (next.id) {
+      setAuthScopeState(next.id, false)
+      const seq = authGeneration.current
+      void readDurableAuthStatus(next, seq)
+    } else {
+      void createOwnedDraft()
+    }
+  }
+
+  const ensureScopeForUrl = async (current: EditorState, nextUrl: string) => {
+    if (!current.id) {
+      return authScopeRef.current.scope || createOwnedDraft()
+    }
+
+    const original = registry?.connections.find(connection => connection.id === current.id)?.url || ''
+    const changed = normalizeGatewayUrl(nextUrl) !== normalizeGatewayUrl(original)
+
+    if (changed) {
+      if (!authScopeRef.current.owned) {
+        setAuthScopeState(null, false)
+
+        return createOwnedDraft()
+      }
+
+      return authScopeRef.current.scope
+    }
+
+    if (authScopeRef.current.owned) {
+      await clearOwnedDraft(current.url)
+    }
+
+    setAuthScopeState(current.id, false)
+    const seq = authGeneration.current
+    void readDurableAuthStatus({ ...current, url: nextUrl }, seq)
+
+    return current.id
+  }
+
+  const probeEditorAuth = async () => {
+    const url = editor?.url.trim()
+
+    if (!editor || editor.kind !== 'remote' || !url || !bridge?.auth) {
+      return
+    }
+
+    const scope = authScopeRef.current.scope || (await createOwnedDraft())
+
+    if (!scope) {
+      return
+    }
+
+    const seq = ++authProbeSeq.current
+    const generation = authGeneration.current
+    setAuthProbeBusy(true)
+    setAuthError(null)
+
+    try {
+      const result = await bridge.auth.probe({ scope, url, headers: editorAuthHeaders(editor) })
+
+      if (seq !== authProbeSeq.current || generation !== authGeneration.current) {
+        return
+      }
+
+      if (!('reachable' in result)) {
+        setAuthProbe(null)
+        setAuthError(result.error)
+
+        return
+      }
+
+      setAuthProbe(result)
+      setAuthProbeGeneration(generation)
+
+      if (!result.reachable) {
+        setAuthError(result.error || t.settings.gateway.probeError)
+
+        return
+      }
+
+      if (normalizeGatewayUrl(result.baseUrl) !== normalizeGatewayUrl(url)) {
+        setAuthError('The gateway response did not match the current URL. Detect authentication again.')
+
+        return
+      }
+
+      setEditor(current =>
+        current && normalizeGatewayUrl(current.url) === normalizeGatewayUrl(url)
+          ? { ...current, authMode: result.authMode === 'oauth' ? 'oauth' : 'token' }
+          : current
+      )
+    } catch (err) {
+      if (seq === authProbeSeq.current) {
+        const message = err instanceof Error ? err.message : t.settings.gateway.probeError
+        setAuthError(message)
+        notifyError(err, t.settings.gateway.probeError)
+      }
+    } finally {
+      if (seq === authProbeSeq.current) {
+        setAuthProbeBusy(false)
+      }
+    }
+  }
+
+  const verifyEditorAuth = async (current = editor) => {
+    const url = current?.url.trim()
+    const scope = authScopeRef.current.scope
+
+    if (!current || current.kind !== 'remote' || !url || !scope || !bridge?.auth) {
+      return false
+    }
+
+    const generation = authGeneration.current
+    setAuthVerifying(true)
+    setAuthError(null)
+
+    try {
+      const result = await bridge.auth.verify({
+        authMode: current.authMode,
+        scope,
+        token: current.token.trim() || undefined,
+        url,
+        headers: editorAuthHeaders(current)
+      })
+
+      if (generation !== authGeneration.current) {
+        return false
+      }
+
+      if (!result.ok) {
+        setAuthReadyGeneration(null)
+        setAuthError(result.error)
+
+        if (result.kind === 'auth-required' && current.id) {
+          setReauthIds(ids => new Set(ids).add(current.id!))
+          setAuthSignedIn(false)
+        }
+
+        return false
+      }
+
+      setAuthReadyGeneration(generation)
+
+      return true
+    } catch (err) {
+      if (generation === authGeneration.current) {
+        setAuthReadyGeneration(null)
+        setAuthError(err instanceof Error ? err.message : s.testFailed)
+      }
+
+      return false
+    } finally {
+      if (generation === authGeneration.current) {
+        setAuthVerifying(false)
+      }
+    }
+  }
+
+  const signInEditorAuth = async () => {
+    const url = editor?.url.trim()
+    const scope = authScopeRef.current.scope
+
+    if (!editor || editor.kind !== 'remote' || !url || !scope || !bridge?.auth) {
+      return
+    }
+
+    const generation = authGeneration.current
+    setAuthSigningIn(true)
+    setAuthError(null)
+
+    try {
+      const result = await bridge.auth.login({ scope, url, headers: editorAuthHeaders(editor) })
+
+      if (generation !== authGeneration.current) {
+        return
+      }
+
+      if (!result.ok) {
+        setAuthError(result.error)
+
+        return
+      }
+
+      if (!result.connected) {
+        notify({
+          kind: 'warning',
+          title: t.boot.failure.signInIncompleteTitle,
+          message: t.boot.failure.signInIncompleteMessage
+        })
+
+        return
+      }
+
+      setAuthSignedIn(true)
+      const verified = await verifyEditorAuth(editor)
+
+      if (verified && editor.id) {
+        setReauthIds(current => {
+          const next = new Set(current)
+          next.delete(editor.id!)
+
+          return next
+        })
+      }
+    } catch (err) {
+      if (generation === authGeneration.current) {
+        setAuthError(err instanceof Error ? err.message : s.signInFailed)
+        notifyError(err, s.signInFailed)
+      }
+    } finally {
+      if (generation === authGeneration.current) {
+        setAuthSigningIn(false)
+      }
+    }
+  }
+
+  const signOutEditorAuth = async () => {
+    const url = editor?.url.trim()
+    const scope = authScopeRef.current.scope
+
+    if (!editor || !url || !scope || !bridge?.auth) {
+      return
+    }
+
+    invalidateReadiness()
+    setAuthSignedIn(false)
+    const result = await bridge.auth.clear({ scope, url, headers: editorAuthHeaders(editor) })
+
+    if (!result.ok) {
+      setAuthError(result.error)
+    }
   }
 
   const save = useCallback(
@@ -315,6 +761,10 @@ export function ConnectionsRegistrySection() {
           payload.url = editor.url
           payload.authMode = editor.authMode
 
+          if (authScopeRef.current.owned && authScopeRef.current.scope) {
+            payload.authDraftScope = authScopeRef.current.scope
+          }
+
           if (editor.token.trim()) {
             payload.token = editor.token.trim()
           }
@@ -344,6 +794,8 @@ export function ConnectionsRegistrySection() {
 
         const result = await bridge.save(payload)
         publishRegistry(result.registry)
+        setAuthScopeState(null, false)
+        resetEditorAuth()
         setEditor(null)
         setPlainTextConfirm(false)
       } catch (err) {
@@ -367,7 +819,7 @@ export function ConnectionsRegistrySection() {
         setSaving(false)
       }
     },
-    [bridge, editor, publishRegistry, registry?.connections, registry?.secureTokenStorage, s]
+    [bridge, editor, publishRegistry, registry?.connections, registry?.secureTokenStorage, resetEditorAuth, s]
   )
 
   const remove = useCallback(async () => {
@@ -443,9 +895,17 @@ export function ConnectionsRegistrySection() {
         if (reachable) {
           notify({ title: conn.label, message: s.testOk })
         } else {
+          if (result.kind === 'auth-required') {
+            setReauthIds(current => new Set(current).add(conn.id))
+          }
+
           notifyError(new Error(result.error || conn.label), s.testFailed)
         }
       } catch (err) {
+        if (isConnectionAuthRejection(err)) {
+          setReauthIds(current => new Set(current).add(conn.id))
+        }
+
         notifyError(err, s.testFailed)
       } finally {
         setTestingId(null)
@@ -654,8 +1114,16 @@ export function ConnectionsRegistrySection() {
                 disabled={Boolean(editor.id) || (kind === 'local' && hasLocal)}
                 key={kind}
                 onClick={() => {
+                  const next = { ...editor, kind }
                   setDupeError(null)
-                  setEditor({ ...editor, kind })
+                  void clearOwnedDraft(editor.url)
+                  resetEditorAuth()
+                  setAuthScopeState(null, false)
+                  setEditor(next)
+
+                  if (kind === 'remote') {
+                    void createOwnedDraft()
+                  }
                 }}
                 size="sm"
                 variant={editor.kind === kind ? 'default' : 'outline'}
@@ -687,8 +1155,12 @@ export function ConnectionsRegistrySection() {
               action={
                 <Input
                   onChange={e => {
+                    const url = e.target.value
+                    const next = { ...editor, url }
                     setDupeError(null)
-                    setEditor({ ...editor, url: e.target.value })
+                    resetEditorAuth()
+                    setEditor(next)
+                    void ensureScopeForUrl(editor, url)
                   }}
                   placeholder="http://homelab.lan:9119"
                   value={editor.url}
@@ -700,37 +1172,90 @@ export function ConnectionsRegistrySection() {
 
           {editor.kind === 'remote' && (
             <>
-              <ListRow
-                action={
-                  <div className="flex gap-2">
-                    {(['token', 'oauth'] as const).map(mode => (
-                      <Button
-                        key={mode}
-                        onClick={() => setEditor({ ...editor, authMode: mode })}
-                        size="sm"
-                        variant={editor.authMode === mode ? 'default' : 'outline'}
-                      >
-                        {mode === 'token' ? t.settings.gateway.tokenTitle : 'OAuth'}
-                      </Button>
-                    ))}
-                  </div>
-                }
-                title={t.settings.gateway.authTitle}
-              />
+              {!authProbeIsCurrent && (
+                <ListRow
+                  action={
+                    <Button
+                      disabled={authProbeBusy || !editor.url.trim()}
+                      onClick={() => void probeEditorAuth()}
+                      size="sm"
+                      variant="outline"
+                    >
+                      {authProbeBusy ? t.settings.gateway.probing : s.detectAuthentication}
+                    </Button>
+                  }
+                  title={t.settings.gateway.authTitle}
+                />
+              )}
               {editor.authMode === 'token' && (
                 <ListRow
                   action={
-                    <Input
-                      onChange={e => setEditor({ ...editor, token: e.target.value })}
-                      placeholder={t.settings.gateway.pasteSessionToken}
-                      type="password"
-                      value={editor.token}
-                    />
+                    <div className="flex items-center gap-2">
+                      <Input
+                        onChange={e => {
+                          invalidateReadiness()
+                          setEditor({ ...editor, token: e.target.value })
+                        }}
+                        placeholder={t.settings.gateway.pasteSessionToken}
+                        type="password"
+                        value={editor.token}
+                      />
+                      {authProbeIsCurrent ? (
+                        <Button
+                          disabled={
+                            authVerifying || (!editor.token.trim() && (!editingExistingTokenEntry || remoteAuthChanged))
+                          }
+                          onClick={() => void verifyEditorAuth()}
+                          size="sm"
+                          variant="outline"
+                        >
+                          {authVerifying ? t.common.connecting : 'Verify connection'}
+                        </Button>
+                      ) : null}
+                    </div>
                   }
                   description={t.settings.gateway.tokenDesc}
                   title={t.settings.gateway.tokenTitle}
                 />
               )}
+              {authProbeIsCurrent && editor.authMode === 'oauth' && (!editor.id || remoteEndpointChanged) && (
+                <ListRow
+                  action={
+                    <Button disabled={authSigningIn || authSignedIn} onClick={() => void signInEditorAuth()} size="sm">
+                      {authSignedIn
+                        ? t.settings.gateway.signedIn
+                        : authSigningIn
+                          ? t.common.connecting
+                          : isPasswordProvider
+                            ? t.settings.gateway.signIn
+                            : t.settings.gateway.signInWith(providerLabel)}
+                    </Button>
+                  }
+                  title={t.settings.gateway.authTitle}
+                />
+              )}
+              {editor.id && editor.authMode === 'oauth' && !remoteEndpointChanged ? (
+                <div className="flex justify-end gap-2">
+                  <Button
+                    disabled={authSigningIn || authVerifying}
+                    onClick={() => void signInEditorAuth()}
+                    size="sm"
+                    variant="outline"
+                  >
+                    Reauthenticate
+                  </Button>
+                  {authSignedIn ? (
+                    <Button
+                      disabled={authSigningIn || authVerifying}
+                      onClick={() => void signOutEditorAuth()}
+                      size="sm"
+                      variant="outline"
+                    >
+                      {t.settings.gateway.signOut}
+                    </Button>
+                  ) : null}
+                </div>
+              ) : null}
             </>
           )}
 
@@ -744,29 +1269,34 @@ export function ConnectionsRegistrySection() {
                 <div className="flex items-center gap-2" key={index}>
                   <Input
                     className="flex-1"
-                    onChange={e =>
+                    onChange={e => {
+                      invalidateReadiness()
                       setEditor({
                         ...editor,
                         headers: editor.headers.map((h, i) => (i === index ? { ...h, name: e.target.value } : h))
                       })
-                    }
+                    }}
                     placeholder="CF-Access-Client-Id"
                     value={row.name}
                   />
                   <Input
                     className="flex-1"
-                    onChange={e =>
+                    onChange={e => {
+                      invalidateReadiness()
                       setEditor({
                         ...editor,
                         headers: editor.headers.map((h, i) => (i === index ? { ...h, value: e.target.value } : h))
                       })
-                    }
+                    }}
                     placeholder={row.stored ? s.headerValueSaved : s.headerValuePlaceholder}
                     type="password"
                     value={row.value}
                   />
                   <Button
-                    onClick={() => setEditor({ ...editor, headers: editor.headers.filter((_, i) => i !== index) })}
+                    onClick={() => {
+                      invalidateReadiness()
+                      setEditor({ ...editor, headers: editor.headers.filter((_, i) => i !== index) })
+                    }}
                     size="sm"
                     variant="ghost"
                   >
@@ -776,9 +1306,10 @@ export function ConnectionsRegistrySection() {
               ))}
               <div>
                 <Button
-                  onClick={() =>
+                  onClick={() => {
+                    invalidateReadiness()
                     setEditor({ ...editor, headers: [...editor.headers, { name: '', stored: false, value: '' }] })
-                  }
+                  }}
                   size="sm"
                   variant="outline"
                 >
@@ -805,12 +1336,27 @@ export function ConnectionsRegistrySection() {
           )}
 
           {dupeError ? <p className="text-xs text-destructive">{dupeError}</p> : null}
+          {authError ? <p className="text-xs text-destructive">{authError}</p> : null}
 
           <div className="flex justify-end gap-2">
             <Button disabled={saving} onClick={() => openEditor(null)} size="sm" variant="ghost">
               {s.cancel}
             </Button>
-            <Button disabled={saving || !editor.label.trim()} onClick={() => void save()} size="sm">
+            <Button
+              disabled={
+                saving ||
+                !editor.label.trim() ||
+                ((editor.kind === 'remote' || editor.kind === 'cloud') && !editor.url.trim()) ||
+                (remoteNeedsReadiness && !authReady) ||
+                (editor.kind === 'remote' && editor.authMode === 'oauth' && !authSignedIn) ||
+                (editor.kind === 'remote' &&
+                  authProbe?.authMode === 'token' &&
+                  !editor.token.trim() &&
+                  !editingExistingTokenEntry)
+              }
+              onClick={() => void save()}
+              size="sm"
+            >
               {saving ? s.saving : s.save}
             </Button>
           </div>

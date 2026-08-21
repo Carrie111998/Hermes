@@ -933,6 +933,8 @@ export const zh: Translations = {
       removeConfirmDesc: (label: string) => `“${label}”将从本应用移除。实例本身不受影响——你可以随时重新添加。`,
       makePrimary: '设为主连接',
       testConnection: '测试',
+      detectAuthentication: '检测认证方式',
+      signInFailed: '网关登录失败',
       testOk: '可访问',
       testFailed: '连接测试失败',
       saveFailed: '无法保存连接',
