@@ -17508,6 +17508,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "suggestions":
             return await self._handle_suggestions_command(event)
 
+        if canonical == "neuralwatt":
+            return await self._handle_neuralwatt_command(event)
+
         if canonical == "blueprint":
             _blueprint_result = await self._handle_blueprint_command(event)
             _blueprint_seed = getattr(_blueprint_result, "agent_seed", None)
@@ -21188,6 +21191,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.debug("suggestions command failed: %s", e)
             return f"Suggestions command failed: {e}"
+
+    async def _handle_neuralwatt_command(self, event: MessageEvent) -> str:
+        """Handle /neuralwatt in the gateway.
+
+        Delegates to the shared handler so the agent-side module and the
+        gateway never drift (the /suggestions pattern).  Data is fetched
+        live from the NeuralWatt usage APIs; output is a compact report.
+        """
+        args = (event.get_command_args() or "").strip()
+        try:
+            from hermes_cli.neuralwatt_cmd import handle_neuralwatt_command
+
+            return handle_neuralwatt_command(args, surface="gateway")
+        except Exception as exc:
+            logger.debug("neuralwatt command failed: %s", exc)
+            return f"NeuralWatt command failed: {exc}"
 
     async def _handle_blueprint_command(self, event: MessageEvent):
         """Handle /blueprint in the gateway.
