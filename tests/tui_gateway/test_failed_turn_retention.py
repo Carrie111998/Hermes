@@ -289,3 +289,306 @@ def test_next_turn_replaces_retained_error_snapshot(emits, turn_env):
     completes = _events(emits, "message.complete")
     assert len(completes) == 1
     assert completes[0]["status"] == "complete"
+
+
+# ── interrupted_during_api_call must not clobber newer live history (#78010)
+
+
+def _history_rows(count: int, *, start: int = 0):
+    return [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"message {index}",
+            "timestamp": float(index),
+        }
+        for index in range(start, start + count)
+    ]
+
+
+def test_interrupted_api_call_does_not_overwrite_newer_live_history(emits, turn_env):
+    """RED on current main: result['messages'] replaces live history in place.
+
+    The reported class: turn starts at 144 rows, the interrupted result
+    returns a stale 113-row prefix plus the current user tail, and the
+    gateway used to assign that list onto session['history'].
+    """
+    live_history = _history_rows(144)
+
+    def _interrupted(_prompt, conversation_history=None, **_kwargs):
+        stale_prefix = [
+            {
+                "role": row["role"],
+                "content": row["content"],
+                "timestamp": row["timestamp"],
+            }
+            for row in (conversation_history or [])[:113]
+        ]
+        return {
+            "final_response": "",
+            "interrupted": True,
+            "turn_exit_reason": "interrupted_during_api_call",
+            "messages": [*stale_prefix, {"role": "user", "content": "retry me"}],
+        }
+
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=_interrupted,
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True, history=live_history)
+    server._start_inflight_turn(session, "retry me")
+
+    server._run_prompt_submit("rid", "sid", session, "retry me")
+
+    assert session["history"][:144] == live_history
+    assert session["history"][-1]["content"] == "retry me"
+    assert len(session["history"]) == 145
+    assert [row["content"] for row in session["history"][:144]] == [
+        f"message {index}" for index in range(144)
+    ]
+
+
+def test_merge_interrupted_history_matrix():
+    from agent.context_compressor import COMPRESSED_SUMMARY_METADATA_KEY, LEGACY_SUMMARY_PREFIX
+
+    live = [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "c"},
+    ]
+    turn_start = list(live)
+
+    # A/D: copied stale prefix + current user tail.
+    returned_copied = [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "retry me"},
+    ]
+    merged = server._merge_interrupted_api_history(
+        live,
+        returned_copied,
+        turn_start_history=turn_start,
+        current_prompt="retry me",
+    )
+    assert merged[:3] == live
+    assert merged[-1]["content"] == "retry me"
+    assert len(merged) == 4
+
+    # B: returned is a strict prefix of live — keep live.
+    strict_prefix = [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+    ]
+    assert (
+        server._merge_interrupted_api_history(
+            live, strict_prefix, turn_start_history=turn_start
+        )
+        == live
+    )
+
+    # C: returned extends the full live prefix.
+    extended = [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "c"},
+        {"role": "assistant", "content": "d"},
+    ]
+    assert (
+        server._merge_interrupted_api_history(
+            live, extended, turn_start_history=turn_start
+        )
+        == extended
+    )
+
+    # E: tool-call identity is part of the fingerprint.
+    live_tool = [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "name": "web"}]},
+        {"role": "tool", "content": "ok", "tool_call_id": "c1", "name": "web"},
+    ]
+    returned_other_tool = [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c2", "name": "web"}]},
+        {"role": "tool", "content": "ok", "tool_call_id": "c2", "name": "web"},
+    ]
+    assert (
+        server._merge_interrupted_api_history(
+            live_tool, returned_other_tool, turn_start_history=live_tool
+        )
+        == live_tool
+    )
+
+    # F: divergent stale snapshot must not append obsolete pre-turn rows.
+    diverged = [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "OTHER"},
+        {"role": "assistant", "content": "obsolete"},
+    ]
+    merged = server._merge_interrupted_api_history(
+        live, diverged, turn_start_history=turn_start, current_prompt="c"
+    )
+    assert merged == live
+    assert {"role": "user", "content": "OTHER"} not in merged
+    assert {"role": "assistant", "content": "obsolete"} not in merged
+
+    # Divergent prefix with the current user buried before a stale assistant.
+    buried = [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "OTHER"},
+        {"role": "user", "content": "retry me"},
+        {"role": "assistant", "content": "partial stale"},
+    ]
+    merged = server._merge_interrupted_api_history(
+        live, buried, turn_start_history=turn_start, current_prompt="retry me"
+    )
+    assert merged[:3] == live
+    assert merged[-1]["content"] == "retry me"
+    assert {"role": "assistant", "content": "partial stale"} not in merged
+
+    # Short prompt "no" must not match an unrelated user row containing those letters.
+    noisy = [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "another note"},
+        {"role": "assistant", "content": "obsolete"},
+    ]
+    assert (
+        server._merge_interrupted_api_history(
+            live, noisy, turn_start_history=turn_start, current_prompt="no"
+        )
+        == live
+    )
+
+    # Transformed current-turn user (context-reference / HUD note wrap).
+    wrapped = [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "[file.md]\n\nretry me"},
+    ]
+    merged = server._merge_interrupted_api_history(
+        live, wrapped, turn_start_history=turn_start, current_prompt="retry me"
+    )
+    assert merged[:3] == live
+    assert merged[-1]["content"] == "[file.md]\n\nretry me"
+
+    # Multimodal current-turn user tail after a truncated snapshot.
+    multimodal_user = {
+        "role": "user",
+        "content": [{"type": "text", "text": "retry me"}, {"type": "image_url", "image_url": {"url": "x"}}],
+    }
+    returned_mm = [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        multimodal_user,
+    ]
+    merged = server._merge_interrupted_api_history(
+        live, returned_mm, turn_start_history=turn_start, current_prompt="retry me"
+    )
+    assert merged[-1] is multimodal_user
+
+    # G: new current-turn compaction rewrite is accepted.
+    compacted = [
+        {
+            "role": "user",
+            "content": f"{LEGACY_SUMMARY_PREFIX} new rewrite of a/b/c",
+            COMPRESSED_SUMMARY_METADATA_KEY: True,
+        }
+    ]
+    assert server._interrupted_result_allows_rewrite(
+        live, compacted, {"compressed": True}, turn_start_history=turn_start
+    )
+    assert (
+        server._merge_interrupted_api_history(
+            live, compacted, turn_start_history=turn_start, allow_rewrite=True
+        )
+        == compacted
+    )
+
+    # H: old summary already represented in live (marker stripped) is not a rewrite.
+    live_with_summary = [
+        {"role": "user", "content": f"{LEGACY_SUMMARY_PREFIX} earlier turns"},
+        {"role": "user", "content": "later ask"},
+        {"role": "assistant", "content": "later answer"},
+    ]
+    stale_marked = [
+        {
+            "role": "user",
+            "content": f"{LEGACY_SUMMARY_PREFIX} earlier turns",
+            COMPRESSED_SUMMARY_METADATA_KEY: True,
+        }
+    ]
+    assert not server._interrupted_result_allows_rewrite(
+        live_with_summary, stale_marked, {"compressed": True},
+        turn_start_history=live_with_summary,
+    )
+    assert (
+        server._merge_interrupted_api_history(
+            live_with_summary,
+            stale_marked,
+            turn_start_history=live_with_summary,
+            allow_rewrite=False,
+        )
+        == live_with_summary
+    )
+
+    # Repeated current prompt must survive even if an earlier turn used the same text.
+    for prompt in ("continue", "yes", "no", "try again"):
+        turn = [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "old"},
+        ]
+        returned = [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "old"},
+            {"role": "user", "content": prompt},
+        ]
+        merged = server._merge_interrupted_api_history(
+            turn, returned, turn_start_history=turn, current_prompt=prompt
+        )
+        assert [row["content"] for row in merged] == [prompt, "old", prompt]
+        assert len(merged) == 3
+
+    # Repeated structured tool shape in a previous turn must not erase this turn's copy.
+    tool_turn = [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "name": "web"}]},
+        {"role": "tool", "content": "ok", "tool_call_id": "c1", "name": "web"},
+    ]
+    tool_returned = [
+        *tool_turn,
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "name": "web"}]},
+    ]
+    merged = server._merge_interrupted_api_history(
+        tool_turn, tool_returned, turn_start_history=tool_turn
+    )
+    assert len(merged) == 3
+    assert merged[-1]["tool_calls"] == [{"id": "c1", "name": "web"}]
+
+    # Older summary A must not authorize rewrite after live moved to summary B.
+    live_newer = [
+        {
+            "role": "user",
+            "content": f"{LEGACY_SUMMARY_PREFIX} summary B",
+            COMPRESSED_SUMMARY_METADATA_KEY: True,
+        },
+        {"role": "user", "content": "later"},
+    ]
+    stale_older = [
+        {
+            "role": "user",
+            "content": f"{LEGACY_SUMMARY_PREFIX} summary A",
+            COMPRESSED_SUMMARY_METADATA_KEY: True,
+        },
+        {"role": "user", "content": "later"},
+    ]
+    assert not server._interrupted_result_allows_rewrite(
+        live_newer, stale_older, {"compressed": True}, turn_start_history=live_newer
+    )
+    assert (
+        server._merge_interrupted_api_history(
+            live_newer,
+            stale_older,
+            turn_start_history=live_newer,
+            allow_rewrite=False,
+        )
+        == live_newer
+    )

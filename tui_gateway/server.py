@@ -7885,6 +7885,207 @@ def _clear_inflight_turn(session: dict) -> None:
     session["inflight_turn"] = None
 
 
+def _message_fingerprint(msg: Any) -> tuple[Any, ...]:
+    """Stable transcript-row identity for interrupt merges (not object id)."""
+    if not isinstance(msg, dict):
+        return ("__non_dict__", type(msg).__name__, repr(msg))
+
+    content = msg.get("content")
+    if content is not None and not isinstance(content, str):
+        try:
+            content = json.dumps(content, sort_keys=True, default=str)
+        except TypeError:
+            content = repr(content)
+
+    tool_calls = msg.get("tool_calls")
+    if tool_calls is not None and not isinstance(tool_calls, str):
+        try:
+            tool_calls = json.dumps(tool_calls, sort_keys=True, default=str)
+        except TypeError:
+            tool_calls = repr(tool_calls)
+
+    return (
+        msg.get("role"),
+        content,
+        msg.get("tool_call_id"),
+        msg.get("name"),
+        tool_calls,
+    )
+
+
+def _common_history_prefix_len(left: list, right: list) -> int:
+    shared = 0
+    limit = min(len(left), len(right))
+    while (
+        shared < limit
+        and _message_fingerprint(left[shared]) == _message_fingerprint(right[shared])
+    ):
+        shared += 1
+    return shared
+
+
+def _is_compaction_summary_message(msg: Any) -> bool:
+    from agent.context_compressor import is_compaction_summary_message
+
+    return bool(is_compaction_summary_message(msg))
+
+
+def _live_already_represents_summary(live_history: list, summary_msg: Any) -> bool:
+    summary_fp = _message_fingerprint(summary_msg)
+    summary_content = summary_msg.get("content") if isinstance(summary_msg, dict) else None
+    for msg in live_history:
+        if _message_fingerprint(msg) == summary_fp:
+            return True
+        if (
+            _is_compaction_summary_message(msg)
+            and isinstance(msg, dict)
+            and msg.get("content") == summary_content
+        ):
+            return True
+    return False
+
+
+def _interrupted_result_allows_rewrite(
+    live_history: list,
+    returned_history: list,
+    result: dict,
+    *,
+    turn_start_history: list | None = None,
+) -> bool:
+    """True only with positive current-turn compaction evidence.
+
+    A summary absent from live history is not enough: an older generation
+    (summary A) is also absent after a newer one (summary B) replaced it.
+    """
+    flagged = bool(
+        result.get("compressed")
+        or result.get("context_compressed")
+        or result.get("history_rewrite")
+    )
+    if not flagged:
+        return False
+
+    live = list(live_history or [])
+    returned = list(returned_history or [])
+    turn_start = list(turn_start_history) if turn_start_history is not None else live
+    returned_summaries = [msg for msg in returned if _is_compaction_summary_message(msg)]
+    if not returned_summaries:
+        return False
+    if all(_live_already_represents_summary(live, msg) for msg in returned_summaries):
+        return False
+    live_summaries = [msg for msg in live if _is_compaction_summary_message(msg)]
+    if live_summaries and not any(
+        _live_already_represents_summary(live, msg) for msg in returned_summaries
+    ):
+        # Live already moved to a different compression generation.
+        return False
+    return not any(
+        _live_already_represents_summary(turn_start, msg) for msg in returned_summaries
+    )
+
+
+def _message_text(msg: Any) -> str:
+    if not isinstance(msg, dict):
+        return ""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        return "\n".join(parts)
+    return ""
+
+
+def _is_current_turn_user_row(msg: Any, current_prompt: str | None) -> bool:
+    if not isinstance(msg, dict) or msg.get("role") != "user":
+        return False
+    if _is_compaction_summary_message(msg):
+        return False
+    if not current_prompt:
+        return False
+    text = _message_text(msg)
+    if text == current_prompt:
+        return True
+    if text.endswith(current_prompt) and (
+        len(text) == len(current_prompt) or text[-(len(current_prompt) + 1)] in "\n "
+    ):
+        return True
+    content = msg.get("content")
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "text":
+                continue
+            part_text = str(part.get("text") or "")
+            if part_text == current_prompt or current_prompt in part_text.splitlines():
+                return True
+    return False
+
+
+def _append_turn_local_tail(live: list, turn_start: list, tail: list) -> list:
+    """Append this-turn rows positionally. Repeated historical text still counts."""
+    shared_live_turn = _common_history_prefix_len(live, turn_start)
+    if shared_live_turn == len(turn_start) and len(live) >= len(turn_start):
+        live_tail = live[len(turn_start) :]
+        already = _common_history_prefix_len(live_tail, tail)
+        return [*live, *tail[already:]]
+    return [*live, *tail]
+
+
+def _merge_interrupted_api_history(
+    live_history: list,
+    returned_history: list,
+    *,
+    turn_start_history: list | None = None,
+    allow_rewrite: bool = False,
+    current_prompt: str | None = None,
+) -> list:
+    """Keep newer live rows when an interrupted turn returns a stale snapshot.
+
+    Reconciliation is positional/turn-relative: a current-turn ``continue`` is
+    not dropped just because an earlier turn used the same text.
+    """
+    live = list(live_history or [])
+    returned = list(returned_history or [])
+    if not returned:
+        return live
+    if not live:
+        return returned
+    if allow_rewrite:
+        return returned
+
+    shared_live = _common_history_prefix_len(live, returned)
+    if shared_live == len(returned) and len(returned) <= len(live):
+        return live
+    if shared_live == len(live):
+        return returned
+
+    turn_start = list(turn_start_history) if turn_start_history is not None else []
+    if turn_start:
+        shared_turn = _common_history_prefix_len(turn_start, returned)
+        if shared_turn == len(turn_start):
+            return _append_turn_local_tail(live, turn_start, returned[shared_turn:])
+        last = None
+        for msg in returned[shared_turn:]:
+            if _is_current_turn_user_row(msg, current_prompt):
+                last = msg
+        if last is not None:
+            if live and _message_fingerprint(live[-1]) == _message_fingerprint(last):
+                return live
+            return [*live, last]
+        return live
+
+    last = returned[-1] if returned else None
+    if last is not None and _is_current_turn_user_row(last, current_prompt):
+        if live and _message_fingerprint(live[-1]) == _message_fingerprint(last):
+            return live
+        return [*live, last]
+    return live
+
+
 def _fail_inflight_turn(session: dict, error: Any) -> None:
     """Mark the in-flight turn terminal-error but keep it replayable.
 
@@ -11093,7 +11294,23 @@ def _run_prompt_submit(
                     with session["history_lock"]:
                         current_version = int(session.get("history_version", 0))
                         if current_version == history_version:
-                            session["history"] = result["messages"]
+                            if result.get("turn_exit_reason") == "interrupted_during_api_call":
+                                live_history = session.get("history") or []
+                                allow_rewrite = _interrupted_result_allows_rewrite(
+                                    live_history,
+                                    result["messages"],
+                                    result,
+                                    turn_start_history=history,
+                                )
+                                session["history"] = _merge_interrupted_api_history(
+                                    live_history,
+                                    result["messages"],
+                                    turn_start_history=history,
+                                    allow_rewrite=allow_rewrite,
+                                    current_prompt=text if isinstance(text, str) else None,
+                                )
+                            else:
+                                session["history"] = result["messages"]
                             session["history_version"] = history_version + 1
                         else:
                             # History mutated externally during the turn.

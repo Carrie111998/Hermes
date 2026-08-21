@@ -2211,6 +2211,9 @@ class AIAgent:
             # at the end of the scan (see append_messages_batch).
             _batch_rows: List[Dict[str, Any]] = []
             _batch_msgs: List[Dict] = []
+            # Stamp live dicts only after the batch commit succeeds. Timestamp
+            # means first successful durable write, not a failed attempt.
+            _pending_live_timestamps: List[tuple[Dict[str, Any], float]] = []
             for _msg_idx in range(_scan_start, len(messages)):
                 msg = messages[_msg_idx]
                 if not isinstance(msg, dict):
@@ -2285,6 +2288,9 @@ class AIAgent:
                         content = _ov_content
                     if _ov_timestamp is not None:
                         _row_timestamp = _ov_timestamp
+                if _row_timestamp is None:
+                    _row_timestamp = time.time()
+                    _pending_live_timestamps.append((msg, _row_timestamp))
                 # Store the sidecar only when it actually differs.
                 if _row_api_content == content:
                     _row_api_content = None
@@ -2392,6 +2398,8 @@ class AIAgent:
                     )
                     or 300.0,
                 )
+                for _msg, _ts in _pending_live_timestamps:
+                    _msg["timestamp"] = _ts
                 for _written in _batch_msgs:
                     _written[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
