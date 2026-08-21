@@ -57,7 +57,7 @@ function load({
     .replace(/^import .* from 'react'\r?\n/m, '')
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
-    .concat('\nglobalThis.__mention = { $botMeta };\n')
+    .concat('\nglobalThis.__mention = { $botMeta, messagingProtocolSection };\n')
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   context.__mention.$botMeta.set(title ? { [activeProfile]: { title } } : {})
 
@@ -65,7 +65,10 @@ function load({
   context.plugin.register({ storage: { get: () => null }, register: entry => registered.push(entry) })
   const middleware = registered.find(entry => entry.id === 'mention-middleware')
   assert.ok(middleware, 'mention middleware did not register')
-  return { handler: middleware.data.handler }
+  return {
+    handler: middleware.data.handler,
+    messagingProtocolSection: context.__mention.messagingProtocolSection
+  }
 }
 
 /** Run the note's first hermes command under a stub that echoes each argv
@@ -122,6 +125,24 @@ test('regression: the handoff command quotes the recipient argument', async () =
   const { handler } = load()
   const result = await handler({ text: 'ping @ops please' })
   assert.match(result.text, /`hermes -p 'ops' chat --in ~/)
+})
+
+test('security: composer handoff writes the message with the file tool and sends via --query-file', async () => {
+  const { handler } = load()
+  const result = await handler({ text: 'ask @ops to review code containing "quotes", `ticks`, and $(substitution)' })
+
+  assert.match(result.text, /file tool FIRST/i)
+  assert.match(result.text, /--query-file/)
+  assert.doesNotMatch(result.text, /\s-q\s/)
+})
+
+test('security: Bot SOUL messaging protocol never puts arbitrary text in -q', () => {
+  const { messagingProtocolSection } = load()
+  const section = messagingProtocolSection('research', [{ name: 'research' }, { name: 'ops' }])
+
+  assert.match(section, /file tool FIRST/i)
+  assert.match(section, /--query-file/)
+  assert.doesNotMatch(section, /\s-q\s/)
 })
 
 test('behavior: a renamed default profile routes from another focused Bot Chat', async () => {
