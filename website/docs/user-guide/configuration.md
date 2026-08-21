@@ -2183,8 +2183,9 @@ sessions:
 Hermes then removes the trigram write triggers and routes affected searches to
 the standard FTS index or a safe `LIKE` fallback. Canonical messages and the
 standard FTS index are preserved. Re-enabling the setting performs a controlled
-rebuild from canonical messages. The `HERMES_TRIGRAM_FTS` environment variable
-is an internal cross-process carrier; configure the YAML key instead.
+rebuild from canonical messages. Each `state.db` reads the `config.yaml` beside
+it, so the same YAML setting applies consistently to CLI, gateway, maintenance,
+and explicit profile database opens.
 
 Control whether shared chats keep one conversation per room or one conversation per participant:
 

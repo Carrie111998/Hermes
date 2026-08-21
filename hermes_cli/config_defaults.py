@@ -3147,7 +3147,8 @@ DEFAULT_CONFIG = {
         # Trigram substring index used for CJK and other substring queries.
         # True preserves upstream behavior. False quarantines any existing
         # index by removing its write triggers while preserving canonical
-        # messages and the standard FTS index. Bridged to HERMES_TRIGRAM_FTS.
+        # messages and the standard FTS index. The setting is resolved from
+        # the config adjacent to each profile's state.db.
         "trigram_fts": True,
         # CJK-bigram search index (messages_fts_cjk, cjk_unicode61 loadable
         # tokenizer). When the extension is built (native/fts5_cjk/build.sh →

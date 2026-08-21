@@ -6,7 +6,6 @@ reference them without importing hermes_state (which would be a cycle).
 hermes_state re-imports every name here for backward compatibility.
 """
 
-import os
 from typing import Any
 
 from agent.skill_commands import (
@@ -250,13 +249,6 @@ _FTS_TRIGRAM_TRIGGERS = (
 )
 
 _FTS_TRIGGERS = _FTS_BASE_TRIGGERS + _FTS_TRIGRAM_TRIGGERS
-
-
-def _trigram_fts_config_enabled() -> bool:
-    """config.yaml ``sessions.trigram_fts`` (default on), via its env bridge."""
-    return os.getenv("HERMES_TRIGRAM_FTS", "1").strip().lower() not in (
-        "0", "false", "off", "no",
-    )
 
 
 SCHEMA_SQL = """

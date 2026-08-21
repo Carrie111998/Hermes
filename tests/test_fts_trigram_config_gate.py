@@ -17,8 +17,6 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-import pytest
-
 from hermes_state import SessionDB
 
 _FTS_TRIGRAM_TRIGGERS = (
@@ -26,6 +24,14 @@ _FTS_TRIGRAM_TRIGGERS = (
     "messages_fts_trigram_delete",
     "messages_fts_trigram_update",
 )
+
+
+def _write_trigram_config(db_path: Path, enabled: bool) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    (db_path.parent / "config.yaml").write_text(
+        f"sessions:\n  trigram_fts: {'true' if enabled else 'false'}\n",
+        encoding="utf-8",
+    )
 
 
 def _trigger_names(conn: sqlite3.Connection) -> set:
@@ -45,9 +51,9 @@ def _table_or_view_exists(conn: sqlite3.Connection, name: str) -> bool:
 
 
 def test_trigram_enabled_by_default_on_fresh_db(tmp_path: Path, monkeypatch):
-    monkeypatch.delenv("HERMES_TRIGRAM_FTS", raising=False)
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
+        assert db._conn is not None
         assert db._trigram_available is True
         assert _table_or_view_exists(db._conn, "messages_fts_trigram")
         assert _table_or_view_exists(db._conn, "messages_fts_trigram_src")
@@ -61,9 +67,11 @@ def test_trigram_enabled_by_default_on_fresh_db(tmp_path: Path, monkeypatch):
 def test_trigram_disabled_prevents_schema_creation_on_fresh_db(
     tmp_path: Path, monkeypatch
 ):
-    monkeypatch.setenv("HERMES_TRIGRAM_FTS", "0")
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db_path = tmp_path / "state.db"
+    _write_trigram_config(db_path, False)
+    db = SessionDB(db_path=db_path)
     try:
+        assert db._conn is not None
         assert db._trigram_available is False
         assert not _table_or_view_exists(db._conn, "messages_fts_trigram")
         assert not _table_or_view_exists(db._conn, "messages_fts_trigram_src")
@@ -85,17 +93,18 @@ def test_trigram_disabled_quarantines_existing_schema_on_reopen(
     tmp_path: Path, monkeypatch
 ):
     path = tmp_path / "state.db"
-    monkeypatch.delenv("HERMES_TRIGRAM_FTS", raising=False)
     db = SessionDB(db_path=path)
+    assert db._conn is not None
     sid = "s1"
     db.create_session(sid, source="test")
     db.append_message(sid, role="user", content="hello searchable world")
     assert db._trigram_available is True
     db.close()
 
-    monkeypatch.setenv("HERMES_TRIGRAM_FTS", "0")
+    _write_trigram_config(path, False)
     db2 = SessionDB(db_path=path)
     try:
+        assert db2._conn is not None
         assert db2._trigram_available is False
         # Match the CJK quarantine pattern: preserve the existing index for a
         # later controlled rebuild, but remove every trigger so a corrupt or
@@ -132,20 +141,22 @@ def test_reenable_rebuilds_quarantined_trigram_from_canonical_messages(
     tmp_path: Path, monkeypatch
 ):
     path = tmp_path / "state.db"
-    monkeypatch.delenv("HERMES_TRIGRAM_FTS", raising=False)
     db = SessionDB(db_path=path)
+    assert db._conn is not None
     db.create_session("s1", source="test")
     db.append_message("s1", role="user", content="before quarantine 프로젝트")
     db.close()
 
-    monkeypatch.setenv("HERMES_TRIGRAM_FTS", "0")
+    _write_trigram_config(path, False)
     disabled = SessionDB(db_path=path)
+    assert disabled._conn is not None
     disabled.append_message("s1", role="user", content="during quarantine 관리도구")
     disabled.close()
 
-    monkeypatch.setenv("HERMES_TRIGRAM_FTS", "1")
+    _write_trigram_config(path, True)
     rebuilt = SessionDB(db_path=path)
     try:
+        assert rebuilt._conn is not None
         assert rebuilt._trigram_available is True
         assert rebuilt._conn.execute(
             "SELECT 1 FROM state_meta WHERE key = 'fts_trigram_stale'"
@@ -165,8 +176,9 @@ def test_trigram_disabled_reopen_does_not_repeat_rebuild(
     doesn't look like "needs repair" forever and re-trigger a full FTS
     rebuild on every single open."""
     path = tmp_path / "state.db"
-    monkeypatch.setenv("HERMES_TRIGRAM_FTS", "0")
+    _write_trigram_config(path, False)
     db = SessionDB(db_path=path)
+    assert db._conn is not None
     db.create_session("s1", source="test")
     db.append_message("s1", role="user", content="hello world")
     db.close()
@@ -186,6 +198,7 @@ def test_trigram_disabled_reopen_does_not_repeat_rebuild(
 
     db2 = SessionDB(db_path=path)
     try:
+        assert db2._conn is not None
         assert calls == [], (
             "reopening a stable disabled-trigram DB must not trigger a "
             f"full FTS rebuild (got calls={calls!r})"
@@ -197,9 +210,11 @@ def test_trigram_disabled_reopen_does_not_repeat_rebuild(
 def test_migrate_broad_update_triggers_does_not_resurrect_disabled_trigram(
     tmp_path: Path, monkeypatch
 ):
-    monkeypatch.setenv("HERMES_TRIGRAM_FTS", "0")
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db_path = tmp_path / "state.db"
+    _write_trigram_config(db_path, False)
+    db = SessionDB(db_path=db_path)
     try:
+        assert db._conn is not None
         assert not _table_or_view_exists(db._conn, "messages_fts_trigram")
 
         # Force a broad (pre-narrowing) main FTS UPDATE trigger the way an
@@ -215,7 +230,8 @@ def test_migrate_broad_update_triggers_does_not_resurrect_disabled_trigram(
         )
         db._conn.commit()
 
-        dropped = db._migrate_broad_fts_update_triggers(db._conn)
+        cursor = db._conn.cursor()
+        dropped = db._migrate_broad_fts_update_triggers(cursor)
         db._conn.commit()
         assert dropped >= 1
 
@@ -233,9 +249,11 @@ def test_migrate_broad_update_triggers_does_not_resurrect_disabled_trigram(
 def test_search_falls_back_safely_when_trigram_disabled(
     tmp_path: Path, monkeypatch
 ):
-    monkeypatch.setenv("HERMES_TRIGRAM_FTS", "0")
-    db = SessionDB(db_path=tmp_path / "state.db")
+    db_path = tmp_path / "state.db"
+    _write_trigram_config(db_path, False)
+    db = SessionDB(db_path=db_path)
     try:
+        assert db._conn is not None
         sid = "s1"
         db.create_session(sid, source="test")
         db.append_message(sid, role="user", content="the quick brown fox jumps")
@@ -254,31 +272,19 @@ def test_search_falls_back_safely_when_trigram_disabled(
         db.close()
 
 
-def test_trigram_fts_config_gate_documented_and_defaults_enabled():
-    """Enabled-by-default upstream parity: the gate function itself must
-    default to True with no env var set, matching _cjk_fts_config_enabled's
-    polarity."""
-    import os
+def test_trigram_fts_config_gate_documented_and_defaults_enabled(tmp_path):
+    """The profile-owned YAML gate defaults on and honors false/true."""
+    from hermes_state import _trigram_fts_enabled_from_config
 
-    from hermes_state_common import _trigram_fts_config_enabled
-
-    assert _trigram_fts_config_enabled.__doc__, (
+    assert _trigram_fts_enabled_from_config.__doc__, (
         "gate must be documented (config/env parity note)"
     )
-    old = os.environ.pop("HERMES_TRIGRAM_FTS", None)
-    try:
-        assert _trigram_fts_config_enabled() is True
-        os.environ["HERMES_TRIGRAM_FTS"] = "0"
-        assert _trigram_fts_config_enabled() is False
-        os.environ["HERMES_TRIGRAM_FTS"] = "false"
-        assert _trigram_fts_config_enabled() is False
-        os.environ["HERMES_TRIGRAM_FTS"] = "1"
-        assert _trigram_fts_config_enabled() is True
-    finally:
-        if old is None:
-            os.environ.pop("HERMES_TRIGRAM_FTS", None)
-        else:
-            os.environ["HERMES_TRIGRAM_FTS"] = old
+    db_path = tmp_path / "state.db"
+    assert _trigram_fts_enabled_from_config(db_path) is True
+    _write_trigram_config(db_path, False)
+    assert _trigram_fts_enabled_from_config(db_path) is False
+    _write_trigram_config(db_path, True)
+    assert _trigram_fts_enabled_from_config(db_path) is True
 
 
 def test_stale_trigram_docstring_is_fixed():

@@ -68,6 +68,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     FTS_SQL,
     FTS_STALE_KEY,
     FTS_STORAGE_VERSION,
+    FTS_TRIGRAM_STALE_KEY,
     FTS_TRIGRAM_SQL,
     LEGACY_FTS_SQL,
     LEGACY_FTS_TRIGRAM_SQL,
@@ -688,6 +689,62 @@ _wal_fallback_warned_lock = threading.Lock()
 # Dedup WARNING for the WAL-reset vulnerability fallback (issue #69784).
 _wal_reset_bug_warned_paths: set[str] = set()
 _wal_reset_bug_warned_lock = threading.Lock()
+
+
+def _trigram_fts_enabled_from_config(db_path: Optional[Path] = None) -> bool:
+    """Return the profile-owned ``sessions.trigram_fts`` setting.
+
+    An explicit database path owns its adjacent config. This keeps CLI,
+    gateway, profile aggregation and maintenance opens in agreement without a
+    process-global environment bridge that can carry another profile's value.
+    Missing or invalid configuration preserves the historical default (on).
+    """
+    import copy
+
+    path = Path(db_path or _default_db_path()).expanduser()
+    config_path = path.parent / "config.yaml"
+    try:
+        from hermes_cli import managed_scope
+        from hermes_cli.config import (
+            DEFAULT_CONFIG,
+            _deep_merge,
+            _expand_env_vars,
+            _normalize_max_turns_config,
+            _normalize_root_model_keys,
+            read_user_config_raw,
+        )
+
+        user = read_user_config_raw(config_path)
+        cfg = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), user)
+        cfg = _normalize_root_model_keys(_normalize_max_turns_config(cfg))
+        cfg = _expand_env_vars(cfg)
+        cfg = managed_scope.apply_managed_overlay(cfg)
+    except Exception as exc:
+        logger.warning(
+            "Could not resolve %s for trigram FTS; keeping the default enabled: %s",
+            config_path,
+            exc,
+        )
+        return True
+    sessions = cfg.get("sessions", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(sessions, dict):
+        return True
+    value = sessions.get("trigram_fts", True)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"false", "off", "no", "0"}:
+            return False
+        if normalized in {"true", "on", "yes", "1"}:
+            return True
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    logger.warning(
+        "Invalid sessions.trigram_fts value in %s; keeping the default enabled",
+        config_path,
+    )
+    return True
 
 def _set_last_init_error(msg: Optional[str]) -> None:
     """Record (or clear) the most recent state.db init failure.
@@ -3299,6 +3356,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._fts_usermerge_floor_applied = False
         self._fts_enabled = False
         self._fts_stale = False
+        self._trigram_enabled = _trigram_fts_enabled_from_config(self.db_path)
         self._trigram_available = False
         # CJK-bigram index (cjk_unicode61 loadable tokenizer). _fts_cjk_loaded:
         # extension present on the writer connection; _fts_cjk_available: the
@@ -3353,7 +3411,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._fts_enabled = (
                         self._fts_table_probe(cursor, "messages_fts") is True
                     )
-                    if self._fts_enabled:
+                    trigram_stale = cursor.execute(
+                        "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+                        (FTS_TRIGRAM_STALE_KEY,),
+                    ).fetchone()
+                    if (
+                        self._fts_enabled
+                        and self._trigram_enabled
+                        and trigram_stale is None
+                    ):
                         self._trigram_available = (
                             self._fts_table_probe(
                                 cursor,
