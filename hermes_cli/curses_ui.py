@@ -456,6 +456,7 @@ def _run_curses_menu(
     cancel_value,
     searchable=False,
     search_labels=None,
+    initial_query="",
 ):
     """Shared curses single-/multi-select event loop.
 
@@ -520,6 +521,13 @@ def _run_curses_menu(
             cursor = initial_cursor
             scroll_offset = 0
             search = _SearchState()
+            if use_search and initial_query:
+                # Open straight into an active, pre-filled, still-editable
+                # filter — e.g. `/ms foo` should land the user already
+                # filtered to "foo" with the cursor in the search box, not
+                # force a `/` press before they can change it to "bar".
+                search.active = True
+                search.query = initial_query
             # Non-None labels for filtering; empty when search is disabled so
             # _filter_indices stays a cheap identity range.
             labels: List[str] = (
@@ -870,6 +878,7 @@ def curses_single_select(
     *,
     cancel_label: str = "Cancel",
     searchable: bool = False,
+    initial_query: str = "",
 ) -> int | None:
     """Curses single-select menu. Returns selected index or None on cancel.
 
@@ -877,6 +886,12 @@ def curses_single_select(
 
     When ``searchable`` is true, ``/`` opens a type-to-filter prompt; the
     returned value is always the original item index (or None for cancel).
+
+    ``initial_query``: when non-empty (and ``searchable`` is true), the menu
+    opens with search already active and pre-filled with this text — so a
+    caller that already knows the user's intent (e.g. ``/ms foo``) can open
+    straight into a filtered, still-live-editable view instead of forcing a
+    second ``/`` keypress before the query can be changed.
     """
     all_items = list(items) + [cancel_label]
     cancel_idx = len(items)
@@ -933,6 +948,7 @@ def curses_single_select(
         cancel_value=None,
         searchable=searchable,
         search_labels=list(all_items) if searchable else None,
+        initial_query=initial_query if searchable else "",
     )
 
 
