@@ -162,9 +162,44 @@ def _format_exhausted_status(entry) -> str:
     return f" {label}{reason_text}{code} ({wait} left)"
 
 
+# Voice-only provider ids (the ``tts.provider`` / ``stt.provider`` id space)
+# that have no inference ``PROVIDER_REGISTRY`` entry but ARE valid
+# credential-pool targets: the voice tools resolve their keys through
+# ``resolve_provider_secret()`` step 3, which reads the pool by exactly these
+# ids (#90956 — #68003 landed the read side, the write side rejected them).
+# Kept OUT of ``PROVIDER_REGISTRY`` on purpose so inference-side provider
+# resolution is untouched; overlapping ids (gemini/xai/minimax/deepinfra) are
+# already registry entries and need no listing here.
+# DERIVED from DEFAULT_CONFIG's tts/stt sections (per-provider dict keys) so a
+# voice provider added to the defaults can never be silently rejected by
+# ``auth add`` while the read side accepts it — the split-brain #90956 fixed,
+# in reverse (review finding on #90965).
+def _derive_voice_credential_provider_ids() -> frozenset:
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    ids: set = set()
+    for section in ("tts", "stt"):
+        cfg = DEFAULT_CONFIG.get(section)
+        if isinstance(cfg, dict):
+            ids |= {
+                key
+                for key, val in cfg.items()
+                if key != "provider" and isinstance(val, dict)
+            }
+    return frozenset(ids - set(PROVIDER_REGISTRY))
+
+
+VOICE_CREDENTIAL_PROVIDER_IDS = _derive_voice_credential_provider_ids()
+
+
 def auth_add_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", ""))
-    if provider not in PROVIDER_REGISTRY and provider != "openrouter" and not provider.startswith(CUSTOM_POOL_PREFIX):
+    if (
+        provider not in PROVIDER_REGISTRY
+        and provider not in VOICE_CREDENTIAL_PROVIDER_IDS
+        and provider != "openrouter"
+        and not provider.startswith(CUSTOM_POOL_PREFIX)
+    ):
         raise SystemExit(f"Unknown provider: {provider}")
 
     requested_type = str(getattr(args, "auth_type", "") or "").strip().lower()
