@@ -415,6 +415,7 @@ export interface Translations {
       sessionDensityCompact: string
       sessionDensityComfortable: string
       sessionDensityDetailed: string
+      sessionDensityPreview: string
       terminalFontTitle: string
       terminalFontDesc: string
       terminalFontPlaceholder: string

@@ -17,22 +17,18 @@ import { $backdrop, setBackdrop } from '@/store/backdrop'
 import { $composerPopoutGesturesEnabled, setComposerPopoutGesturesEnabled } from '@/store/composer-popout'
 import { $embedAllowed, $embedMode, clearEmbedAllowed, type EmbedMode, setEmbedMode } from '@/store/embed-consent'
 import { $introSplash, setIntroSplash } from '@/store/intro-splash'
+import { beginOverlayPeek, endOverlayPeek, pulseOverlayPeek, resetOverlayPeek } from '@/store/overlay-peek'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
 import { $reactionsEnabled, setReactionsEnabled } from '@/store/reactions-enabled'
 import { $reasoningCollapsedByDefault, setReasoningCollapsedByDefault } from '@/store/reasoning-disclosure'
-import { $sessionListDensity, type SessionListDensity, setSessionListDensity } from '@/store/session-list-density'
 import { $toolViewMode, setToolViewMode } from '@/store/tool-view'
 import {
   $translucency,
-  beginTranslucencyPeek,
-  endTranslucencyPeek,
   GLASS_IS_WINDOWS,
   GLASS_SCOPES,
   GLASS_SUPPORTED,
   glassMaterialForPicker,
   glassMaterialsFor,
-  pulseTranslucencyPeek,
-  resetTranslucencyPeek,
   setTranslucency,
   setTranslucencyFade,
   setTranslucencyMaterial,
@@ -52,6 +48,7 @@ import { $marketplaceInstalls, isUserTheme, removeUserTheme } from '@/themes/use
 import { MODE_OPTIONS } from './constants'
 import { PetSettings } from './pet-settings'
 import { ListRow, SectionHeading, SettingsContent, ToggleRow } from './primitives'
+import { SessionDensitySetting } from './session-density-setting'
 import { APPEARANCE_SETTING_IDS } from './settings-search'
 import { TerminalFontSetting } from './terminal-font-setting'
 import { useDeepLinkHighlight } from './use-deep-link-highlight'
@@ -297,19 +294,19 @@ function TranslucencySlider({ label, onChange, value }: TranslucencySliderProps)
         className="h-1 w-40 cursor-pointer appearance-none rounded-full bg-(--ui-stroke-tertiary)"
         max={TRANSLUCENCY_MAX}
         min={TRANSLUCENCY_MIN}
-        onBlur={endTranslucencyPeek}
+        onBlur={endOverlayPeek}
         onChange={event => {
           triggerHaptic('selection')
           onChange(Number(event.target.value))
         }}
         onKeyDown={event => {
           if (SLIDER_STEP_KEYS.has(event.key)) {
-            pulseTranslucencyPeek()
+            pulseOverlayPeek()
           }
         }}
-        onLostPointerCapture={endTranslucencyPeek}
-        onPointerDown={beginTranslucencyPeek}
-        onPointerUp={endTranslucencyPeek}
+        onLostPointerCapture={endOverlayPeek}
+        onPointerDown={beginOverlayPeek}
+        onPointerUp={endOverlayPeek}
         step={TRANSLUCENCY_STEP}
         style={{ accentColor: 'var(--dt-primary)' }}
         type="range"
@@ -344,7 +341,6 @@ export function AppearanceSettings() {
   const { themeName, mode, resolvedMode, availableThemes, setTheme, setMode } = useTheme()
   const toolViewMode = useStore($toolViewMode)
   const reasoningCollapsedByDefault = useStore($reasoningCollapsedByDefault)
-  const sessionListDensity = useStore($sessionListDensity)
   const zoomPercent = useStore($zoomPercent)
   const embedMode = useStore($embedMode)
   const embedAllowed = useStore($embedAllowed)
@@ -359,11 +355,10 @@ export function AppearanceSettings() {
   const activeProfileKey = normalizeProfileKey(useStore($activeGatewayProfile))
   const a = t.settings.appearance
 
-  // A pointer held on the intensity slider when this overlay closes (Escape
-  // mid-drag) never delivers its pointerup here, which would strand the peek
-  // counter above zero and ghost the NEXT settings overlay. Unmount drops
-  // every outstanding hold.
-  useEffect(() => resetTranslucencyPeek, [])
+  // A held preview control can unmount before pointerup/keyup (Escape or a
+  // route change), which would strand the shared counter and ghost the NEXT
+  // settings overlay. Unmount drops every outstanding hold and pulse.
+  useEffect(() => resetOverlayPeek, [])
 
   // Shared by the mode/frost/area pickers: apply the choice, then show it
   // through the overlay it just altered (a pulse, not a hold — see the peek
@@ -375,7 +370,7 @@ export function AppearanceSettings() {
       set(value)
 
       if (translucency.intensity > 0) {
-        pulseTranslucencyPeek()
+        pulseOverlayPeek()
       }
     }
 
@@ -416,12 +411,6 @@ export function AppearanceSettings() {
     { id: 'product', label: a.product },
     { id: 'technical', label: a.technical }
   ] as const
-
-  const sessionDensityOptions = [
-    { id: 'compact', label: a.sessionDensityCompact },
-    { id: 'comfortable', label: a.sessionDensityComfortable },
-    { id: 'detailed', label: a.sessionDensityDetailed }
-  ] as const satisfies readonly { id: SessionListDensity; label: string }[]
 
   const embedOptions = [
     { id: 'ask', label: a.embedsAsk },
@@ -568,20 +557,7 @@ export function AppearanceSettings() {
 
           <TerminalFontSetting />
 
-          <ListRow
-            action={
-              <SegmentedControl
-                onChange={id => {
-                  triggerHaptic('selection')
-                  setSessionListDensity(id)
-                }}
-                options={sessionDensityOptions}
-                value={sessionListDensity}
-              />
-            }
-            description={a.sessionDensityDesc}
-            title={a.sessionDensityTitle}
-          />
+          <SessionDensitySetting />
 
           {/* Linux has neither half of this setting (see TRANSLUCENCY_SUPPORTED),
               so the row is absent there rather than offering a dead lever. */}
@@ -593,7 +569,7 @@ export function AppearanceSettings() {
                   // Arms the peek for the overlay this row lives in — the
                   // ghosting rules in styles.css scope to it, so no other
                   // overlay pays for an opacity transition it never uses.
-                  data-translucency-peek-scope=""
+                  data-overlay-peek-scope=""
                 >
                   {GLASS_SUPPORTED && (
                     <SegmentedControl
@@ -620,7 +596,7 @@ export function AppearanceSettings() {
               }
               below={
                 glassMode ? (
-                  <div className="mt-3 flex flex-col gap-2.5" data-translucency-peek-scope="">
+                  <div className="mt-3 flex flex-col gap-2.5" data-overlay-peek-scope="">
                     <GlassRow label={a.translucencyTintTitle}>
                       <TranslucencySlider
                         label={a.translucencyTintTitle}

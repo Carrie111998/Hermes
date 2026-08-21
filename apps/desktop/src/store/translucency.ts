@@ -249,55 +249,6 @@ const stopRailTracking = (): void => {
   document.documentElement.style.removeProperty('--glass-rail-edge')
 }
 
-/* Peek: while the user is actively adjusting translucency from Settings, the
-   overlay they stand in covers the very effect they're tuning — the scrim
-   plus a deliberately near-opaque card ([data-glass-raised]). A peek ghosts
-   the whole overlay layer so the live window IS the preview (see the
-   [data-hermes-translucency-peek] rules in styles.css). A counter rather
-   than a boolean: a held slider drag and a timed pulse from a picker click
-   can overlap. */
-const PEEK_ATTR = 'data-hermes-translucency-peek'
-
-export const $translucencyPeek = atom<number>(0)
-
-export function beginTranslucencyPeek(): void {
-  $translucencyPeek.set($translucencyPeek.get() + 1)
-}
-
-export function endTranslucencyPeek(): void {
-  $translucencyPeek.set(Math.max(0, $translucencyPeek.get() - 1))
-}
-
-/**
- * Drop every outstanding hold at once. The settings surface calls this on
- * unmount: a pointer held on the slider when the overlay closes (Escape
- * mid-drag) never delivers its pointerup to the unmounted element, and a
- * counter stuck above zero would leave the peek attribute on <html> —
- * rendering the NEXT settings overlay ghosted at 8% opacity. Outstanding
- * pulse timers still fire endTranslucencyPeek later; the zero floor makes
- * them no-ops.
- */
-export function resetTranslucencyPeek(): void {
-  $translucencyPeek.set(0)
-}
-
-/**
- * Timed peek for one-shot changes (frost / area / mode clicks, keyboard
- * slider steps): long enough to read the effect, short enough to hand the
- * settings back without feeling stuck.
- */
-export function pulseTranslucencyPeek(ms = 900): void {
-  beginTranslucencyPeek()
-
-  if (typeof window === 'undefined') {
-    endTranslucencyPeek()
-
-    return
-  }
-
-  window.setTimeout(endTranslucencyPeek, ms)
-}
-
 const applyGlassSurfaces = ({ intensity, mode, scope }: TranslucencyState): void => {
   if (typeof document === 'undefined') {
     return
@@ -399,13 +350,5 @@ if (typeof window !== 'undefined') {
     if (JSON.stringify(next) !== JSON.stringify($translucencyBook.get())) {
       $translucencyBook.set(next)
     }
-  })
-
-  $translucencyPeek.subscribe(count => {
-    if (typeof document === 'undefined') {
-      return
-    }
-
-    document.documentElement.toggleAttribute(PEEK_ATTR, count > 0)
   })
 }

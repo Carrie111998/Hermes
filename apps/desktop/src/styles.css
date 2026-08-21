@@ -679,8 +679,8 @@
     backdrop-filter: blur(0.5rem) !important;
   }
 
-  /* Translucency peek: while the user holds the intensity slider (or for a
-     short pulse after a frost/area/mode click) the entire overlay layer —
+  /* Appearance preview: while the user holds a preview control (or for a
+     short pulse after an appearance choice) the entire overlay layer —
      scrim, blur and near-opaque card as ONE group — ghosts down so the live
      window behind it becomes the preview. The layer keeps pointer events:
      a held drag keeps delivering to the slider it started on. Opacity is
@@ -689,16 +689,16 @@
      hand is on the control, unhurried return.
 
      Both the peek and its return are scoped to a settings overlay that has
-     ARMED the interaction ([data-translucency-peek-scope], set by the
+     ARMED the interaction ([data-overlay-peek-scope], set by the
      appearance row). An unscoped `[data-overlay-surface] { transition:
      opacity … }` would tax every overlay in the app — command center, cron,
      agents, model picker — with a 420ms opacity transition for the life of
-     the process, to serve one slider. */
-  :root [data-overlay-surface]:has([data-translucency-peek-scope]) {
+     the process, to serve Appearance previews alone. */
+  :root [data-overlay-surface]:has([data-overlay-peek-scope]) {
     transition: opacity 420ms cubic-bezier(0.22, 1, 0.36, 1);
   }
 
-  :root[data-hermes-translucency-peek] [data-overlay-surface]:has([data-translucency-peek-scope]) {
+  :root[data-hermes-overlay-peek] [data-overlay-surface]:has([data-overlay-peek-scope]) {
     opacity: 0.08;
     transition: opacity 160ms cubic-bezier(0.32, 0.72, 0, 1);
   }
