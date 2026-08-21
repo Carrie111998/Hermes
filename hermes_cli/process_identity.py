@@ -383,10 +383,11 @@ def ledger_entries(*, project_root: Optional[Path] = None) -> list[dict]:
     want_install = install_id(project_root)
     path = _ledger_path()
     with _LEDGER_LOCK:
-        entries = _read_ledger(path)
-        if entries is None:
-            _quarantine_ledger(path)
-            return []
+        with _ledger_transaction_lock(path):
+            entries = _read_ledger(path)
+            if entries is None:
+                _quarantine_ledger(path)
+                return []
     out: list[dict] = []
     for e in entries:
         if e.get("install") != want_install:

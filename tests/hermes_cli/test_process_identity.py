@@ -14,11 +14,13 @@ Runs on any host: psutil interactions go through a fake module.
 
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 import json
 import subprocess
 import sys
 import textwrap
 import time
+import threading
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -279,6 +281,74 @@ def test_register_self_serializes_real_interpreter_ledger_writes(tmp_path):
                 child.kill()
                 stdout, stderr = child.communicate()
             assert child.returncode == 0, stdout + stderr
+
+
+def test_ledger_entries_cannot_quarantine_a_replaced_valid_ledger(tmp_path):
+    """A stale corrupt read must hold the transaction lock through quarantine."""
+    ledger = tmp_path / "spawn-ledger.json"
+    ledger.write_text("{ not json", encoding="utf-8")
+    transaction_lock = threading.Lock()
+    stale_read = threading.Event()
+    release_reader = threading.Event()
+    reader_result = []
+    reader_errors = []
+    writer_errors = []
+
+    @contextmanager
+    def shared_transaction_lock(_path):
+        with transaction_lock:
+            yield
+
+    original_read = pi._read_ledger
+
+    def paused_corrupt_read(path):
+        entries = original_read(path)
+        if threading.current_thread().name == "ledger-reader":
+            assert entries is None
+            stale_read.set()
+            assert release_reader.wait(timeout=5)
+        return entries
+
+    def read_entries():
+        try:
+            reader_result.extend(pi.ledger_entries(project_root=tmp_path))
+        except Exception as exc:  # pragma: no cover - surfaced below
+            reader_errors.append(exc)
+
+    def register_writer():
+        try:
+            assert pi.register_self("serve", project_root=tmp_path) is True
+        except Exception as exc:  # pragma: no cover - surfaced below
+            writer_errors.append(exc)
+
+    with patch.object(pi, "_ledger_path", return_value=ledger), \
+         patch.object(pi, "_LEDGER_LOCK", nullcontext()), \
+         patch.object(pi, "_ledger_transaction_lock", shared_transaction_lock), \
+         patch.object(pi, "_read_ledger", paused_corrupt_read), \
+         patch.object(pi, "_own_create_time", return_value=1.0):
+        reader = threading.Thread(target=read_entries, name="ledger-reader")
+        writer = threading.Thread(target=register_writer, name="ledger-writer")
+        reader.start()
+        assert stale_read.wait(timeout=5)
+
+        # This is the cross-process boundary: the local lock above is a no-op
+        # to model separate interpreters, so only the sibling transaction lock
+        # can keep the stale corrupt read from acting on a replacement.
+        assert transaction_lock.locked()
+
+        writer.start()
+        release_reader.set()
+        reader.join(timeout=5)
+        writer.join(timeout=5)
+
+    assert not reader.is_alive()
+    assert not writer.is_alive()
+    assert not reader_errors
+    assert not writer_errors
+    assert reader_result == []
+    entries = json.loads(ledger.read_text(encoding="utf-8"))
+    assert [entry["pid"] for entry in entries] == [pi.os.getpid()]
+    assert (tmp_path / "spawn-ledger.json.corrupt").read_text(encoding="utf-8") == "{ not json"
 
 
 def test_ledger_entries_filters_dead_reused_and_foreign(tmp_path):
