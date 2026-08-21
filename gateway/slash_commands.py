@@ -770,6 +770,17 @@ class GatewaySlashCommandsMixin:
 
         return "\n".join(lines)
 
+    async def _handle_fetch_command(self, event: MessageEvent) -> str:
+        """Handle /fetch without blocking the gateway event loop."""
+        from hermes_cli.fetch import collect_fetch_info, render_fetch_slash_args
+
+        info = await asyncio.to_thread(collect_fetch_info)
+        return render_fetch_slash_args(
+            event.get_command_args().strip(),
+            info=info,
+            include_paths=False,
+        )
+
     @staticmethod
     def _redact_matrix_session_key(session_key: str) -> str:
         """Return a stable Matrix session-key fingerprint for shared room status."""
