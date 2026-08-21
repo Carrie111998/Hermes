@@ -404,9 +404,10 @@ export const eu = defineLocale({
         desktopLabel: 'Mahaigaineko UIa',
         agentTargetLocal: profile => `${profile} backend-ean instalatzen da (~/.hermes/plugins/)`,
         agentTargetRemote: profile => `Konektatutako ${profile} backend-ean instalatzen da`,
-        desktopTarget: "Aplikazio honen tokiko desktop-plugins karpetan instalatzen da",
+        desktopTarget: 'Aplikazio honen tokiko desktop-plugins karpetan instalatzen da',
         desktopOnlyNote: 'Mahaigaineko soilik diren paketeek ez dute backend agente-pluginik instalatzen.',
-        insecureWarning: 'URL honek ziurgabeko edo tokiko eskema bat erabiltzen du. Lehenetsi https:// edo git@ produkzio-instalazioetarako.',
+        insecureWarning:
+          'URL honek ziurgabeko edo tokiko eskema bat erabiltzen du. Lehenetsi https:// edo git@ produkzio-instalazioetarako.',
         securityHeading: 'Instalatu aurretik',
         securityIntro:
           'Instalatu soilik konfiantzazko iturrietatik — berrikusi beheko biltegia zer gehituko den ikusi nahi baduzu.',
@@ -468,7 +469,8 @@ export const eu = defineLocale({
       test: 'Bidali probako jakinarazpena',
       testTitle: 'Hermes',
       testBody: 'Jakinarazpenak funtzionatzen ari dira.',
-      testSent: 'Proba bidalita. Ezer agertzen ez bada, egiaztatu zure sistema eragilearen jakinarazpen-baimenak eta Fokua/Ez molestatu.',
+      testSent:
+        'Proba bidalita. Ezer agertzen ez bada, egiaztatu zure sistema eragilearen jakinarazpen-baimenak eta Fokua/Ez molestatu.',
       testUnsupported: 'Sistema honek ez ditu bertako jakinarazpenak onartzen.',
       completionSoundTitle: 'Amaiera-soinua',
       completionSoundDesc: 'Agentearen txanda bat amaitzean jotzen du. Aukeratu aurrezarpen bat eta entzun hemen.',
@@ -545,9 +547,11 @@ export const eu = defineLocale({
       introSplashTitle: 'Hasierako pantaila',
       introSplashDesc: 'Txat huts batean erakusten den logotipoa eta testua.',
       reactionsTitle: 'Mezu-erreakzioak',
-      reactionsDesc: 'iMessage estiloko emoji tapback-ak — erreakzionatu mezuei, eta Hermes-ek zureei erantzun diezaieke.',
+      reactionsDesc:
+        'iMessage estiloko emoji tapback-ak — erreakzionatu mezuei, eta Hermes-ek zureei erantzun diezaieke.',
       composerPopoutTitle: 'Konpositore flotatzailea',
-      composerPopoutDesc: 'Baimendu konpositorea bere atxikitze-lekutik askatzen eta flotatzen. Itzali behean itsatsita mantentzeko.',
+      composerPopoutDesc:
+        'Baimendu konpositorea bere atxikitze-lekutik askatzen eta flotatzen. Itzali behean itsatsita mantentzeko.',
       embedsTitle: 'Txertaketa integratuak',
       embedsDesc:
         'Aurrebista aberatsak hirugarrenen gunetik kargatzen dira (YouTube, X, …). Galdetuak leku-marka bat erakusten du bakoitza baimendu arte; Beti-k automatikoki kargatzen ditu; Itzalita-k lotura soilak mantentzen ditu.',
@@ -596,7 +600,7 @@ export const eu = defineLocale({
         uninstall: name => `Desinstalatu ${name}`,
         delete: name => `Ezabatu ${name}`,
         deleteTitle: name => `Ezabatu ${name}?`,
-        deleteBody: "Honek maskota betirako ezabatzen du — ezin da berriro instalatu.",
+        deleteBody: 'Honek maskota betirako ezabatzen du — ezin da berriro instalatu.',
         deleteConfirm: 'Ezabatu',
         rename: name => `Berrizendatu ${name}`,
         renameTitle: 'Berrizendatu maskota',
@@ -664,9 +668,11 @@ export const eu = defineLocale({
       toolsetsWipeConfirm:
         'Kendu gaitu diren tresna-multzo guztiak? Honek memoria, terminala, web bilaketa, delegazioa eta beste tresna gehienak desgaitzen ditu berriro gaitu arte.',
       keepAwakeTitle: 'Ordenagailua esna mantendu',
-      keepAwakeDesc: 'Eten makina hau loak har dezan gau osoan edo exekuzio luzeetan zehar. Pantailak ilundu daiteke oraindik.',
+      keepAwakeDesc:
+        'Eten makina hau loak har dezan gau osoan edo exekuzio luzeetan zehar. Pantailak ilundu daiteke oraindik.',
       disableF12Title: 'Desgaitu F12 DevTools',
-      disableF12Desc: 'Blokeatu F12-k Garapen Tresnak irekitzea. Ctrl+Shift+I (edo Cmd+Opt+I Mac-en) oraindik funtzionatzen du.',
+      disableF12Desc:
+        'Blokeatu F12-k Garapen Tresnak irekitzea. Ctrl+Shift+I (edo Cmd+Opt+I Mac-en) oraindik funtzionatzen du.',
       attachmentSizeTitle: 'Aurrebista / irudi kargaren gehienezko tamaina',
       attachmentSizeDesc:
         'Zenbat MB-ko fitxategi lokal kargatuko dituen Desktop-ek aurrebista eta irudiak atxikitzeko. Lehenetsia 16 da. Urruneko irudi ez diren eranskinek 256 MB-ko muga bereizia dute. Oso altua jartzeak fitxategi osoa memorian kargatzen du eta aplikazioa izoztu edo huts egin dezake.',
@@ -742,7 +748,8 @@ export const eu = defineLocale({
       kindCloudDesc: 'Zure Hermes Cloud kontutik aurkitutako ostatatutako instantzia.',
       kindSshDesc: 'SSH bidez iritsitako Hermes instalazioa.',
       labelTitle: 'Izena',
-      labelDesc: 'Beharrezkoa. Instantzia hau agertzen den leku guztietan erakusten da; bakarra izan behar du (adb. "Homelab", "Laneko portatila").',
+      labelDesc:
+        'Beharrezkoa. Instantzia hau agertzen den leku guztietan erakusten da; bakarra izan behar du (adb. "Homelab", "Laneko portatila").',
       labelPlaceholder: 'Homelab',
       urlTitle: 'Gateway URLa',
       sshHostTitle: 'SSH ostalaria',
@@ -781,9 +788,11 @@ export const eu = defineLocale({
       localDesc: 'Hasi Hermes backend pribatu bat localhost-en. Hau da lehenetsia eta lineaz kanpo funtzionatzen du.',
       remoteTitle: 'Urruneko gateway-a',
       remoteDesc: 'Konektatu mahaigaineko shell hau urruneko Hermes backend batera.',
-      remoteAuthHint: 'Ostalatutako gateway-ek OAuth edo erabiltzaile-izena eta pasahitza erabiltzen dituzte; auto-ostatatutakoek saio-token bat erabil dezakete.',
+      remoteAuthHint:
+        'Ostalatutako gateway-ek OAuth edo erabiltzaile-izena eta pasahitza erabiltzen dituzte; auto-ostatatutakoek saio-token bat erabil dezakete.',
       cloudTitle: 'Hermes Cloud',
-      cloudDesc: 'Hasi saioa behin Hermes Cloud-en eta aukeratu zure kontuko agenteak — ez dago URL-ik itsatsi beharrik.',
+      cloudDesc:
+        'Hasi saioa behin Hermes Cloud-en eta aukeratu zure kontuko agenteak — ez dago URL-ik itsatsi beharrik.',
       cloudSignInTitle: 'Hermes Cloud',
       cloudSignIn: 'Hasi saioa Hermes Cloud-en',
       cloudSignedIn: 'Saioa hasita Hermes Cloud-en',
@@ -814,9 +823,11 @@ export const eu = defineLocale({
       cloudAgentProvisioning: 'Hornitzen…',
       cloudStatusLabel: status => `Egoera: ${status}`,
       remoteUrlTitle: 'Urruneko URLa',
-      remoteUrlDesc: 'Urruneko dashboard backend-aren oinarrizko URLa. Bide-aurrizkiak onartzen dira, adibidez /hermes.',
+      remoteUrlDesc:
+        'Urruneko dashboard backend-aren oinarrizko URLa. Bide-aurrizkiak onartzen dira, adibidez /hermes.',
       probing: 'Gateway honek nola autentifikatzen duen egiaztatzen…',
-      probeError: 'Ezin izan da oraindik gateway honetara iritsi. Egiaztatu URLa — autentifikazio-metodoa erantzuten duenean agertuko da.',
+      probeError:
+        'Ezin izan da oraindik gateway honetara iritsi. Egiaztatu URLa — autentifikazio-metodoa erantzuten duenean agertuko da.',
       signedIn: 'Saioa hasita',
       signIn: 'Hasi saioa',
       signOut: 'Amaitu saioa',
@@ -825,8 +836,10 @@ export const eu = defineLocale({
       authSignedInPassword:
         'Gateway honek erabiltzaile-izena eta pasahitza erabiltzen ditu. Saioa hasita duzu; saioa automatikoki freskatzen da.',
       authSignedInOauth: 'Gateway honek OAuth erabiltzen du. Saioa hasita duzu; saioa automatikoki freskatzen da.',
-      authNeedsPassword: 'Gateway honek erabiltzaile-izena eta pasahitza erabiltzen ditu. Hasi saioa mahaigaineko aplikazio hau baimendu ahal izateko.',
-      authNeedsOauth: provider => `Gateway honek OAuth erabiltzen du. Hasi saioa ${provider}-rekin mahaigaineko aplikazio hau baimendu ahal izateko.`,
+      authNeedsPassword:
+        'Gateway honek erabiltzaile-izena eta pasahitza erabiltzen ditu. Hasi saioa mahaigaineko aplikazio hau baimendu ahal izateko.',
+      authNeedsOauth: provider =>
+        `Gateway honek OAuth erabiltzen du. Hasi saioa ${provider}-rekin mahaigaineko aplikazio hau baimendu ahal izateko.`,
       tokenTitle: 'Saio-tokena',
       tokenDesc: 'REST eta WebSocket sarbiderako dashboard saio-tokena. Utzi hutsik gordetako tokena mantentzeko.',
       existingToken: value => `${value} token existitzen da`,
@@ -843,7 +856,8 @@ export const eu = defineLocale({
       saveForRestart: 'Gorde hurrengo berrabiarazterako',
       saveAndReconnect: 'Gorde eta berriro konektatu',
       diagnostics: 'Diagnostikoak',
-      diagnosticsDesc: 'Erakutsi desktop.log zure fitxategi-kudeatzailean — baliagarria gateway-a abiarazten huts egiten duenean.',
+      diagnosticsDesc:
+        'Erakutsi desktop.log zure fitxategi-kudeatzailean — baliagarria gateway-a abiarazten huts egiten duenean.',
       openLogs: 'Ireki erregistroak',
       incompleteTitle: 'Urruneko gateway-a osatu gabe',
       incompleteSignIn: 'Sartu urruneko URL bat eta hasi saioa urrunekora aldatu aurretik.',
@@ -853,7 +867,8 @@ export const eu = defineLocale({
       enterUrlFirst: 'Sartu urruneko URL bat lehenengo.',
       restartingTitle: 'Gateway konexioa berrabiarazten',
       savedTitle: 'Gateway ezarpenak gordeta',
-      restartingMessage: 'Hermes Desktop berriro konektatuko da gordetako ezarpenak erabiliz — shell-a irekita mantentzen da.',
+      restartingMessage:
+        'Hermes Desktop berriro konektatuko da gordetako ezarpenak erabiliz — shell-a irekita mantentzen da.',
       savedMessage: 'Hurrengo berrabiarazterako gordeta.',
       connectedTo: (baseUrl, version) => `Konektatuta ${baseUrl}${version ? ` · Hermes ${version}` : ''}-ra`,
       reachableTitle: 'Urruneko gateway-a iristeko moduan',
@@ -868,7 +883,8 @@ export const eu = defineLocale({
       sshTitle: 'Konektatu SSH bidez',
       sshDesc:
         'Hermes urrutiko makina batean abiarazten da SSH bidez eta tunel bidez aplikazio honetara konektatzen da — ez duzu ezer abiarazi edo kanpotik ireki behar. Ostalarirako gakoetan oinarritutako SSH sarbidea behar da.',
-      sshTrustHint: 'Aurkezten den lehen ostalari gakoa fidagarritzat hartu eta ainguratzen da; geroko aldaketek huts egiten dute.',
+      sshTrustHint:
+        'Aurkezten den lehen ostalari gakoa fidagarritzat hartu eta ainguratzen da; geroko aldaketek huts egiten dute.',
       sshHostTitle: 'Ostalaria',
       sshHostDesc: 'user@host, edo ~/.ssh/config-eko Host alias bat.',
       sshHostPick: 'Hautatu ostalari bat…',
@@ -899,7 +915,8 @@ export const eu = defineLocale({
         'Hermes ez dago urruneko ostalarian instalatuta. Instalatu bertan (curl -fsSL https://hermes-agent.nousresearch.com/install.sh | sh) edo ezarri Hermes bidea.',
       sshErrPlatform:
         'Urruneko plataforma ez onartua. Hermes Desktop SSH moduak Linux, macOS eta Windows urruneko ostalariak onartzen ditu.',
-      sshErrTimeout: 'SSH konexioak denbora-muga gainditu du. Ostalaria iristeko moduan ez egotea edo lotan egon daiteke.',
+      sshErrTimeout:
+        'SSH konexioak denbora-muga gainditu du. Ostalaria iristeko moduan ez egotea edo lotan egon daiteke.',
       sshErrUpdateRequired: 'Eguneratu Hermes urruneko ostalarian Desktop SSH-rekin konektatu aurretik.',
       sshErrUnknown: 'SSH konexioak huts egin du.'
     },
@@ -991,7 +1008,8 @@ export const eu = defineLocale({
         'Zerbitzari honek tokiko prozesu bat exekutatzen du zure makinan, behean erakusten den komandoarekin. Jarraitu soilik bere iturria fidagarria bada.',
       deepLinkConfirm: 'Gehitu zerbitzaria',
       deepLinkNameInvalid: 'Izenek 1-64 letra, digitu, puntu, marratxo edo azpimarra erabil ditzakete.',
-      deepLinkNameConflict: name => `${name} izeneko zerbitzari bat jada existitzen da — aukeratu beste izen bat edo utzi.`,
+      deepLinkNameConflict: name =>
+        `${name} izeneko zerbitzari bat jada existitzen da — aukeratu beste izen bat edo utzi.`,
       deepLinkErrorTitle: 'MCP instalazio-esteka baztertuta',
       deepLinkErrorName: 'Estekaren zerbitzari-izena falta da edo baliogabea da.',
       deepLinkErrorConfig: 'Estekaren konfigurazioa ez da base64-ko JSON baliogabea.',
@@ -999,7 +1017,8 @@ export const eu = defineLocale({
       deepLinkErrorUrl: 'http:// eta https:// zerbitzari URLak soilik onartzen dira.',
       deepLinkErrorTooLarge: 'Konfigurazio-kargak 32KB-ko muga gainditzen du.',
       importButton: 'Inportatu',
-      importPlaceholder: 'Itsatsi mcp.json zati bat, npx/docker komandoa, claude mcp add lerroa, URL edo Cursor esteka…',
+      importPlaceholder:
+        'Itsatsi mcp.json zati bat, npx/docker komandoa, claude mcp add lerroa, URL edo Cursor esteka…',
       importNoMatch: 'Ez da zerbitzari-konfiguraziorik ezagutu itsatsitako testuan.',
       importConfirm: 'Gehitu mcp.json-era',
       importConfirmMany: count => `Gehitu ${count} zerbitzari mcp.json-era`
@@ -1016,14 +1035,15 @@ export const eu = defineLocale({
       defaultsFailed: 'Modelo lehenetsiak gordetzeak huts egin du',
       auxiliaryTitle: 'Modelo osagarriak',
       resetAllToMain: 'Berrezarri guztiak nagusira',
-      auxiliaryDesc: 'Zeregin osagarriak modelo nagusian exekutatzen dira lehenetsita. Esleitu modelo dedikatu bat edozein zeregineri override-a egiteko.',
+      auxiliaryDesc:
+        'Zeregin osagarriak modelo nagusian exekutatzen dira lehenetsita. Esleitu modelo dedikatu bat edozein zeregineri override-a egiteko.',
       setToMain: 'Ezarri nagusi gisa',
       change: 'Aldatu',
       autoUseMain: 'auto · erabili modelo nagusia',
       providerDefault: '(hornitzailearen lehenetsia)',
       fallbackAdd: 'Gehitu ordezkoa',
       fallbackEmpty: 'Ez dago ordezko modelorik — modelo lehenetsia erabiltzen da huts egiten ez badu behintzat.',
-      notInCatalog: "ez dago hornitzaile honen modelo zerrendan — deiak ordezko batera eror daitezke.",
+      notInCatalog: 'ez dago hornitzaile honen modelo zerrendan — deiak ordezko batera eror daitezke.',
       tasks: {
         vision: { label: 'Ikusmena', hint: 'Irudien analisia' },
         web_extract: { label: 'Web erauzketa', hint: 'Orrien laburpena' },
@@ -1086,7 +1106,8 @@ export const eu = defineLocale({
       defaultDirTitle: 'Proiektu-direktorio lehenetsia',
       defaultDirDesc:
         'Saio berriak karpeta honetan hasten dira beste bat aukeratu ezean. Utzi ezarri gabe zure etxeko direktorioa erabiltzeko.',
-      defaultDirUpdated: 'Proiektu-direktorio lehenetsia eguneratuta — hasi txat berri batekin (Ctrl/⌘+N) eragina izan dezan',
+      defaultDirUpdated:
+        'Proiektu-direktorio lehenetsia eguneratuta — hasi txat berri batekin (Ctrl/⌘+N) eragina izan dezan',
       defaultsTo: label => `${label}-(e)ra lehenetsita.`,
       change: 'Aldatu',
       choose: 'Aukeratu',
@@ -1114,7 +1135,8 @@ export const eu = defineLocale({
       selectedMessage: provider => `${provider} aktibo dago orain.`,
       failedSelect: provider => `${provider} hautatzeak huts egin du`,
       failedLoad: 'Tresnen konfigurazioa kargatzeak huts egin du',
-      noProviderOptions: 'Toolset honek ez du hornitzaile-aukerarik — gaitu eta zure uneko ezarpenekin funtzionatzen du.',
+      noProviderOptions:
+        'Toolset honek ez du hornitzaile-aukerarik — gaitu eta zure uneko ezarpenekin funtzionatzen du.',
       noProviders: 'Ez dago hornitzailerik toolset honetarako oraintxe bertan.',
       ready: 'Prest',
       needsSignIn: 'Saioa hasi behar da',
@@ -1124,7 +1146,8 @@ export const eu = defineLocale({
       useBackend: 'Erabili backend hau',
       nousIncluded: 'Nous harpidetzan barne — hasi saioa Nous atarian aktibatzeko.',
       nousAuthNeededTitle: 'Hasi saioa Nous atarian',
-      nousAuthNeededMessage: provider => `${provider} gordeta dago, baina ez da aktibatuko Nous atarian saioa hasi arte.`,
+      nousAuthNeededMessage: provider =>
+        `${provider} gordeta dago, baina ez da aktibatuko Nous atarian saioa hasi arte.`,
       nousAuthSignIn: 'Hasi saioa',
       nousAuthDoneTitle: 'Nous ataria konektatuta',
       nousAuthDoneMessage: 'Zure harpidetzako backend-ak aktibo daude orain.',
@@ -1170,11 +1193,12 @@ export const eu = defineLocale({
         unavailable: 'Ez dago erabilgarri',
         inUse: 'Erabiltzen',
         selectedTitle: 'Backend-a hautatuta',
-        selectedMessage: backend => `Terminal-komandoak ${backend} bidez exekutatzen dira orain. Saio berriei aplikatzen zaie.`,
+        selectedMessage: backend =>
+          `Terminal-komandoak ${backend} bidez exekutatzen dira orain. Saio berriei aplikatzen zaie.`,
         failedSelect: backend => `${backend} hautatzeak huts egin du`,
         needsSetupHint: 'Backend hau orain hauta dezakezu — komandoek huts egingo dute konfigurazioa osatu arte.'
       }
-    },
+    }
   },
 
   skills: {
@@ -1379,8 +1403,7 @@ export const eu = defineLocale({
       installed: 'Instalatuta',
       generatedTag: 'Sortua',
       adoptFailed: 'Ezin izan da maskota hori adoptatu.',
-      toggleFailed: (enabled: boolean) =>
-        enabled ? 'Ezin izan da maskota piztu.' : 'Ezin izan da maskota itzali.',
+      toggleFailed: (enabled: boolean) => (enabled ? 'Ezin izan da maskota piztu.' : 'Ezin izan da maskota itzali.'),
       noneAvailable: 'Ez dago maskotarik erabilgarri — aukeratu bat behean instalatzeko.'
     },
     generatePet: {
@@ -1655,7 +1678,10 @@ export const eu = defineLocale({
         help: 'Erabili Socket Mode-rako behar den aplikazio-mailako tokena.',
         placeholder: 'Itsatsi Slack app tokena'
       },
-      SLACK_ALLOWED_USERS: { label: 'Baimendutako Slack erabiltzaile-IDak', help: 'Gomendatua. Slack erabiltzaile-IDak, komaz bereizita.' },
+      SLACK_ALLOWED_USERS: {
+        label: 'Baimendutako Slack erabiltzaile-IDak',
+        help: 'Gomendatua. Slack erabiltzaile-IDak, komaz bereizita.'
+      },
       MATTERMOST_URL: { label: 'Zerbitzariaren URLa', placeholder: 'https://mattermost.example.com' },
       MATTERMOST_TOKEN: { label: 'Bot tokena' },
       MATTERMOST_ALLOWED_USERS: {
@@ -1675,7 +1701,10 @@ export const eu = defineLocale({
         help: 'Martxan dagoen signal-cli REST bridge baten URLa.'
       },
       SIGNAL_ACCOUNT: { label: 'Telefono-zenbakia', help: 'Zure signal-cli bridge-an erregistratutako zenbakia.' },
-      SIGNAL_ALLOWED_USERS: { label: 'Baimendutako Signal erabiltzaileak', help: 'Gomendatua. Signal identifikatzaileak, komaz bereizita.' },
+      SIGNAL_ALLOWED_USERS: {
+        label: 'Baimendutako Signal erabiltzaileak',
+        help: 'Gomendatua. Signal identifikatzaileak, komaz bereizita.'
+      },
       WHATSAPP_ENABLED: {
         label: 'Gaitu WhatsApp bridge-a',
         help: 'Beheko etengailuak automatikoki ezartzen du. Ez ukitu ez badakizu behar duzula.'
@@ -1715,7 +1744,8 @@ export const eu = defineLocale({
     toggleFailed: (name: string) => `"${name}" eguneratzeak huts egin du`,
     newSubscription: 'Harpidetza berria',
     restarting: 'Gateway-a berrabiarazten...',
-    restartNeeded: 'Webhook-ak gaituta daude, baina gateway-a berrabiarazi behar da oraindik hartzailea martxan jarri aurretik.',
+    restartNeeded:
+      'Webhook-ak gaituta daude, baina gateway-a berrabiarazi behar da oraindik hartzailea martxan jarri aurretik.',
     restartGateway: 'Berrabiarazi gateway-a',
     restartingGateway: 'Berrabiarazten...',
     restartFailed: (detail: string) => `Gateway-aren berrabiarazteak huts egin du${detail}`,
@@ -1828,7 +1858,8 @@ export const eu = defineLocale({
     renameDescSuffix: '-ko wrapper script-ak eguneratzen ditu.',
     newNameLabel: 'Izen berria',
     displayNameTitle: 'Izena eman agente honi',
-    displayNameDesc: 'Aplikazio osoan erakusten den bistaratze-izena ezartzen du. Barneko profil IDa "default" izaten jarraitzen du.',
+    displayNameDesc:
+      'Aplikazio osoan erakusten den bistaratze-izena ezartzen du. Barneko profil IDa "default" izaten jarraitzen du.',
     displayNameLabel: 'Bistaratze-izena',
     renaming: 'Berrizendatzen...',
     created: 'Profila sortuta',
@@ -1947,7 +1978,8 @@ export const eu = defineLocale({
     editTitle: 'Editatu cron lana',
     createTitle: 'Cron lan berria',
     editDesc: 'Eguneratu ordutegia, prompt-a edo banaketa-helmuga. Aldaketak hurrengo exekuzioan aplikatzen dira.',
-    createDesc: 'Programatu prompt bat automatikoki exekutatzeko. Erabili cron sintaxia edo esaldi naturala, adibidez "15 minuturo".',
+    createDesc:
+      'Programatu prompt bat automatikoki exekutatzeko. Erabili cron sintaxia edo esaldi naturala, adibidez "15 minuturo".',
     nameLabel: 'Izena',
     namePlaceholder: 'Goizeko laburpena',
     promptLabel: 'Prompt-a',
@@ -2114,7 +2146,8 @@ export const eu = defineLocale({
       createFailed: 'Ezin izan da proiektua sortu',
       staleBackend:
         'Eguneratu Hermes backend-a proiektuak sortzeko — zure backend-a mahaigaineko aplikazio hau baino zaharragoa da (Ezarpenak → Eguneraketak → Backend-a).',
-      deleteConfirm: 'Honek gordetako proiektua kentzen du Hermes-etik. Fitxategiak, git biltegiak eta lan-zuhaitzak ukitu gabe geratzen dira.',
+      deleteConfirm:
+        'Honek gordetako proiektua kentzen du Hermes-etik. Fitxategiak, git biltegiak eta lan-zuhaitzak ukitu gabe geratzen dira.',
       startWork: 'Lan-zuhaitz berria',
       newWorktreeTitle: 'Lan-zuhaitz berria',
       newWorktreeDesc: 'Izena eman lan-zuhaitz honen adarrari.',
@@ -2304,7 +2337,8 @@ export const eu = defineLocale({
     queueResume: 'Jarraitu',
     queueResumeTip: 'Stop-ek geldiarazi du — bidaltzen jarraitu ilaran dauden txandekin',
     queueStuckTitle: 'Ilaratutako mezua ez da bidali',
-    queueStuckBody: 'Ilaratutako txanda bat ez da behin eta berriz bidaltzea lortu. Oraindik ilaran dago — saiatu berriro bidaltzen.',
+    queueStuckBody:
+      'Ilaratutako txanda bat ez da behin eta berriz bidaltzea lortu. Oraindik ilaran dago — saiatu berriro bidaltzen.',
     previewUnavailable: 'Aurrebista ez dago erabilgarri',
     previewLabel: label => `${label}ren aurrebista`,
     couldNotPreview: label => `Ezin izan da ${label} aurrebista egin`,
@@ -2418,8 +2452,10 @@ export const eu = defineLocale({
       viewAsList: 'Ikusi zerrenda gisa',
       revert: 'Berreskuratu',
       revertAll: 'Berreskuratu denak',
-      revertConfirm: 'Baztertu fitxategi honen aldaketak eta itzuli komitatutako egoerara? Honek ez du atzera bueltarik.',
-      revertAllConfirm: 'Baztertu aldaketa guztiak eta itzuli fitxategiak komitatutako egoerara? Honek ez du atzera bueltarik.',
+      revertConfirm:
+        'Baztertu fitxategi honen aldaketak eta itzuli komitatutako egoerara? Honek ez du atzera bueltarik.',
+      revertAllConfirm:
+        'Baztertu aldaketa guztiak eta itzuli fitxategiak komitatutako egoerara? Honek ez du atzera bueltarik.',
       staged: 'Staged',
       noChanges: 'Aldaketarik gabe',
       notRepo: 'Ez da git biltegi bat',
@@ -2436,7 +2472,7 @@ export const eu = defineLocale({
       openPr: 'Ireki PR',
       ghMissing: 'Instalatu GitHub CLI (gh) eta hasi saioa PR-ak irekitzeko',
       agentShip: 'Eskatu Hermes-i PR-a irekitzeko',
-      agentShipUnavailable: "Aldaketa hauek dituen txata ez dago pantailan.",
+      agentShipUnavailable: 'Aldaketa hauek dituen txata ez dago pantailan.',
       agentShipPrompt:
         'Berrikusi uneko aldaketak, komitatu itzazu conventional-commit mezu argi batekin, bultzatu adarra eta ireki pull request bat.',
       newBranch: 'Adar berria',
@@ -2527,7 +2563,8 @@ export const eu = defineLocale({
       restarting: 'Backend-a berrabiarazten eguneraketa kargatzeko…',
       notAvailable: 'Ez dago eguneraketarik backend honetarako.',
       failed: 'Backend-aren eguneraketak huts egin du.',
-      noReturn: 'Backend-a ez da berriro martxan jarri. Eguneraketa agian ez da osatu — egiaztatu backend-aren ostalaria.'
+      noReturn:
+        'Backend-a ez da berriro martxan jarri. Eguneraketa agian ez da osatu — egiaztatu backend-aren ostalaria.'
     }
   },
 
@@ -2555,8 +2592,7 @@ export const eu = defineLocale({
     connectExistingDesc:
       'Erabili urruneko backend bat saio-token batekin edo nabigatzailean saioa hasita. Ez da instalazio lokalik abiatuko.',
     installLocalTitle: 'Instalatu Hermes lokalean',
-    installLocalDesc:
-      'Deskargatu Hermes, sortu bere Python ingurunea eta exekutatu backend-a ordenagailu honetan.',
+    installLocalDesc: 'Deskargatu Hermes, sortu bere Python ingurunea eta exekutatu backend-a ordenagailu honetan.',
     localStartUnavailable: 'Ezin izan da instalazio lokala abiarazi. Berrabiarazi Hermes Desktop eta saiatu berriro.',
     remoteSetupTitle: 'Konektatu lehendik dagoen Hermes-era',
     remoteSetupDesc:
@@ -2610,7 +2646,8 @@ export const eu = defineLocale({
   onboarding: {
     headerTitle: 'Konfigura dezagun Hermes Agent',
     headerDesc: 'Konektatu modelo-hornitzaile bat txateatzen hasteko. Aukera gehienek klik bakar bat behar dute.',
-    preparingInstall: 'Hermes instalazioa amaitzen ari da. Normalean minutu bat baino gutxiago behar du lehen exekuzioan.',
+    preparingInstall:
+      'Hermes instalazioa amaitzen ari da. Normalean minutu bat baino gutxiago behar du lehen exekuzioan.',
     starting: 'Hermes abiarazten…',
     lookingUpProviders: 'Hornitzaileak bilatzen...',
     collapse: 'Tolestu',
@@ -2990,7 +3027,8 @@ export const eu = defineLocale({
     showStripTab: title => `Erakutsi ${title}`,
     hideStripTab: title => `Ezkutatu ${title}`,
     lastTabKeptTitle: 'Azken fitxa geratzen da',
-    lastTabKeptBody: 'Zona honek gutxienez fitxa ikusgarri bat behar du. Erakutsi beste fitxa bat lehenengo, edo tolestu alboko barra osoa.',
+    lastTabKeptBody:
+      'Zona honek gutxienez fitxa ikusgarri bat behar du. Erakutsi beste fitxa bat lehenengo, edo tolestu alboko barra osoa.',
     toggleStripTab: title => `Txandakatu ${title} fitxa`,
     minimize: 'Txikitu',
     reload: 'Kargatu berriro',
@@ -3017,7 +3055,8 @@ export const eu = defineLocale({
     deletePreset: name => `Ezabatu ${name}`,
     zoneEditorTitle: 'Zona-editorea',
     editorHintPre: 'klik zatitzeko · ',
-    editorHintPost: ' lerroa iraultzen du · arrastratu zona artean batzeko · arrastratu partekatutako ertzak tamaina aldatzeko',
+    editorHintPost:
+      ' lerroa iraultzen du · arrastratu zona artean batzeko · arrastratu partekatutako ertzak tamaina aldatzeko',
     templateColumns: 'Zutabeak',
     templateRows: 'Errenkadak',
     templateGrid: 'Sarea',
@@ -3027,7 +3066,8 @@ export const eu = defineLocale({
     customZoneName: count => `${count} zonako pertsonalizatua`,
     layoutNamePlaceholder: fallback => `Diseinuaren izena (${fallback})`,
     saveApply: 'Gorde eta aplikatu',
-    notExpressible: 'antolaketa hau elkarri lotuta dago (pinwheel) — ezin da oraindik habiaratutako zatiketa gisa adierazi',
+    notExpressible:
+      'antolaketa hau elkarri lotuta dago (pinwheel) — ezin da oraindik habiaratutako zatiketa gisa adierazi',
     zoneCount: count => `${count} zona`,
     tabCount: count => `${count} fitxa`
   },
@@ -3038,9 +3078,7 @@ export const eu = defineLocale({
       showEarlier: 'Erakutsi lehenagoko mezuak',
       loadingResponse: 'Hermes erantzun bat kargatzen ari da',
       resumeWhenBackgroundDone: count =>
-        count === 1
-          ? 'Atzeko lana amaitzean jarraituko du'
-          : `${count} atzeko lan amaitzean jarraituko du`,
+        count === 1 ? 'Atzeko lana amaitzean jarraituko du' : `${count} atzeko lan amaitzean jarraituko du`,
       thinking: 'Pentsatzen',
       thought: 'Pentsamendua',
       thoughtBriefly: 'Labur pentsatu du',
@@ -3127,7 +3165,8 @@ export const eu = defineLocale({
       catalogSource: 'Nous-ek onartutako katalogotik',
       envRequired: 'Bete beharrezko kredentzialak lehenengo',
       sendFailed: 'Ezin izan da MCP konfigurazio-erantzuna bidali',
-      reloadFailed: 'Zerbitzaria gordeta, baina MCP tresnak birkargatzeak huts egin du — hurrengo saioan kargatzen dira',
+      reloadFailed:
+        'Zerbitzaria gordeta, baina MCP tresnak birkargatzeak huts egin du — hurrengo saioan kargatzen dira',
       gatewayDisconnected: 'Hermes gateway ez dago konektatuta'
     },
     tool: {
@@ -3179,8 +3218,16 @@ export const eu = defineLocale({
         runningTool: action => `Exekutatzen ${action.toLowerCase()}`
       },
       titles: {
-        browser_click: { done: 'Orri-elementua klikatuta', pending: 'Orri-elementua klikatzen', pendingAction: 'Klikatzen' },
-        browser_fill: { done: 'Formulario-eremua beteta', pending: 'Formulario-eremua betetzen', pendingAction: 'Betetzen' },
+        browser_click: {
+          done: 'Orri-elementua klikatuta',
+          pending: 'Orri-elementua klikatzen',
+          pendingAction: 'Klikatzen'
+        },
+        browser_fill: {
+          done: 'Formulario-eremua beteta',
+          pending: 'Formulario-eremua betetzen',
+          pendingAction: 'Betetzen'
+        },
         browser_navigate: { done: 'Orria irekita', pending: 'Orria irekitzen', pendingAction: 'Irekitzen' },
         browser_snapshot: {
           done: 'Orriaren snapshot-a hartuta',
@@ -3196,9 +3243,17 @@ export const eu = defineLocale({
         clarify: { done: 'Galdera bat eginda', pending: 'Galdera bat egiten', pendingAction: 'Galdetzen' },
         cronjob: { done: 'Cron lana', pending: 'Cron lana programatzen', pendingAction: 'Programatzen' },
         edit_file: { done: 'Fitxategia editatuta', pending: 'Fitxategia editatzen', pendingAction: 'Editatzen' },
-        execute_code: { done: 'Kodea exekutatuta', pending: 'Script-a exekutatzen', pendingAction: 'Script-a exekutatzen' },
+        execute_code: {
+          done: 'Kodea exekutatuta',
+          pending: 'Script-a exekutatzen',
+          pendingAction: 'Script-a exekutatzen'
+        },
         image_generate: { done: 'Irudia sortuta', pending: 'Irudia sortzen', pendingAction: 'Sortzen' },
-        list_files: { done: 'Fitxategiak zerrendatuta', pending: 'Fitxategiak zerrendatzen', pendingAction: 'Zerrendatzen' },
+        list_files: {
+          done: 'Fitxategiak zerrendatuta',
+          pending: 'Fitxategiak zerrendatzen',
+          pendingAction: 'Zerrendatzen'
+        },
         memory: { done: 'Memorian gordeta', pending: 'Memorian gordetzen', pendingAction: 'Gordetzen' },
         patch: { done: 'Fitxategia patch-eginda', pending: 'Fitxategia patch-egiten', pendingAction: 'Patch-egiten' },
         read_file: { done: 'Fitxategia irakurrita', pending: 'Fitxategia irakurtzen', pendingAction: 'Irakurtzen' },
