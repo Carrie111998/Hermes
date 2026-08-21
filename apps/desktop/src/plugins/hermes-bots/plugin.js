@@ -5587,7 +5587,7 @@ async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
     return null
   }
 
-  recordGroupActivity(group, { kind: 'working', member: member.name, thread })
+  recordGroupActivity(group, groupMemberActivityEvent(member, { kind: 'working', thread }))
 
   // Baseline: how many messages exist before our submit.
   let before = 0
@@ -5690,17 +5690,19 @@ async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
               : msg?.text || ''
           const replyText = String(text).trim()
 
-          recordGroupActivity(group, {
-            kind: isGroupPassText(replyText) ? 'passed' : 'replied',
-            member: member.name,
-            thread
-          })
+          recordGroupActivity(
+            group,
+            groupMemberActivityEvent(member, {
+              kind: isGroupPassText(replyText) ? 'passed' : 'replied',
+              thread
+            })
+          )
 
           return replyText
         }
       }
 
-      recordGroupActivity(group, { kind: 'passed', member: member.name, thread })
+      recordGroupActivity(group, groupMemberActivityEvent(member, { kind: 'passed', thread }))
 
       return null
     }
@@ -5717,7 +5719,7 @@ async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
   // clarify timeout runs its own course) and read as a pass, but remember the baseline + thread
   // (runtime-only) so the finished reply can be posted late into the RIGHT
   // thread instead of vanishing.
-  recordGroupActivity(group, { kind: 'timed-out', member: member.name, thread })
+  recordGroupActivity(group, groupMemberActivityEvent(member, { kind: 'timed-out', thread }))
   syncGroupClarify(group, member, null)
   updateGroupChat(group, r => {
     r.stranded = { ...(r.stranded || {}), [groupMemberKey(member)]: { before, thread } }
@@ -5790,7 +5792,10 @@ async function harvestStrandedGroupReply(group, member) {
       const reply = String(text).trim()
 
       if (reply && !isGroupPassText(reply)) {
-        recordGroupActivity(group, { kind: 'delivered', member: member.name, thread: strandedThread })
+        recordGroupActivity(
+          group,
+          groupMemberActivityEvent(member, { kind: 'delivered', thread: strandedThread })
+        )
         appendGroupChatEntry(
           group,
           { kind: 'member', name: member.name, ...(member.remoteSource ? { source: member.connectionLabel || member.connectionId } : {}) },
@@ -5888,6 +5893,7 @@ async function runGroupChatRounds(group, members, thread) {
         // long model turns otherwise read as the room being stuck.
         updateGroupChat(group, r => {
           r.turn = member.name
+          r.turnKey = memberKey
           return r
         })
 
@@ -5896,7 +5902,7 @@ async function runGroupChatRounds(group, members, thread) {
         try {
           reply = await runGroupChatMemberTurn(group, member, prompt, thread, deltaImages)
         } catch {
-          recordGroupActivity(group, { kind: 'failed', member: member.name, thread })
+          recordGroupActivity(group, groupMemberActivityEvent(member, { kind: 'failed', thread }))
           reply = null // a failed turn is a pass, never a room error
         }
 
@@ -5933,6 +5939,7 @@ async function runGroupChatRounds(group, members, thread) {
       updateGroupChat(group, r => {
         r.running = false
         r.turn = null
+        r.turnKey = null
         return r
       })
 
@@ -10264,6 +10271,442 @@ function GroupClarifyCard({ entry, members }) {
   })
 }
 
+
+// ── bot-scoped group activity transcript ────────────────────────────────────
+// The room owns the visible conversation; every member also owns one hidden
+// per-room Hermes session containing the exact prompts, tool calls, tool
+// results, and replies for that bot. The activity drawer reads that canonical
+// session on demand. It deliberately omits system/developer messages and
+// reasoning/thinking blocks: this is an observable execution transcript, not
+// private model chain-of-thought.
+const GROUP_ACTIVITY_TRANSCRIPT_LIMIT = 160
+const GROUP_ACTIVITY_PRIVATE_BLOCKS = new Set(['analysis', 'reasoning', 'thinking', 'redacted_thinking'])
+
+function groupTranscriptContentText(content) {
+  if (typeof content === 'string') {
+    return content
+  }
+
+  if (Array.isArray(content)) {
+    return content
+      .map(part => {
+        if (typeof part === 'string') {
+          return part
+        }
+
+        if (!part || typeof part !== 'object') {
+          return ''
+        }
+
+        const type = String(part.type || '').toLowerCase()
+
+        if (GROUP_ACTIVITY_PRIVATE_BLOCKS.has(type)) {
+          return ''
+        }
+
+        if (typeof part.text === 'string') {
+          return part.text
+        }
+
+        if (typeof part.content === 'string' && (!type || type.includes('text') || type === 'message')) {
+          return part.content
+        }
+
+        return ''
+      })
+      .join('')
+  }
+
+  if (content && typeof content === 'object') {
+    const type = String(content.type || '').toLowerCase()
+
+    if (GROUP_ACTIVITY_PRIVATE_BLOCKS.has(type)) {
+      return ''
+    }
+
+    if (typeof content.text === 'string') {
+      return content.text
+    }
+  }
+
+  return ''
+}
+
+function groupTranscriptTimestamp(message) {
+  const raw = Number(message?.created_at ?? message?.createdAt ?? message?.timestamp ?? message?.at ?? 0)
+
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return null
+  }
+
+  return raw < 1_000_000_000_000 ? raw * 1000 : raw
+}
+
+function groupTranscriptPreview(value, limit = 4000) {
+  let text = ''
+
+  if (typeof value === 'string') {
+    text = value
+  } else if (value !== undefined && value !== null) {
+    try {
+      text = JSON.stringify(value, null, 2)
+    } catch {
+      text = String(value)
+    }
+  }
+
+  return text.length > limit ? `${text.slice(0, limit)}\n…` : text
+}
+
+/** Normalize only user-visible session artifacts. Order follows the backend
+ * message array, which is the canonical chronological order even on gateways
+ * whose individual messages do not carry timestamps. */
+function groupTranscriptRows(messages) {
+  const rows = []
+
+  for (let index = 0; index < (Array.isArray(messages) ? messages.length : 0); index++) {
+    const message = messages[index] || {}
+    const role = String(message.role || message.type || '').toLowerCase()
+    const at = groupTranscriptTimestamp(message)
+
+    // System/developer prompts and explicit private-reasoning records are not
+    // part of the observable transcript exposed to the operator.
+    if (role === 'system' || role === 'developer' || GROUP_ACTIVITY_PRIVATE_BLOCKS.has(role)) {
+      continue
+    }
+
+    if (role === 'user' || role === 'assistant') {
+      const text = groupTranscriptContentText(message.content ?? message.text).trim()
+
+      if (text) {
+        rows.push({
+          key: `message:${index}`,
+          kind: 'message',
+          role,
+          text,
+          at
+        })
+      }
+    }
+
+    const toolCalls = Array.isArray(message.tool_calls)
+      ? message.tool_calls
+      : Array.isArray(message.toolCalls)
+        ? message.toolCalls
+        : []
+
+    for (let callIndex = 0; callIndex < toolCalls.length; callIndex++) {
+      const call = toolCalls[callIndex] || {}
+      const fn = call.function && typeof call.function === 'object' ? call.function : call
+      const name = String(fn.name || call.name || 'tool')
+      const input = fn.arguments ?? call.arguments ?? call.input ?? call.params
+
+      rows.push({
+        key: `tool-call:${index}:${callIndex}`,
+        kind: 'tool-call',
+        role: 'tool',
+        name,
+        text: groupTranscriptPreview(input),
+        at
+      })
+    }
+
+    if (role === 'tool' || role === 'tool_result' || role === 'tool-result') {
+      const name = String(message.name || message.tool_name || message.toolName || 'tool')
+      const result = message.result ?? message.output ?? message.content ?? message.text
+      const text = groupTranscriptPreview(
+        typeof result === 'string' ? result : groupTranscriptContentText(result) || result
+      )
+
+      rows.push({
+        key: `tool-result:${index}`,
+        kind: 'tool-result',
+        role: 'tool',
+        name,
+        text,
+        at
+      })
+    }
+  }
+
+  return rows.slice(-GROUP_ACTIVITY_TRANSCRIPT_LIMIT)
+}
+
+function groupActivityBelongsToMember(event, member) {
+  if (!event || !member) {
+    return false
+  }
+
+  const key = groupMemberKey(member)
+
+  if (event.memberKey) {
+    return event.memberKey === key
+  }
+
+  // Runtime events produced before memberKey was added remain readable, but
+  // newly recorded events always use the source-qualified key.
+  return event.member === member.name
+}
+
+function groupMemberActivityEvent(member, event) {
+  return {
+    ...event,
+    member: member.name,
+    memberKey: groupMemberKey(member)
+  }
+}
+
+/** Bot-scoped activity drawer. It resumes the member's existing hidden room
+ * session with omit_messages:false and polls only while that bot/room is live.
+ * Opening the drawer never creates a session and never writes transcript
+ * state; the backend remains the single source of truth. */
+function GroupMemberActivityPanel({ activityEvents, group, member, onClose, onDirect, room }) {
+  const memberKey = groupMemberKey(member)
+  const storedSession = room.sessions?.[memberKey]
+  const active = room.turnKey
+    ? room.turnKey === memberKey
+    : Boolean(room.turn && room.turn === member.name)
+  const [snapshot, setSnapshot] = useState({ loading: true, messages: [], error: null, busy: active })
+  const [refreshKey, setRefreshKey] = useState(0)
+  const meta = member.remoteSource ? null : botRosterMeta(member, $botMeta.get())
+  const { shape, color, image } = botAppearance(member.name, meta)
+  const photo = Boolean(image && !isBackfilledFacePng(image))
+  const label = displayName(member, meta)
+  const rows = useMemo(() => groupTranscriptRows(snapshot.messages), [snapshot.messages])
+  const memberEvents = activityEvents.filter(event => groupActivityBelongsToMember(event, member)).slice(-12)
+
+  useEffect(() => {
+    let cancelled = false
+    let timer = null
+
+    const refresh = async () => {
+      const target = typeof storedSession === 'string' && storedSession
+        ? storedSession
+        : `Group: ${room.roomId || group}`
+
+      try {
+        const state = await requestForBot(member, 'session.resume', {
+          session_id: target,
+          profile: member.name,
+          omit_messages: false
+        })
+
+        if (!cancelled) {
+          setSnapshot({
+            loading: false,
+            messages: Array.isArray(state?.messages) ? state.messages : [],
+            error: null,
+            busy: Boolean(state?.inflight || state?.running || active)
+          })
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setSnapshot({
+            loading: false,
+            messages: [],
+            error: storedSession ? error?.message || String(error) : null,
+            busy: active
+          })
+        }
+      }
+    }
+
+    void refresh()
+
+    if (active || room.running) {
+      timer = setInterval(() => void refresh(), 1500)
+    }
+
+    return () => {
+      cancelled = true
+
+      if (timer) {
+        clearInterval(timer)
+      }
+    }
+  }, [active, group, memberKey, refreshKey, room.roomId, room.running, storedSession])
+
+  return jsxs('aside', {
+    className:
+      'absolute inset-y-0 right-0 z-30 flex w-[min(28rem,92%)] flex-col border-l border-(--ui-stroke-secondary) bg-(--ui-bg-primary,#111) shadow-2xl',
+    'aria-label': `${label} activity`,
+    children: [
+      jsxs('div', {
+        className: 'flex items-center gap-2 border-b border-(--ui-stroke-secondary) px-3 py-2',
+        children: [
+          jsx(BotFace, {
+            shape,
+            color,
+            image: photo ? image : null,
+            size: 28,
+            name: member.name,
+            mood: active ? 'work' : undefined
+          }),
+          jsxs('div', {
+            className: 'min-w-0 flex-1',
+            children: [
+              jsx('div', { className: 'truncate text-sm font-semibold', children: label }),
+              jsx('div', {
+                className: cn(
+                  'truncate text-[0.65rem]',
+                  snapshot.busy ? 'text-(--ui-accent,#4f9cf9)' : 'text-(--ui-text-quaternary)'
+                ),
+                children: snapshot.busy ? 'Working in this room' : 'Session transcript'
+              })
+            ]
+          }),
+          jsx(Button, {
+            variant: 'ghost',
+            size: 'sm',
+            title: 'Refresh transcript',
+            onClick: () => setRefreshKey(key => key + 1),
+            children: jsx(Codicon, { name: 'refresh' })
+          }),
+          jsx(Button, {
+            variant: 'ghost',
+            size: 'sm',
+            title: 'Close activity panel',
+            onClick: onClose,
+            children: jsx(Codicon, { name: 'close' })
+          })
+        ]
+      }),
+      jsxs('div', {
+        className: 'flex items-center justify-between gap-2 border-b border-(--ui-stroke-secondary) px-3 py-1.5',
+        children: [
+          jsx('span', {
+            className: 'text-[0.625rem] text-(--ui-text-quaternary)',
+            children: 'Observable messages and tool activity only — private model reasoning is never displayed.'
+          }),
+          jsx(Button, {
+            size: 'sm',
+            variant: 'secondary',
+            className: 'h-7 shrink-0 text-[0.7rem]',
+            onClick: onDirect,
+            children: `Message @${botMentionTag(member) || botHandle(member.name, member)}`
+          })
+        ]
+      }),
+      jsx(ScrollArea, {
+        className: 'min-h-0 flex-1',
+        children: jsxs('div', {
+          className: 'grid gap-2 p-3',
+          children: [
+            memberEvents.length
+              ? jsxs('div', {
+                  className: 'grid gap-1 rounded-md border border-(--ui-stroke-secondary) p-2',
+                  children: [
+                    jsx('div', {
+                      className: 'text-[0.65rem] font-semibold uppercase tracking-wide text-(--ui-text-quaternary)',
+                      children: 'Live activity'
+                    }),
+                    ...memberEvents.map((event, index) =>
+                      jsxs('div', {
+                        className: 'flex items-center gap-1.5 text-[0.7rem]',
+                        children: [
+                          jsx(Codicon, {
+                            name: GROUP_ACTIVITY_GLYPHS[event.kind] || 'circle-outline',
+                            className: cn('shrink-0 text-[0.65rem]', groupActivityTone(event.kind))
+                          }),
+                          jsx('span', {
+                            className: cn('min-w-0 flex-1 truncate', groupActivityTone(event.kind)),
+                            children: groupActivityLabel(event)
+                          }),
+                          jsx('span', {
+                            className: 'shrink-0 text-[0.625rem] text-(--ui-text-quaternary)',
+                            children: relativeTime(event.at)
+                          })
+                        ]
+                      }, `${event.at}:${index}`)
+                    )
+                  ]
+                })
+              : null,
+            snapshot.loading
+              ? jsxs('div', {
+                  className: 'flex items-center gap-2 py-4 text-xs text-(--ui-text-tertiary)',
+                  children: [jsx(GlyphSpinner, { size: 14 }), 'Loading transcript…']
+                })
+              : null,
+            !snapshot.loading && snapshot.error
+              ? jsxs('div', {
+                  className: 'rounded-md border border-destructive/40 px-2.5 py-2 text-xs text-destructive',
+                  children: ['Could not load this bot session: ', snapshot.error]
+                })
+              : null,
+            !snapshot.loading && !snapshot.error && !rows.length
+              ? jsx('div', {
+                  className: 'py-6 text-center text-xs text-(--ui-text-tertiary)',
+                  children: storedSession || active
+                    ? 'The session has started, but no observable transcript entries are available yet.'
+                    : 'This bot has not started a session in this room yet.'
+                })
+              : null,
+            ...rows.map(row => {
+              const isTool = row.kind === 'tool-call' || row.kind === 'tool-result'
+              const title = row.kind === 'tool-call'
+                ? `Called ${row.name}`
+                : row.kind === 'tool-result'
+                  ? `${row.name} result`
+                  : row.role === 'user'
+                    ? 'Room context sent to bot'
+                    : label
+
+              return jsxs('div', {
+                className: cn(
+                  'grid gap-1 rounded-md border px-2.5 py-2',
+                  row.role === 'user'
+                    ? 'border-(--ui-stroke-secondary) bg-(--chrome-action-hover)'
+                    : isTool
+                      ? 'border-(--ui-stroke-secondary) bg-(--ui-bg-secondary,#181818)'
+                      : 'border-(--ui-accent,#4f9cf9)/35'
+                ),
+                children: [
+                  jsxs('div', {
+                    className: 'flex items-center gap-1.5',
+                    children: [
+                      jsx(Codicon, {
+                        name: row.kind === 'tool-call'
+                          ? 'tools'
+                          : row.kind === 'tool-result'
+                            ? 'output'
+                            : row.role === 'user'
+                              ? 'comment'
+                              : 'sparkle',
+                        className: 'shrink-0 text-[0.7rem] text-(--ui-text-quaternary)'
+                      }),
+                      jsx('span', { className: 'min-w-0 flex-1 truncate text-[0.7rem] font-semibold', children: title }),
+                      row.at
+                        ? jsx('span', {
+                            className: 'shrink-0 text-[0.625rem] text-(--ui-text-quaternary)',
+                            children: relativeTime(row.at)
+                          })
+                        : null
+                    ]
+                  }),
+                  isTool
+                    ? jsx('pre', {
+                        className:
+                          'max-h-64 overflow-auto whitespace-pre-wrap break-words rounded bg-(--ui-bg-primary,#111) p-2 font-mono text-[0.65rem] text-(--ui-text-secondary)',
+                        'data-selectable-text': 'true',
+                        children: row.text || '(no details)'
+                      })
+                    : jsx('div', {
+                        className:
+                          'text-xs text-(--ui-text-secondary) [&_p]:mb-1 [&_p:last-child]:mb-0 [&_pre]:overflow-x-auto',
+                        'data-selectable-text': 'true',
+                        children: Streamdown ? jsx(Streamdown, { children: row.text }) : row.text
+                      })
+                ]
+              }, row.key)
+            })
+          ]
+        })
+      })
+    ]
+  })
+}
+
 function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   const rooms = useValue($groupChats)
   const allMeta = useValue($botMeta)
@@ -10287,6 +10730,9 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   // composer, otherwise the reply box of that thread. Data URLs, already
   // downscaled — they ride the send into every responding member's session.
   const [pendingImages, setPendingImages] = useState({})
+  // The selected source-qualified member whose canonical hidden room
+  // session is visible in the activity drawer.
+  const [activityMemberKey, setActivityMemberKey] = useState(null)
 
   // Scroll anchoring (#89835): rooms used to open at scroll position 0 and
   // stay there while replies streamed in. Scroll the bottom sentinel into
@@ -10398,6 +10844,18 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   const roomClarifies = Object.values(clarifyAll || {})
     .filter(entry => entry?.group === group)
     .sort((a, b) => (a.at || 0) - (b.at || 0))
+  const selectedActivityMember = activityMemberKey
+    ? members.find(member => groupMemberKey(member) === activityMemberKey) || null
+    : null
+  const activeActivityMember = room.turnKey
+    ? members.find(member => groupMemberKey(member) === room.turnKey) || null
+    : members.find(member => member.name === room.turn) || null
+
+  useEffect(() => {
+    if (activityMemberKey && !selectedActivityMember) {
+      setActivityMemberKey(null)
+    }
+  }, [activityMemberKey, selectedActivityMember])
 
   const header = jsxs('div', {
     className: 'flex items-center gap-2 px-2.5 pt-2.5 pb-2',
@@ -10430,8 +10888,13 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
           const { shape, color, image } = botAppearance(b.name, bMeta)
           const photo = Boolean(image && !isBackfilledFacePng(image))
 
-          return jsx('div', {
-            className: 'rounded-full ring-2 ring-(--ui-bg-primary,#111)',
+          return jsx('button', {
+            type: 'button',
+            className:
+              'cursor-pointer rounded-full border-0 bg-transparent p-0 ring-2 ring-(--ui-bg-primary,#111) transition-transform hover:z-10 hover:scale-110 focus-visible:z-10',
+            title: `Open ${displayName(b, bMeta)} activity`,
+            'aria-label': `Open ${displayName(b, bMeta)} activity`,
+            onClick: () => setActivityMemberKey(groupMemberKey(b)),
             children: jsx(BotFace, { shape, color, image: photo ? image : null, size: 20, name: b.name })
           }, botRosterKey(b))
         })
@@ -10660,8 +11123,16 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                     children: [
                       isUser
                         ? null
-                        : jsx('div', {
-                            className: 'mt-0.5 shrink-0',
+                        : jsx('button', {
+                            type: 'button',
+                            className: cn(
+                              'mt-0.5 shrink-0 cursor-pointer rounded-full border-0 bg-transparent p-0',
+                              member && 'hover:ring-2 hover:ring-(--ui-accent,#4f9cf9)'
+                            ),
+                            title: member ? `Open ${display} activity` : display,
+                            'aria-label': member ? `Open ${display} activity` : display,
+                            disabled: !member,
+                            onClick: () => member && setActivityMemberKey(groupMemberKey(member)),
                             children: jsx(BotFace, {
                               shape,
                               color,
@@ -10881,7 +11352,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
   })
 
   return jsxs('div', {
-    className: 'relative flex h-full flex-col',
+    className: 'relative flex h-full flex-col overflow-hidden',
     onDragOver: event => {
       if ([...(event.dataTransfer?.types || [])].includes('Files')) {
         event.preventDefault()
@@ -10923,14 +11394,46 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
               jsx(GroupClarifyCard, { entry, members }, `clarify:${entry.memberKey}:${entry.requestId}`)
             ),
             room.running
-              ? jsx('div', {
-                  className: 'px-2 py-1 text-[0.7rem] italic text-(--ui-text-quaternary)',
-                  children: roomClarifies.length
-                    ? 'Waiting for your answer…'
-                    : room.turn
-                      ? `${groupSpeakerLabel(room.turn)} is thinking…`
-                      : 'The room is working…'
-                }, 'working')
+              ? roomClarifies.length
+                ? jsx('div', {
+                    className: 'px-2 py-1 text-[0.7rem] italic text-(--ui-text-quaternary)',
+                    children: 'Waiting for your answer…'
+                  }, 'working')
+                : activeActivityMember
+                  ? (() => {
+                      const meta = botRosterMeta(activeActivityMember, allMeta)
+                      const { shape, color, image } = botAppearance(activeActivityMember.name, meta)
+                      const photo = Boolean(image && !isBackfilledFacePng(image))
+                      const label = displayName(activeActivityMember, meta)
+
+                      return jsx('button', {
+                        type: 'button',
+                        className:
+                          'relative mx-2 my-1 size-8 cursor-pointer rounded-full border-0 bg-transparent p-0 ring-2 ring-(--ui-accent,#4f9cf9)/45 hover:ring-(--ui-accent,#4f9cf9)',
+                        title: `${label} is working — open activity`,
+                        'aria-label': `${label} is working — open activity`,
+                        onClick: () => setActivityMemberKey(groupMemberKey(activeActivityMember)),
+                        children: [
+                          jsx(BotFace, {
+                            shape,
+                            color,
+                            image: photo ? image : null,
+                            size: 28,
+                            name: activeActivityMember.name,
+                            mood: 'work'
+                          }),
+                          jsx(Codicon, {
+                            name: 'sync',
+                            className:
+                              'absolute -right-1 -bottom-1 rounded-full bg-(--ui-bg-primary,#111) p-0.5 text-[0.6rem] text-(--ui-accent,#4f9cf9) motion-safe:animate-spin'
+                          })
+                        ]
+                      }, 'working')
+                    })()
+                  : jsx('div', {
+                      className: 'px-2 py-1 text-[0.7rem] italic text-(--ui-text-quaternary)',
+                      children: 'The room is working…'
+                    }, 'working')
               : null,
             // Scroll anchor (#89835): rooms opened at scroll position 0, mid-
             // history. The effect below scrolls this sentinel into view on
@@ -10973,6 +11476,21 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
           ]
         })
       }),
+      selectedActivityMember
+        ? jsx(GroupMemberActivityPanel, {
+            activityEvents,
+            group,
+            member: selectedActivityMember,
+            room,
+            onClose: () => setActivityMemberKey(null),
+            onDirect: () => {
+              const tag = botMentionTag(selectedActivityMember) || botHandle(selectedActivityMember.name, selectedActivityMember)
+              setReplyThread(null)
+              setDraft(current => (current.trim() ? `${current} @${tag} ` : `@${tag} `))
+              setActivityMemberKey(null)
+            }
+          })
+        : null,
       jsx(GroupChatSettingsDialog, {
         group,
         members,
