@@ -45,8 +45,10 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -378,9 +380,43 @@ def _run_one_file_once(
     file_timeout: float,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
-    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
-    
+    # Private --basetemp per subprocess: without it, every concurrent pytest
+    # process shares /tmp/pytest-of-<user>/ and runs the numbered-root
+    # retention pruning (keep-last-3) against its siblings' live roots. Under
+    # 8-way parallelism a sibling's pruning can delete a root between another
+    # process creating it and its first tmp_path use, which surfaces as
+    #   FileNotFoundError: /tmp/pytest-of-runner/pytest-NNN
+    # at fixture setup (seen on CI run 32498702748, slice 9). A per-process
+    # basetemp bypasses the shared numbered-root machinery entirely. A
+    # user-supplied --basetemp in pytest_args comes later on the command
+    # line and therefore wins.
+    basetemp = tempfile.mkdtemp(prefix="hermes-pytest-")
+    cmd = [
+        sys.executable,
+        "-m",
+        "pytest",
+        str(file),
+        f"--basetemp={basetemp}",
+        *pytest_args,
+    ]
+
     subproc_start = time.monotonic()
+    try:
+        return _launch_and_collect(
+            cmd, file, repo_root, file_timeout, subproc_start
+        )
+    finally:
+        shutil.rmtree(basetemp, ignore_errors=True)
+
+
+def _launch_and_collect(
+    cmd: List[str],
+    file: Path,
+    repo_root: Path,
+    file_timeout: float,
+    subproc_start: float,
+) -> Tuple[Path, int, str, dict[str, int], float]:
+    """Launch one pytest subprocess and collect its result (see _run_one_file_once)."""
     # launch the pytest process
     proc = subprocess.Popen(
         cmd,
