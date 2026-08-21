@@ -21,9 +21,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
+import sys
 import time
+from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -49,6 +53,98 @@ COPILOT_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 # Polling constants
 _DEVICE_CODE_POLL_INTERVAL = 5  # seconds
 _DEVICE_CODE_POLL_SAFETY_MARGIN = 3  # seconds
+
+# The API requests below intentionally use the public Copilot CLI integration
+# contract. The version and wire identity, however, must come from the CLI that
+# is installed on this machine rather than from a release snapshot in Hermes.
+COPILOT_INTEGRATION_ID = "copilot-developer-cli"
+
+
+@dataclass(frozen=True)
+class CopilotClientIdentity:
+    """Resolved wire identity for Copilot API catalog and inference calls."""
+
+    version: Optional[str]
+    user_agent: str
+    editor_version: str
+
+
+def _command_version(command: list[str]) -> Optional[str]:
+    """Run a bounded version probe and return its combined output."""
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+            creationflags=windows_hide_flags(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    return output.strip() or None
+
+
+def _installed_copilot_cli_version() -> Optional[str]:
+    """Return the installed ``@github/copilot`` CLI version, if available."""
+    executable = shutil.which("copilot")
+    if not executable:
+        return None
+    output = _command_version([executable, "--version"])
+    if not output:
+        return None
+    match = re.search(r"GitHub Copilot CLI\s+(\S+)", output)
+    return match.group(1).rstrip(".") if match else None
+
+
+def _installed_node_version() -> str:
+    """Return the Node version token used by the npm CLI's User-Agent shape."""
+    executable = shutil.which("node")
+    output = _command_version([executable, "--version"]) if executable else None
+    if output:
+        first_line = output.splitlines()[0].strip()
+        if first_line:
+            return first_line
+    return "unknown"
+
+
+@lru_cache(maxsize=1)
+def resolve_copilot_client_identity() -> CopilotClientIdentity:
+    """Resolve the installed CLI's authentic API identity, or a Hermes fallback.
+
+    ``@github/copilot`` builds its User-Agent as
+    ``copilot/<version> (<platform> <node-version>) term/<TERM_PROGRAM>`` and
+    its Editor-Version as ``copilot/<version>``. When the CLI is absent, use a
+    Hermes-specific identity instead of claiming that an arbitrary CLI build
+    is installed.
+    """
+    version = _installed_copilot_cli_version()
+    if version:
+        term_program = os.getenv("TERM_PROGRAM") or "unknown"
+        editor_version = f"copilot/{version}"
+        return CopilotClientIdentity(
+            version=version,
+            user_agent=(
+                f"{editor_version} ({sys.platform} {_installed_node_version()}) "
+                f"term/{term_program}"
+            ),
+            editor_version=editor_version,
+        )
+
+    try:
+        from hermes_cli import __version__ as hermes_version
+    except Exception:  # pragma: no cover - package metadata is normally present
+        hermes_version = "unknown"
+    editor_version = f"hermes-cli/{hermes_version}"
+    return CopilotClientIdentity(
+        version=None,
+        user_agent=(
+            f"{editor_version} ({sys.platform} "
+            f"python/{sys.version_info.major}.{sys.version_info.minor})"
+        ),
+        editor_version=editor_version,
+    )
 
 
 def validate_copilot_token(token: str) -> tuple[bool, str]:
@@ -254,6 +350,8 @@ def copilot_device_code_login(
         headers={
             "Accept": "application/json",
             "Content-Type": "application/x-www-form-urlencoded",
+            # This flow uses VS Code's OAuth client ID, not the installed
+            # @github/copilot package's client contract.
             "User-Agent": "HermesAgent/1.0",
         },
     )
@@ -353,7 +451,9 @@ def copilot_device_code_login(
 _jwt_cache: dict[str, tuple[str, float, Optional[str]]] = {}
 _JWT_REFRESH_MARGIN_SECONDS = 120  # refresh 2 min before expiry
 
-# Token exchange endpoint and headers (matching VS Code / Copilot CLI)
+# Token exchange is coupled to the VS Code OAuth client ID above. Keep its
+# editor identity separate from catalog and inference requests, which use the
+# installed @github/copilot CLI contract when available.
 _TOKEN_EXCHANGE_URL = "https://api.github.com/copilot_internal/v2/token"
 _EDITOR_VERSION = "vscode/1.104.1"
 _EXCHANGE_USER_AGENT = "GitHubCopilotChat/0.26.7"
@@ -723,10 +823,11 @@ def copilot_request_headers(
 
     Replicates the header set used by opencode and the Copilot CLI.
     """
+    identity = resolve_copilot_client_identity()
     headers: dict[str, str] = {
-        "Editor-Version": "vscode/1.104.1",
-        "User-Agent": "HermesAgent/1.0",
-        "Copilot-Integration-Id": "vscode-chat",
+        "Editor-Version": identity.editor_version,
+        "User-Agent": identity.user_agent,
+        "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
         "Openai-Intent": "conversation-edits",
         "x-initiator": "agent" if is_agent_turn else "user",
     }

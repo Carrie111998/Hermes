@@ -1457,6 +1457,17 @@ def test_try_refresh_copilot_client_credentials_rebuilds_client(monkeypatch):
         "hermes_cli.copilot_auth.get_copilot_api_token",
         lambda _raw: ("tid=exchanged-ide-token", None),
     )
+    identity_headers = {
+        "User-Agent": "copilot/9.8.7 (linux v24.0.0) term/test",
+        "Editor-Version": "copilot/9.8.7",
+        "Copilot-Integration-Id": "copilot-developer-cli",
+        "Openai-Intent": "conversation-edits",
+        "x-initiator": "agent",
+    }
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.copilot_request_headers",
+        lambda **_kwargs: dict(identity_headers),
+    )
     monkeypatch.setattr(run_agent, "OpenAI", _fake_openai)
 
     agent.client = _ExistingClient()
@@ -1467,9 +1478,10 @@ def test_try_refresh_copilot_client_credentials_rebuilds_client(monkeypatch):
     # deferred to GC on current main — no synchronous .close() contract).
     # The freshly EXCHANGED IDE token — not the raw ghu_/gho_ token — goes on
     # the wire, which is what fixes the "401 IDE token expired" recurrence.
+    assert rebuilt["kwargs"] is not None
     assert rebuilt["kwargs"]["api_key"] == "tid=exchanged-ide-token"
     assert rebuilt["kwargs"]["base_url"] == "https://api.githubcopilot.com"
-    assert rebuilt["kwargs"]["default_headers"]["Copilot-Integration-Id"] == "vscode-chat"
+    assert rebuilt["kwargs"]["default_headers"] == identity_headers
     assert isinstance(agent.client, _RebuiltClient)
 
 

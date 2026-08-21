@@ -37,7 +37,7 @@ _HERMES_USER_AGENT = f"hermes-cli/{_HERMES_VERSION}"
 
 COPILOT_BASE_URL = "https://api.githubcopilot.com"
 COPILOT_MODELS_URL = f"{COPILOT_BASE_URL}/models"
-COPILOT_EDITOR_VERSION = "vscode/1.104.1"
+COPILOT_INTEGRATION_ID = "copilot-developer-cli"
 COPILOT_REASONING_EFFORTS_GPT5 = ["minimal", "low", "medium", "high"]
 COPILOT_REASONING_EFFORTS_O_SERIES = ["low", "medium", "high"]
 
@@ -4678,8 +4678,9 @@ def copilot_default_headers(*, is_agent_turn: bool = True) -> dict[str, str]:
         return copilot_request_headers(is_agent_turn=is_agent_turn)
     except ImportError:
         return {
-            "Editor-Version": COPILOT_EDITOR_VERSION,
-            "User-Agent": "HermesAgent/1.0",
+            "Editor-Version": f"hermes-cli/{_HERMES_VERSION}",
+            "User-Agent": f"hermes-cli/{_HERMES_VERSION}",
+            "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
             "Openai-Intent": "conversation-edits",
             "x-initiator": "agent" if is_agent_turn else "user",
         }

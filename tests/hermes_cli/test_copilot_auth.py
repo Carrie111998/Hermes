@@ -127,14 +127,33 @@ class TestGhCliTokenCache:
         self._reset()
 
 
+class TestDeviceOAuthIdentity:
+    def test_vscode_client_id_flow_does_not_claim_cli_identity(self):
+        import urllib.parse
+        import hermes_cli.copilot_auth as mod
+
+        with patch("urllib.request.urlopen", side_effect=OSError("offline")) as urlopen:
+            assert mod.copilot_device_code_login() is None
+
+        request = urlopen.call_args.args[0]
+        form = urllib.parse.parse_qs(request.data.decode())
+        assert form["client_id"] == [mod.COPILOT_OAUTH_CLIENT_ID]
+        assert request.get_header("User-agent") == "HermesAgent/1.0"
+        assert not request.get_header("User-agent").startswith("copilot/")
+
+
 class TestRequestHeaders:
     """Copilot API header generation."""
 
     def test_default_headers_include_openai_intent(self):
-        from hermes_cli.copilot_auth import copilot_request_headers
+        from hermes_cli.copilot_auth import (
+            COPILOT_INTEGRATION_ID,
+            copilot_request_headers,
+        )
         headers = copilot_request_headers()
         assert headers["Openai-Intent"] == "conversation-edits"
-        assert headers["User-Agent"] == "HermesAgent/1.0"
+        assert headers["Copilot-Integration-Id"] == COPILOT_INTEGRATION_ID
+        assert COPILOT_INTEGRATION_ID == "copilot-developer-cli"
         assert "Editor-Version" in headers
 
 
@@ -142,6 +161,73 @@ class TestRequestHeaders:
         from hermes_cli.copilot_auth import copilot_request_headers
         headers = copilot_request_headers()
         assert "Copilot-Vision-Request" not in headers
+
+
+    def test_inference_uses_resolved_cli_identity(self, monkeypatch):
+        from hermes_cli.copilot_auth import (
+            CopilotClientIdentity,
+            COPILOT_INTEGRATION_ID,
+            copilot_request_headers,
+        )
+        identity = CopilotClientIdentity(
+            version="9.8.7",
+            user_agent="copilot/9.8.7 (linux v24.0.0) term/test-terminal",
+            editor_version="copilot/9.8.7",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.copilot_auth.resolve_copilot_client_identity",
+            lambda: identity,
+        )
+
+        headers = copilot_request_headers()
+        assert headers["Copilot-Integration-Id"] == COPILOT_INTEGRATION_ID
+        assert headers["User-Agent"] == identity.user_agent
+        assert headers["Editor-Version"] == identity.editor_version
+
+
+class TestCopilotClientIdentity:
+    def test_installed_version_comes_from_copilot_executable(self, monkeypatch):
+        import hermes_cli.copilot_auth as mod
+
+        monkeypatch.setattr(
+            mod.shutil,
+            "which",
+            lambda name: "/bin/copilot" if name == "copilot" else None,
+        )
+        monkeypatch.setattr(
+            mod,
+            "_command_version",
+            lambda command: "GitHub Copilot CLI 2.3.4-5.\nRun 'copilot update'",
+        )
+        assert mod._installed_copilot_cli_version() == "2.3.4-5"
+
+    def test_resolves_installed_cli_version_and_authentic_shape(self, monkeypatch):
+        import hermes_cli.copilot_auth as mod
+
+        mod.resolve_copilot_client_identity.cache_clear()
+        monkeypatch.setattr(mod, "_installed_copilot_cli_version", lambda: "1.2.3-4")
+        monkeypatch.setattr(mod, "_installed_node_version", lambda: "v24.1.0")
+        monkeypatch.setattr(mod.sys, "platform", "linux")
+        monkeypatch.setenv("TERM_PROGRAM", "tmux")
+
+        identity = mod.resolve_copilot_client_identity()
+        assert identity.version == "1.2.3-4"
+        assert identity.editor_version == "copilot/1.2.3-4"
+        assert identity.user_agent == "copilot/1.2.3-4 (linux v24.1.0) term/tmux"
+        mod.resolve_copilot_client_identity.cache_clear()
+
+    def test_fallback_is_truthfully_hermes_when_cli_is_absent(self, monkeypatch):
+        import hermes_cli.copilot_auth as mod
+
+        mod.resolve_copilot_client_identity.cache_clear()
+        monkeypatch.setattr(mod, "_installed_copilot_cli_version", lambda: None)
+        identity = mod.resolve_copilot_client_identity()
+
+        assert identity.version is None
+        assert identity.editor_version.startswith("hermes-cli/")
+        assert identity.user_agent.startswith(identity.editor_version)
+        assert "copilot/" not in identity.user_agent.lower()
+        mod.resolve_copilot_client_identity.cache_clear()
 
 
 class TestCopilotDefaultHeaders:
