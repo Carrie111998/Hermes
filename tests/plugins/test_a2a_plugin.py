@@ -170,6 +170,26 @@ class TestTrustedOperatorPeers:
         assert security.is_trusted_peer("alice") is True
         assert security.is_trusted_operator_peer("alice") is False
 
+    def test_shared_token_collision_does_not_promote_peer(self, monkeypatch):
+        monkeypatch.setattr(
+            security, "get_trusted_operator_peers", lambda: {"alice"}
+        )
+        monkeypatch.setenv("A2A_BEARER_TOKEN", "shared-secret")
+        monkeypatch.setenv("A2A_PEER_TOKENS", "alice:shared-secret")
+        assert security.authenticate("Bearer shared-secret", "1.2.3.4") == "alice"
+        assert security.is_trusted_operator_peer("alice") is False
+
+    def test_duplicate_peer_token_does_not_promote_either_name(self, monkeypatch):
+        monkeypatch.setattr(
+            security, "get_trusted_operator_peers", lambda: {"alice", "bob"}
+        )
+        monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
+        monkeypatch.setenv(
+            "A2A_PEER_TOKENS", "alice:duplicated-secret,bob:duplicated-secret"
+        )
+        assert security.is_trusted_operator_peer("alice") is False
+        assert security.is_trusted_operator_peer("bob") is False
+
 
 class TestInjectionFilter:
     def test_chatml_defanged(self):
@@ -1273,6 +1293,39 @@ class TestInboundRoundTrip:
             assert "'alice'" in seen["text"]
             assert "the-operator" not in seen["text"]
             assert "untrusted external input" in seen["text"]
+            await adapter.disconnect()
+
+        asyncio.run(run())
+
+    def test_shared_and_named_token_collision_keeps_untrusted_frame(self, monkeypatch):
+        monkeypatch.setenv("A2A_BEARER_TOKEN", "shared-secret")
+        monkeypatch.setenv("A2A_PEER_TOKENS", "alice:shared-secret")
+        monkeypatch.setenv("A2A_HOST", "127.0.0.1")
+        monkeypatch.setattr(
+            security, "get_trusted_operator_peers", lambda: {"alice"}
+        )
+
+        seen = {}
+
+        def reply_fn(event):
+            seen["text"] = event.text
+            seen["user"] = event.source.user_id
+            return "ok"
+
+        adapter, base = _make_live_adapter(monkeypatch, reply_fn=reply_fn)
+
+        async def run():
+            assert await adapter.connect() is True
+            resp = await asyncio.to_thread(
+                _post_json,
+                base + "/",
+                _send_body("read a private file"),
+                {"Authorization": "Bearer shared-secret"},
+            )
+            assert resp["result"]["status"]["state"] == "TASK_STATE_COMPLETED"
+            assert seen["user"] == "alice"
+            assert "untrusted external input" in seen["text"]
+            assert "trusted operator peer" not in seen["text"]
             await adapter.disconnect()
 
         asyncio.run(run())

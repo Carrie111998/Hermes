@@ -47,15 +47,10 @@ def get_bearer_token() -> str:
     return os.getenv("A2A_BEARER_TOKEN", "").strip()
 
 
-def get_peer_tokens() -> dict[str, str]:
-    """Parse A2A_PEER_TOKENS ("alice:tok1,bob:tok2") into {token: peer_name}.
-
-    Per-peer tokens give each remote agent its own credential, so the identity
-    used for rate limiting, trust, and audit is authenticated — not whatever
-    the request body claims.
-    """
+def _get_peer_token_entries() -> list[tuple[str, str]]:
+    """Parse valid A2A_PEER_TOKENS entries without losing duplicates."""
     raw = os.getenv("A2A_PEER_TOKENS", "").strip()
-    out: dict[str, str] = {}
+    entries: list[tuple[str, str]] = []
     for pair in raw.split(","):
         pair = pair.strip()
         if not pair or ":" not in pair:
@@ -63,8 +58,18 @@ def get_peer_tokens() -> dict[str, str]:
         name, token = pair.split(":", 1)
         name, token = name.strip(), token.strip()
         if name and token:
-            out[token] = name
-    return out
+            entries.append((token, name))
+    return entries
+
+
+def get_peer_tokens() -> dict[str, str]:
+    """Parse A2A_PEER_TOKENS ("alice:tok1,bob:tok2") into {token: peer_name}.
+
+    Per-peer tokens give each remote agent its own credential, so the identity
+    used for rate limiting, trust, and audit is authenticated — not whatever
+    the request body claims.
+    """
+    return dict(_get_peer_token_entries())
 
 
 def _parse_bearer(auth_header: Optional[str]) -> Optional[str]:
@@ -200,7 +205,20 @@ def is_trusted_operator_peer(identity: str) -> bool:
     """Whether an authenticated named-token identity has operator authority."""
     if not identity or identity not in get_trusted_operator_peers():
         return False
-    return identity in set(get_peer_tokens().values())
+
+    entries = _get_peer_token_entries()
+    identity_tokens = {token for token, name in entries if name == identity}
+    if not identity_tokens:
+        return False
+
+    shared = get_bearer_token()
+    if shared and any(hmac.compare_digest(shared, token) for token in identity_tokens):
+        return False
+
+    names_by_token: dict[str, set[str]] = {}
+    for token, name in entries:
+        names_by_token.setdefault(token, set()).add(name)
+    return all(len(names_by_token[token]) == 1 for token in identity_tokens)
 
 
 # --------------------------------------------------------------------------
