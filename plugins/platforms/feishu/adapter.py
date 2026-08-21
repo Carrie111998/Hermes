@@ -2986,6 +2986,13 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("Failed to resolve Feishu update prompt: %s", exc)
 
+    def _event_identity_scope(self, data: Any) -> str:
+        """Return the app-and-tenant namespace for an inbound Feishu event."""
+        header = getattr(data, "header", None)
+        tenant_key = str(getattr(header, "tenant_key", "") or "").strip()
+        app_id = str(getattr(self, "_app_id", "") or "").strip()
+        return ":".join(part for part in (app_id, tenant_key) if part)
+
     async def _handle_reaction_event(self, event_type: str, data: Any) -> None:
         """Fetch the reacted-to message; if it was sent by this bot, emit a synthetic text event."""
         if not self._client:
@@ -3034,6 +3041,7 @@ class FeishuAdapter(BasePlatformAdapter):
             user_name=sender_profile["user_name"],
             thread_id=None,
             user_id_alt=sender_profile["user_id_alt"],
+            scope_id=self._event_identity_scope(data),
         )
         synthetic_event = MessageEvent(
             text=synthetic_text,
@@ -3097,6 +3105,7 @@ class FeishuAdapter(BasePlatformAdapter):
             user_name=sender_profile["user_name"],
             thread_id=None,
             user_id_alt=sender_profile["user_id_alt"],
+            scope_id=self._event_identity_scope(data),
         )
         synthetic_event = MessageEvent(
             text=synthetic_text,
@@ -3376,10 +3385,6 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_id = getattr(message, "chat_id", "") or ""
         chat_info = await self.get_chat_info(chat_id)
         sender_profile = await self._resolve_sender_profile(sender_id, is_bot=is_bot)
-        header = getattr(data, "header", None)
-        tenant_key = str(getattr(header, "tenant_key", "") or "").strip()
-        app_id = str(getattr(self, "_app_id", "") or "").strip()
-        identity_scope = ":".join(part for part in (app_id, tenant_key) if part)
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
@@ -3389,7 +3394,7 @@ class FeishuAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             user_id_alt=sender_profile["user_id_alt"],
             is_bot=is_bot,
-            scope_id=identity_scope,
+            scope_id=self._event_identity_scope(data),
         )
         normalized = MessageEvent(
             text=text,
