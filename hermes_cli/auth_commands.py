@@ -170,12 +170,26 @@ def _format_exhausted_status(entry) -> str:
 # Kept OUT of ``PROVIDER_REGISTRY`` on purpose so inference-side provider
 # resolution is untouched; overlapping ids (gemini/xai/minimax/deepinfra) are
 # already registry entries and need no listing here.
-VOICE_CREDENTIAL_PROVIDER_IDS = frozenset({
-    "elevenlabs",  # TTS + STT (Scribe)
-    "openai",      # TTS + STT (Whisper) — voice uses the bare id; inference uses openai-api/openai-codex
-    "groq",        # STT (Whisper-compatible endpoint)
-    "mistral",     # TTS + STT (Voxtral)
-})
+# DERIVED from DEFAULT_CONFIG's tts/stt sections (per-provider dict keys) so a
+# voice provider added to the defaults can never be silently rejected by
+# ``auth add`` while the read side accepts it — the split-brain #90956 fixed,
+# in reverse (review finding on #90965).
+def _derive_voice_credential_provider_ids() -> frozenset:
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    ids: set = set()
+    for section in ("tts", "stt"):
+        cfg = DEFAULT_CONFIG.get(section)
+        if isinstance(cfg, dict):
+            ids |= {
+                key
+                for key, val in cfg.items()
+                if key != "provider" and isinstance(val, dict)
+            }
+    return frozenset(ids - set(PROVIDER_REGISTRY))
+
+
+VOICE_CREDENTIAL_PROVIDER_IDS = _derive_voice_credential_provider_ids()
 
 
 def auth_add_command(args) -> None:
