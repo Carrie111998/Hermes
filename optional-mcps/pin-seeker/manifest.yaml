@@ -3,7 +3,7 @@
 manifest_version: 1
 
 name: pin-seeker
-description: Search golf tee times. Returns GolfNow links; does not book or hold.
+description: Search golf tee times. Returns GolfNow links; does not book or hold. Search queries (location and schedule) are sent to pinseeker.xyz.
 source: https://pinseeker.xyz/agents.html
 
 # Official hosted Streamable HTTP server. URL-only — Hermes never spawns a
@@ -36,3 +36,4 @@ post_install: |
   link so they can complete checkout themselves.
 
   Try: "Find me a Saturday morning tee time near Pleasanton for 2."
+  Search queries (location and schedule) are sent to pinseeker.xyz.
