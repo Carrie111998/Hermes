@@ -100,6 +100,15 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         ),
     )
     update_parser.add_argument(
+        "--no-doctor",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip the automatic read-only `hermes doctor` run after update "
+            "and fleet verification."
+        ),
+    )
+    update_parser.add_argument(
         "--force",
         action="store_true",
         default=False,

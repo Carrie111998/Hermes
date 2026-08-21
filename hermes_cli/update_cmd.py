@@ -42,6 +42,65 @@ from hermes_constants import venv_python_path
 logger = logging.getLogger(__name__)
 
 
+def _run_post_update_doctor(args) -> bool:
+    """Run read-only doctor in the updated runtime after fleet verification."""
+    # Internal callers and older integrations construct ad-hoc Namespaces.
+    # Only the real update parser opts in, which avoids changing those APIs.
+    if not hasattr(args, "no_doctor"):
+        return True
+    if bool(getattr(args, "no_doctor", False)):
+        try:
+            from hermes_cli.update_receipt import record_step
+
+            record_step("post_update_doctor", True, "skipped by --no-doctor")
+        except Exception:
+            pass
+        return True
+
+    print()
+    print("→ Running post-update doctor...")
+    interpreter = venv_python_path(
+        _m().PROJECT_ROOT / "venv", windows=_m()._is_windows()
+    )
+    if not interpreter.exists():
+        interpreter = Path(sys.executable)
+
+    try:
+        result = subprocess.run(
+            [str(interpreter), "-m", "hermes_cli.main", "doctor"],
+            cwd=_m().PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,
+        )
+    except Exception as exc:
+        print(f"  ✗ Post-update doctor could not run: {exc}")
+        try:
+            from hermes_cli.update_receipt import record_step
+
+            record_step("post_update_doctor", False, str(exc))
+        except Exception:
+            pass
+        return False
+
+    if result.stdout:
+        print(result.stdout.rstrip())
+    if result.stderr:
+        print(result.stderr.rstrip())
+    ok = result.returncode == 0
+    try:
+        from hermes_cli.update_receipt import record_step
+
+        record_step("post_update_doctor", ok, f"exit_code={result.returncode}")
+    except Exception:
+        pass
+    if not ok:
+        print(f"  ✗ Post-update doctor exited with code {result.returncode}")
+    return ok
+
+
 def _m():
     """Lazy ``hermes_cli.main`` reference.
 
@@ -1611,15 +1670,18 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
     # Don't stop a working dashboard when the Node refresh failed — see the
     # git-update path for rationale (#30271).
     _finish_dashboard_update_cleanup(node_failures)
+    doctor_ok = _run_post_update_doctor(args)
     try:
         from hermes_cli.update_receipt import finalize_update_receipt
 
         finalize_update_receipt(
-            "success" if (desktop_build_ok and not node_failures) else "partial"
+            "success"
+            if (desktop_build_ok and not node_failures and doctor_ok)
+            else "partial"
         )
     except Exception as _receipt_exc:
         logger.debug("Update receipt finalize (zip path) failed: %s", _receipt_exc)
-    return desktop_build_ok
+    return desktop_build_ok and doctor_ok
 
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
     status = subprocess.run(
@@ -7636,11 +7698,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception as _fleet_exc:
             logger.debug("Fleet version verification failed: %s", _fleet_exc)
 
+        doctor_ok = _run_post_update_doctor(args)
+
         try:
             from hermes_cli.update_receipt import finalize_update_receipt
 
             _receipt_path = finalize_update_receipt(
-                "partial" if gateway_fleet_restart_incomplete else "success",
+                "partial"
+                if (gateway_fleet_restart_incomplete or not doctor_ok)
+                else "success",
                 fleet=_fleet_snapshot,
             )
             if _receipt_path is not None:
@@ -7648,10 +7714,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception as _receipt_exc:
             logger.debug("Update receipt finalize failed: %s", _receipt_exc)
 
-        if gateway_fleet_restart_incomplete:
-            # Code update itself succeeded, but at least one gateway still
-            # runs pre-update modules — surface that as a failed update so
-            # automation / operators do not treat the fleet as healthy.
+        if gateway_fleet_restart_incomplete or not doctor_ok:
+            # Code update itself succeeded, but either a gateway still runs
+            # pre-update modules or the fresh-process doctor failed. Surface
+            # that as a failed update so operators do not treat it as healthy.
             sys.exit(1)
 
     except subprocess.CalledProcessError as e:

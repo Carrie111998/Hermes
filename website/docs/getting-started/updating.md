@@ -29,7 +29,8 @@ When you run `hermes update`, the following steps occur:
 3. **Post-pull syntax validation + auto-rollback** — after the pull, Hermes compiles the nine critical files every `hermes` invocation imports at startup. If any fails to parse (e.g. an orphan merge-conflict marker, an accidentally truncated file), Hermes runs `git reset --hard <pre-pull-sha>` to roll the install back so your shell stays bootable. Re-run `hermes update` once the upstream fix lands.
 4. **Dependency install** — runs `uv pip install -e ".[all]"` to pick up new or changed dependencies
 5. **Config migration** — detects new config options added since your version and prompts you to set them
-6. **Gateway auto-restart** — running gateways are refreshed after the update completes so the new code takes effect immediately. Service-managed gateways (systemd on Linux, launchd on macOS) are restarted through the service manager. Manual gateways are relaunched automatically when Hermes can map the running PID back to a profile.
+6. **Gateway auto-restart** — running gateways are refreshed once after the update completes so the new code takes effect immediately. Service-managed gateways (systemd on Linux, launchd on macOS) are restarted through the service manager. Manual gateways are relaunched automatically when Hermes can map the running PID back to a profile.
+7. **Fleet verification and doctor** — Hermes verifies that restarted gateways serve the updated code, then runs read-only `hermes doctor` in a fresh process. Use `--no-doctor` only when deliberately troubleshooting the updater itself.
 
 ### Updating against a non-default branch: `--branch`
 
@@ -163,12 +164,12 @@ Already up to date.  (or: Updating abc1234..def5678)
 ✅ Hermes Agent updated successfully!
 ```
 
-### Recommended Post-Update Validation
+### Post-update validation
 
-`hermes update` handles the main update path, but a quick validation confirms everything landed cleanly:
+`hermes update` runs `hermes doctor` automatically after its gateway restart wave and fleet verification. For a normal successful update, do not restart the gateway again. If deeper manual validation is warranted, check:
 
 1. `git status --short` — if the tree is unexpectedly dirty, inspect before continuing
-2. `hermes doctor` — checks config, dependencies, and service health
+2. the doctor output embedded in `~/.hermes/logs/update.log` and the update receipt
 3. `hermes --version` — confirm the version bumped as expected
 4. If you use the gateway: `hermes gateway status`
 5. If `doctor` reports npm audit issues: run `npm audit fix` in the flagged directory
