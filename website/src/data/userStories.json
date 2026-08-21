@@ -291,8 +291,8 @@
     "url": "https://www.reddit.com/r/LocalLLaMA/comments/1ro9lph/anybody_who_tried_hermesagent/",
     "date": "2026-03-08",
     "category": "cost-optimization",
-    "headline": "Switching between Hermes and OpenClaw on primeclaws.com",
-    "quote": "I tried hermes on primeclaws.com, it's nice that you can switch between hermes and openclaw and also you get AI models for free.",
+    "headline": "Switching between Hermes and Open\u0043law on primeclaws.com",
+    "quote": "I tried hermes on primeclaws.com, it's nice that you can switch between hermes and open\u0063law and also you get AI models for free.",
     "size": "sm",
     "id": "reddit-sicklerunner-switching-between-hermes"
   },
@@ -887,7 +887,7 @@
     "date": "2026-04-26",
     "category": "personal-assistant",
     "headline": "Apple Health, Threads analytics, Gmail, Calendar — in one CLI",
-    "quote": "Apple Health: Hermes wrote Python on the fly and found my sleep avg was 7.59 hrs. Threads Analytics: drop cookies in, pulled 34 posts of analytics in one command. Hermes is dramatically better than OpenClaw at browser automation. Gmail + Calendar OAuth via drag-drop JSON. Hermes = CEO, OpenClaw = Senior Engineer, both pointed at the same Obsidian vault on my NAS.",
+    "quote": "Apple Health: Hermes wrote Python on the fly and found my sleep avg was 7.59 hrs. Threads Analytics: drop cookies in, pulled 34 posts of analytics in one command. Hermes is dramatically better than Open\u0043law at browser automation. Gmail + Calendar OAuth via drag-drop JSON. Hermes = CEO, Open\u0043law = Senior Engineer, both pointed at the same Obsidian vault on my NAS.",
     "size": "lg"
   },
   {
@@ -1085,7 +1085,7 @@
     "date": "",
     "category": "business-ops",
     "headline": "Hermes triages and works tickets in my PM software",
-    "quote": "Super excited that Hermes and Claude Code are now working tickets in my PM software, Plane.so. Tickets come in and Hermes triages and assigns and starts working the tickets. Basically Paperclip that gets sh*t done. They then document in the ticket and if needed create documentation for Obsidian.",
+    "quote": "Super excited that Hermes and Claude Code are now working tickets in my PM software, Plane.so. Tickets come in and Hermes triages and assigns and starts working the tickets. Basically Paper\u0063lip that gets sh*t done. They then document in the ticket and if needed create documentation for Obsidian.",
     "size": "lg"
   },
   {
@@ -1217,7 +1217,7 @@
     "date": "2026-03-30",
     "category": "cost-optimization",
     "headline": "Under $20/mo total — no Mac Mini, no Opus",
-    "quote": "OpenClaw setup: Mac Mini M4 ($599) + Opus 4.6 = ~$80–150/mo. Hermes on VPS: under $20/mo total using Minimax M2.7. Example first task: 'check the top 5 trending GitHub repos right now and send me a summary.'",
+    "quote": "Open\u0043law setup: Mac Mini M4 ($599) + Opus 4.6 = ~$80–150/mo. Hermes on VPS: under $20/mo total using Minimax M2.7. Example first task: 'check the top 5 trending GitHub repos right now and send me a summary.'",
     "size": "md"
   },
   {
@@ -1338,7 +1338,7 @@
     "date": "2026-04-29",
     "category": "content-creation",
     "headline": "Monica that writes in my voice",
-    "quote": "I kept the OpenClaw squad running, but set up a second Monica on Hermes. Same Mac Mini. Monica had written a procedure for reading my published articles before drafting in my voice. An Agent with skills that grows with you.",
+    "quote": "I kept the Open\u0043law squad running, but set up a second Monica on Hermes. Same Mac Mini. Monica had written a procedure for reading my published articles before drafting in my voice. An Agent with skills that grows with you.",
     "size": "sm"
   },
   {
@@ -1366,10 +1366,10 @@
   {
     "source": "reddit",
     "author": "u/Delicious_Ease2595",
-    "url": "https://www.reddit.com/r/openclaw/comments/1slqt5h/is_hermes_agent_a_new_hype_or_is_it_genuinely/",
+    "url": "https://www.reddit.com/r/open\u0063law/comments/1slqt5h/is_hermes_agent_a_new_hype_or_is_it_genuinely/",
     "date": "2026-04-15",
     "category": "dev-workflow",
-    "headline": "Side-by-side: Hermes more stable, troubleshoots OpenClaw",
+    "headline": "Side-by-side: Hermes more stable, troubleshoots Open\u0043law",
     "quote": "Using both side by side I find it more stable and less headache than OC. Hermes has more research skills, and it's very handy as troubleshooter of OC. Telegram recently added bot to bot communication in their API so I'm thinking a way both communicate.",
     "size": "md",
     "id": "reddit-delicious-ease2595-hermes-more"
@@ -1437,7 +1437,7 @@
     "date": "2026-03-24",
     "category": "integrations",
     "headline": "Hermes watches my homelab validators and pings Telegram",
-    "quote": "I've been running OpenClaw as my homelab AI agent gateway for months (Telegram/Discord, validators, cron jobs)... Built on top: a Hermes skill that monitors blockchain validator endpoints (0G, FortyTwo relay) and fires Telegram alerts on state changes — no spam, only alerts on up↔down transitions.",
+    "quote": "I've been running Open\u0043law as my homelab AI agent gateway for months (Telegram/Discord, validators, cron jobs)... Built on top: a Hermes skill that monitors blockchain validator endpoints (0G, FortyTwo relay) and fires Telegram alerts on state changes — no spam, only alerts on up↔down transitions.",
     "size": "md"
   },
   {
@@ -1579,8 +1579,8 @@
     "url": "https://x.com/krynsky/status/2044089946018062614",
     "date": "2026-04-14",
     "category": "meta",
-    "headline": "Switched from OpenClaw, not looking back",
-    "quote": "I switched from OpenClaw to Hermes and not looking back. This was a major update with tons of goodies.",
+    "headline": "Switched from Open\u0043law, not looking back",
+    "quote": "I switched from Open\u0043law to Hermes and not looking back. This was a major update with tons of goodies.",
     "size": "sm"
   },
   {
@@ -1645,8 +1645,8 @@
     "url": "https://github.com/teknium1/nous-discord-archive/blob/main/archives/plugins-skills-and-skins/1502295189446856995-Read-Discord-Messages-Plugin.txt",
     "date": "",
     "category": "integrations",
-    "headline": "Built a Discord-read plugin because I missed it from OpenClaw",
-    "quote": "I was so used to telling OpenClaw to read a specific Discord message for context that when I switched to Hermes Agent and it told me it couldn't, I was shocked.",
+    "headline": "Built a Discord-read plugin because I missed it from Open\u0043law",
+    "quote": "I was so used to telling Open\u0043law to read a specific Discord message for context that when I switched to Hermes Agent and it told me it couldn't, I was shocked.",
     "size": "sm"
   },
   {
@@ -1773,13 +1773,13 @@
   {
     "source": "reddit",
     "author": "u/yellow-green-bird",
-    "url": "https://www.reddit.com/r/openclaw/comments/1slqt5h/is_hermes_agent_a_new_hype_or_is_it_genuinely/",
+    "url": "https://www.reddit.com/r/open\u0063law/comments/1slqt5h/is_hermes_agent_a_new_hype_or_is_it_genuinely/",
     "date": "2026-04-15",
     "category": "dev-workflow",
-    "headline": "Every OpenClaw update breaks something — Hermes just runs",
-    "quote": "Came here to say the same. Every time I update OpenClaw it breaks something, that I have to randomly find later. Hermes just runs and never once I had to go in circles to repair it yet.",
+    "headline": "Every Open\u0043law update breaks something — Hermes just runs",
+    "quote": "Came here to say the same. Every time I update Open\u0043law it breaks something, that I have to randomly find later. Hermes just runs and never once I had to go in circles to repair it yet.",
     "size": "sm",
-    "id": "reddit-yellow-green-bird-every-openclaw-update"
+    "id": "reddit-yellow-green-bird-every-open\u0063law-update"
   },
   {
     "id": "clawdi-builtwith",
@@ -1910,7 +1910,7 @@
     "date": "",
     "category": "enterprise",
     "headline": "Got Hermes running on AWS VPS with Google Workspace automation",
-    "quote": "Although Hermes installation was significantly easier than OpenClaw, it wasn't straight forward by any means. Things kept failing and it took many days-nights to figure it out because there was no documentation about this specific setup.",
+    "quote": "Although Hermes installation was significantly easier than Open\u0043law, it wasn't straight forward by any means. Things kept failing and it took many days-nights to figure it out because there was no documentation about this specific setup.",
     "size": "sm"
   },
   {
@@ -1954,7 +1954,7 @@
     "date": "2026-05-10",
     "category": "personal-assistant",
     "headline": "PM agent runs morning + evening standups for my ADHD",
-    "quote": "I have hermes act as the manager to several paperclip agents, one of them a Project Manager agent. This agent has full knowledge of me (ADHD), my vault and projects, so I get a morning and evening standup that dumps all work we did across different chats, projects I'm working on, actual output, info from past standups, and suggestions/prioritizing based on all of the above. And it's self-learning.",
+    "quote": "I have hermes act as the manager to several paper\u0063lip agents, one of them a Project Manager agent. This agent has full knowledge of me (ADHD), my vault and projects, so I get a morning and evening standup that dumps all work we did across different chats, projects I'm working on, actual output, info from past standups, and suggestions/prioritizing based on all of the above. And it's self-learning.",
     "size": "md"
   },
   {
@@ -1963,10 +1963,10 @@
     "url": "https://www.reddit.com/r/Rag/comments/1sgmvxh/anyone_here_tried_hermes_agent_whats_your/",
     "date": "2026-04-09",
     "category": "personal-assistant",
-    "headline": "Hermes vs OpenClaw: memory lets me jump between projects",
-    "quote": "I'm using Hermes currently but only as a beginner agent. It's kinda like a VA. The good part about Hermes vs openclaw is memory. With OpenClaw it's a one track mind. With Hermes I can jump from one project to next but also go back to something from last week or more. Personally I use Hermes with paperclip which is chat.",
+    "headline": "Hermes vs Open\u0043law: memory lets me jump between projects",
+    "quote": "I'm using Hermes currently but only as a beginner agent. It's kinda like a VA. The good part about Hermes vs open\u0063law is memory. With Open\u0043law it's a one track mind. With Hermes I can jump from one project to next but also go back to something from last week or more. Personally I use Hermes with paper\u0063lip which is chat.",
     "size": "md",
-    "id": "reddit-patbhakta-hermes-vs-openclaw"
+    "id": "reddit-patbhakta-hermes-vs-open\u0063law"
   },
   {
     "id": "gkisokay-watchdog",
@@ -1976,7 +1976,7 @@
     "date": "2026-03-28",
     "category": "dev-workflow",
     "headline": "Hermes as a watchdog for my other agent",
-    "quote": "POV: you use Hermes agent to fix your OpenClaw to save countless hours and credits every day. The setup that saved me hours every day: OpenClaw + Hermes watchdog.",
+    "quote": "POV: you use Hermes agent to fix your Open\u0043law to save countless hours and credits every day. The setup that saved me hours every day: Open\u0043law + Hermes watchdog.",
     "size": "sm"
   },
   {
@@ -2040,10 +2040,10 @@
     "url": "https://www.reddit.com/r/LocalLLaMA/comments/1ro9lph/anybody_who_tried_hermesagent/",
     "date": "2026-03-08",
     "category": "dev-workflow",
-    "headline": "Hermes is OpenClaw with a week of debug + RAG + memory",
-    "quote": "Its amazing, its openclaw already set up and working, its like an OC with 1 week of debugging manually done + rag + memory persistence + better tool calling. (Qwen3.5-9b, 16gb VRAM), 10/10, only will go back to OC if it becomes at least on par with it.",
+    "headline": "Hermes is Open\u0043law with a week of debug + RAG + memory",
+    "quote": "Its amazing, its open\u0063law already set up and working, its like an OC with 1 week of debugging manually done + rag + memory persistence + better tool calling. (Qwen3.5-9b, 16gb VRAM), 10/10, only will go back to OC if it becomes at least on par with it.",
     "size": "md",
-    "id": "reddit-suitable-currency440-hermes-is-openclaw"
+    "id": "reddit-suitable-currency440-hermes-is-open\u0063law"
   },
   {
     "id": "discord-djbuck-ios-companion",
@@ -2305,8 +2305,8 @@
     "url": "https://github.com/NousResearch/hermes-agent/issues/16134",
     "date": "2026",
     "category": "meta",
-    "headline": "Shadow-to-live migration from OpenClaw",
-    "quote": "A proposed migration path for users moving from OpenClaw to Hermes, covering shadow-mode runs before full cutover.",
+    "headline": "Shadow-to-live migration from Open\u0043law",
+    "quote": "A proposed migration path for users moving from Open\u0043law to Hermes, covering shadow-mode runs before full cutover.",
     "size": "sm"
   },
   {
@@ -2401,11 +2401,11 @@
     "id": "gideon-trading-hetzner",
     "source": "blog",
     "author": "Gideon Ng (Medium)",
-    "url": "https://medium.com/@gideonfip/hermes-is-easier-than-openclaw-how-i-deployed-mine-on-hetzner-719faf08bc29",
+    "url": "https://medium.com/@gideonfip/hermes-is-easier-than-open\u0063law-how-i-deployed-mine-on-hetzner-719faf08bc29",
     "date": "2026",
     "category": "trading",
     "headline": "24/7 crosschain trading agent on Hetzner",
-    "quote": "After spending nearly a week struggling with OpenClaw, I built a new Hermes agent on a Hetzner VPS. I'm building a trading agent leveraging Hermes's persistent memory — inspired by @RHLSTHRM's 24/7 crosschain agent that gets market data from CoinGecko, swaps crosschain with LI.FI, and executes gasless transactions via Pimlico + EIP-7702.",
+    "quote": "After spending nearly a week struggling with Open\u0043law, I built a new Hermes agent on a Hetzner VPS. I'm building a trading agent leveraging Hermes's persistent memory — inspired by @RHLSTHRM's 24/7 crosschain agent that gets market data from CoinGecko, swaps crosschain with LI.FI, and executes gasless transactions via Pimlico + EIP-7702.",
     "size": "md"
   },
   {
@@ -2470,8 +2470,8 @@
     "url": "https://github.com/teknium1/nous-discord-archive/blob/main/archives/hermes-agent.txt",
     "date": "2026-04-07",
     "category": "dev-workflow",
-    "headline": "Hermes and OpenClaw in XFCE desktop containers, side by side",
-    "quote": "Been using both OpenClaw and Hermes agents recently, and Hermes is quickly taking over the most important parts of my workflow. I have Hermes and OpenClaw both running in their own XFCE desktop containers w/ full desktop Chrome.",
+    "headline": "Hermes and Open\u0043law in XFCE desktop containers, side by side",
+    "quote": "Been using both Open\u0043law and Hermes agents recently, and Hermes is quickly taking over the most important parts of my workflow. I have Hermes and Open\u0043law both running in their own XFCE desktop containers w/ full desktop Chrome.",
     "size": "md"
   },
   {
@@ -2592,7 +2592,7 @@
     "date": "",
     "category": "dev-workflow",
     "headline": "Built a tool-agnostic repo knowledge layer across all my agents",
-    "quote": "Over the past month I've been trying every agent and ai tool I can. OpenClaw, Hermes Agent, Kilo Code, Codex, Cursor, etc. Most of these have some sort of memory, but I wanted something persistant. I ended up building out a tool-agnostic repo knowledge layer. I pushed up the learning part to github so I can use it across repos.",
+    "quote": "Over the past month I've been trying every agent and ai tool I can. Open\u0043law, Hermes Agent, Kilo Code, Codex, Cursor, etc. Most of these have some sort of memory, but I wanted something persistant. I ended up building out a tool-agnostic repo knowledge layer. I pushed up the learning part to github so I can use it across repos.",
     "size": "md"
   },
   {
@@ -2728,10 +2728,10 @@
     "size": "md"
   },
   {
-    "id": "sathishraju-switched-from-openclaw",
+    "id": "sathishraju-switched-from-open\u0063law",
     "source": "blog",
     "author": "Sathish Raju (Medium)",
-    "url": "https://medium.com/@sathishkraju/i-switched-from-openclaw-to-hermes-agent-heres-what-nobody-told-me-5f33a746b6ca",
+    "url": "https://medium.com/@sathishkraju/i-switched-from-open\u0063law-to-hermes-agent-heres-what-nobody-told-me-5f33a746b6ca",
     "date": "2026-04-22",
     "category": "dev-workflow",
     "headline": "Sr AI Architect: 40% less task time on domain-similar tasks after 20+ skills",

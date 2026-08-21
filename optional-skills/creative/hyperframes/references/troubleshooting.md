@@ -10,7 +10,7 @@ Protocol error (HeadlessExperimental.beginFrame):
 'HeadlessExperimental.beginFrame' wasn't found
 ```
 
-**Cause:** Chromium 147+ removed the `HeadlessExperimental.beginFrame` CDP command. This affected sandbox environments (e.g., OpenClaw, some containerized agent hosts) that ship modern Chromium as the system browser. See [hyperframes#294](https://github.com/heygen-com/hyperframes/issues/294).
+**Cause:** Chromium 147+ removed the `HeadlessExperimental.beginFrame` CDP command. This affected sandbox environments (e.g., upstream, some containerized agent hosts) that ship modern Chromium as the system browser. See [hyperframes#294](https://github.com/heygen-com/hyperframes/issues/294).
 
 **Fix (permanent — preferred):** upgrade.
 

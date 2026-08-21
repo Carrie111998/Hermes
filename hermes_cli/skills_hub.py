@@ -1114,7 +1114,7 @@ def do_update(name: Optional[str] = None, console: Optional[Console] = None,
     directory). Those are skipped by default and only overwritten when
     ``force=True``. Mirrors the user-modified protection bundled skills
     already get from ``hermes update`` (ported from
-    paperclipai/paperclip#10978's explicit-merge-mode rule: destructive
+    third-party reference #10978's explicit-merge-mode rule: destructive
     replacement must be an explicit caller choice, never a rerun default).
     """
     from tools.skills_hub import SKILLS_DIR, HubLockFile, check_for_skill_updates

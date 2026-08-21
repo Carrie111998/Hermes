@@ -76,7 +76,6 @@ hermes tools        # Configura qué herramientas están habilitadas
 hermes config set   # Establece valores de configuración individuales
 hermes gateway      # Inicia el gateway de mensajería (Telegram, Discord, etc.)
 hermes setup        # Ejecuta el asistente de configuración completo
-hermes claw migrate # Migra desde OpenClaw (si vienes de OpenClaw)
 hermes update       # Actualiza a la última versión
 hermes doctor       # Diagnostica cualquier problema
 ```
@@ -148,34 +147,6 @@ Toda la documentación está en **[hermes-agent.nousresearch.com/docs](https://h
 
 ---
 
-## Migración desde OpenClaw
-
-Si vienes de OpenClaw, Hermes puede importar automáticamente tu configuración, memorias, habilidades y claves API.
-
-**Durante la configuración inicial:** El asistente de configuración (`hermes setup`) detecta automáticamente `~/.openclaw` y ofrece migrar antes de que comience la configuración.
-
-**En cualquier momento después de instalar:**
-
-```bash
-hermes claw migrate              # Migración interactiva (preset completo)
-hermes claw migrate --dry-run    # Vista previa de qué se migraría
-hermes claw migrate --preset user-data   # Migrar sin secretos
-hermes claw migrate --overwrite  # Sobreescribir conflictos existentes
-```
-
-Qué se importa:
-
-- **SOUL.md** — archivo de personalidad
-- **Memorias** — entradas de MEMORY.md y USER.md
-- **Habilidades** — habilidades creadas por el usuario → `~/.hermes/skills/openclaw-imports/`
-- **Lista de comandos permitidos** — patrones de aprobación
-- **Configuración de mensajería** — configuración de plataformas, usuarios permitidos, directorio de trabajo
-- **Claves API** — secretos en lista de permitidos (Telegram, OpenRouter, OpenAI, Anthropic, ElevenLabs)
-- **Assets de TTS** — archivos de audio del espacio de trabajo
-- **Instrucciones del espacio de trabajo** — AGENTS.md (con `--workspace-target`)
-
-Consulta `hermes claw migrate --help` para todas las opciones, o usa la habilidad `openclaw-migration` para una migración guiada interactiva por el agente con vistas previas de dry-run.
-
 ---
 
 ## Contribuir
@@ -209,7 +180,7 @@ scripts/run_tests.sh
 - 📚 [Skills Hub](https://agentskills.io)
 - 🐛 [Issues](https://github.com/NousResearch/hermes-agent/issues)
 - 🔌 [computer-use-linux](https://github.com/avifenesh/computer-use-linux) — Servidor MCP de control de escritorio Linux para Hermes y otros hosts MCP, con árboles de accesibilidad AT-SPI, entrada Wayland/X11, capturas de pantalla y targeting de ventanas del compositor.
-- 🔌 [HermesClaw](https://github.com/AaronWong1999/hermesclaw) — Puente WeChat comunitario: Ejecuta Hermes Agent y OpenClaw en la misma cuenta de WeChat.
+- 🔌 [HermesClaw](https://github.com/AaronWong1999/hermesclaw) — Puente WeChat comunitario: Ejecuta Hermes Agent y upstream en la misma cuenta de WeChat.
 
 ---
 

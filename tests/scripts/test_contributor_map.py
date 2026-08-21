@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from scripts.check_mapping_key import mapping_keys
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 
@@ -44,6 +46,55 @@ def test_effective_map_merges_legacy_and_directory():
     )
     for email, login in release._load_contributor_dir().items():
         assert release.AUTHOR_MAP[email] == login
+
+
+def test_mapping_key_parser_evaluates_concatenated_string_keys(tmp_path):
+    source = tmp_path / "mapping.py"
+    source.write_text(
+        'MAPPING = {"joined@" + "example.test": "person"}\n',
+        encoding="utf-8",
+    )
+
+    assert mapping_keys(source, "MAPPING") == {"joined@example.test"}
+
+
+def test_parser_matches_all_runtime_legacy_mapping_keys():
+    assert mapping_keys(SCRIPTS_DIR / "release.py", "LEGACY_AUTHOR_MAP") == set(
+        release.LEGACY_AUTHOR_MAP
+    )
+
+
+def test_mapping_key_cli_reports_semantic_membership(tmp_path):
+    source = tmp_path / "mapping.py"
+    source.write_text('MAPPING = {"a@" + "example.test": "person"}\n', encoding="utf-8")
+    checker = SCRIPTS_DIR / "check_mapping_key.py"
+
+    present = subprocess.run(
+        [sys.executable, str(checker), str(source), "MAPPING", "a@example.test"]
+    )
+    missing = subprocess.run(
+        [sys.executable, str(checker), str(source), "MAPPING", "missing@example.test"]
+    )
+
+    assert present.returncode == 0
+    assert missing.returncode == 1
+
+
+def test_mapping_key_parser_fails_closed_on_dynamic_key(tmp_path):
+    source = tmp_path / "mapping.py"
+    source.write_text('MAPPING = {make_key(): "person"}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="static string"):
+        mapping_keys(source, "MAPPING")
+
+
+def test_contributor_workflow_uses_semantic_mapping_check():
+    workflow = (REPO_ROOT / ".github/workflows/contributor-check.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "scripts/check_mapping_key.py scripts/release.py LEGACY_AUTHOR_MAP" in workflow
+    assert 'grep -qF "\\\"${email}\\\"" scripts/release.py' not in workflow
 
 
 

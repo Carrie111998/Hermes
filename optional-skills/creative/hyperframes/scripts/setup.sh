@@ -4,7 +4,7 @@
 # Verifies Node >= 22 and FFmpeg, installs the `hyperframes` CLI globally,
 # pre-caches `chrome-headless-shell`, and runs `hyperframes doctor`.
 #
-# Pins `hyperframes@>=0.4.2` so the OpenClaw/Chromium-147 fix from
+# Pins `hyperframes@>=0.4.2` so the upstream/Chromium-147 fix from
 # https://github.com/heygen-com/hyperframes/issues/294 (commit 4c72ba4)
 # is always present — the engine auto-detects `HeadlessExperimental.beginFrame`
 # support and falls back to screenshot capture otherwise.

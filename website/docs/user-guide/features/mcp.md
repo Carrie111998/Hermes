@@ -863,7 +863,7 @@ Or if you installed Hermes in a specific location:
 
 ### Available tools
 
-The MCP server exposes 10 tools, matching OpenClaw's channel bridge surface plus a Hermes-specific channel browser:
+The MCP server exposes 10 tools, matching upstream's channel bridge surface plus a Hermes-specific channel browser:
 
 | Tool | Description |
 |------|-------------|

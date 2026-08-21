@@ -1182,8 +1182,8 @@ def _build_child_system_prompt(
     """Build a focused system prompt for a child agent.
 
     When role='orchestrator', appends a delegation-capability block
-    modeled on OpenClaw's buildSubagentSystemPrompt (canSpawn branch at
-    inspiration/openclaw/src/agents/subagent-system-prompt.ts:63-95).
+    modeled on upstream's buildSubagentSystemPrompt (canSpawn branch at
+    inspiration/upstream/src/agents/subagent-system-prompt.ts:63-95).
     The depth note is literal truth (grounded in the passed config) so
     the LLM doesn't confabulate nesting capabilities that don't exist.
     """

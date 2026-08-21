@@ -1,7 +1,7 @@
 """Tests for tools/tool_search.py — progressive tool disclosure.
 
-Coverage targets — these mirror the issues called out in the OpenClaw tool
-search report. Every test that names an OpenClaw issue is the regression
+Coverage targets — these mirror the issues called out in the upstream tool
+search report. Every test that names an upstream issue is the regression
 guard that would have caught that specific failure mode.
 """
 
@@ -69,7 +69,7 @@ class TestConfigParsing:
 
 class TestClassification:
     def test_core_tools_never_defer(self):
-        """The critical invariant from the OpenClaw report."""
+        """The critical invariant from the upstream report."""
         from tools.tool_search import is_deferrable_tool_name
         # Sample of core tools from _HERMES_CORE_TOOLS.
         for core_name in ["terminal", "read_file", "write_file", "patch",
@@ -148,7 +148,7 @@ class TestClassification:
 
     def test_unknown_tool_not_deferrable(self):
         """Defensive: a tool name we cannot resolve to a registry entry must
-        not be claimed as deferrable. This protects against the OpenClaw
+        not be claimed as deferrable. This protects against the upstream
         cron regression where unresolved tools were silently dropped."""
         from tools.tool_search import is_deferrable_tool_name
         assert not is_deferrable_tool_name("xx_definitely_not_a_tool_xx")
@@ -156,7 +156,7 @@ class TestClassification:
     def test_classify_keeps_unknown_in_visible(self):
         """A tool we can't classify stays visible — never silently dropped.
 
-        This is the OpenClaw #84141 regression guard (cron lost ``exec``
+        This is the upstream #84141 regression guard (cron lost ``exec``
         because it wasn't in the catalog).
         """
         from tools.tool_search import classify_tools
@@ -401,10 +401,10 @@ class TestHandleFunctionCallIntegration:
         assert payload["tool_call_id"] == "private-call"
 
 
-class TestRegression_OpenClawCron84141:
-    """Regression guard for the OpenClaw cron-tool-loss class of bug.
+class TestRegressionCronToolLoss84141:
+    """Regression guard for the referenced cron-tool-loss class of bug.
 
-    OpenClaw #84141: ``toolsAllow: ["exec"]`` on an isolated cron turn
+    upstream #84141: ``toolsAllow: ["exec"]`` on an isolated cron turn
     resulted in the agent receiving only ``sessions_send`` — the catalog
     builder silently dropped the requested core tool.
 

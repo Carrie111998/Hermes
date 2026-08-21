@@ -200,7 +200,7 @@ describe('attachmentPreviewDataUrl', () => {
     $connection.set(null)
   })
 
-  it('reads a local path via the local bridge even in remote mode (paperclip/paste/OS drop)', async () => {
+  it('reads a local path via the local bridge even in remote mode (paper-clip/paste/OS drop)', async () => {
     const readFileDataUrl = vi.fn(async () => LOCAL_PREVIEW)
     const api = vi.fn()
 

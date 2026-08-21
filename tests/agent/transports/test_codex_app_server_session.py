@@ -688,10 +688,10 @@ class TestApprovalPromptEnrichment:
         assert "apply some changes" in captured["command"]
 
 
-# ---- openclaw beta.8 parity: retire/wedge/oauth/abort marker ----
+# ---- upstream beta.8 parity: retire/wedge/oauth/abort marker ----
 
 class TestSessionRetirement:
-    """Mirrors openclaw beta.8's resilience fixes:
+    """Mirrors upstream beta.8's resilience fixes:
       - retire timed-out app-server clients (should_retire on deadline)
       - post-tool completion watchdog (don't burn the full deadline after a
         tool result if codex goes silent)
@@ -827,7 +827,7 @@ class TestSessionRetirement:
 # ---- thread/start cross-fill ----
 
 class TestThreadStartCrossFill:
-    """Mirrors openclaw beta.8's tolerance for thread.id/sessionId aliasing."""
+    """Mirrors upstream beta.8's tolerance for thread.id/sessionId aliasing."""
 
     def test_thread_id_under_thread_key(self):
         client = FakeClient()

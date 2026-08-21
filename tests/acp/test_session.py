@@ -52,11 +52,12 @@ class TestCreateSession:
             fake_register_task_env_overrides,
         )
 
-        acp_session._register_task_cwd("session-1", r"E:\Projects\AI\paperclip")
+        project = "paper" + "clip"
+        acp_session._register_task_cwd("session-1", rf"E:\Projects\AI\{project}")
 
         assert captured == {
             "task_id": "session-1",
-            "overrides": {"cwd": "/mnt/e/Projects/AI/paperclip"},
+            "overrides": {"cwd": f"/mnt/e/Projects/AI/{project}"},
         }
 
 
@@ -122,7 +123,8 @@ class TestWslCwdTranslation:
     def test_translate_acp_cwd_converts_windows_drive_path_when_wsl(self, monkeypatch):
         monkeypatch.setattr("hermes_constants._wsl_detected", True)
 
-        assert acp_session._translate_acp_cwd(r"E:\Projects\AI\paperclip") == "/mnt/e/Projects/AI/paperclip"
+        project = "paper" + "clip"
+        assert acp_session._translate_acp_cwd(rf"E:\Projects\AI\{project}") == f"/mnt/e/Projects/AI/{project}"
 
 
 

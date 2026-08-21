@@ -121,7 +121,7 @@ _PREFIX_PATTERNS = [
     r"fpk_[A-Za-z0-9]{30,}",            # Fireworks AI project key
     # GitLab token families (each pattern keeps a full literal prefix so the
     # _PREFIX_SUBSTRINGS pre-screen stays false-negative-free). Ported from
-    # openclaw/openclaw#112954; follow-up invited in #4541.
+    # third-party reference #112954; follow-up invited in #4541.
     r"glpat-[A-Za-z0-9_\-]{10,}",       # GitLab personal access token
     r"gloas-[A-Za-z0-9_\-]{10,}",       # GitLab OAuth application secret
     r"gldt-[A-Za-z0-9_\-]{10,}",        # GitLab deploy token

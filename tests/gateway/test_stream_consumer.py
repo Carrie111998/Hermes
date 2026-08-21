@@ -800,7 +800,7 @@ class TestEditOverflowSplitAndDeliver:
         # Skip-if-same cache reset so the next edit doesn't false-positive.
         assert consumer._last_sent_text == ""
         # on_new_message fired so the tool-progress bubble breaks below
-        # the new continuation (per the openclaw #32535 lesson).
+        # the new continuation (per the upstream #32535 lesson).
         assert new_msg_count[0] == 1
 
 

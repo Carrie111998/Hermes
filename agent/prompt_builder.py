@@ -467,7 +467,7 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
 # hallucinate instead of using tools, and declare "done" without verification.
-# Inspired by patterns from OpenAI's GPT-5.4 prompting guide & OpenClaw PR #38953.
+# Inspired by patterns from OpenAI's GPT-5.4 prompting guide & third-party reference #38953.
 # Also applied to xAI Grok — same failure modes in practice (claims completion
 # without tool calls, suggests workarounds instead of using existing tools,
 # replies with plans/suggestions instead of executing). The body is

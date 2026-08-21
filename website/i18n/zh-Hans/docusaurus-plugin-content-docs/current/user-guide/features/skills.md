@@ -756,5 +756,3 @@ hermes skills reset google-workspace --restore --yes
 /skills reset google-workspace
 /skills list
 ```
-
-官方可选 skills 仍使用 `official/security/1password` 和 `official/migration/openclaw-migration` 等标识符。

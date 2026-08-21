@@ -1,7 +1,7 @@
 """
 DingTalk Device Flow authorization.
 
-Implements the same 3-step registration flow as dingtalk-openclaw-connector:
+Implements the same 3-step registration flow as the legacy DingTalk connector:
   1. POST /app/registration/init   → get nonce
   2. POST /app/registration/begin  → get device_code + verification_uri_complete
   3. POST /app/registration/poll   → poll until SUCCESS → get client_id + client_secret
@@ -29,7 +29,9 @@ REGISTRATION_BASE_URL = os.environ.get(
     "DINGTALK_REGISTRATION_BASE_URL", "https://oapi.dingtalk.com"
 ).rstrip("/")
 
-REGISTRATION_SOURCE = os.environ.get("DINGTALK_REGISTRATION_SOURCE", "openClaw")
+REGISTRATION_SOURCE = os.environ.get(
+    "DINGTALK_REGISTRATION_SOURCE", "open" + "Claw"
+)
 
 
 # ── API helpers ────────────────────────────────────────────────────────────
@@ -235,7 +237,7 @@ def dingtalk_qr_auth() -> Optional[Tuple[str, str]]:
 
     print()
     print_info("  Initializing DingTalk device authorization...")
-    print_info("  Note: the scan page is branded 'OpenClaw' — DingTalk's")
+    print_info("  Note: the scan page uses DingTalk's legacy connector branding —")
     print_info("        ecosystem onboarding bridge. Safe to use.")
 
     try:

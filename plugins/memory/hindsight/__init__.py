@@ -82,7 +82,7 @@ _DEFAULT_RETAIN_SOURCE = ""
 # Hindsight brand mark — the logo is an eye ringed by graph nodes. Used for
 # the deterministic recall/retain indicators (overrides the generic core default).
 _HINDSIGHT_GLYPH = "👁️"
-# Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
+# Mirrors hindsight-integrations/upstream — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
 # Without it, reusing a stable session-scoped document_id silently
 # overwrites prior turns server-side, so we keep the per-process
@@ -212,7 +212,7 @@ def _ensure_cloud_client_dependency() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Hindsight API capability probe — mirrors hindsight-integrations/openclaw.
+# Hindsight API capability probe — mirrors hindsight-integrations/upstream.
 # ---------------------------------------------------------------------------
 
 # Cache of API_URL -> bool (whether that API supports update_mode='append').

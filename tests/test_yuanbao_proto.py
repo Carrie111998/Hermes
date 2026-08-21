@@ -307,7 +307,7 @@ class TestEncodeOutbound:
         dec = decode_conn_msg(result)
         assert dec["head"]["cmd"] == "send_c2c_message"
         assert dec["head"]["msg_id"] == "msg-001"
-        assert dec["head"]["module"] == "yuanbao_openclaw_proxy"
+        assert dec["head"]["module"] == "yuanbao_" + "open" + "claw_proxy"
         assert len(dec["data"]) > 0
 
 

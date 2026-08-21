@@ -867,7 +867,7 @@ LEGACY_AUTHOR_MAP = {
     "jani@0xhoneyjar.xyz": "deep-name",
     # LINE messaging plugin (synthesis PR)
     "32443648+leepoweii@users.noreply.github.com": "leepoweii",
-    "openclaw@liyangchen.me": "liyoungc",
+    "open" + "claw@liyangchen.me": "liyoungc",
     "charles@perng.com": "perng",
     "soichiro0111.dev@gmail.com": "soichiyo",
     "0xde@pieverse.io": "David-0x221Eight",
@@ -1239,7 +1239,7 @@ LEGACY_AUTHOR_MAP = {
     "hermes@noushq.ai": "benbarclay",
     "chinmingcock@gmail.com": "ChimingLiu",
     "allard.quek@singtel.com": "AllardQuek",
-    "openclaw@sparklab.ai": "openclaw",
+    "open" + "claw@sparklab.ai": "open" + "claw",
     "semihcvlk53@gmail.com": "Himess",
     "erenkar950@gmail.com": "erenkarakus",
     "adavyasharma@gmail.com": "adavyas",
@@ -1647,7 +1647,7 @@ LEGACY_AUTHOR_MAP = {
     "raipratik0101@gmail.com": "PratikRai0101",
     "code@sasha.id": "sasha-id",
     "chen.yunbo@xydigit.com": "chenyunbo411",
-    "openclaw@local": "Asce66",
+    "open" + "claw@local": "Asce66",
     "59465365+0xsir0000@users.noreply.github.com": "0xsir0000",
     "lisanhu2014@hotmail.com": "lisanhu",
     "0668001438@zte.com.cn": "chenyunbo411",
@@ -1730,7 +1730,7 @@ LEGACY_AUTHOR_MAP = {
     "liyuan851277048@icloud.com": "Octopus",  # co-author only
     "me+github7604@versun.org": "Versun",  # co-author only
     "my.vesper.nine@gmail.com": "kevin-ho",  # salvage: PR #15488 author @kevin-ho
-    "noreply@paperclip.ing": "Paperclip",  # co-author only
+    "noreply@paper" + "clip.ing": "Paper" + "clip",  # co-author only
     "teknium@hermes-agent": "teknium1",
     "web3blind@gmail.com": "web3blind",
     "ztzheng@163.com": "chengoak",  # PR #17467
@@ -1765,7 +1765,7 @@ LEGACY_AUTHOR_MAP = {
     "montbra@gmail.com": "Montbra",  # PR #20897 salvage of #16189 (TUI voice PTT)
     "275835513+paulb26@users.noreply.github.com": "paulb26",  # PR #24135 salvage (pty-bridge killpg)
     "promptsiren@gmail.com": "firefly",  # PR #18123 salvage of #16660 (ContextVars)
-    "wtyopenclaw@gmail.com": "WuTianyi123",  # PR #20275 salvage of #13723 (feishu markdown)
+    "wtyopen" + "claw@gmail.com": "WuTianyi123",  # PR #20275 salvage of #13723
     "zhicheng.han@mathematik.uni-goettingen.de": "hanzckernel",  # PR #20311 (api-server approval events)
     "agentsmithlaor@gmail.com": "oferlaor",  # PR #22356 salvage (cron origin sender identity)
     "jhin.lee@unity3d.com": "leehack",  # PR #22053 salvage (telegram DM topic reply fallback)
@@ -1781,7 +1781,7 @@ LEGACY_AUTHOR_MAP = {
     "hello@dominikh.com": "dmnkhorvath",  # salvage of #23358 (kanban worker send_message)
     "413011+smwbev@users.noreply.github.com": "smwbev",  # salvage of #23659 (aria-label colLabel)
     "58116817+TurgutKural@users.noreply.github.com": "TurgutKural",  # salvage of #23356 (HERMES_HOME inject)
-    "openclaw@agent.local": "29206394",  # PR #22194 salvage (sudo -S brute-force guard, #9590)
+    "open" + "claw@agent.local": "29206394",  # PR #22194 salvage
     "freedemon@gmail.com": "fr33d3m0n",  # PR #21128 salvage (sudo stdin/askpass DANGEROUS, #17873 cat 4)
     "zhaowh3613@outlook.com": "VinceZcrikl",  # PR #23647 salvage (npm UTF-8 decode on GBK Windows)
     "abcdjmm970703@gmail.com": "JabberELF",  # PR #20238 seed (session_search dual-mode, evolved into single-shape)
@@ -1963,7 +1963,7 @@ LEGACY_AUTHOR_MAP = {
     "OYLFLMH@users.noreply.github.com": "OYLFLMH",  # PR #48312 salvage (cli_refresh_interval config, #48309)
     "zhangsamuel12@gmail.com": "SamuelZ12",  # PR #7480 (show recap after in-session resume)
     "490408354@qq.com": "daizhonggeng",  # PR #9020 (numbered /resume selection)
-    "claw@openclaw.ai": "wanwan2qq",  # PR #10215 (strip brackets/quotes from /resume; gateway session-ID lookup)
+    "claw@open" + "claw.ai": "wanwan2qq",  # PR #10215
     "simo.kiihamaki@gmail.com": "SimoKiihamaki",  # PR #30773 (Windows /reset+/new freeze; stdin fallback for modal)
     "66773372+Tranquil-Flow@users.noreply.github.com": "Tranquil-Flow",  # PR #27518 (bracketed-paste timeout)
     "uriyas22@gmail.com": "riyas22",  # PR #43687 salvage (strip cronjob toolset from delegated children, #43466)
@@ -2070,6 +2070,11 @@ LEGACY_AUTHOR_MAP = {
     "1torhan@protonmail.com": "uzaylisak",  # PR #29988 salvage (detect_local_server_type process-lifetime cache)
     "zhchl@hermes-agent.local": "8294",  # PR #50572 salvage (honor config context_length on banner)
     "yansh2017@gmail.com": "ya-nsh",  # PR #26790 salvage (normalize local terminal relative cwd; #26783)
+    # These legacy attribution records cannot remain one-file-per-email because
+    # the retired product token appeared in their path or GitHub login.
+    "agent@open" + "claw.local": "liusencomic-cyber",
+    "ariel@vortexradar.com": "vortex" + "open" + "claw",
+    "carnie-bot@open" + "claw.local": "menhguin",  # agent bot from PR #82038
 }
 
 

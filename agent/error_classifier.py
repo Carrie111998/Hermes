@@ -1448,7 +1448,7 @@ def _classify_by_status(
 def _classify_402(error_msg: str, result_fn) -> ClassifiedError:
     """Disambiguate 402: billing exhaustion vs transient usage limit.
 
-    The key insight from OpenClaw: some 402s are transient rate limits
+    The key insight from upstream: some 402s are transient rate limits
     disguised as payment errors.  "Usage limit, try again in 5 minutes"
     is NOT a billing problem — it's a periodic quota that resets.
     """

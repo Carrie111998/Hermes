@@ -47,7 +47,7 @@ export function isImagePath(filePath: string): boolean {
 }
 
 /**
- * Read an attachment's thumbnail preview, local disk first. Paperclip picks,
+ * Read an attachment's thumbnail preview, local disk first. Paper-clip picks,
  * clipboard saves, and OS drops always hand us paths on THIS machine — the
  * remote-routed fs facade would 404 them against the gateway and toast a bogus
  * "preview failed" even though the attach itself works (upload reads local

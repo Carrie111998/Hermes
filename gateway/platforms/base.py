@@ -4077,7 +4077,7 @@ class BasePlatformAdapter(ABC):
         the message in place.
 
         Used by the stream consumer's fresh-final cleanup path (see
-        openclaw/openclaw#72038) to remove long-lived preview messages
+        third-party reference #72038) to remove long-lived preview messages
         after sending the completed reply as a fresh message so the
         platform's visible timestamp reflects completion time.
 

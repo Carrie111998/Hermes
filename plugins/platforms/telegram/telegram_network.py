@@ -39,7 +39,7 @@ _DOH_PROVIDERS: list[dict] = [
 ]
 
 # Last-resort IPv4 Telegram Bot API endpoints in 149.154.160.0/20
-# (same seed used by OpenClaw). Used when DoH is blocked AND as the
+# (same seed used by upstream). Used when DoH is blocked AND as the
 # first-try connect targets so a blackholed IPv6 AAAA for the hostname
 # cannot pin initialize() (#87015).
 SEED_FALLBACK_IPS: list[str] = ["149.154.166.110", "149.154.167.220"]

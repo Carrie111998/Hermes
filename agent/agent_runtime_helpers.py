@@ -848,7 +848,7 @@ def strip_think_blocks(agent, content: str) -> str:
       * ``<function_call>…</function_call>``
       * ``<function_calls>…</function_calls>``
       * ``<function name="…">…</function>`` (Gemma style)
-    Ported from openclaw/openclaw#67318. The ``<function>`` variant is
+    Ported from third-party reference #67318. The ``<function>`` variant is
     boundary-gated (only strips when the tag sits at start-of-line or
     after punctuation and carries a ``name="..."`` attribute) so prose
     mentions like "Use <function> in JavaScript" are preserved.
@@ -893,7 +893,7 @@ def strip_think_blocks(agent, content: str) -> str:
     #    the unterminated-tag pass and take trailing content with them.
     for _pattern in _REASONING_BLOCK_PATTERNS:
         content = _pattern.sub('', content)
-    # 1b. Tool-call XML blocks (openclaw/openclaw#67318). Handle the
+    # 1b. Tool-call XML blocks (third-party reference #67318). Handle the
     #     generic tag names first — they have no attribute gating since
     #     a literal <tool_call> in prose is already vanishingly rare.
     for _pattern in _TOOL_CALL_BLOCK_PATTERNS:
@@ -914,7 +914,7 @@ def strip_think_blocks(agent, content: str) -> str:
     # 3b. Stray tool-call closers. (We do NOT strip bare <function> or
     #     unterminated <function name="..."> because a truncated tail
     #     during streaming may still be valuable to the user; matches
-    #     OpenClaw's intentional asymmetry.)
+    #     upstream's intentional asymmetry.)
     content = _STRAY_TOOL_CALL_CLOSER_PATTERN.sub('', content)
     return content
 
