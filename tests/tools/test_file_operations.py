@@ -375,6 +375,74 @@ class TestShellFileOpsHelpers:
         assert "\x07" not in result.content
         assert "1|print('ok')" in result.content
 
+    def test_no_trailing_newline_counts_final_line(self, mock_env):
+        """wc -l undercounts when the final line has no trailing newline."""
+        content = "alpha\nbravo\ncharlie"  # 3 lines, no final LF
+
+        def side_effect(command, **kwargs):
+            if command.startswith("if [ -f ") or (
+                command.startswith("wc -c") and " < " in command
+            ):
+                return {"output": f"{len(content)}\n", "returncode": 0}
+            if command.startswith("head -c") and "| base64" in command:
+                import base64 as b64
+                return {
+                    "output": b64.b64encode(content.encode()).decode() + "\n",
+                    "returncode": 0,
+                }
+            if command.startswith("head -c"):
+                return {"output": content[:1000], "returncode": 0}
+            if command.startswith("sed -n"):
+                # cut always NL-terminates
+                return {"output": content + "\n", "returncode": 0}
+            if command.startswith("wc -l"):
+                return {"output": "2\n", "returncode": 0}
+            if command.startswith("tail -c 1") and "od " in command:
+                return {"output": "65\n", "returncode": 0}
+            if command.startswith("tail -c 1"):
+                # phantom-NL strip path: last byte not NL → wc -l == 0
+                return {"output": "0\n", "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        result = ops.read_file("/tmp/test/no_nl.txt")
+        assert result.error is None, result
+        assert result.total_lines == 3
+
+    def test_trailing_newline_does_not_double_count(self, mock_env):
+        """Files that already end in LF must keep wc -l's count."""
+        content = "alpha\nbravo\ncharlie\n"
+
+        def side_effect(command, **kwargs):
+            if command.startswith("if [ -f ") or (
+                command.startswith("wc -c") and " < " in command
+            ):
+                return {"output": f"{len(content)}\n", "returncode": 0}
+            if command.startswith("head -c") and "| base64" in command:
+                import base64 as b64
+                return {
+                    "output": b64.b64encode(content.encode()).decode() + "\n",
+                    "returncode": 0,
+                }
+            if command.startswith("head -c"):
+                return {"output": content[:1000], "returncode": 0}
+            if command.startswith("sed -n"):
+                return {"output": content, "returncode": 0}
+            if command.startswith("wc -l"):
+                return {"output": "3\n", "returncode": 0}
+            if command.startswith("tail -c 1") and "od " in command:
+                return {"output": "0a\n", "returncode": 0}
+            if command.startswith("tail -c 1"):
+                return {"output": "1\n", "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        result = ops.read_file("/tmp/test/with_nl.txt")
+        assert result.error is None, result
+        assert result.total_lines == 3
+
     def test_read_file_raw_strips_leaked_terminal_fence_markers(self, mock_env):
         leaked = (
             "__HERMES_FENCE_a9f7b3__\x07'\n"
