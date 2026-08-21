@@ -7660,9 +7660,19 @@ def _legacy_display_kind(role: str, text: str) -> str | None:
     exactly the auto-continue case — so the raw recovery note would paint as a
     user bubble forever. Sniffing the one fixed synthetic prefix is the
     migration for those rows; it is not how new rows get typed.
+
+    Legacy async-delegation completions are retyped by the shared helper in
+    ``tools.process_registry.infer_legacy_display_kind`` so every display
+    projection (this one and the REST transcript endpoint) migrates them
+    identically. This is a one-time repair of already-written rows, NOT a
+    renderer filter — renderers never string-match.
     """
-    if role == "user" and text.lstrip().startswith(_AUTO_CONTINUE_NOTE_PREFIX):
-        return "auto_continue"
+    if role == "user":
+        if text.lstrip().startswith(_AUTO_CONTINUE_NOTE_PREFIX):
+            return "auto_continue"
+        from tools.process_registry import infer_legacy_display_kind
+
+        return infer_legacy_display_kind(role, text)
     return None
 
 
@@ -10348,30 +10358,11 @@ def _notification_poller_loop(
 
 
 def _async_delegation_display_metadata(evt: dict) -> dict:
-    """Build display-only metadata before the completion event is formatted."""
-    raw_results = evt.get("results")
-    results: list[dict] = [
-        result for result in raw_results if isinstance(result, dict)
-    ] if isinstance(raw_results, list) else []
-    task_count = len(results) or 1
-    completed_count = sum(
-        1 for result in results
-        if result.get("status") in {"completed", "success"}
-    )
-    failed_count = sum(
-        1 for result in results
-        if result.get("status") in {"failed", "error"}
-    )
-    metadata = {
-        "delegation_id": str(evt.get("delegation_id") or ""),
-        "task_count": task_count,
-        "completed_count": completed_count or task_count - failed_count,
-        "failed_count": failed_count,
-    }
-    duration = evt.get("total_duration_seconds") or evt.get("duration_seconds")
-    if isinstance(duration, (int, float)):
-        metadata["duration_seconds"] = duration
-    return metadata
+    """Shared metadata builder for delegation completion rows (see
+    ``tools.process_registry.async_delegation_display_metadata``)."""
+    from tools.process_registry import async_delegation_display_metadata
+
+    return async_delegation_display_metadata(evt)
 
 
 def _wire_agent_terminal_output() -> None:

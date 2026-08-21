@@ -368,6 +368,7 @@ describe('toChatMessages', () => {
       'resumed interrupted turn',
       'personality changed'
     ])
+    expect(messages.map(chatMessageText)).not.toContain('opaque delegation context payload')
   })
 
   // A backend older than this app serves display_metadata as unparsed JSON

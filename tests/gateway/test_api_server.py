@@ -79,6 +79,63 @@ class TestRedactApiErrorText:
 
 
 # ---------------------------------------------------------------------------
+# _message_response — the REST transcript projection. Must forward the
+# structured display typing so clients can filter internal control turns, and
+# retype legacy async-delegation rows persisted before the typing shipped.
+# ---------------------------------------------------------------------------
+
+
+class TestMessageResponse:
+
+    def test_forwards_display_kind_and_metadata(self):
+        message = {
+            "id": 7,
+            "session_id": "s",
+            "role": "user",
+            "content": "opaque delegation context payload",
+            "display_kind": "async_delegation_complete",
+            "display_metadata": {"task_count": 2},
+            "secret_extra": "must be dropped",
+        }
+        response = APIServerAdapter._message_response(message)
+        assert response["display_kind"] == "async_delegation_complete"
+        assert response["display_metadata"] == {"task_count": 2}
+        assert "secret_extra" not in response
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "[ASYNC DELEGATION BATCH COMPLETE — deleg_x]\nA background fan-out…",
+            "[ASYNC DELEGATION COMPLETE — deleg_x]\nA background subagent…",
+            "  [ASYNC DELEGATION COMPLETE — deleg_x]\nleading whitespace",
+        ],
+    )
+    def test_migrates_legacy_untyped_delegation_rows(self, content):
+        response = APIServerAdapter._message_response(
+            {"id": 8, "session_id": "s", "role": "user", "content": content}
+        )
+        assert response["display_kind"] == "async_delegation_complete"
+
+    def test_leaves_ordinary_user_rows_untyped(self):
+        response = APIServerAdapter._message_response(
+            {"id": 9, "session_id": "s", "role": "user", "content": "hello there"}
+        )
+        assert "display_kind" not in response
+
+    def test_does_not_retype_existing_kinds(self):
+        response = APIServerAdapter._message_response(
+            {
+                "id": 10,
+                "session_id": "s",
+                "role": "user",
+                "content": "[ASYNC DELEGATION BATCH COMPLETE — deleg_x]",
+                "display_kind": "model_switch",
+            }
+        )
+        assert response["display_kind"] == "model_switch"
+
+
+# ---------------------------------------------------------------------------
 # ResponseStore
 # ---------------------------------------------------------------------------
 

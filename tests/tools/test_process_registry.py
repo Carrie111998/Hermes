@@ -1117,6 +1117,91 @@ class TestProcessToolHandler:
 from tools.process_registry import format_process_notification
 
 
+# =========================================================================
+# infer_legacy_display_kind + async_delegation_display_metadata
+# =========================================================================
+
+from tools.process_registry import (
+    async_delegation_display_metadata,
+    infer_legacy_display_kind,
+)
+
+
+def test_infer_legacy_display_kind_matches_batch_and_single_prefixes():
+    assert (
+        infer_legacy_display_kind(
+            "user", "[ASYNC DELEGATION BATCH COMPLETE — deleg_x]\nresults"
+        )
+        == "async_delegation_complete"
+    )
+    assert (
+        infer_legacy_display_kind(
+            "user", "[ASYNC DELEGATION COMPLETE — deleg_x]\nresults"
+        )
+        == "async_delegation_complete"
+    )
+    assert (
+        infer_legacy_display_kind(
+            "user", "  [ASYNC DELEGATION BATCH COMPLETE — deleg_x]\nleading ws"
+        )
+        == "async_delegation_complete"
+    )
+
+
+def test_infer_legacy_display_kind_ignores_other_roles_and_text():
+    assert infer_legacy_display_kind("assistant", "[ASYNC DELEGATION COMPLETE — x]") is None
+    assert infer_legacy_display_kind("user", "what is [ASYNC DELEGATION COMPLETE]?") is None
+    assert infer_legacy_display_kind("user", "") is None
+    assert infer_legacy_display_kind("user", None) is None
+
+
+def test_async_delegation_display_metadata_counts_batch_results():
+    meta = async_delegation_display_metadata({
+        "delegation_id": "deleg_1",
+        "results": [
+            {"status": "completed"},
+            {"status": "failed"},
+            {"status": "completed"},
+            "not-a-dict",
+        ],
+        "total_duration_seconds": 12.5,
+    })
+    assert meta["delegation_id"] == "deleg_1"
+    assert meta["task_count"] == 3
+    assert meta["completed_count"] == 2
+    assert meta["failed_count"] == 1
+    assert meta["duration_seconds"] == 12.5
+
+
+def test_async_delegation_display_metadata_single_task_defaults():
+    meta = async_delegation_display_metadata({"delegation_id": "deleg_2"})
+    assert meta["task_count"] == 1
+    assert meta["completed_count"] == 1
+    assert meta["failed_count"] == 0
+    assert "duration_seconds" not in meta
+
+
+def test_async_delegation_display_metadata_counts_only_completed_states():
+    """cancelled/timeout/interrupted are terminal but NOT completed — the old
+    task_count - failed_count fallback counted them as completed."""
+    meta = async_delegation_display_metadata({
+        "delegation_id": "deleg_3",
+        "results": [
+            {"status": "completed"},
+            {"status": "success"},
+            {"status": "failed"},
+            {"status": "cancelled"},
+            {"status": "timeout"},
+            {"status": "interrupted"},
+            {"status": "error"},
+            "not-a-dict",
+        ],
+    })
+    assert meta["task_count"] == 7
+    assert meta["completed_count"] == 2
+    assert meta["failed_count"] == 2
+
+
 def test_drain_notifications_completion_callback_exception_fails_closed(registry):
     event = {
         "type": "completion",

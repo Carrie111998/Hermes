@@ -3361,9 +3361,24 @@ class APIServerAdapter(BasePlatformAdapter):
         safe_keys = (
             "id", "session_id", "role", "content", "tool_call_id", "tool_calls",
             "tool_name", "timestamp", "token_count", "finish_reason", "reasoning",
-            "reasoning_content",
+            "reasoning_content", "display_kind", "display_metadata",
         )
-        return {key: message.get(key) for key in safe_keys if key in message}
+        response = {key: message.get(key) for key in safe_keys if key in message}
+        # Read-time migration for synthetic rows persisted before the
+        # display-kind threading shipped: async-delegation completion blocks
+        # were stored as plain user rows and would hydrate as full user
+        # bubbles over this REST transcript route. Retype them by their fixed,
+        # machine-generated prefix (same helper the WebSocket display
+        # projection uses) so clients can filter by the structured kind.
+        row_role = str(response.get("role") or "")
+        row_content = response.get("content")
+        if not response.get("display_kind") and row_role == "user" and isinstance(row_content, str):
+            from tools.process_registry import infer_legacy_display_kind
+
+            inferred = infer_legacy_display_kind(row_role, row_content)
+            if inferred:
+                response["display_kind"] = inferred
+        return response
 
     async def _read_json_body(self, request: "web.Request") -> tuple[Dict[str, Any], Optional["web.Response"]]:
         try:
