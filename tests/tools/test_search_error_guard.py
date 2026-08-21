@@ -150,6 +150,25 @@ class TestSplitToolDiagnostics:
         assert "error: unclosed character class" in diagnostics
         assert payload.strip() == "plain.md"
 
+    def test_capitalized_and_warning_diagnostic_lines_stay_diagnostics(self):
+        """The diagnostic lookaheads are case-insensitive and also cover rg's
+        "warning: ..." lines — a capitalized wrapper build's ``Error:`` must
+        not land in payload as a phantom result file (review on #91702)."""
+        out = "plain.md\nError: unclosed character class\nwarning: skipped binary file\n"
+        diagnostics, payload = _split_tool_diagnostics(out)
+        assert "Error: unclosed character class" in diagnostics
+        assert "warning: skipped binary file" in diagnostics
+        assert payload.strip() == "plain.md"
+
+    def test_spaced_path_match_line_classifies_as_payload(self):
+        """The relaxed first alternative also carries spaced paths in
+        match/count mode — pin it so a future "tighten for files_only"
+        edit cannot silently re-break match mode (review on #91702)."""
+        out = "my vault/note.md:3:needle\n"
+        diagnostics, payload = _split_tool_diagnostics(out)
+        assert diagnostics == ""
+        assert "my vault/note.md:3:needle" in payload
+
 
 @pytest.fixture
 def spaced_tree(tmp_path):

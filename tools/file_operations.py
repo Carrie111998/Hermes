@@ -417,11 +417,19 @@ def _split_tool_diagnostics(output: str) -> tuple[str, str]:
 # ``:`` (match/count), a ``-`` (context), or nothing (files_only). Tool
 # diagnostics never match: "rg: ..."/"grep: ..." are caught by the explicit
 # prefix check above, indented caret lines by the non-whitespace anchor, and
-# rg's trailing "error: ..." line by the lookahead. The files_only branch
-# must accept interior spaces — paths may legitimately contain them, and
-# the old whitespace-free class silently dropped every such file (#91698).
+# rg's "error: ..." / "warning: ..." lines by the case-insensitive
+# lookaheads (scoped group; Py3.11+). The files_only branch must accept
+# interior spaces — paths may legitimately contain them, and the old
+# whitespace-free class silently dropped every such file (#91698).
+#
+# Residual accepted risk after the #91698 relaxation: any non-blank line
+# that is not literally an rg/grep diagnostic shape (e.g. stray progress
+# output interleaved on stdout) classifies as payload and may surface as a
+# phantom entry in the result. That trades a silent fake "no results" for
+# a visible odd line — the safer failure direction — but keep it in mind
+# when widening the diagnostic prefixes here.
 _SEARCH_OUTPUT_RE = re.compile(
-    r'^([A-Za-z]:)?[^\s:][^\n]*?[:\-]\d|^(?!error: )[^\s:][^\n]*$'
+    r'^([A-Za-z]:)?[^\s:][^\n]*?[:\-]\d|^(?i:(?!error: )(?!warning: ))[^\s:][^\n]*$'
 )
 
 
