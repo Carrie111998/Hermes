@@ -883,9 +883,16 @@ class TestProfilesEndpoint:
                 has_env=True,
             ),
         ]
+        unsupported_probe = types.ModuleType("tools.bot_mode_probe")
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch("hermes_cli.profiles.list_profiles", return_value=profiles):
+            with (
+                patch("hermes_cli.profiles.list_profiles", return_value=profiles),
+                patch.dict(
+                    sys.modules,
+                    {"tools.bot_mode_probe": unsupported_probe},
+                ),
+            ):
                 resp = await cli.get(
                     "/api/profiles",
                     headers={"Authorization": "Bearer sk-secret"},
