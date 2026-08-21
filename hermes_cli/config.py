@@ -1010,7 +1010,15 @@ _MODEL_OVERRIDE_METADATA_KEYS = frozenset({
 
 
 def _split_config_key_path(dotted_key: str) -> list[str]:
-    """Split a config path while preserving dotted model override IDs."""
+    """Split a config path while preserving dotted model override IDs.
+
+    ``model_overrides`` is an open mapping, so its model segment consumes every
+    remaining component except a recognized trailing metadata key. This keeps
+    arbitrary dotted IDs addressable, but the dotted CLI syntax cannot
+    distinguish a model ID ending in a metadata-key name from that metadata
+    field; such an override must be written directly in YAML. An unrecognized
+    trailing component is therefore part of the model ID, not a schema error.
+    """
     parts = dotted_key.split(".")
     if (
         len(parts) >= 3
