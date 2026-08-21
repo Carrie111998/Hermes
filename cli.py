@@ -4225,8 +4225,9 @@ def _terminal_supports_extended_enter_keys(env: Optional[Mapping[str, str]] = No
     The classic CLI already maps Kitty CSI-u / xterm modifyOtherKeys Shift+Enter
     byte sequences to the newline handler. Some terminals (notably iTerm2) only
     emit those distinct sequences after the application asks for extended key
-    mode. Keep this allowlist aligned with the Ink TUI, which enables the same
-    modes for these terminals.
+    mode. WezTerm is deliberately excluded: pushing both protocols changes the
+    input stream seen by prompt_toolkit and breaks CJK IME commits and cursor
+    keys under WSL2 (#91624).
     """
     if env is None:
         env = os.environ
@@ -4234,7 +4235,7 @@ def _terminal_supports_extended_enter_keys(env: Optional[Mapping[str, str]] = No
     term = (env.get("TERM") or "").strip().lower()
     if env.get("WT_SESSION"):
         return True
-    if term_program in {"iTerm.app", "WezTerm", "ghostty", "vscode"}:
+    if term_program in {"iTerm.app", "ghostty", "vscode"}:
         return True
     if env.get("KITTY_WINDOW_ID") or "kitty" in term:
         return True

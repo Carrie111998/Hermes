@@ -153,6 +153,18 @@ def test_unknown_terminal_does_not_enable_extended_enter_keys():
     assert cli_mod._terminal_supports_extended_enter_keys({"TERM_PROGRAM": "unknown"}) is False
 
 
+def test_wezterm_does_not_enable_extended_enter_keys():
+    """WezTerm keeps raw input for CJK IME and cursor-key compatibility."""
+    import cli as cli_mod
+
+    out = _FakeOutput()
+    env = {"TERM_PROGRAM": "WezTerm", "TERM": "xterm-256color"}
+
+    assert cli_mod._terminal_supports_extended_enter_keys(env) is False
+    assert cli_mod._enable_extended_enter_keys(output=out, env=env) is False
+    assert out.written == b""
+
+
 # ---------------------------------------------------------------------------
 # Ghostty: must push ONLY modifyOtherKeys, not the Kitty keyboard protocol —
 # see cli._is_ghostty_terminal for the full rationale (#87630).
