@@ -132,11 +132,11 @@ import {
   uninstallArgsForMode
 } from './desktop-uninstall'
 import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
+import { installEmbedReferer } from './embed-referer'
 import {
   EMERGENCY_BACKUP_RETENTION,
   selectEmergencyBackupsToDelete,
 } from './emergency-backup-retention'
-import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
 import {
   buildTerminalScript,
