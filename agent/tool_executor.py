@@ -60,6 +60,17 @@ def _pending_skill_reload_lock(agent) -> threading.RLock:
     return vars(agent).setdefault("_pending_skill_reload_lock", threading.RLock())
 
 
+def _pending_skill_reload_snapshot(agent) -> tuple[str, ...]:
+    """Fix pending names for one model-emitted tool batch.
+
+    A successful ``skill_view`` clears live state immediately, but sibling calls
+    were chosen before the model saw the reloaded instructions. Keeping the
+    batch-start snapshot blocks those calls until the next model round.
+    """
+    with _pending_skill_reload_lock(agent):
+        return tuple(getattr(agent, "_pending_skill_reloads", []))
+
+
 def _message_text(message: dict[str, Any]) -> str:
     content = message.get("content", "")
     if isinstance(content, str):
@@ -143,12 +154,19 @@ def refresh_pending_skill_reloads(agent, messages: list[dict[str, Any]]) -> list
         return list(pending)
 
 
-def _pending_skill_reload_block(agent, function_name: str) -> str | None:
+def _pending_skill_reload_block(
+    agent,
+    function_name: str,
+    pending_skill_reloads: tuple[str, ...] | None = None,
+) -> str | None:
     """Block non-reload tools while canonical prune markers remain pending."""
     if function_name == "skill_view":
         return None
-    with _pending_skill_reload_lock(agent):
-        pending = list(getattr(agent, "_pending_skill_reloads", []))
+    pending = (
+        _pending_skill_reload_snapshot(agent)
+        if pending_skill_reloads is None
+        else pending_skill_reloads
+    )
     if not pending:
         return None
     calls = "; ".join(f"skill_view(name='{name}')" for name in pending)
@@ -696,6 +714,7 @@ def _run_agent_tool_execution_middleware(
     middleware_trace: list[dict[str, Any]] | None = None,
     begin_execution=None,
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
+    pending_skill_reloads: tuple[str, ...] | None = None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
     from agent import relay_tools
@@ -740,7 +759,9 @@ def _run_agent_tool_execution_middleware(
                 return
             begin_execution(callback)
 
-        block_message = _pending_skill_reload_block(agent, function_name)
+        block_message = _pending_skill_reload_block(
+            agent, function_name, pending_skill_reloads
+        )
         block_error_type = "skill_reload_block"
         if block_message is None:
             block_message = scope_block
@@ -938,6 +959,7 @@ def _run_sequential_tool_execution_middleware(
     scope_block: str | None = None,
     display_index: int | None = None,
     middleware_trace: list[dict[str, Any]] | None = None,
+    pending_skill_reloads: tuple[str, ...] | None = None,
 ) -> _ManagedToolResult:
     """Run one sequential call with the concurrent executor's deadline.
 
@@ -956,6 +978,7 @@ def _run_sequential_tool_execution_middleware(
         "scope_block": scope_block,
         "display_index": display_index,
         "middleware_trace": middleware_trace,
+        "pending_skill_reloads": pending_skill_reloads,
     }
     if function_name in _NEVER_PARALLEL_TOOLS:
         return _run_agent_tool_execution_middleware(agent, **kwargs)
@@ -1198,7 +1221,16 @@ def _begin_tool_execution(
             pass
 
 
-def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_concurrent(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    *,
+    finalize: bool = True,
+    pending_skill_reloads: tuple[str, ...] | None = None,
+) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
     Results are collected in the original tool-call order and appended to
@@ -1210,6 +1242,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     """
     tool_calls = assistant_message.tool_calls
     num_tools = len(tool_calls)
+    if pending_skill_reloads is None:
+        pending_skill_reloads = _pending_skill_reload_snapshot(agent)
 
     # Resolve the context-scaled tool-output budget once per turn (cheap, but
     # avoids rebuilding it per result inside the loop below).
@@ -1494,6 +1528,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     middleware_trace=middleware_trace,
                     begin_execution=_advance_start,
                     authorization_gate=authorization_gate,
+                    pending_skill_reloads=pending_skill_reloads,
                 )
                 result = managed.result
                 function_args = managed.args
@@ -2045,7 +2080,16 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
         ))
 
 
-def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_sequential(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    *,
+    finalize: bool = True,
+    pending_skill_reloads: tuple[str, ...] | None = None,
+) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools.
 
     ``finalize=False`` skips the end-of-batch aggregate budget enforcement
@@ -2054,10 +2098,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     """
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
+    if pending_skill_reloads is None:
+        pending_skill_reloads = _pending_skill_reload_snapshot(agent)
 
     # Keep every runtime-tool branch on one bounded execution funnel without
     # duplicating timeout policy across the branch-specific callbacks below.
     def _run_agent_tool_execution_middleware(agent, **kwargs):
+        kwargs["pending_skill_reloads"] = pending_skill_reloads
         return _run_sequential_tool_execution_middleware(agent, **kwargs)
 
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
@@ -2931,7 +2978,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
 
 
-def execute_tool_calls_segmented(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, segments=None) -> None:
+def execute_tool_calls_segmented(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    segments=None,
+) -> None:
     """Execute a mixed tool-call batch as ordered parallel/sequential segments.
 
     ``segments`` is the ``(kind, calls)`` plan from
@@ -2961,6 +3015,8 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
+    pending_skill_reloads = _pending_skill_reload_snapshot(agent)
+
     for kind, calls in segments:
         if getattr(agent, "_incremental_persistence_failed", False):
             return
@@ -2969,11 +3025,13 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             execute_tool_calls_concurrent(
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
+                pending_skill_reloads=pending_skill_reloads,
             )
         else:
             execute_tool_calls_sequential(
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
+                pending_skill_reloads=pending_skill_reloads,
             )
 
         if getattr(agent, "_incremental_persistence_failed", False):

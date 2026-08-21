@@ -1,6 +1,7 @@
 """Runtime tests for tool-call loop guardrails."""
 
 import json
+import threading
 import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -374,6 +375,114 @@ def test_pruned_skill_blocks_other_tools_before_dispatch():
     dispatch.assert_not_called()
     assert "skill_view(name='pdf')" in messages[0]["content"]
     assert agent._pending_skill_reloads == ["pdf"]
+
+
+def test_reload_success_does_not_release_later_tool_in_same_sequential_batch():
+    agent = _make_agent("skill_view", "web_search")
+    refresh_pending_skill_reloads(
+        agent, [{"role": "user", "content": _skill_pruned_marker("pdf")}]
+    )
+    calls = [
+        _mock_tool_call("skill_view", json.dumps({"name": "pdf"}), "c-reload"),
+        _mock_tool_call(
+            "web_search", json.dumps({"query": "must wait"}), "c-after-reload"
+        ),
+    ]
+    messages = []
+    executed = []
+
+    def dispatch(name, args, task_id, **kwargs):
+        del task_id, kwargs
+        executed.append((name, args))
+        if name == "skill_view":
+            return json.dumps({"success": True, "name": "pdf", "content": "rules"})
+        return json.dumps({"ok": True})
+
+    with patch("run_agent.handle_function_call", side_effect=dispatch):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+        )
+
+    assert executed == [("skill_view", {"name": "pdf"})]
+    assert agent._pending_skill_reloads == []
+    assert "skill_view(name='pdf')" in messages[1]["content"]
+
+
+def test_reload_success_does_not_race_later_tool_in_same_concurrent_batch():
+    agent = _make_agent("skill_view", "web_search")
+    refresh_pending_skill_reloads(
+        agent, [{"role": "user", "content": _skill_pruned_marker("pdf")}]
+    )
+    calls = [
+        _mock_tool_call("skill_view", json.dumps({"name": "pdf"}), "c-reload"),
+        _mock_tool_call(
+            "web_search", json.dumps({"query": "must wait"}), "c-after-reload"
+        ),
+    ]
+    messages = []
+    executed = []
+    reload_finished = threading.Event()
+
+    def relay_execute(name, args, callback, **kwargs):
+        del kwargs
+        if name == "web_search":
+            assert reload_finished.wait(timeout=5)
+        result = callback(dict(args))
+        if name == "skill_view":
+            reload_finished.set()
+        return result, dict(args)
+
+    def dispatch(name, args, task_id, **kwargs):
+        del task_id, kwargs
+        executed.append((name, args))
+        if name == "skill_view":
+            return json.dumps({"success": True, "name": "pdf", "content": "rules"})
+        return json.dumps({"ok": True})
+
+    with (
+        patch("agent.relay_tools.execute", side_effect=relay_execute),
+        patch("run_agent.handle_function_call", side_effect=dispatch),
+    ):
+        agent._execute_tool_calls_concurrent(
+            SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+        )
+
+    assert executed == [("skill_view", {"name": "pdf"})]
+    assert agent._pending_skill_reloads == []
+    assert "skill_view(name='pdf')" in messages[1]["content"]
+
+
+def test_reload_boundary_survives_mixed_batch_segmentation():
+    agent = _make_agent("skill_view", "write_file")
+    refresh_pending_skill_reloads(
+        agent, [{"role": "user", "content": _skill_pruned_marker("pdf")}]
+    )
+    calls = [
+        _mock_tool_call("skill_view", json.dumps({"name": "pdf"}), "c-reload"),
+        _mock_tool_call(
+            "write_file",
+            json.dumps({"path": "/tmp/must-wait", "content": "blocked"}),
+            "c-after-reload",
+        ),
+    ]
+    messages = []
+    executed = []
+
+    def dispatch(name, args, task_id, **kwargs):
+        del task_id, kwargs
+        executed.append((name, args))
+        if name == "skill_view":
+            return json.dumps({"success": True, "name": "pdf", "content": "rules"})
+        return json.dumps({"success": True})
+
+    with patch("run_agent.handle_function_call", side_effect=dispatch):
+        agent._execute_tool_calls(
+            SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+        )
+
+    assert executed == [("skill_view", {"name": "pdf"})]
+    assert agent._pending_skill_reloads == []
+    assert "skill_view(name='pdf')" in messages[1]["content"]
 
 
 def test_successful_skill_view_roundtrip_clears_pending_reload_but_failure_does_not():
