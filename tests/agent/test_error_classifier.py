@@ -381,6 +381,20 @@ class TestClassifyApiError:
         assert result.should_rotate_credential is True
         assert result.should_fallback is True
 
+    def test_429_monthly_spend_limit_mixed_case_still_billing(self):
+        """Real SDK bodies may title-case the wording ("Monthly Spend Limit")
+        while _BILLING_PATTERNS are lowercase — the 429 branch matches against
+        the lowered message so the classification cannot go dead in
+        production (review on #91091)."""
+        e = MockAPIError(
+            "HTTP 429: This request would exceed your account's Monthly Spend "
+            "Limit.",
+            status_code=429,
+        )
+        result = classify_api_error(e, provider="anthropic")
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+
     def test_429_spend_limit_takes_priority_over_upstream_disambiguation(self):
         """A billing-proven 429 must resolve before the OpenRouter upstream
         disambiguation: the account state is deterministic regardless of any

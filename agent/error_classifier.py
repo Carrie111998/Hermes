@@ -1275,8 +1275,11 @@ def _classify_by_status(
         # 429, and the default rate_limit policy honors the server's
         # Retry-After (capped at 600s) for api_max_retries attempts before the
         # fallback chain is consulted — a ~40-50 minute stall at defaults for
-        # a cap that cannot clear inside that window (#91091).
-        if any(p in error_msg for p in _BILLING_PATTERNS):
+        # a cap that cannot clear inside that window (#91091). Patterns are
+        # lowercase; match against the lowered message so real SDK bodies
+        # with title-cased wording ("Monthly Spend Limit") classify too
+        # (review on #91091).
+        if any(p in error_msg.lower() for p in _BILLING_PATTERNS):
             return result_fn(
                 FailoverReason.billing,
                 retryable=False,
