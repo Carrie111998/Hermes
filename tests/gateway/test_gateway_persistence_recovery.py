@@ -21,7 +21,12 @@ back to the transient wording again.
 
 import pytest
 
-from gateway.run import _PERSISTENCE_RECOVERY_MESSAGES, _normalize_empty_agent_response
+from gateway.run import (
+    _CORRUPT_RECOVERY_STEPS,
+    _PERSISTENCE_RECOVERY_MESSAGES,
+    _normalize_empty_agent_response,
+    _with_state_db_paths,
+)
 from hermes_state import PERSISTENCE_ERROR_CAUSES
 
 # The generic reassurance that must not be given for a permanent failure.
@@ -29,6 +34,13 @@ TRANSIENT_CLAIMS = ("temporarily unavailable", "should already be saved", "in a 
 
 # Causes where the write genuinely may have landed and a retry is reasonable.
 TRANSIENT_CAUSES = {"locked", "compression", "unknown"}
+
+# ...but only two of them can honestly say the write landed.  ``unknown``
+# is the bucket the classifier reached when it could not identify the
+# failure, so it is transient (a retry is reasonable) without being
+# reassuring (the outcome of the write is exactly what we failed to
+# determine).
+CAUSES_THAT_MAY_CLAIM_THE_WRITE_LANDED = TRANSIENT_CAUSES - {"unknown"}
 
 
 def _failed(cause, error="session storage could not be written"):
@@ -119,7 +131,9 @@ class TestUnstructuredErrorsUseTheCanonicalClassifier:
             "api_calls": 1,
         }
 
-        assert _render(agent_result) == _PERSISTENCE_RECOVERY_MESSAGES["corrupt"]
+        assert _render(agent_result) == _with_state_db_paths(
+            _PERSISTENCE_RECOVERY_MESSAGES["corrupt"]
+        )
 
     def test_real_disk_exhaustion_still_reaches_the_disk_bucket(self):
         agent_result = {
@@ -129,7 +143,9 @@ class TestUnstructuredErrorsUseTheCanonicalClassifier:
             "api_calls": 1,
         }
 
-        assert _render(agent_result) == _PERSISTENCE_RECOVERY_MESSAGES["disk"]
+        assert _render(agent_result) == _with_state_db_paths(
+            _PERSISTENCE_RECOVERY_MESSAGES["disk"]
+        )
 
 
 class TestEveryBucketIsCovered:
@@ -145,8 +161,100 @@ class TestEveryBucketIsCovered:
 
     @pytest.mark.parametrize("cause", PERSISTENCE_ERROR_CAUSES)
     def test_permanent_causes_do_not_promise_a_successful_retry(self, cause):
-        if cause in TRANSIENT_CAUSES:
-            pytest.skip("a retry is genuinely reasonable for this cause")
+        if cause in CAUSES_THAT_MAY_CLAIM_THE_WRITE_LANDED:
+            pytest.skip("the write genuinely may have landed for this cause")
 
         response = _PERSISTENCE_RECOVERY_MESSAGES[cause].lower()
         assert "should already be saved" not in response
+
+
+class TestRecoveryStepsNameThisInstallsPaths:
+    """A salvage command has to point at the file that actually broke.
+
+    ``HERMES_HOME`` is configurable, every non-default profile keeps its own
+    database under ``<root>/profiles/<name>/``, and a native-Windows install
+    lives under ``%LOCALAPPDATA%``.  A literal ``~/.hermes/state.db`` in the
+    recovery steps is therefore wrong for three ordinary setups -- and wrong
+    in the worst direction, since an operator who follows it either salvages
+    nothing or salvages a different, healthy database while the corrupt one
+    stays corrupt.
+    """
+
+    def test_the_salvage_step_names_the_configured_home(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        response = _render(_failed("corrupt"))
+
+        assert str(tmp_path / "state.db") in response
+        assert str(tmp_path / "backups") in response
+
+    def test_a_relocated_home_is_never_reported_as_the_default(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        assert "~/.hermes" not in _render(_failed("corrupt"))
+
+    def test_the_home_is_resolved_per_call_not_at_import(self, tmp_path, monkeypatch):
+        """Two profiles in one process must not be told the same path."""
+        first = tmp_path / "profile-a"
+        second = tmp_path / "profile-b"
+
+        monkeypatch.setenv("HERMES_HOME", str(first))
+        rendered_first = _render(_failed("corrupt"))
+        monkeypatch.setenv("HERMES_HOME", str(second))
+        rendered_second = _render(_failed("corrupt"))
+
+        assert str(first / "state.db") in rendered_first
+        assert str(second / "state.db") in rendered_second
+
+    def test_the_salvage_path_is_quoted_for_paths_with_spaces(self):
+        """``%LOCALAPPDATA%`` sits under ``C:\\Users\\<name>``, which may contain
+        a space; an unquoted path would split into two sqlite3 arguments."""
+        assert '"{state_db}"' in _CORRUPT_RECOVERY_STEPS
+
+    def test_the_startup_warning_shares_the_same_steps(self):
+        """The gateway-startup home-channel warning is where this wording came
+        from.  Leaving its own copy hardcoded is how the cause table drifted
+        out of sync with PERSISTENCE_ERROR_CAUSES in the first place, so pin
+        that gateway/run.py holds exactly one set of recovery steps and no
+        literal home directory anywhere."""
+        from pathlib import Path
+
+        source = (Path(__file__).resolve().parents[2] / "gateway" / "run.py").read_text(
+            encoding="utf-8"
+        )
+
+        assert "sqlite3 ~/.hermes" not in source
+        assert "backup in ~/.hermes" not in source
+        assert source.count("1. Run `hermes doctor --fix`") == 1
+
+    def test_no_recovery_message_hardcodes_a_home_directory(self):
+        for cause, message in _PERSISTENCE_RECOVERY_MESSAGES.items():
+            assert "~/.hermes" not in message, (
+                f"{cause!r} hardcodes ~/.hermes; use the {{state_db}}/{{backups}} "
+                "placeholders so the message names this install's real paths"
+            )
+
+
+class TestUnknownDoesNotPromiseTheWriteLanded:
+    """The generic bucket is reached when classification failed outright.
+
+    Telling that user their message "should already be saved" is a claim
+    about the one thing we just failed to determine.  A resend after a
+    message that did land costs a duplicate; trusting a false "saved" costs
+    the message.
+    """
+
+    def test_does_not_claim_the_message_was_saved(self):
+        assert "should already be saved" not in _render(_failed("unknown"))
+
+    def test_still_asks_for_a_resend(self):
+        response = _render(_failed("unknown")).lower()
+
+        assert "send it" in response
+        assert "/reset" not in response
+
+    def test_the_named_transient_causes_still_reassure(self):
+        """The hedge is scoped to ``unknown`` -- ``locked`` and ``compression``
+        identified the failure, so they keep the reassurance they earned."""
+        for cause in sorted(CAUSES_THAT_MAY_CLAIM_THE_WRITE_LANDED):
+            assert "should already be saved" in _render(_failed(cause))
