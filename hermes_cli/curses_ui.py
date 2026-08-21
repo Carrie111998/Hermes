@@ -441,6 +441,54 @@ def _decode_menu_key(stdscr, key: int) -> str:
 # keypress changed cursor/selection state but didn't resolve the menu).
 _KEEP = object()
 
+# While the CLI's main prompt_toolkit loop owns the terminal, startup pushes
+# the Kitty keyboard protocol (CSI >1u) and/or xterm modifyOtherKeys (CSI
+# >4;2m) so modified keys (Ctrl+C, Ctrl+W, Shift+Enter, ...) arrive as
+# distinct CSI-u escape sequences instead of raw control bytes (see
+# ``_enable_extended_enter_keys`` in cli.py). ``curses.wrapper()`` below does
+# NOT know about those modes: curses' own ``getch()`` expects the classic
+# raw-control-byte encoding, so a keypress made while curses owns the
+# terminal can arrive as an escape sequence curses doesn't recognize, and
+# its tail (e.g. ``9;5u`` for Ctrl+C) gets echoed to the screen and/or left
+# in the input buffer for the next ``input()``/prompt_toolkit read to pick
+# up as literal text (issue: stray "9;5u9;5u" on screen after Ctrl+C/Ctrl+W
+# inside a curses picker). Pop those modes for the duration of the curses
+# session and restore them afterward, mirroring the existing
+# ``_recover_terminal_input_modes`` push/pop cycle in cli.py.
+_CURSES_EXTENDED_KEYS_POP_SEQ = "\x1b[<u" "\x1b[>4m"
+_CURSES_EXTENDED_KEYS_PUSH_SEQ = "\x1b[>1u" "\x1b[>4;2m"
+
+
+def _extended_key_modes_active() -> bool:
+    """Whether this terminal is one cli.py would have pushed extended keys on.
+
+    Lazy import avoids a hard circular dependency (cli.py imports from this
+    module); guards the pop/push cycle so we never turn Kitty/modifyOtherKeys
+    ON for a terminal that never opted in in the first place.
+    """
+    try:
+        from cli import _terminal_supports_extended_enter_keys
+
+        return bool(_terminal_supports_extended_enter_keys())
+    except Exception:
+        return False
+
+
+def _toggle_extended_key_modes(seq: str) -> None:
+    """Best-effort raw write of a terminal mode escape sequence to stdout.
+
+    No-op (and never raises) when stdout isn't a real TTY, or when this
+    terminal never had extended key modes pushed in the first place —
+    matches the guard used everywhere else these sequences are written.
+    """
+    try:
+        stream = sys.stdout
+        if stream is not None and stream.isatty() and _extended_key_modes_active():
+            stream.write(seq)
+            stream.flush()
+    except Exception:
+        pass
+
 
 def _run_curses_menu(
     *,
@@ -621,13 +669,19 @@ def _run_curses_menu(
                         result_holder[0] = outcome
                         return
 
-        curses.wrapper(_draw)
-        flush_stdin()
+        _toggle_extended_key_modes(_CURSES_EXTENDED_KEYS_POP_SEQ)
+        try:
+            curses.wrapper(_draw)
+        finally:
+            flush_stdin()
+            _toggle_extended_key_modes(_CURSES_EXTENDED_KEYS_PUSH_SEQ)
         return result_holder[0] if result_holder[0] is not _KEEP else cancel_value
 
     except KeyboardInterrupt:
+        _toggle_extended_key_modes(_CURSES_EXTENDED_KEYS_PUSH_SEQ)
         return cancel_value
     except Exception:
+        _toggle_extended_key_modes(_CURSES_EXTENDED_KEYS_PUSH_SEQ)
         return fallback()
 
 
@@ -879,6 +933,7 @@ def curses_single_select(
     cancel_label: str = "Cancel",
     searchable: bool = False,
     initial_query: str = "",
+    search_labels: List[str] | None = None,
 ) -> int | None:
     """Curses single-select menu. Returns selected index or None on cancel.
 
@@ -892,9 +947,24 @@ def curses_single_select(
     caller that already knows the user's intent (e.g. ``/ms foo``) can open
     straight into a filtered, still-live-editable view instead of forcing a
     second ``/`` keypress before the query can be changed.
+
+    ``search_labels``: optional per-item haystacks for type-to-filter (length
+    must equal ``items``; the synthetic cancel row is appended automatically).
+    Defaults to ``items`` when omitted. Pass this whenever ``items`` are
+    display-decorated (padded columns, "(Provider Name)" suffixes, "[auth]"
+    flags, etc.) — filtering against the decorated string lets short queries
+    spuriously match padding/decoration text instead of the real field (e.g.
+    "kimi" matching inside "zendesk-openai ... (Zendesk AI Gateway (OpenAI))"
+    via k/i/m/i scattered across "zendesk" + "openai", with no real Kimi
+    model in the list at all).
     """
     all_items = list(items) + [cancel_label]
     cancel_idx = len(items)
+    all_search_labels: List[str] | None = None
+    if searchable:
+        base_labels = list(search_labels) if search_labels is not None else list(items)
+        if len(base_labels) == len(items):
+            all_search_labels = base_labels + [cancel_label]
 
     def _draw_header(stdscr, max_y, max_x, search=None):
         import curses
@@ -947,7 +1017,7 @@ def curses_single_select(
         fallback=lambda: _numbered_single_fallback(title, all_items, cancel_idx),
         cancel_value=None,
         searchable=searchable,
-        search_labels=list(all_items) if searchable else None,
+        search_labels=(all_search_labels if searchable else None),
         initial_query=initial_query if searchable else "",
     )
 
