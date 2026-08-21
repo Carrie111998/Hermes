@@ -124,17 +124,25 @@ def test_cold_session_resume_reports_no_required_prompt_handler(monkeypatch, tmp
 
 
 @pytest.mark.parametrize(
-    "resume_mode",
+    ("resume_mode", "required_handler"),
     [
-        {"lazy": True},
-        {"defer_history": True},
+        ({"lazy": True}, "  hoppe_ocr_approval  "),
+        ({"lazy": True}, None),
+        ({"defer_history": True}, "  hoppe_ocr_approval  "),
+        ({"defer_history": True}, None),
     ],
-    ids=["lazy-watch", "deferred-history"],
+    ids=[
+        "lazy-watch-handler",
+        "lazy-watch-null",
+        "deferred-history-handler",
+        "deferred-history-null",
+    ],
 )
 def test_alternate_session_resume_modes_retain_required_prompt_handler(
     monkeypatch,
     tmp_path,
     resume_mode,
+    required_handler,
 ):
     """Alternate cold-resume branches must preserve the same iOS policy."""
     target = "stored-ios-alternate"
@@ -143,14 +151,16 @@ def test_alternate_session_resume_modes_retain_required_prompt_handler(
         "session_id": target,
         "source": "ios",
         "profile": "router",
-        "required_prompt_handler": "hoppe_ocr_approval",
+        "required_prompt_handler": required_handler,
         **resume_mode,
     }
 
     response = server._methods["session.resume"]("resume-alternate", params)
 
     sid = response["result"]["session_id"]
-    assert server._sessions[sid]["required_prompt_handler"] == "hoppe_ocr_approval"
+    expected = "hoppe_ocr_approval" if required_handler else None
+    assert server._sessions[sid]["required_prompt_handler"] == expected
+    assert response["result"]["required_prompt_handler"] == expected
 
 
 def test_live_session_resume_refreshes_required_prompt_handler(monkeypatch, tmp_path):
@@ -231,7 +241,17 @@ def test_eager_session_constructor_retains_required_prompt_handler(monkeypatch, 
     )
 
 
-def test_eager_session_resume_passes_required_prompt_handler(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("required_handler", "expected"),
+    [
+        ("  hoppe_ocr_approval  ", "hoppe_ocr_approval"),
+        (None, None),
+    ],
+    ids=["handler", "null"],
+)
+def test_eager_session_resume_passes_required_prompt_handler(
+    monkeypatch, tmp_path, required_handler, expected
+):
     """The real eager-resume branch must pass the client policy to its constructor."""
     target = "stored-ios-eager-resume"
     _prepare_resume(monkeypatch, tmp_path, target)
@@ -253,10 +273,57 @@ def test_eager_session_resume_passes_required_prompt_handler(monkeypatch, tmp_pa
             "session_id": target,
             "source": "ios",
             "profile": "router",
-            "required_prompt_handler": "hoppe_ocr_approval",
+            "required_prompt_handler": required_handler,
             "eager_build": True,
         },
     )
 
     sid = response["result"]["session_id"]
-    assert server._sessions[sid]["required_prompt_handler"] == "hoppe_ocr_approval"
+    assert server._sessions[sid]["required_prompt_handler"] == expected
+    assert response["result"]["required_prompt_handler"] == expected
+
+
+def test_eager_resume_race_reasserts_handler_on_concurrent_live_winner(
+    monkeypatch, tmp_path
+):
+    """A concurrent eager winner must use the same reconnect contract."""
+    target = "stored-ios-eager-race"
+    _prepare_resume(monkeypatch, tmp_path, target)
+    winner = server._deferred_session_record(
+        target,
+        cols=80,
+        cwd=str(tmp_path),
+        history=[],
+        lease=None,
+        source="ios",
+        required_prompt_handler=None,
+    )
+    closed = []
+
+    class _RedundantAgent:
+        def close(self):
+            closed.append(True)
+
+    def build_then_lose_race(*_args, **_kwargs):
+        server._sessions["winner-ui"] = winner
+        return _RedundantAgent()
+
+    monkeypatch.setattr(server, "_make_agent", build_then_lose_race)
+    monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+
+    response = server._methods["session.resume"](
+        "resume-eager-race",
+        {
+            "session_id": target,
+            "source": "ios",
+            "profile": "router",
+            "required_prompt_handler": "  hoppe_ocr_approval  ",
+            "eager_build": True,
+        },
+    )
+
+    assert response["result"]["session_id"] == "winner-ui"
+    assert response["result"]["required_prompt_handler"] == "hoppe_ocr_approval"
+    assert winner["required_prompt_handler"] == "hoppe_ocr_approval"
+    assert closed == [True]

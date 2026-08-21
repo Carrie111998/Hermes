@@ -524,6 +524,7 @@ def _(rid, params: dict) -> dict:
                 {
                     "session_id": sid,
                     "resumed": target,
+                    "required_prompt_handler": required_prompt_handler,
                     "message_count": len(display_history) if omit_messages else len(messages),
                     "messages": messages,
                     "messages_omitted": omit_messages,
@@ -586,6 +587,7 @@ def _(rid, params: dict) -> dict:
                 {
                     "session_id": sid,
                     "resumed": target,
+                    "required_prompt_handler": required_prompt_handler,
                     "message_count": record["resume_message_count"],
                     "messages": [],
                     "hydrating": True,
@@ -778,17 +780,7 @@ def _(rid, params: dict) -> dict:
                     pass
                 if lease is not None:
                     lease.release()
-                other_sid, other_session = live
-                payload = _live_session_payload(
-                    other_sid,
-                    other_session,
-                    cols=cols,
-                    touch=True,
-                    transport=current_transport() or _stdio_transport,
-                    omit_messages=omit_messages,
-                )
-                payload["resumed"] = target
-                return _ok(rid, payload)
+                return _ok(rid, _reuse_live_payload(*live))
             try:
                 init_home_token = (
                     set_hermes_home_override(str(profile_home))
@@ -889,6 +881,7 @@ def _(rid, params: dict) -> dict:
     payload = {
         "session_id": sid,
         "resumed": target,
+        "required_prompt_handler": required_prompt_handler,
         "message_count": len(raw_history) if omit_messages else len(messages),
         "messages": messages,
         "messages_omitted": omit_messages,

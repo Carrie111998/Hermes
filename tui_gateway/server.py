@@ -38,7 +38,10 @@ from agent.replay_cleanup import sanitize_replay_history
 from agent.skill_commands import describe_skill_invocation
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from tui_gateway import git_probe
-from tui_gateway.prompt_dispatch_hooks import invoke_pre_prompt_dispatch
+from tui_gateway.prompt_dispatch_hooks import (
+    invoke_pre_prompt_dispatch,
+    normalize_required_prompt_handler,
+)
 from tui_gateway.turn_marker import (
     clear_turn_marker,
     read_turn_marker,
@@ -1785,6 +1788,9 @@ def _compute_host_turn_frame(
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session),
+        "required_prompt_handler": normalize_required_prompt_handler(
+            session.get("required_prompt_handler")
+        ),
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,
     }
