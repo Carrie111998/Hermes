@@ -231,6 +231,11 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # User-input routing transform. Fired only for user-originated, plain
+    # non-command text after each surface has completed its own normalization
+    # and authorization checks. A valid ``{"action": "rewrite", "text": str}``
+    # result replaces the input; ``notice`` is display-only.
+    "pre_user_input_route",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
     # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.

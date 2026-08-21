@@ -15950,10 +15950,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return self._is_user_authorized(source)
         return check
 
+    async def _route_pre_user_input(self, event: MessageEvent) -> MessageEvent:
+        """Run the synchronous input-route hook off the gateway event loop."""
+        source = event.source
+        entry = await self.async_session_store.get_or_create_session(source)
+        session_id = str(getattr(entry, "session_id", "") or "")
+        if await asyncio.to_thread(self._goal_still_active_for_session, session_id):
+            return event
 
+        from hermes_cli.lifecycle import route_pre_user_input
 
-
-
+        text, notice = await asyncio.to_thread(
+            route_pre_user_input,
+            surface="gateway",
+            text=event.text,
+            session_key=self._session_key_for_source(source),
+            platform=source.platform.value if source.platform else "",
+            goal_active=False,
+            has_attachments=False,
+        )
+        if notice:
+            await self._deliver_platform_notice(source, notice)
+        return dataclasses.replace(event, text=text) if text != event.text else event
 
     async def _deliver_platform_notice(self, source, content: str) -> None:
         """Deliver a setup/operational notice using platform-specific privacy rules."""
@@ -16668,6 +16686,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # Route only real, attachment-free user text after authorization. The
+        # synchronous plugin API runs off-loop so a slow callback cannot stall
+        # gateway delivery; a rewrite can intentionally enter slash dispatch.
+        if (
+            not is_internal
+            and not getattr(source, "is_bot", False)
+            and event.message_type == MessageType.TEXT
+            and not event.media_urls
+            and not event.media_types
+            and isinstance(event.text, str)
+            and event.text.strip()
+            and not event.text.lstrip().startswith("/")
+        ):
+            try:
+                event = await self._route_pre_user_input(event)
+            except Exception:
+                logger.warning("pre_user_input_route failed", exc_info=True)
 
         # Global emergency stop (`hermes pause`): give new turns a brief
         # paused notice instead of starting an agent run. Internal events

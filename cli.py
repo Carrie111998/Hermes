@@ -12553,6 +12553,35 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._goal_manager = mgr
         return mgr
 
+    def _route_pre_user_input(self, text: str, *, has_attachments: bool = False) -> str:
+        """Let plugins rewrite one eligible interactive CLI input."""
+        goal_active = False
+        manager = self._get_goal_manager()
+        if manager is not None:
+            try:
+                goal_active = manager.is_active()
+            except Exception:
+                logger.debug("pre-user-input goal check failed", exc_info=True)
+        if goal_active:
+            return text
+        try:
+            from hermes_cli.lifecycle import route_pre_user_input
+
+            rewritten, notice = route_pre_user_input(
+                surface="cli",
+                text=text,
+                session_key=str(getattr(self, "session_id", "") or ""),
+                platform="cli",
+                goal_active=False,
+                has_attachments=has_attachments,
+            )
+        except Exception:
+            logger.warning("pre_user_input_route failed", exc_info=True)
+            return text
+        if notice:
+            _cprint(f"  {notice}")
+        return rewritten
+
     def _get_heartbeat_manager(self):
         """Return the HeartbeatManager bound to the current session_id.
 
@@ -20238,6 +20267,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         and self.handle_bang_shell(user_input)
                     ):
                         continue
+
+                    # Plugins may turn plain user text into a slash command,
+                    # but attachments, synthetic voice, active goals, and
+                    # explicit commands retain their existing routes.
+                    if (
+                        not _file_drop
+                        and not is_voice_input
+                        and not submit_images
+                        and isinstance(user_input, str)
+                        and user_input.strip()
+                        and not _looks_like_slash_command(user_input)
+                    ):
+                        user_input = self._route_pre_user_input(user_input)
 
                     if not _file_drop and isinstance(user_input, str) and _looks_like_slash_command(user_input):
                         _cprint(f"\n⚙️  {user_input}")
