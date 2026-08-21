@@ -97,6 +97,32 @@ class TestDetectToolFailureStructured:
         assert _detect_tool_failure("web_search", result) == (False, "")
 
 
+class TestDetectToolFailureNullError:
+    """A null/empty 'error' key must not be tagged as [error].
+
+    Regression test for #91166: the string heuristic sees '"error"' in
+    the raw JSON and false-positives.
+    """
+
+    def test_null_error_key_not_flagged(self):
+        result = json.dumps({"error": None, "data": "hello"})
+        assert _detect_tool_failure("web_search", result) == (False, "")
+
+    def test_empty_string_error_key_not_flagged(self):
+        result = json.dumps({"success": True, "error": "", "results": [1, 2, 3]})
+        assert _detect_tool_failure("web_search", result) == (False, "")
+
+    def test_null_error_with_success_true_not_flagged(self):
+        result = json.dumps({"success": True, "error": None, "data": "ok"})
+        assert _detect_tool_failure("web_search", result) == (False, "")
+
+    def test_real_error_still_detected(self):
+        result = json.dumps({"success": False, "error": "File not found: /x/y.py"})
+        is_failure, suffix = _detect_tool_failure("read_file", result)
+        assert is_failure is True
+        assert "File not found" in suffix
+
+
 
 class TestGetCuteToolMessageFailureSuffix:
     """End-to-end: failure suffix is appended by get_cute_tool_message."""

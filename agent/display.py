@@ -1369,8 +1369,13 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
         err = data.get("error") or data.get("message")
         if err and (data.get("success") is False or "error" in data):
             return True, f" [{_trim_error(str(err))}]"
+        # JSON parsed as a dict and matched no error pattern — trust the
+        # structure. Falling through to the string heuristic below would
+        # false-positive on keys like "error": null or "error": "".
+        return False, ""
 
-    # Generic heuristic for non-terminal tools
+    # Generic heuristic for non-terminal tools (only reached for non-JSON
+    # results or results where JSON parsing failed).
     # Multimodal tool results (dicts with _multimodal=True) are not strings —
     # treat them as successes since failures would be JSON-encoded strings.
     if not isinstance(result, str):

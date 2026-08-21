@@ -16,6 +16,10 @@ from typing import Any, Mapping
 from utils import safe_json_loads
 from agent.tool_result_classification import file_mutation_result_landed
 
+# Imported lazily at call time to avoid a circular import: display.py imports
+# from tool_guardrails via tool_executor. The function is a pure string helper.
+_TRIM_ERROR = None
+
 
 IDEMPOTENT_TOOL_NAMES = frozenset(
     {
@@ -262,6 +266,19 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
         if isinstance(data, dict):
             if data.get("success") is False and "exceed the limit" in data.get("error", ""):
                 return True, " [full]"
+
+    # Structured JSON result with no error pattern — trust the structure.
+    # Falling through to the string heuristic would false-positive on
+    # keys like "error": null or "error": "".
+    data = safe_json_loads(result)
+    if isinstance(data, dict):
+        err = data.get("error") or data.get("message")
+        if err and (data.get("success") is False or "error" in data):
+            global _TRIM_ERROR
+            if _TRIM_ERROR is None:
+                from agent.display import _trim_error as _TRIM_ERROR
+            return True, f" [{_TRIM_ERROR(str(err))}]"
+        return False, ""
 
     lower = result[:500].lower()
     if '"error"' in lower or '"failed"' in lower or result.startswith("Error"):

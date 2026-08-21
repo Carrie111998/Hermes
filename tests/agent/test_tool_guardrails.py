@@ -169,6 +169,23 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.should_halt is True
 
 
+def test_classify_tool_failure_null_error_not_flagged():
+    """Regression test for #91166: null/empty 'error' key must not be tagged."""
+    # Null error key
+    result = json.dumps({"error": None, "data": "hello"})
+    assert classify_tool_failure("web_search", result) == (False, "")
+
+    # Empty string error key
+    result = json.dumps({"success": True, "error": "", "results": [1, 2, 3]})
+    assert classify_tool_failure("web_search", result) == (False, "")
+
+    # Real error still detected
+    result = json.dumps({"success": False, "error": "File not found: /x/y.py"})
+    is_failure, suffix = classify_tool_failure("read_file", result)
+    assert is_failure is True
+    assert "File not found" in suffix
+
+
 
 
 
