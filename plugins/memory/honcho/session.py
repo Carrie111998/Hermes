@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 _ASYNC_SHUTDOWN = object()
 _PEER_ID_HASH_LEN = 8
 _PEER_ID_HASH_ESCALATION_LENGTHS = (_PEER_ID_HASH_LEN, 12, 16, 24, 32, 64)
+_LOCAL_MESSAGE_RETENTION = 100
 
 
 class HonchoAuthError(RuntimeError):
@@ -108,6 +109,18 @@ class HonchoSession:
             else self.messages
         )
         return [{"role": m["role"], "content": m["content"]} for m in recent]
+
+    def trim_synced_messages(self, max_messages: int = _LOCAL_MESSAGE_RETENTION) -> None:
+        """Bound durable local history while retaining every pending write."""
+        synced_slots = max(0, max_messages)
+        retained_reversed: list[dict[str, Any]] = []
+        for message in reversed(self.messages):
+            if not message.get("_synced"):
+                retained_reversed.append(message)
+            elif synced_slots > 0:
+                retained_reversed.append(message)
+                synced_slots -= 1
+        self.messages = list(reversed(retained_reversed))
 
     def clear(self) -> None:
         """Clear all messages in the session."""
@@ -651,6 +664,7 @@ class HonchoSessionManager:
             honcho_session_id=honcho_session_id,
             messages=local_messages,
         )
+        session.trim_synced_messages()
 
         # Write to cache under lock — only one writer wins
         with self._cache_lock:
@@ -664,6 +678,7 @@ class HonchoSessionManager:
 
         new_messages = [m for m in session.messages if not m.get("_synced")]
         if not new_messages:
+            session.trim_synced_messages()
             return True
 
         # Resolved inside the operation so a retry after a client rebuild gets fresh objects.
@@ -686,6 +701,7 @@ class HonchoSessionManager:
             synced = self._authed_call("message sync", _sync_messages)
             for msg in new_messages:
                 msg["_synced"] = True
+            session.trim_synced_messages()
             logger.debug("Synced %d messages to Honcho for %s", synced, session.key)
             with self._cache_lock:
                 self._cache[session.key] = session

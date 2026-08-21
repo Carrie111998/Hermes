@@ -60,6 +60,29 @@ class TestHonchoSession:
         session.clear()
         assert session.messages == []
 
+    def test_trim_synced_messages_keeps_recent_retention_window(self):
+        session = self._make_session()
+        session.messages = [
+            {"role": "user", "content": str(index), "_synced": True}
+            for index in range(8)
+        ]
+
+        session.trim_synced_messages(3)
+
+        assert [message["content"] for message in session.messages] == ["5", "6", "7"]
+
+    def test_trim_synced_messages_never_drops_pending_writes(self):
+        session = self._make_session()
+        session.messages = [
+            {"role": "user", "content": "old", "_synced": True},
+            {"role": "user", "content": "pending", "_synced": False},
+            {"role": "assistant", "content": "recent", "_synced": True},
+        ]
+
+        session.trim_synced_messages(1)
+
+        assert [message["content"] for message in session.messages] == ["pending", "recent"]
+
 
 # ---------------------------------------------------------------------------
 # HonchoSessionManager._sanitize_id
@@ -131,6 +154,24 @@ class TestManagerCacheOps:
         assert keys == {"k1", "k2"}
         s1_info = next(s for s in sessions if s["key"] == "k1")
         assert s1_info["message_count"] == 1
+
+    def test_successful_flush_trims_durable_local_history(self):
+        mgr = HonchoSessionManager()
+        session = HonchoSession(
+            key="bounded",
+            user_peer_id="u",
+            assistant_peer_id="a",
+            honcho_session_id="s",
+        )
+        for index in range(105):
+            session.add_message("user", str(index))
+        mgr._authed_call = MagicMock(return_value=105)
+
+        assert mgr._flush_session(session) is True
+
+        assert len(session.messages) == 100
+        assert session.messages[0]["content"] == "5"
+        assert all(message["_synced"] for message in session.messages)
 
 
 class TestPeerLookupHelpers:

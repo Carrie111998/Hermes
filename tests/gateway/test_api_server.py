@@ -226,6 +226,139 @@ class TestAdapterInit:
         assert captured["checkpoint_max_total_size_mb"] == 321
         assert captured["checkpoint_max_file_size_mb"] == 4
 
+    def test_create_agent_reuses_ready_honcho_manager_for_same_session(self, monkeypatch):
+        captured = []
+
+        class FakeProvider:
+            name = "honcho"
+            _session_initialized = True
+            _manager = object()
+
+        class FakeManager:
+            providers = [FakeProvider()]
+
+            def shutdown_all(self):
+                raise AssertionError("the cached manager must remain live")
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.append(kwargs)
+                self._memory_manager = kwargs.get("external_memory_manager")
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {"provider": "openai-codex", "base_url": "https://example.test/v1"},
+        )
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5.5")
+        monkeypatch.setattr(
+            "gateway.run._load_gateway_config",
+            lambda: {"memory": {"provider": "honcho"}},
+        )
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_reasoning_config",
+            staticmethod(lambda model="": {}),
+        )
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_honcho_memory_cache_key", lambda **_: ("profile", "session"))
+        manager = FakeManager()
+        adapter._remember_agent_memory_manager(
+            types.SimpleNamespace(_memory_manager=manager),
+            ("profile", "session"),
+        )
+        adapter._release_agent_memory_manager(
+            types.SimpleNamespace(
+                _api_memory_cache_entry=next(iter(adapter._memory_manager_cache.values()))
+            )
+        )
+
+        agent = adapter._create_agent(session_id="session", gateway_session_key="stable-chat")
+
+        assert isinstance(agent, FakeAgent)
+        assert captured[-1]["external_memory_manager"] is manager
+        assert agent._memory_manager is manager
+
+    def test_unready_honcho_manager_is_not_reused(self):
+        class FakeProvider:
+            name = "honcho"
+            _session_initialized = False
+            _manager = None
+
+        class FakeManager:
+            providers = [FakeProvider()]
+
+            def shutdown_all(self):
+                pass
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        key = ("profile", "session")
+        adapter._remember_agent_memory_manager(
+            types.SimpleNamespace(_memory_manager=FakeManager()),
+            key,
+        )
+        adapter._release_agent_memory_manager(
+            types.SimpleNamespace(
+                _api_memory_cache_entry=next(iter(adapter._memory_manager_cache.values()))
+            )
+        )
+
+        assert adapter._acquire_memory_manager(key) is None
+
+    def test_concurrent_miss_does_not_share_initializing_honcho_manager(self):
+        class FakeProvider:
+            name = "honcho"
+            _session_initialized = False
+            _manager = None
+
+        class FakeManager:
+            providers = [FakeProvider()]
+
+            def shutdown_all(self):
+                pass
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        key = ("profile", "session")
+        first = types.SimpleNamespace(_memory_manager=FakeManager())
+        second = types.SimpleNamespace(_memory_manager=FakeManager())
+
+        adapter._remember_agent_memory_manager(first, key)
+        adapter._remember_agent_memory_manager(second, key)
+
+        assert second._memory_manager is not first._memory_manager
+        assert not hasattr(second, "_api_memory_cache_entry")
+
+    def test_memory_manager_cache_evicts_inactive_lru_entry(self):
+        class FakeProvider:
+            name = "honcho"
+            _session_initialized = True
+            _manager = object()
+
+        class FakeManager:
+            providers = [FakeProvider()]
+
+            def __init__(self):
+                self.shutdown_calls = 0
+
+            def shutdown_all(self):
+                self.shutdown_calls += 1
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        adapter._MEMORY_MANAGER_CACHE_MAX = 1
+        first_manager = FakeManager()
+        first = types.SimpleNamespace(_memory_manager=first_manager)
+        adapter._remember_agent_memory_manager(first, ("profile", "one"))
+        adapter._release_agent_memory_manager(first)
+
+        second = types.SimpleNamespace(_memory_manager=FakeManager())
+        adapter._remember_agent_memory_manager(second, ("profile", "two"))
+
+        assert list(adapter._memory_manager_cache) == [("profile", "two")]
+        assert first_manager.shutdown_calls == 1
+
 
 # ---------------------------------------------------------------------------
 # Auth checking

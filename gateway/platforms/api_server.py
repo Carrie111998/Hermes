@@ -42,6 +42,7 @@ Requires:
 
 import asyncio
 import concurrent.futures
+from collections import OrderedDict
 import errno
 import hashlib
 import hmac
@@ -77,6 +78,19 @@ _api_request_browser_control_principal: ContextVar[str] = ContextVar(
 _api_request_browser_control_transport_family: ContextVar[str] = ContextVar(
     "api_server_browser_control_transport_family", default=""
 )
+
+
+class _MemoryManagerCacheEntry:
+    """One bounded API-session lease on a long-lived memory manager."""
+
+    __slots__ = ("key", "manager", "last_used", "active", "run_lock")
+
+    def __init__(self, key: tuple, manager: Any):
+        self.key = key
+        self.manager = manager
+        self.last_used = time.monotonic()
+        self.active = 1
+        self.run_lock = threading.Lock()
 
 #: Minimal scope shape accepted by :func:`gateway.browser_control_artifacts
 #: .artifact_scope_key`: principal + session + transport family.  The API
@@ -1544,6 +1558,13 @@ class APIServerAdapter(BasePlatformAdapter):
         self._session_dbs: Dict[str, Any] = {}
         self._session_db_cache_lock = threading.Lock()
         self._session_db_cache_closed = False
+        # Honcho stages recall across turns, so the API server must preserve its
+        # MemoryManager even though it intentionally rebuilds AIAgent for every
+        # request. Entries are session-scoped, bounded, and idle-evicted; active
+        # turns are never evicted underneath their provider threads.
+        self._memory_manager_cache: "OrderedDict[tuple, _MemoryManagerCacheEntry]" = OrderedDict()
+        self._memory_manager_cache_lock = threading.Lock()
+        self._memory_manager_cache_closed = False
         # Last-known-good resolved model per session (keyed by gateway_session_key
         # ONLY — never session_id, which rotates/is ephemeral for one-off API
         # server requests; "*" is the process-wide fallback), mirroring
@@ -1589,6 +1610,187 @@ class APIServerAdapter(BasePlatformAdapter):
         # _inject_browser_control_artifacts().
         self._browser_control_artifacts: Dict[str, ArtifactStore] = {}
         self._browser_control_artifact_limiter: Optional[ArtifactRateLimiter] = None
+
+    _MEMORY_MANAGER_CACHE_MAX = 128
+    _MEMORY_MANAGER_CACHE_IDLE_TTL = 3600.0
+
+    @staticmethod
+    def _honcho_manager_ready(manager: Any) -> bool:
+        """Whether a manager owns a successfully initialized Honcho provider."""
+        providers = getattr(manager, "providers", ()) if manager is not None else ()
+        for provider in providers:
+            if getattr(provider, "name", "") != "honcho":
+                continue
+            return bool(
+                getattr(provider, "_session_initialized", False)
+                and getattr(provider, "_manager", None) is not None
+            )
+        return False
+
+    @staticmethod
+    def _honcho_manager_initializing(manager: Any) -> bool:
+        """Whether Honcho session setup is still running in the background."""
+        providers = getattr(manager, "providers", ()) if manager is not None else ()
+        for provider in providers:
+            if getattr(provider, "name", "") != "honcho":
+                continue
+            init_thread = getattr(provider, "_init_thread", None)
+            return bool(init_thread is not None and init_thread.is_alive())
+        return False
+
+    @staticmethod
+    def _honcho_memory_cache_key(
+        *,
+        user_config: Dict[str, Any],
+        session_id: Optional[str],
+        gateway_session_key: Optional[str],
+    ) -> Optional[tuple]:
+        """Build a credential-, profile-, and session-scoped Honcho cache key."""
+        memory_config = user_config.get("memory") if isinstance(user_config, dict) else None
+        if not isinstance(memory_config, dict) or memory_config.get("provider") != "honcho":
+            return None
+        try:
+            from plugins.memory.honcho.client import (
+                HonchoClientConfig,
+                _client_cache_key,
+            )
+
+            config = HonchoClientConfig.from_global_config()
+            if not config.enabled or not (config.api_key or config.base_url):
+                return None
+            resolved_session = (
+                config.resolve_session_name(
+                    session_id=session_id,
+                    gateway_session_key=gateway_session_key,
+                )
+                or session_id
+                or gateway_session_key
+            )
+            if not resolved_session:
+                return None
+            return (
+                "honcho",
+                _client_cache_key(config),
+                config.context_tokens,
+                resolved_session,
+            )
+        except Exception:
+            logger.debug("Unable to resolve Honcho API memory cache identity", exc_info=True)
+            return None
+
+    def _retire_memory_manager_entries(self, entries: List[_MemoryManagerCacheEntry]) -> None:
+        for entry in entries:
+            try:
+                entry.manager.shutdown_all()
+            except Exception:
+                logger.debug("Failed to retire cached API memory manager", exc_info=True)
+
+    def _sweep_memory_manager_cache_locked(self, now: float) -> List[_MemoryManagerCacheEntry]:
+        retired: List[_MemoryManagerCacheEntry] = []
+        for key, entry in list(self._memory_manager_cache.items()):
+            if entry.active == 0 and now - entry.last_used >= self._MEMORY_MANAGER_CACHE_IDLE_TTL:
+                self._memory_manager_cache.pop(key, None)
+                retired.append(entry)
+
+        while len(self._memory_manager_cache) > self._MEMORY_MANAGER_CACHE_MAX:
+            victim_key = next(
+                (key for key, entry in self._memory_manager_cache.items() if entry.active == 0),
+                None,
+            )
+            if victim_key is None:
+                break
+            retired.append(self._memory_manager_cache.pop(victim_key))
+        return retired
+
+    def _acquire_memory_manager(self, key: Optional[tuple]) -> Optional[_MemoryManagerCacheEntry]:
+        if key is None:
+            return None
+        retired: List[_MemoryManagerCacheEntry] = []
+        with self._memory_manager_cache_lock:
+            if self._memory_manager_cache_closed:
+                return None
+            now = time.monotonic()
+            retired.extend(self._sweep_memory_manager_cache_locked(now))
+            entry = self._memory_manager_cache.get(key)
+            if entry is not None and not self._honcho_manager_ready(entry.manager):
+                if entry.active == 0 and not self._honcho_manager_initializing(entry.manager):
+                    self._memory_manager_cache.pop(key, None)
+                    retired.append(entry)
+                entry = None
+            if entry is not None:
+                entry.active += 1
+                entry.last_used = now
+                self._memory_manager_cache.move_to_end(key)
+        self._retire_memory_manager_entries(retired)
+        return entry
+
+    def _remember_agent_memory_manager(self, agent: Any, key: Optional[tuple]) -> None:
+        manager = getattr(agent, "_memory_manager", None)
+        if key is None or manager is None:
+            return
+        retired: List[_MemoryManagerCacheEntry] = []
+        with self._memory_manager_cache_lock:
+            if self._memory_manager_cache_closed:
+                return
+            entry = self._memory_manager_cache.get(key)
+            if entry is not None and not self._honcho_manager_ready(entry.manager):
+                # Never publish a manager whose remote session setup has not
+                # succeeded. A simultaneous first request keeps its independent
+                # provider until the candidate becomes ready or is discarded.
+                if entry.active > 0 or self._honcho_manager_initializing(entry.manager):
+                    return
+                self._memory_manager_cache.pop(key, None)
+                retired.append(entry)
+                entry = None
+            if entry is None:
+                entry = _MemoryManagerCacheEntry(key, manager)
+                self._memory_manager_cache[key] = entry
+            else:
+                entry.active += 1
+                if manager is not entry.manager:
+                    discarded = _MemoryManagerCacheEntry(key, manager)
+                    discarded.active = 0
+                    retired.append(discarded)
+                    agent._memory_manager = entry.manager
+            entry.last_used = time.monotonic()
+            self._memory_manager_cache.move_to_end(key)
+            retired.extend(self._sweep_memory_manager_cache_locked(entry.last_used))
+            agent._api_memory_cache_entry = entry
+        self._retire_memory_manager_entries(retired)
+
+    def _release_agent_memory_manager(self, agent: Any) -> None:
+        entry = getattr(agent, "_api_memory_cache_entry", None)
+        if not isinstance(entry, _MemoryManagerCacheEntry):
+            return
+        agent._api_memory_cache_entry = None
+        self._release_memory_manager_entry(entry)
+
+    def _release_memory_manager_entry(self, entry: _MemoryManagerCacheEntry) -> None:
+        with self._memory_manager_cache_lock:
+            entry.active = max(0, entry.active - 1)
+            entry.last_used = time.monotonic()
+            retired = self._sweep_memory_manager_cache_locked(entry.last_used)
+        self._retire_memory_manager_entries(retired)
+
+    @contextmanager
+    def _memory_manager_run_scope(self, agent: Any):
+        entry = getattr(agent, "_api_memory_cache_entry", None)
+        if not isinstance(entry, _MemoryManagerCacheEntry):
+            yield
+            return
+        entry.run_lock.acquire()
+        try:
+            yield
+        finally:
+            entry.run_lock.release()
+            self._release_agent_memory_manager(agent)
+
+    def _close_cached_memory_managers(self) -> None:
+        with self._memory_manager_cache_lock:
+            self._memory_manager_cache_closed = True
+            entries = list(self._memory_manager_cache.values())
+            self._memory_manager_cache.clear()
+        self._retire_memory_manager_entries(entries)
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -3056,6 +3258,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        memory_cache_key = self._honcho_memory_cache_key(
+            user_config=user_config,
+            session_id=session_id,
+            gateway_session_key=gateway_session_key,
+        )
+        memory_cache_entry = self._acquire_memory_manager(memory_cache_key)
 
         max_iterations = _current_max_iterations()
 
@@ -3100,11 +3308,23 @@ class APIServerAdapter(BasePlatformAdapter):
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
+            "external_memory_manager": (
+                memory_cache_entry.manager if memory_cache_entry is not None else None
+            ),
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
 
-        agent = AIAgent(**agent_kwargs)
+        try:
+            agent = AIAgent(**agent_kwargs)
+        except Exception:
+            if memory_cache_entry is not None:
+                self._release_memory_manager_entry(memory_cache_entry)
+            raise
+        if memory_cache_entry is not None:
+            agent._api_memory_cache_entry = memory_cache_entry
+        else:
+            self._remember_agent_memory_manager(agent, memory_cache_key)
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
@@ -7231,11 +7451,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     # ``agent_ref``, and only /v1/runs has a run_id, so neither
                     # is a usable hook for the rest.
                     self._shutdown_interruptible_agents[id(agent)] = agent
-                    result = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id=effective_task_id,
-                    )
+                    with self._memory_manager_run_scope(agent):
+                        result = agent.run_conversation(
+                            user_message=user_message,
+                            conversation_history=conversation_history,
+                            task_id=effective_task_id,
+                        )
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -7362,6 +7583,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         self._active_run_agents.pop(active_run_id, None)
                     if agent is not None:
                         _clear_turn_process_ownership(agent)
+                        self._release_agent_memory_manager(agent)
                         # Symmetric with the registration above: the turn is
                         # over, so it must not be interrupted by a later
                         # shutdown.  pop() is a no-op when _create_agent
@@ -7636,6 +7858,7 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
         async def _run_and_close():
+            agent = None
             try:
                 self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
@@ -7736,11 +7959,12 @@ class APIServerAdapter(BasePlatformAdapter):
                             # ownership so stop/cancel can reap only the
                             # background processes this run created (#76115).
                             _publish_turn_process_ownership(agent, effective_task_id)
-                            r = agent.run_conversation(
-                                user_message=user_message,
-                                conversation_history=conversation_history,
-                                task_id=effective_task_id,
-                            )
+                            with self._memory_manager_run_scope(agent):
+                                r = agent.run_conversation(
+                                    user_message=user_message,
+                                    conversation_history=conversation_history,
+                                    task_id=effective_task_id,
+                                )
                         finally:
                             # Worker finished (interrupted or complete) —
                             # clear turn ownership immediately so a later
@@ -7748,6 +7972,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             # run deliberately left running (same race-window
                             # guard as gateway/run.py and _run_agent above).
                             _clear_turn_process_ownership(agent)
+                            self._release_agent_memory_manager(agent)
                             try:
                                 unregister_gateway_notify(approval_session_key)
                             finally:
@@ -7895,6 +8120,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     _put_event_if_active(None)
                 except Exception:
                     pass
+                if agent is not None:
+                    self._release_agent_memory_manager(agent)
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
@@ -8446,6 +8673,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._runner = None
         finally:
             self._close_cached_session_dbs()
+            self._close_cached_memory_managers()
             self._app = None
         logger.info("[%s] API server stopped", self.name)
 

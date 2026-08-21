@@ -576,6 +576,7 @@ def init_agent(
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
+    external_memory_manager=None,
     skip_background_review: bool = False,
     session_db=None,
     parent_session_id: str = None,
@@ -1853,8 +1854,8 @@ def init_agent(
 
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
-    agent._memory_manager = None
-    if not skip_memory:
+    agent._memory_manager = external_memory_manager
+    if not skip_memory and agent._memory_manager is None:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
