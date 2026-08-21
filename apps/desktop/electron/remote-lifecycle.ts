@@ -244,14 +244,24 @@ async function locateHermes(ssh, remoteHermesPath) {
   throw err
 }
 
-// Probe the resolved binary's version string (first line of `<hermes> --version`,
-// e.g. "Hermes Agent v0.18.2 ..."), or '' on failure. Surfaces WHICH hermes a
-// connection uses, so a stale/unexpected install is visible.
+// Probe the resolved binary's version string (e.g. "Hermes Agent v0.18.2 ..."),
+// or '' on failure. Surfaces WHICH hermes a connection uses, so a
+// stale/unexpected install is visible.
+//
+// Read stdout only, and pick the line by SHAPE rather than position: a remote
+// whose config emits warnings (an unresolved ``${env:…}`` ref, say) prints them
+// to stderr, and merging streams used to put one of them first — so the app
+// recorded a warning as the version.
 async function probeHermesVersion(ssh, hermesPath) {
   try {
-    const out = (await ssh.exec(`${expandRemotePath(hermesPath)} --version 2>&1`)).trim()
+    const out = (await ssh.exec(`${expandRemotePath(hermesPath)} --version`)).trim()
+    const lines = out.split('\n').map(line => line.trim())
 
-    return (out.split('\n')[0] || '').trim()
+    return (
+      lines.find(line => /Hermes Agent v\S+/.test(line)) ??
+      lines.find(line => /\bv?\d+\.\d+\.\d+/.test(line) && !/^Config ref\b/.test(line)) ??
+      ''
+    )
   } catch {
     return ''
   }

@@ -26,6 +26,7 @@ import {
   openForward,
   ownershipDirectory,
   pidIsOurDashboard,
+  probeHermesVersion,
   probeRemotePlatform,
   PROTOCOL_VERSION,
   readLockfile,
@@ -1070,6 +1071,38 @@ test('connect() reuses a healthy dashboard when fingerprint + probe pass', async
   assert.equal(result.remotePort, 40000)
   // never spawned
   assert.ok(!ssh.calls.some(c => /setsid/.test(c)), 'reuse path must not spawn a new dashboard')
+})
+
+test('probeHermesVersion() picks the version line, not a leading config warning', async () => {
+  // A remote whose config has an unresolved ``${env:…}`` ref warns on stderr.
+  // Those warnings must never be mistaken for the version.
+  const ssh = fakeSsh([[/--version/, 'Hermes Agent v0.20.4 (2026.8.18) · upstream efb6b40f\nInstall method: git\n']])
+
+  assert.equal(
+    await probeHermesVersion(ssh, '/usr/bin/hermes'),
+    'Hermes Agent v0.20.4 (2026.8.18) · upstream efb6b40f'
+  )
+  assert.ok(
+    ssh.calls.some(c => /--version/.test(c) && !/2>&1/.test(c)),
+    'must read stdout only so stderr warnings cannot contaminate the capture'
+  )
+})
+
+test('probeHermesVersion() skips warning lines that precede the version', async () => {
+  const ssh = fakeSsh([
+    [
+      /--version/,
+      "Config ref '${env:MODAL_KIMI_KEY}': MODAL_KIMI_KEY is not set (check ~/.hermes/.env); keeping the literal placeholder\nHermes Agent v0.20.4 (2026.8.18)\n"
+    ]
+  ])
+
+  assert.equal(await probeHermesVersion(ssh, '/usr/bin/hermes'), 'Hermes Agent v0.20.4 (2026.8.18)')
+})
+
+test('probeHermesVersion() returns empty when no version line is present', async () => {
+  const ssh = fakeSsh([[/--version/, "Config ref '${env:X}': X is not set\n"]])
+
+  assert.equal(await probeHermesVersion(ssh, '/usr/bin/hermes'), '')
 })
 
 test('connect() respawns when the requested remote profile differs from the lockfile profile', async () => {
