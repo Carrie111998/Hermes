@@ -57,6 +57,13 @@ _EXCLUDED_DIR_NAMES = frozenset({
     "site-packages", "dist-packages",
     "backups", "backup", ".backups",
     "vendor", "third_party",
+    # Agent/tooling home dirs: their AGENTS.md files are tool docs (e.g. the
+    # Hermes dev guide), not user-project context. Sessions rooted at $HOME
+    # would otherwise walk up into ~/.hermes/ and inject them. Sessions whose
+    # working_dir IS inside .hermes/ still load hints normally (the
+    # relative_to() check in _is_excluded only screens segments below
+    # working_dir).
+    ".hermes",
 })
 
 

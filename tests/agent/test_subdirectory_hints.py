@@ -255,6 +255,33 @@ class TestExcludedDirectories:
         tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
         assert tracker.check_tool_call("read_file", {"path": str(target / "f.py")}) is None
 
+    def test_hermes_home_excluded_from_home_rooted_sessions(self, tmp_path):
+        """~/.hermes AGENTS.md (tool docs) must not leak into home-rooted sessions."""
+        hermes = tmp_path / ".hermes" / "hermes-agent"
+        hermes.mkdir(parents=True)
+        (hermes / "AGENTS.md").write_text("Hermes development guide")
+
+        tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
+        assert (
+            tracker.check_tool_call(
+                "read_file", {"path": str(hermes / "agent" / "subdirectory_hints.py")}
+            )
+            is None
+        )
+
+    def test_working_dir_inside_hermes_still_loads(self, tmp_path):
+        """A session whose working_dir IS ~/.hermes/hermes-agent keeps its hints."""
+        hermes = tmp_path / ".hermes" / "hermes-agent"
+        hermes.mkdir(parents=True)
+        (hermes / "AGENTS.md").write_text("Hermes development guide")
+        pkg = hermes / "agent"
+        pkg.mkdir()
+        (pkg / "AGENTS.md").write_text("Agent package rules")
+
+        tracker = SubdirectoryHintTracker(working_dir=str(hermes))
+        result = tracker.check_tool_call("read_file", {"path": str(pkg / "f.py")})
+        assert result is not None and "Agent package rules" in result
+
     def test_excluded_ancestor_blocks_descendant(self, tmp_path):
         """A hint nested under an excluded ancestor is still skipped."""
         deep = tmp_path / "backups" / "2026" / "proj"
