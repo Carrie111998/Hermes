@@ -4968,6 +4968,156 @@ def _handle_session_expired_and_retry(
     return None
 
 
+# Type names of exceptions the MCP SDK / httpcore2 stack raises when a
+# pooled keep-alive connection turns out to have been closed by the remote
+# (CDN idle kill, load-balancer drain, server restart, ...).  Checked by
+# name rather than isinstance because the exact classes differ between the
+# SDK's httpx2 stack and Hermes' own httpx, and either can be unreachable
+# for import at module load.
+_STALE_CONNECTION_TYPE_NAMES: frozenset = frozenset({
+    "RemoteProtocolError",
+    "ConnectionClosed",
+    "ConnectionResetError",
+    "ConnectionAbortedError",
+})
+
+# Message markers for the same failure class.  These are phrased after
+# what the SDK actually emits: ``MCPError: Connection closed`` and
+# ``RemoteProtocolError: Server disconnected without sending a response``
+# (httpcore2 wraps the latter in the SDK's own transport errors).
+_STALE_CONNECTION_MARKERS: tuple = (
+    "server disconnected",
+    "connection reset",
+    "connection closed",
+    "peer closed connection",
+    "remote protocol error",
+)
+
+
+def _is_stale_connection_error(exc: BaseException) -> bool:
+    """Return True if ``exc`` is a stale/dead-connection transport failure.
+
+    Distinct from :func:`_is_session_expired_error`: that classifier covers
+    server-side session GC (``Invalid or expired session``) plus AnyIO
+    stream closures.  This one covers the remote closing the underlying
+    keep-alive connection out from under us — the failure the user sees as
+    ``MCPError: Connection closed`` / ``RemoteProtocolError: Server
+    disconnected without sending a response`` when a CDN or proxy kills an
+    idle connection (#90166).  Both are transient transport conditions that
+    a rebuild-and-retry-once recovers from; neither is a credential or
+    config problem.
+
+    Uses the same bounded, identity-visited traversal as
+    :func:`_is_session_expired_error` so arbitrarily deep ExceptionGroup /
+    ``__cause__`` graphs terminate promptly.
+    """
+    stack: "list[BaseException | None]" = [exc]
+    seen: set[int] = set()
+    budget = _EXC_TRAVERSAL_MAX_NODES
+    while stack and budget > 0:
+        current = stack.pop()
+        if current is None:
+            continue
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        budget -= 1
+
+        if isinstance(current, InterruptedError):
+            return False
+        if type(current).__name__ in _STALE_CONNECTION_TYPE_NAMES:
+            return True
+        msg = str(current).lower()
+        if msg and any(marker in msg for marker in _STALE_CONNECTION_MARKERS):
+            return True
+
+        stack.extend(getattr(current, "exceptions", ()))
+        stack.append(getattr(current, "__cause__", None))
+        stack.append(getattr(current, "__context__", None))
+
+    return False
+
+
+def _handle_stale_connection_and_retry(
+    server_name: str,
+    exc: BaseException,
+    retry_call,
+    op_description: str,
+):
+    """Rebuild the transport and retry once on a stale-connection failure.
+
+    Mirrors :func:`_handle_session_expired_and_retry` (see #13383): signal
+    the server task's reconnect event so the dead transport is torn down
+    and a fresh ``streamablehttp_client`` + ``ClientSession`` pair is
+    built, wait for the new session to report ready, then re-run the
+    operation exactly once.  A CDN/load-balancer idle kill is transient —
+    the server itself is healthy — so surfacing ``Connection closed`` to
+    the model without a retry turns an invisible 300s-recoverable blip
+    into a visible tool failure (#90166).
+
+    Args:
+        server_name: Name of the MCP server that raised.
+        exc: The exception from the failed call.
+        retry_call: Zero-arg callable that re-runs the operation,
+            returning the same JSON string format as the handler.
+        op_description: Human-readable name of the operation (logs).
+
+    Returns:
+        A JSON string if reconnect + retry was attempted and produced a
+        response, or ``None`` to fall through to the caller's generic
+        error path (not a stale-connection error, no server record,
+        reconnect didn't ready in time, or retry also failed).
+    """
+    if not _is_stale_connection_error(exc):
+        return None
+
+    with _lock:
+        srv = _servers.get(server_name)
+    if srv is None or not hasattr(srv, "_reconnect_event"):
+        return None
+
+    loop = _mcp_loop
+    if loop is None or not loop.is_running():
+        return None
+
+    logger.info(
+        "MCP server '%s': %s failed with stale-connection error (%s); "
+        "signalling transport reconnect and retrying once.",
+        server_name, op_description, exc,
+    )
+
+    if not _signal_reconnect_and_wait(
+        server_name,
+        srv,
+        op_description=op_description,
+        timeout=15,
+    ):
+        logger.warning(
+            "MCP server '%s': reconnect did not ready within 15s after "
+            "stale-connection error; falling through to error response.",
+            server_name,
+        )
+        return None
+
+    try:
+        result = retry_call()
+        try:
+            parsed = json.loads(result)
+            if "error" not in parsed:
+                _reset_server_error(server_name)
+                return result
+        except (json.JSONDecodeError, TypeError):
+            _reset_server_error(server_name)
+            return result
+    except Exception as retry_exc:
+        logger.warning(
+            "MCP %s/%s retry after stale-connection reconnect failed: %s",
+            server_name, op_description, retry_exc,
+        )
+    return None
+
+
 # Exact raw server names whose ``supports_parallel_tool_calls`` config is True.
 # Raw identity matters: distinct names such as ``foo-bar`` and ``foo_bar`` both
 # sanitize to ``foo_bar`` but must not share policy.
@@ -5998,6 +6148,17 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             if recovered is not None:
                 return recovered
 
+            # Stale keep-alive connection (#90166): a CDN / load balancer
+            # closed an idle connection out from under us. Rebuild the
+            # transport and retry once instead of surfacing
+            # ``MCPError: Connection closed`` to the model.
+            recovered = _handle_stale_connection_and_retry(
+                server_name, exc, _call_once,
+                f"tools/call {tool_name}",
+            )
+            if recovered is not None:
+                return recovered
+
             _bump_server_error(server_name)
             logger.error(
                 "MCP tool %s/%s call failed: %s",
@@ -6059,6 +6220,11 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
             )
             if recovered is not None:
                 return recovered
+            recovered = _handle_stale_connection_and_retry(
+                server_name, exc, _call_once, "resources/list",
+            )
+            if recovered is not None:
+                return recovered
             logger.error(
                 "MCP %s/list_resources failed: %s", server_name, exc,
             )
@@ -6116,6 +6282,11 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
             if recovered is not None:
                 return recovered
             recovered = _handle_session_expired_and_retry(
+                server_name, exc, _call_once, "resources/read",
+            )
+            if recovered is not None:
+                return recovered
+            recovered = _handle_stale_connection_and_retry(
                 server_name, exc, _call_once, "resources/read",
             )
             if recovered is not None:
