@@ -1,6 +1,8 @@
 """Tests for hermes_constants module."""
 
 import os
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1099,3 +1101,119 @@ class TestHealAttemptFlagSemantics:
         # The flag is set, so the once-per-process budget is spent.
         assert heal_hermes_managed_node() is False
         assert calls["n"] == 1
+
+
+class TestNodeProbesAreBounded:
+    """The Node/agent-browser ``--version`` probes must return within their
+    nominal timeout even when a descendant holds the captured pipes (#91087).
+
+    ``subprocess.run(capture_output=True, timeout=N)`` does not guarantee that.
+    When it times out, ``run()`` kills the direct child and then drains the
+    pipes with an *unbounded* ``communicate()``. A managed ``npm``/``npx`` shim
+    is a ``cmd.exe`` wrapper whose ``node`` grandchild inherits those pipe
+    handles, so they never reach EOF and the drain never returns. The reported
+    symptom was an ACP ``session/prompt`` that hung forever before the first
+    API call, because these probes run while the system prompt is being built.
+    """
+
+    @staticmethod
+    def _lingering_shim(tmp_path, seconds: int):
+        """A launcher that exits immediately, leaving a grandchild holding the
+        inherited stdout/stderr — the ``npx.CMD`` → ``node`` shape."""
+        py = sys.executable
+        if sys.platform == "win32":
+            shim = tmp_path / "npx-probe.cmd"
+            shim.write_text(
+                "@echo off\r\n"
+                f'start /b "" "{py}" -c "import time; time.sleep({seconds})"\r\n'
+                "exit /b 0\r\n"
+            )
+        else:
+            shim = tmp_path / "npx-probe.sh"
+            shim.write_text(
+                "#!/bin/sh\n"
+                f'"{py}" -c "import time; time.sleep({seconds})" &\n'
+                "exit 0\n"
+            )
+            shim.chmod(0o755)
+        return shim
+
+    def test_node_tool_runnable_is_bounded_when_a_grandchild_holds_the_pipes(
+        self, tmp_path
+    ):
+        """The regression test for the reported hang.
+
+        The grandchild outlives the probe's 10s budget by a wide margin, so
+        before the fix this call returned only when the grandchild exited —
+        i.e. the 10s bound did nothing. The assertion is deliberately loose
+        (the pre-fix failure mode is "waits for the grandchild", so any real
+        bound distinguishes them) but far below the grandchild's lifetime.
+        """
+        shim = self._lingering_shim(tmp_path, 120)
+
+        start = time.monotonic()
+        result = node_tool_runnable(str(shim))
+        elapsed = time.monotonic() - start
+
+        assert result is False
+        assert elapsed < 40, (
+            f"probe took {elapsed:.1f}s; the 10s timeout is not being enforced "
+            "(pre-fix this waits for the 120s grandchild)"
+        )
+
+    def test_probes_no_longer_depend_on_subprocess_run(self, tmp_path, monkeypatch):
+        """Pins the mechanism, not just the timing.
+
+        ``subprocess.run`` is the unbounded primitive these call sites used.
+        Detonating it proves they route through ``bounded_probe_run`` instead —
+        and this stays true if someone reintroduces ``run`` with a timeout that
+        again cannot be enforced.
+        """
+        def _detonate(*args, **kwargs):
+            raise AssertionError("probe used subprocess.run instead of bounded_probe_run")
+
+        import subprocess
+
+        monkeypatch.setattr(subprocess, "run", _detonate)
+
+        real = tmp_path / ("ok.cmd" if sys.platform == "win32" else "ok.sh")
+        if sys.platform == "win32":
+            real.write_text("@echo off\r\necho v1.0.0\r\nexit /b 0\r\n")
+        else:
+            real.write_text("#!/bin/sh\necho v1.0.0\nexit 0\n")
+            real.chmod(0o755)
+
+        assert node_tool_runnable(str(real)) is True
+        assert agent_browser_runnable(str(real)) is True
+
+    def test_timeout_is_reported_as_not_runnable(self, tmp_path, monkeypatch):
+        """A ``None`` from the helper (spawn failure OR timeout) is a refusal.
+
+        Fail-closed matters here: a probe that cannot prove the binary runs
+        must not claim it does, or the caller commits to a hung toolchain.
+        """
+        import hermes_cli._subprocess_compat as compat
+
+        monkeypatch.setattr(compat, "bounded_probe_run", lambda *a, **k: None)
+
+        real = tmp_path / ("ok.cmd" if sys.platform == "win32" else "ok.sh")
+        if sys.platform == "win32":
+            real.write_text("@echo off\r\nexit /b 0\r\n")
+        else:
+            real.write_text("#!/bin/sh\nexit 0\n")
+            real.chmod(0o755)
+
+        assert node_tool_runnable(str(real)) is False
+        assert agent_browser_runnable(str(real)) is False
+
+    def test_nonzero_exit_still_means_not_runnable(self, tmp_path):
+        """The success contract is unchanged: only a clean exit 0 counts."""
+        bad = tmp_path / ("bad.cmd" if sys.platform == "win32" else "bad.sh")
+        if sys.platform == "win32":
+            bad.write_text("@echo off\r\nexit /b 3\r\n")
+        else:
+            bad.write_text("#!/bin/sh\nexit 3\n")
+            bad.chmod(0o755)
+
+        assert node_tool_runnable(str(bad)) is False
+        assert agent_browser_runnable(str(bad)) is False
