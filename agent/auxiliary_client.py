@@ -1529,7 +1529,7 @@ class _CodexCompletionsAdapter:
         resp_kwargs: Dict[str, Any] = {
             "model": model,
             "instructions": instructions,
-            "input": input_items or [{"role": "user", "content": ""}],
+            "input": input_items or [{"type": "message", "role": "user", "content": ""}],
             "store": False,
         }
 
