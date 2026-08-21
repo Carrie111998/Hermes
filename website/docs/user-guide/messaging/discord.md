@@ -590,6 +590,36 @@ display:
       reasoning_style: subtext   # code | blockquote | subtext
 ```
 
+## Link Previews
+
+Discord expands URLs in bot messages into preview cards. Masked links
+(`[text](url)`) in the message body do **not** reliably suppress them — the
+only dependable lever is Discord's `SUPPRESS_EMBEDS` message flag, which has
+to be set per message when it is sent.
+
+`disable_link_previews` mirrors the Telegram setting of the same name and
+accepts an extra value:
+
+```yaml
+gateway:
+  platforms:
+    discord:
+      extra:
+        disable_link_previews: false        # default — every message keeps its previews
+        # disable_link_previews: true       # suppress on every bot message
+        # disable_link_previews: scheduled  # suppress only on scheduled (cron) deliveries
+```
+
+`scheduled` is the useful middle ground for news digests and other recurring
+jobs: a cron post that cites ten sources no longer buries the channel under ten
+preview cards, while an ordinary chat reply that shares one link still renders
+it. Scheduled deliveries are identified by the `job_id` their route metadata
+carries (see `cron/scheduler.py`).
+
+Callers can override the configured behavior per message by setting
+`suppress_embeds` in the send metadata, which wins over any of the modes above.
+
+
 ## Slash Command Access Control
 
 By default, every allowed user can run every slash command. To split your allowlist into **admins** (full slash command access) and **regular users** (only commands you explicitly enable), add `allow_admin_from` and `user_allowed_commands` to the Discord platform's `extra` block:

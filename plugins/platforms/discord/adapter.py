@@ -1066,6 +1066,48 @@ class DiscordAdapter(BasePlatformAdapter):
 
         return _format_discord_markdown_link(preview.text, preview.url)
 
+    @staticmethod
+    def _coerce_link_preview_mode(value: Any) -> str:
+        """Normalize ``extra.disable_link_previews`` into a suppression mode.
+
+        Accepts the same booleans Telegram does (``true``/``false`` plus the
+        usual string spellings) and adds ``"scheduled"``, which suppresses
+        previews only on scheduled deliveries so interactive chat keeps them.
+
+        Returns one of ``"never"`` (default), ``"scheduled"``, ``"always"``.
+        """
+        if value is None:
+            return "never"
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"scheduled", "cron"}:
+                return "scheduled"
+            if lowered in {"true", "1", "yes", "on", "always"}:
+                return "always"
+            return "never"
+        return "always" if value else "never"
+
+    def _should_suppress_embeds(self, metadata: Optional[Dict[str, Any]]) -> bool:
+        """Whether this outgoing message sets Discord's SUPPRESS_EMBEDS flag.
+
+        Masked links in ``content`` do **not** reliably stop Discord from
+        expanding URLs into preview cards, so suppression has to be requested
+        at the API level per message.
+
+        An explicit ``metadata["suppress_embeds"]`` always wins so callers can
+        override per message.  Otherwise the configured mode decides, and
+        ``"scheduled"`` limits suppression to cron deliveries, which carry
+        ``job_id`` in their route metadata (``cron/scheduler.py``).
+        """
+        if metadata is not None and "suppress_embeds" in metadata:
+            return bool(metadata["suppress_embeds"])
+        mode = getattr(self, "_link_preview_mode", "never")
+        if mode == "always":
+            return True
+        if mode == "scheduled":
+            return bool(metadata and metadata.get("job_id"))
+        return False
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.DISCORD)
         self._client: Optional[commands.Bot] = None
@@ -1080,6 +1122,15 @@ class DiscordAdapter(BasePlatformAdapter):
         # Voice channel state (per-guild)
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
         self._voice_locks: Dict[int, asyncio.Lock] = {}  # guild_id -> serialize join/leave
+        # Link-preview suppression, mirroring Telegram's
+        # ``platforms.telegram.extra.disable_link_previews``.  Discord expands
+        # bare and masked URLs into preview cards; the only reliable way to stop
+        # it is the SUPPRESS_EMBEDS message flag at send time.
+        self._link_preview_mode: str = self._coerce_link_preview_mode(
+            self.config.extra.get("disable_link_previews")
+            if getattr(self.config, "extra", None)
+            else None
+        )
         # Text batching: merge rapid successive messages (Telegram-style)
         self._text_batch_delay_seconds = env_float("HERMES_DISCORD_TEXT_BATCH_DELAY_SECONDS", 0.6)
         self._text_batch_split_delay_seconds = env_float("HERMES_DISCORD_TEXT_BATCH_SPLIT_DELAY_SECONDS", 2.0)
@@ -3473,6 +3524,14 @@ class DiscordAdapter(BasePlatformAdapter):
             if metadata and metadata.get("thread_id"):
                 thread_id = metadata["thread_id"]
             nonconversational = _metadata_marks_nonconversational(metadata)
+            # Only pass the kwarg when actually suppressing: False is Discord's
+            # default, and omitting it keeps the call signature unchanged for
+            # every existing caller and test double.
+            embed_kwargs = (
+                {"suppress_embeds": True}
+                if self._should_suppress_embeds(metadata)
+                else {}
+            )
             final_delivery = bool(metadata and metadata.get("notify"))
 
             if thread_id:
@@ -3521,6 +3580,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     msg = await channel.send(
                         content=chunk,
                         reference=chunk_reference,
+                        **embed_kwargs,
                     )
                 except Exception as e:
                     err_text = str(e)
@@ -3543,6 +3603,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         msg = await channel.send(
                             content=chunk,
                             reference=None,
+                            **embed_kwargs,
                         )
                     else:
                         raise

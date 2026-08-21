@@ -1149,6 +1149,12 @@ platform_toolsets:
 # Platform-specific knobs live under `extra`.
 #
 # platforms:
+#   discord:
+#     extra:
+#       # Suppress Discord's URL preview cards. false (default) keeps them,
+#       # true suppresses on every bot message, "scheduled" suppresses only on
+#       # cron deliveries so interactive chat still gets previews.
+#       disable_link_previews: false
 #   telegram:
 #     reply_to_mode: "first"  # off | first | all
 #     # guest_mode lets explicit @mentions from non-allowlisted groups through.
