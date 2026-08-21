@@ -260,6 +260,15 @@ export async function runRewindSubmit(
     // gateway's 4030 cross-check. Unresolved: plain resubmit, no truncation.
     resolvedOrdinal = undefined
     resolvedMessageId = undefined
+  } else if (wantsTruncation && typeof truncateRowId === 'number') {
+    // The caller already bound a durable ROW id. Keep it as the SOLE address
+    // and drop the ordinal the same way: the two ordinal spaces can diverge
+    // (failed turns are skipped client-side while durable repair merges
+    // adjacent user rows), and the gateway refuses the ordinal+row_id
+    // combination with 4030 whenever they disagree (#82756). messageId-only
+    // restores keep their ordinal — there the ordinal is still part of the
+    // address (stale rendered ids fall back to it, #82462).
+    resolvedOrdinal = undefined
   }
 
   const interrupt = async () => {
