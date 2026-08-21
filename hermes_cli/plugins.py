@@ -34,6 +34,7 @@ so plugin-defined tools appear alongside the built-in tools.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.metadata
 import importlib.util
 import inspect
@@ -217,6 +218,25 @@ VALID_HOOKS: Set[str] = {
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 
 _NS_PARENT = "hermes_plugins"
+
+
+def _plugin_module_name(key: str, plugin_path: str | None = None) -> str:
+    """Return a package name, disambiguating only a live slug collision."""
+    readable = key.replace("/", "__").replace("-", "_")
+    legacy_name = f"{_NS_PARENT}.{readable}"
+    existing = sys.modules.get(legacy_name)
+    if existing is None or plugin_path is None:
+        return legacy_name
+    existing_file = getattr(existing, "__file__", None)
+    expected_file = Path(plugin_path) / "__init__.py"
+    if existing_file is not None:
+        try:
+            if Path(existing_file).resolve() == expected_file.resolve():
+                return legacy_name
+        except OSError:
+            pass
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+    return f"{legacy_name}__{digest}"
 
 
 def _env_enabled(name: str) -> bool:
@@ -1245,6 +1265,48 @@ class PluginContext:
 # PluginManager
 # ---------------------------------------------------------------------------
 
+class _ToolOnlyRegistrationContext:
+    """Capture profile-plugin tools without exposing other plugin surfaces."""
+
+    def __init__(self, manifest: PluginManifest):
+        self.manifest = manifest
+        self.tools: list[dict] = []
+
+    def register_tool(
+        self,
+        name: str,
+        toolset: str,
+        schema: dict,
+        handler: Callable,
+        check_fn: Callable | None = None,
+        requires_env: list | None = None,
+        is_async: bool = False,
+        description: str = "",
+        emoji: str = "",
+        override: bool = False,
+    ) -> None:
+        if override:
+            raise ValueError("Profile tool-only plugins cannot override tools")
+        self.tools.append({
+            "name": name,
+            "toolset": toolset,
+            "schema": schema,
+            "handler": handler,
+            "check_fn": check_fn,
+            "requires_env": requires_env,
+            "is_async": is_async,
+            "description": description,
+            "emoji": emoji,
+        })
+
+    def __getattr__(self, name: str):
+        if name.startswith("register_"):
+            raise ValueError(
+                f"Profile additive plugin loading is tool-only; {name} is not allowed"
+            )
+        raise AttributeError(name)
+
+
 class PluginManager:
     """Central manager that discovers, loads, and invokes plugins."""
 
@@ -1271,6 +1333,12 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        # Canonical profile-plugin directory -> exact registered tool names.
+        # Profile jobs are serialized, but the lock also protects direct callers
+        # and makes the check/import/commit sequence one operation.
+        self._profile_tool_plugins: dict[str, tuple[str, ...]] = {}
+        self._profile_tool_keys: dict[str, str] = {}
+        self._profile_tool_lock = threading.RLock()
 
     # -----------------------------------------------------------------------
     # Public
@@ -1313,6 +1381,197 @@ class PluginManager:
         except BaseException:
             self._discovered = False
             raise
+
+    def load_profile_tools(self, profile_home: Path | str) -> list[str]:
+        """Add enabled tool-only plugins from one profile without rediscovery.
+
+        Long-lived schedulers discover their own profile once at startup. A
+        cron job may later enter another profile, whose user plugins were not in
+        that initial scan. This narrow path imports only that profile's enabled
+        standalone plugins and permits only ``register_tool`` calls; hooks,
+        middleware, commands, providers, and overrides remain process-global and
+        are therefore refused.
+        """
+        home = Path(profile_home).resolve()
+        config_path = home / "config.yaml"
+        try:
+            config = fast_safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except FileNotFoundError:
+            config = {}
+        plugins_cfg = config.get("plugins") if isinstance(config, dict) else None
+        if not isinstance(plugins_cfg, dict):
+            return []
+        raw_enabled = plugins_cfg.get("enabled")
+        if not isinstance(raw_enabled, list):
+            return []
+        enabled = {str(name) for name in raw_enabled}
+        raw_disabled = plugins_cfg.get("disabled")
+        disabled = (
+            {str(name) for name in raw_disabled}
+            if isinstance(raw_disabled, list)
+            else set()
+        )
+
+        manifests = self._scan_directory(home / "plugins", source="user")
+        winners = {
+            manifest.key or manifest.name: manifest
+            for manifest in manifests
+        }
+        selected = [
+            manifest
+            for key, manifest in winners.items()
+            if (key in enabled or manifest.name in enabled)
+            and key not in disabled
+            and manifest.name not in disabled
+        ]
+        selected_names = {
+            candidate
+            for manifest in selected
+            for candidate in (manifest.key or manifest.name, manifest.name)
+        }
+        globally_known = {
+            candidate
+            for key, loaded in self._plugins.items()
+            if loaded.enabled
+            for candidate in (key, loaded.manifest.name)
+        }
+        missing = sorted(
+            name for name in enabled
+            if name not in disabled
+            and name not in selected_names
+            and name not in globally_known
+        )
+        if missing:
+            raise ValueError(
+                "Enabled profile tool plugin manifest not found: "
+                + ", ".join(repr(name) for name in missing)
+            )
+
+        with self._profile_tool_lock:
+            requested_paths = {str(Path(manifest.path or "").resolve()) for manifest in selected}
+            for manifest in selected:
+                key = manifest.key or manifest.name
+                canonical_path = str(Path(manifest.path or "").resolve())
+                existing_path = self._profile_tool_keys.get(key)
+                loaded = self._plugins.get(key)
+                if existing_path is None and loaded is not None:
+                    existing_path = str(
+                        Path(loaded.manifest.path or "").resolve()
+                    )
+                if existing_path is not None and existing_path != canonical_path:
+                    raise ValueError(
+                        f"Profile tool-only plugin {key!r} was already loaded from "
+                        f"{existing_path!r}; refusing different path {canonical_path!r}"
+                    )
+            from tools.registry import registry
+
+            for manifest in selected:
+                key = manifest.key or manifest.name
+                canonical_path = str(Path(manifest.path or "").resolve())
+                loaded = self._plugins.get(key)
+                if (
+                    canonical_path not in self._profile_tool_plugins
+                    and loaded is not None
+                    and loaded.enabled
+                    and str(Path(loaded.manifest.path or "").resolve())
+                    == canonical_path
+                ):
+                    names = tuple(sorted(loaded.tools_registered))
+                    if not names or any(
+                        registry.get_entry(name) is None for name in names
+                    ):
+                        raise ValueError(
+                            f"Profile tool-only plugin {key!r} is loaded but its "
+                            "declared tools are unavailable"
+                        )
+                    self._profile_tool_plugins[canonical_path] = names
+                    self._profile_tool_keys[key] = canonical_path
+
+            newly_selected = [
+                manifest
+                for manifest in selected
+                if str(Path(manifest.path or "").resolve())
+                not in self._profile_tool_plugins
+            ]
+            for manifest in newly_selected:
+                if manifest.kind != "standalone":
+                    raise ValueError(
+                        f"Profile additive plugin loading is tool-only; "
+                        f"{manifest.key or manifest.name!r} has kind {manifest.kind!r}"
+                    )
+                if manifest.provides_hooks:
+                    raise ValueError(
+                        f"Profile additive plugin loading is tool-only; "
+                        f"{manifest.key or manifest.name!r} declares hooks"
+                    )
+
+            batches: list[tuple[PluginManifest, str, types.ModuleType, list[dict]]] = []
+            imported_modules: list[tuple[str, types.ModuleType]] = []
+            try:
+                with registry.transaction():
+                    for manifest in newly_selected:
+                        canonical_path = str(Path(manifest.path or "").resolve())
+                        module = self._load_directory_module(manifest)
+                        imported_modules.append((module.__name__, module))
+                        register_fn = getattr(module, "register", None)
+                        if register_fn is None:
+                            raise ValueError(
+                                f"Profile tool-only plugin {manifest.name!r} has no register()"
+                            )
+                        ctx = _ToolOnlyRegistrationContext(manifest)
+                        register_fn(ctx)
+                        declared = set(manifest.provides_tools)
+                        actual = {str(entry.get("name") or "") for entry in ctx.tools}
+                        if declared != actual:
+                            raise ValueError(
+                                f"Profile tool-only plugin {manifest.name!r} registered "
+                                f"{sorted(actual)!r}, manifest declares {sorted(declared)!r}"
+                            )
+                        batches.append((manifest, canonical_path, module, ctx.tools))
+
+                    all_entries = [
+                        entry for _, _, _, entries in batches for entry in entries
+                    ]
+                    if all_entries:
+                        registry.register_batch_if_absent(all_entries)
+            except BaseException:
+                for module_name, module in reversed(imported_modules):
+                    if sys.modules.get(module_name) is module:
+                        sys.modules.pop(module_name, None)
+                raise
+            for manifest, canonical_path, module, entries in batches:
+                names = tuple(sorted(str(entry["name"]) for entry in entries))
+                self._profile_tool_plugins[canonical_path] = names
+                self._profile_tool_keys[manifest.key or manifest.name] = canonical_path
+                self._plugins[manifest.key or manifest.name] = LoadedPlugin(
+                    manifest=manifest,
+                    module=module,
+                    tools_registered=list(names),
+                    enabled=True,
+                )
+
+            requested_tools = sorted({
+                tool
+                for path, tools in self._profile_tool_plugins.items()
+                if path in requested_paths
+                for tool in tools
+            })
+            self._plugin_tool_names.update(requested_tools)
+            for manifest in selected:
+                key = manifest.key or manifest.name
+                canonical_path = str(Path(manifest.path or "").resolve())
+                names = self._profile_tool_plugins.get(canonical_path, ())
+                loaded = self._plugins.get(key)
+                if loaded is None:
+                    self._plugins[key] = LoadedPlugin(
+                        manifest=manifest,
+                        module=sys.modules.get(
+                            _plugin_module_name(key, manifest.path)
+                        ),
+                        tools_registered=list(names),
+                        enabled=True,
+                    )
+            return requested_tools
 
     def _discover_and_load_inner(self) -> None:
         """The actual discovery sweep — see :meth:`discover_and_load`."""
@@ -1818,9 +2077,9 @@ class PluginManager:
 
         from tools.registry import registry as _registry
         _plugin_id = manifest.key or manifest.name
-        _slug = _plugin_id.replace("/", "__").replace("-", "_")
+        _module_name = _plugin_module_name(_plugin_id, manifest.path)
         _registry.register_plugin_override_policy(
-            f"{_NS_PARENT}.{_slug}",
+            _module_name,
             PluginContext(manifest, self)._tool_override_allowed(""),
         )
         try:
@@ -1913,8 +2172,7 @@ class PluginManager:
             sys.modules[_NS_PARENT] = ns_pkg
 
         key = manifest.key or manifest.name
-        slug = key.replace("/", "__").replace("-", "_")
-        module_name = f"{_NS_PARENT}.{slug}"
+        module_name = _plugin_module_name(key, manifest.path)
         spec = importlib.util.spec_from_file_location(
             module_name,
             init_file,
@@ -1927,7 +2185,12 @@ class PluginManager:
         module.__package__ = module_name
         module.__path__ = [str(plugin_dir)]  # type: ignore[attr-defined]
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            if sys.modules.get(module_name) is module:
+                sys.modules.pop(module_name, None)
+            raise
         return module
 
     def _load_entrypoint_module(self, manifest: PluginManifest) -> types.ModuleType:

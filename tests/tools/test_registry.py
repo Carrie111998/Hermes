@@ -2,6 +2,8 @@
 
 import json
 import threading
+
+import pytest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -31,6 +33,60 @@ class TestRegisterAndDispatch:
         )
         result = json.loads(reg.dispatch("alpha", {}))
         assert result == {"ok": True}
+
+    def test_register_batch_if_absent_is_atomic_on_name_collision(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="occupied",
+            toolset="existing",
+            schema=_make_schema("occupied"),
+            handler=_dummy_handler,
+        )
+        generation = reg._generation
+
+        with pytest.raises(ValueError, match="already registered"):
+            reg.register_batch_if_absent([
+                {
+                    "name": "new_tool",
+                    "toolset": "profile",
+                    "schema": _make_schema("new_tool"),
+                    "handler": _dummy_handler,
+                },
+                {
+                    "name": "occupied",
+                    "toolset": "profile",
+                    "schema": _make_schema("occupied"),
+                    "handler": _dummy_handler,
+                },
+            ])
+
+        assert reg.get_entry("new_tool") is None
+        assert reg.get_entry("occupied").toolset == "existing"
+        assert reg._generation == generation
+
+    def test_register_batch_if_absent_rolls_back_unexpected_registration_error(self):
+        reg = ToolRegistry()
+        generation = reg._generation
+
+        with pytest.raises(AttributeError):
+            reg.register_batch_if_absent([
+                {
+                    "name": "valid_first",
+                    "toolset": "profile",
+                    "schema": _make_schema("valid_first"),
+                    "handler": _dummy_handler,
+                },
+                {
+                    "name": "invalid_second",
+                    "toolset": "profile",
+                    "schema": None,
+                    "handler": _dummy_handler,
+                },
+            ])
+
+        assert reg.get_entry("valid_first") is None
+        assert reg.get_entry("invalid_second") is None
+        assert reg._generation == generation
 
     def test_dispatch_passes_args(self):
         reg = ToolRegistry()

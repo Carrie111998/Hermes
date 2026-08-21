@@ -448,6 +448,543 @@ class TestPluginDiscovery:
 
         assert "ep_plugin" in mgr._plugins
 
+    def test_additive_profile_tools_loads_enabled_tool_only_plugin_once(
+        self, tmp_path, monkeypatch
+    ):
+        """A profile can add its enabled tools after main discovery, once."""
+        main_home = tmp_path / "profiles" / "main"
+        profile_home = tmp_path / "profiles" / "matcher"
+        main_home.mkdir(parents=True)
+        profile_home.mkdir(parents=True)
+        (main_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": []}}),
+            encoding="utf-8",
+        )
+        plugin_dir = profile_home / "plugins"
+        _make_plugin_dir(
+            plugin_dir,
+            "profile_tool",
+            register_body=(
+                "ctx.register_tool("
+                "name='profile_only_tool', toolset='profile_tools', "
+                "schema={'name': 'profile_only_tool', 'description': 'profile', "
+                "'parameters': {'type': 'object', 'properties': {}}}, "
+                "handler=lambda args, **kwargs: '{}')"
+            ),
+            manifest_extra={"provides_tools": ["profile_only_tool"]},
+            auto_enable=False,
+        )
+        (profile_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["profile_tool"]}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(main_home))
+
+        from tools.registry import registry
+
+        registry.deregister("profile_only_tool")
+        mgr = PluginManager()
+        try:
+            mgr.discover_and_load()
+            assert registry.get_entry("profile_only_tool") is None
+
+            first = mgr.load_profile_tools(profile_home)
+            generation = registry._generation
+            second = mgr.load_profile_tools(profile_home)
+
+            assert first == ["profile_only_tool"]
+            assert second == ["profile_only_tool"]
+            assert registry._generation == generation
+            assert registry.get_entry("profile_only_tool") is not None
+        finally:
+            registry.deregister("profile_only_tool")
+            sys.modules.pop("hermes_plugins.profile_tool", None)
+
+    def test_additive_profile_tools_reuses_same_plugin_loaded_by_discovery(
+        self, tmp_path, monkeypatch
+    ):
+        """Same-path ordinary discovery and additive loading are idempotent."""
+        profile_home = tmp_path / "profiles" / "matcher"
+        profile_home.mkdir(parents=True)
+        _make_plugin_dir(
+            profile_home / "plugins",
+            "profile_tool",
+            register_body=(
+                "ctx.register_tool("
+                "name='profile_discovered_tool', toolset='profile_tools', "
+                "schema={'name': 'profile_discovered_tool', "
+                "'description': 'profile', "
+                "'parameters': {'type': 'object', 'properties': {}}}, "
+                "handler=lambda args, **kwargs: '{}')"
+            ),
+            manifest_extra={"provides_tools": ["profile_discovered_tool"]},
+            auto_enable=False,
+        )
+        (profile_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["profile_tool"]}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        from tools.registry import registry
+
+        registry.deregister("profile_discovered_tool")
+        mgr = PluginManager()
+        try:
+            mgr.discover_and_load()
+            generation = registry._generation
+
+            assert mgr.load_profile_tools(profile_home) == [
+                "profile_discovered_tool"
+            ]
+            assert registry._generation == generation
+        finally:
+            registry.deregister("profile_discovered_tool")
+            sys.modules.pop("hermes_plugins.profile_tool", None)
+
+    def test_additive_profile_tools_restore_metadata_after_force_rediscovery(
+        self, tmp_path, monkeypatch
+    ):
+        """A force pass cannot strand an already-registered profile tool."""
+        profile_home = tmp_path / "profiles" / "matcher"
+        profile_home.mkdir(parents=True)
+        _make_plugin_dir(
+            profile_home / "plugins",
+            "profile_tool",
+            register_body=(
+                "ctx.register_tool("
+                "name='profile_force_tool', toolset='profile_tools', "
+                "schema={'name': 'profile_force_tool', 'description': 'profile', "
+                "'parameters': {'type': 'object', 'properties': {}}}, "
+                "handler=lambda args, **kwargs: '{}')"
+            ),
+            manifest_extra={"provides_tools": ["profile_force_tool"]},
+            auto_enable=False,
+        )
+        (profile_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["profile_tool"]}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        from tools.registry import registry
+
+        registry.deregister("profile_force_tool")
+        mgr = PluginManager()
+        try:
+            mgr.load_profile_tools(profile_home)
+            generation = registry._generation
+            monkeypatch.setattr(
+                PluginManager,
+                "_discover_and_load_inner",
+                lambda _manager: None,
+            )
+            mgr.discover_and_load(force=True)
+
+            assert "profile_force_tool" not in mgr._plugin_tool_names
+            assert mgr.load_profile_tools(profile_home) == ["profile_force_tool"]
+            assert "profile_force_tool" in mgr._plugin_tool_names
+            assert mgr._plugins["profile_tool"].tools_registered == [
+                "profile_force_tool"
+            ]
+            assert registry._generation == generation
+        finally:
+            registry.deregister("profile_force_tool")
+            sys.modules.pop("hermes_plugins.profile_tool", None)
+
+    def test_additive_profile_tools_rolls_back_import_time_registry_side_effects(
+        self, tmp_path, monkeypatch
+    ):
+        """Rejected additive imports cannot leave process-global tools behind."""
+        profile_home = tmp_path / "profiles" / "matcher"
+        profile_home.mkdir(parents=True)
+        plugin_dir = profile_home / "plugins"
+        _make_plugin_dir(
+            plugin_dir,
+            "leaky_plugin",
+            register_body="ctx.register_hook('pre_tool_call', lambda **kwargs: None)",
+            auto_enable=False,
+        )
+        init_path = plugin_dir / "leaky_plugin" / "__init__.py"
+        init_path.write_text(
+            "from tools.registry import registry\n"
+            "registry.register(\n"
+            "    name='import_leak_tool', toolset='profile_tools',\n"
+            "    schema={'name': 'import_leak_tool', 'description': 'leak', "
+            "'parameters': {'type': 'object', 'properties': {}}},\n"
+            "    handler=lambda args, **kwargs: '{}',\n"
+            ")\n"
+            + init_path.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        (profile_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["leaky_plugin"]}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        from tools.registry import registry
+
+        registry.deregister("import_leak_tool")
+        mgr = PluginManager()
+        try:
+            with pytest.raises(ValueError, match="tool-only"):
+                mgr.load_profile_tools(profile_home)
+
+            assert registry.get_entry("import_leak_tool") is None
+            assert "hermes_plugins.leaky_plugin" not in sys.modules
+        finally:
+            registry.deregister("import_leak_tool")
+            sys.modules.pop("hermes_plugins.leaky_plugin", None)
+
+    def test_additive_profile_tools_removes_failed_import_module(
+        self, tmp_path, monkeypatch
+    ):
+        """A failed import cannot poison a later retry through sys.modules."""
+        profile_home = tmp_path / "profiles" / "matcher"
+        profile_home.mkdir(parents=True)
+        plugin_dir = profile_home / "plugins"
+        _make_plugin_dir(
+            plugin_dir,
+            "failed_import_plugin",
+            register_body="pass",
+            auto_enable=False,
+        )
+        init_path = plugin_dir / "failed_import_plugin" / "__init__.py"
+        init_path.write_text(
+            "IMPORT_WAS_PARTIAL = True\nraise RuntimeError('import exploded')\n",
+            encoding="utf-8",
+        )
+        (profile_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["failed_import_plugin"]}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        module_name = "hermes_plugins.failed_import_plugin"
+        sys.modules.pop(module_name, None)
+        mgr = PluginManager()
+        try:
+            with pytest.raises(RuntimeError, match="import exploded"):
+                mgr.load_profile_tools(profile_home)
+
+            assert module_name not in sys.modules
+        finally:
+            sys.modules.pop(module_name, None)
+
+    def test_additive_profile_tools_rejects_non_tool_registration(
+        self, tmp_path, monkeypatch
+    ):
+        """Profile additive loading cannot leak hooks or middleware globally."""
+        profile_home = tmp_path / "profiles" / "matcher"
+        profile_home.mkdir(parents=True)
+        _make_plugin_dir(
+            profile_home / "plugins",
+            "mixed_plugin",
+            register_body=(
+                "ctx.register_tool("
+                "name='partial_profile_tool', toolset='profile_tools', "
+                "schema={'name': 'partial_profile_tool', 'description': 'partial', "
+                "'parameters': {'type': 'object', 'properties': {}}}, "
+                "handler=lambda args, **kwargs: '{}')\n"
+                "    ctx.register_hook('pre_tool_call', lambda **kwargs: None)"
+            ),
+            manifest_extra={
+                "provides_tools": ["partial_profile_tool"],
+                "provides_hooks": ["pre_tool_call"],
+            },
+            auto_enable=False,
+        )
+        (profile_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["mixed_plugin"]}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        from tools.registry import registry
+
+        registry.deregister("partial_profile_tool")
+        mgr = PluginManager()
+        try:
+            with pytest.raises(ValueError, match="tool-only"):
+                mgr.load_profile_tools(profile_home)
+
+            assert registry.get_entry("partial_profile_tool") is None
+            assert mgr._hooks == {}
+            assert mgr._middleware == {}
+        finally:
+            registry.deregister("partial_profile_tool")
+            sys.modules.pop("hermes_plugins.mixed_plugin", None)
+
+    def test_additive_profile_tools_ignores_enabled_plugin_already_globally_known(
+        self, tmp_path, monkeypatch
+    ):
+        """Bundled/global enabled names need not have a profile-local manifest."""
+        profile_home = tmp_path / "profiles" / "matcher"
+        profile_home.mkdir(parents=True)
+        (profile_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["global_plugin"]}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        mgr = PluginManager()
+        mgr._plugins["global_plugin"] = MagicMock(
+            manifest=PluginManifest(
+                name="global_plugin",
+                key="global_plugin",
+                path=str(tmp_path / "bundled" / "global_plugin"),
+            ),
+            enabled=True,
+        )
+
+        assert mgr.load_profile_tools(profile_home) == []
+
+    def test_additive_profile_tools_refuses_enabled_name_without_manifest(
+        self, tmp_path, monkeypatch
+    ):
+        """A configured profile tool must exist instead of disappearing silently."""
+        profile_home = tmp_path / "profiles" / "matcher"
+        profile_home.mkdir(parents=True)
+        (profile_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["missing_profile_tool"]}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        mgr = PluginManager()
+        with pytest.raises(ValueError, match="missing_profile_tool"):
+            mgr.load_profile_tools(profile_home)
+
+    def test_additive_profile_tools_refuses_changed_path_for_loaded_key(
+        self, tmp_path, monkeypatch
+    ):
+        """One plugin key cannot silently change owners between profiles."""
+        first_home = tmp_path / "profiles" / "first"
+        second_home = tmp_path / "profiles" / "second"
+        for home, tool_name in (
+            (first_home, "first_profile_tool"),
+            (second_home, "second_profile_tool"),
+        ):
+            home.mkdir(parents=True)
+            _make_plugin_dir(
+                home / "plugins",
+                "shared_plugin",
+                register_body=(
+                    "ctx.register_tool("
+                    f"name={tool_name!r}, toolset='profile_tools', "
+                    f"schema={{'name': {tool_name!r}, 'description': 'profile', "
+                    "'parameters': {'type': 'object', 'properties': {}}}, "
+                    "handler=lambda args, **kwargs: '{}')"
+                ),
+                manifest_extra={"provides_tools": [tool_name]},
+                auto_enable=False,
+            )
+            (home / "config.yaml").write_text(
+                yaml.safe_dump({"plugins": {"enabled": ["shared_plugin"]}}),
+                encoding="utf-8",
+            )
+        monkeypatch.setenv("HERMES_HOME", str(first_home))
+
+        from tools.registry import registry
+
+        registry.deregister("first_profile_tool")
+        registry.deregister("second_profile_tool")
+        mgr = PluginManager()
+        try:
+            mgr.load_profile_tools(first_home)
+            with pytest.raises(ValueError, match="different path"):
+                mgr.load_profile_tools(second_home)
+
+            assert registry.get_entry("first_profile_tool") is not None
+            assert registry.get_entry("second_profile_tool") is None
+        finally:
+            registry.deregister("first_profile_tool")
+            registry.deregister("second_profile_tool")
+            sys.modules.pop("hermes_plugins.shared_plugin", None)
+
+    def test_directory_plugin_module_names_do_not_collide_after_slug_normalization(
+        self, tmp_path, monkeypatch
+    ):
+        """Distinct valid plugin keys keep distinct Python package namespaces."""
+        first_home = tmp_path / "profiles" / "first"
+        second_home = tmp_path / "profiles" / "second"
+        for home, key, tool_name, helper_value in (
+            (first_home, "alpha-beta", "hyphen_tool", "HYPHEN"),
+            (second_home, "alpha_beta", "underscore_tool", "UNDERSCORE"),
+        ):
+            home.mkdir(parents=True)
+            plugin_dir = home / "plugins"
+            _make_plugin_dir(
+                plugin_dir,
+                key,
+                register_body=(
+                    "ctx.register_tool("
+                    f"name={tool_name!r}, toolset='profile_tools', "
+                    f"schema={{'name': {tool_name!r}, 'description': 'profile', "
+                    "'parameters': {'type': 'object', 'properties': {}}}, "
+                    "handler=_handler)"
+                ),
+                manifest_extra={"provides_tools": [tool_name]},
+                auto_enable=False,
+            )
+            init_path = plugin_dir / key / "__init__.py"
+            init_path.write_text(
+                f"VALUE = {helper_value!r}\n"
+                "def _handler(args, **kwargs):\n"
+                "    return VALUE\n"
+                + init_path.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            (home / "config.yaml").write_text(
+                yaml.safe_dump({"plugins": {"enabled": [key]}}),
+                encoding="utf-8",
+            )
+        monkeypatch.setenv("HERMES_HOME", str(first_home))
+
+        from tools.registry import registry
+
+        registry.deregister("hyphen_tool")
+        registry.deregister("underscore_tool")
+        mgr = PluginManager()
+        try:
+            mgr.load_profile_tools(first_home)
+            mgr.load_profile_tools(second_home)
+
+            assert registry.dispatch("hyphen_tool", {}) == "HYPHEN"
+            assert registry.dispatch("underscore_tool", {}) == "UNDERSCORE"
+            first_module = mgr._plugins["alpha-beta"].module
+            second_module = mgr._plugins["alpha_beta"].module
+            assert first_module.__name__ != second_module.__name__
+        finally:
+            registry.deregister("hyphen_tool")
+            registry.deregister("underscore_tool")
+            for name in list(sys.modules):
+                if name.startswith("hermes_plugins.alpha"):
+                    sys.modules.pop(name, None)
+
+    def test_additive_profile_tools_rejects_loaded_plugin_key_from_different_path(
+        self, tmp_path, monkeypatch
+    ):
+        """A globally loaded key cannot be replaced by a profile-local plugin."""
+        global_home = tmp_path / "profiles" / "main"
+        profile_home = tmp_path / "profiles" / "matcher"
+        global_home.mkdir(parents=True)
+        profile_home.mkdir(parents=True)
+        _make_plugin_dir(
+            global_home / "plugins",
+            "shared_plugin",
+            register_body="pass",
+            auto_enable=False,
+        )
+        _make_plugin_dir(
+            profile_home / "plugins",
+            "shared_plugin",
+            register_body=(
+                "ctx.register_tool("
+                "name='profile_replacement_tool', toolset='profile_tools', "
+                "schema={'name': 'profile_replacement_tool', "
+                "'description': 'replacement', "
+                "'parameters': {'type': 'object', 'properties': {}}}, "
+                "handler=lambda args, **kwargs: '{}')"
+            ),
+            manifest_extra={"provides_tools": ["profile_replacement_tool"]},
+            auto_enable=False,
+        )
+        (global_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["shared_plugin"]}}),
+            encoding="utf-8",
+        )
+        (profile_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["shared_plugin"]}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(global_home))
+
+        from tools.registry import registry
+
+        registry.deregister("profile_replacement_tool")
+        mgr = PluginManager()
+        try:
+            mgr.discover_and_load()
+            with pytest.raises(ValueError, match="different path"):
+                mgr.load_profile_tools(profile_home)
+
+            assert registry.get_entry("profile_replacement_tool") is None
+            assert Path(mgr._plugins["shared_plugin"].manifest.path) == (
+                global_home / "plugins" / "shared_plugin"
+            )
+        finally:
+            registry.deregister("profile_replacement_tool")
+            sys.modules.pop("hermes_plugins.shared_plugin", None)
+
+    def test_additive_profile_tools_rejects_existing_tool_name(
+        self, tmp_path, monkeypatch
+    ):
+        """A profile plugin cannot replace or silently reuse a global tool name."""
+        profile_home = tmp_path / "profiles" / "matcher"
+        profile_home.mkdir(parents=True)
+        _make_plugin_dir(
+            profile_home / "plugins",
+            "collision_plugin",
+            register_body=(
+                "ctx.register_tool("
+                "name='profile_collision_tool', toolset='profile_tools', "
+                "schema={'name': 'profile_collision_tool', 'description': 'new', "
+                "'parameters': {'type': 'object', 'properties': {}}}, "
+                "handler=lambda args, **kwargs: '{}')"
+            ),
+            manifest_extra={"provides_tools": ["profile_collision_tool"]},
+            auto_enable=False,
+        )
+        (profile_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["collision_plugin"]}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        from tools.registry import registry
+
+        def original_handler(args, **kwargs):
+            return "original"
+
+        previous = registry.get_entry("profile_collision_tool")
+        if previous is not None:
+            registry.deregister("profile_collision_tool")
+        registry.register(
+            name="profile_collision_tool",
+            toolset="existing_tools",
+            schema={
+                "name": "profile_collision_tool",
+                "description": "existing",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=original_handler,
+        )
+        mgr = PluginManager()
+        try:
+            with pytest.raises(ValueError, match="already registered"):
+                mgr.load_profile_tools(profile_home)
+
+            assert registry.get_entry("profile_collision_tool").handler is original_handler
+        finally:
+            registry.deregister("profile_collision_tool")
+            if previous is not None:
+                registry.register(
+                    name=previous.name,
+                    toolset=previous.toolset,
+                    schema=previous.schema,
+                    handler=previous.handler,
+                    check_fn=previous.check_fn,
+                    requires_env=previous.requires_env,
+                    is_async=previous.is_async,
+                    description=previous.description,
+                    emoji=previous.emoji,
+                    max_result_size_chars=previous.max_result_size_chars,
+                    dynamic_schema_overrides=previous.dynamic_schema_overrides,
+                )
+            sys.modules.pop("hermes_plugins.collision_plugin", None)
+
     def test_force_rediscover_clears_all_plugin_registries(self, monkeypatch):
         """force=True must clear every plugin-populated registry.
 

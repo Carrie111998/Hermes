@@ -4406,12 +4406,19 @@ def run_job(
     inside the impl) guarantees the no_agent short-circuit is also profile-scoped.
     """
     job_id = job["id"]
-    with _job_profile_context(job_id, job.get("profile")):
-        return _run_job_impl(job, defer_agent_teardown=defer_agent_teardown)
+    with _job_profile_context(job_id, job.get("profile")) as active_profile:
+        return _run_job_impl(
+            job,
+            defer_agent_teardown=defer_agent_teardown,
+            active_profile=active_profile,
+        )
 
 
 def _run_job_impl(
-    job: dict, *, defer_agent_teardown: Optional[list] = None
+    job: dict,
+    *,
+    defer_agent_teardown: Optional[list] = None,
+    active_profile: Optional[str] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -5185,26 +5192,41 @@ def _run_job_impl(
             except Exception as e:
                 logger.debug("Job '%s': failed to load credential pool for %s: %s", job_id, runtime_provider, e)
 
+        # The scheduler process discovers its own profile at startup. A named
+        # profile may enable a tool-only plugin that was absent from that first
+        # sweep, so add those tools while this job's profile context/config are
+        # active and before AIAgent snapshots the registry. The loader is
+        # additive and fail-closed; profile jobs are already serialized because
+        # their .env loading mutates process-global state.
+        if active_profile is not None:
+            from hermes_cli.plugins import get_plugin_manager
+
+            get_plugin_manager().load_profile_tools(_get_hermes_home())
+
+        _enabled_toolsets = _resolve_cron_enabled_toolsets(job, _cfg)
+
         # Initialize MCP servers so configured mcp_servers are available to
         # the agent's tool registry before AIAgent is constructed. Without
         # this, cron jobs never saw any MCP tools — only the gateway / CLI
         # paths called discover_mcp_tools() at startup. Idempotent: subsequent
         # ticks short-circuit on already-connected servers inside
-        # register_mcp_servers(). Non-fatal on failure: a broken MCP server
-        # shouldn't kill an otherwise-working cron job. See #4219.
-        try:
-            from tools.mcp_tool import discover_mcp_tools
-            _mcp_tools = discover_mcp_tools()
-            if _mcp_tools:
-                logger.info(
-                    "Job '%s': %d MCP tool(s) available",
-                    job_id, len(_mcp_tools),
+        # register_mcp_servers(). The explicit ``no_mcp`` per-job sentinel is
+        # also a connection boundary: don't contact servers whose tools this
+        # agent cannot receive. Non-fatal on failure otherwise. See #4219.
+        if "no_mcp" not in (job.get("enabled_toolsets") or []):
+            try:
+                from tools.mcp_tool import discover_mcp_tools
+                _mcp_tools = discover_mcp_tools()
+                if _mcp_tools:
+                    logger.info(
+                        "Job '%s': %d MCP tool(s) available",
+                        job_id, len(_mcp_tools),
+                    )
+            except Exception as _mcp_exc:
+                logger.warning(
+                    "Job '%s': MCP initialization failed (non-fatal): %s",
+                    job_id, _mcp_exc,
                 )
-        except Exception as _mcp_exc:
-            logger.warning(
-                "Job '%s': MCP initialization failed (non-fatal): %s",
-                job_id, _mcp_exc,
-            )
 
         agent = AIAgent(
             model=model,
@@ -5224,7 +5246,7 @@ def _run_job_impl(
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
-            enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
+            enabled_toolsets=_enabled_toolsets,
             disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from

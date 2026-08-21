@@ -247,6 +247,38 @@ class ToolRegistry:
         """Return a stable snapshot of registered tool entries."""
         return self._snapshot_state()[0]
 
+    def transaction(self):
+        """Hold the registry lock and restore all mutable state on failure."""
+        registry = self
+
+        class _Transaction:
+            def __enter__(self):
+                registry._lock.acquire()
+                self._state = (
+                    dict(registry._tools),
+                    dict(registry._toolset_checks),
+                    dict(registry._toolset_aliases),
+                    dict(registry._plugin_override_policy),
+                    registry._generation,
+                )
+                return registry
+
+            def __exit__(self, exc_type, _exc, _tb):
+                try:
+                    if exc_type is not None:
+                        (
+                            registry._tools,
+                            registry._toolset_checks,
+                            registry._toolset_aliases,
+                            registry._plugin_override_policy,
+                            registry._generation,
+                        ) = self._state
+                finally:
+                    registry._lock.release()
+                return False
+
+        return _Transaction()
+
     def _toolset_has_exposable_tools(
         self,
         toolset: str,
@@ -286,6 +318,40 @@ class ToolRegistry:
             entry.name for entry in self._snapshot_entries()
             if entry.toolset == toolset
         )
+
+    def register_batch_if_absent(self, entries: List[dict]) -> None:
+        """Atomically register a batch after proving every name is unclaimed.
+
+        Profile-scoped plugin loading imports untrusted registration code before
+        committing its tool definitions.  A whole-batch preflight prevents a
+        late collision from leaving the earlier tools partially installed in
+        the process-global registry.
+        """
+        with self._lock:
+            names = [str(entry.get("name") or "") for entry in entries]
+            duplicates = sorted({name for name in names if names.count(name) > 1})
+            if duplicates:
+                raise ValueError(
+                    "Duplicate tool names in registration batch: "
+                    + ", ".join(repr(name) for name in duplicates)
+                )
+            conflicts = sorted(name for name in names if name in self._tools)
+            if conflicts:
+                raise ValueError(
+                    "Tool name already registered: "
+                    + ", ".join(repr(name) for name in conflicts)
+                )
+            tools_before = dict(self._tools)
+            checks_before = dict(self._toolset_checks)
+            generation_before = self._generation
+            try:
+                for entry in entries:
+                    self.register(**entry)
+            except BaseException:
+                self._tools = tools_before
+                self._toolset_checks = checks_before
+                self._generation = generation_before
+                raise
 
     def register_toolset_alias(self, alias: str, toolset: str) -> None:
         """Register an explicit alias for a canonical toolset name."""

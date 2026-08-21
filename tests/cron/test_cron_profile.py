@@ -372,11 +372,20 @@ class TestRunJobProfileContext:
         self, isolated_cron_profile_home, monkeypatch
     ):
         import cron.scheduler as sched
+        from hermes_cli.plugins import PluginManager
 
         root, _profile_home = isolated_cron_profile_home
         observed: dict = {}
         self._install_agent_stubs(monkeypatch, observed)
 
+        def reject_additive_profile_load(_manager, _profile_home):
+            pytest.fail("fallback must not load profile-local plugins from default home")
+
+        monkeypatch.setattr(
+            PluginManager,
+            "load_profile_tools",
+            reject_additive_profile_load,
+        )
         job = {
             "id": "missing-profile",
             "name": "missing-profile-job",

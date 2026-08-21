@@ -55,6 +55,14 @@ class TestResolveToolset:
         tools = resolve_toolset("web")
         assert set(tools) == {"web_search", "web_extract"}
 
+    def test_file_read_toolset_has_no_mutation_or_execution_tools(self):
+        tools = set(resolve_toolset("file_read"))
+
+        assert tools == {"read_file", "search_files"}
+        assert tools.isdisjoint({
+            "write_file", "patch", "terminal", "process", "execute_code",
+        })
+
     def test_composite_toolset(self):
         tools = resolve_toolset("debugging")
         assert "terminal" in tools
