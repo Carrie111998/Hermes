@@ -1701,6 +1701,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_ping_timeout = settings.ws_ping_timeout
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
+        self._max_message_age_seconds = settings.max_message_age_seconds
 
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
