@@ -94,6 +94,77 @@ class TestConfigDrivenThresholds:
             assert memory_status.classify_pressure(elevated_avail, total) == "elevated"
             assert memory_status.classify_pressure(critical_avail, total) == "critical"
 
+    def test_crossed_bands_elevated_dropped_to_default(self):
+        """When elevated falls inside/below critical, the elevated override
+        is dropped back to defaults to avoid false OOM evidence."""
+        cfg = {"elevated_fraction": 0.02, "critical_fraction": 0.05}
+        with mock.patch.object(memory_status, "_memory_pressure_config", return_value=cfg):
+            th = memory_status._resolve_thresholds()
+        # elevated fell inside critical -> reset to hardcoded default
+        assert th["elevated_fraction"] == 0.15
+        assert th["critical_fraction"] == 0.05  # critical untouched
+
+    def test_crossed_bands_elevated_kib_dropped_to_default(self):
+        cfg = {"elevated_kib": 32 * 1024, "critical_kib": 64 * 1024}
+        with mock.patch.object(memory_status, "_memory_pressure_config", return_value=cfg):
+            th = memory_status._resolve_thresholds()
+        assert th["elevated_kib"] == 128 * 1024  # reset to default
+        assert th["critical_kib"] == 64 * 1024
+
+    def test_valid_elevated_below_critical_not_dropped(self):
+        """Elevated band above critical is fine and should NOT be reset."""
+        cfg = {"elevated_fraction": 0.20, "critical_fraction": 0.05}
+        with mock.patch.object(memory_status, "_memory_pressure_config", return_value=cfg):
+            th = memory_status._resolve_thresholds()
+        assert th["elevated_fraction"] == 0.20
+
+    def test_collect_memory_status_rollup_downgrades_elevated(self):
+        """Verify collect_memory_status actually applies the show_elevated_banner
+        downgrade in the rollup path (not just classify_pressure)."""
+        total = 31 * 1024 * 1024
+        elevated_avail = int(total * 0.115)
+        now = memory_status.datetime(2026, 8, 21, 12, 0, 0, tzinfo=memory_status.timezone.utc)
+        heartbeat = {
+            "updated_at": now.isoformat(),
+            "mem": {
+                "mem_available_kib": elevated_avail,
+                "mem_total_kib": total,
+                "rss_kib": 500 * 1024,
+                "swap_used_kib": 0,
+            },
+        }
+        sentinel = {"prior_unclean_exit": False, "prior_suspected_oom": False,
+                    "started_at": now.isoformat()}
+        cfg_off = {"show_elevated_banner": False}
+        with mock.patch.object(memory_status, "_read_heartbeat", return_value=heartbeat), \
+             mock.patch.object(memory_status, "_read_sentinel", return_value=sentinel), \
+             mock.patch.object(memory_status, "_memory_pressure_config", return_value=cfg_off):
+            result = memory_status.collect_memory_status(now=now)
+        assert result["pressure"] == "ok"  # elevated downgraded via rollup
+
+    def test_collect_memory_status_critical_not_silenceable(self):
+        """show_elevated_banner: false must NOT suppress critical."""
+        total = 31 * 1024 * 1024
+        critical_avail = int(total * 0.02)
+        now = memory_status.datetime(2026, 8, 21, 12, 0, 0, tzinfo=memory_status.timezone.utc)
+        heartbeat = {
+            "updated_at": now.isoformat(),
+            "mem": {
+                "mem_available_kib": critical_avail,
+                "mem_total_kib": total,
+                "rss_kib": 500 * 1024,
+                "swap_used_kib": 0,
+            },
+        }
+        sentinel = {"prior_unclean_exit": False, "prior_suspected_oom": False,
+                    "started_at": now.isoformat()}
+        cfg_off = {"show_elevated_banner": False}
+        with mock.patch.object(memory_status, "_read_heartbeat", return_value=heartbeat), \
+             mock.patch.object(memory_status, "_read_sentinel", return_value=sentinel), \
+             mock.patch.object(memory_status, "_memory_pressure_config", return_value=cfg_off):
+            result = memory_status.collect_memory_status(now=now)
+        assert result["pressure"] == "critical"  # critical is never silenced
+
     def test_memory_pressure_config_missing_dashboard(self):
         with mock.patch("hermes_cli.config.load_config_readonly", return_value={}):
             assert memory_status._memory_pressure_config() == {}

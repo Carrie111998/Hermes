@@ -119,6 +119,17 @@ def _resolve_thresholds() -> Dict[str, Any]:
             if value > 1.0:
                 continue
         resolved[key] = value
+
+    # Cross-validation: if the elevated band was overridden to land inside
+    # or below the critical band, drop the elevated overrides.  Without this
+    # a typo like ``elevated_fraction: 0.02, critical_fraction: 0.05`` would
+    # make everything at/below 5% report critical — false OOM evidence for
+    # the lifecycle ledger.
+    if resolved["elevated_fraction"] <= resolved["critical_fraction"]:
+        resolved["elevated_fraction"] = _ELEVATED_AVAILABLE_FRACTION
+    if resolved["elevated_kib"] <= resolved["critical_kib"]:
+        resolved["elevated_kib"] = _ELEVATED_AVAILABLE_KIB
+
     return resolved
 
 # A heartbeat older than this no longer describes the present.  The writer
@@ -264,10 +275,12 @@ def collect_memory_status(
                     # Config escape hatch for chronic-elevated hosts
                     # (ZFS ARC, #90713): ``show_elevated_banner: false``
                     # downgrades an *elevated* verdict to ``ok`` in this
-                    # public rollup. Raw numbers stay visible; the
-                    # critical class is never silenced and the kanban
-                    # guard re-reads the same config, so banner and
-                    # dispatcher stay in agreement.
+                    # public rollup.  Raw numbers stay visible; the
+                    # critical class is never silenced.  Note: the kanban
+                    # dispatch guard calls ``classify_pressure()`` directly
+                    # and still sees the raw elevated — this flag controls
+                    # the /api/status rollup only (display concern, not
+                    # dispatch logic).
                     if (
                         pressure == "elevated"
                         and _memory_pressure_config().get(
