@@ -1,0 +1,339 @@
+{
+  "schema_version": 1,
+  "repository": "NousResearch/hermes-agent",
+  "architecture_owner_issue": 90866,
+  "completion_owner_issue": 91230,
+  "captured_main": "b6bcb3e791c673e63974029bbab40cc9326803ff",
+  "invariant": "A proof object must survive from admission to the actual effect and typed settlement; coordinates, configured intent, predecessor evidence, and surviving output shape cannot be re-derived as authority downstream.",
+  "evidence_policy": "exact_object_only",
+  "pipeline": [
+    {
+      "id": "admit",
+      "requires": [
+        "qualified_identity",
+        "scope",
+        "generation",
+        "epistemic_state"
+      ]
+    },
+    {
+      "id": "carry",
+      "requires": [
+        "immutable_authority",
+        "provenance",
+        "operation_identity"
+      ]
+    },
+    {
+      "id": "effect",
+      "requires": [
+        "current_consumer",
+        "exact_target",
+        "capability_attestation"
+      ]
+    },
+    {
+      "id": "settle",
+      "requires": [
+        "typed_outcome",
+        "postconditions",
+        "retry_authority"
+      ]
+    },
+    {
+      "id": "publish",
+      "requires": [
+        "exact_object_receipt",
+        "read_back",
+        "lineage_closure"
+      ]
+    }
+  ],
+  "global_constraints": [
+    "Machine-readable repository state outranks narrative status prose.",
+    "A parent retires only after semantic exhaustiveness, not child count.",
+    "Green, review, and publication evidence never transfer across object versions.",
+    "Publication consumes runtime evidence; runtime does not depend on campaign ledgers.",
+    "Non-injective transforms retain both survivor identity and consumption proof."
+  ],
+  "interlocks": [
+    {
+      "id": "webhook",
+      "architecture_owner": {
+        "kind": "issue",
+        "number": 90989
+      },
+      "active_delivery_owner": {
+        "kind": "pull_request",
+        "number": 90995
+      },
+      "stages": [
+        {
+          "role": "effective_config",
+          "kind": "pull_request",
+          "number": 85002
+        },
+        {
+          "role": "domain_spine",
+          "kind": "pull_request",
+          "number": 90995
+        },
+        {
+          "role": "http_mechanics",
+          "kind": "pull_request",
+          "number": 90236
+        },
+        {
+          "role": "signature_verifier",
+          "kind": "pull_request",
+          "number": 85318
+        },
+        {
+          "role": "session_admission",
+          "kind": "pull_request",
+          "number": 90304
+        },
+        {
+          "role": "effect_settlement",
+          "kind": "pull_request",
+          "number": 85644
+        },
+        {
+          "role": "docs_projection",
+          "kind": "pull_request",
+          "number": 85638
+        },
+        {
+          "role": "terminal_assembler",
+          "kind": "pull_request",
+          "number": 85640
+        }
+      ],
+      "constraints": [
+        "Provider, verifier, event, and delivery identity are bound once by the domain spine.",
+        "HTTP and cryptographic authorities consume the bound namespace and exact raw body.",
+        "Session policy consumes the authenticated envelope without re-derivation.",
+        "Per-target terminal partial truth precedes documentation and final assembly.",
+        "Only the exact composed head may claim integration evidence."
+      ]
+    },
+    {
+      "id": "mcp_oauth",
+      "architecture_owner": {
+        "kind": "pull_request",
+        "number": 84963
+      },
+      "active_delivery_owner": {
+        "kind": "pull_request",
+        "number": 90888
+      },
+      "required_child_roles": [
+        {
+          "role": "oauth_lifecycle",
+          "publication": {
+            "kind": "pull_request",
+            "number": 90888
+          }
+        },
+        {
+          "role": "mcp2_transport_control_plane",
+          "publication": null
+        }
+      ],
+      "parent_retirement_gate": "semantic_exhaustiveness",
+      "parent_may_retire": false,
+      "constraints": [
+        "Protocol-era discovery and OAuth metadata discovery remain orthogonal.",
+        "No second era selector, transport factory, provider cache, or credential authority.",
+        "Original contributor provenance must survive every extracted child."
+      ]
+    },
+    {
+      "id": "compression_projection",
+      "architecture_owner": {
+        "kind": "pull_request",
+        "number": 88551
+      },
+      "active_delivery_owner": {
+        "kind": "pull_request",
+        "number": 88551
+      },
+      "specification_nodes": [
+        {
+          "kind": "issue",
+          "number": 88740
+        },
+        {
+          "kind": "issue",
+          "number": 88758
+        }
+      ],
+      "delivery_lanes": 1,
+      "proof_dimensions": [
+        "_row_id",
+        "_row_id_watermark"
+      ],
+      "constraints": [
+        "Caller stamping and projection watermarking land as one proof-preserving system.",
+        "Durable and live candidates use the same repair/projection transform.",
+        "Provider and display serialization strip internal proof metadata."
+      ]
+    },
+    {
+      "id": "publication_contracts",
+      "architecture_owner": {
+        "kind": "pull_request",
+        "number": 90307
+      },
+      "active_delivery_owner": {
+        "kind": "pull_request",
+        "number": 90307
+      },
+      "consumers": [
+        {
+          "channel": "slack",
+          "kind": "pull_request",
+          "number": 91036
+        },
+        {
+          "channel": "discord",
+          "kind": "pull_request",
+          "number": 90321
+        }
+      ],
+      "constraints": [
+        "The generic publication contract precedes channel ledgers.",
+        "Narrative counts are generated from or conformance-checked against committed ledgers.",
+        "Runtime implementation remains independent of publication validation."
+      ]
+    },
+    {
+      "id": "webhook_docs_assembly",
+      "architecture_owner": {
+        "kind": "issue",
+        "number": 90989
+      },
+      "active_delivery_owner": {
+        "kind": "pull_request",
+        "number": 85640
+      },
+      "docs_owner": {
+        "kind": "pull_request",
+        "number": 85638
+      },
+      "constraints": [
+        "Documentation follows executable composition and never defines runtime truth.",
+        "The terminal assembler is rebuilt from current main after all behavior owners publish.",
+        "Sibling tests are inputs, not substitutes for composed-object evidence."
+      ]
+    },
+    {
+      "id": "hermes_tag",
+      "architecture_owner": {
+        "kind": "issue",
+        "number": 90866
+      },
+      "active_delivery_owner": {
+        "kind": "pull_request",
+        "number": 91111
+      },
+      "next_required_consumers": [
+        "pre_gateway_dispatch",
+        "pre_tool_call"
+      ],
+      "constraints": [
+        "Kernel-only surface is implementation evidence, not runtime delivery.",
+        "One immutable decision crosses admission and a real effect seam.",
+        "Concurrent tasks, stale generations, and approval or lease replay fail closed."
+      ]
+    },
+    {
+      "id": "discord_voice_v6",
+      "architecture_owner": {
+        "kind": "issue",
+        "number": 79564
+      },
+      "active_delivery_owner": null,
+      "paired_publications": [
+        {
+          "kind": "pull_request",
+          "number": 78180
+        },
+        {
+          "kind": "pull_request",
+          "number": 78196
+        }
+      ],
+      "state_machine": [
+        "captured_utterance",
+        "transcription_settlement",
+        "transcript_routing",
+        "agent_turn_admission",
+        "optional_media_delivery",
+        "terminal_stage_receipt"
+      ],
+      "constraints": [
+        "STT fallback never bypasses transcribe-only admission.",
+        "File-only transcript routing never leaks content into Discord.",
+        "Disabled agent turns never suppress transcript persistence."
+      ]
+    },
+    {
+      "id": "windows_update_bootstrap",
+      "architecture_owner": {
+        "kind": "issue",
+        "number": 91277
+      },
+      "active_delivery_owner": {
+        "kind": "pull_request",
+        "number": 91895
+      },
+      "admission_owner": {
+        "kind": "pull_request",
+        "number": 91316
+      },
+      "historical_fossil": {
+        "kind": "pull_request",
+        "number": 60233,
+        "disposition": "invariant_only"
+      },
+      "constraints": [
+        "The mutation actor cannot execute from mutable or native artifacts owned by the target generation.",
+        "Admission binds deployment root, source generation, target generation, and operation identity.",
+        "Settlement observes the admitted generation at the admitted root."
+      ]
+    },
+    {
+      "id": "secret_provider_egress",
+      "architecture_owner": {
+        "kind": "issue",
+        "number": 77162
+      },
+      "active_delivery_owner": {
+        "kind": "pull_request",
+        "number": 77198
+      },
+      "closure_state": "open_current_main_unverified",
+      "constraints": [
+        "Arbitrarily named externally applied secret values are masked at provider egress.",
+        "Closure requires a current-main provider-wire witness bound to the exact head.",
+        "Historical partial implementations remain provenance, not closure evidence."
+      ]
+    },
+    {
+      "id": "godfile_campaign_topology",
+      "architecture_owner": {
+        "kind": "issue",
+        "number": 78647
+      },
+      "active_delivery_owner": null,
+      "selection_authority": "kill_lock_plus_current_main",
+      "survivor_unit": "semantic_slice",
+      "constraints": [
+        "The 77xxx-79xxx population is campaign provenance, not an automatic rebase queue.",
+        "Only selected semantic slices receive active delivery authority.",
+        "Authorship and supersession remain explicit when implementation ownership converges."
+      ]
+    }
+  ]
+}
