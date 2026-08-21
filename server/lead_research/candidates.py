@@ -305,15 +305,29 @@ class CandidateRepository:
         invalid_countries = normalized_countries - ISO_ALPHA_2
         if invalid_countries:
             raise CandidateImportValidationError("countries must use ISO alpha-2 codes")
+        if not current:
+            return []
         query = (
             "SELECT dataset_id,version,source_record_id,company_name,normalized_name,country,domain,data "
             "FROM candidate_records"
         )
-        params: tuple[Any, ...] = ()
+        clauses: list[str] = []
+        params: list[Any] = []
         if normalized_countries:
-            placeholders = ",".join("?" for _ in normalized_countries)
-            query += f" WHERE country IN ({placeholders})"
-            params = tuple(sorted(normalized_countries))
+            clauses.append(
+                f"country IN ({','.join('?' for _ in normalized_countries)})"
+            )
+            params.extend(sorted(normalized_countries))
+        # The version filter belongs in the query, not the loop. A superseded row
+        # was fetched, JSON-decoded and term-matched before being discarded, so a
+        # tenant holding a corrected corpus beside its original paid twice for
+        # every row to use half of them. Both columns are in the country index.
+        clauses.append(
+            "(" + " OR ".join("(dataset_id=? AND version=?)" for _ in current) + ")"
+        )
+        for dataset_id in sorted(current):
+            params.extend((dataset_id, current[dataset_id]))
+        query += " WHERE " + " AND ".join(clauses)
         # Not by dataset_id: that let the alphabetically-first corpus consume
         # the whole limit, so a tenant holding both a plain contact list and a
         # procurement-derived corpus never reached the second one. Record ids
@@ -322,9 +336,7 @@ class CandidateRepository:
         query += " ORDER BY source_record_id,dataset_id,version"
         terms = [normalize_name(str(value)) for value in product_terms if str(value).strip()]
         results: list[CandidateRecord] = []
-        for row in self.db.all(query, params):
-            if current.get(row["dataset_id"]) != row["version"]:
-                continue
+        for row in self.db.all(query, tuple(params)):
             data = json_load(row["data"], {})
             searchable = " ".join([
                 row["normalized_name"],

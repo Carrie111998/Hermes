@@ -243,11 +243,27 @@ class LeadResearchService:
         providers = [self.registry.get(source_id) for source_id in config.enabled_source_ids]
         return estimate_campaign(config, providers)
 
-    def _find_lead(self, company_id: str, organization_id: str):
-        for row in self.db.all("SELECT * FROM leads WHERE company_id=?", (company_id,)):
-            if json_load(row["data"], {}).get("organization_id") == organization_id:
-                return row
-        return None
+    def _lead_ids_by_organization(self, company_id: str) -> dict[str, str]:
+        """Existing leads, keyed by the organization they belong to.
+
+        `organization_id` lives inside the lead's JSON payload, so finding one
+        used to mean reading every lead row and decoding every payload — once
+        per qualifying candidate. On the measured run that was 396 candidates
+        against 173 leads, and it grew with the square of the tenant. Built once
+        per run instead, the way `prior_results` already is.
+
+        Not pushed into SQL: extracting from JSON is spelled differently on
+        Postgres, and a tenant's lead table is small enough that one pass over
+        it costs nothing next to a single Web Unlocker fetch.
+        """
+        index: dict[str, str] = {}
+        for row in self.db.all(
+            "SELECT id,data FROM leads WHERE company_id=?", (company_id,)
+        ):
+            organization_id = json_load(row["data"], {}).get("organization_id")
+            if organization_id and organization_id not in index:
+                index[organization_id] = row["id"]
+        return index
 
     def _save_claim(
         self,
@@ -753,6 +769,7 @@ class LeadResearchService:
         source_ids: list[str],
         evidence_domains: list[str],
         claims: list[Claim],
+        lead_ids: dict[str, str],
     ) -> str:
         organization = self.db.one(
             "SELECT display_name,domain,country FROM organizations WHERE id=? AND company_id=?",
@@ -782,9 +799,9 @@ class LeadResearchService:
             "source_ids": source_ids,
             "top_evidence_sources": evidence_domains,
         }
-        existing = self._find_lead(company_id, organization_id)
+        existing_id = lead_ids.get(organization_id)
         lead_status = "qualified" if verdict.kind == "strong_fit" else "review"
-        if existing:
+        if existing_id:
             self.db.execute(
                 "UPDATE leads SET company_name=?,website=?,country=?,status=?,data=?,updated_at=? WHERE id=?",
                 (
@@ -794,10 +811,10 @@ class LeadResearchService:
                     lead_status,
                     json_dump(lead_data),
                     now(),
-                    existing["id"],
+                    existing_id,
                 ),
             )
-            return existing["id"]
+            return existing_id
         lead_id = new_id("lead")
         stamp = now()
         self.db.execute(
@@ -816,6 +833,10 @@ class LeadResearchService:
                 stamp,
             ),
         )
+        # Kept current within the run: two candidates can resolve to one
+        # organization, and the second must update the first's lead rather than
+        # insert a duplicate.
+        lead_ids[organization_id] = lead_id
         return lead_id
 
     def run(self, company_id: str, campaign_id: str) -> dict:
@@ -877,6 +898,7 @@ class LeadResearchService:
                 (company_id, campaign_id),
             )
         }
+        lead_ids = self._lead_ids_by_organization(company_id)
         for table in ("campaign_partitions", "campaign_metrics", "research_issues", "feature_claims"):
             self.db.execute(
                 f"DELETE FROM {table} WHERE company_id=? AND campaign_id=?", (company_id, campaign_id)
@@ -1218,6 +1240,7 @@ class LeadResearchService:
                                     company_id, campaign_id, organization_id, config,
                                     score, gate, evaluated_verdict, source_ids,
                                     sorted(official_domains | independent_domains), claims,
+                                    lead_ids,
                                 )
                                 metrics["qualified_leads"] += 1
                                 stage = "result"

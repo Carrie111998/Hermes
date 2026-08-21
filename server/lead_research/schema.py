@@ -94,6 +94,11 @@ CREATE INDEX IF NOT EXISTS ix_research_evidence_tenant ON evidence_records(compa
 CREATE INDEX IF NOT EXISTS ix_research_claims_tenant ON feature_claims(company_id, campaign_id, organization_id);
 CREATE INDEX IF NOT EXISTS ix_research_partitions_tenant ON campaign_partitions(company_id, campaign_id, source_id);
 CREATE INDEX IF NOT EXISTS ix_research_results_tenant ON research_results(company_id, campaign_id, verdict);
+-- Evidence reuse reads by tenant, source and age; the tenant index above leads
+-- with campaign_id, which this lookup deliberately does not filter on, so
+-- without this it scanned every evidence row the tenant owns once per run.
+CREATE INDEX IF NOT EXISTS ix_research_evidence_reuse
+    ON evidence_records(company_id, source_id, retrieved_at);
 CREATE INDEX IF NOT EXISTS ix_candidate_records_country ON candidate_records(country, dataset_id, version);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_candidate_records_domain
     ON candidate_records(dataset_id, version, domain) WHERE domain IS NOT NULL;

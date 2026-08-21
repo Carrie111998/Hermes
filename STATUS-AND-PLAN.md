@@ -918,6 +918,50 @@ tests, which is the point of using barriers rather than timing observations.
 515 server tests pass, four consecutive full runs with no flake, plus six WebUI
 suites.
 
+### C4. Work that grew with the tenant instead of with the batch
+
+Three lookups, each measured rather than assumed.
+
+**The lead table was read once per qualifying candidate.** `organization_id`
+lives inside a lead's JSON payload, so finding one meant reading every lead row
+and decoding every payload — and doing it again for the next candidate. On the
+measured shape (396 candidates, 173 leads) that is **168 ms of pure JSON
+decoding per run, now 0.7 ms: 230× faster**, and it was growing with the square
+of the tenant. Built once per run instead, the way `prior_results` already was.
+The index is kept current *inside* the run, because two candidates can resolve to
+one organization and the second must update the first's lead rather than insert
+a duplicate — there is a test for exactly that.
+
+Not pushed into SQL: extracting from JSON is spelled differently on Postgres,
+and one pass over a tenant's lead table costs nothing next to a single fetch.
+
+**Superseded corpus rows were fetched, decoded and term-matched before being
+discarded.** The version filter now sits in the query, so a tenant holding a
+corrected corpus beside its original stops paying twice for every row to use
+half of them. Measured on 10,940 rows across two versions: 1.4 ms → 1.1 ms, and
+1.0 ms once SQLite has statistics — modest, but the wasted work is gone rather
+than moved. Both columns are in the existing country index; nothing here needs a
+new one, and after `ANALYZE` the planner picks that index over the primary key.
+
+**The evidence-reuse read from C2 scanned every evidence row the tenant owns.**
+The existing tenant index leads with `campaign_id`, which that lookup
+deliberately does not filter on. A `(company_id, source_id, retrieved_at)` index
+fixes it, and a test asserts the query plan actually names it rather than
+trusting that it would.
+
+Deliberately left alone: `save_evidence` checks for an existing row once per
+evidence record. That is an N+1 in query *count*, but each one is a point lookup
+on the table's own `UNIQUE` constraint — confirmed with `EXPLAIN QUERY PLAN` —
+so it is O(log n) and free next to a fetch. The test that counts the reuse read
+says so, so nobody re-discovers it as a defect.
+
+These tests pin the *shape* of the work — how many times a table is read — not
+its speed. A timing assertion would be flaky on a loaded machine and would not
+say what broke.
+
+Verified by reverting all three: three tests fail. 522 server tests pass across
+three consecutive runs, plus six WebUI suites.
+
 ## Carried-over risks
 
 - **Postgres paths stay under-tested.** `tests/server/` builds `Settings` with
