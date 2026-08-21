@@ -202,6 +202,19 @@ class TestSecurityScanCommand:
         assert code == 2
         assert "does not exist" in capsys.readouterr().err
 
+    def test_default_baseline_is_application_owned_security_state(
+        self, tmp_path, monkeypatch
+    ):
+        from agent.file_safety import is_write_denied
+
+        home = tmp_path / ".hermes" / "profiles" / "work"
+        home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        baseline = home / "security" / "tirith-scan-baseline.json"
+
+        assert is_write_denied(str(baseline)) is True
+
 
 class TestSecurityScanParser:
     def test_scan_options_are_wired_to_security_handler(self):
