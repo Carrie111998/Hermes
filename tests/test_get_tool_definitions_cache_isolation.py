@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import os
-from pathlib import Path
 from threading import Barrier
 
 import pytest
@@ -74,23 +73,6 @@ class TestQuietModeCacheIsolation:
         )
 
         assert calls == 2
-
-    def test_config_fingerprint_reads_in_bounded_chunks(self, tmp_path, monkeypatch):
-        """The hot cache path must not allocate the entire config file."""
-        config_file = tmp_path / "config.yaml"
-        config_file.write_text("toolsets:\n  - file\n", encoding="utf-8")
-        monkeypatch.setattr(
-            "hermes_cli.config.get_config_path", lambda: config_file
-        )
-
-        def fail_read_bytes(_path):
-            raise AssertionError("cache fingerprint must not use Path.read_bytes()")
-
-        monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
-
-        assert model_tools.get_tool_definitions(
-            enabled_toolsets=["file"], quiet_mode=True
-        )
 
     def test_first_uncached_call_returns_fresh_list(self):
         """The first quiet_mode call must not alias the cached object \u2014

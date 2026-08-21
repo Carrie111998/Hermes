@@ -314,7 +314,12 @@ _TOOL_DEFS_CACHE_MAX = 8
 
 
 def _config_content_fingerprint(config_path) -> bytes:
-    """Return a bounded-memory content fingerprint for a config file."""
+    """Return a content fingerprint, deliberately hashing the file each call.
+
+    Metadata-only shortcuts cannot detect rewrites that preserve both size and
+    mtime. Streaming bounds memory use while correctness takes priority over
+    the small cost of reading and hashing the config.
+    """
     digest = hashlib.sha256()
     with config_path.open("rb") as config_file:
         for chunk in iter(lambda: config_file.read(64 * 1024), b""):
