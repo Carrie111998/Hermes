@@ -6851,7 +6851,12 @@ def _compute_config_revision(raw_config: dict) -> str:
 
 
 def _protect_sensitive_config_fields(existing: dict, incoming: dict) -> None:
-    """Protect security-sensitive auth credentials from empty-string overwrites."""
+    """Restore existing auth credentials over empty-string values in a blind
+    write (no verified expected_revision), so a caller that doesn't know
+    about CAS can't silently wipe them. A caller that *did* send a matching
+    expected_revision has proven it saw the current state, so an empty value
+    from it is a deliberate clear and must go through untouched — otherwise
+    users can never turn dashboard basic auth off (#88947 review)."""
     if not isinstance(existing, dict) or not isinstance(incoming, dict):
         return
 
@@ -7712,7 +7717,12 @@ async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
                 else:
                     raise HTTPException(status_code=400, detail="Either 'config' or 'patch' must be provided")
 
-                _protect_sensitive_config_fields(existing, incoming)
+                # A verified expected_revision proves the caller saw current
+                # disk state, so its empty strings are a deliberate clear.
+                # Without one, protect credentials from a blind overwrite.
+                if not body.expected_revision:
+                    _protect_sensitive_config_fields(existing, incoming)
+
                 merged = _deep_merge(existing, incoming)
                 # Compare normalized approvals.mode across the in-memory
                 # documents, not config blocks and not cache re-reads: the

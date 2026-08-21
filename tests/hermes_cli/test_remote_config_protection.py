@@ -126,3 +126,34 @@ def test_put_config_preserves_dashboard_basic_auth_on_empty_overwrite(web_client
     auth_after = raw_after["dashboard"]["basic_auth"]
     assert auth_after["username"] == "admin"
     assert auth_after["secret"] == "stable-signing-secret"
+
+
+def test_put_config_clears_dashboard_basic_auth_with_verified_revision(web_client):
+    """A PUT carrying a matching expected_revision has proven the caller saw
+    the current state, so an empty basic_auth in that request is a
+    deliberate clear and must go through, not be silently restored."""
+    get_res = web_client.get("/api/config")
+    rev = get_res.json()["_revision"]
+
+    response = web_client.put(
+        "/api/config",
+        json={
+            "config": {
+                "dashboard": {
+                    "basic_auth": {
+                        "username": "",
+                        "password_hash": "",
+                        "password": "",
+                        "secret": "",
+                    }
+                }
+            },
+            "expected_revision": rev,
+        },
+    )
+    assert response.status_code == 200
+
+    raw_after = read_raw_config()
+    auth_after = raw_after["dashboard"]["basic_auth"]
+    assert auth_after["username"] == ""
+    assert auth_after["secret"] == ""
