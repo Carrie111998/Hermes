@@ -19,7 +19,7 @@ export interface RevalidateRemoteConnectionOptions<TConnection extends RemoteCon
   connectionPromise: Promise<TConnection>
   currentConnectionPromise: () => null | Promise<TConnection>
   log: (message: string) => void
-  probe: (connection: TConnection, path: string, options: { timeoutMs: number }) => Promise<unknown>
+  probe: (url: string, options: { timeoutMs: number }) => Promise<unknown>
   resetConnection: () => void
   tracker: RemoteLivenessTracker
 }
@@ -117,16 +117,15 @@ export class RemoteLivenessTracker {
   }
 }
 
-export interface PooledRemoteEntry<TConnection extends RemoteConnectionDescriptor = RemoteConnectionDescriptor> {
-  connectionPromise?: null | Promise<TConnection>
+export interface PooledRemoteEntry {
   process?: unknown
   remoteBaseUrl?: null | string
 }
 
-export interface RevalidatePooledRemoteBackendsOptions<TConnection extends RemoteConnectionDescriptor> {
-  entries: Iterable<[string, PooledRemoteEntry<TConnection>]>
+export interface RevalidatePooledRemoteBackendsOptions {
+  entries: Iterable<[string, PooledRemoteEntry]>
   log: (message: string) => void
-  probe: (connection: TConnection, path: string, options: { timeoutMs: number }) => Promise<unknown>
+  probe: (url: string, options: { timeoutMs: number }) => Promise<unknown>
   stopBackend: (profile: string) => void
   tracker: RemoteLivenessTracker
 }
@@ -142,13 +141,13 @@ export interface RevalidatePooledRemoteBackendsOptions<TConnection extends Remot
  * Entries share the primary's failure policy, keyed per base URL, so a profile
  * pointing at the same host as another does not burn the streak twice as fast.
  */
-export async function revalidatePooledRemoteBackends<TConnection extends RemoteConnectionDescriptor>({
+export async function revalidatePooledRemoteBackends({
   entries,
   log,
   probe,
   stopBackend,
   tracker
-}: RevalidatePooledRemoteBackendsOptions<TConnection>): Promise<{ dropped: string[] }> {
+}: RevalidatePooledRemoteBackendsOptions): Promise<{ dropped: string[] }> {
   const remotes = [...entries].filter(([, entry]) => !entry.process && entry.remoteBaseUrl)
   const dropped: string[] = []
 
@@ -157,12 +156,7 @@ export async function revalidatePooledRemoteBackends<TConnection extends RemoteC
       const baseUrl = String(entry.remoteBaseUrl).replace(/\/+$/, '')
 
       try {
-        if (!entry.connectionPromise) {
-          throw new Error('Remote backend descriptor is unavailable.')
-        }
-
-        const connection = await entry.connectionPromise
-        await probe(connection, '/api/status', { timeoutMs: REMOTE_LIVENESS_TIMEOUT_MS })
+        await probe(`${baseUrl}/api/status`, { timeoutMs: REMOTE_LIVENESS_TIMEOUT_MS })
         tracker.recordSuccess(baseUrl)
       } catch {
         const failure = tracker.recordFailure(baseUrl)
@@ -218,7 +212,7 @@ export async function revalidateRemoteConnection<TConnection extends RemoteConne
   const baseUrl = connection.baseUrl.replace(/\/+$/, '')
 
   try {
-    await probe(connection, '/api/status', { timeoutMs: REMOTE_LIVENESS_TIMEOUT_MS })
+    await probe(`${baseUrl}/api/status`, { timeoutMs: REMOTE_LIVENESS_TIMEOUT_MS })
 
     if (currentConnectionPromise() !== connectionPromise) {
       return { ok: true, rebuilt: false }

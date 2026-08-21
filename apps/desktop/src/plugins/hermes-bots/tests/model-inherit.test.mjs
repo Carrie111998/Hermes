@@ -10,7 +10,6 @@ function loadApplyAdvancedConfig(request) {
   const end = source.indexOf('// ── edit profile dialog', start)
   const context = {
     host: { request },
-    requestForBot: (_bot, method, params) => request(method, params),
     ensureMessagingProtocol: soul => soul,
     $lastRoster: { get: () => [] }
   }
@@ -46,7 +45,7 @@ test('regression: selecting Inherit explicitly clears the profile model assignme
     return { code: 0, blocked: false, output: 'Unset model' }
   })
 
-  const result = await apply({ name: 'ops' }, state({ dirtyModel: true }))
+  const result = await apply('ops', state({ dirtyModel: true }))
 
   assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
     {
@@ -65,7 +64,7 @@ test('integration: model clearing and other dirty sections report a merged resul
     return { ok: true, applied: { soul: true } }
   })
 
-  const result = await apply({ name: 'ops' }, state({ dirtyModel: true, dirtySoul: true, soul: '# Ops' }))
+  const result = await apply('ops', state({ dirtyModel: true, dirtySoul: true, soul: '# Ops' }))
 
   assert.equal(calls[0].method, 'cli.exec')
   assert.deepEqual(JSON.parse(JSON.stringify(calls[1])), {
@@ -81,7 +80,7 @@ test('integration: model clearing and other dirty sections report a merged resul
 test('regression: a rejected model clear is reported as a failed section', async () => {
   const apply = loadApplyAdvancedConfig(async () => ({ code: 1, blocked: false, output: 'Config key not set' }))
 
-  const result = await apply({ name: 'ops' }, state({ dirtyModel: true }))
+  const result = await apply('ops', state({ dirtyModel: true }))
 
   assert.deepEqual(JSON.parse(JSON.stringify(result)), { ok: false, applied: { model: false } })
 })

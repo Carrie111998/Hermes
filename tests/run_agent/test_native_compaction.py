@@ -694,11 +694,7 @@ class TestCheckpointGatedOnCurrentEligibility:
 
         class _Responses:
             def create(self, **kwargs):
-                # #93650 routes the bulk input around the SDK transform via
-                # extra_body; accept the payload in either wire shape.
-                seen["input"] = kwargs.get("input") or (
-                    kwargs.get("extra_body") or {}
-                ).get("input")
+                seen["input"] = kwargs.get("input")
                 raise RuntimeError("stop before network")
 
         class _Client:

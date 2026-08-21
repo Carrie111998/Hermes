@@ -127,7 +127,6 @@ export interface Translations {
       backendStopped: string
       desktopBootFailed: string
       gatewayConnectionLost: string
-      gatewayConnectionLostDetail: string
       gatewaySignInRequired: string
       ipcBridgeUnavailable: string
     }
@@ -146,11 +145,6 @@ export interface Translations {
       remoteSignInHint: (signInLabel: string) => string
       signOutAndSignIn: string
       remoteFailureHint: string
-      cloudDownTitle: string
-      cloudDownDescription: string
-      cloudDownHint: string
-      cloudDownCheckPortal: string
-      cloudDownDiscord: string
       hideRecentLogs: string
       showRecentLogs: string
       signedInTitle: string
@@ -251,27 +245,6 @@ export interface Translations {
     dismiss: string
   }
 
-  sendDiagnostics: {
-    title: string
-    privacyNotice: string
-    upload: string
-    uploading: string
-    cancel: string
-    close: string
-    copyLink: string
-    uploadIdFallback: (id: string) => string
-    doneTitle: string
-    doneDescription: string
-    failedTitle: string
-    failedHint: string
-    handoffLead: string
-    links: {
-      discord: string
-      github: string
-      portal: string
-    }
-  }
-
   titlebar: {
     hideSidebar: string
     showSidebar: string
@@ -287,7 +260,6 @@ export interface Translations {
     openStarmap: string
     enterHud: string
     exitHud: string
-    resetHudLayout: string
     layoutEditor: string
     layoutEditorTitle: (modifier: string) => string
   }
@@ -480,8 +452,6 @@ export interface Translations {
       reactionsDesc: string
       composerPopoutTitle: string
       composerPopoutDesc: string
-      vibeHeartsTitle: string
-      vibeHeartsDesc: string
       embedsTitle: string
       embedsDesc: string
       embedsAsk: string
@@ -1539,34 +1509,6 @@ export interface Translations {
     switchConnectionFailed: (name: string) => string
     manageProfiles: string
     connectGateway: string
-    remoteOverride: {
-      menuItem: string
-      badge: (host: string) => string
-      title: (profile: string) => string
-      description: string
-      urlLabel: string
-      urlPlaceholder: string
-      urlInvalid: string
-      tokenLabel: string
-      tokenPlaceholder: string
-      tokenSavedHint: string
-      plainTextOptIn: string
-      collisionWarning: (label: string) => string
-      confirmTitle: string
-      confirmNote: (profile: string, host: string) => string
-      confirmBack: string
-      connect: string
-      connecting: string
-      disconnect: string
-      savedTitle: string
-      savedMessage: (profile: string, host: string) => string
-      removedTitle: string
-      removedMessage: (profile: string) => string
-      removeFailed: string
-      authFailedTitle: string
-      authFailedMessage: (profile: string, host: string) => string
-      updateToken: string
-    }
     actions: string
     color: string
     colorFor: string
@@ -2424,7 +2366,6 @@ export interface Translations {
       gateway: string
       gatewayReady: string
       gatewayNeedsSetup: string
-      gatewayUnavailable: string
       gatewayChecking: string
       gatewayConnecting: string
       gatewayOffline: string
@@ -2635,7 +2576,6 @@ export interface Translations {
     closeToRight: string
     closeAll: string
     newSessionTab: string
-    newTab: string
     pluginDisabled: (pluginId: string) => string
     pluginDisabledBody: string
     missingPane: (paneId: string) => string
@@ -2727,7 +2667,6 @@ export interface Translations {
       errorOpenLogsFailed: string
       errorOpenDesktopLogs: string
       errorCopyDiagnostics: string
-      errorSendDiagnostics: string
       filesChanged: (count: number) => string
       reviewChanges: string
       readAloudFailed: string

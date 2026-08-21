@@ -307,9 +307,7 @@ class SubagentLifecycleService:
             )
         try:
             accepted = request_hard_interrupt(
-                agent,
-                f"Lifecycle cancellation requested: {reason[:500]}",
-                tool_reason="subagent cancellation requested",
+                agent, f"Lifecycle cancellation requested: {reason[:500]}"
             )
         except Exception:
             return SubagentCancelResult(

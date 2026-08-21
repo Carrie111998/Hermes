@@ -8,29 +8,9 @@ import type {
   SessionSearchResponse
 } from '@/types/hermes'
 
-import { capabilityScoped, hermesApi, type ProfileScope } from './client'
+import { hermesApi } from './client'
 
 const SESSION_LIST_REQUEST_TIMEOUT_MS = 60_000
-
-function sessionScoped(scope?: ProfileScope): { connectionId?: string; profile?: string } {
-  if (scope === undefined || scope === null) {
-    return {}
-  }
-
-  const scoped = capabilityScoped(scope)
-
-  if (typeof scope === 'object' && scope.connectionId?.trim() === 'local') {
-    return { ...scoped, connectionId: 'local' }
-  }
-
-  return scoped
-}
-
-function sessionScopeQuery(scope?: ProfileScope): string {
-  const profile = sessionScoped(scope).profile
-
-  return profile ? `?profile=${encodeURIComponent(profile)}` : ''
-}
 
 /**
  * Trim a page to its window WITHOUT discarding pinned rows.
@@ -319,11 +299,11 @@ export function searchSessions(query: string): Promise<SessionSearchResponse> {
 // the given `profile`). The backend resolves exact ids and unique prefixes and
 // 404s when the id isn't on that profile — so a cheap by-id lookup replaces the
 // cross-profile list scan when locating an unknown id's owner.
-export function getSession(id: string, profile?: ProfileScope): Promise<SessionInfo> {
-  const suffix = sessionScopeQuery(profile)
+export function getSession(id: string, profile?: string | null): Promise<SessionInfo> {
+  const suffix = profile ? `?profile=${encodeURIComponent(profile)}` : ''
 
   return hermesApi<SessionInfo>({
-    ...sessionScoped(profile),
+    ...(profile ? { profile } : {}),
     path: `/api/sessions/${encodeURIComponent(id)}${suffix}`
   })
 }
@@ -334,15 +314,13 @@ export function getSession(id: string, profile?: ProfileScope): Promise<SessionI
 // the current/default profile.
 export function getSessionMessages(
   id: string,
-  profile?: ProfileScope,
+  profile?: string | null,
   page: { limit?: number; offset?: number; order?: 'latest' | 'oldest'; includeCompacted?: boolean } = {}
 ): Promise<SessionMessagesResponse> {
   const query = new URLSearchParams()
 
-  const sessionScope = sessionScoped(profile)
-
-  if (sessionScope.profile) {
-    query.set('profile', sessionScope.profile)
+  if (profile) {
+    query.set('profile', profile)
   }
 
   if (page.limit !== undefined) {
@@ -364,7 +342,7 @@ export function getSessionMessages(
   const suffix = query.size ? `?${query.toString()}` : ''
 
   return hermesApi<SessionMessagesResponse>({
-    ...sessionScope,
+    ...(profile ? { profile } : {}),
     path: `/api/sessions/${encodeURIComponent(id)}/messages${suffix}`
   })
 }
@@ -378,7 +356,7 @@ export function getSessionMessages(
  */
 export const LATEST_SESSION_MESSAGES_LIMIT = 120
 
-export function getLatestSessionMessages(id: string, profile?: ProfileScope): Promise<SessionMessagesResponse> {
+export function getLatestSessionMessages(id: string, profile?: string | null): Promise<SessionMessagesResponse> {
   // includeCompacted: durable display history must include rows preserved by
   // in-place compaction (active=0, compacted=1); without them the transcript
   // silently ends at the compaction boundary and earlier turns are unreachable.
@@ -416,7 +394,7 @@ export function getLatestSessionMessages(id: string, profile?: ProfileScope): Pr
  */
 export function getOlderSessionMessages(
   id: string,
-  profile: ProfileScope,
+  profile: string | null | undefined,
   offset: number,
   limit: number = LATEST_SESSION_MESSAGES_LIMIT
 ): Promise<SessionMessagesResponse> {
@@ -425,7 +403,7 @@ export function getOlderSessionMessages(
 
 export async function getAllSessionMessages(
   id: string,
-  profile?: ProfileScope,
+  profile?: string | null,
   options: { maxJsonChars?: number } = {}
 ): Promise<SessionMessagesResponse> {
   const messages: SessionMessage[] = []
@@ -465,9 +443,9 @@ export async function getAllSessionMessages(
   return { session_id: resolvedSessionId, messages }
 }
 
-export function deleteSession(id: string, profile?: ProfileScope): Promise<{ ok: boolean }> {
+export function deleteSession(id: string, profile?: string | null): Promise<{ ok: boolean }> {
   return hermesApi<{ ok: boolean }>({
-    ...sessionScoped(profile),
+    ...(profile ? { profile } : {}),
     path: `/api/sessions/${encodeURIComponent(id)}`,
     method: 'DELETE'
   })

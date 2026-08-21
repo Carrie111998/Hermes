@@ -286,6 +286,17 @@ export const ClarifyTool = (props: ToolCallMessagePartProps) => {
     return <ClarifyToolSettled {...props} />
   }
 
+  return <ClarifyToolLive {...props} />
+}
+
+function ClarifyToolLive(props: ToolCallMessagePartProps) {
+  const messageRunning = useAuiState(selectMessageRunning)
+
+  // Stopped mid-prompt with no result — don't leave a dead interactive panel.
+  if (!messageRunning) {
+    return <ToolFallback {...props} />
+  }
+
   return <ClarifyToolPending {...props} />
 }
 
@@ -373,38 +384,17 @@ function ClarifyToolPending(props: ToolCallMessagePartProps) {
   const $request = useMemo(() => sessionClarifyRequest(sessionId), [sessionId])
   const request = useStore($request)
   const fromArgs = useMemo(() => readClarifyArgs(props.args), [props.args])
-  const messageRunning = useAuiState(selectMessageRunning)
-  // Answering clears the request a beat before `tool.complete` swaps in the
-  // settled card. Latch submit so that gap doesn't demote; Stop also clears
-  // the request and must still collapse an unanswered card.
-  const [answered, setAnswered] = useState(false)
-
-  // Stopped mid-prompt with no result — don't leave a dead interactive panel.
-  // `session.info` reports running=false while clarify is blocking, so the
-  // running flag alone would remount the question as a tool row. Keep the
-  // card while a request is open or this instance already submitted.
-  if (!messageRunning && !request && !answered) {
-    return <ToolFallback {...props} />
-  }
 
   // Batch: the gateway request carries qid-keyed questions. Args alone can't
   // drive the form (no qids to respond with), so batch waits for the request.
   if (request?.questions?.length || fromArgs.questions) {
-    return <ClarifyToolBatchPending onAnswered={() => setAnswered(true)} request={request} />
+    return <ClarifyToolBatchPending request={request} />
   }
 
-  return <ClarifyToolSinglePending fromArgs={fromArgs} onAnswered={() => setAnswered(true)} request={request} />
+  return <ClarifyToolSinglePending fromArgs={fromArgs} request={request} />
 }
 
-function ClarifyToolSinglePending({
-  fromArgs,
-  onAnswered,
-  request
-}: {
-  fromArgs: ClarifyArgs
-  onAnswered: () => void
-  request: ClarifyRequest | null
-}) {
+function ClarifyToolSinglePending({ fromArgs, request }: { fromArgs: ClarifyArgs; request: ClarifyRequest | null }) {
   const { t } = useI18n()
   const copy = t.assistant.clarify
   const gateway = useStore($gateway)
@@ -445,12 +435,11 @@ function ClarifyToolSinglePending({
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
 
   // Race: tool.start fires a tick before clarify.request, so request_id
-  // arrives slightly after the tool block mounts. If the question text is
-  // already in the tool args, paint the card immediately (disabled until
-  // the request is wired) — a spinner→question swap is a layout jump for
-  // no reason. Only spin when we have nothing to show yet.
+  // arrives slightly after the tool block mounts. Hold the whole panel on a
+  // spinner until the gateway request is wired — showing disabled choices or
+  // a "loading question" stub is worse than a brief wait.
   const ready = Boolean(matchingRequest?.requestId)
-  const loading = !ready && !submitting && !question
+  const loading = !ready && !submitting
 
   const respond = useCallback(
     async (answer: string) => {
@@ -474,7 +463,6 @@ function ClarifyToolSinglePending({
           answer
         })
         triggerHaptic('submit')
-        onAnswered()
         clearClarifyRequest(matchingRequest.requestId, matchingRequest.sessionId)
         // tool.complete lands next → ClarifyToolSettled.
       } catch (error) {
@@ -482,7 +470,7 @@ function ClarifyToolSinglePending({
         setSubmitting(false)
       }
     },
-    [copy.gatewayDisconnected, copy.notReady, copy.sendFailed, gateway, matchingRequest, onAnswered, ready]
+    [copy.gatewayDisconnected, copy.notReady, copy.sendFailed, gateway, matchingRequest, ready]
   )
 
   const trimmedDraft = draft.trim()
@@ -720,7 +708,7 @@ function ClarifyToolSinglePending({
                 active={activeIndex === index}
                 char={letterFor(index)}
                 choice={choice}
-                disabled={submitting || !ready}
+                disabled={submitting}
                 key={`${index}-${choice}`}
                 keyShortcuts={`${letterFor(index)} ${index + 1}`}
                 onClick={() => selectChoice(choice, index)}
@@ -744,7 +732,7 @@ function ClarifyToolSinglePending({
                 aria-current={activeIndex === choices.length || undefined}
                 aria-keyshortcuts={`${letterFor(choices.length)} ${choices.length + 1}`}
                 className={CLARIFY_TEXTAREA_CLASS}
-                disabled={submitting || !ready}
+                disabled={submitting}
                 onBlur={() => setOtherFocused(false)}
                 onChange={event => onDraftChange(event.target.value)}
                 onFocus={() => {
@@ -764,7 +752,7 @@ function ClarifyToolSinglePending({
         ) : (
           <Textarea
             className={CLARIFY_TEXTAREA_CLASS}
-            disabled={submitting || !ready}
+            disabled={submitting}
             onChange={event => onDraftChange(event.target.value)}
             onKeyDown={handleTextareaKey}
             placeholder={copy.placeholder}
@@ -777,10 +765,10 @@ function ClarifyToolSinglePending({
       </ClarifyShell>
 
       <div className="flex items-center justify-end gap-1">
-        <Button disabled={submitting || !ready} onClick={() => void respond('')} size="xs" type="button" variant="text">
+        <Button disabled={submitting} onClick={() => void respond('')} size="xs" type="button" variant="text">
           {copy.skip}
         </Button>
-        <Button disabled={submitting || !ready || !pendingAnswer} size="xs" type="submit">
+        <Button disabled={submitting || !pendingAnswer} size="xs" type="submit">
           {submitting ? (
             <Loader2 className="size-3 animate-spin" />
           ) : (
@@ -919,7 +907,7 @@ const emptyStage = { choices: [] as string[], draft: '' }
  * back-to-back and completes the batch. Staged answers stay editable up to
  * that moment. The per-question wire protocol is unchanged (the TUI/CLI
  * still lock incrementally); this card just batches its locks at the end. */
-function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => void; request: ClarifyRequest | null }) {
+function ClarifyToolBatchPending({ request }: { request: ClarifyRequest | null }) {
   const { t } = useI18n()
   const copy = t.assistant.clarify
   const gateway = useStore($gateway)
@@ -952,24 +940,8 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
           continue
         }
 
-        const options = question.choices ?? []
-        let replayedAnswers = [answer]
-
-        if (question.multiSelect) {
-          try {
-            const parsed = JSON.parse(answer)
-
-            if (Array.isArray(parsed) && parsed.every(value => typeof value === 'string')) {
-              replayedAnswers = parsed
-            }
-          } catch {
-            // Older/non-JSON replies remain a one-value replay below.
-          }
-        }
-
-        const matchedChoices = options.filter(choice => replayedAnswers.includes(bareChoice(choice)))
-        next[question.qid] =
-          matchedChoices.length > 0 ? { choices: matchedChoices, draft: '' } : { choices: [], draft: answer }
+        const asChoice = (question.choices ?? []).find(choice => bareChoice(choice) === answer)
+        next[question.qid] = asChoice ? { choices: [asChoice], draft: '' } : { choices: [], draft: answer }
       }
 
       return next
@@ -1022,14 +994,13 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
       }
 
       triggerHaptic('submit')
-      onAnswered()
       // tool.complete lands next → ClarifyToolBatchSettled.
       clearClarifyRequest(request.requestId, request.sessionId)
     } catch (error) {
       notifyError(error, copy.sendFailed)
       setSubmitting(false)
     }
-  }, [copy, gateway, onAnswered, questions, request, stagedAnswer])
+  }, [copy, gateway, questions, request, stagedAnswer])
 
   const toggleChoice = useCallback((question: ClarifyQuestion, choice: string) => {
     setStaged(current => {
@@ -1054,7 +1025,6 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
       return
     }
 
-    onAnswered()
     clearClarifyRequest(request.requestId, request.sessionId)
 
     try {
@@ -1062,7 +1032,7 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
     } catch {
       // The tool times out on its own; a failed skip must never block the UI.
     }
-  }, [gateway, onAnswered, request])
+  }, [gateway, request])
 
   const handleSubmit = useCallback(
     (event: FormEvent<HTMLFormElement>) => {
