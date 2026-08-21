@@ -90,6 +90,18 @@ class TestParseSchedule:
         now = datetime.now().astimezone()
         assert now < run_at < now + timedelta(minutes=31)
 
+    def test_once_in_display_survives_double_round_trip(self):
+        """Review follow-up on #89560: the duration branch echoes
+        ``original`` in its display. When ``original`` was captured BEFORE
+        the prefix strip, re-submitting "once in 30m" re-serialized as
+        "once in once in 30m" — which itself no longer round-trips. The
+        display must stay stable across repeated edit cycles."""
+        display = parse_schedule("30m")["display"]
+        second = parse_schedule(display)["display"]
+        third = parse_schedule(second)["display"]
+        assert second == display
+        assert third == display
+
     def test_once_prefix_with_bad_payload_still_rejected(self):
         """Prefix stripping must not swallow validation: garbage after the
         prefix still raises the actionable Invalid schedule error."""
