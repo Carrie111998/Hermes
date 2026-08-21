@@ -21,9 +21,11 @@ from __future__ import annotations
 
 # Reuse the same HARDLINE authoring + source-hygiene standards as /learn, so a
 # skill saved by /upskill is identical in quality to one saved by /learn.
-from agent.learn_prompt import (
-    _AUTHORING_STANDARDS,
-    _SOURCE_HYGIENE,
+# Import from agent.skill_standards (the shared source of truth), NOT from
+# learn_prompt — a refactor of /learn's prompt module must not break /upskill.
+from agent.skill_standards import (
+    AUTHORING_STANDARDS,
+    SOURCE_HYGIENE,
 )
 
 
@@ -86,8 +88,8 @@ def build_upskill_prompt(scope_hint: str = "") -> str:
         "`skill_manage` write_file and reference it by relative path.\n"
         "6. Report back: how many candidates you found, which were approved and "
         "saved (names), which were skipped/deduped and why.\n\n"
-        f"{_SOURCE_HYGIENE}\n\n"
-        f"{_AUTHORING_STANDARDS}\n\n"
+        f"{SOURCE_HYGIENE}\n\n"
+        f"{AUTHORING_STANDARDS}\n\n"
         "If, after the sweep, there is genuinely nothing worth saving, say so "
         "clearly rather than inventing a low-value skill.\n"
     )

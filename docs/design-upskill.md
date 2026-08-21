@@ -1,6 +1,6 @@
 # Design — `/upskill` (session→skill sweep)
 
-**Status:** proposed · **Owners:** Hermes + Murph (supervisor + lead dev)
+**Status:** implemented in PR (behind `main`) · **Owners:** Hermes + Murph
 **Basis:** mirrors `/learn` (`agent/learn_prompt.py` + `_handle_learn_command`)
 which builds a guidance prompt and injects it onto the agent's input queue —
 no engine, no model-tool footprint.
