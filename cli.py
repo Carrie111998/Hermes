@@ -488,6 +488,7 @@ def load_cli_config() -> Dict[str, Any]:
 
         "display": {
             "compact": False,
+            "banner": True,
             "resume_display": "full",
             # Recap tuning for /resume — see hermes_cli/config.py DEFAULT_CONFIG.
             "resume_exchanges": 10,
@@ -5012,6 +5013,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.console = Console()
         self.config = CLI_CONFIG
         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
+        self.banner_enabled = bool(CLI_CONFIG["display"].get("banner", True))
         # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
         # YAML 1.1 parses bare `off` as boolean False — normalise to string.
         _raw_tp = CLI_CONFIG["display"].get("tool_progress", "all")
@@ -11872,25 +11874,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # and gets mangled by patch_stdout).
             if self._app:
                 cc = ChatConsole()
-                term_w = shutil.get_terminal_size().columns
-                if self.compact or term_w < 80:
-                    cc.print(_build_compact_banner())
-                else:
-                    tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
-                    cwd = os.getenv("TERMINAL_CWD", os.getcwd())
-                    ctx_len = None
-                    if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
-                        ctx_len = self.agent.context_compressor.context_length
-                    build_welcome_banner(
-                        console=cc,
-                        model=self.model,
-                        cwd=cwd,
-                        tools=tools,
-                        enabled_toolsets=self.enabled_toolsets,
-                        session_id=self.session_id,
-                        context_length=ctx_len,
-                        provider=self.provider,
-                    )
+                if self.banner_enabled:
+                    term_w = shutil.get_terminal_size().columns
+                    if self.compact or term_w < 80:
+                        cc.print(_build_compact_banner())
+                    else:
+                        tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
+                        cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+                        ctx_len = None
+                        if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
+                            ctx_len = self.agent.context_compressor.context_length
+                        build_welcome_banner(
+                            console=cc,
+                            model=self.model,
+                            cwd=cwd,
+                            tools=tools,
+                            enabled_toolsets=self.enabled_toolsets,
+                            session_id=self.session_id,
+                            context_length=ctx_len,
+                            provider=self.provider,
+                        )
                 _cprint("  ✨ (◕‿◕)✨ Fresh start! Screen cleared and conversation reset.\n")
                 # Show a random tip on new session
                 try:
@@ -11905,7 +11908,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 except Exception:
                     pass
             else:
-                self.show_banner()
+                if self.banner_enabled:
+                    self.show_banner()
                 print("  ✨ (◕‿◕)✨ Fresh start! Screen cleared and conversation reset.\n")
                 # Show a random tip on new session
                 try:
@@ -17359,14 +17363,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # responses, and prompt all appear pinned to the bottom — empty
         # space stays above, not below.  This prints enough blank lines to
         # scroll the cursor to the last row before any content is rendered.
-        try:
-            _term_lines = shutil.get_terminal_size().lines
-            if _term_lines > 2:
-                print("\n" * (_term_lines - 1), end="", flush=True)
-        except Exception:
-            pass
+        if self.banner_enabled:
+            try:
+                _term_lines = shutil.get_terminal_size().lines
+                if _term_lines > 2:
+                    print("\n" * (_term_lines - 1), end="", flush=True)
+            except Exception:
+                pass
 
-        self.show_banner()
+            self.show_banner()
         # Surface any active supply-chain security advisories right after the
         # welcome banner. Quiet/single-query paths call this themselves.
         self._show_security_advisories()

@@ -316,6 +316,7 @@ export interface TranscriptRow {
 }
 
 export interface UiState {
+  bannerEnabled: boolean
   battery: boolean
   batteryStatus: BatteryInfo | null
   bgTasks: Set<string>

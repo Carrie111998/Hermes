@@ -4,6 +4,16 @@ import type { Msg, SessionInfo } from '../types.js'
 
 export const introMsg = (info: SessionInfo): Msg => ({ info, kind: 'intro', role: 'system', text: '' })
 
+export const withSessionIntro = (info: null | SessionInfo, messages: Msg[], bannerEnabled: boolean): Msg[] => {
+  if (!bannerEnabled) {
+    return messages
+  }
+
+  const intro: Msg = info ? introMsg(info) : { kind: 'intro', role: 'system', text: '' }
+
+  return [intro, ...messages]
+}
+
 export const userDisplay = (text: string) => {
   if (text.length <= LONG_MSG) {
     return text

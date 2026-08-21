@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { turnController } from '../app/turnController.js'
 import { getTurnState, resetTurnState } from '../app/turnStore.js'
 import { patchUiState, resetUiState } from '../app/uiStore.js'
+import { withSessionIntro } from '../domain/messages.js'
 import {
   hydrateLiveSessionInflight,
   liveSessionInflightMessages,
@@ -14,6 +15,29 @@ import {
   signalFreshSessionBoundary,
   writeActiveSessionFile
 } from '../app/useSessionLifecycle.js'
+
+describe('session intro visibility', () => {
+  const info = { version: 'test' } as any
+  const messages = [{ role: 'user' as const, text: 'hello' }]
+
+  it('prepends the intro when banners are enabled', () => {
+    expect(withSessionIntro(info, messages, true).map(message => message.kind ?? message.role)).toEqual([
+      'intro',
+      'user'
+    ])
+  })
+
+  it('keeps a placeholder intro while session info is loading', () => {
+    expect(withSessionIntro(null, messages, true).map(message => message.kind ?? message.role)).toEqual([
+      'intro',
+      'user'
+    ])
+  })
+
+  it('preserves the transcript without an intro when banners are disabled', () => {
+    expect(withSessionIntro(info, messages, false)).toBe(messages)
+  })
+})
 
 describe('fresh session boundary', () => {
   it('signals only when a live session is replaced by a different session', () => {
