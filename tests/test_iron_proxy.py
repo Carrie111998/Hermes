@@ -764,6 +764,26 @@ def test_docker_egress_prefers_profile_local_proxy(tmp_path, monkeypatch):
     assert env["OPENROUTER_API_KEY"] == "local-token"
 
 
+def test_shared_proxy_uses_default_owner_enforcement(tmp_path, monkeypatch):
+    from hermes_cli.config import load_config, save_config
+    from tools.environments.docker import _egress_enforce_on_docker
+
+    root = tmp_path / "hermes"
+    profile = root / "profiles" / "bot"
+    profile.mkdir(parents=True)
+    _configure_running_proxy(
+        root,
+        token_value="shared-token",
+        share_with_profiles=True,
+    )
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    cfg = load_config()
+    cfg["proxy"]["enforce_on_docker"] = False
+    save_config(cfg)
+
+    assert _egress_enforce_on_docker() is True
+
+
 # ---------------------------------------------------------------------------
 # v3: ensure_audit_log fails loud on OSError (P2 promise mismatch)
 # ---------------------------------------------------------------------------
