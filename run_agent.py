@@ -8272,6 +8272,7 @@ class AIAgent:
         *,
         failed: bool,
         tool_call_id: str = "",
+        preserve_full_result: bool = False,
     ) -> str:
         decision = self._tool_guardrails.after_call(
             tool_name,
@@ -8287,7 +8288,7 @@ class AIAgent:
         # are append-only; nothing already sent to the provider is mutated).
         stall_notice = None
         result_stub = None
-        if self._stall_guards_enabled():
+        if self._stall_guards_enabled() and not preserve_full_result:
             try:
                 observation = self._tool_guardrails.observe_call(
                     tool_name,

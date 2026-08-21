@@ -3,6 +3,7 @@
 import json
 import threading
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -540,7 +541,9 @@ def test_successful_skill_view_roundtrip_clears_pending_reload_but_failure_does_
         {
             "role": "tool",
             "tool_call_id": "c-persisted-reload",
-            "content": json.dumps({"success": True, "name": "skill-0"}),
+            "content": json.dumps(
+                {"success": True, "name": "skill-0", "content": "rules"}
+            ),
         },
     ]
     assert refresh_pending_skill_reloads(agent, history) == []
@@ -548,6 +551,117 @@ def test_successful_skill_view_roundtrip_clears_pending_reload_but_failure_does_
     # A later compaction marker for the same skill re-arms the guard.
     history.append({"role": "user", "content": _skill_pruned_marker("skill-0")})
     assert refresh_pending_skill_reloads(agent, history) == ["skill-0"]
+
+
+def test_support_file_view_does_not_clear_live_or_rehydrated_main_reload(
+    tmp_path: Path, monkeypatch
+):
+    skill_name = "reload-support-boundary"
+    hermes_home = tmp_path / "hermes-home"
+    skill_dir = hermes_home / "skills" / skill_name
+    references_dir = skill_dir / "references"
+    references_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "# Main policy\n\nMAIN-POLICY-SENTINEL\n", encoding="utf-8"
+    )
+    (references_dir / "note.md").write_text(
+        "SUPPORT-FILE-SENTINEL\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    agent = _make_agent("skill_view", "web_search")
+    refresh_pending_skill_reloads(
+        agent, [{"role": "user", "content": _skill_pruned_marker(skill_name)}]
+    )
+    support_args = {"name": skill_name, "file_path": "references/note.md"}
+    support_call = _mock_tool_call(
+        "skill_view", json.dumps(support_args), "c-support-only"
+    )
+    messages = []
+
+    agent._execute_tool_calls_sequential(
+        SimpleNamespace(content="", tool_calls=[support_call]),
+        messages,
+        "task-1",
+    )
+
+    assert "SUPPORT-FILE-SENTINEL" in messages[0]["content"]
+    assert "MAIN-POLICY-SENTINEL" not in messages[0]["content"]
+    assert agent._pending_skill_reloads == [skill_name]
+
+    history = [
+        {"role": "user", "content": _skill_pruned_marker(skill_name)},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "c-support-only",
+                    "type": "function",
+                    "function": {
+                        "name": "skill_view",
+                        "arguments": json.dumps(support_args),
+                    },
+                }
+            ],
+        },
+        messages[0],
+    ]
+    assert refresh_pending_skill_reloads(agent, history) == [skill_name]
+
+
+def test_pending_main_reload_stays_complete_through_dedup_and_result_budgets(
+    tmp_path: Path, monkeypatch
+):
+    skill_name = "reload-full-delivery"
+    tail_sentinel = "TAIL-POLICY-SENTINEL"
+    hermes_home = tmp_path / "hermes-home"
+    skill_dir = hermes_home / "skills" / skill_name
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "# Full policy\n\n" + ("instruction line\n" * 2_500) + tail_sentinel,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    agent = _make_agent("skill_view", "web_search")
+    call_args = {"name": skill_name}
+
+    # Seed the identical-result tracker with the same successful call. The
+    # recovery call below would otherwise be replaced by a result-reference
+    # stub before the model could receive the restored policy.
+    getattr(agent, "context_compressor").context_length = 200_000
+    first_call = _mock_tool_call(
+        "skill_view", json.dumps(call_args), "c-before-prune"
+    )
+    agent._execute_tool_calls_sequential(
+        SimpleNamespace(content="", tool_calls=[first_call]), [], "task-1"
+    )
+
+    refresh_pending_skill_reloads(
+        agent, [{"role": "user", "content": _skill_pruned_marker(skill_name)}]
+    )
+    # A 16K-token context produces a 9,600-char per-result cap and a
+    # 19,200-char aggregate cap, both below this real skill_view response.
+    getattr(agent, "context_compressor").context_length = 16_000
+    reload_call = _mock_tool_call(
+        "skill_view", json.dumps(call_args), "c-reload-full"
+    )
+    messages = []
+
+    agent._execute_tool_calls_sequential(
+        SimpleNamespace(content="", tool_calls=[reload_call]),
+        messages,
+        "task-1",
+    )
+
+    delivered = messages[0]["content"]
+    payload = json.loads(delivered)
+    assert payload["success"] is True
+    assert tail_sentinel in payload["content"]
+    assert "<persisted-output>" not in delivered
+    assert "result-reference" not in delivered
+    assert agent._pending_skill_reloads == []
 
 
 def test_default_run_conversation_warns_without_guardrail_halt():
