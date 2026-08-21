@@ -7,6 +7,7 @@ import pytest
 from datetime import datetime, timedelta, timezone
 
 from cron.jobs import (
+    amend_late_outcome_after_abandon,
     parse_duration,
     parse_schedule,
     compute_next_run,
@@ -2666,3 +2667,155 @@ class TestRequestRun:
         create_job(prompt="b", schedule="every 1h", name="dup")
         with pytest.raises(AmbiguousJobReference):
             request_run("dup", caller="test")
+
+
+class TestAmendLateOutcomeAfterAbandon:
+    """A run that finishes AFTER its soft-deadline abandon is not a failure.
+
+    ``_run_callable_with_deadline`` declares a parallel-safe job failed at
+    its deadline and abandons the worker without killing it. When that
+    worker later finishes SUCCESSFULLY, ``_process_job`` used to discard
+    the verdict wholesale, so ``last_status`` stayed ``error`` forever.
+    Measured on this box 2026-08-20: 10 of 11 soft-deadline events on the
+    two jobflow-tracker jobs had in fact completed, two of them only 42s
+    and 81s past the deadline.
+
+    ``amend_late_outcome_after_abandon`` corrects ONLY the status fields,
+    under a compare-and-swap on the abandon message so it can never
+    overwrite a successor fire's verdict.
+    """
+
+    ABANDON = (
+        "soft deadline exceeded: still running after 1800s; "
+        "worker abandoned (daemon thread)"
+    )
+
+    def _abandoned_job(self):
+        job = create_job(prompt="Slow", schedule="every 4h")
+        mark_job_run(job["id"], success=False, error=self.ABANDON)
+        return job["id"], get_job(job["id"])["last_run_at"]
+
+    def test_late_success_flips_the_status_to_ok(self, tmp_cron_dir):
+        job_id, stamp = self._abandoned_job()
+        assert get_job(job_id)["last_status"] == "error"
+
+        assert amend_late_outcome_after_abandon(
+            job_id,
+            abandon_error=self.ABANDON,
+            expected_last_run_at=stamp,
+            success=True,
+        ) is True
+
+        updated = get_job(job_id)
+        assert updated["last_status"] == "ok"
+        assert updated["last_error"] is None
+
+    def test_late_success_clears_the_consecutive_error_count(self, tmp_cron_dir):
+        job_id, stamp = self._abandoned_job()
+        assert get_job(job_id)["consecutive_errors"] == 1
+
+        amend_late_outcome_after_abandon(
+            job_id,
+            abandon_error=self.ABANDON,
+            expected_last_run_at=stamp,
+            success=True,
+        )
+
+        assert get_job(job_id)["consecutive_errors"] == 0
+
+    def test_late_failure_keeps_error_and_records_the_real_cause(self, tmp_cron_dir):
+        """The 08-20 16:00 fire really did fail — at a DIFFERENT limit.
+
+        Its run record ends 'exceeded wall-clock limit 3600s'. That is the
+        informative message; the 1800s soft-deadline proxy is not.
+        """
+        job_id, stamp = self._abandoned_job()
+        real = "exceeded wall-clock limit 3600s (elapsed 3602.97s)"
+
+        assert amend_late_outcome_after_abandon(
+            job_id,
+            abandon_error=self.ABANDON,
+            expected_last_run_at=stamp,
+            success=False,
+            error=real,
+        ) is True
+
+        updated = get_job(job_id)
+        assert updated["last_status"] == "error"
+        assert updated["last_error"] == real
+        # Already counted once at the deadline — must not double-count.
+        assert updated["consecutive_errors"] == 1
+
+    def test_a_successor_verdict_is_never_overwritten(self, tmp_cron_dir):
+        """CAS negative control: the guard that makes this safe at all.
+
+        The deadline releases the in-flight slot, so a successor fire can
+        start and finish while the runaway is still going. Its verdict
+        owns the job now.
+        """
+        job_id, stamp = self._abandoned_job()
+        mark_job_run(job_id, success=True)  # successor fire lands
+        assert get_job(job_id)["last_status"] == "ok"
+
+        assert amend_late_outcome_after_abandon(
+            job_id,
+            abandon_error=self.ABANDON,
+            expected_last_run_at=stamp,
+            success=False,
+            error="stale",
+        ) is False
+
+        assert get_job(job_id)["last_status"] == "ok"
+        assert get_job(job_id)["last_error"] is None
+
+    def test_a_successor_that_also_hit_its_own_deadline_is_not_overwritten(
+        self, tmp_cron_dir
+    ):
+        """The message alone is not a unique key — the timestamp completes it.
+
+        A successor can fail with the byte-identical abandon string. Only
+        pairing it with the run timestamp we were abandoned at keeps the
+        CAS honest.
+        """
+        job_id, stamp = self._abandoned_job()
+        mark_job_run(job_id, success=False, error=self.ABANDON)  # successor, same msg
+        assert get_job(job_id)["last_run_at"] != stamp
+
+        assert amend_late_outcome_after_abandon(
+            job_id,
+            abandon_error=self.ABANDON,
+            success=True,
+            expected_last_run_at=stamp,
+        ) is False
+
+        assert get_job(job_id)["last_status"] == "error"
+
+    def test_it_touches_nothing_but_the_status_fields(self, tmp_cron_dir):
+        """mark_job_run cannot be reused here: it would bump repeat.completed,
+        recompute next_run_at from NOW (skipping a scheduled fire), and clear
+        claims a successor may own."""
+        job_id, stamp = self._abandoned_job()
+        before = get_job(job_id)
+
+        amend_late_outcome_after_abandon(
+            job_id,
+            abandon_error=self.ABANDON,
+            expected_last_run_at=stamp,
+            success=True,
+        )
+
+        after = get_job(job_id)
+        for field in (
+            "last_run_at", "next_run_at", "state", "enabled",
+            "fire_claim", "run_claim", "schedule", "prompt",
+        ):
+            assert after.get(field) == before.get(field), field
+        assert after["repeat"]["completed"] == before["repeat"]["completed"]
+
+    def test_an_unknown_job_is_a_no_op_not_a_crash(self, tmp_cron_dir):
+        assert amend_late_outcome_after_abandon(
+            "no-such-job",
+            abandon_error=self.ABANDON,
+            expected_last_run_at="never",
+            success=True,
+        ) is False

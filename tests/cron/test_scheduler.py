@@ -6157,6 +6157,412 @@ class TestPerJobSoftDeadline:
             assert "hung-job" in sched._in_flight
         assert saw_abandoned == [True]
 
+    def test_parallel_timeout_hands_the_real_late_outcome_back(self, monkeypatch):
+        """Exercise the actual watchdog/worker handoff, not just its helper.
+
+        The worker finishes while the deadline owner is persisting the
+        provisional failure. The explicit event orders the amendment and
+        carries the exact timestamp/error identity needed by both CAS writes.
+        """
+        import contextvars
+        import threading
+        import time as _t
+        from cron import scheduler as sched
+
+        self._stub_emitter(monkeypatch)
+        monkeypatch.setattr(sched, "mark_job_run", lambda *a, **k: "deadline-stamp")
+        monkeypatch.setattr(sched, "finish_execution", lambda *a, **k: {})
+        job_amends = []
+        ledger_amends = []
+        monkeypatch.setattr(
+            sched,
+            "amend_late_outcome_after_abandon",
+            lambda *a, **k: (job_amends.append((a, k)), True)[1],
+        )
+        monkeypatch.setattr(
+            sched,
+            "amend_execution_after_abandon",
+            lambda *a, **k: ledger_amends.append((a, k)),
+        )
+        amended = threading.Event()
+
+        def fn(job, _abandoned=None, _deadline_box=None):
+            _t.sleep(0.15)
+            assert sched._deadline_has_elapsed(_abandoned, _deadline_box)
+            assert sched._amend_late_deadline_outcome(
+                job,
+                success=True,
+                error=None,
+                deadline_box=_deadline_box,
+            ) is True
+            amended.set()
+            return True
+
+        job = {
+            "id": "late-real-verdict",
+            "name": "late",
+            "timeout_seconds": 0.05,
+            "execution_id": "exec-late",
+        }
+        assert sched._try_register_in_flight(job["id"], job["name"]) is None
+        assert sched._run_callable_with_deadline(
+            job, fn, True, contextvars.copy_context()
+        ) is False
+        assert amended.wait(2), "late worker never amended its verdict"
+
+        assert len(job_amends) == 1
+        assert job_amends[0][0] == (job["id"],)
+        assert job_amends[0][1]["expected_last_run_at"] == "deadline-stamp"
+        assert job_amends[0][1]["success"] is True
+        assert len(ledger_amends) == 1
+        assert ledger_amends[0][0] == ("exec-late",)
+        assert ledger_amends[0][1]["success"] is True
+        assert job_amends[0][1]["abandon_error"] == ledger_amends[0][1]["abandon_error"]
+
+    def test_late_outcome_waits_without_abandoning_handoff(self, monkeypatch):
+        """A slow provisional write cannot permanently discard the real verdict."""
+        from cron import scheduler as sched
+
+        waits = []
+
+        class FinalizedWaitSpy:
+            def wait(self, timeout=None):
+                waits.append(timeout)
+                return timeout is None
+
+        job_amends = []
+        monkeypatch.setattr(
+            sched,
+            "amend_late_outcome_after_abandon",
+            lambda *a, **k: (job_amends.append((a, k)), True)[1],
+        )
+        assert sched._amend_late_deadline_outcome(
+            {"id": "slow-finalizer"},
+            success=True,
+            error=None,
+            deadline_box={
+                "deadline_finalized": FinalizedWaitSpy(),
+                "deadline_error": "deadline proxy",
+                "deadline_last_run_at": "deadline-stamp",
+            },
+        ) is True
+        assert waits == [None]
+        assert len(job_amends) == 1
+
+    def test_monotonic_boundary_waits_for_watchdog_decision(self, monkeypatch):
+        """Worker routing cannot depend on which thread runs first after join."""
+        import threading
+        import time as _t
+        from cron import scheduler as sched
+
+        abandoned = threading.Event()
+        decided = threading.Event()
+        box = {
+            "deadline_monotonic": _t.monotonic() - 0.001,
+            "deadline_decided": decided,
+        }
+        result = []
+        waiter = threading.Thread(
+            target=lambda: result.append(
+                sched._deadline_has_elapsed(abandoned, box)
+            )
+        )
+        waiter.start()
+        _t.sleep(0.02)
+        assert waiter.is_alive(), "worker inferred a verdict before watchdog decision"
+        abandoned.set()
+        decided.set()
+        waiter.join(1)
+        assert result == [True]
+
+    def test_completed_at_boundary_is_not_misclassified_as_abandoned(self):
+        """An elapsed clock alone cannot turn a completed worker into timeout."""
+        import threading
+        import time as _t
+        from cron import scheduler as sched
+
+        decided = threading.Event()
+        decided.set()
+        assert sched._deadline_has_elapsed(
+            threading.Event(),
+            {
+                "deadline_monotonic": _t.monotonic() - 0.001,
+                "deadline_decided": decided,
+            },
+        ) is False
+
+        # Sequential jobs carry no abandonment boundary: they alert and keep
+        # waiting, so the same elapsed wall time must stay on the normal path.
+        assert sched._deadline_has_elapsed(
+            threading.Event(), {"deadline_monotonic": None}
+        ) is False
+
+    def test_abandon_signal_precedes_slow_failure_event(self, monkeypatch):
+        """A slow event subscriber cannot leave the worker on the normal path.
+
+        This pins the race where the worker finished while on_job_completed
+        blocked, wrote success normally, and was then overwritten by the
+        deadline's provisional failure.
+        """
+        import contextvars
+        import threading
+        from cron import scheduler as sched
+
+        event_entered = threading.Event()
+        release_event = threading.Event()
+        worker_saw = []
+
+        class SlowEmitter:
+            def on_job_completed(self, **kwargs):
+                event_entered.set()
+                assert release_event.wait(2)
+
+        monkeypatch.setattr(sched, "_get_event_emitter", lambda: SlowEmitter())
+        monkeypatch.setattr(sched, "mark_job_run", lambda *a, **k: "stamp")
+
+        def worker(job, _abandoned=None, _deadline_box=None):
+            assert event_entered.wait(2)
+            worker_saw.append(_abandoned.is_set())
+            release_event.set()
+            return True
+
+        job = {"id": "event-race", "name": "race", "timeout_seconds": 0.05}
+        assert sched._try_register_in_flight(job["id"], job["name"]) is None
+        assert sched._run_callable_with_deadline(
+            job, worker, True, contextvars.copy_context()
+        ) is False
+        assert worker_saw == [True]
+
+    def test_process_job_branch_amends_instead_of_suppressing(
+        self, monkeypatch, _tick_lock_isolated
+    ):
+        """Pin the original scheduler.py:6088 defect through the real branch.
+
+        A helper-only test would stay green if ``_process_job`` went back to
+        returning immediately after saving late output. Drive ``tick`` so the
+        production branch itself must invoke the amendment.
+        """
+        import threading
+        import time as _t
+        from unittest.mock import patch
+        from cron import scheduler as sched
+
+        job = {
+            "id": "late-process-branch",
+            "name": "late-process",
+            "timeout_seconds": 0.05,
+            "deliver": "local",
+            "schedule": {"kind": "cron", "expr": "0 * * * *"},
+        }
+        amended = threading.Event()
+        seen = []
+
+        def slow_success(_job):
+            _t.sleep(0.15)
+            return True, "saved output", "real response", None
+
+        def amend(*args, **kwargs):
+            seen.append((args, kwargs))
+            amended.set()
+            return True
+
+        with patch("cron.scheduler.get_due_and_skipped_jobs", return_value=([job], [])),              patch("cron.scheduler.advance_next_run"),              patch("cron.scheduler.create_execution", return_value={"id": "exec-real"}),              patch("cron.scheduler.mark_execution_running"),              patch("cron.scheduler.finish_execution"),              patch("cron.scheduler.run_job", side_effect=slow_success),              patch("cron.scheduler.save_job_output", return_value="/tmp/late.md"),              patch("cron.scheduler.mark_job_run", return_value="deadline-stamp"),              patch("cron.scheduler.amend_late_outcome_after_abandon", side_effect=amend),              patch("cron.scheduler.amend_execution_after_abandon"):
+            assert sched.tick(verbose=False, sync=True) == 0
+            assert amended.wait(2), "_process_job suppressed the late verdict"
+
+        assert seen[0][0] == (job["id"],)
+        assert seen[0][1]["success"] is True
+        assert seen[0][1]["expected_last_run_at"] == "deadline-stamp"
+
+    def test_output_save_crossing_deadline_uses_late_path(
+        self, monkeypatch, _tick_lock_isolated
+    ):
+        """Output persistence cannot race abandonment into normal side effects."""
+        import threading
+        import time as _t
+        from unittest.mock import patch
+        from cron import scheduler as sched
+
+        job = {
+            "id": "save-crosses-deadline",
+            "name": "save-crosses-deadline",
+            "timeout_seconds": 0.08,
+            "deliver": "local",
+            "schedule": {"kind": "cron", "expr": "0 * * * *"},
+        }
+        amended = threading.Event()
+        deliveries = []
+        normal_success_marks = []
+
+        def save_output(*args, **kwargs):
+            _t.sleep(0.12)
+            return "/tmp/save-crosses-deadline.md"
+
+        def mark(job_id, success, error=None, **kwargs):
+            if success:
+                normal_success_marks.append(job_id)
+            return "deadline-stamp"
+
+        with patch("cron.scheduler.get_due_and_skipped_jobs", return_value=([job], [])), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.create_execution", return_value={"id": "exec-save"}), \
+             patch("cron.scheduler.mark_execution_running"), \
+             patch("cron.scheduler.finish_execution"), \
+             patch("cron.scheduler.run_job", return_value=(True, "output", "response", None)), \
+             patch("cron.scheduler.save_job_output", side_effect=save_output), \
+             patch("cron.scheduler.mark_job_run", side_effect=mark), \
+             patch("cron.scheduler._deliver_result", side_effect=lambda *a, **k: deliveries.append(True)), \
+             patch(
+                 "cron.scheduler.amend_late_outcome_after_abandon",
+                 side_effect=lambda *a, **k: (amended.set(), True)[1],
+             ), \
+             patch("cron.scheduler.amend_execution_after_abandon"):
+            assert sched.tick(verbose=False, sync=True) == 0
+            assert amended.wait(2), "save-boundary worker never used late CAS path"
+
+        assert deliveries == []
+        assert normal_success_marks == []
+
+    def test_outer_deadline_proxy_is_replaced_by_late_inner_timeout(
+        self, monkeypatch, _tick_lock_isolated
+    ):
+        """Equal nested limits still surface the inner timeout's richer cause.
+
+        The outer join starts before ``run_job`` establishes its own hard-limit
+        clock, so it normally records the soft-deadline proxy first. When the
+        inner limit returns a few seconds later, the production late-outcome
+        branch must replace that proxy in both durable stores.
+        """
+        import threading
+        import time as _t
+        from unittest.mock import patch
+        from cron import scheduler as sched
+
+        job = {
+            "id": "nested-timeout",
+            "name": "nested-timeout",
+            "timeout_seconds": 0.05,
+            "deliver": "local",
+            "schedule": {"kind": "cron", "expr": "0 * * * *"},
+        }
+        hard_error = (
+            "Cron job 'nested-timeout' exceeded wall-clock limit 3600s "
+            "(elapsed 3602.97s) — last activity: executing tool: terminal"
+        )
+        job_amends = []
+        ledger_amends = []
+        amended = threading.Event()
+
+        def late_inner_timeout(_job):
+            _t.sleep(0.15)
+            return False, "durable partial output", "", hard_error
+
+        def amend_job(*args, **kwargs):
+            job_amends.append((args, kwargs))
+            amended.set()
+            return True
+
+        def amend_ledger(*args, **kwargs):
+            ledger_amends.append((args, kwargs))
+            return {"id": args[0], "status": "failed", "error": kwargs["error"]}
+
+        with patch(
+            "cron.scheduler.get_due_and_skipped_jobs", return_value=([job], [])
+        ), patch("cron.scheduler.advance_next_run"), patch(
+            "cron.scheduler.create_execution", return_value={"id": "exec-nested"}
+        ), patch("cron.scheduler.mark_execution_running"), patch(
+            "cron.scheduler.finish_execution"
+        ), patch(
+            "cron.scheduler.run_job", side_effect=late_inner_timeout
+        ), patch(
+            "cron.scheduler.save_job_output", return_value="/tmp/late-timeout.md"
+        ), patch(
+            "cron.scheduler.mark_job_run", return_value="deadline-stamp"
+        ), patch(
+            "cron.scheduler.amend_late_outcome_after_abandon", side_effect=amend_job
+        ), patch(
+            "cron.scheduler.amend_execution_after_abandon", side_effect=amend_ledger
+        ):
+            assert sched.tick(verbose=False, sync=True) == 0
+            assert amended.wait(2), "inner timeout never replaced outer proxy"
+
+        assert len(job_amends) == 1
+        assert job_amends[0][0] == (job["id"],)
+        assert job_amends[0][1]["success"] is False
+        assert job_amends[0][1]["error"] == hard_error
+        assert job_amends[0][1]["expected_last_run_at"] == "deadline-stamp"
+        assert "soft deadline exceeded" in job_amends[0][1]["abandon_error"]
+        assert len(ledger_amends) == 1
+        assert ledger_amends[0][0] == ("exec-nested",)
+        assert ledger_amends[0][1]["success"] is False
+        assert ledger_amends[0][1]["error"] == hard_error
+        assert (
+            ledger_amends[0][1]["abandon_error"]
+            == job_amends[0][1]["abandon_error"]
+        )
+
+    def test_late_outcome_refuses_an_unidentified_deadline(self, monkeypatch):
+        """Missing CAS identity fails closed rather than guessing at ownership."""
+        import threading
+        from cron import scheduler as sched
+
+        touched = []
+        monkeypatch.setattr(
+            sched, "amend_late_outcome_after_abandon", lambda *a, **k: touched.append(1)
+        )
+        finalized = threading.Event()
+        finalized.set()
+
+        assert sched._amend_late_deadline_outcome(
+            {"id": "unidentified"},
+            success=True,
+            error=None,
+            deadline_box={"deadline_finalized": finalized},
+        ) is False
+        assert touched == []
+
+    def test_missing_job_timestamp_still_amends_identified_execution(self, monkeypatch):
+        """A failed job-store write must not strand the uniquely-owned ledger row."""
+        import threading
+        from cron import scheduler as sched
+
+        job_touched = []
+        ledger_touched = []
+        monkeypatch.setattr(
+            sched,
+            "amend_late_outcome_after_abandon",
+            lambda *a, **k: job_touched.append((a, k)),
+        )
+        monkeypatch.setattr(
+            sched,
+            "amend_execution_after_abandon",
+            lambda *a, **k: (ledger_touched.append((a, k)), {"id": a[0]})[1],
+        )
+        finalized = threading.Event()
+        finalized.set()
+
+        assert sched._amend_late_deadline_outcome(
+            {"id": "partial-deadline", "execution_id": "exec-partial"},
+            success=True,
+            error=None,
+            deadline_box={
+                "deadline_finalized": finalized,
+                "deadline_error": "soft deadline",
+                "deadline_last_run_at": None,
+            },
+        ) is True
+        assert job_touched == []
+        assert ledger_touched == [
+            (
+                ("exec-partial",),
+                {
+                    "abandon_error": "soft deadline",
+                    "success": True,
+                    "error": None,
+                },
+            )
+        ]
+
     def test_sequential_timeout_alerts_but_waits_for_completion(self, monkeypatch):
         import contextvars
         import time as _t

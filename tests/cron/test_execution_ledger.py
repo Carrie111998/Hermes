@@ -528,3 +528,49 @@ def test_execution_retention_holds_multiple_days_of_history():
     from cron.executions import MAX_TERMINAL_EXECUTIONS
 
     assert MAX_TERMINAL_EXECUTIONS >= 10000
+
+
+def test_deadline_verdict_can_be_amended_to_late_success(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    row = executions.create_execution("late-ok", source="builtin")
+    executions.mark_execution_running(row["id"])
+    abandon = "soft deadline exceeded: worker abandoned"
+    executions.finish_execution(row["id"], success=False, error=abandon)
+
+    amended = executions.amend_execution_after_abandon(
+        row["id"], abandon_error=abandon, success=True
+    )
+
+    assert amended["status"] == "completed"
+    assert amended["error"] is None
+    assert executions.latest_execution("late-ok")["status"] == "completed"
+
+
+def test_deadline_verdict_can_expose_the_late_real_failure(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    row = executions.create_execution("late-fail", source="builtin")
+    abandon = "soft deadline exceeded: worker abandoned"
+    executions.finish_execution(row["id"], success=False, error=abandon)
+
+    amended = executions.amend_execution_after_abandon(
+        row["id"],
+        abandon_error=abandon,
+        success=False,
+        error="hard wall-clock timeout: last activity terminal",
+    )
+
+    assert amended["status"] == "failed"
+    assert amended["error"] == "hard wall-clock timeout: last activity terminal"
+
+
+def test_deadline_amendment_never_rewrites_an_unrelated_failure(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    row = executions.create_execution("owned", source="builtin")
+    executions.finish_execution(row["id"], success=False, error="successor failure")
+
+    assert executions.amend_execution_after_abandon(
+        row["id"],
+        abandon_error="soft deadline exceeded",
+        success=True,
+    ) is None
+    assert executions.latest_execution("owned")["error"] == "successor failure"
