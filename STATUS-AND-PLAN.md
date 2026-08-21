@@ -11,7 +11,7 @@ they already settled. The demo does not depend on the enrichment work.
 | App | `agent-rota` (Fly, region `fra`, one machine, one volume) |
 | Host | https://agent-rota.fly.dev |
 | Release running | v11, 2026-08-20 09:15 UTC — 12 minutes after `2ec40dcad6`, so incremental selection ships in it. Only `139f23cee0` (tests) is unreleased. Image contents not grep-verified. |
-| Database | Supabase Postgres, migrations 001–009 applied. **010 is new and unapplied** — the boot guard requires it, so apply it before the next deploy or the service refuses to serve. |
+| Database | Supabase Postgres, migrations 001–010 applied — 010 reported applied by the operator on 2026-08-21, not verified from here (no `SUPABASE_DB_URL` in this environment). Verify with the query in Deployment notes if a boot ever fails on the migration guard. |
 | Model | `minimax/MiniMax-M3`, `MINIMAX_API_KEY` set |
 | Verifier | Bright Data Web Unlocker, zone `cli_unlocker`, `active` server-side |
 | CLI | `flyctl` now lives at `~/.fly/bin/flyctl`; the Homebrew copy is gone |
