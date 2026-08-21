@@ -12,8 +12,9 @@ import type { AppendMessage, ThreadMessage } from '@assistant-ui/react'
 import { useCallback, useMemo, useRef } from 'react'
 
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
-import type { ClientSessionState } from '@/app/types'
+import type { ClientSessionState, SessionRedirectResponse } from '@/app/types'
 import { useI18n } from '@/i18n'
+import type { ChatMessage } from '@/lib/chat-messages'
 import { textPart } from '@/lib/chat-messages'
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
@@ -224,7 +225,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
 
       return { attachments: synced, sessionId: liveSessionId }
     },
-    [requestGateway, scope.attachments]
+    [readState, requestGateway, scope.attachments]
   )
 
   // The REAL submit pipeline with tile seams: session always exists, and the
@@ -328,9 +329,10 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
       }
 
       const messageId = `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      let deliverySessionId = sessionId
 
       const mutate = (updater: (state: ClientSessionState) => ClientSessionState) =>
-        sessionTileDelegate()?.updateSession(sessionId, updater)
+        sessionTileDelegate()?.updateSession(deliverySessionId, updater)
 
       // Match the primary composer: record the correction in arrival order —
       // sealed already-streamed output above, correction below, post-redirect
@@ -343,9 +345,24 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
         appendMidTurnUserMessage(state, {
           id: messageId,
           role: 'user' as const,
-          parts: [textPart(text)]
+          parts: [textPart(text)],
+          deliveryState: 'sending'
         })
       )
+
+      const setDeliveryState = (deliveryState: ChatMessage['deliveryState'], deliveryClearsOnProgress = false) =>
+        mutate(state => ({
+          ...state,
+          messages: state.messages.map(message =>
+            message.id === messageId
+              ? {
+                  ...message,
+                  deliveryState,
+                  deliveryClearsOnProgress: deliveryClearsOnProgress || undefined
+                }
+              : message
+          )
+        }))
 
       const discardOptimisticMessage = () =>
         mutate(state => ({
@@ -366,16 +383,46 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
         const { result } = await withSessionNotFoundResume(
           sessionId,
           storedIdRef.current,
-          liveId => requestGateway<{ status?: string }>('session.redirect', { session_id: liveId, text }),
+          liveId =>
+            requestGateway<SessionRedirectResponse>('session.redirect', {
+              session_id: liveId,
+              text,
+              client_message_id: messageId
+            }),
           {
             requestGateway,
             onRecovered: recoveredId => {
+              if (deliverySessionId !== recoveredId) {
+                const delegate = sessionTileDelegate()
+                let optimisticMessage: ChatMessage | undefined
+
+                delegate?.updateSession(deliverySessionId, state => {
+                  optimisticMessage = state.messages.find(message => message.id === messageId)
+
+                  return optimisticMessage
+                    ? { ...state, messages: state.messages.filter(message => message.id !== messageId) }
+                    : state
+                })
+
+                deliverySessionId = recoveredId
+                const messageToMove = optimisticMessage
+
+                if (messageToMove) {
+                  delegate?.updateSession(recoveredId, state =>
+                    state.messages.some(message => message.id === messageId)
+                      ? state
+                      : { ...state, messages: [...state.messages, messageToMove] }
+                  )
+                }
+              }
+
               runtimeIdRef.current = recoveredId
             }
           }
         )
 
         if (result?.status === 'redirected') {
+          setDeliveryState(undefined)
           triggerHaptic('submit')
 
           return true
@@ -383,6 +430,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
 
         if (result?.status === 'queued') {
           moveOptimisticMessageToEnd()
+          setDeliveryState('queued', result.delivery === 'tool_boundary')
           triggerHaptic('submit')
 
           return true
