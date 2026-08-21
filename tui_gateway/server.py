@@ -3295,6 +3295,19 @@ def _load_dashboard_process_isolation_config(cfg: dict | None = None) -> dict[st
     }
 
 
+def _cfg_home() -> Path:
+    """Hermes home used by the ``_load_cfg_raw`` / ``_save_cfg`` pair.
+
+    Honors the context-local profile override so a resumed remote session
+    reads and writes ITS config.yaml. Without this, the documented
+    read→mutate→save round-trip dumps a profile's config into the launch
+    home (#91587).
+    """
+    override = get_hermes_home_override()
+    home = override if isinstance(override, str) and override else _hermes_home
+    return Path(home)
+
+
 def _load_cfg_raw() -> dict:
     """Read the active profile's config.yaml EXACTLY as written (write-back primitive).
 
@@ -3310,9 +3323,7 @@ def _load_cfg_raw() -> dict:
         # remote profile loads ITS config (model, skills, prompt); otherwise the
         # launch profile's _hermes_home. Cache is keyed on the resolved path, so
         # profiles don't clobber each other.
-        override = get_hermes_home_override()
-        home = override if isinstance(override, str) and override else _hermes_home
-        p = Path(home) / "config.yaml"
+        p = _cfg_home() / "config.yaml"
         mtime = p.stat().st_mtime if p.exists() else None
         with _cfg_lock:
             if _cfg_cache is not None and _cfg_mtime == mtime and _cfg_path == p:
@@ -3382,7 +3393,7 @@ def _save_cfg(cfg: dict):
 
     from utils import atomic_roundtrip_yaml_save
 
-    path = _hermes_home / "config.yaml"
+    path = _cfg_home() / "config.yaml"
     # Comment-, ordering-, and Unicode-preserving full-state write.
     # Replaces the previous `yaml.safe_dump(cfg, f)` (and later
     # `atomic_config_write`, which is not comment-preserving) which clobbered
