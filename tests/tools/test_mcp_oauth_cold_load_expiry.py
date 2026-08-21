@@ -107,13 +107,13 @@ class TestSetTokensAbsoluteExpiry:
 
 
 class TestGetTokensMalformedExpiresAt:
-    def test_malformed_expires_at_is_corrupt_and_ignored(
+    def test_malformed_expires_at_forces_refresh(
         self, tmp_path, monkeypatch
     ):
-        """#90704: a non-numeric expires_at must be treated like any other
-        malformed field — corrupt-and-ignored (get_tokens returns None) —
-        not a TypeError that crashes the caller. The sibling expires_in
-        branch already guards this way."""
+        """#90704: a non-numeric expires_at makes the token's real age
+        unknowable — the whole token is treated as corrupt (get_tokens
+        returns None → refresh flow) rather than loaded with an unknown TTL
+        the SDK might read as "never expires" (review on #90704)."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         from tools.mcp_oauth import HermesTokenStorage, _get_token_dir
 
@@ -131,13 +131,10 @@ class TestGetTokensMalformedExpiresAt:
         )
 
         storage = HermesTokenStorage("srv")
-        # The malformed field is ignored (never a TypeError out of
-        # get_tokens); the otherwise-valid token still loads with no
-        # reconstructed TTL — the SDK refresh path decides from there.
+        # Corrupt-token semantics: never a TypeError out of get_tokens, and
+        # never a token loaded with an unknown age — None drives the refresh.
         reloaded = asyncio.run(storage.get_tokens())
-        assert reloaded is not None
-        assert reloaded.access_token == "a"
-        assert reloaded.expires_in is None
+        assert reloaded is None
 
     def test_numeric_expires_at_still_reconstructs_ttl(
         self, tmp_path, monkeypatch

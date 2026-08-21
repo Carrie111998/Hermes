@@ -509,11 +509,16 @@ class HermesTokenStorage:
             try:
                 data["expires_in"] = int(max(absolute_expiry - time.time(), 0))
             except (TypeError, ValueError):
-                # A malformed expires_at is corrupt-and-ignored like every
-                # other malformed field (#90704) — the sibling expires_in
-                # branch below guards the same way; letting TypeError
-                # escape would crash get_tokens instead of returning None.
-                pass
+                # A malformed expires_at means the token's real age is
+                # unknowable. Treat the WHOLE token as corrupt and force the
+                # refresh flow — loading it with an unknown/absent TTL risks
+                # the SDK reading "no known expiry" and using a long-expired
+                # access token until an API 401 (review on #90704).
+                logger.warning(
+                    "Corrupt expires_at in tokens at %s -- forcing refresh",
+                    self._tokens_path(),
+                )
+                return None
         elif data.get("expires_in") is not None:
             try:
                 file_mtime = self._tokens_path().stat().st_mtime
@@ -756,11 +761,14 @@ def _render_callback_error_page(error: object) -> bytes:
 
     The value arrives from the authorization server's redirect (attacker
     controllable query input), so it is html-escaped and the page ships a
-    deny-all CSP — reflected markup must never round-trip (#90704).
+    deny-all CSP — reflected markup must never round-trip (#90704). The
+    text is truncated before escaping: authorization servers sometimes echo
+    huge query payloads, and a loopback tab rendering megabytes of escaped
+    text is pure noise (already sound security-wise).
     """
     body = (
         "<html><body><h2>Authorization Failed</h2>"
-        f"<p>Error: {html.escape(str(error or 'unknown'))}</p>"
+        f"<p>Error: {html.escape(str(error or 'unknown')[:200])}</p>"
         "</body></html>"
     )
     return body.encode()
