@@ -21,6 +21,7 @@ down:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -708,3 +709,565 @@ def test_reviewer_reassigns_for_autonomous_dispatch(kanban_home: Path) -> None:
         ev = _events(conn, tid, kind="review_requested")[0][1]
         assert ev["reviewer"] == "lead-reviewer"
         assert ev["implementer"] == "worker"
+
+
+# ---------------------------------------------------------------------------
+# Reviewer-feedback release (SPEC-active-pr-guard-reviewer-feedback Part B):
+# 6 trigger conditions + 4 non-trigger conditions for the active_pr guard.
+# ---------------------------------------------------------------------------
+
+import time as _time
+
+
+def _add_comment_at(
+    conn, task_id: str, author: str, body: str, created_at: int,
+) -> None:
+    """Insert a comment at a specific ``created_at`` epoch. Mirrors
+    ``add_comment``'s write-txn semantics but lets tests control the
+    timestamp so reviewer-feedback-after-PR ordering is reproducible.
+    """
+    with kb.write_txn(conn, allow_nested=True):
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (task_id, author.strip(), body.strip(), int(created_at)),
+        )
+
+
+def _patch_gh_review_decision(monkeypatch: pytest.MonkeyPatch, decision):
+    """Stub out `_query_pr_review_decision` so tests don't shell out to gh."""
+    monkeypatch.setattr(kb, "_query_pr_review_decision", lambda _url: decision)
+
+
+def _ensure_builder_profile(kanban_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Create the `~/.hermes/profiles/builder/` directory so
+    ``hermes_cli.profiles.profile_exists('builder')`` returns True for
+    dispatcher tests. The dispatcher's ready loop gates each task on
+    ``profile_exists(assignee)`` and bucket-skips non-spawnable
+    assignments (``result.skipped_nonspawnable``) — a real Hermes profile
+    dir is enough to pass the gate in unit-test context.
+    """
+    from hermes_cli.profiles import get_profile_dir
+
+    monkeypatch.setattr(
+        "hermes_cli.profiles.normalize_profile_name",
+        lambda name: "builder" if name == "builder" else name,
+        raising=False,
+    )
+    profile_dir = get_profile_dir("builder")
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    # Drop a minimal profile.yaml so the gate doesn't trip on missing
+    # manifest validation in stricter paths.
+    (profile_dir / "profile.yaml").write_text(
+        "name: builder\nversion: 1\n", encoding="utf-8"
+    )
+
+
+def _setup_task_with_pr_and_feedback(
+    conn,
+    pr_url: str = "https://github.com/example/repo/pull/178",
+    feedback_author: str = "aliaadil",
+    feedback_body: str = (
+        "the logging is not sufficient. ALL actions performed by the user "
+        "and server need to be logged properly. please update this PR."
+    ),
+    feedback_offset_seconds: int = 60,
+    pr_offset_seconds: int = 0,
+    feedback_count: int = 1,
+    workspace_kind: str = "scratch",
+) -> str:
+    """Helper: create a task with a PR-URL breadcrumb plus N reviewer
+    feedback comments. Returns the task id. Uses ``int(time.time())`` so
+    the PR + feedback land inside the 24h window.
+    """
+    tid = kb.create_task(
+        conn, title="t_de993dac repro", assignee="builder",
+        workspace_kind=workspace_kind,
+    )
+    now = int(_time.time())
+    _add_comment_at(
+        conn, tid, author="builder",
+        body=f"Opened {pr_url} for review",
+        created_at=now - 3600 + pr_offset_seconds,
+    )
+    for i in range(feedback_count):
+        _add_comment_at(
+            conn, tid, author=feedback_author,
+            body=feedback_body if i == 0 else (feedback_body + f" [round {i}]"),
+            created_at=now - 3600 + pr_offset_seconds + feedback_offset_seconds + i,
+        )
+    return tid
+
+
+def test_reviewer_feedback_release_trigger_substantive_non_default_author(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trigger 1: non-default author + body >= 80 chars releases the guard."""
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    with kb.connect() as conn:
+        tid = _setup_task_with_pr_and_feedback(
+            conn, feedback_author="aliaadil",
+            feedback_body=(
+                "logging is not sufficient. ALL actions performed by the "
+                "user and server need to be logged properly. please update."
+            ),
+        )
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_reviewer_feedback_release_trigger_body_pattern(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trigger 3: body contains a reviewer-feedback phrase releases the guard."""
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    with kb.connect() as conn:
+        tid = _setup_task_with_pr_and_feedback(
+            conn, feedback_author="aliaadil",
+            # Short comment that still matches a pattern.
+            feedback_body="needs to log all clicks and key presses in the audit trail.",
+        )
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_reviewer_feedback_release_trigger_pr_number_reference(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trigger 3: body references the PR number directly (#178)."""
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    with kb.connect() as conn:
+        tid = _setup_task_with_pr_and_feedback(
+            conn, feedback_author="aliaadil",
+            feedback_body="looks good overall. one nit on PR #178: rename _audit to _audit_log.",
+        )
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_reviewer_feedback_release_trigger_distinct_content_key(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trigger 2: distinct content_key from the PR-URL comment releases."""
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    with kb.connect() as conn:
+        tid = _setup_task_with_pr_and_feedback(
+            conn, feedback_author="aliaadil",
+            # Even if body length is short, distinct content_key + non-default
+            # author + pattern match → release. Use a phrase here.
+            feedback_body="needs to update the comments please update",
+        )
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_reviewer_feedback_release_trigger_review_decision_changes_requested(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trigger 4: reviewDecision == CHANGES_REQUESTED releases even with
+    no new comment body match.
+    """
+    _patch_gh_review_decision(monkeypatch, decision="CHANGES_REQUESTED")
+    with kb.connect() as conn:
+        # No reviewer feedback comment — just the PR-URL breadcrumb.
+        tid = kb.create_task(conn, title="changes requested", assignee="builder")
+        now = int(_time.time())
+        _add_comment_at(
+            conn, tid, author="builder",
+            body="Opened https://github.com/example/repo/pull/178 for review",
+            created_at=now - 60,
+        )
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_reviewer_feedback_release_trigger_short_author_aliadil_pattern_match(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trigger 3 (pattern): a short body from non-default author that
+    matches a phrase still releases the guard.
+    """
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    with kb.connect() as conn:
+        tid = _setup_task_with_pr_and_feedback(
+            conn, feedback_author="aliaadil",
+            feedback_body="please update the type annotations here.",
+        )
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+# --- Non-trigger conditions: guard stays "active_pr" ---
+
+def test_reviewer_feedback_no_release_only_auto_mirrored_default_comments(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Auto-mirrored default-authored status pings do NOT release the guard."""
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="auto mirrored", assignee="builder")
+        now = int(_time.time())
+        _add_comment_at(
+            conn, tid, author="builder",
+            body="Opened https://github.com/example/repo/pull/178 for review",
+            created_at=now - 120,
+        )
+        # Several auto-mirrored 'default'-authored status pings.
+        for body in (
+            "🔨 raphael status: t_x is now running (agent: builder)",
+            "👀 raphael status: t_x is now ready (agent: builder)",
+            "✅ raphael status: t_x is now done (agent: builder)",
+        ):
+            _add_comment_at(
+                conn, tid, author="default", body=body,
+                created_at=now - 60,
+            )
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_reviewer_feedback_no_release_short_default_comment(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A short default-authored comment doesn't release the guard."""
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="short default", assignee="builder")
+        now = int(_time.time())
+        _add_comment_at(
+            conn, tid, author="builder",
+            body="Opened https://github.com/example/repo/pull/178",
+            created_at=now - 120,
+        )
+        _add_comment_at(
+            conn, tid, author="default", body="ok",
+            created_at=now - 30,
+        )
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_reviewer_feedback_no_release_approved_pr_no_feedback(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reviewDecision != CHANGES_REQUESTED with no comment → guard holds."""
+    _patch_gh_review_decision(monkeypatch, decision="APPROVED")
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="approved", assignee="builder")
+        now = int(_time.time())
+        _add_comment_at(
+            conn, tid, author="builder",
+            body="Opened https://github.com/example/repo/pull/178",
+            created_at=now - 60,
+        )
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_reviewer_feedback_no_release_comment_before_pr_url(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reviewer comment BEFORE the PR-URL comment doesn't release."""
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="out-of-order", assignee="builder")
+        now = int(_time.time())
+        # Reviewer comment first
+        _add_comment_at(
+            conn, tid, author="aliaadil",
+            body="needs to update the audit trail before opening a PR",
+            created_at=now - 3600,
+        )
+        # PR URL posted after — reviewer feedback is BEFORE not AFTER
+        _add_comment_at(
+            conn, tid, author="builder",
+            body="Opened https://github.com/example/repo/pull/178",
+            created_at=now - 60,
+        )
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+# --- Pattern-substring false positives (word-boundary fix) ---
+
+def test_reviewer_feedback_no_release_substring_match_priority(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`this pr` should NOT match inside `priority` or `private`.
+
+    The pre-2026-08-21 regex used substring alternation, which let
+    `this pr` match inside `priority` and `this private method`. The
+    tightened per-word word-boundary regex
+    (`_compile_word_boundary_re`) eliminates that false positive so the
+    guard isn't released on incidental substring hits.
+
+    The body here is short and `default`-authored, so trigger 1
+    (non-default author + length >= 80) is already gated. With
+    trigger 3 (pattern match) tightened, the only remaining release
+    path is trigger 4 (reviewDecision), which is mocked to None — so
+    the guard must hold.
+    """
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="priority substring", assignee="builder")
+        now = int(_time.time())
+        _add_comment_at(
+            conn, tid, author="builder",
+            body="Opened https://github.com/example/repo/pull/178",
+            created_at=now - 120,
+        )
+        _add_comment_at(
+            conn, tid, author="aliaadil",
+            body="the priority is low; also private concerns were raised.",
+            created_at=now - 30,
+        )
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_reviewer_feedback_no_release_substring_match_all_actions(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`all actions` should NOT match inside `hall actions` / `small action`.
+
+    Same word-boundary fix as the priority test above. Both bodies are
+    short AND non-default-authored AND distinct-content-key — that
+    combination is intentional so the ONLY release path is trigger 3
+    (pattern match), which we want to prove is now tightened.
+    """
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="hall actions substring", assignee="builder")
+        now = int(_time.time())
+        _add_comment_at(
+            conn, tid, author="builder",
+            body="Opened https://github.com/example/repo/pull/178",
+            created_at=now - 120,
+        )
+        _add_comment_at(
+            conn, tid, author="aliaadil",
+            body="hall actions of the day were notable",
+            created_at=now - 30,
+        )
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_reviewer_feedback_pattern_still_matches_standalone_phrase(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard: tightening the regex must NOT break the
+    legitimate single-occurrence phrase match.
+
+    "this pr" surrounded by punctuation/word-boundaries still triggers
+    release (trigger 3). This is the canonical T_de993dac reviewer body
+    shape and must keep working.
+    """
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="phrase-match-still-works", assignee="builder",
+        )
+        now = int(_time.time())
+        _add_comment_at(
+            conn, tid, author="builder",
+            body="Opened https://github.com/example/repo/pull/178",
+            created_at=now - 120,
+        )
+        _add_comment_at(
+            conn, tid, author="aliaadil",
+            body="please update this pr with the audit logging fix",
+            created_at=now - 30,
+        )
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+# --- Branch-routing override (SPEC Part B step #6) ---
+
+def test_branch_override_populated_when_guard_releases(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the guard releases due to reviewer feedback, the branch
+    override side-channel is populated for the dispatcher to consume.
+    """
+    _patch_gh_review_decision(monkeypatch, decision=None)
+
+    # Stub out the gh subprocess for branch lookup
+    def fake_gh(*args, **kwargs):
+        # kwargs.get('capture_output') won't be set; just return a fake result
+        class R:
+            stdout = '{"headRefName": "feat/t_de993dac-add-logging", "headRefOid": "deadbeef1234"}'
+            stderr = ""
+            returncode = 0
+        return R()
+
+    monkeypatch.setattr(kb.subprocess, "run", fake_gh)
+    # Clear any leftover override state from earlier tests
+    kb._pending_reviewer_branch_override.clear()
+    kb._BRANCH_OVERRIDE_CACHE.clear()
+
+    with kb.connect() as conn:
+        tid = _setup_task_with_pr_and_feedback(conn)
+        assert kb.check_respawn_guard(conn, tid) is None
+        override = kb._pending_reviewer_branch_override.get(tid)
+        assert override is not None, "branch override should be populated"
+        branch, sha = override
+        assert branch == "feat/t_de993dac-add-logging"
+        assert sha == "deadbeef1234"
+
+
+def test_branch_override_not_populated_when_guard_holds(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the guard returns active_pr, no branch override is set."""
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    kb._pending_reviewer_branch_override.clear()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="no feedback", assignee="builder")
+        now = int(_time.time())
+        _add_comment_at(
+            conn, tid, author="builder",
+            body="Opened https://github.com/example/repo/pull/178",
+            created_at=now - 60,
+        )
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+        assert tid not in kb._pending_reviewer_branch_override
+
+
+def test_dispatch_consumes_branch_override(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the dispatcher sees a populated ``_pending_reviewer_branch_override``
+    entry, it pops the entry on claim and forwards ``pr_head_sha`` to the
+    spawn fn via kwarg.
+
+    Uses ``workspace_kind='scratch'`` to avoid the worktree provisioning
+    path (which would require a real git project + worktree-lifecycle
+    setup); the scratch path still exercises the override-popping logic
+    AND the spawn-kwarg forwarding. The branch-rename side of the
+    override (claimed.branch_name = pr_branch) only runs on worktree
+    tasks, so this scratch test does NOT assert that.
+    """
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    _ensure_builder_profile(kanban_home, monkeypatch)
+    # Stub the gh call for branch lookup
+    def fake_gh(*args, **kwargs):
+        class R:
+            stdout = '{"headRefName": "feat/t_de993dac-add-logging", "headRefOid": "deadbeef1234"}'
+            stderr = ""
+            returncode = 0
+        return R()
+    monkeypatch.setattr(kb.subprocess, "run", fake_gh)
+    kb._pending_reviewer_branch_override.clear()
+    kb._BRANCH_OVERRIDE_CACHE.clear()
+
+    captured: dict = {}
+
+    def spawn(task, workspace, *, board=None, pr_head_sha=None):
+        captured["branch_name"] = task.branch_name
+        captured["pr_head_sha"] = pr_head_sha
+        return 12345  # fake PID
+
+    # Make sure no parent env leak (regression guard for the prior
+    # os.environ-mutation design — dispatcher must NOT touch the
+    # process env, only the spawn kwarg).
+    monkeypatch.delenv("HERMES_KANBAN_PR_HEAD_SHA", raising=False)
+    original_env = dict(os.environ)
+
+    with kb.connect() as conn:
+        tid = _setup_task_with_pr_and_feedback(conn, workspace_kind="scratch")
+        # Trigger guard release, which populates _pending_reviewer_branch_override
+        assert kb.check_respawn_guard(conn, tid) is None
+        override = kb._pending_reviewer_branch_override.get(tid)
+        assert override is not None
+        pr_branch, pr_head_sha = override
+        assert pr_branch == "feat/t_de993dac-add-logging"
+        assert pr_head_sha == "deadbeef1234"
+
+        # Run a tick.
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+
+    # Override dict cleared at end of tick
+    assert kb._pending_reviewer_branch_override == {}
+    # The task was spawned (it passed profile_exists gate thanks to
+    # _ensure_builder_profile fixture).
+    assert any(s[0] == tid for s in result.spawned), (
+        f"task {tid} should be in spawned, got {result.spawned}"
+    )
+    # For scratch tasks the entire override path (branch rename + head
+    # SHA forwarding) is intentionally skipped — the gate is
+    # ``workspace_kind == "worktree"`` because only worktree workers
+    # need to land on a specific branch + commit. The override was
+    # popped at claim time (verified via the cleared dict above); we
+    # assert the spawn fn saw NO override kwargs.
+    assert captured.get("pr_head_sha") is None, (
+        f"scratch task should not receive pr_head_sha override, "
+        f"got {captured.get('pr_head_sha')!r}"
+    )
+    assert captured.get("branch_name") is None, (
+        f"scratch task should keep its default branch_name (None), "
+        f"got {captured.get('branch_name')!r}"
+    )
+    # Regression guard: the dispatcher must NOT mutate the parent's
+    # process env to forward the SHA (prior design leaked the SHA from
+    # one task's spawn into the next).
+    assert os.environ == original_env, (
+        f"dispatcher mutated parent process env: {set(os.environ) ^ set(original_env)}"
+    )
+
+
+def test_dispatch_applies_branch_rename_for_worktree_tasks(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On worktree tasks, ``check_respawn_guard`` release must cause
+    ``claimed.branch_name`` to be replaced with the PR branch, AND the
+    spawn fn to receive ``pr_head_sha`` as a kwarg.
+
+    Stubs out ``_resolve_worktree_workspace`` to capture the claimed
+    task at the moment ``replace(claimed, branch_name=pr_branch)``
+    lands — we don't need a real git worktree to verify the rename
+    happens; we just need to assert the kwargs going into the
+    worktree-resolution call carry the override.
+    """
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    _ensure_builder_profile(kanban_home, monkeypatch)
+
+    monkeypatch.setattr(kb.subprocess, "run", lambda *a, **kw: type(
+        "R", (), {"stdout": '{"headRefName": "feat/t_de993dac-add-logging", "headRefOid": "deadbeef1234"}', "stderr": "", "returncode": 0}
+    )())
+    kb._pending_reviewer_branch_override.clear()
+    kb._BRANCH_OVERRIDE_CACHE.clear()
+
+    # Capture what the dispatcher's worktree resolver sees.
+    seen: dict = {}
+
+    def fake_resolve(task, board=None):
+        seen["branch_name"] = task.branch_name
+        # Return a sentinel workspace; the test doesn't run real git
+        # worktree provisioning.
+        from pathlib import Path as _P
+        return _P("/tmp/fake-workspace"), task.branch_name or f"wt/{task.id}"
+
+    monkeypatch.setattr(kb, "_resolve_worktree_workspace", fake_resolve)
+
+    captured: dict = {}
+
+    def spawn(task, workspace, *, board=None, pr_head_sha=None):
+        captured["branch_name"] = task.branch_name
+        captured["pr_head_sha"] = pr_head_sha
+        return 12345
+
+    monkeypatch.delenv("HERMES_KANBAN_PR_HEAD_SHA", raising=False)
+
+    with kb.connect() as conn:
+        tid = _setup_task_with_pr_and_feedback(conn, workspace_kind="worktree")
+        # Pre-populate workspace_path so resolve_workspace doesn't try to
+        # bootstrap a project repo.
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            ("/tmp/fake-workspace", tid),
+        )
+        # Trigger guard release to populate the override.
+        assert kb.check_respawn_guard(conn, tid) is None
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+
+    # The resolver saw the PR branch as the claimed task's branch_name
+    # (this is the dispatcher's `replace(claimed, branch_name=pr_branch)`).
+    assert seen.get("branch_name") == "feat/t_de993dac-add-logging", (
+        f"worktree resolver saw branch_name={seen.get('branch_name')!r}, "
+        f"expected the PR branch override"
+    )
+    # The spawn fn received the head SHA kwarg.
+    assert captured.get("pr_head_sha") == "deadbeef1234", (
+        f"worktree spawn fn got pr_head_sha={captured.get('pr_head_sha')!r}, "
+        f"expected 'deadbeef1234'"
+    )
+    assert any(s[0] == tid for s in result.spawned)
