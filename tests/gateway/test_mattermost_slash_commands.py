@@ -20,6 +20,9 @@ Covered here:
 8. Confirmed-missing thread roots (HTTP 400/404 on GET posts/{id}) resolve
    to "" so replies post flat on the first try — no invalid root_id POST
    and no "⚠️ thread delivery failed" banner (the trigger_id path).
+9. send_typing() includes parent_id (the thread root) only for thread
+   sessions, so the typing indicator renders in thread views too;
+   channel sessions keep the exact {"channel_id": ...} payload.
 """
 
 import asyncio
@@ -505,3 +508,63 @@ class TestThreadRootConfirmedMissing:
         assert "root_id" not in payload
         assert "final reply" in payload["message"]
         assert "⚠️" not in payload["message"]
+
+
+class TestSendTypingThreadScoped:
+    """send_typing() must scope the typing indicator to the active thread.
+
+    Mattermost's PublishUserTyping copies the request's ``parent_id`` into
+    the typing WebSocket event, and the webapp only renders the indicator
+    where ``rootId === parent_id`` — without it, thread views never show
+    "hermes is typing". Thread sessions carry the root post id in
+    ``metadata["thread_id"]``; channel/slash sessions have none, and their
+    wire payload must stay exactly ``{"channel_id": ...}``.
+    """
+
+    def _make_adapter(self, monkeypatch):
+        from plugins.platforms.mattermost.adapter import MattermostAdapter
+
+        monkeypatch.setenv("MATTERMOST_REPLY_MODE", "off")
+        adapter = MattermostAdapter(
+            PlatformConfig(enabled=True, token="test-token", extra={"url": "https://mm.example.com"})
+        )
+        adapter._bot_user_id = BOT_USER_ID
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_thread_metadata_sends_parent_id(self, monkeypatch):
+        """metadata["thread_id"] → POST body carries parent_id=root post id."""
+        adapter = self._make_adapter(monkeypatch)
+        adapter._api_post = AsyncMock(return_value={})
+
+        await adapter.send_typing(CHANNEL_ID, metadata={"thread_id": ROOT_ID})
+
+        path, payload = adapter._api_post.call_args.args
+        assert path == f"users/{BOT_USER_ID}/typing"
+        assert payload == {"channel_id": CHANNEL_ID, "parent_id": ROOT_ID}
+
+    @pytest.mark.asyncio
+    async def test_no_metadata_keeps_channel_scoped_payload(self, monkeypatch):
+        """metadata=None → channel typing unchanged (regression guard)."""
+        adapter = self._make_adapter(monkeypatch)
+        adapter._api_post = AsyncMock(return_value={})
+
+        await adapter.send_typing(CHANNEL_ID, metadata=None)
+
+        path, payload = adapter._api_post.call_args.args
+        assert path == f"users/{BOT_USER_ID}/typing"
+        assert payload == {"channel_id": CHANNEL_ID}
+        assert "parent_id" not in payload
+
+    @pytest.mark.asyncio
+    async def test_empty_thread_id_keeps_channel_scoped_payload(self, monkeypatch):
+        """metadata={"thread_id": ""} → no parent_id key."""
+        adapter = self._make_adapter(monkeypatch)
+        adapter._api_post = AsyncMock(return_value={})
+
+        await adapter.send_typing(CHANNEL_ID, metadata={"thread_id": ""})
+
+        path, payload = adapter._api_post.call_args.args
+        assert path == f"users/{BOT_USER_ID}/typing"
+        assert payload == {"channel_id": CHANNEL_ID}
+        assert "parent_id" not in payload

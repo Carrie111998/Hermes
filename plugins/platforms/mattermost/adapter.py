@@ -732,11 +732,12 @@ class MattermostAdapter(BasePlatformAdapter):
     async def send_typing(
         self, chat_id: str, metadata: Optional[Dict[str, Any]] = None
     ) -> None:
-        """Send a typing indicator."""
-        await self._api_post(
-            f"users/{self._bot_user_id}/typing",
-            {"channel_id": chat_id},
-        )
+        """Send a typing indicator (thread-scoped when replying in a thread)."""
+        payload: Dict[str, Any] = {"channel_id": chat_id}
+        parent_id = str((metadata or {}).get("thread_id") or "")
+        if parent_id:
+            payload["parent_id"] = parent_id
+        await self._api_post(f"users/{self._bot_user_id}/typing", payload)
 
     async def edit_message(
         self, chat_id: str, message_id: str, content: str, *, finalize: bool = False
