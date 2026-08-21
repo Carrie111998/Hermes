@@ -106,7 +106,19 @@ def _model_base_id(model: str | None) -> str:
 
 
 class NeuralWattProfile(ProviderProfile):
-    """NeuralWatt — top-level reasoning_effort + per-model capability contract."""
+    """NeuralWatt — top-level reasoning_effort + per-model capability contract.
+
+    ``default_reasoning_effort`` is the provider's preference when reasoning
+    is enabled but the user did not pick an effort.  ``max`` is native on all
+    three NeuralWatt models (flash/glm-5.2 support max·high·none; pro
+    supports max·high·low·none), so it is the unambiguous default — notably
+    it overrides pro's *server* default of ``low`` so the model always thinks
+    hard unless asked otherwise.
+    """
+
+    #: Effort level sent when reasoning is enabled but no effort is given.
+    #: Overrides the per-model server default (pro: low, flash: none).
+    default_reasoning_effort: str = "max"
 
     def _contract_for(self, model: str | None) -> dict[str, Any] | None:
         return _NEURALWATT_STATIC_CONTRACT.get(_model_base_id(model))
@@ -125,8 +137,10 @@ class NeuralWattProfile(ProviderProfile):
         When the model publishes a reasoning contract we clamp the user's
         requested effort onto that model's wire vocabulary and honor its
         ``none`` sentinel; when it has no contract we reuse the widest
-        OpenAI-compatible ladder.  Omitting the field leaves the server's
-        per-model default in force.
+        OpenAI-compatible ladder.  With reasoning enabled but no effort
+        chosen we send the provider default (``max``) rather than the
+        model's server default (pro: low, flash: none); the field is omitted
+        only when there is no reasoning config at all.
         """
         extra_body: dict[str, Any] = {}
         top_level: dict[str, Any] = {}
@@ -160,8 +174,13 @@ class NeuralWattProfile(ProviderProfile):
                 clamped = clamp_effort(effort, supported, aliases) or effort
                 # clamp_effort maps to the nearest weaker supported level
                 top_level["reasoning_effort"] = clamped
-            # effort == "none" / disabled with no "none" level: fall through
-            # and omit — the model's default (or forced-on) thinking applies.
+            elif not effort and enabled is not False:
+                # Reasoning enabled but no effort chosen → our provider
+                # default (max) instead of the model's server default
+                # (pro: low, flash: none).  Drop the field entirely only
+                # when the default isn't a supported level.
+                if self.default_reasoning_effort in supported:
+                    top_level["reasoning_effort"] = self.default_reasoning_effort
             return extra_body, top_level
 
         # No published contract — widest OpenAI-compatible wire spelling.
@@ -171,6 +190,10 @@ class NeuralWattProfile(ProviderProfile):
         if effort:
             clamped = clamp_effort(effort, OPENAI_COMPAT_WIRE_EFFORTS) or effort
             top_level["reasoning_effort"] = clamped
+        elif enabled is not False:
+            # No effort chosen → our provider default (max).
+            if self.default_reasoning_effort in OPENAI_COMPAT_WIRE_EFFORTS:
+                top_level["reasoning_effort"] = self.default_reasoning_effort
 
         return extra_body, top_level
 

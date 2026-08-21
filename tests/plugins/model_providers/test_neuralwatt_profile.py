@@ -83,12 +83,17 @@ class TestNeuralWattReasoningWireShape:
         )
         assert top_level == {"reasoning_effort": "max"}
 
-    def test_pro_defaults_to_low(self, neuralwatt_profile):
-        """No config → nothing sent; pro server default is low."""
+    def test_pro_defaults_to_max_when_enabled(self, neuralwatt_profile):
+        """Enabled without an explicit effort → our provider default (max).
+
+        This deliberately overrides pro's *server* default of ``low``: with
+        reasoning on but no effort chosen, the model must think hard unless
+        asked otherwise (decision: ``normalize max``).
+        """
         _, top_level = neuralwatt_profile.build_api_kwargs_extras(
-            reasoning_config=None, model="deepseek-v4-pro"
+            reasoning_config={"enabled": True}, model="deepseek-v4-pro"
         )
-        assert top_level == {}
+        assert top_level == {"reasoning_effort": "max"}
 
     # -- glm-5.2 (xhigh→max, medium→high, minimal→none) ---------------
     def test_glm_xhigh_maps_to_max(self, neuralwatt_profile):
