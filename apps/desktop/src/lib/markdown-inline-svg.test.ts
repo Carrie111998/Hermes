@@ -79,6 +79,17 @@ describe('fenceRawSvgBlocks', () => {
     expect(collectBalancedFenceRanges(mismatchedOnly)).toEqual([])
   })
 
+  it.each([
+    ['list continuation', `- item\n    ~~~~html\n  ${SVG}\n  ~~~~`],
+    ['nested list continuation', `- outer\n  - inner\n      ~~~~html\n    ${SVG}\n    ~~~~`],
+    ['blockquoted nested list continuation', `> - outer\n>   - inner\n>       ~~~~html\n>     ${SVG}\n>     ~~~~`]
+  ])('keeps SVG in a fence opened from a %s inert', (_label, input) => {
+    expect(collectBalancedFenceRanges(input)).toEqual([
+      { end: input.length, start: input.lastIndexOf('\n', input.indexOf('~~~~html')) + 1 }
+    ])
+    expect(fenceRawSvgBlocks(input)).toBe(input)
+  })
+
   it.each(['    ', '\t'])('keeps growing %s-indented SVG code inert while streaming', indent => {
     const chunks = [
       `${indent}<svg viewBox="0 0 1 1">`,
@@ -201,5 +212,33 @@ describe('fenceRawSvgBlocks', () => {
     }
 
     expect(structuralSearches).toBeLessThanOrEqual(2)
+  })
+
+  it('indexes increasing unmatched backtick runs within a linear operation budget', () => {
+    const runCount = 200
+    const backticks = Array.from({ length: runCount }, (_, index) => '`'.repeat(index + 1)).join('x')
+    const input = `${backticks}\n${SVG}`
+    const originalIndexOf = String.prototype.indexOf
+    let backtickSearches = 0
+
+    const indexOfSpy = vi.spyOn(String.prototype, 'indexOf').mockImplementation(function (
+      this: string,
+      search: string,
+      position?: number
+    ) {
+      if (this.valueOf() === input && search === '`') {
+        backtickSearches += 1
+      }
+
+      return originalIndexOf.call(this, search, position)
+    })
+
+    try {
+      expect(fenceRawSvgBlocks(input)).toContain(`\`\`\`svg\n${SVG}\n\`\`\``)
+    } finally {
+      indexOfSpy.mockRestore()
+    }
+
+    expect(backtickSearches).toBeLessThanOrEqual(runCount)
   })
 })

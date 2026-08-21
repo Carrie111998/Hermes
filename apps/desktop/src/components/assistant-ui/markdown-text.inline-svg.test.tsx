@@ -74,6 +74,12 @@ describe('MarkdownTextContent raw SVG', () => {
         .map(line => `>      ${line}`)
         .join('\n')}\n>      ~~~~`
     ],
+    [
+      'nested-list continuation fenced code',
+      `- outer\n  - inner\n      ~~~~html\n${SIMPLE_SVG.split('\n')
+        .map(line => `    ${line}`)
+        .join('\n')}\n    ~~~~`
+    ],
     ['inline code', `Keep this as code: \`${SIMPLE_SVG.replaceAll('\n', ' ')}\``],
     [
       'indented code',

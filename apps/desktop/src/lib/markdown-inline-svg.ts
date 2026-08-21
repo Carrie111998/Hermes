@@ -184,8 +184,28 @@ function stripFenceContainerPrefix(line: string, containers: FenceContainer[]): 
   return line.slice(cursor)
 }
 
-function fenceMarker(line: string): FenceMarker | null {
-  const container = fenceContainerPrefix(line)
+function continuedFenceContainerPrefix(line: string, inherited: FenceContainer[]) {
+  for (let length = inherited.length; length > 0; length -= 1) {
+    const containers = inherited.slice(0, length)
+    const continuation = stripFenceContainerPrefix(line, containers)
+
+    if (continuation === null) {
+      continue
+    }
+
+    const nested = fenceContainerPrefix(continuation)
+
+    return {
+      containers: [...containers, ...nested.containers],
+      content: nested.content
+    }
+  }
+
+  return fenceContainerPrefix(line)
+}
+
+function fenceMarker(line: string, inherited: FenceContainer[] = []): FenceMarker | null {
+  const container = continuedFenceContainerPrefix(line, inherited)
   const match = /^ {0,3}(`{3,}|~{3,})/.exec(container.content)
 
   if (!match) {
@@ -226,6 +246,7 @@ function isFenceClose(line: string, marker: FenceMarker): boolean {
 function collectBlockCodeRanges(text: string, includeUnclosedFence = true): Range[] {
   const ranges: Range[] = []
   let cursor = 0
+  let inheritedContainers: FenceContainer[] = []
   let openFence: { marker: FenceMarker; start: number } | null = null
 
   while (cursor < text.length) {
@@ -236,10 +257,11 @@ function collectBlockCodeRanges(text: string, includeUnclosedFence = true): Rang
     if (openFence) {
       if (isFenceClose(line, openFence.marker)) {
         ranges.push({ end: next, kind: 'fence', start: openFence.start })
+        inheritedContainers = openFence.marker.containers
         openFence = null
       }
     } else {
-      const marker = fenceMarker(line)
+      const marker = fenceMarker(line, inheritedContainers)
 
       if (marker) {
         openFence = { marker, start: cursor }
@@ -248,6 +270,10 @@ function collectBlockCodeRanges(text: string, includeUnclosedFence = true): Rang
 
         if (/^(?: {4}|\t)/.test(content) && content.trim()) {
           ranges.push({ end: next, kind: 'indented', start: cursor })
+        }
+
+        if (line.trim()) {
+          inheritedContainers = continuedFenceContainerPrefix(line, inheritedContainers).containers
         }
       }
     }
@@ -312,6 +338,12 @@ export function collectIndentedCodeRanges(text: string): Array<{ end: number; st
   return ranges
 }
 
+interface BacktickDelimiter {
+  end: number
+  length: number
+  start: number
+}
+
 function backtickRun(text: string, start: number): number {
   let length = 0
 
@@ -322,62 +354,11 @@ function backtickRun(text: string, start: number): number {
   return length
 }
 
-function findClosingBacktickRun(text: string, start: number, length: number): number {
-  let cursor = start
-
-  while (cursor < text.length) {
-    const next = text.indexOf('`', cursor)
-
-    if (next === -1) {
-      return -1
-    }
-
-    const run = backtickRun(text, next)
-
-    if (run === length) {
-      return next + run
-    }
-
-    cursor = next + run
-  }
-
-  return -1
-}
-
-function rangeContaining(ranges: Range[], offset: number): Range | null {
-  let low = 0
-  let high = ranges.length - 1
-  let candidate: Range | null = null
-
-  while (low <= high) {
-    const middle = Math.floor((low + high) / 2)
-    const range = ranges[middle]
-
-    if (!range || range.start > offset) {
-      high = middle - 1
-    } else {
-      candidate = range
-      low = middle + 1
-    }
-  }
-
-  return candidate && offset < candidate.end ? candidate : null
-}
-
-function collectProtectedRanges(text: string): Range[] {
-  const blockRanges = collectBlockCodeRanges(text).sort((a, b) => a.start - b.start)
-  const inlineRanges: Range[] = []
+function collectBacktickDelimiters(text: string): BacktickDelimiter[] {
+  const delimiters: BacktickDelimiter[] = []
   let cursor = 0
 
   while (cursor < text.length) {
-    const protectedRange = rangeContaining(blockRanges, cursor)
-
-    if (protectedRange) {
-      cursor = protectedRange.end
-
-      continue
-    }
-
     if (text[cursor] !== '`') {
       cursor += 1
 
@@ -385,16 +366,72 @@ function collectProtectedRanges(text: string): Range[] {
     }
 
     const length = backtickRun(text, cursor)
-    const end = findClosingBacktickRun(text, cursor + length, length)
 
-    if (end === -1) {
-      cursor += length
+    delimiters.push({ end: cursor + length, length, start: cursor })
+    cursor += length
+  }
+
+  return delimiters
+}
+
+function collectProtectedRanges(text: string): Range[] {
+  const blockRanges = collectBlockCodeRanges(text).sort((a, b) => a.start - b.start)
+  const delimiters = collectBacktickDelimiters(text)
+  const nextMatchingDelimiter = new Array<number>(delimiters.length).fill(-1)
+  const nextByLength = new Map<number, number>()
+  const inlineRanges: Range[] = []
+
+  for (let index = delimiters.length - 1; index >= 0; index -= 1) {
+    const delimiter = delimiters[index]
+
+    if (!delimiter) {
+      continue
+    }
+
+    nextMatchingDelimiter[index] = nextByLength.get(delimiter.length) ?? -1
+    nextByLength.set(delimiter.length, index)
+  }
+
+  let blockIndex = 0
+  let delimiterIndex = 0
+
+  while (delimiterIndex < delimiters.length) {
+    const delimiter = delimiters[delimiterIndex]
+
+    if (!delimiter) {
+      break
+    }
+
+    while (blockRanges[blockIndex] && blockRanges[blockIndex].end <= delimiter.start) {
+      blockIndex += 1
+    }
+
+    const blockRange = blockRanges[blockIndex]
+
+    if (blockRange && blockRange.start <= delimiter.start && delimiter.start < blockRange.end) {
+      delimiterIndex += 1
 
       continue
     }
 
-    inlineRanges.push({ end, kind: 'inline', start: cursor })
-    cursor = end
+    const closingIndex = nextMatchingDelimiter[delimiterIndex] ?? -1
+
+    if (closingIndex === -1) {
+      delimiterIndex += 1
+
+      continue
+    }
+
+    const closing = delimiters[closingIndex]
+
+    if (!closing) {
+      delimiterIndex += 1
+
+      continue
+    }
+
+    inlineRanges.push({ end: closing.end, kind: 'inline', start: delimiter.start })
+    delimiterIndex = closingIndex + 1
   }
 
   return [...blockRanges, ...inlineRanges].sort((a, b) => a.start - b.start)
