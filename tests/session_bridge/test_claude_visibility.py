@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, replace
+import hashlib
 
 import pytest
 
@@ -247,6 +248,59 @@ def test_legacy_codex_bridge_registration_is_excluded_even_after_key_rotation(
     assert evaluate_claude_visibility(projection) == "bridge_placeholder"
 
 
+def test_current_codex_registration_is_excluded_after_provenance_and_key_loss() -> None:
+    source = _projection(
+        Provider.CODEX,
+        native_id="original-source",
+        content="Implement the original substantive request",
+    )
+    candidate = build_claude_visibility_candidate(source, eligible_at=30.0)
+    identity = derive_claude_visibility_identity(candidate, SECRET)
+    prompt = build_claude_registration_prompt(candidate, identity, SECRET)
+    imported = _projection(
+        Provider.CODEX,
+        native_id="imported-registration",
+        content=prompt,
+        origin_kind=OriginKind.NATIVE,
+        origin_bridge_id=None,
+    )
+
+    assert prompt.startswith(
+        "This is a Hermes Session Bridge Claude visibility registration.\n"
+        "Do not perform project work or use tools.\n"
+        "Signed marker: HERMES_SESSION_BRIDGE_V1:"
+    )
+    assert evaluate_claude_visibility(imported) == "bridge_placeholder"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        (
+            "This is a Hermes Session Bridge Claude visibility registration.\n"
+            "Do perform project work or use tools.\n"
+            "Signed marker: HERMES_SESSION_BRIDGE_V1:not-an-envelope"
+        ),
+        (
+            "This is a Hermes Session Bridge Claude visibility registration. "
+            "Do not perform project work or use tools.\n"
+            "Signed marker: HERMES_SESSION_BRIDGE_V1:not-an-envelope"
+        ),
+        (
+            "This is a Hermes Session Bridge Claude visibility registration.\n"
+            "Do not perform project work or use tools.\n"
+            "Unsigned marker: HERMES_SESSION_BRIDGE_V1:not-an-envelope"
+        ),
+    ],
+)
+def test_current_registration_structural_near_misses_remain_meaningful(
+    content: str,
+) -> None:
+    assert evaluate_claude_visibility(_projection(Provider.CODEX, content=content)) == (
+        "eligible"
+    )
+
+
 def test_codex_injected_context_does_not_hide_a_real_user_request() -> None:
     projection = replace(
         _projection(Provider.CODEX),
@@ -359,6 +413,28 @@ def test_provider_or_source_identity_changes_reserved_uuid() -> None:
     }
 
     assert len(identities) == 3
+
+
+def test_registration_prompt_bytes_are_stable() -> None:
+    candidate = build_claude_visibility_candidate(
+        _projection(
+            Provider.CODEX,
+            native_id="prompt-byte-contract",
+            content="Implement deterministic visibility",
+        ),
+        eligible_at=30.0,
+    )
+    identity = derive_claude_visibility_identity(
+        candidate, b"prompt-byte-contract-secret"
+    )
+
+    prompt = build_claude_registration_prompt(
+        candidate, identity, b"prompt-byte-contract-secret"
+    )
+
+    assert hashlib.sha256(prompt.encode("utf-8")).hexdigest() == (
+        "c0ad27b2ea817eb6eb4a2ba2c9e6c7825647a0d628af7aa0780b9f4db50eddc8"
+    )
 
 
 def test_registration_prompt_is_bounded_signed_metadata_without_transcript() -> None:

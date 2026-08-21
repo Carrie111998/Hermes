@@ -4,7 +4,12 @@ import logging
 from dataclasses import replace
 from decimal import Decimal
 
-from session_bridge.claude_visibility import ClaudeVisibilityClaim
+from session_bridge.claude_visibility import (
+    ClaudeVisibilityClaim,
+    build_claude_registration_prompt,
+    build_claude_visibility_candidate,
+    derive_claude_visibility_identity,
+)
 from session_bridge.config import BridgeConfig
 from session_bridge.coordinator import (
     ClaudeVisibilityCoordinator,
@@ -278,6 +283,38 @@ def test_dry_run_never_writes_claims_or_invokes_registrar() -> None:
     assert store.enqueued == []
     assert store.claim_calls == 0
     assert registrar.claims == []
+
+
+def test_imported_current_registration_is_excluded_before_dry_run_or_apply() -> None:
+    original = _source("original", text="Implement the original request")
+    candidate = build_claude_visibility_candidate(
+        original.projection,
+        eligible_at=original.projection.last_active,
+        git_root=original.git_root,
+        git_head=original.git_head,
+        worktree_id=original.worktree_id,
+    )
+    identity = derive_claude_visibility_identity(candidate, SECRET)
+    prompt = build_claude_registration_prompt(candidate, identity, SECRET)
+    imported = _source("imported-registration", text=prompt, origin=OriginKind.NATIVE)
+
+    for apply in (False, True):
+        store = FakeStore()
+        registrar = FakeRegistrar()
+        coordinator, _calls = _coordinator(
+            [imported], store=store, registrar=registrar
+        )
+
+        result = coordinator.backfill(days=30, limit=10, apply=apply)
+
+        assert result.candidates == ()
+        assert [(item.source_session_id, item.reason) for item in result.exclusions] == [
+            ("codex:imported-registration", "bridge_placeholder")
+        ]
+        assert result.applied == 0
+        assert store.enqueued == []
+        assert store.claim_calls == 0
+        assert registrar.claims == []
 
 
 def test_apply_refuses_every_nonvisible_open_or_failed_state() -> None:

@@ -20,7 +20,10 @@ from hermes_state import SCHEMA_VERSION, SessionDB
 from session_bridge.claude_visibility import (
     ClaudeVisibilityCandidate,
     ClaudeVisibilityIdentity,
+    build_claude_registration_prompt,
+    build_claude_visibility_candidate,
     derive_claude_visibility_identity,
+    evaluate_claude_visibility,
 )
 from session_bridge.claude_visibility_codes import (
     CLAUDE_VISIBILITY_PUBLIC_RESULT_ERROR_CODES,
@@ -7265,6 +7268,40 @@ def test_claude_visibility_codex_inventory_reuses_full_indexed_projections(db) -
         by_id["indexed-placeholder"].projection.origin_bridge_id
         == "bridge:indexed-placeholder"
     )
+
+
+def test_claude_visibility_codex_inventory_excludes_imported_current_registration(
+    db,
+) -> None:
+    secret = b"persisted-registration-secret"
+    original = _projection(
+        _message("original-user", "Implement the original request", timestamp=101.0),
+        provider=Provider.CODEX,
+        native_id="original-registration-source",
+        last_active=110.0,
+    )
+    candidate = build_claude_visibility_candidate(original, eligible_at=110.0)
+    identity = derive_claude_visibility_identity(candidate, secret)
+    prompt = build_claude_registration_prompt(candidate, identity, secret)
+    imported = _projection(
+        _message("imported-user", prompt, timestamp=121.0),
+        provider=Provider.CODEX,
+        native_id="imported-registration",
+        last_active=130.0,
+        origin_kind=OriginKind.NATIVE,
+        origin_bridge_id=None,
+    )
+    store = SessionBridgeStore(db, clock=lambda: 200.0)
+    store.upsert_projection(imported)
+
+    sources = store.list_claude_visibility_codex_sources(after=100.0, limit=None)
+
+    assert len(sources) == 1
+    reloaded = sources[0].projection
+    assert reloaded.origin_kind is OriginKind.NATIVE
+    assert reloaded.origin_bridge_id is None
+    assert tuple(message.content for message in reloaded.messages) == (prompt,)
+    assert evaluate_claude_visibility(reloaded) == "bridge_placeholder"
 
 
 def test_claude_visibility_source_ids_cover_existing_jobs(db) -> None:

@@ -64,7 +64,13 @@ _CODEX_INJECTED_USER_PREFIXES = (
     "# AGENTS.md instructions for ",
     "<skill>\n",
 )
-_LEGACY_CODEX_REGISTRATION_PREFIXES = (
+_CURRENT_CODEX_REGISTRATION_PREAMBLE = "\n".join((
+    "This is a Hermes Session Bridge Claude visibility registration.",
+    "Do not perform project work or use tools.",
+    "Signed marker: HERMES_SESSION_BRIDGE_V1:",
+))
+_CODEX_REGISTRATION_PREFIXES = (
+    _CURRENT_CODEX_REGISTRATION_PREAMBLE,
     (
         "Hermes Session Bridge registration only. "
         "Hermes Session Bridge placeholder.\n"
@@ -158,9 +164,7 @@ def evaluate_claude_visibility(
         message.content for message in projection.messages if message.role == "user"
     )
     if projection.provider is Provider.CODEX:
-        if any(
-            _is_legacy_codex_registration(content) for content in user_contents
-        ):
+        if any(_is_codex_registration(content) for content in user_contents):
             return "bridge_placeholder"
         if any(_is_codex_automation_envelope(content) for content in user_contents):
             return "automation_only"
@@ -269,10 +273,8 @@ def _is_codex_automation_envelope(value: object) -> bool:
     )
 
 
-def _is_legacy_codex_registration(value: object) -> bool:
-    return isinstance(value, str) and value.startswith(
-        _LEGACY_CODEX_REGISTRATION_PREFIXES
-    )
+def _is_codex_registration(value: object) -> bool:
+    return isinstance(value, str) and value.startswith(_CODEX_REGISTRATION_PREFIXES)
 
 
 def derive_claude_visibility_identity(
@@ -342,10 +344,11 @@ def build_claude_registration_prompt(
         sort_keys=True,
         separators=(",", ":"),
     )
+    marker_suffix = identity.signed_marker.removeprefix(
+        "HERMES_SESSION_BRIDGE_V1:"
+    )
     prompt = "\n".join((
-        "This is a Hermes Session Bridge Claude visibility registration.",
-        "Do not perform project work or use tools.",
-        f"Signed marker: {identity.signed_marker}",
+        f"{_CURRENT_CODEX_REGISTRATION_PREAMBLE}{marker_suffix}",
         f"Bounded metadata: {serialized}",
         "You must reply exactly REGISTERED.",
         "After the first subsequent substantive user request, call session_continue ",
