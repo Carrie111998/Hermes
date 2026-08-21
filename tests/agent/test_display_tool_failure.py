@@ -96,6 +96,18 @@ class TestDetectToolFailureStructured:
         result = json.dumps({"success": True, "data": "hello"})
         assert _detect_tool_failure("web_search", result) == (False, "")
 
+    def test_null_error_field_not_flagged(self):
+        result = json.dumps({
+            "results": [{"content": "short page", "error": None}],
+        })
+        assert _detect_tool_failure("web_extract", result) == (False, "")
+
+    def test_unstructured_error_text_still_flagged(self):
+        assert _detect_tool_failure("web_extract", 'request {"error"} occurred') == (
+            True,
+            " [error]",
+        )
+
 
 
 class TestGetCuteToolMessageFailureSuffix:
@@ -118,4 +130,3 @@ class TestGetCuteToolMessageFailureSuffix:
         ok = json.dumps({"success": True, "data": "hi"})
         line = get_cute_tool_message("web_search", {"query": "hi"}, 0.2, result=ok)
         assert "[" not in line.split("0.2s", 1)[1]
-

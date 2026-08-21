@@ -1370,6 +1370,11 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
         if err and (data.get("success") is False or "error" in data):
             return True, f" [{_trim_error(str(err))}]"
 
+    # A successfully parsed structured result has already been classified
+    # above. Do not let field names such as `"error": null` override it.
+    if isinstance(data, (dict, list)):
+        return False, ""
+
     # Generic heuristic for non-terminal tools
     # Multimodal tool results (dicts with _multimodal=True) are not strings —
     # treat them as successes since failures would be JSON-encoded strings.

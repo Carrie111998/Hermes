@@ -11,6 +11,22 @@ from agent.tool_guardrails import (
 )
 
 
+def test_classify_tool_failure_ignores_null_error_in_structured_success():
+    result = '{"results":[{"content":"short page","error":null}]}'
+    assert classify_tool_failure("web_extract", result) == (False, "")
+
+
+def test_classify_tool_failure_keeps_structured_and_unstructured_errors():
+    assert classify_tool_failure("web_extract", '{"error":"boom"}') == (
+        True,
+        " [error]",
+    )
+    assert classify_tool_failure("web_extract", 'request {"error"} occurred') == (
+        True,
+        " [error]",
+    )
+
+
 def test_tool_call_signature_hashes_canonical_nested_unicode_args_without_exposing_raw_args():
     args_a = {
         "z": [{"β": "☤", "a": 1}],
@@ -167,7 +183,6 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
     assert decision.should_halt is True
-
 
 
 
