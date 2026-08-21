@@ -52,6 +52,7 @@ _MIRROR_FILES = (
     "index.mjs",
     "package.json",
     "package-lock.json",
+    "voice-send.mjs",
 )
 
 
