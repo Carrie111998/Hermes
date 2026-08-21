@@ -33,8 +33,12 @@ Substrate facts (verified May 2026):
 
 from __future__ import annotations
 
+import logging
+
 from dataclasses import dataclass, replace
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # ─── Public types ───────────────────────────────────────────────────────
@@ -606,6 +610,7 @@ def _keyless_slug_set() -> set[str]:
             if d.keyless
         }
     except Exception:
+        logger.debug("keyless slug lookup failed; treating none as keyless", exc_info=True)
         return set()
 
 
@@ -633,8 +638,12 @@ def _append_unconfigured_rows(
     cur_model = str(ctx.current_model or "").strip()
     extras: list[dict] = []
     # Keyless providers (no credential to detect) carry a curated,
-    # anonymously-routable catalog we must surface in the picker.
-    _keyless_by_slug = {s: True for s in _keyless_slug_set()}
+    # anonymously-routable catalog we must surface in the picker. Honor the
+    # user's model_catalog.excluded_providers — exclusion wins over keyless.
+    _excluded = {str(p).strip().lower() for p in (ctx.excluded_providers or []) if p}
+    _keyless_by_slug = {
+        s: True for s in _keyless_slug_set() if s not in _excluded
+    }
     for entry in CANONICAL_PROVIDERS:
         if entry.slug.lower() in seen:
             continue
@@ -686,6 +695,7 @@ def _append_unconfigured_rows(
 
                 _models = list(cached_provider_model_ids(entry.slug) or [])
             except Exception:
+                logger.debug("keyless model catalog fetch failed for %s", entry.slug, exc_info=True)
                 _models = []
         extras.append(
             {
@@ -712,8 +722,12 @@ def _filter_explicit_provider_rows(rows: list[dict], ctx: ConfigContext) -> list
 
     # Keyless providers (e.g. opencode-free) need no credential and no explicit
     # config to be usable, so they always belong in an explicit picker — the
-    # same way a configured provider does.
-    _keyless_slugs = _keyless_slug_set()
+    # same way a configured provider does. list_authenticated_providers() never
+    # emits keyless rows today, so this branch is defensive; it becomes live
+    # once the source emits keyless directly (planned follow-up).
+    _keyless_slugs = _keyless_slug_set() - {
+        str(p).strip().lower() for p in (ctx.excluded_providers or []) if p
+    }
 
     current_slug = str(ctx.current_provider or "").strip().lower()
     kept: list[dict] = []
