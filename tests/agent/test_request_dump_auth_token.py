@@ -37,14 +37,11 @@ class _StubAgent:
         return None
 
     def _mask_api_key_for_logs(self, key):
-        # Mirrors run_agent.Agent._mask_api_key_for_logs
-        if callable(key) and not isinstance(key, str):
-            return "<entra-id-bearer>"
-        if not key:
-            return None
-        if len(key) <= 12:
-            return "***"
-        return f"{key[:8]}...{key[-4:]}"
+        # Delegate to the production masker so the stub cannot drift from
+        # the real masking contract (length thresholds, sentinels).
+        from run_agent import AIAgent
+
+        return AIAgent._mask_api_key_for_logs(self, key)
 
 
 @pytest.fixture(autouse=True)
@@ -93,3 +90,14 @@ class TestRequestDumpAuthorization:
         """No credential at all keeps the explicit "Bearer None" marker."""
         payload = _dump(tmp_path, _StubClient(api_key=None, auth_token=None))
         assert payload["request"]["headers"]["Authorization"] == "Bearer None"
+
+    def test_callable_auth_token_reports_entra_id_sentinel(self, tmp_path):
+        """A callable auth_token (Entra ID bearer provider) resolves through
+        the fallback to the documented sentinel — the callable itself is
+        never invoked in the log path."""
+        payload = _dump(
+            tmp_path, _StubClient(api_key=None, auth_token=lambda: _FAKE_OAUTH)
+        )
+        assert (
+            payload["request"]["headers"]["Authorization"] == "Bearer <entra-id-bearer>"
+        )
