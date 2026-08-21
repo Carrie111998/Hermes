@@ -213,6 +213,27 @@ class TestBackup:
         assert staged_dirs, "no SQLite snapshot was staged"
         assert all(d == str(out_zip.parent) for d in staged_dirs), staged_dirs
 
+    def test_full_backup_excludes_prior_backup_tree(self, tmp_path, monkeypatch):
+        """A manual archive must never contain old archives recursively."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        prior = hermes_home / "backups" / "old-run" / "backups" / "older-run"
+        prior.mkdir(parents=True)
+        (prior / "prior-backup.bin").write_bytes(b"old backup payload")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        out_zip = tmp_path / "backup.zip"
+        from hermes_cli.backup import run_backup
+        run_backup(Namespace(output=str(out_zip)))
+
+        with zipfile.ZipFile(out_zip, "r") as zf:
+            names = zf.namelist()
+        assert "config.yaml" in names
+        assert not any(name.startswith("backups/") for name in names)
+
 
 
 
@@ -1410,6 +1431,19 @@ class TestPreUpdateBackup:
         # pid files excluded
         assert "gateway.pid" not in names
 
+    def test_excludes_prior_backup_tree(self, hermes_home):
+        """The automatic pre-update archive must not nest prior backups."""
+        prior = hermes_home / "backups" / "old-run" / "previous.zip"
+        prior.parent.mkdir(parents=True)
+        prior.write_bytes(b"previous backup")
+
+        from hermes_cli.backup import create_pre_update_backup
+        out = create_pre_update_backup(hermes_home=hermes_home)
+        assert out is not None
+        with zipfile.ZipFile(out) as zf:
+            names = zf.namelist()
+        assert not any(name.startswith("backups/") for name in names)
+
 
     def test_rotation_keeps_only_n(self, hermes_home):
         """After more than ``keep`` backups are created, older ones are
@@ -1706,7 +1740,6 @@ class TestMemoryProviderExternalPaths:
         assert (restored.stat().st_mode & 0o777) == 0o600
         # External state did NOT leak into HERMES_HOME.
         assert not (hermes_home / "_external").exists()
-
 
 
 
