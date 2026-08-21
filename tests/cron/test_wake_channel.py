@@ -1,13 +1,10 @@
-"""In-memory wake channel between the event dispatcher and the scheduler.
+"""Durable wake queue between the event dispatcher and the scheduler.
 
 Activation deliberately does NOT go through ``trigger_job``: that writes
 jobs.json on every activation (contending with the scheduler's own ~1/min
 rewrite) and sets ``enabled: True``, which would silently revive a worker an
-operator had disabled.
-
-The channel is intentionally volatile. Wakes are lost on gateway restart, and
-that is safe *only* because the deterministic reconciler re-derives pending
-work from the mailbox. Durability lives in the ledger, not here.
+operator had disabled. The queue instead uses the canonical cross-profile
+quarantine-control database and is drained transactionally by ``tick()``.
 """
 
 from __future__ import annotations
@@ -67,10 +64,13 @@ class TestValidation:
 class TestBounded:
     def test_channel_is_capped_and_drops_loudly(self):
         """A runaway producer must not grow the channel without bound."""
+        from jobflow_dispatch.quarantine_control import WakeQueueFullError
+
         cap = wake_channel.MAX_PENDING
         for i in range(cap):
             assert wake_channel.request_wake(f"j{i}", caller="test", reason="r") is True
-        assert wake_channel.request_wake("overflow", caller="test", reason="r") is False
+        with pytest.raises(WakeQueueFullError, match="capacity"):
+            wake_channel.request_wake("overflow", caller="test", reason="r")
         assert "overflow" not in wake_channel.pending_wakes()
 
 
@@ -105,13 +105,39 @@ class TestSchedulerIntegration:
         monkeypatch.setattr(scheduler, "load_jobs", lambda: rows)
         return scheduler
 
-    def test_woken_enabled_job_is_returned(self, monkeypatch):
+    def test_woken_enabled_job_is_returned_without_consuming_before_submit(
+        self, monkeypatch
+    ):
         s = self._jobs(monkeypatch, [{"id": "j1", "name": "a", "enabled": True}])
         wake_channel.request_wake("j1", caller="test", reason="r")
 
         got = s._collect_woken_jobs(exclude_ids=set())
 
         assert [j["id"] for j in got] == ["j1"]
+        assert wake_channel.pending_wakes() == frozenset({"j1"})
+        assert got[0]["_durable_wake"]["job_id"] == "j1"
+
+    def test_jobs_load_failure_retains_every_wake(self, monkeypatch):
+        from cron import scheduler
+
+        monkeypatch.setattr(
+            scheduler,
+            "load_jobs",
+            lambda: (_ for _ in ()).throw(OSError("jobs.json unreadable")),
+        )
+        wake_channel.request_wake("j1", caller="test", reason="r")
+
+        assert scheduler._collect_woken_jobs(exclude_ids=set()) == []
+        assert wake_channel.pending_wakes() == frozenset({"j1"})
+
+    def test_exact_wake_ack_does_not_delete_a_replacement(self):
+        wake_channel.request_wake("j1", caller="test", reason="first")
+        first = wake_channel.peek_wakes()[0]
+        wake_channel.ack_wake(first)
+        wake_channel.request_wake("j1", caller="test", reason="second")
+
+        assert wake_channel.ack_wake(first) is False
+        assert wake_channel.pending_wakes() == frozenset({"j1"})
 
     def test_disabled_job_is_never_revived(self, monkeypatch):
         """trigger_job would have set enabled=True; this must not."""
@@ -140,6 +166,66 @@ class TestSchedulerIntegration:
         s._collect_woken_jobs(exclude_ids=set())
 
         assert wake_channel.pending_wakes() == frozenset()
+
+    def test_submit_failure_retains_wake_for_retry(self, monkeypatch):
+        from cron import scheduler
+
+        job = {"id": "j1", "name": "a", "enabled": True}
+        monkeypatch.setattr(scheduler, "get_due_and_skipped_jobs", lambda: ([], []))
+        monkeypatch.setattr(scheduler, "load_jobs", lambda: [job])
+        monkeypatch.setattr(scheduler, "create_execution", lambda *_a, **_k: {"id": "e1"})
+        monkeypatch.setattr(scheduler, "finish_execution", lambda *_a, **_k: None)
+        monkeypatch.setattr(scheduler, "_interpreter_shutting_down", lambda *_a: False)
+
+        class _Pool:
+            def submit(self, _callable):
+                raise RuntimeError("executor unavailable")
+
+        monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _limit: _Pool())
+        wake_channel.request_wake("j1", caller="test", reason="r")
+
+        assert scheduler.tick(verbose=False, sync=False) == 0
+        assert wake_channel.pending_wakes() == frozenset({"j1"})
+
+    def test_successful_submit_acknowledges_wake_before_admission_release(self, monkeypatch):
+        from cron import scheduler
+
+        calls = []
+        job = {"id": "j1", "name": "a", "enabled": True}
+        monkeypatch.setattr(scheduler, "get_due_and_skipped_jobs", lambda: ([], []))
+        monkeypatch.setattr(scheduler, "load_jobs", lambda: [job])
+        monkeypatch.setattr(scheduler, "create_execution", lambda *_a, **_k: {"id": "e1"})
+
+        class _Future:
+            def add_done_callback(self, _callback):
+                return None
+
+            def exception(self):
+                return None
+
+        class _Pool:
+            def submit(self, _callable):
+                calls.append("submit")
+                return _Future()
+
+        class _Store:
+            def dispatch_section(self, *, boundary):
+                class _Admission:
+                    def __enter__(self):
+                        calls.append("enter")
+
+                    def __exit__(self, *_args):
+                        assert wake_channel.pending_wakes() == frozenset()
+                        calls.append("exit")
+                return _Admission()
+
+        monkeypatch.setattr(scheduler, "default_control_store", lambda: _Store())
+        monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _limit: _Pool())
+        monkeypatch.setattr(scheduler, "_running_job_ids", set())
+        wake_channel.request_wake("j1", caller="test", reason="r")
+
+        assert scheduler.tick(verbose=False, sync=False) == 1
+        assert calls.index("submit") < calls.index("exit")
 
     def test_collection_never_raises_into_the_tick(self, monkeypatch):
         from cron import scheduler
@@ -188,6 +274,7 @@ class TestTickExecutesWokenJobs:
         monkeypatch.setattr(scheduler, "save_job_output", lambda *a, **k: None)
         monkeypatch.setattr(scheduler, "advance_next_run", lambda *a, **k: None)
         monkeypatch.setattr(scheduler, "_deliver_result", lambda *a, **k: (True, None))
+        monkeypatch.setattr(scheduler, "_running_job_ids", set())
 
         wake_channel.request_wake("j1", caller="test", reason="score_request")
         scheduler.tick(verbose=False, sync=True)
@@ -250,7 +337,9 @@ class TestWakeSurvivesAConcurrentRun:
         got = s._collect_woken_jobs(exclude_ids=set())
 
         assert [j["id"] for j in got] == ["j1"]
-        assert wake_channel.pending_wakes() == frozenset()          # now consumed
+        # Collection alone is not a handoff. The exact wake remains until the
+        # scheduler successfully submits this returned job to an executor.
+        assert wake_channel.pending_wakes() == frozenset({"j1"})
 
     def test_requeue_survives_many_blocked_ticks_as_one_entry(self, monkeypatch):
         """A 12-minute run spans ~12 ticks; the channel must not grow."""

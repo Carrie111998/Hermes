@@ -48,6 +48,7 @@ from hermes_cli._subprocess_compat import resolve_windows_git_bash, run_text_cap
 from hermes_cli.config import load_config, _expand_env_vars
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
+from jobflow_dispatch.quarantine_control import default_control_store
 
 logger = logging.getLogger(__name__)
 
@@ -4298,35 +4299,38 @@ def _collect_woken_jobs(*, exclude_ids: set) -> list:
     reconciler catching the work, while an exception here would stall every
     scheduled job.
     """
-    woken_ids = wake_channel.drain_wakes()
-    if not woken_ids:
+    wakes = wake_channel.peek_wakes()
+    if not wakes:
         return []
 
     try:
         by_id = {j.get("id"): j for j in load_jobs()}
     except Exception as exc:
         logger.warning(
-            "cron wake collection failed, dropping %d wake(s): %s",
-            len(woken_ids), type(exc).__name__,
+            "cron wake collection failed, retaining %d wake(s): %s",
+            len(wakes), type(exc).__name__,
         )
         return []
 
     collected = []
-    for job_id in sorted(woken_ids):
+    for wake in sorted(wakes, key=lambda row: row["job_id"]):
+        job_id = wake["job_id"]
         if job_id in exclude_ids:
+            wake_channel.ack_wake(wake)
             continue  # already firing on schedule this tick
         job = by_id.get(job_id)
         if job is None:
             logger.warning("cron wake for unknown job %s — dropped", job_id)
+            wake_channel.ack_wake(wake)
             continue
         if not job.get("enabled"):
             # An operator disabled this on purpose. Unlike trigger_job, a wake
             # never re-enables.
             logger.info("cron wake for disabled job %s — not revived", job_id)
+            wake_channel.ack_wake(wake)
             continue
         if job_id in get_running_job_ids():
-            # The job is mid-run, so dispatching now would only hit the
-            # duplicate-fire guard and the wake would be lost. Put it back and
+            # The job is mid-run, so leave the exact durable wake untouched and
             # let a later tick deliver it once the run finishes.
             #
             # Measured 2026-08-18 (canary day 0): dropping it cost every
@@ -4343,11 +4347,8 @@ def _collect_woken_jobs(*, exclude_ids: set) -> list:
             # ended by the cron wall-clock timeout rather than by this loop.
             # Logged at DEBUG because a busy worker is the normal case and this
             # fires once per tick until the run ends.
-            wake_channel.request_wake(
-                job_id, caller="cron.tick", reason="requeued_job_running"
-            )
             logger.debug(
-                "cron wake for %s deferred — job still running; re-queued", job_id
+                "cron wake for %s deferred — job still running; retained", job_id
             )
             continue
 
@@ -4384,7 +4385,7 @@ def _collect_woken_jobs(*, exclude_ids: set) -> list:
                 "cron wake provenance emit failed for job %s — firing anyway",
                 job_id,
             )
-        collected.append(job)
+        collected.append(dict(job, _durable_wake=dict(wake)))
 
     if collected:
         logger.info(
@@ -5663,7 +5664,14 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
+def _run_one_job_admitted(
+    job: dict,
+    *,
+    adapters=None,
+    loop=None,
+    verbose: bool = False,
+    _release_dispatch_admission=None,
+) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
     This is the shared firing body extracted from ``tick``'s per-job closure so
@@ -5748,8 +5756,12 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 logger.warning("Event emit failed for cron_started: %s", ee)
 
         # The attempt is claimed durably before executor/provider dispatch and
-        # becomes running only immediately before the actual run.
+        # becomes running only immediately before the actual run. Once this row is
+        # durable, the settlement census can see the work independently; dispatch
+        # admission must not remain held through the model run and delivery.
         mark_execution_running(execution_id)
+        if _release_dispatch_admission is not None:
+            _release_dispatch_admission()
 
         _run_started_monotonic = time.monotonic()
 
@@ -5919,6 +5931,47 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             _release_in_flight(_job_id)
 
 
+def run_one_job(
+    job: dict,
+    *,
+    adapters=None,
+    loop=None,
+    verbose: bool = False,
+    _admission_boundary: str = "direct-run",
+    _dispatch_admission=None,
+) -> bool:
+    """Run one job after a durable running handoff under dispatch admission."""
+    admission = _dispatch_admission
+    if admission is None:
+        admission = default_control_store().dispatch_section(
+            boundary=_admission_boundary
+        )
+        admission.__enter__()
+    released = False
+
+    def release_admission() -> None:
+        nonlocal released
+        if not released:
+            released = True
+            admission.__exit__(None, None, None)
+
+    try:
+        return _run_one_job_admitted(
+            job,
+            adapters=adapters,
+            loop=loop,
+            verbose=verbose,
+            _release_dispatch_admission=release_admission,
+        )
+    except BaseException as exc:
+        if not released:
+            released = True
+            admission.__exit__(type(exc), exc, exc.__traceback__)
+        raise
+    finally:
+        release_admission()
+
+
 def _notify_provider_jobs_changed() -> None:
     """Best-effort: tell the active scheduler provider the job set changed.
 
@@ -5937,13 +5990,14 @@ def _notify_provider_jobs_changed() -> None:
         logger.debug("on_jobs_changed notify failed: %s", e)
 
 
-def tick(
+def _tick_admitted(
     verbose: bool = True,
     adapters=None,
     loop=None,
     sync: bool = True,
     *,
     can_dispatch=None,
+    _release_dispatch_admission=None,
 ):
     """
     Check and run all due jobs.
@@ -6567,7 +6621,7 @@ def tick(
                         _running_job_ids.discard(j["id"])
 
             try:
-                return pool.submit(_run_and_release)
+                future = pool.submit(_run_and_release)
             except Exception as submit_err:
                 with _running_lock:
                     _running_job_ids.discard(job_id)
@@ -6590,6 +6644,14 @@ def tick(
                     submit_err,
                 )
                 return None
+            wake = job.get("_durable_wake")
+            if wake is not None and not wake_channel.ack_wake(wake):
+                logger.warning(
+                    "cron wake for %s changed before submit acknowledgement; "
+                    "replacement retained",
+                    job_id,
+                )
+            return future
 
         # Sequential pass for env-mutating (workdir) jobs.
         # Queued to a persistent single-thread pool so they run one at a time
@@ -6635,6 +6697,11 @@ def tick(
                 logger.debug("Post-tick MCP orphan cleanup failed: %s", _e)
 
         if sync:
+            # Submission is the acting boundary. Waiting for execution completion
+            # must not retain dispatch admission: an incident barrier needs to
+            # exclude new submissions, not wait for already-censused work to end.
+            if _release_dispatch_admission is not None:
+                _release_dispatch_admission()
             # Sync mode (tests / manual ticks): wait for all dispatched jobs,
             # collect results, then sweep once.
             for f in concurrent.futures.as_completed(_all_futures):
@@ -6682,6 +6749,43 @@ def tick(
             except (OSError, IOError):
                 pass
         lock_fd.close()
+
+
+def tick(
+    verbose: bool = True,
+    adapters=None,
+    loop=None,
+    sync: bool = True,
+    *,
+    can_dispatch=None,
+):
+    """Capture due work and submit it while holding the dispatch boundary."""
+    admission = default_control_store().dispatch_section(boundary="cron-tick")
+    admission.__enter__()
+    released = False
+
+    def release_admission() -> None:
+        nonlocal released
+        if not released:
+            released = True
+            admission.__exit__(None, None, None)
+
+    try:
+        return _tick_admitted(
+            verbose=verbose,
+            adapters=adapters,
+            loop=loop,
+            sync=sync,
+            can_dispatch=can_dispatch,
+            _release_dispatch_admission=release_admission,
+        )
+    except BaseException as exc:
+        if not released:
+            released = True
+            admission.__exit__(type(exc), exc, exc.__traceback__)
+        raise
+    finally:
+        release_admission()
 
 
 if __name__ == "__main__":

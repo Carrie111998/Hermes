@@ -855,6 +855,17 @@ def _reset_module_state():
     except Exception:
         pass
 
+    # --- jobflow_dispatch.quarantine_control — its canonical process cache is
+    #     path-bound by design. HERMES_HOME changes for every test, so retaining
+    #     the previous test's capability correctly reports disappearance but
+    #     makes the suite order-dependent rather than exercising a fresh process.
+    try:
+        _qc_mod = sys.modules["jobflow_dispatch.quarantine_control"]
+        _qc_mod._DEFAULT_CONTROL_STORE = None
+        _qc_mod._DEFAULT_CONTROL_STORE_KEY = None
+    except Exception:
+        pass
+
     yield
 
 

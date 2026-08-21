@@ -85,6 +85,36 @@ class TestCompletion:
         store.claim("m2", "jobflow.tailor.generate", now=1000)
         assert [r.message_key for r in store.pending("cron.jobflow.matcher")] == ["m1"]
 
+    def test_claim_census_returns_every_durable_claim_without_a_limit(self, store):
+        for index in range(525):
+            store.claim(
+                f"message-{index:03d}",
+                "cron.jobflow.matcher" if index % 2 else "jobflow.tailor.generate",
+                now=1000 + index,
+                correlation_id=f"correlation-{index:03d}",
+            )
+        store.complete(
+            "message-001", "cron.jobflow.matcher", outcome="succeeded", now=2000
+        )
+
+        rows = store.claim_census()
+
+        assert len(rows) == 524
+        assert all(row.state == "claimed" for row in rows)
+        assert rows == sorted(rows, key=lambda row: (row.activity_id, row.message_key))
+        assert {row.message_key for row in rows} == {
+            f"message-{index:03d}" for index in range(525)
+        } - {"message-001"}
+
+    def test_claim_census_query_failure_raises_instead_of_returning_partial(self, store, monkeypatch):
+        class Failing:
+            def execute(self, *_args, **_kwargs):
+                raise sqlite3.OperationalError("injected census failure")
+
+        monkeypatch.setattr(store._local, "conn", Failing())
+        with pytest.raises(sqlite3.OperationalError, match="census failure"):
+            store.claim_census()
+
 
 class TestValidation:
     @pytest.mark.parametrize("bad", ("", "   ", None))
@@ -176,6 +206,57 @@ class TestSharedLedgerPath:
         assert path.name == "jobflow_dispatch.db"
         assert path.parent.name == "telemetry"
         assert "profiles" not in path.parts
+
+
+class TestAtomicWakeOutbox:
+    def test_claim_for_wake_commits_claim_and_outbox_together(self, store):
+        outbox = store.claim_for_wake(
+            "tailor/inbox/m1.json",
+            "jobflow.tailor.generate",
+            job_id="job-1",
+            caller="jobflow-dispatcher",
+            reason="mailbox_message",
+            now=10,
+            correlation_id="c1",
+        )
+
+        assert outbox is not None
+        assert store.get(outbox.message_key, outbox.activity_id).state == "claimed"
+        assert store.pending_wake_outbox() == [outbox]
+
+    def test_release_cascades_the_same_claims_pending_outbox(self, store):
+        outbox = store.claim_for_wake(
+            "tailor/inbox/m1.json",
+            "jobflow.tailor.generate",
+            job_id="job-1",
+            caller="jobflow-dispatcher",
+            now=10,
+        )
+        assert outbox is not None
+
+        store.release(outbox.message_key, outbox.activity_id)
+
+        assert store.get(outbox.message_key, outbox.activity_id) is None
+        assert store.pending_wake_outbox() == []
+
+    def test_completion_removes_a_pending_outbox(self, store):
+        outbox = store.claim_for_wake(
+            "tailor/inbox/m1.json",
+            "jobflow.tailor.generate",
+            job_id="job-1",
+            caller="jobflow-dispatcher",
+            now=10,
+        )
+        assert outbox is not None
+
+        store.complete(
+            outbox.message_key,
+            outbox.activity_id,
+            outcome="success",
+            now=11,
+        )
+
+        assert store.pending_wake_outbox() == []
 
 
 class TestLeaseOutlivesRealRuns:

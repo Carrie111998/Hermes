@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_default_hermes_root, get_hermes_home
 from hermes_time import now as _hermes_now
 
 EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
@@ -28,40 +28,60 @@ MAX_TERMINAL_EXECUTIONS = 10000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+_MAX_PROBE_ERROR_LENGTH = 500
+
+
+def _probe_error(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {exc}"[:_MAX_PROBE_ERROR_LENGTH]
+
+
+def _canonical_hermes_root():
+    return get_default_hermes_root()
+
+
+def _connect_path(path, *, create: bool) -> sqlite3.Connection:
+    path = path.resolve()
+    if create:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(
+        f"file:{path.as_posix()}?mode={'rwc' if create else 'ro'}",
+        uri=True,
+        timeout=5,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    if create:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS executions (
+                 id TEXT PRIMARY KEY,
+                 job_id TEXT NOT NULL,
+                 source TEXT NOT NULL,
+                 process_id TEXT NOT NULL,
+                 pid INTEGER NOT NULL,
+                 process_started_at INTEGER,
+                 status TEXT NOT NULL CHECK(status IN
+                   ('claimed','running','completed','failed','unknown')),
+                 claimed_at TEXT NOT NULL,
+                 started_at TEXT,
+                 finished_at TEXT,
+                 error TEXT
+               )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
+            "ON executions(job_id, claimed_at DESC, id DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
+            "ON executions(status, claimed_at DESC, id DESC)"
+        )
+    return conn
 
 
 def _connect() -> sqlite3.Connection:
-    EXECUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(EXECUTIONS_FILE, timeout=5)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=FULL")
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS executions (
-             id TEXT PRIMARY KEY,
-             job_id TEXT NOT NULL,
-             source TEXT NOT NULL,
-             process_id TEXT NOT NULL,
-             pid INTEGER NOT NULL,
-             process_started_at INTEGER,
-             status TEXT NOT NULL CHECK(status IN
-               ('claimed','running','completed','failed','unknown')),
-             claimed_at TEXT NOT NULL,
-             started_at TEXT,
-             finished_at TEXT,
-             error TEXT
-           )"""
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
-        "ON executions(job_id, claimed_at DESC, id DESC)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
-        "ON executions(status, claimed_at DESC, id DESC)"
-    )
-    return conn
+    return _connect_path(EXECUTIONS_FILE, create=True)
 
 
 def _record(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
@@ -247,6 +267,99 @@ def recover_interrupted_execution_records() -> List[Dict[str, Any]]:
             # Materialized above, so pruning cannot strip a row from the return.
             _prune_unlocked(conn)
     return recovered
+
+
+def _classify_nonterminal_rows(rows) -> List[Dict[str, Any]]:
+    census: List[Dict[str, Any]] = []
+    for sqlite_row in rows:
+        row = dict(sqlite_row)
+        pid = int(row["pid"])
+        recorded_start = row["process_started_at"]
+        evidence: Dict[str, Any] = {
+            "process_id": row["process_id"],
+            "pid": pid,
+            "process_started_at": recorded_start,
+        }
+        try:
+            from gateway.status import _pid_exists
+
+            pid_exists = _pid_exists(pid)
+        except Exception as exc:
+            evidence["reason"] = "pid_probe_error"
+            evidence["probe_error"] = _probe_error(exc)
+            liveness = "unprovable"
+        else:
+            evidence["pid_exists"] = pid_exists
+            if pid_exists is None:
+                evidence["reason"] = "pid_probe_indeterminate"
+                liveness = "unprovable"
+            elif not pid_exists:
+                evidence["reason"] = "pid_not_found"
+                liveness = "dead"
+            elif recorded_start is None:
+                evidence["reason"] = "recorded_process_start_time_missing"
+                liveness = "unprovable"
+            else:
+                try:
+                    observed_start = _process_start_time(pid)
+                except Exception as exc:
+                    evidence["reason"] = "process_start_time_probe_error"
+                    evidence["probe_error"] = _probe_error(exc)
+                    liveness = "unprovable"
+                else:
+                    evidence["observed_process_started_at"] = observed_start
+                    if observed_start is None:
+                        evidence["reason"] = "observed_process_start_time_unavailable"
+                        liveness = "unprovable"
+                    elif observed_start == recorded_start:
+                        evidence["reason"] = "process_start_time_matches"
+                        liveness = "live"
+                    else:
+                        evidence["reason"] = "process_start_time_mismatch"
+                        liveness = "dead"
+        row["owner_liveness"] = liveness
+        row["owner_liveness_evidence"] = evidence
+        census.append(row)
+    return census
+
+
+def _nonterminal_execution_census_path(path, *, create: bool) -> List[Dict[str, Any]]:
+    with _lock, _connect_path(path, create=create) as conn:
+        rows = conn.execute(
+            """SELECT * FROM executions
+               WHERE status IN ('claimed','running')
+               ORDER BY claimed_at, id"""
+        ).fetchall()
+    return _classify_nonterminal_rows(rows)
+
+
+def nonterminal_execution_census() -> List[Dict[str, Any]]:
+    """Return every claimed/running row in this profile's execution ledger."""
+    return _nonterminal_execution_census_path(EXECUTIONS_FILE, create=True)
+
+
+def _cross_profile_execution_ledgers() -> tuple:
+    root = _canonical_hermes_root().resolve()
+    candidates = [root / "cron" / "executions.db"]
+    profiles = root / "profiles"
+    if profiles.is_dir():
+        candidates.extend(
+            profile / "cron" / "executions.db"
+            for profile in sorted(profiles.iterdir(), key=lambda path: path.name)
+            if profile.is_dir()
+        )
+    return tuple(path.resolve() for path in candidates if path.is_file())
+
+
+def cross_profile_nonterminal_execution_census() -> List[Dict[str, Any]]:
+    """Return a read-only, lossless census from every existing profile ledger."""
+    rows: List[Dict[str, Any]] = []
+    for ledger in _cross_profile_execution_ledgers():
+        for row in _nonterminal_execution_census_path(ledger, create=False):
+            row["execution_ledger"] = str(ledger)
+            rows.append(row)
+    rows.sort(key=lambda row: (row["claimed_at"], row["id"], row["execution_ledger"]))
+    return rows
 
 
 def list_executions(

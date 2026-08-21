@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
 from jobflow_dispatch.contracts import Activation
+from jobflow_dispatch.quarantine_control import default_control_store
 
 logger = logging.getLogger(__name__)
 
@@ -135,42 +136,45 @@ def activate_pending(
     errors: list[str] = []
     woken: set[str] = set()
 
-    for activity_id in activity_ids:
-        try:
-            job_id = resolve(activity_id)
-        except Exception:
-            logger.exception("activate: resolving %s failed", activity_id)
-            errors.append(activity_id)
-            continue
+    # One retained section closes the scan result's resolve-through-request race.
+    # Per-activity failures remain isolated inside it.
+    with default_control_store().dispatch_section(boundary="jobflow-reconciler"):
+        for activity_id in activity_ids:
+            try:
+                job_id = resolve(activity_id)
+            except Exception:
+                logger.exception("activate: resolving %s failed", activity_id)
+                errors.append(activity_id)
+                continue
 
-        if not job_id:
-            unresolved.append(activity_id)
-            continue
+            if not job_id:
+                unresolved.append(activity_id)
+                continue
 
-        if job_id in woken:
-            continue  # one wake per job per run, however many activities map to it
+            if job_id in woken:
+                continue  # one wake per job per run, however many activities map to it
 
-        try:
-            result = request_run(job_id, caller=caller, reason=reason)
-        except Exception:
-            logger.exception(
-                "activate: request_run failed for %s (%s)", job_id, activity_id
-            )
-            errors.append(activity_id)
-            continue
+            try:
+                result = request_run(job_id, caller=caller, reason=reason)
+            except Exception:
+                logger.exception(
+                    "activate: request_run failed for %s (%s)", job_id, activity_id
+                )
+                errors.append(activity_id)
+                continue
 
-        if result is None:
-            # Enabled at scan time, not enabled now — or gone. Fail closed and
-            # let the next reconcile catch it.
-            logger.warning(
-                "activate: %s (%s) refused — not enabled at activation time",
-                job_id, activity_id,
-            )
-            refused.append(activity_id)
-            continue
+            if result is None:
+                # Enabled at scan time, not enabled now — or gone. Fail closed and
+                # let the next reconcile catch it.
+                logger.warning(
+                    "activate: %s (%s) refused — not enabled at activation time",
+                    job_id, activity_id,
+                )
+                refused.append(activity_id)
+                continue
 
-        woken.add(job_id)
-        activated.append(job_id)
+            woken.add(job_id)
+            activated.append(job_id)
 
     return ActivationReport(
         activations=len(activations),
