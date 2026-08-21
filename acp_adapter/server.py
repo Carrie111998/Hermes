@@ -225,6 +225,7 @@ def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, st
 try:
     from hermes_cli import __version__ as HERMES_VERSION
 except Exception:
+    logger.warning("Could not import hermes_cli.__version__; defaulting to 0.0.0")
     HERMES_VERSION = "0.0.0"
 
 # Thread pool for running AIAgent (synchronous) in parallel.
