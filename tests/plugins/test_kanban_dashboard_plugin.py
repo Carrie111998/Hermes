@@ -200,6 +200,7 @@ def test_running_task_drawer_opens_profile_scoped_worker_chat():
     assert 'const workerSession = props.data.worker_session || null;' in js
     assert 'params.set("profile", workerSession.profile);' in js
     assert 'window.open(`/chat?${params.toString()}`, "_blank", "noopener,noreferrer");' in js
+    assert 'workerSession && t.status === "running"' not in js
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +267,37 @@ def test_running_task_detail_resolves_live_worker_session(client, kanban_home):
         "session_id": "worker-session",
         "profile": "coder",
         "active": True,
+    }
+
+
+def test_completed_task_detail_keeps_durable_worker_session(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "completed worker", "assignee": "coder"},
+    ).json()["task"]
+
+    with kb.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task["id"],))
+        claimed = kb.claim_task(conn, task["id"], claimer="test-worker")
+        assert claimed is not None
+        run = kb.latest_run(conn, task["id"])
+        assert run is not None
+        assert kb.complete_task(
+            conn,
+            task["id"],
+            summary="done",
+            metadata={"worker_session_id": "completed-worker-session"},
+            expected_run_id=run.id,
+        )
+
+    response = client.get(f"/api/plugins/kanban/tasks/{task['id']}")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["worker_session"] == {
+        "session_id": "completed-worker-session",
+        "profile": "coder",
+        "active": False,
     }
 
 

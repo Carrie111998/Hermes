@@ -247,9 +247,6 @@ def _worker_session_dict(
     dispatcher prompt. Fail closed: a missing profile/store/session simply
     hides the UI affordance instead of breaking the task drawer.
     """
-    if task.status != "running":
-        return None
-
     latest_run = runs[-1] if runs else None
     profile = (latest_run.profile if latest_run else None) or task.assignee
     if not profile:
@@ -261,9 +258,15 @@ def _worker_session_dict(
         if isinstance(session_id, str) and session_id.strip():
             return {
                 "session_id": session_id.strip(),
-                "profile": profile,
+                "profile": run.profile or profile,
                 "active": run.ended_at is None,
             }
+
+    # Running workers may not have stamped their session id into run metadata
+    # yet, so resolve the live session from the assignee's store. Completed
+    # runs must use their durable metadata and never guess from an old session.
+    if task.status != "running":
+        return None
 
     try:
         from hermes_cli.profiles import resolve_profile_env

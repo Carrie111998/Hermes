@@ -3922,7 +3922,7 @@
         }) : null,
         t.created_by ? h(MetaRow, { label: tx(i18n, "createdBy", "Created by"), value: t.created_by }) : null,
       ),
-      workerSession && t.status === "running" ? h("div", {
+      workerSession ? h("div", {
         className: "flex items-center gap-2 mb-3",
       },
         h(Button, {
