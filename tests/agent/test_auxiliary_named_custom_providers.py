@@ -408,3 +408,65 @@ class TestResolveProviderClientMainRuntimeCustom:
         assert model == "explicit-model"
         assert "explicit.example.com" in str(client.base_url)
         assert client.api_key == "sk-explicit"
+
+
+class TestExplicitBaseUrlCredentialLeak:
+    """Custom-endpoint key precedence must not leak OPENAI_API_KEY to
+    non-OpenAI hosts (#91308, mirroring the #28660 main-agent gate).
+
+    Precedence: explicit api_key → host-matched main key → OPENAI_API_KEY
+    (OpenAI hosts only) → no-key-required.
+    """
+
+    def test_env_key_not_sent_to_non_openai_host(self, tmp_path, monkeypatch):
+        """FAIL-CLOSED: an exported OPENAI_API_KEY must never reach an
+        unrelated custom endpoint's Authorization header."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-env-secret")
+        from agent.auxiliary_client import resolve_provider_client
+        client, _model = resolve_provider_client(
+            "custom",
+            model="test-model",
+            explicit_base_url="https://api.fireworks.ai/inference/v1",
+        )
+        assert client is not None
+        assert client.api_key != "sk-openai-env-secret"
+        assert client.api_key == "no-key-required"
+
+    def test_env_key_used_for_openai_host(self, tmp_path, monkeypatch):
+        """Backward compat: the env key still applies on OpenAI's own hosts."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-env-secret")
+        from agent.auxiliary_client import resolve_provider_client
+        client, _model = resolve_provider_client(
+            "custom",
+            model="test-model",
+            explicit_base_url="https://api.openai.com/v1",
+        )
+        assert client is not None
+        assert client.api_key == "sk-openai-env-secret"
+
+    def test_host_matched_main_key_wins_over_env_key(self, tmp_path, monkeypatch):
+        """The host-matched configured key must not be shadowed by the env
+        var: same host as the main endpoint → main key is authoritative."""
+        import agent.auxiliary_client as aux
+        monkeypatch.setattr(aux, "_RUNTIME_MAIN_BASE_URL", "https://api.fireworks.ai/inference/v1")
+        monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_KEY", "sk-fireworks-configured")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-env-secret")
+        client, _model = aux.resolve_provider_client(
+            "custom",
+            model="test-model",
+            explicit_base_url="https://api.fireworks.ai/inference/v1",
+        )
+        assert client is not None
+        assert client.api_key == "sk-fireworks-configured"
+
+    def test_azure_openai_host_keeps_env_key(self, tmp_path, monkeypatch):
+        """Azure OpenAI endpoints are also authoritative for the env key."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-env-secret")
+        from agent.auxiliary_client import resolve_provider_client
+        client, _model = resolve_provider_client(
+            "custom",
+            model="test-model",
+            explicit_base_url="https://my-resource.openai.azure.com/openai/deployments/x",
+        )
+        assert client is not None
+        assert client.api_key == "sk-openai-env-secret"
