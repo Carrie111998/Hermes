@@ -66,6 +66,13 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const { McpTab, ToolsetConfigPanel } = sdk
+const FALLBACK_REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+const BOT_REASONING_EFFORTS =
+  typeof sdk === 'undefined' ? FALLBACK_REASONING_EFFORTS : sdk.REASONING_EFFORT_VALUES || FALLBACK_REASONING_EFFORTS
+const botReasoningEffortLabel =
+  typeof sdk === 'undefined' || typeof sdk.reasoningEffortLabel !== 'function'
+    ? effort => effort
+    : sdk.reasoningEffortLabel
 // Keep optional exports feature-detected; test harnesses may strip the SDK namespace.
 const SkillsView = typeof sdk === 'undefined' ? undefined : sdk.SkillsView
 // TRUE only on builds whose SkillsView routes `fixedConnection` to the pinned
@@ -6881,6 +6888,7 @@ function AdvancedProfileConfig({ bot, state, setState }) {
           ...prev,
           provider: res.model?.provider || '',
           model: res.model?.default || '',
+          reasoningEffort: res.reasoning_effort || '',
           soul: res.soul || '',
           skills: res.skills || [],
           toolsets: res.toolsets || [],
@@ -6961,6 +6969,10 @@ function AdvancedProfileConfig({ bot, state, setState }) {
           value: { provider: state.provider, model: state.model },
           onChange: patch => setState(prev => ({ ...prev, dirtyModel: true, ...patch }))
         }),
+        jsx(ReasoningEffortPicker, {
+          value: state.reasoningEffort,
+          onChange: reasoningEffort => setState(prev => ({ ...prev, dirtyReasoning: true, reasoningEffort }))
+        }),
         labeled(
           'Capabilities (applies immediately — skills, tools, MCP)',
           jsx('div', {
@@ -6987,6 +6999,10 @@ function AdvancedProfileConfig({ bot, state, setState }) {
       jsx(ModelPicker, {
         value: { provider: state.provider, model: state.model },
         onChange: patch => setState(prev => ({ ...prev, dirtyModel: true, ...patch }))
+      }),
+      jsx(ReasoningEffortPicker, {
+        value: state.reasoningEffort,
+        onChange: reasoningEffort => setState(prev => ({ ...prev, dirtyReasoning: true, reasoningEffort }))
       }),
       labeled(
         `Skills (${enabledSkills}/${state.skills.length} enabled)`,
@@ -7410,11 +7426,13 @@ function emptyAdvancedState() {
     loaded: false,
     provider: '',
     model: '',
+    reasoningEffort: '',
     soul: '',
     skills: [],
     toolsets: [],
     mcp: [],
     dirtyModel: false,
+    dirtyReasoning: false,
     dirtySoul: false,
     dirtySkills: false,
     dirtyToolsets: false,
@@ -7450,6 +7468,10 @@ async function applyAdvancedConfig(bot, state) {
     } else {
       applied.model = false
     }
+  }
+
+  if (state.dirtyReasoning) {
+    payload.reasoning_effort = state.reasoningEffort.trim()
   }
 
   if (state.dirtySkills) {
@@ -7490,6 +7512,37 @@ function labeled(label, control) {
       control
     ]
   })
+}
+
+function ReasoningEffortPicker({ value, onChange }) {
+  return labeled(
+    'Reasoning effort',
+    jsxs(Select, {
+      value: value || '__inherit__',
+      onValueChange: next => onChange(next === '__inherit__' ? '' : next),
+      children: [
+        jsx(SelectTrigger, {
+          className: 'h-8 rounded-md',
+          children: jsx(SelectValue, { placeholder: 'Use profile default' })
+        }),
+        jsxs(SelectContent, {
+          children: [
+            jsx(SelectItem, { value: '__inherit__', children: 'Use inherited/default' }),
+            ...BOT_REASONING_EFFORTS.map(effort =>
+              jsx(
+                SelectItem,
+                {
+                  value: effort,
+                  children: botReasoningEffortLabel(effort)
+                },
+                effort
+              )
+            )
+          ]
+        })
+      ]
+    })
+  )
 }
 
 function EditProfileDialog({ bot, open, onClose }) {
@@ -7565,7 +7618,10 @@ function EditProfileDialog({ bot, open, onClose }) {
       }
     }
 
-    if (adv.loaded && (adv.dirtyModel || adv.dirtySoul || adv.dirtySkills || adv.dirtyToolsets || adv.dirtyMcp)) {
+    if (
+      adv.loaded &&
+      (adv.dirtyModel || adv.dirtyReasoning || adv.dirtySoul || adv.dirtySkills || adv.dirtyToolsets || adv.dirtyMcp)
+    ) {
       try {
         const res = await applyAdvancedConfig(bot.name, adv)
         const failed = Object.entries(res?.applied || {}).filter(([, ok]) => !ok)
@@ -7643,7 +7699,7 @@ function EditProfileDialog({ bot, open, onClose }) {
               onClick: () => setAdvanced(v => !v),
               children: [
                 jsx(Codicon, { name: advanced ? 'chevron-down' : 'chevron-right', className: 'text-[0.8rem]' }),
-                'Advanced — model, skills, toolsets, SOUL.md'
+                'Advanced — model, reasoning, skills, toolsets, SOUL.md'
               ]
             }),
             advanced
@@ -7689,6 +7745,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
   const [cloneFrom, setCloneFrom] = useState('default')
   const [model, setModel] = useState('')
   const [provider, setProvider] = useState('')
+  const [reasoningEffort, setReasoningEffort] = useState('')
   const [soul, setSoul] = useState('')
   const [noSkills, setNoSkills] = useState(false)
   const [shareAuth, setShareAuth] = useState(true)
@@ -7792,6 +7849,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
     setCloneFrom('default')
     setModel('')
     setProvider('')
+    setReasoningEffort('')
     setSoul('')
     setNoSkills(false)
     setShareAuth(true)
@@ -7896,7 +7954,8 @@ function CreateAgentDialog({ open, onClose, roster }) {
         // ignore the param and copy — still functional, just forked.
         share_auth: shareAuth,
         soul: composeSoul({ name: slug, title, description, roster, customSoul: soul }),
-        ...(model.trim() && provider.trim() ? { model: model.trim(), provider: provider.trim() } : {})
+        ...(model.trim() && provider.trim() ? { model: model.trim(), provider: provider.trim() } : {}),
+        ...(reasoningEffort.trim() ? { reasoning_effort: reasoningEffort.trim() } : {})
       })
 
       createdRef.current = slug
@@ -8256,6 +8315,10 @@ function CreateAgentDialog({ open, onClose, roster }) {
                                 }
                               },
                               placeholderModel: 'inherited from launch profile'
+                            }),
+                            jsx(ReasoningEffortPicker, {
+                              value: reasoningEffort,
+                              onChange: setReasoningEffort
                             }),
                             labeled(
                               'SOUL.md (optional — replaces the generated persona)',

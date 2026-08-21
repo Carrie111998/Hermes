@@ -291,7 +291,8 @@ def _(rid, params: dict) -> dict:
     Params: ``name`` (required, lowercase slug), ``description``,
     ``clone_from`` (source profile; omitted = fresh profile with bundled
     skills), ``clone_all``, ``no_skills``, ``soul`` (SOUL.md content),
-    ``model`` + ``provider`` (optional model pin, best-effort), and
+    ``model`` + ``provider`` (optional model pin, best-effort),
+    ``reasoning_effort`` (optional per-profile reasoning level), and
     ``mirror_credentials`` (default true) — copy the launch profile's
     ``.env`` and ``auth.json`` into the new profile, and inherit its
     model.provider/model.default when no explicit pin is given.
@@ -321,6 +322,18 @@ def _(rid, params: dict) -> dict:
     name = str(params.get("name") or "").strip()
     if not name:
         return _err(rid, 4061, "name required")
+
+    reasoning_effort = None
+    if "reasoning_effort" in params:
+        candidate = str(params.get("reasoning_effort") or "").strip().lower()
+        try:
+            from hermes_constants import parse_reasoning_effort
+
+            if candidate and parse_reasoning_effort(candidate) is None:
+                return _err(rid, 4065, f"invalid reasoning_effort '{candidate}'")
+            reasoning_effort = candidate
+        except Exception:
+            return _err(rid, 4065, f"invalid reasoning_effort '{candidate}'")
     try:
         from hermes_cli import profiles as profiles_mod
 
@@ -358,6 +371,23 @@ def _(rid, params: dict) -> dict:
         try:
             (path / "SOUL.md").write_text(soul, encoding="utf-8")
             soul_written = True
+        except Exception:
+            pass
+
+    if reasoning_effort:
+        try:
+            from hermes_cli.config import read_user_config_raw, save_config
+            from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+            token = set_hermes_home_override(str(path))
+            try:
+                cfg = read_user_config_raw() or {}
+                agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
+                agent_cfg["reasoning_effort"] = reasoning_effort
+                cfg["agent"] = agent_cfg
+                save_config(cfg)
+            finally:
+                reset_hermes_home_override(token)
         except Exception:
             pass
 
@@ -663,6 +693,13 @@ def _(rid, params: dict) -> dict:
                 pass
 
             model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+            agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
+            raw_reasoning_effort = agent_cfg.get("reasoning_effort", "")
+            reasoning_effort = (
+                "none"
+                if raw_reasoning_effort is False
+                else str(raw_reasoning_effort or "").strip().lower()
+            )
 
             description = ""
             try:
@@ -682,6 +719,7 @@ def _(rid, params: dict) -> dict:
                         "provider": str(model_cfg.get("provider") or ""),
                         "default": str(model_cfg.get("default") or ""),
                     },
+                    "reasoning_effort": reasoning_effort,
                     "skills": installed,
                     "toolsets": toolsets_out,
                     "toolsets_pinned": pinned_set is not None,
@@ -701,6 +739,7 @@ def _(rid, params: dict) -> dict:
     Params: ``name`` (required) plus any of:
     ``description`` (str), ``soul`` (str, full SOUL.md replacement),
     ``model`` + ``provider`` (both required together),
+    ``reasoning_effort`` (str; empty clears the profile override),
     ``disabled_skills`` (list[str], replace semantics),
     ``enabled_toolsets`` (list[str], replace semantics; empty list clears
     the pin so every toolset is enabled again), and
@@ -845,6 +884,7 @@ def _(rid, params: dict) -> dict:
             isinstance(params.get("disabled_skills"), list)
             or isinstance(params.get("enabled_toolsets"), list)
             or isinstance(params.get("enabled_mcp_servers"), list)
+            or "reasoning_effort" in params
         )
         if needs_cfg:
             # Launch profile's MCP catalog, read BEFORE the home override
@@ -865,6 +905,35 @@ def _(rid, params: dict) -> dict:
                 from hermes_cli.config import load_config, save_config
 
                 cfg = load_config() or {}
+
+                if "reasoning_effort" in params:
+                    try:
+                        from hermes_cli.config import read_user_config_raw
+                        from hermes_constants import parse_reasoning_effort
+
+                        effort = str(params.get("reasoning_effort") or "").strip().lower()
+                        if effort and parse_reasoning_effort(effort) is None:
+                            applied["reasoning_effort"] = False
+                        else:
+                            raw_cfg = read_user_config_raw() or {}
+                            agent_cfg = (
+                                raw_cfg.get("agent")
+                                if isinstance(raw_cfg.get("agent"), dict)
+                                else {}
+                            )
+                            if effort:
+                                agent_cfg["reasoning_effort"] = effort
+                            else:
+                                agent_cfg.pop("reasoning_effort", None)
+                            if agent_cfg:
+                                raw_cfg["agent"] = agent_cfg
+                            else:
+                                raw_cfg.pop("agent", None)
+                            save_config(raw_cfg)
+                            applied["reasoning_effort"] = True
+                            cfg = load_config() or {}
+                    except Exception:
+                        applied["reasoning_effort"] = False
 
                 if isinstance(params.get("disabled_skills"), list):
                     try:
