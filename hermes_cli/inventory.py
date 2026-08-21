@@ -591,6 +591,24 @@ def _apply_custom_aliases(rows: list[dict]) -> None:
 # ─── Internal: row post-processing ──────────────────────────────────────
 
 
+def _keyless_slug_set() -> set[str]:
+    """Lowercased slugs of keyless providers (no credential needed).
+
+    Built from the unified provider catalog. Empty on any catalog failure —
+    callers then behave exactly as before keyless surfacing existed.
+    """
+    try:
+        from hermes_cli.provider_catalog import provider_catalog_by_slug
+
+        return {
+            d.slug.lower()
+            for d in provider_catalog_by_slug().values()
+            if d.keyless
+        }
+    except Exception:
+        return set()
+
+
 def _append_unconfigured_rows(
     rows: list[dict],
     ctx: ConfigContext,
@@ -615,18 +633,8 @@ def _append_unconfigured_rows(
     cur_model = str(ctx.current_model or "").strip()
     extras: list[dict] = []
     # Keyless providers (no credential to detect) carry a curated,
-    # anonymously-routable catalog we must surface in the picker. Build this
-    # slug lookup once, outside the loop, so we don't rebuild the whole
-    # provider catalog per skeleton row.
-    _keyless_by_slug: dict[str, bool] = {}
-    try:
-        from hermes_cli.provider_catalog import provider_catalog_by_slug
-
-        _keyless_by_slug = {
-            d.slug: bool(d.keyless) for d in provider_catalog_by_slug().values()
-        }
-    except Exception:
-        _keyless_by_slug = {}
+    # anonymously-routable catalog we must surface in the picker.
+    _keyless_by_slug = {s: True for s in _keyless_slug_set()}
     for entry in CANONICAL_PROVIDERS:
         if entry.slug.lower() in seen:
             continue
@@ -704,16 +712,8 @@ def _filter_explicit_provider_rows(rows: list[dict], ctx: ConfigContext) -> list
 
     # Keyless providers (e.g. opencode-free) need no credential and no explicit
     # config to be usable, so they always belong in an explicit picker — the
-    # same way a configured provider does. Build the slug set once.
-    _keyless_slugs: set[str] = set()
-    try:
-        from hermes_cli.provider_catalog import provider_catalog_by_slug
-
-        _keyless_slugs = {
-            d.slug.lower() for d in provider_catalog_by_slug().values() if d.keyless
-        }
-    except Exception:
-        _keyless_slugs = set()
+    # same way a configured provider does.
+    _keyless_slugs = _keyless_slug_set()
 
     current_slug = str(ctx.current_provider or "").strip().lower()
     kept: list[dict] = []
