@@ -2672,4 +2672,271 @@ export const eu = defineLocale({
     notExpressible: 'antolaketa hau elkarri lotuta dago (pinwheel) — ezin da oraindik habiaratutako zatiketa gisa adierazi',
     zoneCount: count => `${count} zona`
   },
+
+  assistant: {
+    thread: {
+      loadingSession: 'Saioa kargatzen',
+      showEarlier: 'Erakutsi lehenagoko mezuak',
+      loadingResponse: 'Hermes erantzun bat kargatzen ari da',
+      resumeWhenBackgroundDone: count =>
+        count === 1
+          ? 'Atzeko lana amaitzean jarraituko du'
+          : `${count} atzeko lan amaitzean jarraituko du`,
+      thinking: 'Pentsatzen',
+      thought: 'Pentsamendua',
+      thoughtBriefly: 'Labur pentsatu du',
+      thoughtFor: duration => `Pentsatzen eman du ${duration}`,
+      today: time => `Gaur, ${time}`,
+      yesterday: time => `Atzo, ${time}`,
+      copy: 'Kopiatu',
+      refresh: 'Freskatu',
+      moreActions: 'Ekintza gehiago',
+      branchNewChat: 'Adarkatu txat berri batean',
+      dismissError: 'Baztertu errorea',
+      readAloudFailed: 'Ozen irakurtzeak huts egin du',
+      preparingAudio: 'Audioa prestatzen...',
+      stopReading: 'Gelditu irakurketa',
+      readAloud: 'Irakurri ozen',
+      editMessage: 'Editatu mezua',
+      expandMessage: 'Zabaldu mezua',
+      scrollToBottom: 'Korritu beheraino',
+      stop: 'Gelditu',
+      restorePrevious: 'Berrezarri aurreko checkpoint-a',
+      restoreCheckpoint: 'Berrezarri checkpoint-a',
+      restoreFromHere: 'Berrezarri checkpoint-a — berriro exekutatu prompt honetatik',
+      restoreTitle: 'Berrezarri checkpoint honetara?',
+      restoreBody:
+        'Prompt honen ondorengo guztia elkarrizketatik kentzen da, eta prompt-a hemendik berriro exekutatzen da.',
+      restoreConfirm: 'Berrezarri eta berriro exekutatu',
+      restoreNext: 'Berrezarri hurrengo checkpoint-a',
+      goForward: 'Aurrera joan',
+      sendEdited: 'Bidali editatutako mezua',
+      attachingFile: 'Erantsitzen…'
+    },
+    approval: {
+      gatewayDisconnected: 'Hermes gateway ez dago konektatuta',
+      sendFailed: 'Ezin izan da onarpen-erantzuna bidali',
+      run: 'Exekutatu',
+      command: 'Komandoa',
+      moreOptions: 'Onarpen-aukera gehiago',
+      allowSession: 'Baimendu saio hau',
+      alwaysAllowMenu: 'Beti baimendu…',
+      jumpToApproval: 'Onarpena behar da',
+      reject: 'Ukatu',
+      alwaysTitle: 'Beti baimendu komando hau?',
+      alwaysDescription: pattern =>
+        `Horrek "${pattern}" patroia zure baimen-zerrenda iraunkorrean gehitzen du (~/.hermes/config.yaml). Hermes-ek ez du berriro galdetuko honelako komandoetarako — saio honetan ezta etorkizunekoetan ere.`,
+      alwaysAllow: 'Beti baimendu'
+    },
+    clarify: {
+      notReady: 'Argibide-eskaera ez dago prest oraindik',
+      gatewayDisconnected: 'Hermes gateway ez dago konektatuta',
+      sendFailed: 'Ezin izan da argibide-erantzuna bidali',
+      loadingQuestion: 'Galdera kargatzen…',
+      other: 'Beste bat (idatzi zure erantzuna)',
+      placeholder: 'Idatzi zure erantzuna…',
+      skip: 'Saltatu',
+      skipped: 'Saltatuta',
+      continueLabel: 'Jarraitu',
+      lateAnswer: (question, choice) => `"${question}"-ri buruz — nire erantzuna: ${choice}`,
+      lateAnswerTip: 'Idatzi erantzun hau jarraipen-mezu gisa',
+      lateAnswerHint: 'Prompt hau ez dago jada zain. Aukeratu aukera bat jarraipen-mezu gisa idazteko.'
+    },
+    tool: {
+      copyCode: 'Kopiatu kodea',
+      renderingImage: 'Irudia errendatzen',
+      copyOutput: 'Kopiatu irteera',
+      copyCommand: 'Kopiatu komandoa',
+      copyContent: 'Kopiatu edukia',
+      copyUrl: 'Kopiatu URLa',
+      copyResults: 'Kopiatu emaitzak',
+      copyQuery: 'Kopiatu kontsulta',
+      copyFile: 'Kopiatu fitxategia',
+      copyPath: 'Kopiatu bidea',
+      outputAlt: 'Tresnaren irteera',
+      rawResponse: 'Erantzun gordina',
+      copyActivity: 'Kopiatu jarduera',
+      recoveredOne: 'Berreskuratuta urrats 1 huts egin ostean',
+      recoveredMany: count => `${count} urrats huts egin ostean berreskuratuta`,
+      failedOne: 'Urrats batek huts egin du',
+      failedMany: count => `${count} urratsek huts eginda`,
+      statusRunning: 'Martxan',
+      statusError: 'Errorea',
+      statusRecovered: 'Berreskuratuta',
+      statusDone: 'Eginda',
+      actions: {
+        read: 'Irakurri',
+        reading: 'Irakurtzen',
+        opened: 'Irekita',
+        opening: 'Irekitzen',
+        failedToOpen: 'Ezin izan da ireki',
+        searched: 'Bilatuta',
+        searching: 'Bilatzen',
+        ran: 'Exekutatuta',
+        running: 'Exekutatzen',
+        ranCode: 'Kodea exekutatuta',
+        runningCode: 'Script-a exekutatzen'
+      },
+      prefixes: {
+        browser: 'Nabigatzailea',
+        web: 'Web'
+      },
+      titleTemplates: {
+        actionCommand: (action, command) => `${action} ${command}`,
+        actionQuoted: (action, value) => `${action} “${value}”`,
+        actionTarget: (action, target) => `${action} ${target}`,
+        prefixedDone: (prefix, action) => `${prefix} ${action}`,
+        runningPrefixedTool: (prefix, action) => `Exekutatzen ${prefix.toLowerCase()} ${action.toLowerCase()}`,
+        runningTool: action => `Exekutatzen ${action.toLowerCase()}`
+      },
+      titles: {
+        browser_click: { done: 'Orri-elementua klikatuta', pending: 'Orri-elementua klikatzen', pendingAction: 'Klikatzen' },
+        browser_fill: { done: 'Formulario-eremua beteta', pending: 'Formulario-eremua betetzen', pendingAction: 'Betetzen' },
+        browser_navigate: { done: 'Orria irekita', pending: 'Orria irekitzen', pendingAction: 'Irekitzen' },
+        browser_snapshot: {
+          done: 'Orriaren snapshot-a hartuta',
+          pending: 'Orriaren snapshot-a hartzen',
+          pendingAction: 'Hartzen'
+        },
+        browser_take_screenshot: {
+          done: 'Pantaila-argazkia aterata',
+          pending: 'Pantaila-argazkia ateratzen',
+          pendingAction: 'Ateratzen'
+        },
+        browser_type: { done: 'Orrian idatzita', pending: 'Orrian idazten', pendingAction: 'Idazten' },
+        clarify: { done: 'Galdera bat eginda', pending: 'Galdera bat egiten', pendingAction: 'Galdetzen' },
+        cronjob: { done: 'Cron lana', pending: 'Cron lana programatzen', pendingAction: 'Programatzen' },
+        edit_file: { done: 'Fitxategia editatuta', pending: 'Fitxategia editatzen', pendingAction: 'Editatzen' },
+        execute_code: { done: 'Kodea exekutatuta', pending: 'Script-a exekutatzen', pendingAction: 'Script-a exekutatzen' },
+        image_generate: { done: 'Irudia sortuta', pending: 'Irudia sortzen', pendingAction: 'Sortzen' },
+        list_files: { done: 'Fitxategiak zerrendatuta', pending: 'Fitxategiak zerrendatzen', pendingAction: 'Zerrendatzen' },
+        memory: { done: 'Memorian gordeta', pending: 'Memorian gordetzen', pendingAction: 'Gordetzen' },
+        patch: { done: 'Fitxategia patch-eginda', pending: 'Fitxategia patch-egiten', pendingAction: 'Patch-egiten' },
+        read_file: { done: 'Fitxategia irakurrita', pending: 'Fitxategia irakurtzen', pendingAction: 'Irakurtzen' },
+        search_files: { done: 'Fitxategiak bilatuta', pending: 'Fitxategiak bilatzen', pendingAction: 'Bilatzen' },
+        session_search_recall: {
+          done: 'Saio-historia bilatuta',
+          pending: 'Saio-historia bilatzen',
+          pendingAction: 'Bilatzen'
+        },
+        terminal: { done: 'Komandoa exekutatuta', pending: 'Komandoa exekutatzen', pendingAction: 'Exekutatzen' },
+        todo: { done: 'TODOak eguneratuta', pending: 'TODOak eguneratzen', pendingAction: 'Eguneratzen' },
+        vision_analyze: { done: 'Irudia aztertuta', pending: 'Irudia aztertzen', pendingAction: 'Aztertzen' },
+        web_extract: { done: 'Web-orria irakurrita', pending: 'Web-orria irakurtzen', pendingAction: 'Irakurtzen' },
+        web_search: { done: 'Weba bilatuta', pending: 'Weba bilatzen', pendingAction: 'Bilatzen' },
+        write_file: { done: 'Fitxategia editatuta', pending: 'Fitxategia editatzen', pendingAction: 'Editatzen' }
+      }
+    }
+  },
+
+  prompts: {
+    gatewayDisconnected: 'Hermes gateway ez dago konektatuta',
+    sudoSendFailed: 'Ezin izan da sudo pasahitza bidali',
+    secretSendFailed: 'Ezin izan da sekretua bidali',
+    sudoTitle: 'Administratzailearen pasahitza',
+    sudoDesc:
+      'Hermes-ek zure sudo pasahitza behar du komando pribilegiatu bat exekutatzeko. Zure agente lokalari soilik bidaltzen zaio.',
+    sudoPlaceholder: 'sudo pasahitza',
+    secretTitle: 'Sekretua behar da',
+    secretDesc: 'Hermes-ek kredentzial bat behar du jarraitzeko.',
+    secretPlaceholder: 'sekretuaren balioa'
+  },
+
+  desktop: {
+    audioReadFailed: 'Ezin izan da grabatutako audioa irakurri',
+    sessionUnavailable: 'Saioa ez dago erabilgarri',
+    createSessionFailed: 'Ezin izan da saio berri bat sortu',
+    promptFailed: 'Prompt-ak huts egin du',
+    providerCredentialRequired: 'Gehitu hornitzaile-kredentzial bat lehen mezua bidali aurretik.',
+    emptySlashCommand: 'slash komando hutsa',
+    desktopCommands: 'Mahaigaineko komandoak',
+    skillCommandsAvailable: count => `${count} skill komando erabilgarri.`,
+    warningLine: message => `abisua: ${message}`,
+    yoloArmed: 'YOLO aktibatuta txat honetarako',
+    yoloOff: 'YOLO itzalita',
+    yoloSystem: active => `YOLO ${active ? 'piztuta' : 'itzalita'} saio honetarako`,
+    yoloTitle: 'YOLO',
+    yoloToggleFailed: 'Ezin izan da YOLO txandakatu',
+    profileStatus: current =>
+      `Profila: ${current}. Erabili /profile <izena> edo "Saio berria" hautatzailea beste profil batean txat bat hasteko.`,
+    unknownProfile: 'Profil ezezaguna',
+    noProfileNamed: (target, available) => `Ez dago "${target}" izeneko profilerik. Erabilgarri: ${available}`,
+    newChatsProfile: name => `Txat berriek ${name} profila erabiliko dute.`,
+    setProfileFailed: 'Ezin izan da profila ezarri',
+    sttDisabled: 'Ahotsetik testura desgaituta dago ezarpenetan.',
+    stopFailed: 'Gelditzeak huts egin du',
+    regenerateFailed: 'Berriro sortzeak huts egin du',
+    editFailed: 'Editatzeak huts egin du',
+    resumeFailed: 'Jarraitzeak huts egin du',
+    resumeStrandedTitle: 'Ezin izan da saio hau kargatu',
+    resumeStrandedBody:
+      'Saio honetarako konexioak huts egin du eta berriro saiakera automatikoak amore eman du. Egiaztatu gateway-a martxan dagoela, eta gero saiatu berriro.',
+    resumeRetry: 'Saiatu berriro',
+    nothingToBranch: 'Ez dago adarkatzeko ezer',
+    branchNeedsChat: 'Hasi edo jarraitu txat bat adarkatu aurretik.',
+    sessionBusy: 'Saioa lanpetuta',
+    branchStopCurrent: 'Gelditu uneko txanda txat hau adarkatu aurretik.',
+    branchNoText: 'Mezu honek ez du testurik adarkatzeko.',
+    branchTitle: n => `Zirriborroa: #${n} adarra`,
+    branchFailed: 'Adarkatzeak huts egin du',
+    deleteFailed: 'Ezabatzeak huts egin du',
+    archived: 'Artxibatuta',
+    archiveFailed: 'Artxibatzeak huts egin du',
+    cwdChangeFailed: 'Lan-direktorioaren aldaketak huts egin du',
+    cwdStagedTitle: 'Lan-direktorioa prestatuta',
+    cwdStagedMessage: 'Berrabiarazi mahaigaineko backend-a cwd aldaketak saio aktibo honetan aplikatzeko.',
+    modelSwitchFailed: 'Modelo-aldaketak huts egin du',
+    sessionExported: 'Saioa esportatuta',
+    sessionExportFailed: 'Ezin izan da saioa esportatu',
+    imageSaved: 'Irudia gordeta',
+    downloadStarted: 'Deskarga hasita',
+    restartToUseSaveImage: 'Berrabiarazi Hermes Desktop "Gorde irudia" erabiltzeko.',
+    restartToSaveImages: 'Berrabiarazi Hermes Desktop irudiak gordetzeko',
+    imageDownloadFailed: 'Irudiaren deskargak huts egin du',
+    openImage: 'Ireki irudia',
+    downloadImage: 'Deskargatu irudia',
+    savingImage: 'Irudia gordetzen',
+    imagePreviewFailed: 'Irudiaren aurrebistak huts egin du',
+    imageAttach: 'Irudia erantsi',
+    imageWriteFailed: 'Ezin izan da irudia diskoan idatzi.',
+    imageAttachFailed: 'Irudiaren eransketak huts egin du',
+    attachImages: 'Erantsi irudiak',
+    clipboard: 'Arbela',
+    noClipboardImage: 'Ez da irudirik aurkitu arbelean',
+    clipboardPasteFailed: 'Arbelaren itsaspenak huts egin du',
+    dropFiles: 'Fitxategiak bota',
+    handoff: {
+      pickPlatform: 'Aukeratu helmuga',
+      success: platform => `${platform}-ra pasatuta. Edozein unetan hemen jarraitu dezakezu.`,
+      systemNote: platform => `↻ ${platform}-ra pasatuta — hemen jarraitu dezakezu edozein unetan.`,
+      failed: error => `Handoff-ak huts egin du: ${error}`,
+      timedOut: 'Denbora-muga igaro da gateway-aren zain. Martxan al dago `hermes gateway`?'
+    }
+  },
+
+  errors: {
+    genericFailure: 'Zerbait gaizki joan da',
+    boundaryTitle: 'Zerbait hautsi da interfazean',
+    boundaryDesc: 'Ikuspegiak ustekabeko errore bat izan du. Zure txatak eta ezarpenak seguru daude.',
+    reloadWindow: 'Kargatu leihoa berriro',
+    openLogs: 'Ireki log-ak'
+  },
+
+  ui: {
+    search: {
+      clear: 'Garbitu bilaketa'
+    },
+    pagination: {
+      label: 'paginazioa',
+      previous: 'Aurrekoa',
+      previousAria: 'Joan aurreko orrira',
+      next: 'Hurrengoa',
+      nextAria: 'Joan hurrengo orrira'
+    },
+    sidebar: {
+      title: 'Alboko barra',
+      description: 'Alboko barra mugikorra erakusten du.',
+      toggle: 'Txandakatu alboko barra'
+    }
+  }
 })
