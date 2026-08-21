@@ -12,6 +12,7 @@ Run:  python3 verify_adr0007_mechanisms.py
 """
 
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -34,9 +35,9 @@ SHA256 = re.compile(r"^[0-9a-f]{64}$")
 # There is deliberately NO `final_candidate_sha` / `final_sha` column: the
 # final candidate SHA is an attestation-layer field the broker derives.
 #
-# v1.1.0 §N2 resolution: no `board` column. kanban.db is already per-board and
-# v1.0.0 §8 rejects board slug as a provenance field; repository identity is
-# `repo_github_id`.
+# v1.1.0 §A.6 (review finding N2): no `board` column. kanban.db is already
+# per-board and v1.0.0 §8 rejects board slug as a provenance field; repository
+# identity is `repo_github_id`.
 DDL = """
 CREATE TABLE task_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
@@ -192,20 +193,19 @@ HOSTILE_SHA40 = {
     "embedded space": "a" * 20 + " " + "a" * 19,
 }
 
-_hostile_run_id = 1000
+_hostile_run_ids = itertools.count(1001)
 
 
 def prov_sha_rejected(column, value):
     """Attempt a minimal insert setting one SHA column; True if CHECK aborts."""
-    global _hostile_run_id
-    _hostile_run_id += 1
+    run_id = next(_hostile_run_ids)
     subject = value if column == "subject_sha" else SHA_A
     head = value if column == "verified_head_sha" else SHA_B
     try:
         probe.execute(
             f"INSERT INTO run_provenance ({PROV_COLUMNS}) "  # noqa: S608
             f"VALUES ({PROV_PLACEHOLDERS})",
-            (_hostile_run_id, "t_hostile", "p", "completed", 0,
+            (run_id, "t_hostile", "p", "completed", 0,
              subject, head, "br", "loc", "worktree", 0, None, 1, 2,
              CONTRACT_VERSION, "d", 3))
         probe.commit()
@@ -231,19 +231,18 @@ HOSTILE_SHA256 = {
     "63 chars (too short)": "c" * 63,
 }
 
-_hostile_ev_id = 2000
+_hostile_ev_ids = itertools.count(2001)
 
 
 def evidence_sha_rejected(value):
     """True if the run_evidence.sha256 CHECK aborts the insert."""
-    global _hostile_ev_id
-    _hostile_ev_id += 1
+    ev_id = next(_hostile_ev_ids)
     try:
         probe.execute(
             "INSERT INTO run_evidence (run_id,task_id,rel_path,sha256,"
             "size_bytes,declared_by,created_at,sealed) "
             "VALUES (?,'t_hostile',?,?,10,'p',100,0)",
-            (_hostile_ev_id, f"evidence/h{_hostile_ev_id}.json", value))
+            (ev_id, f"evidence/h{ev_id}.json", value))
         probe.commit()
         return False
     except sqlite3.IntegrityError:
@@ -258,8 +257,11 @@ check("run_evidence.sha256 CHECK accepts valid full lowercase 64-hex",
 probe.close()
 
 # --- immutability -----------------------------------------------------
+# Tamper with a *valid* 40-hex value, so the abort is attributable to the
+# append-only trigger and not to the hex CHECK constraint.
 try:
-    db.execute("UPDATE run_provenance SET subject_sha='e'*40 WHERE run_id=1")
+    db.execute("UPDATE run_provenance SET subject_sha=? WHERE run_id=1",
+               ("e" * 40,))
     db.commit()
     check("UPDATE on run_provenance aborts", False, "update succeeded!")
 except sqlite3.IntegrityError as e:

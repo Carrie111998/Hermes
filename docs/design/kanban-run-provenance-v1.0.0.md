@@ -288,7 +288,7 @@ fail-closed behaviour to laptop uptime.)
 - **The monotonic cursor is the exporter's, not the broker's.** The exporter tracks the highest
   exported `task_events.id` **against local Kanban** so it can resume after being offline. This is
   deliberately *not* a `give-me-everything-after-N` API the broker calls; exposing that would
-  re-create the pull surface §3b rejected.
+  re-create the pull surface `t_5247914a` §3b rejected.
 - **Detection without polling prose:** a `provenance_ready` row in `task_events` (`kind` is already a
   first-class column; `idx_events_run` already exists) emitted by the kernel at terminalization.
 - **Exporter credentials must be read-only against the canonical SQLite.** An exporter that can
