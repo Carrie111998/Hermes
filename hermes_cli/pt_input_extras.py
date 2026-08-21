@@ -495,6 +495,42 @@ def install_modify_other_keys_aliases() -> int:
     return changed
 
 
+def install_vt100_single_char_data_fix() -> int:
+    """Make single-character key mappings insert the character, not the raw
+    escape sequence.
+
+    prompt_toolkit's ``Vt100Parser._call_handler`` passes the *raw matched
+    sequence* as the KeyPress ``data`` for every ANSI_SEQUENCES hit, and the
+    self-insert binding inserts ``event.data``.  So any mapping that resolves
+    to a plain character (Shift+letter -> ``ESC[27;2;70~`` -> ``'F'``,
+    Shift+Space -> ``' '``, kitty keypad digits, Alt+letter tuples) inserts
+    the literal escape text into the prompt buffer — Shift+F types
+    ``[27;2;70~``.  Rewriting ``data`` to the character itself for
+    single-char string keys fixes every such mapping at the source
+    (normal typing is unaffected: key and data are already identical).
+
+    Idempotent: patches ``Vt100Parser._call_handler`` once per process.
+
+    Returns the number of patches applied (0 or 1).
+    """
+    try:
+        from prompt_toolkit.input.vt100_parser import Vt100Parser
+    except Exception:
+        return 0
+    if getattr(Vt100Parser, "_hermes_single_char_data_fix", False):
+        return 0
+    _orig_call_handler = Vt100Parser._call_handler
+
+    def _call_handler(parser, key, insert_text):
+        if isinstance(key, str) and len(key) == 1 and key != insert_text:
+            insert_text = key
+        return _orig_call_handler(parser, key, insert_text)
+
+    Vt100Parser._call_handler = _call_handler
+    Vt100Parser._hermes_single_char_data_fix = True
+    return 1
+
+
 def install_ignored_terminal_sequences() -> int:
     """Map terminal-emitted noise sequences to ``Keys.Ignore`` so they
     are consumed by the VT100 parser before they reach key bindings or
