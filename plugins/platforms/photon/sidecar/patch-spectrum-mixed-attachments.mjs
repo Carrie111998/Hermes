@@ -19,6 +19,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const MARKER = "Hermes patch: Preserve mixed text + attachment iMessage payloads";
+const POLL_MARKER = "Hermes patch: Recover iMessage poll votes with missing titles";
 
 function scriptDir() {
   return path.dirname(fileURLToPath(import.meta.url));
@@ -115,6 +116,19 @@ function patchChildIndices(source) {
   );
 }
 
+function patchPollTitle(source) {
+  // Photon can omit the title while hydrating an inbound vote. spectrum-ts
+  // validates that display field before it surfaces the selected option, so a
+  // missing title otherwise drops the answer and leaves clarify blocked. Hermes
+  // resolves from the option text, making a neutral internal title sufficient.
+  return replaceOnce(
+    source,
+    `\t\ttitle: input.title,\n\t\toptions: input.options.map((optionInfo) => ({ title: optionInfo.text }))`,
+    `\t\ttitle: input.title || "Poll",\n\t\toptions: input.options.map((optionInfo) => ({ title: optionInfo.text }))`,
+    "poll title fallback"
+  );
+}
+
 export function patchSpectrumTs(root = scriptDir()) {
   const dist = path.join(
     root,
@@ -132,7 +146,7 @@ export function patchSpectrumTs(root = scriptDir()) {
 
   for (const file of files) {
     const raw = fs.readFileSync(file, "utf8");
-    if (raw.includes(MARKER)) {
+    if (raw.includes(MARKER) && raw.includes(POLL_MARKER)) {
       return { patched: false, file, reason: "already patched" };
     }
     // Normalize to LF for matching so the patch works regardless of the
@@ -149,10 +163,16 @@ export function patchSpectrumTs(root = scriptDir()) {
       continue;
     }
     let patched = original;
-    patched = patchRebuild(patched);
-    patched = patchInbound(patched);
-    patched = patchChildIndices(patched);
-    patched = `// ${MARKER}\n${patched}`;
+    if (!original.includes(MARKER)) {
+      patched = patchRebuild(patched);
+      patched = patchInbound(patched);
+      patched = patchChildIndices(patched);
+      patched = `// ${MARKER}\n${patched}`;
+    }
+    if (!original.includes(POLL_MARKER)) {
+      patched = patchPollTitle(patched);
+      patched = `// ${POLL_MARKER}\n${patched}`;
+    }
     if (usedCRLF) {
       patched = patched.split("\n").join(CRLF);
     }

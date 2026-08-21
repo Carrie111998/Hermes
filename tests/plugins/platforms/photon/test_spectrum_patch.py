@@ -161,6 +161,17 @@ const buildAttachmentMessage = async (client, base, info, id, partIndex, parentI
   return msg;
 };
 const cacheMessage = (cache, message) => { cache.set(message.id, message); };
+const asPoll = (input) => {
+  if (!input.title) throw new Error("poll title is required");
+  return { type: "poll", ...input };
+};
+const toCachedPoll = (input) => {
+  const poll = asPoll({
+    title: input.title,
+    options: input.options.map((optionInfo) => ({ title: optionInfo.text }))
+  });
+  return { poll };
+};
 const rebuildFromAppleMessage = async (client, message, phone, chatGuidHint) => {
   const messageGuidStr = message.guid;
   const base = buildMessageBase(message, chatGuidHint, message.dateCreated ?? /* @__PURE__ */ new Date(), phone);
@@ -225,7 +236,7 @@ const toInboundMessages = async (client, cache, event, phone) => {
   cacheMessage(cache, msg);
   return [msg];
 };
-export { rebuildFromAppleMessage, toInboundMessages };
+export { rebuildFromAppleMessage, toCachedPoll, toInboundMessages };
 """
 
 
@@ -273,5 +284,46 @@ def test_spectrum_patch_rewrites_the_imessage_mapper(tmp_path: Path) -> None:
     )
     assert again.returncode == 0, again.stderr
     assert chunk.read_text(encoding="utf-8") == patched
+
+
+def test_spectrum_patch_recovers_poll_votes_with_missing_titles(tmp_path: Path) -> None:
+    """Photon may omit the poll title on vote events; the SDK must still emit
+    the selected option so a pending clarify can resolve."""
+    chunk = _write_fixture(tmp_path)
+
+    result = subprocess.run(
+        ["node", str(_PATCHER), str(tmp_path)],
+        cwd=Path.cwd(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    probe = subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "--eval",
+            (
+                f'import {{ toCachedPoll }} from "{chunk.resolve().as_uri()}"; '
+                'const cached = toCachedPoll({title: "", options: '
+                '[{text: "Audit defects"}, {text: "Fix CI"}]}); '
+                'process.stdout.write(JSON.stringify(cached.poll));'
+            ),
+        ],
+        cwd=Path.cwd(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert probe.returncode == 0, probe.stderr
+    poll = json.loads(probe.stdout)
+    assert poll["title"] == "Poll"
+    assert [option["title"] for option in poll["options"]] == [
+        "Audit defects",
+        "Fix CI",
+    ]
 
 
