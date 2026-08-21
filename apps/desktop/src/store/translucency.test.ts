@@ -17,13 +17,9 @@ import { onPersistenceEvent, type PersistenceEvent } from '@/lib/storage'
 import {
   $translucency,
   $translucencyBook,
-  $translucencyPeek,
-  beginTranslucencyPeek,
   defaultTranslucencyValues,
-  endTranslucencyPeek,
   GLASS_SUPPORTED,
   isChatWindow,
-  resetTranslucencyPeek,
   setAppearance,
   setTranslucency,
   setTranslucencyFade,
@@ -286,56 +282,6 @@ describe('frost and area', () => {
 
     setTranslucencyMode('clear')
     expect(document.documentElement.hasAttribute('data-hermes-glass-scope')).toBe(false)
-  })
-})
-
-// A held slider drag and a timed pulse from a picker click can overlap, which
-// is why the peek counts rather than toggling: the drag must not be cancelled
-// by a pulse expiring underneath it.
-describe('translucency peek', () => {
-  it('stays open until every overlapping hold has ended', () => {
-    beginTranslucencyPeek()
-    beginTranslucencyPeek()
-    expect(document.documentElement.hasAttribute('data-hermes-translucency-peek')).toBe(true)
-
-    endTranslucencyPeek()
-    expect(document.documentElement.hasAttribute('data-hermes-translucency-peek')).toBe(true)
-
-    endTranslucencyPeek()
-    expect(document.documentElement.hasAttribute('data-hermes-translucency-peek')).toBe(false)
-  })
-
-  it('never goes negative, so a stray release cannot wedge the next peek open', () => {
-    endTranslucencyPeek()
-    endTranslucencyPeek()
-    expect($translucencyPeek.get()).toBe(0)
-
-    beginTranslucencyPeek()
-    expect(document.documentElement.hasAttribute('data-hermes-translucency-peek')).toBe(true)
-    endTranslucencyPeek()
-    expect(document.documentElement.hasAttribute('data-hermes-translucency-peek')).toBe(false)
-  })
-})
-
-describe('peek reset', () => {
-  // Escape mid-drag unmounts the slider before its pointerup ever fires; the
-  // settings surface calls reset on unmount so the counter can't stay wedged
-  // and ghost the next overlay at 8% opacity.
-  it('drops every outstanding hold at once', () => {
-    beginTranslucencyPeek()
-    beginTranslucencyPeek()
-    beginTranslucencyPeek()
-    expect(document.documentElement.hasAttribute('data-hermes-translucency-peek')).toBe(true)
-
-    resetTranslucencyPeek()
-    expect($translucencyPeek.get()).toBe(0)
-    expect(document.documentElement.hasAttribute('data-hermes-translucency-peek')).toBe(false)
-
-    // A pulse timer expiring after the reset must not push the counter negative
-    // or resurrect the attribute.
-    endTranslucencyPeek()
-    expect($translucencyPeek.get()).toBe(0)
-    expect(document.documentElement.hasAttribute('data-hermes-translucency-peek')).toBe(false)
   })
 })
 
