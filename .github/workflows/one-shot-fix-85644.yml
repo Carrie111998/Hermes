@@ -1,0 +1,613 @@
+name: One-shot truthful webhook fanout settlement
+
+on:
+  push:
+    branches:
+      - campaign/webhook-delivery-callbacks
+
+permissions:
+  contents: write
+
+concurrency:
+  group: one-shot-fix-85644
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout trigger head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: campaign/webhook-delivery-callbacks
+          fetch-depth: 0
+
+      - name: Rebuild partial settlement on exact current main
+        env:
+          CURRENT_MAIN: b6bcb3e791c673e63974029bbab40cc9326803ff
+          BRANCH: campaign/webhook-delivery-callbacks
+        run: |
+          set -euo pipefail
+          trigger_head="$(git rev-parse HEAD)"
+          git fetch --no-tags https://github.com/NousResearch/hermes-agent.git "${CURRENT_MAIN}"
+          test "$(git rev-parse FETCH_HEAD)" = "${CURRENT_MAIN}"
+          git reset --hard "${CURRENT_MAIN}"
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          base_path = Path("gateway/platforms/base.py")
+          base = base_path.read_text()
+          send_result_anchor = '''@dataclass
+class SendResult:
+    """Result of sending a message."""
+'''
+          target_type = '''@dataclass(frozen=True)
+class SendTargetResult:
+    """Non-secret settlement truth for one ordered fan-out target.
+
+    ``target_index`` is retry authority within the normalized delivery list;
+    ``deliver_type`` is descriptive only. Configuration and ``deliver_extra``
+    are intentionally absent so credentials and destination secrets never
+    cross the adapter boundary in result metadata.
+    """
+
+    target_index: int
+    deliver_type: str
+    success: bool
+    partial: bool = False
+    retryable: bool = False
+    retry_after: Optional[float] = None
+    message_id: Optional[str] = None
+    continuation_message_ids: tuple = ()
+    error: Optional[str] = None
+    error_kind: Optional[str] = None
+    children: tuple["SendTargetResult", ...] = ()
+
+
+@dataclass
+class SendResult:
+    """Result of sending a message."""
+'''
+          if base.count(send_result_anchor) != 1:
+              raise SystemExit("SendResult anchor drifted")
+          base = base.replace(send_result_anchor, target_type, 1)
+
+          field_anchor = '''    error_kind: Optional[str] = None
+
+
+# Machine-readable send-failure categories.'''
+          field_replacement = '''    error_kind: Optional[str] = None
+    # A terminal settlement state: at least one destination made observable
+    # progress but the complete requested delivery did not settle. Generic
+    # retry/fallback MUST stop; only unresolved child targets may be retried.
+    partial: bool = False
+    # Ordered, non-secret child truth for fan-out producers. Empty for ordinary
+    # single-target sends. Each child carries its own retryability/identity.
+    target_results: tuple[SendTargetResult, ...] = ()
+
+
+# Machine-readable send-failure categories.'''
+          if base.count(field_anchor) != 1:
+              raise SystemExit("SendResult field anchor drifted")
+          base = base.replace(field_anchor, field_replacement, 1)
+
+          retry_start = base.index('    async def _send_with_retry(\n')
+          retry_end = base.index('    @staticmethod\n    def _merge_caption', retry_start)
+          retry_region = base[retry_start:retry_end]
+          if retry_region.count('        if result.success:\n') != 2:
+              raise SystemExit("generic retry success gates drifted")
+          retry_region = retry_region.replace(
+              '        if result.success:\n',
+              '        if result.success or result.partial:\n',
+          )
+          retry_region = retry_region.replace(
+              '                    logger.info("[%s] Send succeeded on retry %d", self.name, attempt)\n',
+              '                    if result.partial:\n'
+              '                        logger.warning(\n'
+              '                            "[%s] Send made partial progress on retry %d; "\n'
+              '                            "stopping aggregate retry to avoid duplicate delivery",\n'
+              '                            self.name,\n'
+              '                            attempt,\n'
+              '                        )\n'
+              '                    else:\n'
+              '                        logger.info("[%s] Send succeeded on retry %d", self.name, attempt)\n',
+              1,
+          )
+          base = base[:retry_start] + retry_region + base[retry_end:]
+          base_path.write_text(base)
+
+          webhook_path = Path("gateway/platforms/webhook.py")
+          webhook = webhook_path.read_text()
+          disconnect_anchor = '''    async def send(
+        self,
+        chat_id: str,
+'''
+          helpers_and_send = '''    def _normalize_deliveries(self, route_config: dict, payload: dict) -> list[dict]:
+        """Normalize legacy single delivery and ordered fan-out configuration."""
+        if route_config.get("deliveries"):
+            targets: list[dict] = []
+            for item in route_config["deliveries"]:
+                if not isinstance(item, dict):
+                    continue
+                targets.append(
+                    {
+                        "deliver": item.get("deliver", "log"),
+                        "deliver_extra": self._render_delivery_extra(
+                            item.get("deliver_extra", {}), payload
+                        ),
+                    }
+                )
+            if targets:
+                return targets
+        return [
+            {
+                "deliver": route_config.get("deliver", "log"),
+                "deliver_extra": self._render_delivery_extra(
+                    route_config.get("deliver_extra", {}), payload
+                ),
+            }
+        ]
+
+    @staticmethod
+    def _normalize_delivery(delivery: dict) -> list[dict]:
+        """Accept both persisted fan-out and legacy one-target records."""
+        if "deliveries" in delivery:
+            raw = delivery.get("deliveries")
+            return [item for item in raw or [] if isinstance(item, dict)]
+        return [
+            {
+                "deliver": delivery.get("deliver", "log"),
+                "deliver_extra": delivery.get("deliver_extra", {}),
+            }
+        ]
+
+    async def _deliver_one(
+        self, chat_id: str, content: str, target: dict
+    ) -> SendResult:
+        """Attempt exactly one normalized target without aggregate inference."""
+        deliver_type = str(target.get("deliver", "log") or "log")
+        if deliver_type == "log":
+            logger.info("[webhook] Response for %s: %s", chat_id, content[:200])
+            return SendResult(success=True)
+        if deliver_type == "github_comment":
+            return await self._deliver_github_comment(content, target)
+
+        is_known_platform = deliver_type in _BUILTIN_DELIVER_PLATFORMS
+        if not is_known_platform:
+            try:
+                from gateway.platform_registry import platform_registry
+
+                is_known_platform = platform_registry.is_registered(deliver_type)
+            except Exception:
+                pass
+        if is_known_platform:
+            # The dispatcher distinguishes a known-but-unavailable adapter from
+            # an actually unknown delivery type; do not collapse those states.
+            return await self._deliver_cross_platform(
+                deliver_type, content, target
+            )
+
+        logger.warning("[webhook] Unknown deliver type: %s", deliver_type)
+        return SendResult(
+            success=False, error=f"Unknown deliver type: {deliver_type}"
+        )
+
+    @staticmethod
+    def _target_result(index: int, target: dict, result: SendResult):
+        from gateway.platforms.base import SendTargetResult
+
+        return SendTargetResult(
+            target_index=index,
+            deliver_type=str(target.get("deliver", "log") or "log"),
+            success=result.success,
+            partial=result.partial,
+            retryable=result.retryable,
+            retry_after=result.retry_after,
+            message_id=result.message_id,
+            continuation_message_ids=result.continuation_message_ids,
+            error=result.error,
+            error_kind=result.error_kind,
+            children=result.target_results,
+        )
+
+    async def send(
+        self,
+        chat_id: str,
+'''
+          if webhook.count(disconnect_anchor) != 1:
+              raise SystemExit("webhook send insertion anchor drifted")
+          webhook = webhook.replace(disconnect_anchor, helpers_and_send, 1)
+
+          send_start = webhook.index('    async def send(\n')
+          send_end = webhook.index('    def _prune_delivery_info(', send_start)
+          send_region = '''    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Deliver to every configured target and return settlement truth.
+
+        Single-target callers receive the exact child ``SendResult`` object.
+        Multi-target callers receive ordered, non-secret child outcomes. Mixed
+        success/failure and nested child partials settle as ``partial=True``;
+        generic retry/fallback stops there so successful destinations are never
+        replayed. Retryability remains attached to each unresolved child.
+        """
+        if _is_webhook_silence_response(content):
+            logger.info(
+                "[webhook] Response for %s is a silence marker — not delivering",
+                chat_id,
+            )
+            return SendResult(success=True)
+
+        delivery = self._delivery_info.get(chat_id, {})
+        targets = self._normalize_delivery(delivery)
+        if not targets:
+            targets = [{"deliver": "log", "deliver_extra": {}}]
+
+        results: list[SendResult] = []
+        for target in targets:
+            try:
+                results.append(await self._deliver_one(chat_id, content, target))
+            except Exception as exc:
+                logger.exception("[webhook] Delivery raised for %s", chat_id)
+                results.append(SendResult(success=False, error=str(exc)))
+
+        if len(results) == 1:
+            return results[0]
+
+        target_results = tuple(
+            self._target_result(index, target, result)
+            for index, (target, result) in enumerate(zip(targets, results))
+        )
+        child_partial = any(result.partial for result in results)
+        complete_successes = [
+            result for result in results if result.success and not result.partial
+        ]
+        failures = [result for result in results if not result.success]
+        partial = child_partial or bool(complete_successes and failures)
+
+        if not partial and not failures:
+            return SendResult(success=True, target_results=target_results)
+
+        unsettled = [
+            outcome
+            for outcome in target_results
+            if outcome.partial or not outcome.success
+        ]
+        detail = "; ".join(
+            f"[{outcome.target_index}:{outcome.deliver_type}] "
+            f"{outcome.error or ('partial delivery' if outcome.partial else 'delivery failed')}"
+            for outcome in unsettled
+        )
+        if partial:
+            return SendResult(
+                success=False,
+                partial=True,
+                error=f"Partial delivery: {detail}",
+                # Aggregate retry is deliberately disabled. The ordered child
+                # outcomes carry the only valid per-target retry authority.
+                retryable=False,
+                target_results=target_results,
+            )
+
+        retryable = bool(results) and all(result.retryable for result in results)
+        retry_delays = [
+            result.retry_after
+            for result in results
+            if result.retry_after is not None
+        ]
+        kinds = {result.error_kind for result in results if result.error_kind}
+        return SendResult(
+            success=False,
+            error=detail or "All delivery targets failed",
+            retryable=retryable,
+            retry_after=max(retry_delays) if retryable and retry_delays else None,
+            error_kind=next(iter(kinds)) if len(kinds) == 1 else "unknown",
+            target_results=target_results,
+        )
+
+'''
+          webhook = webhook[:send_start] + send_region + webhook[send_end:]
+
+          delivery_old = '''        deliver_config = {
+            "deliver": route_config.get("deliver", "log"),
+            "deliver_extra": self._render_delivery_extra(
+                route_config.get("deliver_extra", {}), payload
+            ),
+        }
+'''
+          delivery_new = '''        deliver_config = {
+            "deliveries": self._normalize_deliveries(route_config, payload)
+        }
+'''
+          if webhook.count(delivery_old) != 1:
+              raise SystemExit("webhook delivery persistence anchor drifted")
+          webhook = webhook.replace(delivery_old, delivery_new, 1)
+          webhook_path.write_text(webhook)
+
+          integration_path = Path("tests/gateway/test_webhook_integration.py")
+          integration = integration_path.read_text()
+          old = '''        delivery = adapter._delivery_info[chat_id]
+        assert delivery["deliver_extra"]["repo"] == "org/repo"
+        assert delivery["deliver_extra"]["pr_number"] == "42"
+'''
+          new = '''        delivery = adapter._delivery_info[chat_id]
+        target = delivery["deliveries"][0]
+        assert target["deliver_extra"]["repo"] == "org/repo"
+        assert target["deliver_extra"]["pr_number"] == "42"
+'''
+          if integration.count(old) != 1:
+              raise SystemExit("webhook integration assertion anchor drifted")
+          integration_path.write_text(integration.replace(old, new, 1))
+
+          test_path = Path("tests/gateway/test_webhook_delivery_fanout.py")
+          test_path.write_text(r'''"""Terminal settlement and retry authority for webhook delivery fan-out."""
+
+from __future__ import annotations
+
+from dataclasses import asdict
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from gateway.config import PlatformConfig
+from gateway.platforms.base import SendResult, SendTargetResult
+from gateway.platforms.webhook import WebhookAdapter
+
+
+def _adapter(routes=None):
+    return WebhookAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "host": "127.0.0.1",
+                "port": 0,
+                "routes": routes or {"r": {"secret": "s", "prompt": "p"}},
+            },
+        )
+    )
+
+
+def _seed(adapter, targets):
+    adapter._delivery_info["webhook:r:d1"] = {"deliveries": targets}
+
+
+class TestDeliveryFanOut:
+    def test_legacy_single_deliver_normalizes_to_one_element(self):
+        adapter = _adapter({
+            "r": {
+                "secret": "s",
+                "prompt": "p",
+                "deliver": "telegram",
+                "deliver_extra": {"chat_id": "{chat.id}"},
+            }
+        })
+        targets = adapter._normalize_deliveries(
+            adapter._routes["r"], {"chat": {"id": "42"}}
+        )
+        assert targets == [{
+            "deliver": "telegram",
+            "deliver_extra": {"chat_id": "42"},
+        }]
+
+    def test_deliveries_preserve_order_and_duplicate_types(self):
+        adapter = _adapter()
+        targets = adapter._normalize_deliveries({
+            "deliveries": [
+                {"deliver": "telegram", "deliver_extra": {"chat_id": "1"}},
+                {"deliver": "telegram", "deliver_extra": {"chat_id": "2"}},
+            ]
+        }, {})
+        assert [target["deliver_extra"]["chat_id"] for target in targets] == ["1", "2"]
+
+    @pytest.mark.asyncio
+    async def test_all_success_is_complete_with_ordered_truth(self):
+        adapter = _adapter()
+        targets = [
+            {"deliver": "telegram", "deliver_extra": {"chat_id": "1"}},
+            {"deliver": "discord", "deliver_extra": {"chat_id": "2"}},
+        ]
+        _seed(adapter, targets)
+        adapter._deliver_one = AsyncMock(side_effect=[
+            SendResult(success=True, message_id="a"),
+            SendResult(success=True, message_id="b"),
+        ])
+
+        result = await adapter.send("webhook:r:d1", "hello")
+
+        assert result.success is True
+        assert result.partial is False
+        assert [(item.target_index, item.deliver_type, item.message_id) for item in result.target_results] == [
+            (0, "telegram", "a"),
+            (1, "discord", "b"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_mixed_result_is_terminal_partial_with_child_retry_authority(self):
+        adapter = _adapter()
+        targets = [
+            {"deliver": "telegram", "deliver_extra": {"chat_id": "1"}},
+            {"deliver": "discord", "deliver_extra": {"chat_id": "2"}},
+        ]
+        _seed(adapter, targets)
+        adapter._deliver_one = AsyncMock(side_effect=[
+            SendResult(success=True, message_id="sent"),
+            SendResult(
+                success=False,
+                error="connect failed",
+                retryable=True,
+                retry_after=7,
+                error_kind="transient",
+            ),
+        ])
+
+        result = await adapter.send("webhook:r:d1", "hello")
+
+        assert result.success is False
+        assert result.partial is True
+        assert result.retryable is False
+        assert result.target_results[0].success is True
+        assert result.target_results[1].success is False
+        assert result.target_results[1].retryable is True
+        assert result.target_results[1].retry_after == 7
+        assert result.target_results[1].target_index == 1
+
+    @pytest.mark.asyncio
+    async def test_nested_child_partial_propagates(self):
+        adapter = _adapter()
+        targets = [
+            {"deliver": "relay", "deliver_extra": {}},
+            {"deliver": "log", "deliver_extra": {}},
+        ]
+        _seed(adapter, targets)
+        nested = SendTargetResult(
+            target_index=3,
+            deliver_type="nested",
+            success=False,
+            retryable=True,
+            error="nested failure",
+        )
+        adapter._deliver_one = AsyncMock(side_effect=[
+            SendResult(
+                success=False,
+                partial=True,
+                error="child partial",
+                target_results=(nested,),
+            ),
+            SendResult(success=True),
+        ])
+
+        result = await adapter.send("webhook:r:d1", "hello")
+
+        assert result.partial is True
+        assert result.target_results[0].partial is True
+        assert result.target_results[0].children == (nested,)
+
+    @pytest.mark.asyncio
+    async def test_all_failure_remains_retryable_only_when_every_child_is(self):
+        adapter = _adapter()
+        targets = [
+            {"deliver": "telegram", "deliver_extra": {}},
+            {"deliver": "discord", "deliver_extra": {}},
+        ]
+        _seed(adapter, targets)
+        adapter._deliver_one = AsyncMock(side_effect=[
+            SendResult(success=False, error="one", retryable=True, retry_after=2),
+            SendResult(success=False, error="two", retryable=True, retry_after=5),
+        ])
+        result = await adapter.send("webhook:r:d1", "hello")
+        assert result.success is False
+        assert result.partial is False
+        assert result.retryable is True
+        assert result.retry_after == 5
+
+        adapter._deliver_one = AsyncMock(side_effect=[
+            SendResult(success=False, error="one", retryable=True),
+            SendResult(success=False, error="permanent", retryable=False),
+        ])
+        result = await adapter.send("webhook:r:d1", "hello")
+        assert result.retryable is False
+
+    @pytest.mark.asyncio
+    async def test_exception_isolated_to_its_target(self):
+        adapter = _adapter()
+        _seed(adapter, [
+            {"deliver": "telegram", "deliver_extra": {}},
+            {"deliver": "discord", "deliver_extra": {}},
+        ])
+        adapter._deliver_one = AsyncMock(side_effect=[RuntimeError("boom"), SendResult(success=True)])
+        result = await adapter.send("webhook:r:d1", "hello")
+        assert result.partial is True
+        assert result.target_results[0].error == "boom"
+        assert result.target_results[1].success is True
+
+    @pytest.mark.asyncio
+    async def test_single_target_result_is_preserved_verbatim(self):
+        adapter = _adapter()
+        target = {"deliver": "telegram", "deliver_extra": {"chat_id": "1"}}
+        _seed(adapter, [target])
+        sentinel = SendResult(success=False, error="same object", retryable=True)
+        adapter._deliver_one = AsyncMock(return_value=sentinel)
+        result = await adapter.send("webhook:r:d1", "hello")
+        assert result is sentinel
+
+    @pytest.mark.asyncio
+    async def test_result_truth_never_copies_deliver_extra_secrets(self):
+        adapter = _adapter()
+        secret = "TOKEN-MUST-NOT-LEAK"
+        _seed(adapter, [
+            {"deliver": "telegram", "deliver_extra": {"chat_id": "1", "token": secret}},
+            {"deliver": "discord", "deliver_extra": {"chat_id": "2", "password": secret}},
+        ])
+        adapter._deliver_one = AsyncMock(side_effect=[
+            SendResult(success=True),
+            SendResult(success=False, error="failed", retryable=True),
+        ])
+        result = await adapter.send("webhook:r:d1", "hello")
+        assert secret not in repr(result)
+        assert secret not in repr([asdict(item) for item in result.target_results])
+
+    @pytest.mark.asyncio
+    async def test_partial_stops_generic_retry_and_plaintext_fallback(self):
+        adapter = _adapter()
+        _seed(adapter, [
+            {"deliver": "telegram", "deliver_extra": {}},
+            {"deliver": "discord", "deliver_extra": {}},
+        ])
+        adapter._deliver_one = AsyncMock(side_effect=[
+            SendResult(success=True),
+            SendResult(success=False, error="transient", retryable=True),
+        ])
+        result = await adapter._send_with_retry(
+            "webhook:r:d1", "hello", max_retries=2, base_delay=0
+        )
+        assert result.partial is True
+        assert adapter._deliver_one.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_log_delivery_keeps_observable_side_effect(self, caplog):
+        adapter = _adapter()
+        result = await adapter._deliver_one(
+            "webhook:r:d1", "hello log", {"deliver": "log", "deliver_extra": {}}
+        )
+        assert result.success is True
+        assert "hello log" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_known_unavailable_is_not_reported_as_unknown(self):
+        adapter = _adapter()
+        known = await adapter._deliver_one(
+            "webhook:r:d1", "hello", {"deliver": "telegram", "deliver_extra": {}}
+        )
+        unknown = await adapter._deliver_one(
+            "webhook:r:d1", "hello", {"deliver": "not-a-platform", "deliver_extra": {}}
+        )
+        assert known.success is False
+        assert "No gateway runner" in (known.error or "")
+        assert "Unknown deliver type" in (unknown.error or "")
+''')
+          PY
+
+          python -m py_compile gateway/platforms/base.py gateway/platforms/webhook.py tests/gateway/test_webhook_delivery_fanout.py
+          python -m pytest -q \
+            tests/gateway/test_webhook_delivery_fanout.py \
+            tests/gateway/test_webhook_integration.py
+          git diff --check
+
+          git config user.name "andrexibiza"
+          git config user.email "84248988+andrexibiza@users.noreply.github.com"
+          git add \
+            gateway/platforms/base.py \
+            gateway/platforms/webhook.py \
+            tests/gateway/test_webhook_delivery_fanout.py \
+            tests/gateway/test_webhook_integration.py
+          git commit -m "fix(webhook): settle mixed fanout as terminal partial"
+          git push \
+            --force-with-lease="refs/heads/${BRANCH}:${trigger_head}" \
+            origin "HEAD:refs/heads/${BRANCH}"
