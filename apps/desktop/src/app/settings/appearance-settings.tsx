@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button'
 import { SegmentedControl } from '@/components/ui/segmented-control'
 import type { DesktopMarketplaceSearchItem } from '@/global'
 import { useI18n } from '@/i18n'
+import { THINKING_FONT_COPY } from '@/i18n/thinking-font-copy'
 import { triggerHaptic } from '@/lib/haptics'
 import { Check, Download, Loader2, Palette, Trash2 } from '@/lib/icons'
 import { selectableCardClass } from '@/lib/selectable-card'
@@ -22,6 +23,12 @@ import { $reactionsEnabled, setReactionsEnabled } from '@/store/reactions-enable
 import { $reasoningCollapsedByDefault, setReasoningCollapsedByDefault } from '@/store/reasoning-disclosure'
 import { $sessionListDensity, type SessionListDensity, setSessionListDensity } from '@/store/session-list-density'
 import { $tabStripDefault, setTabStripDefault, type TabStripDefault } from '@/store/tabstrip-prefs'
+import {
+  $thinkingFontSize,
+  setThinkingFontSize,
+  THINKING_FONT_SIZE_MAX,
+  THINKING_FONT_SIZE_MIN
+} from '@/store/thinking-font-size'
 import { $toolViewMode, setToolViewMode } from '@/store/tool-view'
 import {
   $translucency,
@@ -58,9 +65,6 @@ import { TerminalFontSetting } from './terminal-font-setting'
 import { useDeepLinkHighlight } from './use-deep-link-highlight'
 
 function ThemePreview({ name, mode }: { name: string; mode: 'light' | 'dark' }) {
-  // Preview in the *current* mode: the dark palette in Dark, and the light
-  // palette in Light — synthesizing one for dark-only themes — so every card
-  // tracks the Light/Dark toggle, exactly like the app itself does.
   const c = getBaseColors(name, mode)
 
   return (
@@ -94,11 +98,6 @@ function ThemePreview({ name, mode }: { name: string; mode: 'light' | 'dark' }) 
   )
 }
 
-// UI scale presets, as zoom percentages. 100 is Chromium's actual-size
-// baseline; the shipped default is the 90% preset. Ids double as the percent
-// values sent to the main process. A Cmd/Ctrl +/- step landing between
-// presets highlights nothing, and the row description keeps showing the
-// exact current percent.
 const UI_SCALE_PRESETS = ['90', '100', '110', '125', '150', '175'] as const
 const APPEARANCE_SEARCH_TARGETS = new Set<string>(Object.values(APPEARANCE_SETTING_IDS))
 const appearanceSettingElementId = (id: string) => `setting-field-${id}`
@@ -111,12 +110,6 @@ function matchUiScalePreset(percent: number): UiScalePreset | null {
 
 const compactNumber = new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 })
 
-/**
- * Live VS Code Marketplace theme search (the same backend as the Cmd-K "Install
- * theme…" page). Renders below the local grid when there's a query: each row
- * downloads + converts + installs via `installVscodeThemeFromMarketplace` and
- * activates it. Extensions already imported locally are marked installed.
- */
 function MarketplaceThemeResults({
   query,
   installs,
@@ -139,14 +132,12 @@ function MarketplaceThemeResults({
     staleTime: 5 * 60 * 1000
   })
 
-  // Already installed → just re-activate it; never re-download what we have.
   const select = (item: DesktopMarketplaceSearchItem) => {
     const owned = installs.get(item.extensionId)
 
     if (owned) {
       triggerHaptic('crisp')
       onInstalled(owned.name)
-
       return
     }
 
@@ -163,7 +154,6 @@ function MarketplaceThemeResults({
 
     try {
       const theme = await installVscodeThemeFromMarketplace(item.extensionId)
-
       triggerHaptic('crisp')
       onInstalled(theme.name)
     } catch (e) {
@@ -262,8 +252,6 @@ function MarketplaceThemeResults({
   )
 }
 
-// Keys a range input treats as a step, so the peek can flash the live window
-// for keyboard adjustment the way a pointer drag holds it open.
 const SLIDER_STEP_KEYS = new Set([
   'ArrowDown',
   'ArrowLeft',
@@ -281,15 +269,6 @@ interface TranslucencySliderProps {
   value: number
 }
 
-/**
- * One 0–100 lever, used up to twice: Clear's window opacity, and under Glass
- * the tint plus an optional native fade.
- *
- * Peek while the hand is on it — the overlay (scrim + near-opaque card) ghosts
- * so the window behind IS the live preview. The pointer pair covers
- * mouse/touch drags; the keyboard path pulses per step instead, and blur ends
- * any residual hold.
- */
 function TranslucencySlider({ label, onChange, value }: TranslucencySliderProps) {
   return (
     <>
@@ -328,7 +307,6 @@ interface GlassRowProps {
   label: string
 }
 
-/** A labelled control in the Glass sub-panel: tint, fade, frost, area. */
 function GlassRow({ children, label }: GlassRowProps) {
   return (
     <div className="flex items-center gap-3">
@@ -341,12 +319,13 @@ function GlassRow({ children, label }: GlassRowProps) {
 }
 
 export function AppearanceSettings() {
-  const { t, isSavingLocale } = useI18n()
+  const { t, isSavingLocale, locale } = useI18n()
   const { themeName, mode, resolvedMode, availableThemes, setTheme, setMode } = useTheme()
   const toolViewMode = useStore($toolViewMode)
   const reasoningCollapsedByDefault = useStore($reasoningCollapsedByDefault)
   const sessionListDensity = useStore($sessionListDensity)
   const tabStripDefault = useStore($tabStripDefault)
+  const thinkingFontSize = useStore($thinkingFontSize)
   const zoomPercent = useStore($zoomPercent)
   const embedMode = useStore($embedMode)
   const embedAllowed = useStore($embedAllowed)
@@ -360,16 +339,10 @@ export function AppearanceSettings() {
   const profiles = useStore($profiles)
   const activeProfileKey = normalizeProfileKey(useStore($activeGatewayProfile))
   const a = t.settings.appearance
+  const thinkingCopy = THINKING_FONT_COPY[locale]
 
-  // A pointer held on the intensity slider when this overlay closes (Escape
-  // mid-drag) never delivers its pointerup here, which would strand the peek
-  // counter above zero and ghost the NEXT settings overlay. Unmount drops
-  // every outstanding hold.
   useEffect(() => resetTranslucencyPeek, [])
 
-  // Shared by the mode/frost/area pickers: apply the choice, then show it
-  // through the overlay it just altered (a pulse, not a hold — see the peek
-  // notes on the slider itself).
   const pickTranslucency =
     <T,>(set: (value: T) => void) =>
     (value: T) => {
@@ -389,9 +362,6 @@ export function AppearanceSettings() {
     ready: id => APPEARANCE_SEARCH_TARGETS.has(id)
   })
 
-  // One box does double duty: filter installed themes live (below), and run a
-  // name search against the VS Code Marketplace (the Cmd-K "Install theme…"
-  // backend) for anything not already installed.
   const needle = normalize(query)
 
   const filteredThemes = availableThemes
@@ -402,11 +372,8 @@ export function AppearanceSettings() {
         theme.name.toLowerCase().includes(needle) ||
         theme.description.toLowerCase().includes(needle)
     )
-    // Active theme first; stable sort keeps the rest in their original order.
     .sort((a, b) => Number(b.name === themeName) - Number(a.name === themeName))
 
-  // Themes save per profile. Surface that only when the user actually has more
-  // than one profile (single-profile installs never see the distinction).
   const showProfileNote = profiles.length > 1
 
   const activeProfileName =
@@ -438,7 +405,6 @@ export function AppearanceSettings() {
   ] as const satisfies readonly { id: EmbedMode; label: string }[]
 
   const uiScaleOptions = UI_SCALE_PRESETS.map(preset => ({ id: preset, label: `${preset}%` }))
-
   const matchedScalePreset = matchUiScalePreset(zoomPercent)
 
   return (
@@ -460,8 +426,6 @@ export function AppearanceSettings() {
           <ListRow
             below={
               <>
-                {/* One search box: filters your installed themes (the grid)
-                    and live-searches the VS Code Marketplace below. */}
                 <div className="mt-3">
                   <input
                     className="w-full rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-quinary) px-3 py-1.5 text-[length:var(--conversation-caption-font-size)] outline-none placeholder:text-(--ui-text-tertiary) focus:border-(--ui-stroke-secondary)"
@@ -472,8 +436,6 @@ export function AppearanceSettings() {
                   />
                 </div>
 
-                {/* Fixed-height scroll area so the (growing) theme list never
-                    runs the page long; the grid scrolls inside it. */}
                 <div className="mt-3 max-h-96 overflow-y-auto pr-1">
                   {filteredThemes.length === 0 ? (
                     needle ? (
@@ -514,8 +476,6 @@ export function AppearanceSettings() {
                                 onClick={() => {
                                   triggerHaptic('crisp')
                                   removeUserTheme(theme.name)
-
-                                  // Re-normalize off the now-missing skin → default.
                                   if (active) {
                                     setTheme(theme.name)
                                   }
@@ -578,6 +538,32 @@ export function AppearanceSettings() {
 
           <ListRow
             action={
+              <div className="flex items-center gap-3">
+                <input
+                  aria-label={thinkingCopy.ariaLabel}
+                  className="h-1 w-40 cursor-pointer appearance-none rounded-full bg-(--ui-stroke-tertiary)"
+                  max={THINKING_FONT_SIZE_MAX}
+                  min={THINKING_FONT_SIZE_MIN}
+                  onChange={event => {
+                    triggerHaptic('selection')
+                    setThinkingFontSize(Number(event.target.value))
+                  }}
+                  step={1}
+                  style={{ accentColor: 'var(--dt-primary)' }}
+                  type="range"
+                  value={thinkingFontSize}
+                />
+                <span className="w-9 text-right text-[length:var(--conversation-caption-font-size)] tabular-nums text-(--ui-text-tertiary)">
+                  {thinkingFontSize}px
+                </span>
+              </div>
+            }
+            description={thinkingCopy.description}
+            title={thinkingCopy.title}
+          />
+
+          <ListRow
+            action={
               <SegmentedControl
                 onChange={id => {
                   triggerHaptic('selection')
@@ -606,18 +592,10 @@ export function AppearanceSettings() {
             title={a.tabStripTitle}
           />
 
-          {/* Linux has neither half of this setting (see TRANSLUCENCY_SUPPORTED),
-              so the row is absent there rather than offering a dead lever. */}
           {TRANSLUCENCY_SUPPORTED && (
             <ListRow
               action={
-                <div
-                  className="flex items-center gap-3"
-                  // Arms the peek for the overlay this row lives in — the
-                  // ghosting rules in styles.css scope to it, so no other
-                  // overlay pays for an opacity transition it never uses.
-                  data-translucency-peek-scope=""
-                >
+                <div className="flex items-center gap-3" data-translucency-peek-scope="">
                   {GLASS_SUPPORTED && (
                     <SegmentedControl
                       onChange={pickTranslucency(setTranslucencyMode)}
@@ -628,10 +606,6 @@ export function AppearanceSettings() {
                       value={translucency.mode}
                     />
                   )}
-                  {/* Clear has one lever and it belongs beside the mode. Glass
-                      has four controls, so they move into the labelled panel
-                      below rather than crowding this line with an unlabelled
-                      slider that means something different. */}
                   {!glassMode && (
                     <TranslucencySlider
                       label={a.translucencyTitle}
@@ -661,9 +635,6 @@ export function AppearanceSettings() {
                     <GlassRow label={a.translucencyFrostTitle}>
                       <SegmentedControl
                         onChange={pickTranslucency(setTranslucencyMaterial)}
-                        // Windows renders four rungs as three backdrops, so it
-                        // is offered three; a frost saved on a Mac highlights
-                        // the rung that renders the same backdrop here.
                         options={glassMaterialsFor(GLASS_IS_WINDOWS).map(material => ({
                           id: material,
                           label: a.translucencyFrost[material]
