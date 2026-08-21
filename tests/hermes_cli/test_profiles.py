@@ -151,6 +151,30 @@ class TestCreateProfile:
         assert (profile_dir / ".env").read_text().strip() == "KEY=val"
         assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
 
+    def test_clone_config_runs_memory_provider_profile_clone(self, profile_env, monkeypatch):
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text("model: test")
+        (default_home / "honcho.json").write_text(json.dumps({
+            "apiKey": "***",
+            "shareAiPeerAcrossProfiles": True,
+            "hosts": {
+                "hermes": {
+                    "aiPeer": "shared-assistant",
+                    "peerName": "eri",
+                    "workspace": "shared",
+                },
+            },
+        }))
+        monkeypatch.setattr(
+            "plugins.memory.honcho.cli._ensure_peer_exists",
+            lambda host_key=None: True,
+        )
+
+        create_profile("coder", clone_config=True, no_alias=True)
+
+        honcho = json.loads((default_home / "honcho.json").read_text())
+        assert honcho["hosts"]["hermes_coder"]["aiPeer"] == "shared-assistant"
+
 
 
 

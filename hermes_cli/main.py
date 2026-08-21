@@ -10409,13 +10409,15 @@ def cmd_profile(args):
                         f"Cloned config, .env, SOUL.md, and skills from {source_label}."
                     )
 
-            # Auto-clone Honcho config for the new profile (only with clone operations)
+            # create_profile() applies provider-specific clone integration for
+            # every surface; report the resulting Honcho peer in the CLI.
             if clone_config or clone_all:
                 try:
-                    from plugins.memory.honcho.cli import clone_honcho_for_profile
+                    from plugins.memory.honcho.cli import cloned_profile_ai_peer
 
-                    if clone_honcho_for_profile(name):
-                        print(f"Honcho config cloned (peer: {name})")
+                    ai_peer = cloned_profile_ai_peer(name)
+                    if ai_peer:
+                        print(f"Honcho config cloned (peer: {ai_peer})")
                 except Exception:
                     pass  # Honcho plugin not installed or not configured
 

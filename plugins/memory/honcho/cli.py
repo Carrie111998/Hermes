@@ -61,11 +61,14 @@ def clone_honcho_for_profile(profile_name: str) -> bool:
     if peer_name:
         new_block["peerName"] = peer_name
 
-    # AI peer is profile-specific; workspace is shared so all profiles
-    # see the same user context, sessions, and project history.
-    # Use the bare profile name as the peer identity (not the host key)
-    # because Honcho's peer ID pattern is ^[a-zA-Z0-9_-]+$ (no dots).
-    new_block["aiPeer"] = profile_name
+    # AI peers stay profile-specific unless the operator explicitly opted
+    # into one shared AI identity for cloned single-operator profiles.
+    if cfg.get("shareAiPeerAcrossProfiles") is True:
+        new_block["aiPeer"] = default_block.get("aiPeer") or cfg.get("aiPeer") or HOST
+    else:
+        # Use the bare profile name as the peer identity (not the host key)
+        # because Honcho's peer ID pattern is ^[a-zA-Z0-9_-]+$ (no dots).
+        new_block["aiPeer"] = profile_name
     new_block["workspace"] = default_block.get("workspace") or cfg.get("workspace") or HOST
     new_block["enabled"] = default_block.get("enabled", True)
 
@@ -75,6 +78,14 @@ def clone_honcho_for_profile(profile_name: str) -> bool:
     # Eagerly create the peer in Honcho so it exists before first message
     _ensure_peer_exists(new_host)
     return True
+
+
+def cloned_profile_ai_peer(profile_name: str) -> str | None:
+    """Return the AI peer stored for a cloned profile, if one exists."""
+    cfg = _read_config()
+    block = cfg.get("hosts", {}).get(profile_host_key(profile_name), {})
+    ai_peer = block.get("aiPeer") if isinstance(block, dict) else None
+    return ai_peer if isinstance(ai_peer, str) and ai_peer else None
 
 
 def _ensure_peer_exists(host_key: str | None = None) -> bool:

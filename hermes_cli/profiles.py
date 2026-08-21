@@ -1262,6 +1262,17 @@ def create_profile(
     # unit-generation paths handle gateway lifecycle.
     _maybe_register_gateway_service(canon)
 
+    # Profile creation is shared by the CLI, REST/Desktop, and Bot Mode RPC.
+    # Keep the existing Honcho clone integration here so every clone surface
+    # applies the same memory identity policy.
+    if source_dir is not None:
+        try:
+            from plugins.memory.honcho.cli import clone_honcho_for_profile
+
+            clone_honcho_for_profile(canon)
+        except Exception:
+            pass  # Honcho plugin not installed or not configured
+
     return profile_dir
 
 
