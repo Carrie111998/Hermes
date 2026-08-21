@@ -179,6 +179,87 @@ function waitForDashboardReadyFile(readyFile, child, timeoutMs = resolvePortAnno
   })
 }
 
+function waitForDashboardPortOrReadyFile(readyFile, child, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let buf = ''
+    let done = false
+    let interval = null
+
+    function cleanup() {
+      if (done) {
+        return
+      }
+
+      done = true
+      clearTimeout(timer)
+
+      if (interval) {
+        clearInterval(interval)
+      }
+
+      child.stdout.off('data', onData)
+      child.off('exit', onExit)
+      child.off('error', onError)
+    }
+
+    function resolvePort(port) {
+      cleanup()
+      resolve(port)
+    }
+
+    function checkFile() {
+      const port = readDashboardReadyFile(readyFile)
+
+      if (port) {
+        resolvePort(port)
+      }
+    }
+
+    function onData(chunk) {
+      buf += chunk.toString()
+      let nl
+
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, nl)
+        buf = buf.slice(nl + 1)
+        const match = line.match(_READY_RE)
+
+        if (match) {
+          resolvePort(parseInt(match[1], 10))
+
+          return
+        }
+      }
+    }
+
+    function onExit(code, signal) {
+      cleanup()
+      reject(new Error(`Hermes backend: exited before port announcement (${signal || code})`))
+    }
+
+    function onError(err) {
+      cleanup()
+      reject(err)
+    }
+
+    const timer = setTimeout(() => {
+      cleanup()
+      reject(new Error(`Timed out waiting for Hermes backend port announcement (${timeoutMs}ms)`))
+    }, timeoutMs)
+
+    child.stdout.on('data', onData)
+    child.on('exit', onExit)
+    child.on('error', onError)
+    interval = setInterval(checkFile, 50)
+
+    if (typeof interval.unref === 'function') {
+      interval.unref()
+    }
+
+    checkFile()
+  })
+}
+
 function waitForDashboardPortAnnouncement(
   child,
   options: {
@@ -189,7 +270,7 @@ function waitForDashboardPortAnnouncement(
   const timeoutMs = options.timeoutMs ?? resolvePortAnnounceTimeoutMs()
 
   if (options.readyFile) {
-    return waitForDashboardReadyFile(options.readyFile, child, timeoutMs)
+    return waitForDashboardPortOrReadyFile(options.readyFile, child, timeoutMs)
   }
 
   return waitForDashboardPort(child, timeoutMs)

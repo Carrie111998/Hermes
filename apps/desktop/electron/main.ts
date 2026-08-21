@@ -10312,7 +10312,10 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   backend.args = getBackendArgsForRuntime(backend)
   const hermesCwd = resolveHermesCwd()
   const webDist = resolveWebDist()
-  const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
+  // Always provide the ready-file fallback. GUI/Dock launches can lose the
+  // stdout sentinel even though the backend is already listening; racing both
+  // channels prevents an otherwise permanent CONNECTING screen.
+  const readyFile = makeDashboardReadyFile()
 
   // Guard BEFORE the "Starting" line: a profile that only exists on a remote
   // backend (remote-primary desktop asked for a forced-local child) rejects
@@ -10678,7 +10681,10 @@ async function startHermes() {
     backend.args = getBackendArgsForRuntime(backend)
     const hermesCwd = resolveHermesCwd()
     const webDist = resolveWebDist()
-    const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
+    // Always provide the ready-file fallback. GUI/Dock launches can lose the
+    // stdout sentinel even though the backend is already listening; racing both
+    // channels prevents an otherwise permanent CONNECTING screen.
+    const readyFile = makeDashboardReadyFile()
 
     await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
     rememberLog(`Starting Hermes backend via ${backend.label}`)
