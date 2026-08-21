@@ -342,6 +342,45 @@ import { THEMES_AREA } from '@hermes/plugin-sdk'
 ctx.register({ id: 'noir', area: THEMES_AREA, data: myDesktopTheme })
 ```
 
+Registering a theme lists it; it does not select it. `useTheme()` reads the
+painted appearance (`theme`, `themeName`, `availableThemes`, `resolvedMode`) and
+changes it (`setTheme`, `setMode`, `previewTheme`) from a component:
+
+```javascript
+import { Button, useTheme } from '@hermes/plugin-sdk'
+
+function ThemePicker() {
+  const { availableThemes, setTheme, themeName } = useTheme()
+
+  return availableThemes.map(t => (
+    <Button key={t.name} disabled={t.name === themeName} onClick={() => setTheme(t.name)}>
+      {t.label}
+    </Button>
+  ))
+}
+```
+
+A switch driven by something other than a render — a gateway connecting, a
+socket event, any `host.onEvent` callback — has no component to hang the hook
+on. Use `requestTheme(name)` there. An unresolvable name is refused rather than
+coerced to the default skin, so the return value doubles as the availability
+check and a wrong name can never silently reset someone's appearance:
+
+```javascript
+import { host, requestTheme } from '@hermes/plugin-sdk'
+
+host.onEvent('gateway.ready', () => {
+  if (!requestTheme('noir')) {
+    host.notifyError('Connected, but the noir theme is not installed.')
+  }
+})
+```
+
+Both doors persist per profile, so a plugin-driven switch sticks exactly like a
+manual pick. To tint the *active* theme rather than replace it, use
+`setAccentOverride(hex)` and clear it in `ctx.onDispose` — the bundled `accent`
+plugin is the worked example.
+
 ### Composer extensions
 
 `COMPOSER_AREAS` (`top`, `bottom`, `leading`, `actions`, `attachments`,
@@ -434,6 +473,7 @@ host.state.awaitingResponse // ReadableAtom<boolean>  true until the first assis
 host.state.busy             // ReadableAtom<boolean>  focused chat is working after a send
 host.state.busyBySession    // ReadableAtom<Record<string, boolean>>  runtime id → mid-turn
 host.state.focusedSessionId // ReadableAtom<string | null>  (runtime id of the FOCUSED session — tile-aware; prefer for session.* RPC)
+host.state.focusedSessionProfile // ReadableAtom<string>  (owner profile of the focused chat — prefer over `profile` for per-bot/profile readouts)
 host.state.focusedStoredSessionId // ReadableAtom<string | null>  (durable id — navigation / session-list matching)
 host.state.focusedUsage     // ReadableAtom<UsageStats | null>  (live streamed usage of the focused session, no RPC needed)
 host.state.cwd              // ReadableAtom<string>
@@ -688,6 +728,21 @@ only locally installed packages contribute a desktop half (same rule as the
 standalone door).
 :::
 
+### Distributing with an install link {#install-link}
+
+Ship your plugin repo (agent half, desktop half, or both) and link to it with
+the `hermes://` scheme — a plain anchor on your website or README:
+
+```html
+<a href="hermes://plugin/install?repo=owner/repo&enable=1">Install in Hermes</a>
+```
+
+The user gets a confirmation dialog (repo id, source links, a probe of what
+the repo ships) and picks components before anything is installed — deep links
+never auto-install. `force=1` replaces an existing install; dev builds use
+`hermes-dev://`. Full link reference:
+[One-click install links](/user-guide/features/plugins#one-click-install-links-desktop).
+
 ### The Python side
 
 Desktop plugins reuse the dashboard plugin backend mount. Put the backend in a
@@ -843,6 +898,7 @@ not treat this pipeline as a trust boundary.
 | Area constants | `PANES_AREA`, `ROUTES_AREA`, `SIDEBAR_NAV_AREA`, `STATUSBAR_AREAS`, `TITLEBAR_AREAS`, `PALETTE_AREA`, `KEYBINDS_AREA`, `THEMES_AREA`, `COMPOSER_AREAS` |
 | Area payloads | `RouteContribution`, `SidebarNavContribution`, `StatusbarItem`, `TitlebarTool`, `PaletteContribution`, `KeybindContribution`, `ComposerMiddleware`, `ComposerAttachmentProvider` |
 | React / state | `useValue`, `atom`, `computed`, `useQuery`, `useMutation`, `useQueryClient`, `queryClient`, `Contribute` |
+| Theming | `useTheme`, `requestTheme`, `setAccentOverride`, `$accentOverride`, `retintTheme`, `themeHue`, `DesktopTheme`, `DesktopThemeColors`, plus OKLCH math (`hexToOklch`, `oklchToHex`, `oklchToSrgb255`, `mixOklab`, `maxChroma`, `hueDelta`, `contrastRatio`, `readableOn`, `normalizeHex`) |
 | UI kit | `Button`, `Input`, `Textarea`, `Select*`, `Switch`, `Checkbox`, `SegmentedControl`, `Tabs*`, `Dialog*`, `ConfirmDialog`, `DropdownMenu*`, `ContextMenu*`, `Popover*`, `Tip`/`Tooltip*`, `Badge`, `Kbd`/`KbdGroup`, `SearchField`, `ScrollArea`, `Separator`, `Skeleton`, `GlyphSpinner`, `Loader`, `EmptyState`, `ErrorState`, `CopyButton`, `StatusDot`, `LogView`, `Codicon`, `DecodeText` |
 | Helpers | `cn`, `icons`, `haptic`, `useI18n`, `profileColor`, `profileColorSoft`, `relativeTime`, `fmtDateTime`, `fmtDayTime`, `coarseElapsed`, `evaluateRuntimeReadiness` |
 
