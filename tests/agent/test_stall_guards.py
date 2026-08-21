@@ -15,6 +15,8 @@ Two guards, both notice/re-prompt-only:
 These assert behavior contracts, not message snapshots.
 """
 
+import json
+
 from agent.agent_runtime_helpers import trailing_continue_intent
 from agent.tool_guardrails import (
     IDENTICAL_RESULT_STUB_MIN_CHARS,
@@ -133,6 +135,31 @@ def test_explicit_unchanged_contract_is_scoped_to_known_emitters():
     assert c.observe_identical_call("other_tool", args, unchanged) is None
     assert c.observe_identical_call("other_tool", args, unchanged) is None
     assert c.observe_identical_call("other_tool", args, unchanged) is not None
+
+
+def test_skill_view_unchanged_envelope_continues_streak():
+    # skill_view's envelope carries extra fields (success, name, file) beyond
+    # the read_file shape; the contract keys on the three dedup fields only.
+    c = ToolCallGuardrailController()
+    args = {"name": "hermes-agent"}
+    unchanged = json.dumps(
+        {
+            "success": True,
+            "status": "unchanged",
+            "name": "hermes-agent",
+            "file": "SKILL.md",
+            "dedup": True,
+            "content_returned": False,
+            "message": "Skill content already in context.",
+        }
+    )
+
+    assert c.observe_identical_call("skill_view", args, "full skill content") is None
+    assert c.observe_identical_call("skill_view", args, unchanged) is None
+    notice = c.observe_identical_call("skill_view", args, unchanged)
+
+    assert notice is not None
+    assert "3rd" in notice
 
 
 def test_lookalike_unchanged_payload_does_not_inherit_prior_streak():
@@ -312,6 +339,24 @@ def test_stub_on_second_identical_call_first_full():
     assert "web_search" in r2
     assert "call_1" in r2  # references the FIRST occurrence in the streak
     assert len(r2) < len(_BIG)
+
+
+def test_stub_fires_on_second_jittered_todo_call():
+    # Jittered args (merge toggled) share the normalized stall signature, so a
+    # byte-identical duplicate result is stubbed on the 2nd call even though the
+    # raw args differ — and the stub still references the first call's id.
+    agent = _fake_agent()
+    todos = [{"id": "1", "content": "inspect", "status": "completed"}]
+    r1 = agent._append(
+        "todo", {"todos": todos, "merge": True}, _BIG, tool_call_id="call_1"
+    )
+    r2 = agent._append(
+        "todo", {"todos": todos, "merge": False}, _BIG, tool_call_id="call_2"
+    )
+    assert r1 == _BIG
+    assert r2 != _BIG
+    assert "byte-identical" in r2
+    assert "call_1" in r2
 
 
 def test_no_stub_when_fresh_result_differs():
