@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import stat
+import sys
 import time
 from pathlib import Path
 
@@ -148,7 +149,22 @@ def main(argv=None) -> None:
                 "version": report.version,
                 "count": report.record_count,
                 "raw_hash": report.raw_hash,
+                # Sector ids come from our own catalog, so naming them
+                # discloses nothing. The unknown categories are corpus values
+                # and are counted, never echoed — the report object still
+                # carries them for a caller in-process.
+                "sector_categories": list(report.sector_categories),
+                "unknown_category_count": len(report.unknown_categories),
+                "findable_by_sector": report.findable_by_sector,
+                "warnings": report.warnings(),
             }, ensure_ascii=False))
+            # On stderr as well as in the payload: a corpus that no sector search
+            # can reach imports perfectly and is then invisible, and the machine
+            # -readable field alone is easy to miss in a terminal. A corpus is
+            # immutable, so the cheapest moment to notice is now — the fix is
+            # re-importing as a new version, not editing this one.
+            for warning in report.warnings():
+                print(f"warning: {warning}", file=sys.stderr)
         finally:
             close = getattr(db, "close", None)
             if close:

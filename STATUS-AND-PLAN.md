@@ -1010,6 +1010,47 @@ better term — which the per-term counts now make visible.
 Verified by reverting: nine tests fail with AND and separator-sensitive
 matching restored. 542 server tests and seven WebUI suites pass.
 
+### D3. An import says whether its corpus can be found
+
+D2 made spelling *variants* match. It did not make *different words* match, and
+the original incident was different words: the 5,470-row corpus was imported
+with the category `kitchen-appliances`, which is not a sector id. It matched no
+playbook and no brief, so the sector the customer page offers selected none of
+it — and nothing said so until someone searched AE and got zero back. A corpus
+is immutable, so the fix is always a re-import; noticing at import is the
+difference between one command and a diagnosis.
+
+`import_file` now classifies a corpus's categories against `sectors.yaml` and
+reports three things: which categories are canonical sector ids, how many are
+not, and the closest sector id to each that is not.
+
+- **It reports, it does not reject.** `categories` is matchable text, not a
+  controlled vocabulary — "white goods" and "ovens" are useful things for a term
+  to match, and forbidding them would forbid what the corpus is for. What is
+  not legitimate is a corpus carrying *no* sector id at all, because the brief
+  page only offers sector ids: those rows cannot be found by a customer search
+  however well they imported. That is what `findable_by_sector` says.
+- **The near-match is suggested, never applied.** Rewriting a customer's
+  category to the sector id we think they meant is the
+  upgrade-a-hint-into-evidence move this module refuses everywhere else.
+  `difflib` names it; a human decides.
+- **No corpus value reaches stdout.** A category is a column of a private
+  candidate row, and `test_candidate_import_cli_emits_only_corpus_identity`
+  exists precisely to stop the CLI disclosing one — it caught the first version
+  of this change, which printed the offending categories. The CLI now prints
+  matched sector ids (our own catalog vocabulary, so they disclose nothing), a
+  *count* of unknown categories, and warnings worded without corpus values. The
+  report object still carries the values for a caller in-process. That test now
+  also asserts no value from the file appears on either stream, so the incident
+  became a guard.
+
+Warnings go to stderr as well as into the JSON payload: a machine-readable field
+alone is easy to miss in a terminal, and a corpus that no sector search can
+reach imports perfectly and is then invisible.
+
+Verified by reverting: five tests fail without the check. 548 server tests and
+seven WebUI suites pass.
+
 ## Carried-over risks
 
 - **Postgres paths stay under-tested.** `tests/server/` builds `Settings` with

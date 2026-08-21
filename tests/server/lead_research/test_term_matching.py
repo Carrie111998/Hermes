@@ -300,3 +300,122 @@ def test_an_estimate_without_a_tenant_reports_not_computed_rather_than_zero(tmp_
     estimate = service.estimate(config)
 
     assert estimate.corpus_candidates is None
+
+
+# ── the category check at import ──────────────────────────────────────────────
+
+def test_a_corpus_with_no_sector_id_is_flagged_at_import(tmp_path):
+    """The historical mistake, caught at the only moment it is cheap.
+
+    The 5,470-row corpus was imported with the category `kitchen-appliances`,
+    which is not a sector id. It matched no playbook and no brief, so the sector
+    the customer page offers selected none of it — and nothing said so until
+    someone searched AE and got zero back. A corpus is immutable, so the fix is
+    always a re-import; noticing at import is the difference between one command
+    and a diagnosis.
+    """
+    repo = CandidateRepository(Database(tmp_path / "flagged.db"))
+
+    report = repo.import_file(
+        "kitchen-appliances", "1", "candidates.jsonl",
+        json.dumps({
+            "source_record_id": "r1", "company_name": "C 1", "country": "AE",
+            "categories": ["kitchen-appliances"],
+        }).encode(),
+    )
+
+    assert report.findable_by_sector is False
+    assert report.unknown_categories == ("kitchen-appliances",)
+    assert report.sector_categories == ()
+    assert any("never select these rows" in warning for warning in report.warnings())
+
+
+def test_the_closest_sector_id_is_suggested_not_applied(tmp_path):
+    """Silently rewriting a customer's category would be a guess.
+
+    Naming the near-match is the whole value of the check; applying it is the
+    upgrade-a-hint-into-evidence move this module refuses everywhere else.
+    """
+    repo = CandidateRepository(Database(tmp_path / "suggest.db"))
+
+    report = repo.import_file(
+        "corpus", "1", "candidates.jsonl",
+        json.dumps({
+            "source_record_id": "r1", "company_name": "C 1", "country": "AE",
+            "categories": ["kitchen-appliances"],
+        }).encode(),
+    )
+
+    assert report.suggestions == (("kitchen-appliances", "household-appliances"),)
+    assert any("household-appliances" in warning for warning in report.warnings())
+    # And the stored row keeps exactly what the file said.
+    assert repo.select(countries=["AE"], product_terms=["kitchen-appliances"], limit=5)
+
+
+def test_a_canonical_category_imports_without_complaint(tmp_path):
+    repo = CandidateRepository(Database(tmp_path / "clean.db"))
+
+    report = repo.import_file(
+        "corpus", "1", "candidates.jsonl",
+        json.dumps({
+            "source_record_id": "r1", "company_name": "C 1", "country": "AE",
+            "categories": ["household-appliances"],
+        }).encode(),
+    )
+
+    assert report.findable_by_sector is True
+    assert report.sector_categories == ("household-appliances",)
+    assert report.warnings() == []
+
+
+def test_free_text_categories_are_allowed_beside_a_sector_id(tmp_path):
+    """`categories` is matchable text, not a controlled vocabulary.
+
+    "white goods" is a useful thing for a term to match. Rejecting it would
+    forbid something the corpus is for; the check only cares that *some*
+    category is a sector id.
+    """
+    repo = CandidateRepository(Database(tmp_path / "mixed.db"))
+
+    report = repo.import_file(
+        "corpus", "1", "candidates.jsonl",
+        json.dumps({
+            "source_record_id": "r1", "company_name": "C 1", "country": "AE",
+            "categories": ["household-appliances", "white goods", "ovens"],
+        }).encode(),
+    )
+
+    assert report.findable_by_sector is True
+    assert set(report.unknown_categories) == {"white goods", "ovens"}
+    assert report.warnings() == ["2 categories are not sector ids."]
+
+
+def test_a_corpus_with_no_categories_at_all_is_flagged(tmp_path):
+    """A plain contact list carries no category, and cannot be found by sector."""
+    repo = CandidateRepository(Database(tmp_path / "bare.db"))
+
+    report = repo.import_file(
+        "corpus", "1", "candidates.jsonl",
+        json.dumps({
+            "source_record_id": "r1", "company_name": "C 1", "country": "AE",
+        }).encode(),
+    )
+
+    assert report.findable_by_sector is False
+    assert report.unknown_categories == ()
+
+
+def test_the_check_never_rejects_an_import(tmp_path):
+    """A warning, not a gate. The rows are still the corpus."""
+    repo = CandidateRepository(Database(tmp_path / "kept.db"))
+
+    report = repo.import_file(
+        "corpus", "1", "candidates.jsonl",
+        json.dumps({
+            "source_record_id": "r1", "company_name": "C 1", "country": "AE",
+            "categories": ["nonsense-category"],
+        }).encode(),
+    )
+
+    assert report.record_count == 1
+    assert len(repo.select(countries=["AE"], product_terms=[], limit=5)) == 1

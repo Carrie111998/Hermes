@@ -88,10 +88,80 @@ class CandidateImportReport:
     version: str
     imported: int
     raw_hash: str
+    # Which of the corpus's categories are canonical sector ids, and which are
+    # not. Reported rather than enforced: `categories` is matchable text, so
+    # "ovens" or "white goods" are legitimate entries and rejecting them would
+    # forbid something useful. What is not legitimate is a corpus that carries
+    # no sector id at all — the brief page only offers sector ids, so those rows
+    # cannot be found by a customer search however well they were imported.
+    sector_categories: tuple[str, ...] = ()
+    unknown_categories: tuple[str, ...] = ()
+    suggestions: tuple[tuple[str, str], ...] = ()
 
     @property
     def record_count(self) -> int:
         return self.imported
+
+    @property
+    def findable_by_sector(self) -> bool:
+        return bool(self.sector_categories)
+
+    def warnings(self) -> list[str]:
+        """Plain sentences an operator should read before trusting the import.
+
+        Deliberately free of corpus values. A category is a column of a private
+        candidate row, and this text is printed by the import CLI — the same
+        boundary that keeps company names off stdout keeps categories off it.
+        The operator has the file; what they lack is our vocabulary, so the
+        suggestions name sector ids and never quote the corpus.
+        """
+        messages: list[str] = []
+        if not self.findable_by_sector:
+            messages.append(
+                "No category in this corpus is a canonical sector id, so a "
+                "customer search by sector will never select these rows."
+            )
+        if self.unknown_categories:
+            messages.append(
+                f"{len(self.unknown_categories)} categories are not sector ids."
+            )
+        closest = sorted({suggestion for _, suggestion in self.suggestions})
+        if closest:
+            messages.append(
+                "Closest sector ids to what this corpus used: "
+                + ", ".join(closest)
+            )
+        return messages
+
+
+def _categorise(candidates: list["CandidateRecord"]) -> tuple[tuple[str, ...], tuple[str, ...], tuple[tuple[str, str], ...]]:
+    """Split a corpus's categories into canonical sector ids and everything else.
+
+    The whole point of this check: the 5,470-row corpus was imported with the
+    category `kitchen-appliances`, which is not a sector id. It matched no
+    playbook and no brief, so the sector the customer page offers selected none
+    of it — and nothing said so until someone searched AE and got zero. A close
+    match is suggested rather than applied, because silently rewriting a
+    customer's category would be the same guess this module refuses everywhere.
+    """
+    from difflib import get_close_matches
+
+    from .sectors import load_sectors
+
+    known = {sector.sector_id for sector in load_sectors()}
+    seen: dict[str, None] = {}
+    for candidate in candidates:
+        for value in candidate.data.get("categories", []):
+            seen.setdefault(str(value).strip(), None)
+    matched = tuple(sorted(value for value in seen if value in known))
+    unknown = tuple(sorted(value for value in seen if value and value not in known))
+    suggestions = tuple(
+        (value, close[0])
+        for value in unknown
+        for close in [get_close_matches(value, sorted(known), n=1, cutoff=.6)]
+        if close
+    )
+    return matched, unknown, suggestions
 
 
 def _clean(value: Any) -> str | None:
@@ -282,7 +352,11 @@ class CandidateRepository:
             if "unique" in message or "duplicate" in message:
                 raise CandidateImportConflict("candidate dataset/version is immutable and already exists") from exc
             raise
-        return CandidateImportReport(dataset_id, version, len(candidates), digest)
+        sector_categories, unknown_categories, suggestions = _categorise(candidates)
+        return CandidateImportReport(
+            dataset_id, version, len(candidates), digest,
+            sector_categories, unknown_categories, suggestions,
+        )
 
     def _current_versions(self) -> dict[str, str]:
         """The newest version of every imported dataset, keyed by dataset id.

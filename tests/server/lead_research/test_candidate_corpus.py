@@ -128,7 +128,12 @@ def test_candidate_selection_filters_countries_and_product_terms(db, candidate_c
 
 
 def test_candidate_import_cli_emits_only_corpus_identity(monkeypatch, tmp_path, candidate_csv, capsys):
-    """Echoing candidate rows from the CLI would disclose a private corpus."""
+    """Echoing candidate rows from the CLI would disclose a private corpus.
+
+    The sector check added later reports on categories, and a category is a
+    column of a private row — so it is counted and never echoed. Sector ids are
+    our own catalog vocabulary and disclose nothing.
+    """
     from server import __main__ as command
 
     source = tmp_path / "candidates.csv"
@@ -139,13 +144,27 @@ def test_candidate_import_cli_emits_only_corpus_identity(monkeypatch, tmp_path, 
         "import-candidates", "--dataset-id", "kitchen-appliances", "--version", "2026-08", "--file", str(source),
     ])
 
-    result = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
     assert result == {
         "dataset_id": "kitchen-appliances",
         "version": "2026-08",
         "count": 2,
         "raw_hash": hashlib.sha256(candidate_csv).hexdigest(),
+        "sector_categories": [],
+        "unknown_category_count": 3,
+        "findable_by_sector": False,
+        "warnings": [
+            "No category in this corpus is a canonical sector id, so a customer "
+            "search by sector will never select these rows.",
+            "3 categories are not sector ids.",
+            "Closest sector ids to what this corpus used: household-appliances",
+        ],
     }
+    # Nothing from the file itself reaches either stream.
+    for secret in ("Atlas Kitchens", "Kitchen appliances", "Built-in ovens", "northstar.example"):
+        assert secret not in captured.out
+        assert secret not in captured.err
 
 
 def test_jsonl_candidate_corpus_imports_each_utf8_json_line(db):
