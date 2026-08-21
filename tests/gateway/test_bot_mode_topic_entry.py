@@ -77,3 +77,31 @@ def test_route_match_failure_is_indeterminate():
         "gateway.profile_routing.match_profile_route", side_effect=RuntimeError("boom")
     ):
         assert _runner()._bot_mode_gateway_entry_state(_source()) is None
+
+
+def test_exact_route_profile_comparison_uses_the_normalized_route_profile():
+    """source.profile comes from the same normalized route, so casing of the
+    raw config value can never demote a legitimate topic (reviewer #3)."""
+    runner = _runner()
+    assert runner._bot_mode_gateway_entry_state(_source(profile="Builder")) is False
+    normalized = parse_profile_routes(
+        [
+            {
+                "name": "builder-topic",
+                "platform": "telegram",
+                "chat_id": "42",
+                "thread_id": "200",
+                "profile": "BuIlDeR",
+            }
+        ]
+    )
+    stamped = _source(profile=normalized[0].profile)
+    assert GatewayRunner._bot_mode_gateway_entry_state(
+        _runner_with_routes(normalized), stamped
+    ) is True
+
+
+def _runner_with_routes(routes):
+    runner = object.__new__(GatewayRunner)
+    runner.config = SimpleNamespace(multiplex_profiles=True, profile_routes=routes)
+    return runner

@@ -321,14 +321,29 @@ def stored_prompt_capability_stale(stored_prompt: str, home: str | os.PathLike |
 
 
 def stored_prompt_has_bot_mode_stamp(stored_prompt: str) -> bool:
-    """Return whether a prompt carries the core-injected Bot Mode section."""
+    """Return whether a prompt carries the core-injected Bot Mode section.
+
+    Anchored structurally, not lexically: the core appends ``epoch_line`` as
+    the FINAL non-empty line of the prompt (right after the protocol section),
+    so a genuine stamp means "exact-format epoch line last, heading before
+    it". Prose that merely quotes the heading or contains an epoch-shaped
+    fragment anywhere else must not make an ordinary session look stamped —
+    a false positive here would trigger a pointless one-time rebuild and
+    prefix-cache break driven by user content.
+    """
     import re
 
     try:
-        return bool(
-            _PROTOCOL_HEADING in (stored_prompt or "")
-            and re.search(_EPOCH_RE_TEXT, stored_prompt or "")
-        )
+        lines = [
+            ln.strip()
+            for ln in (stored_prompt or "").splitlines()
+            if ln.strip()
+        ]
+        if len(lines) < 2 or not lines[-1].startswith(_EPOCH_PREFIX):
+            return False
+        if not re.fullmatch(r"Capability epoch: [0-9a-f]{12}", lines[-1]):
+            return False
+        return _PROTOCOL_HEADING in "\n".join(lines[:-1])
     except Exception:
         return False
 

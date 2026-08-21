@@ -896,25 +896,44 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 _gateway_bot_state = getattr(
                     agent, "_bot_mode_gateway_session", False
                 )
-                _routed_gateway_bot = (
-                    _protocol_enabled and _gateway_bot_state is True
+                # Transition policy for a stored prompt whose runtime identity
+                # still matches. Decision chain (first hit wins):
+                #
+                # 1. Legacy upgrade — an UNSTAMPED prompt on a live entry
+                #    point (canonical Bot Chat or routed topic, protocol on)
+                #    gets ONE rebuild so it gains section + epoch stamp.
+                #    Ordinary unstamped sessions never take this path.
+                # 2. Route state indeterminate (gateway probe failed, None) —
+                #    PRESERVE the stored bytes: never drop a possibly-valid
+                #    section or burn cache on a transient failure.
+                # 3. Live entry point + protocol ON — keep section.
+                # 4. Anything else (route removed/disabled, protocol off,
+                #    ordinary session with coincidental stamp) — strip once.
+                _live_bot_entry = _protocol_enabled and (
+                    _canonical_bot_chat or _gateway_bot_state is True
                 )
-                _eligible_bot_entry = _protocol_enabled and (
-                    _canonical_bot_chat or _routed_gateway_bot
-                )
-                if _eligible_bot_entry:
-                    _bot_stale = stored_bot_chat_prompt_needs_upgrade(
+                _legacy_upgrade_needed = (
+                    not _stamped_bot_prompt
+                    and _live_bot_entry
+                    and stored_bot_chat_prompt_needs_upgrade(
                         stored_prompt, _home_for_epoch
                     )
-                elif _stamped_bot_prompt:
-                    # ``None`` means the gateway could not determine route state.
-                    # Preserve the stored bytes rather than burning prompt cache
-                    # or dropping a valid protocol section on a transient failure.
-                    _bot_stale = not (
-                        _protocol_enabled
-                        and not _canonical_bot_chat
-                        and _gateway_bot_state is None
-                    )
+                )
+                if _legacy_upgrade_needed:
+                    _bot_stale = True
+                elif (
+                    not _stamped_bot_prompt
+                    and not _live_bot_entry
+                ):
+                    # Ordinary session (no stamp, not a Bot Mode entry point):
+                    # the pre-existing behavior — never rebuild, reuse bytes.
+                    _bot_stale = False
+                elif not _canonical_bot_chat and _gateway_bot_state is None:
+                    _bot_stale = False
+                elif _live_bot_entry:
+                    _bot_stale = False
+                else:
+                    _bot_stale = True
         except Exception:
             _bot_stale = False
         if _bot_stale:

@@ -216,6 +216,74 @@ class TestStoredPromptReuse:
             agent._build_system_prompt.assert_not_called()
             db.update_system_prompt.assert_not_called()
 
+    def test_stamped_canonical_bot_chat_keeps_section_while_protocol_on(self, tmp_path):
+        """Stamped canonical Bot Chat + protocol ON → keep (no rebuild)."""
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        from tools.bot_mode_probe import _reset_cache_for_tests, epoch_line
+
+        _reset_cache_for_tests()
+        stored = (
+            "Canonical prompt\n\n## Messaging other agents\nprotocol\n\n"
+            f"{epoch_line(home)}"
+        )
+        db = MagicMock()
+        db.db_path = home / "state.db"
+        db.get_session.return_value = {"system_prompt": stored}
+        db.get_session_title.return_value = "Bot Chat"
+        agent = _make_agent(session_db=db, prebuilt_prompt="REBUILT")
+        agent.platform = "telegram"
+        agent._bot_mode_protocol = True
+        agent._bot_mode_gateway_session = False
+        agent._session_title_hint = "Bot Chat"
+
+        _restore_or_build_system_prompt(
+            agent, None, [{"role": "user", "content": "continue"}]
+        )
+
+        assert agent._cached_system_prompt == stored
+        agent._build_system_prompt.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("title", "gateway_state"),
+        [("Bot Chat", False), ("Former routed topic", True)],
+        ids=["canonical-bot-chat", "routed-topic"],
+    )
+    def test_stamped_prompts_strip_when_protocol_turned_off(
+        self, tmp_path, title, gateway_state
+    ):
+        """Reviewer #2 gap: stamped Bot Mode prompts rebuild exactly once to
+        drop the injected section when `bot_mode_protocol` is disabled — for
+        BOTH entry-point kinds."""
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        from tools.bot_mode_probe import _reset_cache_for_tests, epoch_line
+
+        _reset_cache_for_tests()
+        stored = (
+            "Prompt with protocol\n\n## Messaging other agents\nsection\n\n"
+            f"{epoch_line(home)}"
+        )
+        db = MagicMock()
+        db.db_path = home / "state.db"
+        db.get_session.return_value = {"system_prompt": stored}
+        db.get_session_title.return_value = title
+        agent = _make_agent(session_db=db, prebuilt_prompt="STRIPPED_PROMPT")
+        agent.platform = "telegram"
+        agent._bot_mode_protocol = False
+        agent._bot_mode_gateway_session = gateway_state
+        agent._session_title_hint = title if title != "Former routed topic" else ""
+
+        _restore_or_build_system_prompt(
+            agent, None, [{"role": "user", "content": "continue"}]
+        )
+
+        assert agent._cached_system_prompt == "STRIPPED_PROMPT"
+        agent._build_system_prompt.assert_called_once_with(None)
+        db.update_system_prompt.assert_called_once_with(
+            agent.session_id, "STRIPPED_PROMPT"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Legitimate fresh-build paths (no history, no DB)

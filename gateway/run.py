@@ -5709,6 +5709,14 @@ class TurnRunner:
                             except KeyError:
                                 pass
                         self._runner._init_cached_agent_for_turn(agent, ctx._interrupt_depth)
+                        # Refresh the Bot Mode entry-point marker from the
+                        # CURRENT route state — a cached agent can outlive a
+                        # config change (route added/removed/disabled), and the
+                        # prompt-restore transition policy must never act on a
+                        # stale marker from the turn the agent was created.
+                        agent._bot_mode_gateway_session = (
+                            self._runner._bot_mode_gateway_entry_state(ctx.source)
+                        )
                         # Refresh agent max_iterations from current config
                         # (cached agent may have been created with old config)
                         agent.max_iterations = max_iterations
@@ -27965,6 +27973,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         if not matched or not matched.chat_id or not matched.thread_id:
             return False
+        # Case-sensitivity contract: ``source.profile`` is stamped by
+        # ``build_source`` from ``_profile_name_for_source``, i.e. from the
+        # SAME normalized ``matched.profile`` (parse_profile_routes applies
+        # normalize_profile_name), so a raw comparison cannot diverge by
+        # casing/format. Guarded by test_exact_route_profile_comparison_uses_
+        # the_normalized_route_profile.
         routed_profile = str(getattr(source, "profile", "") or "").strip()
         return not routed_profile or routed_profile == matched.profile
 
