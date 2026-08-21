@@ -1465,8 +1465,8 @@ def do_tap(action: str, repo: str = "", console: Optional[Console] = None) -> No
 
 
 def do_publish(skill_path: str, target: str = "github", repo: str = "",
-               console: Optional[Console] = None) -> None:
-    """Publish a local skill to a registry (GitHub PR or ClawHub submission)."""
+               registry: str = "", console: Optional[Console] = None) -> None:
+    """Publish a local skill to a registry (GitHub PR, ClawHub, or Skillven submission)."""
     from tools.skills_hub import GitHubAuth, SKILLS_DIR
     from tools.skills_guard import scan_skill, format_scan_report
 
@@ -1478,6 +1478,21 @@ def do_publish(skill_path: str, target: str = "github", repo: str = "",
         path = SKILLS_DIR / path
     if not path.exists() or not (path / "SKILL.md").exists():
         c.print(f"[bold red]Error:[/] No SKILL.md found at {path}\n")
+        return
+
+    if target == "skillven":
+        # Skillven's SKILL.md is frontmatter-free (see skillven_publish), so it
+        # can't go through the frontmatter/description validation block below —
+        # run the shared scan here and delegate before that block runs.
+        from hermes_cli.skillven_publish import do_skillven_publish
+
+        c.print(f"[bold]Scanning '{path.name}' before publish...[/]")
+        result = scan_skill(path, source="self")
+        c.print(format_scan_report(result))
+        if result.verdict == "dangerous":
+            c.print("[bold red]Cannot publish a skill with DANGEROUS verdict.[/]\n")
+            return
+        do_skillven_publish(path, registry=registry, scan_result=result, console=c)
         return
 
     # Validate the skill
@@ -1771,6 +1786,7 @@ def skills_command(args) -> None:
             args.skill_path,
             target=getattr(args, "to", "github"),
             repo=getattr(args, "repo", ""),
+            registry=getattr(args, "registry", "") or "",
         )
     elif action == "snapshot":
         snap_action = getattr(args, "snapshot_action", None)

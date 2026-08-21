@@ -277,10 +277,18 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
     )
     skills_publish.add_argument("skill_path", help="Path to skill directory")
     skills_publish.add_argument(
-        "--to", default="github", choices=["github", "clawhub"], help="Target registry"
+        "--to",
+        default="github",
+        choices=["github", "clawhub", "skillven"],
+        help="Target registry",
     )
     skills_publish.add_argument(
         "--repo", default="", help="Target GitHub repo (e.g. openai/skills)"
+    )
+    skills_publish.add_argument(
+        "--registry",
+        default="",
+        help="Registry base URL override (e.g. for --to skillven)",
     )
 
     skills_snapshot = skills_subparsers.add_parser(
