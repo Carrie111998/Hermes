@@ -182,9 +182,15 @@ def get_trusted_operator_peers() -> set[str]:
     try:
         from hermes_cli.config import load_config_readonly
 
-        peers = (load_config_readonly().get("a2a") or {}).get("trusted_operator_peers", [])
+        peers = (load_config_readonly().get("a2a") or {}).get(
+            "trusted_operator_peers", []
+        )
         if isinstance(peers, list):
-            return {str(peer).strip() for peer in peers if str(peer).strip()}
+            return {
+                peer.strip()
+                for peer in peers
+                if isinstance(peer, str) and peer.strip()
+            }
     except Exception:
         logger.debug("A2A: could not load trusted operator peers", exc_info=True)
     return set()
@@ -256,7 +262,11 @@ def wrap_inbound(peer: str, text: str) -> str:
     authorizes local/private work, but filtering still applies.
     """
     identity = peer or "unknown"
-    prefix = TRUSTED_OPERATOR_PREFIX if is_trusted_operator_peer(identity) else PRIVACY_PREFIX
+    prefix = (
+        TRUSTED_OPERATOR_PREFIX
+        if is_trusted_operator_peer(identity)
+        else PRIVACY_PREFIX
+    )
     return prefix.format(peer=identity) + filter_inbound((text or "").strip())
 
 

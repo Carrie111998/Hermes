@@ -144,7 +144,11 @@ class TestTrustedOperatorPeers:
         monkeypatch.setattr(
             config,
             "load_config_readonly",
-            lambda: {"a2a": {"trusted_operator_peers": ["alice", " bob ", ""]}},
+            lambda: {
+                "a2a": {
+                    "trusted_operator_peers": ["alice", " bob ", "", None, 42]
+                }
+            },
         )
         assert security.get_trusted_operator_peers() == {"alice", "bob"}
 
