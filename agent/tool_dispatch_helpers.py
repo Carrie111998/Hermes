@@ -72,6 +72,12 @@ _PATH_SCOPED_WRITERS = frozenset({"write_file", "patch"})
 # File tools can run concurrently when they target independent paths.
 _PATH_SCOPED_TOOLS = _PATH_SCOPED_READERS | _PATH_SCOPED_WRITERS
 
+# Storage-artifact placeholder for image parts dropped from persisted
+# trajectories (#91548). Shared by every emission site so the wording
+# cannot drift apart; historical transcripts may still carry the old
+# "[screenshot]" spelling, so readers must tolerate both.
+IMAGE_PLACEHOLDER_TEXT = "[image not retained]"
+
 # Patterns that indicate a terminal command may modify/delete files.
 _DESTRUCTIVE_PATTERNS = re.compile(
     r"""(?:^|\s|&&|\|\||;|`)(?:
@@ -526,7 +532,7 @@ def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
         cleaned = []
         for p in content:
             if isinstance(p, dict) and p.get("type") in {"image", "image_url", "input_image"}:
-                cleaned.append({"type": "text", "text": "[image not retained]"})
+                cleaned.append({"type": "text", "text": IMAGE_PLACEHOLDER_TEXT})
             else:
                 cleaned.append(p)
         return {**msg, "content": cleaned}
