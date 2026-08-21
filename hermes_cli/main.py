@@ -11427,7 +11427,7 @@ def cmd_dashboard(args):
         logger.debug("terminal config → env bridge failed for dashboard/serve",
                      exc_info=True)
 
-    if _headless_backend:
+    if _headless_backend and os.environ.get("HERMES_DESKTOP") != "1":
         # Don't build the SPA, and tell mount_spa() (read at web_server import
         # below) to disable it even if a stray dist exists. Set it first.
         os.environ["HERMES_SERVE_HEADLESS"] = "1"
