@@ -175,6 +175,7 @@ interface SessionActionsOptions {
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   selectedStoredSessionId: string | null
   selectedStoredSessionIdRef: MutableRefObject<string | null>
+  selectedStoredSessionProfileRef?: MutableRefObject<string | null>
   sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>>
   syncSessionStateToView: (sessionId: string, state: ClientSessionState) => void
   updateSessionState: (
@@ -317,6 +318,7 @@ export function useSessionActions({
   runtimeIdByStoredSessionIdRef,
   selectedStoredSessionId,
   selectedStoredSessionIdRef,
+  selectedStoredSessionProfileRef,
   sessionStateByRuntimeIdRef,
   syncSessionStateToView,
   updateSessionState
@@ -324,6 +326,8 @@ export function useSessionActions({
   const { t } = useI18n()
   const copy = t.desktop
   const resumeRequestRef = useRef(0)
+  const fallbackSelectedProfileRef = useRef<string | null>(null)
+  const selectedProfileRef = selectedStoredSessionProfileRef ?? fallbackSelectedProfileRef
 
   // Follow auto-compression's stored-id rotation only while the exact runtime,
   // selection, and route intent still belong to the rotating conversation.
@@ -428,6 +432,7 @@ export function useSessionActions({
       activeSessionIdRef.current = null
       setSelectedStoredSessionId(null)
       selectedStoredSessionIdRef.current = null
+      selectedProfileRef.current = null
       setMessages([])
       setCurrentUsage({
         calls: 0,
@@ -468,7 +473,15 @@ export function useSessionActions({
       // Never clear the composer here — ChatBar's per-thread draft swap owns it.
       setFreshDraftReady(true)
     },
-    [activeSessionIdRef, busyRef, navigate, onFreshDraftRouteIntent, resetViewSync, selectedStoredSessionIdRef]
+    [
+      activeSessionIdRef,
+      busyRef,
+      navigate,
+      onFreshDraftRouteIntent,
+      resetViewSync,
+      selectedProfileRef,
+      selectedStoredSessionIdRef
+    ]
   )
 
   const createBackendSessionForSend = useCallback(
@@ -614,6 +627,7 @@ export function useSessionActions({
         const yoloArmed = $yoloActive.get()
         const runtimeInfo = applyRuntimeInfo(created.info)
         const runtimeProfile = normalizeProfileKey(typeof params.profile === 'string' ? params.profile : null)
+        selectedProfileRef.current = runtimeProfile
 
         updateSessionState(
           created.session_id,
@@ -642,6 +656,7 @@ export function useSessionActions({
       navigate,
       requestGateway,
       resetViewSync,
+      selectedProfileRef,
       selectedStoredSessionIdRef,
       updateSessionState
     ]
@@ -811,11 +826,24 @@ export function useSessionActions({
     async (storedSessionId: string, replaceRoute = false, capturedOwner?: SessionOwnerScope) => {
       const requestId = resumeRequestRef.current + 1
       resumeRequestRef.current = requestId
-      const resumedSameSelectedSession = selectedStoredSessionIdRef.current === storedSessionId
+      const requestedOwnerProfile =
+        typeof capturedOwner === 'string'
+          ? normalizeProfileKey(capturedOwner)
+          : capturedOwner
+            ? normalizeProfileKey(capturedOwner.profile)
+            : null
+      let resumeOwnerProfile = requestedOwnerProfile
+
+      const resumedSameSelectedSession =
+        selectedStoredSessionIdRef.current === storedSessionId &&
+        (requestedOwnerProfile === null || selectedProfileRef.current === requestedOwnerProfile)
+
       const resumeStartMessages = resumedSameSelectedSession ? $messages.get() : []
 
       const isCurrentResume = () =>
-        resumeRequestRef.current === requestId && selectedStoredSessionIdRef.current === storedSessionId
+        resumeRequestRef.current === requestId &&
+        selectedStoredSessionIdRef.current === storedSessionId &&
+        (resumeOwnerProfile === null || selectedProfileRef.current === resumeOwnerProfile)
 
       // Paint the click before the profile-resolve / gateway-swap awaits below,
       // so there's zero dead air: highlight the row instantly (the sidebar reads
@@ -830,6 +858,7 @@ export function useSessionActions({
       resetViewSync()
       setSelectedStoredSessionId(storedSessionId)
       selectedStoredSessionIdRef.current = storedSessionId
+      selectedProfileRef.current = requestedOwnerProfile
 
       // A session is EITHER the main thread OR a tile — never both. openSessionTile
       // enforces this from the tile side (it refuses to tile the selected session);
@@ -914,7 +943,7 @@ export function useSessionActions({
         return { runtimeId, state }
       }
 
-      if (!takeWarmCache(ownerProfile)) {
+      if (!takeWarmCache(requestedOwnerProfile ?? undefined)) {
         setActiveSessionId(null)
         activeSessionIdRef.current = null
         // History load is not turn-busy. Drop the previous session's leftover
@@ -953,6 +982,8 @@ export function useSessionActions({
       }
 
       const resolvedConnectionId = ownerRoute?.connectionId || storedForProfile?.connection_id || ambientConnectionId
+      resumeOwnerProfile = normalizeProfileKey(sessionProfile)
+      selectedProfileRef.current = resumeOwnerProfile
 
       // A row spliced from a CONNECTED registry gateway (#88880) carries its
       // owning connection. A row fetched directly after activating a registry
@@ -1379,7 +1410,7 @@ export function useSessionActions({
       if (!resumedSameSelectedSession && $messages.get().length === 0) {
         const cachedTail = loadTranscriptTail(storedSessionId, sessionRestScope)
 
-        if (cachedTail && selectedStoredSessionIdRef.current === storedSessionId) {
+        if (cachedTail && isCurrentResume()) {
           cachedTailPaint = cachedTail
           setMessages(cachedTail)
         }
@@ -1828,7 +1859,7 @@ export function useSessionActions({
           let stillListed = false
 
           try {
-            stillListed = Boolean(await resolveStoredSession(storedSessionId))
+            stillListed = Boolean(await resolveStoredSession(storedSessionId, sessionProfile))
           } catch {
             // Resolution itself failed — inconclusive, treat as not listed.
           }
@@ -1894,6 +1925,7 @@ export function useSessionActions({
       requestGateway,
       resetViewSync,
       runtimeIdByStoredSessionIdRef,
+      selectedProfileRef,
       selectedStoredSessionIdRef,
       sessionStateByRuntimeIdRef,
       startFreshSessionDraft,
@@ -2225,7 +2257,7 @@ export function useSessionActions({
         dropTranscriptTailEverywhere(storedSessionId)
         // Only after the RPC lands — the optimistic eviction above can roll
         // back, and a rolled-back row must keep its watermark/marker.
-        forgetSessionUnread(removedIds, profile)
+        forgetSessionUnread(removedIds, removed?.profile)
         clearQueuedPrompts(storedSessionId)
 
         if (closingRuntimeId) {
