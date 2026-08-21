@@ -470,3 +470,25 @@ class TestExplicitBaseUrlCredentialLeak:
         )
         assert client is not None
         assert client.api_key == "sk-openai-env-secret"
+
+    def test_suffix_spoof_hosts_do_not_get_env_key(self, tmp_path, monkeypatch):
+        """FAIL-CLOSED guards for lookalike hosts (suggested in the #91308
+        review): the OpenAI-host gate is only as strong as
+        base_url_host_matches, so pin the negative cases — a looser future
+        matcher must fail loudly here instead of silently leaking the env
+        key."""
+        from agent.auxiliary_client import resolve_provider_client
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-env-secret")
+        for spoof in (
+            "https://api.openai.com.evil.test/v1",       # suffix spoof
+            "https://openai.azure.com.evil.test/v1",      # azure suffix spoof
+            "https://api.openai.com@evil.test/v1",        # userinfo trick
+        ):
+            client, _model = resolve_provider_client(
+                "custom",
+                model="test-model",
+                explicit_base_url=spoof,
+            )
+            assert client is not None, spoof
+            assert client.api_key != "sk-openai-env-secret", spoof
+            assert client.api_key == "no-key-required", spoof
