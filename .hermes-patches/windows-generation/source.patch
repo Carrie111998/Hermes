@@ -1,0 +1,2067 @@
+diff --git a/hermes_cli/update_cmd.py b/hermes_cli/update_cmd.py
+index f41a37fb67bc9b4ec3bb7de7a133304fd3a60dce..06e3c034792b23453b0eee391f917ed233569568 100644
+--- a/hermes_cli/update_cmd.py
++++ b/hermes_cli/update_cmd.py
+@@ -5076,0 +5077,27 @@ def _cmd_update_impl(args, gateway_mode: bool):
++    generation_resume = None
++    if sys.platform == "win32":
++        from hermes_cli.update_generation import (
++            UpdateTransactionError,
++            begin_dependency_handoff,
++            discover_transaction,
++            mark_runtime_settling,
++        )
++
++        try:
++            generation_resume = discover_transaction(_m().PROJECT_ROOT)
++        except UpdateTransactionError as exc:
++            print("✗ Cannot trust the pending Windows update transaction:")
++            print(f"  {exc}")
++            print("  Inspect or remove ~/.hermes/.hermes-update-transaction.json, then retry.")
++            sys.exit(1)
++
++        if generation_resume is not None and generation_resume.phase in {
++            "source_settled",
++            "dependency_handoff",
++            "dependencies_installing",
++        }:
++            print("→ Resuming the generation-bound dependency handoff...")
++            begin_dependency_handoff(generation_resume)
++        if generation_resume is not None and generation_resume.phase == "dependencies_settled":
++            generation_resume = mark_runtime_settling(generation_resume)
++
+@@ -5080,2 +5107,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
+-    active_lazy_features = _m()._capture_active_lazy_features()
+-    active_tool_dependencies = _m()._capture_active_tool_dependencies()
++    if generation_resume is not None:
++        active_lazy_features = generation_resume.active_lazy_features
++        active_tool_dependencies = generation_resume.active_tool_dependencies
++    else:
++        active_lazy_features = _m()._capture_active_lazy_features()
++        active_tool_dependencies = _m()._capture_active_tool_dependencies()
+@@ -5085 +5116,5 @@ def _cmd_update_impl(args, gateway_mode: bool):
+-    pre_update_version = _read_project_version()
++    pre_update_version = (
++        generation_resume.pre_update_version
++        if generation_resume is not None
++        else _read_project_version()
++    )
+@@ -5173 +5208,5 @@ def _cmd_update_impl(args, gateway_mode: bool):
+-    pre_update_snapshot_id = _m()._run_pre_update_backup(args)
++    pre_update_snapshot_id = (
++        generation_resume.pre_update_snapshot_id
++        if generation_resume is not None
++        else _m()._run_pre_update_backup(args)
++    )
+@@ -5185 +5224,5 @@ def _cmd_update_impl(args, gateway_mode: bool):
+-    _windows_gateway_resume = _m()._pause_windows_gateways_for_update()
++    _windows_gateway_resume = (
++        generation_resume.gateway_resume
++        if generation_resume is not None
++        else _m()._pause_windows_gateways_for_update()
++    )
+@@ -5322 +5365,5 @@ def _cmd_update_impl(args, gateway_mode: bool):
+-    had_desktop_app_before_update = _desktop_app_present(desktop_dir)
++    had_desktop_app_before_update = (
++        generation_resume.had_desktop_app_before_update
++        if generation_resume is not None
++        else _desktop_app_present(desktop_dir)
++    )
+@@ -5416,7 +5463,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
+-        print("→ Fetching updates...")
+-        fetch_result = subprocess.run(
+-            git_cmd + ["fetch", "origin", branch],
+-            cwd=_m().PROJECT_ROOT,
+-            capture_output=True,
+-            text=True, encoding="utf-8", errors="replace",
+-        )
++        if generation_resume is not None:
++            print(
++                "→ Source generation already settled at "
++                f"{generation_resume.target_sha[:10]}; skipping network fetch"
++            )
++            fetch_result = subprocess.CompletedProcess(
++                git_cmd + ["fetch", "origin", branch], 0, "", ""
++            )
++        else:
++            print("→ Fetching updates...")
++            fetch_result = subprocess.run(
++                git_cmd + ["fetch", "origin", branch],
++                cwd=_m().PROJECT_ROOT,
++                capture_output=True,
++                text=True, encoding="utf-8", errors="replace",
++            )
+@@ -5532,8 +5588,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
+-        result = subprocess.run(
+-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+-            cwd=_m().PROJECT_ROOT,
+-            capture_output=True,
+-            text=True, encoding="utf-8", errors="replace",
+-            check=True,
+-        )
+-        commit_count = int(result.stdout.strip())
++        if generation_resume is not None:
++            resume_head = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
++            if resume_head != generation_resume.target_sha:
++                raise RuntimeError(
++                    "update transaction target no longer matches checkout HEAD"
++                )
++            commit_count = 1
++        else:
++            result = subprocess.run(
++                git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
++                cwd=_m().PROJECT_ROOT,
++                capture_output=True,
++                text=True, encoding="utf-8", errors="replace",
++                check=True,
++            )
++            commit_count = int(result.stdout.strip())
+@@ -5550 +5614 @@ def _cmd_update_impl(args, gateway_mode: bool):
+-        if commit_count > 0 and apply_is_shallow:
++        if generation_resume is None and commit_count > 0 and apply_is_shallow:
+@@ -5716 +5780,4 @@ def _cmd_update_impl(args, gateway_mode: bool):
+-        print("→ Pulling updates...")
++        if generation_resume is not None:
++            print("→ Verifying the settled source generation...")
++        else:
++            print("→ Pulling updates...")
+@@ -5723 +5790,5 @@ def _cmd_update_impl(args, gateway_mode: bool):
+-        pre_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
++        pre_pull_sha = (
++            generation_resume.previous_sha
++            if generation_resume is not None
++            else _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
++        )
+@@ -5731,6 +5802,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
+-            pull_result = subprocess.run(
+-                git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
+-                cwd=_m().PROJECT_ROOT,
+-                capture_output=True,
+-                text=True, encoding="utf-8", errors="replace",
+-            )
++            if generation_resume is not None:
++                pull_result = subprocess.CompletedProcess(
++                    git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
++                    0,
++                    "",
++                    "",
++                )
++            else:
++                pull_result = subprocess.run(
++                    git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
++                    cwd=_m().PROJECT_ROOT,
++                    capture_output=True,
++                    text=True, encoding="utf-8", errors="replace",
++                )
+@@ -5905,0 +5985,32 @@ def _cmd_update_impl(args, gateway_mode: bool):
++        if sys.platform == "win32" and generation_resume is None:
++            from hermes_cli.update_generation import (
++                begin_dependency_handoff,
++                create_transaction,
++            )
++
++            target_sha = post_pull_sha or _capture_head_sha(
++                git_cmd, _m().PROJECT_ROOT
++            )
++            if not pre_pull_sha or not target_sha:
++                raise RuntimeError(
++                    "cannot establish exact source generations for Windows update handoff"
++                )
++            transaction = create_transaction(
++                project_root=_m().PROJECT_ROOT,
++                previous_sha=pre_pull_sha,
++                target_sha=target_sha,
++                branch=branch,
++                argv=sys.argv[1:],
++                pre_update_version=pre_update_version,
++                pre_update_snapshot_id=pre_update_snapshot_id,
++                had_desktop_app_before_update=had_desktop_app_before_update,
++                gateway_resume=_windows_gateway_resume,
++                active_lazy_features=active_lazy_features,
++                active_tool_dependencies=active_tool_dependencies,
++            )
++            print(
++                "→ Source settled; crossing the Windows process-generation "
++                "barrier before dependency mutation..."
++            )
++            begin_dependency_handoff(transaction)
++
+@@ -5914,2 +6025,5 @@ def _cmd_update_impl(args, gateway_mode: bool):
+-        deps_current = _editable_install_is_current(
+-            git_cmd, _m().PROJECT_ROOT, pre_pull_sha
++        deps_current = (
++            generation_resume is not None
++            or _editable_install_is_current(
++                git_cmd, _m().PROJECT_ROOT, pre_pull_sha
++            )
+@@ -6438,5 +6552,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
+-        _print_update_summary(
+-            node_failures=node_failures,
+-            desktop_build_ok=desktop_build_ok,
+-            pre_update_version=pre_update_version,
+-        )
++        # A generation-bound Windows update is not terminal yet: managed
++        # processes still need to restart and attest the target generation.
++        if generation_resume is None:
++            _print_update_summary(
++                node_failures=node_failures,
++                desktop_build_ok=desktop_build_ok,
++                pre_update_version=pre_update_version,
++            )
++
+@@ -6551 +6669,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
+-            _write_gateway_update_exit_code(desktop_build_ok)
++            # Publish failure/unknown until the generation transaction reaches
++            # exact runtime attestation. A process killed by its own restart
++            # must never leave behind a false-success receipt.
++            _write_gateway_update_exit_code(
++                False if generation_resume is not None else desktop_build_ok
++            )
++
+@@ -7411,0 +7536,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
++        _generation_partial_reasons: list[str] = []
++        if generation_resume is not None:
++            from hermes_cli.update_generation import settlement_partial_reasons
++
++            _generation_partial_reasons = settlement_partial_reasons(
++                generation_resume,
++                active_executable=sys.executable,
++                node_failures=node_failures,
++                desktop_build_ok=desktop_build_ok,
++            )
++
+@@ -7416 +7551,3 @@ def _cmd_update_impl(args, gateway_mode: bool):
+-                "partial" if gateway_fleet_restart_incomplete else "success",
++                "partial"
++                if gateway_fleet_restart_incomplete or _generation_partial_reasons
++                else "success",
+@@ -7423,0 +7561,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
++        if _generation_partial_reasons:
++            from hermes_cli.update_generation import mark_partial
++
++            reason = "; ".join(_generation_partial_reasons)
++            print()
++            print("⚠ Update partially complete — " + reason + ".")
++            mark_partial(generation_resume, reason)
++            if gateway_mode:
++                _write_gateway_update_exit_code(False)
++            sys.exit(1)
++
+@@ -7424,0 +7573,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
++            if generation_resume is not None:
++                from hermes_cli.update_generation import mark_partial
++
++                reason = (
++                    "one or more managed gateways did not attest the target generation"
++                )
++                print()
++                print("⚠ Update partially complete — " + reason + ".")
++                mark_partial(
++                    generation_resume,
++                    reason,
++                    exit_code=1,
++                )
++                if gateway_mode:
++                    _write_gateway_update_exit_code(False)
+@@ -7429,0 +7593,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
++        if generation_resume is not None:
++            from hermes_cli.update_generation import mark_complete
++
++            mark_complete(generation_resume)
++            if gateway_mode:
++                _write_gateway_update_exit_code(True)
++            _print_update_summary(
++                node_failures=[],
++                desktop_build_ok=True,
++                pre_update_version=pre_update_version,
++            )
++
+@@ -7430,0 +7606,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
++        if generation_resume is not None:
++            from hermes_cli.update_generation import mark_failed
++
++            mark_failed(generation_resume, f"post-settlement subprocess failed: {e}")
++            print(f"✗ Target-generation settlement failed: {e}")
++            sys.exit(1)
+@@ -7450,0 +7632,37 @@ def _cmd_update_impl(args, gateway_mode: bool):
++    except SystemExit as exc:
++        if generation_resume is not None:
++            from hermes_cli.update_generation import (
++                mark_failed,
++                read_transaction,
++            )
++
++            try:
++                terminal = read_transaction(
++                    Path(generation_resume.journal_path),
++                    token=generation_resume.token,
++                )
++            except Exception:
++                terminal = None
++            if terminal is not None and terminal.phase not in {
++                "complete",
++                "partial",
++                "failed",
++            }:
++                code = exc.code if isinstance(exc.code, int) else 1
++                mark_failed(
++                    generation_resume,
++                    f"target-generation settlement exited before a terminal verdict ({code})",
++                    exit_code=code or 1,
++                )
++        raise
++
++    except BaseException as exc:
++        if generation_resume is not None:
++            from hermes_cli.update_generation import mark_failed
++
++            mark_failed(
++                generation_resume,
++                f"target-generation settlement raised {type(exc).__name__}: {exc}",
++            )
++        raise
++
+diff --git a/hermes_cli/update_generation.py b/hermes_cli/update_generation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5449c3431f7942b28d0fc87080734efe840876d5
+--- /dev/null
++++ b/hermes_cli/update_generation.py
+@@ -0,0 +1,630 @@
++"""Generation-bound update transaction support.
++
++This module is deliberately stdlib-only.  ``hermes update`` imports it in the
++old (pre-pull) interpreter, while ``update_generation_worker.py`` imports the
++same file after the checkout has moved.  Keeping the transaction vocabulary
++free of project and third-party imports is what lets the old process hand off
++mutation authority before any target-generation dependency is imported.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import errno
++import hmac
++import json
++import os
++import secrets
++import shutil
++import subprocess
++import sys
++import time
++import uuid
++from dataclasses import asdict, dataclass, field
++from pathlib import Path
++from typing import Any, Mapping, NoReturn, Sequence
++
++TRANSACTION_SCHEMA_VERSION = 1
++TRANSACTION_FILE_NAME = ".hermes-update-transaction.json"
++TRANSACTION_PATH_ENV = "HERMES_UPDATE_TRANSACTION"
++TRANSACTION_TOKEN_ENV = "HERMES_UPDATE_TRANSACTION_TOKEN"
++TRANSACTION_RESUME_ENV = "HERMES_UPDATE_GENERATION_RESUME"
++HANDOFF_PID_ENV = "HERMES_UPDATE_HANDOFF_PID"
++
++_PHASES = {
++    "source_settled",
++    "dependency_handoff",
++    "dependencies_installing",
++    "dependencies_settled",
++    "runtime_settling",
++    "complete",
++    "partial",
++    "failed",
++}
++
++
++class UpdateTransactionError(RuntimeError):
++    """The durable transaction cannot be trusted or advanced."""
++
++
++@dataclass(frozen=True)
++class UpdateTransaction:
++    schema_version: int
++    transaction_id: str
++    token: str
++    project_root: str
++    journal_path: str
++    marker_path: str
++    previous_sha: str
++    target_sha: str
++    branch: str
++    phase: str
++    parent_pid: int
++    argv: list[str]
++    created_at: float
++    updated_at: float
++    worker_pid: int | None = None
++    pre_update_version: str | None = None
++    pre_update_snapshot_id: str | None = None
++    had_desktop_app_before_update: bool = False
++    gateway_resume: Any = None
++    active_lazy_features: Any = field(default_factory=list)
++    active_tool_dependencies: Any = field(default_factory=list)
++    optional_dependency_failures: list[str] = field(default_factory=list)
++    runtime_receipt: dict[str, str] | None = None
++    exit_code: int | None = None
++    error: str | None = None
++
++    @classmethod
++    def from_mapping(cls, raw: Mapping[str, Any]) -> "UpdateTransaction":
++        try:
++            tx = cls(**dict(raw))
++        except (TypeError, ValueError) as exc:
++            raise UpdateTransactionError(f"invalid update transaction: {exc}") from exc
++        tx.validate()
++        return tx
++
++    def validate(self) -> None:
++        if self.schema_version != TRANSACTION_SCHEMA_VERSION:
++            raise UpdateTransactionError(
++                f"unsupported update transaction schema {self.schema_version}"
++            )
++        try:
++            uuid.UUID(self.transaction_id)
++        except (ValueError, TypeError) as exc:
++            raise UpdateTransactionError("invalid transaction id") from exc
++        if len(self.token) < 32:
++            raise UpdateTransactionError("transaction token is missing or too short")
++        if self.phase not in _PHASES:
++            raise UpdateTransactionError(f"unknown transaction phase {self.phase!r}")
++        if self.parent_pid <= 0:
++            raise UpdateTransactionError("invalid transaction parent pid")
++        if self.worker_pid is not None and self.worker_pid <= 0:
++            raise UpdateTransactionError("invalid transaction worker pid")
++        for label, sha in (
++            ("previous", self.previous_sha),
++            ("target", self.target_sha),
++        ):
++            if len(sha) != 40 or any(ch not in "0123456789abcdef" for ch in sha.lower()):
++                raise UpdateTransactionError(
++                    f"transaction {label} source generation is not a full Git SHA"
++                )
++        if not self.branch or any(ch in self.branch for ch in "\r\n\x00"):
++            raise UpdateTransactionError("transaction is missing a safe target branch")
++        if not isinstance(self.argv, list) or not all(
++            isinstance(arg, str) for arg in self.argv
++        ):
++            raise UpdateTransactionError("transaction argv must contain only strings")
++        if self.runtime_receipt is not None and (
++            not isinstance(self.runtime_receipt, dict)
++            or not all(
++                isinstance(key, str) and isinstance(value, str)
++                for key, value in self.runtime_receipt.items()
++            )
++        ):
++            raise UpdateTransactionError(
++                "transaction runtime receipt must be a string mapping"
++            )
++        root = Path(self.project_root)
++        journal = Path(self.journal_path)
++        marker = Path(self.marker_path)
++        if not root.is_absolute() or not journal.is_absolute() or not marker.is_absolute():
++            raise UpdateTransactionError("transaction paths must be absolute")
++        if journal.parent.resolve() != marker.parent.resolve():
++            raise UpdateTransactionError(
++                "transaction journal and shared marker must have one ownership root"
++            )
++
++
++def _json_safe(value: Any, fallback: Any) -> Any:
++    """Return ``value`` when it survives a JSON round trip, else ``fallback``."""
++    try:
++        return json.loads(json.dumps(value))
++    except (TypeError, ValueError, OverflowError):
++        return fallback
++
++
++def _default_hermes_home(project_root: Path) -> Path:
++    configured = os.environ.get("HERMES_HOME", "").strip()
++    if configured:
++        return Path(configured).expanduser().resolve()
++    # Managed/source installs place the checkout at <HERMES_HOME>/hermes-agent.
++    # Falling back to the parent keeps the journal outside the tree that Git or
++    # the ZIP swap mutates.
++    return project_root.resolve().parent
++
++
++def default_transaction_path(project_root: Path) -> Path:
++    return _default_hermes_home(project_root) / TRANSACTION_FILE_NAME
++
++
++def default_marker_path(project_root: Path) -> Path:
++    return _default_hermes_home(project_root) / ".hermes-update-in-progress"
++
++
++def _fsync_parent(path: Path) -> None:
++    if os.name == "nt":
++        return
++    try:
++        fd = os.open(path.parent, os.O_RDONLY)
++    except OSError:
++        return
++    try:
++        os.fsync(fd)
++    except OSError:
++        pass
++    finally:
++        os.close(fd)
++
++
++def atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
++    """Publish JSON atomically with owner-only permissions.
++
++    A transaction journal authorizes dependency and process mutation.  A
++    partially-written or world-readable journal is therefore not acceptable.
++    """
++    path = path.resolve()
++    path.parent.mkdir(parents=True, exist_ok=True)
++    temp = path.with_name(
++        f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
++    )
++    payload = json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
++    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
++    fd = os.open(temp, flags, 0o600)
++    try:
++        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
++            handle.write(payload)
++            handle.flush()
++            os.fsync(handle.fileno())
++        os.replace(temp, path)
++        try:
++            os.chmod(path, 0o600)
++        except OSError:
++            pass
++        _fsync_parent(path)
++    except BaseException:
++        try:
++            temp.unlink()
++        except OSError:
++            pass
++        raise
++
++
++def read_transaction(path: Path, *, token: str | None = None) -> UpdateTransaction:
++    unresolved = path.expanduser().absolute()
++    try:
++        if unresolved.is_symlink():
++            raise UpdateTransactionError("transaction journal must not be a symlink")
++        path = unresolved.resolve()
++        raw = json.loads(path.read_text(encoding="utf-8"))
++    except UpdateTransactionError:
++        raise
++    except (OSError, json.JSONDecodeError) as exc:
++        raise UpdateTransactionError(f"cannot read update transaction: {exc}") from exc
++    if not isinstance(raw, dict):
++        raise UpdateTransactionError("update transaction must be a JSON object")
++    tx = UpdateTransaction.from_mapping(raw)
++    if Path(tx.journal_path).resolve() != path:
++        raise UpdateTransactionError("journal path does not match transaction")
++    if token is not None and not hmac.compare_digest(tx.token, token):
++        raise UpdateTransactionError("update transaction token mismatch")
++    return tx
++
++
++def _pid_alive(pid: int) -> bool:
++    """Return whether ``pid`` exists without sending it a signal on Windows."""
++    if pid <= 0:
++        return False
++    if pid == os.getpid():
++        return True
++    if os.name == "nt":
++        # PROCESS_QUERY_LIMITED_INFORMATION.  OpenProcess fails for a dead PID;
++        # ERROR_ACCESS_DENIED still proves that a protected process exists.
++        process_query_limited_information = 0x1000
++        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
++        handle = kernel32.OpenProcess(
++            process_query_limited_information, False, int(pid)
++        )
++        if handle:
++            kernel32.CloseHandle(handle)
++            return True
++        return ctypes.get_last_error() == 5
++    try:
++        os.kill(pid, 0)  # windows-footgun: ok -- guarded by the POSIX-only branch above
++    except ProcessLookupError:
++        return False
++    except PermissionError:
++        return True
++    except (OSError, OverflowError, ValueError):
++        return False
++    return True
++
++
++def _publish_marker_exclusive(path: Path, payload: str) -> bool:
++    """Publish a complete marker without exposing a zero-byte owner file."""
++    path.parent.mkdir(parents=True, exist_ok=True)
++    temp = path.with_name(
++        f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
++    )
++    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
++    try:
++        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
++            handle.write(payload)
++            handle.flush()
++            os.fsync(handle.fileno())
++        try:
++            os.link(temp, path)
++        except FileExistsError:
++            return False
++        except OSError as exc:
++            if exc.errno in {errno.EEXIST, errno.EACCES}:
++                # EACCES is how some Windows filesystems surface an existing
++                # destination.  The caller re-reads and validates the owner.
++                if path.exists():
++                    return False
++            raise UpdateTransactionError(
++                f"cannot atomically publish shared update marker: {exc}"
++            ) from exc
++        return True
++    finally:
++        try:
++            temp.unlink()
++        except OSError:
++            pass
++
++
++def _read_marker_owner(path: Path) -> int | None:
++    try:
++        return int(path.read_text(encoding="utf-8").splitlines()[0].strip())
++    except (OSError, IndexError, ValueError):
++        return None
++
++
++def claim_transaction_marker(tx: UpdateTransaction) -> None:
++    """Transfer the shared update lock to this transaction process.
++
++    ``os.execve`` uses a new PID on Windows.  The durable journal proves the
++    handoff, but the process-wide marker still names process N.  Before any
++    dependency mutation, process N+1 removes only an authorized or dead owner
++    and wins a new atomic marker claim.  A live unrelated claimant fails the
++    update closed.
++    """
++    marker = Path(tx.marker_path)
++    authorized = {tx.parent_pid, os.getpid()}
++    if tx.worker_pid is not None:
++        authorized.add(tx.worker_pid)
++
++    try:
++        orchestrator = int(os.environ.get(HANDOFF_PID_ENV, "0") or 0)
++    except ValueError:
++        orchestrator = 0
++
++    for _attempt in range(16):
++        owner = _read_marker_owner(marker)
++        if owner == os.getpid():
++            return
++        if orchestrator > 0 and owner == orchestrator and _pid_alive(owner):
++            # The outer GUI updater owns the process-wide marker for the whole
++            # transaction.  Do not steal it; the orchestrator remains alive
++            # while this child stage runs and removes its own marker afterward.
++            return
++        if owner is not None and owner not in authorized and _pid_alive(owner):
++            raise UpdateTransactionError(
++                f"another live updater owns the shared marker (PID {owner})"
++            )
++        if marker.exists():
++            try:
++                marker.unlink()
++            except FileNotFoundError:
++                continue
++            except OSError as exc:
++                raise UpdateTransactionError(
++                    f"cannot retire the previous update marker: {exc}"
++                ) from exc
++
++        if _publish_marker_exclusive(
++            marker, f"{os.getpid()}\n{int(time.time())}\n"
++        ):
++            return
++
++    raise UpdateTransactionError(
++        "shared update marker ownership kept changing during generation handoff"
++    )
++
++
++def current_head(project_root: Path) -> str | None:
++    try:
++        result = subprocess.run(
++            ["git", "rev-parse", "HEAD"],
++            cwd=project_root,
++            capture_output=True,
++            text=True,
++            encoding="utf-8",
++            errors="replace",
++            timeout=15,
++        )
++    except (OSError, subprocess.TimeoutExpired):
++        return None
++    if result.returncode != 0:
++        return None
++    return result.stdout.strip() or None
++
++
++def create_transaction(
++    *,
++    project_root: Path,
++    previous_sha: str,
++    target_sha: str,
++    branch: str,
++    argv: Sequence[str],
++    pre_update_version: str | None,
++    pre_update_snapshot_id: str | None,
++    had_desktop_app_before_update: bool,
++    gateway_resume: Any,
++    active_lazy_features: Any,
++    active_tool_dependencies: Any,
++    journal_path: Path | None = None,
++    marker_path: Path | None = None,
++    now: float | None = None,
++) -> UpdateTransaction:
++    root = project_root.expanduser().resolve()
++    path = (journal_path or default_transaction_path(root)).expanduser().resolve()
++    marker = (marker_path or default_marker_path(root)).expanduser().resolve()
++    timestamp = time.time() if now is None else float(now)
++    tx = UpdateTransaction(
++        schema_version=TRANSACTION_SCHEMA_VERSION,
++        transaction_id=str(uuid.uuid4()),
++        token=secrets.token_urlsafe(32),
++        project_root=str(root),
++        journal_path=str(path),
++        marker_path=str(marker),
++        previous_sha=previous_sha,
++        target_sha=target_sha,
++        branch=branch,
++        phase="source_settled",
++        parent_pid=os.getpid(),
++        argv=list(argv),
++        created_at=timestamp,
++        updated_at=timestamp,
++        pre_update_version=pre_update_version,
++        pre_update_snapshot_id=pre_update_snapshot_id,
++        had_desktop_app_before_update=bool(had_desktop_app_before_update),
++        gateway_resume=_json_safe(gateway_resume, None),
++        active_lazy_features=_json_safe(active_lazy_features, []),
++        active_tool_dependencies=_json_safe(active_tool_dependencies, []),
++    )
++    tx.validate()
++    atomic_write_json(path, asdict(tx))
++    return tx
++
++
++def replace_transaction(
++    tx: UpdateTransaction,
++    *,
++    expected_phases: set[str] | None = None,
++    **changes: Any,
++) -> UpdateTransaction:
++    current = read_transaction(Path(tx.journal_path), token=tx.token)
++    if current.transaction_id != tx.transaction_id:
++        raise UpdateTransactionError("transaction generation changed")
++    if expected_phases is not None and current.phase not in expected_phases:
++        raise UpdateTransactionError(
++            f"cannot advance transaction from phase {current.phase!r}"
++        )
++    data = asdict(current)
++    data.update(changes)
++    data["updated_at"] = time.time()
++    updated = UpdateTransaction.from_mapping(data)
++    atomic_write_json(Path(updated.journal_path), asdict(updated))
++    return updated
++
++
++def discover_transaction(project_root: Path) -> UpdateTransaction | None:
++    """Load an unfinished journal, including crash-recovery discovery."""
++    env_path = os.environ.get(TRANSACTION_PATH_ENV, "").strip()
++    env_token = os.environ.get(TRANSACTION_TOKEN_ENV, "").strip() or None
++    path = Path(env_path) if env_path else default_transaction_path(project_root)
++    if not path.exists():
++        return None
++    tx = read_transaction(path, token=env_token)
++    if Path(tx.project_root).resolve() != project_root.resolve():
++        raise UpdateTransactionError("transaction belongs to another checkout")
++    if tx.phase in {"complete", "partial", "failed"}:
++        return None
++    head = current_head(project_root)
++    if head is None or head != tx.target_sha:
++        raise UpdateTransactionError(
++            "checkout generation does not match the durable update transaction"
++        )
++    return tx
++
++
++def venv_python(project_root: Path) -> Path:
++    candidates = (
++        project_root / "venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python"),
++        project_root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python"),
++    )
++    for candidate in candidates:
++        if candidate.is_file():
++            return candidate.resolve()
++    return Path(sys.executable).resolve()
++
++
++def worker_exec_argv(tx: UpdateTransaction) -> list[str]:
++    python = venv_python(Path(tx.project_root))
++    script = Path(__file__).with_name("update_generation_worker.py").resolve()
++    # ``-S`` prevents site initialization and editable-install .pth files
++    # from importing generation-N packages before the worker has settled N+1.
++    return [str(python), "-S", str(script), "--journal", tx.journal_path]
++
++
++def handoff_environment(tx: UpdateTransaction) -> dict[str, str]:
++    env = dict(os.environ)
++    env[TRANSACTION_PATH_ENV] = tx.journal_path
++    env[TRANSACTION_TOKEN_ENV] = tx.token
++    env.pop(TRANSACTION_RESUME_ENV, None)
++    env["PYTHONDONTWRITEBYTECODE"] = "1"
++    return env
++
++
++def begin_dependency_handoff(tx: UpdateTransaction) -> NoReturn:
++    """Replace process N with the stdlib-only dependency worker.
++
++    ``execve`` is load-bearing: process N must cease to exist before any file
++    in its venv can be replaced.  Spawning and waiting would keep N's mapped
++    native extensions alive; spawning and returning would break the caller's
++    completion/exit-code contract.
++    """
++    advanced = replace_transaction(
++        tx,
++        expected_phases={"source_settled", "dependency_handoff", "dependencies_installing"},
++        phase="dependency_handoff",
++        parent_pid=os.getpid(),
++        worker_pid=None,
++        error=None,
++        exit_code=None,
++    )
++    argv = worker_exec_argv(advanced)
++    env = handoff_environment(advanced)
++    for stream in (sys.stdout, sys.stderr):
++        try:
++            stream.flush()
++        except Exception:
++            pass
++    os.execve(argv[0], argv, env)
++    raise AssertionError("os.execve returned")
++
++
++def resume_environment(tx: UpdateTransaction) -> dict[str, str]:
++    env = dict(os.environ)
++    env[TRANSACTION_PATH_ENV] = tx.journal_path
++    env[TRANSACTION_TOKEN_ENV] = tx.token
++    env[TRANSACTION_RESUME_ENV] = "1"
++    return env
++
++
++def mark_runtime_settling(tx: UpdateTransaction) -> UpdateTransaction:
++    return replace_transaction(
++        tx,
++        expected_phases={"dependencies_settled", "runtime_settling"},
++        phase="runtime_settling",
++    )
++
++
++def settlement_partial_reasons(
++    tx: UpdateTransaction,
++    *,
++    active_executable: str,
++    node_failures: Sequence[str],
++    desktop_build_ok: bool,
++) -> list[str]:
++    """Explain why generation N+1 cannot be declared fully settled."""
++    reasons: list[str] = []
++    receipt_executable = (tx.runtime_receipt or {}).get("executable")
++    if not receipt_executable:
++        reasons.append(
++            "target Python runtime did not provide a durable provenance receipt"
++        )
++    elif os.path.normcase(os.path.realpath(receipt_executable)) != os.path.normcase(
++        os.path.realpath(active_executable)
++    ):
++        reasons.append(
++            "active Python runtime does not match the dependency-settlement receipt"
++        )
++    if tx.optional_dependency_failures:
++        reasons.append(
++            "Python optional groups failed: "
++            + ", ".join(tx.optional_dependency_failures)
++        )
++    if node_failures:
++        reasons.append("Node.js dependency refresh failed: " + ", ".join(node_failures))
++    if not desktop_build_ok:
++        reasons.append("Desktop realization did not settle")
++    return reasons
++
++
++def mark_complete(tx: UpdateTransaction) -> None:
++    updated = replace_transaction(
++        tx,
++        expected_phases={"runtime_settling", "dependencies_settled"},
++        phase="complete",
++        exit_code=0,
++        error=None,
++    )
++    remove_owned_marker(updated)
++    path = Path(updated.journal_path)
++    try:
++        path.unlink()
++        _fsync_parent(path)
++    except OSError:
++        # A terminal journal is safe to leave behind; discovery ignores it.
++        pass
++
++
++def mark_partial(tx: UpdateTransaction, reason: str, *, exit_code: int = 1) -> None:
++    replace_transaction(
++        tx,
++        expected_phases=None,
++        phase="partial",
++        exit_code=int(exit_code),
++        error=str(reason)[:4000],
++    )
++
++
++def mark_failed(tx: UpdateTransaction, error: str, *, exit_code: int = 1) -> None:
++    replace_transaction(
++        tx,
++        expected_phases=None,
++        phase="failed",
++        exit_code=int(exit_code),
++        error=str(error)[:4000],
++    )
++
++
++def remove_owned_marker(tx: UpdateTransaction) -> None:
++    """Remove the shared marker only when this process still owns it."""
++    marker = Path(tx.marker_path)
++    try:
++        lines = marker.read_text(encoding="utf-8").splitlines()
++        owner = int(lines[0].strip())
++    except (OSError, IndexError, ValueError):
++        return
++    if owner != os.getpid():
++        return
++    try:
++        marker.unlink()
++    except OSError:
++        pass
++
++
++def find_uv(project_root: Path) -> str | None:
++    home = _default_hermes_home(project_root)
++    executable = "uv.exe" if os.name == "nt" else "uv"
++    candidates = (
++        home / "bin" / executable,
++        project_root / ".hermes-runtime" / "bin" / executable,
++    )
++    for candidate in candidates:
++        if candidate.is_file():
++            return str(candidate.resolve())
++    return shutil.which(executable)
+diff --git a/hermes_cli/update_generation_worker.py b/hermes_cli/update_generation_worker.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..95538715e26e683a0f2cbed38138da804d434950
+--- /dev/null
++++ b/hermes_cli/update_generation_worker.py
+@@ -0,0 +1,325 @@
++"""Stdlib-only dependency realization worker for ``hermes update``.
++
++This file is executed by path, not imported through ``hermes_cli.main``.  The
++old updater process has been replaced before this module starts, so no module
++from generation N and no target venv native extension remains mapped while the
++dependency graph for N+1 is realized.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++# Executing this file directly places hermes_cli/ on sys.path.  Import the
++# stdlib-only sibling without importing the full hermes_cli package.
++import update_generation as generation
++
++
++def _parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(add_help=False)
++    parser.add_argument("--journal", required=True)
++    return parser.parse_args()
++
++
++def _write_incomplete_marker(project_root: Path) -> Path:
++    marker = project_root / ".update-incomplete"
++    temp = marker.with_name(f".{marker.name}.{os.getpid()}.tmp")
++    body = (
++        f"pid={os.getpid()}\n"
++        f"created_at={int(time.time())}\n"
++        "reason=generation-bound-dependency-install\n"
++    )
++    temp.write_text(body, encoding="utf-8")
++    os.replace(temp, marker)
++    return marker
++
++
++def _optional_groups(project_root: Path) -> list[str]:
++    try:
++        import tomllib
++
++        with open(project_root / "pyproject.toml", "rb") as handle:
++            data = tomllib.load(handle)
++    except Exception:
++        return []
++    groups = (data.get("project") or {}).get("optional-dependencies") or {}
++    if not isinstance(groups, dict):
++        return []
++    # Alias/meta groups often expand to other extras and are still valid
++    # editable-install targets.  Preserve manifest order for deterministic
++    # receipts and stop only on the base install, not on one optional group.
++    return [
++        str(name)
++        for name in groups
++        if str(name).strip() and str(name) not in {"all", "termux-all"}
++    ]
++
++
++def _run(command: list[str], *, cwd: Path, env: dict[str, str]) -> int:
++    print("  $ " + " ".join(command), flush=True)
++    try:
++        result = subprocess.run(command, cwd=cwd, env=env)
++    except OSError as exc:
++        print(f"  ✗ could not launch dependency installer: {exc}", file=sys.stderr)
++        return 127
++    return int(result.returncode)
++
++
++def _pip_prefix(project_root: Path) -> tuple[list[str], dict[str, str]]:
++    env = dict(os.environ)
++    env.pop("PYTHONHOME", None)
++    env.pop("PYTHONPATH", None)
++    env["PYTHONDONTWRITEBYTECODE"] = "1"
++    env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
++    if os.name == "nt":
++        # Copy semantics are slower but avoid hardlink/reflink surprises in a
++        # venv that Windows processes and endpoint security inspect live.
++        env.setdefault("UV_LINK_MODE", "copy")
++    if (project_root / "venv").is_dir():
++        venv = project_root / "venv"
++    elif (project_root / ".venv").is_dir():
++        venv = project_root / ".venv"
++    else:
++        venv = project_root / "venv"
++    env["VIRTUAL_ENV"] = str(venv)
++    uv = generation.find_uv(project_root)
++    if not generation.venv_python(project_root).is_relative_to(venv.resolve()):
++        if not uv:
++            raise RuntimeError("managed venv is missing and uv is unavailable")
++        print("→ Recreating the managed virtual environment before dependency realization...")
++        if _run([uv, "venv", "--clear", str(venv)], cwd=project_root, env=env) != 0:
++            raise RuntimeError("managed venv recreation failed")
++    python = generation.venv_python(project_root)
++    if not python.is_relative_to(venv.resolve()):
++        raise RuntimeError("managed venv recreation did not produce its Python interpreter")
++    if uv:
++        # Name the target interpreter explicitly.  VIRTUAL_ENV remains in the
++        # environment for build hooks, but it is not the authority deciding
++        # which environment uv mutates.
++        return [uv, "pip", "install", "--python", str(python)], env
++
++    # The worker itself is stdlib-only, so invoking this interpreter does not
++    # map any target site-package extension before pip attempts replacement.
++    subprocess.run(
++        [str(python), "-m", "ensurepip", "--upgrade", "--default-pip"],
++        cwd=project_root,
++        env=env,
++        stdout=subprocess.DEVNULL,
++        stderr=subprocess.DEVNULL,
++        check=False,
++    )
++    return [str(python), "-m", "pip", "install"], env
++
++
++
++
++def _wait_for_predecessor_exit(
++    tx: generation.UpdateTransaction, *, timeout_seconds: float = 30.0
++) -> None:
++    """Fence Windows' spawn-backed ``execve`` before mutating the venv.
++
++    POSIX ``execve`` keeps one PID, but CPython's Windows overlay can briefly
++    run the replacement while process N is still exiting.  Process N may have
++    native extensions mapped from the target venv, so N+1 must prove that the
++    predecessor is gone before it invokes uv/pip.
++    """
++    if tx.parent_pid == os.getpid():
++        return
++    deadline = time.monotonic() + max(float(timeout_seconds), 0.0)
++    while generation._pid_alive(tx.parent_pid):
++        if time.monotonic() >= deadline:
++            raise generation.UpdateTransactionError(
++                f"predecessor updater PID {tx.parent_pid} did not exit before dependency mutation"
++            )
++        time.sleep(0.05)
++
++
++def _verify_target_environment(
++    project_root: Path, env: dict[str, str]
++) -> tuple[bool, dict[str, str] | str]:
++    """Prove the interpreter users will execute can import this checkout."""
++    python = generation.venv_python(project_root)
++    expected_root = str(project_root.resolve())
++    probe = r"""
++import json
++import os
++import pathlib
++import sys
++
++expected = pathlib.Path(os.environ["HERMES_EXPECTED_PROJECT_ROOT"]).resolve()
++import hermes_cli.main as main_module
++import yaml
++import cryptography
++
++module_path = pathlib.Path(main_module.__file__).resolve()
++if expected != module_path and expected not in module_path.parents:
++    raise SystemExit(41)
++print(json.dumps({
++    "executable": sys.executable,
++    "prefix": sys.prefix,
++    "main": str(module_path),
++}, sort_keys=True))
++"""
++    probe_env = dict(env)
++    probe_env["HERMES_EXPECTED_PROJECT_ROOT"] = expected_root
++    try:
++        result = subprocess.run(
++            [str(python), "-I", "-c", probe],
++            cwd=project_root,
++            env=probe_env,
++            capture_output=True,
++            text=True,
++            encoding="utf-8",
++            errors="replace",
++            timeout=90,
++        )
++    except (OSError, subprocess.TimeoutExpired) as exc:
++        return False, str(exc)
++    if result.returncode != 0:
++        detail = (result.stderr or result.stdout or "import probe failed").strip()
++        return False, detail[-4000:]
++    try:
++        receipt = json.loads((result.stdout or "").strip())
++    except json.JSONDecodeError as exc:
++        return False, f"runtime probe returned an invalid receipt: {exc}"
++    if not isinstance(receipt, dict) or not all(
++        isinstance(key, str) and isinstance(value, str)
++        for key, value in receipt.items()
++    ):
++        return False, "runtime probe receipt is not a string mapping"
++    return True, receipt
++
++
++def _realize_dependencies(
++    tx: generation.UpdateTransaction,
++) -> tuple[bool, list[str], dict[str, str] | None]:
++    root = Path(tx.project_root)
++    prefix, env = _pip_prefix(root)
++
++    print("→ Realizing target-generation Python dependencies in a clean process...")
++    full = [*prefix, "-e", ".[all]"]
++    failures: list[str] = []
++    if _run(full, cwd=root, env=env) != 0:
++        print("  ⚠ Combined optional install failed; preserving the base install and retrying extras individually.")
++        if _run([*prefix, "-e", "."], cwd=root, env=env) != 0:
++            return False, ["base"], None
++
++        for group in _optional_groups(root):
++            if _run([*prefix, "-e", f".[{group}]"], cwd=root, env=env) != 0:
++                failures.append(group)
++                print(
++                    f"  ⚠ Optional dependency group {group!r} could not be refreshed; continuing with the verified base install.",
++                    file=sys.stderr,
++                )
++
++    verified, receipt_or_error = _verify_target_environment(root, env)
++    if not verified:
++        print(
++            "  ✗ Target environment import/provenance probe failed: "
++            + str(receipt_or_error),
++            file=sys.stderr,
++        )
++        return False, ["runtime-probe"], None
++    receipt = receipt_or_error
++    assert isinstance(receipt, dict)
++    print("  ✓ Target environment verified: " + json.dumps(receipt, sort_keys=True))
++    return True, failures, receipt
++
++
++def _main() -> int:
++    args = _parse_args()
++    journal = Path(args.journal).expanduser().resolve()
++    try:
++        token = os.environ.get(generation.TRANSACTION_TOKEN_ENV, "")
++        if not token:
++            raise generation.UpdateTransactionError(
++                "generation worker is missing its transaction capability"
++            )
++        tx = generation.read_transaction(journal, token=token)
++        _wait_for_predecessor_exit(tx)
++        generation.claim_transaction_marker(tx)
++        head = generation.current_head(Path(tx.project_root))
++        if head != tx.target_sha:
++            raise generation.UpdateTransactionError(
++                f"worker checkout is {head or 'unknown'}, expected {tx.target_sha}"
++            )
++        tx = generation.replace_transaction(
++            tx,
++            expected_phases={
++                "source_settled",
++                "dependency_handoff",
++                "dependencies_installing",
++            },
++            phase="dependencies_installing",
++            worker_pid=os.getpid(),
++            error=None,
++            exit_code=None,
++        )
++    except Exception as exc:
++        print(f"✗ Cannot resume update transaction: {exc}", file=sys.stderr)
++        return 1
++
++    incomplete = _write_incomplete_marker(Path(tx.project_root))
++    try:
++        ok, optional_failures, runtime_receipt = _realize_dependencies(tx)
++        if not ok:
++            generation.mark_failed(
++                tx,
++                "target-generation base dependency installation failed",
++                exit_code=1,
++            )
++            generation.remove_owned_marker(tx)
++            print(
++                "✗ Dependency realization failed. The source generation is settled and the durable journal was retained for diagnosis.",
++                file=sys.stderr,
++            )
++            return 1
++
++        try:
++            incomplete.unlink()
++        except OSError:
++            pass
++        tx = generation.replace_transaction(
++            tx,
++            expected_phases={"dependencies_installing"},
++            phase="dependencies_settled",
++            optional_dependency_failures=optional_failures,
++            runtime_receipt=runtime_receipt,
++            error=None,
++            exit_code=None,
++        )
++
++        command_args = list(tx.argv)
++        if not command_args or command_args[0] != "update":
++            command_args.insert(0, "update")
++        python = generation.venv_python(Path(tx.project_root))
++        argv = [str(python), "-m", "hermes_cli.main", *command_args]
++        env = generation.resume_environment(tx)
++        print("→ Dependency generation settled; continuing migrations, builds, and runtime activation in process N+1...")
++        for stream in (sys.stdout, sys.stderr):
++            try:
++                stream.flush()
++            except Exception:
++                pass
++        os.execve(argv[0], argv, env)
++        raise AssertionError("os.execve returned")
++    except SystemExit:
++        raise
++    except BaseException as exc:
++        try:
++            generation.mark_failed(tx, f"generation worker failed: {exc}", exit_code=1)
++            generation.remove_owned_marker(tx)
++        except Exception:
++            pass
++        print(f"✗ Generation worker failed: {exc}", file=sys.stderr)
++        return 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(_main())
+diff --git a/hermes_cli/update_lock.py b/hermes_cli/update_lock.py
+index 964638df05636ee5cfa96e5a651ac84964b34df6..f722222f5e210875134f8ea777cb436ab2040940 100644
+--- a/hermes_cli/update_lock.py
++++ b/hermes_cli/update_lock.py
+@@ -162,0 +163,25 @@ def _is_ancestor_pid(pid: int) -> bool:
++def _generation_resume_requested() -> bool:
++    """Whether the current process carries a complete generation-resume handoff.
++
++    A marker owned by our own pid is otherwise ambiguous: it can be the claim
++    inherited across ``execve``, or it can belong to an earlier ``UpdateLock``
++    instance in the same process. Only the worker's complete transaction env
++    triplet permits adoption. The durable journal and token are validated by
++    the update command immediately after this lock boundary.
++    """
++    try:
++        from hermes_cli.update_generation import (
++            TRANSACTION_PATH_ENV,
++            TRANSACTION_RESUME_ENV,
++            TRANSACTION_TOKEN_ENV,
++        )
++    except Exception as exc:
++        logger.debug("Could not load generation resume contract: %s", exc)
++        return False
++    return (
++        os.environ.get(TRANSACTION_RESUME_ENV) == "1"
++        and bool(os.environ.get(TRANSACTION_PATH_ENV, "").strip())
++        and bool(os.environ.get(TRANSACTION_TOKEN_ENV, "").strip())
++    )
++
++
+@@ -168,0 +194 @@ class UpdateHolder:
++    detail: str | None = None
+@@ -207,0 +234,2 @@ def describe_holder(holder: UpdateHolder) -> str:
++    if holder.detail:
++        return holder.detail
+@@ -219,0 +248,39 @@ def describe_holder(holder: UpdateHolder) -> str:
++def _publish_update_marker_exclusive(path: Path, payload: str) -> bool | None:
++    """Publish a complete marker iff no marker exists.
++
++    Writing directly to an ``O_EXCL``-created authoritative path still leaves
++    a race: another reader can observe the zero-byte file, classify it as a
++    malformed/stale marker, and unlink it before the owner finishes writing.
++    Write and fsync a private file first, then hard-link that complete inode
++    into the authoritative name. ``link`` is atomic and refuses to replace an
++    existing owner on both NTFS and POSIX filesystems.
++
++    Returns ``True`` when this process won, ``False`` when another owner
++    already exists, and ``None`` when the filesystem cannot publish the claim.
++    """
++    try:
++        path.parent.mkdir(parents=True, exist_ok=True)
++        temp = path.with_name(
++            f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
++        )
++        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
++        try:
++            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
++                handle.write(payload)
++                handle.flush()
++                os.fsync(handle.fileno())
++            try:
++                os.link(temp, path)
++            except FileExistsError:
++                return False
++            return True
++        finally:
++            try:
++                temp.unlink()
++            except OSError:
++                pass
++    except OSError as exc:
++        logger.debug("Could not atomically publish update marker %s: %s", path, exc)
++        return None
++
++
+@@ -244,0 +312,39 @@ class UpdateLock:
++        # The filesystem create is the authority.  A read-before-write check
++        # alone lets two updaters both observe no marker and then overwrite it.
++        for _attempt in range(8):
++            existing = read_live_update(path=self.path)
++            if existing is not None:
++                if existing.pid == os.getpid() and _generation_resume_requested():
++                    # A generation-bound exec keeps the transaction inside
++                    # one process identity; the final generation adopts the
++                    # same claim so it can release it normally.
++                    self.acquired = True
++                    return True
++                if existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid):
++                    return True
++                self.holder = existing
++                return False
++
++            published = _publish_update_marker_exclusive(
++                self.path,
++                f"{os.getpid()}\n{int(time.time())}\n",
++            )
++            if published is True:
++                self.acquired = True
++                return True
++            if published is False:
++                # Another claimant won after our read. Re-read its complete
++                # marker and authorize only a real handoff/ancestor.
++                continue
++            self.holder = UpdateHolder(
++                pid=0,
++                age_seconds=0.0,
++                detail=(
++                    "✗ Hermes could not acquire the update ownership marker.\n"
++                    f"  Path: {self.path}\n"
++                    "  The update is refusing to mutate the installation without "
++                    "exclusive ownership."
++                ),
++            )
++            return False
++
+@@ -247,2 +352,0 @@ class UpdateLock:
+-            if existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid):
+-                return True
+@@ -251,13 +355,11 @@ class UpdateLock:
+-        try:
+-            self.path.parent.mkdir(parents=True, exist_ok=True)
+-            self.path.write_text(
+-                f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8"
+-            )
+-        except OSError as exc:
+-            # Best-effort, exactly like the Rust guard: an unwritable marker
+-            # must not block the update itself (that would be a worse failure
+-            # than the race it prevents). Degrade to the pre-lock behavior.
+-            logger.debug("Could not write update marker %s: %s", self.path, exc)
+-            return True
+-        self.acquired = True
+-        return True
++        logger.warning("Update marker ownership kept changing; refusing concurrent update")
++        self.holder = UpdateHolder(
++            pid=0,
++            age_seconds=0.0,
++            detail=(
++                "✗ Hermes could not establish exclusive update ownership because "
++                "the marker kept changing. Retry after the other updater exits."
++            ),
++        )
++        return False
++
+diff --git a/tests/hermes_cli/test_update_generation.py b/tests/hermes_cli/test_update_generation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7075e6bac7aff5833b09007ee9935cf57c290978
+--- /dev/null
++++ b/tests/hermes_cli/test_update_generation.py
+@@ -0,0 +1,525 @@
++from __future__ import annotations
++
++import importlib.util
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++ROOT = Path(__file__).resolve().parents[2]
++MODULE = ROOT / "hermes_cli" / "update_generation.py"
++WORKER_MODULE = ROOT / "hermes_cli" / "update_generation_worker.py"
++
++spec = importlib.util.spec_from_file_location("update_generation", MODULE)
++assert spec and spec.loader
++update_generation = importlib.util.module_from_spec(spec)
++sys.modules["update_generation"] = update_generation
++spec.loader.exec_module(update_generation)
++
++worker_spec = importlib.util.spec_from_file_location(
++    "update_generation_worker", WORKER_MODULE
++)
++assert worker_spec and worker_spec.loader
++update_generation_worker = importlib.util.module_from_spec(worker_spec)
++worker_spec.loader.exec_module(update_generation_worker)
++
++
++def _repo(tmp_path: Path) -> tuple[Path, str, str]:
++    root = tmp_path / "home" / "hermes-agent"
++    root.mkdir(parents=True)
++    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
++    subprocess.run(["git", "config", "user.name", "test"], cwd=root, check=True)
++    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
++    (root / "tracked.txt").write_text("n\n", encoding="utf-8")
++    subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
++    subprocess.run(["git", "commit", "-qm", "n"], cwd=root, check=True)
++    previous = subprocess.check_output(
++        ["git", "rev-parse", "HEAD"], cwd=root, encoding="ascii"
++    ).strip()
++    (root / "tracked.txt").write_text("n+1\n", encoding="utf-8")
++    subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
++    subprocess.run(["git", "commit", "-qm", "n+1"], cwd=root, check=True)
++    target = subprocess.check_output(
++        ["git", "rev-parse", "HEAD"], cwd=root, encoding="ascii"
++    ).strip()
++    return root, previous, target
++
++
++def _transaction(tmp_path: Path):
++    root, previous, target = _repo(tmp_path)
++    tx = update_generation.create_transaction(
++        project_root=root,
++        previous_sha=previous,
++        target_sha=target,
++        branch="main",
++        argv=["update", "--yes", "--gateway"],
++        pre_update_version="0.20.4",
++        pre_update_snapshot_id="snap-1",
++        had_desktop_app_before_update=True,
++        gateway_resume={"profiles": ["default"]},
++        active_lazy_features=["provider.bedrock"],
++        active_tool_dependencies=[{"name": "boto3"}],
++    )
++    return tx, root
++
++
++def test_journal_is_owner_only_atomic_and_token_bound(tmp_path, monkeypatch):
++    root, previous, target = _repo(tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(root.parent))
++    tx = update_generation.create_transaction(
++        project_root=root,
++        previous_sha=previous,
++        target_sha=target,
++        branch="main",
++        argv=["update"],
++        pre_update_version=None,
++        pre_update_snapshot_id=None,
++        had_desktop_app_before_update=False,
++        gateway_resume=None,
++        active_lazy_features=[],
++        active_tool_dependencies=[],
++    )
++
++    path = Path(tx.journal_path)
++    assert path.parent == root.parent
++    assert path.exists()
++    if os.name != "nt":
++        assert path.stat().st_mode & 0o077 == 0
++    assert not list(path.parent.glob(f".{path.name}.*.tmp"))
++    assert update_generation.read_transaction(path, token=tx.token) == tx
++    with pytest.raises(update_generation.UpdateTransactionError, match="token"):
++        update_generation.read_transaction(path, token="x" * 43)
++
++
++def test_discovery_refuses_checkout_generation_drift(tmp_path, monkeypatch):
++    tx, root = _transaction(tmp_path)
++    monkeypatch.setenv(update_generation.TRANSACTION_PATH_ENV, tx.journal_path)
++    monkeypatch.setenv(update_generation.TRANSACTION_TOKEN_ENV, tx.token)
++    assert update_generation.discover_transaction(root) == tx
++
++    (root / "tracked.txt").write_text("n+2\n", encoding="utf-8")
++    subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
++    subprocess.run(["git", "commit", "-qm", "n+2"], cwd=root, check=True)
++    with pytest.raises(update_generation.UpdateTransactionError, match="generation"):
++        update_generation.discover_transaction(root)
++
++
++def test_phase_transition_is_compare_and_swap(tmp_path):
++    tx, _root = _transaction(tmp_path)
++    settling = update_generation.replace_transaction(
++        tx,
++        expected_phases={"source_settled"},
++        phase="dependency_handoff",
++    )
++    assert settling.phase == "dependency_handoff"
++    with pytest.raises(update_generation.UpdateTransactionError, match="cannot advance"):
++        update_generation.replace_transaction(
++            tx,
++            expected_phases={"source_settled"},
++            phase="dependencies_installing",
++        )
++
++
++def test_begin_handoff_execs_worker_instead_of_spawning_and_waiting(tmp_path, monkeypatch):
++    tx, _root = _transaction(tmp_path)
++    seen = {}
++
++    def fake_execve(executable, argv, env):
++        seen.update(executable=executable, argv=argv, env=env)
++        raise RuntimeError("exec sentinel")
++
++    monkeypatch.setattr(os, "execve", fake_execve)
++    with pytest.raises(RuntimeError, match="exec sentinel"):
++        update_generation.begin_dependency_handoff(tx)
++
++    persisted = update_generation.read_transaction(Path(tx.journal_path), token=tx.token)
++    assert persisted.phase == "dependency_handoff"
++    assert persisted.parent_pid == os.getpid()
++    assert seen["argv"][1] == "-S"
++    assert seen["argv"][2].endswith("update_generation_worker.py")
++    assert "--token" not in seen["argv"]
++    assert seen["env"][update_generation.TRANSACTION_PATH_ENV] == tx.journal_path
++    assert seen["env"][update_generation.TRANSACTION_TOKEN_ENV] == tx.token
++    assert update_generation.TRANSACTION_RESUME_ENV not in seen["env"]
++
++
++def test_dependency_worker_falls_back_to_base_and_individual_extras(tmp_path, monkeypatch):
++    tx, _root = _transaction(tmp_path)
++    commands: list[list[str]] = []
++
++    monkeypatch.setattr(
++        update_generation_worker,
++        "_pip_prefix",
++        lambda _root: (["uv", "pip", "install"], {}),
++    )
++    monkeypatch.setattr(
++        update_generation_worker,
++        "_optional_groups",
++        lambda _root: ["alpha", "beta"],
++    )
++
++    def fake_run(command, *, cwd, env):
++        commands.append(command)
++        if command[-1] == ".[all]":
++            return 1
++        if command[-1] == ".[beta]":
++            return 1
++        return 0
++
++    monkeypatch.setattr(update_generation_worker, "_run", fake_run)
++    monkeypatch.setattr(
++        update_generation_worker,
++        "_verify_target_environment",
++        lambda _root, _env: (True, {"main": "verified"}),
++    )
++    ok, failures, receipt = update_generation_worker._realize_dependencies(tx)
++
++    assert ok is True
++    assert failures == ["beta"]
++    assert receipt == {"main": "verified"}
++    assert commands == [
++        ["uv", "pip", "install", "-e", ".[all]"],
++        ["uv", "pip", "install", "-e", "."],
++        ["uv", "pip", "install", "-e", ".[alpha]"],
++        ["uv", "pip", "install", "-e", ".[beta]"],
++    ]
++
++
++def test_base_dependency_failure_is_terminal(tmp_path, monkeypatch):
++    tx, _root = _transaction(tmp_path)
++    monkeypatch.setattr(
++        update_generation_worker,
++        "_pip_prefix",
++        lambda _root: (["uv", "pip", "install"], {}),
++    )
++    monkeypatch.setattr(update_generation_worker, "_optional_groups", lambda _root: [])
++    monkeypatch.setattr(update_generation_worker, "_run", lambda *a, **k: 1)
++    monkeypatch.setattr(
++        update_generation_worker,
++        "_verify_target_environment",
++        lambda _root, _env: (True, {"main": "verified"}),
++    )
++
++    ok, failures, receipt = update_generation_worker._realize_dependencies(tx)
++    assert ok is False
++    assert failures == ["base"]
++    assert receipt is None
++
++
++def test_mark_complete_removes_journal(tmp_path):
++    tx, _root = _transaction(tmp_path)
++    tx = update_generation.replace_transaction(
++        tx,
++        expected_phases={"source_settled"},
++        phase="dependencies_settled",
++    )
++    tx = update_generation.mark_runtime_settling(tx)
++    update_generation.mark_complete(tx)
++    assert not Path(tx.journal_path).exists()
++
++
++def test_json_unsafe_snapshots_fail_closed_to_empty_values(tmp_path):
++    root, previous, target = _repo(tmp_path)
++    tx = update_generation.create_transaction(
++        project_root=root,
++        previous_sha=previous,
++        target_sha=target,
++        branch="main",
++        argv=["update"],
++        pre_update_version=None,
++        pre_update_snapshot_id=None,
++        had_desktop_app_before_update=False,
++        gateway_resume=object(),
++        active_lazy_features={object()},
++        active_tool_dependencies=object(),
++    )
++    assert tx.gateway_resume is None
++    assert tx.active_lazy_features == []
++    assert tx.active_tool_dependencies == []
++
++
++def test_generation_handoff_reclaims_the_parent_marker(tmp_path):
++    tx, _root = _transaction(tmp_path)
++    marker = Path(tx.marker_path)
++    marker.write_text(
++        f"{tx.parent_pid}\n{int(update_generation.time.time())}\n",
++        encoding="utf-8",
++    )
++
++    update_generation.claim_transaction_marker(tx)
++
++    owner = int(marker.read_text(encoding="utf-8").splitlines()[0])
++    assert owner == os.getpid()
++
++
++def test_generation_handoff_preserves_live_gui_orchestrator_marker(
++    tmp_path, monkeypatch
++):
++    tx, _root = _transaction(tmp_path)
++    marker = Path(tx.marker_path)
++    marker.write_text(
++        f"{os.getpid()}\n{int(update_generation.time.time())}\n",
++        encoding="utf-8",
++    )
++    tx = update_generation.replace_transaction(
++        tx,
++        parent_pid=os.getpid() + 100000,
++        worker_pid=os.getpid() + 100001,
++    )
++    monkeypatch.setenv(update_generation.HANDOFF_PID_ENV, str(os.getpid()))
++
++    update_generation.claim_transaction_marker(tx)
++
++    assert int(marker.read_text(encoding="utf-8").splitlines()[0]) == os.getpid()
++
++
++def test_generation_handoff_refuses_a_live_unrelated_owner(tmp_path):
++    tx, _root = _transaction(tmp_path)
++    blocker = subprocess.Popen(
++        [sys.executable, "-c", "import time; time.sleep(30)"]
++    )
++    try:
++        tx = update_generation.replace_transaction(
++            tx,
++            parent_pid=os.getpid() + 100000,
++            worker_pid=os.getpid() + 100001,
++        )
++        marker = Path(tx.marker_path)
++        marker.write_text(
++            f"{blocker.pid}\n{int(update_generation.time.time())}\n",
++            encoding="utf-8",
++        )
++
++        with pytest.raises(
++            update_generation.UpdateTransactionError, match="live updater"
++        ):
++            update_generation.claim_transaction_marker(tx)
++    finally:
++        blocker.terminate()
++        blocker.wait(timeout=10)
++
++
++def test_generation_handoff_reclaims_a_dead_unrelated_owner(tmp_path, monkeypatch):
++    tx, _root = _transaction(tmp_path)
++    marker = Path(tx.marker_path)
++    marker.write_text("4294967294\n1\n", encoding="utf-8")
++    monkeypatch.setattr(update_generation, "_pid_alive", lambda _pid: False)
++
++    update_generation.claim_transaction_marker(tx)
++
++    owner = int(marker.read_text(encoding="utf-8").splitlines()[0])
++    assert owner == os.getpid()
++
++
++def test_generation_handoff_fails_closed_when_atomic_publish_is_unavailable(
++    tmp_path, monkeypatch
++):
++    tx, _root = _transaction(tmp_path)
++    marker = Path(tx.marker_path)
++    marker.unlink(missing_ok=True)
++
++    def fail_link(_src, _dst):
++        raise OSError("hard links unavailable")
++
++    monkeypatch.setattr(os, "link", fail_link)
++    with pytest.raises(
++        update_generation.UpdateTransactionError,
++        match="atomically publish",
++    ):
++        update_generation.claim_transaction_marker(tx)
++
++
++def test_partial_is_terminal_but_retained_for_diagnosis(tmp_path, monkeypatch):
++    tx, root = _transaction(tmp_path)
++    tx = update_generation.replace_transaction(
++        tx,
++        expected_phases={"source_settled"},
++        phase="runtime_settling",
++    )
++    update_generation.mark_partial(tx, "desktop realization failed")
++
++    retained = update_generation.read_transaction(
++        Path(tx.journal_path), token=tx.token
++    )
++    assert retained.phase == "partial"
++    assert retained.exit_code == 1
++    assert "desktop" in (retained.error or "")
++
++    monkeypatch.setenv(update_generation.TRANSACTION_PATH_ENV, tx.journal_path)
++    monkeypatch.setenv(update_generation.TRANSACTION_TOKEN_ENV, tx.token)
++    assert update_generation.discover_transaction(root) is None
++
++
++def test_terminal_journal_does_not_block_a_later_checkout_generation(
++    tmp_path, monkeypatch
++):
++    tx, root = _transaction(tmp_path)
++    update_generation.mark_failed(tx, "old failed attempt")
++    (root / "tracked.txt").write_text("later\n", encoding="utf-8")
++    subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
++    subprocess.run(["git", "commit", "-qm", "later"], cwd=root, check=True)
++    monkeypatch.setenv(update_generation.TRANSACTION_PATH_ENV, tx.journal_path)
++
++    assert update_generation.discover_transaction(root) is None
++
++
++def test_worker_requires_transaction_token_in_environment(tmp_path, monkeypatch):
++    tx, _root = _transaction(tmp_path)
++    monkeypatch.setattr(
++        sys,
++        "argv",
++        ["update_generation_worker.py", "--journal", tx.journal_path],
++    )
++    monkeypatch.delenv(update_generation.TRANSACTION_TOKEN_ENV, raising=False)
++
++    assert update_generation_worker._main() == 1
++    persisted = update_generation.read_transaction(Path(tx.journal_path), token=tx.token)
++    assert persisted.phase == "source_settled"
++
++
++def test_transaction_rejects_abbreviated_source_generations(tmp_path):
++    tx, _root = _transaction(tmp_path)
++    raw = update_generation.asdict(tx)
++    raw["target_sha"] = tx.target_sha[:10]
++
++    with pytest.raises(
++        update_generation.UpdateTransactionError,
++        match="full Git SHA",
++    ):
++        update_generation.UpdateTransaction.from_mapping(raw)
++
++
++def test_transaction_rejects_marker_in_another_ownership_root(tmp_path):
++    tx, _root = _transaction(tmp_path)
++    raw = update_generation.asdict(tx)
++    raw["marker_path"] = str((tmp_path / "other" / "marker").resolve())
++
++    with pytest.raises(
++        update_generation.UpdateTransactionError,
++        match="one ownership root",
++    ):
++        update_generation.UpdateTransaction.from_mapping(raw)
++
++
++def test_runtime_probe_failure_prevents_dependency_settlement(tmp_path, monkeypatch):
++    tx, _root = _transaction(tmp_path)
++    monkeypatch.setattr(
++        update_generation_worker,
++        "_pip_prefix",
++        lambda _root: (["uv", "pip", "install"], {}),
++    )
++    monkeypatch.setattr(update_generation_worker, "_run", lambda *a, **k: 0)
++    monkeypatch.setattr(
++        update_generation_worker,
++        "_verify_target_environment",
++        lambda _root, _env: (False, "wrong source root"),
++    )
++
++    ok, failures, receipt = update_generation_worker._realize_dependencies(tx)
++
++    assert ok is False
++    assert failures == ["runtime-probe"]
++    assert receipt is None
++
++
++def test_worker_waits_for_predecessor_to_exit_before_mutation(tmp_path, monkeypatch):
++    tx, _root = _transaction(tmp_path)
++    tx = update_generation.replace_transaction(
++        tx, parent_pid=os.getpid() + 100000
++    )
++    probes = iter([True, True, False])
++    sleeps = []
++    monkeypatch.setattr(
++        update_generation, "_pid_alive", lambda _pid: next(probes)
++    )
++    monkeypatch.setattr(update_generation_worker.time, "sleep", sleeps.append)
++
++    update_generation_worker._wait_for_predecessor_exit(
++        tx, timeout_seconds=1.0
++    )
++
++    assert sleeps == [0.05, 0.05]
++
++
++def test_worker_refuses_dependency_mutation_while_predecessor_is_live(
++    tmp_path, monkeypatch
++):
++    tx, _root = _transaction(tmp_path)
++    tx = update_generation.replace_transaction(
++        tx, parent_pid=os.getpid() + 100000
++    )
++    monkeypatch.setattr(update_generation, "_pid_alive", lambda _pid: True)
++
++    with pytest.raises(
++        update_generation.UpdateTransactionError, match="did not exit"
++    ):
++        update_generation_worker._wait_for_predecessor_exit(
++            tx, timeout_seconds=0.0
++        )
++
++
++def test_runtime_receipt_is_durable_and_typed(tmp_path):
++    tx, _root = _transaction(tmp_path)
++    receipt = {
++        "executable": "C:/Hermes/venv/Scripts/python.exe",
++        "prefix": "C:/Hermes/venv",
++        "main": "C:/Hermes/hermes-agent/hermes_cli/main.py",
++    }
++    settled = update_generation.replace_transaction(
++        tx,
++        expected_phases={"source_settled"},
++        phase="dependencies_settled",
++        runtime_receipt=receipt,
++    )
++    reread = update_generation.read_transaction(
++        Path(settled.journal_path), token=settled.token
++    )
++    assert reread.runtime_receipt == receipt
++
++    raw = update_generation.asdict(reread)
++    raw["runtime_receipt"] = {"main": 42}
++    with pytest.raises(
++        update_generation.UpdateTransactionError, match="runtime receipt"
++    ):
++        update_generation.UpdateTransaction.from_mapping(raw)
++
++
++def test_settlement_partial_reasons_accept_exact_runtime_receipt(tmp_path):
++    tx, _root = _transaction(tmp_path)
++    tx = update_generation.replace_transaction(
++        tx,
++        runtime_receipt={"executable": sys.executable},
++    )
++
++    assert (
++        update_generation.settlement_partial_reasons(
++            tx,
++            active_executable=sys.executable,
++            node_failures=[],
++            desktop_build_ok=True,
++        )
++        == []
++    )
++
++
++def test_settlement_partial_reasons_aggregate_every_unsettled_component(tmp_path):
++    tx, _root = _transaction(tmp_path)
++    tx = update_generation.replace_transaction(
++        tx,
++        runtime_receipt={"executable": str(tmp_path / "other-python")},
++        optional_dependency_failures=["beta"],
++    )
++
++    assert update_generation.settlement_partial_reasons(
++        tx,
++        active_executable=sys.executable,
++        node_failures=["npm"],
++        desktop_build_ok=False,
++    ) == [
++        "active Python runtime does not match the dependency-settlement receipt",
++        "Python optional groups failed: beta",
++        "Node.js dependency refresh failed: npm",
++        "Desktop realization did not settle",
++    ]
+diff --git a/tests/hermes_cli/test_update_lock.py b/tests/hermes_cli/test_update_lock.py
+index 912d217d898eb12665a25f3bb417731a7f73c2ab..d4ead169aa6bc9644998864b5107712df9d1bd94 100644
+--- a/tests/hermes_cli/test_update_lock.py
++++ b/tests/hermes_cli/test_update_lock.py
+@@ -18,0 +19 @@ from __future__ import annotations
++import multiprocessing
+@@ -20,0 +22 @@ import time
++from pathlib import Path
+@@ -23,0 +26,5 @@ import pytest
++from hermes_cli.update_generation import (
++    TRANSACTION_PATH_ENV,
++    TRANSACTION_RESUME_ENV,
++    TRANSACTION_TOKEN_ENV,
++)
+@@ -77,0 +85,36 @@ def test_second_acquire_is_refused_while_the_first_is_live(marker):
++def test_generation_reexec_same_pid_adopts_and_releases_its_existing_claim(
++    marker, monkeypatch
++):
++    marker.write_text(f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8")
++    monkeypatch.setenv(TRANSACTION_PATH_ENV, str(marker.with_suffix(".json")))
++    monkeypatch.setenv(TRANSACTION_TOKEN_ENV, "generation-token")
++    monkeypatch.setenv(TRANSACTION_RESUME_ENV, "1")
++
++    lock = UpdateLock(path=marker)
++    assert lock.acquire() is True
++    assert lock.acquired is True
++
++    lock.release()
++    assert not marker.exists()
++
++
++@pytest.mark.parametrize(
++    "missing",
++    [TRANSACTION_PATH_ENV, TRANSACTION_TOKEN_ENV, TRANSACTION_RESUME_ENV],
++    ids=["path", "token", "resume"],
++)
++def test_same_pid_claim_requires_complete_generation_handoff(
++    marker, monkeypatch, missing
++):
++    marker.write_text(f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8")
++    monkeypatch.setenv(TRANSACTION_PATH_ENV, str(marker.with_suffix(".json")))
++    monkeypatch.setenv(TRANSACTION_TOKEN_ENV, "generation-token")
++    monkeypatch.setenv(TRANSACTION_RESUME_ENV, "1")
++    monkeypatch.delenv(missing)
++
++    lock = UpdateLock(path=marker)
++    assert lock.acquire() is False
++    assert lock.holder is not None
++    assert lock.acquired is False
++
++
+@@ -168,6 +211,2 @@ def test_describe_holder_names_the_pid_and_elapsed_time(marker):
+-def test_unwritable_marker_location_does_not_block_the_update(tmp_path):
+-    """Degrade to pre-lock behavior rather than refusing to update at all.
+-
+-    An unwritable marker path is a worse reason to block an update than the
+-    race the lock prevents.
+-    """
++def test_unwritable_marker_location_refuses_unowned_mutation(tmp_path):
++    """An updater without a durable exclusive claim must fail closed."""
+@@ -177,2 +216,40 @@ def test_unwritable_marker_location_does_not_block_the_update(tmp_path):
+-    assert lock.acquire() is True
+-    assert lock.acquired is False, "nothing was written, so there is nothing to release"
++    assert lock.acquire() is False
++    assert lock.acquired is False
++    assert lock.holder is not None
++    assert "exclusive ownership" in describe_holder(lock.holder)
++
++
++def _race_for_update_lock(path: str, start, release, outcomes) -> None:
++    lock = UpdateLock(path=Path(path))
++    start.wait(timeout=10)
++    acquired = lock.acquire()
++    outcomes.put(acquired)
++    if acquired:
++        release.wait(timeout=10)
++        lock.release()
++
++
++def test_concurrent_claimants_have_exactly_one_owner(marker):
++    """The filesystem publication closes UpdateLock.acquire's TOCTOU."""
++    ctx = multiprocessing.get_context("spawn")
++    start = ctx.Event()
++    release = ctx.Event()
++    outcomes = ctx.Queue()
++    processes = [
++        ctx.Process(
++            target=_race_for_update_lock,
++            args=(str(marker), start, release, outcomes),
++        )
++        for _ in range(8)
++    ]
++    for process in processes:
++        process.start()
++    start.set()
++    results = [outcomes.get(timeout=15) for _ in processes]
++    release.set()
++    for process in processes:
++        process.join(timeout=15)
++        assert process.exitcode == 0
++
++    assert results.count(True) == 1
++    assert results.count(False) == 7
