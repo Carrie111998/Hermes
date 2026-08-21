@@ -187,6 +187,22 @@ class TestToolSurfaceSwap:
         names = {t["function"]["name"] for t in defs}
         assert "browser_exec" in names
 
+    def test_browser_use_toolset_exposes_only_browser_exec(self, monkeypatch):
+        monkeypatch.setattr(bu_cli, "is_browser_use_cli_mode", lambda: True)
+        from tools.registry import registry
+
+        entry = registry.get_entry("browser_exec")
+        monkeypatch.setattr(entry, "check_fn", lambda: True)
+        import model_tools
+
+        defs = model_tools.get_tool_definitions(
+            enabled_toolsets=["browser-use", "file", "terminal"], quiet_mode=False
+        )
+        names = {tool["function"]["name"] for tool in defs}
+        browser_names = {name for name in names if name.startswith("browser_")}
+        assert browser_names == {"browser_exec"}
+        assert "web_search" not in names
+
 
 class TestFindCli:
     """The tests/tools conftest pins _find_cli to None (host isolation);
