@@ -356,6 +356,7 @@ def test_unrestricted_daemon_serve_command_unchanged(monkeypatch):
     command = captured["command"]
     assert "--dangerously-bypass-approvals" in command
     assert "--capability-manifest" not in command
+    assert "--grant" not in command
 
 
 # ── standard-mode --grant existing-profile ──────────────────────────────
