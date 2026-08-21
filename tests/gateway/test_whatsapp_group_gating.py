@@ -99,6 +99,17 @@ def test_regex_mention_patterns_allow_custom_wake_words():
     assert adapter._should_process_message(_group_message("hey chompy")) is False
 
 
+def test_rico_fallback_pattern_requires_at_symbol():
+    adapter = _make_adapter(
+        require_mention=True,
+        mention_patterns=[r"(?<![\w@])@(?:rico|hermes)\b"],
+        group_policy="open",
+    )
+
+    assert adapter._should_process_message(_group_message("@Rico status")) is True
+    assert adapter._should_process_message(_group_message("Rico status")) is False
+
+
 def test_invalid_regex_patterns_are_ignored():
     adapter = _make_adapter(
         require_mention=True,
