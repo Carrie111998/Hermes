@@ -4902,6 +4902,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_print_curator_first_run_notice",
         "_print_curator_recent_run_notice",
         "_print_fts_optimize_available_notice",
+        "_print_parked_branch_kept_notice",
         "_print_parked_branch_skip_warning",
         "_print_stash_cleanup_guidance",
         "_print_update_completion",
@@ -10077,6 +10078,22 @@ def cmd_update(args):
 
     if is_managed():
         managed_error("update Hermes Agent")
+        return
+
+    # --plan is read-only and deployment-kind aware, so it runs BEFORE the
+    # docker/nix/apt refusal gates: on an image-managed or package-managed
+    # install the plan itself reports "not updatable in place" plus the
+    # right mechanism — strictly more useful than the bare refusal text.
+    if getattr(args, "plan", False):
+        # Read-only plan phase (#91277 Phase 2): inventory every running
+        # Hermes runtime across profiles, its supervisor, and its running
+        # code version — without mutating anything. Safe on a live fleet.
+        from hermes_cli.update_inventory import (
+            collect_runtime_inventory,
+            print_update_plan,
+        )
+
+        print_update_plan(collect_runtime_inventory())
         return
 
     # Docker users can't ``git pull`` — the image excludes ``.git`` from
