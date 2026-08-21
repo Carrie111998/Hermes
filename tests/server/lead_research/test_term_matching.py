@@ -21,7 +21,9 @@ import json
 import pytest
 
 from server.db import Database
-from server.lead_research.candidates import CandidateRepository, searchable_term
+from server.lead_research.candidates import (
+    CandidateRepository, matches_term, searchable_term,
+)
 
 
 @pytest.fixture()
@@ -419,3 +421,33 @@ def test_the_check_never_rejects_an_import(tmp_path):
 
     assert report.record_count == 1
     assert len(repo.select(countries=["AE"], product_terms=[], limit=5)) == 1
+
+
+# ── whole words, not fragments ───────────────────────────────────────────────
+
+def test_a_term_does_not_match_a_longer_word_containing_it():
+    """`oven` selected `ovenware` — a housewares retailer, not an appliance buyer."""
+    assert matches_term("oven", "atlas ovenware supplies") is False
+    assert matches_term("tile", "nordic textiles ab") is False
+
+
+def test_a_plural_is_the_same_product_as_its_singular():
+    """Bounding on words must not make `ovens` a different product from `oven`."""
+    assert matches_term("oven", "built in ovens")
+    assert matches_term("ovens", "built in oven")
+
+
+def test_a_short_word_is_not_stripped_into_a_different_one():
+    """`gas` must not fold to `ga` and start matching unrelated tokens."""
+    assert matches_term("gas", "gas hobs")
+    assert matches_term("gas", "ga hobs") is False
+
+
+def test_a_multi_word_term_matches_as_a_phrase():
+    assert matches_term("built in oven", "premium built in oven hoods")
+    assert matches_term("built in oven", "oven and built in furniture") is False
+
+
+def test_an_empty_term_matches_nothing():
+    assert matches_term("", "built in ovens") is False
+    assert matches_term("   ", "built in ovens") is False

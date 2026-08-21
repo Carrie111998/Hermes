@@ -106,9 +106,13 @@ def test_weight_values_are_multiples_of_five():
 
 
 def test_fit_is_derived_from_supported_claims_not_candidate_hints():
+    # Validated, because this test is about hints versus claims and not about
+    # standing: an unvalidated claim is discounted on purpose, which would move
+    # this number for a reason the test is not making a point about.
     weak = Claim(
         field="product_sector_fit", value=90, status="observed", confidence=.25,
         method="observed", evidence_ids=["ev_weak"], applicability="required",
+        validated=True,
     )
     score = score_lead({"dimension_scores": {key: 100 for key in ScoringProfile().weights.model_dump()}}, [weak], ScoringProfile())
 

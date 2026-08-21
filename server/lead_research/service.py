@@ -18,7 +18,7 @@ from .registry import ProviderRegistry, build_registry
 from .scoring import attainable_dimensions, score_lead
 from .sectors import load_sectors
 from .storage import EvidenceRepository
-from .verdicts import SourceCoverage, evaluate_verdict
+from .verdicts import SourceCoverage, evaluate_verdict, terminal_value
 
 
 def _domain(url: str) -> str:
@@ -299,6 +299,8 @@ class LeadResearchService:
         source_ids: list[str],
         confidence: float,
         status: str = "observed",
+        validated: bool = False,
+        observed_at: float | None = None,
     ) -> Claim:
         numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
         claim = Claim(
@@ -310,6 +312,8 @@ class LeadResearchService:
             method="observed",
             evidence_ids=evidence_ids,
             applicability="useful",
+            validated=validated,
+            observed_at=observed_at,
         )
         self.db.execute(
             "INSERT INTO feature_claims VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -330,11 +334,59 @@ class LeadResearchService:
                     "unit": claim.unit,
                     "currency": claim.currency,
                     "applicability": claim.applicability,
+                    # Both ride in `data` rather than in new columns: the
+                    # Postgres schema is guarded for parity, and a JSON field
+                    # needs no migration to reach the deployed database.
+                    "validated": claim.validated,
+                    "observed_at": claim.observed_at,
                 }),
                 now(),
             ),
         )
         return claim
+
+    SCALAR_CLAIM_FIELDS = frozenset({"company_name", "country", "domain"})
+
+    def _validated(self, stored: dict) -> bool:
+        """Whether a publisher with standing vouched for this evidence.
+
+        The company's own page, or a source the catalog declares an
+        authoritative registry. Deliberately the same test `SourceCoverage`
+        uses for `has_authority`, so "validated" means one thing across
+        scoring, verdicts and the shared cache rather than three.
+        """
+        return (
+            stored["source"].classification == "official"
+            or self._is_registry(stored["source_id"])
+        )
+
+    def _resolve_scalar(self, entries: list[dict], values: list[Any]) -> tuple[Any, bool]:
+        """Pick one value for a single-valued field, or report a real conflict.
+
+        Two sources disagreeing is information before it is a problem: a
+        validated publisher outranks an unvalidated one, and on equal standing
+        the newer page outranks the older. Only a disagreement between equally
+        authoritative, equally recent sources is unresolvable — and only that
+        one is worth penalising, which matters more once a long-lived cache
+        makes stale-versus-fresh the ordinary case rather than the exception.
+        """
+        ranked: dict[Any, tuple[int, float]] = {}
+        for entry in entries:
+            standing = 1 if self._validated(entry) else 0
+            age = entry["source"].retrieved_at or 0.0
+            for value in entry["values"]:
+                if value not in ranked or (standing, age) > ranked[value]:
+                    ranked[value] = (standing, age)
+        if not ranked:
+            return (values[0] if values else None), False
+        best = max(ranked.values())
+        winners = [value for value, rank in ranked.items() if rank == best]
+        if len(winners) > 1:
+            # Equal standing, equal recency, still disagreeing. Nothing here can
+            # break the tie, so the claim stays conflicted and carries every
+            # candidate value rather than picking one arbitrarily.
+            return sorted(winners, key=str), True
+        return winners[0], False
 
     def _claim_plan(self, prepared_evidence: list[dict]) -> list[dict]:
         """Derive bounded claim writes before any tenant identity is created."""
@@ -343,7 +395,7 @@ class LeadResearchService:
             for field, values in stored["source"].facts.items():
                 facts[field].append({**stored, "values": values})
         plan: list[dict] = []
-        scalar_fields = {"company_name", "country", "domain"}
+        stamp = now()
         for field in sorted(facts):
             entries = facts[field]
             values: list[Any] = []
@@ -353,8 +405,10 @@ class LeadResearchService:
                         values.append(value)
             if not values:
                 continue
-            conflicting = field in scalar_fields and len(values) > 1
-            value: Any = values[0] if len(values) == 1 else values
+            if field in self.SCALAR_CLAIM_FIELDS and len(values) > 1:
+                value, conflicting = self._resolve_scalar(entries, values)
+            else:
+                value, conflicting = (values[0] if len(values) == 1 else values), False
             plan.append({
                 "field": field,
                 "value": value,
@@ -364,6 +418,13 @@ class LeadResearchService:
                     sum(entry["confidence"] for entry in entries) / len(entries), 3
                 ),
                 "status": "conflicted" if conflicting else "observed",
+                "validated": any(self._validated(entry) for entry in entries),
+                # The newest page behind the claim. A live provider result has
+                # no timestamp because it is happening now; a reused one carries
+                # the age of what it reused.
+                "observed_at": max(
+                    (entry["source"].retrieved_at or stamp) for entry in entries
+                ),
             })
         return plan
 
@@ -695,6 +756,22 @@ class LeadResearchService:
         and the requests they cost — so a run can say what it looked for,
         whether it found it, and what looking was worth.
         """
+        # Deep research is the most expensive thing a run does, so it does not
+        # run on a company whose assessment is already over. A closed company
+        # cannot be argued back into business by more evidence, and it is headed
+        # for `reject` whatever else we learn — so every fetch spent here is
+        # spent to confirm a rejection.
+        #
+        # Only terminal facts prune. A candidate that merely looks unpromising
+        # is not skipped: combining means further evidence can only raise a
+        # score, so there is no sound ceiling to rule anything out against, and
+        # a prune on "probably will not qualify" would silently drop leads that
+        # would have qualified.
+        for _, bundle in bundles:
+            for source in bundle.sources:
+                for field, values in source.facts.items():
+                    if terminal_value(field, values):
+                        return [], [], 0
         fact_fields = {
             field
             for _, bundle in bundles

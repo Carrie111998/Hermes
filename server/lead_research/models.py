@@ -114,6 +114,11 @@ class VerificationSource(ApiModel):
     classification: Literal["official", "independent"]
     retrieved_via: str
     facts: dict[str, list[str]] = Field(default_factory=dict)
+    # When this page was actually fetched. None for a bundle a provider just
+    # returned, which is by definition now; a bundle rebuilt from the cache
+    # carries the age of the evidence, which is the whole reason freshness can
+    # be measured at all.
+    retrieved_at: float | None = None
 
     @field_validator("provenance_url", "retrieved_via")
     @classmethod
@@ -204,6 +209,15 @@ class Claim(ApiModel):
     method: Literal["observed", "calculated", "estimated_range"]
     evidence_ids: list[str] = Field(default_factory=list)
     applicability: Literal["required", "useful", "not_applicable"] = "useful"
+    # Whether a publisher with standing vouched for this fact — the company's
+    # own page, or an authoritative registry. An independent web page and an
+    # agentic web-search result are real evidence and score, but they are not
+    # validated, and only validated facts are safe to share between customers.
+    validated: bool = False
+    # When the newest evidence behind this claim was retrieved. Confidence reads
+    # it to age the claim against its field's own shelf life. None means the
+    # claim predates age tracking, which reads as "unknown", never as "fresh".
+    observed_at: float | None = None
 
     @model_validator(mode="after")
     def validate_claim(self):

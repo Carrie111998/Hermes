@@ -161,6 +161,7 @@ class EvidenceRepository:
                     classification=payload.get("classification", "independent"),
                     retrieved_via=payload.get("retrieved_via") or row["provenance_url"] or "",
                     facts=payload.get("facts") or {},
+                    retrieved_at=row["retrieved_at"],
                 )
             except Exception:
                 # One unreadable row must not cost a run its whole cache, and it

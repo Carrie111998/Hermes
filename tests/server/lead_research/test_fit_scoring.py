@@ -18,10 +18,20 @@ from server.lead_research.models import Claim, ScoringProfile, VerificationBundl
 from server.lead_research.scoring import derive_dimension_scores, score_lead
 
 
-def _claim(field, value, *, confidence=.9, evidence=("ev_1",), status="observed") -> Claim:
+def _claim(
+    field, value, *, confidence=.9, evidence=("ev_1",), status="observed", validated=True,
+) -> Claim:
+    """A claim, validated by default.
+
+    `validated` means a publisher with standing vouched for the fact — the
+    company's own page, or an authoritative registry. Most of these fixtures
+    describe the ordinary case where a verifier fetched the company's own site,
+    so the default matches it; the tests that care about the distinction say so
+    explicitly.
+    """
     return Claim(
         field=field, value=value, status=status, confidence=confidence,
-        method="observed", evidence_ids=list(evidence),
+        method="observed", evidence_ids=list(evidence), validated=validated,
     )
 
 
@@ -89,9 +99,16 @@ def test_no_evidence_scores_nothing_at_all():
 # ── the ordering the lead list depends on ─────────────────────────────────────
 
 def _thin():
+    """One independent mention per dimension, nothing vouching for it."""
     return [
-        _claim("product_term", ["household-appliances"], confidence=.85, evidence=("ev_i",)),
-        _claim("buyer_role", ["public procurement supplier"], confidence=.85, evidence=("ev_i",)),
+        _claim(
+            "product_term", ["household-appliances"],
+            confidence=.85, evidence=("ev_i",), validated=False,
+        ),
+        _claim(
+            "buyer_role", ["public procurement supplier"],
+            confidence=.85, evidence=("ev_i",), validated=False,
+        ),
     ]
 
 

@@ -53,6 +53,42 @@ def _terms(product_terms) -> list[str]:
     ]
 
 
+def _singular(token: str) -> str:
+    """`ovens` and `oven` as one token, so a plural is not a different product.
+
+    ponytail: English plurals only, and only the regular ones. Real morphology
+    is per language — German pluralises `Backofen` as `Backöfen` — and belongs in
+    the sector playbook's term list beside the local-language variants, which is
+    where every other language-specific term already lives. Nothing here should
+    grow into a stemmer.
+    """
+    for suffix in ("es", "s"):
+        if token.endswith(suffix) and len(token) - len(suffix) >= 3:
+            return token[: -len(suffix)]
+    return token
+
+
+def _fold(text: str) -> str:
+    return " ".join(_singular(token) for token in text.split())
+
+
+def matches_term(needle: str, haystack: str) -> bool:
+    """Whether a term occurs in a haystack as whole words.
+
+    Raw substring matching selected on fragments: `oven` matched `ovenware`,
+    which is a housewares retailer and not a buyer of appliances, and `tile`
+    matched `textiles`. Both sides are already normalised to space-separated
+    words, so bounding on spaces is enough — no expression needed, and it stays
+    exact rather than approximately right.
+
+    Multi-word terms match as a phrase: `built in oven` matches `built in oven
+    hoods`, not a page that merely says `oven` somewhere.
+    """
+    if not needle.strip():
+        return False
+    return f" {_fold(needle)} " in f" {_fold(haystack)} "
+
+
 def _haystack(row, data: dict) -> str:
     """Everything a term may match against for one candidate row."""
     return " ".join([
@@ -393,7 +429,7 @@ class CandidateRepository:
         for row, data in self._rows(countries):
             haystack = _haystack(row, data)
             for term, needle in folded.items():
-                if needle and needle in haystack:
+                if matches_term(needle, haystack):
                     counts[term] += 1
         return counts
 
@@ -491,7 +527,7 @@ class CandidateRepository:
             # conditions to satisfy together — and no company name contains two
             # different product names, so requiring all of them made selecting a
             # second product guarantee zero candidates.
-            if terms and not any(term in searchable for term in terms):
+            if terms and not any(matches_term(term, searchable) for term in terms):
                 continue
             if (row["normalized_name"], (row["country"] or "").upper()) in skip:
                 continue

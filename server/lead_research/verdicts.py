@@ -16,6 +16,45 @@ class Verdict:
     conflicting_claims: list[str]
 
 
+# Facts that end an assessment rather than lowering it. A company that has
+# closed is not a weak lead, and no amount of product fit makes it a lead at
+# all — so this is a veto, not a subtraction that leaves it ranked fourth.
+#
+# It lives here rather than only in eligibility because eligibility is
+# configurable: `exclude_inactive` can be switched off, and closure is not a
+# preference a tenant should be able to switch off. The gate still reports it
+# too, so the reason a lead was dropped stays legible in both places.
+HARD_NEGATIVE_CLAIMS = {"lifecycle_status": {"closed", "dissolved", "liquidated"}}
+
+
+def terminal_value(field: str, values) -> str | None:
+    """A named reason when one of `values` ends the assessment, else None.
+
+    Takes a field and raw values rather than a Claim so the same test can run
+    on evidence before claims exist — which is what lets a run skip paying for
+    deep research on a company that has already closed.
+    """
+    terminal = HARD_NEGATIVE_CLAIMS.get(field)
+    if not terminal:
+        return None
+    for value in (values if isinstance(values, list) else [values]):
+        folded = str(value).strip().casefold()
+        if folded in terminal:
+            return f"{field}_{folded}"
+    return None
+
+
+def hard_negative(claims: list[Claim]) -> str | None:
+    """The first terminal fact in a claim set, or None."""
+    for claim in claims:
+        if claim.status not in {"observed", "conflicted"}:
+            continue
+        reason = terminal_value(claim.field, claim.value)
+        if reason:
+            return reason
+    return None
+
+
 @dataclass(frozen=True)
 class SourceCoverage:
     """Which publishers vouched for a company, and in what capacity.
@@ -82,6 +121,16 @@ def evaluate_verdict(
     # absent. One authoritative publisher, and a second publisher agreeing.
     corroborated = coverage.has_authority and len(coverage.all_domains) >= 2
 
+    # Before eligibility and before the score: nothing downstream can make a
+    # company that no longer exists worth contacting.
+    terminal = hard_negative(claims)
+    if terminal:
+        return Verdict(
+            kind="reject",
+            reasons=[terminal],
+            missing_evidence=missing,
+            conflicting_claims=conflicting,
+        )
     if not eligibility.eligible:
         return Verdict(
             kind="reject",
