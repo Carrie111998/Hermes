@@ -6577,6 +6577,19 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return job_id, None
 
+    @staticmethod
+    def _bot_owner_for_request() -> str:
+        """Return the profile whose cron store the current request can see."""
+        routed = (_api_request_profile.get() or "").strip()
+        if routed:
+            return routed
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            return (get_active_profile_name() or "default").strip() or "default"
+        except Exception:
+            return "default"
+
     async def _handle_list_jobs(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs — list all cron jobs."""
         auth_err = self._check_auth(request)
@@ -6588,7 +6601,12 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             include_disabled = request.query.get("include_disabled", "").lower() in {"true", "1"}
             jobs = _cron_list(include_disabled=include_disabled)
-            return web.json_response({"jobs": jobs})
+            owner = self._bot_owner_for_request()
+            owned_jobs = [
+                {**job, "bot_owner": owner} if isinstance(job, dict) else job
+                for job in jobs
+            ]
+            return web.json_response({"jobs": owned_jobs, "scoped": owner})
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 

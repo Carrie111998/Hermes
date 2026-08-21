@@ -33,6 +33,7 @@ from gateway.platforms.api_server import (
     _IdempotencyCache,
     _derive_chat_session_id,
     _hermes_version,
+    _api_request_profile,
     _redact_api_error_text,
     _request_agent_overrides,
     check_api_server_requirements,
@@ -949,6 +950,41 @@ class TestProfilesEndpoint:
                 body = await resp.json()
 
         assert body["bot_mode_protocol"] is True
+
+
+class TestCronJobsBotOwnership:
+    @pytest.mark.asyncio
+    async def test_list_jobs_reports_profile_scope_without_mutating_store(self, auth_adapter):
+        stored_job = {
+            "id": "abc123def456",
+            "name": "[bot:researcher] Daily brief",
+            "schedule": "0 9 * * *",
+        }
+        app = _create_app(auth_adapter)
+        app.router.add_get("/api/jobs", auth_adapter._handle_list_jobs)
+        token = _api_request_profile.set("researcher")
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                with (
+                    patch.object(auth_adapter, "_check_auth", return_value=None),
+                    patch("gateway.platforms.api_server._CRON_AVAILABLE", True),
+                    patch(
+                        "gateway.platforms.api_server._cron_list",
+                        return_value=[stored_job],
+                    ),
+                ):
+                    resp = await cli.get(
+                        "/api/jobs?include_disabled=true",
+                        headers={"Authorization": "Bearer sk-secret"},
+                    )
+                    assert resp.status == 200
+                    body = await resp.json()
+        finally:
+            _api_request_profile.reset(token)
+
+        assert body["scoped"] == "researcher"
+        assert body["jobs"][0]["bot_owner"] == "researcher"
+        assert "bot_owner" not in stored_job
 
 
 # ---------------------------------------------------------------------------
