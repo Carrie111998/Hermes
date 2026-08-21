@@ -4495,6 +4495,26 @@ def _cron_preflight_enabled(cfg: dict) -> bool:
     return cron_cfg.get("preflight", True) is not False
 
 
+def _normalize_cron_custom_route_provider(
+    provider: Optional[str], base_url: Optional[str]
+) -> Optional[str]:
+    """Map an alias-only custom label to the bare custom runtime."""
+    if not (
+        base_url
+        and provider
+        and provider.lower().startswith("custom:")
+    ):
+        return provider
+    try:
+        from hermes_cli.runtime_provider import has_named_custom_provider
+
+        if not has_named_custom_provider(provider):
+            return "custom"
+    except Exception:
+        pass
+    return provider
+
+
 def _resolve_cron_inference_route(
     *, model: Any, provider: Any, base_url: Any, config: Optional[dict] = None
 ) -> tuple[str, Optional[str], Optional[str]]:
@@ -4503,7 +4523,13 @@ def _resolve_cron_inference_route(
     resolved_provider = str(provider or "").strip() or None
     resolved_base_url = str(base_url or "").strip().rstrip("/") or None
     if not resolved_model:
-        return resolved_model, resolved_provider, resolved_base_url
+        return (
+            resolved_model,
+            _normalize_cron_custom_route_provider(
+                resolved_provider, resolved_base_url
+            ),
+            resolved_base_url,
+        )
     try:
         from hermes_cli import model_switch
 
@@ -4516,12 +4542,28 @@ def _resolve_cron_inference_route(
     except Exception:
         alias = None
     if alias is None:
-        return resolved_model, resolved_provider, resolved_base_url
-    return (
-        str(alias.model).strip(),
-        resolved_provider or (str(alias.provider).strip() or None),
-        resolved_base_url or (str(alias.base_url).strip().rstrip("/") or None),
+        return (
+            resolved_model,
+            _normalize_cron_custom_route_provider(
+                resolved_provider, resolved_base_url
+            ),
+            resolved_base_url,
+        )
+    resolved_model = str(alias.model).strip()
+    resolved_provider = resolved_provider or (str(alias.provider).strip() or None)
+    resolved_base_url = resolved_base_url or (
+        str(alias.base_url).strip().rstrip("/") or None
     )
+
+    # A model alias may use ``custom:<label>`` only to identify its endpoint;
+    # unlike providers/custom_providers entries it owns no stored credential.
+    # Resolve that alias-only spelling through bare custom so runtime provider
+    # validation does not reject it as an unknown named provider. Configured
+    # named custom providers retain their identity and credential protections.
+    resolved_provider = _normalize_cron_custom_route_provider(
+        resolved_provider, resolved_base_url
+    )
+    return resolved_model, resolved_provider, resolved_base_url
 
 
 def _resolve_cron_terminal_timeout(job: dict, cfg: dict) -> int:

@@ -18,6 +18,7 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 def test_cron_route_dereferences_direct_model_alias(monkeypatch):
     from hermes_cli import model_switch
+    from hermes_cli import runtime_provider
 
     direct_aliases = {
         "ornith": DirectAlias(
@@ -27,18 +28,62 @@ def test_cron_route_dereferences_direct_model_alias(monkeypatch):
         )
     }
     monkeypatch.setattr(model_switch, "_load_direct_aliases", lambda: direct_aliases)
+    monkeypatch.setattr(runtime_provider, "has_named_custom_provider", lambda _: False)
 
     assert scheduler._resolve_cron_inference_route(
         model="ornith", provider=None, base_url=None
     ) == (
         "Ornith-1.5-35B-Q6_K.gguf",
-        "custom:ornith",
+        "custom",
         "http://127.0.0.1:8085/v1",
     )
 
 
-def test_cron_route_keeps_explicit_provider_and_base_url(monkeypatch):
+def test_cron_route_keeps_configured_named_custom_provider(monkeypatch):
     from hermes_cli import model_switch
+    from hermes_cli import runtime_provider
+
+    direct_aliases = {
+        "ornith": DirectAlias(
+            model="aliased-model",
+            provider="custom:ornith",
+            base_url="https://ornith.example/v1",
+        )
+    }
+    monkeypatch.setattr(model_switch, "_load_direct_aliases", lambda: direct_aliases)
+    monkeypatch.setattr(runtime_provider, "has_named_custom_provider", lambda _: True)
+
+    assert scheduler._resolve_cron_inference_route(
+        model="ornith", provider=None, base_url=None
+    ) == (
+        "aliased-model",
+        "custom:ornith",
+        "https://ornith.example/v1",
+    )
+
+
+def test_cron_route_normalizes_unconfigured_custom_provider_without_model_alias(
+    monkeypatch,
+):
+    from hermes_cli import runtime_provider
+
+    monkeypatch.setattr(runtime_provider, "has_named_custom_provider", lambda _: False)
+
+    assert scheduler._resolve_cron_inference_route(
+        model="canonical-model",
+        provider="custom:ornith",
+        base_url="http://127.0.0.1:8085/v1",
+        config={},
+    ) == (
+        "canonical-model",
+        "custom",
+        "http://127.0.0.1:8085/v1",
+    )
+
+
+def test_cron_route_keeps_explicit_base_url_for_alias_only_custom_provider(monkeypatch):
+    from hermes_cli import model_switch
+    from hermes_cli import runtime_provider
 
     direct_aliases = {
         "ornith": DirectAlias(
@@ -48,6 +93,7 @@ def test_cron_route_keeps_explicit_provider_and_base_url(monkeypatch):
         )
     }
     monkeypatch.setattr(model_switch, "_load_direct_aliases", lambda: direct_aliases)
+    monkeypatch.setattr(runtime_provider, "has_named_custom_provider", lambda _: False)
 
     assert scheduler._resolve_cron_inference_route(
         model="ornith",
@@ -55,7 +101,7 @@ def test_cron_route_keeps_explicit_provider_and_base_url(monkeypatch):
         base_url="http://127.0.0.1:9999/v1/",
     ) == (
         "aliased-model",
-        "custom:explicit",
+        "custom",
         "http://127.0.0.1:9999/v1",
     )
 

@@ -569,6 +569,11 @@ def _validate_cron_base_url(
             f"custom provider's stored credential may only be sent to its own "
             f"configured endpoint ({cfg_host or 'unknown'})."
         )
+    if prov.lower().startswith("custom:"):
+        # Alias-only custom labels carry no configured credential. The
+        # scheduler normalizes them to bare custom before runtime resolution,
+        # so they have the same BYOK trust boundary as provider="custom".
+        return None
     try:
         resolved = resolve_requested_provider(prov)
     except Exception:
