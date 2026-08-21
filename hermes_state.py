@@ -1686,6 +1686,25 @@ def classify_persistence_error(exc_or_str) -> str:
     if (
         "locked" in text
         or "busy" in text
+        # PostgreSQL transient-availability vocabulary. A managed server
+        # restarting for maintenance, or briefly refusing connections, is
+        # contention rather than storage damage — the same "send it again in
+        # a moment" guidance applies, and none of the SQLite-shaped markers
+        # above ever appear in libpq's wording. Without these the turn
+        # reports the "unknown" bucket, which tells the operator to run
+        # `hermes doctor` against a database that is perfectly healthy.
+        or "shutting down" in text
+        or "starting up" in text
+        or "reconnect failed" in text
+        or "connection refused" in text
+        or "server closed the connection" in text
+        or "terminating connection" in text
+        or "connection already closed" in text
+        or "no connection to the server" in text
+        or "could not connect to server" in text
+        or "connection timed out" in text
+        or "too many clients" in text
+        or "deadlock detected" in text
     ):
         return "locked"
     if (
@@ -3219,7 +3238,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception:
             logger.debug("Could not close a SessionDB connection", exc_info=True)
 
-    def __init__(self, db_path: Path = None, read_only: bool = False):
+    def __init__(
+        self,
+        db_path: Path = None,
+        read_only: bool = False,
+        *,
+        postgres_dsn: Optional[str] = None,
+    ):
+        """Open the session store.
+
+        ``postgres_dsn`` pins the physical store explicitly for this instance.
+        Callers that must open a *specific* profile's store (the backend-aware
+        seam) pass it here instead of mutating process-global
+        ``HERMES_STATE_*`` env vars: env mutation is visible to every other
+        thread constructing a ``SessionDB`` concurrently, so a caller could
+        observe another profile's pinned DSN and open the wrong physical store.
+        When None, the backend is resolved normally from env vars + config.
+        """
         self.db_path = db_path or _default_db_path()
         # Fail hard (before any connection/pragma/mkdir) if a pytest-context
         # process resolved the developer's production state.db — see the
@@ -3307,6 +3342,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._fts_cjk_loaded = False
         self._fts_cjk_available = False
         self._fts_unavailable_warned = False
+        self._is_postgres = False
         self._conn = None
         # Async token accounting (see queue_token_counts). The condition
         # guards queue + writer state; it is distinct from self._lock so
@@ -3319,6 +3355,105 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._token_atexit_hook: Optional[Callable[[], None]] = None
         initialization_complete = False
         try:
+            # Optional PostgreSQL state backend. Engaged only when configured
+            # (sessions.state_backend = "postgres"); the import is lazy so a
+            # default install without the 'postgres' extra never loads it.
+            #
+            # ``read_only`` is deliberately NOT a gate here. It is a SQLite
+            # *attach mode* (a URI open that takes no write lock), not a
+            # statement about which physical store owns the data. Gating on it
+            # made every read-only caller — the dashboard's status/session
+            # listing, cron history, usage analytics, and resume lookup — open
+            # the local ``state.db`` while the live write path was on Postgres,
+            # which is exactly the dual-truth split this seam exists to prevent.
+            # Postgres reads are served by the same adapter; the caller simply
+            # issues no writes.
+            #
+            # An explicit ``db_path`` still stays on SQLite: that names a
+            # specific file, so honouring it is the caller's whole intent.
+            if db_path is None:
+                # Detect whether the operator has explicitly selected the
+                # Postgres backend via an env var BEFORE attempting the import.
+                # An import-time failure (bad psycopg install, ABI mismatch,
+                # missing dep) must NOT silently degrade to SQLite when Postgres
+                # was explicitly configured — that would split history across
+                # two stores with no warning to the operator.
+                _pg_env_backend = (
+                    os.environ.get("HERMES_STATE_BACKEND") or ""
+                ).strip().lower()
+                if _pg_env_backend in ("postgresql", "pg"):
+                    _pg_env_backend = "postgres"
+                _pg_env_dsn = (
+                    os.environ.get("HERMES_STATE_DATABASE_URL")
+                    or os.environ.get("HERMES_STATE_POSTGRES_DSN")
+                    or ""
+                ).strip()
+                _pg_explicitly_selected = _pg_env_backend == "postgres" or bool(_pg_env_dsn)
+                # An explicit DSN passed to the constructor pins the physical
+                # store for THIS instance only — no process-global env
+                # mutation, so a concurrent SessionDB() on another thread can
+                # never observe it and open the wrong store.
+                if postgres_dsn:
+                    _pg_explicitly_selected = True
+                try:
+                    from hermes_state_postgres import maybe_open_postgres
+
+                    # Also check config.yaml so the fallback is never silent
+                    # regardless of which configuration path the user took.
+                    if not _pg_explicitly_selected:
+                        try:
+                            from hermes_cli.config import load_config as _lc
+
+                            _c = _lc()
+                            if (
+                                str(
+                                    (_c.get("sessions") or {}).get(
+                                        "state_backend", ""
+                                    )
+                                ).strip().lower() == "postgres"
+                            ):
+                                _pg_explicitly_selected = True
+                        except Exception:
+                            pass
+                except Exception as _pg_import_exc:
+                    if _pg_explicitly_selected:
+                        raise RuntimeError(
+                            "Postgres backend is explicitly configured "
+                            "(HERMES_STATE_BACKEND/HERMES_STATE_DATABASE_URL "
+                            "or sessions.state_backend in config.yaml) "
+                            "but the hermes_state_postgres module could not be "
+                            f"imported: {_pg_import_exc}"
+                        ) from _pg_import_exc
+                    logger.warning(
+                        "hermes_state_postgres could not be imported; "
+                        "falling back to SQLite backend: %s",
+                        _pg_import_exc,
+                    )
+                    maybe_open_postgres = None  # type: ignore[assignment]
+                if maybe_open_postgres is not None:
+                    pg_conn = maybe_open_postgres(
+                        read_only, SCHEMA_VERSION, dsn_override=postgres_dsn
+                    )
+                    if pg_conn is not None:
+                        self._conn = pg_conn
+                        self._is_postgres = True
+                        # Mark the open as complete before returning: the
+                        # ``finally`` below closes and drops self._conn for
+                        # any path that leaves this block without setting it.
+                        initialization_complete = True
+                        return
+                    if _pg_explicitly_selected:
+                        # postgres configured but no DSN resolved — warn so the
+                        # operator knows writes are going to SQLite, not their
+                        # intended backend.
+                        logger.warning(
+                            "Postgres backend is configured "
+                            "(sessions.state_backend=postgres) but no DSN was "
+                            "resolved from sessions.postgres_dsn, "
+                            "HERMES_STATE_DATABASE_URL, or "
+                            "HERMES_STATE_POSTGRES_DSN; falling back to SQLite. "
+                            "Set the DSN to engage the Postgres backend."
+                        )
             if read_only:
                 # Read-only attach for cross-profile aggregation: SELECT-only,
                 # so we skip schema init entirely (no DDL, no FTS probe, no
@@ -4025,7 +4160,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         raise
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
+                if (
+                    not self._is_postgres
+                    and self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0
+                ):
                     self._try_wal_checkpoint()
                 if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
                     self._try_incremental_merge_fts()
@@ -4106,6 +4244,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # untouched.
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
+                raise
+            except Exception as exc:
+                # PostgreSQL serialization failures (40001) and deadlocks
+                # (40P01) are transient: the correct retry unit is the WHOLE
+                # transaction (re-run fn from scratch), NOT an individual
+                # method call. This handler is reached only on the Postgres
+                # backend because sqlite3.* exceptions are caught above;
+                # non-retryable Postgres errors propagate unchanged.
+                if self._is_postgres:
+                    try:
+                        from hermes_state_postgres import is_postgres_retryable
+                    except ImportError:
+                        raise exc
+                    if is_postgres_retryable(exc) and self._sleep_before_write_retry(
+                        deadline, patience_s
+                    ):
+                        continue
                 raise
 
     def _sleep_before_write_retry(
@@ -6414,6 +6569,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         expires_at = now + ttl_seconds
 
         def _do(conn):
+            if self._is_postgres:
+                from hermes_state_postgres import acquire_compression_lock_sql
+
+                return acquire_compression_lock_sql(
+                    conn, session_id, holder, now, expires_at
+                )
             reclaimed_holder = None
             row = conn.execute(
                 "SELECT holder, expires_at FROM compression_locks "
@@ -6455,7 +6616,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return acquired, reclaimed_holder
 
         try:
-            acquired, reclaimed_holder = self._execute_write(_do)
+            result = self._execute_write(_do)
+            # Both backends must return ``(acquired, reclaimed_holder)``.
+            # Checked before unpacking so a shape regression names the culprit
+            # instead of raising a bare "cannot unpack non-iterable bool".
+            if not (isinstance(result, tuple) and len(result) == 2):
+                raise TypeError(
+                    "try_acquire_compression_lock: backend returned "
+                    f"{type(result).__name__} {result!r}, expected a "
+                    "(acquired, reclaimed_holder) 2-tuple — a lock row may "
+                    "have been written and leaked"
+                )
+            acquired, reclaimed_holder = result
             if reclaimed_holder:
                 logger.warning(
                     "Reclaimed stale compression lock for session=%s "
@@ -6471,6 +6643,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             # Fail open: returning False makes the caller skip compression,
             # which is the safe behaviour when the lock subsystem is broken.
+            return False
+        except Exception as exc:
+            # Same fail-open behaviour for the PostgreSQL backend, whose driver
+            # raises its own error hierarchy rather than sqlite3.Error — but for
+            # DRIVER faults only. The bug classes below mean our own code is
+            # wrong; swallowing them is what would let a return-shape mismatch
+            # pose as healthy lock contention indefinitely.
+            if not self._is_postgres or isinstance(
+                exc, (TypeError, ValueError, AttributeError, KeyError)
+            ):
+                raise
+            logger.warning(
+                "try_acquire_compression_lock(%s) failed: %s",
+                session_id, exc,
+            )
             return False
 
     def release_compression_lock(self, session_id: str, holder: str) -> None:
@@ -7512,10 +7699,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    cache_write_tokens = ?,
                    reasoning_tokens = ?,
                    estimated_cost_usd = COALESCE(?, 0),
-                   actual_cost_usd = CASE
-                       WHEN ? IS NULL THEN actual_cost_usd
-                       ELSE ?
-                   END,
+                   actual_cost_usd = COALESCE(?, actual_cost_usd, ?),
                    cost_status = COALESCE(?, cost_status),
                    cost_source = COALESCE(?, cost_source),
                    pricing_version = COALESCE(?, pricing_version),
@@ -7533,10 +7717,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    cache_write_tokens = cache_write_tokens + ?,
                    reasoning_tokens = reasoning_tokens + ?,
                    estimated_cost_usd = COALESCE(estimated_cost_usd, 0) + COALESCE(?, 0),
-                   actual_cost_usd = CASE
-                       WHEN ? IS NULL THEN actual_cost_usd
-                       ELSE COALESCE(actual_cost_usd, 0) + ?
-                   END,
+                   actual_cost_usd = COALESCE(
+                       actual_cost_usd + COALESCE(?, 0.0), actual_cost_usd, ?
+                   ),
                    cost_status = COALESCE(?, cost_status),
                    cost_source = COALESCE(?, cost_source),
                    pricing_version = COALESCE(?, pricing_version),
@@ -7708,16 +7891,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(session_id, model, billing_provider, billing_base_url, billing_mode, task)
                DO UPDATE SET
-                   api_call_count = api_call_count + excluded.api_call_count,
-                   input_tokens = input_tokens + excluded.input_tokens,
-                   output_tokens = output_tokens + excluded.output_tokens,
-                   cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
-                   cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
-                   reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
-                   estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
-                   actual_cost_usd = actual_cost_usd + excluded.actual_cost_usd,
-                   cost_status = COALESCE(excluded.cost_status, cost_status),
-                   cost_source = COALESCE(excluded.cost_source, cost_source),
+                   api_call_count = session_model_usage.api_call_count + excluded.api_call_count,
+                   input_tokens = session_model_usage.input_tokens + excluded.input_tokens,
+                   output_tokens = session_model_usage.output_tokens + excluded.output_tokens,
+                   cache_read_tokens = session_model_usage.cache_read_tokens + excluded.cache_read_tokens,
+                   cache_write_tokens = session_model_usage.cache_write_tokens + excluded.cache_write_tokens,
+                   reasoning_tokens = session_model_usage.reasoning_tokens + excluded.reasoning_tokens,
+                   estimated_cost_usd = session_model_usage.estimated_cost_usd + excluded.estimated_cost_usd,
+                   actual_cost_usd = session_model_usage.actual_cost_usd + excluded.actual_cost_usd,
+                   cost_status = COALESCE(excluded.cost_status, session_model_usage.cost_status),
+                   cost_source = COALESCE(excluded.cost_source, session_model_usage.cost_source),
                    last_seen = excluded.last_seen""",
             (
                 session_id,
@@ -9074,9 +9257,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     # Sentinel prefix used to distinguish JSON-encoded structured content
     # (multimodal messages: lists of parts like text + image_url) from plain
-    # string content. The NUL byte is not legal in normal text, so this
-    # cannot collide with real user content.
-    _CONTENT_JSON_PREFIX = "\x00json:"
+    # string content. The control byte is not legal in normal text, so this
+    # cannot collide with real user content. The write prefix uses U+0001
+    # (START OF HEADING), which is storable across supported state backends —
+    # PostgreSQL's ``text`` type rejects NUL outright, so a NUL-prefixed write
+    # fails there. The legacy NUL-byte prefix is still accepted on read for
+    # rows written by older versions.
+    _CONTENT_JSON_PREFIX = "\x01json:"
+    _CONTENT_JSON_PREFIX_LEGACY = "\x00json:"
 
     @classmethod
     def _encode_content(cls, content: Any) -> Any:
@@ -9115,16 +9303,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     @classmethod
     def _decode_content(cls, content: Any) -> Any:
-        """Reverse :meth:`_encode_content`; returns scalars unchanged."""
-        if isinstance(content, str) and content.startswith(cls._CONTENT_JSON_PREFIX):
-            try:
-                return json.loads(content[len(cls._CONTENT_JSON_PREFIX):])
-            except (json.JSONDecodeError, TypeError):
-                logger.warning(
-                    "Failed to decode JSON-encoded message content; "
-                    "returning raw string"
-                )
-                return content
+        """Reverse :meth:`_encode_content`; returns scalars unchanged.
+
+        Accepts both the current write prefix and the legacy NUL-byte prefix
+        so rows written by older versions decode correctly.
+        """
+        if isinstance(content, str):
+            for prefix in (cls._CONTENT_JSON_PREFIX, cls._CONTENT_JSON_PREFIX_LEGACY):
+                if content.startswith(prefix):
+                    try:
+                        return json.loads(content[len(prefix):])
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning(
+                            "Failed to decode JSON-encoded message content; "
+                            "returning raw string"
+                        )
+                        return content
         return content
 
     @staticmethod
