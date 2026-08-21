@@ -3578,7 +3578,7 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
     // ── Pre-flight state.db integrity guard (#68474) ─────────────────
     // Emergency backup and header verification before the update touches
     // anything.  Runs while the backend is still alive.
-    preflightStateDb(HERMES_HOME, rememberLog)
+    preflightStateDb(HERMES_HOME, rememberLog, updateRoot)
 
     // Stop our own backend(s) and wait for the venv shim to unlock BEFORE we
     // spawn the updater. Without this the updater races a still-locked
@@ -3918,7 +3918,7 @@ function runningAppBundle() {
 // desktop Electron process itself, before the backend is killed and
 // before the updater is spawned — a separate safety net from the
 // Python-level pre-update snapshot inside `hermes update`.
-function preflightStateDb(hermesHome, rememberLog) {
+function preflightStateDb(hermesHome, rememberLog, updateRoot) {
   const stateDbPath = path.join(hermesHome, 'state.db')
 
   if (!fileExists(stateDbPath)) {
@@ -3945,6 +3945,45 @@ function preflightStateDb(hermesHome, rememberLog) {
           `headerOk=${headerOk}, headerHex=${header.toString('hex')}`
       )
 
+      // Full integrity probe, not just the header (#68474 follow-up):
+      // a valid header can sit on top of corrupt B-tree/FTS pages — the
+      // "database disk image is malformed" class that slipped past this
+      // pre-flight on 2026-08-21. PRAGMA integrity_check on a ~65MB DB
+      // returns in <1s (measured 0.4s on Apple Silicon), so the cost of
+      // catching corruption before mutation is negligible. Run it through
+      // the repo's Python (stdlib sqlite3; venv may not ship a sqlite3
+      // binary), never blocking the update if the probe itself fails.
+      let integrityOk = false
+      let integrityProblem = 'not-run'
+      try {
+        const pythonBin = findPythonForRoot(updateRoot)
+        if (pythonBin) {
+          const code =
+            'import sqlite3,sys;' +
+            'c=sqlite3.connect(sys.argv[1], timeout=5);' +
+            'r=c.execute("PRAGMA integrity_check").fetchall();' +
+            'print("\\n".join(x[0] for x in r))'
+          const probe = execFileSync(pythonBin, ['-c', code, stateDbPath], {
+            encoding: 'utf8',
+            timeout: 30_000, // 30s cap; 65MB DB takes ~0.4s
+          })
+          const lines = (probe || '').trim().split('\n').filter(Boolean)
+          if (lines.length === 1 && lines[0] === 'ok') {
+            integrityOk = true
+          } else {
+            integrityProblem = (lines[0] || 'non-ok').slice(0, 300)
+          }
+        } else {
+          integrityProblem = 'no-python-found'
+        }
+      } catch (integrityErr) {
+        integrityProblem = String(integrityErr && integrityErr.message ? integrityErr.message : integrityErr)
+      }
+      rememberLog(
+        `[updates] state.db pre-flight integrity: ok=${integrityOk}, ` +
+          `problem=${integrityProblem}`
+      )
+
       if (!headerOk) {
         rememberLog(
           '[updates] state.db header is INVALID before update — ' +
@@ -3952,10 +3991,20 @@ function preflightStateDb(hermesHome, rememberLog) {
         )
       }
 
+      if (!integrityOk) {
+        rememberLog(
+          '[updates] state.db INTEGRITY FAILED before update — ' +
+            'pre-existing corruption detected; emergency backup will be tagged as damaged'
+        )
+      }
+
       // Emergency timestamped backup, separate from the Python-level snapshot.
       const ts = new Date().toISOString().replace(/[:.]/g, '-')
 
-      const emergencyPath = path.join(hermesHome, `state.db.pre-update-emergency-${ts}.bak`)
+      const emergencyPath = path.join(
+        hermesHome,
+        `state.db.pre-update-emergency-${ts}${integrityOk ? '' : '.CORRUPT'}.bak`
+      )
 
       try {
         fs.copyFileSync(stateDbPath, emergencyPath)
@@ -4026,7 +4075,7 @@ async function applyUpdatesPosixHandoff(opts: any) {
   }
 
   // ── Pre-flight state.db integrity guard (#68474) ──
-  preflightStateDb(HERMES_HOME, rememberLog)
+  preflightStateDb(HERMES_HOME, rememberLog, updateRoot)
 
   // Branch-pin so a non-main checkout doesn't get switched to main (and
   // self-heal to main when the pinned branch no longer exists on origin).
