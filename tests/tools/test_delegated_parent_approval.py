@@ -5,6 +5,7 @@ import hashlib
 import json
 import threading
 import time
+from dataclasses import FrozenInstanceError
 
 import pytest
 
@@ -97,7 +98,9 @@ def _start_wait(authority, command: str, *, timeout: float = 2.0):
                     command=command,
                     description="local test",
                     pattern_keys=["script execution via -e/-c flag"],
-                    tool_call_id=f"call-{id(authority.child_agent)}",
+                    request_identity=da.capture_request_identity(
+                        command, f"call-{id(authority.child_agent)}"
+                    ),
                     timeout=timeout,
                 )
             )
@@ -121,6 +124,55 @@ def _start_wait(authority, command: str, *, timeout: float = 2.0):
     pytest.fail("approval request was not registered")
 
 
+def _guard_on_existing_user_or_block_path(monkeypatch, command: str) -> tuple[dict, list, list]:
+    """Exercise the real guard while making the existing user seam deterministic."""
+    from tools import approval
+
+    parent, _, authority = _authority(command=command)
+    parent_events: list[dict] = []
+    user_requests: list[dict] = []
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False)
+    monkeypatch.setattr(
+        "tools.tirith_security.check_command_security",
+        lambda _command: {"action": "allow", "findings": [], "summary": ""},
+    )
+    monkeypatch.setattr(da, "_publish_parent_event", parent_events.append)
+
+    def _deny_user(_session_key, _notify, approval_data, **_kwargs):
+        user_requests.append(approval_data)
+        return {"resolved": True, "choice": "deny"}
+
+    monkeypatch.setattr(approval, "_await_gateway_decision", _deny_user)
+    approval.register_gateway_notify(authority.owner_approval_session_key, lambda _data: None)
+    session_token = approval.set_current_session_key(authority.owner_approval_session_key)
+    tool_token = approval._approval_tool_call_id.set("call-negative-control")
+    child_context = __import__("contextvars").copy_context()
+    outcome: dict = {}
+
+    def _run_guard():
+        with delegated_approval_context(authority):
+            outcome.update(approval.check_all_command_guards(command, "local"))
+
+    try:
+        thread = threading.Thread(target=lambda: child_context.run(_run_guard), daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 1
+        while thread.is_alive() and time.monotonic() < deadline:
+            if parent_events:
+                da.resolve_parent_decision(parent, parent_events[0]["approval_id"], "deny")
+                break
+            time.sleep(0.002)
+        thread.join(1)
+        assert not thread.is_alive(), "guard did not reach either deterministic decision seam"
+    finally:
+        approval._approval_tool_call_id.reset(tool_token)
+        approval.reset_current_session_key(session_token)
+        approval.unregister_gateway_notify(authority.owner_approval_session_key)
+    return outcome, parent_events, user_requests
+
+
 def test_authority_is_context_local_and_contains_no_resolver_capability():
     _, _, authority = _authority()
     assert get_delegated_approval_authority() is None
@@ -132,7 +184,7 @@ def test_authority_is_context_local_and_contains_no_resolver_capability():
 
 
 def test_classifier_requires_structured_safe_lane_and_local_authority():
-    command = "python -m pytest tests/safe.py"
+    command = "python -c 'print(1)'"
     _, _, authority = _authority(command=command)
     assert da.is_specialist_local_reversible(
         authority, command, "local", pattern_keys=["script execution via -e/-c flag"], tirith_findings=[]
@@ -201,6 +253,73 @@ def test_classifier_accepts_only_exact_current_interpreter_aliases():
             pattern_keys=[key],
             tirith_findings=[],
         )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python -c \"import os; os.remove('/tmp/important')\"",
+        "python -c \"from pathlib import Path; Path('/tmp/important').unlink()\"",
+        "python -c \"open('/tmp/security-control','w').write('disabled')\"",
+        "python -c \"import socket; socket.create_connection(('127.0.0.1', 22))\"",
+        "python -c \"__import__('os').remove('/tmp/important')\"",
+        "python -c \"import subprocess; subprocess.run(['id'])\"",
+        "python -c \"import os; print(os.environ.get('TOKEN'))\"",
+        "python -c \"print(open('/etc/shadow').read())\"",
+        "python -c \"(lambda: 1)()\"",
+        "python -c \"[x for x in [1]]\"",
+        "python -c \"print(1)\"; sudo id",
+        "python -c \"print(1)\" | sh",
+        "python -c \"print(1)\" > /tmp/output",
+        "sh -c \"python -c 'print(1)'\"",
+        "docker run python -c \"print(1)\"",
+        "ssh host python -c \"print(1)\"",
+        "perl -e 'print 1'",
+        "ruby -e 'puts 1'",
+        "node -e 'console.log(1)'",
+        "python -c \"if\"",
+        "python -c \"print(1)\" extra",
+    ],
+)
+def test_real_guard_keeps_unsafe_or_non_python_inline_code_on_existing_path(
+    monkeypatch, command
+):
+    result, parent_events, user_requests = _guard_on_existing_user_or_block_path(
+        monkeypatch, command
+    )
+    assert result["approved"] is False
+    assert parent_events == []
+    assert da.pending_requests() == []
+    assert user_requests or result.get("hardline") or result.get("outcome") == "denied"
+
+
+def test_strict_utf8_and_size_boundary_reject_before_parent_registration(monkeypatch):
+    for command in ("python -c 'print(1)' # \ud800", "python -c '" + "x" * 8192 + "'"):
+        result, parent_events, _user_requests = _guard_on_existing_user_or_block_path(
+            monkeypatch, command
+        )
+        assert result["approved"] is False
+        assert parent_events == []
+        assert da.pending_requests() == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python -c 'print(1)'",
+        "python3 -c 'print(\"dynamic-\" + \"literal\")'",
+        "python3.11 -c 'print((1 + 2) * 3)'",
+    ],
+)
+def test_closed_python_subset_is_positive_eligibility_proof(command):
+    _, _, authority = _authority(command=command)
+    assert da.is_specialist_local_reversible(
+        authority,
+        command,
+        "local",
+        pattern_keys=["script execution via -e/-c flag"],
+        tirith_findings=[],
+    )
 
 
 def test_matching_parent_resolves_exact_request_once(monkeypatch):
@@ -294,7 +413,7 @@ def test_dynamic_command_never_prelisted_reaches_parent_once_and_resumes(monkeyp
     event = published[0]
     assert event["command"] == command
     assert event["command_digest"] == _digest(command)
-    assert event["tool_call_id"] == "call-dynamic"
+    assert "tool_call_id" not in event
     assert da.resolve_parent_decision(
         parent, event["approval_id"], "once"
     )["resolved"]
@@ -365,26 +484,38 @@ def test_ids_alone_cannot_authorize_self_sibling_or_other_parent(monkeypatch):
     assert outcome == {"resolved": True, "choice": "deny"}
 
 
-def test_command_or_tool_call_substitution_fails_closed(monkeypatch):
+def test_command_and_tool_call_binding_are_frozen_against_nonempty_substitution(monkeypatch):
     command = "python -m pytest tests/safe.py"
     parent, _, authority = _authority(command=command)
     monkeypatch.setattr(da, "_publish_parent_event", lambda event: None)
     thread, outcome, approval_id = _start_wait(authority, command)
     with da._lock:
-        da._pending[approval_id].raw_command = command + " -x"
-    assert not da.resolve_parent_decision(parent, approval_id, "once")["resolved"]
-    da.revoke_for_child(authority.child_agent, "test")
+        entry = da._pending[approval_id]
+        with pytest.raises(FrozenInstanceError):
+            entry.binding.tool_call_id = entry.binding.tool_call_id[:-1] + "X"
+        with pytest.raises(FrozenInstanceError):
+            entry.binding.raw_command = command + " -x"
+    assert da.resolve_parent_decision(parent, approval_id, "once")["resolved"]
     thread.join(1)
-    assert outcome["choice"] == "deny"
+    assert outcome["choice"] == "once"
 
-    parent, _, authority = _authority(command=command)
-    thread, outcome, approval_id = _start_wait(authority, command)
-    with da._lock:
-        da._pending[approval_id].tool_call_id = ""
-    assert not da.resolve_parent_decision(parent, approval_id, "once")["resolved"]
-    da.revoke_for_child(authority.child_agent, "test")
-    thread.join(1)
-    assert outcome["choice"] == "deny"
+
+def test_concurrent_request_identity_mismatch_fails_before_publication(monkeypatch):
+    _, _, authority = _authority()
+    published: list[dict] = []
+    monkeypatch.setattr(da, "_publish_parent_event", published.append)
+    identity = da.capture_request_identity("python -c 'print(1)'", "call-A")
+    with delegated_approval_context(authority):
+        result = da.await_parent_decision(
+            command="python -c 'print(2)'",
+            description="mismatch",
+            pattern_keys=["script execution via -e/-c flag"],
+            request_identity=identity,
+            timeout=0.01,
+        )
+    assert result.get("ineligible") is True
+    assert published == []
+    assert da.pending_requests() == []
 
 
 def test_expiry_revocation_and_transport_generation_replacement_fail_closed(monkeypatch):
@@ -437,6 +568,40 @@ def test_lifecycle_revocation_unblocks_child_as_deny(monkeypatch, revoker, reaso
     assert outcome == {"resolved": True, "choice": "deny"}
     assert not da.resolve_parent_decision(parent, approval_id, "once")["resolved"]
     assert audits[-1] == ("revoked", reason)
+
+
+def test_production_unregister_completion_revokes_waiter(monkeypatch):
+    from tools.delegate_tool import _unregister_subagent
+
+    _, child, authority = _authority()
+    monkeypatch.setattr(da, "_publish_parent_event", lambda _event: None)
+    thread, outcome, _approval_id = _start_wait(authority, "python -c 'print(1)'")
+    _unregister_subagent(authority.subagent_id, agent=child)
+    thread.join(1)
+    assert outcome == {"resolved": True, "choice": "deny"}
+
+
+def test_production_interrupt_revokes_waiter(monkeypatch):
+    from tools.delegate_tool import interrupt_subagent
+
+    _, _, authority = _authority()
+    monkeypatch.setattr(da, "_publish_parent_event", lambda _event: None)
+    monkeypatch.setattr("tools.delegate_tool.request_hard_interrupt", lambda *_args: True)
+    thread, outcome, _approval_id = _start_wait(authority, "python -c 'print(1)'")
+    assert interrupt_subagent(authority.subagent_id) is True
+    thread.join(1)
+    assert outcome == {"resolved": True, "choice": "deny"}
+
+
+def test_production_parent_reset_revokes_waiter(monkeypatch):
+    from tools import approval
+
+    _, _, authority = _authority()
+    monkeypatch.setattr(da, "_publish_parent_event", lambda _event: None)
+    thread, outcome, _approval_id = _start_wait(authority, "python -c 'print(1)'")
+    approval.clear_session(authority.owner_approval_session_key)
+    thread.join(1)
+    assert outcome == {"resolved": True, "choice": "deny"}
 
 
 def test_concurrent_children_are_keyed_not_fifo(monkeypatch):
@@ -513,9 +678,75 @@ def test_parent_event_is_bounded_redacted_system_authored_and_not_raw_secret():
     assert payload["untrusted_data"] is True
     assert payload["pattern_keys"] == ["script execution via -e/-c flag"]
     assert payload["expires_in_seconds"] == 90
-    assert "tool_call_id" in payload
+    assert "tool_call_id" not in payload
     assert "parent_task_id" in payload
     assert "delegated_goal" in payload
+
+
+def test_million_character_tool_call_id_fails_closed_before_publication(monkeypatch):
+    _, _, authority = _authority()
+    published: list[dict] = []
+    monkeypatch.setattr(da, "_publish_parent_event", published.append)
+    identity = da.capture_request_identity("python -c 'print(1)'", "x" * 1_000_000)
+    with delegated_approval_context(authority):
+        result = da.await_parent_decision(
+            command="python -c 'print(1)'",
+            description="bounded",
+            pattern_keys=["script execution via -e/-c flag"],
+            request_identity=identity,
+            timeout=0.01,
+        )
+    assert result.get("ineligible") is True
+    assert published == []
+    assert da.pending_requests() == []
+
+
+def test_formatter_rebounds_all_variable_fields_and_enforces_aggregate_limit():
+    huge = "z" * 1_000_000
+    evt = {
+        "type": "delegated_approval_request",
+        "approval_id": huge,
+        "delegation_id": huge,
+        "subagent_id": huge,
+        "child_session_id": huge,
+        "parent_session_id": huge,
+        "session_key": huge,
+        "origin_ui_session_id": huge,
+        "command": huge,
+        "description": huge,
+        "command_digest": huge,
+        "tool_call_id": huge,
+        "pattern_keys": [huge] * 100,
+        "parent_task_id": huge,
+        "delegated_goal": huge,
+        "expires_in_seconds": huge,
+    }
+    formatted = format_process_notification(evt)
+    assert formatted.startswith("[SYSTEM EVENT: delegated_approval_request]")
+    assert len(formatted.encode("utf-8")) <= da.MAX_SERIALIZED_MESSAGE_BYTES
+    assert huge not in formatted
+
+
+def test_formatter_rejects_invalid_utf8_surrogates_without_persisting_them():
+    evt = {
+        "type": "delegated_approval_request",
+        "approval_id": "approval-\ud800",
+        "delegation_id": "delegation",
+        "subagent_id": "child",
+        "child_session_id": "session",
+        "parent_session_id": "parent",
+        "session_key": "key",
+        "origin_ui_session_id": "ui",
+        "command": "python -c 'print(1)'\ud800",
+        "description": "description\ud800",
+        "command_digest": "digest",
+        "pattern_keys": ["safe\ud800"],
+        "parent_task_id": "task",
+        "delegated_goal": "goal",
+    }
+    formatted = format_process_notification(evt)
+    assert "\ud800" not in formatted
+    assert len(formatted.encode("utf-8")) <= da.MAX_SERIALIZED_MESSAGE_BYTES
 
 
 def test_audit_contains_digest_ids_and_no_raw_secret(monkeypatch):
@@ -523,14 +754,18 @@ def test_audit_contains_digest_ids_and_no_raw_secret(monkeypatch):
     parent, _, authority = _authority(command=command)
     captured = []
     monkeypatch.setattr("tools.approval._fire_approval_hook", lambda hook, **payload: captured.append((hook, payload)))
+    identity = da.capture_request_identity(command, "call")
     entry = da._PendingApproval(
         approval_id="opaque",
-        authority=authority,
-        raw_command=command,
-        command_digest=_digest(command),
-        tool_call_id="call",
-        description="contains sk-" + "b" * 40,
-        pattern_keys=("execute Python code",),
+        binding=da._ApprovalBinding(
+            authority=authority,
+            raw_command=command,
+            command_digest=_digest(command),
+            tool_call_id="call",
+            request_identity=identity,
+            description="contains sk-" + "b" * 40,
+            pattern_keys=("execute Python code",),
+        ),
         created_monotonic=1.0,
         expires_monotonic=2.0,
     )

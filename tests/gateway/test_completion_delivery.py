@@ -9,6 +9,8 @@ state (when available) is acknowledged through its authoritative SQLite API.
 import asyncio
 import json
 import queue
+import threading
+import time
 from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -16,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import Platform
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, _drain_gateway_watch_events
 from gateway.session import SessionSource
 from tools.process_registry import ProcessRegistry, ProcessSession
 
@@ -147,6 +149,126 @@ def test_delegated_approval_event_uses_gateway_fresh_turn_delivery(
     incoming = adapter.handle_message.await_args.args[0]
     assert incoming.text.startswith("[SYSTEM EVENT: delegated_approval_request]")
     assert "UNTRUSTED DATA" in incoming.text
+
+
+def test_post_turn_drain_preserves_delegated_request_for_single_gateway_owner():
+    isolated = queue.Queue()
+    completion = _completion_event(started_at=1.0)
+    approval = _delegated_approval_event()
+    watch = {"type": "watch_match", "session_id": "p", "pattern": "ready"}
+    for event in (completion, approval, watch):
+        isolated.put(event)
+
+    assert _drain_gateway_watch_events(isolated) == [watch]
+    remaining = [isolated.get_nowait()]
+    assert remaining == [approval]
+    assert isolated.empty()
+
+
+def test_post_turn_drain_does_not_publish_duplicate_delegated_request():
+    isolated = queue.Queue()
+    approval = _delegated_approval_event()
+    isolated.put(approval)
+    assert _drain_gateway_watch_events(isolated) == []
+    assert isolated.get_nowait() is approval
+    assert isolated.empty()
+
+
+def test_commissioning_turn_request_survives_drain_and_resumes_one_completion(
+    monkeypatch, isolated_registry
+):
+    """Full deterministic queue path: pause, fresh turn, resume, completion."""
+    from agent.delegation_context import delegated_approval_context
+    from tools import approval
+    from tools import delegated_approval as da
+    from tools.delegate_tool import _active_subagents, _active_subagents_lock
+
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False)
+    monkeypatch.setattr(
+        "tools.tirith_security.check_command_security",
+        lambda _command: {"action": "allow", "findings": [], "summary": ""},
+    )
+
+    parent = object()
+    child = object()
+    authority = da.DelegatedApprovalAuthority(
+        owner_agent=parent,
+        child_agent=child,
+        subagent_id="subagent-commissioned",
+        child_session_id="child-commissioned",
+        parent_session_id="parent-commissioned",
+        owner_approval_session_key="agent:main:telegram:dm:12345:678",
+        owner_session_id=None,
+        owner_transport=None,
+        owner_session_record=None,
+        delegation_id="deleg-commissioned",
+        parent_lane_enabled=True,
+        parent_task_id="task-commissioned",
+        delegated_goal="commission deterministic child",
+    )
+    with _active_subagents_lock:
+        _active_subagents[authority.subagent_id] = {
+            "subagent_id": authority.subagent_id,
+            "agent": child,
+            "owner_agent": parent,
+            "approval_authority": authority,
+            "accepting_steer": True,
+        }
+
+    child_result = {}
+    command = "python -c 'print(1 + 2)'"
+
+    def _child_run():
+        token = approval._approval_tool_call_id.set("call-commissioned")
+        try:
+            with delegated_approval_context(authority):
+                child_result.update(approval.check_all_command_guards(command, "local"))
+            if child_result.get("approved"):
+                isolated.put({
+                    **_async_event("deleg-final-completion"),
+                    "status": "completed",
+                    "summary": "one final child completion",
+                })
+        finally:
+            approval._approval_tool_call_id.reset(token)
+
+    child_thread = threading.Thread(target=_child_run, daemon=True)
+    child_thread.start()
+    deadline = time.monotonic() + 1
+    while isolated.empty() and time.monotonic() < deadline:
+        time.sleep(0.002)
+    assert not isolated.empty() and child_thread.is_alive()
+
+    assert _drain_gateway_watch_events(isolated) == []
+    assert isolated.qsize() == 1
+
+    delivered_texts = []
+
+    async def _handle_message(event):
+        delivered_texts.append(event.text)
+        if event.text.startswith("[SYSTEM EVENT: delegated_approval_request]"):
+            payload = json.loads(event.text.splitlines()[2])
+            assert da.resolve_parent_decision(
+                parent, payload["approval_id"], "once"
+            )["resolved"]
+
+    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=_handle_message))
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=3)
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+    child_thread.join(1)
+
+    assert child_result.get("parent_agent_approved") is True
+    assert sum(text.startswith("[SYSTEM EVENT: delegated_approval_request]") for text in delivered_texts) == 1
+    assert sum("one final child completion" in text for text in delivered_texts) == 1
+    assert len(delivered_texts) == 2
+    assert isolated.empty()
+    with _active_subagents_lock:
+        _active_subagents.pop(authority.subagent_id, None)
 
 
 def test_unroutable_async_event_is_not_requeued_forever(

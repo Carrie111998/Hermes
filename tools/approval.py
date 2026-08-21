@@ -3946,6 +3946,32 @@ def check_all_command_guards(command: str, env_type: str,
         if not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
 
+    # While the disabled-by-default delegated lane is explicitly active, an
+    # inline interpreter wrapper cannot bypass review just because the legacy
+    # scanner missed that exact shell/container/SSH shape. The closed parser
+    # below still decides whether the parent lane is eligible.
+    if not warnings:
+        try:
+            from agent.delegation_context import get_delegated_approval_authority
+            from tools.delegated_approval import (
+                DelegatedApprovalAuthority,
+                requires_delegated_inline_review,
+            )
+
+            _review_authority = get_delegated_approval_authority()
+            if (
+                isinstance(_review_authority, DelegatedApprovalAuthority)
+                and _review_authority.parent_lane_enabled
+                and requires_delegated_inline_review(command)
+            ):
+                warnings.append((
+                    "script execution via -e/-c flag",
+                    "inline interpreter execution requires review",
+                    False,
+                ))
+        except Exception:
+            pass
+
     # Nothing to warn about
     if not warnings:
         return {"approved": True, "message": None}
@@ -4016,15 +4042,19 @@ def check_all_command_guards(command: str, env_type: str,
     # Every owner-consequence or otherwise ineligible request falls through to
     # the unchanged user approval path below.
     _await_parent_decision = None
+    _capture_request_identity = None
+    _current_request_identity = None
     try:
         from agent.delegation_context import get_delegated_approval_authority
         from tools.delegated_approval import (
             DelegatedApprovalAuthority,
             await_parent_decision,
+            capture_request_identity,
             is_specialist_local_reversible,
         )
 
         _await_parent_decision = await_parent_decision
+        _capture_request_identity = capture_request_identity
         _delegated_authority = get_delegated_approval_authority()
         _delegated_eligible = (
             isinstance(_delegated_authority, DelegatedApprovalAuthority)
@@ -4041,12 +4071,31 @@ def check_all_command_guards(command: str, env_type: str,
     except Exception:
         _delegated_eligible = False
 
-    if _delegated_eligible and _await_parent_decision is not None:
+    if (
+        _delegated_eligible
+        and _await_parent_decision is not None
+        and _capture_request_identity is not None
+    ):
+        try:
+            _current_request_identity = _capture_request_identity(
+                command,
+                _approval_tool_call_id.get(),
+            )
+        except (TypeError, UnicodeError):
+            _current_request_identity = None
+        if _current_request_identity is None:
+            _delegated_eligible = False
+
+    if (
+        _delegated_eligible
+        and _await_parent_decision is not None
+        and _current_request_identity is not None
+    ):
         _parent_decision = _await_parent_decision(
             command=command,
             description=combined_desc,
             pattern_keys=all_keys,
-            tool_call_id=_approval_tool_call_id.get(),
+            request_identity=_current_request_identity,
         )
         _parent_choice = _parent_decision.get("choice")
         if _parent_decision.get("resolved") and _parent_choice == "once":

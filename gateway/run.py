@@ -3467,6 +3467,9 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
     return None
 
 
+_ASYNC_DELEGATION_QUEUE_LOCK = threading.Lock()
+
+
 def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
     """Drain gateway-owned watch events without spinning on requeued events.
 
@@ -3479,19 +3482,20 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
     """
     watch_events: list[dict] = []
     requeue: list[dict] = []
-    while not completion_queue.empty():
-        try:
-            evt = completion_queue.get_nowait()
-        except Exception:
-            break
-        evt_type = evt.get("type", "completion")
-        if evt_type in {"watch_match", "watch_disabled"}:
-            watch_events.append(evt)
-        elif evt_type == "async_delegation":
-            requeue.append(evt)
-        # else: process completion events are handled by the watcher task
-    for evt in requeue:
-        completion_queue.put(evt)
+    with _ASYNC_DELEGATION_QUEUE_LOCK:
+        while not completion_queue.empty():
+            try:
+                evt = completion_queue.get_nowait()
+            except Exception:
+                break
+            evt_type = evt.get("type", "completion")
+            if evt_type in {"watch_match", "watch_disabled"}:
+                watch_events.append(evt)
+            elif evt_type in {"async_delegation", "delegated_approval_request"}:
+                requeue.append(evt)
+            # else: process completion events are handled by the watcher task
+        for evt in requeue:
+            completion_queue.put(evt)
     return watch_events
 
 
@@ -22360,19 +22364,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # so requeue anything that isn't ours.
                 requeue = []
                 async_events = []
-                while not _pr.completion_queue.empty():
-                    try:
-                        evt = _pr.completion_queue.get_nowait()
-                    except Exception:
-                        break
-                    if evt.get("type") in {
-                        "async_delegation", "delegated_approval_request"
-                    }:
-                        async_events.append(evt)
-                    else:
-                        requeue.append(evt)
-                for evt in requeue:
-                    _pr.completion_queue.put(evt)
+                with _ASYNC_DELEGATION_QUEUE_LOCK:
+                    while not _pr.completion_queue.empty():
+                        try:
+                            evt = _pr.completion_queue.get_nowait()
+                        except Exception:
+                            break
+                        if evt.get("type") in {
+                            "async_delegation", "delegated_approval_request"
+                        }:
+                            async_events.append(evt)
+                        else:
+                            requeue.append(evt)
+                    for evt in requeue:
+                        _pr.completion_queue.put(evt)
                 for evt in async_events:
                     self._enrich_async_delegation_routing(evt)
                     synth_text = _format_gateway_process_notification(evt)
