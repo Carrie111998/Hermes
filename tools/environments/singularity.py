@@ -125,7 +125,11 @@ def _apptainer_exec_env() -> dict[str, str]:
             get_all_passthrough,
             resolve_passthrough_value,
         )
-    except Exception:
+    except Exception as exc:
+        # Passthrough quietly does nothing on this install; name the reason
+        # so the silent no-op is diagnosable the first time the module
+        # layout shifts (review on #90298).
+        logger.debug("env_passthrough unavailable; Apptainer forwarding skipped: %s", exc)
         return env
     for name in get_all_passthrough():
         if not name or "=" in name or name.startswith("APPTAINERENV_"):
