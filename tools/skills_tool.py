@@ -935,13 +935,18 @@ def skill_view(
         skill_dir = None
         skill_md = None
 
+        # Subdirectories that hold a skill's own supporting files rather than other
+        # skills. Read as skill CONTENT further down (references/, templates/,
+        # assets/, scripts/); a .md inside one is never itself a skill.
+        _SKILL_CONTENT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
+
         # Collision detection: collect ALL candidates across every dir using
         # every lookup strategy (direct path, recursive by parent dir name,
         # legacy flat <name>.md). If more than one matches, refuse and tell
         # the caller — silent shadowing of a local skill by a same-named
         # external skill is a real bug class (`/skills` shows one, agent
         # loaded the other) so we surface it loudly instead of guessing.
-        from agent.skill_utils import iter_skill_index_files
+        from agent.skill_utils import iter_skill_index_files, is_excluded_skill_path
 
         candidates: List[Tuple[Optional[Path], Path]] = []  # (skill_dir, skill_md)
         seen_md: set = set()
@@ -982,9 +987,32 @@ def skill_view(
                     _record(found_skill_md.parent, found_skill_md)
 
             # Strategy 3: legacy flat <name>.md files anywhere under the dir.
+            #
+            # rglob matches ANY file with that basename, including a skill's own
+            # supporting documents. A workflow skill that keeps
+            # references/<topic>.md beside its SKILL.md is following the layout this
+            # module reads below (references/, templates/, assets/, scripts/), but
+            # every such file used to register as a rival candidate for <topic>.
+            # Observed on one install: `notion` and `airtable` each resolved to three
+            # candidates — the real productivity/<name>/SKILL.md plus
+            # creative/web-design-prototype/references/<name>.md and an archived
+            # templates/<name>.md, both 322-line "Design System" documents — so
+            # skill_view refused to load either skill. The refusal is right on a real
+            # collision; these candidates were not skills.
+            #
+            # is_excluded_skill_path is applied here for the same reason its own
+            # docstring gives: "use this on every SKILL.md path produced by rglob."
+            # Strategy 2 goes through iter_skill_index_files and gets it already;
+            # this loop was the one scanning site that did not, so .archive/ content
+            # counted as candidates too.
             for found_md in search_dir.rglob(f"{name}.md"):
-                if found_md.name != "SKILL.md":
-                    _record(None, found_md)
+                if found_md.name == "SKILL.md":
+                    continue
+                if is_excluded_skill_path(found_md):
+                    continue
+                if _SKILL_CONTENT_DIRS.intersection(found_md.parent.parts):
+                    continue
+                _record(None, found_md)
 
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
