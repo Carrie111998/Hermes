@@ -158,6 +158,43 @@ def test_keygen_env_key_with_existing_env_file_key_warns_not_clobbers(
     assert content == "API_SERVER_KEY=file-key-abcdef0123456789\n"
 
 
+def test_keygen_env_key_drops_stale_empty_assignment(
+    stage2_text: str, tmp_path: Path
+) -> None:
+    """Container env key + stale empty `API_SERVER_KEY=` line in .env.
+
+    The empty assignment must be removed: .env is loaded with override=True,
+    so python-dotenv would set API_SERVER_KEY to the empty string, clobbering
+    the operator's container-provided key and failing the api_server startup
+    guard — silently losing every cron fire.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".env").write_text("OTHER=1\nAPI_SERVER_KEY=\n")
+    result = _run_keygen(stage2_text, home, env_key="operator-env-key-0123456789")
+    assert result.returncode == 0, result.stderr
+    assert "skipping generation" in (result.stdout + result.stderr)
+    content = (home / ".env").read_text()
+    assert "OTHER=1" in content
+    # No generated (non-empty) key may appear — the operator's env key wins.
+    assert not re.search(r"^API_SERVER_KEY=..+$", content, re.MULTILINE)
+    # The stale empty line must be gone so override=True cannot clobber the
+    # container key. (GNU sed only: BSD sed on macOS dev hosts silently skips
+    # the -i invocation, same caveat as the append test above.)
+    if _sed_is_gnu():
+        assert "API_SERVER_KEY=" not in content
+
+
+def _sed_is_gnu() -> bool:
+    try:
+        probe = subprocess.run(
+            ["sed", "--version"], capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.returncode == 0 and "GNU sed" in probe.stdout
+
+
 def test_dockerignore_keeps_env_example_template() -> None:
     """The first-boot seed copies /opt/hermes/.env.example -> $HERMES_HOME/.env.
 

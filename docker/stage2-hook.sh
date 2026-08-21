@@ -460,6 +460,14 @@ if [ -n "${API_SERVER_KEY:-}" ]; then
     if [ -f "$HERMES_HOME/.env" ] && grep -q '^API_SERVER_KEY=..*' "$HERMES_HOME/.env" 2>/dev/null; then
         echo "[stage2] Warning: API_SERVER_KEY is set in both the container environment and $HERMES_HOME/.env — the .env value wins at runtime (loaded with override=True)"
     else
+        # A stale empty `API_SERVER_KEY=` line (left by an old seed) would
+        # clobber the container-provided key at runtime: .env is loaded with
+        # override=True and python-dotenv sets the empty string, which fails
+        # the api_server's startup guard — the exact silent-cron-loss symptom
+        # this hook exists to prevent. Drop it so the operator key wins.
+        if [ -f "$HERMES_HOME/.env" ] && ! refuse_symlinked_path "clean" "$HERMES_HOME/.env"; then
+            sed -i '/^API_SERVER_KEY=$/d' "$HERMES_HOME/.env" 2>/dev/null || true
+        fi
         echo "[stage2] API_SERVER_KEY provided via container environment — skipping generation"
     fi
 elif ! grep -q '^API_SERVER_KEY=..*' "$HERMES_HOME/.env" 2>/dev/null; then
