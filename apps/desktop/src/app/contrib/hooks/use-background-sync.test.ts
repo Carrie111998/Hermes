@@ -2,8 +2,16 @@ import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { sessionMessagesSignature } from '@/lib/session-signatures'
 import { $changeEventsAvailable, notifySessionsChanged, resetLiveSync } from '@/store/live-sync'
-import { $activeSessionId, $selectedStoredSessionId, setBusy, setMessagingSessions, setSessions } from '@/store/session'
+import {
+  $activeSessionId,
+  $selectedStoredSessionId,
+  setBusy,
+  setCronSessions,
+  setMessagingSessions,
+  setSessions
+} from '@/store/session'
 import {
   $attentionSessionIds,
   $stalledSessionIds,
@@ -15,6 +23,7 @@ import {
 import {
   type ActiveTranscriptRefreshDeps,
   reconcileActiveTranscript,
+  reconcileOpenTranscripts,
   rehydrateLiveSessionStatuses,
   resolveActiveTranscriptSession,
   useBackgroundSync,
@@ -91,6 +100,7 @@ function useSyncHarness({
     freshDraftReady: false,
     gatewayState: 'open',
     refreshActiveTranscript,
+    refreshSessionTiles: vi.fn(async () => undefined),
     refreshCronJobs: vi.fn(),
     refreshCurrentModel: vi.fn(),
     refreshHermesConfig: vi.fn(),
@@ -128,6 +138,7 @@ afterEach(() => {
   $activeSessionId.set(null)
   $selectedStoredSessionId.set(null)
   setSessions([])
+  setCronSessions([])
   setMessagingSessions([])
   setBusy(false)
   vi.clearAllMocks()
@@ -157,6 +168,37 @@ describe('active transcript refresh', () => {
         text: 'external answer'
       })
     )
+  })
+
+  it('refreshes session tiles alongside the primary transcript when sessions.changed ticks', async () => {
+    $changeEventsAvailable.set(true)
+    const refreshActiveTranscript = vi.fn(async () => undefined)
+    const refreshSessionTiles = vi.fn(async () => undefined)
+
+    renderHook(() =>
+      useBackgroundSync({
+        activeConnectionId: 'local',
+        activeGatewayProfile: 'default',
+        activeIsMessaging: false,
+        activeSessionId: ACTIVE_RUNTIME_ID,
+        activeStoredSessionId: ACTIVE_STORED_ID,
+        freshDraftReady: false,
+        gatewayState: 'open',
+        refreshActiveTranscript,
+        refreshSessionTiles,
+        refreshCronJobs: vi.fn(),
+        refreshCurrentModel: vi.fn(),
+        refreshHermesConfig: vi.fn(),
+        refreshMessagingSessions: vi.fn(),
+        refreshSessions: vi.fn(),
+        requestGateway: vi.fn(async () => ({ sessions: [] })) as never
+      })
+    )
+
+    act(() => notifySessionsChanged())
+
+    await waitFor(() => expect(refreshSessionTiles).toHaveBeenCalledTimes(1))
+    expect(refreshActiveTranscript).toHaveBeenCalledTimes(1)
   })
 
   it('does not add a periodic transcript poll to local/Desktop sessions', async () => {
@@ -237,7 +279,143 @@ describe('active transcript refresh', () => {
   })
 })
 
+describe('reconcileOpenTranscripts', () => {
+  it('hydrates every idle session tile through its own runtime cache', async () => {
+    const fixtureState = createClientSessionState('fixture')
+
+    const states = new Map([
+      ['runtime-a', createClientSessionState('stored-a')],
+      ['runtime-b', createClientSessionState('stored-b-tip')]
+    ])
+
+    const updateSessionState = vi.fn((runtimeId: string, updater: (state: typeof fixtureState) => typeof fixtureState) => {
+      const current = states.get(runtimeId)!
+      const next = updater(current)
+      states.set(runtimeId, next)
+
+      return next
+    })
+
+    const storedBMessages = [
+      { content: 'question for stored-b', role: 'user', timestamp: 1 },
+      { content: 'external answer for stored-b', role: 'assistant', timestamp: 2 }
+    ]
+
+    const signatureRef = {
+      current: new Map([['work:stored-b:runtime-old', sessionMessagesSignature(storedBMessages as never)]])
+    }
+
+    vi.mocked(getLatestSessionMessages).mockImplementation(async storedSessionId =>
+      ({
+        messages: [
+          { content: `question for ${storedSessionId}`, role: 'user', timestamp: 1 },
+          { content: `external answer for ${storedSessionId}`, role: 'assistant', timestamp: 2 }
+        ],
+        session_id: storedSessionId
+      }) as never
+    )
+
+    await reconcileOpenTranscripts({
+      requestSequenceRefs: { current: new Map() },
+      signatureRef,
+      targets: () => [
+        {
+          currentStoredSessionId: () => states.get('runtime-a')?.storedSessionId,
+          isBusy: () => false,
+          isCurrent: () => true,
+          profile: 'default',
+          runtimeSessionId: 'runtime-a',
+          storedSessionId: 'stored-a'
+        },
+        {
+          currentStoredSessionId: () => states.get('runtime-b')?.storedSessionId,
+          isBusy: () => false,
+          isCurrent: () => true,
+          profile: 'work',
+          runtimeSessionId: 'runtime-b',
+          storedSessionId: 'stored-b'
+        }
+      ],
+      updateSessionState
+    })
+
+    expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-a', 'default')
+    expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-b', 'work')
+    expect(updateSessionState).toHaveBeenCalledWith('runtime-b', expect.any(Function), 'stored-b-tip')
+    expect(signatureRef.current.has('work:stored-b:runtime-old')).toBe(false)
+    expect(signatureRef.current.has('work:stored-b:runtime-b')).toBe(true)
+    expect(states.get('runtime-a')?.messages.at(-1)?.parts[0]).toMatchObject({
+      text: 'external answer for stored-a'
+    })
+    expect(states.get('runtime-b')?.messages.at(-1)?.parts[0]).toMatchObject({
+      text: 'external answer for stored-b'
+    })
+  })
+
+  it('does not clobber a tile that is busy or closes during its read', async () => {
+    const updateSessionState = vi.fn()
+    const staleSequenceRef = { current: 3 }
+
+    const requestSequenceRefs = {
+      current: new Map<string, { current: number }>([['default:closed:runtime-closed', staleSequenceRef]])
+    }
+
+    let current = true
+    let resolve: ((value: unknown) => void) | undefined
+
+    vi.mocked(getLatestSessionMessages).mockReturnValueOnce(
+      new Promise(currentResolve => {
+        resolve = currentResolve
+      }) as never
+    )
+
+    const refresh = reconcileOpenTranscripts({
+      requestSequenceRefs,
+      signatureRef: { current: new Map() },
+      targets: () => [
+        {
+          currentStoredSessionId: () => 'stored-a',
+          isBusy: () => false,
+          isCurrent: () => current,
+          runtimeSessionId: 'runtime-a',
+          storedSessionId: 'stored-a'
+        },
+        {
+          currentStoredSessionId: () => 'stored-b',
+          isBusy: () => true,
+          isCurrent: () => true,
+          runtimeSessionId: 'runtime-b',
+          storedSessionId: 'stored-b'
+        }
+      ],
+      updateSessionState: updateSessionState as never
+    })
+
+    current = false
+    resolve?.(transcript('stale tile answer'))
+    await refresh
+
+    expect(getLatestSessionMessages).toHaveBeenCalledTimes(1)
+    expect(updateSessionState).not.toHaveBeenCalled()
+    expect(staleSequenceRef.current).toBe(4)
+    expect(requestSequenceRefs.current.has('default:closed:runtime-closed')).toBe(false)
+  })
+})
+
 describe('reconcileActiveTranscript', () => {
+  it('resolves and hydrates a cron-only session from the cron sessions store', async () => {
+    setCronSessions([{ id: ACTIVE_STORED_ID, profile: 'cron-profile', source: 'cron' } as never])
+    const fixture = makeRefresh(resolveActiveTranscriptSession)
+    vi.mocked(getLatestSessionMessages).mockResolvedValue(transcript('cron answer') as never)
+
+    await fixture.refresh()
+
+    expect(getLatestSessionMessages).toHaveBeenCalledWith(ACTIVE_STORED_ID, 'cron-profile')
+    expect(fixture.states.get(ACTIVE_RUNTIME_ID)?.messages.at(-1)?.parts[0]).toMatchObject({
+      text: 'cron answer'
+    })
+  })
+
   it('resolves and hydrates a messaging session from the messaging sessions store', async () => {
     setMessagingSessions([{ id: ACTIVE_STORED_ID, profile: 'messaging-profile', source: 'telegram' } as never])
     const fixture = makeRefresh(resolveActiveTranscriptSession)

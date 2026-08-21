@@ -9,9 +9,11 @@ import { sessionMessagesSignature } from '@/lib/session-signatures'
 import { $changeEventsAvailable, $cronChangeTick, $sessionsChangeTick } from '@/store/live-sync'
 import { $onBattery, batteryPollInterval } from '@/store/power'
 import { refreshActiveProfile } from '@/store/profile'
+import { $projectTree } from '@/store/projects'
 import {
   $activeSessionId,
   $busy,
+  $cronSessions,
   $currentCwd,
   $messagingSessions,
   $selectedStoredSessionId,
@@ -25,6 +27,7 @@ import {
   SESSION_WATCHDOG_TIMEOUT_MS,
   setSessionStalled
 } from '@/store/session-states'
+import type { SessionInfo } from '@/types/hermes'
 
 import type { ClientSessionState } from '../../types'
 import type { GatewayRequester } from '../types'
@@ -33,11 +36,21 @@ interface ActiveTranscriptSession {
   profile?: string | null
 }
 
-/** Resolve an active transcript from either local recents or messaging slices. */
+/** Resolve an open transcript from recents, messaging, or the project tree. */
 export function resolveActiveTranscriptSession(storedSessionId: string): ActiveTranscriptSession | undefined {
+  const match = (session: SessionInfo) => sessionMatchesStoredId(session, storedSessionId)
+
   return (
-    $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId)) ??
-    $messagingSessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+    $sessions.get().find(match) ??
+    $cronSessions.get().find(match) ??
+    $messagingSessions.get().find(match) ??
+    $projectTree
+      .get()
+      .flatMap(project => [
+        ...project.repos.flatMap(repo => repo.groups.flatMap(group => group.sessions)),
+        ...(project.previewSessions ?? [])
+      ])
+      .find(match)
   )
 }
 
@@ -48,11 +61,28 @@ export interface ActiveTranscriptRefreshDeps {
   selectedStoredSessionIdRef: MutableRefObject<string | null>
   resolveSession: (storedSessionId: string) => ActiveTranscriptSession | null | undefined
   signatureRef: MutableRefObject<Map<string, string>>
+  updateStoredSessionId?: () => null | string | undefined
   updateSessionState: (
     sessionId: string,
     updater: (state: ClientSessionState) => ClientSessionState,
     storedSessionId?: string | null
   ) => ClientSessionState
+}
+
+export interface OpenTranscriptTarget {
+  currentStoredSessionId: () => null | string | undefined
+  isBusy: () => boolean
+  isCurrent: () => boolean
+  profile?: string | null
+  runtimeSessionId: string
+  storedSessionId: string
+}
+
+export interface OpenTranscriptRefreshDeps {
+  requestSequenceRefs: MutableRefObject<Map<string, MutableRefObject<number>>>
+  signatureRef: MutableRefObject<Map<string, string>>
+  targets: () => readonly OpenTranscriptTarget[]
+  updateSessionState: ActiveTranscriptRefreshDeps['updateSessionState']
 }
 
 /** Reconcile one persisted transcript snapshot into the currently viewed session. */
@@ -63,6 +93,7 @@ export async function reconcileActiveTranscript({
   resolveSession,
   selectedStoredSessionIdRef,
   signatureRef,
+  updateStoredSessionId,
   updateSessionState
 }: ActiveTranscriptRefreshDeps): Promise<void> {
   const storedSessionId = selectedStoredSessionIdRef.current
@@ -93,7 +124,7 @@ export async function reconcileActiveTranscript({
       return
     }
 
-    const signatureKey = `${stored.profile ?? 'default'}:${storedSessionId}`
+    const signatureKey = `${stored.profile ?? 'default'}:${storedSessionId}:${runtimeSessionId}`
     const signature = sessionMessagesSignature(latest.messages)
 
     if (signatureRef.current.get(signatureKey) === signature) {
@@ -112,11 +143,86 @@ export async function reconcileActiveTranscript({
         // them (see transcript-backfill).
         messages: preserveLocalAssistantErrors(graftRefreshedTailOntoBackfill(messages, state.messages), state.messages)
       }),
-      storedSessionId
+      updateStoredSessionId ? updateStoredSessionId() : storedSessionId
     )
   } catch {
     // Non-fatal: the next change event or manual resume can hydrate the view.
   }
+}
+
+/** Reconcile every open chat surface through the guarded primary path. */
+export async function reconcileOpenTranscripts({
+  requestSequenceRefs,
+  signatureRef,
+  targets,
+  updateSessionState
+}: OpenTranscriptRefreshDeps): Promise<void> {
+  const uniqueTargets = new Map<string, OpenTranscriptTarget>()
+
+  for (const target of targets()) {
+    if (target.isCurrent()) {
+      uniqueTargets.set(target.runtimeSessionId, target)
+    }
+  }
+
+  const requestKeyFor = (target: OpenTranscriptTarget) =>
+    `${target.profile ?? 'default'}:${target.storedSessionId}:${target.runtimeSessionId}`
+
+  const activeRequestKeys = new Set([...uniqueTargets.values()].map(requestKeyFor))
+
+  for (const [key, requestSequenceRef] of requestSequenceRefs.current) {
+    if (!activeRequestKeys.has(key)) {
+      // Invalidate an in-flight read before releasing its sequence entry. If a
+      // tile later reopens under the same ids, that old response must not land.
+      requestSequenceRef.current += 1
+      requestSequenceRefs.current.delete(key)
+    }
+  }
+
+  for (const key of signatureRef.current.keys()) {
+    if (!activeRequestKeys.has(key)) {
+      signatureRef.current.delete(key)
+    }
+  }
+
+  await Promise.all(
+    [...uniqueTargets.values()].map(target => {
+      const requestKey = requestKeyFor(target)
+      let requestSequenceRef = requestSequenceRefs.current.get(requestKey)
+
+      if (!requestSequenceRef) {
+        requestSequenceRef = { current: 0 }
+        requestSequenceRefs.current.set(requestKey, requestSequenceRef)
+      }
+
+      return reconcileActiveTranscript({
+        activeSessionIdRef: {
+          get current() {
+            return target.isCurrent() ? target.runtimeSessionId : null
+          },
+          set current(_value: string | null) {}
+        },
+        busyRef: {
+          get current() {
+            return target.isBusy()
+          },
+          set current(_value: boolean) {}
+        },
+        requestSequenceRef,
+        resolveSession: storedSessionId =>
+          target.isCurrent() && storedSessionId === target.storedSessionId ? { profile: target.profile } : undefined,
+        selectedStoredSessionIdRef: {
+          get current() {
+            return target.isCurrent() ? target.storedSessionId : null
+          },
+          set current(_value: string | null) {}
+        },
+        signatureRef,
+        updateStoredSessionId: target.currentStoredSessionId,
+        updateSessionState
+      })
+    })
+  )
 }
 
 // Cron sessions are written by a background scheduler tick, messaging turns by
@@ -292,6 +398,7 @@ interface BackgroundSyncParams {
   freshDraftReady: boolean
   gatewayState: string
   refreshActiveTranscript: () => Promise<unknown> | unknown
+  refreshSessionTiles: () => Promise<unknown> | unknown
   refreshCronJobs: () => Promise<unknown> | unknown
   refreshCurrentModel: (force?: boolean) => Promise<unknown> | unknown
   refreshHermesConfig: () => Promise<unknown> | unknown
@@ -360,6 +467,7 @@ export function useBackgroundSync({
   freshDraftReady,
   gatewayState,
   refreshActiveTranscript,
+  refreshSessionTiles,
   refreshCronJobs,
   refreshCurrentModel,
   refreshHermesConfig,
@@ -512,6 +620,7 @@ export function useBackgroundSync({
       void refreshSessions()
       void refreshMessagingSessions()
       requestActiveTranscriptRefresh(true)
+      void refreshSessionTiles()
     }
 
     const unsubscribe = $sessionsChangeTick.listen(() => {
@@ -534,7 +643,14 @@ export function useBackgroundSync({
         window.clearTimeout(timer)
       }
     }
-  }, [changeEventsAvailable, gatewayState, refreshMessagingSessions, refreshSessions, requestActiveTranscriptRefresh])
+  }, [
+    changeEventsAvailable,
+    gatewayState,
+    refreshMessagingSessions,
+    refreshSessions,
+    refreshSessionTiles,
+    requestActiveTranscriptRefresh
+  ])
 
   // Keep the cron-jobs section live without a user action (scheduler ticks in
   // the background). cron.changed (jobs.json moved: CRUD or a scheduler tick's

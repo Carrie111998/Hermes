@@ -21,6 +21,7 @@ function render(activeGatewayProfile: string, activeConnectionId: string, refres
         freshDraftReady: false,
         gatewayState: 'open',
         refreshActiveTranscript: noop,
+        refreshSessionTiles: noop,
         refreshCronJobs: noop,
         refreshCurrentModel: noop,
         refreshHermesConfig: noop,

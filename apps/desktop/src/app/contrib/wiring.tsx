@@ -71,6 +71,7 @@ import {
   setMessages
 } from '@/store/session'
 import { requestForSessionProfile } from '@/store/session-request-router'
+import { $sessionTiles } from '@/store/session-states'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '@/store/todos'
 import { armWakeWord, stopClientCapture } from '@/store/wake-word'
 import { isAuxiliaryWindow, isHudWindow } from '@/store/windows'
@@ -114,6 +115,7 @@ import { usePreviewRouting } from '../session/hooks/use-preview-routing'
 import { usePromptActions } from '../session/hooks/use-prompt-actions'
 import { useRouteResume } from '../session/hooks/use-route-resume'
 import { useSessionActions } from '../session/hooks/use-session-actions'
+import { resolveSessionProfile } from '../session/hooks/use-session-actions/utils'
 import { useSessionListActions } from '../session/hooks/use-session-list-actions'
 import { useSessionStateCache } from '../session/hooks/use-session-state-cache'
 import { startWorkspaceSession } from '../session/workspace-session-target'
@@ -132,6 +134,7 @@ import { UpdatesOverlay } from '../updates-overlay'
 import { ContribWiringContext } from './context'
 import {
   reconcileActiveTranscript,
+  reconcileOpenTranscripts,
   resolveActiveTranscriptSession,
   useBackgroundSync
 } from './hooks/use-background-sync'
@@ -173,7 +176,9 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const billingSettingsSeenRef = useRef(0)
   const cronReviewSeenRef = useRef(0)
   const activeTranscriptSignatureRef = useRef(new Map<string, string>())
+  const tileTranscriptSignatureRef = useRef(new Map<string, string>())
   const activeTranscriptRequestSequenceRef = useRef(0)
+  const openTranscriptRequestSequenceRefs = useRef(new Map<string, { current: number }>())
   // Stable identity for the whole callback surface (see WiringActions). Mutated
   // in place each render so memoized surfaces never re-render on churn.
   const actionsRef = useRef<WiringActions | null>(null)
@@ -428,6 +433,58 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       }),
     [activeSessionIdRef, busyRef, selectedStoredSessionIdRef, updateSessionState]
   )
+
+  const refreshSessionTiles = useCallback(async () => {
+    const tiles = await Promise.all(
+      $sessionTiles.get().map(async tile => {
+        const runtimeSessionId = tile.runtimeId
+
+        if (!runtimeSessionId) {
+          return null
+        }
+
+        const storedSessionId = tile.storedSessionId
+        const cachedProfile = resolveActiveTranscriptSession(storedSessionId)?.profile?.trim()
+        const profile = cachedProfile || (await resolveSessionProfile(storedSessionId).catch(() => undefined))
+
+        if (!profile) {
+          return null
+        }
+
+        return { profile, runtimeSessionId, storedSessionId }
+      })
+    )
+
+    return reconcileOpenTranscripts({
+      requestSequenceRefs: openTranscriptRequestSequenceRefs,
+      signatureRef: tileTranscriptSignatureRef,
+      targets: () =>
+        tiles.flatMap(tile =>
+          tile
+            ? [
+                {
+                  currentStoredSessionId: () =>
+                    sessionStateByRuntimeIdRef.current.get(tile.runtimeSessionId)?.storedSessionId,
+                  isBusy: () => Boolean(sessionStateByRuntimeIdRef.current.get(tile.runtimeSessionId)?.busy),
+                  isCurrent: () =>
+                    sessionStateByRuntimeIdRef.current.has(tile.runtimeSessionId) &&
+                    $sessionTiles
+                      .get()
+                      .some(
+                        current =>
+                          current.storedSessionId === tile.storedSessionId &&
+                          current.runtimeId === tile.runtimeSessionId
+                      ),
+                  profile: tile.profile,
+                  runtimeSessionId: tile.runtimeSessionId,
+                  storedSessionId: tile.storedSessionId
+                }
+              ]
+            : []
+        ),
+      updateSessionState
+    })
+  }, [sessionStateByRuntimeIdRef, updateSessionState])
 
   const { handleGatewayEvent } = useMessageStream({
     activeGatewayProfile,
@@ -807,6 +864,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     freshDraftReady,
     gatewayState,
     refreshActiveTranscript,
+    refreshSessionTiles,
     refreshCronJobs,
     refreshCurrentModel,
     refreshHermesConfig,
