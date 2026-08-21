@@ -80,8 +80,8 @@
     {
       "path": "website/docs/guides/task-completion-verification.md",
       "role": "architecture_guide",
-      "bytes": 6450,
-      "sha256": "511026ea8a033af57e7534673d2c89228cb9f4357ea59e58b1b94d2211e7787b"
+      "bytes": 6437,
+      "sha256": "9aac538bfa9c31604dbe609e94cc2b4362016353b9a4439b872beff7f0ea40bb"
     },
     {
       "path": "docs/research/all-gods-must-die-interlock.md",

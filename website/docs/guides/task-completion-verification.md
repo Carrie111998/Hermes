@@ -100,9 +100,9 @@ The repository package includes:
 
 - `docs/research/task-completion-record.schema.json` - JSON Schema for completion records;
 - `docs/research/task-completion-verification-ledger.json` - the dated webhook packet and current GitHub reconciliation as separate, valid records;
-- `docs/research/task-completion-verification-amendment.md` / `.tex` / `.pdf` - the formal doctrine;
-- `docs/research/all-gods-must-die-adversarially-verified-transformation-v1.1.pdf` - successor release preserving v1.0 and incorporating the amendment;
-- `docs/research/all-gods-must-die-v1.1-release-manifest.json` - component digests and typed lineage.
+- `docs/research/task-completion-verification-amendment.md` - the formal doctrine source;
+- `docs/research/all-gods-must-die-adversarially-verified-transformation-v1.1.tex` - composition source for the successor release;
+- `docs/research/all-gods-must-die-v1.1-release-manifest.json` - source and generated-output digests with typed lineage.
 
 A verifier must reject any record that borrows CI from another SHA, uses a local path as proof of remote mutation, marks a superseded object active, omits a write failure, or names a stronger predicate than its receipts support.
 
