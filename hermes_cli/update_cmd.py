@@ -3927,7 +3927,7 @@ def _windows_process_image_rows() -> list[tuple[int, str, str | None]] | None:
                 entry.dwSize = ctypes.sizeof(entry)
                 if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
                     error = ctypes.get_last_error()
-                    if error not in (0, 18):  # ERROR_NO_MORE_FILES
+                    if error != 18:  # ERROR_NO_MORE_FILES
                         return None
                     break
         finally:
@@ -4076,6 +4076,11 @@ def _detect_venv_python_processes(
                 continue
             if not exe:
                 continue
+            live_executable_name = Path(str(exe)).name
+            process_name = live_executable_name.lower()
+            process_is_python = _looks_like_python_image(process_name)
+            executable_is_python = process_is_python
+            info["name"] = live_executable_name
         try:
             exe_norm = str(Path(exe).resolve()).lower()
         except (OSError, ValueError):

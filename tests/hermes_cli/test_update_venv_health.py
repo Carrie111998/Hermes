@@ -228,6 +228,37 @@ def test_detect_venv_python_revalidates_native_pid_identity(_winp, tmp_path):
     reused.exe.assert_called_once_with()
 
 
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_detect_venv_python_reclassifies_reused_pid_from_live_executable(_winp, tmp_path):
+    snapshot_exe = str(tmp_path / "venv" / "Scripts" / "custom-runner.exe")
+    live_exe = r"C:\Python311\python3.11.exe"
+    venv_py = str(tmp_path / "venv" / "Scripts" / "python.exe")
+    reused = _proc(
+        616,
+        live_exe,
+        "python3.11.exe",
+        [live_exe, venv_py, "worker.py"],
+    )
+    me = MagicMock()
+    me.parents.return_value = []
+    fake_psutil = types.SimpleNamespace(
+        process_iter=MagicMock(side_effect=AssertionError("fallback must not run")),
+        Process=lambda pid=None: me if pid is None else reused,
+    )
+
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.object(
+        update_module,
+        "_windows_process_image_rows",
+        return_value=[(616, "custom-runner.exe", snapshot_exe)],
+    ), patch.dict(sys.modules, {"psutil": fake_psutil}):
+        assert cli_main._detect_venv_python_processes() == [
+            (616, "python3.11.exe", f"{live_exe} {venv_py} worker.py")
+        ]
+
+    reused.exe.assert_called_once_with()
+    reused.cmdline.assert_called_once_with()
+
+
 def _fake_kernel32(*, next_error: int = 18, invalid_snapshot: bool = False):
     from ctypes import wintypes
 
@@ -290,6 +321,18 @@ def test_windows_process_image_rows_invalid_snapshot_fails_to_fallback(_winp):
 @patch.object(cli_main, "_is_windows", return_value=True)
 def test_windows_process_image_rows_abnormal_next_error_fails_to_fallback(_winp):
     kernel, last_error = _fake_kernel32(next_error=5)
+    with (
+        patch.object(ctypes, "WinDLL", create=True, return_value=kernel),
+        patch.object(ctypes, "get_last_error", return_value=last_error),
+    ):
+        assert update_module._windows_process_image_rows() is None
+
+    assert kernel.CloseHandle.call_args_list == [call(200), call(100)]
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_windows_process_image_rows_zero_next_error_fails_to_fallback(_winp):
+    kernel, last_error = _fake_kernel32(next_error=0)
     with (
         patch.object(ctypes, "WinDLL", create=True, return_value=kernel),
         patch.object(ctypes, "get_last_error", return_value=last_error),
