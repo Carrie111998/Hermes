@@ -5,10 +5,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig, load_gateway_config
 from plugins.platforms.whatsapp.adapter import (
     WhatsAppAdapter,
-    _apply_yaml_config,
     _normalize_outbound_mode,
     _standalone_send,
 )
@@ -38,13 +37,20 @@ def test_outbound_mode_defaults_normal_and_fails_closed():
     assert _normalize_outbound_mode("typo") == "never"
 
 
-def test_yaml_config_seeds_outbound_mode_without_process_env():
-    assert _apply_yaml_config({}, {"outbound_mode": "never"}) == {
-        "outbound_mode": "never"
-    }
-    assert _apply_yaml_config({}, {"outbound_mode": "typo"}) == {
-        "outbound_mode": "never"
-    }
+def test_yaml_config_seeds_outbound_mode_through_gateway_loader(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "whatsapp:\n  enabled: true\n  outbound_mode: never\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    config = load_gateway_config()
+
+    assert config.platforms[Platform.WHATSAPP].extra["outbound_mode"] == "never"
 
 
 @pytest.mark.asyncio
