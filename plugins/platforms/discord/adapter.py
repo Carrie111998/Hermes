@@ -4402,6 +4402,10 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("Could not load discord.%s config: %s", key, e)
             return default
 
+    # Discord API rejects activity name/details longer than 128 chars
+    # (HTTP 400); discord.py does not enforce this client-side.
+    _ACTIVITY_FIELD_MAX = 128
+
     def _load_discord_activity_config(self) -> Dict[str, Any]:
         """Read discord.activity from config.yaml.
 
@@ -4455,10 +4459,15 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _render_activity_templates(self, text: str, model_name: str,
                                    profile_name: str) -> str:
-        """Expand {{model}} and {{profile}} in an activity text field."""
+        """Expand {{model}} and {{profile}} in an activity text field.
+
+        The rendered result is truncated to the Discord API limit so a long
+        model name can't make every presence update 400.
+        """
         if not text:
             return ""
-        return text.replace("{{model}}", model_name).replace("{{profile}}", profile_name)
+        rendered = text.replace("{{model}}", model_name).replace("{{profile}}", profile_name)
+        return rendered[: self._ACTIVITY_FIELD_MAX]
 
     def _activity_type(self, atype: str):
         """Map an activity type string to the discord.ActivityType enum.

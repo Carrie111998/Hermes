@@ -572,9 +572,11 @@ discord:
 - **`enabled`** — `true` to activate, `false` (default) to disable.
 - **`type`** — One of `playing`, `watching`, `listening`, or `competing`. Determines the verb shown before `state` in the activity (e.g., "Watching Qwen3.6-27B").
 - **`state`** — The text displayed after the verb. Supports template variables:
-  - `{{model}}` — Resolved to the active model from `model.default` in config.yaml. Empty string if not configured.
-  - `{{profile}}` — The profile the gateway is running as (inferred from the active profile, e.g. `coder`).
+  - `{{model}}` — Resolved to the global model from `model.default` in config.yaml (per-session `/model` overrides do not change the presence). Empty string if not configured.
+  - `{{profile}}` — The profile the gateway is running as (inferred from the active profile, e.g. `coder`). Non-standard `HERMES_HOME` directories render as the literal string `custom`.
 - **`details`** — Optional secondary info line under the activity text; supports the same templates.
+
+Rendered `state` and `details` are truncated to 128 characters (Discord's API limit), so long `{{model}}` values won't cause presence updates to fail.
 
 **Example:** Show "Playing gpt-4o" under the bot name:
 

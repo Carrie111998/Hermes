@@ -263,6 +263,27 @@ class TestApplyActivity:
         self._assert_activity_created("watching", "hermes",
                                       expected_details="on coder")
 
+    def test_long_model_name_truncated_to_128(self):
+        """Discord rejects activity names > 128 chars (HTTP 400); a long
+        custom model ID must be truncated, not sent as-is."""
+        long_model = "custom-provider/" + "x" * 200
+        client = self._do_apply(
+            {"enabled": True, "type": "watching", "state": "{{model}}"},
+            {"model": {"default": long_model}},
+        )
+        call_kwargs = discord.Activity.call_args.kwargs
+        assert len(call_kwargs["name"]) == 128
+        self._assert_change_presence_awaited(client)
+
+    def test_truncation_applies_to_details(self):
+        client = self._do_apply(
+            {"enabled": True, "type": "watching",
+             "state": "hermes", "details": "d" * 200},
+            {},
+        )
+        call_kwargs = discord.Activity.call_args.kwargs
+        assert len(call_kwargs["details"]) == 128
+
     def test_missing_model_left_as_empty(self):
         client = self._do_apply(
             {"enabled": True, "type": "watching", "state": "{{model}}"},
