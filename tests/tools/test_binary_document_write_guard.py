@@ -8,7 +8,9 @@ allowing new-.pdf creation (raw PDF syntax is text-authorable).
 
 import json
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+import pytest
 
 from tools.binary_extensions import (
     has_opaque_document_extension,
@@ -19,6 +21,52 @@ from tools.file_tools import (
     patch_tool,
     write_file_tool,
 )
+from tools.file_operations import (
+    FilePrefixResult,
+    PatchResult,
+    ShellFileOperations,
+    WriteResult,
+)
+from tools.environments.local import LocalEnvironment
+
+
+class _RemoteEnvironment:
+    cwd = "/workspace"
+
+
+class _FakeRemoteFileOps:
+    def __init__(self, prefix: FilePrefixResult):
+        self.env = _RemoteEnvironment()
+        self.prefix = prefix
+        self.prefix_reads = []
+        self.write_calls = 0
+        self.patch_calls = 0
+
+    def read_file_prefix(self, path: str, length: int) -> FilePrefixResult:
+        self.prefix_reads.append((path, length))
+        return self.prefix
+
+    def write_file(self, path: str, content: str) -> WriteResult:
+        self.write_calls += 1
+        return WriteResult(bytes_written=len(content), verified=True)
+
+    def patch_replace(self, path: str, old_string: str, new_string: str,
+                      replace_all: bool = False) -> PatchResult:
+        self.patch_calls += 1
+        return PatchResult(success=True, files_modified=[path])
+
+
+def _install_remote_file_ops(monkeypatch, prefix: FilePrefixResult) -> _FakeRemoteFileOps:
+    import tools.file_tools as file_tools
+
+    file_ops = _FakeRemoteFileOps(prefix)
+    monkeypatch.setattr(
+        file_tools,
+        "_resolve_path_for_task",
+        lambda path, task_id="default": PurePosixPath("/workspace") / path,
+    )
+    monkeypatch.setattr(file_tools, "_get_file_ops", lambda task_id="default": file_ops)
+    return file_ops
 
 
 def _make_minimal_docx(path: Path) -> None:
@@ -36,6 +84,28 @@ def _make_minimal_docx(path: Path) -> None:
             "<w:t>Quarterly numbers look good.</w:t></w:r></w:p></w:body>"
             "</w:document>",
         )
+
+
+class TestFilePrefixRead:
+    def test_reads_only_requested_binary_prefix(self, tmp_path: Path):
+        target = tmp_path / "large.pot"
+        target.write_bytes(bytes.fromhex("D0CF11E0A1B11AE1") + b"x" * 100_000)
+        file_ops = ShellFileOperations(LocalEnvironment(cwd=str(tmp_path)))
+
+        result = file_ops.read_file_prefix(str(target), 8)
+
+        assert result.error is None
+        assert result.missing is False
+        assert result.content == bytes.fromhex("D0CF11E0A1B11AE1")
+
+    def test_distinguishes_missing_file(self, tmp_path: Path):
+        file_ops = ShellFileOperations(LocalEnvironment(cwd=str(tmp_path)))
+
+        result = file_ops.read_file_prefix(str(tmp_path / "missing.pot"), 8)
+
+        assert result.error is None
+        assert result.missing is True
+        assert result.content == b""
 
 
 class TestExtensionHelpers:
@@ -89,6 +159,53 @@ class TestCheckBinaryDocumentWrite:
         err = _check_binary_document_write(str(pot))
         assert err is not None
         assert "PowerPoint" in err
+
+    def test_remote_inspection_failure_rejected(self, monkeypatch):
+        file_ops = _install_remote_file_ops(
+            monkeypatch, FilePrefixResult(error="permission denied")
+        )
+
+        err = _check_binary_document_write("slides.pot", task_id="remote")
+
+        assert err is not None
+        assert "could not be inspected safely" in err
+        assert file_ops.prefix_reads == [("/workspace/slides.pot", 8)]
+
+
+@pytest.mark.parametrize("tool_name", ["write", "patch"])
+@pytest.mark.parametrize(
+    ("prefix", "should_reject"),
+    [
+        (FilePrefixResult(content=bytes.fromhex("D0CF11E0A1B11AE1")), True),
+        (FilePrefixResult(content=b'msgid "'), False),
+        (FilePrefixResult(missing=True), False),
+    ],
+    ids=["ole-powerpoint", "gettext", "missing"],
+)
+def test_remote_pot_guard_uses_backend_for_both_write_paths(
+    monkeypatch, tool_name, prefix, should_reject
+):
+    file_ops = _install_remote_file_ops(monkeypatch, prefix)
+
+    if tool_name == "write":
+        result = json.loads(
+            write_file_tool("slides.pot", 'msgid "hello"\n', task_id="remote")
+        )
+    else:
+        result = json.loads(
+            patch_tool(
+                mode="replace",
+                path="slides.pot",
+                old_string="hello",
+                new_string="goodbye",
+                task_id="remote",
+            )
+        )
+
+    assert bool(result.get("error")) is should_reject
+    assert file_ops.prefix_reads == [("/workspace/slides.pot", 8)]
+    assert file_ops.write_calls == (1 if tool_name == "write" and not should_reject else 0)
+    assert file_ops.patch_calls == (1 if tool_name == "patch" and not should_reject else 0)
 
 
 class TestWriteFileToolGuard:

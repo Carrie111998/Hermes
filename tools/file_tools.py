@@ -2207,24 +2207,47 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
         )
     if is_pot_path(filepath):
         try:
-            resolved = Path(_resolve_path_for_task(filepath, task_id))
+            resolved = _resolve_path_for_task(filepath, task_id)
         except Exception:
             resolved = Path(_expand_tilde(filepath))
         try:
-            is_ole_template = False
-            if resolved.is_file():
-                with resolved.open("rb") as existing:
-                    is_ole_template = existing.read(8) == _OLE_COMPOUND_MAGIC
-            if is_ole_template:
+            file_ops = _get_file_ops(task_id)
+        except Exception as exc:
+            return (
+                f"Refusing to write '{filepath}' because its .pot file could not "
+                f"be inspected through the active file backend: {exc}"
+            )
+        if _file_ops_uses_host_paths(file_ops):
+            try:
+                prefix = b""
+                host_path = Path(resolved)
+                if host_path.is_file():
+                    with host_path.open("rb") as existing:
+                        prefix = existing.read(len(_OLE_COMPOUND_MAGIC))
+            except OSError as exc:
                 return (
-                    f"Refusing to overwrite legacy PowerPoint template '{filepath}' "
-                    "with plain text. The existing .pot file is an OLE compound "
-                    "document; use the powerpoint skill or a compatible library via "
-                    "the terminal to modify it. Plain-text gettext .pot files remain "
-                    "writable."
+                    f"Refusing to write '{filepath}' because its existing .pot file "
+                    f"could not be inspected safely: {exc}"
                 )
-        except OSError:
-            pass
+        else:
+            inspected = file_ops.read_file_prefix(
+                str(resolved), len(_OLE_COMPOUND_MAGIC)
+            )
+            if inspected.error:
+                return (
+                    f"Refusing to write '{filepath}' because its existing .pot file "
+                    f"could not be inspected safely: {inspected.error}"
+                )
+            prefix = b"" if inspected.missing else inspected.content
+
+        if prefix == _OLE_COMPOUND_MAGIC:
+            return (
+                f"Refusing to overwrite legacy PowerPoint template '{filepath}' "
+                "with plain text. The existing .pot file is an OLE compound "
+                "document; use the powerpoint skill or a compatible library via "
+                "the terminal to modify it. Plain-text gettext .pot files remain "
+                "writable."
+            )
     if is_pdf_path(filepath):
         try:
             resolved = Path(_resolve_path_for_task(filepath, task_id))
