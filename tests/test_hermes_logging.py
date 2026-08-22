@@ -283,6 +283,20 @@ class TestRedactingFormatterMissingFields:
         assert "hello world" in out
         assert "test.no_factory" in out
 
+    def test_format_tolerates_missing_numeric_field(self):
+        """A missing numeric field is defaulted to 0 so %d render doesn't raise TypeError."""
+        from agent.redact import RedactingFormatter
+
+        formatter = RedactingFormatter("%(asctime)s %(message)s %(fake_count)d")
+        record = logging.LogRecord(
+            "test.no_factory", logging.INFO, __file__, 1, "hello", (), None,
+        )
+        # A directly constructed record has no fake_count field.
+        assert not hasattr(record, "fake_count")
+        out = formatter.format(record)
+        # Should not raise, and the output should contain the message.
+        assert "hello" in out
+
 
 class TestComponentFilter:
     """Unit tests for _ComponentFilter."""
