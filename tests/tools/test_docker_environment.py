@@ -50,12 +50,28 @@ def _make_dummy_env(**kwargs):
         network=kwargs.get("network", True),
         host_cwd=kwargs.get("host_cwd"),
         auto_mount_cwd=kwargs.get("auto_mount_cwd", False),
+        mount_profile_skills=kwargs.get("mount_profile_skills", True),
         env=kwargs.get("env"),
         run_as_host_user=kwargs.get("run_as_host_user", False),
         extra_args=kwargs.get("extra_args", []),
         persist_across_processes=kwargs.get("persist_across_processes", True),
         shm_size=kwargs.get("shm_size", docker_env._DEFAULT_SHM_SIZE),
     )
+
+
+def test_profile_skills_mount_policy_is_forwarded(monkeypatch):
+    """Shared containers can omit only the creating profile's skills tree."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    _mock_subprocess_run(monkeypatch)
+    captured = []
+    monkeypatch.setattr(
+        "tools.credential_files.get_skills_directory_mount",
+        lambda **kwargs: captured.append(kwargs) or [],
+    )
+
+    _make_dummy_env(mount_profile_skills=False)
+
+    assert captured == [{"include_profile_skills": False}]
 
 
 def test_ensure_docker_available_logs_and_raises_when_not_found(monkeypatch, caplog):
@@ -1254,7 +1270,7 @@ def test_credential_mount_skipped_when_source_is_directory(monkeypatch, tmp_path
     )
     monkeypatch.setattr(
         "tools.credential_files.get_skills_directory_mount",
-        lambda: [],
+        lambda **_: [],
     )
     monkeypatch.setattr(
         "tools.credential_files.get_cache_directory_mounts",
@@ -1294,7 +1310,7 @@ def test_credential_mount_skipped_when_source_missing(monkeypatch, tmp_path, cap
     )
     monkeypatch.setattr(
         "tools.credential_files.get_skills_directory_mount",
-        lambda: [],
+        lambda **_: [],
     )
     monkeypatch.setattr(
         "tools.credential_files.get_cache_directory_mounts",

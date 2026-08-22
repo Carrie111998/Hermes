@@ -883,6 +883,7 @@ class DockerEnvironment(BaseEnvironment):
         network: bool = True,
         host_cwd: Optional[str] = None,
         auto_mount_cwd: bool = False,
+        mount_profile_skills: bool = True,
         run_as_host_user: bool = False,
         extra_args: list = None,
         persist_across_processes: bool = True,
@@ -1046,7 +1047,9 @@ class DockerEnvironment(BaseEnvironment):
 
             # Mount skill directories (local + external) so skill
             # scripts/templates are available inside the container.
-            for skills_mount in get_skills_directory_mount():
+            for skills_mount in get_skills_directory_mount(
+                include_profile_skills=mount_profile_skills,
+            ):
                 src = Path(skills_mount["host_path"])
                 if not src.is_dir():
                     logger.warning(
