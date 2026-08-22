@@ -82,6 +82,20 @@ STALL_GUARD_UNCHANGED_RESULT_TOOLS = frozenset(
     }
 )
 
+# Tools whose arguments include how-to-apply selectors that don't change the
+# desired end state; those arguments are dropped from the stall signature.
+# Each entry maps a tool name to ``(required_list_arg, jitter_args)``: the
+# normalizer only applies when ``required_list_arg`` is a list (the end-state
+# payload), and every key in ``jitter_args`` is stripped before hashing. Keep
+# this narrow — like STALL_GUARD_UNCHANGED_RESULT_TOOLS above, each entry is
+# a deliberate claim about one tool's argument semantics, pinned by tests.
+STALL_GUARD_ARG_NORMALIZERS: dict[str, tuple[str, frozenset[str]]] = {
+    # todo: ``merge`` selects how to apply the list; alternating it while
+    # re-asserting the same ``todos`` is still the same stalled action. Item
+    # order inside ``todos`` stays significant — it defines priority.
+    "todo": ("todos", frozenset({"merge"})),
+}
+
 # Poller naming conventions (e.g. ``<vendor>_get_result``) used by generated /
 # MCP tool surfaces. Matched as suffixes so vendor-prefixed pollers are exempt
 # without enumerating every vendor.
@@ -312,20 +326,20 @@ def _stall_guard_signature(
     """Return the call identity used by the observational stall guard.
 
     Some tools declare a desired end state while also accepting arguments that
-    only select how to apply it. For ``todo``, ``merge`` is such an argument:
-    alternating it while re-asserting the same list is still the same stalled
-    action. Normalize that one observed jitter pattern without weakening the
-    stricter signatures used by failure and no-progress guardrails.
+    only select how to apply it. ``STALL_GUARD_ARG_NORMALIZERS`` lists the
+    observed jitter patterns to normalize (currently just ``todo``'s ``merge``
+    selector) without weakening the stricter signatures used by failure and
+    no-progress guardrails.
 
-    Todo item order remains significant because it defines priority. All other
-    tools and argument differences retain their exact canonical identity.
+    All other tools and argument differences retain their exact canonical
+    identity.
     """
     coerced = _coerce_args(args)
-    if tool_name != "todo" or not isinstance(coerced.get("todos"), list):
+    normalizer = STALL_GUARD_ARG_NORMALIZERS.get(tool_name)
+    if normalizer is None or not isinstance(coerced.get(normalizer[0]), list):
         return ToolCallSignature.from_call(tool_name, coerced)
 
-    normalized = dict(coerced)
-    normalized.pop("merge", None)
+    normalized = {key: value for key, value in coerced.items() if key not in normalizer[1]}
     return ToolCallSignature.from_call(tool_name, normalized)
 
 
@@ -839,7 +853,14 @@ def _result_hash(result: str | None) -> str:
 
 
 def _is_explicit_unchanged_result(tool_name: str, result: str | None) -> bool:
-    """Whether a known tool certifies that its underlying content is unchanged."""
+    """Whether a known tool certifies that its underlying content is unchanged.
+
+    Trust-the-emitter contract: the guard does not re-verify content; it
+    relies on the emitters in ``tools/file_tools.py`` (read_file) and
+    ``tools/skills_tool.py`` (skill_view) only stamping this envelope after
+    an mtime/size equality check. Each emitter carries a CONTRACT comment
+    keeping the two sides in sync.
+    """
     if tool_name not in STALL_GUARD_UNCHANGED_RESULT_TOOLS or not isinstance(result, str):
         return False
     parsed = safe_json_loads(result)
