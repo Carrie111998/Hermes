@@ -3560,6 +3560,12 @@ class APIServerAdapter(BasePlatformAdapter):
         if "pinned" in body:
             await asyncio.to_thread(db.set_session_pinned, session_id, body["pinned"])
         if "archived" in body:
+            # Generic field write for desktop UIs / clients already driving
+            # PATCH. The dedicated reversible archive surface is the
+            # POST /api/sessions/{id}/archive[/unarchive] pair — see
+            # _set_session_archived. Both funnel into the same
+            # db.set_session_archived, so invoking either keeps the flag
+            # consistent; build new integrations on the archive endpoints.
             await asyncio.to_thread(db.set_session_archived, session_id, body["archived"])
         if "hidden" in body:
             await asyncio.to_thread(db.set_session_hidden, session_id, body["hidden"])
@@ -3571,7 +3577,17 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
 
     async def _set_session_archived(self, request: "web.Request", archived: bool) -> "web.Response":
-        """Set the reversible archive flag for one API session."""
+        """Set the reversible archive flag for one API session.
+
+        Canonical archive surface: clients wanting to archive/unarchive a
+        session should use the dedicated
+        ``POST /api/sessions/{session_id}/archive`` and
+        ``.../unarchive`` routes, not the ``archived`` field on PATCH.
+        ``PATCH /api/sessions/{session_id}`` with ``{\"archived\": bool}``
+        remains supported as the generic flag write the desktop sidebar
+        drives, and the two paths share this core, so the flag can never
+        diverge no matter which one a client uses.
+        """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
