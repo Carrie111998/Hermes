@@ -192,9 +192,19 @@ test('the budget row mirrors the app\'s own settings row', () => {
   const body = row.slice(0, row.indexOf('\n/** The room budget editor'))
 
   assert.match(body, /@container/)
-  assert.match(body, /grid gap-3 py-3 @2xl:grid-cols-\[minmax\(0,1fr\)_minmax\(15rem,22rem\)\] @2xl:items-center/)
   assert.match(body, /text-\[length:var\(--conversation-text-font-size\)\] font-medium text-foreground/)
-  assert.match(body, /@2xl:justify-self-end/)
+  assert.match(body, /@xs:justify-self-end/)
+
+  // The app's own rows split at @2xl, which is 672px of container. These rows
+  // live in a 448px dialog, so that breakpoint would never fire and every row
+  // would stack label-over-control. Split early instead.
+  assert.match(body, /@xs:grid-cols-\[minmax\(0,1fr\)_11rem\]/)
+  assert.doesNotMatch(body, /@2xl:grid-cols/)
+
+  // CONTROL_TEXT in src/app/settings/constants.ts is 'text-xs', and the
+  // standard field fills its column instead of carrying a fixed width.
+  assert.match(body, /className: 'min-w-0 flex-1 text-xs'/)
+  assert.doesNotMatch(body, /className: 'w-20/)
 })
 
 test('switching an axis fires the same haptic the app uses elsewhere', () => {

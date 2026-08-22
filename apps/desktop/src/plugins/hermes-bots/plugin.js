@@ -9303,7 +9303,10 @@ function GroupLimitRow({ label, hint, value, fallback, ceiling, onChange, brake 
 
   const numberField = (props) =>
     jsx(Input, {
-      className: 'w-20 text-right',
+      // text-xs mirrors CONTROL_TEXT in src/app/settings/constants.ts; the
+      // field fills its column there rather than carrying a fixed width,
+      // which is what makes its border read at this size.
+      className: 'min-w-0 flex-1 text-xs',
       inputMode: 'numeric',
       max: ceiling,
       min: 1,
@@ -9311,13 +9314,13 @@ function GroupLimitRow({ label, hint, value, fallback, ceiling, onChange, brake 
       ...props
     })
 
-  const control = (children) => jsx('div', { className: 'flex items-center justify-end gap-2', children })
+  const control = (children) => jsx('div', { className: 'flex min-w-0 items-center gap-2', children })
 
   return jsxs('div', {
     className: '@container',
     children: [
       jsxs('div', {
-        className: 'grid gap-3 py-3 @2xl:grid-cols-[minmax(0,1fr)_minmax(15rem,22rem)] @2xl:items-center',
+        className: 'grid gap-2 py-2.5 @xs:grid-cols-[minmax(0,1fr)_11rem] @xs:items-center @xs:gap-3',
         children: [
           jsxs('div', {
             className: 'min-w-0',
@@ -9336,7 +9339,7 @@ function GroupLimitRow({ label, hint, value, fallback, ceiling, onChange, brake 
             ]
           }),
           jsx('div', {
-            className: 'min-w-0 @2xl:justify-self-end',
+            className: 'min-w-0 @xs:justify-self-end',
             children: control([
               numberField({
                 'aria-label': label,
@@ -9368,7 +9371,7 @@ function GroupLimitRow({ label, hint, value, fallback, ceiling, onChange, brake 
       off && brake
         ? jsxs('div', {
             className:
-              'grid gap-3 border-l border-(--ui-border) pb-3 pl-3 @2xl:grid-cols-[minmax(0,1fr)_minmax(15rem,22rem)] @2xl:items-center',
+              'grid gap-2 border-l border-(--ui-border) pb-2.5 pl-3 @xs:grid-cols-[minmax(0,1fr)_11rem] @xs:items-center @xs:gap-3',
             children: [
               jsx('div', {
                 className:
@@ -9376,7 +9379,7 @@ function GroupLimitRow({ label, hint, value, fallback, ceiling, onChange, brake 
                 children: brake.value === null ? `No safety stop on ${label.toLowerCase()}` : 'Safety stop after'
               }),
               jsx('div', {
-                className: 'min-w-0 @2xl:justify-self-end',
+                className: 'min-w-0 @xs:justify-self-end',
                 children: control([
                   numberField({
                     'aria-label': `Safety stop for ${label.toLowerCase()}`,
