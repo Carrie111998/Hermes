@@ -10253,14 +10253,17 @@ def _dispatch_once_locked(
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
+            # Introspect the callable and pass `board`/`conn` only when
+            # supported.
             import inspect
             try:
                 sig = inspect.signature(_spawn)
+                spawn_kwargs = {}
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
+                    spawn_kwargs["board"] = board
+                if "conn" in sig.parameters:
+                    spawn_kwargs["conn"] = conn
+                pid = _spawn(claimed, str(workspace), **spawn_kwargs)
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
@@ -10389,10 +10392,12 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
+                spawn_kwargs = {}
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
+                    spawn_kwargs["board"] = board
+                if "conn" in sig.parameters:
+                    spawn_kwargs["conn"] = conn
+                pid = _spawn(claimed, str(workspace), **spawn_kwargs)
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
@@ -10706,11 +10711,82 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+def _resolve_worker_resume_session_id(
+    conn: sqlite3.Connection,
+    task_id: str,
+    profile_arg: str,
+    profile_home: Optional[str],
+) -> Optional[str]:
+    """Resolve a warm session to ``--resume`` for a re-dispatch, or ``None``.
+
+    Resume-on-retry (card t_e1ba67d5): a task that bounces back from
+    review via ``request_changes`` re-enters ``ready`` and gets reclaimed
+    by the SAME implementer profile. Without this, every round is a fully
+    cold ``chat -q`` session — full system prompt, tool schemas, and the
+    whole task history re-fetched from scratch every time.
+
+    Looks at the most recent ENDED ``task_runs`` row for this task under
+    the profile that is about to be (re)spawned. Runs are filtered by
+    ``profile`` in the SQL, so a reviewer's intervening run (different
+    profile) is never a candidate — only the implementer's own last run
+    is. The candidate session id is the worker's own ``HERMES_SESSION_ID``,
+    stamped into run metadata by ``kanban_complete`` /
+    ``kanban_request_review`` (see ``tools/kanban_tools.py``
+    ``_stamp_worker_session_metadata``), so it names the CLI session that
+    actually holds the transcript — not a synthetic id.
+
+    Verifies the session still exists in THAT profile's own ``state.db``
+    (sessions are profile-scoped) before handing it back. Any failure —
+    missing profile home, missing/corrupt session row, DB error — returns
+    ``None``. Dispatch must never block on a resume failure; the caller
+    falls back to a cold start.
+    """
+    if not profile_home:
+        return None
+    try:
+        rows = conn.execute(
+            "SELECT metadata FROM task_runs "
+            "WHERE task_id = ? AND profile = ? AND ended_at IS NOT NULL "
+            "AND metadata IS NOT NULL "
+            "ORDER BY id DESC LIMIT 5",
+            (task_id, profile_arg),
+        ).fetchall()
+    except Exception:
+        return None
+    session_id = None
+    for row in rows:
+        try:
+            meta = json.loads(row["metadata"]) if row["metadata"] else None
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(meta, dict):
+            candidate = meta.get("worker_session_id")
+            if isinstance(candidate, str) and candidate.strip():
+                session_id = candidate.strip()
+                break
+    if not session_id:
+        return None
+    try:
+        from hermes_state import SessionDB
+        state_db_path = Path(profile_home) / "state.db"
+        if not state_db_path.exists():
+            return None
+        sdb = SessionDB(db_path=state_db_path, read_only=True)
+        try:
+            session_meta = sdb.get_session(session_id)
+        finally:
+            sdb.close()
+    except Exception:
+        return None
+    return session_id if session_meta else None
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
     *,
     board: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -10723,6 +10799,13 @@ def _default_spawn(
     ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
     vars all resolve to the same board the dispatcher claimed the task
     from. Workers cannot accidentally see other boards.
+
+    ``conn`` (optional — passed by the dispatcher, absent in older
+    ``spawn_fn`` test stubs) enables resume-on-retry: when this task has a
+    prior ENDED run under the same profile with a durable
+    ``worker_session_id`` that still resolves in that profile's own
+    ``state.db``, the child is launched with ``--resume <session_id>``
+    instead of a cold ``chat -q``. See ``_resolve_worker_resume_session_id``.
     """
     import subprocess
     if not task.assignee:
@@ -10751,8 +10834,10 @@ def _default_spawn(
     # profile-specific config entirely.  Fixes profile-scoped fallback_providers
     # being invisible to kanban workers.
     from hermes_cli.profiles import resolve_profile_env
+    profile_home: Optional[str] = None
     try:
-        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+        profile_home = resolve_profile_env(profile_arg)
+        env["HERMES_HOME"] = profile_home
     except FileNotFoundError:
         # Profile dir doesn't exist — defer resolution to the CLI's
         # _apply_profile_override() via HERMES_PROFILE (set below).
@@ -10848,6 +10933,25 @@ def _default_spawn(
         # profile-local worker sessions still register configured hooks.
         "--accept-hooks",
     ]
+    # Resume-on-retry (t_e1ba67d5): reuse a warm session for the SAME
+    # profile's re-dispatch (e.g. review-requested-changes -> ready) instead
+    # of paying full system-prompt + tool-schema + task-history cache-write
+    # again. `conn` is only passed by the live dispatcher — spawn_fn test
+    # stubs that call `_default_spawn(task, workspace)` positionally skip
+    # this entirely and keep today's cold-start behaviour.  Never blocks
+    # dispatch: any resolution failure falls back to a fresh session.
+    resume_session_id = None
+    if conn is not None:
+        resume_session_id = _resolve_worker_resume_session_id(
+            conn, task.id, profile_arg, profile_home,
+        )
+    if resume_session_id:
+        cmd.extend(["--resume", resume_session_id])
+        # The worker's cwd is pinned to `workspace` by this function's own
+        # Popen(cwd=...) call below. Without this flag, resuming would cd
+        # into the OLD session's recorded directory instead — which drifts
+        # from the current task workspace for worktree tasks in particular.
+        cmd.append("--no-restore-cwd")
     # Per-task force-loaded skills. Each name goes in its own
     # `--skills X` pair rather than a single comma-joined arg: the CLI
     # accepts both forms (action='append' + comma-split), but
