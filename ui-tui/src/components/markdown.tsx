@@ -445,7 +445,6 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
         const colLines = cellLines[ci] ?? ['']
         const lineContent = li < colLines.length ? colLines[li]! : ''
         const pad = ' '.repeat(Math.max(0, columnWidths[ci]! - stringWidth(lineContent)))
-        
         line += lineContent + pad
 
         if (ci < numCols - 1) {
