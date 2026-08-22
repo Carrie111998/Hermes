@@ -38,7 +38,7 @@ export const tr = defineLocale({
     set: 'Ayarla',
     skip: 'Atla',
     update: 'Güncelle',
-    tryHint: (term: string) => `"${term}" deneyin`,
+    tryHint: (term: string) => `${term} deneyin`,
     on: 'Açık',
     off: 'Kapalı',
   },
@@ -112,7 +112,7 @@ export const tr = defineLocale({
     region: 'Bildirimler',
     hide: 'Gizle',
     show: 'Göster',
-    more: (count: number) => `${count} ${count === 1 ? 'bildirim' : 'bildirim'} daha`,
+    more: (count: number) => `${count} bildirim daha`,
     clearAll: 'Tümünü temizle',
     dismiss: 'Bildirimi kapat',
     details: 'Detaylar',
@@ -133,7 +133,7 @@ export const tr = defineLocale({
         'Masaüstü arka uç bu isteği reddetti (405 Method Not Allowed). Hermes Desktop\'ı yeniden başlatmayı deneyin.',
       microphonePermission: 'Mikrofon izni reddedildi.',
       openaiRejectedApiKey: 'OpenAI API anahtarını reddetti.',
-      openaiRejectedApiKeyWithStatus: (status: any) => `OpenAI API anahtarını reddetti (${status} invalid_api_key).`,
+      openaiRejectedApiKeyWithStatus: (status: string) => `OpenAI API anahtarını reddetti (${status} invalid_api_key).`,
       openaiTtsNeedsKey: 'OpenAI TTS, VOICE_TOOLS_OPENAI_KEY veya OPENAI_API_KEY gerektirir.',
     },
     voice: {
@@ -171,7 +171,7 @@ export const tr = defineLocale({
   },
 
   remoteDisplayBanner: {
-    message: (reason: any) =>
+    message: (reason: string) =>
       `Yazılım işleme etkin — uzak ekran algılandı (${reason}). GPU hızlandırma titremeyi önlemek için devre dışı.`,
   },
 
@@ -434,7 +434,7 @@ export const tr = defineLocale({
       embedsAsk: 'Sor',
       embedsAlways: 'Her Zaman',
       embedsOff: 'Kapalı',
-      embedsReset: (count: number) => `${count} izin verilen ${count === 1 ? 'servis' : 'servis'} sıfırla`,
+      embedsReset: (count: number) => `İzin verilen ${count} servisi sıfırla`,
       product: 'Ürün',
       productDesc: 'Özlü özetlerle insan dostu araç etkinliği.',
       technical: 'Teknik',
@@ -858,7 +858,7 @@ export const tr = defineLocale({
       emptyArchivedDesc: 'Bir sohbeti burada gizlemek için arşivleyin.',
       unarchive: 'Arşivden çıkar',
       deletePermanently: 'Kalıcı olarak sil',
-      messages: (count: number) => `${count} ${count === 1 ? 'mesaj' : 'mesaj'}`,
+      messages: (count: number) => `${count} mesaj`,
       restored: 'Geri yüklendi',
       deleteConfirm: (title: string) => `"${title}" kalıcı olarak silinsin mi? Bu geri alınamaz.`,
       defaultDirTitle: 'Varsayılan proje dizini',
@@ -873,7 +873,7 @@ export const tr = defineLocale({
       notSet: 'Ayarlanmadı',
       failedLoad: 'Arşivlenmiş oturumlar yüklenemedi',
       autoArchiveTitle: 'Eski sohbetleri otomatik arşivle',
-      autoArchiveDesc: '',
+      autoArchiveDesc: 'Bir süredir dokunmadığınız sohbetleri otomatik arşivleyin. Sabitlenen sohbetler asla arşivlenmez ve hiçbir şey silinmez — arşivlenen sohbetler yalnızca buraya taşınır.',
       autoArchiveDaysLabel: 'Şu kadar sonra arşivle:',
       autoArchiveDaysUnit: 'gün hareketsizlik',
       autoArchiveFailed: 'Otomatik arşivleme güncellenemedi',
