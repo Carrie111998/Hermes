@@ -154,6 +154,49 @@ def test_an_unrecognized_verdict_is_normalized_to_failed(monkeypatch):
     assert "vibes" in decision["reason"]
 
 
+def test_an_inactive_goal_resolves_rather_than_failing(monkeypatch):
+    """`inactive` is an ordinary condition, not a malformed verdict.
+
+    ``evaluate_after_turn`` returns it when the goal is no longer active — done,
+    cleared, or paused between turns. Normalizing it to `failed` cost the
+    operator a Resume for a mission that had simply finished: production showed
+    three such resumes within minutes of the first deployment.
+    """
+
+    class Manager:
+        def __init__(self, session_id, *, default_max_turns):
+            self.state = _State(status="done")
+
+        def evaluate_after_turn(self, response, background_processes=None):
+            return {"verdict": "inactive", "reason": "no active goal",
+                    "should_continue": False, "continuation_prompt": None}
+
+    _install_fake_goals(monkeypatch, Manager)
+    from hermes_cli.goal_session import run_goal_turn
+
+    result = run_goal_turn("s1", "evaluate", response="x")
+    assert result["decision"]["verdict"] == "done"
+    assert result["decision"]["failure_kind"] == ""
+    assert result["decision"]["should_continue"] is False
+
+
+def test_an_inactive_goal_that_was_paused_reports_a_pause(monkeypatch):
+    class Manager:
+        def __init__(self, session_id, *, default_max_turns):
+            self.state = _State(status="paused")
+
+        def evaluate_after_turn(self, response, background_processes=None):
+            return {"verdict": "inactive", "reason": "no active goal",
+                    "should_continue": False, "continuation_prompt": None}
+
+    _install_fake_goals(monkeypatch, Manager)
+    from hermes_cli.goal_session import run_goal_turn
+
+    result = run_goal_turn("s1", "evaluate", response="x")
+    assert result["decision"]["verdict"] == "hard_pause"
+    assert result["state"]["status"] == "hard_paused"
+
+
 def test_a_paused_state_becomes_a_hard_pause(monkeypatch):
     class Manager:
         def __init__(self, session_id, *, default_max_turns):

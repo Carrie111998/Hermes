@@ -60,7 +60,15 @@ ACTIONS = ("start", "evaluate", "resume", "pause", "cancel", "status")
 # Verdicts an embedder may act on. Anything else is a protocol violation and is
 # normalized to ``failed`` rather than passed through — an unrecognized verdict
 # driving another agent turn is how a loop runs on a decision nobody made.
-_KNOWN_VERDICTS = frozenset({"done", "continue", "wait", "waiting", "failed"})
+#
+# ``inactive`` is deliberately present. ``evaluate_after_turn`` returns it when
+# the goal is not active — a goal that was completed, cleared, or paused between
+# turns — and that is an ORDINARY, expected condition, not a malformed verdict.
+# Normalizing it to ``failed`` (as this module first did) turns a quiet
+# "nothing to supervise" into a mission failure the operator has to resume:
+# production showed three such resumes within minutes of the first deployment,
+# each reading "The goal supervisor returned an unrecognized verdict".
+_KNOWN_VERDICTS = frozenset({"done", "continue", "wait", "waiting", "failed", "inactive"})
 
 
 def _state_payload(state: Any, *, status: Optional[str] = None) -> Dict[str, Any]:
@@ -235,6 +243,19 @@ def run_goal_turn(
             f"The goal supervisor is unavailable ({_judge_detail(state, decision)}); "
             "progress cannot be verified."
         )
+    elif verdict == "inactive":
+        # There is nothing left to supervise. Resolve it against the goal's own
+        # status rather than reporting a verdict no embedder can act on: a goal
+        # that reached `done` between turns IS done, and one that was paused is
+        # a pause. Neither is a failure, and neither should cost the operator a
+        # Resume.
+        should_continue, continuation = False, None
+        if str(state.status) == "paused":
+            verdict, status = "hard_pause", "hard_paused"
+            decision["reason"] = decision.get("reason") or "The goal is paused; there is nothing to supervise."
+        else:
+            verdict, status = "done", "done"
+            decision["reason"] = decision.get("reason") or "The goal is no longer active; nothing remains to supervise."
     elif status == "paused":
         verdict, status, should_continue, continuation = "hard_pause", "hard_paused", False, None
     elif verdict == "waiting":
