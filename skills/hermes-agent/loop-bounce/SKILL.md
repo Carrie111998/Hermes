@@ -1,6 +1,6 @@
 ---
 name: loop-bounce
-description: Break agent loops and escalate to stronger models via a 3-attempt ladder.
+description: Detect agent loops and escalate to stronger models.
 version: 2.0.0
 author: Hermes Agent
 license: MIT
