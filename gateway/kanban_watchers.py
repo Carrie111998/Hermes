@@ -25,6 +25,14 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+def _run_parent_process_call(fn, *args):
+    """Run gateway-owned blocking work without copied child identity."""
+    from agent.delegation_context import parent_process_context
+
+    with parent_process_context():
+        return fn(*args)
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -1681,7 +1689,9 @@ class GatewayKanbanWatchersMixin:
             try:
                 # Reap zombie children before per-board work so a board DB
                 # failure cannot block cleanup of unrelated workers.
-                pids = await asyncio.to_thread(_kb.reap_worker_zombies)
+                pids = await asyncio.to_thread(
+                    _run_parent_process_call, _kb.reap_worker_zombies
+                )
                 if pids:
                     logger.info(
                         "kanban dispatcher: reaped %d zombie worker(s), pids=%s",
@@ -1704,8 +1714,14 @@ class GatewayKanbanWatchersMixin:
                     # takes effect on the next tick, not on gateway restart (#49638).
                     _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
                     if _ad_enabled:
-                        await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
-                    results = await asyncio.to_thread(_tick_once)
+                        await asyncio.to_thread(
+                            _run_parent_process_call,
+                            _auto_decompose_tick,
+                            _ad_per_tick,
+                        )
+                    results = await asyncio.to_thread(
+                        _run_parent_process_call, _tick_once
+                    )
                     any_spawned = False
                     for slug, res in (results or []):
                         if res is not None and getattr(res, "spawned", None):
@@ -1724,7 +1740,9 @@ class GatewayKanbanWatchersMixin:
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                             )
                     # Health telemetry (aggregate across boards)
-                    ready_pending = await asyncio.to_thread(_ready_nonempty)
+                    ready_pending = await asyncio.to_thread(
+                        _run_parent_process_call, _ready_nonempty
+                    )
                     if ready_pending and not any_spawned:
                         bad_ticks += 1
                     else:

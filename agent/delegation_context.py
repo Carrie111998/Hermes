@@ -71,6 +71,22 @@ def is_delegated_child_context() -> bool:
 
 
 @contextmanager
+def parent_process_context() -> Iterator[None]:
+    """Restore trusted parent identity around process-owned background work.
+
+    ``asyncio.to_thread`` copies the caller's ContextVars. A gateway service
+    scheduled from child-owned work can therefore inherit delegated identity
+    even though the service belongs to the parent process. Keep this override
+    narrow: it is for internal infrastructure, never work done for a child.
+    """
+    token = _DELEGATED_CHILD_CONTEXT.set(False)
+    try:
+        yield
+    finally:
+        _DELEGATED_CHILD_CONTEXT.reset(token)
+
+
+@contextmanager
 def non_dispatcher_owned_context() -> Iterator[None]:
     """Mark in-process execution that does NOT own the dispatcher's Kanban task.
 
