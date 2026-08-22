@@ -1973,7 +1973,7 @@ class SlackAdapter(BasePlatformAdapter):
                 channel = event.get("channel", "no-channel")
                 user = event.get("user", "no-user")
 
-                logger.info(
+                logger.debug(
                     "[Slack Instrumentation] Envelope received: envelope_id=%s type=%s "
                     "event_ts=%s channel=%s user=%s",
                     envelope_id, event_type, event_ts, channel, user,
@@ -1983,7 +1983,7 @@ class SlackAdapter(BasePlatformAdapter):
                 try:
                     await next_middleware()
                     elapsed = time.time() - start_time
-                    logger.info(
+                    logger.debug(
                         "[Slack Instrumentation] Envelope processed: envelope_id=%s "
                         "type=%s elapsed=%.3fs status=success",
                         envelope_id, event_type, elapsed,
