@@ -141,10 +141,29 @@ test('the drive loop is bounded by the caps, not by the constants', () => {
   )
 })
 
-test('a room that hits its brake says so instead of going quiet', () => {
+test('every stop on a count is reported, the inherited default included', () => {
+  // #92213 review (AllanGamal): a two-bot room hit the shipped 3-round cap on
+  // a directed handoff and went silent for 12 minutes. Silence there is
+  // indistinguishable from the conversation having settled.
   const loop = source.slice(source.indexOf('async function runGroupChatRounds('))
-  assert.match(loop, /kind: 'safety', member: null, thread, detail: 'rounds'/)
-  assert.match(loop, /kind: 'safety', member: null, thread, detail: 'messages'/)
+
+  assert.match(loop, /if \(caps\.rounds !== null && round === caps\.rounds - 1\)/)
+  assert.match(loop, /kind: limits\.rounds === null \? 'safety' : 'capped'/)
+  assert.match(loop, /kind: limits\.messages === null \? 'safety' : 'capped'/)
+
+  // The report must not hang off the axis being switched off.
+  assert.doesNotMatch(loop, /limits\.rounds === null && caps\.rounds !== null/)
+})
+
+test('the two stop kinds read differently and both stand out', () => {
+  const labels = source.slice(source.indexOf('function groupActivityLabel('))
+  const body = labels.slice(0, labels.indexOf('\nconst GROUP_ACTIVITY_LABELS'))
+
+  assert.match(body, /kind === 'safety' \|\| kind === 'capped'/)
+  assert.match(body, /safety stop: /)
+  assert.match(body, /raise it in the room budget/)
+  assert.match(source, /capped: 'stopped at the limit'/)
+  assert.match(source, /if \(kind === 'safety' \|\| kind === 'capped'\) \{\n {4}return 'text-\(--ui-warning/)
 })
 
 test('the editor warns when the message budget, not the round setting, ends the room', () => {

@@ -266,10 +266,12 @@ function groupActivityLabel(event) {
 
   // The safety stop is about the room, not about a member, so it reads as a
   // statement rather than "<bot> hit the safety stop".
-  if (kind === 'safety') {
-    return event?.detail === 'messages'
-      ? `safety stop: ${event?.at ?? '?'} messages reached`
-      : `safety stop: ${event?.at ?? '?'} rounds reached`
+  if (kind === 'safety' || kind === 'capped') {
+    const what = event?.detail === 'messages' ? 'messages' : 'rounds'
+    const at = event?.at ?? '?'
+    return kind === 'safety'
+      ? `safety stop: ${at} ${what} reached`
+      : `stopped at the ${what} limit (${at}), raise it in the room budget`
   }
 
   const who = event?.member === 'You' ? 'You' : groupSpeakerLabel(event?.member || 'A bot')
@@ -287,7 +289,8 @@ const GROUP_ACTIVITY_LABELS = {
   cancelled: 'turn interrupted by a newer message',
   settled: 'turn settled',
   delivered: 'delivered a late reply',
-  safety: 'safety stop'
+  safety: 'safety stop',
+  capped: 'stopped at the limit'
 }
 
 const GROUP_ACTIVITY_GLYPHS = {
@@ -300,7 +303,8 @@ const GROUP_ACTIVITY_GLYPHS = {
   cancelled: 'close',
   settled: 'check-all',
   delivered: 'mail-read',
-  safety: 'debug-pause'
+  safety: 'debug-pause',
+  capped: 'debug-pause'
 }
 
 /** Text tone for an activity row: quiet for pass/cancel/settle, accent for
@@ -312,7 +316,7 @@ function groupActivityTone(kind) {
 
   // A safety stop is not a failure, but it must not read as routine either:
   // the room stopped short of what the user asked for.
-  if (kind === 'safety') {
+  if (kind === 'safety' || kind === 'capped') {
     return 'text-(--ui-warning,#d68b00)'
   }
 
@@ -5602,10 +5606,19 @@ async function runGroupChatRounds(group, members, thread) {
 
   try {
     for (let round = 0; caps.rounds === null || round < caps.rounds; round++) {
-      // A room that turned rounds off but kept the brake stops here, and says
-      // so — silence would read as the conversation having settled.
-      if (limits.rounds === null && caps.rounds !== null && round === caps.rounds - 1) {
-        recordGroupActivity(group, { kind: 'safety', member: null, thread, detail: 'rounds', at: caps.rounds })
+      // Any stop on a count says so, inherited default included. Reported by
+      // AllanGamal on #92213: a two-bot room hit the shipped 3-round cap on a
+      // directed handoff and went quiet, which is indistinguishable from the
+      // room having settled. `capped` is the ordinary limit, `safety` the
+      // brake behind a switched-off axis.
+      if (caps.rounds !== null && round === caps.rounds - 1) {
+        recordGroupActivity(group, {
+          kind: limits.rounds === null ? 'safety' : 'capped',
+          member: null,
+          thread,
+          detail: 'rounds',
+          at: caps.rounds
+        })
       }
       // Deliver any replies that finished after their turn timed out —
       // every member, not just this round's responders, so long work is
@@ -5641,8 +5654,14 @@ async function runGroupChatRounds(group, members, thread) {
         if (!isCurrent() || (caps.messages !== null && posted >= caps.messages)) {
           if (!isCurrent()) {
             recordGroupActivity(group, { kind: 'cancelled', member: null, thread })
-          } else if (limits.messages === null) {
-            recordGroupActivity(group, { kind: 'safety', member: null, thread, detail: 'messages', at: caps.messages })
+          } else {
+            recordGroupActivity(group, {
+              kind: limits.messages === null ? 'safety' : 'capped',
+              member: null,
+              thread,
+              detail: 'messages',
+              at: caps.messages
+            })
           }
           return
         }
