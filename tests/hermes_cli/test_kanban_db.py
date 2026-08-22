@@ -326,6 +326,77 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         assert "crashed" not in outcomes
 
 
+def test_sigterm_exit_requeues_without_counting_failure(
+    kanban_home, monkeypatch,
+):
+    """The SIGTERM sentinel is a reclaimed run, not a crash or violation."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="terminated", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:worker")
+        pid = 71000
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        _kb._record_worker_exit(
+            pid, _exited_status(_kb.KANBAN_SIGTERM_EXIT_CODE)
+        )
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid not in crashed
+        assert tid in getattr(_kb.detect_crashed_workers, "_last_terminated", [])
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+        assert not task.last_failure_error
+
+        events = kb.list_events(conn, tid)
+        terminated = [event for event in events if event.kind == "terminated"]
+        assert len(terminated) == 1
+        assert terminated[0].payload["exit_code"] == _kb.KANBAN_SIGTERM_EXIT_CODE
+        outcomes = [
+            row["outcome"] for row in conn.execute(
+                "SELECT outcome FROM task_runs WHERE task_id=?", (tid,),
+            ).fetchall()
+        ]
+        assert "reclaimed" in outcomes
+        assert "crashed" not in outcomes
+
+
+def test_transient_failure_reasons_are_bounded():
+    import hermes_cli.kanban_db as _kb
+
+    assert _kb.KANBAN_TRANSIENT_FAILURE_REASONS == {
+        "rate_limit", "billing", "timeout", "overloaded",
+    }
+    assert "unknown" not in _kb.KANBAN_TRANSIENT_FAILURE_REASONS
+    assert "format_error" not in _kb.KANBAN_TRANSIENT_FAILURE_REASONS
+
+
+def test_worker_exit_contract_classifies_zero_one_tempfail_and_sigterm():
+    import hermes_cli.kanban_db as _kb
+
+    expected = {
+        0: ("clean_exit", 0),
+        1: ("nonzero_exit", 1),
+        _kb.KANBAN_RATE_LIMIT_EXIT_CODE: (
+            "rate_limited", _kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+        ),
+        _kb.KANBAN_SIGTERM_EXIT_CODE: (
+            "terminated", _kb.KANBAN_SIGTERM_EXIT_CODE,
+        ),
+    }
+    for index, (exit_code, classification) in enumerate(expected.items()):
+        pid = 72000 + index
+        _kb._record_worker_exit(pid, _exited_status(exit_code))
+        assert _kb._classify_worker_exit(pid) == classification
+
+
 
 
 def test_respawn_guard_defers_rate_limited_within_cooldown(

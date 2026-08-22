@@ -1436,6 +1436,56 @@ def _flush_one_shot_session_store(cli) -> None:
         logger.debug("one-shot end_session failed", exc_info=True)
 
 
+_KANBAN_SIGTERM_EXIT_CODE = 143
+
+
+def _terminate_kanban_worker_on_signal(
+    cli,
+    *,
+    exit_fn=os._exit,
+    signal_module=None,
+    logging_shutdown=None,
+    streams=None,
+) -> None:
+    """Flush one-shot worker state and terminate with the SIGTERM sentinel.
+
+    ``os._exit`` is required because dispatcher workers can still have a
+    non-daemon tool thread alive after the main thread receives SIGTERM. The
+    injectable boundaries keep the production path directly behavior-testable
+    without reading this source file or terminating the test runner.
+    """
+    if signal_module is None:
+        import signal as signal_module
+    if logging_shutdown is None:
+        logging_shutdown = logging.shutdown
+    if streams is None:
+        streams = (sys.stdout, sys.stderr)
+
+    try:
+        if hasattr(signal_module, "SIGALRM"):
+            signal_module.signal(
+                signal_module.SIGALRM,
+                lambda *_: exit_fn(_KANBAN_SIGTERM_EXIT_CODE),
+            )
+            signal_module.alarm(5)
+    except Exception:
+        pass
+    try:
+        _flush_one_shot_session_store(cli)
+    except Exception:
+        pass
+    try:
+        logging_shutdown()
+    except Exception:
+        pass
+    for stream in streams:
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    exit_fn(_KANBAN_SIGTERM_EXIT_CODE)
+
+
 def _finalize_single_query(cli) -> None:
     """Close one-shot CLI resources before releasing the active session lease."""
     try:
@@ -1463,7 +1513,7 @@ def _reset_terminal_input_modes_on_exit() -> None:
     (#36823). Called from ``_run_cleanup`` (atexit-registered + invoked on the
     normal / EOF / interrupt exit paths) this covers normal quit, Ctrl+C and
     SIGTERM/SIGHUP. ``kill -9`` is uncatchable, and the kanban worker's
-    ``os._exit(0)`` path bypasses ``atexit``; neither runs this — but both are
+    ``os._exit(143)`` path bypasses ``atexit``; neither runs this — but both are
     non-TTY / non-TUI, so there is nothing to reset there.
 
     Gated on ``_tui_input_modes_active`` so one-shot non-TUI CLI runs (which
@@ -21155,41 +21205,19 @@ def main(
         # unwinds the main thread; the worker thread keeps running, the
         # process gets reparented to init, and the dispatcher's _pid_alive
         # check returns True forever — task stuck in 'running' indefinitely.
-        # Skip the controlled-unwind dance and call os._exit(0) so the kernel
+        # Skip the controlled-unwind dance and call os._exit(143) so the kernel
         # reclaims the PID immediately and detect_crashed_workers can reclaim
-        # the stale claim on the next tick. Flush logging + stdout/stderr
+        # the stale claim on the next tick without mistaking termination for
+        # a clean protocol-violating exit. Flush logging + stdout/stderr
         # first so the final debug trace isn't lost; SIGALRM deadman guards
         # the flush against any rare blocking-I/O case (the reporter measured
         # flush in <1ms; the alarm is a failsafe, not the common path).
         if os.environ.get("HERMES_KANBAN_TASK"):
-            try:
-                import signal as _sig_mod
-                if hasattr(_sig_mod, "SIGALRM"):
-                    # Cancel any pre-existing alarm to avoid colliding with
-                    # caller-installed timers.
-                    _sig_mod.signal(_sig_mod.SIGALRM, lambda *_: os._exit(0))
-                    _sig_mod.alarm(5)
-            except Exception:
-                pass
-            # os._exit(0) skips atexit AND SessionDB's token-drain hook, so
+            # os._exit(143) skips atexit AND SessionDB's token-drain hook, so
             # flush + finalize the session store here or the worker's turn
             # (and its usage deltas) never become durable (#88583 / #50881
             # class). Best-effort under the SIGALRM deadman above.
-            try:
-                _flush_one_shot_session_store(cli)
-            except Exception:
-                pass
-            try:
-                import logging as _lg
-                _lg.shutdown()
-            except Exception:
-                pass
-            for _stream in (sys.stdout, sys.stderr):
-                try:
-                    _stream.flush()
-                except Exception:
-                    pass
-            os._exit(0)
+            _terminate_kanban_worker_on_signal(cli)
         raise KeyboardInterrupt()
     try:
         import signal as _signal
@@ -21397,14 +21425,14 @@ def main(
                         _exit_code = 0
                         if isinstance(result, dict) and result.get("failed"):
                             _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
-                                "failure_reason"
-                            ) in ("rate_limit", "billing"):
+                            if os.environ.get("HERMES_KANBAN_TASK"):
                                 try:
                                     from hermes_cli.kanban_db import (
                                         KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
+                                        KANBAN_TRANSIENT_FAILURE_REASONS as _TRANSIENT_REASONS,
                                     )
-                                    _exit_code = _RL_CODE
+                                    if result.get("failure_reason") in _TRANSIENT_REASONS:
+                                        _exit_code = _RL_CODE
                                 except Exception:
                                     _exit_code = 1
                         sys.exit(_exit_code)

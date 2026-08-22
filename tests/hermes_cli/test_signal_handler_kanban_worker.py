@@ -11,9 +11,9 @@ dispatcher's ``_pid_alive`` check returns True forever, and the task stays
 ``running`` indefinitely.
 
 The fix: when the process is a dispatcher-spawned worker (``HERMES_KANBAN_TASK``
-env var set), flush logging + stdout/stderr and call ``os._exit(0)`` instead.
+env var set), flush logging + stdout/stderr and call ``os._exit(143)`` instead.
 The kernel reclaims the PID immediately, and ``detect_crashed_workers``
-reclaims the stale claim on the next dispatcher tick.
+classifies it as a termination and reclaims the stale claim on the next tick.
 
 These tests use a synthetic Python script that mirrors the cli.py signal
 handler shape so we can exercise the exit-path contract without booting the
@@ -27,6 +27,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -59,13 +60,13 @@ def _synthetic_worker_script() -> str:
             if os.environ.get("HERMES_KANBAN_TASK"):
                 try:
                     if hasattr(signal, "SIGALRM"):
-                        signal.signal(signal.SIGALRM, lambda *_: os._exit(0))
+                        signal.signal(signal.SIGALRM, lambda *_: os._exit(143))
                         signal.alarm(2)
                 except Exception:
                     pass
                 sys.stdout.flush()
                 sys.stderr.flush()
-                os._exit(0)
+                os._exit(143)
             raise KeyboardInterrupt()
 
         signal.signal(signal.SIGTERM, handler)
@@ -166,13 +167,14 @@ def test_sigterm_with_kanban_task_env_terminates_quickly():
         t0 = time.time()
         os.kill(proc.pid, signal.SIGTERM)
 
-        # Should die in <2s. The handler sleeps ~50ms, then os._exit(0)
+        # Should die in <2s. The handler sleeps ~50ms, then os._exit(143)
         # is immediate. Give generous headroom for slow CI runners.
         deadline = t0 + 2.0
         while time.time() < deadline:
             if not _is_alive_like_dispatcher(proc.pid):
                 elapsed = time.time() - t0
                 assert elapsed < 2.0
+                assert proc.wait(timeout=2) == 143
                 return
             time.sleep(0.02)
         pytest.fail(
@@ -181,6 +183,53 @@ def test_sigterm_with_kanban_task_env_terminates_quickly():
         )
     finally:
         _cleanup(proc)
+
+
+def test_real_handler_uses_termination_sentinel():
+    """Exercise the production termination helper without killing pytest."""
+    import cli as cli_module
+
+    events = []
+
+    class FakeSignal:
+        SIGALRM = 14
+
+        def signal(self, signum, handler):
+            events.append(("signal", signum))
+            self.handler = handler
+
+        def alarm(self, seconds):
+            events.append(("alarm", seconds))
+
+    fake_signal = FakeSignal()
+    streams = (
+        SimpleNamespace(flush=lambda: events.append(("flush", "stdout"))),
+        SimpleNamespace(flush=lambda: events.append(("flush", "stderr"))),
+    )
+
+    def exit_fn(code):
+        events.append(("exit", code))
+        raise SystemExit(code)
+
+    with pytest.raises(SystemExit) as exc:
+        cli_module._terminate_kanban_worker_on_signal(
+            SimpleNamespace(),
+            exit_fn=exit_fn,
+            signal_module=fake_signal,
+            logging_shutdown=lambda: events.append(("logging", "shutdown")),
+            streams=streams,
+        )
+
+    assert exc.value.code == 143
+    assert events[-1] == ("exit", 143)
+    assert ("alarm", 5) in events
+    assert ("logging", "shutdown") in events
+    assert ("flush", "stdout") in events
+    assert ("flush", "stderr") in events
+
+    with pytest.raises(SystemExit) as alarm_exc:
+        fake_signal.handler(fake_signal.SIGALRM, None)
+    assert alarm_exc.value.code == 143
 
 
 @pytest.mark.skipif(
@@ -214,5 +263,3 @@ def test_sigterm_without_kanban_task_env_uses_keyboard_interrupt_path():
             pass
     finally:
         _cleanup(proc)
-
-

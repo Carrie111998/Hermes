@@ -429,6 +429,18 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
+# Exit code used by dispatcher workers when their SIGTERM handler must bypass
+# Python's normal unwind path. The handler has to use ``os._exit`` to avoid
+# leaving non-daemon tool threads alive, which otherwise erases the fact that
+# the process was terminated. 143 is the conventional 128 + SIGTERM sentinel.
+KANBAN_SIGTERM_EXIT_CODE = 143
+
+# Backend/infrastructure failures that should use EX_TEMPFAIL rather than burn
+# a task's failure budget. Unknown and format errors are intentionally absent.
+KANBAN_TRANSIENT_FAILURE_REASONS = frozenset(
+    {"rate_limit", "billing", "timeout", "overloaded"}
+)
+
 
 def _resolve_crash_grace_seconds() -> int:
     """Return the crash-detection grace period in seconds.
@@ -8134,6 +8146,9 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
+    * ``"terminated"`` — ``WIFEXITED`` with status
+      ``KANBAN_SIGTERM_EXIT_CODE``. The worker was terminated externally and
+      is requeued without counting a failure or a protocol violation.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -8155,6 +8170,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_SIGTERM_EXIT_CODE:
+                return ("terminated", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -8876,9 +8893,14 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     ``check_respawn_guard`` defers their respawn until the window clears.
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
+
+    A worker that exits with ``KANBAN_SIGTERM_EXIT_CODE`` is likewise
+    requeued without failure accounting. It records a ``terminated`` event
+    and a ``reclaimed`` run outcome rather than a crash or protocol violation.
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    terminated: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -8916,6 +8938,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            terminated_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -8963,6 +8986,21 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
+            elif kind == "terminated":
+                # SIGTERM is an external lifecycle event, not evidence that
+                # either the task or its terminal-kanban contract failed.
+                protocol_violation = False
+                terminated_exit = True
+                error_text = (
+                    f"pid {pid} exited on SIGTERM (termination, not a task "
+                    "failure) — requeued"
+                )
+                event_kind = "terminated"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                }
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
@@ -8990,7 +9028,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
                 # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                if rate_limited_exit:
+                    _run_outcome = "rate_limited"
+                elif terminated_exit:
+                    _run_outcome = "reclaimed"
+                else:
+                    _run_outcome = "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -9023,6 +9066,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (error_text[:500], row["id"]),
                     )
                     rate_limited.append(row["id"])
+                elif terminated_exit:
+                    terminated.append(row["id"])
                 else:
                     if protocol_violation:
                         # Stamp the failure error now: a below-budget
@@ -9132,6 +9177,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_terminated = terminated  # type: ignore[attr-defined]
     # Worker-lifecycle observer (RFC #58548): exit events are tick-derived
     # from this reclaim pass — fired only now, after the main reclaim txn
     # AND the breaker accounting above have committed, so subscribers always
@@ -10876,14 +10922,12 @@ def _default_spawn(
     cmd.extend([
         "chat",
         "-q", prompt,
+        # Every dispatcher worker must use fully quiet single-query mode so
+        # cli.py returns the explicit 0/1/75/143 worker-exit contract. This is
+        # not goal-mode-specific: a non-goal worker also has to complete or
+        # block its card before a clean exit is considered terminal.
+        "-Q",
     ])
-    if task.goal_mode:
-        # Goal-mode workers must take the fully-quiet single-query path:
-        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
-        # cli.py's quiet branch. Without -Q the worker gets exactly one
-        # turn, prints text, exits rc=0, and the dispatcher records a
-        # protocol violation (incident 2026-06-09 t_d9cbe312).
-        cmd.append("-Q")
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
