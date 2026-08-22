@@ -190,6 +190,9 @@ export function SidebarCronJobsSection({
             {hiddenCount > 0 && (
               <span className="font-normal normal-case tracking-normal text-(--ui-text-tertiary)">
                 {' · '}
+                {/* The denominator is capped by the same `max` that limits the
+                    rows load-more can actually reveal, so the badge and the
+                    button always agree on how many jobs remain hidden. */}
                 {t.cron.shownOf(shown.length, Math.min(sorted.length, max))}
               </span>
             )}

@@ -112,6 +112,36 @@ describe('SidebarCronJobsSection load-more affordance', () => {
     fireEvent.click(loadMore)
 
     expect(screen.getByText('job-7')).toBeInTheDocument()
+    // Once every job is shown, the "N of M" badge and the load-more control
+    // must both disappear — the truncation affordance is gone.
+    expect(screen.queryByText('6 of 7', { exact: false })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Show 1 more…' })).not.toBeInTheDocument()
+  })
+
+  it('renders no count badge and no load-more row when all jobs already fit', () => {
+    // INITIAL_VISIBLE_JOBS is 6, so 6 jobs or fewer should show fully with
+    // neither the "N of M" badge nor the load-more control.
+    render(
+      <SidebarCronJobsSection
+        jobs={[
+          makeJob('job-1'),
+          makeJob('job-2'),
+          makeJob('job-3'),
+          makeJob('job-4'),
+          makeJob('job-5'),
+          makeJob('job-6')
+        ]}
+        label="Scheduled jobs"
+        onManageJob={vi.fn()}
+        onOpenRun={vi.fn()}
+        onToggle={vi.fn()}
+        onTriggerJob={vi.fn()}
+        open
+      />
+    )
+
+    expect(screen.getByText('job-6')).toBeInTheDocument()
+    expect(screen.queryByText(' of ', { exact: false })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /more/i })).not.toBeInTheDocument()
   })
 })

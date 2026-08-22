@@ -18,7 +18,13 @@ interface SidebarLoadMoreRowProps {
 export function SidebarLoadMoreRow({ step, onClick, loading = false, variant = 'icon' }: SidebarLoadMoreRowProps) {
   const { t } = useI18n()
   const label = loading ? t.sidebar.loading : step > 0 ? t.sidebar.loadCount(step) : t.sidebar.loadMore
-  const visibleLabel = variant === 'row' && !loading ? `${label}…` : label
+  // Row variant appends a trailing ellipsis as a "more" affordance. Strip any
+  // ellipsis a locale already puts at the end of its string (ASCII `.`, the
+  // horizontal ellipsis `…`, or the two-dot leader `‥`) so we never render
+  // doubled punctuation. The ellipsis is UI chrome, not translator-owned text,
+  // so it stays in code rather than in the i18n strings.
+  const visibleLabel =
+    variant === 'row' && !loading ? `${label.replace(/[.\u2026\u2025]+$/u, '')}…` : label
 
   return (
     <Tip label={visibleLabel}>

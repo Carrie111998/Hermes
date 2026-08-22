@@ -43,6 +43,17 @@ describe('SidebarLoadMoreRow', () => {
     expect(screen.getByRole('button', { name: 'Load 1 more…' })).toHaveTextContent('Load 1 more…')
   })
 
+  it('suppresses the ellipsis and shows a spinner in row variant while loading', () => {
+    render(<SidebarLoadMoreRow loading onClick={vi.fn()} step={1} variant="row" />)
+
+    const button = screen.getByRole('button', { name: 'Loading…' })
+    // The trailing "…" affordance must not be appended in the loading state,
+    // and the visible text stays the loading label (the spinner is the child).
+    expect(button).toHaveTextContent('Loading…')
+    expect(button).not.toHaveTextContent('Loading……')
+    expect(button).not.toHaveTextContent('more…')
+  })
+
   it('wraps the button in a Tip with the generic label when step is 0', () => {
     render(<SidebarLoadMoreRow onClick={vi.fn()} step={0} />)
 
