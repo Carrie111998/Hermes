@@ -269,6 +269,10 @@ function groupActivityToolPreview(payload) {
 
   return raw
     .replace(/(token|api[_ -]?key|secret|password|authorization|credential)\s*[:=]\s*("[^"]*"|'[^']*'|\S+)/gi, '$1=[redacted]')
+    // Label-less credential shapes: bearer-style JWTs and other long
+    // high-entropy token runs (base64url/hex) pasted without a key name.
+    .replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}\b/g, '[redacted]')
+    .replace(/\b[A-Za-z0-9_-]{32,}\b/g, match => (/[0-9]/.test(match) && /[A-Za-z]/.test(match) ? '[redacted]' : match))
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 96)
@@ -347,6 +351,7 @@ function beginGroupLiveRun(group, members, thread, runId, epoch, previousRunWasL
         groupActivityBindings.delete(token)
       }
     }
+    pruneGroupLiveCoalesceState(pending => pending.group === group && pending.runId !== runId)
   }
 
   $groupLiveActivity.set({ ...$groupLiveActivity.get(), [group]: run })
@@ -376,7 +381,7 @@ function applyGroupLiveMemberPatch(group, runId, memberKey, patch) {
   })
 }
 
-function flushGroupLiveMemberPatch(token) {
+function flushGroupLiveMemberPatch(token, { dropPending = false } = {}) {
   const pending = groupLiveCoalescedPatches.get(token)
   const timer = groupLiveCoalesceTimers.get(token)
 
@@ -391,8 +396,25 @@ function flushGroupLiveMemberPatch(token) {
   groupLiveCoalesceTimers.delete(token)
   groupLiveCoalescedPatches.delete(token)
 
-  if (pending) {
+  if (pending && !dropPending) {
     applyGroupLiveMemberPatch(pending.group, pending.runId, pending.memberKey, pending.patch)
+  }
+}
+
+/** Drop any coalesced patch/timer state for tokens under a predicate (all
+ *  entries when omitted). Called wherever bindings are pruned so a member
+ *  that goes silent mid-run cannot leave its 120ms timer entry behind after
+ *  the run ends. */
+function pruneGroupLiveCoalesceState(predicate) {
+  for (const token of groupLiveCoalesceTimers.keys()) {
+    const pending = groupLiveCoalescedPatches.get(token)
+
+    // A token with no pending patch still owns a live timer; parse-free
+    // matching is impossible, so consult the pending payload when present
+    // and otherwise leave the entry to fire and self-remove.
+    if (pending && (predicate ? predicate(pending) : true)) {
+      flushGroupLiveMemberPatch(token, { dropPending: true })
+    }
   }
 }
 
@@ -445,6 +467,7 @@ function finishGroupLiveMember(group, runId, memberKey, status) {
       groupActivityBindings.delete(token)
     }
   }
+  pruneGroupLiveCoalesceState(pending => pending.runId === runId && pending.memberKey === memberKey)
 }
 
 function appendGroupLiveRecent(run, event) {
@@ -500,7 +523,7 @@ function applyGroupActivityToLive(group, event, runId) {
     Object.keys(live.members || {}).find(key => live.members[key]?.name === event.member)
 
   if (event.kind === 'settled') {
-    updateGroupLiveRun(group, run => {
+    updateGroupLiveRun(group, runId, run => {
       appendGroupLiveRecent(run, event)
       run.status = 'settled'
       run.activeMemberKey = null
@@ -511,7 +534,7 @@ function applyGroupActivityToLive(group, event, runId) {
   }
 
   if (event.kind === 'cancelled') {
-    updateGroupLiveRun(group, run => {
+    updateGroupLiveRun(group, runId, run => {
       appendGroupLiveRecent(run, event)
       run.status = 'cancelled'
       run.activeMemberKey = null
@@ -553,6 +576,7 @@ function applyGroupActivityToLive(group, event, runId) {
           groupActivityBindings.delete(token)
         }
       }
+      pruneGroupLiveCoalesceState(pending => pending.runId === runId && pending.memberKey === memberKey)
     }
   }
 
@@ -610,6 +634,7 @@ function clearGroupActivityRun(group, runId) {
       groupActivityBindings.delete(token)
     }
   }
+  pruneGroupLiveCoalesceState(pending => pending.group === group && pending.runId === runId)
 }
 
 /** Events for the room's CURRENT run — superseded runs (epoch moved on)
@@ -734,6 +759,9 @@ function unbindGroupActivitySession(binding) {
   }
 
   groupActivityBindings.delete(binding.token)
+  pruneGroupLiveCoalesceState(
+    pending => pending.group === binding.group && pending.runId === binding.runId && pending.memberKey === binding.memberKey
+  )
 }
 
 function findGroupActivityBinding(event) {
@@ -817,6 +845,7 @@ function markGroupActivityReconnecting() {
 
   $groupLiveActivity.set(liveMap)
   groupActivityBindings.clear()
+  pruneGroupLiveCoalesceState()
 }
 
 function reconcileGroupActivityFromSession(group, runId, memberKey, state) {
@@ -939,6 +968,7 @@ function handleSessionsGatewayTransition() {
 
   $groupLiveActivity.set(live)
   groupActivityBindings.clear()
+  pruneGroupLiveCoalesceState()
 }
 
 /** Per-bot appearance + display meta, persisted via ctx.storage:
@@ -4565,6 +4595,7 @@ async function disbandGroupChat(group, members) {
       groupActivityBindings.delete(token)
     }
   }
+  pruneGroupLiveCoalesceState(pending => pending.group === group)
 
   if ($groupChatWorkspace.get() === group) {
     $groupChatWorkspace.set(null)
@@ -10849,6 +10880,7 @@ export default {
           unbindGroupEventListener()
         }
         groupActivityBindings.clear()
+        pruneGroupLiveCoalesceState()
         for (const timer of groupLiveCoalesceTimers.values()) {
           try {
             clearTimeout(timer)

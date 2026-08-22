@@ -397,6 +397,46 @@ test('tool previews redact credential-shaped values and stay bounded', () => {
   assert.equal(preview.length <= 96, true)
 })
 
+test('tool previews redact label-less bearer tokens and bare high-entropy runs', () => {
+  const gc = load()
+  const jwt = 'eyJ' + 'Aa'.repeat(20) + '.' + 'Bb'.repeat(20) + '.' + 'Cc'.repeat(10)
+  const opaque = 'sk-9f8e7d6c5b4a3210fedcba9876543210ff'
+  const preview = gc.groupActivityToolPreview({ preview: `curl -H "Authorization: Bearer ${jwt}" ${opaque}` })
+
+  assert.doesNotMatch(preview, /eyJ|Authorization: Bearer [A-Za-z0-9_.-]{10,}/)
+  assert.match(preview, /\[redacted\]/)
+  // Ordinary words and pure-alphabetic identifiers survive untouched.
+  const benign = gc.groupActivityToolPreview({ preview: 'deploying application to production environment now' })
+  assert.equal(benign.includes('[redacted]'), false)
+})
+
+test('settled and cancelled events transition the live run in the UI', () => {
+  for (const kind of ['settled', 'cancelled']) {
+    const gc = load()
+    gc.updateGroupChat('Terminal', room => {
+      room.epoch = 1
+      room.activityRunId = 'run-terminal'
+      room.running = true
+      return room
+    })
+    gc.$groupLiveActivity.set({
+      Terminal: {
+        group: 'Terminal', runId: 'run-terminal', epoch: 1, status: 'running',
+        members: { research: { key: 'research', name: 'research', status: 'thinking', updatedAt: Date.now() } },
+        recent: []
+      }
+    })
+
+    gc.recordGroupActivity('Terminal', { kind, member: null, runId: 'run-terminal' })
+    const live = gc.currentGroupLiveActivity('Terminal')
+    assert.equal(live.status, kind, `run must reach ${kind}`)
+    if (kind === 'cancelled') {
+      assert.equal(live.members.research.status, 'cancelled', 'active rows flip to cancelled')
+    }
+    assert.equal(live.recent.some(event => event.kind === kind), true)
+  }
+})
+
 test('source contract: the workspace mounts a quiet, collapsed-by-default disclosure', () => {
   // Collapsed default — opening is always an explicit user action.
   assert.match(pluginSource, /const \[activityOpen, setActivityOpen\] = useState\(false\)/)
