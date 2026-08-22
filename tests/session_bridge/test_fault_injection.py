@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
+from decimal import Decimal
 import json
 import sqlite3
 from pathlib import Path
@@ -21,6 +22,7 @@ from session_bridge.claude_visibility import (
 from session_bridge.codex_adapter import CodexSourceAdapter, CodexTargetAdapter
 from session_bridge.config import BridgeConfig
 from session_bridge.coordinator import (
+    ClaudeVisibilityCoordinator,
     SessionBridgeCoordinator,
     _claude_visibility_enqueue_gates,
 )
@@ -1041,6 +1043,134 @@ def test_claude_visibility_registrar_faults_reconcile_same_uuid_without_relaunch
         assert reconciliation_factory.spawns == []
         status = store.claude_visibility_status(current[0])
         assert status["usage"]["attempts"] == 1  # launch_count remains one
+    finally:
+        database.close()
+
+
+def test_claude_visibility_coordinator_restart_reconciles_ambiguous_lease(
+    tmp_path: Path,
+) -> None:
+    base = 1_700_000_000.0
+    current = [base]
+    database = SessionDB(tmp_path / "coordinator-ambiguous-restart.db")
+    store = SessionBridgeStore(database, clock=lambda: current[0])
+    base_config = BridgeConfig()
+    config = replace(
+        base_config,
+        claude_visibility=replace(
+            base_config.claude_visibility,
+            enabled=True,
+            continuous=True,
+            lease_seconds=10.0,
+            max_attempts=5,
+            daily_registration_limit=25,
+            emergency_daily_cost_usd=Decimal("0.50"),
+            reserved_cost_per_attempt_usd=Decimal("0.02"),
+        ),
+    )
+    try:
+        candidate = _registrar_candidate()
+        identity = derive_claude_visibility_identity(candidate, _REGISTRAR_SECRET)
+        store.enqueue_claude_visibility_job(candidate, identity, _REGISTRAR_SECRET)
+        store.upsert_projection(
+            _projection(
+                provider=Provider.CODEX,
+                native_id=candidate.source_session_id.removeprefix("codex:"),
+            )
+        )
+        launch_factory = _ClaudeFactory(_ClaudePty(read_error=TimeoutError()))
+        first_registrar = ClaudeNativeRegistrar(
+            store,
+            _ClaudeSource([None]),
+            marker_secret=_REGISTRAR_SECRET,
+            startup_theme="light",
+            pty_factory=launch_factory,
+            clock=lambda: current[0],
+            monotonic=lambda: 1.0,
+            sleep=lambda _seconds: None,
+            process_timeout=1.0,
+            exit_timeout=0.1,
+            discovery_timeout=0.0,
+            retry_delay=1.0,
+        )
+        first = ClaudeVisibilityCoordinator(
+            config=config,
+            store=store,
+            inventory=lambda _after: [],
+            registrar=first_registrar,
+            marker_secret=_REGISTRAR_SECRET,
+            clock=lambda: current[0],
+        ).run_once(discover_continuous=True)
+
+        assert first.status == "retry"
+        assert first.error_code == "creation_ambiguous"
+        assert len(launch_factory.spawns) == 1
+        usage = [
+            dict(row)
+            for row in database._conn.execute(
+                "SELECT * FROM session_claude_registration_usage"
+            ).fetchall()
+        ]
+        assert len(usage) == 1
+
+        current[0] = base + 1.0
+        interrupted = store.claim_claude_visibility_job(
+            current[0], 10.0, 25, "0.50", "0.02", 5
+        )
+        assert interrupted.lease_kind == "reconciliation"
+        assert interrupted.prior_error_code == "creation_ambiguous"
+        assert interrupted.reserved_claude_uuid == identity.claude_uuid
+
+        current[0] = base + 11.0
+        recovered_projection = _registrar_projection(
+            interrupted,
+            response=(
+                "You've hit your weekly limit · resets Aug 24, 4am "
+                "(America/New_York)"
+            ),
+        )
+        recovery_factory = _ClaudeFactory()
+        restarted_registrar = ClaudeNativeRegistrar(
+            store,
+            _ClaudeSource([recovered_projection]),
+            marker_secret=_REGISTRAR_SECRET,
+            startup_theme="light",
+            pty_factory=recovery_factory,
+            clock=lambda: current[0],
+            monotonic=lambda: 1.0,
+            sleep=lambda _seconds: None,
+            discovery_timeout=0.0,
+        )
+        recovered = ClaudeVisibilityCoordinator(
+            config=config,
+            store=store,
+            inventory=lambda _after: [],
+            registrar=restarted_registrar,
+            marker_secret=_REGISTRAR_SECRET,
+            clock=lambda: current[0],
+        ).run_once(discover_continuous=True)
+
+        assert recovered.status == "visible"
+        assert recovered.job_id == identity.job_id
+        assert recovery_factory.spawns == []
+        assert [
+            dict(row)
+            for row in database._conn.execute(
+                "SELECT * FROM session_claude_registration_usage"
+            ).fetchall()
+        ] == usage
+        row = dict(
+            database._conn.execute(
+                """SELECT state, attempts, reserved_claude_uuid
+                   FROM session_claude_visibility_jobs WHERE id = ?""",
+                (identity.job_id,),
+            ).fetchone()
+        )
+        assert row == {
+            "state": "claude_visible",
+            "attempts": 1,
+            "reserved_claude_uuid": identity.claude_uuid,
+        }
     finally:
         database.close()
 

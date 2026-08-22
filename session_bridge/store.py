@@ -2885,8 +2885,8 @@ class SessionBridgeStore:
         with self.db._lock:
             conn = self.db._conn
             assert conn is not None
-            count_rows = conn.execute(
-                """SELECT state, COUNT(*) AS count
+            status_rows = conn.execute(
+                """SELECT state, error_code, lease_expires_at
                    FROM session_claude_visibility_jobs AS job
                    WHERE job.operator_cleared_at IS NULL AND NOT EXISTS (
                        SELECT 1
@@ -2896,21 +2896,7 @@ class SessionBridgeStore:
                              'cleanup_completed', 'launch_aborted'
                          )
                    )
-                   GROUP BY state"""
-            ).fetchall()
-            code_rows = conn.execute(
-                """SELECT state, error_code, COUNT(*) AS count
-                   FROM session_claude_visibility_jobs AS job
-                   WHERE error_code IS NOT NULL
-                     AND job.operator_cleared_at IS NULL AND NOT EXISTS (
-                       SELECT 1
-                       FROM session_claude_visibility_characterization_events AS event
-                       WHERE event.job_id = job.id
-                         AND event.event_kind IN (
-                             'cleanup_completed', 'launch_aborted'
-                         )
-                   )
-                   GROUP BY state, error_code"""
+                   ORDER BY state, error_code, id"""
             ).fetchall()
             usage_rows = conn.execute(
                 """SELECT reserved_estimated_cost_usd
@@ -2943,49 +2929,67 @@ class SessionBridgeStore:
                 source_identity_issue=self._claude_lineage_source_identity_issue,
             )
         counts = {state: 0 for state in states}
-        fatal: list[dict[str, Any]] = []
-        for row in count_rows:
-            if row["state"] in counts:
-                counts[row["state"]] = int(row["count"])
-            else:
-                matching_codes = [
-                    code_row
-                    for code_row in code_rows
-                    if code_row["state"] == row["state"]
-                ]
-                if not matching_codes:
-                    matching_codes = [{"error_code": None, "count": row["count"]}]
-                for code_row in matching_codes:
-                    fatal.append({
-                        "code": "unknown_job_state",
-                        "state": _claude_status_token(row["state"]),
-                        "error_code": _claude_status_token(
-                            code_row["error_code"], optional=True
-                        ),
-                        "count": int(
-                            code_row["count"] if code_row["count"] is not None else 0
-                        ),
-                    })
         retry_codes: dict[str, int] = {}
         failed_codes: dict[str, int] = {}
-        for row in code_rows:
-            safe_code = _claude_status_token(row["error_code"])
+        fatal_groups: dict[tuple[str, str | None, str | None], int] = {}
+
+        def add_fatal(
+            code: str, state: object, error_code: object, *, count: int = 1
+        ) -> None:
+            safe_state = _claude_status_token(state)
+            safe_error = _claude_status_token(error_code, optional=True)
+            key = (code, safe_state, safe_error)
+            fatal_groups[key] = fatal_groups.get(key, 0) + count
+
+        for row in status_rows:
+            literal_state = row["state"]
+            if literal_state not in counts:
+                add_fatal("unknown_job_state", literal_state, row["error_code"])
+                continue
+
+            error_code = row["error_code"]
+            if literal_state == "claude_leased":
+                if (
+                    error_code is not None
+                    and error_code not in CLAUDE_VISIBILITY_RETRY_CODES
+                ):
+                    counts[literal_state] += 1
+                    add_fatal("unknown_error_code", literal_state, error_code)
+                    continue
+                lease_expires_at = row["lease_expires_at"]
+                if (
+                    lease_expires_at is not None
+                    and float(lease_expires_at) <= status_time
+                ):
+                    counts["claude_retry"] += 1
+                    retry_codes["lease_expired"] = (
+                        retry_codes.get("lease_expired", 0) + 1
+                    )
+                else:
+                    counts[literal_state] += 1
+                continue
+
+            counts[literal_state] += 1
+            if error_code is None:
+                continue
+            safe_code = _claude_status_token(error_code)
             assert safe_code is not None
-            if row["state"] == "claude_retry":
-                retry_codes[safe_code] = retry_codes.get(safe_code, 0) + int(
-                    row["count"]
-                )
-            elif row["state"] == "claude_failed":
-                failed_codes[safe_code] = failed_codes.get(safe_code, 0) + int(
-                    row["count"]
-                )
-            elif row["state"] in counts:
-                fatal.append({
-                    "code": "unknown_error_code",
-                    "state": _claude_status_token(row["state"]),
-                    "error_code": safe_code,
-                    "count": int(row["count"]),
-                })
+            if literal_state == "claude_retry":
+                retry_codes[safe_code] = retry_codes.get(safe_code, 0) + 1
+            elif literal_state == "claude_failed":
+                failed_codes[safe_code] = failed_codes.get(safe_code, 0) + 1
+            else:
+                add_fatal("unknown_error_code", literal_state, error_code)
+
+        fatal = [
+            {
+                "code": code,
+                "state": state,
+                "error_code": error_code,
+                "count": count,
+            }
+            for (code, state, error_code), count in fatal_groups.items()
+        ]
         total_cost = sum(
             (Decimal(row["reserved_estimated_cost_usd"]) for row in usage_rows),
             Decimal("0"),

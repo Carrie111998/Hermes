@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
+from datetime import timezone
 from decimal import Decimal
 
+from hermes_state import SessionDB
 from session_bridge.claude_visibility import (
     ClaudeVisibilityClaim,
     build_claude_registration_prompt,
@@ -21,7 +23,7 @@ from session_bridge.models import (
     Provider,
     SessionProjection,
 )
-from session_bridge.store import SidebarSource
+from session_bridge.store import SessionBridgeStore, SidebarSource
 
 
 SECRET = b"visibility-coordinator-test-secret"
@@ -775,6 +777,103 @@ def test_run_once_fails_closed_on_unknown_claim_and_registrar_statuses() -> None
     assert registrar_result.fatal is True
     assert registrar_result.error_code == "unknown_registrar_status"
     assert registrar.claims == [claimed]
+
+
+def test_real_store_reconciliation_lease_waits_then_recovers_at_exact_expiry(
+    tmp_path,
+) -> None:
+    clock = [NOW]
+    database = SessionDB(tmp_path / "coordinator-lease-status.db")
+    store = SessionBridgeStore(
+        database,
+        clock=lambda: clock[0],
+        local_timezone=timezone.utc,
+    )
+    try:
+        source = _source("lease-status-recovery")
+        candidate = build_claude_visibility_candidate(
+            source.projection,
+            eligible_at=source.projection.last_active,
+            git_root=source.git_root,
+            git_head=source.git_head,
+            worktree_id=source.worktree_id,
+        )
+        identity = derive_claude_visibility_identity(candidate, SECRET)
+        store.enqueue_claude_visibility_job(candidate, identity, SECRET)
+        launch = store.claim_claude_visibility_job(
+            NOW, 10.0, 25, "0.50", "0.02", 5
+        )
+        store.retry_claude_visibility_job(
+            identity.job_id,
+            launch.lease_digest or "",
+            "creation_ambiguous",
+            NOW,
+            "historical launch uncertainty",
+        )
+        reconciliation = store.claim_claude_visibility_job(
+            NOW, 10.0, 25, "0.50", "0.02", 5
+        )
+        assert reconciliation.lease_kind == "reconciliation"
+        literal = dict(
+            database._conn.execute(
+                "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+                (identity.job_id,),
+            ).fetchone()
+        )
+        usage = [
+            dict(row)
+            for row in database._conn.execute(
+                "SELECT * FROM session_claude_registration_usage"
+            ).fetchall()
+        ]
+        registrar = FakeRegistrar()
+        coordinator = ClaudeVisibilityCoordinator(
+            config=_config(continuous=True),
+            store=store,
+            inventory=lambda _after: [],
+            registrar=registrar,
+            marker_secret=SECRET,
+            clock=lambda: clock[0],
+        )
+
+        waiting = coordinator.run_once(discover_continuous=True)
+
+        assert waiting.status == "no_due_job"
+        assert registrar.claims == []
+        assert dict(
+            database._conn.execute(
+                "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+                (identity.job_id,),
+            ).fetchone()
+        ) == literal
+        assert [
+            dict(row)
+            for row in database._conn.execute(
+                "SELECT * FROM session_claude_registration_usage"
+            ).fetchall()
+        ] == usage
+
+        clock[0] = NOW + 10.0
+        recovered = coordinator.run_once(discover_continuous=True)
+
+        assert recovered.status == "visible"
+        assert len(registrar.claims) == 1
+        recovered_claim = registrar.claims[0]
+        assert recovered_claim.job_id == identity.job_id
+        assert recovered_claim.reserved_claude_uuid == identity.claude_uuid
+        assert recovered_claim.lease_kind == "reconciliation"
+        assert recovered_claim.prior_error_code == "lease_expired"
+        assert recovered_claim.registration_reserved is False
+        assert recovered_claim.launch_permitted is False
+        assert recovered_claim.attempt_ordinal == launch.attempt_ordinal == 1
+        assert [
+            dict(row)
+            for row in database._conn.execute(
+                "SELECT * FROM session_claude_registration_usage"
+            ).fetchall()
+        ] == usage
+    finally:
+        database.close()
 
 
 def test_run_once_blocks_before_claim_on_unknown_persisted_job_state() -> None:

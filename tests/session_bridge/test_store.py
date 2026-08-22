@@ -27,6 +27,7 @@ from session_bridge.claude_visibility import (
 )
 from session_bridge.claude_visibility_codes import (
     CLAUDE_VISIBILITY_PUBLIC_RESULT_ERROR_CODES,
+    CLAUDE_VISIBILITY_RETRY_CODES,
 )
 from session_bridge.mirror import (
     DiscoveryMode,
@@ -13857,6 +13858,152 @@ def test_claude_visibility_claims_at_most_one_due_job_and_status_is_exact(
     }
     assert status["retry_codes"] == {"native_transcript_not_indexed": 1}
     assert status["failed_codes"] == {"marker_conflict": 1}
+
+
+def _seed_claude_visibility_status_lease(
+    db: SessionDB,
+    *,
+    retained_error_code: str | None,
+) -> tuple[SessionBridgeStore, ClaudeVisibilityIdentity, dict[str, object]]:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity(
+        f"status-lease-{retained_error_code or 'none'}"
+    )
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 10, 25, "0.50", "0.02")
+    if retained_error_code is not None:
+        store.retry_claude_visibility_job(
+            identity.job_id,
+            launch.lease_digest,
+            "creation_ambiguous",
+            100.0,
+            "historical launch uncertainty",
+        )
+        reconciliation = store.claim_claude_visibility_job(
+            100.0, 10, 25, "0.50", "0.02"
+        )
+        assert reconciliation.lease_kind == "reconciliation"
+        if retained_error_code != "creation_ambiguous":
+            db._execute_write(
+                lambda conn: conn.execute(
+                    "UPDATE session_claude_visibility_jobs SET error_code = ? WHERE id = ?",
+                    (retained_error_code, identity.job_id),
+                )
+            )
+    row = _rows(
+        db,
+        """SELECT state, attempts, lease_digest, lease_expires_at, lease_kind,
+                  error_code, reserved_claude_uuid
+             FROM session_claude_visibility_jobs WHERE id = ?""",
+        (identity.job_id,),
+    )[0]
+    return store, identity, row
+
+
+@pytest.mark.parametrize(
+    "retained_error_code",
+    (None, *sorted(CLAUDE_VISIBILITY_RETRY_CODES)),
+)
+def test_claude_visibility_status_projects_valid_leases_without_mutation(
+    db: SessionDB,
+    retained_error_code: str | None,
+) -> None:
+    store, identity, literal = _seed_claude_visibility_status_lease(
+        db, retained_error_code=retained_error_code
+    )
+    usage = _rows(db, "SELECT * FROM session_claude_registration_usage")
+
+    active = store.claude_visibility_status(109.999)
+    exact_expiry = store.claude_visibility_status(110.0)
+    after_expiry = store.claude_visibility_status(111.0)
+
+    assert active["counts"]["claude_leased"] == 1
+    assert active["counts"]["claude_retry"] == 0
+    assert active["retry_codes"] == {}
+    assert active["fatal"] == []
+    for expired in (exact_expiry, after_expiry):
+        assert expired["counts"]["claude_leased"] == 0
+        assert expired["counts"]["claude_retry"] == 1
+        assert expired["retry_codes"] == {"lease_expired": 1}
+        assert expired["fatal"] == []
+    assert _rows(
+        db,
+        """SELECT state, attempts, lease_digest, lease_expires_at, lease_kind,
+                  error_code, reserved_claude_uuid
+             FROM session_claude_visibility_jobs WHERE id = ?""",
+        (identity.job_id,),
+    )[0] == literal
+    assert _rows(db, "SELECT * FROM session_claude_registration_usage") == usage
+
+
+@pytest.mark.parametrize("retained_error_code", ("source_conflict", "future_code"))
+@pytest.mark.parametrize("status_time", (109.999, 110.0, 111.0))
+def test_claude_visibility_status_rejects_invalid_leased_error_without_mutation(
+    db: SessionDB,
+    retained_error_code: str,
+    status_time: float,
+) -> None:
+    store, identity, literal = _seed_claude_visibility_status_lease(
+        db, retained_error_code=retained_error_code
+    )
+
+    status = store.claude_visibility_status(status_time)
+
+    assert status["counts"]["claude_leased"] == 1
+    assert status["counts"]["claude_retry"] == 0
+    assert status["retry_codes"] == {}
+    assert status["fatal"] == [
+        {
+            "code": "unknown_error_code",
+            "state": "claude_leased",
+            "error_code": retained_error_code,
+            "count": 1,
+        }
+    ]
+    assert _rows(
+        db,
+        """SELECT state, attempts, lease_digest, lease_expires_at, lease_kind,
+                  error_code, reserved_claude_uuid
+             FROM session_claude_visibility_jobs WHERE id = ?""",
+        (identity.job_id,),
+    )[0] == literal
+
+
+@pytest.mark.parametrize("state", ("claude_pending", "claude_visible"))
+def test_claude_visibility_status_rejects_errors_on_nonerror_states(
+    db: SessionDB,
+    state: str,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity(f"status-invalid-{state}")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    def _write_invalid_nonerror_state(conn) -> None:
+        if state == "claude_visible":
+            conn.execute(
+                """UPDATE session_claude_visibility_jobs
+                   SET state = ?, error_code = 'creation_ambiguous',
+                       completion_digest = ?, visible_at = 100.0 WHERE id = ?""",
+                (state, "a" * 64, identity.job_id),
+            )
+        else:
+            conn.execute(
+                """UPDATE session_claude_visibility_jobs
+                   SET state = ?, error_code = 'creation_ambiguous' WHERE id = ?""",
+                (state, identity.job_id),
+            )
+
+    db._execute_write(_write_invalid_nonerror_state)
+
+    status = store.claude_visibility_status(100.0)
+
+    assert status["fatal"] == [
+        {
+            "code": "unknown_error_code",
+            "state": state,
+            "error_code": "creation_ambiguous",
+            "count": 1,
+        }
+    ]
 
 
 def test_claude_visibility_status_reports_unknown_state_as_sanitized_fatal(
