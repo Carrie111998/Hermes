@@ -2318,6 +2318,16 @@ os.environ["HERMES_TURN_LEASE_TIMEOUT"] = str(
     _DEFAULT_CONFIG["agent"]["gateway_turn_lease_timeout"]
 )
 
+# Same reasoning for the flap horizon: it is bridge plumbing for the
+# documented agent.reconnect_stable_after setting, so seed it from the
+# canonical default first. Without this, a stale .env entry written by an
+# old setup run would outrank the value config.yaml advertises whenever the
+# key is left at its default, which is the shape of the 60-vs-500 max_turns
+# incident (PR #18413).
+os.environ["HERMES_RECONNECT_STABLE_AFTER_SECONDS"] = str(
+    _DEFAULT_CONFIG["agent"]["reconnect_stable_after"]
+)
+
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
 _config_path = _hermes_home / 'config.yaml'
@@ -2485,6 +2495,12 @@ if _config_path.exists():
                 # is the documented, user-facing setting.
                 os.environ["HERMES_RECONNECT_ATTENTION_AFTER_SECONDS"] = str(
                     _agent_cfg["reconnect_attention_after"]
+                )
+            if "reconnect_stable_after" in _agent_cfg:
+                # Internal bridge only — config.yaml (agent.reconnect_stable_after)
+                # is the documented, user-facing setting.
+                os.environ["HERMES_RECONNECT_STABLE_AFTER_SECONDS"] = str(
+                    _agent_cfg["reconnect_stable_after"]
                 )
             if "restart_drain_timeout" in _agent_cfg:
                 os.environ["HERMES_RESTART_DRAIN_TIMEOUT"] = str(_agent_cfg["restart_drain_timeout"])
@@ -4271,8 +4287,9 @@ _RECONNECT_ATTENTION_AFTER_SECONDS = _float_env(
 # escalates (#92178: two systemd units racing the same bot token, each brief
 # successful bind resetting the attention clock, four days with no signal).
 # Only the clock is carried; retry scheduling is untouched.
-# Env-only knob, deliberately: this is the flap horizon for an escalation
-# signal, not a policy an operator normally tunes.
+# User-facing setting: agent.reconnect_stable_after in config.yaml
+# (bridged to this env var above). 0 makes every successful bind count
+# as a recovery, which is the pre-#92178 behaviour.
 _RECONNECT_STABLE_AFTER_SECONDS = _float_env(
     "HERMES_RECONNECT_STABLE_AFTER_SECONDS", 900
 )
