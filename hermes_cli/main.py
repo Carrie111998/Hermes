@@ -11236,7 +11236,9 @@ def _is_electron_packaged_web_dist(path: str) -> bool:
     return "app.asar" in path.replace("\\", "/")
 
 
-def _serve_should_force_headless(headless_backend: bool, env=None) -> bool:
+def _serve_should_force_headless(
+    headless_backend: bool, env: dict[str, str] | None = None
+) -> bool:
     """True when ``hermes serve`` must disable the browser SPA.
 
     ``serve`` is the headless backend: a standalone `hermes serve` is not a
