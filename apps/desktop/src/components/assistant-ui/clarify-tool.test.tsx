@@ -449,6 +449,118 @@ describe('ClarifyTool pending marker', () => {
   })
 })
 
+describe('ClarifyTool hydration-race fallback', () => {
+  // Regression: when the gateway's clarify request carries a question that
+  // disagrees with the tool arg question on whitespace or casing (or simply
+  // hasn't arrived yet), matchingRequest dropped to null and fromArgs.choices
+  // was ignored, so the card rendered a textarea-only fallback instead of the
+  // choice buttons.
+
+  it('still renders choice buttons when args.choices has values even if no matching gateway request is wired', () => {
+    // No setClarifyRequest() — simulates the moment between tool.start and
+    // clarify.request when matchingRequest would have been null AND fromArgs
+    // already carries choices.
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn().mockResolvedValue({ ok: true }) } as never)
+
+    const args = { choices: ['staging', 'production'], question: 'Which target?' }
+    renderClarify(
+      <ClarifyTool
+        addResult={vi.fn()}
+        args={args}
+        argsText={JSON.stringify(args)}
+        isError={false}
+        respondToApproval={vi.fn()}
+        result={undefined}
+        resume={vi.fn()}
+        status={{ type: 'running' }}
+        toolCallId="clarify-args-only"
+        toolName="clarify"
+        type="tool-call"
+      />
+    )
+
+    // Both choice buttons are on screen — not a textarea-only fallback.
+    expect(screen.getByRole('button', { name: /staging/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /production/ })).toBeTruthy()
+    // The textarea-only fallback would have shown a single bare textarea.
+    // The choices layout shows the same textarea as the "Other" row, so just
+    // assert the choices marker is present.
+    expect(document.querySelector('[data-clarify-choices]')).toBeTruthy()
+  })
+
+  it('treats a gateway question that only differs on casing as the same question', () => {
+    // Gateway request carries a lowercased version of the question. Before
+    // the fix, the strict `fromArgs.question !== request.question` compare
+    // dropped matchingRequest to null and the card lost its recommended
+    // labels from the gateway. Now we compare via normalize() so they match.
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn().mockResolvedValue({ ok: true }) } as never)
+    setClarifyRequest({
+      choices: ['staging (Recommended)', 'production'],
+      multiSelect: false,
+      question: 'which deployment target?  ',
+      requestId: 'request-casing',
+      sessionId: 'session-1'
+    })
+
+    const args = { question: 'Which deployment target?' }
+    renderClarify(
+      <ClarifyTool
+        addResult={vi.fn()}
+        args={args}
+        argsText={JSON.stringify(args)}
+        isError={false}
+        respondToApproval={vi.fn()}
+        result={undefined}
+        resume={vi.fn()}
+        status={{ type: 'running' }}
+        toolCallId="clarify-casing"
+        toolName="clarify"
+        type="tool-call"
+      />
+    )
+
+    // matchingRequest matched, so the gateway's recommended choices won.
+    expect(screen.getByRole('button', { name: /staging/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /production/ })).toBeTruthy()
+  })
+
+  it('still rejects a gateway question that genuinely differs (not just casing/whitespace)', () => {
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn().mockResolvedValue({ ok: true }) } as never)
+    setClarifyRequest({
+      choices: ['apple', 'banana'],
+      multiSelect: false,
+      question: 'A fruit?',
+      requestId: 'request-mismatch',
+      sessionId: 'session-1'
+    })
+
+    const args = { choices: ['staging', 'production'], question: 'Which target?' }
+    renderClarify(
+      <ClarifyTool
+        addResult={vi.fn()}
+        args={args}
+        argsText={JSON.stringify(args)}
+        isError={false}
+        respondToApproval={vi.fn()}
+        result={undefined}
+        resume={vi.fn()}
+        status={{ type: 'running' }}
+        toolCallId="clarify-mismatch"
+        toolName="clarify"
+        type="tool-call"
+      />
+    )
+
+    // matchingRequest dropped out, so we fall through to fromArgs.choices
+    // — the buttons still render, but with the args' wording.
+    expect(screen.getByRole('button', { name: /staging/ })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /apple/ })).toBeNull()
+  })
+})
+
 // ─── Batch (multi-question) clarify ─────────────────────────────────────────
 
 function batchArgs(): { questions: { question: string; choices?: string[] }[] } {
