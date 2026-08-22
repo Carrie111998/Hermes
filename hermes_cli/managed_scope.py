@@ -84,6 +84,17 @@ def invalidate_managed_cache() -> None:
         _CONFIG_FAILURE_CACHE.clear()
 
 
+def _dangling_symlink_key(path: Path) -> Optional[tuple]:
+    """Return lstat provenance when *path* is a dangling symlink."""
+    if not path.is_symlink():
+        return None
+    try:
+        st = path.lstat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size, st.st_ctime_ns, st.st_mode)
+
+
 def _cached_read(
     path: Path,
     cache: Dict[str, tuple],
@@ -103,8 +114,23 @@ def _cached_read(
     path_key = str(path)
     try:
         st = path.stat()
-    except FileNotFoundError:
-        return None  # absent
+    except FileNotFoundError as exc:
+        key = _dangling_symlink_key(path)
+        if key is None:
+            return None  # genuinely absent
+        logger.warning(
+            "managed scope: %s is a dangling symlink — IGNORING this managed "
+            "file. Admin policy from this file is NOT being applied.",
+            path,
+        )
+        if failure_cache is not None:
+            with _CACHE_LOCK:
+                failure_cache[path_key] = key
+        if require_resolved:
+            raise ManagedConfigResolutionError(
+                f"Current managed config source at {path} is unresolved"
+            ) from exc
+        return None
     except OSError as exc:
         logger.warning(
             "managed scope: failed to access %s: %s — IGNORING this managed file. "
@@ -156,7 +182,9 @@ def _cached_read(
 
 
 def _parse_managed_config(f) -> dict:
-    parsed = yaml.safe_load(f) or {}
+    parsed = yaml.safe_load(f)
+    if parsed is None:
+        return {}
     if not isinstance(parsed, dict):
         raise ValueError("managed config root must be a mapping")
     return parsed
@@ -204,8 +232,16 @@ def require_managed_config_resolved() -> None:
     path = managed_dir / "config.yaml"
     try:
         st = path.stat()
-    except FileNotFoundError:
-        return
+    except FileNotFoundError as exc:
+        key = _dangling_symlink_key(path)
+        if key is None:
+            return
+        path_key = str(path)
+        with _CACHE_LOCK:
+            _CONFIG_FAILURE_CACHE[path_key] = key
+        raise ManagedConfigResolutionError(
+            f"Current managed config source at {path} is unresolved"
+        ) from exc
     except OSError as exc:
         raise ManagedConfigResolutionError(
             f"Current managed config source at {path} is inaccessible"

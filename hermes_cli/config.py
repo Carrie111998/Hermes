@@ -31,7 +31,7 @@ import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Set
+from typing import Dict, Any, Optional, List, Tuple, Set, cast
 
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.secret_prompt import masked_secret_prompt
@@ -243,25 +243,27 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # produces a fresh inode, so stat() sees a new mtime_ns and the next
 # load repopulates automatically — no explicit invalidation hook.
 # Cached tuple is (user mtime/size/ctime/mode, managed mtime/size/ctime/mode,
-# merged_value, env_ref_snapshot) — the managed-file signature is folded in so
+# merged_value, env_ref_snapshot, raw_user_source, raw_managed_source) — the
+# raw sources preserve explicit section shape for strict path validation, while
+# the managed-file signature is folded in so
 # editing the managed-scope config.yaml invalidates the cache (see
 # managed_scope), and the env snapshot invalidates it when a referenced ${VAR}
 # changes value (late .env load, in-process rotation — #58514).
-_LOAD_CONFIG_CACHE: Dict[
-    str,
-    Tuple[
-        int,
-        int,
-        int,
-        int,
-        int,
-        int,
-        int,
-        int,
-        Dict[str, Any],
-        Dict[str, Optional[str]],
-    ],
-] = {}
+_ConfigCacheEntry = Tuple[
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    Dict[str, Any],
+    Dict[str, Optional[str]],
+    Dict[str, Any],
+    Dict[str, Any],
+]
+_LOAD_CONFIG_CACHE: Dict[str, _ConfigCacheEntry] = {}
 # Explicit-path consumers such as SessionDB need to distinguish a successfully
 # resolved default from a config that only fell back because the current user
 # file could not be parsed. Cache that failure on the user's
@@ -3483,6 +3485,28 @@ def load_config_readonly() -> Dict[str, Any]:
     return _load_config_impl(want_deepcopy=False)
 
 
+def _require_mapping_path(
+    source: Dict[str, Any],
+    keys: Tuple[str, ...],
+    *,
+    source_label: str,
+) -> None:
+    """Reject an explicitly non-mapping intermediate config section."""
+    current: Any = source
+    for key in keys[:-1]:
+        if not isinstance(current, dict):
+            raise ConfigResolutionError(
+                f"{source_label} path {'.'.join(keys)} crosses a non-mapping value"
+            )
+        if key not in current:
+            return
+        current = current[key]
+    if keys and not isinstance(current, dict):
+        raise ConfigResolutionError(
+            f"{source_label} path {'.'.join(keys)} crosses a non-mapping value"
+        )
+
+
 def resolve_effective_config_value(
     config_path: Path,
     *keys: str,
@@ -3509,6 +3533,7 @@ def resolve_effective_config_value(
             want_deepcopy=False,
             config_path=Path(config_path),
             require_resolved=True,
+            required_path=tuple(keys),
         )
     except ConfigResolutionError:
         raise
@@ -3516,7 +3541,22 @@ def resolve_effective_config_value(
         raise ConfigResolutionError(
             f"Could not resolve effective config at {config_path}"
         ) from exc
-    return copy.deepcopy(cfg_get(config, *keys, default=default))
+    if not keys:
+        return copy.deepcopy(config)
+    current: Any = config
+    for key in keys[:-1]:
+        if not isinstance(current, dict):
+            raise ConfigResolutionError(
+                f"Effective config path {'.'.join(keys)} crosses a non-mapping value"
+            )
+        if key not in current:
+            return copy.deepcopy(default)
+        current = current[key]
+    if not isinstance(current, dict):
+        raise ConfigResolutionError(
+            f"Effective config path {'.'.join(keys)} crosses a non-mapping value"
+        )
+    return copy.deepcopy(current.get(keys[-1], default))
 
 
 def write_platform_config_field(
@@ -3676,6 +3716,7 @@ def _load_config_impl(
     want_deepcopy: bool,
     config_path: Optional[Path] = None,
     require_resolved: bool = False,
+    required_path: Optional[Tuple[str, ...]] = None,
 ) -> Dict[str, Any]:
     with _CONFIG_LOCK:
         if config_path is None:
@@ -3696,8 +3737,18 @@ def _load_config_impl(
             )
             user_failure_sig = user_sig
         except FileNotFoundError:
-            user_sig = None
-            user_failure_sig = None
+            if config_path.is_symlink():
+                link_stat = config_path.lstat()
+                user_sig = (
+                    link_stat.st_mtime_ns,
+                    link_stat.st_size,
+                    link_stat.st_ctime_ns,
+                    stat.S_IMODE(link_stat.st_mode),
+                )
+                user_failure_sig = user_sig
+            else:
+                user_sig = None
+                user_failure_sig = None
 
         # Managed scope: fold the managed config file's (mtime, size) into the
         # cache signature so editing /etc/hermes/config.yaml invalidates the
@@ -3758,14 +3809,34 @@ def _load_config_impl(
             # life of the process (#58514).
             env_snapshot = cached[9] if len(cached) > 9 else {}
             if all(os.environ.get(k) == v for k, v in env_snapshot.items()):
+                if require_resolved and required_path:
+                    cached_user_source = cached[10] if len(cached) > 10 else {}
+                    cached_managed_source = cached[11] if len(cached) > 11 else {}
+                    _require_mapping_path(
+                        cached_user_source,
+                        required_path,
+                        source_label="User config",
+                    )
+                    _require_mapping_path(
+                        cached_managed_source,
+                        required_path,
+                        source_label="Managed config",
+                    )
                 return copy.deepcopy(cached[8]) if want_deepcopy else cached[8]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
+        user_config_for_path: Dict[str, Any] = {}
 
         if user_sig is not None:
             try:
                 with open(config_path, encoding="utf-8") as f:
-                    user_config = fast_safe_load(f) or {}
+                    parsed_user_config = fast_safe_load(f)
+                if parsed_user_config is None:
+                    user_config = {}
+                elif not isinstance(parsed_user_config, dict):
+                    raise ValueError("config root must be a mapping")
+                else:
+                    user_config = parsed_user_config
 
                 if "max_turns" in user_config:
                     agent_user_config = dict(user_config.get("agent") or {})
@@ -3774,6 +3845,7 @@ def _load_config_impl(
                     user_config["agent"] = agent_user_config
                     user_config.pop("max_turns", None)
 
+                user_config_for_path = copy.deepcopy(user_config)
                 config = _deep_merge(config, user_config)
                 _CONFIG_RESOLUTION_FAILURE_CACHE.pop(path_key, None)
             except Exception as e:
@@ -3816,9 +3888,15 @@ def _load_config_impl(
                         # re-parse the broken file; fixing the file changes the
                         # signature and triggers a normal reload.
                         _empty_env: Dict[str, Optional[str]] = {}
-                        _LOAD_CONFIG_CACHE[path_key] = (
-                            *cache_sig,
-                            lkg_copy, _empty_env,
+                        _LOAD_CONFIG_CACHE[path_key] = cast(
+                            _ConfigCacheEntry,
+                            (
+                                *cache_sig,
+                                lkg_copy,
+                                _empty_env,
+                                {},
+                                {},
+                            ),
                         )
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
                 resolution_failed = True
@@ -3832,10 +3910,13 @@ def _load_config_impl(
         # against the process environment, never against user-config-defined refs.
         # This deliberately inverts the usual env-over-config precedence for the
         # keys the managed layer pins — see docs/design/managed-scope.md §4.1.
-        managed_config = (
+        managed_config_value = (
             managed_scope.load_managed_config_strict()
             if require_resolved
             else managed_scope.load_managed_config()
+        )
+        managed_config: Dict[str, Any] = (
+            managed_config_value if isinstance(managed_config_value, dict) else {}
         )
         if managed_config:
             # Normalize the managed overlay through the same canonicalization as
@@ -3851,6 +3932,17 @@ def _load_config_impl(
                 managed_normalized["model"] = {"default": managed_normalized["model"]}
             managed_expanded = _expand_env_vars(managed_normalized)
             expanded = _deep_merge(expanded, managed_expanded)
+        if require_resolved and required_path:
+            _require_mapping_path(
+                user_config_for_path,
+                required_path,
+                source_label="User config",
+            )
+            _require_mapping_path(
+                managed_config,
+                required_path,
+                source_label="Managed config",
+            )
         if not resolution_failed:
             _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
@@ -3858,15 +3950,24 @@ def _load_config_impl(
             # (deepcopy=True) callers can mutate freely without affecting the
             # cached value, and ``load_config_readonly()`` (deepcopy=False)
             # callers all see the same stable cached object. The cached tuple is
-            # (user and managed mtime/size/ctime/mode, value, env_ref_snapshot).
+            # (user and managed metadata, value, env snapshot, raw source maps).
             # The snapshot records the environment values
             # this expansion was made against so later loads can detect env
             # drift (late .env load, in-process rotation) — see cache hit above.
-            cached_copy = copy.deepcopy(expanded)
+            cached_copy = cast(Dict[str, Any], copy.deepcopy(expanded))
             env_snapshot = _env_ref_snapshot(normalized)
             if managed_config:
                 _env_ref_snapshot(managed_config, env_snapshot)
-            _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, cached_copy, env_snapshot)
+            _LOAD_CONFIG_CACHE[path_key] = cast(
+                _ConfigCacheEntry,
+                (
+                    *cache_sig,
+                    cached_copy,
+                    env_snapshot,
+                    copy.deepcopy(user_config_for_path),
+                    copy.deepcopy(managed_config),
+                ),
+            )
             # On the readonly path return the same cached object subsequent
             # calls will see — keeps "two readonly calls return the same
             # object" invariant that callers may rely on for identity checks.
@@ -3879,7 +3980,7 @@ def _load_config_impl(
         # canonical "freshly-built mutable result" the function has always
         # returned. For the deepcopy=False path with no cache (e.g. config
         # file missing), it's also fine — callers get an isolated object.
-        return expanded
+        return cast(Dict[str, Any], expanded)
 
 
 _SECURITY_COMMENT = """

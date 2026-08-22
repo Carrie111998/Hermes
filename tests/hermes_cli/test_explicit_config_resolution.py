@@ -230,8 +230,9 @@ def test_unresolved_managed_config_fails_strict_reader_until_repaired(
 def test_unreadable_config_failure_cache_invalidates_after_chmod_repair(
     config_module, tmp_path, monkeypatch
 ):
-    if os.geteuid() == 0:
-        pytest.skip("permission denial cannot be exercised as root")
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None or geteuid() == 0:
+        pytest.skip("permission denial cannot be exercised on this platform/user")
 
     profile = tmp_path / "permission-profile"
     profile.mkdir()
@@ -268,3 +269,141 @@ def test_unreadable_config_failure_cache_invalidates_after_chmod_repair(
         ) is False
     finally:
         config_path.chmod(0o600)
+
+
+@pytest.mark.parametrize(
+    "invalid_yaml",
+    (
+        "false\n",
+        "[]\n",
+        "sessions: false\n",
+        "sessions: []\n",
+        "sessions: null\n",
+    ),
+)
+def test_strict_reader_rejects_wrong_shape_config(
+    config_module,
+    tmp_path,
+    invalid_yaml,
+):
+    profile = tmp_path / "wrong-shape-profile"
+    profile.mkdir()
+    config_path = profile / "config.yaml"
+    config_path.write_text(invalid_yaml, encoding="utf-8")
+
+    with pytest.raises(config_module.ConfigResolutionError):
+        config_module.resolve_effective_config_value(
+            config_path,
+            "sessions",
+            "trigram_fts",
+            default=True,
+        )
+
+
+@pytest.mark.linux_only
+def test_strict_reader_rejects_dangling_user_symlink_until_target_appears(
+    config_module,
+    tmp_path,
+):
+    profile = tmp_path / "dangling-user-profile"
+    profile.mkdir()
+    config_path = profile / "config.yaml"
+    target = profile / "deployed-config.yaml"
+    config_path.symlink_to(target)
+
+    with pytest.raises(config_module.ConfigResolutionError):
+        config_module.resolve_effective_config_value(
+            config_path,
+            "sessions",
+            "trigram_fts",
+            default=True,
+        )
+
+    target.write_text(
+        "sessions:\n  trigram_fts: false\n",
+        encoding="utf-8",
+    )
+    assert config_module.resolve_effective_config_value(
+        config_path,
+        "sessions",
+        "trigram_fts",
+        default=True,
+    ) is False
+
+
+@pytest.mark.linux_only
+def test_dangling_user_symlink_retains_last_known_good_for_general_readers(
+    config_module,
+    tmp_path,
+    monkeypatch,
+):
+    profile = tmp_path / "dangling-lkg-profile"
+    profile.mkdir()
+    config_path = profile / "config.yaml"
+    config_path.write_text(
+        "approvals:\n  deny:\n    - dangerous-command\n"
+        "sessions:\n  trigram_fts: false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    loaded = config_module.load_config_readonly()
+    assert loaded["approvals"]["deny"] == ["dangerous-command"]
+
+    target = profile / "deployed-config.yaml"
+    config_path.unlink()
+    config_path.symlink_to(target)
+
+    fallback = config_module.load_config_readonly()
+    assert fallback["approvals"]["deny"] == ["dangerous-command"]
+    with pytest.raises(config_module.ConfigResolutionError):
+        config_module.resolve_effective_config_value(
+            config_path,
+            "sessions",
+            "trigram_fts",
+            default=True,
+        )
+
+
+@pytest.mark.linux_only
+def test_strict_reader_rejects_dangling_managed_symlink_until_target_appears(
+    config_module,
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_cli import managed_scope
+
+    profile = tmp_path / "profile"
+    managed = tmp_path / "managed"
+    profile.mkdir()
+    managed.mkdir()
+    config_path = profile / "config.yaml"
+    config_path.write_text(
+        "sessions:\n  trigram_fts: true\n",
+        encoding="utf-8",
+    )
+    managed_path = managed / "config.yaml"
+    target = managed / "deployed-config.yaml"
+    managed_path.symlink_to(target)
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    managed_scope.invalidate_managed_cache()
+    config_module.load_config_readonly()
+
+    with pytest.raises(config_module.ConfigResolutionError):
+        config_module.resolve_effective_config_value(
+            config_path,
+            "sessions",
+            "trigram_fts",
+            default=True,
+        )
+
+    target.write_text(
+        "sessions:\n  trigram_fts: false\n",
+        encoding="utf-8",
+    )
+    assert config_module.resolve_effective_config_value(
+        config_path,
+        "sessions",
+        "trigram_fts",
+        default=True,
+    ) is False

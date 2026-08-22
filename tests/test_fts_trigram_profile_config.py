@@ -5,6 +5,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from hermes_state import SessionDB
 
 
@@ -497,3 +499,202 @@ def test_malformed_managed_config_preserves_existing_trigram_quarantine(
         assert trigger_count == 0
     finally:
         unresolved.close()
+
+
+def _assert_hardening_quarantine(db: SessionDB) -> None:
+    assert db._conn is not None
+    assert db._trigram_enabled is False
+    assert db._trigram_available is False
+    assert db._conn.execute(
+        "SELECT 1 FROM state_meta WHERE key = 'fts_trigram_stale'"
+    ).fetchone() is not None
+    trigger_count = db._conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' "
+        "AND name LIKE 'messages_fts_trigram%'"
+    ).fetchone()[0]
+    assert trigger_count == 0
+
+
+def _establish_user_hardening_quarantine(home: Path) -> Path:
+    db_path = _write_config(home, True)
+    enabled = SessionDB(db_path=db_path)
+    enabled.close()
+
+    _write_config(home, False)
+    disabled = SessionDB(db_path=db_path)
+    try:
+        _assert_hardening_quarantine(disabled)
+    finally:
+        disabled.close()
+    return db_path
+
+
+def _establish_managed_hardening_quarantine(
+    profile: Path,
+    managed_path: Path,
+) -> Path:
+    db_path = _write_config(profile, True)
+    managed_path.write_text(
+        "sessions:\n  trigram_fts: true\n",
+        encoding="utf-8",
+    )
+    enabled = SessionDB(db_path=db_path)
+    enabled.close()
+
+    managed_path.write_text(
+        "sessions:\n  trigram_fts: false\n",
+        encoding="utf-8",
+    )
+    from hermes_cli import managed_scope
+
+    managed_scope.invalidate_managed_cache()
+    disabled = SessionDB(db_path=db_path)
+    try:
+        _assert_hardening_quarantine(disabled)
+    finally:
+        disabled.close()
+    return db_path
+
+
+@pytest.mark.parametrize(
+    "invalid_yaml",
+    (
+        "false\n",
+        "[]\n",
+        "sessions: false\n",
+        "sessions: []\n",
+        "sessions: null\n",
+    ),
+)
+def test_wrong_shape_user_config_preserves_existing_trigram_quarantine(
+    tmp_path,
+    monkeypatch,
+    invalid_yaml,
+):
+    from hermes_cli import config as config_module
+
+    home = tmp_path / "wrong-shape-user"
+    db_path = _establish_user_hardening_quarantine(home)
+    (home / "config.yaml").write_text(invalid_yaml, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    config_module.load_config_readonly()
+
+    unresolved = SessionDB(db_path=db_path)
+    try:
+        _assert_hardening_quarantine(unresolved)
+    finally:
+        unresolved.close()
+
+
+@pytest.mark.parametrize(
+    "invalid_yaml",
+    (
+        "false\n",
+        "[]\n",
+        "sessions: false\n",
+        "sessions: []\n",
+        "sessions: null\n",
+    ),
+)
+def test_wrong_shape_managed_config_preserves_existing_trigram_quarantine(
+    tmp_path,
+    monkeypatch,
+    invalid_yaml,
+):
+    from hermes_cli import config as config_module
+    from hermes_cli import managed_scope
+
+    profile = tmp_path / "wrong-shape-managed-profile"
+    managed = tmp_path / "wrong-shape-managed"
+    profile.mkdir()
+    managed.mkdir()
+    managed_path = managed / "config.yaml"
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    managed_scope.invalidate_managed_cache()
+    db_path = _establish_managed_hardening_quarantine(profile, managed_path)
+
+    managed_path.write_text(invalid_yaml, encoding="utf-8")
+    managed_scope.invalidate_managed_cache()
+    config_module.load_config_readonly()
+    unresolved = SessionDB(db_path=db_path)
+    try:
+        _assert_hardening_quarantine(unresolved)
+    finally:
+        unresolved.close()
+
+
+@pytest.mark.linux_only
+def test_dangling_user_config_symlink_preserves_quarantine_and_recovers(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_cli import config as config_module
+
+    home = tmp_path / "dangling-user"
+    db_path = _establish_user_hardening_quarantine(home)
+    config_path = home / "config.yaml"
+    missing_target = home / "deployed-config.yaml"
+    config_path.unlink()
+    config_path.symlink_to(missing_target)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    config_module.load_config_readonly()
+
+    unresolved = SessionDB(db_path=db_path)
+    try:
+        _assert_hardening_quarantine(unresolved)
+    finally:
+        unresolved.close()
+
+    missing_target.write_text(
+        "sessions:\n  trigram_fts: true\n",
+        encoding="utf-8",
+    )
+    repaired = SessionDB(db_path=db_path)
+    try:
+        assert repaired._trigram_enabled is True
+        assert repaired._trigram_available is True
+    finally:
+        repaired.close()
+
+
+@pytest.mark.linux_only
+def test_dangling_managed_config_symlink_preserves_quarantine_and_recovers(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_cli import config as config_module
+    from hermes_cli import managed_scope
+
+    profile = tmp_path / "dangling-managed-profile"
+    managed = tmp_path / "dangling-managed"
+    profile.mkdir()
+    managed.mkdir()
+    managed_path = managed / "config.yaml"
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    managed_scope.invalidate_managed_cache()
+    db_path = _establish_managed_hardening_quarantine(profile, managed_path)
+
+    missing_target = managed / "deployed-config.yaml"
+    managed_path.unlink()
+    managed_path.symlink_to(missing_target)
+    managed_scope.invalidate_managed_cache()
+    config_module.load_config_readonly()
+
+    unresolved = SessionDB(db_path=db_path)
+    try:
+        _assert_hardening_quarantine(unresolved)
+    finally:
+        unresolved.close()
+
+    missing_target.write_text(
+        "sessions:\n  trigram_fts: true\n",
+        encoding="utf-8",
+    )
+    repaired = SessionDB(db_path=db_path)
+    try:
+        assert repaired._trigram_enabled is True
+        assert repaired._trigram_available is True
+    finally:
+        repaired.close()
