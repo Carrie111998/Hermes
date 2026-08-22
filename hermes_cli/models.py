@@ -2595,6 +2595,52 @@ def _resolve_nous_pricing_credentials() -> tuple[str, str]:
     return (api_key, base_url)
 
 
+def pricing_cache_scope(
+    provider: str,
+    *,
+    current_provider: str = "",
+    current_base_url: str = "",
+) -> str:
+    """Return the current endpoint identity used by a provider's pricing cache.
+
+    This only resolves local configuration; it never fetches a catalog. Picker
+    prewarm single-flight uses the result to let an endpoint rotation start a
+    new worker while the previous endpoint is still slow or unreachable.
+    """
+    normalized = normalize_provider(provider)
+    if normalized == "openrouter":
+        return "https://openrouter.ai/api"
+    if normalized == "ai-gateway":
+        from hermes_constants import AI_GATEWAY_BASE_URL
+
+        return AI_GATEWAY_BASE_URL.rstrip("/")
+    if normalized == "novita":
+        return (
+            os.getenv("NOVITA_BASE_URL", "").strip()
+            or "https://api.novita.ai/openai/v1"
+        ).rstrip("/")
+    if normalized == "deepinfra":
+        cache_key, _url = _deepinfra_catalog_url()
+        return cache_key
+    if normalized == "fireworks":
+        return "models.dev/fireworks"
+    if normalized == "nous":
+        try:
+            from hermes_cli.auth import _nous_inference_env_override
+
+            env_base = _nous_inference_env_override()
+        except Exception:
+            env_base = None
+        if env_base:
+            return env_base.rstrip("/").removesuffix("/v1")
+        if normalize_provider(current_provider) == "nous" and current_base_url:
+            return current_base_url.rstrip("/").removesuffix("/v1")
+        return _pricing_provider_cache_keys.get(
+            (_pricing_profile_key(), normalized), _DEFAULT_NOUS_INFERENCE_BASE
+        )
+    return ""
+
+
 def get_pricing_for_provider(
     provider: str,
     *,

@@ -40,7 +40,7 @@ from typing import Any, Optional
 
 
 _pricing_prewarm_lock = Lock()
-_pricing_prewarm_threads: dict[str, Thread] = {}
+_pricing_prewarm_threads: dict[tuple[str, tuple[tuple[str, str], ...]], Thread] = {}
 
 
 # ─── Public types ───────────────────────────────────────────────────────
@@ -328,7 +328,11 @@ def build_model_options_payload(
         probe_current_custom_provider=not refresh,
     )
     if not refresh:
-        _prewarm_pricing_async(payload["providers"])
+        _prewarm_pricing_async(
+            payload["providers"],
+            current_provider=ctx.current_provider,
+            current_base_url=ctx.current_base_url,
+        )
     return payload
 
 
@@ -966,14 +970,38 @@ def _apply_pricing(
                 row["unavailable_models"] = []
 
 
-def _prewarm_pricing_async(rows: list[dict]) -> Optional[Thread]:
+def _prewarm_pricing_async(
+    rows: list[dict],
+    *,
+    current_provider: str = "",
+    current_base_url: str = "",
+) -> Optional[Thread]:
     """Warm picker pricing caches without delaying the current payload."""
     from hermes_constants import hermes_home_key
+    from hermes_cli.models import pricing_cache_scope
 
     profile_key = hermes_home_key()
+    endpoint_scope = tuple(
+        sorted(
+            (
+                slug,
+                pricing_cache_scope(
+                    slug,
+                    current_provider=current_provider,
+                    current_base_url=current_base_url,
+                ),
+            )
+            for slug in {
+                str(row.get("slug") or "").lower()
+                for row in rows
+                if row.get("slug")
+            }
+        )
+    )
+    prewarm_key = (profile_key, endpoint_scope)
 
     with _pricing_prewarm_lock:
-        current = _pricing_prewarm_threads.get(profile_key)
+        current = _pricing_prewarm_threads.get(prewarm_key)
         if current is not None and current.is_alive():
             return current
 
@@ -994,7 +1022,7 @@ def _prewarm_pricing_async(rows: list[dict]) -> Optional[Thread]:
             name="hermes-picker-pricing-prewarm",
             daemon=True,
         )
-        _pricing_prewarm_threads[profile_key] = thread
+        _pricing_prewarm_threads[prewarm_key] = thread
         thread.start()
         return thread
 

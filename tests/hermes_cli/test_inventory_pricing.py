@@ -228,6 +228,81 @@ def test_prewarm_preserves_context_and_runs_once_per_profile(tmp_path, monkeypat
                 thread.join(timeout=2)
 
 
+def test_prewarm_endpoint_rotation_starts_a_new_worker(tmp_path, monkeypatch):
+    """A live endpoint-A worker must not suppress endpoint B for its profile."""
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    endpoint_a = "https://endpoint-a.example"
+    endpoint_b = "https://endpoint-b.example"
+    active_endpoint = {"value": endpoint_a}
+    started = {endpoint_a: Event(), endpoint_b: Event()}
+    release_a = Event()
+    expected = {
+        endpoint_a: {"a/model": {"prompt": "1", "completion": "2"}},
+        endpoint_b: {"b/model": {"prompt": "3", "completion": "4"}},
+    }
+    monkeypatch.setattr(inv, "_pricing_prewarm_threads", {})
+    monkeypatch.setattr(models_mod, "_pricing_cache", {})
+    monkeypatch.setattr(models_mod, "_pricing_cache_retry_after", {})
+    monkeypatch.setattr(models_mod, "_pricing_provider_cache_keys", {})
+    monkeypatch.setattr(
+        models_mod,
+        "_resolve_nous_pricing_credentials",
+        lambda: ("", active_endpoint["value"]),
+    )
+
+    def fetch_pricing(*, base_url, **_kwargs):
+        started[base_url].set()
+        if base_url == endpoint_a:
+            release_a.wait(timeout=5)
+        return models_mod._cache_catalog(base_url, expected[base_url])
+
+    monkeypatch.setattr(models_mod, "fetch_models_with_pricing", fetch_pricing)
+    monkeypatch.setattr(
+        inv,
+        "_apply_pricing",
+        lambda _rows: models_mod.get_pricing_for_provider("nous"),
+    )
+
+    token = set_hermes_home_override(str(tmp_path / "profile"))
+    threads = []
+    try:
+        threads.append(
+            inv._prewarm_pricing_async(
+                [{"slug": "nous", "models": ["a/model"]}],
+                current_provider="nous",
+                current_base_url=endpoint_a,
+            )
+        )
+        assert started[endpoint_a].wait(timeout=1)
+
+        active_endpoint["value"] = endpoint_b
+        threads.append(
+            inv._prewarm_pricing_async(
+                [{"slug": "nous", "models": ["b/model"]}],
+                current_provider="nous",
+                current_base_url=endpoint_b,
+            )
+        )
+
+        assert threads[0] is not threads[1]
+        assert started[endpoint_b].wait(timeout=1)
+        threads[1].join(timeout=2)
+        assert not threads[1].is_alive()
+        assert models_mod.get_pricing_for_provider(
+            "nous", cached_only=True
+        ) == expected[endpoint_b]
+    finally:
+        release_a.set()
+        for thread in threads:
+            if thread is not None:
+                thread.join(timeout=2)
+        reset_hermes_home_override(token)
+
+
 def test_cached_only_pricing_returns_a_warm_value_without_fetching(monkeypatch):
     """Cache-only picker reads preserve pricing once the prewarm completes."""
     cache_key = "https://openrouter.ai/api"
