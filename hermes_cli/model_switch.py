@@ -520,7 +520,20 @@ class DirectAlias(NamedTuple):
 
 
 # Built-in direct aliases (can be extended via config.yaml model_aliases:)
-_BUILTIN_DIRECT_ALIASES: dict[str, DirectAlias] = {}
+_BUILTIN_DIRECT_ALIASES: dict[str, DirectAlias] = {
+    # OpenCode Zen exposes Ox Alpha under its exact preview slug. Keep the
+    # endpoint identity fixed while accepting the operator-facing spellings.
+    "alpha-0": DirectAlias(
+        model="x-preview-f-free",
+        provider="opencode-zen",
+        base_url="https://opencode.ai/zen/v1",
+    ),
+    "ox-alpha": DirectAlias(
+        model="x-preview-f-free",
+        provider="opencode-zen",
+        base_url="https://opencode.ai/zen/v1",
+    ),
+}
 
 # Merged dict (builtins + user config); populated by _load_direct_aliases()
 DIRECT_ALIASES: dict[str, DirectAlias] = {}
