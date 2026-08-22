@@ -12,6 +12,7 @@ or rewrite request/response bodies. It's a credential-attaching forwarder.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import ipaddress
 import logging
 import signal
@@ -21,6 +22,7 @@ try:
     import aiohttp
     from aiohttp import web
     from yarl import URL
+
     AIOHTTP_AVAILABLE = True
 except ImportError:
     aiohttp = None  # type: ignore[assignment]
@@ -35,21 +37,19 @@ logger = logging.getLogger(__name__)
 # Headers we strip when forwarding to the upstream. ``host``/``content-length``
 # are recomputed by aiohttp; ``authorization`` is replaced with our bearer.
 # Everything else (content-type, accept, user-agent, x-* headers) passes through.
-_HOP_BY_HOP_HEADERS = frozenset(
-    {
-        "host",
-        "content-length",
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailers",
-        "transfer-encoding",
-        "upgrade",
-        "authorization",  # we replace this one
-    }
-)
+_HOP_BY_HOP_HEADERS = frozenset({
+    "host",
+    "content-length",
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "authorization",  # we replace this one
+})
 
 DEFAULT_PORT = 8645
 DEFAULT_HOST = "127.0.0.1"
@@ -90,9 +90,7 @@ def _strip_owned_headers(headers: dict, owned_names: frozenset[str]) -> dict:
     """Remove all client spellings of adapter-owned identity headers."""
     owned = {str(name).strip().lower() for name in owned_names if str(name).strip()}
     return {
-        key: value
-        for key, value in headers.items()
-        if str(key).lower() not in owned
+        key: value for key, value in headers.items() if str(key).lower() not in owned
     }
 
 
@@ -198,11 +196,19 @@ async def _stream_upstream_response(
         await session.close()
 
 
-def create_app(adapter: UpstreamAdapter) -> "web.Application":
+def create_app(
+    adapter: UpstreamAdapter,
+    *,
+    client_auth_token: Optional[str] = None,
+) -> "web.Application":
     """Build the aiohttp application bound to a specific upstream adapter."""
     if not AIOHTTP_AVAILABLE:
         raise RuntimeError(
             "aiohttp is required for `hermes proxy`. Run `hermes setup` to install it."
+        )
+    if adapter.requires_client_auth and not client_auth_token:
+        raise RuntimeError(
+            f"{adapter.display_name} proxy requires client authentication."
         )
 
     app = web.Application(client_max_size=MAX_REQUEST_BYTES)
@@ -211,16 +217,39 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
     _adapter_key = web.AppKey("adapter", UpstreamAdapter)
     app[_adapter_key] = adapter
 
-    async def handle_health(request: "web.Request") -> "web.Response":
-        return web.json_response(
-            {
-                "status": "ok",
-                "upstream": adapter.display_name,
-                "authenticated": adapter.is_authenticated(),
-            }
+    def _client_is_authorized(request: "web.Request") -> bool:
+        if client_auth_token is None:
+            return True
+        authorization = request.headers.get("Authorization", "")
+        scheme, separator, supplied = authorization.partition(" ")
+        supplied = supplied.strip()
+        if not separator or scheme.lower() != "bearer" or not supplied:
+            return False
+        return hmac.compare_digest(
+            supplied.encode("utf-8"),
+            client_auth_token.encode("utf-8"),
         )
 
+    def _client_auth_error() -> "web.Response":
+        return _json_error(
+            401,
+            "A valid proxy bearer token is required.",
+            code="proxy_auth_failed",
+        )
+
+    async def handle_health(request: "web.Request") -> "web.Response":
+        if not _client_is_authorized(request):
+            return _client_auth_error()
+        return web.json_response({
+            "status": "ok",
+            "upstream": adapter.display_name,
+            "authenticated": adapter.is_authenticated(),
+        })
+
     async def handle_proxy(request: "web.Request") -> "web.StreamResponse":
+        if not _client_is_authorized(request):
+            return _client_auth_error()
+
         # Extract the path *after* /v1
         rel_path = request.match_info.get("tail", "")
         rel_path = "/" + rel_path.lstrip("/")
@@ -268,7 +297,9 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                 fwd_headers,
                 adapter.get_upstream_headers(active_cred),
             )
-            fwd_headers["Authorization"] = f"{active_cred.token_type} {active_cred.bearer}"
+            fwd_headers["Authorization"] = (
+                f"{active_cred.token_type} {active_cred.bearer}"
+            )
 
             logger.debug(
                 "proxy: forwarding %s %s -> %s%s (body=%d bytes)",
@@ -350,6 +381,8 @@ async def run_server(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     shutdown_event: Optional[asyncio.Event] = None,
+    *,
+    client_auth_token: Optional[str] = None,
 ) -> None:
     """Run the proxy in the current event loop until shutdown_event is set.
 
@@ -365,7 +398,7 @@ async def run_server(
             f"{adapter.display_name} proxy is loopback-only; refusing bind host {host!r}."
         )
 
-    app = create_app(adapter)
+    app = create_app(adapter, client_auth_token=client_auth_token)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, host=host, port=port)
@@ -373,7 +406,9 @@ async def run_server(
 
     logger.info(
         "proxy: listening on http://%s:%d/v1 -> %s",
-        host, port, adapter.display_name,
+        host,
+        port,
+        adapter.display_name,
     )
 
     stop_event = shutdown_event or asyncio.Event()

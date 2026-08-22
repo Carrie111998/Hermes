@@ -23,12 +23,6 @@ from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
 # ---------------------------------------------------------------------------
 
 
-
-
-
-
-
-
 # ---------------------------------------------------------------------------
 # NousPortalAdapter
 # ---------------------------------------------------------------------------
@@ -37,21 +31,25 @@ from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
 def _write_auth_store(hermes_home: Path, nous_state: Dict[str, Any]) -> Path:
     """Write an auth.json with the given nous state into a hermetic HERMES_HOME."""
     auth_path = hermes_home / "auth.json"
-    auth_path.write_text(json.dumps({
-        "version": 1,
-        "providers": {"nous": nous_state},
-    }))
+    auth_path.write_text(
+        json.dumps({
+            "version": 1,
+            "providers": {"nous": nous_state},
+        })
+    )
     return auth_path
-
-
 
 
 def test_nous_adapter_concurrent_refresh_serialized(tmp_path, monkeypatch):
     """Two parallel get_credential() calls must serialize through the lock."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    _write_auth_store(tmp_path, {
-        "access_token": "a", "refresh_token": "r",
-    })
+    _write_auth_store(
+        tmp_path,
+        {
+            "access_token": "a",
+            "refresh_token": "r",
+        },
+    )
 
     call_log: list = []
     in_flight = threading.Event()
@@ -68,6 +66,7 @@ def test_nous_adapter_concurrent_refresh_serialized(tmp_path, monkeypatch):
             call_log.append(threading.current_thread().ident)
             # Simulate refresh latency so any race window is exposed.
             import time
+
             time.sleep(0.05)
             with counter_lock:
                 counter[0] += 1
@@ -122,34 +121,38 @@ def _write_xai_pool_entry(
 ) -> Path:
     """Write an xai-oauth pool entry into a hermetic HERMES_HOME."""
     auth_path = hermes_home / "auth.json"
-    auth_path.write_text(json.dumps({
-        "version": 1,
-        "providers": {},
-        "credential_pool": {
-            "xai-oauth": [
-                {
-                    "id": "xai123",
-                    "label": "xai-test",
-                    "auth_type": "oauth",
-                    "priority": 0,
-                    "source": source,
-                    "access_token": access_token,
-                    "refresh_token": refresh_token,
-                    "base_url": base_url,
-                }
-            ]
-        },
-    }))
+    auth_path.write_text(
+        json.dumps({
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "xai-oauth": [
+                    {
+                        "id": "xai123",
+                        "label": "xai-test",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": source,
+                        "access_token": access_token,
+                        "refresh_token": refresh_token,
+                        "base_url": base_url,
+                    }
+                ]
+            },
+        })
+    )
     return auth_path
 
 
 def test_xai_adapter_not_authenticated_when_no_pool_entry(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    (tmp_path / "auth.json").write_text(json.dumps({
-        "version": 1,
-        "providers": {},
-        "credential_pool": {},
-    }))
+    (tmp_path / "auth.json").write_text(
+        json.dumps({
+            "version": 1,
+            "providers": {},
+            "credential_pool": {},
+        })
+    )
     assert not XAIGrokAdapter().is_authenticated()
 
 
@@ -170,34 +173,36 @@ def test_xai_adapter_retry_rotates_pool_entry_on_429(tmp_path, monkeypatch):
 
     # Two pool entries so rotation has somewhere to go.
     auth_path = tmp_path / "auth.json"
-    auth_path.write_text(json.dumps({
-        "version": 1,
-        "providers": {},
-        "credential_pool": {
-            "xai-oauth": [
-                {
-                    "id": "xai-first",
-                    "label": "xai-first",
-                    "auth_type": "oauth",
-                    "priority": 0,
-                    "source": "manual:xai_pkce",
-                    "access_token": "first-access-token",
-                    "refresh_token": "first-refresh-token",
-                    "base_url": "https://api.x.ai/v1",
-                },
-                {
-                    "id": "xai-second",
-                    "label": "xai-second",
-                    "auth_type": "oauth",
-                    "priority": 1,
-                    "source": "manual:xai_pkce",
-                    "access_token": "second-access-token",
-                    "refresh_token": "second-refresh-token",
-                    "base_url": "https://api.x.ai/v1",
-                },
-            ]
-        },
-    }))
+    auth_path.write_text(
+        json.dumps({
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "xai-oauth": [
+                    {
+                        "id": "xai-first",
+                        "label": "xai-first",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:xai_pkce",
+                        "access_token": "first-access-token",
+                        "refresh_token": "first-refresh-token",
+                        "base_url": "https://api.x.ai/v1",
+                    },
+                    {
+                        "id": "xai-second",
+                        "label": "xai-second",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:xai_pkce",
+                        "access_token": "second-access-token",
+                        "refresh_token": "second-refresh-token",
+                        "base_url": "https://api.x.ai/v1",
+                    },
+                ]
+            },
+        })
+    )
 
     # Refresh must NOT be called on the 429 path — guard against
     # the fix accidentally trying to refresh-on-rate-limit.
@@ -208,7 +213,9 @@ def test_xai_adapter_retry_rotates_pool_entry_on_429(tmp_path, monkeypatch):
 
     adapter = XAIGrokAdapter()
     failed = adapter.get_credential()
-    assert failed.bearer == "first-access-token", "starting bearer should be the first entry"
+    assert failed.bearer == "first-access-token", (
+        "starting bearer should be the first entry"
+    )
 
     retry = adapter.get_retry_credential(
         failed_credential=failed,
@@ -242,11 +249,16 @@ from hermes_cli.proxy.server import (  # noqa: E402
 class FakeAdapter(UpstreamAdapter):
     """A test adapter that returns a fixed credential without touching disk."""
 
-    def __init__(self, base_url: str, bearer: str = "test-bearer",
-                 allowed=None, raise_on_credential=False,
-                 retry_bearer: str | None = None,
-                 upstream_headers: dict[str, str] | None = None,
-                 owned_headers: set[str] | None = None):
+    def __init__(
+        self,
+        base_url: str,
+        bearer: str = "test-bearer",
+        allowed=None,
+        raise_on_credential=False,
+        retry_bearer: str | None = None,
+        upstream_headers: dict[str, str] | None = None,
+        owned_headers: set[str] | None = None,
+    ):
         self._base_url = base_url
         self._bearer = bearer
         self._allowed = frozenset(allowed or ["/chat/completions"])
@@ -255,25 +267,32 @@ class FakeAdapter(UpstreamAdapter):
         self._upstream_headers = dict(upstream_headers or {})
         self._owned_headers = frozenset(owned_headers or self._upstream_headers)
         self.calls = 0
+        self.auth_checks = 0
         self.retry_calls = 0
 
     @property
-    def name(self): return "fake"
+    def name(self):
+        return "fake"
 
     @property
-    def display_name(self): return "Fake Provider"
+    def display_name(self):
+        return "Fake Provider"
 
     @property
-    def allowed_paths(self): return self._allowed
+    def allowed_paths(self):
+        return self._allowed
 
-    def is_authenticated(self): return True
+    def is_authenticated(self):
+        self.auth_checks += 1
+        return True
 
     def get_credential(self):
         self.calls += 1
         if self._raise:
             raise RuntimeError("simulated auth failure")
         return UpstreamCredential(
-            bearer=self._bearer, base_url=self._base_url,
+            bearer=self._bearer,
+            base_url=self._base_url,
             expires_at="2099-01-01T00:00:00Z",
         )
 
@@ -322,7 +341,8 @@ def _build_fake_upstream(captured: Dict[str, Any]) -> "web.Application":
 
     async def sse(request):
         resp = web.StreamResponse(
-            status=200, headers={"Content-Type": "text/event-stream"},
+            status=200,
+            headers={"Content-Type": "text/event-stream"},
         )
         await resp.prepare(request)
         for chunk in [b"data: hello\n\n", b"data: world\n\n", b"data: [DONE]\n\n"]:
@@ -357,18 +377,12 @@ def _build_retrying_fake_upstream(captured: Dict[str, Any]) -> "web.Application"
     return app
 
 
-
-
-
-
 def _build_rate_limited_fake_upstream(captured: Dict[str, Any]) -> "web.Application":
     async def rate_limited(request):
-        captured["requests"].append(
-            {
-                "auth": request.headers.get("Authorization"),
-                "path": request.path,
-            }
-        )
+        captured["requests"].append({
+            "auth": request.headers.get("Authorization"),
+            "path": request.path,
+        })
         return web.json_response({"error": "rate limited"}, status=429)
 
     app = web.Application()
@@ -457,9 +471,12 @@ def test_prepare_failure_releases_upstream_response_and_session():
 
 def test_server_strips_client_auth_header():
     """The client's Authorization header MUST NOT reach the upstream."""
+
     async def run():
         captured: Dict[str, Any] = {"requests": []}
-        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        upstream_runner, upstream_base = await _start_runner(
+            _build_fake_upstream(captured)
+        )
         adapter = FakeAdapter(f"{upstream_base}/v1", bearer="ours")
         proxy_runner, proxy_base = await _start_runner(create_app(adapter))
         try:
@@ -475,6 +492,99 @@ def test_server_strips_client_auth_header():
         finally:
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_server_requires_client_authority_before_resolving_upstream_credential():
+    """Local reachability alone must not authorize subscription spending."""
+
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(
+            _build_fake_upstream(captured)
+        )
+        adapter = FakeAdapter(f"{upstream_base}/v1", bearer="upstream-secret")
+        proxy_runner, proxy_base = await _start_runner(
+            create_app(adapter, client_auth_token="owner-client-secret")
+        )
+        try:
+            async with aiohttp.ClientSession() as session:
+                for headers in (
+                    {},
+                    {"Authorization": "Bearer wrong-secret"},
+                ):
+                    async with session.post(
+                        f"{proxy_base}/v1/chat/completions",
+                        json={"model": "test"},
+                        headers=headers,
+                    ) as resp:
+                        body = await resp.json()
+                        assert resp.status == 401
+                        assert body["error"]["code"] == "proxy_auth_failed"
+
+                assert adapter.calls == 0
+                assert captured["requests"] == []
+
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={"model": "test"},
+                    headers={
+                        "Authorization": "Bearer owner-client-secret",
+                    },
+                ) as resp:
+                    assert resp.status == 200
+                    await resp.read()
+
+            assert adapter.calls == 1
+            assert captured["requests"][0]["auth"] == "Bearer upstream-secret"
+            assert "owner-client-secret" not in captured["requests"][0]["auth"]
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_health_requires_client_authority_before_reading_auth_state():
+    """Protected health checks must not touch credential-pool state first."""
+
+    async def run():
+        adapter = FakeAdapter("http://127.0.0.1:1/v1")
+        proxy_runner, proxy_base = await _start_runner(
+            create_app(adapter, client_auth_token="owner-client-secret")
+        )
+        try:
+            async with aiohttp.ClientSession() as session:
+                for headers in (
+                    {},
+                    {"Authorization": "Bearer wrong-secret"},
+                ):
+                    async with session.get(
+                        f"{proxy_base}/health",
+                        headers=headers,
+                    ) as resp:
+                        body = await resp.json()
+                        assert resp.status == 401
+                        assert body["error"]["code"] == "proxy_auth_failed"
+
+                assert adapter.auth_checks == 0
+                assert adapter.calls == 0
+
+                async with session.get(
+                    f"{proxy_base}/health",
+                    headers={
+                        "Authorization": "Bearer owner-client-secret",
+                    },
+                ) as resp:
+                    body = await resp.json()
+                    assert resp.status == 200
+                    assert body["authenticated"] is True
+
+                assert adapter.auth_checks == 1
+                assert adapter.calls == 0
+        finally:
+            await proxy_runner.cleanup()
 
     asyncio.run(run())
 
@@ -539,7 +649,9 @@ def test_server_returns_429_when_adapter_has_no_rotation():
 def test_server_preserves_raw_query_and_does_not_log_it(caplog):
     async def run():
         captured: Dict[str, Any] = {"requests": []}
-        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        upstream_runner, upstream_base = await _start_runner(
+            _build_fake_upstream(captured)
+        )
         adapter = FakeAdapter(
             f"{upstream_base}/v1",
             allowed=["/responses"],
@@ -552,9 +664,7 @@ def test_server_preserves_raw_query_and_does_not_log_it(caplog):
                 async with session.post(url, json={"model": "gpt-5.6-sol"}) as resp:
                     assert resp.status == 200
                     await resp.read()
-            assert captured["requests"][0]["raw_path"] == (
-                f"/v1/responses?{raw_query}"
-            )
+            assert captured["requests"][0]["raw_path"] == (f"/v1/responses?{raw_query}")
         finally:
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()
@@ -568,7 +678,9 @@ def test_server_preserves_raw_query_and_does_not_log_it(caplog):
 def test_server_preserves_codex_responses_body_bytes():
     async def run():
         captured: Dict[str, Any] = {"requests": []}
-        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        upstream_runner, upstream_base = await _start_runner(
+            _build_fake_upstream(captured)
+        )
         adapter = FakeAdapter(
             f"{upstream_base}/v1",
             allowed=["/responses"],
@@ -637,13 +749,11 @@ def test_server_aborts_downstream_on_truncated_upstream_sse():
         proxy_runner, proxy_base = await _start_runner(create_app(adapter))
         try:
             async with aiohttp.ClientSession() as session:
-                with pytest.raises(
-                    (
-                        aiohttp.ClientPayloadError,
-                        aiohttp.ServerDisconnectedError,
-                        aiohttp.ClientConnectionError,
-                    )
-                ):
+                with pytest.raises((
+                    aiohttp.ClientPayloadError,
+                    aiohttp.ServerDisconnectedError,
+                    aiohttp.ClientConnectionError,
+                )):
                     async with session.post(
                         f"{proxy_base}/v1/responses",
                         json={"model": "gpt-5.6-sol", "stream": True, "input": []},
@@ -659,7 +769,9 @@ def test_server_aborts_downstream_on_truncated_upstream_sse():
 def test_codex_proxy_rejects_chat_completions():
     async def run():
         captured: Dict[str, Any] = {"requests": []}
-        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        upstream_runner, upstream_base = await _start_runner(
+            _build_fake_upstream(captured)
+        )
         adapter = FakeAdapter(
             f"{upstream_base}/v1",
             allowed=["/responses", "/models"],
@@ -685,7 +797,9 @@ def test_codex_proxy_rejects_chat_completions():
 def test_server_strips_owned_account_header_when_adapter_has_no_value():
     async def run():
         captured: Dict[str, Any] = {"requests": []}
-        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        upstream_runner, upstream_base = await _start_runner(
+            _build_fake_upstream(captured)
+        )
         adapter = FakeAdapter(
             f"{upstream_base}/v1",
             allowed=["/responses"],
@@ -705,7 +819,9 @@ def test_server_strips_owned_account_header_when_adapter_has_no_value():
                 ) as resp:
                     assert resp.status == 200
                     await resp.read()
-            headers = {k.lower(): v for k, v in captured["requests"][0]["headers"].items()}
+            headers = {
+                k.lower(): v for k, v in captured["requests"][0]["headers"].items()
+            }
             assert "chatgpt-account-id" not in headers
         finally:
             await proxy_runner.cleanup()
@@ -717,7 +833,9 @@ def test_server_strips_owned_account_header_when_adapter_has_no_value():
 def test_server_adapter_headers_override_spoofed_client_values():
     async def run():
         captured: Dict[str, Any] = {"requests": []}
-        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        upstream_runner, upstream_base = await _start_runner(
+            _build_fake_upstream(captured)
+        )
         adapter = FakeAdapter(
             f"{upstream_base}/v1",
             bearer="codex-token",
@@ -743,7 +861,9 @@ def test_server_adapter_headers_override_spoofed_client_values():
                 ) as resp:
                     assert resp.status == 200
                     await resp.read()
-            headers = {k.lower(): v for k, v in captured["requests"][0]["headers"].items()}
+            headers = {
+                k.lower(): v for k, v in captured["requests"][0]["headers"].items()
+            }
             assert headers["authorization"] == "Bearer codex-token"
             assert headers["user-agent"] == "codex_cli_rs/0.0.0 (Hermes Agent)"
             assert headers["originator"] == "codex_cli_rs"
@@ -758,9 +878,3 @@ def test_server_adapter_headers_override_spoofed_client_values():
 # ---------------------------------------------------------------------------
 # CLI handlers
 # ---------------------------------------------------------------------------
-
-
-
-
-
-
