@@ -731,7 +731,7 @@ async def test_auto_resumed_handoff_reserves_route_capacity_until_completion(
         transport_delivery_policy_hash=adapter._delivery_policy_hash(
             adapter._routes["relay"]
         ),
-        provenance={"ingress_route": "relay"},
+        provenance=None,
     )
     pending_entry = SessionEntry(
         session_key="market-analysis:webhook:restored-A",
@@ -1024,12 +1024,13 @@ async def test_handoff_concurrency_limit_rejects_without_starting_another_run(se
 @pytest.mark.asyncio
 async def test_handoff_completion_releases_concurrency_slot():
     adapter = _adapter(_trusted_route())
-    chat_id = "webhook:relay:finished"
+    chat_id = "webhook:relay:trusted-handoff:finished"
     adapter._active_handoffs["relay"].add(chat_id)
     source = SessionSource(
         platform=Platform.WEBHOOK,
         chat_id=chat_id,
         profile="market-analysis",
+        transport_profile="dispatcher",
         provenance={
             "ingress_route": "relay",
             "target_profile": "market-analysis",

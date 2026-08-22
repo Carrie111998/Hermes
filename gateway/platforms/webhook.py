@@ -1538,11 +1538,11 @@ class WebhookAdapter(BasePlatformAdapter):
         try:
             await self._end_webhook_session(event, event.source.chat_id)
         finally:
-            provenance = getattr(event.source, "provenance", None)
-            if isinstance(provenance, dict):
-                route_name = provenance.get("ingress_route")
-                if isinstance(route_name, str):
-                    self.release_restored_source(event.source)
+            # Capacity is authoritative transport state, not descriptive
+            # provenance. Restored rows from older or partially-written state
+            # may lack provenance but still carry a validated transport owner.
+            if getattr(event.source, "transport_profile", None) is not None:
+                self.release_restored_source(event.source)
 
     async def _end_webhook_session(
         self, event: "MessageEvent", session_chat_id: str
