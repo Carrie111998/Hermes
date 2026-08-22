@@ -1,10 +1,13 @@
 """Behavior contracts for authenticated webhook profile handoffs."""
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
+import time
 from datetime import datetime
+from unittest.mock import AsyncMock
 
 import pytest
 from aiohttp import web
@@ -12,7 +15,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.authz_mixin import GatewayAuthorizationMixin
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, SendResult
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
 from gateway.session import (
     SessionContext,
@@ -24,6 +27,31 @@ from gateway.session import (
 
 def _signature(body: bytes, secret: str) -> str:
     return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
+def _v2_headers(body: bytes, *, request_id: str, timestamp: str) -> dict[str, str]:
+    signed = timestamp.encode() + b"." + body
+    return {
+        "Content-Type": "application/json",
+        "X-Webhook-Timestamp": timestamp,
+        "X-Webhook-Signature-V2": hmac.new(
+            b"relay-secret", signed, hashlib.sha256
+        ).hexdigest(),
+        "X-Request-ID": request_id,
+    }
+
+
+def _svix_headers(body: bytes, *, message_id: str, timestamp: str) -> dict[str, str]:
+    signed = message_id.encode() + b"." + timestamp.encode() + b"." + body
+    signature = base64.b64encode(
+        hmac.new(b"relay-secret", signed, hashlib.sha256).digest()
+    ).decode()
+    return {
+        "Content-Type": "application/json",
+        "svix-id": message_id,
+        "svix-timestamp": timestamp,
+        "svix-signature": f"v1,{signature}",
+    }
 
 
 def _adapter(route: dict, *, multiplex: bool = True) -> WebhookAdapter:
@@ -84,6 +112,11 @@ def served_profiles(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def isolated_handoff_receipts(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+
+
 @pytest.mark.asyncio
 async def test_authenticated_selector_hands_off_to_allowlisted_profile(served_profiles):
     adapter = _adapter(_trusted_route())
@@ -94,7 +127,11 @@ async def test_authenticated_selector_hands_off_to_allowlisted_profile(served_pr
 
     adapter.handle_message = capture
     payload = {
-        "_hermes": {"target_profile": "market-analysis", "handoff_depth": 1},
+        "_hermes": {
+            "target_profile": "market-analysis",
+            "handoff_depth": 1,
+            "delivery_id": "handoff-allowed",
+        },
         "task": "Summarize the market with the local CLI",
     }
     body = json.dumps(payload).encode()
@@ -120,6 +157,8 @@ async def test_authenticated_selector_hands_off_to_allowlisted_profile(served_pr
     assert source.profile == "market-analysis"
     assert source.transport_profile == "dispatcher"
     assert source.trusted_handoff_depth == 1
+    assert source.transport_deliver == "discord"
+    assert source.transport_deliver_extra == {"chat_id": "market-room"}
     assert "_hermes" not in events[0].raw_message
     assert sorted(adapter.toolsets_for_source(source)) == ["terminal", "web"]
     assert source.provenance == {
@@ -135,7 +174,151 @@ async def test_authenticated_selector_hands_off_to_allowlisted_profile(served_pr
     assert SessionSource.from_dict(source.to_dict()).provenance == source.provenance
 
 
-def test_persisted_handoff_resolves_ingress_adapter_and_revalidates_bounds(
+@pytest.mark.asyncio
+async def test_generic_v2_handoff_replay_ignores_unsigned_request_id_after_restart(
+    served_profiles,
+):
+    payload = {
+        "_hermes": {
+            "target_profile": "market-analysis",
+            "handoff_depth": 1,
+            "delivery_id": "signed-v2-delivery",
+        },
+        "task": "run once",
+    }
+    body = json.dumps(payload).encode()
+    timestamp = str(int(time.time()))
+    events: list[MessageEvent] = []
+
+    async def capture(event: MessageEvent):
+        events.append(event)
+
+    first_adapter = _adapter(_trusted_route())
+    first_adapter.handle_message = capture
+    async with TestClient(TestServer(_app(first_adapter))) as client:
+        first = await client.post(
+            "/p/dispatcher/webhooks/relay",
+            data=body,
+            headers=_v2_headers(body, request_id="unsigned-A", timestamp=timestamp),
+        )
+        assert first.status == 202
+        assert (await first.json())["delivery_id"] == "signed-v2-delivery"
+
+    await asyncio.sleep(0.05)
+    restarted_adapter = _adapter(_trusted_route())
+    restarted_adapter.handle_message = capture
+    async with TestClient(TestServer(_app(restarted_adapter))) as client:
+        replay = await client.post(
+            "/p/dispatcher/webhooks/relay",
+            data=body,
+            headers=_v2_headers(body, request_id="unsigned-B", timestamp=timestamp),
+        )
+        assert replay.status == 200
+        assert await replay.json() == {
+            "status": "duplicate",
+            "delivery_id": "signed-v2-delivery",
+        }
+
+    await asyncio.sleep(0.05)
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_svix_signed_handoff_id_accepts_once_and_deduplicates_retry(
+    served_profiles,
+):
+    adapter = _adapter(_trusted_route())
+    events: list[MessageEvent] = []
+
+    async def capture(event: MessageEvent):
+        events.append(event)
+
+    adapter.handle_message = capture
+    payload = {
+        "_hermes": {
+            "target_profile": "market-analysis",
+            "handoff_depth": 1,
+            "delivery_id": "signed-svix-delivery",
+        },
+        "task": "run once",
+    }
+    body = json.dumps(payload).encode()
+    headers = _svix_headers(
+        body,
+        message_id="msg_provider_signed",
+        timestamp=str(int(time.time())),
+    )
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        first = await client.post(
+            "/p/dispatcher/webhooks/relay", data=body, headers=headers
+        )
+        retry = await client.post(
+            "/p/dispatcher/webhooks/relay", data=body, headers=headers
+        )
+        assert first.status == 202
+        assert retry.status == 200
+        assert (await retry.json())["status"] == "duplicate"
+
+    await asyncio.sleep(0.05)
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_handoff_replay_store_failure_blocks_dispatch(
+    served_profiles, monkeypatch
+):
+    adapter = _adapter(_trusted_route())
+    adapter.handle_message = pytest.fail
+    payload = {
+        "_hermes": {
+            "target_profile": "market-analysis",
+            "handoff_depth": 1,
+            "delivery_id": "store-failure",
+        },
+        "task": "must not run",
+    }
+    body = json.dumps(payload).encode()
+
+    def fail_claim(**_kwargs):
+        raise OSError("state database unavailable")
+
+    monkeypatch.setattr(
+        "gateway.webhook_replay.claim_handoff_delivery", fail_claim
+    )
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/p/dispatcher/webhooks/relay",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Hub-Signature-256": _signature(body, "relay-secret"),
+            },
+        )
+        assert response.status == 503
+
+
+@pytest.mark.asyncio
+async def test_atomic_handoff_claim_has_exactly_one_winner():
+    from gateway.webhook_replay import claim_handoff_delivery
+
+    claims = await asyncio.gather(
+        *(
+            asyncio.to_thread(
+                claim_handoff_delivery,
+                route_name="relay",
+                source_profile="dispatcher",
+                delivery_id="concurrent-signed-id",
+            )
+            for _ in range(8)
+        )
+    )
+    assert claims.count(True) == 1
+    assert claims.count(False) == 7
+
+
+@pytest.mark.asyncio
+async def test_persisted_handoff_resolves_ingress_adapter_and_revalidates_bounds(
     served_profiles,
 ):
     adapter = _adapter(_trusted_route())
@@ -145,6 +328,8 @@ def test_persisted_handoff_resolves_ingress_adapter_and_revalidates_bounds(
         profile="market-analysis",
         transport_profile="dispatcher",
         trusted_handoff_depth=1,
+        transport_deliver="discord",
+        transport_deliver_extra={"chat_id": "market-room"},
         provenance={"source_profile": "descriptive-only-and-not-trusted"},
     )
     now = datetime.now()
@@ -164,15 +349,41 @@ def test_persisted_handoff_resolves_ingress_adapter_and_revalidates_bounds(
     class Runner(GatewayAuthorizationMixin):
         adapters = {}
         _profile_adapters = {"dispatcher": {Platform.WEBHOOK: adapter}}
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=[
+                "dispatcher",
+                "market-analysis",
+                "server-development",
+            ],
+        )
 
         @staticmethod
         def _active_profile_name():
             return "default"
 
     runner = Runner()
+    target = AsyncMock()
+    target.send.return_value = SendResult(success=True)
+    runner.adapters = {Platform.DISCORD: target}
+    adapter.gateway_runner = runner
+    assert adapter._handoff_config_error(adapter._routes["relay"]) is None
+    assert "market-analysis" in adapter._served_profile_names()
+    assert restored.transport_deliver == "discord"
+    assert restored.transport_deliver_extra == {"chat_id": "market-room"}
+    assert adapter.validate_restored_source(restored) is True
     assert runner._adapter_for_source(restored) is adapter
     assert adapter.toolsets_for_source(restored) == ["web", "terminal"]
     assert restored.profile == "market-analysis"
+    result = await adapter.send(restored.chat_id, "finished after restart")
+    assert result.success is True
+    target.send.assert_awaited_once_with(
+        "market-room", "finished after restart", metadata=None
+    )
+
+    adapter._routes["relay"]["deliver"] = "slack"
+    assert runner._adapter_for_source(restored) is None
+    adapter._routes["relay"]["deliver"] = "discord"
 
     adapter._routes["relay"]["allowed_target_profiles"] = ["server-development"]
     assert runner._adapter_for_source(restored) is None
@@ -293,7 +504,11 @@ async def test_handoff_concurrency_limit_rejects_without_starting_another_run(se
     adapter._active_handoffs["relay"].add("webhook:relay:already-running")
     adapter.handle_message = pytest.fail
     payload = {
-        "_hermes": {"target_profile": "market-analysis", "handoff_depth": 1},
+        "_hermes": {
+            "target_profile": "market-analysis",
+            "handoff_depth": 1,
+            "delivery_id": "concurrency-check",
+        },
         "task": "do work",
     }
     body = json.dumps(payload).encode()

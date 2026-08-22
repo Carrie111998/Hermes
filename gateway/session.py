@@ -190,6 +190,11 @@ class SessionSource:
     # Authenticated handoff depth used only with ``transport_profile``. The
     # transport rechecks this against the current route ceiling after restore.
     trusted_handoff_depth: Optional[int] = None
+    # Resolved egress for an authenticated webhook handoff. Restart recovery
+    # revalidates the delivery type against the current static route before
+    # restoring the adapter's process-local delivery cache.
+    transport_deliver: Optional[str] = None
+    transport_deliver_extra: Optional[Dict[str, Any]] = None
     # Platform-owned execution provenance persisted in ``origin_json`` for
     # operator diagnostics. This is descriptive only: authorization decisions
     # must never trust values restored from this mapping.
@@ -295,6 +300,10 @@ class SessionSource:
             d["transport_profile"] = self.transport_profile
         if self.trusted_handoff_depth is not None:
             d["trusted_handoff_depth"] = self.trusted_handoff_depth
+        if self.transport_deliver is not None:
+            d["transport_deliver"] = self.transport_deliver
+        if self.transport_deliver_extra is not None:
+            d["transport_deliver_extra"] = dict(self.transport_deliver_extra)
         if self.provenance:
             d["provenance"] = self.provenance
         if self.auto_thread_created:
@@ -326,6 +335,12 @@ class SessionSource:
             profile=data.get("profile"),
             transport_profile=data.get("transport_profile"),
             trusted_handoff_depth=data.get("trusted_handoff_depth"),
+            transport_deliver=data.get("transport_deliver"),
+            transport_deliver_extra=(
+                dict(data["transport_deliver_extra"])
+                if isinstance(data.get("transport_deliver_extra"), dict)
+                else None
+            ),
             provenance=(
                 dict(data["provenance"])
                 if isinstance(data.get("provenance"), dict)
