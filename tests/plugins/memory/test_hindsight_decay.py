@@ -1,6 +1,8 @@
 """Tests for the optional LivingMemory-style Hindsight decay ledger."""
 
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -53,6 +55,49 @@ def test_recent_access_halves_elapsed_decay(tmp_path):
 
     # 10 days * 0.01/day, halved because the result was accessed recently.
     assert _importance(tmp_path / "decay.sqlite3") == 0.45
+
+
+def test_decay_claims_write_lock_before_reading_timestamp(tmp_path, monkeypatch):
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    path = tmp_path / "decay.sqlite3"
+    store = HindsightDecayStore(path, "default", DecayPolicy())
+    result = _result("shared", created_at=start)
+    assert store.filter_results([result], now=start) == [result]
+
+    lock_holder = sqlite3.connect(path, timeout=5.0)
+    lock_holder.execute("PRAGMA journal_mode=WAL")
+    lock_holder.execute("BEGIN IMMEDIATE")
+
+    begin_attempted = threading.Event()
+    timestamp_read = threading.Event()
+    real_connect = store._connect
+
+    def traced_connect():
+        conn = real_connect()
+
+        def trace(statement):
+            normalized = " ".join(statement.upper().split())
+            if normalized == "BEGIN IMMEDIATE":
+                begin_attempted.set()
+            if "SELECT LAST_DECAY_AT FROM MEMORY_DECAY_META" in normalized:
+                timestamp_read.set()
+
+        conn.set_trace_callback(trace)
+        return conn
+
+    monkeypatch.setattr(store, "_connect", traced_connect)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(store.apply_decay, start + timedelta(days=10))
+            assert begin_attempted.wait(timeout=2.0)
+            assert not timestamp_read.wait(timeout=0.2)
+            lock_holder.commit()
+            assert future.result(timeout=5.0) == 1
+    finally:
+        lock_holder.close()
+
+    assert timestamp_read.is_set()
+    assert _importance(path) == 0.45
 
 
 def test_permanent_tag_bypasses_decay(tmp_path):

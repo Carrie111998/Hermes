@@ -106,7 +106,9 @@ def result_identity(result: Any) -> str:
 
     Hindsight 0.6.x exposes ``RecallResult.id``.  The content hash fallback
     keeps the optional layer compatible with older clients and lightweight
-    test doubles that only provide ``text``.
+    test doubles that only provide ``text``.  Results with the same fallback
+    ``document_id`` and text intentionally share one ledger row, so recalling
+    either also refreshes the other's preservation window.
     """
 
     value = _field(result, "id")
@@ -184,6 +186,11 @@ class HindsightDecayStore:
             )
 
     def _decay_conn(self, conn: sqlite3.Connection, now: datetime) -> int:
+        # Serialize the meta read, importance updates, and timestamp write.
+        # A deferred transaction would let two gateways sharing HERMES_HOME
+        # read the same last_decay_at before either claims the writer slot,
+        # risking duplicate elapsed-time decay (or SQLITE_BUSY_SNAPSHOT).
+        conn.execute("BEGIN IMMEDIATE")
         meta = conn.execute(
             "SELECT last_decay_at FROM memory_decay_meta WHERE bank_id = ?",
             (self.bank_id,),
