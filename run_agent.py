@@ -5572,7 +5572,9 @@ class AIAgent:
             "direct",
             self._anthropic_api_key,
             getattr(self, "_anthropic_base_url", None),
-            get_provider_request_timeout(self.provider, self.model),
+            get_provider_request_timeout(
+                self.provider, self.model, base_url=getattr(self, "base_url", None)
+            ),
             bool(getattr(self, "_oauth_1m_beta_disabled", False)),
         )
 
@@ -5637,7 +5639,9 @@ class AIAgent:
             client = build_anthropic_client(
                 self._anthropic_api_key,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=get_provider_request_timeout(
+                    self.provider, self.model, base_url=getattr(self, "base_url", None)
+                ),
                 drop_context_1m_beta=key[4],
             )
         logger.debug(
@@ -6306,7 +6310,9 @@ class AIAgent:
             self._anthropic_client = build_anthropic_client(
                 new_token,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=get_provider_request_timeout(
+                    self.provider, self.model, base_url=getattr(self, "base_url", None)
+                ),
             )
         except Exception as exc:
             logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc)
@@ -6448,7 +6454,9 @@ class AIAgent:
             self._anthropic_base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
             self._anthropic_client = build_anthropic_client(
                 runtime_key, self._anthropic_base_url,
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=get_provider_request_timeout(
+                    self.provider, self.model, base_url=getattr(self, "base_url", None)
+                ),
             )
             self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
             self.api_key = runtime_key
@@ -6559,7 +6567,9 @@ class AIAgent:
             self._anthropic_client = build_anthropic_client(
                 self._anthropic_api_key,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=get_provider_request_timeout(
+                    self.provider, self.model, base_url=getattr(self, "base_url", None)
+                ),
                 drop_context_1m_beta=_drop_1m,
             )
 

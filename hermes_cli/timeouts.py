@@ -13,51 +13,91 @@ def _coerce_timeout(raw: object) -> float | None:
     return timeout
 
 
+_URL_KEYS = ("base_url", "url", "api", "baseUrl")
+
+
+def _entry_url(entry: dict[str, Any]) -> str:
+    """Normalized route identity of a providers entry, honoring the same URL key
+    aliases the config normalizer accepts (``base_url`` / ``url`` / ``api`` /
+    ``baseUrl``)."""
+    from hermes_cli.route_identity import normalize_route_base_url
+
+    for key in _URL_KEYS:
+        raw = entry.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return normalize_route_base_url(raw.strip())
+    return ""
+
+
+def _is_custom_like(provider_id: str) -> bool:
+    """True when ``provider_id`` is what a *named* custom provider runs as at
+    runtime: ``custom``, ``custom:<x>``, or a registry alias of the custom
+    profile (``ollama``, ``vllm``, ``llamacpp`` …).  Built-in providers
+    (``openrouter``, ``anthropic`` …) are never custom-like, so they can never
+    inherit timeouts from an unrelated custom entry that shares their URL."""
+    pid = (provider_id or "").strip().lower()
+    if not pid:
+        return False
+    if pid == "custom" or pid.startswith("custom:"):
+        return True
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(pid)
+    except Exception:
+        return False
+    return bool(profile is not None and getattr(profile, "name", "") == "custom")
+
+
 def _resolve_provider_config(
     config: dict[str, Any], provider_id: str, base_url: str | None
 ) -> dict[str, Any] | None:
     """Find the ``providers`` entry that governs this request.
 
-    Priority:
-      1. ``providers.<provider_id>`` — an explicit, configured provider key.
-      2. The first ``providers`` entry whose ``base_url`` matches ``base_url``
-         (route identity, so scheme case / trailing slashes don't matter).
-      3. Same match over legacy ``custom_providers`` list entries.
+    * Built-in provider ids resolve by key only: ``providers.<provider_id>``.
+    * Custom-like ids (see :func:`_is_custom_like`) resolve by the ACTIVE
+      route first — the first *enabled* ``providers.*`` entry (then legacy
+      ``custom_providers``) whose URL matches ``base_url`` — and only then by
+      key.  The active URL must beat the key because a user may literally name
+      an entry ``providers.custom`` while running a different named provider.
 
-    Step 2/3 exist because a *named* custom provider (``providers.mlx-lm``)
-    runs with ``AIAgent.provider == "custom"`` — the config key never reaches
-    the agent, so keying on ``provider_id`` alone silently ignores every
-    timeout the user set on that entry.  Matching by ``base_url`` mirrors
+    Why: a *named* custom provider (``providers.mlx-lm``) runs with
+    ``AIAgent.provider == "custom"`` — the config key never reaches the agent,
+    so keying on ``provider_id`` alone silently ignores every timeout set on
+    that entry.  Matching by URL mirrors
     :func:`hermes_cli.config.get_custom_provider_context_length` (#15779).
+    Duplicate URLs resolve to the first match in config order.
     """
     providers = config.get("providers", {})
-    if isinstance(providers, dict):
-        explicit = providers.get(provider_id)
-        if isinstance(explicit, dict) and explicit:
-            return explicit
+    providers = providers if isinstance(providers, dict) else {}
 
-    if not base_url:
-        return None
-    try:
+    def _explicit() -> dict[str, Any] | None:
+        entry = providers.get(provider_id)
+        return entry if isinstance(entry, dict) and entry else None
+
+    if not _is_custom_like(provider_id):
+        return _explicit()
+
+    if base_url:
         from hermes_cli.route_identity import normalize_route_base_url
-    except Exception:
-        return None
-    target = normalize_route_base_url(base_url)
-    if not target:
-        return None
 
-    candidates: list[Any] = []
-    if isinstance(providers, dict):
-        candidates.extend(providers.values())
-    legacy = config.get("custom_providers")
-    if isinstance(legacy, list):
-        candidates.extend(legacy)
-    for entry in candidates:
-        if not isinstance(entry, dict):
-            continue
-        if normalize_route_base_url(entry.get("base_url")) == target:
-            return entry
-    return None
+        target = normalize_route_base_url(base_url)
+        if target:
+            try:
+                from hermes_cli.config import is_provider_enabled
+            except Exception:  # pragma: no cover - defensive
+                def is_provider_enabled(_cfg):  # type: ignore[misc]
+                    return True
+            candidates: list[Any] = list(providers.values())
+            legacy = config.get("custom_providers")
+            if isinstance(legacy, list):
+                candidates.extend(legacy)
+            for entry in candidates:
+                if not isinstance(entry, dict) or not is_provider_enabled(entry):
+                    continue
+                if _entry_url(entry) == target:
+                    return entry
+    return _explicit()
 
 
 def _provider_config_for(

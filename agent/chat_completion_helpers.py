@@ -2703,7 +2703,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # Honor per-provider / per-model request_timeout_seconds for the
         # fallback target (same knob the primary client uses).  None = use
         # SDK default.
-        _fb_timeout = get_provider_request_timeout(fb_provider, fb_model)
+        _fb_timeout = get_provider_request_timeout(
+            fb_provider, fb_model, base_url=fb_base_url
+        )
 
         if fb_api_mode == "anthropic_messages":
             # Build native Anthropic client instead of using OpenAI client
@@ -3841,7 +3843,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         import httpx as _httpx
         # Per-provider / per-model request_timeout_seconds (from config.yaml)
         # wins over the HERMES_API_TIMEOUT env default if the user set it.
-        _provider_timeout_cfg = get_provider_request_timeout(agent.provider, agent.model)
+        _provider_timeout_cfg = get_provider_request_timeout(
+            agent.provider, agent.model, base_url=getattr(agent, "base_url", None)
+        )
         _base_timeout = (
             _provider_timeout_cfg
             if _provider_timeout_cfg is not None

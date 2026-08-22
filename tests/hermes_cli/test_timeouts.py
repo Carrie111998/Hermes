@@ -182,16 +182,87 @@ def test_explicit_provider_key_still_wins_over_base_url(monkeypatch, tmp_path):
     assert to.get_provider_stale_timeout("mlx-lm", "m", base_url=url) == 900.0
 
 
-def test_agent_stale_timeout_uses_base_url_for_custom_provider(monkeypatch, tmp_path):
-    """End-to-end through AIAgent: provider='custom' + matching base_url → config wins
-    over the reasoning-model floor and the env var."""
+def test_literal_providers_custom_entry_does_not_shadow_active_route(monkeypatch, tmp_path):
+    # A user may literally name an entry "custom"; at runtime provider_id is also
+    # "custom" for every named provider, so the ACTIVE URL must win over the key.
+    to = _isolate(monkeypatch, tmp_path, """\
+        providers:
+          custom:
+            base_url: http://127.0.0.1:5555/v1
+            stale_timeout_seconds: 5
+          mlx-lm:
+            base_url: http://127.0.0.1:8001/v1
+            stale_timeout_seconds: 900
+        """)
+    assert to.get_provider_stale_timeout("custom", "m", base_url="http://127.0.0.1:8001/v1") == 900.0
+    assert to.get_provider_stale_timeout("custom", "m", base_url="http://127.0.0.1:5555/v1") == 5.0
+    # No base_url → the literal key is still honored (unchanged behavior).
+    assert to.get_provider_stale_timeout("custom", "m") == 5.0
+
+
+def test_disabled_entries_are_skipped(monkeypatch, tmp_path):
+    to = _isolate(monkeypatch, tmp_path, """\
+        providers:
+          old-mlx:
+            enabled: false
+            base_url: http://127.0.0.1:8001/v1
+            stale_timeout_seconds: 5
+          mlx-lm:
+            base_url: http://127.0.0.1:8001/v1
+            stale_timeout_seconds: 900
+        """)
+    assert to.get_provider_stale_timeout("custom", "m", base_url="http://127.0.0.1:8001/v1") == 900.0
+
+
+def test_url_key_aliases_are_honored(monkeypatch, tmp_path):
+    to = _isolate(monkeypatch, tmp_path, """\
+        providers:
+          via-api-key:
+            api: http://127.0.0.1:8001/v1
+            stale_timeout_seconds: 900
+          via-url-key:
+            url: http://127.0.0.1:8002/v1
+            request_timeout_seconds: 77
+        """)
+    assert to.get_provider_stale_timeout("custom", "m", base_url="http://127.0.0.1:8001/v1") == 900.0
+    assert to.get_provider_request_timeout("custom", "m", base_url="http://127.0.0.1:8002/v1") == 77.0
+
+
+def test_builtin_provider_never_inherits_from_custom_entry_sharing_url(monkeypatch, tmp_path):
+    to = _isolate(monkeypatch, tmp_path, """\
+        providers:
+          my-proxy:
+            base_url: https://openrouter.ai/api/v1
+            stale_timeout_seconds: 5
+        """)
+    # provider_id is a built-in, not custom-like → key-only resolution → None.
+    assert to.get_provider_stale_timeout("openrouter", "m", base_url="https://openrouter.ai/api/v1") is None
+
+
+def test_custom_profile_aliases_resolve_by_url(monkeypatch, tmp_path):
+    # ``ollama`` / ``vllm`` are registry aliases of the custom profile.
     to = _isolate(monkeypatch, tmp_path, _NAMED_CUSTOM_CONFIG)
+    assert to.get_provider_stale_timeout("vllm", "m", base_url="http://127.0.0.1:8001/v1") == 900.0
+
+
+def test_agent_e2e_named_custom_provider_stale_timeout(monkeypatch, tmp_path):
+    """Real AIAgent constructed as the runtime does for a named custom provider
+    (provider='custom' + the entry's base_url): config must beat both the
+    reasoning-model floor and the env var."""
+    _isolate(monkeypatch, tmp_path, _NAMED_CUSTOM_CONFIG)
     monkeypatch.setenv("HERMES_API_CALL_STALE_TIMEOUT", "123")
     import importlib, run_agent as ra_mod
     importlib.reload(ra_mod)
-    agent = object.__new__(ra_mod.AIAgent)
-    agent.provider = "custom"
-    agent.model = "/models/Qwen3.8-27B-MLX-4bit"  # reasoning floor would give 180
-    agent.base_url = "http://127.0.0.1:8001/v1"
+    agent = ra_mod.AIAgent(
+        model="/models/Qwen3.8-27B-MLX-4bit",  # reasoning floor alone would give 180
+        provider="custom",
+        api_key="local",
+        base_url="http://127.0.0.1:8001/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        platform="cli",
+    )
+    assert agent.provider == "custom"
     assert agent._resolved_api_call_stale_timeout_base() == (900.0, False)
     assert agent._resolved_api_call_timeout() == 1200.0
