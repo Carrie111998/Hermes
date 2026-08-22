@@ -29,6 +29,7 @@ back to today's string-sniffing behavior (older backends keep working).
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -99,9 +100,13 @@ _STREAM_DROP_FRAGMENTS = (
     "incomplete chunked read",
     "connection broken",
     "stream ended prematurely",
-    "sse",
     "mid-stream",
 )
+
+# "sse" must match as a standalone token only: as a bare substring it hits
+# ordinary provider prose ("processed", "surpassed", "dismissed") and
+# misroutes provider-layer failures to the streaming layer.
+_SSE_TOKEN_RE = re.compile(r"\bsse\b")
 
 # Exception modules that indicate the failure came from an API/transport call
 # (vs. a bug in our own dispatcher code, which is a gateway-layer failure).
@@ -132,7 +137,9 @@ def _is_custom_endpoint(provider: Optional[str]) -> bool:
 
 def _looks_like_stream_drop(message: str) -> bool:
     msg = message.lower()
-    return any(fragment in msg for fragment in _STREAM_DROP_FRAGMENTS)
+    if any(fragment in msg for fragment in _STREAM_DROP_FRAGMENTS):
+        return True
+    return bool(_SSE_TOKEN_RE.search(msg))
 
 
 def _surface(
