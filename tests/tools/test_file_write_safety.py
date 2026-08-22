@@ -3,6 +3,7 @@
 Based on PR #1085 by ismoilh (salvaged).
 """
 
+import json
 import os
 from pathlib import Path
 
@@ -595,7 +596,9 @@ class TestProtectedInstructionFiles:
 
         assert res.get("error") and "BLOCKED" in res["error"]
         assert not (fake_home / "SOUL.md").exists()
-        assert str((fake_home / "SOUL.md").resolve()) in approvals["calls"][0]["command"]
+        assert json.dumps(
+            str((fake_home / "SOUL.md").resolve()), ensure_ascii=False
+        ) in approvals["calls"][0]["command"]
 
     def test_active_home_symlink_approval_names_alias_and_resolved_target(
         self, tmp_path, approvals, monkeypatch
@@ -616,8 +619,10 @@ class TestProtectedInstructionFiles:
 
         assert res.get("error") and "BLOCKED" in res["error"]
         command = approvals["calls"][0]["command"]
-        assert str(alias) in command
-        assert str(target.resolve()) in command
+        displayed = json.dumps(
+            f"{alias} -> {target.resolve()}", ensure_ascii=False
+        )
+        assert displayed in command
         assert target.read_text(encoding="utf-8") == "original"
 
     def test_extra_pattern_in_real_hermes_home_is_gated(
@@ -737,8 +742,8 @@ class TestProtectedInstructionFiles:
 
         assert res.get("error") and "BLOCKED" in res["error"]
         command = approvals["calls"][0]["command"]
-        assert str(project_agents.resolve()) in command
-        assert str(home_agents.resolve()) in command
+        assert json.dumps(str(project_agents.resolve()), ensure_ascii=False) in command
+        assert json.dumps(str(home_agents.resolve()), ensure_ascii=False) in command
         assert command.count("AGENTS.md") == 2
 
     # ---- gateway round-trip ----------------------------------------------

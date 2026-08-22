@@ -845,14 +845,40 @@ def _protected_instruction_approval_target(
         filepath: str, task_id: str = "default") -> tuple[str, str]:
     """Return the canonical identity and qualified display for an approved write."""
     try:
-        requested = os.path.normpath(str(_resolve_path_for_task(filepath, task_id)))
+        container_paths = _uses_container_paths(task_id)
+        expanded = _expand_tilde(filepath)
+        if container_paths:
+            requested = _normalize_without_host_deref(
+                expanded if posixpath.isabs(expanded)
+                else posixpath.join(
+                    str(_resolve_base_dir(task_id, container_paths=True)), expanded
+                )
+            )
+        elif sys.platform == "win32":
+            from tools.environments.local import _msys_to_windows_path
+            import ntpath
+
+            expanded = _expand_tilde(_msys_to_windows_path(filepath))
+            requested = ntpath.normpath(
+                expanded if ntpath.isabs(expanded)
+                else ntpath.join(
+                    str(_resolve_base_dir(task_id, container_paths=False)), expanded
+                )
+            )
+        else:
+            requested = os.path.normpath(
+                expanded if os.path.isabs(expanded)
+                else os.path.join(
+                    str(_resolve_base_dir(task_id, container_paths=False)), expanded
+                )
+            )
     except (OSError, ValueError, RuntimeError):
         requested = os.path.abspath(os.path.normpath(_expand_tilde(filepath)))
     canonical = os.path.realpath(requested)
     display = requested
     if os.path.normcase(requested) != os.path.normcase(canonical):
         display = f"{requested} -> {canonical}"
-    return os.path.normcase(canonical), display
+    return os.path.normcase(canonical), json.dumps(display, ensure_ascii=False)
 
 
 def _request_protected_instruction_approval(
@@ -973,7 +999,9 @@ def _check_protected_instruction_write(paths: list[str],
             p, task_id, enabled=enabled, extra_patterns=extra)
         if reason:
             identity, display = _protected_instruction_approval_target(p, task_id)
-            targets.setdefault(identity, display)
+            previous = targets.get(identity)
+            if previous is None or (" -> " in display and " -> " not in previous):
+                targets[identity] = display
     if not targets:
         return None
     return _request_protected_instruction_approval(list(targets.values()), task_id)
