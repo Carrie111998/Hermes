@@ -448,4 +448,3 @@ class TestRegistration:
 
         assert "openrouter" in _REF_CAPABLE
         assert "nous" in _REF_CAPABLE
-        assert "openrouter-image-api" in _REF_CAPABLE

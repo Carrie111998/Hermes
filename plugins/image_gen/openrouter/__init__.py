@@ -518,6 +518,10 @@ _IMAGE_API_ASPECT_RATIOS = {
 _IMAGE_API_RESOLUTIONS = {"1k": "1K", "2k": "2K"}
 _IMAGE_API_DEFAULT_RESOLUTION = "1K"
 _IMAGE_API_DEFAULT_MODEL = "x-ai/grok-imagine-image-2.0"
+# Quality options (deliberately excludes "high" as a cost guard — the Image API
+# per-call charge scales with the quality tier and the marginal visual improvement
+# from "high" over "medium" on the default resolution is negligible for prompt
+# generations. Pet sprites are uniformly generated at "medium" anyway.)
 _IMAGE_API_QUALITY_OPTIONS = {"low", "medium"}
 
 
@@ -592,7 +596,16 @@ class OpenRouterImageAPIProvider(ImageGenProvider):
         }
 
     def _resolve_image_api_model(self) -> str:
-        """Resolve model from env, config scoped to this provider, or top-level image_gen.model."""
+        """Resolve model from env var or provider-scoped config only.
+
+        Does NOT fall back to the top-level ``image_gen.model`` because that
+        config key is shared across *all* image backends. A user whose global
+        ``image_gen.model`` targets a chat-completions model (e.g.
+        ``google/gemini-3-pro-image``) would have that model silently sent to
+        ``/api/v1/images``, where it doesn't exist — producing a confusing 404.
+        The resolver stops at the provider-scoped layer and uses the dedicated
+        default instead.
+        """
         env_override = os.environ.get("OPENROUTER_IMAGES_API_MODEL", "").strip()
         if env_override:
             return env_override
@@ -601,9 +614,6 @@ class OpenRouterImageAPIProvider(ImageGenProvider):
         value = scoped.get("model") if isinstance(scoped.get("model"), str) else None
         if value and value.strip():
             return value.strip()
-        top = cfg.get("model")
-        if isinstance(top, str) and top.strip():
-            return top.strip()
         return _IMAGE_API_DEFAULT_MODEL
 
     def generate(
@@ -639,8 +649,26 @@ class OpenRouterImageAPIProvider(ImageGenProvider):
             )
 
         model_id = self._resolve_image_api_model()
-        aspect = resolve_aspect_ratio(aspect_ratio)
-        or_aspect = _IMAGE_API_ASPECT_RATIOS.get(aspect, "1:1")
+        # Accept raw aspect_ratio keys directly (the API supports many more
+        # ratios than the standard three, e.g. "4:3", "3:2", "9:19.5"),
+        # then fall back to the standard normalizer for the common names.
+        raw = aspect_ratio.strip().lower() if isinstance(aspect_ratio, str) else ""
+        if raw in _IMAGE_API_ASPECT_RATIOS:
+            or_aspect = _IMAGE_API_ASPECT_RATIOS[raw]
+            aspect = raw
+        else:
+            aspect = resolve_aspect_ratio(aspect_ratio)
+            or_aspect = _IMAGE_API_ASPECT_RATIOS.get(aspect)
+        if or_aspect is None:
+            valid = sorted(_IMAGE_API_ASPECT_RATIOS)
+            return error_response(
+                error=f"Unsupported aspect ratio '{aspect_ratio}'. "
+                f"Valid values: {', '.join(valid)}",
+                error_type="invalid_aspect_ratio",
+                provider=self.name,
+                model=model_id,
+                prompt=prompt,
+            )
 
         payload: Dict[str, Any] = {
             "model": model_id,
@@ -799,8 +827,14 @@ class OpenRouterImageAPIProvider(ImageGenProvider):
                     saved_path = save_url_image(url, prefix=f"openrouter_{model_id.replace('/', '_')}")
                     image_ref = str(saved_path)
                 except Exception as exc:
-                    logger.warning("Could not cache URL (%s); returning raw URL", exc)
-                    image_ref = url
+                    return error_response(
+                        error=f"Could not cache image URL ({url}): {exc}",
+                        error_type="io_error",
+                        provider=self.name,
+                        model=model_id,
+                        prompt=prompt,
+                        aspect_ratio=aspect,
+                    )
             else:
                 return error_response(
                     error="OpenRouter response contained neither b64_json nor URL",
