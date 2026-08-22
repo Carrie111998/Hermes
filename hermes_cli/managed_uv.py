@@ -44,6 +44,8 @@ _RUNTIME_DIR_NAME = ".hermes-runtime"
 _VENV_NAME = "venv"
 _ALT_VENV_NAME = ".venv"
 _REPAIR_LOCK_NAME = "runtime-repair.lock"
+# Keep this synchronized with the exclusive upper minor in pyproject.toml;
+# test_fallback_bound_matches_project_python_cap enforces that relationship.
 _MAX_SUPPORTED_MINOR = 14
 
 # ---------------------------------------------------------------------------
@@ -705,7 +707,9 @@ def _install_safe_python_generation(
     # compatibility; only supported minor lines through this bound are tried.
     cur_major, cur_minor = current.python_version[:2]
     fb_tried: set[tuple[int, int, int]] = set(tried_versions)
-    for next_minor in range(cur_minor + 1, _MAX_SUPPORTED_MINOR + 1):
+    for next_minor in range(
+        cur_minor + 1, _MAX_SUPPORTED_MINOR + 1
+    ):  # inclusive through _MAX_SUPPORTED_MINOR
         next_request = f"{cur_major}.{next_minor}"
         print(
             f"  → No fixed {cur_major}.{cur_minor} build available; "

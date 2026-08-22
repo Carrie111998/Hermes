@@ -10,7 +10,9 @@ readme = "README.md"
 # fresh distro whose newest interpreter uv auto-picks) will otherwise select
 # an untested minor. Python 3.14 is supported for the core and normal `[all]`
 # profile; optional extras may have narrower dependency support. Keep the next
-# minor out until its native dependency wheels and full test suite are covered.
+# minor out until Rust-backed transitives (especially pydantic-core) publish
+# native wheels and the full test suite is covered; future ceiling raises
+# require the same evidence rather than a source-build fallback through maturin.
 requires-python = ">=3.11,<3.15"
 authors = [{ name = "Nous Research" }]
 license = "MIT"

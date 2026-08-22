@@ -842,13 +842,14 @@ class TestMinorLineFallForward:
     """
 
     def test_fallback_bound_matches_project_python_cap(self):
+        """Source-tree contract: tests are not shipped in installed wheels."""
         import re
         import tomllib
 
         import hermes_cli.managed_uv as managed_uv
 
         project = tomllib.loads(
-            (Path(__file__).parents[2] / "pyproject.toml").read_text()
+            (managed_uv._PROJECT_ROOT / "pyproject.toml").read_text()
         )
         specifier = project["project"]["requires-python"]
         upper = re.search(r"<\s*(\d+)\.(\d+)", specifier)
@@ -864,13 +865,24 @@ class TestMinorLineFallForward:
         import hermes_cli.managed_uv as managed_uv
 
         install_calls = []
+        cap = managed_uv._MAX_PATCH_RETRIES
+        patch_lists = {
+            "3.11": [],
+            "3.12": [(3, 12, patch) for patch in range(40, 40 - cap - 2, -1)],
+            "3.13": [(3, 13, patch) for patch in range(40, 40 - cap - 2, -1)],
+            "3.14": [],
+        }
+        resolutions = {
+            "3.11": (3, 11, 14),
+            "3.12": (3, 12, 11),
+            "3.13": (3, 13, 11),
+            "3.14": (3, 14, 7),
+        }
+        for versions in patch_lists.values():
+            for version in versions:
+                resolutions[".".join(str(part) for part in version)] = version
         fake_run, fake_probe = self._mapped_run(
-            resolutions={
-                "3.11": (3, 11, 14),
-                "3.12": (3, 12, 30),
-                "3.13": (3, 13, 30),
-                "3.14": (3, 14, 7),
-            },
+            resolutions=resolutions,
             fixed_versions={(3, 14, 7)},
             install_calls=install_calls,
         )
@@ -879,7 +891,7 @@ class TestMinorLineFallForward:
         monkeypatch.setattr(
             managed_uv,
             "_list_available_patches",
-            lambda uv_bin, minor, **kw: [],
+            lambda uv_bin, minor, **kw: patch_lists[minor],
         )
 
         result = managed_uv._install_safe_python_generation(
@@ -889,7 +901,61 @@ class TestMinorLineFallForward:
         assert result is not None
         _, _, candidate = result
         assert candidate.python_version == (3, 14, 7)
-        assert install_calls == ["3.11", "3.12", "3.13", "3.14"]
+        expected = ["3.11", "3.12"]
+        expected.extend(
+            ".".join(str(part) for part in version)
+            for version in patch_lists["3.12"][:cap]
+        )
+        expected.append("3.13")
+        expected.extend(
+            ".".join(str(part) for part in version)
+            for version in patch_lists["3.13"][:cap]
+        )
+        expected.append("3.14")
+        assert install_calls == expected
+
+    def test_max_supported_minor_never_falls_forward_to_3_15(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.managed_uv as managed_uv
+        from hermes_cli.sqlite_runtime import SQLiteRuntimeInfo
+
+        install_calls = []
+        cap = managed_uv._MAX_PATCH_RETRIES
+        patches = [(3, 14, patch) for patch in range(40, 40 - cap - 2, -1)]
+        resolutions = {"3.14": (3, 14, 11)}
+        for version in patches:
+            resolutions[".".join(str(part) for part in version)] = version
+        fake_run, fake_probe = self._mapped_run(
+            resolutions=resolutions,
+            fixed_versions=set(),
+            install_calls=install_calls,
+        )
+        monkeypatch.setattr(managed_uv.subprocess, "run", fake_run)
+        monkeypatch.setattr(managed_uv, "probe_sqlite_runtime", fake_probe)
+        monkeypatch.setattr(
+            managed_uv,
+            "_list_available_patches",
+            lambda uv_bin, minor, **kw: patches,
+        )
+        current = SQLiteRuntimeInfo(
+            executable=Path("/venv/bin/python"),
+            base_prefix=Path("/venv"),
+            python_version=(3, 14, 0),
+            sqlite_version=(3, 50, 4),
+            sqlite_version_string="3.50.4",
+            sqlite_source_id="old",
+        )
+
+        result = managed_uv._install_safe_python_generation(
+            "uv", project_root=tmp_path, current=current
+        )
+
+        assert result is None
+        assert install_calls[0] == "3.14"
+        assert len(install_calls) == 1 + cap
+        assert all(call == "3.14" or call.startswith("3.14.") for call in install_calls)
+        assert not any(call.startswith("3.15") for call in install_calls)
 
     @staticmethod
     def _mapped_run(resolutions, fixed_versions, install_calls):
