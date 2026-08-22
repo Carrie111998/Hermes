@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
@@ -203,3 +204,25 @@ class TestHooksDoctor:
         )
         assert "not allowlisted" in out.lower()
         assert "skipped JSON smoke test" in out
+
+    def test_flags_unsupported_pre_tool_call_directive(self, tmp_path):
+        script = _hook_script(
+            tmp_path,
+            'print(\'{"action": "permit"}\')\n',
+            name="hook.py",
+        )
+        command = f'"{sys.executable}" "{script}"'
+        shell_hooks._record_approval("pre_tool_call", command)
+        cfg = {
+            "hooks": {
+                "pre_tool_call": [
+                    {"command": command, "fail_closed": True},
+                ],
+            },
+        }
+
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            out = _run(SimpleNamespace(hooks_action="doctor"))
+
+        assert "unsupported pre_tool_call action: 'permit'" in out
+        assert "1 issue(s) found" in out
