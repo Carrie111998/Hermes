@@ -32,6 +32,14 @@ import { normalizeSessionSource, sessionSourceLabel } from '@/lib/session-source
 import { cn } from '@/lib/utils'
 import { $activeConnectionId } from '@/store/connections'
 import { $cronJobs } from '@/store/cron'
+import {
+  $attachedConnectionId,
+  $multiGateway,
+  agentKey,
+  gatewayLabel,
+  onAttachedConnection,
+  sessionConnectionId
+} from '@/store/gateway-separation'
 import { $bindings } from '@/store/keybinds'
 import {
   $dismissedAutoProjectIds,
@@ -391,6 +399,16 @@ export function ChatSidebar({
   const profileColors = useStore($profileColors)
   const profileScope = useStore($profileScope)
   const activeConnectionId = useStore($activeConnectionId)
+  // Off entirely until a second connection
+  // is registered, so single-gateway sidebars render exactly as before.
+  const multiGateway = useStore($multiGateway)
+  // Re-runs the session scoping when the live gateway hops machines.
+  const attachedConnectionId = useStore($attachedConnectionId)
+
+  const onAttachedGateway = useMemo(
+    () => onAttachedConnection(multiGateway, attachedConnectionId),
+    [multiGateway, attachedConnectionId]
+  )
 
   // Toggle the persisted read-state watermark from a row menu. The row's own
   // `unread` prop mirrors what the dot paints; flip it and let the backend
@@ -490,8 +508,14 @@ export function ChatSidebar({
   const scopedSessions = useMemo(() => {
     const pool = showArchived ? archivedSessions : sessions
 
-    return filterSessionsByProfileScope(pool, profileScope)
-  }, [sessions, archivedSessions, showArchived, profileScope])
+    // The scope is (connection, profile), not a profile name: two machines both
+    // serve `default`, so a name-only filter kept showing the primary's rows
+    // while the live gateway was on the other box, which made switching gateway
+    // look like a no-op. `onAttachedGateway` is in the deps because the
+    // predicate reads the attached connection. All-profiles browse stays
+    // unfiltered — it exists to show everything.
+    return showAllProfiles ? pool : filterSessionsByProfileScope(pool, profileScope).filter(onAttachedGateway)
+  }, [sessions, archivedSessions, showArchived, showAllProfiles, profileScope, onAttachedGateway])
 
   // One predicate for the status/project filters, so the flat list and the
   // project lanes narrow by the same rule. A project lane holds rows the loaded
@@ -545,13 +569,13 @@ export function ChatSidebar({
   )
 
   const visibleCronSessions = useMemo(
-    () => filterSessionsByProfileScope(cronSessions, profileScope),
-    [cronSessions, profileScope]
+    () => filterSessionsByProfileScope(cronSessions, profileScope).filter(onAttachedGateway),
+    [cronSessions, profileScope, onAttachedGateway]
   )
 
   const visibleMessagingSessions = useMemo(
-    () => filterSessionsByProfileScope(messagingSessions, profileScope),
-    [messagingSessions, profileScope]
+    () => filterSessionsByProfileScope(messagingSessions, profileScope).filter(onAttachedGateway),
+    [messagingSessions, profileScope, onAttachedGateway]
   )
 
   // Index sessions by every id a pin might be stored under — recents, cron,
@@ -1254,29 +1278,40 @@ export function ChatSidebar({
     }
 
     const groups = new Map<string, SidebarSessionGroup>()
+    // A profile name alone is not an identity once two machines
+    // both serve `default`. Key each group by (connection, profile) so the
+    // Dell's default and the HP's default become separate lanes instead of one
+    // merged bucket, and name the machine in the header.
+    const sortKeys = new Map<string, string>()
 
     for (const session of agentSessions) {
-      const key = normalizeProfileKey(session.profile)
+      const profileKey = normalizeProfileKey(session.profile)
+      const connectionId = sessionConnectionId(session)
+      const device = multiGateway ? gatewayLabel(connectionId) : ''
+      const key = multiGateway ? agentKey(connectionId, profileKey) : profileKey
 
       const group = groups.get(key) ?? {
-        color: resolveProfileColor(key, profileColors),
+        color: resolveProfileColor(profileKey, profileColors),
         id: key,
-        label: key,
+        label: device ? `${profileKey} · ${device}` : profileKey,
         mode: 'profile',
         path: null,
         sessions: []
       }
+
+      // Machine first, then default-before-named within each machine.
+      sortKeys.set(key, `${device} ${profileKey === 'default' ? '0' : `1${profileKey}`}`)
 
       group.sessions.push(session)
 
       groups.set(key, group)
     }
 
-    // default (root) first, then the rest alphabetically.
+    // default (root) first, then the rest alphabetically — per machine.
     return [...groups.values()].sort((a, b) =>
-      a.id === 'default' ? -1 : b.id === 'default' ? 1 : a.label.localeCompare(b.label)
+      (sortKeys.get(a.id) || a.label).localeCompare(sortKeys.get(b.id) || b.label)
     )
-  }, [profileGrouped, agentSessions, profileColors])
+  }, [profileGrouped, agentSessions, profileColors, multiGateway])
 
   // The flat Sessions list always shows ALL recent sessions; Projects is a
   // parallel grouped view, not a filter on this one — nothing is hidden here.

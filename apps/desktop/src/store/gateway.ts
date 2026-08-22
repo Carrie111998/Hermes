@@ -985,6 +985,48 @@ export function retireLocalProfileGateways(profile: string): void {
   }
 }
 
+/**
+ * Retire the sockets owned by ONE agent, in whichever pool they live.
+ *
+ * `retireLocalProfileGateways` is deliberately local-only (#88638): it retires
+ * the bare-profile and explicit-`local` scopes and PRESERVES same-named agents
+ * on other connections. That is exactly right when the profile being deleted or
+ * renamed is the local/primary-route one, and exactly wrong when it is not —
+ * deleting `default` on a registry secondary would then tear down the LOCAL
+ * `default`'s sockets and leave the secondary's own socket redialing a profile
+ * that no longer exists.
+ *
+ * The discriminator is the pool the agent actually resolves into, not whether
+ * it "looks remote": a remote PRIMARY still routes through the bare profile
+ * scope, so it must keep taking the legacy path.
+ */
+export function retireAgentGateways(connectionId: null | string, profile: string): void {
+  const key = normKey(profile)
+  const scope = registryBackendScopeKey(connectionId, key)
+
+  if (scope === key) {
+    retireLocalProfileGateways(key)
+
+    return
+  }
+
+  const entry = g.secondaries.get(scope)
+
+  if (!entry) {
+    return
+  }
+
+  const activeInvalidated = scope === g.activeKey
+
+  disposeSecondary(entry)
+  g.secondaries.delete(scope)
+  restoreActiveToPrimaryIfEvicted()
+
+  if (activeInvalidated) {
+    g.config?.onActiveConnectionInvalidated?.(g.primaryProfile, gatewayActivationEpoch())
+  }
+}
+
 // Registry lifecycle: a connection was removed or materially edited. Dispose
 // every secondary scoped to it (a removed remote/cloud source has no local
 // process to die, so without this its WebSocket stays open streaming ghost

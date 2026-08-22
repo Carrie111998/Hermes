@@ -1,17 +1,24 @@
 import { useStore } from '@nanostores/react'
 import type * as React from 'react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { CodeEditor } from '@/components/chat/code-editor'
 import { PageLoader } from '@/components/page-loader'
 import { Button } from '@/components/ui/button'
 import { ProfileGlyph } from '@/components/ui/profile-glyph'
-import { getProfileSoul, type ProfileInfo, updateProfileSoul } from '@/hermes'
+import { getProfiles, getProfileSoul, type ProfileInfo, updateProfileSoul } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { displayPath } from '@/lib/display-path'
 import { AlertTriangle, Save } from '@/lib/icons'
 import { resolveProfileColor } from '@/lib/profile-color'
 import { normalize } from '@/lib/text'
+import {
+  $connectionLabels,
+  $multiGateway,
+  $primaryConnectionId,
+  agentKey,
+  LOCAL_CONNECTION_ID
+} from '@/store/gateway-separation'
 import { notify, notifyError } from '@/store/notifications'
 import { $profileColors, profileLabel, refreshProfiles } from '@/store/profile'
 
@@ -39,31 +46,105 @@ interface ProfilesViewProps {
   onClose: () => void
 }
 
+/** One row's full identity: a profile plus
+ *  the machine that owns it. Two registered gateways both serve a `default`, so
+ *  a name on its own can neither identify a row nor address an action. */
+interface ProfileEntry {
+  /** '' for the primary / local pool — the byte-identical single-gateway case. */
+  connectionId: string
+  connectionLabel: string
+  profile: ProfileInfo
+}
+
+const entryKey = (entry: ProfileEntry) => agentKey(entry.connectionId, entry.profile.name)
+
 export function ProfilesView({ onClose }: ProfilesViewProps) {
   const { t } = useI18n()
   const p = t.profiles
-  const [profiles, setProfiles] = useState<null | ProfileInfo[]>(null)
-  const [selectedName, setSelectedName] = useState<null | string>(null)
+  const [entries, setEntries] = useState<null | ProfileEntry[]>(null)
+  const [selectedKey, setSelectedKey] = useState<null | string>(null)
   const [query, setQuery] = useState('')
-  const [createOpen, setCreateOpen] = useState(false)
-  const [pendingRename, setPendingRename] = useState<null | ProfileInfo>(null)
-  const [pendingDelete, setPendingDelete] = useState<null | ProfileInfo>(null)
+  const [createOn, setCreateOn] = useState<null | string>(null)
+  const [pendingRename, setPendingRename] = useState<null | ProfileEntry>(null)
+  const [pendingDelete, setPendingDelete] = useState<null | ProfileEntry>(null)
+
+  // Every registered gateway, primary first. Manage Profiles used
+  // to call `refreshProfiles()` alone, which is hard-wired to the primary, so a
+  // second machine's agents were simply absent from the one screen that exists
+  // to manage them.
+  const multiGateway = useStore($multiGateway)
+  const connectionLabels = useStore($connectionLabels)
+  const primaryConnectionId = useStore($primaryConnectionId)
+
+  // The primary carries its REAL registry id, never ''.
+  //
+  // An omitted connection means "whichever gateway is ambient", NOT "the
+  // registry primary" — `hermesApi` spreads `connectionScoped()`. Encoding the
+  // primary as '' therefore made the section LABELLED with the primary's name
+  // read, and write to, whatever machine happened to be attached: open Manage
+  // Profiles from a secondary and the primary's section listed the secondary's
+  // profiles, while create/rename/delete under that heading hit the secondary
+  // too. Addressing every source explicitly is what keeps a row's machine and
+  // its label the same machine.
+  const primaryId = (primaryConnectionId || LOCAL_CONNECTION_ID).trim()
+
+  const sources = useMemo(() => {
+    const primaryLabel = connectionLabels[primaryId] || ''
+    const rest = Object.keys(connectionLabels).filter(id => id !== primaryId && id !== LOCAL_CONNECTION_ID)
+
+    return [
+      { connectionId: primaryId, label: primaryLabel },
+      ...rest.map(id => ({ connectionId: id, label: connectionLabels[id] || id }))
+    ]
+  }, [connectionLabels, primaryId])
 
   const refresh = useCallback(async () => {
-    try {
-      const list = await refreshProfiles()
-      setProfiles(list)
-      setSelectedName(current => {
-        if (current && list.some(p => p.name === current)) {
-          return current
-        }
+    // Best-effort per source: an unreachable machine contributes nothing rather
+    // than emptying the whole panel, matching how the roster degrades.
+    const perSource = await Promise.all(
+      sources.map(async source => {
+        try {
+          // Explicit id for every source once a second gateway exists. A
+          // single-gateway install keeps upstream's exact ambient call, so
+          // nothing changes for it.
+          const list = multiGateway ? (await getProfiles(source.connectionId)).profiles : await refreshProfiles()
 
-        return list.find(p => p.is_default)?.name ?? list[0]?.name ?? null
+          return list.map(profile => ({
+            connectionId: source.connectionId,
+            connectionLabel: source.label,
+            profile
+          }))
+        } catch (err) {
+          // Only the primary failing is worth interrupting the user for; a
+          // secondary gateway being down is expected and already visible as an
+          // absent section.
+          if (source.connectionId === primaryId) {
+            notifyError(err, p.failedLoad)
+          }
+
+          return [] as ProfileEntry[]
+        }
       })
-    } catch (err) {
-      notifyError(err, p.failedLoad)
+    )
+
+    const flat = perSource.flat()
+    setEntries(flat)
+    setSelectedKey(current => {
+      if (current && flat.some(entry => entryKey(entry) === current)) {
+        return current
+      }
+
+      const fallback = flat.find(entry => entry.connectionId === primaryId && entry.profile.is_default) ?? flat[0]
+
+      return fallback ? entryKey(fallback) : null
+    })
+
+    // The rail's own cache is ambient by design (it describes the attached
+    // machine), so keep it current alongside the explicit per-source reads.
+    if (multiGateway) {
+      void refreshProfiles().catch(() => undefined)
     }
-  }, [p])
+  }, [multiGateway, p, primaryId, sources])
 
   useRefreshHotkey(refresh)
 
@@ -72,44 +153,80 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
   }, [refresh])
 
   const selected = useMemo(() => {
-    if (!profiles) {
+    if (!entries) {
       return null
     }
 
-    return profiles.find(p => p.name === selectedName) ?? profiles[0] ?? null
-  }, [profiles, selectedName])
+    return entries.find(entry => entryKey(entry) === selectedKey) ?? entries[0] ?? null
+  }, [entries, selectedKey])
 
-  const visibleProfiles = useMemo(() => {
+  const visibleEntries = useMemo(() => {
     const q = normalize(query)
 
-    if (!profiles || !q) {
-      return profiles ?? []
+    if (!entries || !q) {
+      return entries ?? []
     }
 
-    return profiles.filter(
-      profile => profile.name.toLowerCase().includes(q) || (profile.model ?? '').toLowerCase().includes(q)
+    return entries.filter(
+      entry =>
+        entry.profile.name.toLowerCase().includes(q) ||
+        (entry.profile.model ?? '').toLowerCase().includes(q) ||
+        entry.connectionLabel.toLowerCase().includes(q)
     )
-  }, [profiles, query])
+  }, [entries, query])
+
+  // One section per machine while more than one gateway is registered; a single
+  // unlabelled run of rows otherwise, exactly as upstream renders it.
+  const sections = useMemo(
+    () =>
+      sources
+        .map(source => ({
+          ...source,
+          rows: visibleEntries.filter(entry => entry.connectionId === source.connectionId)
+        }))
+        .filter(section => section.rows.length > 0 || section.connectionId === primaryId),
+    [primaryId, sources, visibleEntries]
+  )
+
+  // Internally every source carries its real id, so a row's machine and its
+  // label can never drift. On the WIRE, a single-gateway install must still
+  // issue upstream's byte-identical ambient call — '' means "no override".
+  const scopeFor = (id?: null | string): string => (multiGateway ? ((id ?? '').trim() || primaryId) : '')
 
   // The shared Create/Rename dialogs own the createProfile / renameProfile /
   // updateProfileSoul calls; the panel just selects the resulting profile and
   // re-pulls the list.
   const selectAndRefresh = useCallback(
-    async (name: string) => {
-      setSelectedName(name)
+    async (connectionId: string, name: string) => {
+      setSelectedKey(agentKey(connectionId, name))
       await refresh()
     },
     [refresh]
   )
 
+  const menuFor = (entry: ProfileEntry): PanelMenuItem[] =>
+    entry.profile.is_default
+      ? // Renaming the default profile sets a presentation-only display name
+        // (the canonical id stays "default").
+        [{ icon: 'edit', label: p.renameMenu, onSelect: () => setPendingRename(entry) }]
+      : [
+          { icon: 'edit', label: p.renameMenu, onSelect: () => setPendingRename(entry) },
+          {
+            icon: 'trash',
+            label: t.common.delete,
+            onSelect: () => setPendingDelete(entry),
+            tone: 'danger'
+          }
+        ]
+
   return (
     <Panel closeLabel={p.close} onClose={onClose}>
-      {!profiles ? (
+      {!entries ? (
         <PageLoader label={p.loading} />
-      ) : profiles.length === 0 ? (
+      ) : entries.length === 0 ? (
         <PanelEmpty
           action={
-            <Button onClick={() => setCreateOpen(true)} size="sm">
+            <Button onClick={() => setCreateOn('')} size="sm">
               {p.newProfile}
             </Button>
           }
@@ -119,7 +236,7 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
         />
       ) : (
         <>
-          <PanelHeader subtitle={p.count(profiles.length)} title={p.title} />
+          <PanelHeader subtitle={p.count(entries.length)} title={p.title} />
           <PanelBody>
             <PanelList
               onSearchChange={setQuery}
@@ -127,34 +244,31 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
               searchPlaceholder={p.search}
               searchValue={query}
             >
-              {visibleProfiles.map(profile => (
-                <ProfileRow
-                  active={selected?.name === profile.name}
-                  key={profile.name}
-                  menuItems={
-                    profile.is_default
-                      ? // Renaming the default profile sets a presentation-only
-                        // display name (the canonical id stays "default").
-                        [{ icon: 'edit', label: p.renameMenu, onSelect: () => setPendingRename(profile) }]
-                      : [
-                          { icon: 'edit', label: p.renameMenu, onSelect: () => setPendingRename(profile) },
-                          {
-                            icon: 'trash',
-                            label: t.common.delete,
-                            onSelect: () => setPendingDelete(profile),
-                            tone: 'danger'
-                          }
-                        ]
-                  }
-                  onSelect={() => setSelectedName(profile.name)}
-                  profile={profile}
-                />
+              {sections.map(section => (
+                <Fragment key={section.connectionId}>
+                  {multiGateway && section.label ? <PanelSectionLabel>{section.label}</PanelSectionLabel> : null}
+                  {section.rows.map(entry => (
+                    <ProfileRow
+                      active={selected ? entryKey(selected) === entryKey(entry) : false}
+                      key={entryKey(entry)}
+                      menuItems={menuFor(entry)}
+                      onSelect={() => setSelectedKey(entryKey(entry))}
+                      profile={entry.profile}
+                    />
+                  ))}
+                  {/* Create lands on the machine whose section it sits in. */}
+                  <PanelAddButton label={p.newProfile} onClick={() => setCreateOn(section.connectionId)} />
+                </Fragment>
               ))}
-              <PanelAddButton label={p.newProfile} onClick={() => setCreateOpen(true)} />
             </PanelList>
 
             {selected ? (
-              <ProfileDetail key={selected.name} profile={selected} />
+              <ProfileDetail
+                connectionId={scopeFor(selected.connectionId)}
+                connectionLabel={multiGateway ? selected.connectionLabel : ''}
+                key={entryKey(selected)}
+                profile={selected.profile}
+              />
             ) : (
               <PanelEmpty description={p.selectPrompt} icon="account" />
             )}
@@ -163,28 +277,31 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
       )}
 
       <RenameProfileDialog
-        currentName={pendingRename?.name ?? ''}
-        isDefault={pendingRename?.is_default ?? false}
+        connectionId={scopeFor(pendingRename?.connectionId)}
+        currentName={pendingRename?.profile.name ?? ''}
+        isDefault={pendingRename?.profile.is_default ?? false}
         onClose={() => setPendingRename(null)}
-        onRenamed={selectAndRefresh}
+        onRenamed={name => selectAndRefresh(pendingRename?.connectionId ?? primaryId, name)}
         open={pendingRename !== null}
       />
 
       <CreateProfileDialog
-        onClose={() => setCreateOpen(false)}
-        onCreated={selectAndRefresh}
-        open={createOpen}
-        profiles={profiles ?? []}
+        connectionId={scopeFor(createOn)}
+        onClose={() => setCreateOn(null)}
+        onCreated={name => selectAndRefresh(createOn ?? primaryId, name)}
+        open={createOn !== null}
+        profiles={(entries ?? []).filter(entry => entry.connectionId === (createOn ?? primaryId)).map(entry => entry.profile)}
       />
 
       <DeleteProfileDialog
+        connectionId={scopeFor(pendingDelete?.connectionId)}
         onClose={() => setPendingDelete(null)}
         onDeleted={async () => {
-          setSelectedName(null)
+          setSelectedKey(null)
           await refresh()
         }}
         open={pendingDelete !== null}
-        profile={pendingDelete}
+        profile={pendingDelete?.profile ?? null}
       />
     </Panel>
   )
@@ -223,7 +340,16 @@ function ProfileRow({
   )
 }
 
-function ProfileDetail({ profile }: { profile: ProfileInfo }) {
+function ProfileDetail({
+  connectionId,
+  connectionLabel,
+  profile
+}: {
+  connectionId: string
+  /** '' on a single-gateway install, which renders exactly as upstream. */
+  connectionLabel: string
+  profile: ProfileInfo
+}) {
   const { t } = useI18n()
   const p = t.profiles
 
@@ -235,6 +361,10 @@ function ProfileDetail({ profile }: { profile: ProfileInfo }) {
             <h3 className="text-[0.95rem] font-semibold tracking-tight text-foreground">{profileLabel(profile)}</h3>
             {profile.is_default && <PanelPill tone="good">{p.defaultBadge}</PanelPill>}
             {profile.has_env && <PanelPill tone="muted">.env</PanelPill>}
+            {/* Which machine this profile lives on — the path below is a path
+                on THAT box, and two gateways' `default` are otherwise
+                indistinguishable here. */}
+            {connectionLabel ? <PanelPill tone="muted">{connectionLabel}</PanelPill> : null}
           </div>
           <p
             className="mt-1 truncate font-mono text-[0.66rem] text-muted-foreground/55"
@@ -262,12 +392,12 @@ function ProfileDetail({ profile }: { profile: ProfileInfo }) {
         />
       </header>
 
-      <SoulEditor profileName={profile.name} />
+      <SoulEditor connectionId={connectionId} profileName={profile.name} />
     </PanelDetail>
   )
 }
 
-function SoulEditor({ profileName }: { profileName: string }) {
+function SoulEditor({ connectionId, profileName }: { connectionId: string; profileName: string }) {
   const { t } = useI18n()
   const p = t.profiles
   const [content, setContent] = useState('')
@@ -287,7 +417,7 @@ function SoulEditor({ profileName }: { profileName: string }) {
 
     void (async () => {
       try {
-        const soul = await getProfileSoul(profileName)
+        const soul = await getProfileSoul(profileName, connectionId)
 
         if (requestRef.current === profileName) {
           setContent(soul.content)
@@ -303,7 +433,7 @@ function SoulEditor({ profileName }: { profileName: string }) {
         }
       }
     })()
-  }, [p, profileName])
+  }, [connectionId, p, profileName])
 
   const dirty = content !== original
 
@@ -312,7 +442,7 @@ function SoulEditor({ profileName }: { profileName: string }) {
     setError(null)
 
     try {
-      await updateProfileSoul(profileName, content)
+      await updateProfileSoul(profileName, content, connectionId)
       setOriginal(content)
       notify({ kind: 'success', title: p.soulSaved, message: profileName })
     } catch (err) {

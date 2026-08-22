@@ -210,21 +210,32 @@ export function requestFreshSession(): void {
 // get "default" (→ the primary backend) with no extra fetches.
 let _lastRoutedProfile: string | null = null
 
+/** Drop everything scoped to the backend we were just routed to.
+ *
+ *  Extracted so the CONNECTION change can reuse it. These caches
+ *  are per-backend, but the only trigger used to be a change of profile NAME,
+ *  and two registered machines both serve a `default` — so hopping gateways
+ *  invalidated nothing and every settings surface kept showing the previous
+ *  machine's data. */
+export function invalidateProfileRoutedCaches(): void {
+  invalidateCronModelImpactScopeState()
+  // Profile-scoped settings + the unified session list are now stale.
+  // Narrowed so account/marketplace/onboarding caches don't refetch on
+  // every profile switch.
+  invalidateProfileScopedQueries()
+  resetStarmapGraph()
+  // /api/profiles now routes to a different backend: strand any in-flight
+  // profile-list fetch so the previous backend's late answer can't clobber
+  // the rail (the #85731 class — same guard as the connection-apply wipe).
+  invalidateProfileListFetches()
+}
+
 $activeGatewayProfile.subscribe(value => {
   const key = normalizeProfileKey(value)
   setApiRequestProfile(key)
 
   if (_lastRoutedProfile !== null && _lastRoutedProfile !== key) {
-    invalidateCronModelImpactScopeState()
-    // Profile-scoped settings + the unified session list are now stale.
-    // Narrowed so account/marketplace/onboarding caches don't refetch on
-    // every profile switch.
-    invalidateProfileScopedQueries()
-    resetStarmapGraph()
-    // /api/profiles now routes to a different backend: strand any in-flight
-    // profile-list fetch so the previous backend's late answer can't clobber
-    // the rail (the #85731 class — same guard as the connection-apply wipe).
-    invalidateProfileListFetches()
+    invalidateProfileRoutedCaches()
   }
 
   _lastRoutedProfile = key

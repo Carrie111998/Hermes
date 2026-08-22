@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, expect, it, vi } from 'vitest'
 
 import { renameProfile } from '@/hermes'
-import { retireLocalProfileGateways } from '@/store/gateway'
+import { retireAgentGateways } from '@/store/gateway'
 
 import { RenameProfileDialog } from './rename-profile-dialog'
 
@@ -22,13 +22,13 @@ vi.mock('@/hermes', () => ({
 }))
 
 vi.mock('@/store/gateway', () => ({
-  retireLocalProfileGateways: vi.fn()
+  retireAgentGateways: vi.fn()
 }))
 
 it('retires the old-name local gateways before issuing the rename', async () => {
   const order: string[] = []
 
-  vi.mocked(retireLocalProfileGateways).mockImplementationOnce(() => {
+  vi.mocked(retireAgentGateways).mockImplementationOnce(() => {
     order.push('retire')
   })
   vi.mocked(renameProfile).mockImplementationOnce(async () => {
@@ -43,7 +43,10 @@ it('retires the old-name local gateways before issuing the rename', async () => 
   fireEvent.click(screen.getByRole('button', { name: /^rename$/i }))
 
   await waitFor(() => expect(renameProfile).toHaveBeenCalledWith('selena', 'renamed'))
-  expect(retireLocalProfileGateways).toHaveBeenCalledWith('selena')
+  // Owner-scoped: null is "the legacy/primary-route pool", which is what an
+  // un-scoped dialog (single gateway) means. A registry row passes its own id
+  // so the same-named profile on another machine is left alone (#88638).
+  expect(retireAgentGateways).toHaveBeenCalledWith(null, 'selena')
   expect(order).toEqual(['retire', 'rename'])
 })
 
@@ -54,6 +57,20 @@ it('does not retire gateways when validation rejects the submit', async () => {
   fireEvent.click(screen.getByRole('button', { name: /^rename$/i }))
 
   await waitFor(() => expect(screen.getByText('Name is required.')).toBeTruthy())
-  expect(retireLocalProfileGateways).not.toHaveBeenCalled()
+  expect(retireAgentGateways).not.toHaveBeenCalled()
   expect(renameProfile).not.toHaveBeenCalled()
+})
+
+
+it('retires the OWNING machine\'s gateways when the row belongs to another connection', async () => {
+  render(<RenameProfileDialog connectionId="mechahome-hermes-dell" currentName="selena" onClose={vi.fn()} open />)
+
+  fireEvent.change(screen.getByLabelText(/new name/i), { target: { value: 'renamed' } })
+  fireEvent.click(screen.getByRole('button', { name: /^rename$/i }))
+
+  await waitFor(() => expect(renameProfile).toHaveBeenCalledWith('selena', 'renamed', 'mechahome-hermes-dell'))
+
+  // The local-only seam would have retired the LOCAL `selena`'s sockets while
+  // renaming the Dell's — tearing down a machine the row does not own.
+  expect(retireAgentGateways).toHaveBeenCalledWith('mechahome-hermes-dell', 'selena')
 })

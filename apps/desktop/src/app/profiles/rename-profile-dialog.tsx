@@ -16,7 +16,7 @@ import { renameProfile } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { AlertTriangle } from '@/lib/icons'
 import { slug } from '@/lib/sanitize'
-import { retireLocalProfileGateways } from '@/store/gateway'
+import { retireAgentGateways } from '@/store/gateway'
 
 import { isValidProfileName } from './create-profile-dialog'
 
@@ -26,12 +26,18 @@ const identity = (raw: string) => raw
 // Self-contained rename (owns the renameProfile call) so every caller just
 // reacts via onRenamed. Unchanged name is a no-op close.
 export function RenameProfileDialog({
+  connectionId,
   currentName,
   isDefault = false,
   onClose,
   onRenamed,
   open
 }: {
+  /** The machine that owns this profile.
+   *  Manage Profiles lists every registered gateway's profiles, so an action
+   *  has to run on the box the row came from. Omitted / '' = the primary, so
+   *  single-gateway callers are unchanged. */
+  connectionId?: null | string
   currentName: string
   /** Default profile: sets a presentation-only display name (Unicode ok);
    *  the canonical id stays "default" and no backend teardown is needed. */
@@ -86,10 +92,17 @@ export function RenameProfileDialog({
       // old-name backend whose ensure_hermes_home() recreates the directory
       // the rename just moved (same class as the delete path, #88638).
       if (!isDefault) {
-        retireLocalProfileGateways(currentName)
+        // Scoped to the agent being renamed. The local-only seam retires the
+        // bare and `local::` scopes, so renaming a secondary's profile used to
+        // tear down the same-named LOCAL one and leave the secondary's own
+        // socket redialing the old name (#88638).
+        retireAgentGateways(connectionId ?? null, currentName)
       }
 
-      await renameProfile(currentName, trimmed)
+      // Pass the owning machine ONLY when there is one, so a
+      // single-gateway install issues the byte-identical upstream call.
+      const scope: [] | [string] = connectionId ? [connectionId] : []
+      await renameProfile(currentName, trimmed, ...scope)
       await onRenamed?.(trimmed)
       setStatus('done')
       window.setTimeout(onClose, 800)

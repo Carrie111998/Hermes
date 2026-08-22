@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { memo } from 'react'
 import type * as React from 'react'
 
+import { GatewayTag } from '@/app/chat/gateway-tag'
 import { PrTag } from '@/app/chat/pr-tag'
 import { ProfileTag } from '@/app/chat/profile-tag'
 import { startSessionDrag } from '@/app/chat/session-drag'
@@ -24,6 +25,7 @@ import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
+import { sessionConnectionId } from '@/store/gateway-separation'
 import { $sidebarRowMeta } from '@/store/layout'
 import { normalizeProfileKey } from '@/store/profile'
 import { $projects } from '@/store/projects'
@@ -202,6 +204,12 @@ function SidebarSessionRowImpl({
   if ((showProfile || pinnedProfile) && hasProfileTag) {
     trailing.push({ key: 'profile', node: <ProfileTag profile={session.profile} /> })
   }
+
+  // Name the machine. Upstream decides the profile chip from the
+  // profile NAME, so a remote gateway's `default` gets no chip at all and reads
+  // as a local row. GatewayTag renders itself away unless two or more
+  // connections are registered, so this is inert on single-gateway installs.
+  trailing.push({ key: 'gateway', node: <GatewayTag connectionId={sessionConnectionId(session)} /> })
 
   if (pr) {
     trailing.push({ key: 'pr', node: <PrTag pr={pr} /> })

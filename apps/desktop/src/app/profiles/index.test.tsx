@@ -1,9 +1,10 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { atom } from 'nanostores'
 import type * as Nanostores from 'nanostores'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { deleteProfile } from '@/hermes'
-import { retireLocalProfileGateways } from '@/store/gateway'
+import { deleteProfile, getProfiles } from '@/hermes'
+import { activeGatewayConnectionId, retireAgentGateways } from '@/store/gateway'
 import { refreshProfiles, selectProfile, setActiveProfile } from '@/store/profile'
 import type { ProfileInfo } from '@/types/hermes'
 
@@ -29,6 +30,7 @@ vi.mock('@/components/chat/code-editor', () => ({
 
 vi.mock('@/hermes', () => ({
   createProfile: vi.fn(async () => ({ name: 'x', ok: true, path: '/x' })),
+  getProfiles: vi.fn(async () => ({ profiles: [] })),
   deleteProfile: vi.fn(async () => ({ ok: true, path: '/x' })),
   getProfileSoul: vi.fn(async () => ({ content: '', exists: true })),
   renameProfile: vi.fn(async () => ({ name: 'x', ok: true, path: '/x' })),
@@ -41,7 +43,14 @@ vi.mock('@/store/notifications', () => ({
 }))
 
 vi.mock('@/store/gateway', () => ({
-  retireLocalProfileGateways: vi.fn()
+  // Owner-scoped retirement: the local-only seam would tear down a same-named
+  // LOCAL profile when the row being deleted belongs to another machine.
+  retireAgentGateways: vi.fn(),
+  retireLocalProfileGateways: vi.fn(),
+  // Manage Profiles now lists every registered gateway, so it pulls in
+  // store/gateway-separation, which mirrors the live gateway's connection.
+  $gateway: atom<unknown>(null),
+  activeGatewayConnectionId: vi.fn(() => null)
 }))
 
 const { $activeGatewayProfile: activeGateway, $profileColors } = vi.hoisted(() => {
@@ -134,10 +143,10 @@ describe('ProfilesView', () => {
 
   it('re-homes to default when the active profile is deleted', async () => {
     const deleteProfileMock = vi.mocked(deleteProfile)
-    const retireLocalProfileGatewaysMock = vi.mocked(retireLocalProfileGateways)
+    const retireMock = vi.mocked(retireAgentGateways)
 
     deleteProfileMock.mockClear()
-    retireLocalProfileGatewaysMock.mockClear()
+    retireMock.mockClear()
     vi.mocked(refreshProfiles).mockResolvedValue([makeProfile('default', true), makeProfile(NAMED_PROFILE)])
     activeGateway.set(NAMED_PROFILE)
 
@@ -145,10 +154,10 @@ describe('ProfilesView', () => {
     await deleteTheNamedProfile()
 
     await waitFor(() => expect(deleteProfile).toHaveBeenCalledWith(NAMED_PROFILE))
-    expect(retireLocalProfileGateways).toHaveBeenCalledWith(NAMED_PROFILE)
-    expect(retireLocalProfileGatewaysMock.mock.invocationCallOrder[0]).toBeLessThan(
-      deleteProfileMock.mock.invocationCallOrder[0]
-    )
+    // Retirement is addressed to the OWNING agent. '' is "no override" — a
+    // single-gateway install, where the wire call stays byte-identical.
+    expect(retireAgentGateways).toHaveBeenCalledWith('', NAMED_PROFILE)
+    expect(retireMock.mock.invocationCallOrder[0]).toBeLessThan(deleteProfileMock.mock.invocationCallOrder[0])
     await waitFor(() => expect(selectProfile).toHaveBeenCalledWith('default'))
     expect(setActiveProfile).toHaveBeenCalledWith('default')
   })
@@ -165,6 +174,98 @@ describe('ProfilesView', () => {
     await waitFor(() => expect(deleteProfile).toHaveBeenCalledWith(NAMED_PROFILE))
     // The dialog closes once the delete settles; a non-active delete must not re-home.
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Delete' })).toBeNull())
+    expect(selectProfile).not.toHaveBeenCalled()
+    expect(setActiveProfile).not.toHaveBeenCalled()
+  })
+})
+
+
+// ── ownership across machines ──────────────────────────────────────────────
+// Both gateways serve `default` AND an overlapping named profile. Without that
+// overlap a bare name is still unambiguous and none of this can go wrong.
+const HP = '192-168-1-218-9119'
+const DELL = 'mechahome-hermes-dell'
+
+function installTwoGatewayRegistry() {
+  ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = {
+    connections: {
+      list: vi.fn(async () => ({
+        primary: HP,
+        connections: [
+          { id: 'local', kind: 'local', label: 'This device' },
+          { id: HP, kind: 'remote', label: 'Mecha Hermes (HP)' },
+          { id: DELL, kind: 'remote', label: 'MechaHome Hermes (Dell)' }
+        ]
+      }))
+    },
+    getAgentRoster: vi.fn(async () => ({
+      sources: [
+        { connectionId: HP, reachable: true },
+        { connectionId: DELL, reachable: true }
+      ],
+      agents: [
+        { connectionId: HP, connectionLabel: 'Mecha Hermes (HP)', handle: 'work', profile: NAMED_PROFILE },
+        { connectionId: DELL, connectionLabel: 'MechaHome Hermes (Dell)', handle: 'work-dell', profile: NAMED_PROFILE }
+      ]
+    }))
+  }
+}
+
+describe('ProfilesView across registered gateways', () => {
+  it('addresses the PRIMARY by its registry id while the live gateway is elsewhere', async () => {
+    const { refreshGatewaySeparation } = await import('@/store/gateway-separation')
+
+    installTwoGatewayRegistry()
+    // The live gateway is the Dell — the ambient connection every un-scoped
+    // request would follow.
+    vi.mocked(activeGatewayConnectionId).mockReturnValue(DELL)
+    vi.mocked(getProfiles).mockResolvedValue({ profiles: [makeProfile('default', true)] })
+
+    await act(async () => {
+      await refreshGatewaySeparation()
+    })
+    await renderProfilesView()
+
+    const targets = vi.mocked(getProfiles).mock.calls.map(call => call[0])
+
+    // The section labelled with the primary's name must READ the primary. An
+    // omitted id means "ambient", which while attached to the Dell made the
+    // primary-labelled section list the Dell's profiles instead.
+    expect(targets).toContain(HP)
+    expect(targets).toContain(DELL)
+    expect(targets).not.toContain('')
+    expect(targets).not.toContain(undefined)
+  })
+
+  it('never re-homes when the deleted profile is a DIFFERENT machine\'s same-named one', async () => {
+    const { refreshGatewaySeparation } = await import('@/store/gateway-separation')
+
+    installTwoGatewayRegistry()
+    vi.mocked(activeGatewayConnectionId).mockReturnValue(HP)
+    vi.mocked(selectProfile).mockClear()
+    vi.mocked(setActiveProfile).mockClear()
+    vi.mocked(retireAgentGateways).mockClear()
+    // The live agent is work@HP. The row we delete is work@DELL — same name,
+    // different machine.
+    activeGateway.set(NAMED_PROFILE)
+    vi.mocked(getProfiles).mockImplementation(async (connectionId?: null | string) =>
+      connectionId === DELL ? { profiles: [makeProfile(NAMED_PROFILE)] } : { profiles: [makeProfile('default', true)] }
+    )
+
+    await act(async () => {
+      await refreshGatewaySeparation()
+    })
+    await renderProfilesView()
+    await deleteTheNamedProfile()
+
+    await waitFor(() => expect(deleteProfile).toHaveBeenCalledWith(NAMED_PROFILE, DELL))
+
+    // Retirement is scoped to the DELL's agent. Routing it through the
+    // local-only seam would have torn down work@HP's sockets instead (#88638).
+    expect(retireAgentGateways).toHaveBeenCalledWith(DELL, NAMED_PROFILE)
+
+    // And the live route is untouched: deciding "was it active?" by profile
+    // NAME alone reset an innocent machine's gateway and pill to `default`.
     expect(selectProfile).not.toHaveBeenCalled()
     expect(setActiveProfile).not.toHaveBeenCalled()
   })
