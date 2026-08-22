@@ -420,7 +420,66 @@ class TestStreamingAccumulator:
         assert tool_calls[0]["function"]["name"] == "search"
         assert tool_calls[0]["function"]["arguments"] == '{"q":"hello"}'
 
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_tool_call_argument_assembly_is_chunk_boundary_invariant(self, mock_close, mock_create):
+        """Assembled arguments are byte-identical regardless of chunk boundaries.
 
+        Buffering fragments in a list and joining once (#92207) only pays off
+        if the join is boundary-invariant: the same JSON payload split into a
+        single chunk, many equal-size chunks, and odd/prime-size chunks (which
+        can split a multi-byte UTF-8 character across a boundary) must all
+        assemble to the exact same string.
+        """
+        import json
+
+        from run_agent import AIAgent
+
+        payload = json.dumps({"path": "/tmp/x", "content": "héllo wörld 日本語 " * 500})
+
+        def assemble(fragment_size):
+            fragments = [
+                payload[i : i + fragment_size]
+                for i in range(0, len(payload), fragment_size)
+            ] or [payload]
+
+            chunks = [
+                _make_stream_chunk(tool_calls=[
+                    _make_tool_call_delta(index=0, tc_id="call_x", name="write_file", arguments=fragments[0])
+                ]),
+            ]
+            chunks += [
+                _make_stream_chunk(tool_calls=[
+                    _make_tool_call_delta(index=0, arguments=frag)
+                ])
+                for frag in fragments[1:]
+            ]
+            chunks.append(_make_stream_chunk(finish_reason="tool_calls"))
+
+            mock_client = MagicMock()
+            mock_client.chat.completions.create.return_value = iter(chunks)
+            mock_create.return_value = mock_client
+
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            agent.api_mode = "chat_completions"
+            agent._interrupt_requested = False
+
+            response = agent._interruptible_streaming_api_call({})
+            return response.choices[0].message.tool_calls[0].function.arguments
+
+        # A single chunk, evenly-sized chunks, and prime-sized chunks (to
+        # cross multi-byte UTF-8 characters at arbitrary offsets).
+        results = {size: assemble(size) for size in (len(payload), 64, 7, 3, 1)}
+
+        for size, arguments in results.items():
+            assert arguments == payload, f"assembly diverged at fragment size {size}"
 
 
 
