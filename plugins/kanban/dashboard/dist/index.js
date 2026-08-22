@@ -2495,20 +2495,21 @@
         tx(t, "lanesByProfile", "Lanes by profile"),
       ),
       h("div", { className: "flex flex-col gap-1",
-                 title: "Wide: all columns in one horizontal row (scroll/pan sideways). Wrapped: columns wrap to rows that fit the window — no horizontal scrolling, page scrolls vertically." },
+                 title: tx(t, "boardViewTitle",
+                   "Wide: all columns in one horizontal row (scroll/pan sideways). Wrapped: columns wrap to rows that fit the window — no horizontal scrolling, page scrolls vertically.") },
         h(Label, { className: "text-xs text-muted-foreground" }, tx(t, "boardView", "Board view")),
         h("div", { className: "flex items-center gap-1" },
           h(Button, {
             size: "sm",
             variant: props.boardView === "wide" ? "default" : "outline",
             onClick: function () { props.setBoardView("wide"); writeBoardView("wide"); },
-            title: "One horizontal row; pan or scroll sideways.",
+            title: tx(t, "viewWideTitle", "One horizontal row; pan or scroll sideways."),
           }, tx(t, "viewWide", "Wide")),
           h(Button, {
             size: "sm",
             variant: props.boardView === "wrapped" ? "default" : "outline",
             onClick: function () { props.setBoardView("wrapped"); writeBoardView("wrapped"); },
-            title: "Columns wrap to rows; no horizontal scrolling.",
+            title: tx(t, "viewWrappedTitle", "Columns wrap to rows; no horizontal scrolling."),
           }, tx(t, "viewWrapped", "Wrapped")),
         ),
       ),
@@ -2821,7 +2822,7 @@
         window.removeEventListener("blur", onMouseUp);
       };
       e.preventDefault();
-    }, [isPanBlockedTarget, stopPan]);
+    }, [isPanBlockedTarget, stopPan, props.view]);
 
     const handleDragStart = useCallback(function (e) {
       const card = e.target.closest && e.target.closest(".hermes-kanban-card");
