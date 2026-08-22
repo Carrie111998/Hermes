@@ -162,6 +162,46 @@ from an isolated `HERMES_HOME`. Those tests load and invoke the plugin through
 `PluginManager`; they assert real registration and callback outcomes rather
 than internal symbol lists or source-code shape.
 
+### Observe and resolve live user interactions
+
+Trusted backend plugins can use `ctx.pending_interactions` to observe an exact
+approval or clarification after Hermes has registered its native request:
+
+```python
+from agent.pending_interactions import PendingInteractionResponse
+
+def register(ctx):
+    def on_interaction(event):
+        if event.event != "pending_interaction.registered":
+            return
+        # Store event.target in process memory and present the bounded metadata.
+
+    unsubscribe = ctx.pending_interactions.subscribe(on_interaction)
+    # Hermes also removes this subscription automatically when the plugin unloads.
+```
+
+To answer the same request, pass its immutable target back unchanged:
+
+```python
+result = ctx.pending_interactions.resolve(
+    target,
+    PendingInteractionResponse(kind="answer", value="staging"),
+)
+```
+
+Approvals use one of the explicit choices carried in event metadata (`once`,
+`session`, `always`, or `deny` as permitted by that request); omitting or
+inventing a choice returns `invalid_response`. Clarification uses `answer` or
+`cancel`. Resolution results include `accepted`, `already_resolved`,
+`process_mismatch`, `policy_denied`, `invalid_response`, and `not_found`.
+
+Targets are profile- and process-bound and include the runtime session, native
+request id, interaction type, and optional batch question id. Events never
+contain answer text, secrets, or raw approval commands. Subscription does not
+attach or replace a TUI/Desktop transport, resume a session, receive transcript
+streams, or keep the session alive. Subscriber exceptions are isolated from the
+agent, and no chat-completion event is emitted by this service.
+
 ## What you're building
 
 A **calculator** plugin with two tools:

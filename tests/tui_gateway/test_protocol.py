@@ -216,6 +216,135 @@ def test_live_session_payload_replays_pending_approval(server, monkeypatch):
     assert replayed == first
 
 
+def test_approval_respond_requires_explicit_choice(server, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_sess",
+        lambda _params, _rid: ({"session_key": "stored-session"}, None),
+    )
+    response = server.handle_request(
+        {
+            "id": "missing-choice",
+            "method": "approval.respond",
+            "params": {"session_id": "ui-1", "request_id": "req-1"},
+        }
+    )
+
+    assert response["error"]["code"] == 4002
+    assert response["error"]["message"] == "explicit approval choice required"
+
+
+def test_clarify_block_registers_exact_target_without_replacing_transport(
+    server, monkeypatch
+):
+    from agent.pending_interactions import (
+        PendingInteractionResponse,
+        get_pending_interaction_service,
+    )
+
+    emitted = []
+    registered = []
+    ready = threading.Event()
+    transport = object()
+    server._sessions["observer-session"] = {"transport": transport}
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload: emitted.append((event, sid, dict(payload))),
+    )
+    service = get_pending_interaction_service()
+
+    def observe(event):
+        if (
+            event.event == "pending_interaction.registered"
+            and event.target.runtime_session_id == "observer-session"
+        ):
+            registered.append(event)
+            ready.set()
+
+    unsubscribe = service.subscribe(observe)
+    result = []
+    thread = threading.Thread(
+        target=lambda: result.append(
+            server._block(
+                "clarify.request",
+                "observer-session",
+                {"question": "Deploy?"},
+                timeout=2,
+            )
+        )
+    )
+    try:
+        thread.start()
+        assert ready.wait(2)
+        target = registered[0].target
+        assert emitted[0][2]["request_id"] == target.request_id
+        assert server._sessions["observer-session"]["transport"] is transport
+        assert service.resolve(
+            target,
+            PendingInteractionResponse("answer", "staging", resolved_by="test-plugin"),
+        ).status == "accepted"
+        thread.join(2)
+        assert result == ["staging"]
+    finally:
+        unsubscribe()
+        server._sessions.pop("observer-session", None)
+        thread.join(2)
+
+
+def test_batch_clarify_registers_one_target_per_question(server, monkeypatch):
+    from agent.pending_interactions import (
+        PendingInteractionResponse,
+        get_pending_interaction_service,
+    )
+
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    service = get_pending_interaction_service()
+    targets = []
+    ready = threading.Event()
+
+    def observe(event):
+        if (
+            event.event == "pending_interaction.registered"
+            and event.target.runtime_session_id == "batch-observer-session"
+        ):
+            targets.append(event.target)
+            if len(targets) == 2:
+                ready.set()
+
+    unsubscribe = service.subscribe(observe)
+    result = []
+    thread = threading.Thread(
+        target=lambda: result.append(
+            server._block(
+                "clarify.request",
+                "batch-observer-session",
+                {"questions": []},
+                timeout=2,
+                batch_qids=["environment", "region"],
+            )
+        )
+    )
+    try:
+        thread.start()
+        assert ready.wait(2)
+        assert {target.question_id for target in targets} == {"environment", "region"}
+        assert len({target.request_id for target in targets}) == 1
+        for target in targets:
+            value = "staging" if target.question_id == "environment" else "us-east"
+            assert service.resolve(
+                target, PendingInteractionResponse("answer", value)
+            ).status == "accepted"
+        thread.join(2)
+        payload = json.loads(result[0])
+        assert payload == {
+            "answers": {"environment": "staging", "region": "us-east"}
+        }
+    finally:
+        unsubscribe()
+        thread.join(2)
+
+
 def test_live_session_payload_replays_pending_clarify(server):
     """A reattached client also receives a clarify question emitted while detached."""
     session = {

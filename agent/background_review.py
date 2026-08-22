@@ -1523,13 +1523,16 @@ def spawn_background_review_thread(
         )
 
     def _target() -> None:
-        _run_review_in_thread(
-            agent,
-            messages_snapshot,
-            prompt,
-            task_cfg=task_cfg,
-            review_run=review_run,
-        )
+        from agent.pending_interactions import pending_interaction_source
+
+        with pending_interaction_source("background_review"):
+            _run_review_in_thread(
+                agent,
+                messages_snapshot,
+                prompt,
+                task_cfg=task_cfg,
+                review_run=review_run,
+            )
 
     return _target, prompt
 

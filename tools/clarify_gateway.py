@@ -55,6 +55,7 @@ class _ClarifyEntry:
     event: threading.Event = field(default_factory=threading.Event)
     response: Optional[str] = None
     awaiting_text: bool = False  # set when user picked "Other" or clarify is open-ended
+    pending_interaction_target: object = None
 
     def signature(self) -> Dict[str, object]:
         return {
@@ -99,8 +100,50 @@ def register(
         awaiting_text=not bool(choices),
     )
     with _lock:
+        previous = _entries.get(clarify_id)
         _entries[clarify_id] = entry
         _session_index.setdefault(session_key, []).append(clarify_id)
+    if previous is not None and previous.pending_interaction_target is not None:
+        from agent.pending_interactions import get_pending_interaction_service
+
+        get_pending_interaction_service().terminal(
+            previous.pending_interaction_target, "cancelled"
+        )
+    from agent.pending_interactions import (
+        PendingInteractionResponse,
+        current_interaction_metadata,
+        get_pending_interaction_service,
+    )
+
+    def _resolve(response: PendingInteractionResponse) -> bool:
+        with _lock:
+            current = _entries.get(clarify_id)
+            if current is not entry or entry.event.is_set():
+                return False
+            entry.response = str(response.value) if response.value is not None else ""
+            entry.event.set()
+            return True
+
+    def _valid(response: PendingInteractionResponse) -> bool:
+        if response.kind == "cancel":
+            return response.value in (None, "")
+        if response.kind != "answer" or not isinstance(response.value, str):
+            return False
+        if not entry.choices or entry.awaiting_text:
+            return True
+        return _coerce_text_response(entry, response.value) is not None
+
+    entry.pending_interaction_target = get_pending_interaction_service().register(
+        runtime_session_id=session_key,
+        request_id=clarify_id,
+        interaction_type="clarify",
+        resolver=_resolve,
+        validator=_valid,
+        metadata={
+            **current_interaction_metadata(surface="gateway"),
+            "multi_select": entry.multi_select,
+        },
+    )
     return entry
 
 
@@ -154,6 +197,14 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
             if not ids:
                 _session_index.pop(entry.session_key, None)
 
+    if entry.pending_interaction_target is not None:
+        from agent.pending_interactions import get_pending_interaction_service
+
+        get_pending_interaction_service().terminal(
+            entry.pending_interaction_target,
+            "resolved" if entry.event.is_set() else "expired",
+        )
+
     return entry.response
 
 
@@ -171,9 +222,26 @@ def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
         entry = _entries.get(clarify_id)
         if entry is None or entry.event.is_set():
             return False
-        entry.response = str(response) if response is not None else ""
-        entry.event.set()
-        return True
+        target = entry.pending_interaction_target
+    if target is None:
+        with _lock:
+            entry.response = str(response) if response is not None else ""
+            entry.event.set()
+            return True
+    from agent.pending_interactions import (
+        PendingInteractionResponse,
+        get_pending_interaction_service,
+    )
+
+    result = get_pending_interaction_service().resolve(
+        target,
+        PendingInteractionResponse(
+            kind="cancel" if response in (None, "") else "answer",
+            value=response,
+            resolved_by="native_ui",
+        ),
+    )
+    return result.status == "accepted"
 
 
 def get_pending_for_session(
@@ -521,6 +589,13 @@ def clear_session(session_key: str) -> int:
             entry.response = ""
             entry.event.set()
             cancelled += 1
+    from agent.pending_interactions import get_pending_interaction_service
+
+    for entry in entries:
+        if entry is not None and entry.pending_interaction_target is not None:
+            get_pending_interaction_service().terminal(
+                entry.pending_interaction_target, "cancelled"
+            )
     return cancelled
 
 

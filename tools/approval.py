@@ -2588,7 +2588,10 @@ def _denial_breaker_addendum(session_key: str) -> str:
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason", "acknowledged")
+    __slots__ = (
+        "event", "data", "result", "reason", "acknowledged",
+        "pending_interaction_target",
+    )
 
     def __init__(self, data: dict):
         self.event = threading.Event()
@@ -2596,6 +2599,7 @@ class _ApprovalEntry:
         self.data.setdefault("request_id", uuid.uuid4().hex)
         self.acknowledged = False
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
+        self.pending_interaction_target = None
         # Optional free-text reason supplied with an explicit deny
         # (``/deny <reason>``) so the agent can adapt instead of only
         # hearing "denied". Ported from qwibitai/nanoclaw#2832.
@@ -2629,6 +2633,65 @@ def unregister_gateway_notify(session_key: str) -> None:
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
         entry.event.set()
+        if entry.pending_interaction_target is not None:
+            from agent.pending_interactions import get_pending_interaction_service
+
+            get_pending_interaction_service().terminal(
+                entry.pending_interaction_target, "cancelled"
+            )
+
+
+def _native_approval_choices(data: dict) -> tuple[str, ...]:
+    choices = data.get("choices")
+    if isinstance(choices, (list, tuple)):
+        return tuple(str(choice) for choice in choices)
+    if data.get("smart_denied"):
+        return ("once", "deny")
+    if data.get("allow_permanent") is False:
+        return ("once", "session", "deny")
+    return ("once", "session", "always", "deny")
+
+
+def _register_pending_approval(session_key: str, entry: _ApprovalEntry, surface: str) -> None:
+    from agent.pending_interactions import (
+        PendingInteractionResponse,
+        current_interaction_metadata,
+        get_pending_interaction_service,
+    )
+
+    choices = _native_approval_choices(entry.data)
+
+    def _resolve(response: PendingInteractionResponse) -> bool:
+        with _lock:
+            queue = _gateway_queues.get(session_key, [])
+            if entry not in queue or entry.event.is_set():
+                return False
+            queue.remove(entry)
+            if not queue:
+                _gateway_queues.pop(session_key, None)
+            entry.result = response.kind
+            if response.kind == "deny" and response.value:
+                entry.reason = str(response.value)[:500]
+            entry.event.set()
+            return True
+
+    entry.pending_interaction_target = get_pending_interaction_service().register(
+        runtime_session_id=session_key,
+        request_id=str(entry.data["request_id"]),
+        interaction_type="approval",
+        resolver=_resolve,
+        validator=lambda response: (
+            response.kind in choices
+            and (
+                response.value in (None, "")
+                or (response.kind == "deny" and isinstance(response.value, str))
+            )
+        ),
+        metadata={
+            **current_interaction_metadata(surface=surface),
+            "choices": choices,
+        },
+    )
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
@@ -2656,21 +2719,42 @@ def resolve_gateway_approval(session_key: str, choice: str,
             targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
             if not targets:
                 return 0
-            queue[:] = [entry for entry in queue if entry not in targets]
         elif resolve_all:
             targets = list(queue)
-            queue.clear()
         else:
-            targets = [queue.pop(0)]
-        if not queue:
-            _gateway_queues.pop(session_key, None)
+            targets = [queue[0]]
 
+    resolved = 0
     for entry in targets:
-        entry.result = choice
-        if reason:
-            entry.reason = reason
-        entry.event.set()
-    return len(targets)
+        target = entry.pending_interaction_target
+        if target is None:  # Backward-compatible synthetic entries in integrations/tests.
+            with _lock:
+                queue = _gateway_queues.get(session_key, [])
+                if entry not in queue:
+                    continue
+                queue.remove(entry)
+                if not queue:
+                    _gateway_queues.pop(session_key, None)
+                entry.result = choice
+                entry.reason = reason
+                entry.event.set()
+            resolved += 1
+            continue
+        from agent.pending_interactions import (
+            PendingInteractionResponse,
+            get_pending_interaction_service,
+        )
+
+        result = get_pending_interaction_service().resolve(
+            target,
+            PendingInteractionResponse(
+                kind=choice,
+                value=reason if choice == "deny" else None,
+                resolved_by="native_ui",
+            ),
+        )
+        resolved += result.status == "accepted"
+    return resolved
 
 
 def list_gateway_approvals(session_key: str) -> list[dict]:
@@ -4232,14 +4316,23 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     entry = _ApprovalEntry(approval_data)
     with _lock:
         _gateway_queues.setdefault(session_key, []).append(entry)
+    _register_pending_approval(session_key, entry, surface)
 
-    def _drop_entry() -> None:
+    def _drop_entry(status: str = "expired") -> None:
+        removed = False
         with _lock:
             queue = _gateway_queues.get(session_key, [])
             if entry in queue:
                 queue.remove(entry)
+                removed = True
             if not queue:
                 _gateway_queues.pop(session_key, None)
+        if removed and entry.pending_interaction_target is not None:
+            from agent.pending_interactions import get_pending_interaction_service
+
+            get_pending_interaction_service().terminal(
+                entry.pending_interaction_target, status
+            )
 
     # Notify plugins that an approval is being requested. Fires before the
     # gateway notify callback so observers get the event in real time.
@@ -4251,6 +4344,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         pattern_keys=list(all_keys),
         session_key=session_key,
         surface=surface,
+        request_id=entry.data["request_id"],
     )
 
     # Notify the user (bridges sync agent thread → async gateway)
@@ -4258,7 +4352,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         notify_cb(dict(entry.data))
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
-        _drop_entry()
+        _drop_entry("cancelled")
         _fire_approval_hook(
             "post_approval_response",
             command=command,
@@ -4306,9 +4400,12 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                     "returning deny for session %s",
                     session_key,
                 )
-                entry.result = "deny"
-                entry.event.set()
-                resolved = True
+                result = resolve_gateway_approval(
+                    session_key,
+                    "deny",
+                    request_id=str(entry.data["request_id"]),
+                )
+                resolved = result == 1
                 break
             _remaining = _deadline - time.monotonic()
             if _remaining <= 0:

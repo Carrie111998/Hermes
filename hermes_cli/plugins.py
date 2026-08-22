@@ -1399,6 +1399,7 @@ class PluginContext:
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
+        self._pending_interactions: Any = None
         self._state: PluginState | None = None
         # Lazy-built capability-gated platform action facade (#64176).
         self._platform_actions: Any = None
@@ -1600,6 +1601,28 @@ class PluginContext:
                 get_active_subagent_parent
             )
         return self._subagent_lifecycle
+
+    @property
+    def pending_interactions(self) -> Any:
+        """Return the process-bound observer/resolver for live user prompts.
+
+        Subscriptions receive immutable approval and clarification lifecycle
+        snapshots without attaching a UI transport. They are automatically
+        removed when this plugin unloads.
+        """
+        if self._pending_interactions is None:
+            from agent.pending_interactions import (
+                PluginPendingInteractionService,
+                get_pending_interaction_service,
+            )
+
+            def _track(unsubscribe: Callable[[], None]) -> None:
+                self._track("pending_interaction_subscription", "subscription", unsubscribe)
+
+            self._pending_interactions = PluginPendingInteractionService(
+                get_pending_interaction_service(), _track
+            )
+        return self._pending_interactions
 
     # -- profile awareness --------------------------------------------------
 

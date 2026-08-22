@@ -146,6 +146,7 @@ _methods: dict[str, callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
 _pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
 _answers: dict[str, str] = {}
+_pending_interaction_targets: dict[tuple[str, str], object] = {}
 # Batch clarify accumulators: rid → {"qids": [...], "answers": {qid: answer}}.
 # Written by clarify.respond (per-question lock, update-in-place), read out by
 # _block on resolution/timeout so locked answers survive the deadline.
@@ -3527,6 +3528,51 @@ def _block(
             # (update-in-place until every qid is locked). Locked answers
             # survive a timeout — see the batch read-out below.
             _batch_clarify[rid] = {"qids": list(batch_qids), "answers": {}}
+    if event == "clarify.request":
+        from agent.pending_interactions import (
+            PendingInteractionResponse,
+            current_interaction_metadata,
+            get_pending_interaction_service,
+        )
+
+        def _register_target(question_id: str | None) -> None:
+            key = (rid, question_id or "")
+
+            def _resolve(response: PendingInteractionResponse) -> bool:
+                with _prompt_lock:
+                    entry = _pending.get(rid)
+                    if entry is None:
+                        return False
+                    _, pending_event = entry
+                    batch = _batch_clarify.get(rid)
+                    if question_id is not None:
+                        if batch is None or question_id not in batch["qids"]:
+                            return False
+                        batch["answers"][question_id] = response.value
+                        if all(qid in batch["answers"] for qid in batch["qids"]):
+                            pending_event.set()
+                    else:
+                        _answers[rid] = response.value if response.value is not None else ""
+                        pending_event.set()
+                    return True
+
+            target = get_pending_interaction_service().register(
+                runtime_session_id=sid,
+                request_id=rid,
+                interaction_type="clarify",
+                question_id=question_id,
+                resolver=_resolve,
+                validator=lambda response: (
+                    response.kind in {"answer", "cancel"}
+                    and (response.kind != "cancel" or response.value in (None, ""))
+                ),
+                metadata=current_interaction_metadata(surface="desktop"),
+            )
+            with _prompt_lock:
+                _pending_interaction_targets[key] = target
+
+        for qid in batch_qids or [None]:
+            _register_target(qid)
     answered = False
     answer = ""
     answer_present = False
@@ -3538,6 +3584,7 @@ def _block(
         # session.interrupt), 0 → return immediately, > 0 → bounded wait.
         answered = ev.wait(timeout)
     finally:
+        terminal_status = "resolved" if answered else "expired"
         with _prompt_lock:
             _pending.pop(rid, None)
             _pending_prompt_payloads.pop(rid, None)
@@ -3546,6 +3593,15 @@ def _block(
             batch_state = _batch_clarify.pop(rid, None)
             if batch_state is not None:
                 batch_answers = dict(batch_state["answers"])
+            targets = [
+                _pending_interaction_targets.pop((rid, qid or ""), None)
+                for qid in (batch_qids or [None])
+            ]
+        from agent.pending_interactions import get_pending_interaction_service
+
+        for target in targets:
+            if target is not None:
+                get_pending_interaction_service().terminal(target, terminal_status)
 
     if batch_qids is not None:
         # Cancel-all (respond with no question_id) resolves via _answers with
@@ -11985,6 +12041,39 @@ def _stage_session_file_attachment(
 def _respond(rid, params, key, *, allow_expired=False):
     r = params.get("request_id", "")
     question_id = str(params.get("question_id") or "")
+    if key == "answer":
+        with _prompt_lock:
+            target = _pending_interaction_targets.get((r, question_id))
+        if target is not None:
+            from agent.pending_interactions import (
+                PendingInteractionResponse,
+                get_pending_interaction_service,
+            )
+
+            value = params.get(key, "")
+            result = get_pending_interaction_service().resolve(
+                target,
+                PendingInteractionResponse(
+                    kind="cancel" if value in (None, "") else "answer",
+                    value=value,
+                    resolved_by="native_ui",
+                ),
+            )
+            if result.status != "accepted":
+                if allow_expired and result.status == "already_resolved":
+                    return _ok(rid, {"status": "expired"})
+                return _err(rid, 4009, f"pending {key} request already resolved")
+            with _prompt_lock:
+                batch = _batch_clarify.get(r)
+                remaining = (
+                    [qid for qid in batch["qids"] if qid not in batch["answers"]]
+                    if batch is not None
+                    else []
+                )
+            result_payload = {"status": "ok"}
+            if question_id:
+                result_payload["remaining"] = remaining
+            return _ok(rid, result_payload)
     with _prompt_lock:
         entry = _pending.get(r)
         if not entry:
