@@ -171,7 +171,9 @@ describe('ModelEditSubmenu lands in the right stacking world', () => {
     // No container was provided, so the portal chain must terminate at
     // document.body exactly as the bare Radix Portal did before.
     let node: Node | null = sub
-    while (node && node !== document.body) node = node.parentNode
+    while (node && node !== document.body) {
+      node = node.parentNode
+    }
 
     expect(node).toBe(document.body)
   })
