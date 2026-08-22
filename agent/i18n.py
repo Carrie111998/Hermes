@@ -2,7 +2,8 @@
 
 Scope (thin slice, by design): only the highest-impact static strings shown
 to the user by Hermes itself -- approval prompts, a handful of gateway slash
-command replies, restart-drain notices.  Agent-generated output, log lines,
+command replies, restart-drain notices, and gateway busy-input acknowledgements
+(steer / queue / interrupt).  Agent-generated output, log lines,
 error tracebacks, tool outputs, and slash-command descriptions all stay in
 English.
 

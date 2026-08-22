@@ -1,9 +1,10 @@
 # Hermes static-message catalog -- English (baseline / source of truth)
 #
-# Only user-facing static messages from the CLI approval prompt and a handful
-# of gateway slash-command replies live here.  Agent-generated output, log
-# lines, error tracebacks, tool outputs, and slash-command descriptions stay
-# in English and are NOT translated -- see agent/i18n.py for scope rationale.
+# Only user-facing static messages from the CLI approval prompt, a handful
+# of gateway slash-command replies, and gateway busy-input acknowledgements
+# live here.  Agent-generated output, log lines, error tracebacks, tool
+# outputs, and slash-command descriptions stay in English and are NOT
+# translated -- see agent/i18n.py for scope rationale.
 #
 # Keys are dotted paths; nesting below is purely for readability.  Values may
 # contain {placeholder} tokens for str.format substitution.  When adding a
@@ -37,6 +38,18 @@ gateway:
   no_active_goal:   "No active goal."
   config_read_failed: "⚠️ Could not read config.yaml: {error}"
   config_save_failed: "⚠️ Could not save config: {error}"
+
+  # Busy-input acknowledgements — shown when a user messages a running turn.
+  busy_ack:
+    steer: "⏩ Steered into current run{status_detail}. Your message arrives after the next tool call."
+    redirect: "↪ Redirected current run{status_detail}. I'll adjust using your correction."
+    queue_subagent: "⏳ Subagent working{status_detail} — your message is queued for when it finishes (use /stop to cancel everything)."
+    queue_compression: "⏳ Compressing context{status_detail} — your message is queued for when it finishes (use /stop to cancel everything)."
+    queue: "⏳ Queued for the next turn{status_detail}. I'll respond once the current task finishes."
+    interrupt: "⚡ Interrupting current task{status_detail}. I'll respond to your message shortly."
+    status_elapsed: "{minutes} min elapsed"
+    status_iteration: "iteration {iteration}/{max_iter}"
+    status_running: "running: {tool}"
 
   # /model command output -- shown after a model switch or when listing models.
   # Provider names, model IDs, capability strings, and cost figures are NOT

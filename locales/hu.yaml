@@ -27,6 +27,17 @@ gateway:
   config_read_failed: "⚠️ Nem sikerült olvasni a config.yaml fájlt: {error}"
   config_save_failed: "⚠️ Nem sikerült menteni a konfigurációt: {error}"
 
+  busy_ack:
+    steer: "⏩ Beillesztve a jelenlegi futásba{status_detail}. Az üzeneted a következő eszközhívás után érkezik."
+    redirect: "↪ Jelenlegi futás átirányítva{status_detail}. A javításod alapján igazítom."
+    queue_subagent: "⏳ Az alügynök dolgozik{status_detail} — az üzeneted a végéig várakozik (mindent töröl: /stop)."
+    queue_compression: "⏳ Kontextus tömörítése{status_detail} — az üzeneted a végéig várakozik (mindent töröl: /stop)."
+    queue: "⏳ Sorban a következő körre{status_detail}. Akkor válaszolok, ha a jelenlegi feladat kész."
+    interrupt: "⚡ Megszakítom a jelenlegi feladatot{status_detail}. Hamarosan válaszolok."
+    status_elapsed: "{minutes} perc telt el"
+    status_iteration: "iteráció {iteration}/{max_iter}"
+    status_running: "fut: {tool}"
+
   model:
     error_prefix:           "Hiba: {error}"
     switched:               "Modell átváltva: `{model}`"

@@ -31,6 +31,17 @@ gateway:
   config_read_failed: "⚠️ Níorbh fhéidir config.yaml a léamh: {error}"
   config_save_failed: "⚠️ Níorbh fhéidir an chumraíocht a shábháil: {error}"
 
+  busy_ack:
+    steer: "⏩ Curtha isteach sa rith reatha{status_detail}. Tagann do theachtaireacht i ndiaidh an chéad ghlao uirlise eile."
+    redirect: "↪ Rith reatha atreoraithe{status_detail}. Déanfaidh mé coigeartú de réir do cheartúcháin."
+    queue_subagent: "⏳ Fo-ghníomhaire ag obair{status_detail} — tá do theachtaireacht i scuaine go dtí go gcríochnaíonn sé (úsáid /stop chun gach rud a chealú)."
+    queue_compression: "⏳ Comhthéacs á chomhbhrú{status_detail} — tá do theachtaireacht i scuaine go dtí go gcríochnaíonn sé (úsáid /stop chun gach rud a chealú)."
+    queue: "⏳ Curtha i scuaine don chéad bhabhta eile{status_detail}. Freagróidh mé nuair a chríochnaíonn an tasc reatha."
+    interrupt: "⚡ Ag cur isteach ar an tasc reatha{status_detail}. Freagróidh mé go luath."
+    status_elapsed: "{minutes} nóim imithe"
+    status_iteration: "aiteráil {iteration}/{max_iter}"
+    status_running: "ar siúl: {tool}"
+
   model:
     error_prefix:           "Earráid: {error}"
     switched:               "Athraíodh an tsamhail go `{model}`"

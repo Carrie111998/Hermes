@@ -27,6 +27,17 @@ gateway:
   config_read_failed: "⚠️ 无法读取 config.yaml：{error}"
   config_save_failed: "⚠️ 无法保存配置：{error}"
 
+  busy_ack:
+    steer: "⏩ 已插入当前运行{status_detail}。下一次工具调用后生效。"
+    redirect: "↪ 已根据你的更正调整当前运行{status_detail}。"
+    queue_subagent: "⏳ 子代理工作中{status_detail} — 结束后处理你的消息（用 /stop 取消全部）。"
+    queue_compression: "⏳ 正在压缩上下文{status_detail} — 结束后处理你的消息（用 /stop 取消全部）。"
+    queue: "⏳ 已排队到下一轮{status_detail}。当前任务结束后回复。"
+    interrupt: "⚡ 正在中断当前任务{status_detail}。稍后回复。"
+    status_elapsed: "已过 {minutes} 分钟"
+    status_iteration: "迭代 {iteration}/{max_iter}"
+    status_running: "正在运行: {tool}"
+
   model:
     error_prefix:           "错误：{error}"
     switched:               "已切换模型为 `{model}`"

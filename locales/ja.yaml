@@ -27,6 +27,17 @@ gateway:
   config_read_failed: "⚠️ config.yaml を読み込めませんでした: {error}"
   config_save_failed: "⚠️ 設定を保存できませんでした: {error}"
 
+  busy_ack:
+    steer: "⏩ 実行中の処理に差し込みました{status_detail}。次のツール呼び出しの後に反映されます。"
+    redirect: "↪ 実行中の処理を修正します{status_detail}。いまの指示で方向を変えます。"
+    queue_subagent: "⏳ サブエージェント作業中{status_detail} — 終了後にメッセージを処理します（全部キャンセルは /stop）。"
+    queue_compression: "⏳ コンテキストを圧縮中{status_detail} — 終了後にメッセージを処理します（全部キャンセルは /stop）。"
+    queue: "⏳ 次のターンにキューしました{status_detail}。今の作業が終わってから返信します。"
+    interrupt: "⚡ 今の作業を中断します{status_detail}。すぐ返信します。"
+    status_elapsed: "{minutes}分経過"
+    status_iteration: "反復 {iteration}/{max_iter}"
+    status_running: "実行中: {tool}"
+
   model:
     error_prefix:           "エラー: {error}"
     switched:               "モデルを `{model}` に切り替えました"

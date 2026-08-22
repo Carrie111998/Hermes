@@ -27,6 +27,17 @@ gateway:
   config_read_failed: "⚠️ config.yaml okunamadı: {error}"
   config_save_failed: "⚠️ Yapılandırma kaydedilemedi: {error}"
 
+  busy_ack:
+    steer: "⏩ Geçerli çalışmaya eklendi{status_detail}. Mesajın bir sonraki araç çağrısından sonra gelir."
+    redirect: "↪ Geçerli çalışma yönlendirildi{status_detail}. Düzeltmene göre ayarlayacağım."
+    queue_subagent: "⏳ Alt ajan çalışıyor{status_detail} — mesajın bitince kuyruğa alındı (hepsini iptal için /stop)."
+    queue_compression: "⏳ Bağlam sıkıştırılıyor{status_detail} — mesajın bitince kuyruğa alındı (hepsini iptal için /stop)."
+    queue: "⏳ Sonraki tur için kuyruğa alındı{status_detail}. Geçerli iş bitince yanıtlarım."
+    interrupt: "⚡ Geçerli iş kesiliyor{status_detail}. Kısa süre içinde yanıtlarım."
+    status_elapsed: "{minutes} dk geçti"
+    status_iteration: "yineleme {iteration}/{max_iter}"
+    status_running: "çalışıyor: {tool}"
+
   model:
     error_prefix:           "Hata: {error}"
     switched:               "Model `{model}` olarak değiştirildi"

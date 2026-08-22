@@ -27,6 +27,17 @@ gateway:
   config_read_failed: "⚠️ config.yaml을 읽을 수 없습니다: {error}"
   config_save_failed: "⚠️ 설정을 저장할 수 없습니다: {error}"
 
+  busy_ack:
+    steer: "⏩ 지금 실행 중인 작업에 넣었습니다{status_detail}. 다음 도구 호출 뒤에 반영됩니다."
+    redirect: "↪ 지금 실행 중인 작업을 고칩니다{status_detail}. 방금 말로 방향을 바꿉니다."
+    queue_subagent: "⏳ 하위 에이전트가 작업 중입니다{status_detail} — 끝나면 대기 중인 메시지를 처리합니다 (/stop으로 전부 취소)."
+    queue_compression: "⏳ 맥락을 압축하는 중입니다{status_detail} — 끝나면 대기 중인 메시지를 처리합니다 (/stop으로 전부 취소)."
+    queue: "⏳ 다음 턴에 대기시켰습니다{status_detail}. 현재 작업이 끝나면 답합니다."
+    interrupt: "⚡ 현재 작업을 중단합니다{status_detail}. 곧 답합니다."
+    status_elapsed: "{minutes}분 경과"
+    status_iteration: "반복 {iteration}/{max_iter}"
+    status_running: "실행 중: {tool}"
+
   model:
     error_prefix:           "오류: {error}"
     switched:               "모델이 `{model}`(으)로 전환되었습니다"

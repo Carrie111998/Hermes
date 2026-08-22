@@ -27,6 +27,17 @@ gateway:
   config_read_failed: "⚠️ Impossible de lire config.yaml : {error}"
   config_save_failed: "⚠️ Impossible de sauvegarder la configuration : {error}"
 
+  busy_ack:
+    steer: "⏩ Inséré dans l'exécution en cours{status_detail}. Votre message arrive après le prochain appel d'outil."
+    redirect: "↪ Exécution en cours redirigée{status_detail}. J'ajuste avec votre correction."
+    queue_subagent: "⏳ Sous-agent au travail{status_detail} — votre message est mis en file jusqu'à la fin (utilisez /stop pour tout annuler)."
+    queue_compression: "⏳ Compression du contexte{status_detail} — votre message est mis en file jusqu'à la fin (utilisez /stop pour tout annuler)."
+    queue: "⏳ Mis en file pour le prochain tour{status_detail}. Je répondrai une fois la tâche actuelle terminée."
+    interrupt: "⚡ Interruption de la tâche actuelle{status_detail}. Je répondrai sous peu."
+    status_elapsed: "{minutes} min écoulées"
+    status_iteration: "itération {iteration}/{max_iter}"
+    status_running: "en cours : {tool}"
+
   model:
     error_prefix:           "Erreur : {error}"
     switched:               "Modèle changé pour `{model}`"

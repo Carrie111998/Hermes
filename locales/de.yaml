@@ -27,6 +27,17 @@ gateway:
   config_read_failed: "⚠️ config.yaml konnte nicht gelesen werden: {error}"
   config_save_failed: "⚠️ Konfiguration konnte nicht gespeichert werden: {error}"
 
+  busy_ack:
+    steer: "⏩ In den laufenden Durchlauf eingefügt{status_detail}. Deine Nachricht kommt nach dem nächsten Tool-Aufruf."
+    redirect: "↪ Laufenden Durchlauf umgeleitet{status_detail}. Ich passe anhand deiner Korrektur an."
+    queue_subagent: "⏳ Unteragent arbeitet{status_detail} — deine Nachricht wartet bis zum Ende (mit /stop alles abbrechen)."
+    queue_compression: "⏳ Kontext wird komprimiert{status_detail} — deine Nachricht wartet bis zum Ende (mit /stop alles abbrechen)."
+    queue: "⏳ Für den nächsten Zug vorgemerkt{status_detail}. Ich antworte, wenn die aktuelle Aufgabe fertig ist."
+    interrupt: "⚡ Unterbreche die aktuelle Aufgabe{status_detail}. Ich antworte gleich."
+    status_elapsed: "{minutes} Min. vergangen"
+    status_iteration: "Iteration {iteration}/{max_iter}"
+    status_running: "läuft: {tool}"
+
   model:
     error_prefix:           "Fehler: {error}"
     switched:               "Modell gewechselt zu `{model}`"

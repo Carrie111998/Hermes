@@ -50,6 +50,17 @@ gateway:
   config_read_failed: "⚠️ تعذّر قراءة config.yaml: {error}"
   config_save_failed: "⚠️ تعذّر حفظ الإعدادات: {error}"
 
+  busy_ack:
+    steer: "⏩ أُدرج في التشغيل الحالي{status_detail}. تصل رسالتك بعد استدعاء الأداة التالي."
+    redirect: "↪ أُعيد توجيه التشغيل الحالي{status_detail}. سأعدّل وفق تصحيحك."
+    queue_subagent: "⏳ الوكيل الفرعي يعمل{status_detail} — رسالتك في الانتظار حتى ينتهي (استخدم /stop لإلغاء الكل)."
+    queue_compression: "⏳ جارٍ ضغط السياق{status_detail} — رسالتك في الانتظار حتى ينتهي (استخدم /stop لإلغاء الكل)."
+    queue: "⏳ وُضعت في الانتظار للجولة التالية{status_detail}. سأرد عندما تنتهي المهمة الحالية."
+    interrupt: "⚡ أقاطع المهمة الحالية{status_detail}. سأرد قريبًا."
+    status_elapsed: "مرّت {minutes} دقائق"
+    status_iteration: "تكرار {iteration}/{max_iter}"
+    status_running: "يعمل: {tool}"
+
   model:
     error_prefix:           "خطأ: {error}"
     switched:               "تم التبديل إلى النموذج `{model}`"

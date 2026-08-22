@@ -27,6 +27,17 @@ gateway:
   config_read_failed: "⚠️ Не удалось прочитать config.yaml: {error}"
   config_save_failed: "⚠️ Не удалось сохранить конфигурацию: {error}"
 
+  busy_ack:
+    steer: "⏩ Добавлено в текущий запуск{status_detail}. Сообщение придёт после следующего вызова инструмента."
+    redirect: "↪ Текущий запуск перенаправлен{status_detail}. Подстроюсь под вашу правку."
+    queue_subagent: "⏳ Работает подагент{status_detail} — сообщение в очереди до завершения (отменить всё: /stop)."
+    queue_compression: "⏳ Сжимается контекст{status_detail} — сообщение в очереди до завершения (отменить всё: /stop)."
+    queue: "⏳ В очереди на следующий ход{status_detail}. Отвечу, когда текущая задача закончится."
+    interrupt: "⚡ Прерываю текущую задачу{status_detail}. Отвечу скоро."
+    status_elapsed: "прошло {minutes} мин"
+    status_iteration: "итерация {iteration}/{max_iter}"
+    status_running: "выполняется: {tool}"
+
   model:
     error_prefix:           "Ошибка: {error}"
     switched:               "Модель изменена на `{model}`"

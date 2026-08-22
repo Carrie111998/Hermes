@@ -27,6 +27,17 @@ gateway:
   config_read_failed: "⚠️ No se pudo leer config.yaml: {error}"
   config_save_failed: "⚠️ No se pudo guardar la configuración: {error}"
 
+  busy_ack:
+    steer: "⏩ Insertado en la ejecución actual{status_detail}. Tu mensaje llega después de la siguiente llamada a herramienta."
+    redirect: "↪ Ejecución actual redirigida{status_detail}. Ajustaré con tu corrección."
+    queue_subagent: "⏳ Subagente trabajando{status_detail} — tu mensaje queda en cola hasta que termine (usa /stop para cancelarlo todo)."
+    queue_compression: "⏳ Comprimiendo contexto{status_detail} — tu mensaje queda en cola hasta que termine (usa /stop para cancelarlo todo)."
+    queue: "⏳ En cola para el siguiente turno{status_detail}. Responderé cuando termine la tarea actual."
+    interrupt: "⚡ Interrumpiendo la tarea actual{status_detail}. Responderé enseguida."
+    status_elapsed: "{minutes} min transcurridos"
+    status_iteration: "iteración {iteration}/{max_iter}"
+    status_running: "ejecutando: {tool}"
+
   model:
     error_prefix:           "Error: {error}"
     switched:               "Modelo cambiado a `{model}`"

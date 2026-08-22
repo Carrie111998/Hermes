@@ -122,6 +122,19 @@ def test_t_missing_key_in_non_english_falls_back_to_english(tmp_path, monkeypatc
 
 
 
+def test_busy_ack_keys_render_korean():
+    """Gateway busy-ack strings are in the catalog and format cleanly in Korean."""
+    i18n.reset_language_cache()
+    try:
+        text = i18n.t("gateway.busy_ack.steer", lang="ko", status_detail="")
+        assert "지금 실행 중인 작업에 넣었습니다" in text
+        assert "{status_detail}" not in text
+        elapsed = i18n.t("gateway.busy_ack.status_elapsed", lang="ko", minutes=10)
+        assert "10" in elapsed
+    finally:
+        i18n.reset_language_cache()
+
+
 # ---------------------------------------------------------------------------
 # _locales_dir resolution ladder -- regression for #23943 / #27632 / #35374.
 # Sealed installs (Nix store venv, pip wheel) have no source tree next to

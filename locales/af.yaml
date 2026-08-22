@@ -27,6 +27,17 @@ gateway:
   config_read_failed: "⚠️ Kon nie config.yaml lees nie: {error}"
   config_save_failed: "⚠️ Kon nie konfigurasie stoor nie: {error}"
 
+  busy_ack:
+    steer: "⏩ In die huidige lopie ingevoeg{status_detail}. Jou boodskap kom ná die volgende nutoproep."
+    redirect: "↪ Huidige lopie herlei{status_detail}. Ek pas aan volgens jou korreksie."
+    queue_subagent: "⏳ Subagent werk{status_detail} — jou boodskap wag tot dit klaar is (gebruik /stop om alles te kanselleer)."
+    queue_compression: "⏳ Konteks word saamgepers{status_detail} — jou boodskap wag tot dit klaar is (gebruik /stop om alles te kanselleer)."
+    queue: "⏳ In die ry vir die volgende beurt{status_detail}. Ek antwoord wanneer die huidige taak klaar is."
+    interrupt: "⚡ Onderbreek die huidige taak{status_detail}. Ek antwoord binnekort."
+    status_elapsed: "{minutes} min verloop"
+    status_iteration: "iterasie {iteration}/{max_iter}"
+    status_running: "besig: {tool}"
+
   model:
     error_prefix:           "Fout: {error}"
     switched:               "Model verander na `{model}`"
