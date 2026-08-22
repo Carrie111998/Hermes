@@ -277,7 +277,7 @@ OPENCODE_RUN_SCHEMA = {
             },
             "timeout_minutes": {
                 "type": "integer",
-                "description": "Maximum minutes to wait in blocking mode before returning a timeout notice (the task keeps running server-side). Default 30.",
+                "description": "Maximum minutes to wait in blocking mode before returning a timeout notice (the task keeps running server-side). Default 30 — note the blocking wait counts against the agent's own tool-call deadline, so prefer background=true for long tasks.",
             },
         },
         "required": ["task"],
