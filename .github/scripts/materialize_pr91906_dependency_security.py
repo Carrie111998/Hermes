@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[2]
 LEGACY_ELECTRON = "40.10.2"
 VERIFIED_ELECTRON = "41.10.3"
 NEWER_ELECTRON = "43.4.1"
-ALLOWED_SOURCE_ELECTRON = {LEGACY_ELECTRON, NEWER_ELECTRON}
+ALLOWED_ELECTRON = {LEGACY_ELECTRON, VERIFIED_ELECTRON, NEWER_ELECTRON}
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -52,7 +52,7 @@ def source_electron_version() -> str:
     dev = desktop["devDependencies"].get("electron")
     build = desktop["build"].get("electronVersion")
     expect(dev == build, f"Desktop Electron pins disagree: dev={dev}, build={build}")
-    expect(dev in ALLOWED_SOURCE_ELECTRON, f"unrecognized landing-main Electron source: {dev}")
+    expect(dev in ALLOWED_ELECTRON, f"unrecognized Electron source: {dev}")
     return str(dev)
 
 
@@ -92,7 +92,7 @@ def apply() -> None:
     allow_scripts = root_package["allowScripts"]
     source_key = f"electron@{source_electron}"
     target_key = f"electron@{target_electron}"
-    expect(allow_scripts.get(source_key) is True, f"missing landing-main Electron allowScripts key: {source_key}")
+    expect(allow_scripts.get(source_key) is True, f"missing Electron allowScripts key: {source_key}")
     rewritten_allow_scripts: dict[str, Any] = {}
     inserted = False
     for key, value in allow_scripts.items():
