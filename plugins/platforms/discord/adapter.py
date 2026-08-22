@@ -9391,10 +9391,22 @@ def _define_discord_view_classes() -> None:
             self._build_model_select(provider_slug)
 
             page_info = f" (page 1/{self._model_pages})" if self._model_pages > 1 else ""
+
+            filter_note = ""
+            if provider and provider.get("free_models"):
+                shown_total = len(provider.get("models", []))
+                free_total = len(provider["free_models"])
+                if self._free_only:
+                    filter_note = f"\n*Showing {free_total} free of {shown_total} models*"
+                else:
+                    filter_note = f"\n*All {shown_total} models*"
+
             await interaction.response.edit_message(
                 embed=discord.Embed(
                     title="⚙ Model Configuration",
-                    description=f"Provider: **{pname}**{page_info}\nSelect a model:",
+                    description=(
+                        f"Provider: **{pname}**{page_info}\nSelect a model:{filter_note}"
+                    ),
                     color=discord.Color.blue(),
                 ),
                 view=self,
@@ -9493,10 +9505,23 @@ def _define_discord_view_classes() -> None:
                 if self._model_pages > 1
                 else ""
             )
+
+            # Make the free filter self-explanatory: "showing N free of M".
+            filter_note = ""
+            if provider and provider.get("free_models"):
+                shown_total = len(provider.get("models", []))
+                free_total = len(provider["free_models"])
+                if self._free_only:
+                    filter_note = f"\n*Showing {free_total} free of {shown_total} models*"
+                else:
+                    filter_note = f"\n*All {shown_total} models*"
+
             await interaction.response.edit_message(
                 embed=discord.Embed(
                     title="⚙ Model Configuration",
-                    description=f"Provider: **{pname}**{page_info}\nSelect a model:",
+                    description=(
+                        f"Provider: **{pname}**{page_info}\nSelect a model:{filter_note}"
+                    ),
                     color=discord.Color.blue(),
                 ),
                 view=self,

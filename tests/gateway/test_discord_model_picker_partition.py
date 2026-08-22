@@ -13,6 +13,9 @@ The :free Portal tail is the original regression: it used to fall off the
 """
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import asyncio
 
 from gateway.platforms.base import utf16_len
 from plugins.platforms.discord.adapter import ModelPickerView
@@ -226,6 +229,51 @@ def test_free_toggle_shows_free_subset_first():
     assert rendered == sorted(models)
     nav = _nav_labels(view)
     assert "💳 All" in nav
+
+
+def test_free_filter_note_in_embed():
+    """The embed reports 'showing N free of M' so the filter is self-explanatory."""
+    models = [
+        "anthropic/claude-fable-5",
+        "openai/gpt-5.6-sol",
+        "tencent/hy3:free",
+        "stepfun/step-3.7-flash:free",
+    ]
+    free = ["tencent/hy3:free", "stepfun/step-3.7-flash:free"]
+    view = _make_view(models, free_models=free)
+
+    captured = {}
+
+    async def edit_message(**kwargs):
+        captured["description"] = kwargs["embed"].description
+
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=123),
+        channel_id=456,
+        data={"values": ["nous"]},
+        response=SimpleNamespace(
+            defer=AsyncMock(),
+            send_message=AsyncMock(),
+            edit_message=AsyncMock(side_effect=edit_message),
+        ),
+        edit_original_response=AsyncMock(),
+    )
+
+    # Free-only default: "showing 2 free of 4 models"
+    view._free_only = True
+    view._model_page = 0
+    view._selected_provider = "nous"
+    asyncio.get_event_loop().run_until_complete(
+        view._render_model_page(interaction)
+    )
+    assert "Showing 2 free of 4 models" in captured["description"]
+
+    # All-models toggle: "All 4 models"
+    view._free_only = False
+    asyncio.get_event_loop().run_until_complete(
+        view._render_model_page(interaction)
+    )
+    assert "All 4 models" in captured["description"]
 
 
 def test_139_model_provider_fully_reachable():
