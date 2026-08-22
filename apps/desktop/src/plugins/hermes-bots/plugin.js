@@ -240,7 +240,9 @@ function recordGroupActivity(group, event) {
   }
 
   const current = $groupActivity.get()[group] || { events: [] }
-  const entry = { at: Date.now(), epoch: room.epoch || 0, ...event }
+  // Spread first: `at` and `epoch` belong to the record, not to the caller. A
+  // caller that shipped its own `at` once rendered an event as decades old.
+  const entry = { ...event, at: Date.now(), epoch: room.epoch || 0 }
   const events = [...current.events, entry].slice(-GROUP_ACTIVITY_LIMIT)
   $groupActivity.set({ ...$groupActivity.get(), [group]: { ...current, events } })
 
@@ -268,10 +270,10 @@ function groupActivityLabel(event) {
   // statement rather than "<bot> hit the safety stop".
   if (kind === 'safety' || kind === 'capped') {
     const what = event?.detail === 'messages' ? 'messages' : 'rounds'
-    const at = event?.at ?? '?'
+    const count = event?.count ?? '?'
     return kind === 'safety'
-      ? `safety stop: ${at} ${what} reached`
-      : `stopped at the ${what} limit (${at}), raise it in the room budget`
+      ? `safety stop: ${count} ${what} reached`
+      : `stopped at the ${what} limit (${count}), raise it in the room budget`
   }
 
   const who = event?.member === 'You' ? 'You' : groupSpeakerLabel(event?.member || 'A bot')
@@ -5737,7 +5739,11 @@ async function runGroupChatRounds(group, members, thread) {
               member: null,
               thread,
               detail: stoppedBy,
-              at: stoppedBy === 'rounds' ? caps.rounds : caps.messages
+              // NOT `at`: recordGroupActivity stamps that with Date.now(), and
+              // spreading the event over it turned "1 round" into a timestamp
+              // of 1ms past the epoch, which the room rendered as "20688 days
+              // ago".
+              count: stoppedBy === 'rounds' ? caps.rounds : caps.messages
             }
           : { kind: 'settled', member: null, thread }
       )

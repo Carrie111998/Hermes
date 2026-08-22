@@ -222,3 +222,22 @@ test('a switched-off axis shows the infinity placeholder, not an empty box', () 
   const row = source.slice(source.indexOf('function GroupLimitRow('))
   assert.match(row.slice(0, 4000), /placeholder: off \? '\\u221e' : String\(fallback\)/)
 })
+
+test('an activity event cannot overwrite its own timestamp', () => {
+  // Live test: the limit event carried `at: 1` for "1 round". recordGroupActivity
+  // spread the event over its own `at: Date.now()`, so the room rendered the
+  // stop as "20688 days ago". The record's fields win over the caller's.
+  const record = source.slice(source.indexOf('function recordGroupActivity('))
+  const body = record.slice(0, record.indexOf('\n}\n'))
+
+  assert.match(body, /const entry = \{ \.\.\.event, at: Date\.now\(\), epoch: room\.epoch \|\| 0 \}/)
+  assert.doesNotMatch(body, /at: Date\.now\(\), epoch: room\.epoch \|\| 0, \.\.\.event/)
+})
+
+test('the limit event carries its count under a name of its own', () => {
+  const loop = source.slice(source.indexOf('async function runGroupChatRounds('))
+
+  assert.match(loop, /count: stoppedBy === 'rounds' \? caps\.rounds : caps\.messages/)
+  assert.doesNotMatch(loop, /at: stoppedBy === 'rounds'/)
+  assert.match(source, /const count = event\?\.count \?\? '\?'/)
+})
