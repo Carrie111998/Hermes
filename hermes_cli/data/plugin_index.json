@@ -6,20 +6,11 @@
       "name": "hermes-media-studio",
       "description": "Media Studio — generative media workspace plugin for Hermes Desktop (fal + Krea, durable job queue, library).",
       "author": "NousResearch",
-      "tags": [
-        "media",
-        "image-gen",
-        "video-gen",
-        "dashboard",
-        "desktop"
-      ],
+      "tags": ["media", "image-gen", "video-gen", "dashboard", "desktop"],
       "repo": "NousResearch/hermes-media-studio",
       "ref": "e8d59971d2b7901405b39dac7b03bdd616272d0d",
       "homepage": "https://github.com/NousResearch/hermes-media-studio",
-      "capabilities": [
-        "tools",
-        "dashboard"
-      ],
+      "capabilities": ["tools", "dashboard"],
       "api_version": 1,
       "added_at": "2026-08-12"
     },
@@ -27,18 +18,11 @@
       "name": "hermes-telegram-business",
       "description": "Observe-with-approval Telegram Business Mode (secretary bot) plugin — every drafted reply requires owner approval before it reaches the customer.",
       "author": "NousResearch",
-      "tags": [
-        "telegram",
-        "gateway",
-        "approvals",
-        "messaging"
-      ],
+      "tags": ["telegram", "gateway", "approvals", "messaging"],
       "repo": "NousResearch/hermes-telegram-business",
       "ref": "e905f3bc5eeaa5a9dab9bc5155601b3ebec75757",
       "homepage": "https://github.com/NousResearch/hermes-telegram-business",
-      "capabilities": [
-        "platform"
-      ],
+      "capabilities": ["platform"],
       "api_version": 1,
       "added_at": "2026-08-12"
     },
@@ -46,20 +30,12 @@
       "name": "plugin-llm-example",
       "description": "Reference plugin showing host-owned structured LLM access via ctx.llm.complete_structured(). Registers a /receipt-extract slash command.",
       "author": "NousResearch",
-      "tags": [
-        "example",
-        "llm",
-        "reference",
-        "slash-command"
-      ],
+      "tags": ["example", "llm", "reference", "slash-command"],
       "repo": "NousResearch/hermes-example-plugins",
       "subdir": "plugin-llm-example",
       "ref": "38fe0fb53eff98d477f807432e965429e665ca33",
       "homepage": "https://github.com/NousResearch/hermes-example-plugins/tree/main/plugin-llm-example",
-      "capabilities": [
-        "commands",
-        "llm"
-      ],
+      "capabilities": ["commands", "llm"],
       "api_version": 1,
       "added_at": "2026-08-12"
     },
@@ -67,20 +43,12 @@
       "name": "plugin-llm-async-example",
       "description": "Reference plugin demonstrating async host-owned LLM access from plugin code — the asyncio counterpart to plugin-llm-example.",
       "author": "NousResearch",
-      "tags": [
-        "example",
-        "llm",
-        "async",
-        "reference"
-      ],
+      "tags": ["example", "llm", "async", "reference"],
       "repo": "NousResearch/hermes-example-plugins",
       "subdir": "plugin-llm-async-example",
       "ref": "38fe0fb53eff98d477f807432e965429e665ca33",
       "homepage": "https://github.com/NousResearch/hermes-example-plugins/tree/main/plugin-llm-async-example",
-      "capabilities": [
-        "commands",
-        "llm"
-      ],
+      "capabilities": ["commands", "llm"],
       "api_version": 1,
       "added_at": "2026-08-12"
     },
@@ -88,18 +56,11 @@
       "name": "hermes-plugin-chrome-profiles",
       "description": "Switch Hermes browser tools between Chrome profiles via CDP.",
       "author": "anpicasso",
-      "tags": [
-        "browser",
-        "chrome",
-        "cdp",
-        "tools"
-      ],
+      "tags": ["browser", "chrome", "cdp", "tools"],
       "repo": "anpicasso/hermes-plugin-chrome-profiles",
       "ref": "5b9c3257b464c0f926d4355149a8aed9c8f307b4",
       "homepage": "https://github.com/anpicasso/hermes-plugin-chrome-profiles",
-      "capabilities": [
-        "tools"
-      ],
+      "capabilities": ["tools"],
       "api_version": 1,
       "added_at": "2026-08-12"
     },
@@ -107,19 +68,11 @@
       "name": "usage-center",
       "description": "Hermes Usage Center — local token stats plus official Grok, Codex, and Claude quota in the desktop sidebar and status bar.",
       "author": "Chen Leshu",
-      "tags": [
-        "usage",
-        "tokens",
-        "quota",
-        "desktop",
-        "observability"
-      ],
+      "tags": ["usage", "tokens", "quota", "desktop", "observability"],
       "repo": "chenleshu/hermes-usage-center",
       "ref": "255f9c80e7df34b99dcc1fe0a57ddfcb19f5030e",
       "homepage": "https://github.com/chenleshu/hermes-usage-center",
-      "capabilities": [
-        "dashboard"
-      ],
+      "capabilities": ["dashboard"],
       "api_version": 1,
       "added_at": "2026-08-22"
     }
