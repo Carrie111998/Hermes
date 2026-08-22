@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { atom } from 'nanostores'
 import { afterEach, expect, it, vi } from 'vitest'
 
 import { createProfile } from '@/hermes'
@@ -21,6 +22,7 @@ vi.mock('@/hermes', () => ({
 }))
 
 vi.mock('@/store/profile', () => ({
+  $profileGlyphs: atom<Record<string, string>>({}),
   setProfileGlyph: vi.fn()
 }))
 

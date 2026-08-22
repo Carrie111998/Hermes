@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { atom } from 'nanostores'
 
 // The store wires itself to gateway/profile atoms and the REST layer at import
 // time paths; mock the seams (same shape as updates.test.ts) so this test only
@@ -17,6 +18,7 @@ vi.mock('@/store/notifications', () => ({
 }))
 
 vi.mock('@/store/profile', () => ({
+  $profileGlyphs: atom<Record<string, string>>({}),
   $activeGatewayProfile: { get: () => 'default', listen: () => () => {} },
   normalizeProfileKey: (name: string | null | undefined) => (name ?? '').trim() || 'default'
 }))
