@@ -146,3 +146,4 @@ jobs:
           echo "Published exact head $commit"
 
 # closure-sweep trigger: publish the verified runtime tree as a normal branch diff
+# closure-sweep retry: materialize verified product tree and retire the carrier
