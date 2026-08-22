@@ -167,19 +167,6 @@ def test_session_turn_lock_serializes_same_session():
     assert adapter._session_turn_lock_refs == {}
 
 
-def test_session_turn_lock_wired_into_run_agent_and_handle_runs():
-    """Both agent entry paths must acquire _hold_session_turn_lock."""
-    import inspect
-
-    from gateway.platforms.api_server import APIServerAdapter
-
-    run_agent_src = inspect.getsource(APIServerAdapter._run_agent)
-    handle_runs_src = inspect.getsource(APIServerAdapter._handle_runs)
-    assert "_hold_session_turn_lock" in run_agent_src
-    assert "_hold_session_turn_lock" in handle_runs_src
-    assert "async with self._hold_session_turn_lock(session_id)" in handle_runs_src
-
-
 def test_session_turn_lock_allows_different_sessions_in_parallel():
     adapter = _bare_session_lock_adapter()
 

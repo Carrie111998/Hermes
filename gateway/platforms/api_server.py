@@ -7135,6 +7135,11 @@ class APIServerAdapter(BasePlatformAdapter):
         with an in-flight run on the same SessionDB transcript (#84235).
         Waiting on this lock queues the second turn behind the first.
         The map entry is removed when the last waiter/holder exits.
+
+        The lock is not re-entrant: a turn that already holds it must not
+        synchronously await another entry on the same ``session_id`` within
+        the same task. Re-entry must arrive as a separate HTTP request (or
+        other task) so it queues on ``lock.acquire()`` instead of deadlocking.
         """
         sid = (session_id or "").strip()
         if not sid:
