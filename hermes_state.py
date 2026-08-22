@@ -9004,8 +9004,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         configured per-user isolation policy).
 
         Pass ``titled_only=True`` to exclude null, empty, and whitespace-only
-        titles before LIMIT/OFFSET are applied. Picker callers use this so
-        recent unnamed sessions cannot displace older named conversations.
+        effective titles before LIMIT/OFFSET are applied. For compression
+        lineages the effective title is the surfaced continuation tip's title,
+        not the hidden root's. Picker callers use this so recent unnamed
+        sessions cannot displace older named conversations.
         """
         # Rows carry token/cost totals — drain queued deltas first so
         # listings (sidebar, /resume, dashboards) show exact counters.
@@ -9057,7 +9059,49 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not include_hidden:
             where_clauses.append("s.hidden = 0")
         if titled_only:
-            where_clauses.append("NULLIF(TRIM(s.title), '') IS NOT NULL")
+            # The row admitted here may later project from a compression root
+            # to its live tip. Filter on that same surfaced tip's title before
+            # LIMIT/OFFSET, including the child-selection precedence used by
+            # get_compression_tip(), so a lineage title transferred off the
+            # hidden root remains discoverable without letting unnamed rows
+            # consume the picker window.
+            where_clauses.append(
+                f"""
+                NULLIF(TRIM((
+                    WITH RECURSIVE effective_tip(id, title, depth) AS (
+                        SELECT s.id, s.title, 0
+                        UNION ALL
+                        SELECT child.id, child.title, et.depth + 1
+                        FROM effective_tip et
+                        JOIN sessions parent ON parent.id = et.id
+                        JOIN sessions child ON child.id = (
+                            SELECT candidate.id
+                            FROM sessions candidate
+                            WHERE candidate.parent_session_id = parent.id
+                              AND json_extract(COALESCE(candidate.model_config, '{{}}'), '$._branched_from') IS NULL
+                              AND json_extract(COALESCE(candidate.model_config, '{{}}'), '$._delegate_from') IS NULL
+                              AND COALESCE(candidate.source, '') != 'tool'
+                            ORDER BY
+                              CASE
+                                WHEN candidate.end_reason = 'compression' THEN 0
+                                WHEN candidate.ended_at IS NULL THEN 1
+                                ELSE 2
+                              END,
+                              {_sql_session_last_active("candidate")} DESC,
+                              candidate.started_at DESC,
+                              candidate.id DESC
+                            LIMIT 1
+                        )
+                        WHERE parent.end_reason = 'compression'
+                          AND et.depth < 100
+                    )
+                    SELECT title
+                    FROM effective_tip
+                    ORDER BY depth DESC
+                    LIMIT 1
+                )), '') IS NOT NULL
+                """
+            )
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         # Snapshot the filter params before the query builders below extend
