@@ -9700,6 +9700,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return modes.get(profile_name, fallback) if isinstance(modes, dict) else fallback
 
     @staticmethod
+    def _followup_grace_seconds(platform: "Platform") -> float:
+        """Seconds after a run starts during which a text message is a FOLLOW-UP.
+
+        Some transports deliver ONE human message as SEVERAL events. iMessage does
+        this whenever the message carries a URL preview or an attachment: the user
+        types a sentence plus a link, presses send once, and the adapter receives two
+        TEXT events a second or two apart. Telegram behaves the same way.
+
+        Without this window the trailing event lands mid-turn and is treated as the
+        user interrupting themselves — the run is aborted and the user is told they
+        interrupted a message they sent as one piece.
+
+        Resolution order, first match wins:
+
+          HERMES_<PLATFORM>_FOLLOWUP_GRACE_SECONDS   per-platform override
+          HERMES_GATEWAY_FOLLOWUP_GRACE_SECONDS      every platform
+          3.0                                        default
+
+        The per-platform form reproduces ``HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS``
+        exactly, so the documented Telegram knob keeps working by construction rather
+        than by special case. Set a value to ``0`` to disable the window.
+        """
+        names = ("HERMES_GATEWAY_FOLLOWUP_GRACE_SECONDS",)
+        value = getattr(platform, "value", "") or ""
+        if value:
+            names = (f"HERMES_{value.upper()}_FOLLOWUP_GRACE_SECONDS",) + names
+        for name in names:
+            raw = os.getenv(name, "").strip()
+            if not raw:
+                continue
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Ignoring %s=%r — not a number; falling back.", name, raw
+                )
+        return 3.0
+
+    @staticmethod
     def _load_restart_drain_timeout() -> float:
         """Load graceful gateway restart/stop drain timeout in seconds."""
         raw = os.getenv("HERMES_RESTART_DRAIN_TIMEOUT", "").strip()
@@ -17268,20 +17307,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             effective_busy_input_mode = self._effective_busy_input_mode(source)
-            _telegram_followup_grace = float(
-                os.getenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "3.0")
-            )
+            _followup_grace = self._followup_grace_seconds(source.platform)
             _grace_state = self._peek_session_state(_quick_key)
             _started_at = _grace_state.turn.started_ts if _grace_state else 0
             if (
-                source.platform == Platform.TELEGRAM
-                and event.message_type == MessageType.TEXT
-                and _telegram_followup_grace > 0
+                event.message_type == MessageType.TEXT
+                and _followup_grace > 0
                 and _started_at
-                and (time.time() - _started_at) <= _telegram_followup_grace
+                and (time.time() - _started_at) <= _followup_grace
             ):
                 logger.debug(
-                    "Telegram follow-up arrived %.2fs after run start for %s — queueing without interrupt",
+                    "%s follow-up arrived %.2fs after run start for %s — queueing without interrupt",
+                    source.platform.value,
                     time.time() - _started_at,
                     _quick_key,
                 )

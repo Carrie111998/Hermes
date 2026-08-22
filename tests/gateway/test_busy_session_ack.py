@@ -149,6 +149,107 @@ class TestBusySessionAck:
         agent.interrupt.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_followup_grace_applies_to_non_telegram_platforms(self, monkeypatch):
+        """A rapid text follow-up must not interrupt on ANY platform, not just Telegram.
+
+        Some transports deliver ONE human message as TWO events. iMessage does this
+        whenever the message carries a URL preview or an attachment: the user types
+        "subscribe to this calendar?" plus a link, presses send once, and the adapter
+        receives two TEXT events a second or two apart.
+
+        Without a follow-up grace window the second event lands mid-turn and is treated
+        as the user interrupting themselves — the run is aborted and the user is told
+        they interrupted a message they sent as one piece.
+
+        The grace window already solves this. It was simply gated to Telegram, so every
+        other adapter re-encounters the same bug.
+        """
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setenv("HERMES_GATEWAY_FOLLOWUP_GRACE_SECONDS", "3.0")
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        runner._queued_events = {}
+        adapter = _make_adapter()
+
+        source = SessionSource(
+            platform=Platform.BLUEBUBBLES,
+            chat_id="any;-;+15550001111",
+            chat_type="dm",
+            user_id="+15550001111",
+        )
+        sk = build_session_key(source)
+        runner.adapters[source.platform] = adapter
+
+        agent = MagicMock()
+        agent.get_activity_summary.return_value = {"seconds_since_activity": 0.0}
+        runner._running_agents[sk] = agent
+        runner._running_agents_ts[sk] = time.time()
+
+        # The two halves of a single iMessage send.
+        halves = [
+            "Can you subscribe to this calendar?",
+            "https://example.com/calendars/team.ics",
+        ]
+        for idx, text in enumerate(halves, start=1):
+            result = await GatewayRunner._handle_message(
+                runner,
+                MessageEvent(
+                    text=text,
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    message_id=f"bb-{idx}",
+                ),
+            )
+            assert result is None
+
+        # The run must survive: the user did not interrupt anything.
+        agent.interrupt.assert_not_called()
+        # And the second half must still be waiting to be handled, not dropped.
+        assert sk in adapter._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_telegram_env_var_still_honoured_after_generalisation(self, monkeypatch):
+        """The platform-specific env var must keep working — it is documented and in use."""
+        from gateway.run import GatewayRunner
+
+        # Only the LEGACY Telegram name is set; the generic one is explicitly off.
+        monkeypatch.setenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "3.0")
+        monkeypatch.setenv("HERMES_GATEWAY_FOLLOWUP_GRACE_SECONDS", "0")
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        runner._queued_events = {}
+        adapter = _make_adapter()
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="dm",
+            user_id="user1",
+        )
+        sk = build_session_key(source)
+        runner.adapters[source.platform] = adapter
+
+        agent = MagicMock()
+        agent.get_activity_summary.return_value = {"seconds_since_activity": 0.0}
+        runner._running_agents[sk] = agent
+        runner._running_agents_ts[sk] = time.time()
+
+        result = await GatewayRunner._handle_message(
+            runner,
+            MessageEvent(
+                text="follow-up",
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id="tg-1",
+            ),
+        )
+        assert result is None
+        agent.interrupt.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_sends_ack_when_agent_running(self):
         """First message during busy session should get a status ack."""
         runner, sentinel = _make_runner()
