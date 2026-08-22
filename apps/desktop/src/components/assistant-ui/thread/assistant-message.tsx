@@ -16,6 +16,7 @@ import {
   pickPrimaryPreviewTarget
 } from '@/components/assistant-ui/thread/content'
 import { MESSAGE_PARTS_COMPONENTS } from '@/components/assistant-ui/thread/message-parts'
+import { MessageTimeLabel } from '@/components/assistant-ui/thread/message-time'
 import { ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
 import { ResponseLoadingIndicator, StreamStallIndicator } from '@/components/assistant-ui/thread/status'
 import { formatMessageTimestamp } from '@/components/assistant-ui/thread/timestamp'
@@ -401,5 +402,8 @@ const AssistantFooter: FC<MessageActionProps> = props => (
       </BranchPickerPrimitive.Next>
     </BranchPickerPrimitive.Root>
     <AssistantActionBar {...props} />
+    {/* Always-visible wall-clock time, under the hover action bar; hover
+        for the friendly "Today at …" form (see MessageTimeLabel). */}
+    <MessageTimeLabel className="pb-0.5" />
   </div>
 )

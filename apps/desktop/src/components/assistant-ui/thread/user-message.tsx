@@ -3,6 +3,7 @@ import { type FC, type ReactNode, useCallback, useEffect, useRef, useState } fro
 
 import { DirectiveContent } from '@/components/assistant-ui/directive-text'
 import { messageAttachmentRefs, messageContentText } from '@/components/assistant-ui/thread/content'
+import { MessageTimeLabel } from '@/components/assistant-ui/thread/message-time'
 import { ReactionBadge, ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
 import { useMessageReactions } from '@/components/assistant-ui/thread/use-message-reactions'
@@ -563,6 +564,11 @@ export const UserMessage: FC<{
                 )}
               </div>
             </ReactionPicker>
+            {/* Wall-clock time for the bubble — always visible, right-aligned
+                to the sent bubble; hover for the friendly "Today at …" form. */}
+            <div className="flex justify-end pt-1 pb-0.5 pr-2">
+              <MessageTimeLabel />
+            </div>
             {/* Below the bubble, same register as the assistant action row:
                 same emoji size, same vertical padding, right-aligned to the
                 sent bubble. Overlaying the corner read badly in practice. */}
