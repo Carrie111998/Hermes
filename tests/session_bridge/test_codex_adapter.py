@@ -74,6 +74,24 @@ class FakeRetryingInitializeClient(FakeInitializingClient):
         return {"userAgent": "synthetic"}
 
 
+class _ClockAdvancingClient(FakeInitializingClient):
+    def __init__(
+        self,
+        responses: dict[str, list[dict[str, Any] | Exception]],
+        clock: dict[str, float],
+        costs: dict[str, float],
+    ) -> None:
+        super().__init__(responses)
+        self._clock = clock
+        self._costs = costs
+
+    def request(
+        self, method: str, params: dict[str, Any], timeout: float
+    ) -> dict[str, Any]:
+        self._clock["now"] += self._costs.get(method, 0.0)
+        return super().request(method, params, timeout)
+
+
 def _fixture(name: str) -> dict[str, Any]:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
@@ -1016,6 +1034,260 @@ class TestInventory:
             ("user", "Finish the reviewed native visibility rollout")
         ]
         assert source.git_head == "def456"
+
+    def test_visibility_inventory_initialization_uses_remaining_deadline(self) -> None:
+        clock = {"now": 100.0}
+
+        class InitializingClient(FakeInitializingClient):
+            def initialize(self, **kwargs: Any) -> dict[str, Any]:
+                self.initialize_calls.append(deepcopy(kwargs))
+                clock["now"] += 2.0
+                self._initialized = True
+                return {"userAgent": "synthetic"}
+
+        client = InitializingClient({
+            "thread/list": [{"data": []}, {"data": []}],
+        })
+
+        assert CodexSourceAdapter(
+            client,
+            marker_secret=SECRET,
+            monotonic=lambda: clock["now"],
+        ).list_claude_visibility_sources(
+            after=0,
+            discovery_timeout=10.0,
+        ) == ()
+
+        assert client.initialize_calls == [
+            {
+                "capabilities": {"experimentalApi": True},
+                "timeout": 10.0,
+            }
+        ]
+        assert [timeout for _method, _params, timeout in client.calls] == [
+            8.0,
+            8.0,
+        ]
+
+    def test_visibility_inventory_uses_one_deadline_for_lists_and_reads(self) -> None:
+        clock = {"now": 100.0}
+
+        def entry(native_id: str, updated: int) -> dict[str, object]:
+            return {
+                "id": native_id,
+                "cwd": f"C:/work/{native_id}",
+                "createdAt": updated - 10,
+                "updatedAt": updated,
+                "source": "vscode",
+            }
+
+        rows = [entry("first", 300), entry("second", 290)]
+        client = _ClockAdvancingClient(
+            {
+                "thread/list": [{"data": rows}, {"data": []}],
+                "thread/read": [
+                    {"thread": {**rows[0], "turns": []}},
+                    {"thread": {**rows[1], "turns": []}},
+                ],
+            },
+            clock,
+            {"thread/list": 2.0, "thread/read": 3.0},
+        )
+
+        sources = CodexSourceAdapter(
+            client,
+            marker_secret=SECRET,
+            monotonic=lambda: clock["now"],
+        ).list_claude_visibility_sources(
+            after=250,
+            state_db_only=True,
+            discovery_timeout=15.0,
+        )
+
+        assert [source.projection.native_id for source in sources] == [
+            "first",
+            "second",
+        ]
+        assert [(method, timeout) for method, _params, timeout in client.calls] == [
+            ("thread/list", 15.0),
+            ("thread/list", 13.0),
+            ("thread/read", 11.0),
+            ("thread/read", 8.0),
+        ]
+
+    def test_visibility_inventory_rejects_indexed_partial_result_at_deadline(
+        self,
+    ) -> None:
+        clock = {"now": 100.0}
+        row = {
+            "id": "late",
+            "cwd": "C:/work/late",
+            "createdAt": 290,
+            "updatedAt": 300,
+            "source": "vscode",
+        }
+        client = _ClockAdvancingClient(
+            {
+                "thread/list": [{"data": [row]}, {"data": []}],
+                "thread/read": [{"thread": {**row, "turns": []}}],
+            },
+            clock,
+            {"thread/read": 6.0},
+        )
+
+        with pytest.raises(RuntimeError, match="Codex sidebar deadline exhausted"):
+            CodexSourceAdapter(
+                client,
+                marker_secret=SECRET,
+                monotonic=lambda: clock["now"],
+            ).list_claude_visibility_sources(
+                after=250,
+                state_db_only=True,
+                indexed_sources={},
+                discovery_timeout=5.0,
+            )
+
+        assert [method for method, _params, _timeout in client.calls] == [
+            "thread/list",
+            "thread/list",
+            "thread/read",
+        ]
+
+    def test_visibility_inventory_previews_unindexed_remainder_after_deadline(
+        self,
+    ) -> None:
+        clock = {"now": 100.0}
+        rows = [
+            {
+                "id": native_id,
+                "name": native_id,
+                "preview": f"Preview {native_id}",
+                "cwd": f"C:/work/{native_id}",
+                "createdAt": 290 - index,
+                "updatedAt": 300 - index,
+                "source": "vscode",
+            }
+            for index, native_id in enumerate(("first", "second", "third"))
+        ]
+        client = _ClockAdvancingClient(
+            {
+                "thread/list": [{"data": rows}, {"data": []}],
+                "thread/read": [
+                    {"thread": {**rows[0], "turns": []}},
+                    {"thread": {**rows[1], "turns": []}},
+                ],
+            },
+            clock,
+            {"thread/read": 3.0},
+        )
+
+        sources = CodexSourceAdapter(
+            client,
+            marker_secret=SECRET,
+            monotonic=lambda: clock["now"],
+        ).list_claude_visibility_sources(
+            after=250,
+            state_db_only=True,
+            discovery_timeout=5.0,
+        )
+
+        assert [source.projection.native_id for source in sources] == [
+            "first",
+            "second",
+            "third",
+        ]
+        assert [method for method, _params, _timeout in client.calls].count(
+            "thread/read"
+        ) == 2
+        assert sources[1].projection.messages[0].content == "Preview second"
+        assert sources[2].projection.messages[0].content == "Preview third"
+
+    def test_visibility_inventory_stops_hydrating_after_raw_timeout_uses_budget(
+        self,
+    ) -> None:
+        clock = {"now": 100.0}
+        rows = [
+            {
+                "id": native_id,
+                "name": native_id,
+                "preview": f"Preview {native_id}",
+                "cwd": f"C:/work/{native_id}",
+                "createdAt": 290 - index,
+                "updatedAt": 300 - index,
+                "source": "vscode",
+            }
+            for index, native_id in enumerate(("first", "second"))
+        ]
+
+        class TimingOutClient(_ClockAdvancingClient):
+            def request(
+                self, method: str, params: dict[str, Any], timeout: float
+            ) -> dict[str, Any]:
+                if method == "thread/read":
+                    self.calls.append((method, params, timeout))
+                    clock["now"] += timeout
+                    raise TimeoutError("fixed transport timeout")
+                return super().request(method, params, timeout)
+
+        client = TimingOutClient(
+            {"thread/list": [{"data": rows}, {"data": []}]},
+            clock,
+            {},
+        )
+
+        sources = CodexSourceAdapter(
+            client,
+            marker_secret=SECRET,
+            monotonic=lambda: clock["now"],
+        ).list_claude_visibility_sources(
+            after=250,
+            state_db_only=True,
+            discovery_timeout=5.0,
+        )
+
+        assert [source.projection.native_id for source in sources] == [
+            "first",
+            "second",
+        ]
+        assert [method for method, _params, _timeout in client.calls].count(
+            "thread/read"
+        ) == 1
+        assert sources[1].projection.messages[0].content == "Preview second"
+
+    def test_visibility_inventory_stops_paging_when_deadline_expires(self) -> None:
+        clock = {"now": 100.0}
+        page = {
+            "data": [
+                {
+                    "id": "first-page",
+                    "cwd": "C:/work/first-page",
+                    "createdAt": 290,
+                    "updatedAt": 300,
+                    "source": "vscode",
+                }
+            ],
+            "nextCursor": "next-page",
+        }
+        client = _ClockAdvancingClient(
+            {"thread/list": [page], "thread/read": []},
+            clock,
+            {"thread/list": 6.0},
+        )
+
+        with pytest.raises(RuntimeError, match="Codex sidebar deadline exhausted"):
+            CodexSourceAdapter(
+                client,
+                marker_secret=SECRET,
+                monotonic=lambda: clock["now"],
+            ).list_claude_visibility_sources(
+                after=250,
+                state_db_only=True,
+                discovery_timeout=5.0,
+            )
+
+        assert [method for method, _params, _timeout in client.calls] == [
+            "thread/list"
+        ]
 
     def test_claude_visibility_inventory_preserves_normal_automation_and_subagent_kinds(
         self,
