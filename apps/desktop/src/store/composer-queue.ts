@@ -215,6 +215,13 @@ export const reorderQueuedPrompts = (key: string | null | undefined, ids: string
   }
 
   const queue = queueFor(sid)
+
+  // Duplicate ids can match queue.length while silently dropping entries
+  // (e.g. [a, a, b] against [a, b, c]). Only accept true permutations.
+  if (new Set(ids).size !== queue.length) {
+    return false
+  }
+
   const next = ids.map(id => queue.find(e => e.id === id)).filter((e): e is QueuedPromptEntry => Boolean(e))
 
   if (next.length === 0 || next.length !== queue.length) {

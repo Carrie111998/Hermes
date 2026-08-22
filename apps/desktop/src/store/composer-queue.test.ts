@@ -111,6 +111,20 @@ describe('composer queue store', () => {
     expect(getQueuedPrompts(SESSION_KEY).map(entry => entry.text)).toEqual(['first', 'second'])
   })
 
+  it('rejects a reorder with duplicate ids', () => {
+    const first = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'first' })
+    const second = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'second' })
+    const third = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'third' })
+
+    expect(first).not.toBeNull()
+    expect(second).not.toBeNull()
+    expect(third).not.toBeNull()
+
+    // Duplicate first id so the list has matching length but drops third.
+    expect(reorderQueuedPrompts(SESSION_KEY, [first!.id, first!.id, second!.id])).toBe(false)
+    expect(getQueuedPrompts(SESSION_KEY).map(entry => entry.text)).toEqual(['first', 'second', 'third'])
+  })
+
   it('updates queued text and attachment snapshot', () => {
     const first = enqueueQueuedPrompt(SESSION_KEY, { attachments: [attachment('f-1')], text: 'draft one' })
     const editedAttachments = [attachment('f-2'), attachment('f-3', 'image')]
