@@ -692,6 +692,81 @@ def test_named_custom_provider_filters_capabilities_at_lookup_boundary(monkeypat
     assert provider["capabilities"] == {"openai_native_compaction": True}
 
 
+@pytest.mark.parametrize("configured", [True, False])
+def test_named_custom_provider_propagates_parallel_tool_calls(monkeypatch, configured):
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "vendor": {
+                    "api": "https://api.vendor.example.com/v1",
+                    "api_key": "vendor-key",
+                    "parallel_tool_calls": configured,
+                    "extra_body": {"include_reasoning": True},
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
+
+    resolved = rp.resolve_runtime_provider(requested="vendor")
+
+    assert resolved["request_overrides"] == {
+        "extra_body": {"include_reasoning": True},
+        "parallel_tool_calls": configured,
+    }
+
+
+def test_named_custom_provider_omits_unset_parallel_tool_calls(monkeypatch):
+    monkeypatch.setattr(
+        rp,
+        "_get_named_custom_provider",
+        lambda _requested: {
+            "name": "vendor",
+            "base_url": "https://api.vendor.example.com/v1",
+        },
+    )
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
+
+    resolved = rp._resolve_named_custom_runtime(requested_provider="vendor")
+
+    assert resolved is not None
+    assert "request_overrides" not in resolved
+
+
+@pytest.mark.parametrize("configured", [True, False])
+def test_named_custom_provider_pool_merges_parallel_tool_calls(monkeypatch, configured):
+    custom_provider = {
+        "name": "vendor",
+        "base_url": "https://api.vendor.example.com/v1",
+        "parallel_tool_calls": configured,
+        "extra_body": {"include_reasoning": True},
+    }
+    pool_result = {
+        "provider": "custom",
+        "api_mode": "chat_completions",
+        "base_url": custom_provider["base_url"],
+        "api_key": "pool-key",
+        "request_overrides": {"service_tier": "priority"},
+    }
+    monkeypatch.setattr(rp, "_get_named_custom_provider", lambda _requested: custom_provider)
+    monkeypatch.setattr(
+        rp,
+        "_try_resolve_from_custom_pool",
+        lambda *a, **k: dict(pool_result),
+    )
+
+    resolved = rp._resolve_named_custom_runtime(requested_provider="vendor")
+
+    assert resolved is not None
+    assert resolved["request_overrides"] == {
+        "service_tier": "priority",
+        "extra_body": {"include_reasoning": True},
+        "parallel_tool_calls": configured,
+    }
+
+
 def test_bare_custom_resolves_providers_dict_entry_named_custom(monkeypatch):
     """A request for bare ``provider="custom"`` must resolve a literal
     ``providers.custom`` entry (e.g. a cliproxy endpoint) instead of falling

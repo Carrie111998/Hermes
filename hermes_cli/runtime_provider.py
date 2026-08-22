@@ -757,6 +757,12 @@ def _lift_extra_headers(entry: Dict[str, Any], result: Dict[str, Any]) -> None:
         result["extra_headers"] = extra_headers
 
 
+def _lift_parallel_tool_calls(entry: Dict[str, Any], result: Dict[str, Any]) -> None:
+    parallel_tool_calls = entry.get("parallel_tool_calls")
+    if isinstance(parallel_tool_calls, bool):
+        result["parallel_tool_calls"] = parallel_tool_calls
+
+
 def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, Any]]:
     requested_norm = _normalize_custom_provider_name(requested_provider or "")
     if not requested_norm:
@@ -837,6 +843,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                     extra_body = entry.get("extra_body")
                     if isinstance(extra_body, dict):
                         result["extra_body"] = dict(extra_body)
+                    _lift_parallel_tool_calls(entry, result)
                     _lift_extra_headers(entry, result)
                     # Command that PRINTS a credential, for gateways issuing
                     # short-lived bearers instead of static keys. Propagated
@@ -898,6 +905,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
         extra_body = entry.get("extra_body")
         if isinstance(extra_body, dict):
             result["extra_body"] = dict(extra_body)
+        _lift_parallel_tool_calls(entry, result)
         _lift_extra_headers(entry, result)
         api_mode = _parse_api_mode(entry.get("api_mode"))
         if api_mode:
@@ -1185,10 +1193,14 @@ def _normalize_base_url_for_match(value) -> str:
 
 
 def _custom_provider_request_overrides(custom_provider: Dict[str, Any]) -> Dict[str, Any]:
+    overrides: Dict[str, Any] = {}
     extra_body = custom_provider.get("extra_body")
-    if not isinstance(extra_body, dict) or not extra_body:
-        return {}
-    return {"extra_body": dict(extra_body)}
+    if isinstance(extra_body, dict) and extra_body:
+        overrides["extra_body"] = dict(extra_body)
+    parallel_tool_calls = custom_provider.get("parallel_tool_calls")
+    if isinstance(parallel_tool_calls, bool):
+        overrides["parallel_tool_calls"] = parallel_tool_calls
+    return overrides
 
 
 def _resolve_named_custom_runtime(
