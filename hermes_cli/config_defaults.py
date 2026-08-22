@@ -2590,6 +2590,29 @@ DEFAULT_CONFIG = {
         "media_send_timeout_seconds": 300,
     },
 
+    # Hermes-to-Codex execution bridge. Disabled by default so interactive
+    # Codex tasks and existing gateway conversations keep their direct paths.
+    "codex_bridge": {
+        "enabled": False,
+        "allowed_origins": ["local"],
+        # An empty allowlist fails closed. Add explicit repository roots before
+        # enabling the bridge; request-supplied arbitrary paths are rejected.
+        "workspace_allowlist": [],
+        "default_workspace": None,
+        "command_prefix": "/codex",
+        "model": None,
+        "sandbox": "workspace-write",
+        "collaboration_mode": "default",
+        "stale_recovery_seconds": 60,
+    },
+
+    # Rollback-only gate for the old queue-owned GPT worker path. The legacy
+    # implementation and card history remain intact, but gateway startup will
+    # not spawn its dispatcher unless this is explicitly enabled.
+    "legacy_hermes_workers": {
+        "auto_dispatch_enabled": False,
+    },
+
     # Kanban multi-agent coordination — controls the dispatcher loop that
     # spawns workers for ready tasks. The dispatcher ticks every N seconds
     # (default 60), reclaims stale claims, promotes dependency-satisfied

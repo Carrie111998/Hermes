@@ -164,6 +164,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Codex-first gateway execution lane. Kept out of the base install so the
+# default-off feature does not add a bundled CLI runtime to ordinary Hermes.
+codex-bridge = ["openai-codex>=0.147,<0.149"]
 # Native Anthropic provider — only needed when provider=anthropic (not via
 # OpenRouter or other aggregators).
 anthropic = ["anthropic==0.87.0"]  # CVE-2026-34450, CVE-2026-34452
@@ -404,6 +407,10 @@ exclude-newer = "14 days"
 # risk — their newest releases are years old — and unbricks resolvers that
 # cannot see upload dates.
 #
+# openai-codex and its pinned runtime: the bridge intentionally targets the
+# current stable SDK documented by OpenAI. The narrow <0.149 ceiling and the
+# SDK's exact runtime dependency keep this exception bounded and reviewable.
+#
 # setuptools, pillow, mcp: exact-pinned bricks (#78227, #75992, #76020). uv
 # applies exclude-newer to build-system.requires and core deps too; when a
 # resolver cannot see an upload date (old uv, mirror index, stale HTTP cache)
@@ -414,7 +421,7 @@ exclude-newer = "14 days"
 # cutoff can still brick installs. Exempting exact pins is pure brick-risk
 # removal at no supply-chain cost. Guarded by
 # tests/test_packaging_metadata.py::test_build_system_requires_exempt_from_exclude_newer.
-exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, aiohttp = false, cryptography = false, defusedxml = false, python-olm = false, unpaddedbase64 = false, setuptools = false, pillow = false, mcp = false }
+exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, aiohttp = false, cryptography = false, defusedxml = false, python-olm = false, unpaddedbase64 = false, setuptools = false, pillow = false, mcp = false, openai-codex = false, openai-codex-cli-bin = false }
 
 [tool.setuptools]
 # Top-level single-file modules (not packages). Without this, uv2nix's

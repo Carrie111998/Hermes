@@ -2673,6 +2673,10 @@ from gateway.session_state import (
     legacy_lease_token_property,
 )
 from gateway.authz_mixin import GatewayAuthorizationMixin
+from gateway.codex_bridge import (
+    GatewayCodexBridgeMixin,
+    legacy_workers_auto_dispatch_enabled,
+)
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
@@ -6723,7 +6727,12 @@ class TurnRunner:
 _SESSION_DB_UNPINNED = object()
 
 
-class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+class GatewayRunner(
+    GatewayAuthorizationMixin,
+    GatewayCodexBridgeMixin,
+    GatewayKanbanWatchersMixin,
+    GatewaySlashCommandsMixin,
+):
     """
     Main gateway controller.
 
@@ -13312,11 +13321,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # when another gateway owns the single dispatcher.
         self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
 
-        # Start background kanban dispatcher — spawns workers for ready
-        # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
-        # When false, users run `hermes kanban daemon` externally or
-        # simply don't use kanban; this loop becomes a no-op.
-        self._spawn_supervised(self._kanban_dispatcher_watcher, "kanban_dispatcher_watcher")
+        # Legacy Hermes GPT workers remain available for explicit rollback,
+        # but the new architecture freezes their auto-dispatch path off.  Both
+        # this dedicated gate and the historical kanban.dispatch_in_gateway
+        # switch must be enabled before the watcher may spawn workers.
+        if legacy_workers_auto_dispatch_enabled():
+            self._spawn_supervised(
+                self._kanban_dispatcher_watcher,
+                "kanban_dispatcher_watcher",
+            )
+        else:
+            logger.info(
+                "Legacy Hermes worker auto-dispatch disabled; Kanban remains observational"
+            )
 
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
@@ -16922,6 +16939,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         getattr(source, "chat_id", None) or "unknown",
                     )
                     return _paused_notice
+
+        # Opt-in Codex execution lane. This runs only after normal gateway
+        # authentication and the emergency-stop gate. A handled request never
+        # enters the Hermes AIAgent loop, preserving one executor per request.
+        if not is_internal:
+            _bridge_result = await self._maybe_handle_codex_bridge(event)
+            if _bridge_result.handled:
+                return _bridge_result.response
 
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher

@@ -2234,12 +2234,34 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
             ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
+            ("POST", "/v1/codex/tasks", self._handle_codex_task_start),
+            ("GET", "/v1/codex/tasks/{task_id}", self._handle_codex_task_get),
+            (
+                "POST",
+                "/v1/codex/tasks/{task_id}/reply",
+                self._handle_codex_task_reply,
+            ),
         ]
         if _CRON_AVAILABLE:
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated
             # by a NAS-minted JWT (NOT API_SERVER_KEY).
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
         return routes
+
+    async def _handle_codex_task_start(self, request: "web.Request") -> "web.Response":
+        from gateway.codex_bridge_http import start_codex_task
+
+        return await start_codex_task(self, request)
+
+    async def _handle_codex_task_get(self, request: "web.Request") -> "web.Response":
+        from gateway.codex_bridge_http import get_codex_task
+
+        return await get_codex_task(self, request)
+
+    async def _handle_codex_task_reply(self, request: "web.Request") -> "web.Response":
+        from gateway.codex_bridge_http import reply_to_codex_task
+
+        return await reply_to_codex_task(self, request)
 
     # ------------------------------------------------------------------
     # Session header helpers
@@ -3314,6 +3336,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": True,
                 "run_steer": True,
                 "run_approval_response": True,
+                "codex_bridge_tasks": True,
                 "tool_progress_events": True,
                 "approval_events": True,
                 "session_resources": True,
@@ -3371,6 +3394,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "codex_task_start": {"method": "POST", "path": "/v1/codex/tasks"},
+                "codex_task_status": {
+                    "method": "GET",
+                    "path": "/v1/codex/tasks/{task_id}",
+                },
+                "codex_task_reply": {
+                    "method": "POST",
+                    "path": "/v1/codex/tasks/{task_id}/reply",
+                },
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
