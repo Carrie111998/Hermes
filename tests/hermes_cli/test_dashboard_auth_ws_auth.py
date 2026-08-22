@@ -13,6 +13,7 @@ pre-existing regression unrelated to dashboard-auth.
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -290,6 +291,56 @@ class TestWsAuthOkGated:
             assert "ws_ticket_rejected" in content
 
 
+@pytest.mark.parametrize(
+    "handler_name",
+    [
+        "speak_stream_ws",
+        "console_ws",
+        "pty_ws",
+        "gateway_ws",
+        "pub_ws",
+        "events_ws",
+    ],
+)
+def test_ws_auth_rejection_completes_handshake_before_4401(
+    handler_name,
+    monkeypatch,
+):
+    """Browsers must receive terminal auth codes instead of generic 1006.
+
+    Closing before ``accept`` is an HTTP denial at the ASGI boundary. Real
+    browsers map that to 1006 and reconnect logic treats it like a transient
+    transport drop. Every dashboard socket must accept and immediately close
+    so its 4401 policy reaches the client.
+    """
+
+    class RecordingWebSocket:
+        client = SimpleNamespace(host="127.0.0.1")
+
+        def __init__(self):
+            self.events = []
+
+        async def accept(self):
+            self.events.append(("accept",))
+
+        async def close(self, code=1000, reason=""):
+            self.events.append(("close", code, reason))
+
+    monkeypatch.setattr(web_server, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+    monkeypatch.setattr(
+        web_server,
+        "_ws_auth_reason",
+        lambda ws: ("token_mismatch", "token"),
+    )
+    monkeypatch.setattr(web_server, "_ws_auth_ok", lambda ws: False)
+
+    ws = RecordingWebSocket()
+    asyncio.run(getattr(web_server, handler_name)(ws))
+
+    assert [event[0] for event in ws.events] == ["accept", "close"]
+    assert ws.events[1][1] == 4401
+
+
 class TestWsRequestIsAllowedGated:
     """Bug fix: in gated mode, the WS peer-IP loopback check must be
     bypassed.
@@ -472,4 +523,3 @@ class TestGatewayWsUrl:
         gw_cred = gw.split("internal=")[1].split("&")[0]
         sc_cred = sc.split("internal=")[1].split("&")[0]
         assert gw_cred == sc_cred
-

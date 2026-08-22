@@ -59,14 +59,14 @@ def _recv_until(conn, frame_type: str, *, status: str | None = None) -> dict:
 
 
 def test_console_ws_rejects_missing_or_bad_token(console_client):
-    with pytest.raises(WebSocketDisconnect) as exc:
-        with console_client.websocket_connect("/api/console"):
-            pass
+    with console_client.websocket_connect("/api/console") as conn:
+        with pytest.raises(WebSocketDisconnect) as exc:
+            conn.receive_text()
     assert exc.value.code == 4401
 
-    with pytest.raises(WebSocketDisconnect) as exc:
-        with console_client.websocket_connect(_url(token="wrong")):
-            pass
+    with console_client.websocket_connect(_url(token="wrong")) as conn:
+        with pytest.raises(WebSocketDisconnect) as exc:
+            conn.receive_text()
     assert exc.value.code == 4401
 
 
