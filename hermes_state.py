@@ -11246,6 +11246,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``totals["truncated"]`` is True if the cap was hit, so callers
         can tell a capped total from a complete one instead of silently
         under-reporting again.
+
+        Two known limitations, inherited rather than introduced here —
+        noted so a reader doesn't mistake either for this function
+        being wrong:
+
+        - ``get_conversation_root`` itself caps its up-walk at 100 hops
+          (``_session_lineage_root_to_tip``). A conversation with more
+          than 100 compression rotations resolves to a non-root
+          ancestor there, and this function then only sums the subtree
+          below *that* node — silently missing earlier segments, the
+          same undercount class this function exists to fix, just one
+          layer up in a dependency this reuses rather than duplicates.
+        - ``estimated_cost_usd``/``actual_cost_usd`` are 0.0 for any
+          session with ``cost_status == 'included'`` (subscription
+          billing, e.g. ``openai-codex`` — confirmed against real local
+          data). That's correct upstream behavior, not a bug: there is
+          no meaningful per-token price to attribute on a flat-fee
+          plan. It means the cost fields of the returned totals are
+          only informative for pay-per-token providers; the token
+          count fields remain meaningful regardless of billing mode.
         """
         self.flush_token_counts()
         root = self.get_conversation_root(session_id)
