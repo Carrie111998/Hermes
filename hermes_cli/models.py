@@ -2595,6 +2595,27 @@ def _resolve_nous_pricing_credentials() -> tuple[str, str]:
     return (api_key, base_url)
 
 
+def get_cached_nous_inference_base_url() -> str:
+    """Return the profile's persisted Nous endpoint without refreshing auth."""
+    try:
+        from hermes_cli.auth import (
+            _load_auth_store,
+            _load_provider_state,
+            _optional_base_url,
+            _validate_nous_inference_url_from_network,
+        )
+
+        state = _load_provider_state(_load_auth_store(), "nous") or {}
+        return (
+            _validate_nous_inference_url_from_network(
+                _optional_base_url(state.get("inference_base_url"))
+            )
+            or ""
+        ).rstrip("/").removesuffix("/v1")
+    except Exception:
+        return ""
+
+
 def pricing_cache_scope(
     provider: str,
     *,
@@ -2635,6 +2656,9 @@ def pricing_cache_scope(
             return env_base.rstrip("/").removesuffix("/v1")
         if normalize_provider(current_provider) == "nous" and current_base_url:
             return current_base_url.rstrip("/").removesuffix("/v1")
+        persisted_base = get_cached_nous_inference_base_url()
+        if persisted_base:
+            return persisted_base
         return _pricing_provider_cache_keys.get(
             (_pricing_profile_key(), normalized), _DEFAULT_NOUS_INFERENCE_BASE
         )
