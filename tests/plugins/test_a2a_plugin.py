@@ -383,13 +383,16 @@ class TestV1Parts:
 
 class TestV1Task:
     def test_completed_task_exposes_fenced_json_as_structured_data(self):
-        reply = 'Result:\n```json\n{"answer": 42}\n```'
+        reply = 'Result:\n```json\n{"answer": 42, "markdown": "```"}\n```'
 
         task = protocol.build_task("t-json", "c-json", protocol.STATE_COMPLETED, reply)
 
         assert task["artifacts"][0]["parts"] == [
             {"text": reply, "mediaType": "text/plain"},
-            {"data": {"answer": 42}, "mediaType": "application/json"},
+            {
+                "data": {"answer": 42, "markdown": "```"},
+                "mediaType": "application/json",
+            },
         ]
 
     def test_completed_task_shape(self):
