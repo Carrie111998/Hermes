@@ -1,9 +1,9 @@
 """Gateway runtime-metadata footer.
 
 Renders a compact footer showing runtime state (model, context %, cwd, session ID,
-and Telegram thread) and appends it to the FINAL message of an agent turn when
-enabled. Telegram identity fields can be rendered as a blockquote. Off by default
-to keep replies minimal.
+Telegram chat, and Telegram thread) and appends it to the FINAL message of an agent
+turn when enabled. Telegram identity fields can be rendered as a blockquote. Off
+by default to keep replies minimal.
 
 Config (``~/.hermes/config.yaml``)::
 
@@ -30,7 +30,7 @@ from typing import Any, Iterable, Optional
 
 _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
-_LABEL_FIELDS = {"session_id", "telegram_topic"}
+_LABEL_FIELDS = {"session_id", "telegram_chat_id", "telegram_topic"}
 
 
 def _home_relative_cwd(cwd: str) -> str:
@@ -96,6 +96,7 @@ def format_runtime_footer(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     session_id: Optional[str] = None,
+    telegram_chat_id: Optional[str] = None,
     telegram_topic: Optional[str] = None,
     blockquote: bool = False,
     fields: Iterable[str] = _DEFAULT_FIELDS,
@@ -125,6 +126,9 @@ def format_runtime_footer(
         elif field == "session_id":
             if session_id:
                 parts.append(f"Session: {session_id}")
+        elif field == "telegram_chat_id":
+            if telegram_chat_id:
+                parts.append(f"Telegram chat: {telegram_chat_id}")
         elif field == "telegram_topic":
             if telegram_topic:
                 parts.append(f"Telegram thread: {telegram_topic}")
@@ -151,6 +155,7 @@ def build_footer_line(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     session_id: Optional[str] = None,
+    telegram_chat_id: Optional[str] = None,
     telegram_topic: Optional[str] = None,
     blockquote: bool = False,
 ) -> str:
@@ -169,6 +174,7 @@ def build_footer_line(
         context_length=context_length,
         cwd=cwd,
         session_id=session_id,
+        telegram_chat_id=telegram_chat_id,
         telegram_topic=telegram_topic,
         blockquote=blockquote,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,

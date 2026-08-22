@@ -175,6 +175,24 @@ def test_format_footer_dual_telegram_context_uses_exact_two_line_format():
     assert out == "Session: sid-42\nTelegram thread: 227617"
 
 
+def test_format_footer_telegram_chat_context_uses_exact_three_line_format():
+    out = format_runtime_footer(
+        model="",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+        session_id="sid-42",
+        telegram_chat_id="123456789",
+        telegram_topic="227617",
+        fields=("session_id", "telegram_chat_id", "telegram_topic"),
+    )
+    assert out == (
+        "Session: sid-42\n"
+        "Telegram chat: 123456789\n"
+        "Telegram thread: 227617"
+    )
+
+
 def test_format_footer_dual_telegram_context_uses_blockquote_format():
     out = format_runtime_footer(
         model="",
