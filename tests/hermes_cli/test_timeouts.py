@@ -214,6 +214,24 @@ def test_disabled_entries_are_skipped(monkeypatch, tmp_path):
     assert to.get_provider_stale_timeout("custom", "m", base_url="http://127.0.0.1:8001/v1") == 900.0
 
 
+def test_disabled_keyed_entry_is_not_resolved_by_key(monkeypatch, tmp_path):
+    # A disabled entry must be invisible to BOTH resolution paths — the URL
+    # scan skipping it must not let the keyed fallback return it anyway.
+    to = _isolate(monkeypatch, tmp_path, """\
+        providers:
+          openrouter:
+            enabled: false
+            stale_timeout_seconds: 5
+          custom:
+            enabled: false
+            base_url: http://127.0.0.1:8001/v1
+            stale_timeout_seconds: 7
+        """)
+    assert to.get_provider_stale_timeout("openrouter", "m") is None
+    assert to.get_provider_stale_timeout("custom", "m") is None
+    assert to.get_provider_stale_timeout("custom", "m", base_url="http://127.0.0.1:8001/v1") is None
+
+
 def test_url_key_aliases_are_honored(monkeypatch, tmp_path):
     to = _isolate(monkeypatch, tmp_path, """\
         providers:

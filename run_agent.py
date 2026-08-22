@@ -6455,7 +6455,7 @@ class AIAgent:
             self._anthropic_client = build_anthropic_client(
                 runtime_key, self._anthropic_base_url,
                 timeout=get_provider_request_timeout(
-                    self.provider, self.model, base_url=getattr(self, "base_url", None)
+                    self.provider, self.model, base_url=runtime_base  # the NEW route, not the pre-rotation one
                 ),
             )
             self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False

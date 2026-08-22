@@ -71,9 +71,17 @@ def _resolve_provider_config(
     providers = config.get("providers", {})
     providers = providers if isinstance(providers, dict) else {}
 
+    try:
+        from hermes_cli.config import is_provider_enabled
+    except Exception:  # pragma: no cover - defensive
+        def is_provider_enabled(_cfg):  # type: ignore[misc]
+            return True
+
     def _explicit() -> dict[str, Any] | None:
         entry = providers.get(provider_id)
-        return entry if isinstance(entry, dict) and entry else None
+        if not isinstance(entry, dict) or not entry or not is_provider_enabled(entry):
+            return None
+        return entry
 
     if not _is_custom_like(provider_id):
         return _explicit()
@@ -83,11 +91,6 @@ def _resolve_provider_config(
 
         target = normalize_route_base_url(base_url)
         if target:
-            try:
-                from hermes_cli.config import is_provider_enabled
-            except Exception:  # pragma: no cover - defensive
-                def is_provider_enabled(_cfg):  # type: ignore[misc]
-                    return True
             candidates: list[Any] = list(providers.values())
             legacy = config.get("custom_providers")
             if isinstance(legacy, list):
