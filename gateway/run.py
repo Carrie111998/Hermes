@@ -15963,6 +15963,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _route_pre_user_input(self, event: MessageEvent) -> MessageEvent:
         """Run the synchronous input-route hook off the gateway event loop."""
+        from hermes_cli.lifecycle import has_hook, route_pre_user_input
+
+        if not await asyncio.to_thread(has_hook, "pre_user_input_route"):
+            return event
+
         source = event.source
         entry = await self.async_session_store.get_or_create_session(source)
         session_id = str(getattr(entry, "session_id", "") or "")
@@ -15971,8 +15976,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if goal_active is not False:
             return event
-
-        from hermes_cli.lifecycle import route_pre_user_input
 
         text, notice = await asyncio.to_thread(
             route_pre_user_input,

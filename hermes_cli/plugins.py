@@ -2001,6 +2001,10 @@ class PluginContext:
         msg = content if role == "user" else f"[{role}] {content}"
 
         if cli is not None:
+            if role != "user":
+                from cli import _SyntheticInputMessage
+
+                msg = _SyntheticInputMessage(msg)
             if getattr(cli, "_agent_running", False):
                 # Agent is mid-turn - interrupt with the message
                 cli._interrupt_queue.put(msg)

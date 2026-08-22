@@ -12571,6 +12571,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def _route_pre_user_input(self, text: str, *, has_attachments: bool = False) -> str:
         """Let plugins rewrite one eligible interactive CLI input."""
+        try:
+            from hermes_cli.lifecycle import has_hook, route_pre_user_input
+
+            if not has_hook("pre_user_input_route"):
+                return text
+        except Exception:
+            logger.warning("pre_user_input_route availability check failed", exc_info=True)
+            return text
+
         manager = self._get_goal_manager()
         if manager is None:
             return text
@@ -12582,8 +12591,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if goal_active:
             return text
         try:
-            from hermes_cli.lifecycle import route_pre_user_input
-
             rewritten, notice = route_pre_user_input(
                 surface="cli",
                 text=text,
@@ -16921,6 +16928,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     except queue.Empty:
                         break
                 combined = "\n".join(all_parts)
+                if all(isinstance(part, _SyntheticInputMessage) for part in all_parts):
+                    combined = _SyntheticInputMessage(combined)
                 n = len(all_parts)
                 preview = combined[:50] + ("..." if len(combined) > 50 else "")
                 if n > 1:
@@ -20292,7 +20301,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         continue
 
                     # Plugins may turn plain user text into a slash command,
-                    # but attachments, synthetic voice, active goals, and
+                    # but attachments, voice, synthetic input, active goals, and
                     # explicit commands retain their existing routes.
                     if (
                         not _file_drop
