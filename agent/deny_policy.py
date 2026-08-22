@@ -337,7 +337,7 @@ def _fixed_width_search_prefix_compatible(
         pattern_parts = normalized.strip("/").split("/") if normalized.strip("/") else []
         compatible = True
         for index, pattern_part in enumerate(pattern_parts):
-            if pattern_part == "**":
+            if "*" in pattern_part:
                 break
             if index >= len(candidate_parts):
                 break
@@ -361,7 +361,11 @@ def _path_matches_normalized_pattern(candidate: str, pat: str) -> bool:
     """Return whether normalized *candidate* is denied by normalized *pat*."""
     if not pat:
         return False
-    if fnmatch.fnmatchcase(candidate, pat):
+    # A configured trailing slash declares directory intent. Normalized paths
+    # deliberately omit that slash, so compare against the directory spelling
+    # while retaining the original rule for diagnostics.
+    match_pat = pat.rstrip("/") or "/"
+    if fnmatch.fnmatchcase(candidate, match_pat):
         return True
 
     # A rule that matches a directory also denies everything below it, even
@@ -375,20 +379,20 @@ def _path_matches_normalized_pattern(candidate: str, pat: str) -> bool:
         ancestor = ancestor.rsplit("/", 1)[0]
         if not ancestor:
             ancestor = "/"
-        if fnmatch.fnmatchcase(ancestor, pat):
+        if fnmatch.fnmatchcase(ancestor, match_pat):
             return True
         if ancestor == "/":
             break
 
     # Treat a plain directory pattern as "that directory and everything below".
-    has_glob = any(ch in pat for ch in "*?[")
+    has_glob = any(ch in match_pat for ch in "*?[")
     if not has_glob:
-        base = pat.rstrip("/")
+        base = match_pat.rstrip("/")
         return candidate == base or candidate.startswith(base + "/")
 
     # Common spelling: /secret/** should also block /secret itself.
-    if pat.endswith("/**"):
-        base = pat[:-3].rstrip("/")
+    if match_pat.endswith("/**"):
+        base = match_pat[:-3].rstrip("/")
         return candidate == base or candidate.startswith(base + "/")
     return False
 

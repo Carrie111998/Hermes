@@ -76,6 +76,20 @@ class TestPermissionsDenyPathMatching:
         assert match is not None
         assert match.pattern == str(tmp_path / "private?")
 
+    def test_trailing_slash_globbed_directory_pattern_matches_children(self, tmp_path):
+        secret_dir = tmp_path / "private1"
+        target = secret_dir / "nested" / "file.txt"
+        pattern = f"{tmp_path.as_posix()}/private*/"
+
+        match = deny_policy.match_permissions_deny_path(
+            str(target),
+            patterns=[pattern],
+            canonicalize=False,
+        )
+
+        assert match is not None
+        assert match.pattern == pattern
+
     def test_windows_style_glob_normalizes_separators(self):
         match = deny_policy.match_permissions_deny_path(
             r"C:\Users\alice\obsidian\Daedalus\capsule.md",
@@ -275,28 +289,22 @@ class TestPermissionsDenyPathMatching:
         assert disjoint is None
         assert matching is not None
 
-    def test_segment_local_star_search_overlap_is_precise_after_fixed_segment(self):
-        pattern = "/workspace/?/foo*"
+    def test_variable_width_star_search_overlap_stays_conservative(self):
+        pattern = "/a/foo*/secret"
 
-        ancestor = deny_policy.match_permissions_deny_search_root(
-            "/workspace/a",
+        search_root = deny_policy.match_permissions_deny_search_root(
+            "/a/foo/x",
             patterns=[pattern],
             canonicalize=False,
         )
-        disjoint = deny_policy.match_permissions_deny_search_root(
-            "/workspace/a/bar",
-            patterns=[pattern],
-            canonicalize=False,
-        )
-        matching = deny_policy.match_permissions_deny_search_root(
-            "/workspace/a/foobar",
+        descendant = deny_policy.match_permissions_deny_path(
+            "/a/foo/x/secret",
             patterns=[pattern],
             canonicalize=False,
         )
 
-        assert ancestor is not None
-        assert disjoint is None
-        assert matching is not None
+        assert search_root is not None
+        assert descendant is not None
 
 
 class TestPermissionsDenyFileTools:
