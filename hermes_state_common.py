@@ -6,7 +6,8 @@ reference them without importing hermes_state (which would be a cycle).
 hermes_state re-imports every name here for backward compatibility.
 """
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Optional
 
 from agent.skill_commands import (
     SKILL_EXCERPT_JOINT,
@@ -332,6 +333,402 @@ _FTS_TRIGGERS = (
 )
 
 
+# ── Session metadata FTS substrate (#128 / fork #25) ──────────────────
+# ``sessions`` gains a named stable ``row_id`` so external-content FTS can
+# key documents on a stable integer identity. ``id`` stays the logical /
+# public identity every API, relationship and ``messages.session_id``
+# reference continues to use.
+SESSION_TABLE_REBUILD_SQL = """
+CREATE TABLE sessions_new (
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    source TEXT NOT NULL,
+    user_id TEXT,
+    session_key TEXT,
+    chat_id TEXT,
+    chat_type TEXT,
+    thread_id TEXT,
+    display_name TEXT,
+    origin_json TEXT,
+    expiry_finalized INTEGER DEFAULT 0,
+    model TEXT,
+    model_config TEXT,
+    system_prompt TEXT,
+    system_prompt_hash TEXT,
+    parent_session_id TEXT,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    end_reason TEXT,
+    message_count INTEGER DEFAULT 0,
+    tool_call_count INTEGER DEFAULT 0,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    cache_write_tokens INTEGER DEFAULT 0,
+    reasoning_tokens INTEGER DEFAULT 0,
+    cwd TEXT,
+    git_branch TEXT,
+    git_repo_root TEXT,
+    git_metadata_generation INTEGER NOT NULL DEFAULT 0,
+    billing_provider TEXT,
+    billing_base_url TEXT,
+    billing_mode TEXT,
+    estimated_cost_usd REAL,
+    actual_cost_usd REAL,
+    cost_status TEXT,
+    cost_source TEXT,
+    pricing_version TEXT,
+    title TEXT,
+    title_source TEXT,
+    last_activity_at REAL,
+    last_activity_description TEXT,
+    last_activity_provenance TEXT,
+    api_call_count INTEGER DEFAULT 0,
+    handoff_state TEXT,
+    handoff_platform TEXT,
+    handoff_error TEXT,
+    compression_failure_cooldown_until REAL,
+    compression_failure_error TEXT,
+    compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
+    compression_ineffective_count INTEGER NOT NULL DEFAULT 0,
+    profile_name TEXT,
+    rewind_count INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    hidden INTEGER NOT NULL DEFAULT 0,
+    last_read_at REAL,
+    FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
+    FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
+)
+"""
+
+
+# Indexes on ``sessions`` that DROP TABLE removes during the row_id swap;
+# the migration recreates them inside the same transaction (all IF NOT EXISTS
+# so the later SCHEMA_SQL / DEFERRED_INDEX_SQL passes no-op on them).
+SESSION_INDEX_SQL_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_session_key "
+    "ON sessions(session_key, started_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer ON sessions("
+    "source, user_id, chat_id, chat_type, thread_id, started_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state "
+    "ON sessions(handoff_state, started_at)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_system_prompt_hash "
+    "ON sessions(system_prompt_hash)",
+)
+
+
+# Unicode session-metadata external-content FTS over raw
+# (title, id, display_name), keyed by named ``sessions.row_id``. Triggers are
+# gated on a dedicated H/P marker pair (``fts_session_rebuild_*``) so an
+# empty external index is never served as complete — historical rows are
+# backfilled by the resumable chunk engine, and rows committing after the
+# high-water mark are live-indexed by the triggers.
+SESSIONS_FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
+    title,
+    id,
+    display_name,
+    content='sessions',
+    content_rowid='row_id',
+    tokenize='unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_insert AFTER INSERT ON sessions
+WHEN (new.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                             WHERE key = 'fts_session_rebuild_high_water'), -1)
+   OR new.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                              WHERE key = 'fts_session_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts(rowid, title, id, display_name)
+    VALUES (new.row_id, new.title, new.id, new.display_name);
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_delete AFTER DELETE ON sessions
+WHEN (old.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                             WHERE key = 'fts_session_rebuild_high_water'), -1)
+   OR old.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                              WHERE key = 'fts_session_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts(sessions_fts, rowid, title, id, display_name)
+    VALUES ('delete', old.row_id, old.title, old.id, old.display_name);
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_update
+AFTER UPDATE OF title, id, display_name ON sessions
+WHEN (old.title IS NOT new.title
+   OR old.id IS NOT new.id
+   OR old.display_name IS NOT new.display_name)
+   AND (old.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                               WHERE key = 'fts_session_rebuild_high_water'), -1)
+     OR old.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                                WHERE key = 'fts_session_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts(sessions_fts, rowid, title, id, display_name)
+    VALUES ('delete', old.row_id, old.title, old.id, old.display_name);
+    INSERT INTO sessions_fts(rowid, title, id, display_name)
+    VALUES (new.row_id, new.title, new.id, new.display_name);
+END;
+"""
+
+
+# ── Optional CJK session-metadata index (#128 / fork #26) ────────────────
+# Same external-content raw (title, id, display_name) document keyed by named
+# row_id, but tokenized with the loadable ``cjk_unicode61`` bigram tokenizer.
+# It owns an independent marker pair (``fts_session_cjk_rebuild_*``) and its
+# own stale key (``fts_session_cjk_stale``) so optional tokenizer
+# availability can never gate or corrupt the complete Unicode index. Split
+# table/trigger DDL so a stale optional index can exist while unsafe triggers
+# remain absent.
+SESSIONS_FTS_CJK_TABLE_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts_cjk USING fts5(
+    title,
+    id,
+    display_name,
+    content='sessions',
+    content_rowid='row_id',
+    tokenize='cjk_unicode61'
+);
+"""
+
+SESSIONS_FTS_CJK_TRIGGER_SQL = """
+CREATE TRIGGER IF NOT EXISTS sessions_fts_cjk_insert AFTER INSERT ON sessions
+WHEN (new.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                             WHERE key = 'fts_session_cjk_rebuild_high_water'), -1)
+   OR new.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                              WHERE key = 'fts_session_cjk_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts_cjk(rowid, title, id, display_name)
+    VALUES (new.row_id, new.title, new.id, new.display_name);
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_cjk_delete AFTER DELETE ON sessions
+WHEN (old.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                             WHERE key = 'fts_session_cjk_rebuild_high_water'), -1)
+   OR old.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                              WHERE key = 'fts_session_cjk_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts_cjk(sessions_fts_cjk, rowid, title, id, display_name)
+    VALUES ('delete', old.row_id, old.title, old.id, old.display_name);
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_cjk_update
+AFTER UPDATE OF title, id, display_name ON sessions
+WHEN (old.title IS NOT new.title
+   OR old.id IS NOT new.id
+   OR old.display_name IS NOT new.display_name)
+   AND (old.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                               WHERE key = 'fts_session_cjk_rebuild_high_water'), -1)
+     OR old.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                                WHERE key = 'fts_session_cjk_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts_cjk(sessions_fts_cjk, rowid, title, id, display_name)
+    VALUES ('delete', old.row_id, old.title, old.id, old.display_name);
+    INSERT INTO sessions_fts_cjk(rowid, title, id, display_name)
+    VALUES (new.row_id, new.title, new.id, new.display_name);
+END;
+"""
+
+
+_FTS_SESSION_CJK_TRIGGERS = (
+    "sessions_fts_cjk_insert",
+    "sessions_fts_cjk_delete",
+    "sessions_fts_cjk_update",
+)
+
+
+# Breadcrumb set when a tokenizer-less process had to drop the session-CJK
+# triggers to keep canonical session writes alive: rows written from that
+# moment on are missing from the CJK index, so it must not serve reads until
+# a capable host resets and rebuilds. Distinct from the message
+# ``FTS_CJK_STALE_KEY`` and from the Unicode-session markers.
+FTS_SESSION_CJK_STALE_KEY = "fts_session_cjk_stale"
+
+
+# ── Optional trigram session-metadata index (#128 / fork #30) ───────────
+# Same canonical-source principle as the Unicode sessions_fts: metadata text
+# is canonical ONLY in ``sessions``. The trigram document reads through the
+# ``sessions_fts_trigram_src`` VIEW so the INDEXED text is
+# ``compact(title)``, RAW ``id``, ``compact(display_name)`` while ``sessions``
+# keeps raw canonical values — no persistent normalized columns are added.
+#
+# The compact transform deletes EXACTLY the separator set below
+# (``- _ .`` and ASCII space); ``id`` stays raw so punctuation-bearing id
+# substrings preserve the #16 contract. The separator policy is defined ONCE
+# here and drives both the Python query compacting
+# (``compact_session_metadata_text``) and the SQL expression embedded in the
+# VIEW. Case-insensitivity comes from the trigram tokenizer's normal default
+# behavior.
+#
+# The trigram lane owns its own durable H/P marker pair
+# (``fts_session_trigram_rebuild_*``): P means target-specific processed
+# completeness, so the Unicode and trigram lanes never share a claim. The
+# UPDATE is split into BEFORE/AFTER triggers reading the VIEW projection.
+SESSION_METADATA_COMPACT_SEPARATORS = ("-", "_", ".", " ")
+
+
+def compact_session_metadata_text(text: Optional[str]) -> str:
+    """Delete the canonical compact separators from *text*.
+
+    Mirrors the SQL expression generated by ``_session_metadata_compact_sql``
+    so search-query compacting and the stored-side VIEW derive from ONE
+    policy (the canonical ``- _ . space`` set — never broadened to arbitrary
+    punctuation).
+    """
+    text = text or ""
+    for sep in SESSION_METADATA_COMPACT_SEPARATORS:
+        text = text.replace(sep, "")
+    return text
+
+
+def _session_metadata_compact_sql(column: str) -> str:
+    """Pure-SQL expression removing the canonical compact separators from
+    ``column`` (nested REPLACE) — no application-defined SQL function."""
+    expr = f"COALESCE({column}, '')"
+    for sep in SESSION_METADATA_COMPACT_SEPARATORS:
+        expr = f"REPLACE({expr}, '{sep}', '')"
+    return expr
+
+
+SESSIONS_FTS_TRIGRAM_SQL = f"""
+CREATE VIEW IF NOT EXISTS sessions_fts_trigram_src AS
+SELECT
+    row_id,
+    {_session_metadata_compact_sql('title')} AS title,
+    id AS id,
+    {_session_metadata_compact_sql('display_name')} AS display_name
+FROM sessions;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts_trigram USING fts5(
+    title,
+    id,
+    display_name,
+    content='sessions_fts_trigram_src',
+    content_rowid='row_id',
+    tokenize='trigram'
+);
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_trigram_insert AFTER INSERT ON sessions
+WHEN (new.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                             WHERE key = 'fts_session_trigram_rebuild_high_water'), -1)
+   OR new.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                              WHERE key = 'fts_session_trigram_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts_trigram(rowid, title, id, display_name)
+    SELECT row_id, title, id, display_name FROM sessions_fts_trigram_src
+    WHERE row_id = new.row_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_trigram_delete BEFORE DELETE ON sessions
+WHEN (old.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                             WHERE key = 'fts_session_trigram_rebuild_high_water'), -1)
+   OR old.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                              WHERE key = 'fts_session_trigram_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts_trigram(sessions_fts_trigram, rowid, title, id, display_name)
+    SELECT 'delete', row_id, title, id, display_name FROM sessions_fts_trigram_src
+    WHERE row_id = old.row_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_trigram_update_before
+BEFORE UPDATE OF title, id, display_name ON sessions
+WHEN (old.title IS NOT new.title
+   OR old.id IS NOT new.id
+   OR old.display_name IS NOT new.display_name)
+   AND (old.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                               WHERE key = 'fts_session_trigram_rebuild_high_water'), -1)
+     OR old.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                                WHERE key = 'fts_session_trigram_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts_trigram(sessions_fts_trigram, rowid, title, id, display_name)
+    SELECT 'delete', row_id, title, id, display_name FROM sessions_fts_trigram_src
+    WHERE row_id = old.row_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_fts_trigram_update_after
+AFTER UPDATE OF title, id, display_name ON sessions
+WHEN (old.title IS NOT new.title
+   OR old.id IS NOT new.id
+   OR old.display_name IS NOT new.display_name)
+   AND (new.row_id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                               WHERE key = 'fts_session_trigram_rebuild_high_water'), -1)
+     OR new.row_id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
+                                WHERE key = 'fts_session_trigram_rebuild_progress'), -1))
+BEGIN
+    INSERT INTO sessions_fts_trigram(rowid, title, id, display_name)
+    SELECT row_id, title, id, display_name FROM sessions_fts_trigram_src
+    WHERE row_id = new.row_id;
+END;
+"""
+
+
+_FTS_SESSION_TRIGRAM_TRIGGERS = (
+    "sessions_fts_trigram_insert",
+    "sessions_fts_trigram_delete",
+    "sessions_fts_trigram_update_before",
+    "sessions_fts_trigram_update_after",
+)
+
+
+# Breadcrumb set when a host could not build the trigram session index
+# (tokenizer unavailable / capability loss); the index must not serve reads
+# until a capable host resets and rebuilds. Distinct from the Unicode and
+# CJK-session markers.
+FTS_SESSION_TRIGRAM_STALE_KEY = "fts_session_trigram_stale"
+
+
+@dataclass(frozen=True)
+class _SessionFtsLane:
+    """Identity and ensure-settings of one session-metadata FTS lane.
+
+    ``marker_prefix`` names the lane's OWN H/P marker pair (so no lane can
+    falsely certify another), ``fts_table`` is the external-content table the
+    chunk backfill inserts into, ``src_from`` is the row source (``sessions``
+    or the compact trigram VIEW), and ``available_attr`` names the
+    search-serving flag to flip once the backfill completes (None for the
+    Unicode lane, whose availability is implicit via the rebuild-gap check).
+    ``stale_key`` / ``table_sql`` / ``trigger_sql`` drive the optional-lane
+    schema ensure (split table/trigger DDL so a stale optional index can
+    exist while unsafe triggers remain absent; ``trigger_sql`` None means the
+    table SQL already includes the triggers).
+    """
+
+    marker_prefix: str
+    fts_table: str
+    src_from: str
+    available_attr: Optional[str] = None
+    stale_key: Optional[str] = None
+    table_sql: Optional[str] = None
+    trigger_sql: Optional[str] = None
+
+
+_FTS_SESSION_LANES = (
+    _SessionFtsLane("fts_session_rebuild", "sessions_fts", "sessions"),
+    _SessionFtsLane(
+        "fts_session_cjk_rebuild",
+        "sessions_fts_cjk",
+        "sessions",
+        available_attr="_sessions_cjk_available",
+        stale_key=FTS_SESSION_CJK_STALE_KEY,
+        table_sql=SESSIONS_FTS_CJK_TABLE_SQL,
+        trigger_sql=SESSIONS_FTS_CJK_TRIGGER_SQL,
+    ),
+    _SessionFtsLane(
+        "fts_session_trigram_rebuild",
+        "sessions_fts_trigram",
+        "sessions_fts_trigram_src",
+        available_attr="_sessions_trigram_available",
+        stale_key=FTS_SESSION_TRIGRAM_STALE_KEY,
+        table_sql=SESSIONS_FTS_TRIGRAM_SQL,
+        trigger_sql=None,
+    ),
+)
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
@@ -343,7 +740,8 @@ CREATE TABLE IF NOT EXISTS system_prompts (
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
     source TEXT NOT NULL,
     user_id TEXT,
     session_key TEXT,

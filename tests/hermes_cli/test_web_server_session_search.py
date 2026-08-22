@@ -58,6 +58,14 @@ class _FakeSessionDB:
             )
         ][:limit]
 
+    def list_sessions_rich(self, **kwargs):
+        # Whole-store metadata-discovery lane: this fixture has no stored
+        # title/display_name rows beyond the id match, so the endpoint's
+        # result order stays ID-first then content.
+        assert kwargs.get("search_query") == "20260603"
+        assert kwargs.get("order_by_last_active") is True
+        return []
+
     def search_messages(
         self,
         query,
@@ -141,3 +149,36 @@ def test_desktop_session_search_merges_id_matches_before_content_matches(monkeyp
         ]
     }
     assert _FakeSessionDB.opened_read_only is True
+
+
+def test_desktop_session_search_surfaces_stored_title_only_session():
+    """Behavior regression (#128): a session whose STORED TITLE matches the
+    query but whose message body does not is returned by
+    ``GET /api/sessions/search``, and the stored title survives in the result.
+
+    On the pre-#128 endpoint this is RED: ID discovery only matches ids and
+    message-content FTS only matches the body, so a stored-title-only session
+    was invisible from the Desktop search box.
+    """
+    from hermes_cli import web_server
+    from hermes_constants import get_hermes_home
+    from hermes_state import SessionDB
+
+    db_path = get_hermes_home() / "state.db"
+    seed = SessionDB(db_path=db_path)
+    try:
+        sid = seed.create_session("sess_title_only", source="cli")
+        seed.set_session_title(sid, "Arby's Faribault, MN")
+        seed.append_message(
+            sid,
+            role="user",
+            content="weekly sync notes; nothing here about food or cities",
+        )
+    finally:
+        seed.close()
+
+    response = asyncio.run(web_server.search_sessions(q="Faribault", limit=5))
+
+    hits = [r for r in response["results"] if r["id"] == sid]
+    assert hits, "stored-title-only session must surface via the metadata lane"
+    assert hits[0]["title"] == "Arby's Faribault, MN"

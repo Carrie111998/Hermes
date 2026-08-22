@@ -175,9 +175,11 @@ async def search_sessions(
     sources: str = None,
     exclude_sources: str = None,
 ):
-    """Search sessions by ID plus full-text message content using FTS5.
+    """Search sessions by ID, stored metadata, and full-text message content.
 
-    Direct session-id matches are surfaced first, then FTS message-content
+    Direct session-id matches are surfaced first, then whole-store metadata
+    discovery (title / logical id / gateway display_name through the shared
+    ``list_sessions_rich(search_query=...)`` seam), then FTS message-content
     matches. Results are deduped by compression lineage, not by raw
     ``session_id``. Auto-compression rotates a conversation onto a fresh
     session id (and leaves the old segment's messages in the FTS index), so one
@@ -339,6 +341,41 @@ async def search_sessions(
                         "session_started": row.get("started_at"),
                     },
                 )
+
+            # Whole-store metadata discovery through the shared listing seam
+            # (list_sessions_rich): title / logical id / gateway display_name
+            # matched at the state layer (compression-chain aware), so a
+            # session whose STORED TITLE matches the query but whose message
+            # body does not still surfaces here. Over-fetch so lineage dedup
+            # can still surface `limit` distinct conversations.
+            if len(seen) < safe_limit:
+                meta_rows = db.list_sessions_rich(
+                    source=source_filter,
+                    sources=source_list or None,
+                    exclude_sources=exclude_list or None,
+                    limit=max(safe_limit * 4, safe_limit),
+                    order_by_last_active=True,
+                    search_query=q,
+                    include_archived=True,
+                )
+                for row in meta_rows:
+                    if len(seen) >= safe_limit:
+                        break
+                    sid = row.get("id")
+                    if not sid:
+                        continue
+                    preview = (row.get("preview") or "").strip()
+                    snippet = preview or f"Session ID: {sid}"
+                    add_lineage_result(
+                        sid,
+                        {
+                            "snippet": snippet,
+                            "role": None,
+                            "source": row.get("source"),
+                            "model": row.get("model"),
+                            "session_started": row.get("started_at"),
+                        },
+                    )
 
             # Auto-add prefix wildcards so partial words match
             # e.g. "nimb" → "nimb*" matches "nimby"

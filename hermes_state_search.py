@@ -14,7 +14,8 @@ import os
 import re
 import sqlite3
 import time
-from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, Collection, Dict, List, Literal, Optional, Tuple
 
 from agent.skill_commands import describe_skill_invocation
 from hermes_state_common import (
@@ -26,12 +27,33 @@ from hermes_state_common import (
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_VERSION,
     _FTS_CJK_TRIGGERS,
+    _FTS_SESSION_LANES,
+    _session_metadata_compact_sql,
+    compact_session_metadata_text,
     escape_like as _escape_like,
 )
 
 # Moved methods logged under the "hermes_state" logger before the split;
 # keep that logger identity so log filtering/capture behavior is unchanged.
 logger = logging.getLogger("hermes_state")
+
+
+@dataclass(frozen=True)
+class MetadataCandidateResult:
+    """Outcome of routing one metadata search query to whole-store row_ids.
+
+    ``path`` names the lane that produced the final ``row_ids``: ``"none"``
+    (empty query), ``"like"`` (direct / zero-result / route-failure canonical
+    LIKE fallback), ``"unicode"`` (raw Unicode token lane), ``"cjk+unicode"``
+    (CJK+Unicode union), or ``"trigram"`` (normalized trigram lane).
+    ``status`` is ``"hits"`` when ``row_ids`` is non-empty and ``"zero"`` when
+    the search ran but matched nothing. ``row_ids`` are stable
+    ``sessions.row_id`` values - never public text IDs.
+    """
+
+    path: Literal["none", "like", "unicode", "cjk+unicode", "trigram"]
+    row_ids: Tuple[int, ...]
+
 
 # Characters FTS5's query grammar rejects outside a quoted phrase. Anything
 # missing from this set reaches MATCH raw and raises, which the execute site
@@ -120,6 +142,32 @@ class SessionSearchMixin:
             return None
         pct = min(100, int(100 * progress / total))
         return {"pending": True, "total": total, "indexed": progress, "percent": pct}
+
+    def _fts_session_lane_status(self, lane) -> Optional[Dict[str, Any]]:
+        """Backfill progress of one session-metadata lane, or None when no
+        rebuild is pending."""
+        hw_key = f"{lane.marker_prefix}_high_water"
+        prog_key = f"{lane.marker_prefix}_progress"
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT key, value FROM state_meta WHERE key IN (?, ?)",
+                (hw_key, prog_key),
+            ).fetchall()
+        meta = {r["key"]: r["value"] for r in row}
+        high_water = meta.get(hw_key)
+        if high_water is None:
+            return None
+        progress = int(meta.get(prog_key) or 0)
+        total = int(high_water)
+        if total <= 0:
+            return None
+        pct = min(100, int(100 * progress / total))
+        return {"pending": True, "total": total, "indexed": progress, "percent": pct}
+
+    def fts_session_rebuild_status(self) -> Optional[Dict[str, Any]]:
+        """Unicode session-metadata index backfill progress, or None when no
+        rebuild is pending."""
+        return self._fts_session_lane_status(_FTS_SESSION_LANES[0])
 
     def _fts_rebuild_finish(self) -> None:
         """Finalize the deferred rebuild: boundary sweep + clear markers.
@@ -341,6 +389,378 @@ class SessionSearchMixin:
                 self._fts_rebuild_finish()
             return False
         return bool(more)
+
+    def _fts_session_lane_step(self, lane) -> bool:
+        """Backfill one chunk of one session-metadata lane's deferred rebuild.
+
+        Returns True when more work remains, False when the rebuild is
+        complete (or none pending). Chunks are claimed atomically inside the
+        write transaction, so concurrent callers interleave. The optional
+        lanes flip search-serving availability on only after the markers are
+        cleared.
+        """
+        if not self._fts_enabled:
+            return False
+        hw_key = f"{lane.marker_prefix}_high_water"
+        prog_key = f"{lane.marker_prefix}_progress"
+        high_water_raw = self.get_meta(hw_key)
+        if high_water_raw is None:
+            return False
+        high_water = int(high_water_raw)
+        chunk = self._FTS_REBUILD_CHUNK_ROWS
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (prog_key,)
+            ).fetchone()
+            if row is None:
+                return False  # finished (or cleared) by another process
+            progress = int(row[0])
+            if progress >= high_water:
+                return False
+            upper = min(progress + chunk, high_water)
+            conn.execute(
+                f"INSERT INTO {lane.fts_table}(rowid, title, id, display_name) "
+                f"SELECT row_id, title, id, display_name FROM {lane.src_from} "
+                "WHERE row_id > ? AND row_id <= ?",
+                (progress, upper),
+            )
+            # Publish progress in the same transaction as the rows it
+            # covers — crash-atomic: either both land or neither does.
+            conn.execute(
+                "UPDATE state_meta SET value = ? WHERE key = ?",
+                (str(upper), prog_key),
+            )
+            return upper < high_water
+
+        try:
+            more = self._execute_write(_do)
+        except sqlite3.OperationalError as exc:
+            logger.debug("%s rebuild chunk failed (will retry): %s", lane.marker_prefix, exc)
+            return True  # transient (lock contention) — caller retries
+        if more is False:
+            status = self._fts_session_lane_status(lane)
+            if status is not None and status["indexed"] >= status["total"]:
+                self._clear_session_fts_rebuild_markers(lane)
+            return False
+        return bool(more)
+
+    def _clear_session_fts_rebuild_markers(self, lane) -> None:
+        """Remove one session-metadata lane's rebuild H/P markers once the
+        backfill completes and flip its search-serving availability on (the
+        optional lanes only; the Unicode lane's availability is implicit via
+        the rebuild-gap check)."""
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM state_meta WHERE key IN (?, ?)",
+                (f"{lane.marker_prefix}_high_water", f"{lane.marker_prefix}_progress"),
+            )
+        self._execute_write(_do)
+        if lane.available_attr is not None:
+            setattr(self, lane.available_attr, True)
+
+    def fts_session_rebuild_step(self) -> bool:
+        """Backfill one chunk of the Unicode session-metadata rebuild."""
+        return self._fts_session_lane_step(_FTS_SESSION_LANES[0])
+
+    def fts_session_cjk_rebuild_status(self) -> Optional[Dict[str, Any]]:
+        """CJK session-metadata index backfill progress, or None when no
+        rebuild is pending."""
+        return self._fts_session_lane_status(_FTS_SESSION_LANES[1])
+
+    def fts_session_cjk_rebuild_step(self) -> bool:
+        """Backfill one chunk of the CJK session-metadata rebuild."""
+        return self._fts_session_lane_step(_FTS_SESSION_LANES[1])
+
+    def fts_session_trigram_rebuild_status(self) -> Optional[Dict[str, Any]]:
+        """Trigram session-metadata index backfill progress, or None when no
+        rebuild is pending."""
+        return self._fts_session_lane_status(_FTS_SESSION_LANES[2])
+
+    def fts_session_trigram_rebuild_step(self) -> bool:
+        """Backfill one chunk of the trigram session-metadata rebuild."""
+        return self._fts_session_lane_step(_FTS_SESSION_LANES[2])
+
+    # ── Metadata candidate router (#128 / fork #14, #37, #89) ─────────────
+    # Whole-store metadata discovery routes a query to one of the session
+    # metadata FTS lanes (Unicode / CJK / trigram) and falls back to a bounded
+    # canonical LIKE scan when the routed lane cannot serve (unavailable,
+    # pending rebuild, zero hits, or an unindexable query). Candidate-first:
+    # a successful non-empty routed result never runs the LIKE fallback.
+    @staticmethod
+    def _metadata_search_needle(raw_query: str) -> str:
+        """Bound and trim a raw metadata search query."""
+        return (raw_query or "")[:MAX_FTS5_QUERY_CHARS].strip()
+
+    def _metadata_query_has_explicit_token_syntax(self, needle: str) -> bool:
+        """True when *needle* carries explicit FTS5 token intent (a balanced
+        double-quoted phrase, a standalone AND/OR/NOT, or a legal trailing
+        prefix star). Only these route a bare Latin query down the raw Unicode
+        token lane; ordinary picker text is a literal/infix query."""
+        if '"' in needle:
+            open_quote = False
+            for ch in needle:
+                if ch == '"':
+                    open_quote = not open_quote
+            if not open_quote:
+                return True
+        if re.search(r"\b(?:AND|OR|NOT)\b", needle, flags=re.IGNORECASE):
+            return True
+        if "*" in needle and re.search(r"[A-Za-z0-9_]\*", needle):
+            return True
+        return False
+
+    def _classify_metadata_query(self, needle: str) -> str:
+        """Classify a bounded metadata search needle into a route.
+
+        Returns "none" (empty), "like" (direct canonical LIKE fallback: a
+        lone CJK run or a literal whose raw/compact needle is < 3 chars),
+        "cjk" (CJK 2+ run + Unicode union), "unicode" (explicit FTS token
+        syntax), or "trigram" (plain literal/infix with a usable 3+ char
+        needle). CJK classification takes precedence (issue #37 routing).
+        """
+        needle = needle.strip()
+        if not needle:
+            return "none"
+        if self._has_lone_cjk_run(needle):
+            return "like"
+        if self._contains_cjk(needle):
+            return "cjk"
+        if self._metadata_query_has_explicit_token_syntax(needle):
+            return "unicode"
+        if len(needle) >= 3 and len(compact_session_metadata_text(needle)) >= 3:
+            return "trigram"
+        return "like"
+
+    @staticmethod
+    def _metadata_literal_fallback_needle(needle: str) -> str:
+        """Strip FTS5 query syntax so a fallback LIKE searches literal
+        content (balanced quotes, boolean operators, trailing prefix stars)."""
+        open_quote = False
+        out = []
+        for ch in needle or "":
+            if ch == '"':
+                open_quote = not open_quote
+                continue
+            out.append(ch)
+        cleaned = "".join(out)
+        cleaned = re.sub(
+            r"\s*\b(?:AND|OR|NOT)\b\s*", " ", cleaned, flags=re.IGNORECASE
+        )
+        return re.sub(r"\*+\s*$", "", cleaned).strip()
+
+    def _metadata_like_fallback_row_ids(
+        self, needle: str, *, conn=None
+    ) -> List[int]:
+        """Bounded canonical LIKE fallback over stable ``row_id`` only.
+
+        Strips FTS5 syntax first; every predicate uses ``ESCAPE '\\'`` with an
+        escaped pattern so ``%`` / ``_`` / ``\\`` stay literal - a bare ``%``
+        or ``_`` can never become an accidental match-all scan. Matches raw
+        title / raw id / raw display_name plus canonical compact title /
+        compact display_name (case-insensitive via LOWER).
+        """
+        needle = self._metadata_literal_fallback_needle(needle)
+        if not needle:
+            return []
+
+        def _escape(text: str) -> str:
+            return (
+                text.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+
+        pattern = f"%{_escape(needle)}%"
+        compact_needle = compact_session_metadata_text(needle)
+        compact_pattern = (
+            f"%{_escape(compact_needle)}%" if compact_needle else None
+        )
+        clauses = [
+            "LOWER(COALESCE(s.title, '')) LIKE ? ESCAPE '\\'",
+            "LOWER(COALESCE(s.id, '')) LIKE ? ESCAPE '\\'",
+            "LOWER(COALESCE(s.display_name, '')) LIKE ? ESCAPE '\\'",
+        ]
+        params: List[Any] = [pattern] * 3
+        if compact_pattern is not None:
+            clauses.append(
+                "LOWER("
+                f"{_session_metadata_compact_sql('s.title')}) LIKE ? ESCAPE '\\'"
+            )
+            params.append(compact_pattern)
+            clauses.append(
+                "LOWER("
+                f"{_session_metadata_compact_sql('s.display_name')}) "
+                "LIKE ? ESCAPE '\\'"
+            )
+            params.append(compact_pattern)
+        sql = f"SELECT s.row_id FROM sessions s WHERE {' OR '.join(clauses)}"
+        if conn is not None:
+            return [r["row_id"] for r in conn.execute(sql, params).fetchall()]
+        with self._read_ctx() as conn:
+            return [r["row_id"] for r in conn.execute(sql, params).fetchall()]
+
+    def _session_fts_rebuild_gap(self, conn=None) -> Optional[Tuple[int, int]]:
+        """Bounded unindexed Unicode session gap ``(progress, high_water]``
+        while a rebuild is pending; None when no rebuild is pending."""
+        def _read(c):
+            row = c.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_session_rebuild_high_water'"
+            ).fetchone()
+            if row is None:
+                return None
+            high_water = int(row[0])
+            p = c.execute(
+                "SELECT value FROM state_meta "
+                "WHERE key = 'fts_session_rebuild_progress'"
+            ).fetchone()
+            progress = int(p[0]) if p is not None else 0
+            if progress >= high_water:
+                return None
+            return progress, high_water
+        if conn is not None:
+            return _read(conn)
+        with self._read_ctx() as conn:
+            return _read(conn)
+
+    def _fts_metadata_lane_match(
+        self, fts_table: str, match_query: str, *, conn=None
+    ) -> Tuple[bool, List[int]]:
+        """Run a MATCH on one session-metadata lane, returning ``(ok,
+        row_ids)``. ok is False when the lane's MATCH itself failed (table
+        unavailable / corrupt), so callers can fall back to the bounded LIKE
+        lane instead of trusting a partial result."""
+        def _run(conn):
+            try:
+                rows = conn.execute(
+                    f"SELECT rowid AS row_id FROM {fts_table} "
+                    f"WHERE {fts_table} MATCH ?",
+                    (match_query,),
+                ).fetchall()
+                return True, [r["row_id"] for r in rows]
+            except sqlite3.OperationalError:
+                return False, []
+
+        if conn is not None:
+            return _run(conn)
+        with self._read_ctx() as conn:
+            return _run(conn)
+
+    def _fts_metadata_candidates(
+        self, raw_query: str, *, conn=None
+    ) -> Tuple[bool, List[int]]:
+        """Raw Unicode session-metadata candidates (title/id/display_name)
+        via external-content ``sessions_fts``. Returns ``(ok, row_ids)``; ok
+        is False when the lane cannot serve (rebuild pending / corrupt), so
+        callers fall back to the bounded LIKE lane."""
+        if self._session_fts_rebuild_gap(conn=conn) is not None:
+            return False, []
+        sanitized = self._sanitize_fts5_query(raw_query)
+        if not sanitized:
+            return True, []
+        return self._fts_metadata_lane_match("sessions_fts", sanitized, conn=conn)
+
+    @staticmethod
+    def _trigram_match_needle(needle: str) -> str:
+        """Quote a needle as a safe FTS5 trigram phrase."""
+        return '"' + needle.replace('"', '""') + '"'
+
+    def _fts_session_trigram_candidates(
+        self, needle: str, *, conn=None
+    ) -> Tuple[bool, List[int]]:
+        """Compact trigram session-metadata candidates. Returns ``(ok,
+        row_ids)``; ok is False when the lane is unavailable."""
+        if not getattr(self, "_sessions_trigram_available", False):
+            return False, []
+        compact_needle = compact_session_metadata_text(needle)
+        if len(compact_needle) < 3:
+            return False, []
+        q = self._trigram_match_needle(compact_needle)
+        return self._fts_metadata_lane_match("sessions_fts_trigram", q, conn=conn)
+
+    def _fts_cjk_metadata_candidates(
+        self, needle: str, *, conn=None
+    ) -> Tuple[bool, List[int]]:
+        """CJK session-metadata candidates. Returns ``(ok, row_ids)``; ok
+        is False when the CJK lane cannot serve."""
+        if not getattr(self, "_sessions_cjk_available", False):
+            return False, []
+        return self._fts_metadata_lane_match("sessions_fts_cjk", needle, conn=conn)
+
+    def _metadata_candidate_row_ids_on_conn(
+        self, needle: str, conn
+    ) -> "MetadataCandidateResult":
+        """Inner router over a caller-provided coherent read snapshot."""
+
+        def _like_fallback() -> "MetadataCandidateResult":
+            row_ids = tuple(self._metadata_like_fallback_row_ids(needle, conn=conn))
+            return MetadataCandidateResult(
+                path="like",
+                row_ids=row_ids,
+            )
+
+        route = self._classify_metadata_query(needle)
+        if route == "like":
+            return _like_fallback()
+        if route == "unicode":
+            fts_ok, candidates = self._fts_metadata_candidates(needle, conn=conn)
+            if fts_ok and candidates:
+                return MetadataCandidateResult(
+                    path="unicode", row_ids=tuple(candidates)
+                )
+            return _like_fallback()
+        if route == "trigram":
+            fts_ok, candidates = self._fts_session_trigram_candidates(needle, conn=conn)
+            if fts_ok and candidates:
+                return MetadataCandidateResult(
+                    path="trigram", row_ids=tuple(candidates)
+                )
+            return _like_fallback()
+        if route == "cjk":
+            servable, cjk_candidates = self._fts_cjk_metadata_candidates(
+                needle, conn=conn
+            )
+            if not servable:
+                return _like_fallback()
+            fts_ok, uni_candidates = self._fts_metadata_candidates(needle, conn=conn)
+            if not fts_ok:
+                return _like_fallback()
+            union: Dict[int, None] = {}
+            for r in cjk_candidates or []:
+                union[r] = None
+            for r in uni_candidates or []:
+                union[r] = None
+            if union:
+                return MetadataCandidateResult(
+                    path="cjk+unicode", row_ids=tuple(union)
+                )
+            return _like_fallback()
+        # Defensive: an unknown classifier result never fabricates a match.
+        return _like_fallback()
+
+    def _metadata_candidate_row_ids(
+        self, raw_query: str, *, conn=None
+    ) -> "MetadataCandidateResult":
+        """Route one metadata search query to whole-store ``row_id``
+        candidates.
+
+        Bounds the query, classifies it, runs the routed candidate lane(s) or
+        the bounded canonical-LIKE fallback. A successful non-empty routed
+        result never runs the LIKE fallback; a valid zero or route failure
+        runs it exactly once.
+        """
+        needle = self._metadata_search_needle(raw_query)
+        if not needle:
+            return MetadataCandidateResult(path="none", row_ids=())
+        if conn is not None:
+            return self._metadata_candidate_row_ids_on_conn(needle, conn)
+        with self._read_ctx() as conn:
+            conn.execute("BEGIN")
+            try:
+                return self._metadata_candidate_row_ids_on_conn(needle, conn)
+            finally:
+                conn.execute("ROLLBACK")
 
     def fts_cjk_rebuild_status(self) -> Optional[Dict[str, Any]]:
         """CJK-index backfill progress, or None when none is pending."""
@@ -574,6 +994,53 @@ class SessionSearchMixin:
             ("fts_rebuild_high_water", str(hw)),
             ("fts_rebuild_progress", "0"),
         ):
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (k, v),
+            )
+        return int(hw)
+
+    def _seed_session_fts_rebuild_markers(
+        self, conn, lane, *, force: bool = False
+    ) -> int:
+        """Seed one session-metadata lane's H/P markers for a full backfill.
+        Returns the high-water row_id. Caller must hold the write transaction
+        / lock. Empty DBs seed nothing (an empty index is complete by
+        construction)."""
+        hw_key = f"{lane.marker_prefix}_high_water"
+        prog_key = f"{lane.marker_prefix}_progress"
+        existing_hw = conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (hw_key,)
+        ).fetchone()
+        if existing_hw is not None and not force:
+            hw = int(existing_hw[0])
+            progress = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (prog_key,)
+            ).fetchone()
+            if progress is None:
+                # high_water without progress would leave the chunk loop a
+                # no-op; re-seed progress so the backfill actually runs.
+                conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, '0') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (prog_key,),
+                )
+            return hw
+
+        hw = conn.execute(
+            "SELECT COALESCE(MAX(row_id), 0) FROM sessions"
+        ).fetchone()[0]
+        if int(hw) <= 0:
+            # Empty DB: the index is complete by construction. Never leave
+            # H=0/P=0 zombie markers behind (they would keep optimize
+            # permanently pending as ``backfill_incomplete``).
+            conn.execute(
+                "DELETE FROM state_meta WHERE key IN (?, ?)",
+                (hw_key, prog_key),
+            )
+            return 0
+        for k, v in ((hw_key, str(hw)), (prog_key, "0")):
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -859,6 +1326,20 @@ class SessionSearchMixin:
                 break
             _emit("backfill")
             _pause(time.monotonic() - _t0)
+
+        # Phase 1c: backfill the session-metadata lanes (Unicode / CJK /
+        # trigram), each with its own H/P marker pair. Driven from here so a
+        # DB that already had sessions at open (the upgrade path — any DB
+        # created before the session-metadata substrate existed) converges to
+        # serving via FTS instead of the whole-store LIKE fallback forever.
+        # Each lane's step is a no-op when nothing is pending.
+        for lane in _FTS_SESSION_LANES:
+            while True:
+                _t0 = time.monotonic()
+                if not self._fts_session_lane_step(lane):
+                    break
+                _emit("backfill")
+                _pause(time.monotonic() - _t0)
 
         # Phase 2: tear down the demoted legacy shadow tables in chunks.
         _emit("teardown")

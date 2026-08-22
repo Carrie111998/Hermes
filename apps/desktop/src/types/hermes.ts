@@ -1180,6 +1180,9 @@ export interface SessionSearchResult {
   session_started: number | null
   snippet: string
   source: string | null
+  /** Stored session title, hydrated by the server via
+   *  `get_session_rich_row` (all search lanes). */
+  title?: string | null
 }
 
 export interface SessionSearchResponse {

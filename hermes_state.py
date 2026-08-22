@@ -64,6 +64,8 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _sql_session_last_active,
     _sql_session_last_active_by_id,
     escape_like as _escape_like,
+    _session_metadata_compact_sql,
+    compact_session_metadata_text,
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
     FTS_SQL,
@@ -3923,6 +3925,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 apply_database_pragmas(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
+                # Session metadata FTS availability; the Unicode lane's
+                # availability is implicit via the rebuild-gap check, the
+                # optional CJK/trigram lanes are flipped by their ensure /
+                # rebuild-finish paths during _init_schema.
+                self._sessions_cjk_available = False
+                self._sessions_trigram_available = False
                 self._init_schema()
 
             def _connect_and_init_with_lock_patience():
@@ -9308,9 +9316,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         and OFFSET still apply efficiently.
 
         ``search_query`` matches case-insensitive substrings against each
-        surfaced row's title and id (and, like ``id_query``, every title/id in
-        its forward compression chain). A punctuation-stripped variant is also
-        matched so e.g. ``an94`` finds ``AN-94``. Only honored in the
+        surfaced row's title, gateway display_name, and id (and, like
+        ``id_query``, every title/id/display_name in its forward compression
+        chain). A punctuation-stripped variant is also matched so e.g.
+        ``an94`` finds ``AN-94`` or ``#an-94-ops``. Only honored in the
         ``order_by_last_active`` path.
 
         Pass ``compact_rows=True`` for dashboard and picker callers that only
@@ -9438,28 +9447,56 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 id_params.append(_like_pattern(id_needle))
             if search_needle:
-                # Same chain-membership trick as id_query, but matching either
-                # the title or the id of any session in the chain. The compact
-                # (punctuation-stripped) variant lets `an94` match `AN-94`.
-                compact_needle = re.sub(r"[\W_]+", "", search_needle)
-                compact_sql = (
-                    "REPLACE(REPLACE(REPLACE(REPLACE(LOWER(COALESCE({0}, '')),"
-                    " '-', ''), '_', ''), '.', ''), ' ', '')"
-                )
-                search_clause = (
-                    "EXISTS (SELECT 1 FROM chain cq"
-                    " JOIN sessions cs ON cs.id = cq.cur_id"
-                    " WHERE cq.root_id = s.id"
-                    " AND (LOWER(COALESCE(cs.title, '')) LIKE ? ESCAPE '\\'"
-                    " OR LOWER(cq.cur_id) LIKE ? ESCAPE '\\'"
-                )
-                id_params.extend([_like_pattern(search_needle)] * 2)
-                if compact_needle:
-                    search_clause += (
-                        f" OR {compact_sql.format('cs.title')} LIKE ? ESCAPE '\\'"
+                # Candidate-first metadata discovery through the shared router:
+                # the query is routed to the session-metadata FTS lanes
+                # (Unicode / CJK / trigram) and the compression chain is
+                # restricted to the resulting row_ids. Zero candidates or an
+                # unavailable route falls back to the bounded canonical LIKE
+                # lane below (raw + compact title/display_name/id).
+                metadata = self._metadata_candidate_row_ids(search_query)
+                if metadata.row_ids:
+                    placeholders = ",".join("?" for _ in metadata.row_ids)
+                    filter_clauses.append(
+                        "EXISTS (SELECT 1 FROM chain cq"
+                        " JOIN sessions cs ON cs.id = cq.cur_id"
+                        " WHERE cq.root_id = s.id"
+                        f" AND cs.row_id IN ({placeholders}))"
                     )
-                    id_params.append(_like_pattern(compact_needle))
-                filter_clauses.append(search_clause + "))")
+                    id_params.extend(metadata.row_ids)
+                else:
+                    # Same chain-membership trick as id_query, but matching
+                    # either the title, the gateway display_name, or the id of
+                    # any session in the chain. display_name is the persisted
+                    # gateway peer/chat identity (issue #9006), so
+                    # `/sessions search` finds a channel or DM by name. The
+                    # compact (punctuation-stripped) variant lets `an94` match
+                    # `AN-94` and `#an-94-ops`.
+                    # Same canonical compact policy as the metadata router /
+                    # trigram lane (one source of truth in hermes_state_common)
+                    # so `an94` matches `AN-94` / `#an-94-ops` identically on
+                    # both the FTS and the LIKE fallback path.
+                    compact_needle = compact_session_metadata_text(search_needle)
+                    compact_sql = (
+                        "LOWER("
+                        + _session_metadata_compact_sql("{0}")
+                        + ")"
+                    )
+                    search_clause = (
+                        "EXISTS (SELECT 1 FROM chain cq"
+                        " JOIN sessions cs ON cs.id = cq.cur_id"
+                        " WHERE cq.root_id = s.id"
+                        " AND (LOWER(COALESCE(cs.title, '')) LIKE ? ESCAPE '\\'"
+                        " OR LOWER(COALESCE(cs.display_name, '')) LIKE ? ESCAPE '\\'"
+                        " OR LOWER(cq.cur_id) LIKE ? ESCAPE '\\'"
+                    )
+                    id_params.extend([_like_pattern(search_needle)] * 3)
+                    if compact_needle:
+                        search_clause += (
+                            f" OR {compact_sql.format('cs.title')} LIKE ? ESCAPE '\\'"
+                            f" OR {compact_sql.format('cs.display_name')} LIKE ? ESCAPE '\\'"
+                        )
+                        id_params.extend([_like_pattern(compact_needle)] * 2)
+                    filter_clauses.append(search_clause + "))")
             if filter_clauses:
                 combined = " AND ".join(filter_clauses)
                 outer_where = (

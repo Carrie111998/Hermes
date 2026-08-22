@@ -17,15 +17,21 @@ from hermes_constants import get_hermes_home
 from hermes_state_common import (
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
-    FTS_STALE_KEY,
+    FTS_SESSION_CJK_STALE_KEY,
     FTS_SQL,
+    FTS_STALE_KEY,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
     LEGACY_FTS_SQL,
     LEGACY_FTS_TRIGRAM_SQL,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    SESSION_INDEX_SQL_STATEMENTS,
+    SESSION_TABLE_REBUILD_SQL,
+    SESSIONS_FTS_SQL,
     _FTS_CJK_TRIGGERS,
+    _FTS_SESSION_CJK_TRIGGERS,
+    _FTS_SESSION_LANES,
     _FTS_TRIGGERS,
     _ephemeral_child_sql,
 )
@@ -836,6 +842,12 @@ class SessionSchemaMixin:
 
         cursor.executescript(SCHEMA_SQL)
 
+        # Give legacy sessions tables a named stable row_id for the
+        # external-content session-metadata FTS substrate (fresh installs
+        # already declare row_id in SCHEMA_SQL). Runs before _reconcile_columns
+        # so the reconciler never tries to ALTER-ADD a PRIMARY KEY column.
+        self._migrate_sessions_row_id(cursor)
+
         # ── Declarative column reconciliation ──────────────────────────
         # Diff live tables against SCHEMA_SQL and ADD any missing columns.
         # This is idempotent and self-healing: even if a version-gated
@@ -1297,7 +1309,296 @@ class SessionSchemaMixin:
             if getattr(self, "_fts_enabled", False):
                 self._migrate_broad_fts_update_triggers(cursor)
 
+        # Session Unicode metadata FTS (external-content over raw
+        # title/id/display_name, keyed by named sessions.row_id). Safe to
+        # run only when FTS5 is available; _ensure_fts_schema fails closed.
+        if fts5_available:
+            self._ensure_sessions_fts_schema(cursor)
+            self._ensure_sessions_fts_cjk_schema(cursor)
+            self._ensure_sessions_fts_trigram_schema(cursor)
+
         self._conn.commit()
+
+    def _migrate_sessions_row_id(self, cursor: sqlite3.Cursor) -> None:
+        """Give ``sessions`` a named ``row_id INTEGER PRIMARY KEY`` (#25).
+
+        Session-metadata FTS is migrating to external-content backed by the
+        canonical ``sessions`` table, which needs a stable integer document
+        identity. SQLite cannot ALTER a PRIMARY KEY, so this rebuilds the
+        table with ``row_id INTEGER PRIMARY KEY AUTOINCREMENT`` while keeping
+        the text ``id`` as ``NOT NULL UNIQUE`` — the public/logical session
+        identity every SessionDB API, relationship, and
+        ``messages.session_id`` reference continues to use.
+
+        Idempotent: no-op when ``row_id`` already exists (fresh installs and
+        already-migrated DBs). Runs BEFORE ``_reconcile_columns`` (which must
+        not ALTER-ADD a PK column) and before any DML starts a transaction
+        (``PRAGMA foreign_keys`` can only toggle outside a transaction, and
+        the DROP TABLE swap requires FKs off).
+
+        The legacy hidden ``rowid`` value itself is copied into ``row_id``.
+        An order-preserving copy (``ORDER BY rowid`` + fresh AUTOINCREMENT
+        allocation) is NOT sufficient: deleted-row holes would be densified
+        (1=A, 3=B, 7=C must stay 1,3,7, not become 1,2,3). The whole
+        create/copy/verify/drop/rename/index-recreate swap is one explicit
+        BEGIN IMMEDIATE transaction, so an interrupted swap rolls back to the
+        intact legacy layout instead of stranding an empty replacement.
+        """
+        if getattr(self, "read_only", False):
+            return
+        try:
+            rows = cursor.execute('PRAGMA table_info("sessions")').fetchall()
+        except sqlite3.OperationalError:
+            return
+        names = {
+            (r["name"] if isinstance(r, sqlite3.Row) else r[1]) for r in rows
+        }
+        if "row_id" in names:
+            return
+
+        # Preflight pathological legacy rows before mutating anything: the
+        # new shape requires id NOT NULL UNIQUE, and we refuse to invent an
+        # ID for a row that never had one.
+        null_id = cursor.execute(
+            "SELECT COUNT(*) FROM sessions WHERE id IS NULL"
+        ).fetchone()
+        null_count = int(
+            null_id[0] if not isinstance(null_id, sqlite3.Row) else null_id[0]
+        )
+        if null_count > 0:
+            logger.error(
+                "Cannot migrate sessions to named row_id: %d row(s) have NULL "
+                "id; sessions table left unchanged", null_count,
+            )
+            raise sqlite3.IntegrityError(
+                "sessions.id contains NULL rows; cannot make id NOT NULL UNIQUE"
+            )
+
+        logger.warning(
+            "Migrating sessions table to named row_id (#25); one transactional "
+            "rebuild (preserves every logical id and exact numeric rowid)"
+        )
+        # Clear any transaction executescript may have left open so the
+        # PRAGMA foreign_keys toggle is legal (autocommit only).
+        try:
+            cursor.execute("COMMIT")
+        except sqlite3.OperationalError:
+            pass
+        cursor.execute("PRAGMA foreign_keys=OFF")
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            # A donor-style interrupted attempt may have left a partial
+            # sessions_new behind; drop it inside the transaction.
+            cursor.execute("DROP TABLE IF EXISTS sessions_new")
+            cursor.execute(SESSION_TABLE_REBUILD_SQL)
+            new_cols = {
+                (r["name"] if isinstance(r, sqlite3.Row) else r[1])
+                for r in cursor.execute(
+                    'PRAGMA table_info("sessions_new")'
+                ).fetchall()
+            }
+            # Copy only columns the new table declares (guards against drift
+            # if an old table ever carries a stray extra column), copying the
+            # OLD hidden rowid explicitly into row_id.
+            shared = (names & new_cols) - {"row_id"}
+            cols_sql = ", ".join(f'"{c}"' for c in sorted(shared))
+            cursor.execute(
+                f"INSERT INTO sessions_new (row_id, {cols_sql}) "
+                f"SELECT rowid, {cols_sql} FROM sessions"
+            )
+            # Verify row count and exact {id: row_id} identity before the
+            # destructive drop — never commit a densified / lost-row swap.
+            old_count = cursor.execute(
+                "SELECT COUNT(*) FROM sessions"
+            ).fetchone()[0]
+            new_count = cursor.execute(
+                "SELECT COUNT(*) FROM sessions_new"
+            ).fetchone()[0]
+            if old_count != new_count:
+                raise sqlite3.OperationalError(
+                    "sessions row_id migration row-count mismatch: "
+                    f"old={old_count} new={new_count}"
+                )
+            mismatch = cursor.execute(
+                "SELECT COUNT(*) FROM sessions s "
+                "LEFT JOIN sessions_new n "
+                "  ON n.id = s.id AND n.row_id = s.rowid "
+                "WHERE n.id IS NULL"
+            ).fetchone()[0]
+            if int(mismatch) > 0:
+                raise sqlite3.OperationalError(
+                    "sessions row_id migration failed {id: row_id} identity check"
+                )
+            cursor.execute("DROP TABLE sessions")
+            cursor.execute("ALTER TABLE sessions_new RENAME TO sessions")
+            # Recreate the sessions indexes DROP TABLE removed. All IF NOT
+            # EXISTS; the later SCHEMA_SQL / DEFERRED_INDEX_SQL passes no-op.
+            for stmt in SESSION_INDEX_SQL_STATEMENTS:
+                cursor.execute(stmt)
+            cursor.execute("COMMIT")
+        except sqlite3.Error:
+            try:
+                cursor.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            logger.exception(
+                "sessions row_id migration failed; sessions table left unchanged"
+            )
+            raise
+        finally:
+            cursor.execute("PRAGMA foreign_keys=ON")
+        # FK integrity across every reference to sessions(id) after the swap.
+        fk_violations = cursor.execute("PRAGMA foreign_key_check").fetchall()
+        if fk_violations:
+            logger.error(
+                "sessions row_id migration left %d FK violation(s)",
+                len(fk_violations),
+            )
+
+    def _ensure_sessions_fts_schema(self, cursor: sqlite3.Cursor) -> bool:
+        """Ensure the Unicode session-metadata external-content FTS surface.
+
+        Fresh-create over a populated DB stages a durable H/P claim BEFORE
+        the empty external table can look complete (never serve an empty
+        index as complete): seed the markers first, then ensure the schema;
+        the resumable chunk engine backfills (P, H]. A crash between the
+        claim and the schema ensure leaves markers without a table -- reopen
+        re-ensures the schema and finds the claim already durable. Rows
+        committing after the claim are live-indexed by the triggers.
+
+        Returns True when sessions_fts is available for search.
+        """
+        existing = bool(
+            cursor.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'sessions_fts'"
+            ).fetchone()
+        )
+        if not existing:
+            row = cursor.execute(
+                "SELECT 1 FROM state_meta "
+                "WHERE key = 'fts_session_rebuild_high_water' LIMIT 1"
+            ).fetchone()
+            if row is None:
+                self._seed_session_fts_rebuild_markers(cursor, _FTS_SESSION_LANES[0])
+        ok = self._ensure_fts_schema(cursor, "sessions_fts", SESSIONS_FTS_SQL)
+        return ok
+
+    def _ensure_sessions_fts_cjk_schema(self, cursor) -> None:
+        """Create / repair / self-heal the optional CJK-bigram session
+        metadata index (mirrors the message ``_ensure_fts_cjk_schema``).
+
+        Sets ``self._sessions_cjk_available``. Never raises; every failure
+        mode degrades to "no CJK session index" (Unicode/trigram/LIKE
+        routing keeps working).
+
+        Cases:
+          tokenizer loaded, table absent  -> create. Empty DB: index is
+              complete by construction. Populated DB: set the dedicated
+              ``fts_session_cjk_*`` markers so the id-gated triggers keep
+              NEW rows indexed while old rows await the resumable backfill;
+              the index is not served until that backfill completes.
+          tokenizer loaded, table present -> ensure triggers, honour the
+              stale breadcrumb (serve only when absent and no backfill
+              pending).
+          tokenizer NOT loaded, table present with live triggers -> drop
+              the CJK triggers so canonical session writes don't fail at
+              trigger time, and leave the stale breadcrumb (self-heal).
+        """
+        cjk_present = bool(cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'sessions_fts_cjk'"
+        ).fetchone())
+
+        if not self._fts_cjk_loaded:
+            if cjk_present:
+                live = [
+                    r[0] for r in cursor.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                        f"AND name IN ({','.join('?' for _ in _FTS_SESSION_CJK_TRIGGERS)})",
+                        _FTS_SESSION_CJK_TRIGGERS,
+                    ).fetchall()
+                ]
+                if live:
+                    # Self-heal: this process cannot tokenize, so every
+                    # session INSERT would die inside the CJK trigger.
+                    # Breadcrumb FIRST, then drop.
+                    logger.warning(
+                        "sessions_fts_cjk triggers present but the "
+                        "cjk_unicode61 tokenizer is unavailable (%s) - "
+                        "dropping the CJK session triggers so session writes "
+                        "keep working; run `hermes sessions optimize-storage` "
+                        "on a host with the extension to rebuild.",
+                        fts5_cjk_so_path(),
+                    )
+                    cursor.execute(
+                        "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                        "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                        (FTS_SESSION_CJK_STALE_KEY,),
+                    )
+                    for trig in live:
+                        cursor.execute(f"DROP TRIGGER IF EXISTS {trig}")
+            self._sessions_cjk_available = False
+            return
+
+        self._ensure_session_optional_lane(cursor, _FTS_SESSION_LANES[1])
+
+    def _ensure_session_optional_lane(self, cursor, lane) -> None:
+        """Create / repair / self-heal one OPTIONAL session-metadata lane
+        (CJK / trigram) on a tokenizer-capable host. Sets the lane's
+        search-serving availability flag; never raises - a host whose SQLite
+        build lacks the lane's tokenizer degrades to Unicode/trigram/LIKE
+        routing.
+
+        Fresh-create over a populated DB seeds the lane's own H/P markers so
+        the id-gated triggers keep NEW rows indexed while old rows await the
+        resumable backfill; a stale breadcrumb (capability loss of unknown
+        extent) is never served until a capable host rebuilds.
+        """
+        present = bool(cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (lane.fts_table,),
+        ).fetchone())
+        try:
+            cursor.executescript(lane.table_sql)
+            if not present:
+                cursor.execute(
+                    "DELETE FROM state_meta WHERE key = ?", (lane.stale_key,)
+                )
+                n_sessions = cursor.execute(
+                    "SELECT COUNT(*) FROM sessions"
+                ).fetchone()[0]
+                if n_sessions > 0:
+                    self._seed_session_fts_rebuild_markers(cursor, lane)
+            stale = cursor.execute(
+                "SELECT 1 FROM state_meta WHERE key = ?", (lane.stale_key,)
+            ).fetchone()
+            if stale:
+                # Capability loss of unknown extent - do not serve until a
+                # capable host resets and rebuilds the index. Split DDL keeps
+                # the unsafe triggers absent (an external-content 'delete'
+                # for an unindexed rowid corrupts the index).
+                setattr(self, lane.available_attr, False)
+                return
+            if lane.trigger_sql:
+                cursor.executescript(lane.trigger_sql)
+            pending = cursor.execute(
+                "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+                (f"{lane.marker_prefix}_high_water",),
+            ).fetchone()
+            setattr(self, lane.available_attr, not bool(pending))
+        except sqlite3.OperationalError:
+            # Includes "no such tokenizer: ..." if the tokenizer is missing.
+            logger.warning(
+                "%s ensure failed; %s session search stays on Unicode/trigram/LIKE",
+                lane.marker_prefix, lane.marker_prefix, exc_info=True,
+            )
+            setattr(self, lane.available_attr, False)
+
+    def _ensure_sessions_fts_trigram_schema(self, cursor) -> None:
+        """Create / repair / self-heal the optional trigram session metadata
+        index over the compact derived VIEW (mirrors the CJK-session ensure)."""
+        self._ensure_session_optional_lane(cursor, _FTS_SESSION_LANES[2])
 
     def _backfill_gateway_metadata_from_sessions_json(
         self, cursor: sqlite3.Cursor
