@@ -6,7 +6,7 @@ from dataclasses import asdict
 
 import pytest
 
-from jobflow_dispatch.store import ActivationRow
+from jobflow_dispatch.store import ActivationRow, WakeOutboxRow
 
 
 def _claim(message_key="message-1", activity_id="cron.jobflow.matcher"):
@@ -22,11 +22,15 @@ def _claim(message_key="message-1", activity_id="cron.jobflow.matcher"):
 
 
 class _ActivationStore:
-    def __init__(self, rows=()):
+    def __init__(self, rows=(), outbox=()):
         self.rows = list(rows)
+        self.outbox = list(outbox)
 
     def claim_census(self):
         return list(self.rows)
+
+    def pending_wake_outbox(self):
+        return list(self.outbox)
 
 
 class _Barrier:
@@ -122,7 +126,18 @@ def _settlement(**overrides):
 
 def test_snapshot_composes_every_complete_source_without_filtering():
     claim = _claim()
-    control = _settlement(activation_store=_ActivationStore([claim]))
+    outbox = WakeOutboxRow(
+        message_key=claim.message_key,
+        activity_id=claim.activity_id,
+        outbox_token="outbox-1",
+        job_id="job-a",
+        caller="jobflow-dispatcher",
+        reason="mailbox_message",
+        requested_at=1000.0,
+    )
+    control = _settlement(
+        activation_store=_ActivationStore([claim], [outbox])
+    )
 
     snapshot = control.snapshot(("target-1", "target-2"))
 
@@ -146,8 +161,22 @@ def test_snapshot_composes_every_complete_source_without_filtering():
             }
         ],
         "dispatcher_claims": [asdict(claim)],
+        "dispatcher_wake_outbox": [asdict(outbox)],
         "target_ids": ["target-1", "target-2"],
     }
+
+
+def test_snapshot_rejects_malformed_dispatcher_wake_outbox():
+    malformed = {
+        "message_key": "message-1",
+        "activity_id": "cron.jobflow.matcher",
+        "job_id": "job-a",
+    }
+
+    with pytest.raises(RuntimeError, match="wake outbox"):
+        _settlement(
+            activation_store=_ActivationStore(outbox=[malformed])
+        ).snapshot(("target-1",))
 
 
 def test_snapshot_preserves_unprovable_execution_liveness():
@@ -184,6 +213,26 @@ def test_snapshot_rejects_malformed_execution_liveness_evidence():
         "owner_liveness_evidence": {"pid": 42},
     }
     with pytest.raises(RuntimeError, match="owner identity evidence"):
+        _settlement(execution_census=lambda: [malformed]).snapshot(("target-1",))
+
+
+@pytest.mark.parametrize("field", ["id", "job_id"])
+@pytest.mark.parametrize("value", [None, "", "  "])
+def test_snapshot_rejects_malformed_execution_identity(field, value):
+    malformed = {
+        "id": "execution-1",
+        "job_id": "target-1",
+        "status": "running",
+        "owner_liveness": "live",
+        "owner_liveness_evidence": {
+            "process_id": "process-1",
+            "pid": 42,
+            "process_started_at": 100.0,
+        },
+    }
+    malformed[field] = value
+
+    with pytest.raises(RuntimeError, match="execution identity"):
         _settlement(execution_census=lambda: [malformed]).snapshot(("target-1",))
 
 

@@ -44,12 +44,51 @@ def _claim_row(value: Any) -> dict[str, Any]:
     return row
 
 
+def _wake_outbox_row(value: Any) -> dict[str, Any]:
+    if is_dataclass(value):
+        row = asdict(value)
+    elif isinstance(value, dict):
+        row = copy.deepcopy(value)
+    else:
+        raise RuntimeError("dispatcher wake outbox contains a malformed row")
+    required = {
+        "message_key", "activity_id", "outbox_token", "job_id", "caller",
+        "reason", "requested_at",
+    }
+    if set(row) != required:
+        raise RuntimeError("dispatcher wake outbox contains an incomplete row")
+    for field in ("message_key", "activity_id", "outbox_token", "job_id", "caller"):
+        try:
+            row[field] = _identity(row[field], field)
+        except ValueError as exc:
+            raise RuntimeError(
+                "dispatcher wake outbox contains an incomplete row"
+            ) from exc
+    if row["reason"] is not None:
+        try:
+            row["reason"] = _identity(row["reason"], "reason")
+        except ValueError as exc:
+            raise RuntimeError(
+                "dispatcher wake outbox contains an incomplete row"
+            ) from exc
+    if isinstance(row["requested_at"], bool) or not isinstance(
+        row["requested_at"], (int, float)
+    ):
+        raise RuntimeError("dispatcher wake outbox contains an incomplete row")
+    return row
+
+
 def _execution_row(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise RuntimeError("execution census contains a malformed row")
     row = copy.deepcopy(value)
     if not {"id", "job_id", "status", "owner_liveness", "owner_liveness_evidence"} <= set(row):
         raise RuntimeError("execution census contains an incomplete row")
+    try:
+        row["id"] = _identity(row["id"], "execution id")
+        row["job_id"] = _identity(row["job_id"], "execution job id")
+    except ValueError as exc:
+        raise RuntimeError("execution identity is incomplete") from exc
     if row["status"] not in {"claimed", "running"}:
         raise RuntimeError("execution census contains a terminal row")
     if row["owner_liveness"] not in _LIVENESS:
@@ -137,6 +176,10 @@ class QuarantineSettlementControl:
         running = sorted({_identity(value, "running job id") for value in self._running_jobs()})
         executions = [_execution_row(row) for row in self._execution_census()]
         claims = [_claim_row(row) for row in self.activation_store.claim_census()]
+        wake_outbox = [
+            _wake_outbox_row(row)
+            for row in self.activation_store.pending_wake_outbox()
+        ]
         return {
             "schema_version": 1,
             "complete": True,
@@ -145,6 +188,7 @@ class QuarantineSettlementControl:
             "running_job_ids": running,
             "executions": executions,
             "dispatcher_claims": claims,
+            "dispatcher_wake_outbox": wake_outbox,
             "target_ids": list(targets),
         }
 
