@@ -66,11 +66,11 @@
     },
     {
       "name": "jackal-verified",
-      "description": "JACKAL v1.7.3 candidate adapter with 41 catalog-derived tools across exact, checked, estimated, bounded, formal-bounded, claim/bundle, structural, decision, and caller-pinned program-evidence routes. Unsupported or failed admission and execution paths return named refusals. This pinned commit is unpublished pending release sign-off.",
+      "description": "Released JACKAL v1.7.3 adapter with 41 catalog-derived tools across exact, checked, estimated, bounded, formal-bounded, claim/bundle, structural, decision, and caller-pinned program-evidence routes. Unsupported or failed admission and execution paths return named refusals.",
       "author": "AnubisQuantumCipher",
       "tags": ["mathematics", "verification", "formal-methods", "lean", "interval-arithmetic", "evidence", "tools"],
       "repo": "AnubisQuantumCipher/hermes-jackal-verified",
-      "ref": "936dab4458d4618f4ecf56c2da5c9f5cdbb9aef4",
+      "ref": "dab507a521406a69d308025bed380401eff967b9",
       "homepage": "https://github.com/AnubisQuantumCipher/hermes-jackal-verified",
       "capabilities": ["tools", "skills"],
       "api_version": 1,
