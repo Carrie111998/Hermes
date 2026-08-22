@@ -583,23 +583,23 @@ def cmd_mcp_add(args):
         tools = _probe_single_server(name, server_config)
     except Exception as exc:
         _error(f"Failed to connect: {exc}")
-        if _confirm("Save config anyway (you can test later)?", default=False):
-            server_config["enabled"] = False
-            if _save_mcp_server(name, server_config):
-                _success(f"Saved '{name}' to config (disabled)")
-                _info("Fix the issue, then: hermes mcp test " + name)
-            else:
-                return 1
-        return
+        if not _confirm("Save config anyway (you can test later)?", default=False):
+            return 1
+        server_config["enabled"] = False
+        if _save_mcp_server(name, server_config):
+            _success(f"Saved '{name}' to config (disabled)")
+            _info("Fix the issue, then: hermes mcp test " + name)
+            return 0
+        return 1
 
     if not tools:
         _warning("Server connected but reported no tools.")
-        if _confirm("Save config anyway?", default=True):
-            if _save_mcp_server(name, server_config):
-                _success(f"Saved '{name}' to config")
-            else:
-                return 1
-        return
+        if not _confirm("Save config anyway?", default=True):
+            return 1
+        if _save_mcp_server(name, server_config):
+            _success(f"Saved '{name}' to config")
+            return 0
+        return 1
 
     # ── Tool selection ────────────────────────────────────────────────
 

@@ -305,6 +305,32 @@ class TestMcpAdd:
         assert "Saved 'github'" not in captured.out
         assert "was not persisted" in captured.err.lower()
 
+    @pytest.mark.parametrize("probe_result", [[], RuntimeError("unreachable")])
+    def test_add_returns_failure_when_user_declines_fallback_save(
+        self, tmp_path, monkeypatch, probe_result
+    ):
+        def probe(name, config):
+            if isinstance(probe_result, Exception):
+                raise probe_result
+            return probe_result
+
+        monkeypatch.setattr("hermes_cli.mcp_config._probe_single_server", probe)
+        monkeypatch.setattr("builtins.input", lambda _: "n")
+
+        from hermes_cli.mcp_config import mcp_command
+
+        rc = mcp_command(
+            _make_args(
+                name="github",
+                mcp_action="add",
+                mcp_command="npx",
+                args=["@mcp/github"],
+            )
+        )
+
+        assert rc == 1
+        assert not (tmp_path / "config.yaml").exists()
+
 
 # ---------------------------------------------------------------------------
 # Tests: cmd_mcp_test
