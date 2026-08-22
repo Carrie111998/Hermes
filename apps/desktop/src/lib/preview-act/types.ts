@@ -58,15 +58,24 @@ export interface PreviewActDelta {
   same?: number
 }
 
+export interface PreviewUploadFile {
+  dataUrl: string
+  name: string
+}
+
 /** A normalized action. `kind` is the verb; the rest is per-verb payload. */
 export interface PreviewActAction {
   /** scroll distance in px. Defaults to ~90% of the viewport height. */
   amount?: number
+  /** Local paths supplied by the upload tool; read in the renderer, never injected. */
+  filePaths?: string[]
+  /** Local files converted to data URLs immediately before page injection. */
+  files?: PreviewUploadFile[]
   key?: string
   /** `pin`/`unpin`/`hold` never reach the engine — they resolve their targets
    *  through `locate`/`elements` and then talk to the overlay — but they arrive
    *  on the same wire. */
-  kind: 'click' | 'elements' | 'hold' | 'hover' | 'locate' | 'pin' | 'press' | 'scroll' | 'strobe' | 'type' | 'unpin'
+  kind: 'click' | 'elements' | 'hold' | 'hover' | 'locate' | 'pin' | 'press' | 'scroll' | 'strobe' | 'type' | 'unpin' | 'upload'
   /** locate: also give the target keyboard focus, for a key press that must not
    *  be preceded by a click (which would activate the control instead). */
   focus?: boolean
