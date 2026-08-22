@@ -130,3 +130,73 @@ class TestSplitToolDiagnostics:
         assert diagnostics == ""
         assert "--" in payload
         assert "a.py-6-after" in payload
+
+
+class TestSplitToolDiagnosticsFilesOnly:
+    """Unit coverage for mode-aware splitting of files_only output (#91698).
+
+    ``rg -l`` / ``grep -l`` emit bare paths, and paths may contain whitespace.
+    The whitespace-forbidding shape regex misfiled every spaced path as a
+    diagnostic, silently dropping it from the results.
+    """
+
+    def test_spaced_path_is_payload(self):
+        diagnostics, payload = _split_tool_diagnostics(
+            "/tmp/v/Obsidian Vault/note.md\n", output_mode="files_only")
+        assert diagnostics == ""
+        assert "note.md" in payload
+
+    def test_error_block_still_split_from_paths(self):
+        out = ("rg: regex parse error:\n"
+               "    \\\n"
+               "     ^\n"
+               "error: unclosed character class\n"
+               "/tmp/v/Obsidian Vault/note.md\n")
+        diagnostics, payload = _split_tool_diagnostics(out, output_mode="files_only")
+        assert payload.strip() == "/tmp/v/Obsidian Vault/note.md"
+        assert "regex parse error" in diagnostics
+        assert "error: unclosed character class" in diagnostics
+
+    def test_pure_failure_has_empty_payload(self):
+        out = "rg: regex parse error:\n    \\\n     ^\nerror: bad pattern\n"
+        diagnostics, payload = _split_tool_diagnostics(out, output_mode="files_only")
+        assert payload.strip() == ""
+        assert "bad pattern" in diagnostics
+
+    def test_content_mode_shape_rules_unchanged(self):
+        # Match/count lines tolerate spaces after the first char; the
+        # default classification is untouched by the files_only branch.
+        diagnostics, payload = _split_tool_diagnostics("/tmp/my dir/f.py:12:hit\n")
+        assert diagnostics == ""
+        assert "hit" in payload
+
+
+@pytest.mark.parametrize("method", _METHODS)
+class TestFilesOnlySpacePathsEndToEnd:
+    """#91698 end-to-end: files_only must return spaced paths, both backends."""
+
+    @pytest.fixture
+    def spaced_tree(self, tmp_path):
+        (tmp_path / "file with space.md").write_text("needle\n")
+        (tmp_path / "plain.txt").write_text("needle\n")
+        vault = tmp_path / "Obsidian Vault"
+        vault.mkdir()
+        (vault / "note.md").write_text("needle\n")
+        return tmp_path
+
+    def test_files_only_returns_spaced_paths(self, method, spaced_tree):
+        res = _search(_ops(spaced_tree), method, "needle", spaced_tree,
+                      output_mode="files_only")
+        assert res.error is None
+        assert {os.path.basename(p) for p in res.files} == {
+            "file with space.md", "plain.txt", "note.md",
+        }
+        assert res.total_count == 3
+
+    def test_files_only_hard_error_still_surfaced(self, method, match_tree):
+        # The exit-2 guard must keep working in files_only mode: an invalid
+        # regex yields only diagnostic-shaped lines and MUST be surfaced.
+        res = _search(_ops(match_tree), method, "[", match_tree,
+                      output_mode="files_only")
+        assert res.error is not None, "search error was silently swallowed"
+        assert not res.files
