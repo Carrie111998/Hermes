@@ -26,6 +26,10 @@ def parse_arxiv_id(full_id):
     (solv-int, adap-org, chao-dyn, patt-sol, comp-gas), e.g.
     'solv-int/9701001v1' -> 'sol'. Anchor the version suffix to the
     end of the string instead.
+
+    A malformed suffix (e.g. a trailing bare 'v' with no digits, as in
+    '2402.03300v') rides along as part of the base id untouched, since
+    arXiv never emits ids in that form.
     """
     match = re.fullmatch(r"(.+?)(v\d+)?", full_id)
     return match.group(1), match.group(2) or ""
