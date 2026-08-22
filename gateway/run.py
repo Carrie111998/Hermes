@@ -1525,7 +1525,21 @@ def _compose_gateway_ephemeral_prompt(
     channel_prompt: Optional[str] = None,
 ) -> str:
     """Compose per-turn gateway context identically for every execution path."""
-    parts = [str(context_prompt or "").strip(), str(channel_prompt or "").strip()]
+    resolved_channel_prompt = str(channel_prompt or "").strip()
+    if not resolved_channel_prompt:
+        platform_config = getattr(
+            getattr(runner, "config", None), "platforms", {}
+        ).get(source.platform)
+        config_extra = getattr(platform_config, "extra", {}) or {}
+        chat_id = str(source.chat_id or "")
+        thread_id = str(getattr(source, "thread_id", None) or "")
+        parent_id = str(getattr(source, "parent_chat_id", None) or "")
+        scoped_id = f"{chat_id}:{thread_id}" if chat_id and thread_id else chat_id
+        resolved_channel_prompt = resolve_channel_prompt(
+            config_extra, scoped_id, thread_id or parent_id
+        ) or resolve_channel_prompt(config_extra, chat_id, parent_id) or ""
+
+    parts = [str(context_prompt or "").strip(), resolved_channel_prompt]
     configured = runner._get_system_prompt_for_channel(
         source.platform,
         source.chat_id or "",
@@ -2734,6 +2748,7 @@ from gateway.platforms.base import (
     _reply_anchor_for_event,
     build_auto_tts_output_path,
     merge_pending_message_event,
+    resolve_channel_prompt,
     utf16_len,
 )
 from gateway.shutdown_watchdog import (

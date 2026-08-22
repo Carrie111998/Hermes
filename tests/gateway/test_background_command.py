@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
 
@@ -144,6 +144,62 @@ def test_auto_skill_loader_is_shared_and_generic(tmp_path):
 
 class TestRunBackgroundTask:
     """Tests for GatewayRunner._run_background_task (the actual execution)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("platform", "chat_id", "thread_id", "prompt_key"),
+        [
+            (Platform.TELEGRAM, "-100123456", "42", "-100123456:42"),
+            (Platform.DISCORD, "channel-123", None, "channel-123"),
+            (Platform.SLACK, "C123", "1712345.0001", "C123:1712345.0001"),
+        ],
+    )
+    async def test_inherits_configured_channel_prompt_with_auto_skill(
+        self, platform, chat_id, thread_id, prompt_key
+    ):
+        runner = _make_runner()
+        adapter = MagicMock()
+        adapter.send = AsyncMock()
+        adapter.extract_media = MagicMock(return_value=([], "done"))
+        adapter.extract_images = MagicMock(return_value=([], "done"))
+        runner.adapters[platform] = adapter
+        runner.config.platforms[platform] = PlatformConfig(
+            extra={
+                "channel_prompts": {
+                    prompt_key: "CHANNEL_SENTINEL_ONLY_IN_CONFIG",
+                }
+            }
+        )
+        source = SessionSource(
+            platform=platform,
+            user_id="12345",
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
+             patch("gateway.run._load_gateway_config", return_value={}), \
+             patch(
+                 "gateway.run._build_auto_skill_context",
+                 return_value=("GENERIC AUTO SKILL SENTINEL", ["generic-topic-skill"]),
+             ), \
+             patch("run_agent.AIAgent") as MockAgent:
+            agent = MockAgent.return_value
+            agent.run_conversation.return_value = {"final_response": "done", "messages": []}
+            await runner._run_background_task(
+                "return the configured sentinel",
+                source,
+                "bg_channel_prompt",
+                auto_skill=["generic-topic-skill"],
+            )
+
+        run_kwargs = agent.run_conversation.call_args.kwargs
+        assert "CHANNEL_SENTINEL_ONLY_IN_CONFIG" in run_kwargs["system_message"]
+        assert "GENERIC AUTO SKILL SENTINEL" in run_kwargs["user_message"]
+        assert run_kwargs["current_user_text"] == "return the configured sentinel"
+        assert run_kwargs["internal_context"] == {
+            "auto_skill": ["generic-topic-skill"],
+        }
 
 
     @pytest.mark.asyncio
