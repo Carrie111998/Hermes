@@ -17,7 +17,9 @@ from agent.transports.antigravity_stream_json import (
 
 logger = logging.getLogger(__name__)
 
-AGY_BIN = "/home/admin/.local/bin/agy"
+# AGY source carrier was retired. Keep the provider module importable for
+# rollback compatibility, but fail closed instead of launching a source binary.
+AGY_BIN: Optional[str] = None
 
 
 def _coerce_prompt_text(user_message: Any) -> str:
@@ -355,6 +357,17 @@ def run_antigravity_mcp_turn(
     """Run one Antigravity structured turn and project it into Hermes."""
     if messages is None:
         messages = getattr(agent, "messages", [])
+
+    if AGY_BIN is None:
+        return {
+            "final_response": "Antigravity provider is retired on this source host",
+            "messages": messages,
+            "api_calls": 0,
+            "completed": False,
+            "partial": True,
+            "error": "AGY source carrier retired",
+            "agent_persisted": False,
+        }
 
     if not hasattr(agent, "_antigravity_stream_session") or agent._antigravity_stream_session is None:
         cwd = getattr(agent, "session_cwd", None) or "/home/admin/antigravity-bot/workspace"
