@@ -275,6 +275,8 @@ interface DiskPlugin {
   id: null | string
   /** Origin label (folder name) — the toast/inventory name for load errors. */
   origin: string
+  /** Last bytes reconciled for this entry (successful or broken). */
+  source: null | string
   watchId: null | string
 }
 
@@ -283,6 +285,7 @@ interface DiskPlugin {
 const disk = new Map<string, DiskPlugin>()
 let watching = false
 let scanning = false
+let reloadExistingPending = false
 
 /** Drop a folder-named error record — unless that name is the live plugin id
  *  of ANOTHER disk entry (two roots can carry same-named folders; a broken one
@@ -297,12 +300,13 @@ function dropOriginRecord(origin: string, except: DiskPlugin): void {
   dropPlugin(origin)
 }
 
-async function loadDiskPlugin(entry: DiskPlugin): Promise<void> {
+async function loadDiskPlugin(entry: DiskPlugin, source?: string): Promise<void> {
   const desktop = window.hermesDesktop!
   const prevId = entry.id
 
   try {
-    const { text } = await desktop.readFileText(entry.file)
+    const text = source ?? (await desktop.readFileText(entry.file)).text
+    entry.source = text
 
     const id = await loadRuntimePlugin(text, entry.origin, {
       defaultEnabled: entry.defaultEnabled,
@@ -329,8 +333,12 @@ async function loadDiskPlugin(entry: DiskPlugin): Promise<void> {
   }
 }
 
-async function scanDiskPlugins(): Promise<void> {
+async function scanDiskPlugins(options: { reloadExisting?: boolean } = {}): Promise<void> {
   const desktop = window.hermesDesktop
+
+  if (options.reloadExisting) {
+    reloadExistingPending = true
+  }
 
   // Re-entrancy guard: the 5s poll must not overlap a slow in-flight scan
   // (reads/loads can exceed the interval).
@@ -339,6 +347,8 @@ async function scanDiskPlugins(): Promise<void> {
   }
 
   scanning = true
+  const reloadExisting = reloadExistingPending
+  reloadExistingPending = false
 
   try {
     const roots = await diskRoots()
@@ -362,7 +372,23 @@ async function scanDiskPlugins(): Promise<void> {
         const file = root.entry(dir.path)
         seen.add(file)
 
-        if (disk.has(file)) {
+        const existing = disk.get(file)
+
+        if (existing) {
+          try {
+            const { text } = await desktop.readFileText(file)
+
+            // Root-directory watches are not recursive on every platform and
+            // atomic-save/rename patterns can evade a per-file fs.watch. A
+            // content comparison makes both the reconciliation poll and a
+            // manual rescan authoritative for edits to known entries.
+            if (reloadExisting || text !== existing.source) {
+              await loadDiskPlugin(existing, text)
+            }
+          } catch {
+            // File vanished mid-scan — deletion reconciliation runs below.
+          }
+
           continue
         }
 
@@ -377,6 +403,7 @@ async function scanDiskPlugins(): Promise<void> {
           file,
           id: null,
           origin: dir.name,
+          source: null,
           watchId: null
         }
 
@@ -415,11 +442,18 @@ async function scanDiskPlugins(): Promise<void> {
     // No plugin roots (or no gateway yet) — nothing to reconcile.
   } finally {
     scanning = false
+
+    // A manual reload requested during an in-flight reconciliation must not be
+    // dropped by the re-entrancy guard; run it as soon as this pass completes.
+    if (reloadExistingPending) {
+      void scanDiskPlugins()
+    }
   }
 }
 
-/** Manual rescan (the ⌘K "Reload desktop plugins" fallback). */
-export const discoverRuntimePlugins = scanDiskPlugins
+/** Manual rescan (the ⌘K "Reload desktop plugins" fallback). Existing entries
+ *  must reload too — a discovery-only scan makes the command a no-op for edits. */
+export const discoverRuntimePlugins = (): Promise<void> => scanDiskPlugins({ reloadExisting: true })
 
 /** Start the self-maintaining disk door: initial scan, per-file hot reload,
  *  fs-watched folder reconciliation (poll fallback on older shells). Idempotent. */
@@ -485,25 +519,19 @@ export function watchRuntimePlugins(): void {
   }
 
   void scanDiskPlugins()
-  void startDirWatches().then(watched => {
-    if (watched) {
+  void startDirWatches()
+
+  // Keep a lightweight content reconciliation pass even when all native
+  // watchers started successfully. Linux atomic renames, editor safe-writes,
+  // and transient watcher loss can otherwise leave a known plugin stale until
+  // the whole app restarts. Unchanged sources are never re-evaluated.
+  window.setInterval(() => {
+    if (document.visibilityState !== 'visible') {
       return
     }
 
-    const timer = window.setInterval(() => {
-      if (document.visibilityState !== 'visible') {
-        return
-      }
-
-      void scanDiskPlugins()
-
-      // A root may have appeared since — upgrade to the watches and retire
-      // this poll once every root is covered.
-      void startDirWatches().then(upgraded => {
-        if (upgraded) {
-          window.clearInterval(timer)
-        }
-      })
-    }, DISK_POLL_MS)
-  })
+    void scanDiskPlugins()
+    // Retry roots that were missing/unwatchable at startup.
+    void startDirWatches()
+  }, DISK_POLL_MS)
 }

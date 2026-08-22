@@ -72,6 +72,64 @@ describe('scanDiskPlugins (#66899)', () => {
     expect(readDir).not.toHaveBeenCalled()
   })
 
+  it('manual rescan reloads an already-known plugin after its source changes', async () => {
+    desktopPluginsRoot.mockResolvedValue('/local/.hermes/desktop-plugins')
+    agentPluginsRoot.mockResolvedValue('')
+    readDir.mockResolvedValue({
+      entries: [
+        {
+          isDirectory: true,
+          name: 'manual-reload',
+          path: '/local/.hermes/desktop-plugins/manual-reload'
+        }
+      ]
+    })
+
+    const registrations: string[] = []
+
+    ;(globalThis as unknown as { __manualReload: (version: string) => void }).__manualReload = version =>
+      registrations.push(version)
+
+    let version = 'v1'
+    readFileText.mockImplementation(async () => ({
+      text: `export default { id: 'manual-reload', register() { globalThis.__manualReload('${version}') } }`
+    }))
+    watchPreviewFile.mockRejectedValue(new Error('watch unavailable'))
+
+    const createObjectURL = vi
+      .spyOn(URL, 'createObjectURL')
+      .mockImplementation(
+        blob =>
+          `data:text/javascript;base64,${Buffer.from((blob as unknown as { parts: string[] }).parts.join('')).toString('base64')}`
+      )
+
+    const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const RealBlob = globalThis.Blob
+    vi.stubGlobal(
+      'Blob',
+      class {
+        parts: string[]
+        constructor(parts: string[]) {
+          this.parts = parts
+        }
+      }
+    )
+
+    try {
+      await discoverRuntimePlugins()
+      expect(registrations).toEqual(['v1'])
+
+      version = 'v2'
+      await discoverRuntimePlugins()
+      expect(registrations).toEqual(['v1', 'v2'])
+    } finally {
+      createObjectURL.mockRestore()
+      revokeObjectURL.mockRestore()
+      vi.stubGlobal('Blob', RealBlob)
+      delete (globalThis as unknown as { __manualReload?: unknown }).__manualReload
+    }
+  })
+
   it('probes desktop/plugin.js inside agent-plugin packages (unified packaging)', async () => {
     desktopPluginsRoot.mockResolvedValue('/local/.hermes/desktop-plugins')
     agentPluginsRoot.mockResolvedValue('/local/.hermes/plugins')
@@ -162,20 +220,83 @@ describe('scanDiskPlugins (#66899)', () => {
 })
 
 describe('watchRuntimePlugins dir watch (#66899)', () => {
-  it('watches both Electron-resolved local roots, never the backend hermes_home', async () => {
+  it('watches both local roots and keeps a content-reconciliation poll as a watcher fallback', async () => {
     desktopPluginsRoot.mockResolvedValue('/local/.hermes/desktop-plugins')
     agentPluginsRoot.mockResolvedValue('/local/.hermes/plugins')
-    readDir.mockResolvedValue({ entries: [] })
-    watchDirectory.mockResolvedValue({ id: 'watch-1' })
+    readDir.mockImplementation(async dir =>
+      dir === '/local/.hermes/desktop-plugins'
+        ? {
+            entries: [
+              {
+                isDirectory: true,
+                name: 'poll-reload',
+                path: '/local/.hermes/desktop-plugins/poll-reload'
+              }
+            ]
+          }
+        : { entries: [] }
+    )
+    watchDirectory
+      .mockResolvedValueOnce({ id: 'watch-desktop-root' })
+      .mockResolvedValueOnce({ id: 'watch-agent-root' })
+    watchPreviewFile.mockResolvedValue({ id: 'watch-plugin-file' })
 
-    watchRuntimePlugins()
-    // Drain the async scan + startDirWatches chains.
-    await vi.waitFor(() => expect(watchDirectory).toHaveBeenCalledTimes(2))
+    const registrations: string[] = []
 
-    expect(watchDirectory).toHaveBeenCalledWith('/local/.hermes/desktop-plugins')
-    expect(watchDirectory).toHaveBeenCalledWith('/local/.hermes/plugins')
-    expect(watchDirectory).not.toHaveBeenCalledWith('/remote/box/.hermes/desktop-plugins')
-    expect(getStatus).not.toHaveBeenCalled()
+    ;(globalThis as unknown as { __pollReload: (version: string) => void }).__pollReload = version =>
+      registrations.push(version)
+    let version = 'v1'
+    readFileText.mockImplementation(async () => ({
+      text: `export default { id: 'poll-reload', register() { globalThis.__pollReload('${version}') } }`
+    }))
+
+    const createObjectURL = vi
+      .spyOn(URL, 'createObjectURL')
+      .mockImplementation(
+        blob =>
+          `data:text/javascript;base64,${Buffer.from((blob as unknown as { parts: string[] }).parts.join('')).toString('base64')}`
+      )
+
+    const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const RealBlob = globalThis.Blob
+    vi.stubGlobal(
+      'Blob',
+      class {
+        parts: string[]
+        constructor(parts: string[]) {
+          this.parts = parts
+        }
+      }
+    )
+    let poll: (() => void) | undefined
+
+    const setInterval = vi.spyOn(window, 'setInterval').mockImplementation(callback => {
+      poll = callback as () => void
+
+      return 1 as unknown as ReturnType<typeof window.setInterval>
+    })
+
+    try {
+      watchRuntimePlugins()
+      await vi.waitFor(() => expect(watchDirectory).toHaveBeenCalledTimes(2))
+      await vi.waitFor(() => expect(registrations).toEqual(['v1']))
+
+      expect(watchDirectory).toHaveBeenCalledWith('/local/.hermes/desktop-plugins')
+      expect(watchDirectory).toHaveBeenCalledWith('/local/.hermes/plugins')
+      expect(watchDirectory).not.toHaveBeenCalledWith('/remote/box/.hermes/desktop-plugins')
+      expect(getStatus).not.toHaveBeenCalled()
+      expect(poll).toBeTypeOf('function')
+
+      version = 'v2'
+      poll?.()
+      await vi.waitFor(() => expect(registrations).toEqual(['v1', 'v2']))
+    } finally {
+      setInterval.mockRestore()
+      createObjectURL.mockRestore()
+      revokeObjectURL.mockRestore()
+      vi.stubGlobal('Blob', RealBlob)
+      delete (globalThis as unknown as { __pollReload?: unknown }).__pollReload
+    }
   })
 })
 
