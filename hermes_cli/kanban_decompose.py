@@ -447,11 +447,14 @@ def decompose_task(
     # this path to promote a root with zero new children.
     with kb.connect_closing() as conn:
         board_tasks = kb.list_tasks(conn, tenant=task.tenant)
-    existing_by_title = {
-        _normalize_title(t.title): t.id
-        for t in board_tasks
-        if t.id != task_id and t.status not in ("done", "archived") and t.title
-    }
+    # Sorted oldest-first so that when several open cards share a
+    # normalized title, the longest-standing one wins deterministically
+    # instead of whichever happened to sort last.
+    existing_by_title: dict[str, str] = {}
+    for t in sorted(board_tasks, key=lambda t: t.created_at):
+        if t.id == task_id or t.status in ("done", "archived") or not t.title:
+            continue
+        existing_by_title.setdefault(_normalize_title(t.title), t.id)
     duplicates: dict[int, str] = {
         idx: existing_by_title[_normalize_title(child["title"])]
         for idx, child in enumerate(children)
