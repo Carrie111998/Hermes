@@ -67,6 +67,28 @@ class TestNormalizeCustomProviderEntry:
         assert result is not None
         assert result["base_url"] == "${PROVIDER_A_BASE_URL}"
 
+    @pytest.mark.parametrize("field", ["max_output_tokens", "context_length", "rate_limit_delay"])
+    def test_a_yaml_true_is_not_taken_as_a_number(self, field):
+        """bool is an int subclass, so ``field: true`` used to persist as 1.
+
+        A token ceiling of 1 from what reads like a feature-flag typo is
+        worse than the field being absent — the provider answers with one
+        token and nothing explains why.
+        """
+        entry = {"name": "local", "base_url": "http://x/v1", field: True}
+        result = _normalize_custom_provider_entry(entry, provider_key="local")
+        assert field not in result, (
+            f"{field}: true was accepted as a number ({result.get(field)!r})"
+        )
+
+    @pytest.mark.parametrize(
+        "field,good",
+        [("max_output_tokens", 8192), ("context_length", 32000), ("rate_limit_delay", 0.5)],
+    )
+    def test_real_numbers_still_pass(self, field, good):
+        entry = {"name": "local", "base_url": "http://x/v1", field: good}
+        assert _normalize_custom_provider_entry(entry, provider_key="local")[field] == good
+
     def test_max_output_tokens_preserved_without_warning(self, caplog):
         """max_output_tokens and max_tokens alias must be preserved in normalized
         entry without triggering unknown key warning (#88997)."""

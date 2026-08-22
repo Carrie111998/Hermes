@@ -1345,6 +1345,19 @@ def _canonical_api_mode(api_mode: str) -> str:
     return _API_MODE_ALIASES.get(cleaned.lower(), cleaned)
 
 
+def _positive_int(value) -> Optional[int]:
+    """A strictly-positive integer, or None.
+
+    ``bool`` is a subclass of ``int``, so a plain ``isinstance(v, int)``
+    accepts a YAML ``true`` and silently persists it as ``1`` — a token
+    ceiling of one, from what reads like a feature flag typo. Rejecting
+    bools here keeps that out of every numeric provider field at once.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value > 0 else None
+
+
 def _normalize_custom_provider_entry(
     entry: Any,
     *,
@@ -1523,18 +1536,23 @@ def _normalize_custom_provider_entry(
     if models_discovered:
         normalized["models_discovered"] = True
 
-    context_length = entry.get("context_length")
-    if isinstance(context_length, int) and context_length > 0:
+    context_length = _positive_int(entry.get("context_length"))
+    if context_length is not None:
         normalized["context_length"] = context_length
 
     max_output_tokens = entry.get("max_output_tokens")
     if max_output_tokens is None:
         max_output_tokens = entry.get("max_tokens")
-    if isinstance(max_output_tokens, int) and max_output_tokens > 0:
+    max_output_tokens = _positive_int(max_output_tokens)
+    if max_output_tokens is not None:
         normalized["max_output_tokens"] = max_output_tokens
 
     rate_limit_delay = entry.get("rate_limit_delay")
-    if isinstance(rate_limit_delay, (int, float)) and rate_limit_delay >= 0:
+    if (
+        isinstance(rate_limit_delay, (int, float))
+        and not isinstance(rate_limit_delay, bool)
+        and rate_limit_delay >= 0
+    ):
         normalized["rate_limit_delay"] = rate_limit_delay
 
     discover_models = entry.get("discover_models")
