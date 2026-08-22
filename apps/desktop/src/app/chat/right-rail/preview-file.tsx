@@ -40,6 +40,8 @@ import { setPreviewDirty } from '@/store/preview-edit'
 import { $connection, $currentCwd } from '@/store/session'
 import { notifyWorkspaceChanged } from '@/store/workspace-events'
 
+import { availableViewModes, type PreviewViewMode, resolveViewMode } from './preview-view-mode'
+
 const SHIKI_THEME = { dark: 'github-dark-default', light: 'github-light-default' } as const
 const TEXT_PREVIEW_MAX_BYTES = 512 * 1024
 const SOURCE_CHUNK_LINES = 200
@@ -428,6 +430,7 @@ const MARKDOWN_COMPONENTS = {
   a: MarkdownLink
 }
 
+// Exported for the view-mode renderer test; not part of any other surface.
 export function MarkdownPreview({ text }: { text: string }) {
   const mathText = useMemo(() => normalizeFilePreviewMath(text), [text])
 
@@ -681,7 +684,10 @@ export function SourceView({ filePath, language, text }: { filePath?: string; la
   )
 }
 
-export type PreviewViewMode = 'diff' | 'rendered' | 'source'
+// The type lives in preview-view-mode.ts with the policy that owns it; kept
+// importable from here because the artifact preview and mode switcher have
+// always taken it from this module.
+export type { PreviewViewMode } from './preview-view-mode'
 
 export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; target: PreviewTarget }) {
   const { t } = useI18n()
@@ -1100,21 +1106,8 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
   if (isText && state.text !== undefined) {
     const isMarkdown = (state.language || target.language) === 'markdown'
     const hasDiff = Boolean(state.diff && state.diff.trim())
-    // Order the toggle reads left→right; default lands on the most useful view.
-    const modes: PreviewViewMode[] = []
-
-    if (isMarkdown) {
-      modes.push('rendered')
-    }
-
-    modes.push('source')
-
-    if (hasDiff) {
-      modes.push('diff')
-    }
-
-    const autoMode: PreviewViewMode = hasDiff ? 'diff' : isMarkdown ? 'rendered' : 'source'
-    const mode = userMode && modes.includes(userMode) ? userMode : autoMode
+    const modes = availableViewModes({ hasDiff, isMarkdown })
+    const mode = resolveViewMode({ hasDiff, isMarkdown }, userMode)
 
     return (
       <div
