@@ -8,6 +8,55 @@ import pytest
 from tools.environments import docker as docker_env
 
 
+def test_sandbox_task_component_preserves_portable_id():
+    assert docker_env._sandbox_task_component("session-20260822_210946") == "session-20260822_210946"
+
+
+def test_sandbox_task_component_sanitizes_windows_invalid_characters():
+    component = docker_env._sandbox_task_component("session:20260822_210946_71d78a")
+
+    assert ":" not in component
+    assert component.startswith("session_20260822_210946_71d78a-")
+    assert len(component.rsplit("-", 1)[1]) == 12
+
+
+def test_sandbox_task_component_keeps_sanitized_values_collision_safe():
+    colon = docker_env._sandbox_task_component("session:a")
+    question = docker_env._sandbox_task_component("session?a")
+
+    assert colon != question
+
+
+@pytest.mark.parametrize("task_id", ["..", "CON", "nested/task", "trailing. "])
+def test_sandbox_task_component_rejects_unsafe_windows_names(task_id):
+    component = docker_env._sandbox_task_component(task_id)
+
+    assert component not in {"", ".", ".."}
+    assert all(char not in component for char in '<>:"/\\|?*')
+    assert not component.endswith((".", " "))
+    assert component.split(".", 1)[0].upper() not in {"CON", "PRN", "AUX", "NUL"}
+
+
+def test_persistent_sandbox_uses_portable_task_component(monkeypatch, tmp_path):
+    from tools.environments import base as base_env
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(base_env, "get_sandbox_dir", lambda: tmp_path)
+    _mock_subprocess_run(monkeypatch)
+
+    env = _make_dummy_env(
+        task_id="session:20260822_210946_71d78a",
+        persistent_filesystem=True,
+        persist_across_processes=False,
+    )
+
+    assert os.path.basename(os.path.dirname(env._home_dir)) == docker_env._sandbox_task_component(
+        "session:20260822_210946_71d78a"
+    )
+    assert os.path.isdir(env._home_dir)
+    assert os.path.isdir(env._workspace_dir)
+
+
 def _mock_subprocess_run(monkeypatch):
     """Mock subprocess.run to intercept docker run -d and docker version calls.
 

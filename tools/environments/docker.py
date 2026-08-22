@@ -114,6 +114,12 @@ def _load_hermes_env_vars() -> dict[str, str]:
 # safely through `docker ps --filter label=key=value`. Profile and task names
 # can technically contain other characters; sanitize defensively.
 _LABEL_VALUE_OK_RE = re.compile(r"[^A-Za-z0-9_.-]")
+_WINDOWS_PATH_INVALID_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WINDOWS_RESERVED_PATH_STEMS = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
 
 
 def _sanitize_label_value(value: str) -> str:
@@ -128,6 +134,37 @@ def _sanitize_label_value(value: str) -> str:
     cleaned = _LABEL_VALUE_OK_RE.sub("_", value)
     cleaned = cleaned[:63] or "unknown"
     return cleaned
+
+
+def _sandbox_task_component(task_id: str) -> str:
+    """Return a portable, collision-resistant directory name for *task_id*.
+
+    Session IDs remain the logical container/cache key, but persistent Docker
+    filesystems also use them as host path components. Windows rejects several
+    characters that are valid in session IDs (notably ``:``), reserved device
+    names, and trailing dots/spaces. Preserve already-portable IDs for backward
+    compatibility; transformed values carry a digest so distinct IDs cannot
+    collapse onto the same persistent sandbox.
+    """
+    raw = str(task_id or "default")
+    cleaned = _WINDOWS_PATH_INVALID_RE.sub("_", raw).rstrip(" .")
+    reserved = cleaned.split(".", 1)[0].upper() in _WINDOWS_RESERVED_PATH_STEMS
+    portable = (
+        cleaned == raw
+        and cleaned not in {"", ".", ".."}
+        and not reserved
+        and len(cleaned) <= 63
+    )
+    if portable:
+        return cleaned
+
+    if cleaned in {"", ".", ".."}:
+        cleaned = "task"
+    elif reserved:
+        cleaned = f"_{cleaned}"
+    stem = cleaned[:50].rstrip(" .") or "task"
+    digest = hashlib.sha256(raw.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
+    return f"{stem}-{digest}"
 
 
 def _get_active_profile_name() -> str:
@@ -980,7 +1017,7 @@ class DockerEnvironment(BaseEnvironment):
         self._home_dir: Optional[str] = None
         writable_args = []
         if self._persistent:
-            sandbox = get_sandbox_dir() / "docker" / task_id
+            sandbox = get_sandbox_dir() / "docker" / _sandbox_task_component(task_id)
             self._home_dir = str(sandbox / "home")
             os.makedirs(self._home_dir, exist_ok=True)
             writable_args.extend([
