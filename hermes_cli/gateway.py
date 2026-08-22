@@ -4741,6 +4741,10 @@ def generate_launchd_plist() -> str:
 """
 
 
+# Latched so a generator regression is reported once, not on every status call.
+_WARNED_GENERATED_PLIST_UNPARSEABLE = False
+
+
 def _plist_bytes_as_xml_text(raw: bytes) -> str | None:
     """Re-render plist bytes as XML text, or None when they don't parse."""
     import plistlib
@@ -4769,6 +4773,19 @@ def _launchd_plist_comparison_pair(raw: bytes, expected: str) -> tuple[str, str]
     if raw.startswith(b"bplist00"):
         installed_xml = _plist_bytes_as_xml_text(raw)
         expected_xml = _plist_bytes_as_xml_text(expected.encode("utf-8"))
+        if expected_xml is None:
+            # The GENERATED plist doesn't parse — a template regression, not a
+            # bad file on disk. Both cases fall through to "stale", so without
+            # this line a generator bug would surface only as plists being
+            # rewritten more often than expected, with nothing naming the cause.
+            global _WARNED_GENERATED_PLIST_UNPARSEABLE
+            if not _WARNED_GENERATED_PLIST_UNPARSEABLE:
+                _WARNED_GENERATED_PLIST_UNPARSEABLE = True
+                logger.warning(
+                    "Generated launchd plist is not parseable; the installed "
+                    "binary plist cannot be compared against it and will be "
+                    "treated as stale."
+                )
         if installed_xml is None or expected_xml is None:
             return None
         return installed_xml, expected_xml

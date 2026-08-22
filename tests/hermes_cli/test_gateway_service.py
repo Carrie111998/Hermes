@@ -2245,3 +2245,29 @@ class TestLaunchdBinaryPlistStaleCheck:
         self._install(tmp_path, monkeypatch, b"\xff\xfe\x00garbage", self.XML_PLIST)
 
         assert gateway_cli.launchd_plist_is_current() is False
+
+    def test_unparseable_generated_plist_is_reported_once(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A generator regression must name itself, not just look like churn.
+
+        An unparseable *generated* plist and an unreadable *installed* file
+        both fall through to "stale", so without a distinct signal a template
+        bug would surface only as plists being rewritten unusually often.
+        """
+        monkeypatch.setattr(gateway_cli, "_WARNED_GENERATED_PLIST_UNPARSEABLE", False)
+        self._install(
+            tmp_path,
+            monkeypatch,
+            self._as_binary(self.XML_PLIST),
+            "<plist>not valid xml &",
+        )
+
+        with caplog.at_level("WARNING", logger=gateway_cli.logger.name):
+            assert gateway_cli.launchd_plist_is_current() is False
+            assert gateway_cli.launchd_plist_is_current() is False
+
+        warnings = [
+            r for r in caplog.records if "Generated launchd plist" in r.getMessage()
+        ]
+        assert len(warnings) == 1, "the warning must latch, not repeat per call"
