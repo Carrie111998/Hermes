@@ -583,9 +583,13 @@ class VoiceReceiver:
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
 
-    def __init__(self, voice_client, allowed_user_ids: set = None):
+    def __init__(self, voice_client, allowed_user_ids: set = None,
+                 speech_start_callback: Optional[Callable[[int], None]] = None,
+                 speech_start_allowed: Optional[Callable[[int], bool]] = None):
         self._vc = voice_client
         self._allowed_user_ids = allowed_user_ids or set()
+        self._speech_start_callback = speech_start_callback
+        self._speech_start_allowed = speech_start_allowed
         self._running = False
 
         # Decryption
@@ -600,6 +604,7 @@ class VoiceReceiver:
         # Per-user audio buffers
         self._buffers: Dict[int, bytearray] = defaultdict(bytearray)
         self._last_packet_time: Dict[int, float] = {}
+        self._speech_started_ssrcs: set[int] = set()
 
         # Opus decoder per SSRC (each user needs own decoder state)
         self._decoders: Dict[int, object] = {}
@@ -636,6 +641,7 @@ class VoiceReceiver:
         with self._lock:
             self._buffers.clear()
             self._last_packet_time.clear()
+            self._speech_started_ssrcs.clear()
             self._decoders.clear()
             self._ssrc_to_user.clear()
         logger.info("VoiceReceiver stopped")
@@ -818,9 +824,49 @@ class VoiceReceiver:
             if ssrc not in self._decoders:
                 self._decoders[ssrc] = discord.opus.Decoder()
             pcm = self._decoders[ssrc].decode(decrypted)
+            speech_start_callback = None
+            speech_start_user_id = 0
+            should_authorize_speech_start = False
             with self._lock:
                 self._buffers[ssrc].extend(pcm)
                 self._last_packet_time[ssrc] = time.monotonic()
+                user_id = self._ssrc_to_user.get(ssrc, 0)
+                if (
+                    self._speech_start_callback
+                    and user_id
+                    and ssrc not in self._speech_started_ssrcs
+                ):
+                    self._speech_started_ssrcs.add(ssrc)
+                    should_authorize_speech_start = True
+                    speech_start_user_id = user_id
+            if should_authorize_speech_start:
+                try:
+                    allowed = self._allowed_user_ids
+                    is_allowed = (
+                        self._speech_start_allowed(speech_start_user_id)
+                        if self._speech_start_allowed
+                        else not allowed
+                        or "*" in allowed
+                        or str(speech_start_user_id) in allowed
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "Voice speech-start authorization failed for user %s: %s",
+                        speech_start_user_id,
+                        e,
+                    )
+                    is_allowed = False
+                if is_allowed:
+                    speech_start_callback = self._speech_start_callback
+            if speech_start_callback:
+                try:
+                    speech_start_callback(speech_start_user_id)
+                except Exception as e:
+                    logger.debug(
+                        "Voice speech-start callback failed for user %s: %s",
+                        speech_start_user_id,
+                        e,
+                    )
         except Exception as e:
             with self._lock:
                 self._decoders.pop(ssrc, None)
@@ -887,10 +933,12 @@ class VoiceReceiver:
                         completed.append((user_id, bytes(buf)))
                     self._buffers[ssrc] = bytearray()
                     self._last_packet_time.pop(ssrc, None)
+                    self._speech_started_ssrcs.discard(ssrc)
                 elif silence_duration >= self.SILENCE_THRESHOLD * 2:
                     # Stale buffer with no valid user — discard
                     self._buffers.pop(ssrc, None)
                     self._last_packet_time.pop(ssrc, None)
+                    self._speech_started_ssrcs.discard(ssrc)
 
         return completed
 
@@ -911,6 +959,7 @@ class VoiceReceiver:
                         completed.append((user_id, bytes(buf)))
                 self._buffers.pop(ssrc, None)
                 self._last_packet_time.pop(ssrc, None)
+                self._speech_started_ssrcs.discard(ssrc)
 
         return completed
 
@@ -1102,6 +1151,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_listen_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> listen loop
         self._voice_input_callback: Optional[Callable] = None  # set by run.py
         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
+        self._voice_barge_in_enabled = self._load_voice_barge_in_enabled()
         # Resolves the current voice-reply mode ("off"|"voice_only"|"all") for a
         # linked text-channel id; set by run.py. Lets the inactivity timer leave
         # the bot in the channel when the user deliberately picked text-only
@@ -4335,6 +4385,22 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("Could not load discord.voice_fx config: %s", e)
         return defaults
 
+    def _load_voice_barge_in_enabled(self) -> bool:
+        """Return whether inbound speech may interrupt Discord voice playback.
+
+        ``voice.barge_in`` is the shared voice-mode setting used by the CLI,
+        TUI, desktop, and gateway.  Keep Discord on that same contract rather
+        than inventing a platform-local duplicate under ``discord.voice``.
+        """
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            voice = cfg.get("voice") or {}
+            return voice.get("barge_in", True) is True
+        except Exception as e:
+            logger.debug("Could not load voice.barge_in config: %s", e)
+            return True
+
     def _load_discord_int_config(self, key: str, default: int, *, minimum: int = 0) -> int:
         """Read a non-secret integer from the top-level ``discord`` config."""
         try:
@@ -4551,6 +4617,23 @@ class DiscordAdapter(BasePlatformAdapter):
         mixers = getattr(self, "_voice_mixers", None)
         return bool(mixers) and mixers.get(guild_id) is not None
 
+    def _on_voice_speech_start(self, guild_id: int, user_id: int) -> None:
+        """Synchronously interrupt active speech when an allowed user starts."""
+        mixer = getattr(self, "_voice_mixers", {}).get(guild_id)
+        if mixer is not None:
+            if mixer.speech_active:
+                mixer.stop_speech()
+            return
+
+        vc = getattr(self, "_voice_clients", {}).get(guild_id)
+        if vc is not None and vc.is_playing():
+            vc.stop()
+
+    def _is_voice_speech_start_allowed(self, guild_id: int, user_id: int) -> bool:
+        """Apply the canonical Discord authorization union to voice speech."""
+        guild = self._client.get_guild(guild_id) if self._client is not None else None
+        return self._is_allowed_user(str(user_id), guild=guild, is_dm=False)
+
     async def join_voice_channel(self, channel, *, text_channel_id: int = None, source: dict = None) -> bool:
         """Join a Discord voice channel. Returns True on success.
 
@@ -4588,7 +4671,21 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Start voice receiver (Phase 2: listen to users)
             try:
-                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+                speech_start_callback = None
+                speech_start_allowed = None
+                if self._voice_barge_in_enabled:
+                    speech_start_callback = lambda user_id: self._on_voice_speech_start(
+                        guild_id, user_id
+                    )
+                    speech_start_allowed = lambda user_id: self._is_voice_speech_start_allowed(
+                        guild_id, user_id
+                    )
+                receiver = VoiceReceiver(
+                    vc,
+                    allowed_user_ids=self._allowed_user_ids,
+                    speech_start_callback=speech_start_callback,
+                    speech_start_allowed=speech_start_allowed,
+                )
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
@@ -4690,7 +4787,10 @@ class DiscordAdapter(BasePlatformAdapter):
             # ── Legacy one-shot path (no mixer) ─────────────────────────
             # Pause voice receiver while playing (echo prevention)
             receiver = self._voice_receivers.get(guild_id)
-            if receiver:
+            pause_receiver = receiver and not getattr(
+                self, "_voice_barge_in_enabled", False
+            )
+            if pause_receiver:
                 receiver.pause()
 
             try:
@@ -4735,7 +4835,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     vc.stop()
                 return True
             finally:
-                if receiver:
+                if pause_receiver:
                     receiver.resume()
         finally:
             self._reset_voice_timeout(guild_id)
