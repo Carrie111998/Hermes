@@ -787,6 +787,18 @@ def _managed_node_tree_outdated(home: Path | None = None) -> bool:
             # Bounded for the same reason as node_tool_runnable (#91087). A
             # None result is a spawn failure or a timeout, both of which mean
             # "broken" — exactly what the old except-arm returned.
+            #
+            # No ``env=with_hermes_node_path()`` here, unlike the other two
+            # probe sites, and the asymmetry is deliberate rather than an
+            # oversight. Those two spawn a *tool* that needs ``node`` on PATH
+            # to do its work: on Windows the resolved candidate is an
+            # npm-installed ``.cmd`` shim whose real work happens in a node
+            # grandchild, which is the #91087 shape. This site spawns ``node``
+            # itself, by absolute path, and ``_candidate_node_command_names
+            # ("node")`` returns ``["node.exe", "node"]`` — the one branch
+            # that never offers a ``.cmd`` — so there is no shim layer to
+            # feed and nothing in this spawn reads PATH. Adding the env would
+            # be inert, not harmful; it is left off so the call says that.
             result = bounded_probe_run([str(candidate), "--version"], timeout=10)
             if result is None:
                 return False  # broken, not outdated — the runnable probe handles it
