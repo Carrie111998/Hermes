@@ -2221,6 +2221,11 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
             try:
                 prefix = b""
                 host_path = Path(resolved)
+                if host_path.exists() and not host_path.is_file():
+                    return (
+                        f"Refusing to write '{filepath}' because its existing .pot file "
+                        "could not be inspected safely: not a regular file"
+                    )
                 if host_path.is_file():
                     with host_path.open("rb") as existing:
                         prefix = existing.read(len(OLE_COMPOUND_MAGIC))
@@ -2230,9 +2235,15 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
                     f"could not be inspected safely: {exc}"
                 )
         else:
-            inspected = file_ops.read_file_prefix(
-                str(resolved), len(OLE_COMPOUND_MAGIC)
-            )
+            try:
+                inspected = file_ops.read_file_prefix(
+                    str(resolved), len(OLE_COMPOUND_MAGIC)
+                )
+            except Exception as exc:
+                return (
+                    f"Refusing to write '{filepath}' because its existing .pot file "
+                    f"could not be inspected safely: {exc}"
+                )
             if inspected.error:
                 return (
                     f"Refusing to write '{filepath}' because its existing .pot file "

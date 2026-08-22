@@ -160,6 +160,15 @@ class TestCheckBinaryDocumentWrite:
         assert err is not None
         assert "PowerPoint" in err
 
+    def test_existing_non_regular_pot_rejected(self, tmp_path: Path):
+        pot = tmp_path / "messages.pot"
+        pot.mkdir()
+
+        err = _check_binary_document_write(str(pot))
+
+        assert err is not None
+        assert "not a regular file" in err
+
     def test_remote_inspection_failure_rejected(self, monkeypatch):
         file_ops = _install_remote_file_ops(
             monkeypatch, FilePrefixResult(error="permission denied")
@@ -170,6 +179,20 @@ class TestCheckBinaryDocumentWrite:
         assert err is not None
         assert "could not be inspected safely" in err
         assert file_ops.prefix_reads == [("/workspace/slides.pot", 8)]
+
+    def test_remote_inspection_exception_rejected(self, monkeypatch):
+        file_ops = _install_remote_file_ops(monkeypatch, FilePrefixResult())
+
+        def raise_transport_error(path: str, length: int) -> FilePrefixResult:
+            raise RuntimeError("transport unavailable")
+
+        monkeypatch.setattr(file_ops, "read_file_prefix", raise_transport_error)
+
+        err = _check_binary_document_write("slides.pot", task_id="remote")
+
+        assert err is not None
+        assert "could not be inspected safely" in err
+        assert "transport unavailable" in err
 
 
 @pytest.mark.parametrize("tool_name", ["write", "patch"])
