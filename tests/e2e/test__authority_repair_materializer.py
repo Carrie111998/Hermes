@@ -22,11 +22,18 @@ import pytest
 
 CURRENT_MAIN = "b6bcb3e791c673e63974029bbab40cc9326803ff"
 SELF = "tests/e2e/test__authority_repair_materializer.py"
+BRANCH_BY_CARRIER = {
+    "one-shot-fix-86354.yml": "fix/email-app-password-normalization",
+    "one-shot-fix-88796.yml": "fix/memory-prefetch-cancel",
+    "one-shot-fix-85644.yml": "campaign/webhook-delivery-callbacks",
+    "one-shot-fix-89252.yml": "fix/88715-canonical-multiplex-identity",
+}
 
 
 def _carrier() -> Path:
     candidates = sorted(Path(".github/workflows").glob("one-shot-fix-*.yml"))
     assert len(candidates) == 1, [str(path) for path in candidates]
+    assert candidates[0].name in BRANCH_BY_CARRIER, candidates[0].name
     return candidates[0]
 
 
@@ -105,12 +112,15 @@ def _product_diff() -> tuple[bytes, dict[str, object]]:
 
 
 def test_materialize_exact_authority_repair_tree(tmp_path: Path) -> None:
+    carrier = _carrier()
     script = tmp_path / "carrier.sh"
-    script.write_text(_run_block(_carrier()))
+    script.write_text(_run_block(carrier))
     subprocess.run(["bash", "-n", str(script)], check=True)
 
     env = os.environ.copy()
     env["PATH"] = f"{_install_read_only_git(tmp_path)}:{env['PATH']}"
+    env["CURRENT_MAIN"] = CURRENT_MAIN
+    env["BRANCH"] = BRANCH_BY_CARRIER[carrier.name]
     subprocess.run(["bash", str(script)], check=True, env=env, timeout=1800)
 
     artifact, manifest = _product_diff()
