@@ -1318,6 +1318,26 @@ def _abort_zip_update_if_dirty_tree() -> None:
     _m().sys.exit(1)
 
 
+def _is_git_checkout(root: Path) -> bool:
+    """Return whether ``root`` carries Git's checkout metadata.
+
+    An empty ``.git`` directory is not a checkout.  Valid repositories keep
+    ``HEAD`` in that directory, while linked worktrees use a ``.git`` file
+    pointing at the shared gitdir.
+    """
+    git_path = root / ".git"
+    if git_path.is_dir():
+        return (git_path / "HEAD").is_file()
+    if not git_path.is_file():
+        return False
+    try:
+        return git_path.read_text(encoding="utf-8", errors="replace").lstrip().startswith(
+            "gitdir:"
+        )
+    except OSError:
+        return False
+
+
 def _read_project_version() -> str | None:
     """Read the ``version`` field from the checkout's pyproject.toml.
 
@@ -1428,7 +1448,26 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
             f"--branch {branch}`, or update against main with `hermes update`."
         )
         _m().sys.exit(1)
+    # A source install has a Git checkout that is authoritative for both the
+    # current revision and a contributor's local work. Copying an archive over
+    # it while preserving .git leaves HEAD at the old commit and can overwrite
+    # uncommitted changes. The ZIP path remains available for non-Git installs,
+    # but a checkout must be repaired through Git so its history and files stay
+    # in sync.
+    if _is_git_checkout(_m().PROJECT_ROOT):
+        print("✗ ZIP fallback cannot safely update a Git checkout.")
+        print(
+            "  It would replace source files while leaving the checkout's Git "
+            "history behind origin/main."
+        )
+        print(
+            "  The ZIP fallback did not modify source files. Resolve the Git error and "
+            "rerun `hermes update`."
+        )
+        _m().sys.exit(1)
+
     _abort_zip_update_if_dirty_tree()
+
     zip_url = (
         f"https://github.com/NousResearch/hermes-agent/archive/refs/heads/{branch}.zip"
     )
