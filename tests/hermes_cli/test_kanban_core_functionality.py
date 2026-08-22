@@ -106,7 +106,7 @@ def kanban_home(tmp_path, monkeypatch):
 def test_notify_sub_crud(kanban_home):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x")
+        tid = kb.create_task(conn, title="x", bead_id="worktracker-789")
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="123", user_id="u1",
             notifier_profile="default",
@@ -155,7 +155,7 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
     conn1 = kb.connect()
     conn2 = kb.connect()
     try:
-        tid = kb.create_task(conn1, title="x", assignee="w")
+        tid = kb.create_task(conn1, title="x", assignee="w", bead_id="worktracker-789")
         kb.add_notify_sub(conn1, task_id=tid, platform="telegram", chat_id="123")
         # New subs start caught up at the task's current MAX(task_events.id)
         # (the `created` event) — issue #29905.
@@ -274,7 +274,7 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
         conn = kb.connect()
         try:
             tid = kb.create_task(
-                conn, title="long job", assignee="worker",
+                conn, title="long job", assignee="worker", bead_id="worktracker-789",
                 max_runtime_seconds=1,  # one second cap
             )
             # Spawn by hand: claim + set pid + set active run start to the past.
@@ -347,7 +347,7 @@ def test_migration_renames_legacy_event_kinds(tmp_path, monkeypatch):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x")
+        tid = kb.create_task(conn, title="x", bead_id="worktracker-789")
         # Inject legacy event kinds directly.
         now = int(time.time())
         with kb.write_txn(conn):
@@ -408,7 +408,8 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="retry heartbeat guarded", assignee="worker")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="retry heartbeat guarded", assignee="worker")
 
         kb.claim_task(conn, tid)
         run1 = kb.latest_run(conn, tid)
@@ -465,7 +466,8 @@ def test_migration_backfills_inflight_run_for_legacy_db(kanban_home):
     heartbeat) have something to write to."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="pre-migration", assignee="worker")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="pre-migration", assignee="worker")
         # Simulate legacy: set running + claim_lock directly, leave
         # current_run_id NULL and delete the run row the claim created.
         kb.claim_task(conn, tid)
@@ -534,7 +536,8 @@ def test_claim_task_recovers_from_invariant_leak(kanban_home):
     than strand it further."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="invariant test", assignee="worker")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="invariant test", assignee="worker")
         # Manually engineer the invariant violation: create a run, then
         # flip status back to 'ready' without closing the run.
         kb.claim_task(conn, tid)
@@ -578,7 +581,8 @@ def test_unblock_invariant_recovery(kanban_home):
     code path left it dangling. Engineer the leak, verify recovery."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="unblock invariant", assignee="worker")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="unblock invariant", assignee="worker")
         # Start on running, then open a run, then force to 'blocked' but
         # leave current_run_id pointing at the open run — simulate the
         # invariant violation erosika flagged.
@@ -619,7 +623,8 @@ def test_migration_backfill_idempotent_under_re_run(tmp_path, monkeypatch):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="legacy inflight", assignee="worker")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="legacy inflight", assignee="worker")
         now = int(time.time())
         conn.execute(
             "UPDATE tasks SET status='running', claim_lock='old', "
@@ -719,7 +724,8 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="skill-loading test",
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="skill-loading test",
                              assignee="some-profile")
         task = kb.get_task(conn, tid)
         workspace = kb.resolve_workspace(task)
@@ -1133,12 +1139,14 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
     try:
         # Two parallel completing tasks so we can exercise both retry
         # shapes without status interference.
-        parent_a = kb.create_task(conn, title="retry-empty", assignee="alice")
+        parent_a = kb.create_task(conn,
+                        bead_id="worktracker-790", title="retry-empty", assignee="alice")
         kb.claim_task(conn, parent_a)
-        parent_b = kb.create_task(conn, title="retry-corrected", assignee="alice")
+        parent_b = kb.create_task(conn,
+                        bead_id="worktracker-790", title="retry-corrected", assignee="alice")
         kb.claim_task(conn, parent_b)
         real = kb.create_task(
-            conn, title="real-child", assignee="x", created_by="alice",
+            conn, title="real-child", assignee="x", created_by="alice", bead_id="worktracker-790",
         )
 
         # First attempt: phantom in the list rejects, task stays running.
@@ -1207,7 +1215,8 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
     import hermes_cli.kanban_db as _kb
     conn = kb.connect()
     try:
-        t = kb.create_task(conn, title="stuck", assignee="broken")
+        t = kb.create_task(conn,
+                        bead_id="worktracker-790", title="stuck", assignee="broken")
         # Simulate a live claim (not expired).
         lock = f"{_kb._claimer_id().split(':', 1)[0]}:{secrets.token_hex(8)}"
         future = int(time.time()) + 3600
@@ -1333,7 +1342,8 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
     import hermes_cli.kanban_db as _kb
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="mixed", assignee="worker")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="mixed", assignee="worker")
 
         # One real crash: unified counter ticks to 1 (below
         # DEFAULT_FAILURE_LIMIT=2 — task stays ready).
@@ -1390,7 +1400,8 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
     """
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="old task", assignee="w")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="old task", assignee="w")
         # Historical terminal activity BEFORE anyone subscribes.
         kb.complete_task(conn, tid, result="done long ago")
 

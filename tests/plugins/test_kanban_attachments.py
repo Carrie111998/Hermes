@@ -60,7 +60,7 @@ def client(kanban_home):
 
 
 def _make_task(conn, title="t") -> str:
-    return kb.create_task(conn, title=title)
+    return kb.create_task(conn, title=title, bead_id="worktracker-123")
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +164,7 @@ def test_worker_context_lists_attachments_with_absolute_path(kanban_home):
 
 
 def _create_task_via_api(client) -> str:
-    r = client.post("/api/plugins/kanban/tasks", json={"title": "x"})
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "x", "bead_id": "worktracker-123"})
     assert r.status_code == 200, r.text
     return r.json()["task"]["id"]
 

@@ -618,6 +618,9 @@ class CreateTaskBody(BaseModel):
     # Explicit project link; when omitted, create_task inherits the board's
     # scoped project (if any) so a project-scoped board anchors every task.
     project_id: Optional[str] = None
+    # Upstream issue-tracker id (estate: beads). REQUIRED for every task;
+    # the API returns 400 when missing/malformed.
+    bead_id: Optional[str] = None
 
 
 @router.post("/tasks")
@@ -646,6 +649,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             provider_override=payload.provider_override,
             reasoning_effort=payload.reasoning_effort,
             project_id=payload.project_id,
+            bead_id=payload.bead_id,
             board=board,
         )
         task = kanban_db.get_task(conn, task_id)
@@ -851,6 +855,10 @@ class UpdateTaskBody(BaseModel):
     # override doesn't silently reset the depth the operator chose.
     reasoning_effort: Optional[str] = None
     clear_reasoning_effort: bool = False
+    # Upstream issue-tracker reference (estate: beads). ``None`` = not sent;
+    # omit to leave unchanged. Used to link a legacy card that predates the
+    # mandatory field.
+    bead_id: Optional[str] = None
 
 
 def _reopen_if_review(conn, task_id: str, current) -> Optional[bool]:
@@ -1000,7 +1008,16 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             if not ok:
                 raise HTTPException(status_code=404, detail="task not found")
 
-        # --- priority -----------------------------------------------------
+        # --- bead reference -------------------------------------------------
+        if payload.bead_id is not None:
+            try:
+                ok = kanban_db.set_bead_id(conn, task_id, payload.bead_id)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            if not ok:
+                raise HTTPException(status_code=404, detail="task not found")
+
+        # --- priority --------------------------------------------------------
         if payload.priority is not None:
             with kanban_db.write_txn(conn):
                 conn.execute(

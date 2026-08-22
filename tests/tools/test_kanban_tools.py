@@ -61,7 +61,7 @@ def worker_env(monkeypatch, tmp_path):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
+        tid = kb.create_task(conn, bead_id="worktracker-789", title="worker-test", assignee="test-worker")
         kb.claim_task(conn, tid)
     finally:
         conn.close()
@@ -86,9 +86,9 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        a = kb.create_task(conn, title="alpha", assignee="factory", priority=5)
-        b = kb.create_task(conn, title="beta", assignee="reviewer")
-        c = kb.create_task(conn, title="gamma", assignee="factory", tenant="other")
+        a = kb.create_task(conn, bead_id="worktracker-789", title="alpha", assignee="factory", priority=5)
+        b = kb.create_task(conn, bead_id="worktracker-789", title="beta", assignee="reviewer")
+        c = kb.create_task(conn, bead_id="worktracker-789", title="gamma", assignee="factory", tenant="other")
     finally:
         conn.close()
 
@@ -180,7 +180,7 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         goal_task_id = kb.create_task(
-            conn, title="goal-mode-test", assignee="test-worker",
+            conn, bead_id="worktracker-789", title="goal-mode-test", assignee="test-worker",
             body="Must achieve X with verified evidence.", goal_mode=True
         )
         kb.claim_task(conn, goal_task_id)
@@ -246,7 +246,7 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         goal_task_id = kb.create_task(
-            conn, title="goal-mode-block-test", assignee="test-worker",
+            conn, bead_id="worktracker-789", title="goal-mode-block-test", assignee="test-worker",
             body="Must achieve X.", goal_mode=True,
         )
         kb.claim_task(conn, goal_task_id)
@@ -398,7 +398,7 @@ def test_comment_ignores_caller_supplied_author(worker_env):
 def test_create_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_create({
-        "title": "child task",
+        "title": "child task", "bead_id": "worktracker-789",
         "assignee": "peer",
         "parents": [worker_env],
     })
@@ -420,8 +420,8 @@ def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        a = kb.create_task(conn, title="A", assignee="x")
-        b = kb.create_task(conn, title="B", assignee="x")
+        a = kb.create_task(conn, bead_id="worktracker-789", title="A", assignee="x")
+        b = kb.create_task(conn, bead_id="worktracker-789", title="B", assignee="x")
     finally:
         conn.close()
     from tools import kanban_tools as kt
@@ -435,7 +435,7 @@ def test_unblock_happy_path(monkeypatch, worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="blocked", assignee="worker")
+        tid = kb.create_task(conn, bead_id="worktracker-789", title="blocked", assignee="worker")
         kb.block_task(conn, tid, reason="waiting")
     finally:
         conn.close()
@@ -467,8 +467,8 @@ def test_unblock_with_pending_parents_returns_todo(monkeypatch, tmp_path):
     kb.init_db()
     conn = kb.connect()
     try:
-        parent = kb.create_task(conn, title="parent", assignee="worker")
-        child = kb.create_task(conn, title="child", assignee="worker", parents=[parent])
+        parent = kb.create_task(conn, bead_id="worktracker-789", title="parent", assignee="worker")
+        child = kb.create_task(conn, bead_id="worktracker-789", title="child", assignee="worker", parents=[parent])
         conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (child,))
         conn.commit()
     finally:
@@ -508,7 +508,7 @@ def test_worker_lifecycle_through_tools(worker_env):
 
     # 4. spawn a child task for follow-up
     child_out = json.loads(kt._handle_create({
-        "title": "write integration test",
+        "title": "write integration test", "bead_id": "worktracker-789",
         "assignee": "qa",
         "parents": [worker_env],
     }))
@@ -601,7 +601,7 @@ def test_worker_complete_rejects_foreign_task_id(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        other = kb.create_task(conn, title="sibling")
+        other = kb.create_task(conn, bead_id="worktracker-789", title="sibling")
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (other,))
         conn.commit()
     finally:
@@ -633,7 +633,7 @@ def test_worker_can_comment_on_foreign_task(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        other = kb.create_task(conn, title="sibling")
+        other = kb.create_task(conn, bead_id="worktracker-789", title="sibling")
     finally:
         conn.close()
 
@@ -668,7 +668,7 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        other = kb.create_task(conn, title="blocked sibling", assignee="peer")
+        other = kb.create_task(conn, bead_id="worktracker-789", title="blocked sibling", assignee="peer")
         kb.block_task(conn, other, reason="waiting")
     finally:
         conn.close()
@@ -703,7 +703,7 @@ def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="child to close out")
+        tid = kb.create_task(conn, bead_id="worktracker-789", title="child to close out")
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
         conn.commit()
     finally:
@@ -754,7 +754,7 @@ def multi_board_env(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         seed_default = kb.create_task(
-            conn, title="seed-default", assignee="worker-d"
+            conn, bead_id="worktracker-789", title="seed-default", assignee="worker-d"
         )
     finally:
         conn.close()
@@ -762,7 +762,7 @@ def multi_board_env(monkeypatch, tmp_path):
     conn = kb.connect(board="alt")
     try:
         seed_alt = kb.create_task(
-            conn, title="seed-alt", assignee="worker-a"
+            conn, bead_id="worktracker-789", title="seed-alt", assignee="worker-a"
         )
     finally:
         conn.close()
@@ -851,7 +851,7 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "forum")
 
     out = kt._handle_create({
-        "title": "auto-sub gateway",
+        "title": "auto-sub gateway", "bead_id": "worktracker-789",
         "assignee": "peer",
     })
     d = json.loads(out)
@@ -885,7 +885,7 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
 
     out = kt._handle_create({
-        "title": "auto-sub tui",
+        "title": "auto-sub tui", "bead_id": "worktracker-789",
         "assignee": "peer",
     })
     d = json.loads(out)
@@ -911,7 +911,7 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
 
     out = kt._handle_create({
-        "title": "no sub cli",
+        "title": "no sub cli", "bead_id": "worktracker-789",
         "assignee": "peer",
     })
     d = json.loads(out)
@@ -940,7 +940,7 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
 
     from tools import kanban_tools as kt
     out = kt._handle_create({
-        "title": "no sub gated",
+        "title": "no sub gated", "bead_id": "worktracker-789",
         "assignee": "peer",
     })
     d = json.loads(out)
@@ -967,7 +967,7 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
     monkeypatch.setattr(kb, "add_notify_sub", _boom)
 
     out = kt._handle_create({
-        "title": "auto-sub tolerates add_notify_sub failure",
+        "title": "auto-sub tolerates add_notify_sub failure", "bead_id": "worktracker-789",
         "assignee": "peer",
     })
     d = json.loads(out)

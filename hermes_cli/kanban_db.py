@@ -134,6 +134,15 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# Every kanban card must reference the upstream issue-tracker item it
+# captures (estate: beads). This is the identifier stored in ``tasks.bead_id``
+# and rendered as the card's clickable link. The shape is the tracker's own:
+# ``<tracker>-<numeric-id>`` where the numeric id may itself be dotted
+# (beads tree ids like ``worktracker-676.4.36.8.6.2``) — e.g. ``worktracker-123``.
+# Adjust here if your tracker uses a different id scheme; the requirement
+# itself stays.
+VALID_BEAD_RE = re.compile(r"^[a-z][a-z0-9-]*-\d+(\.\d+)*$")
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -1141,6 +1150,9 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Upstream issue-tracker reference (estate: beads). Required for all
+    # non-archived tasks on all boards; the card links to this.
+    bead_id: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1234,6 +1246,9 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            bead_id=(
+                row["bead_id"] if "bead_id" in keys and row["bead_id"] else None
             ),
         )
 
@@ -1422,7 +1437,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Upstream issue-tracker id this card captures (estate: beads).
+    -- REQUIRED on every non-archived task on every board — the card renders
+    -- it as the clickable link to the tracker. NULL only for legacy rows
+    -- created before this column existed; new creates are refused without it.
+    bead_id              TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2679,6 +2699,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "bead_id" not in cols:
+        # Upstream issue-tracker reference. Existing rows start NULL so a
+        # legacy board keeps working unmodified — the UI renders the
+        # missing-bead chip on those cards and the drawer lets them be
+        # linked with one click. NEW creates are refused without one.
+        _add_column_if_missing(conn, "tasks", "bead_id", "bead_id TEXT")
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3155,6 +3182,40 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def set_bead_id(
+    conn: sqlite3.Connection,
+    task_id: str,
+    bead_id: Optional[str],
+) -> bool:
+    """Set (or clear) a task's upstream issue-tracker reference.
+
+    Validates the id shape the same way :func:`create_task` does; returns
+    ``True`` on success, ``False`` when the task doesn't exist. Used by the
+    dashboard PATCH to link legacy cards that predate the mandatory field.
+    """
+    bead_id = str(bead_id).strip() if bead_id is not None else None
+    if bead_id is not None and not VALID_BEAD_RE.fullmatch(bead_id):
+        raise ValueError(
+            "bead_id must look like an issue-tracker id "
+            "`worktracker-<digits>` (got %r)" % (bead_id,)
+        )
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET bead_id = ? WHERE id = ?",
+            (bead_id, task_id),
+        )
+        if cur.rowcount == 0:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "bead_set",
+            {"bead_id": bead_id},
+        )
+    notify_task_updated(conn, task_id, ("bead_id",))
+    return True
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3183,6 +3244,10 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    # Upstream issue-tracker reference (estate: beads). Required for ALL
+    # non-archived tasks on ALL boards — the card surfaces it as a clickable
+    # link. Children with no explicit bead inherit the first parent's.
+    bead_id: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3222,6 +3287,12 @@ def create_task(
     in its own projects.db, a matching canonical project-linked task in this
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
+
+    ``bead_id`` names the upstream issue-tracker item this task captures.
+    Every task on every board must carry one: it is the status-truth anchor
+    the card links to. It is also the identifier recorded in the ``created``
+    event, so a task created with ``idempotency_key`` that dedupes onto an
+    existing row returns that row untouched (its bead stands as recorded).
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
@@ -3244,6 +3315,33 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+
+    # The bead reference is mandatory on every board. It is the card's link
+    # to the upstream issue tracker (estate: beads); a card without one has
+    # no status-truth anchor. Workers/agents that spawn children inherit the
+    # parent's bead below, so this never trips on decomposed work.
+    bead_id = str(bead_id).strip() if bead_id is not None else None
+    if not bead_id:
+        inherited_bead = None
+        for pid in parents:
+            _ptask = get_task(conn, pid) if pid else None
+            if _ptask is not None and _ptask.bead_id:
+                inherited_bead = _ptask.bead_id
+                break
+        if inherited_bead is not None:
+            bead_id = inherited_bead
+        else:
+            raise ValueError(
+                "bead_id is required: every kanban card must reference the "
+                "bead it captures (e.g. `hermes kanban create '…' --bead "
+                "worktracker-123`). Cards created by agents without an "
+                "explicit bead inherit the first parent's bead."
+            )
+    if not VALID_BEAD_RE.fullmatch(bead_id):
+        raise ValueError(
+            "bead_id must look like an issue-tracker id "
+            "`worktracker-<digits>` (got %r)" % (bead_id,)
+        )
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -3497,8 +3595,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, bead_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3524,6 +3622,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        bead_id,
                     ),
                 )
                 for pid in parents:
@@ -3552,6 +3651,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "bead_id": bead_id,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)

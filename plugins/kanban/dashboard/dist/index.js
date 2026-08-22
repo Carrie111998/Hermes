@@ -2997,6 +2997,15 @@
     const t = props.task;
     const cardRef = useRef(null);
 
+    // Bead link — the card's mandatory upstream-issue reference (estate:
+    // beads board at this machine's 127.0.0.1:8767). Derived from the id.
+    const beadHref = t.bead_id
+      ? "http://127.0.0.1:8767/" + String(t.bead_id).replace(/^worktracker-/, "")
+      : null;
+    const beadShort = t.bead_id
+      ? String(t.bead_id).replace(/^worktracker-/, "")
+      : "";
+
     useEffect(function () {
       return attachTouchDrag(cardRef.current, t.id);
     }, [t.id]);
@@ -3138,6 +3147,19 @@
               ? h("span", { className: "hermes-kanban-count",
                             title: `${t.comment_count} comment${t.comment_count === 1 ? "" : "s"} on this task` }, "💬 ", t.comment_count)
               : null,
+            t.bead_id
+              ? h("a", {
+                  className: "hermes-kanban-bead",
+                  href: beadHref,
+                  title: "Linked bead — opens the beads tracker",
+                  onClick: function (e) { e.stopPropagation(); },
+                  target: "_blank",
+                  rel: "noreferrer",
+                }, "◆ ", beadShort)
+              : h("span", {
+                  className: "hermes-kanban-bead hermes-kanban-bead--missing",
+                  title: "This card predates the mandatory bead field — open it to link a bead.",
+                }, tx(i18n, "beadMissing", "⚠ no bead")),
             t.link_counts && (t.link_counts.parents + t.link_counts.children) > 0
               ? h("span", { className: "hermes-kanban-count",
                             title: `${t.link_counts.parents} parent${t.link_counts.parents === 1 ? "" : "s"}, ${t.link_counts.children} child${t.link_counts.children === 1 ? "" : "ren"}. Children stay blocked until their parent is done.` },
@@ -3164,10 +3186,12 @@
   function InlineCreate(props) {
     const { t } = useI18n();
     const [title, setTitle] = useState("");
+    const [bead, setBead] = useState("");
     const [assignee, setAssignee] = useState("");
     const [priority, setPriority] = useState(0);
     const [parent, setParent] = useState("");
     const [skills, setSkills] = useState("");
+    const [createErr, setCreateErr] = useState(null);
     // A board with a configured workdir defaults to a persistent workspace:
     // worktree for git repositories, dir for ordinary directories. Boards
     // without one keep scratch for disposable research and ops tasks.
@@ -3186,11 +3210,21 @@
     const submit = function () {
       const trimmed = title.trim();
       if (!trimmed) return;
+      const beadTrimmed = (bead || "").trim();
+      if (!beadTrimmed) {
+        setCreateErr(tx(t, "beadRequired", "Bead id is required — every card must reference the bead it captures."));
+        return;
+      }
+      if (!/^[a-z][a-z0-9-]*-\d+(\.\d+)*$/.test(beadTrimmed)) {
+        setCreateErr(tx(t, "beadInvalid", "Bead id must look like worktracker-<digits>."));
+        return;
+      }
       const body = {
         title: trimmed,
         assignee: assignee.trim() || null,
         priority: Number(priority) || 0,
         triage: props.columnName === "triage",
+        bead_id: beadTrimmed,
       };
       if (parent) body.parents = [parent];
       // Parse comma-separated skills into a clean list. Blank = no
@@ -3216,9 +3250,9 @@
         if (Number.isFinite(gmt) && gmt > 0) body.goal_max_turns = gmt;
       }
       props.onSubmit(body);
-      setTitle(""); setAssignee(""); setPriority(0); setParent(""); setSkills("");
+      setTitle(""); setBead(""); setAssignee(""); setPriority(0); setParent(""); setSkills("");
       setWorkspaceKind(defaultWorkspaceKind); setWorkspacePath(defaultWorkspacePath);
-      setGoalMode(false); setGoalMaxTurns("");
+      setGoalMode(false); setGoalMaxTurns(""); setCreateErr(null);
     };
 
     const showPathInput = workspaceKind !== "scratch";
@@ -3245,6 +3279,21 @@
           tx(t, "newTaskTitle", "New task — {column}",
             { column: getColumnLabel(t, props.columnName) || props.columnName })),
         h("div", { className: "flex flex-col gap-3" },
+          h("div", { className: "flex flex-col gap-1" },
+            fieldLabel(tx(t, "beadLabel", "Bead id"),
+              tx(t, "beadLabelHint", "(required — links this card to its bead)")),
+            h(Input, {
+              value: bead,
+              onChange: function (e) { setBead(e.target.value); },
+              placeholder: "worktracker-123",
+              title: "Upstream issue-tracker id this task captures. Every card must reference one.",
+              className: "h-8 text-sm",
+              autoCapitalize: "none",
+              autoCorrect: "off",
+              spellCheck: false,
+            }),
+            createErr ? h("div", { className: "text-xs text-destructive", role: "alert" }, createErr) : null,
+          ),
           h("div", { className: "flex flex-col gap-1" },
             fieldLabel(tx(t, "taskTitleLabel", "Title")),
             h("textarea", {
@@ -3383,7 +3432,7 @@
           h(Button, {
             type: "submit",
             size: "sm",
-            disabled: !title.trim(),
+            disabled: !title.trim() || !!createErr,
           }, tx(t, "create", "Create")),
         ),
       ),

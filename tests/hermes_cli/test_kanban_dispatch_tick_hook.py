@@ -50,7 +50,8 @@ def test_active_tick_fires_hook_with_outcome_ok(
     """A tick that spawns a worker fires the hook with outcome='ok'."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="t", assignee="alice")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="t", assignee="alice")
         kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242)
     finally:
         conn.close()

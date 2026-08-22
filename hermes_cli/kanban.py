@@ -330,6 +330,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
     p_create.add_argument("--body", default=None, help="Optional opening post")
+    p_create.add_argument(
+        "--bead",
+        default=None,
+        dest="bead_id",
+        metavar="ID",
+        help=(
+            "Upstream issue-tracker id this task captures, e.g. "
+            "worktracker-123 (REQUIRED; children inherit the parent's bead "
+            "when omitted)"
+        ),
+    )
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
@@ -1586,6 +1597,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            bead_id=getattr(args, "bead_id", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):

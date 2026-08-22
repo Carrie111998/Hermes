@@ -68,7 +68,8 @@ def _add_worktree(repo: Path, target: Path, branch: str) -> Path:
 
 def test_decompose_worktree_children_get_own_workspace(kanban_home):
     with kb.connect() as conn:
-        root = kb.create_task(conn, title="build the feature", triage=True)
+        root = kb.create_task(conn,
+                        bead_id="worktracker-790", title="build the feature", triage=True)
         conn.execute(
             "UPDATE tasks SET workspace_kind='worktree', "
             "workspace_path='/repo/.worktrees/root' WHERE id = ?",
@@ -107,7 +108,7 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
 
     with kb.connect() as conn:
         tid = kb.create_task(
-            conn,
+            conn, bead_id="worktracker-789",
             title="second sibling",
             workspace_kind="worktree",
             workspace_path=str(occupied),  # inherited shared/stale path

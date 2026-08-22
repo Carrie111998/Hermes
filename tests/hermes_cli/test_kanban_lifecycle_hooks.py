@@ -51,7 +51,8 @@ def captured_hooks(monkeypatch):
 def test_claim_fires_hook(kanban_home, captured_hooks):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="t", assignee="worker")
+        tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="t", assignee="worker")
         claimed = kb.claim_task(conn, tid)
         assert claimed is not None
     finally:
@@ -79,7 +80,8 @@ def test_misbehaving_hook_does_not_break_transition(kanban_home, monkeypatch):
     try:
         conn = kb.connect()
         try:
-            tid = kb.create_task(conn, title="t", assignee="worker")
+            tid = kb.create_task(conn,
+                        bead_id="worktracker-790", title="t", assignee="worker")
             kb.claim_task(conn, tid)
             # Despite the raising hook, completion succeeds and persists.
             assert kb.complete_task(conn, tid, summary="ok") is True

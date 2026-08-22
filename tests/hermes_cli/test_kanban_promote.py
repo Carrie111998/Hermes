@@ -41,11 +41,12 @@ def _stuck_todo(conn, *, parents_done=True, n_parents=1):
     have closed as 'done' without the auto-promote logic firing.
     """
     parent_ids = [
-        kb.create_task(conn, title=f"parent{i}", assignee="setup")
+        kb.create_task(conn,
+                        bead_id="worktracker-790", title=f"parent{i}", assignee="setup")
         for i in range(n_parents)
     ]
     child_id = kb.create_task(
-        conn, title="child", parents=parent_ids, assignee="setup"
+        conn, bead_id="worktracker-789", title="child", parents=parent_ids, assignee="setup"
     )
     assert kb.get_task(conn, child_id).status == "todo"
     if parents_done:
@@ -89,9 +90,10 @@ def _promote_ns(task_id, *, ids=None, reason=None, force=False,
 
 def test_cli_promote_bulk_ids_promotes_all(kanban_home, capsys):
     with kb.connect() as conn:
-        parent = kb.create_task(conn, title="parent")
+        parent = kb.create_task(conn, title="parent", bead_id="worktracker-789")
         children = [
-            kb.create_task(conn, title=f"c{i}", parents=[parent])
+            kb.create_task(conn,
+                        bead_id="worktracker-790", title=f"c{i}", parents=[parent])
             for i in range(3)
         ]
         conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))

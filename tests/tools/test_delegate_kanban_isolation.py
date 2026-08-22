@@ -43,7 +43,7 @@ def _make_running_kanban_task(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         tid = kb.create_task(
-            conn,
+            conn, bead_id="worktracker-789",
             title="parent",
             assignee="parent-worker",
             workspace_kind="scratch",

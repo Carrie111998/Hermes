@@ -45,7 +45,7 @@ def _claimed_review(
     max_runtime_seconds: int | None = None,
 ):
     task_id = kb.create_task(
-        conn,
+        conn, bead_id="worktracker-789",
         title=title,
         assignee="builder",
         max_runtime_seconds=max_runtime_seconds,
@@ -69,7 +69,8 @@ def _claimed_review(
 
 
 def test_same_card_review_supports_changes_and_approval_without_block_loop(conn):
-    task_id = kb.create_task(conn, title="Implement guarded export", assignee="builder")
+    task_id = kb.create_task(conn,
+                        bead_id="worktracker-790", title="Implement guarded export", assignee="builder")
     implementation = kb.claim_task(conn, task_id, claimer="builder:1")
     assert implementation is not None
 
@@ -204,9 +205,10 @@ def test_rereview_requires_explicit_reviewer_when_provenance_is_invalid(
 
 
 def test_review_changes_reapply_parent_gate(conn):
-    parent_id = kb.create_task(conn, title="Upstream prerequisite", assignee="planner")
+    parent_id = kb.create_task(conn,
+                        bead_id="worktracker-790", title="Upstream prerequisite", assignee="planner")
     task_id = kb.create_task(
-        conn,
+        conn, bead_id="worktracker-789",
         title="Dependent implementation",
         assignee="builder",
         parents=[parent_id],
@@ -241,10 +243,11 @@ def test_review_changes_reapply_parent_gate(conn):
 
 
 def test_parent_reopen_blocks_request_review_until_parent_is_done(conn) -> None:
-    parent_id = kb.create_task(conn, title="Parent", assignee="planner")
+    parent_id = kb.create_task(conn,
+                        bead_id="worktracker-790", title="Parent", assignee="planner")
     assert kb.complete_task(conn, parent_id)
     task_id = kb.create_task(
-        conn,
+        conn, bead_id="worktracker-789",
         title="Implementation with reopened parent",
         assignee="builder",
         parents=[parent_id],
@@ -276,7 +279,8 @@ def test_request_changes_fails_closed_on_malformed_review_provenance(
     conn,
     bad_payload: str,
 ):
-    task_id = kb.create_task(conn, title="Malformed handoff", assignee="builder")
+    task_id = kb.create_task(conn,
+                        bead_id="worktracker-790", title="Malformed handoff", assignee="builder")
     implementation = kb.claim_task(conn, task_id, claimer="builder:1")
     assert implementation is not None
     assert kb.request_review(
@@ -417,10 +421,11 @@ def test_review_escalation_unblocks_back_to_review(conn) -> None:
 
 
 def test_review_dependency_wait_reenters_review_after_parent_finishes(conn) -> None:
-    parent_id = kb.create_task(conn, title="Parent", assignee="planner")
+    parent_id = kb.create_task(conn,
+                        bead_id="worktracker-790", title="Parent", assignee="planner")
     assert kb.complete_task(conn, parent_id)
     task_id = kb.create_task(
-        conn,
+        conn, bead_id="worktracker-789",
         title="Review after dependency refresh",
         assignee="builder",
         parents=[parent_id],
@@ -498,7 +503,8 @@ def test_crashed_and_timed_out_review_runs_retry_in_review_phase(
 
 
 def test_goal_run_status_is_bound_to_original_run(conn) -> None:
-    task_id = kb.create_task(conn, title="Goal handoff race", assignee="builder")
+    task_id = kb.create_task(conn,
+                        bead_id="worktracker-790", title="Goal handoff race", assignee="builder")
     implementation = kb.claim_task(conn, task_id)
     assert implementation is not None
     assert kb.request_review(
@@ -541,7 +547,8 @@ def test_goal_run_status_is_bound_to_original_run(conn) -> None:
 
 
 def test_parked_review_approval_without_evidence_still_creates_audit_run(conn) -> None:
-    task_id = kb.create_task(conn, title="Manual approval", assignee="reviewer")
+    task_id = kb.create_task(conn,
+                        bead_id="worktracker-790", title="Manual approval", assignee="reviewer")
     assert kb.request_review(conn, task_id, summary="implementation handoff")
     assert kb.complete_task(conn, task_id)
     completed_event = _event(kb.list_events(conn, task_id), "completed")
@@ -560,12 +567,12 @@ def test_parked_review_approval_without_evidence_still_creates_audit_run(conn) -
 
 def test_legacy_review_child_deadlock_is_reported_immediately(conn):
     implementation_id = kb.create_task(
-        conn,
+        conn, bead_id="worktracker-789",
         title="Implement export",
         assignee="builder",
     )
     reviewer_id = kb.create_task(
-        conn,
+        conn, bead_id="worktracker-789",
         title="Review export",
         assignee="reviewer",
         parents=[implementation_id],
@@ -610,10 +617,10 @@ def test_legacy_review_child_deadlock_is_reported_immediately(conn):
 
 def test_hard_block_with_waiting_child_is_not_mislabeled_as_review_deadlock(conn):
     implementation_id = kb.create_task(
-        conn, title="Implement export", assignee="builder"
+        conn, bead_id="worktracker-789", title="Implement export", assignee="builder"
     )
     child_id = kb.create_task(
-        conn,
+        conn, bead_id="worktracker-789",
         title="Publish export",
         assignee="release",
         parents=[implementation_id],
@@ -653,7 +660,8 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
     a crash after request_changes increments it to 2 and trips a
     failure_limit=2 breaker. Only complete_task's success path resets it.
     """
-    task_id = kb.create_task(conn, title="flaky feature", assignee="builder")
+    task_id = kb.create_task(conn,
+                        bead_id="worktracker-790", title="flaky feature", assignee="builder")
     with kb.write_txn(conn):
         conn.execute(
             "UPDATE tasks SET consecutive_failures = 1 WHERE id = ?",
@@ -699,7 +707,8 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
     assert kb.get_task(conn, task_id).status == "blocked"
 
     # Sanity: complete_task's success path still clears the counter.
-    ok_id = kb.create_task(conn, title="healthy", assignee="builder")
+    ok_id = kb.create_task(conn,
+                        bead_id="worktracker-790", title="healthy", assignee="builder")
     with kb.write_txn(conn):
         conn.execute(
             "UPDATE tasks SET consecutive_failures = 1 WHERE id = ?",

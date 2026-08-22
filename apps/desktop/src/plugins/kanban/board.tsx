@@ -144,6 +144,20 @@ function Meta({ children, icon }: { children: ReactNode; icon: string }) {
   )
 }
 
+// Bead link — the card's mandatory upstream-issue reference. The beads UI is
+// the estate's tracker on this machine; derive the clickable URL from the id.
+export const beadUrl = (beadId: string) => `http://127.0.0.1:8767/${
+  // The beads tracker routes by the full id ("worktracker-676.4.36.8.6.2")
+  // or its short numeric form; keep the raw id so both forms work.
+  beadId.replace(/^worktracker-/, '')
+}`
+
+export const beadDisplay = (beadId: string) =>
+  beadId.startsWith('worktracker-') ? beadId.slice('worktracker-'.length) : beadId
+
+/** Does the id look like a beads id? Mirrors the backend gate (kanban_db). */
+export const isBeadId = (beadId: string) => /^[a-z][a-z0-9-]*-\d+(\.\d+)*$/.test(beadId.trim())
+
 function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
   const k = useKanban()
   const created = ago(task.created_at)
@@ -209,6 +223,26 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
         </Tip>
       )}
       <div className="ml-auto flex min-w-0 shrink items-center gap-2">
+        {task.bead_id ? (
+          <a
+            className="inline-flex items-center gap-1 rounded border border-(--ui-stroke-tertiary) px-1 py-px font-mono text-[0.625rem] text-(--ui-text-secondary) transition-colors hover:border-(--accent) hover:text-foreground"
+            href={beadUrl(task.bead_id)}
+            onClick={event => event.stopPropagation()}
+            rel="noreferrer"
+            target="_blank"
+            title={k.beadLink}
+          >
+            <Codicon name="link-external" size="0.65rem" />
+            {beadDisplay(task.bead_id)}
+          </a>
+        ) : (
+          <Tip label={k.beadMissingTip}>
+            <span className="inline-flex cursor-help items-center gap-0.5 text-amber-500">
+              <Codicon name="warning" size="0.7rem" />
+              {k.beadMissing}
+            </span>
+          </Tip>
+        )}
         {typeof task.priority === 'number' && task.priority > 0 && (
           <span className="inline-flex items-center gap-0.5 text-amber-500">
             <Codicon name="arrow-up" size="0.7rem" />
@@ -564,6 +598,7 @@ function NewTaskDialog({
   const isTriage = target === 'triage'
   const [title, setTitle] = useState('')
   const [bodyText, setBodyText] = useState('')
+  const [bead, setBead] = useState('')
   const [assignee, setAssignee] = useState('')
   const [priority, setPriority] = useState('0')
   const [skills, setSkills] = useState('')
@@ -599,6 +634,7 @@ function NewTaskDialog({
     if (target) {
       setTitle('')
       setBodyText('')
+      setBead('')
       setAssignee('')
       setPriority('0')
       setSkills('')
@@ -620,6 +656,20 @@ function NewTaskDialog({
       return
     }
 
+    const beadTrimmed = bead.trim()
+
+    if (!beadTrimmed) {
+      setError(k.beadRequired)
+
+      return
+    }
+
+    if (!isBeadId(beadTrimmed)) {
+      setError(k.beadInvalid)
+
+      return
+    }
+
     setBusy(true)
     setError(null)
 
@@ -634,6 +684,7 @@ function NewTaskDialog({
       const { task, warning } = await createTask({
         assignee: assignee === PARKED ? undefined : assignee || resolvedDefault,
         body: bodyText.trim() || undefined,
+        bead_id: beadTrimmed,
         goal_mode: goalMode,
         parents: parent ? [parent] : undefined,
         priority: Number(priority) || 0,
@@ -697,6 +748,15 @@ function NewTaskDialog({
             placeholder={k.descPlaceholder}
             value={bodyText}
           />
+
+          <Field label={k.bead}>
+            <Input
+              onChange={event => setBead(event.target.value)}
+              placeholder={k.beadPlaceholder}
+              value={bead}
+            />
+            <span className="text-[0.625rem] text-(--ui-text-quaternary)">{k.beadHint}</span>
+          </Field>
 
           <div className="grid grid-cols-2 gap-3">
             <Field label={k.priority}>

@@ -594,6 +594,29 @@
   align-items: center;
 }
 
+/* Mandatory bead reference — the card's link to the upstream issue tracker. */
+.hermes-kanban-bead {
+  display: inline-flex;
+  gap: 0.2rem;
+  align-items: center;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.6rem;
+  padding: 0.05rem 0.3rem;
+  border-radius: 0.25rem;
+  border: 1px solid color-mix(in srgb, var(--color-ring) 30%, transparent);
+  color: var(--color-foreground);
+  text-decoration: none;
+}
+.hermes-kanban-bead:hover {
+  border-color: var(--color-ring);
+  text-decoration: underline;
+}
+.hermes-kanban-bead--missing {
+  border-color: color-mix(in srgb, var(--color-warning, #d4b348) 45%, var(--color-border));
+  color: var(--color-warning, #d4b348);
+  cursor: help;
+}
+
 /* ---- Selection chrome ----------------------------------------------- */
 
 .hermes-kanban-card--selected :where(.hermes-kanban-card-content) {
