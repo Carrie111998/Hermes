@@ -1416,7 +1416,8 @@ def normalize_usage(
     # normalize_usage call. Standard level-gated logger.debug.
     _ptd = _usage_get(response_usage, "prompt_tokens_details", None)
     if (
-        mode not in {"anthropic_messages", "codex_responses"}
+        logger.isEnabledFor(logging.DEBUG)
+        and mode not in {"anthropic_messages", "codex_responses"}
         and provider_name != "anthropic"
         and _usage_get(_ptd, "cached_tokens", None) is None
         and _usage_get(response_usage, "cache_read_input_tokens", None) is None
