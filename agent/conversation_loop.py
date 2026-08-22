@@ -6024,27 +6024,22 @@ def run_conversation(
                     # exists; otherwise "trying fallback..." is a lie and the
                     # session looks like it's recovering when it's about to
                     # abort silently (#35314, #17446).
-                    if (
-                        classified.reason != FailoverReason.disk_space
-                        and agent._has_pending_fallback()
-                    ):
-                        if classified.reason == FailoverReason.content_policy_blocked:
-                            agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
-                        elif classified.reason == FailoverReason.ssl_cert_verification:
-                            agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
-                        else:
-                            agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if (
-                        classified.reason != FailoverReason.disk_space
-                        and agent._try_activate_fallback()
-                    ):
-                        active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt)
-                        retry_count = 0
-                        compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
-                        _retry.restart_with_rebuilt_messages = True
-                        break
+                    if classified.reason != FailoverReason.disk_space:
+                        if agent._has_pending_fallback():
+                            if classified.reason == FailoverReason.content_policy_blocked:
+                                agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
+                            elif classified.reason == FailoverReason.ssl_cert_verification:
+                                agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
+                            else:
+                                agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
+                        if agent._try_activate_fallback():
+                            active_system_prompt = _sync_failover_system_message(
+                                agent, api_messages, active_system_prompt)
+                            retry_count = 0
+                            compression_attempts = 0
+                            _retry.primary_recovery_attempted = False
+                            _retry.restart_with_rebuilt_messages = True
+                            break
                     if api_kwargs is not None:
                         agent._dump_api_request_debug(
                             api_kwargs, reason="non_retryable_client_error", error=api_error,
