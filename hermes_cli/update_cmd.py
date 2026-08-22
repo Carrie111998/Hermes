@@ -4217,10 +4217,45 @@ def _fetch_command(git_cmd: list, branch: str, repo_root) -> list:
     reported success. When ``.git/shallow`` is present, fetch with
     ``--unshallow`` so ``origin/<branch>`` reaches the real remote tip
     (one-time cost per checkout; afterwards the repo is no longer shallow).
+
+    The shallow marker lives in the git COMMON dir. For a primary checkout
+    that is ``<root>/.git/shallow``; for a linked worktree the ``.git`` entry
+    is a file pointing at a gitdir elsewhere, so we resolve the common dir
+    via ``git rev-parse --git-common-dir`` and test that before deciding
+    (worktree blind spot noted in automated review).
     """
-    if (Path(repo_root) / ".git" / "shallow").exists():
+    git_dir = _git_common_dir(git_cmd, repo_root)
+    if git_dir is not None and (git_dir / "shallow").exists():
         return git_cmd + ["fetch", "--unshallow", "origin", branch]
     return git_cmd + ["fetch", "origin", branch]
+
+
+def _git_common_dir(git_cmd: list, repo_root) -> Optional[Path]:
+    """Resolve the repo's git common dir, or None when git is unusable.
+
+    ``git rev-parse --git-common-dir`` returns the directory holding
+    ``HEAD``/``shallow`` — ``<root>/.git`` for a primary checkout, the
+    linked-worktree gitdir's common parent for a worktree. Falls back to
+    ``<root>/.git`` when the command fails (e.g. not yet a git repo) so the
+    shallow probe still works for the primary-checkout shape.
+    """
+    root = Path(repo_root)
+    try:
+        result = subprocess.run(
+            git_cmd + ["rev-parse", "--git-common-dir"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=15,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            common = Path(result.stdout.strip())
+            if common.is_absolute():
+                return common
+            return (root / common).resolve()
+    except Exception:
+        pass
+    return root / ".git"
 
 
 def _discard_lockfile_churn(git_cmd, repo_root):
