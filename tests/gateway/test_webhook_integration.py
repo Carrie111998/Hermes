@@ -22,7 +22,7 @@ from gateway.config import (
     Platform,
     PlatformConfig,
 )
-from gateway.platforms.base import MessageEvent, SendResult
+from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
 
 
@@ -309,6 +309,13 @@ class TestCrossPlatformDelivery:
             if event.message_id == "delivery-1":
                 first_started.set()
                 await release_first.wait()
+            # Background work spawned while a turn is active inherits that
+            # turn's ContextVar. It must therefore retain this delivery's
+            # rendered destination rather than falling back to the persistent
+            # session chat id (which deliberately is not a delivery-info key).
+            await asyncio.create_task(
+                adapter.send(event.source.chat_id, f"status-{event.message_id}")
+            )
             return f"reply-{event.message_id}"
 
         adapter._message_handler = _message_handler
@@ -344,9 +351,36 @@ class TestCrossPlatformDelivery:
         assert "delivery-1" in adapter._delivery_info
         assert "delivery-2" in adapter._delivery_info
         assert mock_tg_adapter.send.await_args_list == [
+            call("chat-a", "status-delivery-1", metadata=None),
             call("chat-a", "reply-delivery-1", metadata=None),
+            call("chat-b", "status-delivery-2", metadata=None),
             call("chat-b", "reply-delivery-2", metadata=None),
         ]
+
+    @pytest.mark.asyncio
+    async def test_processing_completion_restores_prior_delivery_context(self):
+        """A completed webhook turn cannot leak its delivery target in-task."""
+        adapter = _make_adapter({})
+        prior = adapter._active_delivery_id.set("prior-delivery")
+        event = MessageEvent(
+            text="test",
+            message_type=MessageType.TEXT,
+            source=adapter.build_source(
+                chat_id="webhook:alerts:delivery:new-delivery",
+                chat_name="webhook/alerts",
+                chat_type="webhook",
+                user_id="webhook:alerts",
+                user_name="alerts",
+            ),
+            message_id="new-delivery",
+            metadata={"webhook_persistent_session": True},
+        )
+
+        await adapter.on_processing_start(event)
+        assert adapter._active_delivery_id.get() == "new-delivery"
+        await adapter.on_processing_complete(event, outcome=None)
+        assert adapter._active_delivery_id.get() == "prior-delivery"
+        adapter._active_delivery_id.reset(prior)
 
     @pytest.mark.asyncio
     async def test_persistent_key_and_fallback_delivery_use_disjoint_session_ids(self):

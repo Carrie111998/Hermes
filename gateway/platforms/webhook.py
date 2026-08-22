@@ -42,7 +42,7 @@ import subprocess
 import sys
 import time
 from collections import deque
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from typing import Any, Deque, Dict, List, Optional
 
 try:
@@ -218,6 +218,12 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info_order: Deque[tuple[float, str]] = deque()
         self._active_delivery_id: ContextVar[Optional[str]] = ContextVar(
             f"webhook_delivery_id_{id(self)}", default=None
+        )
+        # The processing hooks run in the task that owns one agent turn. Keep
+        # that task's reset token alongside its delivery id so a task reused by
+        # an embedding host cannot retain a completed turn's routing context.
+        self._active_delivery_token: ContextVar[Optional[Token]] = ContextVar(
+            f"webhook_delivery_token_{id(self)}", default=None
         )
 
         # Reference to gateway runner for cross-platform delivery (set externally)
@@ -1002,7 +1008,8 @@ class WebhookAdapter(BasePlatformAdapter):
     async def on_processing_start(self, event: "MessageEvent") -> None:
         """Bind response routing to this delivery for the current async turn."""
         if event.message_id:
-            self._active_delivery_id.set(str(event.message_id))
+            token = self._active_delivery_id.set(str(event.message_id))
+            self._active_delivery_token.set(token)
 
     async def on_processing_complete(
         self, event: "MessageEvent", outcome: Any
@@ -1026,9 +1033,15 @@ class WebhookAdapter(BasePlatformAdapter):
         ``end_session()`` is first-reason-wins and no-ops on an already-ended
         row, so this never clobbers a ``compression``/``agent_close`` reason.
         """
-        if bool((event.metadata or {}).get("webhook_persistent_session")):
-            return
-        await self._end_webhook_session(event, event.source.chat_id)
+        try:
+            if bool((event.metadata or {}).get("webhook_persistent_session")):
+                return
+            await self._end_webhook_session(event, event.source.chat_id)
+        finally:
+            token = self._active_delivery_token.get()
+            if token is not None:
+                self._active_delivery_id.reset(token)
+                self._active_delivery_token.set(None)
 
     async def _end_webhook_session(
         self, event: "MessageEvent", session_chat_id: str

@@ -250,7 +250,7 @@ Two POSTs with the same tenant, account, and conversation IDs land in the same s
 Behavior notes:
 
 - **Idempotency is unchanged** — duplicate deliveries are still deduplicated by delivery ID, regardless of `session_key`.
-- **Fallback** — if the template doesn't resolve against a payload (e.g. the field is missing), that delivery gets a per-delivery session, same as an unconfigured route.
+- **Fallback** — if the template doesn't resolve against a payload (e.g. the field is missing), that delivery gets a per-delivery session, same as an unconfigured route. A rendered key containing `{` is also treated as unresolved, so use stable opaque IDs that do not contain braces.
 - **Lifecycle** — persistent sessions are not auto-closed after each event (they expect follow-up turns). Manage them with `hermes sessions prune` or your idle-timeout policy.
 - **Ordering vs. concurrency** — deliveries sharing a `session_key` are processed sequentially on that session. For conversational sources this is what you want (turns stay ordered); routes that need concurrent processing should leave `session_key` unset.
 - **Delivery routing stays per request** — `session_key` identifies the conversation only. Each delivery keeps its own rendered `deliver_extra`, so overlapping turns cannot redirect an earlier response.
