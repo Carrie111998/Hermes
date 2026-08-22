@@ -141,18 +141,21 @@ test('the drive loop is bounded by the caps, not by the constants', () => {
   )
 })
 
-test('every stop on a count is reported, the inherited default included', () => {
-  // #92213 review (AllanGamal): a two-bot room hit the shipped 3-round cap on
-  // a directed handoff and went silent for 12 minutes. Silence there is
-  // indistinguishable from the conversation having settled.
+test('the drive reports why it ended, not just that it ended', () => {
+  // #92213 (AllanGamal): every ending reported as `settled`, so a room cut off
+  // by its budget looked like a room that had finished talking. The reason is
+  // recorded where the drive actually exits and reported once in `finally`.
   const loop = source.slice(source.indexOf('async function runGroupChatRounds('))
 
-  assert.match(loop, /if \(caps\.rounds !== null && round === caps\.rounds - 1\)/)
-  assert.match(loop, /kind: limits\.rounds === null \? 'safety' : 'capped'/)
-  assert.match(loop, /kind: limits\.messages === null \? 'safety' : 'capped'/)
+  assert.match(loop, /let stoppedBy = null/)
+  assert.match(loop, /stoppedBy = 'settled'\n\s*return \/\/ everyone passed/)
+  assert.match(loop, /stoppedBy = 'messages'/)
+  assert.match(loop, /stoppedBy = stoppedBy \?\? \(caps\.rounds === null \? 'settled' : 'rounds'\)/)
+  assert.match(loop, /stoppedBy === 'rounds' \|\| stoppedBy === 'messages'/)
 
-  // The report must not hang off the axis being switched off.
-  assert.doesNotMatch(loop, /limits\.rounds === null && caps\.rounds !== null/)
+  // The reason must not be guessed at the top of the last round: a round that
+  // settles there would report a limit stop that never happened.
+  assert.doesNotMatch(loop, /round === caps\.rounds - 1/)
 })
 
 test('the two stop kinds read differently and both stand out', () => {

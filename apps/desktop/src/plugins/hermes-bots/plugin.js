@@ -5602,24 +5602,15 @@ async function runGroupChatRounds(group, members, thread) {
   // so a running conversation keeps the rules it started under.
   const limits = resolveGroupChatLimits($groupChats.get()[group])
   const caps = groupChatDriveCaps(limits)
+  // Why the drive ended, decided where it actually ends and reported once in
+  // `finally`. Before this, every ending reported as `settled`, so a room cut
+  // off by its budget looked exactly like a room that had finished talking
+  // (#92213, reported by AllanGamal against a two-bot room on the 3-round cap).
+  let stoppedBy = null
   let posted = 0
 
   try {
     for (let round = 0; caps.rounds === null || round < caps.rounds; round++) {
-      // Any stop on a count says so, inherited default included. Reported by
-      // AllanGamal on #92213: a two-bot room hit the shipped 3-round cap on a
-      // directed handoff and went quiet, which is indistinguishable from the
-      // room having settled. `capped` is the ordinary limit, `safety` the
-      // brake behind a switched-off axis.
-      if (caps.rounds !== null && round === caps.rounds - 1) {
-        recordGroupActivity(group, {
-          kind: limits.rounds === null ? 'safety' : 'capped',
-          member: null,
-          thread,
-          detail: 'rounds',
-          at: caps.rounds
-        })
-      }
       // Deliver any replies that finished after their turn timed out —
       // every member, not just this round's responders, so long work is
       // late, never lost.
@@ -5655,13 +5646,7 @@ async function runGroupChatRounds(group, members, thread) {
           if (!isCurrent()) {
             recordGroupActivity(group, { kind: 'cancelled', member: null, thread })
           } else {
-            recordGroupActivity(group, {
-              kind: limits.messages === null ? 'safety' : 'capped',
-              member: null,
-              thread,
-              detail: 'messages',
-              at: caps.messages
-            })
+            stoppedBy = 'messages'
           }
           return
         }
@@ -5734,12 +5719,28 @@ async function runGroupChatRounds(group, members, thread) {
       }
 
       if (spokeThisRound === 0) {
+        stoppedBy = 'settled'
         return // everyone passed — the conversation settled
       }
     }
+
+    // Falling out of the loop means the round budget ran out; every other exit
+    // returns above.
+    stoppedBy = stoppedBy ?? (caps.rounds === null ? 'settled' : 'rounds')
   } finally {
     if (isCurrent()) {
-      recordGroupActivity(group, { kind: 'settled', member: null, thread })
+      recordGroupActivity(
+        group,
+        stoppedBy === 'rounds' || stoppedBy === 'messages'
+          ? {
+              kind: (stoppedBy === 'rounds' ? limits.rounds : limits.messages) === null ? 'safety' : 'capped',
+              member: null,
+              thread,
+              detail: stoppedBy,
+              at: stoppedBy === 'rounds' ? caps.rounds : caps.messages
+            }
+          : { kind: 'settled', member: null, thread }
+      )
       updateGroupChat(group, r => {
         r.running = false
         r.turn = null
