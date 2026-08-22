@@ -30,6 +30,8 @@ Behavioral settings live in `$HERMES_HOME/mem0.json` (set them via `hermes memor
 | `user_id` | `hermes-user` | User identifier on Mem0 |
 | `agent_id` | `hermes` | Agent identifier |
 | `rerank` | `false` | Rerank search results for relevance (platform mode only) |
+| `shared_pool.enabled` | `false` | Enable the agent-scoped shared "company knowledge" pool (`mem0_search_shared` / `mem0_add_shared`) |
+| `shared_pool.authorized_submitters` | `[]` | Operator identifiers allowed to WRITE to the shared pool. Empty = any operator may contribute |
 
 The plugin has three connection modes:
 
@@ -142,10 +144,37 @@ hermes memory setup mem0 --mode oss --oss-llm-key sk-... --dry-run
 
 | Tool | Description |
 |------|-------------|
-| `mem0_search` | Semantic search by meaning |
-| `mem0_add` | Store a fact verbatim (no LLM extraction) |
+| `mem0_search` | Semantic search by meaning (per-user scope) |
+| `mem0_add` | Store a fact verbatim (no LLM extraction) (per-user scope) |
 | `mem0_update` | Update a memory's text by ID |
 | `mem0_delete` | Delete a memory by ID |
+| `mem0_search_shared` | Search the agent-scoped shared "company knowledge" pool (enabled via `shared_pool.enabled`) |
+| `mem0_add_shared` | Store a company-wide fact in the shared pool (refused for operators not in `shared_pool.authorized_submitters`) |
+
+## Shared Company Knowledge Pool
+
+By default, every mem0 memory is scoped to a single operator (`user_id`): each operator's conversations, preferences, and notes stay isolated under their own identity. This is correct for a user's private memory.
+
+For a **team agent** — one Hermes agent that talks to several operators (e.g. an "employee" agent serving multiple people) — you often want a shared pool that every operator can read, alongside each operator's private memory. Enable it in `$HERMES_HOME/mem0.json`:
+
+```json
+{
+  "shared_pool": {
+    "enabled": true,
+    "authorized_submitters": ["operator-a@example.com", "operator-b@example.com"]
+  }
+}
+```
+
+When enabled, two extra tools are registered:
+
+- **`mem0_search_shared`** – reads the agent-scoped shared pool. It returns **only true agent-scoped company facts** (records written via `mem0_add_shared` / written with no per-user scope). Per-user private memories (`mem0_search` / `mem0_add`) are individually scoped and **never** surface in the company view — so a user's private notes stay isolated from the shared pool.
+- **`mem0_add_shared`** – writes a company-wide fact into the shared pool (scoped to `agent_id`, with no `user_id`). Whether a given operator may call it is enforced in code:
+
+  - If `shared_pool.authorized_submitters` is **empty** (default), any operator may contribute.
+  - If it is **non-empty**, only operators whose `user_id` appears in the list may write. Everyone else gets a refusal from `mem0_add_shared` and can still read via `mem0_search_shared`.
+
+This enables the common pattern: **everyone reads company knowledge, only specified team members write it.** Private per-user memory (`mem0_search` / `mem0_add`) is unaffected.
 
 ## Troubleshooting
 
