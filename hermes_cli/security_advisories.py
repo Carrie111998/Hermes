@@ -411,7 +411,7 @@ def render_doctor_section(hits: list[AdvisoryHit]) -> tuple[bool, list[str]]:
     """
     fresh = filter_unacked(hits)
     if not fresh:
-        return False, ["No active security advisories.  ✓"]
+        return False, ["No known-compromised packages detected.  ✓"]
 
     lines: list[str] = []
     for i, hit in enumerate(fresh):
