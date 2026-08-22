@@ -66,11 +66,11 @@
     },
     {
       "name": "usage-center",
-      "description": "Hermes Usage Center — local token stats plus official Grok, Codex, and Claude quota in the desktop sidebar and status bar.",
+      "description": "Hermes Usage Center — local tokens plus official Grok/Codex/Claude quota, with reset-cycle usage beside remaining percent.",
       "author": "Chen Leshu",
       "tags": ["usage", "tokens", "quota", "desktop", "observability"],
       "repo": "chenleshu/hermes-usage-center",
-      "ref": "255f9c80e7df34b99dcc1fe0a57ddfcb19f5030e",
+      "ref": "7f480c3f45760314c2505f14a62bb4ce7e0a6666",
       "homepage": "https://github.com/chenleshu/hermes-usage-center",
       "capabilities": ["dashboard"],
       "api_version": 1,
