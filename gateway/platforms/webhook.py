@@ -41,7 +41,7 @@ import re
 import subprocess
 import sys
 import time
-from collections import deque
+from collections import defaultdict, deque
 from typing import Any, Deque, Dict, List, Optional
 
 try:
@@ -227,6 +227,10 @@ class WebhookAdapter(BasePlatformAdapter):
         self._rate_counts: Dict[str, Deque[float]] = {}
         self._rate_limit: int = int(config.extra.get("rate_limit", 30))  # per minute
 
+        # Trusted handoffs have a separate in-flight bound from request rate.
+        # Entries are released by on_processing_complete at the true run end.
+        self._active_handoffs: Dict[str, set[str]] = defaultdict(set)
+
         # Body size limit (auth-before-body pattern)
         self._max_body_bytes: int = int(
             config.extra.get("max_body_bytes", 1_048_576)
@@ -281,6 +285,21 @@ class WebhookAdapter(BasePlatformAdapter):
                         f"[webhook] Route '{name}' has deliver_only=true but "
                         f"deliver is '{deliver}'. Direct delivery requires a "
                         f"real target (telegram, discord, slack, github_comment, etc.)."
+                    )
+            handoff_error = self._handoff_config_error(route)
+            if handoff_error:
+                raise ValueError(f"[webhook] Route '{name}' {handoff_error}")
+            if "allowed_target_profiles" in route:
+                if secret == _INSECURE_NO_AUTH:
+                    raise ValueError(
+                        f"[webhook] Route '{name}' trusted profile handoffs "
+                        "require webhook authentication"
+                    )
+                gateway_config = getattr(self.gateway_runner, "config", None)
+                if not getattr(gateway_config, "multiplex_profiles", False):
+                    raise ValueError(
+                        f"[webhook] Route '{name}' trusted profile handoffs "
+                        "require gateway.multiplex_profiles: true"
                     )
 
         # client_max_size makes aiohttp enforce the cap on every read path,
@@ -487,11 +506,190 @@ class WebhookAdapter(BasePlatformAdapter):
         route_config = self._routes.get(parts[1])
         if not isinstance(route_config, dict):
             return None
+        provenance = getattr(source, "provenance", None)
+        if isinstance(provenance, dict):
+            target_profile = provenance.get("target_profile")
+            if (
+                provenance.get("ingress_route") == parts[1]
+                and isinstance(target_profile, str)
+                and target_profile == getattr(source, "profile", None)
+            ):
+                allowed = route_config.get("allowed_target_profiles")
+                target_toolsets = route_config.get("allowed_target_toolsets")
+                if (
+                    isinstance(allowed, list)
+                    and target_profile in allowed
+                    and isinstance(target_toolsets, dict)
+                ):
+                    configured = target_toolsets.get(target_profile)
+                    if isinstance(configured, list):
+                        cleaned = [
+                            value.strip()
+                            for value in configured
+                            if isinstance(value, str) and value.strip()
+                        ]
+                        return cleaned or None
         toolsets = route_config.get("toolsets")
         if not isinstance(toolsets, list) or not toolsets:
             return None
         cleaned = [str(t).strip() for t in toolsets if str(t).strip()]
         return cleaned or None
+
+    @staticmethod
+    def _handoff_config_error(route_config: dict) -> Optional[str]:
+        """Validate the static bounds required by a trusted handoff route."""
+        if "allowed_target_profiles" not in route_config:
+            return None
+        allowed = route_config.get("allowed_target_profiles")
+        if (
+            not isinstance(allowed, list)
+            or not allowed
+            or any(not isinstance(value, str) or not value.strip() for value in allowed)
+        ):
+            return "must define a non-empty allowed_target_profiles string list"
+        normalized = [value.strip() for value in allowed]
+        if len(set(normalized)) != len(normalized):
+            return "contains duplicate allowed_target_profiles"
+        target_toolsets = route_config.get("allowed_target_toolsets")
+        if not isinstance(target_toolsets, dict):
+            return "must define allowed_target_toolsets for every target profile"
+        from hermes_cli.tools_config import (
+            CONFIGURABLE_TOOLSETS,
+            _get_platform_tools,
+            _get_plugin_toolset_keys,
+        )
+
+        known_toolsets = {
+            key for key, _label, _description in CONFIGURABLE_TOOLSETS
+        } | _get_plugin_toolset_keys()
+
+        for target in normalized:
+            configured = target_toolsets.get(target)
+            if (
+                not isinstance(configured, list)
+                or not configured
+                or any(
+                    not isinstance(value, str) or not value.strip()
+                    for value in configured
+                )
+            ):
+                return f"must define non-empty allowed_target_toolsets for {target!r}"
+            requested = [value.strip() for value in configured]
+            if any(value not in known_toolsets for value in requested):
+                return f"contains unknown or webhook-restricted toolsets for {target!r}"
+            effective = sorted(
+                _get_platform_tools(
+                    {"platform_toolsets": {"webhook": requested}}, "webhook"
+                )
+            )
+            if set(effective) != set(requested):
+                return f"contains unknown or webhook-restricted toolsets for {target!r}"
+        max_depth = route_config.get("max_handoff_depth", 1)
+        if isinstance(max_depth, bool) or not isinstance(max_depth, int) or max_depth < 1:
+            return "must set max_handoff_depth to a positive integer"
+        max_concurrency = route_config.get("max_handoff_concurrency", 1)
+        if (
+            isinstance(max_concurrency, bool)
+            or not isinstance(max_concurrency, int)
+            or max_concurrency < 1
+        ):
+            return "must set max_handoff_concurrency to a positive integer"
+        if route_config.get("deliver_only"):
+            return "cannot combine trusted handoff configuration with deliver_only"
+        return None
+
+    def _served_profile_names(self) -> set[str]:
+        """Return multiplex profiles this gateway is configured to serve."""
+        runner = self.gateway_runner
+        cfg = getattr(runner, "config", None)
+        if not getattr(cfg, "multiplex_profiles", False):
+            return set()
+        from hermes_cli.profiles import profiles_to_serve
+
+        return {
+            name
+            for name, _ in profiles_to_serve(
+                multiplex=True,
+                profile_allowlist=getattr(cfg, "multiplex_profile_allowlist", None),
+            )
+        }
+
+    def _resolve_trusted_handoff(
+        self,
+        *,
+        route_name: str,
+        route_config: dict,
+        payload: dict,
+        source_profile: str,
+        secret: str,
+    ) -> tuple[Optional[str], Optional[List[str]], Optional[int]]:
+        """Resolve an authenticated, statically bounded profile selector.
+
+        Authority lives only in the reserved ``_hermes`` object from the raw,
+        authenticated request body. Prompt rendering and route scripts never
+        participate in this decision, and callers cannot request toolsets.
+        """
+        dispatch_configured = "allowed_target_profiles" in route_config
+        selector = payload.get("_hermes")
+        ambiguous_keys = {"target_profile", "handoff_depth", "toolsets"} & set(payload)
+        if dispatch_configured and selector is None and ambiguous_keys:
+            raise ValueError(
+                "Profile handoff selectors must use the reserved _hermes object"
+            )
+        if selector is None:
+            return None, None, None
+        if not dispatch_configured:
+            raise ValueError("This webhook route does not allow profile handoffs")
+        if route_name not in self._static_routes:
+            raise ValueError("Trusted profile handoffs require a static config.yaml route")
+        if secret == _INSECURE_NO_AUTH:
+            raise ValueError("Trusted profile handoffs require webhook authentication")
+        if not isinstance(selector, dict):
+            raise ValueError("_hermes must be an object")
+        unexpected = set(selector) - {"target_profile", "handoff_depth"}
+        if unexpected:
+            raise ValueError("_hermes contains unsupported authority fields")
+
+        target = selector.get("target_profile")
+        depth = selector.get("handoff_depth")
+        if not isinstance(target, str) or not target.strip():
+            raise ValueError("_hermes.target_profile must be a non-empty string")
+        target = target.strip()
+        if isinstance(depth, bool) or not isinstance(depth, int) or depth < 1:
+            raise ValueError("_hermes.handoff_depth must be a positive integer")
+        if depth > route_config.get("max_handoff_depth", 1):
+            raise ValueError("Requested handoff depth exceeds the route limit")
+
+        allowed = [value.strip() for value in route_config["allowed_target_profiles"]]
+        if target not in allowed:
+            raise ValueError("Requested target profile is not allowed for this route")
+        if target not in self._served_profile_names():
+            raise ValueError("Requested target profile is not served by this gateway")
+
+        configured = route_config["allowed_target_toolsets"][target]
+        from hermes_cli.tools_config import _get_platform_tools
+
+        toolsets = sorted(
+            _get_platform_tools(
+                {
+                    "platform_toolsets": {
+                        "webhook": [value.strip() for value in configured]
+                    }
+                },
+                "webhook",
+            )
+        )
+        logger.info(
+            "[webhook] trusted handoff route=%s source_profile=%s target_profile=%s "
+            "toolsets=%s depth=%d delivery=%s",
+            route_name,
+            source_profile,
+            target,
+            ",".join(toolsets),
+            depth,
+            route_config.get("deliver", "log"),
+        )
+        return target, toolsets, depth
 
     # ------------------------------------------------------------------
     # HTTP handlers
@@ -526,6 +724,13 @@ class WebhookAdapter(BasePlatformAdapter):
             new_dynamic: Dict[str, dict] = {}
             for k, v in data.items():
                 if k in self._static_routes:
+                    continue
+                if "allowed_target_profiles" in v:
+                    logger.warning(
+                        "[webhook] Dynamic route '%s' skipped: trusted profile "
+                        "handoffs are only allowed on static config.yaml routes.",
+                        k,
+                    )
                     continue
                 effective_secret = v.get("secret", self._global_secret)
                 if not effective_secret:
@@ -733,6 +938,37 @@ class WebhookAdapter(BasePlatformAdapter):
                 return web.json_response(
                     {"error": "Cannot parse body"}, status=400
                 )
+        if not isinstance(payload, dict):
+            return web.json_response(
+                {"error": "Webhook payload must be a JSON object"}, status=400
+            )
+
+        source_profile = profile or "default"
+        try:
+            handoff_target, handoff_toolsets, handoff_depth = (
+                self._resolve_trusted_handoff(
+                    route_name=route_name,
+                    route_config=route_config,
+                    payload=payload,
+                    source_profile=source_profile,
+                    secret=secret,
+                )
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning(
+                "[webhook] Rejected trusted handoff route=%s source_profile=%s: %s",
+                route_name,
+                source_profile,
+                exc,
+            )
+            return web.json_response({"error": str(exc)}, status=403)
+        if handoff_target:
+            # Keep the authenticated authority envelope out of untrusted task
+            # text, filter/transform scripts, raw payload persistence, and
+            # prompt templates (including {__raw__}). The resolved immutable
+            # values above are the only handoff state used downstream.
+            payload = dict(payload)
+            payload.pop("_hermes", None)
 
         # Check event type filter
         event_type = (
@@ -837,6 +1073,16 @@ class WebhookAdapter(BasePlatformAdapter):
             ),
         )
 
+        handoff_session_chat_id = f"webhook:{route_name}:{delivery_id}"
+        if handoff_target:
+            active = self._active_handoffs[route_name]
+            max_concurrency = route_config.get("max_handoff_concurrency", 1)
+            if len(active) >= max_concurrency:
+                return web.json_response(
+                    {"error": "Trusted handoff concurrency limit exceeded"},
+                    status=429,
+                )
+
         # ── Idempotency ─────────────────────────────────────────
         # Skip duplicate deliveries (webhook retries).
         now = time.time()
@@ -848,6 +1094,8 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"status": "duplicate", "delivery_id": delivery_id},
                 status=200,
             )
+        if handoff_target:
+            self._active_handoffs[route_name].add(handoff_session_chat_id)
 
         # ── Direct delivery mode (deliver_only) ─────────────────
         # Skip the agent entirely — the rendered prompt IS the message we
@@ -909,7 +1157,7 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Use delivery_id in session key so concurrent webhooks on the
         # same route get independent agent runs (not queued/interrupted).
-        session_chat_id = f"webhook:{route_name}:{delivery_id}"
+        session_chat_id = handoff_session_chat_id
 
         # Store delivery info for send().  Read by every send() invocation
         # for this chat_id (interim status messages and the final response),
@@ -935,6 +1183,22 @@ class WebhookAdapter(BasePlatformAdapter):
         )
         if profile and isinstance(profile, str):
             source.profile = profile
+        if handoff_target and handoff_toolsets and handoff_depth is not None:
+            source.profile = handoff_target
+            delivery_extra = deliver_config.get("deliver_extra") or {}
+            delivery_chat_id = delivery_extra.get("chat_id")
+            source.provenance = {
+                "ingress_platform": "webhook",
+                "ingress_route": route_name,
+                "source_profile": source_profile,
+                "target_profile": handoff_target,
+                "effective_toolsets": list(handoff_toolsets),
+                "delivery_platform": deliver_config["deliver"],
+                "delivery_chat_id": (
+                    str(delivery_chat_id) if delivery_chat_id is not None else None
+                ),
+                "handoff_depth": handoff_depth,
+            }
         event = MessageEvent(
             text=prompt,
             message_type=MessageType.TEXT,
@@ -967,6 +1231,11 @@ class WebhookAdapter(BasePlatformAdapter):
                 "route": route_name,
                 "event": event_type,
                 "delivery_id": delivery_id,
+                **(
+                    {"target_profile": handoff_target}
+                    if handoff_target
+                    else {}
+                ),
             },
             status=202,
         )
@@ -993,7 +1262,18 @@ class WebhookAdapter(BasePlatformAdapter):
         ``end_session()`` is first-reason-wins and no-ops on an already-ended
         row, so this never clobbers a ``compression``/``agent_close`` reason.
         """
-        await self._end_webhook_session(event, event.source.chat_id)
+        try:
+            await self._end_webhook_session(event, event.source.chat_id)
+        finally:
+            provenance = getattr(event.source, "provenance", None)
+            if isinstance(provenance, dict):
+                route_name = provenance.get("ingress_route")
+                if isinstance(route_name, str):
+                    active = self._active_handoffs.get(route_name)
+                    if active is not None:
+                        active.discard(event.source.chat_id)
+                        if not active:
+                            self._active_handoffs.pop(route_name, None)
 
     async def _end_webhook_session(
         self, event: "MessageEvent", session_chat_id: str

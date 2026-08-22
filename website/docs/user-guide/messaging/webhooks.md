@@ -86,6 +86,10 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `script` | No | Filter/transform script under `~/.hermes/scripts/`. The webhook payload is passed as JSON on stdin. JSON object stdout replaces the payload before templating; text stdout is exposed as `script_output`; empty stdout, `[SILENT]`, or a nonzero exit code ignores the webhook. |
 | `skills` | No | List of skill names to load for the agent run. |
 | `toolsets` | No | List of toolset keys (e.g. `["terminal", "file", "web"]`) that **replaces** the platform-level webhook toolset for runs triggered by this route only. Manual config edit only — not settable via `hermes webhook subscribe`, so agent-created subscriptions cannot self-grant elevated tools. Names are validated the same way as `platform_toolsets` entries (unknown or platform-restricted names are dropped). See [Per-route toolsets](#per-route-toolsets). |
+| `allowed_target_profiles` | No | Enables [trusted profile handoff](#trusted-profile-handoff) for this static route. Every target must also be served by `gateway.multiplex_profiles` and have a separate `allowed_target_toolsets` entry. |
+| `allowed_target_toolsets` | With `allowed_target_profiles` | Mapping from each allowed target profile to the maximum toolsets that target receives. The request cannot add to this list. |
+| `max_handoff_depth` | No | Maximum accepted `_hermes.handoff_depth` (default `1`). |
+| `max_handoff_concurrency` | No | Maximum simultaneous handed-off runs for this route (default `1`). |
 | `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant`, `email`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`, or `log` (default). |
 | `deliver_extra` | No | Additional delivery config — keys depend on `deliver` type (e.g. `repo`, `pr_number`, `chat_id`). Values support the same `{dot.notation}` templates as `prompt`. |
 | `deliver_only` | No | If `true`, skip the agent entirely — the rendered `prompt` template becomes the literal message that gets delivered. Zero LLM cost, sub-second delivery. See [Direct Delivery Mode](#direct-delivery-mode) for use cases. Requires `deliver` to be a real target (not `log`). |
@@ -485,6 +489,62 @@ Behavior and safety properties:
 - Names are validated through the same path as `platform_toolsets` config — unknown names and platform-restricted toolsets are dropped.
 - `hermes webhook subscribe` deliberately does **not** accept a toolsets flag. Granting elevated tools is a manual config-file edit, so an agent creating its own subscription at runtime cannot self-grant `terminal`.
 - Only grant elevated toolsets to routes whose senders you fully control, with a real HMAC secret. Anyone who can POST a validly-signed payload to that route is effectively running an agent with those tools.
+
+---
+
+## Trusted profile handoff {#trusted-profile-handoff}
+
+A general-purpose relay can select an explicit specialist profile without deriving authority from task text or from the delivery destination. This uses the existing multiplex-profile runtime boundary, so the target run loads the target profile's instructions, config, credentials, memory scope, and statically bounded toolsets.
+
+Trusted handoff is available only on static `config.yaml` routes with real authentication and `gateway.multiplex_profiles` enabled. Dynamic subscriptions and `INSECURE_NO_AUTH` cannot use it.
+
+```yaml
+gateway:
+  multiplex_profiles: true
+  multiplex_profile_allowlist: [dispatcher, server-development, market-analysis]
+
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      routes:
+        trusted-task-relay:
+          profile: dispatcher
+          secret: "relay-secret"
+          prompt: "Complete this task: {task}"
+          allowed_target_profiles: [server-development, market-analysis]
+          allowed_target_toolsets:
+            server-development: [web, terminal, file]
+            market-analysis: [web, terminal]
+          max_handoff_depth: 1
+          max_handoff_concurrency: 2
+          deliver: discord
+          deliver_extra:
+            chat_id: "1234567890"
+```
+
+POST the request to the source profile's bound URL (`/p/dispatcher/webhooks/trusted-task-relay`) and put the selector in the reserved `_hermes` object of the authenticated body:
+
+```json
+{
+  "_hermes": {
+    "target_profile": "market-analysis",
+    "handoff_depth": 1
+  },
+  "task": "Use the local market CLI to summarize last week."
+}
+```
+
+Safety properties:
+
+- Only `_hermes.target_profile` selects identity. A `target_profile` string inside free-form task data is rejected on a handoff-enabled route.
+- `_hermes` accepts only `target_profile` and `handoff_depth`; a request-side `toolsets` field fails closed. Toolsets come exclusively from `allowed_target_toolsets`.
+- The selector is resolved from the raw authenticated payload before filters, transform scripts, or prompt rendering run, then `_hermes` is removed so authority metadata never enters task text or persisted raw payload.
+- The requested profile must be both route-allowlisted and served by this gateway. The egress Discord/Slack/etc. destination never grants execution identity.
+- Existing delivery-ID idempotency prevents retry duplication; depth and in-flight limits bound recursive or concurrent dispatch.
+- Persisted session origin metadata and the session context distinguish ingress route, source profile, target profile, effective toolsets, and delivery destination. If a tool is unavailable, diagnostics say that it is outside the session capability surface rather than claiming the host binary is absent.
+
+For generic senders, use the timestamp-bound V2 HMAC signature so the selector and task body are integrity-protected together and captured requests expire. Ordinary webhook routes remain on the constrained webhook-safe defaults.
 
 ---
 
