@@ -41,6 +41,7 @@ from agent.tool_dispatch_helpers import (
     _plan_tool_batch_segments,
     make_tool_result_message,
 )
+from agent.tool_result_classification import tool_may_have_side_effect
 from tools.terminal_tool import (
     get_active_env,
 )
@@ -1184,6 +1185,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             (tool_call, function_name, function_args, [], None, _ts_scope_block)
         )
 
+    all_resolved_names_are_no_effect = bool(parsed_calls) and all(
+        not tool_may_have_side_effect(name)
+        for _, name, _, _, _, _ in parsed_calls
+    )
+
     # ── Logging / callbacks ──────────────────────────────────────────
     tool_names_str = ", ".join(name for _, name, _, _, _, _ in parsed_calls)
     if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
@@ -1663,6 +1669,74 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             total_dur = sum(r[3] for r in results if r is not None)
             spinner.stop(f"⚡ {completed}/{num_tools} tools completed in {total_dur:.1f}s total")
 
+    deferred_completion_projections = []
+
+    def _project_tool_completion(
+        i,
+        tc,
+        name,
+        args,
+        tool_duration,
+        is_error,
+        blocked,
+        progress_function_name,
+        display_function_result,
+        risk_metadata,
+    ) -> None:
+        # Every completion surface is downstream of the canonical append. If
+        # the UI bridge or process dies while projecting one of these events,
+        # resume can reconstruct the tool result that was already visible.
+        if not blocked and agent.tool_progress_callback:
+            try:
+                agent.tool_progress_callback(
+                    "tool.completed", progress_function_name, None, None,
+                    duration=tool_duration, is_error=is_error,
+                    result=display_function_result,
+                )
+            except Exception as cb_err:
+                logging.debug("Tool progress callback error: %s", cb_err)
+
+        # Print cute message per tool
+        if agent._should_emit_quiet_tool_messages():
+            cute_msg = _get_cute_tool_message_impl(
+                name, args, tool_duration, result=display_function_result,
+            )
+            agent._safe_print(f"  {cute_msg}")
+        elif not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
+            _preview_str = _multimodal_text_summary(display_function_result)
+            if agent.verbose_logging:
+                print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s")
+                print(agent._wrap_verbose("Result: ", _preview_str))
+            else:
+                response_preview = _preview_str[:agent.log_prefix_chars] + "..." if len(_preview_str) > agent.log_prefix_chars else _preview_str
+                print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s - {response_preview}")
+
+        if not blocked and agent.tool_complete_callback:
+            try:
+                display_args = _redact_tool_args_for_display(name, args) or args
+                agent.tool_complete_callback(
+                    tc.id, name, display_args, display_function_result,
+                )
+            except Exception as cb_err:
+                logging.debug("Tool complete callback error: %s", cb_err)
+
+        if (
+            risk_metadata is not None
+            and risk_metadata.get("risk") != "low"
+            and agent.tool_progress_callback
+        ):
+            try:
+                agent.tool_progress_callback(
+                    "tool.output_risk",
+                    name,
+                    None,
+                    None,
+                    tool_call_id=tc.id,
+                    risk_metadata=risk_metadata,
+                )
+            except Exception as cb_err:
+                logging.debug("Tool output risk callback error: %s", cb_err)
+
     # ── Post-execution: display per-tool results ─────────────────────
     for i, (tc, name, args, middleware_trace, _parse_error, _scope_block) in enumerate(
         parsed_calls
@@ -1815,66 +1889,38 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
+        projection_args = (
+            i,
+            tc,
+            name,
+            args,
+            tool_duration,
+            is_error,
+            blocked,
+            progress_function_name,
+            display_function_result,
+            risk_metadata,
+        )
+        if all_resolved_names_are_no_effect:
+            deferred_completion_projections.append(projection_args)
+            continue
         if not _flush_session_db_after_tool_progress(
             agent,
             messages,
             stage=f"tool result {name}",
         ):
             return
+        _project_tool_completion(*projection_args)
 
-        # Every completion surface is downstream of the canonical append. If
-        # the UI bridge or process dies while projecting one of these events,
-        # resume can reconstruct the tool result that was already visible.
-        if not blocked and agent.tool_progress_callback:
-            try:
-                agent.tool_progress_callback(
-                    "tool.completed", progress_function_name, None, None,
-                    duration=tool_duration, is_error=is_error,
-                    result=display_function_result,
-                )
-            except Exception as cb_err:
-                logging.debug("Tool progress callback error: %s", cb_err)
-
-        # Print cute message per tool
-        if agent._should_emit_quiet_tool_messages():
-            cute_msg = _get_cute_tool_message_impl(
-                name, args, tool_duration, result=display_function_result,
-            )
-            agent._safe_print(f"  {cute_msg}")
-        elif not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
-            _preview_str = _multimodal_text_summary(display_function_result)
-            if agent.verbose_logging:
-                print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s")
-                print(agent._wrap_verbose("Result: ", _preview_str))
-            else:
-                response_preview = _preview_str[:agent.log_prefix_chars] + "..." if len(_preview_str) > agent.log_prefix_chars else _preview_str
-                print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s - {response_preview}")
-
-        if not blocked and agent.tool_complete_callback:
-            try:
-                display_args = _redact_tool_args_for_display(name, args) or args
-                agent.tool_complete_callback(
-                    tc.id, name, display_args, display_function_result,
-                )
-            except Exception as cb_err:
-                logging.debug("Tool complete callback error: %s", cb_err)
-
-        if (
-            risk_metadata is not None
-            and risk_metadata.get("risk") != "low"
-            and agent.tool_progress_callback
+    if all_resolved_names_are_no_effect:
+        if not _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage="tool result batch",
         ):
-            try:
-                agent.tool_progress_callback(
-                    "tool.output_risk",
-                    name,
-                    None,
-                    None,
-                    tool_call_id=tc.id,
-                    risk_metadata=risk_metadata,
-                )
-            except Exception as cb_err:
-                logging.debug("Tool output risk callback error: %s", cb_err)
+            return
+        for projection_args in deferred_completion_projections:
+            _project_tool_completion(*projection_args)
 
     # ── Per-turn aggregate budget enforcement ─────────────────────────
     # Keep /steer pending until the final post-budget drain below.  The model
