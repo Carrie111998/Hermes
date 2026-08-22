@@ -4261,6 +4261,15 @@ def _inject_trusted_mcp_arguments(
             merged[key] = value
     return merged
 
+
+def trusted_mcp_argument_names_for_tool(tool_name: str) -> set[str]:
+    """Return request-scoped keys that the MCP handler will inject."""
+    with _lock:
+        server_name = _mcp_tool_server_names.get(tool_name)
+    if not server_name:
+        return set()
+    return set((_trusted_mcp_context.get().get(server_name) or {}).keys())
+
 # Connection-retry cooldown (per-server isolation against restart storms).
 #
 # A single stdio MCP server that fails to spawn (bad PATH, ``exec: not
