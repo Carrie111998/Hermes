@@ -458,13 +458,112 @@ async def test_retry_returns_duplicate_while_route_is_full(served_profiles):
 
 
 @pytest.mark.asyncio
+async def test_ordinary_delivery_id_cannot_overwrite_trusted_egress(
+    served_profiles,
+):
+    adapter = _adapter(
+        _trusted_route(deliver_extra={"chat_id": "{destination}"})
+    )
+    events: list[MessageEvent] = []
+
+    async def capture(event: MessageEvent):
+        events.append(event)
+
+    adapter.handle_message = capture
+    trusted_payload = {
+        "_hermes": {
+            "target_profile": "market-analysis",
+            "handoff_depth": 1,
+            "delivery_id": "shared-id",
+        },
+        "destination": "trusted-room",
+        "task": "trusted",
+    }
+    trusted_body = json.dumps(trusted_payload).encode()
+    ordinary_body = json.dumps(
+        {"destination": "attacker-room", "task": "ordinary"}
+    ).encode()
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        trusted = await client.post(
+            "/p/dispatcher/webhooks/relay",
+            data=trusted_body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Hub-Signature-256": _signature(
+                    trusted_body, "relay-secret"
+                ),
+            },
+        )
+        ordinary = await client.post(
+            "/p/dispatcher/webhooks/relay",
+            data=ordinary_body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Hub-Signature-256": _signature(
+                    ordinary_body, "relay-secret"
+                ),
+                "X-Request-ID": "shared-id",
+            },
+        )
+        assert trusted.status == 202
+        assert ordinary.status == 202
+
+    await asyncio.sleep(0.05)
+    trusted_source = next(
+        event.source for event in events if event.source.provenance is not None
+    )
+    assert trusted_source.chat_id == "webhook:relay:trusted-handoff:shared-id"
+    assert adapter._delivery_info[trusted_source.chat_id]["deliver_extra"] == {
+        "chat_id": "trusted-room"
+    }
+    assert adapter._delivery_info["webhook:relay:shared-id"]["deliver_extra"] == {
+        "chat_id": "attacker-room"
+    }
+
+
+@pytest.mark.asyncio
+async def test_post_claim_exception_releases_handoff_capacity(
+    served_profiles, monkeypatch
+):
+    adapter = _adapter(_trusted_route(max_handoff_concurrency=1))
+
+    def fail_render(*_args, **_kwargs):
+        raise RuntimeError("render failed")
+
+    monkeypatch.setattr(adapter, "_render_prompt", fail_render)
+    payload = {
+        "_hermes": {
+            "target_profile": "market-analysis",
+            "handoff_depth": 1,
+            "delivery_id": "render-failure",
+        },
+        "task": "must not leak capacity",
+    }
+    body = json.dumps(payload).encode()
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/p/dispatcher/webhooks/relay",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Hub-Signature-256": _signature(body, "relay-secret"),
+            },
+        )
+        assert response.status == 500
+
+    await asyncio.sleep(0)
+    assert not adapter._active_handoffs.get("relay")
+
+
+@pytest.mark.asyncio
 async def test_persisted_handoff_resolves_ingress_adapter_and_revalidates_bounds(
     served_profiles,
 ):
     adapter = _adapter(_trusted_route())
     source = SessionSource(
         platform=Platform.WEBHOOK,
-        chat_id="webhook:relay:restart",
+        chat_id="webhook:relay:trusted-handoff:restart",
         profile="market-analysis",
         transport_profile="dispatcher",
         trusted_handoff_depth=1,
@@ -510,11 +609,18 @@ async def test_persisted_handoff_resolves_ingress_adapter_and_revalidates_bounds
     target.send.return_value = SendResult(success=True)
     runner.adapters = {Platform.DISCORD: target}
     adapter.gateway_runner = runner
+    adapter._delivery_info[restored.chat_id] = {
+        "deliver": "discord",
+        "deliver_extra": {"chat_id": "attacker-room"},
+    }
     assert adapter._handoff_config_error(adapter._routes["relay"]) is None
     assert "market-analysis" in adapter._served_profile_names()
     assert restored.transport_deliver == "discord"
     assert restored.transport_deliver_extra == {"chat_id": "market-room"}
     assert adapter.validate_restored_source(restored) is True
+    assert adapter._delivery_info[restored.chat_id]["deliver_extra"] == {
+        "chat_id": "market-room"
+    }
     assert runner._adapter_for_source(restored) is adapter
     assert adapter.toolsets_for_source(restored) == ["web", "terminal"]
     assert restored.profile == "market-analysis"
@@ -533,6 +639,16 @@ async def test_persisted_handoff_resolves_ingress_adapter_and_revalidates_bounds
     assert runner._adapter_for_source(restored) is None
     target.send.assert_not_awaited()
     adapter._routes["relay"]["deliver_extra"] = {"chat_id": "market-room"}
+
+    adapter._routes["relay"]["allowed_target_profiles"] = [
+        " market-analysis ",
+        "server-development",
+    ]
+    assert runner._adapter_for_source(restored) is adapter
+    adapter._routes["relay"]["allowed_target_profiles"] = [
+        "market-analysis",
+        "server-development",
+    ]
 
     adapter._routes["relay"].pop("profile")
     assert runner._adapter_for_source(restored) is None

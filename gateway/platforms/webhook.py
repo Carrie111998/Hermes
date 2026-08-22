@@ -557,7 +557,13 @@ class WebhookAdapter(BasePlatformAdapter):
 
         target_profile = getattr(source, "profile", None)
         allowed = route_config.get("allowed_target_profiles")
-        if not isinstance(target_profile, str) or target_profile not in allowed:
+        normalized_allowed = {
+            value.strip() for value in allowed if isinstance(value, str)
+        }
+        if (
+            not isinstance(target_profile, str)
+            or target_profile not in normalized_allowed
+        ):
             return False
         if target_profile not in self._served_profile_names():
             return False
@@ -590,15 +596,14 @@ class WebhookAdapter(BasePlatformAdapter):
         # cache populated by POST handling. Payload-rendered values cannot be
         # reconstructed from route templates after a restart, so hydrate the
         # cache only after all current static authority bounds pass above.
-        if chat_id not in self._delivery_info:
-            now = time.time()
-            self._delivery_info[chat_id] = {
-                "deliver": persisted_deliver,
-                "deliver_extra": dict(persisted_extra),
-            }
-            self._delivery_info_created[chat_id] = now
-            self._delivery_info_order.append((now, chat_id))
-            self._prune_delivery_info(now)
+        now = time.time()
+        self._delivery_info[chat_id] = {
+            "deliver": persisted_deliver,
+            "deliver_extra": dict(persisted_extra),
+        }
+        self._delivery_info_created[chat_id] = now
+        self._delivery_info_order.append((now, chat_id))
+        self._prune_delivery_info(now)
         return True
 
     @staticmethod
@@ -623,6 +628,16 @@ class WebhookAdapter(BasePlatformAdapter):
             return None
         if route_config.get("deliver_only"):
             return "cannot combine trusted profile handoffs with deliver_only"
+        if not isinstance(route_config.get("prompt", ""), str):
+            return "must define prompt as a string"
+        if not isinstance(route_config.get("deliver", "log"), str):
+            return "must define deliver as a string"
+        if not isinstance(route_config.get("deliver_extra", {}), dict):
+            return "must define deliver_extra as a mapping"
+        try:
+            WebhookAdapter._delivery_policy_hash(route_config)
+        except (TypeError, ValueError):
+            return "contains a non-serializable delivery policy"
         allowed = route_config.get("allowed_target_profiles")
         if (
             not isinstance(allowed, list)
@@ -1122,9 +1137,12 @@ class WebhookAdapter(BasePlatformAdapter):
         # capacity enforcement, durable claim, and active-slot insertion one
         # event-loop critical section. The SQLite claim remains the cross-process
         # authority for duplicate IDs.
+        handoff_admission_transferred = False
         if handoff_target:
             delivery_id = handoff_delivery_id
-            handoff_session_chat_id = f"webhook:{route_name}:{delivery_id}"
+            handoff_session_chat_id = (
+                f"webhook:{route_name}:trusted-handoff:{delivery_id}"
+            )
             lock = self._handoff_locks.setdefault(route_name, asyncio.Lock())
             try:
                 from gateway.webhook_replay import (
@@ -1163,6 +1181,15 @@ class WebhookAdapter(BasePlatformAdapter):
                             status=200,
                         )
                     active.add(handoff_session_chat_id)
+                    request_task = asyncio.current_task()
+                    if request_task is not None:
+                        def _release_untransferred_handoff(_completed_task) -> None:
+                            if not handoff_admission_transferred:
+                                active.discard(handoff_session_chat_id)
+
+                        request_task.add_done_callback(
+                            _release_untransferred_handoff
+                        )
             except Exception:
                 logger.exception(
                     "[webhook] Failed to claim trusted handoff route=%s delivery=%s",
@@ -1394,6 +1421,8 @@ class WebhookAdapter(BasePlatformAdapter):
         # fire-and-forget: it spawns ``_process_message_background`` and
         # returns before the run starts, so nothing can be closed here).
         task = asyncio.create_task(self.handle_message(event))
+        if handoff_target:
+            handoff_admission_transferred = True
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
