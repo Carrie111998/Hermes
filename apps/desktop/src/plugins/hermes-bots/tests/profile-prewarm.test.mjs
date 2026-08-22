@@ -42,7 +42,7 @@ function renderBotRow(input = 'alpha') {
   const node = (type, props = {}) => ({ type, props })
   // i18n stub: components call useBots(); behavior tests never assert labels.
   const botsTextStub = new Proxy(function () { return '' }, {
-    get: (_t, _p) => botsTextStub,
+    get: () => botsTextStub,
     apply: () => ''
   })
   const context = {
@@ -247,7 +247,7 @@ test('behavior: remote default never opens the same-name local chat', async () =
   const node = (type, props = {}) => ({ type, props })
   // i18n stub: components call useBots(); behavior tests never assert labels.
   const botsTextStub = new Proxy(function () { return '' }, {
-    get: (_t, _p) => botsTextStub,
+    get: () => botsTextStub,
     apply: () => ''
   })
   const context = {

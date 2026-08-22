@@ -84,7 +84,7 @@ test('Bot pane renders the canonical search field and no-match state', () => {
     source,
     /const showRosterSearch =\s*gatewayOptions\.length > 1 \|\| rosterItemCount >= BOT_ROSTER_SEARCH_THRESHOLD/
   )
-  assert.match(source, /jsx\(SearchField,\s*\{[\s\S]*?placeholder: 'Search bots and group chats…'/)
+  assert.match(source, /jsx\(SearchField,\s*\{[\s\S]*?placeholder: k\.pane\.searchBotsPlaceholder/)
   assert.match(source, /query \? 'opacity-100!' : 'opacity-50 focus-within:opacity-100'/)
   assert.match(source, /placeholder:text-\(--ui-text-tertiary\)/)
   assert.match(source, /children: jsx\(Codicon, \{ name: 'list-filter' \}\)/)

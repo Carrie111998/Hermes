@@ -42,8 +42,6 @@ const BOTS_EN = {
     newGroupChat: 'New Group Chat',
     pinnedTip: 'Pinned',
     hiddenTip: 'Hidden from the roster',
-    pinStayHint: handle =>
-      `Stay in this chat and @${handle} to message them. Gateway stays on this device.`,
     pinToggle: (name, pinned) => `${name} ${pinned ? 'unpinned' : 'pinned to top'}`,
     waitingGateway:
       'Waiting for the gateway connection… (remote gateways can take a few seconds; retries automatically)',
@@ -55,6 +53,11 @@ const BOTS_EN = {
     deleteConfirm: 'Delete',
     deleting: 'Deleting…',
     noAgentsYet: 'No bots yet',
+    emptyStateDescription: 'Create your first bot.',
+    searchBotsAria: 'Search bots and group chats',
+    searchBotsPlaceholder: 'Search bots and group chats…',
+    rosterUnavailable: message =>
+      `Roster unavailable: ${message}. If your gateway predates profiles.list, update Hermes and restart the gateway.`,
   },
   create: {
     title: 'New Bot',
@@ -94,6 +97,7 @@ const BOTS_EN = {
     createAgent: 'Create Bot',
     creating: 'Creating…',
     draftDiscarded: draft => `Draft agent "${draft}" discarded`,
+    draftCleanupFailed: draft => `Could not clean up draft profile "${draft}"`,
     defaultToolsetNote:
       'Leaving all (or none) checked keeps the default toolset behavior.',
   },
@@ -135,6 +139,10 @@ const BOTS_EN = {
     duplicateFailed: 'Duplicate failed',
     newChat: 'New chat with this agent',
     delete: 'Delete',
+    // Sibling menu item of the pin/unpin toast (pane.pinToggle) — both flip
+    // together on the same bot state.
+    pin: 'Pin to top',
+    unpin: 'Unpin',
   },
   composer: {
     neverResetsTitle: 'This chat never resets',
@@ -145,10 +153,50 @@ const BOTS_EN = {
     cancel: 'Cancel',
     save: 'Save',
     saving: 'Saving…',
+    deleted: 'Deleted',
   },
 }
 
 const BOTS_LOCALES = { en: BOTS_EN }
+
+// TODO(i18n sweep, out of scope for this first en bundle — these still
+// hardcode English and move into the bundle when the zh locale lands):
+//  - group activity feed (GROUP_ACTIVITY_LABELS + `did something` fallback)
+//  - inbound-activity toasts (`🫆 New message for ${…}` / `${…} has new
+//    activity` / `Open the chat to see it.`)
+//  - connection failures (`Could not reach ${…}`, `Could not open ${…} chat —
+//    try again`, roster-render copies included)
+//  - canonical-chat/session titles + cross-machine notices (`Bot Chat`,
+//    `Agent Inbox`, `Hey, tell me about yourself!`, `This Hermes Desktop
+//    version cannot open stored sessions`, `Still on ${…} …`, `No remote
+//    session`, `Messaged @… will relay …`)
+//  - avatar/face editor (lock/unlock, `Describe your avatar…`, generation
+//    errors, pet picker, image-too-large toasts)
+//  - cron/Routines UI (job editor, schedule summaries, `Untitled cronjob`,
+//    `Could not refresh/load cronjobs. …`, paused-for-security notice)
+//  - group chat UI (disband dialog, room header/footer, thread actions,
+//    activity view, member search `Search bots to add…`, group settings,
+//    clarify/answer cards)
+//  - roster rows + Active-Now strip (`Working on a task right now`,
+//    `Last message came from @…`, `Lives on ${…}`, stale-roster notices)
+//  - empty/filter states (`No bots match “…”`, `All bots are hidden …`,
+//    `No conversations yet — say hi`)
+//  - MCP/capabilities setup UI (`Could not add server`, `Could not start
+//    OAuth`, catalog notes, install toasts) + `Could not create the agent.`
+//  - model/provider + connection pickers and hub browser controls
+//    (`← Back to dropdowns`, `✏️ Enter manually…`, `e.g. model name`,
+//    `${connection.label} (current)`, `hide the hub browser`, install rows)
+//  - mention-completion rows (`Bot · ${display}${source}`, ` · ${label}`)
+//  - misc toasts (`Deleted profile …`, `Deleted group “…”`, duplicate/delete
+//    errors like `No free name for the duplicate.`, `can't delete a bot`,
+//    `Could not delete profile ${…}.`, group name-collision, pet failures)
+//  - palette/command copy (`New Agent…` label + hint, `@<bot> do the thing`)
+//  - static contribution metadata is ALREADY sourced from BOTS_EN
+//    (export name/description); the pane/palette `title: 'Bots'`,
+//    `title: 'Cronjobs'` registrations are the same static-metadata case.
+//  - SOUL.md protocol + @-mention handoff PROMPT text and avatar/group-picture
+//    image-generation prompts (model-facing, not UI) are deliberately
+//    excluded from UI localization — a separate decision.
 
 function bindBotsText(t, template, prefix = '') {
   const out = {}
@@ -173,7 +221,13 @@ function useBots() {
       ? sdk.usePluginI18n
       : null
   if (!usePluginI18n) return BOTS_EN
-  return bindBotsText(usePluginI18n('hermes-bots'), BOTS_EN)
+  const t = usePluginI18n('hermes-bots')
+  // Memoize the bound wrapper tree on the translator identity. The SDK keeps
+  // `t` stable per (plugin, locale, registry version), so the tree rebuilds
+  // only on a real locale switch or (re)registration — not on every render
+  // of every Bot component. Fresh function identities per render would loop
+  // any future useEffect(..., [k.pane.pinToggle]) pattern.
+  return useMemo(() => bindBotsText(t, BOTS_EN), [t])
 }
 
 import {
@@ -8217,7 +8271,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }) {
                 })
               }).catch(error => host.notifyError?.(error, 'Could not load bot metadata'))
             },
-            children: pinned ? 'Unpin' : 'Pin to top'
+            children: pinned ? k.menu.unpin : k.menu.pin
           }),
           jsx(ContextMenuItem, {
             onSelect: () => {
@@ -9444,7 +9498,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
       : deleteBot({ name: draft })
     void Promise.resolve(discard)
       .then(() => host.notify({ kind: 'success', message: k.create.draftDiscarded(draft) }))
-      .catch(err => host.notifyError(err, `Could not clean up draft profile "${draft}"`))
+      .catch(err => host.notifyError(err, k.create.draftCleanupFailed(draft)))
   }
 
   const reset = () => {
@@ -14162,14 +14216,14 @@ function BotsPane() {
                 ? jsx(
                     SearchField,
                     {
-                      'aria-label': 'Search bots and group chats',
+                      'aria-label': k.pane.searchBotsAria,
                       containerClassName: cn(
                         'min-w-0 flex-1',
                         query ? 'opacity-100!' : 'opacity-50 focus-within:opacity-100'
                       ),
                       inputClassName:
                         'w-full text-[0.75rem] placeholder:text-(--ui-text-tertiary)',
-                      placeholder: 'Search bots and group chats…',
+                      placeholder: k.pane.searchBotsPlaceholder,
                       value: query,
                       onChange: setQuery
                     },
@@ -14318,7 +14372,7 @@ function BotsPane() {
               children: [
                 jsx('div', {
                   children: gatewayUp
-                    ? `Roster unavailable: ${error instanceof Error ? error.message : 'gateway error'}. If your gateway predates profiles.list, update Hermes and restart the gateway.`
+                    ? k.pane.rosterUnavailable(error instanceof Error ? error.message : 'gateway error')
                     : k.pane.waitingGateway
                 }),
                 jsx(Button, {
@@ -14334,7 +14388,7 @@ function BotsPane() {
             ? jsx(EmptyState, {
                 icon: 'hubot',
                 title: k.pane.noAgentsYet,
-                description: 'Create your first bot.'
+                description: k.pane.emptyStateDescription
               })
             : allBotsHidden && !hiddenExpanded
               ? jsxs('div', {
@@ -14477,7 +14531,7 @@ function BotsPane() {
         destructive: true,
         confirmLabel: k.pane.deleteConfirm,
         busyLabel: k.pane.deleting,
-        doneLabel: 'Deleted',
+        doneLabel: k.common.deleted,
         onClose: () => setDeleting(null),
         onConfirm: async () => {
           if (!deleting) {
@@ -14499,7 +14553,7 @@ function BotsPane() {
         destructive: true,
         confirmLabel: 'Delete Group',
         busyLabel: 'Deleting…',
-        doneLabel: 'Deleted',
+        doneLabel: k.common.deleted,
         onClose: () => setDeletingGroup(null),
         onConfirm: async () => {
           if (!deletingGroup) return
@@ -14515,8 +14569,13 @@ function BotsPane() {
 
 export default {
   id: ID,
-  name: 'Bots',
-  description: 'Bot Mode — a one-chat-per-agent roster with avatars, routines, group chats, and bot-to-bot messaging. Ships with the app; disable here if unwanted.',
+  // Static plugin metadata is read by the host at plugin load — before any
+  // translator exists — so name/description stay sourced from the en
+  // template's canonical strings rather than a t() call. A localized
+  // description would need host-side metadata resolution (out of scope for
+  // this bundle); pulling from BOTS_EN keeps ONE canonical copy.
+  name: BOTS_EN.pluginName,
+  description: BOTS_EN.pluginDescription,
   register(ctx) {
     pluginCtx = ctx
     // Older hosts without plugin i18n (pre-#67303) must not crash here:
