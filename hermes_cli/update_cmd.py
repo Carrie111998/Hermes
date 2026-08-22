@@ -1231,14 +1231,65 @@ def _write_gateway_update_exit_code(ok: bool) -> None:
         pass
 
 
+def _zip_overlay_block_reason(root: Path) -> Optional[str]:
+    """Why overlaying a ZIP onto ``root`` would destroy work, or None if safe.
+
+    The ZIP path swaps every top-level entry (except a tiny preserve set) and
+    then deletes the backups, so uncommitted edits and untracked files under
+    a replaced directory are gone. Fail closed when git status cannot run:
+    unknown dirtiness is not a license to clobber the tree (#91962).
+    """
+    if not (root / ".git").exists():
+        return None
+    git_cmd = ["git"]
+    if sys.platform == "win32":
+        git_cmd = ["git", "-c", "windows.appendAtomically=false"]
+    result = subprocess.run(
+        git_cmd + ["status", "--porcelain", "--untracked-files=all"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        suffix = f" ({detail[0]})" if detail else ""
+        return f"could not check the working tree{suffix}"
+    if result.stdout.strip():
+        return "the working tree has uncommitted changes or untracked files"
+    return None
+
+
+def _abort_zip_update_if_dirty_tree() -> None:
+    """Refuse to overlay a ZIP onto a dirty git checkout (#91962)."""
+    reason = _zip_overlay_block_reason(_m().PROJECT_ROOT)
+    if reason is None:
+        return
+    print(f"✗ ZIP fallback refused: {reason}.")
+    print(
+        "  Overlaying the ZIP would overwrite uncommitted edits and permanently "
+        "delete untracked files."
+    )
+    print(
+        "  Commit, stash, or clean up your local changes manually, then rerun "
+        "`hermes update`."
+    )
+    print("  To inspect: git status --porcelain")
+    _m().sys.exit(1)
+
+
 def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> bool:
     """Update Hermes Agent by downloading a ZIP archive.
 
     Used on Windows when git file I/O is broken (antivirus, NTFS filter
-    drivers causing 'Invalid argument' errors on file creation).
+    drivers causing 'Invalid argument' errors on file creation). Refuses to
+    overlay a dirty git checkout: the extract-over-working-tree path would
+    silently destroy uncommitted edits and then report success (#91962).
 
     Returns ``False`` when a Desktop rebuild ran and failed; ``True`` otherwise.
     """
+    _abort_zip_update_if_dirty_tree()
     active_tool_dependencies = _m()._capture_active_tool_dependencies()
 
     import tempfile
