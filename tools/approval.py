@@ -3271,6 +3271,26 @@ def _get_kanban_approval_mode() -> str:
         return "deny"
 
 
+def _is_kanban_approval_context() -> bool:
+    """True for this worker operation, excluding an in-process cron run.
+
+    ``HERMES_KANBAN_SESSION`` is process-wide and legitimately remains set
+    while a worker invokes a cron job in-process.  The ContextVar marks that
+    cron execution as independently owned so its own ``cron_mode`` policy
+    wins.  A ``delegate_task`` child is still part of the worker operation and
+    therefore intentionally retains the worker's ``kanban_mode`` policy.
+    """
+    if not env_var_enabled("HERMES_KANBAN_SESSION"):
+        return False
+    try:
+        from agent.delegation_context import is_non_dispatcher_owned_context
+
+        return not is_non_dispatcher_owned_context()
+    except Exception:
+        # Import failure must preserve the fail-closed worker classification.
+        return True
+
+
 def _strip_shell_comments(command: str) -> str:
     """Strip shell-style comments from a command before LLM assessment.
 
@@ -3501,7 +3521,7 @@ def _run_approval_gate(
     # ambient state means a human can answer here, so it must never reroute
     # a worker into a prompt or a pending queue nobody watches. Both arms
     # return so the precedence is unconditional.
-    if env_var_enabled("HERMES_KANBAN_SESSION"):
+    if _is_kanban_approval_context():
         if _get_kanban_approval_mode() == "deny":
             return {
                 "approved": False,
@@ -3511,6 +3531,23 @@ def _run_approval_gate(
             }
         logger.warning(
             "%s (pattern: %s): %s — approvals.kanban_mode is 'approve'.",
+            autoapprove_log_prefix, pattern_key, description,
+        )
+        return {"approved": True, "message": None}
+
+    # A cron job can execute in-process inside a Kanban worker.  Its scoped
+    # context outranks the worker process's inherited interactive marker, so
+    # resolve cron policy before any CLI/gateway inference.
+    if _is_cron_approval_context():
+        if _get_cron_approval_mode() == "deny":
+            return {
+                "approved": False,
+                "message": cron_deny_message,
+                "pattern_key": pattern_key,
+                "description": description,
+            }
+        logger.warning(
+            "%s (pattern: %s): %s — approvals.cron_mode is 'approve'.",
             autoapprove_log_prefix, pattern_key, description,
         )
         return {"approved": True, "message": None}
@@ -3548,17 +3585,7 @@ def _run_approval_gate(
                 autoapprove_log_prefix, pattern_key, description,
             )
             return {"approved": True, "message": None}
-        # Cron sessions: respect cron_mode config
-        if _is_cron_approval_context():
-            if _get_cron_approval_mode() == "deny":
-                return {
-                    "approved": False,
-                    "message": cron_deny_message,
-                    "pattern_key": pattern_key,
-                    "description": description,
-                }
-            # cron_mode: approve — fall through to auto-approve below.
-        elif fail_closed_when_no_human:
+        if fail_closed_when_no_human:
             # Non-cron, non-interactive, no gateway: no human can answer.
             # The plugin-escalation path opts in to fail-closed here so a
             # plugin-flagged action never runs ungated. (The dangerous-
@@ -4532,9 +4559,19 @@ def check_all_command_guards(command: str, env_type: str,
     # state must never pull it into a prompt, smart approval, or a pending
     # queue that lives in the dispatcher process. Both arms return so the
     # precedence is unconditional.
-    if env_var_enabled("HERMES_KANBAN_SESSION"):
+    if _is_kanban_approval_context():
         if _get_kanban_approval_mode() == "deny":
             blocked = _unattended_deny_check(command, "kanban workers", "kanban_mode")
+            if blocked is not None:
+                return blocked
+        return {"approved": True, "message": None}
+
+    # In-process cron jobs are independently owned even when their parent
+    # worker left HERMES_INTERACTIVE set process-wide. Resolve cron policy
+    # before ambient interactive/gateway/ask markers.
+    if _is_cron_approval_context():
+        if _get_cron_approval_mode() == "deny":
+            blocked = _unattended_deny_check(command, "cron jobs", "cron_mode")
             if blocked is not None:
                 return blocked
         return {"approved": True, "message": None}
@@ -4626,12 +4663,6 @@ def check_all_command_guards(command: str, env_type: str,
                         }
                     # else: tirith_fail_open is True — allow as before
             # single_query_mode: approve — fall through to auto-approve below.
-        # Cron sessions: respect cron_mode config
-        if _is_cron_approval_context():
-            if _get_cron_approval_mode() == "deny":
-                blocked = _unattended_deny_check(command, "cron jobs", "cron_mode")
-                if blocked is not None:
-                    return blocked
         return {"approved": True, "message": None}
 
     # --- Phase 1: Gather findings from both checks ---
@@ -5145,7 +5176,7 @@ def check_execute_code_guard(code: str, env_type: str,
     # is process-global in a scheduler parent and can leak into the worker
     # env (#63183) — an inherited cron approve-mode must not preempt the
     # worker's own kanban policy.
-    if env_var_enabled("HERMES_KANBAN_SESSION"):
+    if _is_kanban_approval_context():
         if _get_kanban_approval_mode() == "deny":
             return {
                 "approved": False,
