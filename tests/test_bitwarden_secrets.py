@@ -210,6 +210,53 @@ def test_fetch_server_url_sets_env(monkeypatch, tmp_path):
     assert captured_env.get("BWS_SERVER_URL") == "https://vault.bitwarden.eu"
 
 
+def test_bws_json_disables_forced_color(monkeypatch, tmp_path):
+    """Inherited color-forcing vars must not corrupt ``--output json``."""
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    source_env = {
+        "PATH": "/usr/bin",
+        "FORCE_COLOR": "3",
+        "CLICOLOR_FORCE": "1",
+        "CLICOLOR": "1",
+        "NO_COLOR": "0",
+    }
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs["env"]
+        return mock.Mock(
+            returncode=0,
+            stdout=_fake_bws_payload([{"key": "SAFE_KEY", "value": "value"}]),
+            stderr="",
+        )
+
+    monkeypatch.setattr(bw, "get_source_environment", lambda: source_env)
+    monkeypatch.setattr(bw.subprocess, "run", fake_run)
+
+    secrets, warnings = bw._run_bws_list(fake_binary, "0.test", "project-id")
+
+    assert captured["cmd"] == [
+        str(fake_binary),
+        "secret",
+        "list",
+        "project-id",
+        "--output",
+        "json",
+        "--color",
+        "no",
+    ]
+    assert captured["env"]["BWS_ACCESS_TOKEN"] == "0.test"
+    assert captured["env"]["NO_COLOR"] == "1"
+    assert "FORCE_COLOR" not in captured["env"]
+    assert "CLICOLOR_FORCE" not in captured["env"]
+    assert "CLICOLOR" not in captured["env"]
+    assert source_env["FORCE_COLOR"] == "3"
+    assert secrets == {"SAFE_KEY": "value"}
+    assert warnings == []
+
+
 
 
 

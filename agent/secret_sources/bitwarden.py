@@ -674,7 +674,7 @@ def _summarize_bws_stderr(raw: str) -> str:
 def _run_bws_list(
     bws: Path, access_token: str, project_id: str, server_url: str = ""
 ) -> Tuple[Dict[str, str], List[str]]:
-    cmd = [str(bws), "secret", "list", project_id, "--output", "json"]
+    cmd = [str(bws), "secret", "list", project_id, "--output", "json", "--color", "no"]
     # bws child intentionally receives the access token.  Under a profile-local
     # fetch it must not inherit sibling credentials from process-global env.
     source_env = get_source_environment()
@@ -685,8 +685,15 @@ def _run_bws_list(
     else:
         env = dict(source_env)
     env["BWS_ACCESS_TOKEN"] = access_token
-    # Make sure we're not echoing telemetry / colour codes into json.
-    env.setdefault("NO_COLOR", "1")
+    # Make sure we're not echoing telemetry / colour codes into the json stream.
+    # bws 2.0.0 lets FORCE_COLOR / CLICOLOR_FORCE override NO_COLOR and ANSI-colorizes
+    # even `--output json`; the first byte then becomes ESC (0x1b) and json.loads breaks
+    # at char 0.  `--color no` on the command line is the deterministic fix; forcing
+    # NO_COLOR and stripping the colour-forcing vars a parent (e.g. an agent/CI harness
+    # that exports FORCE_COLOR=3) may hold is defence in depth.
+    env["NO_COLOR"] = "1"
+    for _colour_var in ("FORCE_COLOR", "CLICOLOR_FORCE", "CLICOLOR"):
+        env.pop(_colour_var, None)
     # Region / self-hosted support.  bws defaults to https://vault.bitwarden.com
     # (US Cloud); EU Cloud users need https://vault.bitwarden.eu, and
     # self-hosted users need their own URL.  When unset, fall back to whatever
