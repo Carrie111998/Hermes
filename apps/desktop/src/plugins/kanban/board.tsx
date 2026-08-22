@@ -31,6 +31,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
   ErrorState,
+  formatModifierToken,
   host,
   Input,
   Loader,
@@ -242,6 +243,7 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
 function Card({
   columns,
   onDelete,
+  onDraggingChange,
   onMove,
   onOpen,
   onToggleSelect,
@@ -250,6 +252,7 @@ function Card({
 }: {
   columns: string[]
   onDelete: (id: string) => void
+  onDraggingChange: (dragging: boolean) => void
   onMove: (id: string, status: string) => void
   onOpen: (id: string) => void
   onToggleSelect: (id: string) => void
@@ -278,7 +281,10 @@ function Card({
           data-kanban-card={task.id}
           draggable
           onClick={event => (event.metaKey || event.ctrlKey ? onToggleSelect(task.id) : onOpen(task.id))}
-          onDragEnd={() => setDragging(false)}
+          onDragEnd={() => {
+            setDragging(false)
+            onDraggingChange(false)
+          }}
           onDragStart={event => {
             event.dataTransfer.setData('text/plain', task.id)
             event.dataTransfer.effectAllowed = 'move'
@@ -286,6 +292,7 @@ function Card({
             // stays a solid card (dimming first would bake 40% into it).
             event.dataTransfer.setDragImage(event.currentTarget, event.nativeEvent.offsetX, event.nativeEvent.offsetY)
             setDragging(true)
+            onDraggingChange(true)
           }}
           style={{ '--kanban-tone': meta.tone, borderLeftColor: meta.tone } as CSSProperties}
         >
@@ -313,7 +320,7 @@ function Card({
         </ContextMenuItem>
         <ContextMenuItem onSelect={() => onToggleSelect(task.id)}>
           <Codicon name={selected ? 'close' : 'check-all'} size="0.85rem" />
-          {selected ? k.deselect : k.select}
+          {selected ? k.deselect : k.select(formatModifierToken('mod'))}
         </ContextMenuItem>
         <ContextMenuSeparator />
         {columns
@@ -344,6 +351,7 @@ function Column({
   laneRef,
   onAdd,
   onDelete,
+  onDraggingChange,
   onDropTask,
   onMove,
   onOpen,
@@ -358,6 +366,7 @@ function Column({
   laneRef: (element: HTMLDivElement | HTMLButtonElement | null) => void
   onAdd: (status: string) => void
   onDelete: (id: string) => void
+  onDraggingChange: (dragging: boolean) => void
   onDropTask: (id: string, status: string) => void
   onMove: (id: string, status: string) => void
   onOpen: (id: string) => void
@@ -453,7 +462,7 @@ function Column({
     <div
       {...dragHandlers}
       className={cn(
-        'group/col flex h-full w-[calc(100vw-2.25rem)] max-w-full shrink-0 snap-start snap-always flex-col rounded-none border border-(--ui-stroke-tertiary) p-2 transition-colors md:w-64 md:rounded-lg md:border-0 md:[scroll-snap-align:none]',
+        'group/col flex h-full w-[calc(100vw-2.25rem)] max-w-full shrink-0 snap-start snap-always flex-col rounded-none border border-(--ui-stroke-tertiary) p-2 transition-colors motion-reduce:transition-none md:w-64 md:rounded-lg md:border-0 md:[scroll-snap-align:none]',
         wash
       )}
       data-kanban-lane={column.name}
@@ -492,6 +501,7 @@ function Column({
                     columns={columns}
                     key={task.id}
                     onDelete={onDelete}
+                    onDraggingChange={onDraggingChange}
                     onMove={onMove}
                     onOpen={onOpen}
                     onToggleSelect={onToggleSelect}
@@ -506,6 +516,7 @@ function Column({
                 columns={columns}
                 key={task.id}
                 onDelete={onDelete}
+                onDraggingChange={onDraggingChange}
                 onMove={onMove}
                 onOpen={onOpen}
                 onToggleSelect={onToggleSelect}
@@ -1273,6 +1284,7 @@ export function KanbanBoardPage() {
   const lanesRef = useRef<HTMLDivElement>(null)
   const laneElements = useRef(new Map<string, HTMLDivElement | HTMLButtonElement>())
   const [selectedLane, setSelectedLane] = useState('triage')
+  const [cardDragging, setCardDragging] = useState(false)
   const { grabbing, onMouseDown } = useGrabScroll(lanesRef)
 
   // Lane collapse: auto (empty → rail) unless the user overrode it. The map
@@ -1494,8 +1506,8 @@ export function KanbanBoardPage() {
         <div
           aria-label={k.board}
           className={cn(
-            'flex flex-1 snap-x snap-mandatory scroll-px-4 gap-2 overflow-x-auto overscroll-x-contain px-4 pt-1 pb-3 md:snap-none',
-            grabbing && 'cursor-grabbing'
+            'flex flex-1 snap-x scroll-px-4 gap-2 overflow-x-auto overscroll-x-contain px-4 pt-1 pb-3 md:snap-none',
+            grabbing || cardDragging ? 'cursor-grabbing snap-none' : 'snap-mandatory'
           )}
           data-kanban-scroller=""
           onMouseDown={onMouseDown}
@@ -1519,6 +1531,7 @@ export function KanbanBoardPage() {
                 laneWidth={viewport.laneWidth}
                 onAdd={setAddStatus}
                 onDelete={id => deleteMut.mutate(id)}
+                onDraggingChange={setCardDragging}
                 onDropTask={onMove}
                 onMove={onMove}
                 onOpen={setOpenId}

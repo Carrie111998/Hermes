@@ -232,14 +232,26 @@ test('actual shell validates exact mobile viewports and all lane input paths', a
     const shell = await page.evaluate(() => ({
       board: document.querySelector<HTMLElement>('[data-kanban-board-root]')!.clientWidth,
       lane: document.querySelector<HTMLElement>('[data-kanban-lane="triage"]')!.clientWidth,
+      overscrollBehaviorX: getComputedStyle(document.querySelector<HTMLElement>('[data-kanban-scroller]')!).overscrollBehaviorX,
       viewport: innerWidth
     }))
     expect(shell.viewport).toBe(width)
     expect(shell.board).toBe(shell.viewport) // the mobile shell hides its desktop rail; no board delta
     expect(shell.lane).toBe(shell.board - 38) // 36px outer gutter plus the lane's two one-pixel borders
+    expect(shell.overscrollBehaviorX).toBe('contain')
     await expectMobileTargetsAndClipping(page)
 
     const scroller = page.locator('[data-kanban-scroller]:visible')
+    const card = page.locator('[data-kanban-card]').first()
+    await scroller.dispatchEvent('mousedown', { button: 0, clientX: 200, clientY: 500 })
+    await page.mouse.move(150, 500)
+    await expect(scroller).toHaveCSS('scroll-snap-type', 'none')
+    await page.mouse.up()
+    await expect(scroller).toHaveCSS('scroll-snap-type', 'x mandatory')
+    await card.dispatchEvent('dragstart', { dataTransfer: await page.evaluateHandle(() => new DataTransfer()) })
+    await expect(scroller).toHaveCSS('scroll-snap-type', 'none')
+    await card.dispatchEvent('dragend')
+    await expect(scroller).toHaveCSS('scroll-snap-type', 'x mandatory')
     await scroller.evaluate(element => element.scrollTo({ left: 0, behavior: 'instant' }))
     await expect.poll(() => measureTrailingPeek(page, 'triage', 'todo')).toMatchObject({
       currentContained: true,
@@ -312,22 +324,25 @@ test('actual shell validates exact mobile viewports and all lane input paths', a
       await expectContained(page, status)
     }
 
-    expect(await page.evaluate(() => matchMedia('(prefers-reduced-motion: reduce)').matches)).toBe(true)
+    const reducedMotion = await page.evaluate(() => ({
+      matches: matchMedia('(prefers-reduced-motion: reduce)').matches,
+      scrollBehavior: getComputedStyle(document.querySelector<HTMLElement>('[data-kanban-scroller]')!).scrollBehavior,
+      transitionDuration: getComputedStyle(document.querySelector<HTMLElement>('[data-kanban-lane="triage"]')!).transitionDuration,
+    }))
+    expect(reducedMotion.matches).toBe(true)
+    expect(reducedMotion.scrollBehavior).toBe('auto')
+    expect(Number.parseFloat(reducedMotion.transitionDuration)).toBeLessThanOrEqual(0.001)
   }
 
   const manifestPath = testInfo.outputPath('kanban-mobile-viewport-manifest.json')
-  const boardSource = path.join(REPO_ROOT, 'apps', 'desktop', 'src', 'plugins', 'kanban', 'board.tsx')
-  const responsiveSource = path.join(REPO_ROOT, 'apps', 'desktop', 'src', 'plugins', 'kanban', 'responsive.ts')
   const distRoot = path.join(REPO_ROOT, 'apps', 'desktop', 'dist')
   const rendererBundle = fs.readdirSync(path.join(distRoot, 'assets')).find(name => /^index-.*\.js$/.test(name))!
   const sha256File = (file: string) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
   const evidence = {
     captures: manifest,
     provenance: {
-      boardSource: { path: path.relative(REPO_ROOT, boardSource), sha256: sha256File(boardSource) },
       rendererBundle: { path: `apps/desktop/dist/assets/${rendererBundle}`, sha256: sha256File(path.join(distRoot, 'assets', rendererBundle)) },
       rendererIndex: { path: 'apps/desktop/dist/index.html', sha256: sha256File(path.join(distRoot, 'index.html')) },
-      responsiveSource: { path: path.relative(REPO_ROOT, responsiveSource), sha256: sha256File(responsiveSource) },
     },
   }
   fs.writeFileSync(manifestPath, `${JSON.stringify(evidence, null, 2)}\n`)
@@ -362,6 +377,11 @@ test('mobile fixture covers long cards, drawer actions, filters, grouping, and e
   await expect(search).toHaveValue('Synthetic long triage')
   await expect(page.getByText('Synthetic long triage card 0 with deterministic wrapping words', { exact: true }).first()).toBeVisible()
   await expectMobileTargetsAndClipping(page)
+  const overflowingLane = await page.locator('[data-kanban-lane="triage"] > div:last-child').evaluate(element => ({
+    overflowY: getComputedStyle(element).overflowY,
+    overflows: element.scrollHeight > element.clientHeight,
+  }))
+  expect(overflowingLane).toEqual({ overflowY: 'auto', overflows: true })
   await search.fill('definitely-no-synthetic-match')
   await expect(page.getByText('No tasks match the filters', { exact: true })).toBeVisible()
   expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBe(0)
@@ -419,6 +439,29 @@ test('1280 desktop regression keeps lanes, navigation, and drawer geometry', asy
   const actionBox = await page.getByRole('button', { name: 'Task actions' }).boundingBox()
   expect(actionBox?.width).toBe(24)
   expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBe(0)
+})
+
+// eslint-disable-next-line no-empty-pattern
+test('767/768 boundary changes toolbar order and snap behavior exactly once', async ({}) => {
+  const page = fixture!.page
+  seedBoard(fixture!.sandbox.hermesHome)
+  await page.reload()
+
+  for (const [width, expected] of [[767, { actionOrder: '0', layout: 'mobile', snap: 'x mandatory' }], [768, { actionOrder: '9999', layout: 'desktop', snap: 'none' }]] as const) {
+    await setContentViewport(fixture!, width)
+    const state = await page.evaluate(() => {
+      const header = document.querySelector<HTMLElement>('[data-kanban-layout]')!
+      const children = [...header.children]
+      return {
+        actionOrder: getComputedStyle(children[1]).order,
+        filterOrder: getComputedStyle(children[2]).order,
+        layout: header.dataset.kanbanLayout,
+        snap: getComputedStyle(document.querySelector<HTMLElement>('[data-kanban-scroller]')!).scrollSnapType,
+      }
+    })
+    expect(state).toMatchObject(expected)
+    expect(state.filterOrder).toBe('0')
+  }
 })
 
 // eslint-disable-next-line no-empty-pattern
