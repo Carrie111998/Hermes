@@ -6862,6 +6862,83 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         state = self._peek_session_state(session_key)
         return bool(token and state is not None and state.turn.routing_owner == token)
 
+    def _consume_pending_one_turn_model_override(
+        self, event: MessageEvent, session_key: str
+    ) -> bool:
+        """Bind the pending /model --once restore to this exact adaptive turn.
+
+        The restore record is consumed before the fast router awaits.  The
+        event keeps its immutable copy, while the turn state lets control
+        commands restore it immediately before releasing the running slot.
+        Neither path relies on ``routing_owner`` remaining current.
+        """
+        if not session_key:
+            return False
+        state = self._peek_session_state(session_key)
+        if state is None:
+            return False
+        pending = state.conversation.one_turn_restore
+        if not isinstance(pending, dict):
+            return False
+        restore_id = str(pending.get("restore_id") or "").strip()
+        current_id = state.conversation.model_override_instance_id
+        if not restore_id or current_id != restore_id:
+            return False
+        record = dict(pending)
+        record["consumed_override"] = dict(state.conversation.model_override or {})
+        record["consumed_override_instance_id"] = restore_id
+        state.conversation.one_turn_restore = None
+        state.turn.one_turn_restore = dict(record)
+        setattr(event, "_whatsapp_adaptive_one_turn_restore", dict(record))
+        return True
+
+    def _restore_consumed_one_turn_model_override(
+        self, session_key: str, restore_record: Optional[Dict[str, Any]]
+    ) -> bool:
+        """CAS-restore one consumed /model --once instance.
+
+        ``restore_record`` is owned by the turn/event that consumed it.  The
+        current override must still carry the same instance id; a newer
+        /model --once, ordinary /model, /new, or other state transition wins
+        and is left untouched.
+        """
+        if not session_key or not isinstance(restore_record, dict):
+            return False
+        restore_id = str(
+            restore_record.get("consumed_override_instance_id")
+            or restore_record.get("restore_id")
+            or ""
+        ).strip()
+        if not restore_id:
+            return False
+        state = self._peek_session_state(session_key)
+        if state is None:
+            return False
+        if state.conversation.model_override_instance_id != restore_id:
+            return False
+        if restore_record.get("had_override"):
+            state.conversation.model_override = dict(
+                restore_record.get("override") or {}
+            )
+            state.conversation.model_override_instance_id = restore_record.get(
+                "baseline_instance_id"
+            )
+        else:
+            state.conversation.model_override = None
+            state.conversation.model_override_instance_id = None
+        if (
+            state.turn.one_turn_restore is not None
+            and str(
+                state.turn.one_turn_restore.get("consumed_override_instance_id")
+                or state.turn.one_turn_restore.get("restore_id")
+                or ""
+            )
+            == restore_id
+        ):
+            state.turn.one_turn_restore = None
+        self._evict_cached_agent(session_key)
+        return True
+
     def _release_whatsapp_adaptive_routing_owner(
         self, event: MessageEvent, session_key: str, *, restore: bool = True
     ) -> bool:
@@ -6870,6 +6947,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not token or not self._adaptive_routing_owner_matches(event, session_key):
             return False
         if restore:
+            self._restore_consumed_one_turn_model_override(
+                session_key,
+                getattr(event, "_whatsapp_adaptive_one_turn_restore", None),
+            )
             self._restore_pending_one_turn_model_override(
                 session_key, owner_token=token
             )
@@ -16557,6 +16638,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
         event._whatsapp_adaptive_routing_owner = owner
+        self._consume_pending_one_turn_model_override(event, session_key)
 
         def _route_in_profile_scope():
             config_obj = getattr(self, "config", None)
@@ -16594,10 +16676,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             decision = await asyncio.to_thread(_route_in_profile_scope)
             if not self._adaptive_routing_owner_matches(event, session_key):
+                self._restore_consumed_one_turn_model_override(
+                    session_key,
+                    getattr(event, "_whatsapp_adaptive_one_turn_restore", None),
+                )
                 event._whatsapp_adaptive_ownership_lost = True
                 return None
             return decision
         except BaseException:
+            self._restore_consumed_one_turn_model_override(
+                session_key,
+                getattr(event, "_whatsapp_adaptive_one_turn_restore", None),
+            )
             self._release_whatsapp_adaptive_routing_owner(event, session_key)
             raise
 
@@ -17841,6 +17931,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "api_key": "moa-virtual-provider",
                     "api_mode": "chat_completions",
                 }
+                _moa_state.conversation.model_override_instance_id = None
                 self._evict_cached_agent(_quick_key)
                 event._moa_disable_after_turn = True
             except Exception:
@@ -18123,6 +18214,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the fast request.
         _adaptive_decision = await self._run_whatsapp_adaptive_route(event, source)
         if getattr(event, "_whatsapp_adaptive_ownership_lost", False):
+            self._restore_consumed_one_turn_model_override(
+                _quick_key,
+                getattr(event, "_whatsapp_adaptive_one_turn_restore", None),
+            )
             return (
                 "⚠️ The WhatsApp adaptive turn was cancelled by another session "
                 "operation. Please resend the message."
@@ -18218,7 +18313,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and self._adaptive_routing_owner_matches(event, _quick_key)
             )
             self._restore_moa_one_shot(event, _quick_key)
-            if _adaptive_owned:
+            _adaptive_one_turn_restore = getattr(
+                event, "_whatsapp_adaptive_one_turn_restore", None
+            )
+            if _adaptive_one_turn_restore is not None:
+                self._restore_consumed_one_turn_model_override(
+                    _quick_key, _adaptive_one_turn_restore
+                )
+            elif _adaptive_owned:
                 self._restore_pending_one_turn_model_override(
                     _quick_key, owner_token=_adaptive_owner
                 )
@@ -18267,7 +18369,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         try:
             _restore = getattr(event, "_moa_restore_override", None)
-            self._session_state(quick_key).conversation.model_override = _restore
+            _moa_state = self._session_state(quick_key).conversation
+            _moa_state.model_override = _restore
+            _moa_state.model_override_instance_id = None
             self._evict_cached_agent(quick_key)
         except Exception:
             pass
@@ -26529,7 +26633,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "(provider=%s); using credential-less override",
                     provider, exc_info=True,
                 )
-        self._session_state(session_key).conversation.model_override = override
+        _rehydrate_state = self._session_state(session_key).conversation
+        _rehydrate_state.model_override = override
+        _rehydrate_state.model_override_instance_id = None
         logger.info(
             "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
             session_key, override.get("model"), provider or "",
@@ -26579,13 +26685,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not session_key:
             return
         if snapshot.get("had_override"):
-            self._session_state(session_key).conversation.model_override = dict(
-                snapshot.get("override") or {}
-            )
+            _restore_state = self._session_state(session_key).conversation
+            _restore_state.model_override = dict(snapshot.get("override") or {})
+            _restore_state.model_override_instance_id = None
         else:
             _rst_state = self._peek_session_state(session_key)
             if _rst_state is not None:
                 _rst_state.conversation.model_override = None
+                _rst_state.conversation.model_override_instance_id = None
         self._evict_cached_agent(session_key)
 
     def _is_intentional_model_switch(self, session_key: str, agent_model: str) -> bool:
@@ -26929,6 +27036,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _iac_state is not None:
             _iac_state.persistent.pending_command_text = None
         if release_running_state:
+            if _iac_state is not None:
+                self._restore_consumed_one_turn_model_override(
+                    session_key, _iac_state.turn.one_turn_restore
+                )
             self._release_running_agent_state(session_key)
             # Evict the cached agent: ``_interrupt_requested`` is only
             # cleared by the turn finalizer, so on a hung or still-draining

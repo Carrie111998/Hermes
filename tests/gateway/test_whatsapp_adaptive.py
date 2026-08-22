@@ -608,13 +608,17 @@ def _ownership_runner(monkeypatch):
 def _stage_model_once_override(runner, key, *, baseline=None, generation=1):
     state = runner._session_state(key)
     state.persistent.run_generation = generation
+    restore_id = f"test-restore-{generation}"
     state.conversation.model_override = {
         "model": "one-turn-model",
         "provider": "one-turn-provider",
     }
+    state.conversation.model_override_instance_id = restore_id
     runner._pending_one_turn_model_restores[key] = {
         "had_override": baseline is not None,
         "override": baseline,
+        "restore_id": restore_id,
+        "baseline_instance_id": None,
     }
     return state
 
@@ -985,6 +989,365 @@ async def test_adaptive_agentic_control_invalidation_releases_exact_lease_and_ma
     )
     assert next_token is not None
     assert runner._turn_leases.release(next_token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("control_operation", ["stop", "new"])
+async def test_model_once_adaptive_control_invalidation_restores_before_owner_clear(
+    monkeypatch, tmp_path, control_operation
+):
+    """Control invalidation consumes the exact model-once instance safely."""
+    runner, store = _lifecycle_runner(monkeypatch, tmp_path)
+    source = SessionSource(
+        platform=Platform.WHATSAPP,
+        chat_id="model-once-control",
+        user_id="a",
+        chat_type="dm",
+    )
+    store.get_or_create_session(source)
+    key = runner._session_key_for_source(source)
+    _stage_model_once_override(
+        runner,
+        key,
+        baseline={"model": "baseline-model", "provider": "baseline-provider"},
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingRouter:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def route(self, text):
+            entered.set()
+            assert release.wait(2)
+            return AdaptiveDecision(AdaptiveRoute.AGENTIC, reason="tool_required")
+
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {"gateway": {"whatsapp_adaptive_routing": {"enabled": True}}},
+    )
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+        lambda provider: {"provider": provider, "api_key": "gemini-key"},
+    )
+    monkeypatch.setattr("gateway.whatsapp_adaptive.WhatsAppFastRouter", BlockingRouter)
+
+    restore_calls = []
+    original_restore = runner._restore_consumed_one_turn_model_override
+
+    def recording_restore(session_key, restore_record):
+        if restore_record is not None:
+            restore_calls.append(
+                runner._session_state(session_key).conversation.model_override
+            )
+        return original_restore(session_key, restore_record)
+
+    monkeypatch.setattr(
+        runner, "_restore_consumed_one_turn_model_override", recording_restore
+    )
+    event = MessageEvent(text="Inspect the runtime", source=source)
+    task = asyncio.create_task(runner._handle_message(event))
+    await asyncio.to_thread(entered.wait, 2)
+
+    if control_operation == "stop":
+        await runner._interrupt_and_clear_session(
+            key,
+            source,
+            interrupt_reason="/stop",
+            invalidation_reason="model_once_stop",
+        )
+        state = runner._session_state(key)
+        assert state.conversation.model_override == {
+            "model": "baseline-model",
+            "provider": "baseline-provider",
+        }
+        assert state.conversation.one_turn_restore is None
+    else:
+        async def emit_hook(*args, **kwargs):
+            return None
+
+        runner.hooks = SimpleNamespace(emit=emit_hook)
+        await runner._handle_reset_command(
+            MessageEvent(text="/new", source=source)
+        )
+        assert restore_calls
+        assert restore_calls[0] == {
+            "model": "one-turn-model",
+            "provider": "one-turn-provider",
+        }
+        state = runner._session_state(key)
+        assert state.conversation.model_override is None
+        assert state.conversation.one_turn_restore is None
+
+    release.set()
+    assert await task == (
+        "⚠️ The WhatsApp adaptive turn was cancelled by another session "
+        "operation. Please resend the message."
+    )
+    state = runner._session_state(key)
+    assert state.conversation.one_turn_restore is None
+    assert not runner._is_session_running(key)
+
+
+@pytest.mark.asyncio
+async def test_model_once_adaptive_router_cancellation_restores(monkeypatch, tmp_path):
+    runner, store = _lifecycle_runner(monkeypatch, tmp_path)
+    source = SessionSource(
+        platform=Platform.WHATSAPP,
+        chat_id="model-once-cancel",
+        user_id="a",
+        chat_type="dm",
+    )
+    store.get_or_create_session(source)
+    key = runner._session_key_for_source(source)
+    _stage_model_once_override(runner, key)
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingRouter:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def route(self, text):
+            entered.set()
+            assert release.wait(2)
+            return AdaptiveDecision(AdaptiveRoute.AGENTIC, reason="unknown")
+
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {"gateway": {"whatsapp_adaptive_routing": {"enabled": True}}},
+    )
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+        lambda provider: {"provider": provider, "api_key": "gemini-key"},
+    )
+    monkeypatch.setattr("gateway.whatsapp_adaptive.WhatsAppFastRouter", BlockingRouter)
+
+    event = MessageEvent(text="Do the work", source=source)
+    task = asyncio.create_task(runner._run_whatsapp_adaptive_route(event, source))
+    await asyncio.to_thread(entered.wait, 2)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    state = runner._session_state(key)
+    assert state.conversation.model_override is None
+    assert state.conversation.one_turn_restore is None
+    assert not runner._is_session_running(key)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("new_override_kind", ["once", "ordinary"])
+async def test_old_adaptive_cleanup_preserves_new_model_override(
+    monkeypatch, tmp_path, new_override_kind
+):
+    """An invalidated old event cannot CAS over newer model state."""
+    runner, store = _lifecycle_runner(monkeypatch, tmp_path)
+    source = SessionSource(
+        platform=Platform.WHATSAPP,
+        chat_id=f"model-once-new-{new_override_kind}",
+        user_id="a",
+        chat_type="dm",
+    )
+    store.get_or_create_session(source)
+    key = runner._session_key_for_source(source)
+    _stage_model_once_override(runner, key)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def adaptive_route(event, route_source):
+        owner, limit_message = runner._claim_whatsapp_adaptive_routing_owner(
+            key, route_source
+        )
+        assert owner and limit_message is None
+        event._whatsapp_adaptive_routing_owner = owner
+        runner._consume_pending_one_turn_model_override(event, key)
+        return AdaptiveDecision(AdaptiveRoute.AGENTIC, reason="tool_required")
+
+    async def blocked_agent(*args, **kwargs):
+        state = runner._session_state(key)
+        state.turn.agent = _AGENT_PENDING_SENTINEL
+        entered.set()
+        await release.wait()
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(runner, "_run_whatsapp_adaptive_route", adaptive_route)
+    monkeypatch.setattr(runner, "_handle_message_with_agent", blocked_agent)
+    task = asyncio.create_task(
+        runner._handle_message(MessageEvent(text="old", source=source))
+    )
+    await asyncio.wait_for(entered.wait(), timeout=2)
+
+    await runner._interrupt_and_clear_session(
+        key,
+        source,
+        interrupt_reason="/stop",
+        invalidation_reason="old_model_once_test",
+    )
+    state = runner._session_state(key)
+    state.conversation.model_override = {
+        "model": "new-model",
+        "provider": "new-provider",
+    }
+    if new_override_kind == "once":
+        state.conversation.model_override_instance_id = "new-restore-id"
+        state.conversation.one_turn_restore = {
+            "had_override": False,
+            "override": None,
+            "restore_id": "new-restore-id",
+            "baseline_instance_id": None,
+        }
+    else:
+        state.conversation.model_override_instance_id = None
+        state.conversation.one_turn_restore = None
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    state = runner._session_state(key)
+    assert state.conversation.model_override == {
+        "model": "new-model",
+        "provider": "new-provider",
+    }
+    if new_override_kind == "once":
+        assert state.conversation.one_turn_restore["restore_id"] == "new-restore-id"
+    else:
+        assert state.conversation.one_turn_restore is None
+
+
+@pytest.mark.asyncio
+async def test_old_adaptive_finally_preserves_new_ordinary_turn(
+    monkeypatch, tmp_path
+):
+    """An invalidated adaptive turn cannot release or rewrite a new turn."""
+    runner, store = _lifecycle_runner(monkeypatch, tmp_path)
+    source = SessionSource(
+        platform=Platform.WHATSAPP,
+        chat_id="model-once-new-turn",
+        user_id="a",
+        chat_type="dm",
+    )
+    store.get_or_create_session(source)
+    key = runner._session_key_for_source(source)
+    _stage_model_once_override(runner, key)
+    old_entered = asyncio.Event()
+    new_entered = asyncio.Event()
+    old_release = asyncio.Event()
+    new_release = asyncio.Event()
+
+    async def adaptive_route(event, route_source):
+        if event.text != "old":
+            return None
+        owner, limit_message = runner._claim_whatsapp_adaptive_routing_owner(
+            key, route_source
+        )
+        assert owner and limit_message is None
+        event._whatsapp_adaptive_routing_owner = owner
+        runner._consume_pending_one_turn_model_override(event, key)
+        from gateway.whatsapp_adaptive import AdaptiveRoute
+
+        return AdaptiveDecision(AdaptiveRoute.AGENTIC, reason="tool_required")
+
+    async def agent_pipeline(event, route_source, quick_key, run_generation):
+        if event.text == "old":
+            old_entered.set()
+            await old_release.wait()
+            raise asyncio.CancelledError
+        new_entered.set()
+        await new_release.wait()
+        return "new ordinary turn"
+
+    monkeypatch.setattr(runner, "_run_whatsapp_adaptive_route", adaptive_route)
+    monkeypatch.setattr(runner, "_handle_message_with_agent", agent_pipeline)
+
+    old_task = asyncio.create_task(
+        runner._handle_message(MessageEvent(text="old", source=source))
+    )
+    await asyncio.wait_for(old_entered.wait(), timeout=2)
+    await runner._interrupt_and_clear_session(
+        key,
+        source,
+        interrupt_reason="/stop",
+        invalidation_reason="old_turn_before_new_turn",
+    )
+
+    new_task = asyncio.create_task(
+        runner._handle_message(MessageEvent(text="new", source=source))
+    )
+    await asyncio.wait_for(new_entered.wait(), timeout=2)
+    old_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await old_task
+
+    state = runner._session_state(key)
+    assert state.turn.agent is not None
+    assert state.conversation.model_override is None
+    assert state.conversation.one_turn_restore is None
+
+    new_release.set()
+    assert await new_task == "new ordinary turn"
+    assert not runner._is_session_running(key)
+
+
+@pytest.mark.asyncio
+async def test_adaptive_agentic_same_fast_provider_runs_normal_pipeline_once(
+    monkeypatch, tmp_path
+):
+    runner, store = _lifecycle_runner(monkeypatch, tmp_path)
+    source = SessionSource(
+        platform=Platform.WHATSAPP,
+        chat_id="same-provider",
+        user_id="a",
+        chat_type="dm",
+    )
+    store.get_or_create_session(source)
+    calls = []
+    original = "Inspect the runtime"
+
+    class FakeRouter:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def route(self, text):
+            calls.append(text)
+            return AdaptiveDecision(AdaptiveRoute.AGENTIC, reason="tool_required")
+
+    async def normal_agent(event, route_source, quick_key, run_generation):
+        assert event.text == original
+        return "normal-agent"
+
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {"gateway": {"whatsapp_adaptive_routing": {"enabled": True}}},
+    )
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+        lambda provider: {"provider": "gemini", "api_key": "gemini-key"},
+    )
+    monkeypatch.setattr("gateway.whatsapp_adaptive.WhatsAppFastRouter", FakeRouter)
+    monkeypatch.setattr(runner, "_handle_message_with_agent", normal_agent)
+
+    assert await runner._handle_message(MessageEvent(text=original, source=source)) == (
+        "normal-agent"
+    )
+    assert calls == [original]
+
+
+def test_adaptive_agentic_pipeline_keeps_native_fallback_and_profile_contract():
+    import inspect
+
+    from gateway.run import GatewayRunner, TurnRunner
+
+    turn_source = inspect.getsource(TurnRunner.run_sync)
+    assert "fallback_model=self._runner._refresh_fallback_model()" in turn_source
+    assert "disable_provider_fallback" not in turn_source
+
+    agent_source = inspect.getsource(GatewayRunner._run_agent)
+    assert "_profile_runtime_scope" in agent_source
+    assert "_run_agent_inner" in agent_source
 
 
 @pytest.mark.asyncio
