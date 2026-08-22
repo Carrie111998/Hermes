@@ -54,7 +54,12 @@ from hermes_cli.fallback_config import get_fallback_chain
 from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
 from hermes_cli.cli_commands_mixin import CLICommandsMixin
 from hermes_cli.cli_billing_mixin import CLIBillingMixin
-from agent.interrupt_compat import request_hard_interrupt
+from agent.interrupt_compat import (
+    request_hard_interrupt,
+    INTERRUPT_JOIN_MAX_TICKS,
+    interrupt_followup_disposition,
+    interrupt_join_should_stop,
+)
 
 # prompt_toolkit for fixed input area TUI
 from prompt_toolkit.history import FileHistory
@@ -5449,6 +5454,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._agent_running = False
         self._pending_input = queue.Queue()
         self._interrupt_queue = queue.Queue()
+        self._deferred_followups: list = []
         # Tracks whether the turn that just finished was interrupted via
         # Ctrl+C. Consumed by _maybe_continue_goal_after_turn so /goal loops
         # don't auto-queue another continuation on top of a user-cancelled
@@ -12838,6 +12844,31 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             pass  # Non-fatal — never break the main loop
 
+    def _park_interrupt_followup(self, text: str) -> None:
+        """Hold a follow-up until the interrupted agent thread has exited."""
+        if not text:
+            return
+        held = getattr(self, "_deferred_followups", None)
+        if held is None:
+            self._deferred_followups = []
+            held = self._deferred_followups
+        held.append(text)
+
+    def _flush_deferred_followups(self) -> None:
+        """Move parked interrupt follow-ups onto the idle input queue."""
+        held = getattr(self, "_deferred_followups", None)
+        if not held or not hasattr(self, "_pending_input"):
+            return
+        if getattr(self, "_agent_running", False):
+            return
+        thread = getattr(self, "_last_agent_thread", None)
+        if thread is not None and thread.is_alive():
+            return
+        self._deferred_followups = []
+        for text in held:
+            if text:
+                self._pending_input.put(text)
+
     def _maybe_continue_goal_after_turn(self) -> None:
         """Hook run after every CLI turn. Judges + maybe re-queues.
 
@@ -16481,6 +16512,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._prompt_start_time = time.time()
             self._prompt_duration = 0.0
             agent_thread = threading.Thread(target=run_agent, daemon=True)
+            self._last_agent_thread = agent_thread
             agent_thread.start()
 
             # Ambient "thinking" sound: calm bubble blips while the agent
@@ -16568,21 +16600,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # stays responsive — if the user sent another interrupt or the
             # agent gets stuck, we can break out instead of freezing forever.
             if interrupt_msg is not None:
-                # Interrupt path: poll briefly, then move on.  The agent
-                # thread is daemon — it dies on process exit regardless.
-                for _wait_tick in range(50):  # 50 * 0.2s = 10s max
+                # Bounded wait (10s). Do not freeze forever if a child ignores
+                # interrupt; do not start a new Codex turn on the same agent
+                # while the thread is still alive — park the follow-up instead.
+                for _wait_tick in range(INTERRUPT_JOIN_MAX_TICKS):
                     agent_thread.join(timeout=0.2)
-                    if not agent_thread.is_alive():
-                        break
-                    # Check if user fired ANOTHER interrupt (Ctrl+C sets
-                    # _should_exit which process_loop checks on next pass).
-                    if getattr(self, '_should_exit', False):
+                    if interrupt_join_should_stop(
+                        ticks_elapsed=_wait_tick + 1,
+                        agent_thread_alive=agent_thread.is_alive(),
+                        should_exit=bool(getattr(self, '_should_exit', False)),
+                    ):
                         break
                 if agent_thread.is_alive():
                     logger.warning(
                         "Agent thread still alive after interrupt "
-                        "(thread %s). Daemon thread will be cleaned up "
-                        "on exit.",
+                        "(thread %s); parking follow-up until it exits.",
                         agent_thread.ident,
                     )
             else:
@@ -16875,19 +16907,45 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 combined = "\n".join(all_parts)
                 n = len(all_parts)
                 preview = combined[:50] + ("..." if len(combined) > 50 else "")
-                if n > 1:
-                    print(f"\n⚡ Sending {n} messages after interrupt: '{preview}'")
-                else:
-                    print(f"\n⚡ Sending after interrupt: '{preview}'")
-                self._pending_input.put(combined)
+                disposition = interrupt_followup_disposition(
+                    agent_thread_alive=agent_thread.is_alive(),
+                    should_exit=bool(getattr(self, "_should_exit", False)),
+                )
+                if disposition == "enqueue":
+                    if n > 1:
+                        print(f"\n⚡ Sending {n} messages after interrupt: '{preview}'")
+                    else:
+                        print(f"\n⚡ Sending after interrupt: '{preview}'")
+                    self._pending_input.put(combined)
+                elif disposition == "park":
+                    logger.warning(
+                        "Parking interrupt follow-up; agent thread %s is still alive",
+                        agent_thread.ident,
+                    )
+                    print(
+                        "\n⚡ Stop is still draining parent/child work; "
+                        "holding your message until that thread exits."
+                    )
+                    self._park_interrupt_followup(combined)
 
             # If a /steer was left over (agent finished before another tool
             # batch could absorb it), deliver it as the next user turn.
             _leftover_steer = result.get("pending_steer") if result else None
             if _leftover_steer and hasattr(self, '_pending_input'):
                 preview = _leftover_steer[:60] + ("..." if len(_leftover_steer) > 60 else "")
-                print(f"\n⏩ Delivering leftover /steer as next turn: '{preview}'")
-                self._pending_input.put(_leftover_steer)
+                disposition = interrupt_followup_disposition(
+                    agent_thread_alive=agent_thread.is_alive(),
+                    should_exit=bool(getattr(self, "_should_exit", False)),
+                )
+                if disposition == "enqueue":
+                    print(f"\n⏩ Delivering leftover /steer as next turn: '{preview}'")
+                    self._pending_input.put(_leftover_steer)
+                elif disposition == "park":
+                    print(
+                        f"\n⏩ Holding leftover /steer until the interrupted "
+                        f"agent thread exits: '{preview}'"
+                    )
+                    self._park_interrupt_followup(_leftover_steer)
 
             return response
             
@@ -20141,6 +20199,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 try:
                     # Check for pending input with timeout
                     try:
+                        if not self._agent_running:
+                            self._flush_deferred_followups()
                         user_input = self._pending_input.get(timeout=0.1)
                     except queue.Empty:
                         # Periodic config watcher — auto-reload MCP on mcp_servers change

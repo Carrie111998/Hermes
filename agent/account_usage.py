@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
@@ -44,6 +45,61 @@ class AccountUsageSnapshot:
     @property
     def available(self) -> bool:
         return bool(self.windows or self.details) and not self.unavailable_reason
+
+
+def codex_weekly_used_percent(snapshot: Optional[AccountUsageSnapshot]) -> Optional[float]:
+    """Return the Codex weekly window used_percent, if present."""
+    if snapshot is None:
+        return None
+    for window in snapshot.windows:
+        if str(window.label or "").strip().lower() == "weekly":
+            if window.used_percent is None:
+                return None
+            return float(window.used_percent)
+    return None
+
+
+def weekly_used_percent_from_headers(rate_limit_state: Any) -> Optional[float]:
+    """Prefer weekly token/request buckets from x-ratelimit-*-1w / -7d headers."""
+    if rate_limit_state is None:
+        return None
+    for attr in ("tokens_week", "requests_week"):
+        bucket = getattr(rate_limit_state, attr, None)
+        if bucket is None:
+            continue
+        limit = int(getattr(bucket, "limit", 0) or 0)
+        if limit <= 0:
+            continue
+        pct = getattr(bucket, "usage_pct", None)
+        if pct is None:
+            continue
+        return float(pct)
+    return None
+
+
+def should_trip_codex_weekly_breaker(
+    snapshot: Optional[AccountUsageSnapshot],
+    threshold_percent: float,
+    rate_limit_state: Any = None,
+) -> bool:
+    """Trip when weekly headers or the usage-API weekly window hit the percent.
+
+    Header buckets win when present. ``threshold_percent <= 0`` disables.
+    Missing both sources does not trip (caller still must not Codex-fallback).
+    """
+    if threshold_percent is None or float(threshold_percent) <= 0:
+        return False
+    used = weekly_used_percent_from_headers(rate_limit_state)
+    if used is None:
+        used = codex_weekly_used_percent(snapshot)
+    if used is None:
+        return False
+    return used >= float(threshold_percent)
+
+
+def allow_non_codex_weekly_fallback(provider: str | None) -> bool:
+    """Weekly breaker may continue only on a non-Codex fallback provider."""
+    return str(provider or "").strip().lower() != "openai-codex"
 
 
 def _title_case_slug(value: Optional[str]) -> Optional[str]:
@@ -900,3 +956,26 @@ def fetch_account_usage(
     except Exception:
         return None
     return None
+
+
+def cached_codex_usage_snapshot(agent: Any, *, ttl_seconds: float = 60.0) -> Optional[AccountUsageSnapshot]:
+    """Return the last Codex usage snapshot, refreshing at most once per TTL."""
+    now = time.time()
+    cache = getattr(agent, "_codex_usage_snapshot_cache", None)
+    if isinstance(cache, tuple) and len(cache) == 2:
+        ts, snap = cache
+        try:
+            if now - float(ts) < float(ttl_seconds):
+                return snap
+        except (TypeError, ValueError):
+            pass
+    snap = fetch_account_usage(
+        "openai-codex",
+        base_url=getattr(agent, "base_url", None),
+        api_key=getattr(agent, "api_key", None),
+    )
+    try:
+        agent._codex_usage_snapshot_cache = (now, snap)
+    except Exception:
+        pass
+    return snap

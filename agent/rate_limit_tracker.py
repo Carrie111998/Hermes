@@ -59,8 +59,10 @@ class RateLimitState:
 
     requests_min: RateLimitBucket = field(default_factory=RateLimitBucket)
     requests_hour: RateLimitBucket = field(default_factory=RateLimitBucket)
+    requests_week: RateLimitBucket = field(default_factory=RateLimitBucket)
     tokens_min: RateLimitBucket = field(default_factory=RateLimitBucket)
     tokens_hour: RateLimitBucket = field(default_factory=RateLimitBucket)
+    tokens_week: RateLimitBucket = field(default_factory=RateLimitBucket)
     captured_at: float = 0.0  # when the headers were captured
     provider: str = ""
 
@@ -122,8 +124,14 @@ def parse_rate_limit_headers(
     return RateLimitState(
         requests_min=_bucket("requests"),
         requests_hour=_bucket("requests", "-1h"),
+        requests_week=_bucket("requests", "-1w")
+        if lowered.get("x-ratelimit-limit-requests-1w") is not None
+        else _bucket("requests", "-7d"),
         tokens_min=_bucket("tokens"),
         tokens_hour=_bucket("tokens", "-1h"),
+        tokens_week=_bucket("tokens", "-1w")
+        if lowered.get("x-ratelimit-limit-tokens-1w") is not None
+        else _bucket("tokens", "-7d"),
         captured_at=now,
         provider=provider,
     )
@@ -199,9 +207,11 @@ def format_rate_limit_display(state: RateLimitState) -> str:
         "",
         _bucket_line("Requests/min", state.requests_min),
         _bucket_line("Requests/hr", state.requests_hour),
+        _bucket_line("Requests/wk", state.requests_week),
         "",
         _bucket_line("Tokens/min", state.tokens_min),
         _bucket_line("Tokens/hr", state.tokens_hour),
+        _bucket_line("Tokens/wk", state.tokens_week),
     ]
 
     # Add warnings if any bucket is getting hot
@@ -209,8 +219,10 @@ def format_rate_limit_display(state: RateLimitState) -> str:
     for label, bucket in [
         ("requests/min", state.requests_min),
         ("requests/hr", state.requests_hour),
+        ("requests/wk", state.requests_week),
         ("tokens/min", state.tokens_min),
         ("tokens/hr", state.tokens_hour),
+        ("tokens/wk", state.tokens_week),
     ]:
         if bucket.limit > 0 and bucket.usage_pct >= 80:
             reset = _fmt_seconds(bucket.remaining_seconds_now)

@@ -188,11 +188,24 @@ class TestCodexSingleWriter:
         mock_client = MagicMock()
         mock_client.responses.create.return_value = event_gen()
 
-        run_codex_stream(agent, {"model": "gpt-5.3-codex"}, client=mock_client)
+        with pytest.raises(InterruptedError, match="superseded"):
+            run_codex_stream(agent, {"model": "gpt-5.3-codex"}, client=mock_client)
 
         assert "".join(delivered) == "first"
         assert "-stale-tail" not in "".join(delivered)
 
+    def test_codex_does_not_retry_after_supersede_interrupt(self):
+        from agent.codex_runtime import run_codex_stream
+
+        agent = _make_agent()
+        agent.api_mode = "codex_responses"
+        agent._interrupt_requested = True
+        mock_client = MagicMock()
+
+        with pytest.raises(InterruptedError, match="before Codex stream retry"):
+            run_codex_stream(agent, {"model": "gpt-5.3-codex"}, client=mock_client)
+
+        mock_client.responses.create.assert_not_called()
 
     def test_codex_interrupt_closes_stream_without_draining_provider(self):
         from agent.codex_runtime import run_codex_stream

@@ -149,6 +149,10 @@ def test_loop_cap_zero_disables_and_junk_falls_back():
     assert LoopCapConfig.from_mapping({"max_web_searches": 0}).max_web_searches == 0
     assert LoopCapConfig.from_mapping({"max_web_searches": -5}).max_web_searches == 50
     assert LoopCapConfig.from_mapping({"max_subagents": "nope"}).max_subagents == 50
+    assert LoopCapConfig.from_mapping({"max_subagents_per_session": 0}).max_subagents_per_session == 0
+    assert LoopCapConfig.from_mapping(
+        {"max_delegate_batches_per_session": "nope"}
+    ).max_delegate_batches_per_session == 4
 
 
 def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
@@ -167,6 +171,168 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
     assert decision.should_halt is True
+
+
+def test_session_subagent_cap_survives_reset_for_turn():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=False,
+            loop_caps=LoopCapConfig(
+                max_subagents=50,
+                max_subagents_per_session=4,
+                max_delegate_batches_per_session=0,
+            ),
+        )
+    )
+    for turn in range(2):
+        controller.reset_for_turn()
+        if turn > 0:
+            assert controller.apply_user_checkpoint("yes") is True
+        decision = controller.before_call(
+            "delegate_task",
+            {"tasks": [{"goal": "review-a"}, {"goal": "review-b"}]},
+        )
+        assert decision.action == "allow"
+    controller.reset_for_turn()
+    assert controller.apply_user_checkpoint("yes") is True
+    blocked = controller.before_call("delegate_task", {"goal": "one-more-review"})
+    assert blocked.action == "block"
+    assert blocked.code == "loop_subagent_session_cap"
+    # Control actions must still work after the spawn cap.
+    assert controller.before_call("delegate_task", {"action": "stop"}).action == "allow"
+
+
+def test_session_delegate_batch_cap_stops_review_rework_loop():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=False,
+            loop_caps=LoopCapConfig(
+                max_subagents=50,
+                max_subagents_per_session=0,
+                max_delegate_batches_per_session=4,
+            ),
+        )
+    )
+    for turn in range(4):
+        controller.reset_for_turn()
+        if turn > 0:
+            assert controller.apply_user_checkpoint("yes") is True
+        decision = controller.before_call(
+            "delegate_task",
+            {"tasks": [{"goal": "review"}, {"goal": "review"}]},
+        )
+        assert decision.action == "allow"
+    controller.reset_for_turn()
+    assert controller.apply_user_checkpoint("yes") is True
+    blocked = controller.before_call(
+        "delegate_task",
+        {"tasks": [{"goal": "review"}, {"goal": "review"}]},
+    )
+    assert blocked.action == "block"
+    assert blocked.code == "loop_delegate_batch_session_cap"
+
+
+def test_second_delegate_batch_same_turn_requires_checkpoint():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=False,
+            loop_caps=LoopCapConfig(
+                max_subagents=50,
+                max_subagents_per_session=0,
+                max_delegate_batches_per_session=0,
+            ),
+        )
+    )
+    assert controller.before_call("delegate_task", {"goal": "review A"}).action == "allow"
+    blocked = controller.before_call("delegate_task", {"goal": "review B"})
+    assert blocked.action == "block"
+    assert blocked.code == "loop_delegate_batch_checkpoint"
+    controller.reset_for_turn()
+    still_blocked = controller.before_call("delegate_task", {"goal": "review C"})
+    assert still_blocked.action == "block"
+    assert still_blocked.code == "loop_delegate_batch_checkpoint"
+    assert controller.apply_user_checkpoint("nope") is False
+    assert controller.apply_user_checkpoint("yes") is True
+    assert controller.before_call("delegate_task", {"goal": "review C"}).action == "allow"
+
+
+def test_child_api_and_token_session_caps():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=False,
+            loop_caps=LoopCapConfig(
+                max_subagents_per_session=0,
+                max_delegate_batches_per_session=0,
+                require_delegate_batch_checkpoint=False,
+                max_child_api_calls_per_session=2,
+                max_child_tokens_per_session=100,
+            ),
+        )
+    )
+    assert controller.before_call("delegate_task", {"goal": "one"}).action == "allow"
+    controller.record_child_usage(api_calls=2, tokens=10)
+    blocked = controller.before_call("delegate_task", {"goal": "two"})
+    assert blocked.action == "block"
+    assert blocked.code == "loop_child_api_session_cap"
+
+    controller2 = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=False,
+            loop_caps=LoopCapConfig(
+                max_subagents_per_session=0,
+                max_delegate_batches_per_session=0,
+                require_delegate_batch_checkpoint=False,
+                max_child_api_calls_per_session=0,
+                max_child_tokens_per_session=50,
+            ),
+        )
+    )
+    assert controller2.before_call("delegate_task", {"goal": "one"}).action == "allow"
+    controller2.record_child_usage(api_calls=1, tokens=50)
+    blocked2 = controller2.before_call("delegate_task", {"goal": "two"})
+    assert blocked2.action == "block"
+    assert blocked2.code == "loop_child_token_session_cap"
+
+
+def test_review_patch_review_cycle_mentions_checkpoint():
+    from agent.tool_guardrails import LoopCapConfig
+
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=False,
+            loop_caps=LoopCapConfig(
+                max_subagents=50,
+                max_subagents_per_session=0,
+                max_delegate_batches_per_session=0,
+            ),
+        )
+    )
+    assert controller.before_call("delegate_task", {"goal": "review the diff"}).action == "allow"
+    assert controller.apply_user_checkpoint("yes") is True
+    assert controller.before_call("delegate_task", {"goal": "apply the patch"}).action == "allow"
+    blocked = controller.before_call("delegate_task", {"goal": "review the diff again"})
+    assert blocked.action == "block"
+    assert blocked.code == "loop_delegate_batch_checkpoint"
+    assert "review → patch → review" in blocked.message
+
+
+def test_child_budget_unavailable_fail_closed():
+    from agent.tool_guardrails import child_session_budget_exhausted, record_child_session_usage
+
+    class _Child:
+        def _delegate_parent_ref(self):
+            return None
+
+    child = _Child()
+    decision = child_session_budget_exhausted(child)
+    assert decision is not None
+    assert decision.code == "loop_child_budget_unavailable"
+    try:
+        record_child_session_usage(child, api_calls=1, tokens=1)
+        raise AssertionError("expected RuntimeError")
+    except RuntimeError:
+        pass
+
 
 
 

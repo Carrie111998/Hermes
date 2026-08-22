@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -178,8 +180,25 @@ class ToolCallGuardrailConfig:
 # single turn" rather than cumulative over the whole session. A single loop
 # issuing dozens of web searches or spawning dozens of subagents is already
 # pathological, so the defaults are deliberately low.
+#
+# Session-lifetime delegation caps do NOT reset between turns. Sequential
+# review batches across an 8-hour CLI task are one session; a per-turn cap
+# of 50 cannot stop 17 batches of reviewers. 0 disables a given cap.
 _DEFAULT_MAX_WEB_SEARCHES_PER_TURN = 50
 _DEFAULT_MAX_SUBAGENTS_PER_TURN = 50
+_DEFAULT_MAX_SUBAGENTS_PER_SESSION = 16
+_DEFAULT_MAX_DELEGATE_BATCHES_PER_SESSION = 4
+_DEFAULT_MAX_CHILD_API_CALLS_PER_SESSION = 80
+_DEFAULT_MAX_CHILD_TOKENS_PER_SESSION = 8_000_000
+_DEFAULT_CODEX_WEEKLY_BREAK_PERCENT = 90
+_REVIEW_DELEGATE_RE = re.compile(
+    r"\b(code\s*review|reviewer|review|nitpick|lgtm)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_CHECKPOINT_RE = re.compile(
+    r"^\s*(y|yes|yeah|ok|okay|continue|proceed|allow|confirm)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -202,6 +221,12 @@ class LoopCapConfig:
 
     max_web_searches: int = _DEFAULT_MAX_WEB_SEARCHES_PER_TURN
     max_subagents: int = _DEFAULT_MAX_SUBAGENTS_PER_TURN
+    max_subagents_per_session: int = _DEFAULT_MAX_SUBAGENTS_PER_SESSION
+    max_delegate_batches_per_session: int = _DEFAULT_MAX_DELEGATE_BATCHES_PER_SESSION
+    max_child_api_calls_per_session: int = _DEFAULT_MAX_CHILD_API_CALLS_PER_SESSION
+    max_child_tokens_per_session: int = _DEFAULT_MAX_CHILD_TOKENS_PER_SESSION
+    require_delegate_batch_checkpoint: bool = True
+    codex_weekly_break_percent: int = _DEFAULT_CODEX_WEEKLY_BREAK_PERCENT
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "LoopCapConfig":
@@ -215,6 +240,30 @@ class LoopCapConfig:
             ),
             max_subagents=_non_negative_int(
                 data.get("max_subagents"), defaults.max_subagents
+            ),
+            max_subagents_per_session=_non_negative_int(
+                data.get("max_subagents_per_session"),
+                defaults.max_subagents_per_session,
+            ),
+            max_delegate_batches_per_session=_non_negative_int(
+                data.get("max_delegate_batches_per_session"),
+                defaults.max_delegate_batches_per_session,
+            ),
+            max_child_api_calls_per_session=_non_negative_int(
+                data.get("max_child_api_calls_per_session"),
+                defaults.max_child_api_calls_per_session,
+            ),
+            max_child_tokens_per_session=_non_negative_int(
+                data.get("max_child_tokens_per_session"),
+                defaults.max_child_tokens_per_session,
+            ),
+            require_delegate_batch_checkpoint=_as_bool(
+                data.get("require_delegate_batch_checkpoint"),
+                defaults.require_delegate_batch_checkpoint,
+            ),
+            codex_weekly_break_percent=_non_negative_int(
+                data.get("codex_weekly_break_percent"),
+                defaults.codex_weekly_break_percent,
             ),
         )
 
@@ -336,6 +385,17 @@ class ToolCallGuardrailController:
 
     def __init__(self, config: ToolCallGuardrailConfig | None = None):
         self.config = config or ToolCallGuardrailConfig()
+        # Session-lifetime counters survive reset_for_turn(). The controller is
+        # constructed once per AIAgent, so these bound one parent task.
+        self._session_subagent_count = 0
+        self._session_delegate_batches = 0
+        self._session_child_api_calls = 0
+        self._session_child_tokens = 0
+        self._session_checkpoint_granted = False
+        self._session_awaiting_delegate_checkpoint = False
+        self._session_last_delegate_was_review = False
+        self._session_saw_patch_after_review = False
+        self._session_lock = threading.Lock()
         self.reset_for_turn()
 
     def reset_for_turn(self) -> None:
@@ -372,6 +432,16 @@ class ToolCallGuardrailController:
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
         return self._halt_decision
+
+    def apply_user_checkpoint(self, text: str) -> bool:
+        """Grant one extra delegate batch only on an explicit yes-style reply."""
+        if not self._session_awaiting_delegate_checkpoint:
+            return False
+        if not _explicit_checkpoint_text(text):
+            return False
+        self._session_checkpoint_granted = True
+        self._session_awaiting_delegate_checkpoint = False
+        return True
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
@@ -694,16 +764,89 @@ class ToolCallGuardrailController:
             return None
 
         if tool_name == "delegate_task":
-            cap = caps.max_subagents
-            if not cap:
-                return None
             spawn_count = _subagent_spawn_count(args)
             if spawn_count == 0:
                 # Control action (list/steer/stop) — spawns nothing. Never
                 # block: once the spawn cap is hit, steering/stopping the
                 # existing children is exactly what should still work.
                 return None
-            if self._turn_subagent_count >= cap:
+
+            usage_block = self._child_usage_block(tool_name, signature)
+            if usage_block is not None:
+                return usage_block
+
+            if (
+                caps.require_delegate_batch_checkpoint
+                and self._session_delegate_batches >= 1
+                and not self._session_checkpoint_granted
+            ):
+                is_review = looks_like_review_delegate(args)
+                cycle = is_review and self._session_saw_patch_after_review
+                kind = "review" if is_review else "delegation"
+                cycle_note = (
+                    " Detected a review → patch → review cycle."
+                    if cycle
+                    else ""
+                )
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code="loop_delegate_batch_checkpoint",
+                    message=(
+                        f"Blocked delegate_task: this session already ran a "
+                        f"{kind} batch.{cycle_note} Reply yes / continue / "
+                        "allow before another review or delegation batch."
+                    ),
+                    tool_name=tool_name,
+                    count=self._session_delegate_batches,
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                self._session_awaiting_delegate_checkpoint = True
+                return decision
+
+            session_cap = caps.max_subagents_per_session
+            if session_cap and (
+                self._session_subagent_count >= session_cap
+                or self._session_subagent_count + spawn_count > session_cap
+            ):
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code="loop_subagent_session_cap",
+                    message=(
+                        f"Blocked delegate_task: this session has already spawned "
+                        f"{self._session_subagent_count} subagents "
+                        f"(session limit {session_cap}). Do not start another "
+                        "review or rework batch. Finish with the results you "
+                        "have, or ask the user before delegating more."
+                    ),
+                    tool_name=tool_name,
+                    count=self._session_subagent_count,
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
+
+            batch_cap = caps.max_delegate_batches_per_session
+            if batch_cap and self._session_delegate_batches >= batch_cap:
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code="loop_delegate_batch_session_cap",
+                    message=(
+                        f"Blocked delegate_task: this session has already run "
+                        f"{self._session_delegate_batches} delegation batches "
+                        f"(session limit {batch_cap}). Repeated review → patch → "
+                        "review loops require a user checkpoint. Summarize "
+                        "progress and wait for the user."
+                    ),
+                    tool_name=tool_name,
+                    count=self._session_delegate_batches,
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
+
+            cap = caps.max_subagents
+            if cap and self._turn_subagent_count >= cap:
                 decision = ToolGuardrailDecision(
                     action="block",
                     code="loop_subagent_cap",
@@ -720,9 +863,75 @@ class ToolCallGuardrailController:
                 self._halt_decision = decision
                 return decision
             self._turn_subagent_count += spawn_count
+            self._session_subagent_count += spawn_count
+            self._session_delegate_batches += 1
+            if self._session_checkpoint_granted:
+                self._session_checkpoint_granted = False
+            is_review = looks_like_review_delegate(args)
+            if (not is_review) and self._session_last_delegate_was_review:
+                self._session_saw_patch_after_review = True
+            self._session_last_delegate_was_review = is_review
+            self._session_awaiting_delegate_checkpoint = True
             return None
 
         return None
+
+    def _child_usage_block(
+        self,
+        tool_name: str,
+        signature: ToolCallSignature,
+    ) -> ToolGuardrailDecision | None:
+        caps = self.config.loop_caps
+        api_cap = caps.max_child_api_calls_per_session
+        token_cap = caps.max_child_tokens_per_session
+        with self._session_lock:
+            api_used = self._session_child_api_calls
+            token_used = self._session_child_tokens
+        if api_cap and api_used >= api_cap:
+            decision = ToolGuardrailDecision(
+                action="block",
+                code="loop_child_api_session_cap",
+                message=(
+                    f"Blocked delegate_task: child agents in this session have "
+                    f"already made {api_used} API calls (session limit {api_cap}). "
+                    "Stop delegating and finish with the results you have."
+                ),
+                tool_name=tool_name,
+                count=api_used,
+                signature=signature,
+            )
+            self._halt_decision = decision
+            return decision
+        if token_cap and token_used >= token_cap:
+            decision = ToolGuardrailDecision(
+                action="block",
+                code="loop_child_token_session_cap",
+                message=(
+                    f"Blocked delegate_task: child agents in this session have "
+                    f"already used {token_used} tokens (session limit {token_cap}). "
+                    "Stop delegating and finish with the results you have."
+                ),
+                tool_name=tool_name,
+                count=token_used,
+                signature=signature,
+            )
+            self._halt_decision = decision
+            return decision
+        return None
+
+    def record_child_usage(self, *, api_calls: int = 0, tokens: int = 0) -> None:
+        """Accumulate live child spend. Session-lifetime; does not reset per turn."""
+        if api_calls <= 0 and tokens <= 0:
+            return
+        with self._session_lock:
+            if api_calls > 0:
+                self._session_child_api_calls += int(api_calls)
+            if tokens > 0:
+                self._session_child_tokens += int(tokens)
+
+    def child_budget_exhausted(self) -> ToolGuardrailDecision | None:
+        """True when live child spend already hit a session cap (stop in-flight children)."""
+        return self._child_usage_block("delegate_task", ToolCallSignature.from_call("delegate_task", {}))
 
 
 def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:
@@ -845,6 +1054,81 @@ def _subagent_spawn_count(args: Mapping[str, Any]) -> int:
     if isinstance(tasks, list) and tasks:
         return len(tasks)
     return 1
+
+
+def _explicit_checkpoint_text(text: str | None) -> bool:
+    if not isinstance(text, str) or not text.strip():
+        return False
+    return bool(_EXPLICIT_CHECKPOINT_RE.match(text))
+
+
+def looks_like_review_delegate(args: Mapping[str, Any] | None) -> bool:
+    """Heuristic for review→patch→review fan-out (issue #91040)."""
+    if not isinstance(args, Mapping):
+        return False
+    blobs: list[str] = []
+    goal = args.get("goal")
+    if isinstance(goal, str):
+        blobs.append(goal)
+    tasks = args.get("tasks")
+    if isinstance(tasks, list):
+        for item in tasks:
+            if isinstance(item, Mapping):
+                item_goal = item.get("goal")
+                if isinstance(item_goal, str):
+                    blobs.append(item_goal)
+            elif isinstance(item, str):
+                blobs.append(item)
+    text = " ".join(blobs)
+    return bool(text and _REVIEW_DELEGATE_RE.search(text))
+
+
+def session_root_guardrails(agent: Any) -> ToolCallGuardrailController | None:
+    """Walk ``_delegate_parent_ref`` to the parent task's guardrail controller."""
+    cur = agent
+    seen: set[int] = set()
+    while cur is not None:
+        ident = id(cur)
+        if ident in seen:
+            break
+        seen.add(ident)
+        ref = getattr(cur, "_delegate_parent_ref", None)
+        parent = ref() if callable(ref) else None
+        if parent is None:
+            break
+        cur = parent
+    controller = getattr(cur, "_tool_guardrails", None)
+    return controller if isinstance(controller, ToolCallGuardrailController) else None
+
+
+def record_child_session_usage(agent: Any, *, api_calls: int = 0, tokens: int = 0) -> None:
+    if not callable(getattr(agent, "_delegate_parent_ref", None)):
+        return
+    controller = session_root_guardrails(agent)
+    if controller is None:
+        raise RuntimeError("child usage caps unavailable")
+    controller.record_child_usage(api_calls=api_calls, tokens=tokens)
+
+
+def child_session_budget_exhausted(agent: Any) -> ToolGuardrailDecision | None:
+    if not callable(getattr(agent, "_delegate_parent_ref", None)):
+        return None
+    unavailable = ToolGuardrailDecision(
+        action="block",
+        code="loop_child_budget_unavailable",
+        message=(
+            "Blocked: this subagent cannot read parent session usage caps. "
+            "Stopping to avoid unbounded child API spend."
+        ),
+        tool_name="delegate_task",
+    )
+    try:
+        controller = session_root_guardrails(agent)
+        if controller is None:
+            return unavailable
+        return controller.child_budget_exhausted()
+    except Exception:
+        return unavailable
 
 
 def _sha256(value: str) -> str:

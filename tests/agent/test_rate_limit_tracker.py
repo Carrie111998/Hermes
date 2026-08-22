@@ -57,6 +57,18 @@ class TestParseHeaders:
         state = parse_rate_limit_headers({})
         assert state is None
 
+    def test_weekly_headers(self):
+        headers = {
+            "x-ratelimit-limit-tokens-1w": "1000",
+            "x-ratelimit-remaining-tokens-1w": "50",
+        }
+        state = parse_rate_limit_headers(headers, provider="openai-codex")
+        assert state is not None
+        assert state.tokens_week.limit == 1000
+        assert state.tokens_week.remaining == 50
+        assert state.tokens_week.usage_pct == pytest.approx(95.0)
+
+
 
 
 

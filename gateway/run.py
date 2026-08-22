@@ -26865,6 +26865,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _process_baseline = getattr(
                 running_agent, "_gateway_turn_process_baseline", None
             )
+            try:
+                from tools.async_delegation import interrupt_all as _interrupt_delegates
+                _interrupt_delegates(reason=interrupt_reason)
+            except Exception:
+                pass
         # Bump the generation *before* scheduling the reap thread and capture
         # the post-bump value: task_id is session-scoped (task_id ==
         # session_id), so if a replacement turn claims this session and
