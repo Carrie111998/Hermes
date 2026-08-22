@@ -35,6 +35,13 @@ reason attached instead of a mystery to re-derive.
   separate standalone repo of the same name (MIT, MershLab), folded into
   this fork so the harness is one repo to install, not several. Every
   tool is live-tested, not just written.
+- **`plugins/kernel/`** — the audit invariant: observes every outgoing
+  model call via Hermes's real `pre_api_request`/`post_api_request`
+  hooks, flags a session whose message history silently shrinks between
+  two consecutive calls. Detects and records, loudly; cannot block,
+  because Hermes's hooks are observer-only by design. See its own
+  `README.md` for exactly what it checks and what it deliberately
+  doesn't.
 - **`mershlab/`** — anything that isn't a Hermes plugin or skill and
   still needs a home: process supervision, deployment scripts. See its
   own `README.md` for the exact dividing line.
