@@ -1031,7 +1031,8 @@ class TestAgentIdentityAvoidsZaiContentFilter:
         from agent.prompt_builder import HERMES_AGENT_HELP_GUIDANCE
 
         assert "Hermes Agent" not in HERMES_AGENT_HELP_GUIDANCE
-        assert "You run on Hermes " in HERMES_AGENT_HELP_GUIDANCE
+        assert HERMES_AGENT_HELP_GUIDANCE.startswith("You run on Hermes")
+        assert "Hermes Agent" not in HERMES_AGENT_HELP_GUIDANCE
 
     def test_default_soul_md_does_not_contain_the_trigger_phrase(self):
         from hermes_cli.default_soul import DEFAULT_SOUL_MD
