@@ -292,8 +292,8 @@ himalaya message add --mailbox drafts --flag draft < message.eml
 #     himalaya message send < /tmp/draft.eml
 #
 #   Current `master` (bleeding edge, output via global `-o/--output`):
-#     cargo install --locked --git https://github.com/pimalaya/mml.git
-#     # master: output is the global `-o` / `--output` flag
+#     cargo install --locked --git https://github.com/pimalaya/mml.git --rev ad50fd97786be9c94a9d758fc1f7792a03d6d378
+#     # master @ ad50fd97786be9c94a9d758fc1f7792a03d6d378: output is the global `-o` / `--output` flag
 #     mml compose --from me@example.org --output /tmp/draft.eml
 #     himalaya message send < /tmp/draft.eml
 #
@@ -305,6 +305,11 @@ himalaya message add --mailbox drafts --flag draft < message.eml
 # - If you mix the install source with the wrong invocation, the binary will
 #   fail at parse time (positional `/tmp/draft.eml` is "unexpected argument"
 #   on master; `--output` is "unexpected argument" on v1.1.1).
+# - The master install is pinned to a specific git rev
+#   (`ad50fd97786be9c94a9d758fc1f7792a03d6d378`) so that the install and the
+#   documented `--output` CLI contract stay aligned. Without `--rev`, the
+#   install would resolve whatever `master` points to AT INSTALL TIME, which
+#   could re-introduce the source/CLI drift this section exists to prevent.
 ```
 
 This is the cleanest path for attachments, PGP signing, and inline images.

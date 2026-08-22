@@ -209,8 +209,118 @@ def test_mml_install_uses_cargo_crate_name_not_binary() -> None:
             f"MML install line `{line.strip()}` doesn't name the Cargo crate "
             "`mime-meta-language` and isn't a git install. Use one of:\n"
             "  cargo install mime-meta-language --version 1.1.1 --locked --features cli\n"
-            "  cargo install --locked --git https://github.com/pimalaya/mml.git"
+            "  cargo install --locked --git https://github.com/pimalaya/mml.git --rev ad50fd97786be9c94a9d758fc1f7792a03d6d378"
         )
+
+
+def test_mml_master_install_pins_rev() -> None:
+    """The git-route install of `mml` must pin a specific `--rev` so the
+    install doesn't drift with `master`.
+
+    Reviewer @andrexibiza flagged this in round 6: the master install
+    `cargo install --git https://github.com/pimalaya/mml.git` resolves
+    whatever `master` points to AT INSTALL TIME, which can select a
+    different parser and reintroduce the source/CLI drift this skill
+    exists to prevent. Pin to a specific commit hash.
+    """
+    text = _read("references/message-composition.md")
+    # The install line may be commented (since it lives in a ```bash
+    # example) so match `cargo install` anywhere in the line, not just
+    # at the start.
+    install_lines = [
+        line for line in text.splitlines()
+        if "cargo install" in line
+        and "pimalaya/mml" in line
+        and "--git" in line
+    ]
+    assert install_lines, (
+        "No `cargo install --git https://github.com/pimalaya/mml.git` line "
+        "found in references/message-composition.md. The master install "
+        "must be present and pinned (or removed entirely, in which case "
+        "the v1.1.1 released path becomes the only one)."
+    )
+    for line in install_lines:
+        # Reject the unpinned form: `cargo install --git ... --locked` is the
+        # bad form. Acceptable is `cargo install --git ... --rev <sha>`.
+        assert "--rev" in line, (
+            f"Master install line `{line.strip()}` does not pin `--rev`. "
+            "Without `--rev`, the install resolves whatever `master` points "
+            "to at install time, which can re-introduce the source/CLI drift "
+            "this section exists to prevent. Add "
+            "`--rev ad50fd97786be9c94a9d758fc1f7792a03d6d378` (or remove "
+            "the master route entirely and keep only the v1.1.1 path)."
+        )
+        # The pinned rev must be the specific one @andrexibiza verified
+        # the `--output` behavior against.
+        assert "ad50fd97786be9c94a9d758fc1f7792a03d6d378" in line, (
+            f"Master install line `{line.strip()}` is pinned to a rev, "
+            "but not the one @andrexibiza verified the `--output` "
+            "behavior against. Pin to "
+            "`ad50fd97786be9c94a9d758fc1f7792a03d6d378`."
+        )
+
+
+def test_mml_master_route_pairs_rev_with_output_flag() -> None:
+    """If the master route is present, the documented `mml compose`
+    invocation in that route must use the `--output` flag (matching the
+    pinned rev's CLI contract).
+
+    Reviewer @andrexibiza's round-6 closing: the `--rev` + `--output`
+    pair must be tested together. An `--rev` pin without a matching
+    `--output` invocation, or vice versa, re-introduces the contract
+    drift.
+    """
+    text = _read("references/message-composition.md")
+    # Only enforce this test if the master route is present.
+    has_master_route = any(
+        "pimalaya/mml" in line and "--git" in line
+        for line in text.splitlines()
+    )
+    if not has_master_route:
+        pytest.skip("Master route not present; only the v1.1.1 contract is documented.")
+    # Locate the master install line and check that the FIRST
+    # `mml compose` invocation after it uses the `--output` flag.
+    # We must look at the actual `mml compose` command line, not just
+    # any mention of `--output` in nearby comments (which always
+    # mention the flag for explanatory reasons).
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if (
+            "cargo install" in line
+            and "pimalaya/mml" in line
+            and "--git" in line
+        ):
+            # Found a master install line; find the next `mml compose`
+            # line and verify it uses `--output`.
+            for j in range(i+1, min(i+10, len(lines))):
+                next_line = lines[j]
+                if "mml compose" in next_line:
+                    # Check this is the master route's `mml compose`
+                    # (not the v1.1.1 route's, which uses positional
+                    # output). The master route's `mml compose` line
+                    # should contain `--output` (not just a comment
+                    # about it).
+                    stripped = next_line.lstrip("# ").strip()
+                    if not stripped.startswith("mml compose"):
+                        # This is a comment line containing the
+                        # phrase, not the executable — skip.
+                        continue
+                    assert "--output" in stripped, (
+                        f"Master route's `mml compose` invocation at "
+                        f"line {j+1} is `{next_line.strip()}`. The "
+                        "pinned rev's CLI requires the global `--output` "
+                        "flag. Use `mml compose --from you@example.com "
+                        "--output /tmp/draft.eml`."
+                    )
+                    # Found and validated the master invocation.
+                    break
+            else:
+                pytest.fail(
+                    f"Master install at line {i+1} is present, but no "
+                    "`mml compose` invocation found in the next 10 lines. "
+                    "Add `mml compose --from you@example.com --output "
+                    "/tmp/draft.eml` after the install line."
+                )
 
 
 def test_mml_contract_pins_one_version_end_to_end() -> None:
