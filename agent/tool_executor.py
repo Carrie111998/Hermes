@@ -1322,6 +1322,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             agent._tool_worker_threads.add(_worker_tid)
             if not agent._current_tool:
                 agent._current_tool = tool_names_str
+            if getattr(agent, "_current_tool_started_at", None) is None:
+                # The watchdog must have a wall-time anchor even when a worker
+                # reaches dispatch without going through tool preflight.
+                agent._current_tool_started_at = time.monotonic()
         # Race: if the agent was interrupted between fan-out (which
         # snapshotted an empty/earlier set) and our registration, apply
         # the interrupt to our own tid now so is_interrupted() inside
