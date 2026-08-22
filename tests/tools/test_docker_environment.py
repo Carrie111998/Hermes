@@ -621,6 +621,7 @@ def test_labels_attribute_populated_after_init(monkeypatch):
         "hermes-task-id": "abc",
         "hermes-profile": "default",
         "hermes-egress": "off",
+        "hermes-profile-skills": "true",
     }
 
 
@@ -699,6 +700,30 @@ def test_reuse_attaches_to_running_container_without_docker_run(monkeypatch):
     assert not start_invocations, (
         f"docker start should be skipped when container already running, got: {start_invocations}"
     )
+
+
+def test_disabling_profile_skills_replaces_legacy_persistent_container(monkeypatch):
+    """An unlabeled legacy container has the immutable profile-skills mount."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    calls = _mock_subprocess_run_with_reuse(monkeypatch, ps_state="running")
+
+    env = _make_dummy_env(
+        task_id="reuse-without-profile-skills",
+        mount_profile_skills=False,
+    )
+
+    assert env._container_id == "fresh-cid"
+    assert any(
+        isinstance(cmd, list) and cmd[1:4] == ["rm", "-f", "reused-cid"]
+        for cmd, _kwargs in calls
+    ), "the legacy mounted container must be removed before replacement"
+    assert any(
+        isinstance(cmd, list)
+        and cmd[1] == "run"
+        and "hermes-profile-skills=false" in cmd
+        for cmd, _kwargs in calls
+    ), "the replacement container must record its immutable mount posture"
 
 
 def test_egress_enabled_does_not_reuse_pre_egress_container(monkeypatch):
