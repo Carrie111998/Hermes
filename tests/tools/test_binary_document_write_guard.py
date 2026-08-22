@@ -226,9 +226,58 @@ def test_remote_pot_guard_uses_backend_for_both_write_paths(
         )
 
     assert bool(result.get("error")) is should_reject
-    assert file_ops.prefix_reads == [("/workspace/slides.pot", 8)]
+    expected_reads = 1 if should_reject else 2
+    assert file_ops.prefix_reads == [
+        ("/workspace/slides.pot", 8)
+    ] * expected_reads
     assert file_ops.write_calls == (1 if tool_name == "write" and not should_reject else 0)
     assert file_ops.patch_calls == (1 if tool_name == "patch" and not should_reject else 0)
+
+
+@pytest.mark.parametrize("tool_name", ["write", "patch"])
+def test_pot_guard_reinspects_after_acquiring_mutation_lock(
+    monkeypatch, tmp_path: Path, tool_name: str
+):
+    import tools.file_tools as file_tools
+
+    target = tmp_path / "messages.pot"
+    target.write_text('msgid "hello"\nmsgstr ""\n', encoding="utf-8")
+    ole_content = bytes.fromhex("D0CF11E0A1B11AE1") + b"legacy powerpoint"
+    real_lock_path = file_tools.file_state.lock_path
+
+    class SwapToOleOnEnter:
+        def __init__(self, resolved: str):
+            self._lock = real_lock_path(resolved)
+
+        def __enter__(self):
+            self._lock.__enter__()
+            target.write_bytes(ole_content)
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return self._lock.__exit__(exc_type, exc, traceback)
+
+    monkeypatch.setattr(
+        file_tools.file_state,
+        "lock_path",
+        lambda resolved: SwapToOleOnEnter(resolved),
+    )
+
+    if tool_name == "write":
+        result = json.loads(write_file_tool(str(target), 'msgid "replacement"\n'))
+    else:
+        result = json.loads(
+            patch_tool(
+                mode="replace",
+                path=str(target),
+                old_string="hello",
+                new_string="replacement",
+            )
+        )
+
+    assert result.get("error")
+    assert "PowerPoint" in result["error"]
+    assert target.read_bytes() == ole_content
 
 
 class TestWriteFileToolGuard:

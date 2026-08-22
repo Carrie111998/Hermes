@@ -2322,6 +2322,10 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
 
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)
+            if is_pot_path(path):
+                binary_doc_err = _check_binary_document_write(path, task_id)
+                if binary_doc_err:
+                    return tool_error(binary_doc_err)
             file_ops = _get_file_ops(task_id)
             result = file_ops.write_file(path, content)
             result_dict = result.to_dict()
@@ -2336,6 +2340,13 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         # subagents can't interleave on the same file.  Different paths
         # remain fully parallel.
         with file_state.lock_path(_resolved):
+            # Reinspect ambiguous .pot files under the mutation lock. Another
+            # in-process writer may have replaced the file after the initial
+            # preflight check while this operation waited for the lock.
+            if is_pot_path(path):
+                binary_doc_err = _check_binary_document_write(path, task_id)
+                if binary_doc_err:
+                    return tool_error(binary_doc_err)
             # Cross-agent staleness wins over per-task warning when both
             # fire — its message names the sibling subagent.
             cross_warning = file_state.check_stale(task_id, _resolved)
@@ -2475,6 +2486,14 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         with ExitStack() as _locks:
             for _r in _resolved_paths:
                 _locks.enter_context(file_state.lock_path(_r))
+
+            # Reinspect ambiguous .pot files only after every target lock is
+            # held, closing the gap between preflight validation and mutation.
+            for _p in _content_write_paths:
+                if is_pot_path(_p):
+                    binary_doc_err = _check_binary_document_write(_p, task_id)
+                    if binary_doc_err:
+                        return tool_error(binary_doc_err)
 
             # Collect warnings — cross-agent registry first (names sibling),
             # then per-task tracker as a fallback.
