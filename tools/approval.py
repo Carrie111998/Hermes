@@ -606,7 +606,14 @@ def detect_hardline_command(command: str) -> tuple:
     Returns:
         (is_hardline, description) or (False, None)
     """
-    if _command_parser_limit_exceeded(command):
+    # Parser-limit guard is scoped (kanban t_f5717f20): an oversized command
+    # whose bulk is a QUOTED heredoc body is NOT a hardline here. The quoted
+    # delimiter makes every body byte literal stdin — provably non-injectable
+    # shell data — so "too large to parse" is a benign-shape signal, not a
+    # forbidden operation. We fall through to the pattern scan below, which
+    # still catches any genuine danger in the ORIGINAL command (HARDLINE/
+    # DANGEROUS patterns run against the raw text regardless of size).
+    if _command_parser_limit_exceeded(command) and not _has_quoted_heredoc_inert_body(command):
         return (True, _PARSER_LIMIT_DESCRIPTION)
     # NOTE: an ambiguous/malformed grep parse deliberately does NOT hardline
     # here. ``_quoted_grep_pattern_spans`` reports ``malformed`` whenever a
@@ -1444,6 +1451,71 @@ _MAX_DETECTION_SEGMENTS = 25_000
 _PARSER_LIMIT_DESCRIPTION = "command parser limit exceeded"
 _MALFORMED_EXEC_DESCRIPTION = "command parser limit or malformed executable payload"
 
+
+# Quoted-heredoc delimiter regexes. `<<'WORD'`, `<<"WORD"` and `<<\WORD`
+# guarantee the heredoc BODY is literal stdin: the shell performs NO word
+# splitting, NO command substitution, NO variable expansion and NO pathname
+# expansion on it, so the body can never be shell-parsed into further
+# commands. Only the delimiter line itself is real shell syntax. A quoted
+# heredoc is therefore a provably non-injectable container for arbitrary
+# payload text (script bodies, JSON, HTML). Captures the delimiter word so
+# callers can bound the inert region precisely.
+_QUOTED_HEREDOC_DELEM_RE = re.compile(
+    r"<<'([^'\n]*)'|<<\"([^\"\n]*)\"|<<\\([A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE,
+)
+
+
+def _quoted_heredoc_delimiter_spans(command: str) -> list[tuple[int, int]]:
+    """Return spans of QUOTED heredoc delimiter bodies as ``(start, end)``.
+
+    A ``python3 - <<'EOF'`` … ``EOF`` block has its body between the closing
+    quote of the opener and the standalone closing delimiter line. Because
+    the delimiter is quoted, every byte of that body is inert stdin — it
+    cannot be parsed, evaluated, or executed by the shell. Returning the
+    body span lets the parser-limit / malformed classifiers treat the region
+    as inert data instead of a reason to hardline-block a benign payload.
+
+    The scanner is deliberately conservative: it only recognizes the three
+    quoted/escaped opener forms (``<<'X'``, ``<<\"X\"``, ``<<\\X``) and the
+    matching standalone closing line (``^X$`` on its own line). Unquoted
+    ``<<X`` heredocs still expand `$`, ``$(...)`` and backticks, so their
+    bodies remain executable-shell surface and are NOT treated as inert.
+    """
+    spans: list[tuple[int, int]] = []
+    offset = 0
+    while True:
+        m = _QUOTED_HEREDOC_DELEM_RE.search(command, offset)
+        if not m:
+            break
+        word = m.group(1) or m.group(2) or m.group(3)
+        word = word.strip()
+        body_start = m.end()
+        if word:
+            # Find a standalone closing delimiter line: `word` alone on its
+            # own line (leading spaces tolerated), after the opener. The
+            # close may be at end-of-command without a trailing newline
+            # (heredoc bodies usually include it, but the very last one need
+            # not). The lookahead accepts either a line end or end-of-string.
+            close_re = re.compile(
+                r"(?m)^[ \t]*" + re.escape(word) + r"[ \t]*(?=\n|$)"
+            )
+            close = close_re.search(command, body_start)
+            if close:
+                spans.append((body_start, close.start()))
+        offset = m.end()
+    return spans
+
+
+def _has_quoted_heredoc_inert_body(command: str) -> bool:
+    """True if the command contains a quoted heredoc with a non-empty body.
+
+    Used to decide whether a parser-limit / malformed classification is
+    explainable purely by an inert quoted-heredoc payload (benign) rather
+    than by genuinely shell-parseable oversized content.
+    """
+    return any(end > start for start, end in _quoted_heredoc_delimiter_spans(command))
+
 # Content-blind inline-script mechanism flags. These fire on HOW a command is
 # expressed (heredoc, interpreter -c/-e, bash -c), not on WHAT it does — a
 # benign local patch script is flagged identically to `curl|bash`. In
@@ -1856,7 +1928,19 @@ def _execution_flag_findings(command: str):
             )
             if tokens is None:
                 if is_program_bearing:
-                    yield (_MALFORMED_EXEC_DESCRIPTION, None)
+                    # A malformed/opaque parse for a program-bearing word is
+                    # usually an interpreter heredoc whose BODY failed to
+                    # lex (e.g. an apostrophe in a quoted heredoc: `<<'EOF'`
+                    # with `"don't"` inside). Because the delimiter is
+                    # QUOTED, that body is inert literal stdin and cannot be
+                    # shell-parsed — an uncertain parse here is exactly the
+                    # t_3b7efd90 case: don't mask, scan the ORIGINAL, and let
+                    # the hardline floor catch real danger. Elevating it to
+                    # an unconditional "malformed executable payload" block
+                    # false-positived benign 8kwa dashboard-review heredocs
+                    # (kanban t_f5717f20, 3 events / 2 sessions).
+                    if not _has_quoted_heredoc_inert_body(command):
+                        yield (_MALFORMED_EXEC_DESCRIPTION, None)
                 continue
             if not tokens:
                 continue
@@ -2405,7 +2489,13 @@ def detect_dangerous_command(command: str) -> tuple:
     Returns:
         (is_dangerous, pattern_key, description) or (False, None, None)
     """
-    if _command_parser_limit_exceeded(command):
+    # Parser-limit is scoped to genuinely shell-parseable oversized content
+    # (kanban t_f5717f20). An oversized command whose bulk is a QUOTED
+    # heredoc body is inert literal stdin — fall through to the normal
+    # mechanism/pattern scan, which flags the heredoc mechanism (recoverable)
+    # and any real danger inside/outside the body. Only a large command
+    # with no quoted-heredoc inert region gets the parser-limit block.
+    if _command_parser_limit_exceeded(command) and not _has_quoted_heredoc_inert_body(command):
         return (True, _PARSER_LIMIT_DESCRIPTION, _PARSER_LIMIT_DESCRIPTION)
     if _is_verification_artifact_cleanup(command):
         return (False, None, None)
