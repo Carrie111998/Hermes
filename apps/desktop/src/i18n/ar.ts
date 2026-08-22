@@ -1814,6 +1814,7 @@ export const ar = defineLocale({
       scopeUncommitted: 'غير مُودَع',
       scopeBranch: 'فرع',
       scopeLastTurn: 'آخر دور',
+      readOnlyScope: 'عرض للقراءة فقط — التخزين المؤقت والاستعادة والإيداع تنطبق على غير المُودَع',
       commit: 'إيداع',
       commitAndPush: 'إيداع ودفع',
       commitPlaceholder: 'رسالة (⌘↵ للإيداع)',
