@@ -364,6 +364,12 @@ _TOOL_STUBS = {
         '"""Targeted find-and-replace (mode="replace") or V4A multi-file patches (mode="patch"). Returns dict with status. cross_profile=True opts out of the cross-Hermes-profile soft guard."""',
         '{"path": path, "old_string": old_string, "new_string": new_string, "replace_all": replace_all, "mode": mode, "patch": patch, "cross_profile": cross_profile}',
     ),
+    "anchored_edit": (
+        "anchored_edit",
+        'path: str, edits: list',
+        '"""Apply Dirac-style anchored edits: each edit is {"anchor": <ANCHOR≫CONTENT line>, "end_anchor": ..., "text": <new lines>}. The current lines are located by their content-derived IDs and the content is verified exactly, so the old block is never re-sent. Requires a prior include_anchors=true read. Returns dict with status; a stale anchor returns an error with a re-read hint."""',
+        '{"path": path, "edits": [{"anchor": "ANCHOR0:abc≫def", "text": "new line"}]}',
+    ),
     "terminal": (
         "terminal",
         "command: str, timeout: int = None, workdir: str = None",

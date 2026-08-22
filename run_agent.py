@@ -7623,6 +7623,8 @@ class AIAgent:
         OpenRouter forwards unknown extra_body fields to upstream providers.
         Some providers/routes reject `reasoning` with 400s, so gate it to
         known reasoning-capable model families and direct Nous Portal.
+        Host allowlist is pinned by test_supports_reasoning_extra_body_allowlist
+        — adding a host must update that test explicitly.
         """
         if base_url_host_matches(self._base_url_lower, "nousresearch.com"):
             return True
@@ -8325,6 +8327,8 @@ class AIAgent:
         tool_calls = assistant_message.tool_calls
 
         # Allow _vprint during tool execution even with stream consumers
+        # Dirac-style: the edited files' mtimes, for the stale-file alert
+        self._edited_files_mtimes: dict = {}
         self._executing_tools = True
         try:
             if len(tool_calls) <= 1:
@@ -8339,6 +8343,10 @@ class AIAgent:
 
             if len(segments) == 1:
                 kind = segments[0][0]
+                if kind == "parallel" and os.environ.get("HERMES_TOOL_EXEC_ASYNC"):
+                    return self._execute_tool_calls_async_segment(
+                        assistant_message, messages, effective_task_id, api_call_count
+                    )
                 if kind == "parallel":
                     return self._execute_tool_calls_concurrent(
                         assistant_message, messages, effective_task_id, api_call_count
@@ -8347,13 +8355,35 @@ class AIAgent:
                     assistant_message, messages, effective_task_id, api_call_count
                 )
 
-            from agent.tool_executor import execute_tool_calls_segmented
+            from agent.tool_executor import (
+                _execute_tool_batch_async,
+                _parse_tool_arguments,
+                execute_tool_calls_segmented,
+            )
+
+            # Async dispatch (opt-in, HERMES_TOOL_EXEC_ASYNC): the parallel
+            # segments run through the async batch — real daemon threads, a
+            # LOOP-TIME gate timeout (cancellable, test-mockable), the shared
+            # authorization gate + thread-context propagation. The sequential
+            # segments keep the sync path; the turn-end work is the segmented
+            # executor's (finalize once per batch). Off by default.
+            if os.environ.get("HERMES_TOOL_EXEC_ASYNC") and all(
+                k == "parallel" for k, _ in segments
+            ):
+                _seg_msg = SimpleNamespace(
+                    tool_calls=[c for _, cs in segments for c in cs]
+                )
+                if self._execute_tool_calls_async_segment(
+                    _seg_msg, messages, effective_task_id, api_call_count
+                ):
+                    return
             return execute_tool_calls_segmented(
                 self, assistant_message, messages, effective_task_id, api_call_count,
                 segments=segments,
             )
         finally:
             self._executing_tools = False
+            self._record_edited_files(tool_calls)
 
     def _dispatch_delegate_task(self, function_args: dict) -> str:
         """Single call site for delegate_task dispatch.
@@ -8435,6 +8465,78 @@ class AIAgent:
                 out_lines.extend(wrapped or [raw_line])
         body = ("\n" + indent).join(out_lines)
         return f"{indent}{label}{body}"
+
+    def _record_edited_files(self, tool_calls) -> None:
+        """Record the mtimes of the patch/write targets after the execution
+        (Dirac-style: the next turn's stale-file check compares them)."""
+        import json as _json
+        import os as _os
+
+        for tc in tool_calls or []:
+            name = getattr(getattr(tc, "function", None), "name", "")
+            if name not in ("patch", "write_file", "edit_file", "anchored_edit"):
+                continue
+            try:
+                args = _json.loads(getattr(getattr(tc, "function", None), "arguments", "{}"))
+            except Exception:
+                continue
+            path = args.get("path") if isinstance(args, dict) else None
+            if not path:
+                continue
+            p = _os.path.abspath(_os.path.expanduser(path))
+            try:
+                self._edited_files_mtimes[p] = _os.stat(p).st_mtime_ns
+            except OSError:
+                pass
+
+    def _stale_edited_files(self) -> list:
+        """The edited files whose mtimes changed since the last edit; a
+        DELETED file is the most drastic change — it is always flagged."""
+        import os as _os
+
+        changed = []
+        for path, recorded in list(getattr(self, "_edited_files_mtimes", {}).items()):
+            try:
+                if _os.stat(path).st_mtime_ns != recorded:
+                    changed.append(path)
+            except OSError:
+                changed.append(path)  # the file is gone — flag it
+        return changed
+
+    def _execute_tool_calls_async_segment(self, assistant_message, messages, effective_task_id, api_call_count):
+        """Run a parallel segment through the async batch: real daemon threads,
+        a loop-time gate timeout, the shared auth gate + thread context. The
+        middleware appends the results; the turn-end work stays the sync's."""
+        from agent.tool_executor import (
+            _execute_tool_batch_async,
+            _parse_tool_arguments,
+        )
+        import asyncio as _asyncio
+
+        calls = []
+        for tc in assistant_message.tool_calls:
+            fn = tc.function.name
+            args, malformed = _parse_tool_arguments(tc.function.arguments)
+            if malformed is not None:
+                return False
+            def _execute(_next, _name=fn, _tid=effective_task_id,
+                         _cid=getattr(tc, "id", "") or ""):
+                return self._invoke_tool(
+                    _name, _next, _tid,
+                    tool_call_id=_cid, messages=messages,
+                )
+            calls.append({
+                "function_name": fn,
+                "function_args": args,
+                "effective_task_id": effective_task_id,
+                "tool_call_id": getattr(tc, "id", "") or "",
+                "execute": _execute,
+            })
+        if calls:
+            _asyncio.run(_execute_tool_batch_async(
+                self, calls, timeout_s=None, _messages=messages
+            ))
+        return True
 
     def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Forwarder — see ``agent.tool_executor.execute_tool_calls_concurrent``."""

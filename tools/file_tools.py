@@ -56,13 +56,13 @@ def _expand_tilde(path: str) -> str:
 # ---------------------------------------------------------------------------
 # Read-size guard: cap the character count returned to the model.
 # We're model-agnostic so we can't count tokens; characters are a safe proxy.
-# 100K chars ≈ 25–35K tokens across typical tokenisers.  Files larger than
+# 50K chars ≈ 12-15K tokens across typical tokenisers.  Files larger than
 # this in a single read are a context-window hazard — the model should use
 # offset+limit to read the relevant section.
 #
 # Configurable via config.yaml:  file_read_max_chars: 200000
 # ---------------------------------------------------------------------------
-_DEFAULT_MAX_READ_CHARS = 100_000
+_DEFAULT_MAX_READ_CHARS = 50_000
 _max_read_chars_cached: int | None = None
 
 
@@ -1390,9 +1390,11 @@ def _looks_like_read_file_line_numbered_content(content: str) -> bool:
 
 def _is_internal_file_tool_content(content: str) -> bool:
     """Return True when content is file-tool display text, not intended file bytes."""
+    anchored = content.startswith("ANCHOR") or "\nANCHOR" in content
     return (
         _is_internal_file_status_text(content)
         or _looks_like_read_file_line_numbered_content(content)
+        or anchored
     )
 
 
@@ -1621,7 +1623,8 @@ def _special_file_kind(path) -> str | None:
     return "a special (non-regular) file"
 
 
-def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str = "default") -> str:
+def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str = "default",
+                      include_anchors: bool = False) -> str:
     """Read a file with pagination and line numbers."""
     try:
         offset, limit = normalize_read_pagination(offset, limit)
@@ -1807,7 +1810,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                 task_data["read_timestamps"] = {}
             cached_mtime = task_data.get("dedup", {}).get(dedup_key)
 
-        if cached_mtime is not None:
+        # The include_anchors read bypasses the dedup: the anchored
+        # coordinates are the point of the re-read, and the stale-file
+        # alert's freshness makes the re-render meaningful.
+        if cached_mtime is not None and not include_anchors:
             try:
                 current_mtime = os.path.getmtime(resolved_str)
                 if current_mtime == cached_mtime:
@@ -1908,6 +1914,21 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         # ── Redact secrets (after guard check to skip oversized content) ──
         if result.content:
             result.content = redact_sensitive_text(result.content, file_read=True)
+            if include_anchors:
+                from tools.anchors import render_anchored_lines
+                _raw = []
+                for _ln in result.content.splitlines():
+                    # strip the read's "<n>|" line-number prefix
+                    if "|" in _ln:
+                        _ln = _ln.split("|", 1)[1]
+                    _raw.append(_ln)
+                result.content = "\n".join(render_anchored_lines(_raw))
+                _wok, _wreason, _watomic = check_path_writable(path)
+                result_dict["_writable"] = _wok
+                if not _wok:
+                    result_dict["_writable_reason"] = _wreason
+                if not _watomic:
+                    result_dict["_atomicity"] = "not guaranteed (network-backed fs)"
             result_dict["content"] = result.content
 
         # Large-file hint: if the file is big and the caller didn't ask
@@ -2535,7 +2556,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
 def search_tool(pattern: str, target: str = "content", path: str = ".",
                 file_glob: str = None, limit: int = 50, offset: int = 0,
                 output_mode: str = "content", context: int = 0,
-                task_id: str = "default") -> str:
+                task_id: str = "default", include_anchors: bool = False) -> str:
     """Search for content or files."""
     try:
         offset, limit = normalize_search_pagination(offset, limit)
@@ -2603,6 +2624,9 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             for m in result.matches:
                 if hasattr(m, 'content') and m.content:
                     m.content = redact_sensitive_text(m.content, file_read=True)
+                    if include_anchors:
+                        from tools.anchors import render_anchored_lines
+                        m.content = render_anchored_lines([m.content])[0]
         result_dict = result.to_dict(densify=True)
 
         if omitted:
@@ -2641,6 +2665,26 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
 # ---------------------------------------------------------------------------
 # Schemas + Registry
 # ---------------------------------------------------------------------------
+ANCHORED_EDIT_SCHEMA = {
+    "name": "anchored_edit",
+    "description": (
+        "Apply Dirac-style anchored edits: each edit is {anchor: <ANCHOR≫CONTENT line>, "
+        "end_anchor: <line>, text: <new lines>}. The current lines are located by their "
+        "content-derived IDs and the content is verified exactly, so the old block is never "
+        "re-sent. Requires a prior include_anchors=true read. A stale anchor returns an error "
+        "with a re-read hint."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "The file to edit."},
+            "edits": {"type": "array", "description": "The anchored edits."},
+        },
+        "required": ["path", "edits"],
+    },
+}
+
+
 from tools.registry import registry, tool_error
 
 
@@ -2803,10 +2847,361 @@ def _handle_search_files(args, **kw):
     return search_tool(
         pattern=args.get("pattern", ""), target=target, path=args.get("path", "."),
         file_glob=args.get("file_glob"), limit=args.get("limit", 50), offset=args.get("offset", 0),
-        output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
+        output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid,
+        include_anchors=bool(args.get("include_anchors", False)))
 
 
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)
 registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
 registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
 registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)
+
+
+def _register_temp_ignore_patterns(full: str) -> None:
+    """Best-effort: ensure the anchored temps are ignored by the target
+    repo's git (the .git/info/exclude), so the filewatchers (git status,
+    the git-based IDEs) do not flash the stage/probe siblings as untracked
+    noise. No-op outside a git repo; never touches .gitignore."""
+    import os as _os
+
+    _dir = _os.path.dirname(_os.path.abspath(full)) or "."
+    try:
+        _git = None
+        _cur = _dir
+        while True:
+            if _os.path.isdir(_os.path.join(_cur, ".git")):
+                _git = _cur
+                break
+            _parent = _os.path.dirname(_cur)
+            if _parent == _cur:
+                break
+            _cur = _parent
+    except OSError:
+        return
+    if _git is None:
+        return
+    try:
+        _exclude = _os.path.join(_git, ".git", "info", "exclude")
+        with open(_exclude, "a+", encoding="utf-8") as fh:
+            fh.seek(0)
+            _existing = fh.read()
+            _patterns = ("\n.anchored-edit-*\n.anchored-probe-*\n"
+                         if ".anchored-edit-" not in _existing else "")
+            if _patterns:
+                fh.write(_patterns)
+    except OSError:
+        pass
+
+
+
+
+def _mark_hidden(path: str) -> None:
+    """Mark a temp sibling as hidden per-platform: the POSIX leading dot is
+    the name; the Windows hidden attribute is the attribute. The filewatcher
+    consumers (IDEs, git UIs) filter the hidden, so the stage/probe files
+    never surface as noise."""
+    import sys as _sys
+
+    if _sys.platform == "win32":
+        try:
+            import ctypes as _ctypes
+            _FILE_ATTRIBUTE_HIDDEN = 0x2
+            _ctypes.windll.kernel32.SetFileAttributesW(
+                path, _FILE_ATTRIBUTE_HIDDEN
+            )
+        except Exception:
+            pass
+
+
+
+
+def check_path_writable(full: str) -> tuple:
+    """Pre-flight write-ability probe: can the anchored edit's temp + rename
+    actually land here? The definitive test is the real mkstemp in the target
+    directory (os.access can lie about ACLs/sandboxes). Returns
+    (ok, reason)."""
+    import os as _os
+    import tempfile as _tempfile
+
+    import stat as _stat
+
+    _dir = _os.path.dirname(_os.path.abspath(full)) or "."
+    _register_temp_ignore_patterns(full)
+    try:
+        _st = _os.stat(full)  # follows the symlink; the target's type matters
+    except OSError as exc:
+        return False, f"the target is not statable: {exc}"
+    if not _stat.S_ISREG(_st.st_mode):
+        return False, ("the target is not a regular file "
+                       "(fifo/socket/device/dir) — refusing")
+    try:
+        _fd, _staged = _tempfile.mkstemp(dir=_dir, prefix=".anchored-probe-")
+        _os.close(_fd)
+        _os.unlink(_staged)
+    except OSError as exc:
+        return False, f"the target directory is not writable: {exc}"
+    if not _os.access(full, _os.W_OK):
+        return False, "the file exists but is read-only"
+    try:
+        _vfs = _os.statvfs(_dir)
+        _free = _vfs.f_bavail * _vfs.f_frsize
+        if _free < 64 * 1024:  # the stage needs a small sibling; refuse early
+            return False, "the filesystem is nearly full (the staged sibling cannot land)"
+    except OSError:
+        pass
+    _fstype = getattr(_os.statvfs(_dir), "f_fstypename", "") or ""
+    _atomic = not any(_n in _fstype.lower() for _n in ("nfs", "smbfs", "cifs", "fuse", "sshfs"))
+    return True, "", _atomic
+
+
+def estimate_write_time(full: str, payload_bytes: int = 4096) -> float:
+    """Live write+fsync latency of the target directory (ms): stage a probe
+    sibling + fsync it + measure. The model's think-time gives seconds to
+    minutes to run this, so the read can report the expected write cost."""
+    import os as _os
+    import tempfile as _tempfile
+    import time as _time
+
+    _dir = _os.path.dirname(_os.path.abspath(full)) or "."
+    try:
+        _fd, _staged = _tempfile.mkstemp(dir=_dir, prefix=".anchored-probe-")
+        _mark_hidden(_staged)
+        _os.write(_fd, b"x" * payload_bytes)
+        _t0 = _time.perf_counter()
+        try:
+            _os.fsync(_fd)
+        except OSError:
+            pass
+        _ms = (_time.perf_counter() - _t0) * 1000.0
+        _os.close(_fd)
+        _os.unlink(_staged)
+        return round(_ms, 3)
+    except OSError:
+        return -1.0
+
+
+
+
+def _check_syntax_after_edit(full: str):
+    """Dirac's debug-syntax pattern: a .py edit whose result does not parse
+    is flagged — the cause is the model's own mistake (a misread or
+    mis-inserted line) or a proxy's lossy compression; the tool cannot tell
+    which, it only surfaces the break. The edit stands, with the warning."""
+    import ast as _ast
+
+    if not full.endswith(".py"):
+        return None
+    try:
+        with open(full, "r", encoding="utf-8", newline="") as fh:
+            _ast.parse(fh.read())
+        return None
+    except (OSError, SyntaxError, ValueError) as exc:
+        return f"the edited file does not parse: {exc}"
+
+
+
+
+def _file_drifted(full: str, original_content: str) -> bool:
+    """True when the file's current content differs from the read it was
+    resolved against (the TOCTOU drift caught under the flock)."""
+    import os as _os
+
+    try:
+        with open(full, "r", encoding="utf-8", newline="") as fh:
+            return fh.read() != original_content
+    except OSError:
+        return True
+
+
+
+
+def _handle_anchored_edit(args, **kw):
+    tid = kw.get("task_id") or "default"
+    if not args.get("path") or not isinstance(args.get("edits"), list):
+        return tool_error(
+            "anchored_edit: missing 'path' or 'edits'. Requires a prior "
+            "include_anchors=true read; the edits are {anchor, end_anchor, text}."
+        )
+    return anchored_edit_tool(path=args["path"], edits=args["edits"], task_id=tid)
+
+
+registry.register(name="anchored_edit", toolset="file",
+                  schema=ANCHORED_EDIT_SCHEMA, handler=_handle_anchored_edit,
+                  check_fn=_check_file_reqs, emoji="⚓", max_result_size_chars=100_000)
+
+
+def anchored_edit_tool(path: str, edits: list, task_id: str = "default") -> str:
+    """Apply Dirac-style anchored edits to a file.
+
+    Each edit is {"anchor": <ANCHOR≫CONTENT line>, "end_anchor": ...,
+    "text": <new lines>}. The current lines are rendered as the anchored
+    coordinates (the include_anchors read's format), the edits are resolved
+    by the line IDs with the exact-content verification, and the result is
+    written back. The valid edits apply even if some fail; the tool errors
+    only when ALL fail (the model re-reads with include_anchors=true).
+    """
+    import json as _json
+    import os as _os
+
+    from tools.anchors import render_anchored_lines, resolve_anchored_edits
+
+    if not isinstance(edits, list):
+        return _json.dumps({
+            "error": "anchored_edit: 'edits' must be an array of "
+                     "{anchor, end_anchor, text}",
+            "ok": False,
+        })
+
+    # Resolve a symlink: the anchored edit targets the REAL file and the
+    # atomic rename would otherwise replace the symlink itself with a
+    # regular file (the link destroyed, the real untouched).
+    full = _os.path.realpath(_os.path.expanduser(path))
+    import stat as _stat
+    try:
+        if not _stat.S_ISREG(_os.stat(full).st_mode):
+            return _json.dumps({
+                "error": "anchored_edit: the target is not a regular file "
+                         "(fifo/socket/device/dir) — refusing",
+                "ok": False,
+            })
+    except OSError as exc:
+        return _json.dumps({"error": f"stat failed: {exc}", "ok": False})
+    # Cooperative-writer exclusion: flock the file for the whole
+    # read->verify->stage->rename sequence, so a sibling hermes process
+    # (the cross-profile world) cannot edit the same file mid-sequence.
+    # Uncooperative writers (vim, rm) ignore the lock — the verify catches
+    # their drift.
+    try:
+        import fcntl as _fcntl
+        _lkfd = _os.open(full, _os.O_RDONLY)
+        try:
+            _fcntl.flock(_lkfd, _fcntl.LOCK_EX)
+        except OSError:
+            _os.close(_lkfd)
+            _lkfd = None
+    except ImportError:
+        _lkfd = None
+    try:
+        with open(full, "r", encoding="utf-8", newline="") as fh:
+            content = fh.read()
+    except OSError as exc:
+        if _lkfd is not None:
+            _os.close(_lkfd)
+        return _json.dumps({"error": f"read failed: {exc}", "ok": False})
+    try:
+        anchored = render_anchored_lines(content.splitlines())
+        updated, failures = resolve_anchored_edits(anchored, edits)
+        if failures and updated == anchored:
+            return _json.dumps({"error": "; ".join(failures[:5]), "ok": False,
+                                "hint": "re-read with include_anchors=true"})
+        if updated == anchored and not failures:
+            return _json.dumps({"ok": True, "path": full, "noop": True})
+        trailing = "\n" if content.endswith("\n") else ""
+        newline = "\r\n" if "\r\n" in content else "\n"
+        # A hardlinked file's atomic rename would break the sibling links
+        # (they keep the old inode's content) — for those, the in-place write
+        # preserves the links at the cost of the rename's atomicity.
+        _multi_link = _os.stat(full).st_nlink > 1
+        # Stage OUTSIDE the flock: the disk write (the file-size-bound chunk
+        # of the locked time) happens before the lock is taken.
+        import tempfile as _tempfile
+        import stat as _stat
+        _dir = _os.path.dirname(full) or "."
+        _mode = _stat.S_IMODE(_os.stat(full).st_mode)
+        # The staged copy is the SIBLING in the target's own directory
+        # (mkstemp(dir=...) — never the system tmp, so a sandbox's /tmp
+        # restrictions do not apply; only the target dir's writability
+        # matters, which the pre-flight probe already checked).
+        _register_temp_ignore_patterns(full)  # defensive: the edit may run
+        # without the include_anchors read (the exclude then never registered)
+        _fd, _staged = _tempfile.mkstemp(dir=_dir, prefix=".anchored-edit-")
+        _mark_hidden(_staged)
+        _os.chmod(_staged, _mode)  # mkstemp is 0600; keep the original's mode
+        try:
+            with _os.fdopen(_fd, "w", encoding="utf-8", newline="") as fh:
+                fh.write(newline.join(updated) + trailing)
+        except OSError as _stage_exc:
+            # The disk-full rescue: the staged sibling cannot land, but the
+            # IN-PLACE write may — the existing blocks are overwritten, no
+            # new allocation, on the non-copy-on-write filesystems (the
+            # atomicity is lost; the file is never observed half-written is
+            # no longer guaranteed, but the edit lands).
+            try:
+                _os.close(_fd)
+            except OSError:
+                pass
+            try:
+                _os.unlink(_staged)
+            except OSError:
+                pass
+            if getattr(_stage_exc, "errno", None) in (28, 122):  # ENOSPC/EDQUOT
+                with open(full, "w", encoding="utf-8", newline="") as fh:
+                    fh.write(newline.join(updated) + trailing)
+                applied = len(edits) - len(failures)
+                result = {"ok": True, "path": full, "applied": applied,
+                          "inplace_fallback": True,
+                          "atomicity": "lost (the disk is full; in-place rescue)"}
+                if failures:
+                    result["failures"] = failures[:5]
+                    result["hint"] = "re-read with include_anchors=true"
+                return _json.dumps(result)
+            raise
+        try:
+            _os.fsync(_fd)  # the content is durable BEFORE the rename —
+            # a crash right after the rename can no longer lose the bytes
+        except OSError:
+            pass  # some sandboxes block fsync; the rename still lands
+        if _multi_link:
+            with open(full, "w", encoding="utf-8", newline="") as fh:
+                fh.write(newline.join(updated) + trailing)
+            applied = len(edits) - len(failures)
+            result = {"ok": True, "path": full, "applied": applied,
+                      "hardlinked": True}
+            if failures:
+                result["failures"] = failures[:5]
+                result["hint"] = "re-read with include_anchors=true"
+            return _json.dumps(result)
+        # Under the flock: re-read + whole-file compare + the single rename.
+        # The lock now guards only the nanos, not the stage's disk write.
+        if _lkfd is not None:
+            _fcntl.flock(_lkfd, _fcntl.LOCK_EX)
+        try:
+            if _file_drifted(full, content):
+                try:
+                    _os.unlink(_staged)
+                except OSError:
+                    pass
+                return _json.dumps({
+                    "error": "file changed between the read and the write",
+                    "ok": False,
+                    "hint": "re-read with include_anchors=true",
+                })
+            _os.replace(_staged, full)
+        finally:
+            if _lkfd is not None:
+                _fcntl.flock(_lkfd, _fcntl.LOCK_UN)
+        applied = len(edits) - len(failures)
+        result = {"ok": True, "path": full, "applied": applied}
+        _ok, _reason, _atomic = check_path_writable(full)
+        if not _atomic:
+            result["atomicity"] = "not guaranteed (the filesystem is network-backed)"
+        _syn_err = _check_syntax_after_edit(full)
+        if _syn_err:
+            result["syntax_warning"] = _syn_err
+        if failures:
+            result["failures"] = failures[:5]
+            result["hint"] = "re-read with include_anchors=true"
+        return _json.dumps(result)
+    except OSError as exc:
+        try:
+            if "_tmp" in locals():
+                _os.unlink(_staged)
+        except OSError:
+            pass
+        return _json.dumps({"error": f"write failed: {exc}", "ok": False})
+    finally:
+        if _lkfd is not None:
+            try:
+                _fcntl.flock(_lkfd, _fcntl.LOCK_UN)
+            finally:
+                _os.close(_lkfd)
