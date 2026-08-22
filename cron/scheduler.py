@@ -7100,7 +7100,17 @@ def _run_one_job_body(
                 delivery_attempted = True
                 try:
                     delivery_error = _deliver_result(
-                        job, failure_content, adapters=adapters, loop=loop,
+                        job,
+                        # Composed exactly like the normal failure delivery
+                        # above. mark_job_run below records THIS run in
+                        # failure_streak whichever layer failed, so a job that
+                        # fails before the run body every tick builds a streak
+                        # nobody is ever told about: its alerts only ever leave
+                        # through here, and the nudge only ever left through
+                        # there (#88655).
+                        failure_content + _failure_streak_nudge(job),
+                        adapters=adapters,
+                        loop=loop,
                     )
                 except Exception as delivery_exc:
                     delivery_error = str(delivery_exc)
