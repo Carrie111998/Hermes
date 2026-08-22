@@ -252,6 +252,12 @@ class TestAgentCardV1:
         assert "web_search" in web["tags"]
         assert "web_extract" in web["tags"]
 
+    def test_skills_advertise_supported_io_modes(self):
+        skills = protocol.skills_from_toolsets(["web"])
+
+        assert skills[0]["inputModes"] == ["text/plain", "application/json"]
+        assert skills[0]["outputModes"] == ["text/plain", "application/json"]
+
     def test_skills_default_when_empty(self):
         assert protocol.skills_from_toolsets([])[0]["id"] == "general"
         assert protocol.skills_from_toolsets({})[0]["id"] == "general"
@@ -376,6 +382,16 @@ class TestV1Parts:
 
 
 class TestV1Task:
+    def test_completed_task_exposes_fenced_json_as_structured_data(self):
+        reply = 'Result:\n```json\n{"answer": 42}\n```'
+
+        task = protocol.build_task("t-json", "c-json", protocol.STATE_COMPLETED, reply)
+
+        assert task["artifacts"][0]["parts"] == [
+            {"text": reply, "mediaType": "text/plain"},
+            {"data": {"answer": 42}, "mediaType": "application/json"},
+        ]
+
     def test_completed_task_shape(self):
         task = protocol.build_task("t1", "c1", protocol.STATE_COMPLETED, "the answer")
         assert task["status"]["state"] == "TASK_STATE_COMPLETED"

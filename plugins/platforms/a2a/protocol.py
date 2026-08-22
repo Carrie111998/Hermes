@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import copy
 import os
+import re
 import threading
 import time
 import uuid
@@ -160,6 +161,8 @@ def skills_from_toolsets(toolsets: "list[str] | dict[str, list[str]] | None") ->
                 "name": ts_name,
                 "description": f"Hermes '{ts_name}' capabilities",
                 "tags": [ts_name] + tool_names[:10],
+                "inputModes": ["text/plain", "application/json"],
+                "outputModes": ["text/plain", "application/json"],
             })
     else:
         for ts in sorted(set(toolsets or [])):
@@ -168,6 +171,8 @@ def skills_from_toolsets(toolsets: "list[str] | dict[str, list[str]] | None") ->
                 "name": ts,
                 "description": f"Hermes '{ts}' capabilities",
                 "tags": [ts],
+                "inputModes": ["text/plain", "application/json"],
+                "outputModes": ["text/plain", "application/json"],
             })
     if not skills:
         skills.append({
@@ -175,6 +180,8 @@ def skills_from_toolsets(toolsets: "list[str] | dict[str, list[str]] | None") ->
             "name": "general",
             "description": "General-purpose conversational agent",
             "tags": ["general"],
+            "inputModes": ["text/plain", "application/json"],
+            "outputModes": ["text/plain", "application/json"],
         })
     return skills
 
@@ -256,6 +263,24 @@ def file_part(url: str = "", raw: str = "", filename: str = "",
 def data_part(data: Any, media_type: str = "application/json") -> dict:
     """Build a v1.0 data Part (structured data, no ``kind`` field)."""
     return {"data": data, "mediaType": media_type}
+
+
+_JSON_FENCE_RE = re.compile(
+    r"```json[ \t]*\r?\n(?P<payload>.*?)\r?\n?[ \t]*```",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _artifact_parts(agent_text: str) -> list[dict]:
+    """Preserve reply text and expose valid fenced JSON as structured Parts."""
+    parts = [text_part(agent_text)]
+    for match in _JSON_FENCE_RE.finditer(agent_text):
+        try:
+            data = json.loads(match.group("payload"))
+        except (TypeError, ValueError):
+            continue
+        parts.append(data_part(data))
+    return parts
 
 
 def text_message(role: str, text: str, context_id: str = "") -> dict:
@@ -391,7 +416,7 @@ def build_task(
         if state == STATE_COMPLETED:
             task["artifacts"] = [{
                 "artifactId": uuid.uuid4().hex,
-                "parts": [text_part(agent_text)],
+                "parts": _artifact_parts(agent_text),
             }]
     return task
 
@@ -416,7 +441,7 @@ def artifact_update(task_id: str, context_id: str, text: str) -> dict:
             "contextId": context_id,
             "artifact": {
                 "artifactId": uuid.uuid4().hex,
-                "parts": [text_part(text)],
+                "parts": _artifact_parts(text),
             },
         }
     }
