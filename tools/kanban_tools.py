@@ -1352,6 +1352,11 @@ def _handle_create(args: dict, **kw) -> str:
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
+    # Titles are free text too and MORE visible than bodies (board listings,
+    # dispatcher logs, notifications), so the same masking contract applies.
+    # Task dispatch/routing keys off the task id, not the title, so a masked
+    # title does not disturb matching heuristics (#92354 review follow-up).
+    title = redact_sensitive_text(str(title), force=True)
     assignee = args.get("assignee")
     if not assignee:
         return tool_error(
