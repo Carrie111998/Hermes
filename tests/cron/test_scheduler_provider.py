@@ -705,3 +705,87 @@ def test_multiplex_ticker_overlays_owning_profile_adapters(tmp_path):
 
     # The shared default map itself is never mutated by the overlay.
     assert default_map["discord"] is default_discord
+
+
+def test_multiplex_ticker_reads_profile_adapters_per_tick(tmp_path):
+    """A profile whose adapter connects AFTER the ticker started is picked up
+    on the next tick, with no gateway restart.
+
+    The overlay reads the gateway's live ``profile_adapters`` dict on every
+    tick rather than snapshotting it at ``start()``. That is the property that
+    makes a secondary profile's Discord bot usable as soon as it finishes
+    connecting — profile adapters come up seconds after the ticker thread
+    does. A "cache the map once for efficiency" refactor would silently
+    reintroduce the delivery-identity bug for every late-connecting profile,
+    so pin it here: the map starts EMPTY and gains its entry mid-run.
+    """
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    p1 = tmp_path / "default"
+    p2 = tmp_path / "worker"
+    for d in (p1, p2):
+        (d / "cron").mkdir(parents=True)
+    profile_homes = [("default", p1), ("worker", p2)]
+
+    default_discord = object()
+    late_discord = object()
+    default_map = {"discord": default_discord}
+    # The worker profile has not connected yet — nothing to overlay.
+    profile_adapters: dict = {}
+
+    calls: list = []
+
+    def _tracking_tick(*args, **kwargs):
+        calls.append(kwargs.get("adapters"))
+        return 0
+
+    stop = threading.Event()
+    prov = InProcessCronScheduler()
+
+    with patch("cron.scheduler.tick", side_effect=_tracking_tick), \
+         patch("cron.jobs.record_ticker_heartbeat", lambda **kw: None):
+        t = threading.Thread(
+            target=prov.start,
+            args=(stop,),
+            kwargs={
+                "interval": 0,
+                "profile_homes": profile_homes,
+                "adapters": default_map,
+                "profile_adapters": profile_adapters,
+            },
+            daemon=True,
+        )
+        t.start()
+        # Let at least one full cycle run with the map still empty.
+        deadline = time.monotonic() + 10
+        while len(calls) < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        pre_injection = list(calls)
+
+        # The worker's Discord adapter finishes connecting.
+        profile_adapters["worker"] = {"discord": late_discord}
+
+        # A later tick must carry it without the ticker being restarted.
+        deadline = time.monotonic() + 10
+        while (
+            not any(
+                isinstance(a, dict) and a.get("discord") is late_discord
+                for a in calls
+            )
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.005)
+        stop.set()
+        t.join(timeout=5)
+
+    assert not t.is_alive()
+    # Before the adapter connected, the worker tick used the default map.
+    assert all(
+        a is default_map or a.get("discord") is default_discord
+        for a in pre_injection
+    ), pre_injection
+    # After it connected, a tick picked it up — no restart involved.
+    assert any(
+        isinstance(a, dict) and a.get("discord") is late_discord
+        for a in calls
+    ), "late-connecting profile adapter was never picked up"
