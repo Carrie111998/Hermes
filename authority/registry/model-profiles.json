@@ -210,6 +210,27 @@
       "supports_images": false,
       "routing_role": "image-generation-only",
       "capability_source": "FAL catalog: recraft/v4/pro/text-to-image model; generation-only"
+    },
+    "teamo-router/<default>": {
+      "vendor_family": "teamo",
+      "supported_reasoning": [
+        "off",
+        "low",
+        "medium",
+        "high"
+      ],
+      "thinking_map": {
+        "off": "off",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "deep": "high"
+      },
+      "context_window": 128000,
+      "supports_tools": true,
+      "supports_images": false,
+      "routing_role": "hard-failover-only",
+      "capability_source": "Teamo Router vendor adapter: cross-vendor failover only, no resident primary traffic; reasoning surface inherited from the upstream router's default surface"
     }
   }
 }

@@ -8,7 +8,8 @@
       ],
       "primary_pool_mode": "flexible_available_primary",
       "soft_failover": [
-        "openai-codex/gpt-5.6-luna"
+        "openai-codex/gpt-5.6-luna",
+        "teamo-router/<default>"
       ],
       "hard_failover": [
         "deepseek/deepseek-v4-flash"
@@ -26,7 +27,8 @@
       ],
       "primary_pool_mode": "flexible_available_primary",
       "soft_failover": [
-        "openai-codex/gpt-5.6-luna"
+        "openai-codex/gpt-5.6-luna",
+        "teamo-router/<default>"
       ],
       "hard_failover": [
         "deepseek/deepseek-v4-flash"
@@ -35,7 +37,8 @@
     "standard-reasoning": {
       "primary": "openai-codex/gpt-5.6-luna",
       "soft_failover": [
-        "minimax-cn/MiniMax-M3"
+        "minimax-cn/MiniMax-M3",
+        "teamo-router/<default>"
       ],
       "hard_failover": [
         "deepseek/deepseek-v4-flash"
