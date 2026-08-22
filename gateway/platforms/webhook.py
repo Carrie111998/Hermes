@@ -506,34 +506,69 @@ class WebhookAdapter(BasePlatformAdapter):
         route_config = self._routes.get(parts[1])
         if not isinstance(route_config, dict):
             return None
-        provenance = getattr(source, "provenance", None)
-        if isinstance(provenance, dict):
-            target_profile = provenance.get("target_profile")
-            if (
-                provenance.get("ingress_route") == parts[1]
-                and isinstance(target_profile, str)
-                and target_profile == getattr(source, "profile", None)
-            ):
-                allowed = route_config.get("allowed_target_profiles")
-                target_toolsets = route_config.get("allowed_target_toolsets")
-                if (
-                    isinstance(allowed, list)
-                    and target_profile in allowed
-                    and isinstance(target_toolsets, dict)
-                ):
-                    configured = target_toolsets.get(target_profile)
-                    if isinstance(configured, list):
-                        cleaned = [
-                            value.strip()
-                            for value in configured
-                            if isinstance(value, str) and value.strip()
-                        ]
-                        return cleaned or None
+        if getattr(source, "transport_profile", None) is not None:
+            if not self.validate_restored_source(source):
+                return None
+            target_profile = source.profile
+            configured = route_config["allowed_target_toolsets"][target_profile]
+            cleaned = [
+                value.strip()
+                for value in configured
+                if isinstance(value, str) and value.strip()
+            ]
+            return cleaned or None
         toolsets = route_config.get("toolsets")
         if not isinstance(toolsets, list) or not toolsets:
             return None
         cleaned = [str(t).strip() for t in toolsets if str(t).strip()]
         return cleaned or None
+
+    def validate_restored_source(self, source) -> bool:
+        """Reauthorize a persisted trusted handoff against current config."""
+        if getattr(source, "platform", None) != Platform.WEBHOOK:
+            return False
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        parts = chat_id.split(":", 2)
+        if len(parts) != 3 or parts[0] != "webhook":
+            return False
+        route_name = parts[1]
+        route_config = self._routes.get(route_name)
+        if route_name not in self._static_routes or not isinstance(route_config, dict):
+            return False
+        if self._handoff_config_error(route_config) is not None:
+            return False
+
+        transport_profile = getattr(source, "transport_profile", None)
+        configured_profile = route_config.get("profile")
+        if (
+            not isinstance(transport_profile, str)
+            or (
+                isinstance(configured_profile, str)
+                and transport_profile != configured_profile
+            )
+        ):
+            return False
+        secret = route_config.get("secret", self._global_secret)
+        if not secret or secret == _INSECURE_NO_AUTH:
+            return False
+
+        target_profile = getattr(source, "profile", None)
+        allowed = route_config.get("allowed_target_profiles")
+        if not isinstance(target_profile, str) or target_profile not in allowed:
+            return False
+        if target_profile not in self._served_profile_names():
+            return False
+
+        depth = getattr(source, "trusted_handoff_depth", None)
+        max_depth = route_config.get("max_handoff_depth", 1)
+        if (
+            isinstance(depth, bool)
+            or not isinstance(depth, int)
+            or depth < 1
+            or depth > max_depth
+        ):
+            return False
+        return True
 
     @staticmethod
     def _handoff_config_error(route_config: dict) -> Optional[str]:
@@ -1185,6 +1220,8 @@ class WebhookAdapter(BasePlatformAdapter):
             source.profile = profile
         if handoff_target and handoff_toolsets and handoff_depth is not None:
             source.profile = handoff_target
+            source.transport_profile = source_profile
+            source.trusted_handoff_depth = handoff_depth
             delivery_extra = deliver_config.get("deliver_extra") or {}
             delivery_chat_id = delivery_extra.get("chat_id")
             source.provenance = {

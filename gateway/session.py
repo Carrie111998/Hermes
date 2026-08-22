@@ -182,6 +182,14 @@ class SessionSource:
     # None => the gateway's active/default profile. Drives both session-key
     # namespacing and the per-turn config/credential scope.
     profile: Optional[str] = None
+    # Profile that owns the authenticated ingress transport when it differs
+    # from ``profile`` (the execution scope). Persisted so restart recovery can
+    # find the original adapter, which must revalidate the current static route
+    # before honoring it.
+    transport_profile: Optional[str] = None
+    # Authenticated handoff depth used only with ``transport_profile``. The
+    # transport rechecks this against the current route ceiling after restore.
+    trusted_handoff_depth: Optional[int] = None
     # Platform-owned execution provenance persisted in ``origin_json`` for
     # operator diagnostics. This is descriptive only: authorization decisions
     # must never trust values restored from this mapping.
@@ -283,6 +291,10 @@ class SessionSource:
             d["message_id"] = self.message_id
         if self.profile:
             d["profile"] = self.profile
+        if self.transport_profile:
+            d["transport_profile"] = self.transport_profile
+        if self.trusted_handoff_depth is not None:
+            d["trusted_handoff_depth"] = self.trusted_handoff_depth
         if self.provenance:
             d["provenance"] = self.provenance
         if self.auto_thread_created:
@@ -312,6 +324,8 @@ class SessionSource:
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
             profile=data.get("profile"),
+            transport_profile=data.get("transport_profile"),
+            trusted_handoff_depth=data.get("trusted_handoff_depth"),
             provenance=(
                 dict(data["provenance"])
                 if isinstance(data.get("provenance"), dict)

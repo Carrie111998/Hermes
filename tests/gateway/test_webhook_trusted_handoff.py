@@ -4,15 +4,22 @@ import asyncio
 import hashlib
 import hmac
 import json
+from datetime import datetime
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.platforms.base import MessageEvent
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
-from gateway.session import SessionContext, SessionSource, build_session_context_prompt
+from gateway.session import (
+    SessionContext,
+    SessionEntry,
+    SessionSource,
+    build_session_context_prompt,
+)
 
 
 def _signature(body: bytes, secret: str) -> str:
@@ -111,6 +118,8 @@ async def test_authenticated_selector_hands_off_to_allowlisted_profile(served_pr
     source = events[0].source
     assert source.platform.value == "webhook"
     assert source.profile == "market-analysis"
+    assert source.transport_profile == "dispatcher"
+    assert source.trusted_handoff_depth == 1
     assert "_hermes" not in events[0].raw_message
     assert sorted(adapter.toolsets_for_source(source)) == ["terminal", "web"]
     assert source.provenance == {
@@ -124,6 +133,50 @@ async def test_authenticated_selector_hands_off_to_allowlisted_profile(served_pr
         "handoff_depth": 1,
     }
     assert SessionSource.from_dict(source.to_dict()).provenance == source.provenance
+
+
+def test_persisted_handoff_resolves_ingress_adapter_and_revalidates_bounds(
+    served_profiles,
+):
+    adapter = _adapter(_trusted_route())
+    source = SessionSource(
+        platform=Platform.WEBHOOK,
+        chat_id="webhook:relay:restart",
+        profile="market-analysis",
+        transport_profile="dispatcher",
+        trusted_handoff_depth=1,
+        provenance={"source_profile": "descriptive-only-and-not-trusted"},
+    )
+    now = datetime.now()
+    restored = SessionEntry.from_dict(
+        SessionEntry(
+            session_key="market-analysis:webhook:restart",
+            session_id="restart-session",
+            created_at=now,
+            updated_at=now,
+            origin=source,
+            resume_pending=True,
+        ).to_dict()
+    ).origin
+    assert restored is not None
+    assert getattr(restored, "_transport_adapter_ref", None) is None
+
+    class Runner(GatewayAuthorizationMixin):
+        adapters = {}
+        _profile_adapters = {"dispatcher": {Platform.WEBHOOK: adapter}}
+
+        @staticmethod
+        def _active_profile_name():
+            return "default"
+
+    runner = Runner()
+    assert runner._adapter_for_source(restored) is adapter
+    assert adapter.toolsets_for_source(restored) == ["web", "terminal"]
+    assert restored.profile == "market-analysis"
+
+    adapter._routes["relay"]["allowed_target_profiles"] = ["server-development"]
+    assert runner._adapter_for_source(restored) is None
+    assert adapter.toolsets_for_source(restored) is None
 
 
 @pytest.mark.asyncio
