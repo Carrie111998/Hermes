@@ -294,13 +294,25 @@ class TestLegacyCloudMigration:
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: None)
         assert bu_cli.is_browser_use_cli_mode() is False
 
-    def test_migrated_config_gets_bu_autospawn(self, tmp_path, monkeypatch):
+    def test_migrated_config_reuses_hermes_provider_session(self, tmp_path, monkeypatch):
+        import tools.browser_tool as bt
+
         monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: self._LEGACY)
         monkeypatch.setenv("BROWSER_USE_API_KEY", "bu-key")
-        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "autospawn:$BU_AUTOSPAWN"\n')
+        monkeypatch.setattr(bt, "_get_cdp_override", lambda: "")
+        monkeypatch.setattr(bt, "_get_cloud_provider", lambda: object())
+        monkeypatch.setattr(
+            bt,
+            "_get_session_info",
+            lambda key: {"cdp_url": "wss://browser.example/cdp/owned"},
+        )
+        cli = _fake_cli(
+            tmp_path,
+            'cat > /dev/null\necho "autospawn:${BU_AUTOSPAWN:-} ws:$BU_CDP_WS"\n',
+        )
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
         result = json.loads(bu_cli.browser_exec("print(1)"))
-        assert "autospawn:1" in result["output"]
+        assert "autospawn: ws:wss://browser.example/cdp/owned" in result["output"]
 
     def test_explicit_backend_does_not_set_bu_autospawn(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
@@ -436,27 +448,25 @@ class TestBackendCdpResolution:
         assert bu_cli._resolve_backend_cdp(env2, "task-B", session_name="research") is None
         assert seen == ["bu-named-research", "bu-named-research"]
 
-    def test_named_session_direct_api_bu_cloud_still_skips_provider(
-        self, tmp_path, monkeypatch
-    ):
-        """Direct-API Browser Use cloud configs keep the native named-daemon
-        path: resolving through the provider would double-session and
-        double-bill."""
+    def test_named_session_direct_api_bu_cloud_reuses_provider(self, monkeypatch):
+        """Direct Browser Use sessions are Hermes-owned so liveUrl survives."""
         import tools.browser_tool as bt
 
         class _BUProvider:
             name = "browser-use"
 
+        seen = []
         monkeypatch.setattr(bt, "_get_cdp_override", lambda: "")
         monkeypatch.setattr(bt, "_get_cloud_provider", lambda: _BUProvider())
         monkeypatch.setattr(
             bt, "_get_session_info",
-            lambda key: (_ for _ in ()).throw(AssertionError("must skip provider")),
+            lambda key: seen.append(key) or {"cdp_url": "wss://browser.example/cdp/owned"},
         )
         monkeypatch.setattr(bu_cli, "_read_browser_cfg", lambda: {"cloud_provider": "browser-use"})
         env = {}
         assert bu_cli._resolve_backend_cdp(env, "t1", session_name="r7k2") is None
-        assert "BU_CDP_WS" not in env and "BU_CDP_URL" not in env
+        assert seen == ["bu-named-r7k2"]
+        assert env["BU_CDP_WS"] == "wss://browser.example/cdp/owned"
 
 
 class TestOwnTabPreamble:

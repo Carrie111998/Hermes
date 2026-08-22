@@ -58,6 +58,7 @@ async def deliver_wake(
     *,
     text: str,
     session_id: str = "",
+    session_key: str = "",
     source: Any = None,
 ) -> None:
     """Deliver a wake turn to the session behind ``adapter``.
@@ -65,7 +66,9 @@ async def deliver_wake(
     ``session_id`` is the RAW session id (the ``X-Hermes-Session-Id`` value /
     ``state.db`` key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` used to build the synthetic event — required for
-    push-capable adapters.
+    push-capable adapters. When both ``session_key`` and ``session_id`` are
+    supplied for a push adapter, the gateway rejects the event if that route
+    was reset or replaced before delivery.
 
     Raises on failure (bad arguments, exhausted retries, HTTP error) so the
     caller can rewind/retry instead of treating the wake as delivered.
@@ -82,6 +85,15 @@ async def deliver_wake(
             message_type=MessageType.TEXT,
             source=source,
             internal=True,
+            metadata=(
+                {
+                    "gateway_session_key": session_key,
+                    "gateway_session_id": session_id,
+                    "gateway_session_strict": True,
+                }
+                if session_key and session_id
+                else {}
+            ),
         )
         await adapter.handle_message(synth_event)
         return

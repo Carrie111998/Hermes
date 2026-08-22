@@ -463,8 +463,7 @@ def _resolve_backend_cdp(
        ``_get_session_info()`` so browser_exec shares the SAME provider
        session machinery — per-task session cache, expiry replacement,
        inactivity reaper, and atexit cleanup — instead of duplicating it.
-    4. Nothing configured: return None; the harness attaches to local
-       Chrome (or Browser Use cloud via BU_AUTOSPAWN for legacy configs).
+    4. Nothing configured: return None; the harness attaches to local Chrome.
 
     ``session_name`` (the tool's ``session`` argument / BU_NAME) keys the
     provider session cache when set, so every distinct name gets its OWN
@@ -503,21 +502,6 @@ def _resolve_backend_cdp(
     if provider is None:
         return None
 
-    # Browser Use direct-API configs: the CLI talks to Browser Use cloud
-    # natively (BU_AUTOSPAWN / auth login) — routing through the legacy
-    # provider here would just create a second, redundant session. The
-    # Nous-gateway variant (use_gateway: true) DOES resolve through the
-    # provider: the gateway provisions the cloud browser server-side and
-    # returns its CDP URL, giving subscribers CLI mode with no raw key.
-    provider_key = str(getattr(provider, "name", "") or "").strip().lower()
-    if provider_key == _BACKEND_KEY and not is_truthy_value(
-        _read_browser_cfg().get("use_gateway"), default=False
-    ):
-        # Named BU cloud browsers are exclusive to their daemon — no shared
-        # tab to isolate from.
-        env[_PRIVATE_BROWSER_SENTINEL] = "1"
-        return None
-
     try:
         # Named sessions get their OWN provider browser, keyed by name so the
         # same name reuses one browser across calls and tasks, and different
@@ -547,13 +531,40 @@ def _resolve_backend_cdp(
 
 
 def browser_exec(
-    code: str,
+    code: str = "",
     session: str = "",
     timeout_s: int = _DEFAULT_TIMEOUT_S,
     task_id: Optional[str] = None,
+    action: str = "exec",
+    instruction: str = "",
 ):
     """Run Python code through the browser-use CLI, and return its output"""
     from tools.registry import tool_error, tool_result
+
+    if action == "handoff":
+        try:
+            from gateway.browser_handoff import create_browser_handoff
+
+            result = create_browser_handoff(
+                instruction=instruction,
+                task_id=task_id or "",
+                session_name=session,
+            )
+            return tool_result(
+                {
+                    "success": True,
+                    "output": result["message"],
+                    "meta": {
+                        "browser_handoff": True,
+                        "handoff_id": result["handoff_id"],
+                        "expires_at": result["expires_at"],
+                    },
+                },
+            )
+        except Exception as exc:
+            return tool_error(str(exc))
+    if action != "exec":
+        return tool_error("Invalid browser_exec action; use 'exec' or 'handoff'.")
 
     if not code or not code.strip():
         return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
@@ -584,9 +595,9 @@ def browser_exec(
     # with the backend: BU_NAME namespaces the harness daemon (its IPC
     # socket, log, and pid), and on provider backends the name additionally
     # keys its own cloud browser — so concurrent sessions stop clobbering
-    # each other's daemon (#86894). Browser Use direct-API cloud configs
-    # are the one exception: the CLI manages named cloud browsers natively,
-    # and _resolve_backend_cdp skips provider resolution for them.
+    # each other's daemon (#86894). Browser Use cloud also resolves through
+    # this provider path so Hermes retains its browser ID and live URL for a
+    # possible human handoff while the CLI attaches over CDP.
     backend_err = _resolve_backend_cdp(env, task_id, session_name=session)
     if backend_err:
         return tool_error(backend_err)
@@ -603,11 +614,6 @@ def browser_exec(
     workspace = _workspace_dir(task_id)
     if workspace:
         env["BH_AGENT_WORKSPACE"] = workspace
-
-    # BU_AUTOSPAWN makes the CLI start a Browser Use cloud browser when no
-    # local Chrome/CDP endpoint is reachable (their API key authenticates it)
-    if "BU_AUTOSPAWN" not in env and is_legacy_browser_use_cloud_config(_read_browser_cfg()):
-        env["BU_AUTOSPAWN"] = "1"
 
     try:
         timeout = max(_MIN_TIMEOUT_S, min(int(timeout_s), _MAX_TIMEOUT_S))
@@ -763,7 +769,9 @@ _HELPERS_DIGEST = (
     "role/name/backendDOMNodeId (filter in Python before printing; it is "
     "thousands of nodes), then cdp('DOM.getBoxModel', backendNodeId=n) gives "
     "click coordinates. ensure_real_tab() recovers from a stale/internal "
-    "tab. Login walls: stop and ask the user; never guess credentials."
+    "tab. Login/CAPTCHA walls: never guess credentials or bypass them. If "
+    "browser handoff is configured, call this tool with action='handoff' and "
+    "a precise instruction, then end the turn and wait for the resumed session."
 )
 
 
@@ -793,9 +801,31 @@ BROWSER_EXEC_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["exec", "handoff"],
+                "description": (
+                    "Use exec to control or inspect the browser. Use handoff only "
+                    "when a human must solve a login, CAPTCHA, or similar blocker; "
+                    "it DMs the owner a 30-minute remote-control link and pauses "
+                    "this session."
+                ),
+                "default": "exec",
+            },
             "code": {
                 "type": "string",
-                "description": "Python code to execute using the pre-imported browser helpers. Use print(...) for any data you need back.",
+                "description": (
+                    "For action=exec: Python code using the pre-imported browser "
+                    "helpers. Use print(...) for data you need back."
+                ),
+            },
+            "instruction": {
+                "type": "string",
+                "description": (
+                    "For action=handoff: a concise description of exactly what the "
+                    "human must do, such as 'Complete the CAPTCHA and sign in with "
+                    "your account'."
+                ),
             },
             "session": {
                 "type": "string",
@@ -807,7 +837,7 @@ BROWSER_EXEC_SCHEMA = {
                 "default": _DEFAULT_TIMEOUT_S,
             },
         },
-        "required": ["code"],
+        "required": [],
     },
 }
 
@@ -826,6 +856,8 @@ registry.register(
         session=args.get("session", "") or "",
         timeout_s=args.get("timeout_s", _DEFAULT_TIMEOUT_S),
         task_id=kw.get("task_id"),
+        action=args.get("action", "exec") or "exec",
+        instruction=args.get("instruction", "") or "",
     ),
     check_fn=is_browser_use_cli_mode,
     dynamic_schema_overrides=_dynamic_schema_overrides,

@@ -53,6 +53,26 @@ def test_adapter_supports_push_default_true():
     assert adapter_supports_push(ApiServerLikeAdapter()) is False
 
 
+def test_push_wake_can_pin_exact_gateway_session():
+    adapter = PushAdapter()
+
+    asyncio.run(
+        deliver_wake(
+            adapter,
+            text="resume",
+            source=_source(),
+            session_key="agent:main:telegram:group:chat-1",
+            session_id="raw-sid-42",
+        )
+    )
+
+    assert adapter.handled[0].metadata == {
+        "gateway_session_key": "agent:main:telegram:group:chat-1",
+        "gateway_session_id": "raw-sid-42",
+        "gateway_session_strict": True,
+    }
+
+
 async def _serve(handler):
     """Spin an in-process aiohttp server on an ephemeral loopback port."""
     from aiohttp import web
@@ -123,5 +143,4 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
 
     asyncio.run(run())
     assert calls["n"] == 2
-
 

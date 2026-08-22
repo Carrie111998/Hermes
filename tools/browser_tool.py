@@ -4965,6 +4965,16 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         bb_session_id = session_info.get("bb_session_id", "unknown")
         logger.debug("Found session for task %s: bb_session_id=%s", task_id, bb_session_id)
 
+        # Revoke any public live-control link before the provider browser is
+        # closed, regardless of the link's nominal expiration time.
+        if bool((session_info.get("features") or {}).get("browser_use")):
+            try:
+                from gateway.browser_handoff import cancel_browser_handoffs
+
+                cancel_browser_handoffs(str(bb_session_id))
+            except Exception:
+                logger.debug("Browser handoff revocation failed", exc_info=True)
+
         # Stop auto-recording before closing (saves the file)
         _maybe_stop_recording(task_id)
 
