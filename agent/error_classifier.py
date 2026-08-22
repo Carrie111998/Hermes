@@ -712,9 +712,7 @@ def _is_disk_space_error(error: Exception) -> bool:
             current_msg = str(current).lower()
             if any(pattern in current_msg for pattern in _DISK_SPACE_PATTERNS):
                 return True
-        current = getattr(current, "__cause__", None) or getattr(
-            current, "__context__", None
-        )
+        current = getattr(current, "__cause__", None)
     return False
 
 # Server disconnect patterns (no status code, but transport-level).

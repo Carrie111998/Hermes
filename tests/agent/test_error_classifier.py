@@ -668,6 +668,22 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.disk_space
         assert result.retryable is False
 
+    def test_implicit_disk_context_does_not_override_provider_error(self):
+        inner = OSError(errno.ENOSPC, "No space left on device")
+        outer = MockAPIError("Internal server error", status_code=500)
+        outer.__context__ = inner
+
+        result = classify_api_error(outer)
+
+        assert result.reason == FailoverReason.server_error
+        assert result.retryable is True
+
+    def test_plain_runtime_disk_message_is_not_treated_as_local_storage(self):
+        result = classify_api_error(RuntimeError("No space left on device"))
+
+        assert result.reason == FailoverReason.unknown
+        assert result.retryable is True
+
     def test_read_timeout(self):
         e = ReadTimeout("Read timed out")
         result = classify_api_error(e)
