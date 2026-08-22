@@ -772,16 +772,16 @@ def _blocked_question_options(inner: Dict[str, Any]) -> Optional[List[str]]:
     measured exactly 200 with no margin.
 
     The producer's flat list wins, including an explicitly empty list. The
-    per-question lists in `questions[i].options` are the fallback for the
-    notifier-bridge envelope and for a replay of an envelope written before
-    the flat key existed. As with `question`, that means a fixed producer
-    passes through untouched and a stale one is still salvaged.
+    per-question list in `questions[i].options` is a fallback for the
+    notifier-bridge envelope and for replaying an envelope written before the
+    flat key existed. On a one-entry array that entry is necessarily focused.
+    On a multi-entry array, only the unique entry named by top-level `question`
+    may supply labels; an unmatched or ambiguous focus stays absent rather than
+    borrowing another question's choices.
 
     The return value is deliberately three-state. ``None`` means no option
-    popup was observed; ``[]`` means a popup was observed and offered nothing;
-    a non-empty list contains the exact labels. Among per-question entries, a
-    later observed non-empty list wins over an earlier observed-empty list,
-    matching the applier's ``question_options`` helper.
+    popup was observed; ``[]`` means the focused popup was observed and offered
+    nothing; a non-empty list contains that focused popup's exact labels.
     """
     def _labels(value: Any) -> List[str]:
         if not isinstance(value, (list, tuple)):
@@ -801,19 +801,34 @@ def _blocked_question_options(inner: Dict[str, Any]) -> Optional[List[str]]:
             return _labels(value)
 
     questions = inner.get("questions") or inner.get("unansweredQuestions")
-    observed_empty = False
-    if isinstance(questions, list):
-        for entry in questions:
-            if not isinstance(entry, dict) or "options" not in entry:
-                continue
-            value = entry.get("options")
-            if not isinstance(value, (list, tuple)):
-                continue
-            labels = _labels(value)
-            if labels:
-                return labels
-            observed_empty = True
-    return [] if observed_empty else None
+    if not isinstance(questions, list):
+        return None
+    entries = [entry for entry in questions if isinstance(entry, dict)]
+    if len(entries) == 1:
+        focused = entries[0]
+    else:
+        question = inner.get("question")
+        if not isinstance(question, str) or not question.strip():
+            return None
+        focus = question.strip()
+        matches = [
+            entry for entry in entries
+            if any(
+                isinstance(entry.get(key), str)
+                and entry[key].strip() == focus
+                for key in ("label", "question", "name")
+            )
+        ]
+        if len(matches) != 1:
+            return None
+        focused = matches[0]
+
+    if "options" not in focused:
+        return None
+    value = focused.get("options")
+    if not isinstance(value, (list, tuple)):
+        return None
+    return _labels(value)
 
 
 def _blocked_question_text(inner: Dict[str, Any]) -> str:

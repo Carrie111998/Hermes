@@ -1312,11 +1312,15 @@ class TestBlockedQuestionOptions:
         assert len(out["question"]) <= 200
         assert out["options"] == self.OPTIONS
 
-    def test_options_are_recovered_from_the_per_question_lists(self, bus):
-        """Envelopes written before the flat key existed, and the
-        notifier-bridge producer, only carry `questions[i].options`."""
+    def test_options_are_recovered_from_the_focused_question(self, bus):
+        """Legacy/notifier envelopes carry options on questions[i].
+
+        A multi-question envelope must identify the focused entry explicitly;
+        options from a different question are not interchangeable.
+        """
         _mailbox_event(bus, "BLOCKED_QUESTION", {
             "job_key": "j1",
+            "question": "How Did You Hear About Us?",
             "unansweredQuestions": [
                 {"label": "First Name*", "type": "text"},
                 {"label": "How Did You Hear About Us?", "type": "listbox",
@@ -1325,6 +1329,63 @@ class TestBlockedQuestionOptions:
         })
         _translate(bus)
         assert self._blocked(bus)["options"] == self.OPTIONS
+
+    def test_focused_fanout_events_do_not_borrow_other_question_options(self, bus):
+        """MassMutual-shaped fan-out stays two distinct events, each scoped.
+
+        Both envelopes carry the complete shared questions array. Only the
+        source prompt owns the observed list; the prior-employment prompt must
+        not inherit it merely because that entry appears first.
+        """
+        questions = [
+            {"label": "How Did You Hear About Us?*", "type": "listbox",
+             "options": self.OPTIONS},
+            {"label": "Have you previously worked for MassMutual?*",
+             "type": "listbox"},
+        ]
+        _mailbox_event(bus, "BLOCKED_QUESTION", {
+            "job_key": "j1",
+            "question": "How Did You Hear About Us?*",
+            "questions": questions,
+        }, correlation_id="source-corr")
+        _mailbox_event(bus, "BLOCKED_QUESTION", {
+            "job_key": "j1",
+            "question": "Have you previously worked for MassMutual?*",
+            "questions": questions,
+        }, correlation_id="employment-corr")
+
+        _translate(bus)
+        blocked = [p for et, p in _recent_domain_events(bus)
+                   if et == EventType.APPLICATION_BLOCKED]
+        assert len(blocked) == 2
+        by_question = {entry["question"]: entry for entry in blocked}
+        assert by_question["How Did You Hear About Us?*"]["options"] == self.OPTIONS
+        assert "options" not in by_question[
+            "Have you previously worked for MassMutual?*"]
+
+    def test_ambiguous_multi_question_fallback_omits_options(self, bus):
+        _mailbox_event(bus, "BLOCKED_QUESTION", {
+            "job_key": "j1",
+            "question": "Source?",
+            "questions": [
+                {"label": "Source?", "options": ["Internet"]},
+                {"question": "Source?", "options": ["Referral"]},
+            ],
+        })
+        _translate(bus)
+        assert "options" not in self._blocked(bus)
+
+    def test_unmatched_multi_question_fallback_omits_options(self, bus):
+        _mailbox_event(bus, "BLOCKED_QUESTION", {
+            "job_key": "j1",
+            "question": "Prior employment?",
+            "questions": [
+                {"label": "Source?", "options": ["Internet"]},
+                {"label": "State?", "options": ["Florida"]},
+            ],
+        })
+        _translate(bus)
+        assert "options" not in self._blocked(bus)
 
     def test_a_producer_supplied_list_wins_over_the_per_question_one(self, bus):
         _mailbox_event(bus, "BLOCKED_QUESTION", {
@@ -1363,17 +1424,14 @@ class TestBlockedQuestionOptions:
         _translate(bus)
         assert self._blocked(bus)["options"] == []
 
-    def test_later_observed_labels_win_over_earlier_observed_empty(self, bus):
-        """Matches the applier helper: [] is retained only if no list has labels."""
+    def test_single_question_empty_list_is_preserved_even_with_focus(self, bus):
         _mailbox_event(bus, "BLOCKED_QUESTION", {
             "job_key": "j1",
-            "questions": [
-                {"label": "Source?", "options": []},
-                {"label": "State?", "options": ["Florida", "Georgia"]},
-            ],
+            "question": "Source?",
+            "questions": [{"label": "Source?", "options": []}],
         })
         _translate(bus)
-        assert self._blocked(bus)["options"] == ["Florida", "Georgia"]
+        assert self._blocked(bus)["options"] == []
 
     def test_flat_empty_list_wins_over_per_question_labels(self, bus):
         """A producer-supplied flat key is authoritative even when empty."""
