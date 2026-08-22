@@ -1300,7 +1300,6 @@ def draft_contract(
     objective: str,
     *,
     timeout: float = DEFAULT_JUDGE_TIMEOUT,
-    main_runtime: Optional[Dict[str, Any]] = None,
 ) -> Optional[GoalContract]:
     """Expand a plain-language objective into a structured completion contract.
 
@@ -1332,7 +1331,6 @@ def draft_contract(
             temperature=0,
             max_tokens=_goal_judge_max_tokens(),
             timeout=timeout,
-            main_runtime=main_runtime,
         )
     except Exception as exc:
         logger.info("goal draft: API call failed (%s)", exc)

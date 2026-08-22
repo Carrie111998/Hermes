@@ -21323,7 +21323,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _main_runtime = dict(_turn_runtime or {})
                     _main_runtime["model"] = _turn_model
             except Exception:
-                logger.debug("goal continuation: session runtime resolution failed", exc_info=True)
+                logger.info("goal continuation: session runtime resolution failed — judge falls back to process-global route", exc_info=True)
 
             return mgr.evaluate_after_turn(
                 final_response or "",
