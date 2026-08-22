@@ -10339,31 +10339,38 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         )
 
             # --- Launchd services (macOS) ---
+            # Discover and restart all loaded hermes launchd gateway services
+            # across all profiles (ai.hermes.gateway, ai.hermes.gateway-coder, etc.)
+            # (#19784, #73625, #91277).
             if is_macos():
                 try:
                     from hermes_cli.gateway import (
-                        launchd_restart,
+                        find_all_launchd_gateway_services,
+                        launchd_restart_service,
                         get_launchd_label,
                         get_launchd_plist_path,
                     )
 
-                    plist_path = get_launchd_plist_path()
-                    if plist_path.exists():
+                    all_launchd = find_all_launchd_gateway_services()
+                    if not all_launchd:
+                        plist_path = get_launchd_plist_path()
+                        if plist_path.exists():
+                            all_launchd = [(get_launchd_label(), plist_path)]
+
+                    for label, plist_path in all_launchd:
                         check = subprocess.run(
-                            ["launchctl", "list", get_launchd_label()],
+                            ["launchctl", "list", label],
                             capture_output=True,
                             text=True,
                             timeout=5,
                         )
                         if check.returncode == 0:
-                            try:
-                                launchd_restart()
-                                restarted_services.append(get_launchd_label())
-                            except subprocess.CalledProcessError as e:
-                                stderr = (getattr(e, "stderr", "") or "").strip()
-                                print(f"  ⚠ Gateway restart failed: {stderr}")
-                except (FileNotFoundError, subprocess.TimeoutExpired, ImportError):
-                    pass
+                            if launchd_restart_service(label, plist_path):
+                                restarted_services.append(label)
+                            else:
+                                print(f"  ⚠ Failed to restart launchd gateway: {label}")
+                except (FileNotFoundError, subprocess.TimeoutExpired, ImportError) as exc:
+                    logger.debug("macOS launchd gateway fleet restart error: %s", exc)
 
             # --- Manual (non-service) gateways ---
             # Kill any remaining gateway processes not managed by a service.
@@ -10532,6 +10539,33 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # (no saved launch args) but we can stop it, and a hint is
         # printed for the user to re-launch.
         _kill_stale_dashboard_processes()
+
+        # Structured update receipt (#91277 Phase 1)
+        # Writes machine-readable record to ~/.hermes/updates/latest-receipt.json
+        try:
+            from hermes_cli.update_receipt import UpdateReceipt
+            from hermes_cli.config import detect_install_method
+
+            head_rev = ""
+            try:
+                head_rev = subprocess.run(
+                    git_cmd + ["rev-parse", "HEAD"],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+            except Exception:
+                pass
+
+            receipt = UpdateReceipt(
+                target_branch=branch,
+                updated_commit=head_rev,
+                deployment_kind=detect_install_method(PROJECT_ROOT),
+                status="SUCCESS",
+            )
+            receipt.write()
+        except Exception as _rcpt_exc:
+            logger.debug("Failed to write update receipt: %s", _rcpt_exc)
 
         print()
         print("Tip: You can now select a provider and model:")

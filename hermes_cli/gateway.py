@@ -4105,6 +4105,60 @@ def launchd_restart():
         _clear_launchd_unsupported_marker()
 
 
+def find_all_launchd_gateway_services() -> list[tuple[str, Path]]:
+    """Discover all installed hermes launchd gateway services across profiles.
+
+    Returns a list of (label, plist_path) tuples for all ai.hermes.gateway*.plist
+    files found in ~/Library/LaunchAgents/.
+    """
+    if not is_macos():
+        return []
+    try:
+        launch_agents = _launchd_user_home() / "Library" / "LaunchAgents"
+        if not launch_agents.is_dir():
+            return []
+
+        services = []
+        for plist in sorted(launch_agents.glob("ai.hermes.gateway*.plist")):
+            label = plist.stem  # e.g. "ai.hermes.gateway" or "ai.hermes.gateway-coder"
+            services.append((label, plist))
+        return services
+    except Exception:
+        return []
+
+
+def launchd_restart_service(label: str, plist_path: Path | None = None) -> bool:
+    """Restart a specific launchd gateway service by label and optional plist_path.
+
+    Returns True if successfully restarted/kickstarted, False on failure.
+    """
+    target = f"{_launchd_domain()}/{label}"
+    try:
+        subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
+        return True
+    except subprocess.CalledProcessError as e:
+        if not _launchd_error_indicates_unloaded(e):
+            if _launchctl_domain_unsupported(e.returncode):
+                _launchd_fallback_to_detached(f"launchctl kickstart exit {e.returncode}")
+                return True
+            return False
+        # Job not loaded — bootstrap and kickstart
+        if plist_path is None:
+            plist_path = _launchd_user_home() / "Library" / "LaunchAgents" / f"{label}.plist"
+        if plist_path.exists():
+            try:
+                subprocess.run(
+                    ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
+                    check=True,
+                    timeout=30,
+                )
+                subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
+                return True
+            except subprocess.CalledProcessError:
+                return False
+        return False
+
+
 def launchd_status(deep: bool = False):
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
