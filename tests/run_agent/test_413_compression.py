@@ -6,6 +6,8 @@ Verifies that:
 - Preflight compression proactively compresses oversized sessions before API calls
 """
 
+import errno
+
 import pytest
 #pytestmark = pytest.mark.skip(reason="Hangs in non-interactive environments")
 
@@ -141,6 +143,27 @@ def test_current_user_turn_is_persisted_before_provider_call(agent):
         == "new message that must survive a crash"
     )
     assert isinstance(persisted_messages[-1]["timestamp"], float)
+
+
+def test_disk_full_aborts_without_retry_or_provider_fallback(agent):
+    agent.client.chat.completions.create.side_effect = OSError(
+        errno.ENOSPC, "No space left on device"
+    )
+    agent._fallback_chain = [{"provider": "anthropic", "model": "claude"}]
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_try_activate_fallback") as activate_fallback,
+    ):
+        result = agent.run_conversation("hello", conversation_history=[])
+
+    assert agent.client.chat.completions.create.call_count == 1
+    activate_fallback.assert_not_called()
+    assert result["failure_reason"] == "disk_space"
+    assert "local storage" in result["final_response"].lower()
+    assert "free disk space" in result["final_response"].lower()
 
 
 class TestHTTP413Compression:

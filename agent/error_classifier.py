@@ -12,6 +12,7 @@ that the main retry loop in run_agent.py consults for every API failure.
 from __future__ import annotations
 
 import enum
+import errno
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
@@ -47,6 +48,7 @@ class FailoverReason(enum.Enum):
 
     # Transport
     timeout = "timeout"                  # Connection/read timeout — rebuild client + retry
+    disk_space = "disk_space"            # Local filesystem/quota exhausted — abort
     # TLS certificate verification failure — deterministic for the host
     # (TLS-inspecting proxy, missing/expired CA bundle, self-signed cert).
     # Retrying reproduces the identical handshake failure, so fail fast
@@ -686,6 +688,33 @@ _TRANSPORT_ERROR_TYPES = frozenset({
     "APITimeoutError",
 })
 
+_DISK_SPACE_ERRNOS = frozenset({
+    errno.ENOSPC,
+    getattr(errno, "EDQUOT", None),
+}) - {None}
+
+_DISK_SPACE_PATTERNS = (
+    "no space left on device",
+    "disk quota exceeded",
+    "not enough space on the disk",
+)
+
+
+def _is_disk_space_error(error: Exception) -> bool:
+    """Detect local filesystem exhaustion before generic message matching."""
+    current: Optional[BaseException] = error
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, OSError):
+            if getattr(current, "errno", None) in _DISK_SPACE_ERRNOS:
+                return True
+            current_msg = str(current).lower()
+            if any(pattern in current_msg for pattern in _DISK_SPACE_PATTERNS):
+                return True
+        current = getattr(current, "__cause__", None)
+    return False
+
 # Server disconnect patterns (no status code, but transport-level).
 # These are the "ambiguous" patterns — a plain connection close could be
 # transient transport hiccup OR server-side context overflow rejection
@@ -892,6 +921,13 @@ def classify_api_error(
             reason.value, provider, status_code,
         )
         return _result(reason, **plugin_classification)
+
+    # Local disk/quota exhaustion is deterministic until the operator frees
+    # storage. It must beat billing's generic "quota" patterns and OSError's
+    # generic transport classification: credential rotation, provider
+    # fallback, compression, and retry all repeat the same failed local write.
+    if _is_disk_space_error(error):
+        return _result(FailoverReason.disk_space, retryable=False)
 
     # ── 1. Provider-specific patterns (highest priority) ────────────
 
