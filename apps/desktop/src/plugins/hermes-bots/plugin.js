@@ -9297,7 +9297,7 @@ function GroupLimitRow({ label, hint, value, fallback, ceiling, onChange, brake 
             inputMode: 'numeric',
             max: ceiling,
             min: 1,
-            placeholder: String(fallback),
+            placeholder: off ? '\u221e' : String(fallback),
             type: 'number',
             value: shown,
             onChange: event => {
@@ -9310,13 +9310,26 @@ function GroupLimitRow({ label, hint, value, fallback, ceiling, onChange, brake 
               onChange(Number.isFinite(n) && n > 0 ? Math.min(n, ceiling) : undefined)
             }
           }),
-          jsx(Tip, {
-            label: off ? `No limit on ${label.toLowerCase()}` : `Limit ${label.toLowerCase()}`,
-            children: jsx(Switch, {
-              'aria-label': `Limit ${label.toLowerCase()}`,
-              checked: !off,
-              onCheckedChange: on => onChange(on ? fallback : null)
-            })
+          // The switch alone is not readable in the dark theme: "on" is a
+          // slightly different dark track. Name the state next to it.
+          jsxs('div', {
+            className: 'flex shrink-0 items-center gap-1.5',
+            children: [
+              jsx('span', {
+                className: off
+                  ? 'w-12 text-right text-[0.65rem] text-(--ui-warning,#d68b00)'
+                  : 'w-12 text-right text-[0.65rem] text-(--ui-text-tertiary)',
+                children: off ? 'no limit' : 'limit'
+              }),
+              jsx(Tip, {
+                label: off ? `No limit on ${label.toLowerCase()}` : `Limit ${label.toLowerCase()}`,
+                children: jsx(Switch, {
+                  'aria-label': `Limit ${label.toLowerCase()}`,
+                  checked: !off,
+                  onCheckedChange: on => onChange(on ? fallback : null)
+                })
+              })
+            ]
           })
         ]
       }),
@@ -9348,13 +9361,25 @@ function GroupLimitRow({ label, hint, value, fallback, ceiling, onChange, brake 
                   brake.onChange(Number.isFinite(n) && n > 0 ? Math.min(n, ceiling) : undefined)
                 }
               }),
-              jsx(Tip, {
-                label: brake.value === null ? 'No safety stop at all' : 'Stop the room after this many',
-                children: jsx(Switch, {
-                  'aria-label': `Safety stop for ${label.toLowerCase()}`,
-                  checked: brake.value !== null,
-                  onCheckedChange: on => brake.onChange(on ? brake.fallback : null)
-                })
+              jsxs('div', {
+                className: 'flex shrink-0 items-center gap-1.5',
+                children: [
+                  jsx('span', {
+                    className:
+                      brake.value === null
+                        ? 'w-12 text-right text-[0.65rem] text-(--ui-warning,#d68b00)'
+                        : 'w-12 text-right text-[0.65rem] text-(--ui-text-tertiary)',
+                    children: brake.value === null ? 'none' : 'brake'
+                  }),
+                  jsx(Tip, {
+                    label: brake.value === null ? 'No safety stop at all' : 'Stop the room after this many',
+                    children: jsx(Switch, {
+                      'aria-label': `Safety stop for ${label.toLowerCase()}`,
+                      checked: brake.value !== null,
+                      onCheckedChange: on => brake.onChange(on ? brake.fallback : null)
+                    })
+                  })
+                ]
               })
             ]
           })

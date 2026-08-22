@@ -163,3 +163,24 @@ test('the room header label is what the create dialog and settings also write', 
   assert.equal(mounts.length, 2, 'create dialog and group settings mount the shared editor')
   assert.match(source, /children: groupChatBudgetLabel\(room\)/, 'the header shows the same resolved budget')
 })
+
+test('every switch is paired with the state in words', () => {
+  // Radix renders "on" as a slightly different dark track, which is not
+  // readable in the dark theme. First live test: the toggles looked off while
+  // every limit was active.
+  const editor = source.slice(source.indexOf('function GroupLimitRow('))
+  const body = editor.slice(0, editor.indexOf('\nfunction '))
+
+  assert.match(body, /children: off \? 'no limit' : 'limit'/)
+  assert.match(body, /children: brake\.value === null \? 'none' : 'brake'/)
+
+  const switches = [...body.matchAll(/jsx\(Switch, \{/g)]
+  const labels = [...body.matchAll(/text-\(--ui-warning,#d68b00\)'\n\s*: 'w-12/g)]
+  assert.equal(switches.length, 2, 'the row has a limit switch and a brake switch')
+  assert.equal(labels.length, switches.length, 'each switch carries its own state word')
+})
+
+test('a switched-off axis shows the infinity placeholder, not an empty box', () => {
+  const editor = source.slice(source.indexOf('function GroupLimitRow('))
+  assert.match(editor.slice(0, 3000), /placeholder: off \? '\\u221e' : String\(fallback\)/)
+})
