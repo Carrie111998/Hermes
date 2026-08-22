@@ -27036,6 +27036,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _iac_state is not None:
             _iac_state.persistent.pending_command_text = None
         if release_running_state:
+            # Ordinary /model --once state remains conversation-scoped until
+            # the turn finalizer restores it.  Control invalidation advances
+            # the generation before the old finalizer runs, so restore it
+            # against the post-invalidation generation here.  This keeps the
+            # ordinary pending-state authority separate from the adaptive
+            # consumed-record CAS cleanup below.
+            self._restore_pending_one_turn_model_override(
+                session_key, run_generation=_generation_at_interrupt
+            )
             if _iac_state is not None:
                 self._restore_consumed_one_turn_model_override(
                     session_key, _iac_state.turn.one_turn_restore

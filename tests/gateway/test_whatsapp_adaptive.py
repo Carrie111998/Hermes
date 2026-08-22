@@ -736,6 +736,178 @@ async def test_model_once_agentic_exception_and_cancellation_restore(
 
 
 @pytest.mark.asyncio
+async def test_ordinary_model_once_stop_restores_before_stale_finalizer(
+    monkeypatch, tmp_path
+):
+    runner, store = _lifecycle_runner(monkeypatch, tmp_path)
+    source = SessionSource(
+        platform=Platform.WHATSAPP,
+        chat_id="ordinary-model-once-stop",
+        user_id="a",
+        chat_type="dm",
+    )
+    store.get_or_create_session(source)
+    key = runner._session_key_for_source(source)
+    _stage_model_once_override(
+        runner,
+        key,
+        baseline={"model": "baseline-model", "provider": "baseline-provider"},
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_agent(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(runner, "_handle_message_with_agent", blocked_agent)
+    task = asyncio.create_task(
+        runner._handle_message(MessageEvent(text="ordinary work", source=source))
+    )
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    old_generation = runner._session_state(key).persistent.run_generation
+
+    await runner._interrupt_and_clear_session(
+        key,
+        source,
+        interrupt_reason="/stop",
+        invalidation_reason="ordinary_model_once_stop",
+    )
+
+    state = runner._session_state(key)
+    assert state.persistent.run_generation > old_generation
+    assert state.conversation.model_override == {
+        "model": "baseline-model",
+        "provider": "baseline-provider",
+    }
+    assert state.conversation.one_turn_restore is None
+    next_model, _ = runner._apply_session_model_override(
+        key, "configured-model", {"provider": "configured-provider"}
+    )
+    assert next_model == "baseline-model"
+
+    # The old finalizer is stale and must remain harmless after the control
+    # path already restored the ordinary pending record.
+    runner._restore_pending_one_turn_model_override(
+        key, run_generation=old_generation
+    )
+    assert state.conversation.model_override["model"] == "baseline-model"
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_ordinary_model_once_stop_then_new_override_survives_late_cleanup(
+    monkeypatch, tmp_path
+):
+    runner, store = _lifecycle_runner(monkeypatch, tmp_path)
+    source = SessionSource(
+        platform=Platform.WHATSAPP,
+        chat_id="ordinary-model-once-new-override",
+        user_id="a",
+        chat_type="dm",
+    )
+    store.get_or_create_session(source)
+    key = runner._session_key_for_source(source)
+    _stage_model_once_override(runner, key)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_agent(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(runner, "_handle_message_with_agent", blocked_agent)
+    task = asyncio.create_task(
+        runner._handle_message(MessageEvent(text="ordinary work", source=source))
+    )
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    old_generation = runner._session_state(key).persistent.run_generation
+
+    await runner._interrupt_and_clear_session(
+        key,
+        source,
+        interrupt_reason="/stop",
+        invalidation_reason="ordinary_model_once_new_override",
+    )
+
+    state = runner._session_state(key)
+    state.conversation.model_override = {
+        "model": "new-model",
+        "provider": "new-provider",
+    }
+    state.conversation.model_override_instance_id = "new-instance"
+    state.conversation.one_turn_restore = {
+        "had_override": False,
+        "override": None,
+        "restore_id": "new-instance",
+        "baseline_instance_id": None,
+    }
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert state.conversation.model_override == {
+        "model": "new-model",
+        "provider": "new-provider",
+    }
+    assert state.conversation.one_turn_restore["restore_id"] == "new-instance"
+    # Explicitly model the stale old finalizer after the replacement install.
+    runner._restore_pending_one_turn_model_override(
+        key, run_generation=old_generation
+    )
+    assert state.conversation.model_override["model"] == "new-model"
+
+
+@pytest.mark.asyncio
+async def test_ordinary_model_once_new_clears_pending_state(
+    monkeypatch, tmp_path
+):
+    runner, store = _lifecycle_runner(monkeypatch, tmp_path)
+    source = SessionSource(
+        platform=Platform.WHATSAPP,
+        chat_id="ordinary-model-once-new",
+        user_id="a",
+        chat_type="dm",
+    )
+    store.get_or_create_session(source)
+    key = runner._session_key_for_source(source)
+    _stage_model_once_override(runner, key)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_agent(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        raise asyncio.CancelledError
+
+    async def emit_hook(*args, **kwargs):
+        return None
+
+    runner.hooks = SimpleNamespace(emit=emit_hook)
+    monkeypatch.setattr(runner, "_handle_message_with_agent", blocked_agent)
+    task = asyncio.create_task(
+        runner._handle_message(MessageEvent(text="ordinary work", source=source))
+    )
+    await asyncio.wait_for(entered.wait(), timeout=2)
+
+    await runner._handle_reset_command(MessageEvent(text="/new", source=source))
+
+    state = runner._session_state(key)
+    assert state.conversation.model_override is None
+    assert state.conversation.one_turn_restore is None
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
 async def test_concurrent_a_b_direct_agentic_has_one_routing_owner(monkeypatch):
     runner = _ownership_runner(monkeypatch)
     source = SimpleNamespace(platform=Platform.WHATSAPP, chat_id="chat", user_id="a")
