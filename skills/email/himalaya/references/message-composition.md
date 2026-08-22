@@ -274,25 +274,30 @@ himalaya message add --mailbox drafts --flag draft < message.eml
 
 ```bash
 # Install mml. Upstream's Cargo package is `mime-meta-language`; the binary
-# is named `mml`. Pin one contract end-to-end:
+# is named `mml`. Pin one contract end-to-end — the CLI shape differs between
+# released tags and current master, so the install command and invocation must
+# agree on the same source.
 #
 #   Released `v1.1.1` (stable, recommended):
-#     cargo install mime-meta-language --locked --features cli
-#     mml compose --from me@example.org --output /tmp/draft.eml
+#     cargo install mime-meta-language --version 1.1.1 --locked --features cli
+#     # v1.1.1: `output` is a POSITIONAL argument
+#     mml compose --from me@example.org /tmp/draft.eml
 #     himalaya message send < /tmp/draft.eml
 #
 #   Current `master` (bleeding edge, output via global `-o/--output`):
 #     cargo install --locked --git https://github.com/pimalaya/mml.git
+#     # master: output is the global `-o` / `--output` flag
 #     mml compose --from me@example.org --output /tmp/draft.eml
 #     himalaya message send < /tmp/draft.eml
 #
 # Notes:
-# - `mml` rejects stdout redirection for editor-driven composition (the
-#   spawned editor needs a TTY); always use `--output`.
+# - Both contracts require a real path (stdout redirection breaks
+#   editor-driven composition because the spawned editor needs a TTY).
 # - The artifact consumed by `himalaya message send` is RFC 5322/MIME, so
 #   use a `.eml` extension, not `.mml` (which is the source template format).
-mml compose --from me@example.org --output /tmp/draft.eml
-himalaya message send < /tmp/draft.eml
+# - If you mix the install source with the wrong invocation, the binary will
+#   fail at parse time (positional `/tmp/draft.eml` is "unexpected argument"
+#   on master; `--output` is "unexpected argument" on v1.1.1).
 ```
 
 This is the cleanest path for attachments, PGP signing, and inline images.
