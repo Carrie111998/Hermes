@@ -204,10 +204,11 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
         return val
     # Startup race (#92124): the first auxiliary call can run before any
     # secret scope is installed. Non-multiplex deployments often keep keys
-    # ONLY in <home>/.env — check the file lazily (one read per miss, never
-    # mutating os.environ) so that first call succeeds. Multiplex never
-    # reaches here: it raised above. Env wins over the file, matching the
-    # overlay precedence everywhere else.
+    # ONLY in <hermes home>/.env (e.g. ~/.hermes/.env — NOT $HOME/.env) —
+    # check the file lazily (one read per miss, never mutating os.environ)
+    # so that first call succeeds. Multiplex never reaches here: it raised
+    # above. Env wins over the file, matching the overlay precedence
+    # everywhere else.
     try:
         from hermes_constants import get_hermes_home
 
