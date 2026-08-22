@@ -1,5 +1,5 @@
 import { usageBarsText } from '../../../components/overlayPrimitives.js'
-import { introMsg, toTranscriptMessages } from '../../../domain/messages.js'
+import { toTranscriptMessages, withSessionIntro } from '../../../domain/messages.js'
 import { sessionScopedModelArg, TUI_SESSION_MODEL_FLAG } from '../../../domain/slash.js'
 import type {
   BackgroundStartResponse,
@@ -17,7 +17,7 @@ import type { PanelSection } from '../../../types.js'
 import { applyConfiguredTuiTheme } from '../../createGatewayEventHandler.js'
 import { DEFAULT_INDICATOR_STYLE, INDICATOR_STYLES, type IndicatorStyle } from '../../interfaces.js'
 import { patchOverlayState } from '../../overlayStore.js'
-import { patchUiState } from '../../uiStore.js'
+import { getUiState, patchUiState } from '../../uiStore.js'
 import type { SlashCommand } from '../types.js'
 
 const USAGE_CTA = 'Run /subscription to change plan · /topup to add to your balance'
@@ -229,7 +229,7 @@ export const sessionCommands: SlashCommand[] = [
             if (Array.isArray(r.messages)) {
               const rows = toTranscriptMessages(r.messages)
 
-              ctx.transcript.setHistoryItems(r.info ? [introMsg(r.info), ...rows] : rows)
+              ctx.transcript.setHistoryItems(withSessionIntro(r.info ?? null, rows, getUiState().bannerEnabled))
             }
 
             if (r.info) {

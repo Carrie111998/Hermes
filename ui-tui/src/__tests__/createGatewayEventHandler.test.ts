@@ -1001,6 +1001,19 @@ describe('createGatewayEventHandler', () => {
     expect(resumeById).not.toHaveBeenCalled()
   })
 
+  it('removes intro chrome when gateway.ready disables banners', () => {
+    const ctx = buildCtx([])
+    const onEvent = createGatewayEventHandler(ctx)
+    const intro = { kind: 'intro' as const, role: 'system' as const, text: '' }
+    const user = { role: 'user' as const, text: 'hello' }
+
+    onEvent({ payload: { banner_enabled: false }, type: 'gateway.ready' } as any)
+
+    expect(getUiState().bannerEnabled).toBe(false)
+    const update = ctx.transcript.setHistoryItems.mock.calls[0][0]
+    expect(update([intro, user])).toEqual([user])
+  })
+
   it('on gateway.ready after a crash, resumes the recovered session once and skips forge', async () => {
     const appended: Msg[] = []
     const newSession = vi.fn()

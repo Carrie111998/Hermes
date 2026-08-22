@@ -5,6 +5,7 @@ import { forceRedraw, onTerminalBackground, onTerminalForeground } from '@hermes
 import { STARTUP_IMAGE, STARTUP_QUERY } from '../config/env.js'
 import { STREAM_BATCH_MS } from '../config/timing.js'
 import { buildSetupRequiredSections, SETUP_REQUIRED_TITLE } from '../content/setup.js'
+import { withSessionIntro } from '../domain/messages.js'
 import type {
   CommandsCatalogResponse,
   ConfigFullResponse,
@@ -759,6 +760,16 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
     switch (ev.type) {
       case 'gateway.ready':
+        patchUiState({ bannerEnabled: ev.payload?.banner_enabled !== false })
+        setHistoryItems(previous => {
+          const withoutIntro = previous.filter(message => message.kind !== 'intro')
+
+          if (ev.payload?.banner_enabled === false) {
+            return withoutIntro
+          }
+
+          return withSessionIntro(getUiState().info, withoutIntro, true)
+        })
         handleReady(ev.payload?.skin)
 
         return

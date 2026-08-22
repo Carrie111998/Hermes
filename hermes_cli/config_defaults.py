@@ -1267,6 +1267,8 @@ DEFAULT_CONFIG = {
     
     "display": {
         "compact": False,
+        # Show welcome/session chrome in interactive CLI and TUI surfaces.
+        "banner": True,
         "personality": "",
         "resume_display": "full",
         # Recap tuning for /resume and startup resume. The defaults match the

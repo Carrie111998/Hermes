@@ -243,6 +243,18 @@ def test_clear_command_starts_new_session_before_redrawing(tmp_path):
     assert cli.conversation_history == []
 
 
+def test_clear_command_suppresses_banner_when_disabled(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    cli.console = MagicMock()
+    cli.show_banner = MagicMock()
+    cli.banner_enabled = False
+
+    cli.process_command("/clear")
+
+    cli.console.clear.assert_called_once()
+    cli.show_banner.assert_called_once_with(show_chrome=False)
+
+
 def test_new_session_resets_token_counters(tmp_path):
     """Regression test for #2099: /new must zero all token counters."""
     cli = _prepare_cli_with_active_session(tmp_path)

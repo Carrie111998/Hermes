@@ -341,6 +341,7 @@ async def handle_ws(
         # (#60800). The skin payload is small (a dict of strings/arrays),
         # so the to_thread overhead is negligible.
         skin_payload = await asyncio.to_thread(server.resolve_skin)
+        banner_enabled = await asyncio.to_thread(server.resolve_banner_enabled)
         ready_ok = await transport.write_async(
             {
                 "jsonrpc": "2.0",
@@ -350,7 +351,11 @@ async def handle_ws(
                     # change_events: this backend broadcasts pet.changed /
                     # cron.changed / sessions.changed, so clients can demote
                     # their legacy polls to slow backstops.
-                    "payload": {"skin": skin_payload, "change_events": True},
+                    "payload": {
+                        "skin": skin_payload,
+                        "banner_enabled": banner_enabled,
+                        "change_events": True,
+                    },
                 },
             }
         )

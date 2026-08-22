@@ -3758,6 +3758,14 @@ def resolve_skin() -> dict:
         return {}
 
 
+def resolve_banner_enabled() -> bool:
+    """Return the interactive banner preference for TUI boot payloads."""
+    display = _load_cfg().get("display")
+    if not isinstance(display, dict):
+        return True
+    return bool(display.get("banner", True))
+
+
 # Signature of the last skin broadcast: (name, active user-file mtime). Lets the
 # per-tool reconcile fire ``skin.changed`` on any real move — a name switch OR a
 # live color edit to the active skin — and nothing else.
