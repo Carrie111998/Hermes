@@ -156,7 +156,8 @@ import {
   gatewayFilePath,
   isNotFoundError,
   parseDataUrlToBuffer,
-  pumpStreamToFile
+  pumpStreamToFile,
+  saveDialogFilters
 } from './gateway-file-download'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { registerGitIpc } from './git-ipc'
@@ -7410,6 +7411,7 @@ async function finalizeGatewayDownload(res, statusCode, headers, ctx: any = {}) 
 
   const result = await dialog.showSaveDialog(mainWindow, {
     defaultPath: filename,
+    filters: saveDialogFilters(filename),
     title: 'Save File'
   })
 
@@ -7539,6 +7541,7 @@ async function saveGatewayFileViaDataUrl(connection, profile, filePath, ctx: any
 
   const result = await dialog.showSaveDialog(mainWindow, {
     defaultPath: filename,
+    filters: saveDialogFilters(filename),
     title: 'Save File'
   })
 
