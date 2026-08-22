@@ -135,6 +135,106 @@ class TestPerJobToolsetMcpMerge:
             result = _resolve_cron_enabled_toolsets(job, {})
         assert result == ["file", "memory", "web"]
 
+    def test_resolver_failure_raises_typed_error_instead_of_loading_defaults(self):
+        import cron.scheduler as scheduler
+
+        with pytest.raises(
+            scheduler.CronToolsetResolutionError,
+            match="toolset resolution failed",
+        ):
+            _resolve_cron_enabled_toolsets(
+                {"enabled_toolsets": None},
+                {"platform_toolsets": ["not-a-mapping"]},
+            )
+
+    @pytest.mark.parametrize(
+        "cron_toolsets",
+        [
+            [123],
+            ["web", 123],
+            [{"web": True}],
+        ],
+    )
+    def test_platform_cron_toolsets_members_must_be_strings(self, cron_toolsets):
+        import cron.scheduler as scheduler
+
+        with pytest.raises(
+            scheduler.CronToolsetResolutionError,
+            match="toolset resolution failed",
+        ):
+            _resolve_cron_enabled_toolsets(
+                {"enabled_toolsets": None},
+                {"platform_toolsets": {"cron": cron_toolsets}},
+            )
+
+    def test_per_job_mcp_resolution_failure_raises_typed_error(self):
+        import cron.scheduler as scheduler
+
+        with pytest.raises(
+            scheduler.CronToolsetResolutionError,
+            match="toolset resolution failed",
+        ):
+            _resolve_cron_enabled_toolsets(
+                {"enabled_toolsets": ["web"]},
+                {"mcp_servers": ["not-a-mapping"]},
+            )
+
+    @pytest.mark.parametrize(
+        "bad_value",
+        [
+            "web",
+            "no_mcp",
+            [123],
+            ["web", 123],
+            {"web": True},
+        ],
+    )
+    def test_per_job_enabled_toolsets_must_be_list_of_strings(self, bad_value):
+        import cron.scheduler as scheduler
+
+        with pytest.raises(
+            scheduler.CronToolsetResolutionError,
+            match="toolset resolution failed",
+        ):
+            _resolve_cron_enabled_toolsets(
+                {"enabled_toolsets": bad_value},
+                self.CFG,
+            )
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"cron": "not-a-mapping"},
+            {"cron": False},
+            {"cron": {"allow_agent_scheduling": "false"}},
+            {"agent": []},
+            {"agent": {"disabled_toolsets": {"memory": True}}},
+            {"agent": {"disabled_toolsets": [{"memory": True}]}},
+            {"agent": {"disabled_toolsets": "[memory"}},
+        ],
+    )
+    def test_disabled_toolset_resolution_failure_is_typed(self, config):
+        import cron.scheduler as scheduler
+
+        with pytest.raises(
+            scheduler.CronToolsetResolutionError,
+            match="toolset resolution failed",
+        ):
+            scheduler._resolve_cron_disabled_toolsets(config)
+
+    def test_empty_platform_toolset_remains_explicit_empty_list(self):
+        result = _resolve_cron_enabled_toolsets(
+            {"enabled_toolsets": None},
+            {
+                "platform_toolsets": {"cron": []},
+                "context": {"engine": "hindsight"},
+                "mcp_servers": {"playwright": {"enabled": True}},
+            },
+        )
+
+        assert result == []
+        assert result is not None
+
 
 class TestResolveOrigin:
     def test_full_origin(self):
@@ -1345,9 +1445,20 @@ class TestRunJobModelResolution:
         assert error is None
         assert mock_agent_cls.call_args.kwargs["model"] == "alias-key-model"
 
-    def test_corrupt_config_yaml_does_not_crash_with_job_model(self, tmp_path, monkeypatch):
-        """A malformed config.yaml degrades gracefully when the job has a model."""
-        (tmp_path / "config.yaml").write_text("{{{invalid yaml!!!")
+    @pytest.mark.parametrize(
+        "bad_config",
+        [
+            "{{{invalid yaml!!!",
+            "- valid-yaml-but-not-a-mapping\n",
+            "[]\n",
+            "false\n",
+        ],
+    )
+    def test_unreadable_config_blocks_even_with_job_model(
+        self, tmp_path, monkeypatch, bad_config
+    ):
+        """An explicit model cannot make an unreadable authority policy safe."""
+        (tmp_path / "config.yaml").write_text(bad_config)
         monkeypatch.delenv("HERMES_MODEL", raising=False)
 
         job = {"id": "corrupt-job", "name": "corrupt", "prompt": "hi", "model": "explicit-model"}
@@ -1359,17 +1470,16 @@ class TestRunJobModelResolution:
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
              patch("hermes_state.SessionDB", return_value=fake_db), \
              patch("hermes_cli.runtime_provider.resolve_runtime_provider",
-                   return_value=self._RUNTIME), \
+                   return_value=self._RUNTIME) as runtime_resolver, \
              patch("run_agent.AIAgent") as mock_agent_cls:
-            mock_agent = MagicMock()
-            mock_agent.run_conversation.return_value = {"final_response": "ok"}
-            mock_agent_cls.return_value = mock_agent
-            success, _, _, error = run_job(job)
+            success, output, _, error = run_job(job)
 
-        # Explicit job model survives the corrupt-config fall-through.
-        assert success is True
-        assert error is None
-        assert mock_agent_cls.call_args.kwargs["model"] == "explicit-model"
+        assert success is False
+        assert error is not None and "[blocked_config]" in error
+        assert "config.yaml could not be loaded" in f"{error} {output}".lower()
+        assert "while parsing" not in output.lower()
+        runtime_resolver.assert_not_called()
+        mock_agent_cls.assert_not_called()
 
 
 class TestRunJobSkillBacked:
