@@ -38,6 +38,9 @@ data/
 .pytest_cache/
 test_durations.json
 .pytest-cache/
+# Unique repo-local pytest basetemps used by focused acceptance runs.
+# They are disposable test state and can contain thousands of nested files.
+/.pytest-*/
 tmp/
 temp_vision_images/
 hermes-*/*
