@@ -216,6 +216,26 @@ def test_snapshot_rejects_malformed_execution_liveness_evidence():
         _settlement(execution_census=lambda: [malformed]).snapshot(("target-1",))
 
 
+@pytest.mark.parametrize("field", ["id", "job_id"])
+@pytest.mark.parametrize("value", [None, "", "  "])
+def test_snapshot_rejects_malformed_execution_identity(field, value):
+    malformed = {
+        "id": "execution-1",
+        "job_id": "target-1",
+        "status": "running",
+        "owner_liveness": "live",
+        "owner_liveness_evidence": {
+            "process_id": "process-1",
+            "pid": 42,
+            "process_started_at": 100.0,
+        },
+    }
+    malformed[field] = value
+
+    with pytest.raises(RuntimeError, match="execution identity"):
+        _settlement(execution_census=lambda: [malformed]).snapshot(("target-1",))
+
+
 def test_fence_transition_requires_the_exact_held_barrier_capability():
     control_store = _ControlStore()
     control = _settlement(control_store=control_store)

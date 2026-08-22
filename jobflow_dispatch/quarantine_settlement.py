@@ -84,6 +84,11 @@ def _execution_row(value: Any) -> dict[str, Any]:
     row = copy.deepcopy(value)
     if not {"id", "job_id", "status", "owner_liveness", "owner_liveness_evidence"} <= set(row):
         raise RuntimeError("execution census contains an incomplete row")
+    try:
+        row["id"] = _identity(row["id"], "execution id")
+        row["job_id"] = _identity(row["job_id"], "execution job id")
+    except ValueError as exc:
+        raise RuntimeError("execution identity is incomplete") from exc
     if row["status"] not in {"claimed", "running"}:
         raise RuntimeError("execution census contains a terminal row")
     if row["owner_liveness"] not in _LIVENESS:
