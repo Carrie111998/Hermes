@@ -44,7 +44,9 @@ export function createClientSessionState(
     needsInput: false,
     turnStartedAt: null,
     turnLive: false,
-    usage: null
+    usage: null,
+    lastActivityAt: null,
+    lastActivityDescription: ''
   }
 }
 
@@ -447,7 +449,14 @@ export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
       content: message.parts.filter((part): part is Extract<ChatMessagePart, { type: 'text' }> => part.type === 'text'),
       attachments: [],
       createdAt,
-      metadata: { custom: { attachmentRefs: message.attachmentRefs ?? [], ...reactionMeta, ...timelineMeta } }
+      metadata: {
+        custom: {
+          attachmentRefs: message.attachmentRefs ?? [],
+          ...(message.deliveryState ? { deliveryState: message.deliveryState } : {}),
+          ...reactionMeta,
+          ...timelineMeta
+        }
+      }
     } as ThreadMessage
   }
 

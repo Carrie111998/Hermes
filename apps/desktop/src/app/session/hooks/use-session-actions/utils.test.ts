@@ -1400,17 +1400,43 @@ describe('appendLiveSessionProjection', () => {
     expect(userText).toBe('current running prompt')
   })
 
+  it('settles the correlated queued bubble when resume proves that turn is inflight', () => {
+    const stored = [
+      msg('user-question-mark', 'user', '؟', {
+        deliveryState: 'queued',
+        deliveryClearsOnProgress: true
+      })
+    ]
+
+    const restored = appendLiveSessionProjection(stored, {
+      session_id: 'runtime-1',
+      inflight: {
+        client_message_id: 'user-question-mark',
+        user: '؟',
+        assistant: 'بدأت',
+        streaming: true
+      }
+    })
+
+    expect(restored.filter(message => message.role === 'user')).toHaveLength(1)
+    expect(restored[0]).toMatchObject({ id: 'user-question-mark', role: 'user' })
+    expect(restored[0]).not.toHaveProperty('deliveryState')
+    expect(restored[0]).not.toHaveProperty('deliveryClearsOnProgress')
+    expect(restored[1]).toMatchObject({ id: 'assistant-stream-runtime-1', pending: true })
+  })
+
   it('restores the running turn and accepted queued prompt after a renderer restart', () => {
     const stored = [msg('stored-user', 'user', 'earlier'), msg('stored-assistant', 'assistant', 'earlier answer')]
 
     const restored = appendLiveSessionProjection(stored, {
       session_id: 'runtime-1',
       inflight: {
+        client_message_id: 'user-current-client',
         user: 'current prompt',
         assistant: 'partial answer',
         streaming: true
       },
-      queued: { user: 'newest prompt' }
+      queued: { client_message_id: 'user-queued-client', user: 'newest prompt' }
     })
 
     expect(restored.map(message => message.role)).toEqual(['user', 'assistant', 'user', 'assistant', 'user'])
@@ -1422,6 +1448,8 @@ describe('appendLiveSessionProjection', () => {
       'newest prompt'
     ])
     expect(restored[3]).toMatchObject({ id: 'assistant-stream-runtime-1', pending: true })
+    expect(restored[2]).toMatchObject({ id: 'user-current-client' })
+    expect(restored[4]).toMatchObject({ id: 'user-queued-client', deliveryState: 'queued' })
   })
 
   it('does not duplicate a persisted inflight user after consecutive canceled user turns', () => {

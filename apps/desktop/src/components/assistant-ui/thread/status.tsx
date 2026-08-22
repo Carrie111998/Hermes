@@ -63,6 +63,8 @@ function useThreadSessionStatus() {
   // finished with), which is exactly when the transcript used to fall silent
   // while the app still said it was working.
   const busy = useStore(view.$busy)
+  const lastActivityAt = useStore(view.$lastActivityAt)
+  const lastActivityDescription = useStore(view.$lastActivityDescription)
   const turnStartedAt = useStore(view.$turnStartedAt)
   const compacting = useStore(useMemo(() => sessionCompacting(sessionId), [sessionId]))
   const drafting = useStore(useMemo(() => sessionDraftingTool(sessionId), [sessionId]))
@@ -77,6 +79,8 @@ function useThreadSessionStatus() {
     busy,
     compacting,
     drafting,
+    lastActivityAt,
+    lastActivityDescription,
     providerWait,
     // Epoch ms this surface's turn began, or undefined between turns. The
     // origin for anything measuring the WHOLE turn rather than one phase of
@@ -94,7 +98,12 @@ const DRAFTING_REVEAL_MS = 200
  * What to call the wait, if it deserves a name. Compaction outranks a draft —
  * it's rarer, slower, and explains a transcript that looks like it reset.
  */
-function useStatusHint(compacting: boolean, drafting: DraftingTool | null, providerWait: string): string {
+function useStatusHint(
+  compacting: boolean,
+  drafting: DraftingTool | null,
+  providerWait: string,
+  lastActivityDescription = ''
+): string {
   const [revealed, setRevealed] = useState(false)
   const name = drafting?.name ?? ''
 
@@ -118,7 +127,11 @@ function useStatusHint(compacting: boolean, drafting: DraftingTool | null, provi
     return providerWait
   }
 
-  return revealed && name ? toolPresentVerb(name) : ''
+  if (revealed && name) {
+    return toolPresentVerb(name)
+  }
+
+  return lastActivityDescription
 }
 
 export const CenteredThreadSpinner: FC = () => {
@@ -144,9 +157,18 @@ export const CenteredThreadSpinner: FC = () => {
 
 export const ResponseLoadingIndicator: FC = () => {
   const { t } = useI18n()
-  const { compacting, drafting, providerWait, turnStartedAt } = useThreadSessionStatus()
-  const elapsed = useElapsedSeconds(true, undefined, turnStartedAt)
-  const hint = useStatusHint(compacting, drafting, providerWait)
+
+  const { compacting, drafting, lastActivityAt, lastActivityDescription, providerWait, turnStartedAt } =
+    useThreadSessionStatus()
+
+  const hint = useStatusHint(compacting, drafting, providerWait, lastActivityDescription)
+
+  const hintStartedAt = compacting
+    ? turnStartedAt
+    : (drafting?.since ??
+      (!providerWait && lastActivityDescription ? (lastActivityAt ?? turnStartedAt) : turnStartedAt))
+
+  const elapsed = useElapsedSeconds(true, undefined, hintStartedAt)
 
   return (
     <StatusRow data-slot="aui_response-loading" label={hint || t.assistant.thread.loadingResponse}>
@@ -214,8 +236,19 @@ export const TurnActivityIndicator: FC = () => {
   // timer read "quiet for 12s" rather than the age of this component, which is
   // the whole turn so far.
   const [quietSince, setQuietSince] = useState<number | undefined>(undefined)
-  const { awaitingInput, busy, compacting, drafting, providerWait, turnStartedAt } = useThreadSessionStatus()
-  const hint = useStatusHint(compacting, drafting, providerWait)
+
+  const {
+    awaitingInput,
+    busy,
+    compacting,
+    drafting,
+    lastActivityAt,
+    lastActivityDescription,
+    providerWait,
+    turnStartedAt
+  } = useThreadSessionStatus()
+
+  const hint = useStatusHint(compacting, drafting, providerWait, lastActivityDescription)
 
   // A tool run at the tail already narrates the wait — its summary counts the
   // calls, its ticker names the current one, and it carries its own timer. A
@@ -249,7 +282,12 @@ export const TurnActivityIndicator: FC = () => {
   const elapsed = useElapsedSeconds(
     active,
     undefined,
-    compacting ? turnStartedAt : (quietSince ?? drafting?.since ?? turnStartedAt)
+    compacting
+      ? turnStartedAt
+      : (drafting?.since ??
+          (!providerWait && lastActivityDescription ? lastActivityAt : undefined) ??
+          quietSince ??
+          turnStartedAt)
   )
 
   if (!active) {

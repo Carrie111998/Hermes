@@ -36,6 +36,16 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
       void refreshBackgroundProcesses(sessionId)
     } else if (sessionId && payload?.kind === 'goal') {
       applyGoalStatusText(sessionId, coerceGatewayText(payload?.text))
+    } else if (sessionId && payload?.kind === 'lifecycle') {
+      const text = coerceGatewayText(payload?.text).trim()
+
+      if (text) {
+        updateSessionState(sessionId, state => ({
+          ...state,
+          lastActivityAt: occurredAt * 1000,
+          lastActivityDescription: text
+        }))
+      }
     }
 
     return true

@@ -10399,6 +10399,59 @@ def test_session_redirect_calls_capable_core_agent(monkeypatch):
     assert before is None or session["last_active"] >= before
 
 
+def test_session_redirect_prioritizes_user_over_local_lease_waiter(monkeypatch):
+    """A user correction must not sit behind a synthetic cross-process wait."""
+
+    class _ImmediateInterruptThread:
+        def __init__(self, target=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            assert self._target is not None
+            self._target()
+
+    class _Agent:
+        _supports_active_turn_redirect = True
+        _waiting_for_session_turn_lease = True
+
+        def __init__(self):
+            self.interrupted = False
+
+        def redirect(self, _text):
+            raise AssertionError("lease waiter must be queued before redirect")
+
+        def interrupt(self):
+            self.interrupted = True
+
+    agent = _Agent()
+    session = _session(agent=agent, running=True)
+    session["inflight_turn"] = {
+        "user": "synthetic completion",
+        "assistant": "",
+        "streaming": True,
+        "error": "",
+    }
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateInterruptThread)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.redirect",
+                "params": {"session_id": "sid", "text": "user message wins"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert resp["result"] == {
+        "status": "queued",
+        "text": "user message wins",
+    }
+    assert session["queued_prompt"]["text"] == "user message wins"
+    assert agent.interrupted is True
+
+
 def test_session_redirect_rpc_drops_queued_duplicate_of_inflight_user():
     """#84417: Desktop ``session.redirect`` must purge stale self-duplicates.
 
@@ -14573,6 +14626,61 @@ def test_session_active_list_reports_live_sessions(monkeypatch):
     assert rows["sid-b"]["status"] == "working"
     assert rows["sid-b"]["title"] == "Implement"
     assert rows["sid-b"]["preview"] == "writing code"
+
+
+def test_session_active_list_projects_cross_process_turn_activity(monkeypatch):
+    class _DB:
+        def get_session_title(self, _key):
+            return "Shared work"
+
+        def get_active_session_turn_lease(self, key):
+            assert key == "shared-key"
+            return {
+                "conversation_id": key,
+                "holder": "pid=424242:platform=api_server",
+                "acquired_at": 40.0,
+                "expires_at": 400.0,
+            }
+
+        def resolve_resume_session_id(self, key):
+            assert key == "shared-key"
+            return "shared-tip"
+
+        def get_session_activity(self, key):
+            assert key == "shared-tip"
+            return {
+                "last_activity_at": 55.0,
+                "last_activity_description": "executing tool: terminal",
+            }
+
+    previous_sessions = dict(server._sessions)
+    server._sessions.clear()
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    server._sessions["sid-shared"] = _session(
+        agent=types.SimpleNamespace(model="model-shared"),
+        history=[{"role": "user", "content": "continue elsewhere"}],
+        running=False,
+        session_key="shared-key",
+        created_at=10.0,
+        last_active=20.0,
+    )
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.active_list",
+                "params": {},
+            }
+        )
+    finally:
+        server._sessions.clear()
+        server._sessions.update(previous_sessions)
+
+    row = resp["result"]["sessions"][0]
+    assert row["status"] == "working"
+    assert row["last_active"] == 55.0
+    assert row["last_activity_at"] == 55.0
+    assert row["last_activity_description"] == "executing tool: terminal"
 
 
 def test_session_active_list_excludes_finalized_sessions(monkeypatch):

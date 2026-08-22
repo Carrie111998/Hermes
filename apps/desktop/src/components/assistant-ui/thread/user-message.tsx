@@ -1,6 +1,8 @@
 import { ActionBarPrimitive, BranchPickerPrimitive, MessagePrimitive, useAuiState } from '@assistant-ui/react'
+import { useStore } from '@nanostores/react'
 import { type FC, type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
 
+import { useSessionView } from '@/app/chat/session-view'
 import { DirectiveContent } from '@/components/assistant-ui/directive-text'
 import { messageAttachmentRefs, messageContentText } from '@/components/assistant-ui/thread/content'
 import { ReactionBadge, ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
@@ -270,6 +272,14 @@ export const UserMessage: FC<{
   const content = useAuiState(s => s.message.content)
   const messageText = messageContentText(content)
   const threadRunning = useAuiState(s => s.thread.isRunning)
+  const sessionView = useSessionView()
+  const lastActivityDescription = useStore(sessionView.$lastActivityDescription)
+
+  const deliveryState = useAuiState(s => {
+    const value = (s.message.metadata?.custom as { deliveryState?: unknown } | undefined)?.deliveryState
+
+    return value === 'sending' || value === 'queued' || value === 'failed' ? value : undefined
+  })
 
   const latestUserId = useAuiState(s => {
     for (let i = s.thread.messages.length - 1; i >= 0; i--) {
@@ -399,6 +409,25 @@ export const UserMessage: FC<{
 
   const hasBody = messageText.trim().length > 0
   const isLatestUser = messageId === latestUserId
+  const queuedBySessionActivity = isLatestUser && /^Queued behind active Hermes\b/.test(lastActivityDescription.trim())
+
+  const effectiveDeliveryState =
+    deliveryState === 'failed' ? 'failed' : queuedBySessionActivity ? 'queued' : deliveryState
+
+  const deliveryLabel =
+    effectiveDeliveryState === 'sending'
+      ? copy.messageSending
+      : effectiveDeliveryState === 'queued'
+        ? copy.messageQueued
+        : effectiveDeliveryState === 'failed'
+          ? copy.messageFailed
+          : null
+
+  // An explicit state belongs to this exact client-correlated bubble and must
+  // remain visible even when a newer prompt is queued behind it. Only the
+  // cross-process activity fallback is latest-only because it has no message
+  // id to correlate safely.
+  const showDeliveryLabel = Boolean(deliveryLabel) && (Boolean(deliveryState) || isLatestUser)
   const showStop = !readOnly && isLatestUser && threadRunning && Boolean(onCancel)
   // Restore (re-run this exact prompt) is available everywhere the Stop button
   // isn't — including mid-stream on older prompts, since the action interrupts
@@ -578,6 +607,20 @@ export const UserMessage: FC<{
               onRetract={() => react(null)}
               reactions={shownReactions}
             />
+            {showDeliveryLabel && deliveryLabel && (
+              <span
+                aria-live="polite"
+                className={cn(
+                  'self-end pr-1.5 text-[0.625rem] leading-4 text-muted-foreground/60',
+                  effectiveDeliveryState === 'failed' && 'text-destructive/85'
+                )}
+                data-delivery-state={effectiveDeliveryState}
+                data-slot="aui_user-delivery-status"
+                role="status"
+              >
+                {deliveryLabel}
+              </span>
+            )}
             <MessageTimelineTimestamp className="self-end pr-1.5" />
             <BranchPickerPrimitive.Root
               className={cn(

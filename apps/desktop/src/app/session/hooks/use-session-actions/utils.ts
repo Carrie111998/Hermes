@@ -146,6 +146,7 @@ const COMPARED_FIELDS = [
   'id',
   'role',
   'pending',
+  'deliveryState',
   'error',
   // Structured failure layer — drives the error card's title and action row,
   // so a change (e.g. resume replay attaching the descriptor) must repaint.
@@ -161,7 +162,7 @@ const COMPARED_FIELDS = [
   'durationS'
 ] as const
 
-const IGNORED_FIELDS = ['attachmentRefs', 'parts', 'rowId'] as const
+const IGNORED_FIELDS = ['attachmentRefs', 'deliveryClearsOnProgress', 'parts', 'rowId'] as const
 
 // Compile-time check: every ChatMessagePart discriminant must be handled by
 // chatPartsEquivalent. If @assistant-ui adds a new part type, this fails tsc.
@@ -257,6 +258,7 @@ export function chatMessagesEquivalent(a: ChatMessage, b: ChatMessage): boolean 
     a.id !== b.id ||
     a.role !== b.role ||
     a.pending !== b.pending ||
+    a.deliveryState !== b.deliveryState ||
     a.error !== b.error ||
     // Structural compare — the descriptor arrives as a fresh object per
     // resume/replay, so identity comparison would repaint forever.
@@ -726,8 +728,36 @@ type ReconciledSessionResumeResponse = SessionResumeResponse & {
 
 export function appendLiveSessionProjection(messages: ChatMessage[], projection: LiveSessionProjection): ChatMessage[] {
   const inflightUser = projection.inflight?.user?.trim() ?? ''
+  const inflightClientMessageId = projection.inflight?.client_message_id?.trim() ?? ''
   const inflightAssistant = projection.inflight?.assistant ?? ''
   const inflightStreaming = Boolean(projection.inflight?.streaming)
+
+  // message.start can be missed while Desktop is disconnected. A correlated
+  // inflight snapshot is equivalent proof that this exact accepted prompt has
+  // started, so its optimistic bubble must no longer claim to be queued.
+  // `deliveryClearsOnProgress` is transient dispatch metadata used by deferred
+  // redirects; once the turn is inflight it has served its purpose too.
+  const reconciledMessages = inflightClientMessageId
+    ? messages.map(message => {
+        if (message.id !== inflightClientMessageId) {
+          return message
+        }
+
+        if (
+          message.deliveryState === undefined &&
+          !Object.prototype.hasOwnProperty.call(message, 'deliveryClearsOnProgress')
+        ) {
+          return message
+        }
+
+        const settled = { ...message }
+
+        delete settled.deliveryState
+        delete settled.deliveryClearsOnProgress
+
+        return settled
+      })
+    : messages
 
   // Mid-turn redirect corrections. They are additional user bubbles belonging
   // to this same turn, ordered by arrival: after the output that had already
@@ -753,6 +783,7 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
   const inflightError = projection.inflight?.error?.trim() ?? ''
   const inflightErrorSurface = parseErrorSurface(projection.inflight?.error_surface)
   const queuedUser = projection.queued?.user?.trim() ?? ''
+  const queuedClientMessageId = projection.queued?.client_message_id?.trim() ?? ''
 
   if (
     !inflightUser &&
@@ -762,7 +793,7 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
     !queuedUser &&
     !inflightCorrections.length
   ) {
-    return messages
+    return reconciledMessages
   }
 
   const sessionId = projection.session_id || 'session'
@@ -777,11 +808,11 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
   // rows (#73793), so collect the run by walking back over the live tail:
   // user rows count, live-tail assistant rows are skipped, and a committed
   // assistant reply ends the turn.
-  const latestUserIndex = messages.map(message => message.role).lastIndexOf('user')
+  const latestUserIndex = reconciledMessages.map(message => message.role).lastIndexOf('user')
   const latestUserRun: ChatMessage[] = []
 
   for (let index = latestUserIndex; index >= 0; index -= 1) {
-    const candidate = messages[index]
+    const candidate = reconciledMessages[index]
 
     if (candidate.role === 'user') {
       latestUserRun.unshift(candidate)
@@ -806,7 +837,7 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
 
   if (inflightUser && !inflightUserAlreadyPersisted) {
     projected.push({
-      id: `user-inflight-${sessionId}`,
+      id: inflightClientMessageId || `user-inflight-${sessionId}`,
       role: 'user',
       parts: [textPart(inflightUser)]
     })
@@ -824,7 +855,7 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
   const liveStreamId = `assistant-stream-${sessionId}`
 
   const liveAssistantOfCurrentTurn = ((): ChatMessage | null => {
-    const byStreamId = messages.find(message => message.id === liveStreamId)
+    const byStreamId = reconciledMessages.find(message => message.id === liveStreamId)
 
     if (byStreamId) {
       return byStreamId
@@ -835,9 +866,9 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
       return null
     }
 
-    for (let index = messages.length - 1; index > latestUserIndex; index -= 1) {
-      if (messages[index].role === 'assistant') {
-        return messages[index]
+    for (let index = reconciledMessages.length - 1; index > latestUserIndex; index -= 1) {
+      if (reconciledMessages[index].role === 'assistant') {
+        return reconciledMessages[index]
       }
     }
 
@@ -924,15 +955,25 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
     }
   }
 
-  if (queuedUser) {
+  if (
+    queuedUser &&
+    (!queuedClientMessageId || !reconciledMessages.some(message => message.id === queuedClientMessageId))
+  ) {
     projected.push({
-      id: `user-queued-${sessionId}`,
+      id: queuedClientMessageId || `user-queued-${sessionId}`,
       role: 'user',
-      parts: [textPart(queuedUser)]
+      parts: [textPart(queuedUser)],
+      deliveryState: 'queued'
     })
   }
 
-  return projected.length ? [...messages, ...projected] : messages
+  const combined = projected.length ? [...reconciledMessages, ...projected] : reconciledMessages
+
+  return queuedClientMessageId
+    ? combined.map(message =>
+        message.id === queuedClientMessageId ? { ...message, deliveryState: 'queued' } : message
+      )
+    : combined
 }
 
 function normalizedMessageText(message: ChatMessage): string {

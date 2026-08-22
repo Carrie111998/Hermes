@@ -6,6 +6,7 @@ import { $changeEventsAvailable, notifySessionsChanged, resetLiveSync } from '@/
 import { $activeSessionId, $selectedStoredSessionId, setBusy, setMessagingSessions, setSessions } from '@/store/session'
 import {
   $attentionSessionIds,
+  $sessionStates,
   $stalledSessionIds,
   $workingSessionIds,
   clearAllSessionStates,
@@ -359,6 +360,36 @@ describe('rehydrateLiveSessionStatuses', () => {
     expect($workingSessionIds.get()).toEqual(['needs-user'])
     expect($attentionSessionIds.get()).toEqual(['needs-user'])
     expect($stalledSessionIds.get()).toEqual([])
+  })
+
+  it('projects and clears durable cross-process activity', () => {
+    rehydrateLiveSessionStatuses({
+      sessions: [
+        {
+          id: 'runtime-shared',
+          last_activity_at: 123,
+          last_activity_description: 'executing tool: terminal',
+          session_key: 'shared-session',
+          status: 'working'
+        }
+      ]
+    })
+
+    expect($sessionStates.get()['runtime-shared']).toMatchObject({
+      busy: true,
+      lastActivityAt: 123_000,
+      lastActivityDescription: 'executing tool: terminal'
+    })
+
+    rehydrateLiveSessionStatuses({
+      sessions: [{ id: 'runtime-shared', session_key: 'shared-session', status: 'idle' }]
+    })
+
+    expect($sessionStates.get()['runtime-shared']).toMatchObject({
+      busy: false,
+      lastActivityAt: null,
+      lastActivityDescription: ''
+    })
   })
 
   it('ignores idle, starting, and malformed live-session rows', () => {

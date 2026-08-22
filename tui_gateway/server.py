@@ -1781,6 +1781,7 @@ def _compute_host_turn_frame(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    client_message_id: str | None = None,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -1797,6 +1798,7 @@ def _compute_host_turn_frame(
         "session_key": session.get("session_key") or sid,
         "text": text,
         **({"display_kind": display_kind} if display_kind else {}),
+        **({"client_message_id": client_message_id} if client_message_id else {}),
         "history": history,
         "history_version": history_version,
         "cols": int(session.get("cols", 80) or 80),
@@ -1886,6 +1888,7 @@ def _submit_prompt_to_compute_host(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    client_message_id: str | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -1896,6 +1899,7 @@ def _submit_prompt_to_compute_host(
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
         display_kind=display_kind,
+        client_message_id=client_message_id,
     )
 
     def _complete(done: dict) -> None:
@@ -5667,6 +5671,28 @@ def _session_usage_snapshot(session: dict | None) -> dict:
     return dict(mirror_usage) if isinstance(mirror_usage, dict) else {}
 
 
+def _session_activity_snapshot(session: dict | None) -> dict:
+    agent = (session or {}).get("agent") if isinstance(session, dict) else None
+    summary = None
+    if agent is not None:
+        try:
+            getter = getattr(agent, "get_activity_summary", None)
+            if callable(getter):
+                summary = getter()
+        except Exception:
+            logger.debug("session activity summary failed", exc_info=True)
+    if not isinstance(summary, dict):
+        summary = {}
+    return {
+        "last_activity_at": summary.get("last_activity_at"),
+        "last_activity_description": str(
+            summary.get("last_activity_description")
+            or summary.get("last_activity_desc")
+            or ""
+        ),
+    }
+
+
 def _project_info_for_cwd(cwd: str) -> dict | None:
     """Return the first-class Project owning ``cwd`` for UI status surfaces.
 
@@ -5783,6 +5809,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "update_behind": None,
         "update_command": "",
         "usage": _session_usage_snapshot(session),
+        **_session_activity_snapshot(session),
         "profile_name": _response_profile_name(
             Path(session["profile_home"]).name
             if isinstance(session, dict) and session.get("profile_home")
@@ -7856,7 +7883,14 @@ def _inflight_text(value: Any) -> str:
     return _content_display_text(value).strip()
 
 
-def _start_inflight_turn(session: dict, text: Any) -> None:
+def _client_message_id(value: Any) -> str | None:
+    """Return a usable optional client-side message correlation id."""
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _start_inflight_turn(
+    session: dict, text: Any, client_message_id: str | None = None
+) -> None:
     now = time.time()
     session["inflight_turn"] = {
         "assistant": "",
@@ -7864,6 +7898,11 @@ def _start_inflight_turn(session: dict, text: Any) -> None:
         "streaming": True,
         "updated_at": now,
         "user": _inflight_text(text),
+        **(
+            {"client_message_id": normalized_id}
+            if (normalized_id := _client_message_id(client_message_id))
+            else {}
+        ),
     }
 
 
@@ -8111,17 +8150,20 @@ def _enqueue_prompt(
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
+    client_message_id: str | None = None,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
     Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). Text-only
-    arrivals share a slot and merge losslessly (mirroring the consecutive-user
-    merge in ``repair_message_sequence``). Image-bearing submissions stay as
-    separate envelopes, so their attachment ownership and chronology survive.
+    legacy arrivals share a slot and merge losslessly (mirroring the
+    consecutive-user merge in ``repair_message_sequence``). Correlated and
+    image-bearing submissions stay as separate envelopes, so one
+    ``message.start`` id and attachment set always identify one submission.
     ``transport`` is pinned so the drained turn streams back to the client that
     sent it even if the session transport is rebound meanwhile.
     """
     image_paths = list(image_paths or [])
+    client_message_id = _client_message_id(client_message_id)
     # #84417: scrub any live-turn self-duplicates first so the consecutive-text
     # merge below cannot glue "{original}\\n\\n{later}" and re-fire original
     # on drain after a later correction settles.
@@ -8134,9 +8176,20 @@ def _enqueue_prompt(
         original = (
             str(turn.get("user") or "").strip() if isinstance(turn, dict) else ""
         )
-        if original and text.strip() == original:
+        original_message_id = (
+            _client_message_id(turn.get("client_message_id"))
+            if isinstance(turn, dict)
+            else None
+        )
+        if (
+            original
+            and text.strip() == original
+            and (not client_message_id or client_message_id == original_message_id)
+        ):
             return
     queued = {"text": text, "transport": transport}
+    if client_message_id:
+        queued["client_message_id"] = client_message_id
     if image_paths:
         queued["image_paths"] = image_paths
     existing = session.get("queued_prompt")
@@ -8146,6 +8199,8 @@ def _enqueue_prompt(
         and isinstance(text, str)
         and not existing.get("image_paths")
         and not image_paths
+        and not existing.get("client_message_id")
+        and not client_message_id
         and not session.get("queued_prompts")
     ):
         prev = existing["text"]
@@ -8158,12 +8213,13 @@ def _enqueue_prompt(
 
 
 def _sanitize_queued_entry_vs_inflight_user(
-    entry: Any, original: str
+    entry: Any, original: str, original_client_message_id: str | None = None
 ) -> dict | None:
     """Drop or rewrite a queue envelope that re-carries the live user text.
 
     Returns ``None`` to drop the envelope, or a (possibly rewritten) dict to
-    keep. Text-only self-duplicates of ``original`` are dropped. A merged
+    keep. Text-only self-duplicates of ``original`` are dropped unless a
+    distinct client id proves a separate submission. A merged
     slot ``"{original}\\n\\n{later}"`` (from ``_enqueue_prompt``'s consecutive
     text merge) is rewritten to just ``later`` so a later correction is not
     lost and the original is not re-fired (#84417). Image-bearing envelopes
@@ -8172,6 +8228,11 @@ def _sanitize_queued_entry_vs_inflight_user(
     if not original or not isinstance(entry, dict):
         return entry if isinstance(entry, dict) else None
     if entry.get("image_paths"):
+        return entry
+    entry_message_id = _client_message_id(entry.get("client_message_id"))
+    if entry_message_id and entry_message_id != original_client_message_id:
+        # Same text with a different client id is a distinct user submission,
+        # not the stale optimistic resend this scrubber removes.
         return entry
     text = entry.get("text")
     if not isinstance(text, str):
@@ -8211,6 +8272,7 @@ def _drop_queued_duplicates_of_inflight_user(session: dict) -> None:
     if not isinstance(turn, dict):
         return
     original = str(turn.get("user") or "").strip()
+    original_client_message_id = _client_message_id(turn.get("client_message_id"))
     if not original:
         return
 
@@ -8218,7 +8280,9 @@ def _drop_queued_duplicates_of_inflight_user(session: dict) -> None:
     rest = list(session.get("queued_prompts") or [])
     kept: list[dict] = []
     for entry in ([head] if head else []) + rest:
-        cleaned = _sanitize_queued_entry_vs_inflight_user(entry, original)
+        cleaned = _sanitize_queued_entry_vs_inflight_user(
+            entry, original, original_client_message_id
+        )
         if cleaned is not None:
             kept.append(cleaned)
 
@@ -8269,7 +8333,13 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    queued: bool = False,
+    client_message_id: str | None = None,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -8347,7 +8417,13 @@ def _handle_busy_submit(
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        _enqueue_prompt(
+            session,
+            text,
+            transport,
+            image_paths=image_paths,
+            client_message_id=client_message_id,
+        )
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without
@@ -8418,10 +8494,24 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    **(
+                        {"client_message_id": queued["client_message_id"]}
+                        if queued.get("client_message_id")
+                        else {}
+                    ),
                 )
             else:
                 resp = _submit_prompt_to_compute_host(
-                    rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
+                    rid,
+                    sid,
+                    session,
+                    queued["text"],
+                    queued_prompt_generation=queue_generation,
+                    **(
+                        {"client_message_id": queued["client_message_id"]}
+                        if queued.get("client_message_id")
+                        else {}
+                    ),
                 )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
@@ -8439,6 +8529,11 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    **(
+                        {"client_message_id": queued["client_message_id"]}
+                        if queued.get("client_message_id")
+                        else {}
+                    ),
                 )
             else:
                 _run_prompt_submit(
@@ -8447,6 +8542,11 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
+                    **(
+                        {"client_message_id": queued["client_message_id"]}
+                        if queued.get("client_message_id")
+                        else {}
+                    ),
                 )
     except Exception as exc:
         print(
@@ -8482,6 +8582,8 @@ def _inflight_snapshot(session: dict) -> dict | None:
         "streaming": streaming,
         "user": user,
     }
+    if client_message_id := _client_message_id(turn.get("client_message_id")):
+        snapshot["client_message_id"] = client_message_id
     raw_corrections = turn.get("corrections") or []
     raw_offsets = turn.get("correction_offsets") or []
     correction_pairs = [
@@ -8598,7 +8700,12 @@ def _queued_prompt_snapshot(session: dict) -> dict | None:
     if not isinstance(queued, dict):
         return None
     user = _inflight_text(queued.get("text"))
-    return {"user": user} if user else None
+    if not user:
+        return None
+    snapshot = {"user": user}
+    if client_message_id := _client_message_id(queued.get("client_message_id")):
+        snapshot["client_message_id"] = client_message_id
+    return snapshot
 
 
 # ── Methods: session ─────────────────────────────────────────────────
@@ -8825,6 +8932,35 @@ def _session_live_title(session: dict, key: str) -> str:
     return title
 
 
+def _durable_active_turn_snapshot(session: dict, key: str) -> dict | None:
+    """Read the shared-DB activity for a conversation owned by any process."""
+    if not key:
+        return None
+    try:
+        with _session_db(session) as db:
+            if db is None:
+                return None
+            lease_getter = getattr(db, "get_active_session_turn_lease", None)
+            if not callable(lease_getter) or not lease_getter(key):
+                return None
+            activity_key = key
+            resume_resolver = getattr(db, "resolve_resume_session_id", None)
+            if callable(resume_resolver):
+                activity_key = str(resume_resolver(key) or key)
+            activity_getter = getattr(db, "get_session_activity", None)
+            activity = (
+                activity_getter(activity_key)
+                if callable(activity_getter)
+                else None
+            )
+    except Exception:
+        logger.debug(
+            "failed to read durable active turn for %s", key, exc_info=True
+        )
+        return None
+    return activity if isinstance(activity, dict) else {}
+
+
 def _session_live_item(sid: str, session: dict, current_sid: str = "") -> dict:
     key = _session_lookup_key(session, fallback=sid)
     agent = session.get("agent")
@@ -8840,10 +8976,26 @@ def _session_live_item(sid: str, session: dict, current_sid: str = "") -> dict:
         preview = inflight.get("assistant") or inflight.get("user") or preview
         preview = " ".join(str(preview).split())[:160]
     now = time.time()
-    return {
+    last_active = float(
+        session.get("last_active") or session.get("created_at") or now
+    )
+    durable_activity = _durable_active_turn_snapshot(session, key)
+    if durable_activity is not None:
+        # The shared gateway may be idle locally while API/Telegram/another
+        # Hermes process owns the conversation. The durable lease is the
+        # serialization truth; report it as working instead of lying idle.
+        status = "working"
+        try:
+            activity_at = float(durable_activity.get("last_activity_at") or 0)
+        except (TypeError, ValueError):
+            activity_at = 0.0
+        if activity_at > 0:
+            last_active = max(last_active, activity_at)
+
+    row = {
         "current": sid == current_sid,
         "id": sid,
-        "last_active": float(session.get("last_active") or session.get("created_at") or now),
+        "last_active": last_active,
         "message_count": len(history),
         "model": str(getattr(agent, "model", "") or _resolve_model()),
         "preview": preview,
@@ -8852,6 +9004,12 @@ def _session_live_item(sid: str, session: dict, current_sid: str = "") -> dict:
         "status": status,
         "title": _session_live_title(session, key),
     }
+    if durable_activity is not None:
+        row["last_activity_at"] = durable_activity.get("last_activity_at")
+        row["last_activity_description"] = str(
+            durable_activity.get("last_activity_description") or ""
+        )
+    return row
 
 
 def _session_lookup_key(session: dict, *, fallback: str = "") -> str:
@@ -10731,6 +10889,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    client_message_id: str | None = None,
 ) -> bool:
     with session["history_lock"]:
         if session.get("_closing"):
@@ -10751,7 +10910,7 @@ def _run_prompt_submit(
         # A retained failed turn (see _fail_inflight_turn) is a stale leftover
         # by the time a new turn starts — replace it, never append onto it.
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
-            _start_inflight_turn(session, text)
+            _start_inflight_turn(session, text, client_message_id)
         agent = session["agent"]
         if hasattr(agent, "clear_interrupt"):
             try:
@@ -10777,7 +10936,11 @@ def _run_prompt_submit(
         len(text) if isinstance(text, str) else "-",
         len(images),
     )
-    _emit("message.start", sid)
+    message_start_payload = None
+    if isinstance(inflight := session.get("inflight_turn"), dict):
+        if correlated_id := _client_message_id(inflight.get("client_message_id")):
+            message_start_payload = {"client_message_id": correlated_id}
+    _emit("message.start", sid, message_start_payload)
 
     def run():
         # The conversation runs on a fresh thread, so ContextVars from the RPC

@@ -17,9 +17,15 @@ class _DB:
         self.events = []
         self.session_exists = session_exists
         self.acquire_result = acquire_result
+        self.activity = None
+        self.activity_session_ids = []
 
     def get_session(self, session_id):
         return {"id": session_id} if self.session_exists else None
+
+    def get_session_activity(self, session_id):
+        self.activity_session_ids.append(session_id)
+        return self.activity
 
     def acquire_session_turn_lease(self, session_id, holder, **kwargs):
         self.events.append(("acquire", session_id, holder))
@@ -106,10 +112,11 @@ def test_run_conversation_acquires_then_reloads_latest_tip(monkeypatch):
     assert [event[0] for event in db.events] == [
         "acquire",
         "resolve",
+        "resolve",
         "reload",
         "release",
     ]
-    assert db.events[2][2] == {
+    assert db.events[3][2] == {
         "repair_alternation": True,
         "include_row_ids": True,
     }
@@ -125,6 +132,7 @@ def test_run_conversation_acquires_then_reloads_latest_tip(monkeypatch):
         and "loading the latest transcript" in text
         for kind, text in status_events
     )
+    assert agent._waiting_for_session_turn_lease is False
 
 
 def test_run_conversation_acquires_lease_when_session_probe_raises(monkeypatch):
@@ -168,6 +176,7 @@ def test_run_conversation_acquires_lease_when_session_probe_raises(monkeypatch):
     }
     assert [event[0] for event in db.events] == [
         "acquire",
+        "resolve",
         "resolve",
         "reload",
         "release",
@@ -218,7 +227,7 @@ def test_run_conversation_lease_timeout_returns_resend_notice(monkeypatch):
     assert result["completed"] is False
     assert "session_turn_lease_timeout:" in result["error"]
     assert "send it again" in result["final_response"]
-    assert [event[0] for event in db.events] == ["acquire"]
+    assert [event[0] for event in db.events] == ["acquire", "resolve"]
     assert any(
         kind == "lifecycle"
         and text
@@ -231,6 +240,54 @@ def test_run_conversation_lease_timeout_returns_resend_notice(monkeypatch):
     )
 
 
+def test_run_conversation_lease_wait_surfaces_active_process_activity(monkeypatch):
+    db = _DB(acquire_result=False)
+    db.activity = {
+        "last_activity_description": "executing tool: terminal",
+        "seconds_since_activity": 4.2,
+    }
+    agent = _agent_with_db(db)
+    status_events = []
+    agent.status_callback = lambda kind, text=None: status_events.append(
+        (kind, text)
+    )
+
+    def acquire_with_progress(session_id, holder, **kwargs):
+        db.events.append(("acquire", session_id, holder))
+        on_wait = kwargs.get("on_wait")
+        assert callable(on_wait)
+        on_wait(0.0)
+        on_wait(16.0)
+        return False
+
+    db.acquire_session_turn_lease = acquire_with_progress
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("turn must not start without a lease")
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", boom)
+    result = AIAgent.run_conversation(
+        agent,
+        "new message",
+        conversation_history=[{"role": "user", "content": "stale"}],
+    )
+
+    assert result["failed"] is True
+    lifecycle = [
+        text for kind, text in status_events if kind == "lifecycle" and text
+    ]
+    assert any("Queued behind active Hermes" in text for text in lifecycle)
+    assert any("executing tool: terminal" in text for text in lifecycle)
+    assert any("updated 4s ago" in text for text in lifecycle)
+    assert any("waiting 16s" in text for text in lifecycle)
+    assert [event[:2] for event in db.events] == [
+        ("acquire", "stale-parent"),
+        ("resolve", "stale-parent"),
+        ("resolve", "stale-parent"),
+    ]
+    assert db.activity_session_ids == ["compressed-tip", "compressed-tip"]
+
+
 def test_run_conversation_lease_wait_honors_interrupt(monkeypatch):
     db = _DB()
     agent = _agent_with_db(db)
@@ -238,7 +295,11 @@ def test_run_conversation_lease_wait_honors_interrupt(monkeypatch):
     def acquire_with_abort(session_id, holder, **kwargs):
         db.events.append(("acquire", session_id, holder))
         should_abort = kwargs.get("should_abort")
+        on_wait = kwargs.get("on_wait")
         assert callable(should_abort)
+        assert callable(on_wait)
+        on_wait(0.0)
+        assert agent._waiting_for_session_turn_lease is True
         agent._interrupt_requested = True
         agent._interrupt_message = "follow-up while waiting"
         assert should_abort()
@@ -262,7 +323,8 @@ def test_run_conversation_lease_wait_honors_interrupt(monkeypatch):
     assert "not processed" in result["final_response"]
     assert result.get("interrupt_message") == "follow-up while waiting"
     assert "session_turn_lease_timeout" not in str(result.get("error", ""))
-    assert [event[0] for event in db.events] == ["acquire"]
+    assert [event[0] for event in db.events] == ["acquire", "resolve"]
+    assert agent._waiting_for_session_turn_lease is False
     assert agent._interrupt_requested is False
     assert agent._interrupt_message is None
 
@@ -563,6 +625,7 @@ def test_run_conversation_exposes_holder_for_fenced_flush(monkeypatch):
     assert getattr(agent, "_active_session_turn_lease_holder", None) is None
     assert [event[0] for event in db.events] == [
         "acquire",
+        "resolve",
         "resolve",
         "reload",
         "release",

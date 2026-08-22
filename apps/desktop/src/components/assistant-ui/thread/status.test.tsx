@@ -3,8 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { __resetElapsedTimerRegistryForTests } from '@/components/chat/activity-timer'
 import { I18nProvider } from '@/i18n'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import { $providerWaitSessions, setSessionProviderWait } from '@/store/provider-wait'
 import { $activeSessionId, $turnStartedAt } from '@/store/session'
+import { $sessionStates } from '@/store/session-states'
 
 import { ResponseLoadingIndicator } from './status'
 
@@ -32,6 +34,7 @@ describe('ResponseLoadingIndicator timer', () => {
     $activeSessionId.set(null)
     $turnStartedAt.set(null)
     $providerWaitSessions.set({})
+    $sessionStates.set({})
     __resetElapsedTimerRegistryForTests()
     vi.restoreAllMocks()
     vi.useRealTimers()
@@ -69,6 +72,31 @@ describe('ResponseLoadingIndicator timer', () => {
     renderIndicator()
 
     expect(screen.getByText('⏳ waiting on local-model — 30s with no output yet')).toBeTruthy()
+  })
+
+  it('shows durable tool activity instead of a timer-only row', () => {
+    const startedAt = Date.now()
+    const activityAt = startedAt - 23_000
+
+    $activeSessionId.set('session-a')
+    $turnStartedAt.set(startedAt)
+    $sessionStates.set({
+      'session-a': {
+        ...createClientSessionState('stored-session-a'),
+        busy: true,
+        lastActivityAt: activityAt,
+        lastActivityDescription: 'executing tool: terminal',
+        turnStartedAt: startedAt
+      }
+    })
+
+    renderIndicator()
+
+    const status = screen.getByRole('status', { name: 'executing tool: terminal' })
+
+    expect(status).toBeTruthy()
+    expect(screen.getByText('executing tool: terminal')).toBeTruthy()
+    expect(status.textContent).toContain('23s')
   })
 })
 

@@ -87,6 +87,7 @@ export interface SessionSteerResponse {
 
 export interface SessionRedirectResponse {
   status?: 'redirected' | 'queued' | 'rejected'
+  delivery?: 'tool_boundary'
   text?: string
 }
 
@@ -216,4 +217,6 @@ export interface ClientSessionState {
    *  the primary-only $currentUsage — the statusbar reads it for a focused
    *  tile's context count. Null until the first turn reports. */
   usage: null | UsageStats
+  lastActivityAt: number | null
+  lastActivityDescription: string
 }

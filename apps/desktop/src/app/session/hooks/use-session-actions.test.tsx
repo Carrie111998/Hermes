@@ -1112,6 +1112,8 @@ describe('resumeSession failure recovery', () => {
             fast: false,
             interimBoundaryPending: false,
             interrupted: false,
+            lastActivityAt: null,
+            lastActivityDescription: '',
             messages: [],
             adoptedRunningTurn: false,
             model: '',

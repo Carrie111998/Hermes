@@ -2701,6 +2701,9 @@ export interface Translations {
       stopReading: string
       readAloud: string
       editMessage: string
+      messageSending: string
+      messageQueued: string
+      messageFailed: string
       expandMessage: string
       scrollToBottom: string
       stop: string

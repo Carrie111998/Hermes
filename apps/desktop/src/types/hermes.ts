@@ -625,6 +625,8 @@ export interface SessionResumeResponse {
   }
   hydrating?: boolean
   inflight?: null | {
+    /** Desktop-generated optimistic bubble id for this turn. */
+    client_message_id?: string
     assistant?: string
     /** Mid-turn redirect corrections, oldest first. The turn's original prompt
      *  stays in `user`; these are the follow-ups typed while it ran. */
@@ -647,6 +649,8 @@ export interface SessionResumeResponse {
     user?: string
   }
   queued?: null | {
+    /** Desktop-generated optimistic bubble id for this queued turn. */
+    client_message_id?: string
     user?: string
   }
   // The oldest gateway approval still waiting for a response. This is returned
@@ -670,6 +674,8 @@ export interface SessionResumeResponse {
     request_id?: string
   }
   info?: SessionRuntimeInfo
+  last_activity_at?: number | null
+  last_activity_description?: string
   message_count: number
   messages: SessionMessage[]
   messages_omitted?: boolean
@@ -692,6 +698,8 @@ export interface SessionRuntimeInfo {
   desktop_contract?: number
   fast?: boolean
   install_warning?: string
+  last_activity_at?: number | null
+  last_activity_description?: string
   model?: string
   personality?: string
   provider?: string

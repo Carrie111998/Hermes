@@ -8629,10 +8629,64 @@ class AIAgent:
                 _lease_ttl = 300.0
                 _lease_waited = False
 
+                def _active_turn_activity() -> str:
+                    getter = getattr(_turn_db, "get_session_activity", None)
+                    if not callable(getter):
+                        return ""
+                    try:
+                        # The lease is keyed to the stable conversation root,
+                        # while compression writes live activity to the latest
+                        # continuation row. Resolve that row on every poll: the
+                        # other process may rotate again while we are waiting.
+                        activity_session_id = session_id
+                        resume_resolver = getattr(
+                            _turn_db, "resolve_resume_session_id", None
+                        )
+                        if callable(resume_resolver):
+                            activity_session_id = str(
+                                resume_resolver(session_id) or session_id
+                            )
+                        activity = getter(activity_session_id) or {}
+                        description = str(
+                            activity.get("last_activity_description")
+                            or activity.get("description")
+                            or ""
+                        ).strip()
+                        if not description:
+                            return ""
+                        age = activity.get("seconds_since_activity")
+                        if age is None:
+                            return description
+                        return (
+                            f"{description} · updated "
+                            f"{max(0, int(float(age)))}s ago"
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Could not observe active session while waiting for "
+                            "turn lease: %s",
+                            session_id,
+                            exc_info=True,
+                        )
+                        return ""
+
                 def _on_session_turn_lease_wait(elapsed: float) -> None:
                     nonlocal _lease_waited
                     _lease_waited = True
-                    if elapsed < 1.0:
+                    self._waiting_for_session_turn_lease = True
+                    activity = _active_turn_activity()
+                    if activity:
+                        if elapsed < 1.0:
+                            self._emit_status(
+                                "⏳ Queued behind active Hermes — "
+                                f"{activity}."
+                            )
+                        else:
+                            self._emit_status(
+                                "⏳ Queued behind active Hermes — "
+                                f"{activity} · waiting {int(elapsed)}s."
+                            )
+                    elif elapsed < 1.0:
                         self._emit_status(
                             "⏳ Another Hermes process is using this session; "
                             "waiting for it to finish before starting your turn..."
@@ -8643,14 +8697,23 @@ class AIAgent:
                             f"this session ({int(elapsed)}s)..."
                         )
 
-                if not _turn_db.acquire_session_turn_lease(
-                    session_id,
-                    _durable_holder,
-                    ttl_seconds=_lease_ttl,
-                    wait_seconds=1800.0,
-                    on_wait=_on_session_turn_lease_wait,
-                    should_abort=lambda: getattr(self, "_interrupt_requested", False),
-                ):
+                self._waiting_for_session_turn_lease = False
+                try:
+                    _durable_turn_lease_acquired = (
+                        _turn_db.acquire_session_turn_lease(
+                            session_id,
+                            _durable_holder,
+                            ttl_seconds=_lease_ttl,
+                            wait_seconds=1800.0,
+                            on_wait=_on_session_turn_lease_wait,
+                            should_abort=lambda: getattr(
+                                self, "_interrupt_requested", False
+                            ),
+                        )
+                    )
+                finally:
+                    self._waiting_for_session_turn_lease = False
+                if not _durable_turn_lease_acquired:
                     if getattr(self, "_interrupt_requested", False):
                         logger.info(
                             "session turn lease wait aborted by interrupt: %s",

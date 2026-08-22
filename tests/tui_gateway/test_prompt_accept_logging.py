@@ -119,6 +119,38 @@ def test_accepted_and_finished_records_on_success(turn_env, caplog):
     assert "hunter2" not in fin
 
 
+def test_message_start_correlates_the_client_bubble(turn_env, monkeypatch):
+    emits = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emits.append((event, sid, payload)),
+    )
+    agent = types.SimpleNamespace(
+        session_id="agent-sid-1",
+        run_conversation=lambda *a, **k: {"final_response": "done"},
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True)
+
+    server._run_prompt_submit(
+        "rid",
+        "ui-sid",
+        session,
+        "?",
+        client_message_id="client-question",
+    )
+
+    starts = [event for event in emits if event[0] == "message.start"]
+    assert starts == [
+        (
+            "message.start",
+            "ui-sid",
+            {"client_message_id": "client-question"},
+        )
+    ]
+
+
 def test_finished_record_reflects_mid_turn_rotation(turn_env, caplog):
     """Compression rotating agent.session_id mid-turn must be visible as an
     accepted/finished pair with different agent ids — that pair IS the

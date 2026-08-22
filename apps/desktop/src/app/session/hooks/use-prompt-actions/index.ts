@@ -284,7 +284,7 @@ export function usePromptActions({
       role: ChatMessage['role'],
       text: string,
       storedSessionId?: string | null,
-      options: { appendAfterActiveReply?: boolean } = {}
+      options: { appendAfterActiveReply?: boolean; deliveryState?: ChatMessage['deliveryState'] } = {}
     ) => {
       // Strip ANSI: slash-command output from the backend worker carries SGR
       // color codes (e.g. "Unknown command" in red). The ESC byte is invisible
@@ -304,7 +304,8 @@ export function usePromptActions({
           const message: ChatMessage = {
             id: messageId,
             role,
-            parts: [textPart(body)]
+            parts: [textPart(body)],
+            ...(options.deliveryState ? { deliveryState: options.deliveryState } : {})
           }
 
           // Mid-turn correction: arrival order. The bubble lands after the
@@ -741,7 +742,24 @@ export function usePromptActions({
         // gateway, in arrival order: sealed already-streamed output above,
         // correction bubble below it, post-redirect deltas below that
         // (#73793, #83151).
-        const messageId = appendSessionTextMessage(id, 'user', text, undefined, { appendAfterActiveReply: true })
+        const messageId = appendSessionTextMessage(id, 'user', text, undefined, {
+          appendAfterActiveReply: true,
+          deliveryState: 'sending'
+        })
+
+        const setDeliveryState = (deliveryState: ChatMessage['deliveryState'], deliveryClearsOnProgress = false) =>
+          updateSessionState(id, state => ({
+            ...state,
+            messages: state.messages.map(message =>
+              message.id === messageId
+                ? {
+                    ...message,
+                    deliveryState,
+                    deliveryClearsOnProgress: deliveryClearsOnProgress || undefined
+                  }
+                : message
+            )
+          }))
 
         const discardOptimisticMessage = () =>
           updateSessionState(id, state => ({
@@ -759,18 +777,26 @@ export function usePromptActions({
           })
 
         try {
-          const result = await requestGateway<SessionRedirectResponse>('session.redirect', { session_id: id, text })
+          const result = await requestGateway<SessionRedirectResponse>('session.redirect', {
+            session_id: id,
+            text,
+            client_message_id: messageId
+          })
 
           if (result?.status === 'redirected') {
+            setDeliveryState(undefined)
             triggerHaptic('submit')
 
             return true
           }
 
           if (result?.status === 'queued') {
-            // Build-window redirects become the next turn, not part of the
-            // active reply, so retain the optimistic row at the tail.
+            // Build/lease-window redirects become the next turn. A redirect
+            // accepted during a tool batch stays in the active turn but cannot
+            // reach the model until the next safe boundary. Both are honestly
+            // queued; only the latter clears on model-originated progress.
             moveOptimisticMessageToEnd()
+            setDeliveryState('queued', result.delivery === 'tool_boundary')
             triggerHaptic('submit')
 
             return true

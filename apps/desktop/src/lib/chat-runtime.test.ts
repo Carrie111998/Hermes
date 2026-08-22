@@ -253,6 +253,17 @@ describe('toRuntimeMessage timeline metadata', () => {
 
     expect((runtime.metadata?.custom as { timelineTimestamp?: number }).timelineTimestamp).toBeUndefined()
   })
+
+  it('passes optimistic user delivery state through message metadata', () => {
+    const runtime = toRuntimeMessage({
+      id: 'user-local',
+      parts: [{ text: '؟', type: 'text' }],
+      role: 'user',
+      deliveryState: 'queued'
+    })
+
+    expect((runtime.metadata?.custom as { deliveryState?: string }).deliveryState).toBe('queued')
+  })
 })
 
 describe('coalesceToolOnlyAssistants toolCallId uniqueness', () => {

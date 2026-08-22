@@ -53,6 +53,119 @@ def test_turn_lease_serializes_separate_session_db_instances(tmp_path):
     second.release_session_turn_lease("shared", second_holder)
 
 
+def test_legacy_turn_lease_table_rebuilds_to_conversation_pk(tmp_path):
+    """Legacy session_id-PK lease tables collapse to one conversation holder."""
+    path = tmp_path / "state.db"
+    now = time.time()
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            """CREATE TABLE session_turn_leases (
+                session_id TEXT PRIMARY KEY,
+                holder TEXT NOT NULL,
+                acquired_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                conversation_id TEXT
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO session_turn_leases "
+            "(session_id, holder, acquired_at, expires_at, conversation_id) "
+            "VALUES (NULL, ?, ?, ?, 'root')",
+            (f"pid={os.getpid()}:turn=live", now, now + 100),
+        )
+        conn.execute(
+            "INSERT INTO session_turn_leases "
+            "(session_id, holder, acquired_at, expires_at, conversation_id) "
+            "VALUES (NULL, ?, ?, ?, 'root')",
+            ("pid=99999999:turn=dead", now + 1, now + 200),
+        )
+        conn.execute(
+            "INSERT INTO session_turn_leases "
+            "(session_id, holder, acquired_at, expires_at, conversation_id) "
+            "VALUES ('legacy-session', 'legacy-session-holder', ?, ?, NULL)",
+            (now + 2, now + 300),
+        )
+        same_holder = f"pid={os.getpid()}:turn=same-holder"
+        conn.execute(
+            "INSERT INTO session_turn_leases "
+            "(session_id, holder, acquired_at, expires_at, conversation_id) "
+            "VALUES (NULL, ?, ?, ?, 'same-holder-root')",
+            (same_holder, now + 3, now + 400),
+        )
+        conn.execute(
+            "INSERT INTO session_turn_leases "
+            "(session_id, holder, acquired_at, expires_at, conversation_id) "
+            "VALUES (NULL, ?, ?, ?, 'same-holder-root')",
+            (same_holder, now + 4, now + 500),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    db = SessionDB(path)
+
+    columns = db._conn.execute(
+        'PRAGMA table_info("session_turn_leases")'
+    ).fetchall()
+    pk_cols = [
+        row["name"]
+        for row in sorted(
+            (row for row in columns if row["pk"]),
+            key=lambda row: row["pk"],
+        )
+    ]
+    assert pk_cols == ["conversation_id"]
+    rows = db._conn.execute(
+        "SELECT conversation_id, holder, acquired_at, expires_at "
+        "FROM session_turn_leases ORDER BY conversation_id"
+    ).fetchall()
+    assert [dict(row) for row in rows] == [
+        {
+            "conversation_id": "legacy-session",
+            "holder": "legacy-session-holder",
+            "acquired_at": now + 2,
+            "expires_at": now + 300,
+        },
+        {
+            "conversation_id": "root",
+            "holder": "legacy-migration-blocker",
+            "acquired_at": now + 1,
+            "expires_at": now + 200,
+        },
+        {
+            "conversation_id": "same-holder-root",
+            "holder": same_holder,
+            "acquired_at": now + 4,
+            "expires_at": now + 500,
+        },
+    ]
+
+    reopened = SessionDB(path)
+    assert (
+        reopened._conn.execute(
+            "SELECT COUNT(*) FROM session_turn_leases"
+        ).fetchone()[0]
+        == 3
+    )
+    assert not reopened._conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'session_turn_leases_legacy_pk'"
+    ).fetchone()
+    assert "idx_session_turn_leases_expires" in {
+        row[1]
+        for row in reopened._conn.execute(
+            'PRAGMA index_list("session_turn_leases")'
+        ).fetchall()
+    }
+
+    db.create_session("root", source="test")
+    first_holder = f"pid={os.getpid()}:turn=first"
+    assert not db.try_acquire_session_turn_lease(
+        "root", first_holder, ttl_seconds=5
+    )
+
+
 def test_turn_lease_is_scoped_to_conversation_root(tmp_path):
     """Compression descendants share one durable serialization domain."""
     db = SessionDB(tmp_path / "state.db")
@@ -69,6 +182,32 @@ def test_turn_lease_is_scoped_to_conversation_root(tmp_path):
         "child", child_holder, ttl_seconds=5
     )
     db.release_session_turn_lease("child", root_holder)
+
+
+def test_get_active_turn_lease_observes_alias_and_ignores_expiry(tmp_path):
+    """Read-only observers see the same live conversation lease as writers."""
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("root", source="test")
+    db.end_session("root", "compression")
+    db.create_session("child", source="test", parent_session_id="root")
+
+    holder = f"pid={os.getpid()}:turn=owner"
+    assert db.try_acquire_session_turn_lease(
+        "root", holder, ttl_seconds=5
+    )
+
+    observed = db.get_active_session_turn_lease("child")
+    assert observed is not None
+    assert observed["conversation_id"] == "root"
+    assert observed["holder"] == holder
+
+    db._conn.execute(
+        "UPDATE session_turn_leases SET expires_at = ? "
+        "WHERE conversation_id = 'root'",
+        (time.time() - 1,),
+    )
+    db._conn.commit()
+    assert db.get_active_session_turn_lease("child") is None
 
 
 def test_turn_lease_does_not_serialize_delegate_child_with_parent(tmp_path):

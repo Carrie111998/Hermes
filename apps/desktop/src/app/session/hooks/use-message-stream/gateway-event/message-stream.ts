@@ -2,6 +2,7 @@ import type { BillingBlock } from '@hermes/shared'
 
 import { burstVibeHearts } from '@/components/chat/vibe-hearts'
 import { translateNow } from '@/i18n'
+import type { ChatMessage } from '@/lib/chat-messages'
 import { coerceGatewayText, coerceThinkingText } from '@/lib/chat-runtime'
 import { playCompletionSound } from '@/lib/completion-sound'
 import { parseErrorSurface } from '@/lib/error-surface'
@@ -21,6 +22,33 @@ import type { GatewayEventContext } from './types'
 
 function firstBillingLine(text: string): string {
   return (text || '').split('\n')[0]?.trim() ?? ''
+}
+
+/** Settle only the optimistic bubble whose turn actually started. Newer
+ * gateways echo its client id; the legacy fallback clears a plain `sending`
+ * tail but deliberately leaves `queued` alone because it may belong to the
+ * next turn. */
+function settleStartedUserMessage(messages: ChatMessage[], clientMessageId?: string): ChatMessage[] {
+  const exactIndex = clientMessageId ? messages.findIndex(message => message.id === clientMessageId) : -1
+  let targetIndex = exactIndex
+
+  if (targetIndex < 0 && !clientMessageId) {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index]
+
+      if (message.role === 'user' && message.deliveryState === 'sending') {
+        targetIndex = index
+
+        break
+      }
+    }
+  }
+
+  if (targetIndex < 0 || !messages[targetIndex]?.deliveryState) {
+    return messages
+  }
+
+  return messages.map((message, index) => (index === targetIndex ? { ...message, deliveryState: undefined } : message))
 }
 
 /**
@@ -122,8 +150,11 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
 
       return {
         ...state,
+        messages: settleStartedUserMessage(state.messages, payload?.client_message_id?.trim() || undefined),
         busy: true,
         awaitingResponse: true,
+        lastActivityAt: null,
+        lastActivityDescription: '',
         sawAssistantPayload: false,
         interrupted: false,
         interimBoundaryPending: false,
