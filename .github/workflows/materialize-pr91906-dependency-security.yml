@@ -39,7 +39,7 @@ jobs:
         with:
           version: "0.12.5"
 
-      - name: Generate exact current-main dependency graph
+      - name: Generate exact landing-main dependency graph
         shell: bash
         run: |
           set -euo pipefail
@@ -61,7 +61,7 @@ jobs:
           npm audit --workspace ui-tui --audit-level=high
           npm audit --workspace apps/desktop --audit-level=high
 
-      - name: Prove exact eight-file publication set
+      - name: Prove publication delta stays inside the closure domain
         shell: bash
         run: |
           set -euo pipefail
@@ -74,7 +74,7 @@ jobs:
             apps/desktop/scripts/packaged-app-layout.mjs \
             apps/desktop/scripts/packaged-app-layout.test.mjs \
             apps/desktop/scripts/test-desktop.mjs
-          cat > /tmp/expected-files <<'FILES'
+          cat > /tmp/allowed-files <<'FILES'
           .npmrc
           apps/desktop/package.json
           apps/desktop/scripts/packaged-app-layout.mjs
@@ -85,10 +85,12 @@ jobs:
           uv.lock
           FILES
           git diff --cached --name-only | sort > /tmp/actual-files
-          diff -u /tmp/expected-files /tmp/actual-files
+          test -s /tmp/actual-files
+          comm -23 /tmp/actual-files /tmp/allowed-files > /tmp/outside-domain
+          test ! -s /tmp/outside-domain
           git diff --cached --check
 
-      - name: Publish exact current-main child commit to upstream staging branch
+      - name: Publish one exact landing-main child to upstream staging branch
         shell: bash
         env:
           MATERIALIZED_BRANCH: automation/pr91906-materialized
@@ -96,10 +98,13 @@ jobs:
           set -euo pipefail
           git config user.name "Axl Ibiza"
           git config user.email "andrexibiza@gmail.com"
-          git commit -m "fix(deps): close current advisory graph on current main" -m "Consolidate the live Electron, Nano ID, and h2 advisory closure on the exact current-main dependency graph while preserving React Compiler movement, Nano ID v6 isolation, packaged Desktop architecture, and source provenance.\n\nRefs #89479\nRefs #90486\nRefs #91042\n\nCo-authored-by: schmitzi8 <schmitzi8@users.noreply.github.com>\nCo-authored-by: orcaspainting-dev <264355715+orcaspainting-dev@users.noreply.github.com>\nSigned-off-by: Axl Ibiza <andrexibiza@gmail.com>"
+          git commit -m "fix(deps): close current advisory graph on landing main" -m "Consolidate the live Electron, Nano ID, and h2 advisory closure on the exact landing-main dependency graph while preserving newer repository-truth dependency sources, React Compiler movement, Nano ID v6 isolation, packaged Desktop architecture, and source provenance.\n\nRefs #89479\nRefs #90486\nRefs #91042\nRefs #92543\n\nCo-authored-by: schmitzi8 <schmitzi8@users.noreply.github.com>\nCo-authored-by: orcaspainting-dev <264355715+orcaspainting-dev@users.noreply.github.com>\nSigned-off-by: Axl Ibiza <andrexibiza@gmail.com>"
           FINAL_SHA="$(git rev-parse HEAD)"
           test "$(git rev-parse HEAD^)" = "${{ github.sha }}"
           test "$(git rev-list --count '${{ github.sha }}..HEAD')" = '1'
-          test "$(git diff --name-only '${{ github.sha }}..HEAD' | wc -l | tr -d ' ')" = '8'
+          git diff --name-only '${{ github.sha }}..HEAD' | sort > /tmp/final-files
+          test -s /tmp/final-files
+          comm -23 /tmp/final-files /tmp/allowed-files > /tmp/final-outside-domain
+          test ! -s /tmp/final-outside-domain
           git push --force origin "HEAD:refs/heads/$MATERIALIZED_BRANCH"
           echo "Materialized exact closure at $FINAL_SHA"
