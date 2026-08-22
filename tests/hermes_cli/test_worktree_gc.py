@@ -17,6 +17,7 @@ the entire value of these tests is exercising actual git verdicts):
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -200,6 +201,30 @@ class TestReclaim:
         assert _verdict(records, "hermes-zombie").verdict == "reap"
         worktree_gc.reclaim_worktrees(str(repo), records=records)
         assert not tree.exists()
+
+
+class TestWorktreeHelp:
+    def test_help_displays_active_profile_archive(self, tmp_path, monkeypatch, capsys):
+        """The displayed recovery location must follow the active profile."""
+        from hermes_cli import main as main_mod
+
+        home = tmp_path / "home"
+        profile_home = home / ".hermes" / "profiles" / "review"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setattr(sys, "argv", ["hermes", "worktree", "--help"])
+        monkeypatch.setattr(main_mod, "_sweep_stale_bytecode_if_checkout_changed", lambda: None)
+        monkeypatch.setattr(main_mod, "_recover_from_interrupted_install", lambda: None)
+        monkeypatch.setattr(main_mod, "_plugin_cli_discovery_needed", lambda: False)
+
+        with pytest.raises(SystemExit) as exited:
+            main_mod.main()
+
+        assert exited.value.code == 0
+        output = capsys.readouterr().out
+        assert "~/.hermes/profiles/review/archive/worktree-prune/" in output
+        assert "~/.hermes/archive/worktree-prune/" not in output
 
 
 class TestBranchGC:
