@@ -17,8 +17,16 @@ from tools.mcp_tool import _HTTPNotificationStreamTracker
 
 
 class _Response:
-    def __init__(self, method: str = "GET", content_type: str = "text/event-stream"):
-        self.request = SimpleNamespace(method=method)
+    def __init__(
+        self,
+        method: str = "GET",
+        content_type: str = "text/event-stream",
+        request_headers: dict[str, str] | None = None,
+    ):
+        self.request = SimpleNamespace(
+            method=method,
+            headers=request_headers or {},
+        )
         self.headers = {"content-type": content_type}
         self.close_count = 0
 
@@ -51,7 +59,7 @@ async def test_replacement_notification_stream_cancels_full_reconnect():
         on_stalled=reconnect.set,
     )
     first = _Response()
-    replacement = _Response()
+    replacement = _Response(request_headers={"Last-Event-ID": "notification-1"})
 
     await tracker.response_hook(first)
     await first.aclose()
@@ -71,9 +79,7 @@ async def test_auxiliary_sse_get_does_not_replace_notification_stream():
         on_stalled=reconnect.set,
     )
     notification = _Response()
-    auxiliary = _Response()
-
-    await tracker.response_hook(notification)
+    auxiliary = _Response(request_headers={"Last-Event-ID": "request-1"})
 
     async def finish_auxiliary_get() -> None:
         await tracker.response_hook(auxiliary)
@@ -83,9 +89,9 @@ async def test_auxiliary_sse_get_does_not_replace_notification_stream():
     await asyncio.sleep(0.05)
 
     assert not reconnect.is_set()
-    assert notification.close_count == 0
     assert auxiliary.close_count == 1
 
+    await tracker.response_hook(notification)
     await notification.aclose()
     await asyncio.wait_for(reconnect.wait(), timeout=0.5)
     tracker.close()

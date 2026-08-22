@@ -624,6 +624,15 @@ class _HTTPNotificationStreamTracker:
 
         current_task = asyncio.current_task()
         if self._owner_task is None:
+            request_headers = getattr(request, "headers", {})
+            if any(
+                str(name).lower() == "last-event-id"
+                for name in request_headers
+            ):
+                # A finite request-resumption GET may complete before the
+                # long-lived notification response arrives. It must not claim
+                # ownership of notification-channel health.
+                return
             self._owner_task = current_task
         elif current_task is not self._owner_task:
             # The SDK uses the same client for finite request-resumption GETs.
