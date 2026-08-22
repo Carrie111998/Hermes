@@ -545,6 +545,7 @@ def _(rid, params: dict) -> dict:
         session = _sessions.get(params.get("session_id", ""))
         agent = session.get("agent") if session else None
         ctx = _model_picker_context(agent)
+        # Newly authenticated providers need their complete catalog for TUI search.
         payload = build_models_payload(
             ctx,
             picker_hints=True,
