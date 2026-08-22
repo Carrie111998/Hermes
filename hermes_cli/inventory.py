@@ -33,13 +33,14 @@ Substrate facts (verified May 2026):
 
 from __future__ import annotations
 
+from contextvars import copy_context
 from dataclasses import dataclass, replace
 from threading import Lock, Thread
 from typing import Any, Optional
 
 
 _pricing_prewarm_lock = Lock()
-_pricing_prewarm_thread: Optional[Thread] = None
+_pricing_prewarm_threads: dict[str, Thread] = {}
 
 
 # ─── Public types ───────────────────────────────────────────────────────
@@ -859,6 +860,7 @@ def _apply_pricing(
         _format_price_per_mtok,
         check_nous_free_tier,
         compute_sale_discount,
+        get_cached_nous_free_tier,
         get_pricing_for_provider,
         partition_nous_models_by_tier,
     )
@@ -876,7 +878,24 @@ def _apply_pricing(
             raw_pricing = get_pricing_for_provider(slug, **pricing_kwargs) or {}
         except Exception:
             raw_pricing = {}
+        cached_nous_tier: Optional[bool] = None
+        if slug == "nous" and cached_only:
+            cached_nous_tier = get_cached_nous_free_tier()
+            if cached_nous_tier is None:
+                # Entitlement is not yet known. Keep the response nonblocking,
+                # but fail closed until this profile's prewarm has populated
+                # both caches; otherwise a free account can briefly select
+                # paid models on its first picker open.
+                row["free_tier_pending"] = True
+                row["unavailable_models"] = list(models)
+                continue
         if not raw_pricing:
+            if slug == "nous":
+                row["free_tier"] = bool(cached_nous_tier)
+                row["pricing_pending"] = True
+                row["unavailable_models"] = (
+                    list(models) if cached_nous_tier else []
+                )
             continue
 
         formatted: dict[str, dict] = {}
@@ -926,12 +945,12 @@ def _apply_pricing(
         if slug == "nous":
             try:
                 if nous_free_tier is None:
-                    tier_kwargs = {
-                        "force_fresh": force_fresh_nous_tier,
-                    }
                     if cached_only:
-                        tier_kwargs["cached_only"] = True
-                    nous_free_tier = check_nous_free_tier(**tier_kwargs)
+                        nous_free_tier = cached_nous_tier
+                    else:
+                        nous_free_tier = check_nous_free_tier(
+                            force_fresh=force_fresh_nous_tier
+                        )
                 row["free_tier"] = bool(nous_free_tier)
                 if nous_free_tier:
                     _selectable, unavailable = partition_nous_models_by_tier(
@@ -949,11 +968,14 @@ def _apply_pricing(
 
 def _prewarm_pricing_async(rows: list[dict]) -> Optional[Thread]:
     """Warm picker pricing caches without delaying the current payload."""
-    global _pricing_prewarm_thread
+    from hermes_constants import hermes_home_key
+
+    profile_key = hermes_home_key()
 
     with _pricing_prewarm_lock:
-        if _pricing_prewarm_thread is not None and _pricing_prewarm_thread.is_alive():
-            return _pricing_prewarm_thread
+        current = _pricing_prewarm_threads.get(profile_key)
+        if current is not None and current.is_alive():
+            return current
 
         # The worker mutates only private copies while the pricing helpers
         # populate their shared process caches.
@@ -965,12 +987,14 @@ def _prewarm_pricing_async(rows: list[dict]) -> Optional[Thread]:
         def _worker() -> None:
             _apply_pricing(worker_rows)
 
+        worker_context = copy_context()
         thread = Thread(
-            target=_worker,
+            target=worker_context.run,
+            args=(_worker,),
             name="hermes-picker-pricing-prewarm",
             daemon=True,
         )
-        _pricing_prewarm_thread = thread
+        _pricing_prewarm_threads[profile_key] = thread
         thread.start()
         return thread
 

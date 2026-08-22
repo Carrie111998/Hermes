@@ -133,7 +133,7 @@ def test_model_options_cold_pricing_fetch_runs_off_the_request_path(monkeypatch)
     monkeypatch.setattr(inv, "_moa_provider_row", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(inv, "_apply_capabilities", lambda _rows: None)
     monkeypatch.setattr(inv, "_apply_featured", lambda _rows: None)
-    monkeypatch.setattr(inv, "_pricing_prewarm_thread", None)
+    monkeypatch.setattr(inv, "_pricing_prewarm_threads", {})
 
     try:
         started_at = monotonic()
@@ -153,9 +153,79 @@ def test_model_options_cold_pricing_fetch_runs_off_the_request_path(monkeypatch)
         assert fetch_started.wait(timeout=1), "pricing should prewarm in the background"
     finally:
         release_fetch.set()
-        thread = inv._pricing_prewarm_thread
-        if thread is not None:
+        for thread in inv._pricing_prewarm_threads.values():
             thread.join(timeout=2)
+
+
+def test_cold_nous_entitlement_keeps_models_unselectable(monkeypatch):
+    """A cold nonblocking response must not expose paid models fail-open."""
+    monkeypatch.setattr(
+        models_mod, "get_pricing_for_provider", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(models_mod, "get_cached_nous_free_tier", lambda: None)
+    rows = [{"slug": "nous", "models": ["free/model", "paid/model"]}]
+
+    inv._apply_pricing(rows, cached_only=True)
+
+    assert rows[0]["free_tier_pending"] is True
+    assert rows[0]["unavailable_models"] == ["free/model", "paid/model"]
+
+
+def test_prewarm_preserves_context_and_runs_once_per_profile(tmp_path, monkeypatch):
+    """Concurrent multiplex profiles retain their own home and secret scope."""
+    from agent.secret_scope import (
+        current_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+    from hermes_constants import (
+        hermes_home_key,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    monkeypatch.setattr(inv, "_pricing_prewarm_threads", {})
+    release = Event()
+    started = {"a": Event(), "b": Event()}
+    observed = {}
+
+    def capture_context(_rows):
+        scope = current_secret_scope()
+        label = scope["PROFILE_MARKER"]
+        observed[label] = (hermes_home_key(), dict(scope))
+        started[label].set()
+        release.wait(timeout=5)
+
+    monkeypatch.setattr(inv, "_apply_pricing", capture_context)
+
+    threads = []
+    try:
+        for label in ("a", "b"):
+            home = tmp_path / label
+            home_token = set_hermes_home_override(str(home))
+            secret_token = set_secret_scope({"PROFILE_MARKER": label})
+            try:
+                threads.append(inv._prewarm_pricing_async([{"models": []}]))
+            finally:
+                reset_secret_scope(secret_token)
+                reset_hermes_home_override(home_token)
+
+        assert threads[0] is not threads[1]
+        assert started["a"].wait(timeout=1)
+        assert started["b"].wait(timeout=1)
+        assert observed["a"] == (
+            hermes_home_key(tmp_path / "a"),
+            {"PROFILE_MARKER": "a"},
+        )
+        assert observed["b"] == (
+            hermes_home_key(tmp_path / "b"),
+            {"PROFILE_MARKER": "b"},
+        )
+    finally:
+        release.set()
+        for thread in threads:
+            if thread is not None:
+                thread.join(timeout=2)
 
 
 def test_cached_only_pricing_returns_a_warm_value_without_fetching(monkeypatch):
@@ -174,5 +244,51 @@ def test_cached_only_pricing_returns_a_warm_value_without_fetching(monkeypatch):
     assert models_mod.get_pricing_for_provider(
         "openrouter", cached_only=True
     ) == expected
+
+
+def test_cached_only_dynamic_pricing_is_profile_scoped(tmp_path, monkeypatch):
+    """Alternating profiles read the endpoint each profile warmed."""
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    endpoint_a = "https://profile-a.example"
+    endpoint_b = "https://profile-b.example"
+    expected_a = {"a/model": {"prompt": "1", "completion": "2"}}
+    expected_b = {"b/model": {"prompt": "3", "completion": "4"}}
+    monkeypatch.setattr(
+        models_mod,
+        "_pricing_cache",
+        {endpoint_a: expected_a, endpoint_b: expected_b},
+    )
+    monkeypatch.setattr(models_mod, "_pricing_cache_retry_after", {})
+    monkeypatch.setattr(models_mod, "_pricing_provider_cache_keys", {})
+    active_endpoint = {"value": endpoint_a}
+    monkeypatch.setattr(
+        models_mod,
+        "_resolve_nous_pricing_credentials",
+        lambda: ("", active_endpoint["value"]),
+    )
+    monkeypatch.setattr(
+        models_mod,
+        "fetch_models_with_pricing",
+        lambda **kwargs: models_mod._pricing_cache[kwargs["base_url"]],
+    )
+
+    def in_profile(home, endpoint, *, cached_only):
+        token = set_hermes_home_override(str(home))
+        active_endpoint["value"] = endpoint
+        try:
+            return models_mod.get_pricing_for_provider(
+                "nous", cached_only=cached_only
+            )
+        finally:
+            reset_hermes_home_override(token)
+
+    assert in_profile(tmp_path / "a", endpoint_a, cached_only=False) == expected_a
+    assert in_profile(tmp_path / "b", endpoint_b, cached_only=False) == expected_b
+    assert in_profile(tmp_path / "a", endpoint_b, cached_only=True) == expected_a
+    assert in_profile(tmp_path / "b", endpoint_a, cached_only=True) == expected_b
 
 
