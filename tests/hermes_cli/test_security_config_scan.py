@@ -297,6 +297,28 @@ class TestSecurityScanCommand:
         assert "Scan incomplete: tirith truncated the scan." in output
         assert "baseline was not updated" in output
 
+    def test_incomplete_human_output_preserves_detected_findings(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        home = tmp_path / "home"
+        home.mkdir()
+        baseline = tmp_path / "baseline.json"
+        monkeypatch.setattr(scan, "get_hermes_home", lambda: home)
+        payload = _tirith_payload(title="Hidden instruction")
+        payload["panic_count"] = 1
+        _install_fake_tirith(monkeypatch, payload)
+
+        code = scan.cmd_security_scan(
+            _args(home, baseline, update_baseline=True, json=False)
+        )
+        output = capsys.readouterr().out
+
+        assert code == 2
+        assert "[HIGH] SOUL.md: agent_instruction_hidden — Hidden instruction" in output
+        assert "Scan incomplete: tirith reported 1 rule panic(s)." in output
+        assert "baseline was not updated" in output
+        assert not baseline.exists()
+
     def test_default_baseline_is_application_owned_security_state(
         self, tmp_path, monkeypatch
     ):

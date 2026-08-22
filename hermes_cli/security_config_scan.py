@@ -209,10 +209,7 @@ def _render_human(
     incomplete_reasons: list[str],
 ) -> str:
     lines = [f"Scanned {scanned_count} file(s); tirith reported {len(findings)} finding(s)."]
-    if incomplete_reasons:
-        lines.append(f"Scan incomplete: {'; '.join(incomplete_reasons)}.")
-        lines.append("The baseline was not updated; resolve the incomplete analysis and retry.")
-    elif updated:
+    if updated:
         lines.append(f"Baseline updated with {len(findings)} finding(s): {baseline_path}")
     elif not new_findings:
         lines.append("No new findings since the accepted baseline.")
@@ -223,6 +220,9 @@ def _render_human(
             lines.append(f"  [{finding.severity}] {finding.path}: {finding.rule_id} — {finding.title}")
         if not baseline_exists:
             lines.append("Review the findings, then rerun with --update-baseline to accept them.")
+    if incomplete_reasons:
+        lines.append(f"Scan incomplete: {'; '.join(incomplete_reasons)}.")
+        lines.append("The baseline was not updated; resolve the incomplete analysis and retry.")
     return "\n".join(lines)
 
 
