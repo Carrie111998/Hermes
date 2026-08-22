@@ -2404,6 +2404,8 @@ export interface Translations {
       toggleBackendVersion: string
       toggleCommandCenter: string
       toggleContextUsage: string
+      toggleTokPerCall: string
+      toggleTokPerTurn: string
       toggleRunningTimer: string
       toggleSessionTimer: string
       toggleTerminal: string

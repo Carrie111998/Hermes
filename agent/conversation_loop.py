@@ -3181,7 +3181,12 @@ def run_conversation(
                     break
                 
                 api_duration = time.time() - api_start_time
-                
+
+                # WHY: the gateway's _get_usage reads this to compute per-call
+                # tokens/sec for the desktop status bar. The duration was
+                # previously only logged below and then lost.
+                agent._last_api_duration = api_duration
+
                 # Stop thinking spinner silently -- the response box or tool
                 # execution messages that follow are more informative.
                 if thinking_spinner:

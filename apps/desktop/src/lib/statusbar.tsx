@@ -59,6 +59,29 @@ export function contextBarLabel(usage: UsageStats): string {
   return `[${contextBar(usage.context_percent)}] ${pct}%`
 }
 
+export function tokPerCallLabel(usage: UsageStats): string {
+  // WHY: the backend omits tok_per_call entirely when no API call has
+  // completed yet, so a null/undefined value means "no measurement". We must
+  // NOT use a falsy check here: a real but tiny rate (e.g. 1 token / 30s)
+  // rounds to 0.0 and would be wrongly hidden. Only hide when the field is
+  // absent.
+  if (usage.tok_per_call == null) {
+    return ''
+  }
+
+  return `call ${usage.tok_per_call.toFixed(1)} tok/s`
+}
+
+export function tokPerTurnLabel(usage: UsageStats): string {
+  // WHY: same rule as tokPerCallLabel. The backend omits tok_per_turn until a
+  // turn completes; a real 0.0 rate is still a measurement and must show.
+  if (usage.tok_per_turn == null) {
+    return ''
+  }
+
+  return `turn ${usage.tok_per_turn.toFixed(1)} tok/s`
+}
+
 export function LiveDuration({ since }: { since: number | null | undefined }) {
   const [now, setNow] = useState(() => Date.now())
 

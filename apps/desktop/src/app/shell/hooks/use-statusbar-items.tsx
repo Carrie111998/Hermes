@@ -15,7 +15,7 @@ import { useI18n } from '@/i18n'
 import { displayPath, pathLeaf } from '@/lib/display-path'
 import { Activity, AlertCircle, Clock, Command, FolderOpen, Globe, Hash, Loader2, Terminal } from '@/lib/icons'
 import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
-import { contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusbar'
+import { contextBarLabel, LiveDuration, tokPerCallLabel, tokPerTurnLabel, usageContextLabel } from '@/lib/statusbar'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { resolveVersionStatus } from '@/lib/version-status'
@@ -266,6 +266,11 @@ export function useStatusbarItems({
 
   const contextUsage = useMemo(() => usageContextLabel(gaugeUsage), [gaugeUsage])
   const contextBar = useMemo(() => contextBarLabel(gaugeUsage), [gaugeUsage])
+
+  // Speed pills read the raw per-session usage (not gaugeUsage, which overlays
+  // the context breakdown) because the breakdown never carries tok/s fields.
+  const tokPerCall = useMemo(() => tokPerCallLabel(currentUsage), [currentUsage])
+  const tokPerTurn = useMemo(() => tokPerTurnLabel(currentUsage), [currentUsage])
 
   const approvalModeItem = useApprovalModeStatusbarItem(activeGatewayProfile, requestGateway)
 
@@ -556,6 +561,24 @@ export function useStatusbarItems({
         variant: 'menu'
       },
       {
+        // WHY: hidden until the backend reports a real per-call rate, so the
+        // pill only appears once an API call has completed this session.
+        hidden: !tokPerCall,
+        id: 'tok-per-call',
+        label: tokPerCall,
+        toggleLabel: copy.toggleTokPerCall,
+        variant: 'text'
+      },
+      {
+        // WHY: same visibility rule as tok-per-call, but for the last
+        // completed turn's average rate.
+        hidden: !tokPerTurn,
+        id: 'tok-per-turn',
+        label: tokPerTurn,
+        toggleLabel: copy.toggleTokPerTurn,
+        variant: 'text'
+      },
+      {
         detail: <LiveDuration since={sessionStartedAt} />,
         hidden: !sessionStartedAt,
         id: 'session-timer',
@@ -597,6 +620,8 @@ export function useStatusbarItems({
       sessionStartedAt,
       gatewayState,
       terminalShowing,
+      tokPerCall,
+      tokPerTurn,
       turnStartedAt
     ]
   )

@@ -714,6 +714,8 @@ export interface UsageStats {
   input: number
   output: number
   total: number
+  tok_per_call?: number
+  tok_per_turn?: number
 }
 
 /** One graph node in the star map (learned skill or memory chunk). */
