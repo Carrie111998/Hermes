@@ -1,10 +1,8 @@
-# Skin / Theme System
+# Skin and Theme System
 
-Data-driven CLI theming. Skins are pure data — no code changes needed to add one.
+This reference is required when working in the areas it covers. Root `AGENTS.md` remains authoritative.
 
-> Extracted from `AGENTS.md`. Load this file when working in this area.
-
----
+## Skin/Theme System
 
 The skin engine (`hermes_cli/skin_engine.py`) provides data-driven CLI visual customization. Skins are **pure data** — no code changes needed to add a new skin.
 
@@ -90,3 +88,5 @@ tool_prefix: "▏"
 ```
 
 Activate with `/skin cyberpunk` or `display.skin: cyberpunk` in config.yaml.
+
+---

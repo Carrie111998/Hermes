@@ -1,11 +1,8 @@
-# Skill Authoring Standards
+# Skill Authoring
 
-The hardline standards every bundled, optional, or contributed skill must meet.
-Read this before writing a skill or reviewing a skill PR.
+This reference is required when working in the areas it covers. Root `AGENTS.md` remains authoritative.
 
-> Extracted from `AGENTS.md`. Load this file when working in this area.
-
----
+## Skills
 
 Two parallel surfaces:
 
@@ -113,3 +110,5 @@ The full salvage / modernization checklist for external skill PRs
 lives in the `hermes-agent-dev` skill at
 `references/new-skill-pr-salvage.md` — load it before polishing
 contributor skill PRs.
+
+---

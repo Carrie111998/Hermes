@@ -1,11 +1,8 @@
-# Plugin System
+# Plugins
 
-General plugins, memory providers, and model providers — three separate discovery paths.
-Read this before adding or reviewing anything under `plugins/`.
+This reference is required when working in the areas it covers. Root `AGENTS.md` remains authoritative.
 
-> Extracted from `AGENTS.md`. Load this file when working in this area.
-
----
+## Plugins
 
 Hermes has two plugin surfaces. Both live under `plugins/` in the repo so
 repo-shipped plugins can be discovered alongside user-installed ones in
@@ -31,11 +28,44 @@ as a side effect of importing `model_tools.py`. Code paths that read plugin
 state without importing `model_tools.py` first must call `discover_plugins()`
 explicitly (it's idempotent).
 
+#### Native plugin compatibility policy
+
+The canonical contract and deprecation policy live in
+`website/docs/developer-guide/plugins/index.md#native-plugin-compatibility-contract`.
+Compatibility is enforced as a behavior contract, not through a monolithic
+`PLUGIN_API_VERSION`, a manifest-wide native `api:` match, or version literals
+on unrelated payloads. Keep documented plugin surfaces additive:
+
+- add hook payload data as keyword fields; signature-inspect callbacks so old
+  narrow signatures receive only fields they declare, while `**kwargs`
+  callbacks receive the complete payload;
+- do not remove or rename `PluginContext` methods; make new parameters optional
+  with defaults and keyword-only where possible;
+- ignore unknown native manifest fields;
+- give new provider methods default implementations, and signature-inspect
+  optional callback kwargs rather than forwarding them unconditionally;
+- use a local schema version only for a capability with a wire or persisted
+  contract, and preserve old state/config/session replay or ship a migration.
+
+Deprecations require a once-per-process warning, a documented replacement and
+migration note, and at least two subsequent minor releases before removal.
+Compatibility tests must load frozen plugins through the real discovery path
+and assert outcomes. Do not replace these with exact registry/catalog counts,
+source-reading tests, or assertions that a global version literal changed.
+
 ### Memory-provider plugins (`plugins/memory/<name>/`)
 
 Separate discovery system for pluggable memory backends. Current built-in
 providers include **honcho, mem0, supermemory, byterover, hindsight,
 holographic, openviking, retaindb**.
+
+Discovery covers the same four sources as the general `PluginManager` —
+bundled, `$HERMES_HOME/plugins/`, `./.hermes/plugins/` (opt-in via
+`HERMES_ENABLE_PROJECT_PLUGINS`), and `hermes_agent.memory_providers` entry
+points — but with **bundled-first** precedence, the reverse of the general
+system's later-wins order: a memory provider is activated by name, so a
+dropped-in directory must not be able to shadow a shipped one. Discovery
+enumerates without importing; nothing runs until `memory.provider` names it.
 
 Each provider implements the `MemoryProvider` ABC (see `agent/memory_provider.py`)
 and is orchestrated by `agent/memory_manager.py`. Lifecycle hooks include
@@ -66,6 +96,24 @@ landing in this tree. PRs that add a new directory under
 `plugins/memory/` will be closed with a pointer to publish the
 provider as its own repo. Existing in-tree providers stay; bug fixes
 to them are welcome.
+
+**No new third-party-product plugins in-tree (policy, June 2026):** the
+same rule applies beyond memory providers. Plugins that integrate
+someone else's product or project — observability/metrics backends,
+vendor SaaS connectors, analytics dashboards, paid-service tie-ins —
+must ship as **standalone plugin repos** that users install into
+`~/.hermes/plugins/` (or via pip entry points). They register through
+the existing plugin discovery path and use the ABCs/hooks/ctx surface
+we expose; nothing special is needed in core. The reason is
+maintenance load: every product we absorb into the tree becomes our
+burden to keep working against a fast-moving core, for a backend we
+don't own. Promote standalone plugins in the Nous Research Discord
+(`#plugins-skills-and-skins`). PRs that add such a directory under
+`plugins/` are closed with a pointer to publish it as its own repo —
+this is a coupling decision, not a quality judgment. (The
+`observability/`, `kanban/`, `disk-cleanup/`, etc. directories already
+in the tree are existing precedent, not an invitation to add more
+third-party-product plugins alongside them.)
 
 ### Model-provider plugins (`plugins/model-providers/<name>/`)
 
@@ -102,3 +150,5 @@ plug into `agent/context_engine.py`; image-gen providers into
 `plugin-llm-async-example`) live in the
 [`hermes-example-plugins`](https://github.com/NousResearch/hermes-example-plugins)
 companion repo, not in this tree.
+
+---

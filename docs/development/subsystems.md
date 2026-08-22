@@ -1,9 +1,58 @@
-# Subsystems — Curator, Cron, Kanban
+# Toolsets and Background Subsystems
 
-Three long-running subsystems with their own CLIs, config sections, and invariants.
-Read the relevant section before changing scheduling, skill lifecycle, or the work queue.
+This reference is required when working in the areas it covers. Root `AGENTS.md` remains authoritative.
 
-> Extracted from `AGENTS.md`. Load this file when working in this area.
+## Toolsets
+
+All toolsets are defined in `toolsets.py` as a single `TOOLSETS` dict.
+Each platform's adapter picks a base toolset (e.g. Telegram uses
+`"messaging"`); `_HERMES_CORE_TOOLS` is the default bundle most
+platforms inherit from.
+
+Current toolset keys: `browser`, `clarify`, `code_execution`, `cronjob`,
+`debugging`, `delegation`, `discord`, `discord_admin`, `feishu_doc`,
+`feishu_drive`, `file`, `homeassistant`, `image_gen`, `kanban`, `memory`,
+`messaging`, `moa`, `rl`, `safe`, `search`, `session_search`, `skills`,
+`spotify`, `terminal`, `todo`, `tts`, `video`, `vision`, `web`, `yuanbao`.
+
+Enable/disable per platform via `hermes tools` (the curses UI) or the
+`tools.<platform>.enabled` / `tools.<platform>.disabled` lists in
+`config.yaml`.
+
+---
+
+## Delegation (`delegate_task`)
+
+`tools/delegate_tool.py` spawns a subagent with an isolated
+context + terminal session. By default the parent waits for the
+child's summary before continuing its own loop. With `background=true`,
+Hermes returns a delegation id immediately and the result re-enters the
+conversation later through the async-delegation completion queue.
+
+Two shapes:
+
+- **Single:** pass `goal` (+ optional `context`, `toolsets`).
+- **Batch (parallel):** pass `tasks: [...]` — each gets its own subagent
+  running concurrently. Concurrency is capped by
+  `delegation.max_concurrent_children` (default 3).
+
+Roles:
+
+- `role="leaf"` (default) — focused worker. Cannot call `delegate_task`,
+  `clarify`, `memory`, `send_message`, `cronjob`. Retains `execute_code`
+  (programmatic tool calling).
+- `role="orchestrator"` — retains `delegate_task` so it can spawn its
+  own workers. Gated by `delegation.orchestrator_enabled` (default true)
+  and bounded by `delegation.max_spawn_depth` (default 2).
+
+Key config knobs (under `delegation:` in `config.yaml`):
+`max_concurrent_children`, `max_spawn_depth`, `child_timeout_seconds`,
+`orchestrator_enabled`, `subagent_auto_approve`, `inherit_mcp_toolsets`,
+`max_iterations`.
+
+Durability rule: background `delegate_task` is detached from the current
+turn but still process-local. For work that must survive process restart, use
+`cronjob` or `terminal(background=True, notify_on_complete=True)` instead.
 
 ---
 
@@ -38,6 +87,7 @@ Config section (`curator:` in `config.yaml`):
 `archive_after_days`, `backup.*`.
 
 Full user-facing docs: `website/docs/user-guide/features/curator.md`.
+
 ---
 
 ## Cron (scheduled jobs)
@@ -73,6 +123,7 @@ Hardening invariants:
 Cron deliveries are **not** mirrored into the target gateway session —
 they land in their own cron session with a header/footer frame so the
 main conversation's message-role alternation stays intact.
+
 ---
 
 ## Kanban (multi-agent work queue)
@@ -85,12 +136,15 @@ kanban task.
 
 - **CLI:** `hermes_cli/kanban.py` wires `hermes kanban` with verbs
   `init`, `create`, `list` (alias `ls`), `show`, `assign`, `link`,
-  `unlink`, `comment`, `complete`, `block`, `unblock`, `archive`,
+  `unlink`, `comment`, `attach`, `attachments`, `attach-rm`, `complete`,
+  `request-review`, `request-changes`, `reopen-review`, `block`, `unblock`, `archive`,
   `tail`, plus less-commonly-used `watch`, `stats`, `runs`, `log`,
   `assignees`, `heartbeat`, `notify-*`, `dispatch`, `daemon`, `gc`.
 - **Worker/orchestrator toolset:** `tools/kanban_tools.py` exposes
-  `kanban_show`, `kanban_complete`, `kanban_block`, `kanban_heartbeat`,
-  `kanban_comment`, `kanban_create`, `kanban_link`; profiles that
+  `kanban_show`, `kanban_complete`, `kanban_request_review`,
+  `kanban_request_changes`, `kanban_block`,
+  `kanban_heartbeat`, `kanban_comment`, `kanban_create`, `kanban_link`,
+  `kanban_attach`, `kanban_attach_url`, `kanban_attachments`; profiles that
   explicitly enable the `kanban` toolset outside a dispatcher-spawned
   task also get `kanban_list` and `kanban_unblock` for board routing.
 - **Dispatcher:** long-lived loop that (default every 60s) reclaims
@@ -113,3 +167,5 @@ Isolation model:
   loops.
 
 Full user-facing docs: `website/docs/user-guide/features/kanban.md`.
+
+---

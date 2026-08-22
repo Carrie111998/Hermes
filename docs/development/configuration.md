@@ -1,11 +1,8 @@
-# Configuration Reference
+# Configuration
 
-Full detail on `config.yaml` sections, `.env` policy, the three config loaders,
-and working-directory resolution.
+This reference is required when working in the areas it covers. Root `AGENTS.md` remains authoritative.
 
-> Extracted from `AGENTS.md`. Load this file when working in this area.
-
----
+## Adding Configuration
 
 ### config.yaml options:
 1. Add to `DEFAULT_CONFIG` in `hermes_cli/config.py`
@@ -66,3 +63,5 @@ versa), you're on the wrong loader. Check `DEFAULT_CONFIG` coverage.
   removed** — the config loader prints a deprecation warning if it's set in
   `.env`. Same for `TERMINAL_CWD` in `.env`; the canonical setting is
   `terminal.cwd` in `config.yaml`.
+
+---
