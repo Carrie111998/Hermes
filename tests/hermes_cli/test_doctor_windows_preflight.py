@@ -11,7 +11,9 @@ import hermes_cli.doctor as doctor_mod
 
 
 class TestSymlinkPrivilegeCheck:
-    def test_ok_when_symlink_creation_succeeds(self, capsys):
+    def test_ok_when_symlink_creation_succeeds(self, monkeypatch, capsys):
+        monkeypatch.setattr(doctor_mod.os, "symlink", lambda *args, **kwargs: None)
+
         doctor_mod._check_windows_symlink_privilege()
 
         out = capsys.readouterr().out
