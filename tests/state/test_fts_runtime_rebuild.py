@@ -106,6 +106,7 @@ class TestRuntimeFtsRebuild:
             ("python3", "worker.py", "hermes_cli.main"),
             ("python3", "-m", "other.module", "hermes_cli.main"),
             ("python3", "-c", "hermes_cli.main"),
+            ("python3", "-Icprint('hermes_cli.main')", "hermes_cli/main.py"),
         ),
     )
     def test_uninspectable_non_hermes_process_is_not_a_holder(self, argv):
@@ -118,6 +119,8 @@ class TestRuntimeFtsRebuild:
             ("/usr/local/bin/hermes-agent", "serve"),
             ("/usr/local/bin/hermes-acp", "--stdio"),
             ("/usr/bin/python3", "-m", "hermes_cli.main", "gateway"),
+            ("/usr/bin/python3", "-Im", "hermes_cli.main", "gateway"),
+            ("/usr/bin/python3", "-mhermes_cli.main", "gateway"),
             ("/usr/bin/python3", "-W", "ignore", "-m", "hermes_cli.main"),
             ("/usr/bin/python3", "-Xdev", "-m", "hermes_cli.main"),
             (
@@ -232,7 +235,9 @@ class TestRuntimeFtsRebuild:
         os.chmod(proc_root / "222" / "fd", 0o000)
         # PID 222's cmdline is world-readable and looks like Hermes
         cmdline_path = proc_root / "222" / "cmdline"
-        cmdline_path.write_bytes(b"python3\x00hermes_cli.main\x00chat\x00")
+        cmdline_path.write_bytes(
+            b"python3\x00-m\x00hermes_cli.main\x00chat\x00"
+        )
 
         monkeypatch.setattr(hermes_state, "_IS_WINDOWS", False)
         monkeypatch.setattr(hermes_state.os, "getpid", lambda: 111)
@@ -240,6 +245,8 @@ class TestRuntimeFtsRebuild:
         real_listdir = os.listdir
         def _listdir(path):
             if isinstance(path, str):
+                if path == "/proc/222/fd":
+                    raise PermissionError(path)
                 path = path.replace("/proc", str(proc_root))
             return real_listdir(path)
         monkeypatch.setattr(hermes_state.os, "listdir", _listdir)

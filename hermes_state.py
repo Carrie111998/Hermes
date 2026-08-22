@@ -3536,8 +3536,9 @@ def _looks_like_python_executable(program: str) -> bool:
 
 
 _HERMES_EXECUTABLES = frozenset({"hermes", "hermes-agent", "hermes-acp"})
-_PYTHON_OPTIONS_WITH_OPERANDS = frozenset(
-    {"-Q", "-W", "-X", "--check-hash-based-pycs", "--jit"}
+_PYTHON_SHORT_OPTIONS_WITH_OPERANDS = frozenset({"Q", "W", "X"})
+_PYTHON_LONG_OPTIONS_WITH_OPERANDS = frozenset(
+    {"--check-hash-based-pycs", "--jit"}
 )
 
 
@@ -3549,23 +3550,37 @@ def _python_execution_target(argv: Sequence[str]) -> Optional[Tuple[str, str]]:
         if arg == "--":
             index += 1
             return ("script", argv[index]) if index < len(argv) else None
-        if arg in ("-c", "-m"):
-            index += 1
-            if index >= len(argv) or arg == "-c":
-                return None
-            return "module", argv[index]
-        if arg in _PYTHON_OPTIONS_WITH_OPERANDS:
+        if arg in _PYTHON_LONG_OPTIONS_WITH_OPERANDS:
             index += 2
             continue
         if (
-            arg.startswith(("-Q", "-W", "-X"))
-            or arg.startswith("--check-hash-based-pycs=")
+            arg.startswith("--check-hash-based-pycs=")
             or arg.startswith("--jit=")
         ):
             index += 1
             continue
-        if arg.startswith("-"):
+        if arg.startswith("--"):
             index += 1
+            continue
+        if arg.startswith("-") and arg != "-":
+            options = arg[1:]
+            option_index = 0
+            consumed_next = False
+            while option_index < len(options):
+                option = options[option_index]
+                attached = options[option_index + 1 :]
+                if option == "c":
+                    return None
+                if option == "m":
+                    if attached:
+                        return "module", attached
+                    index += 1
+                    return ("module", argv[index]) if index < len(argv) else None
+                if option in _PYTHON_SHORT_OPTIONS_WITH_OPERANDS:
+                    consumed_next = not attached
+                    break
+                option_index += 1
+            index += 2 if consumed_next else 1
             continue
         return "script", arg
     return None
