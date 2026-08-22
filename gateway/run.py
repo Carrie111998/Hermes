@@ -13210,6 +13210,10 @@ class GatewayRunner(
         self._install_plugin_message_injector()
         self._update_runtime_status("running")
 
+        # Phase 2 is fail-closed and default-off. When enabled, startup itself
+        # must drain durable projection backlog even if no new Codex event arrives.
+        await self._start_codex_bridge_projection()
+
         self._start_loop_heartbeat_task()
 
         # Emit gateway:startup hook
@@ -15128,6 +15132,8 @@ class GatewayRunner(
                 "Shutdown phase: all adapters disconnected at +%.2fs",
                 _phase_elapsed(),
             )
+
+            await self._stop_codex_bridge_projection()
 
             for _task in list(self._background_tasks):
                 if _task is self._stop_task:

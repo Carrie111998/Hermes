@@ -17,7 +17,7 @@ import sqlite3
 import threading
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
@@ -787,6 +787,12 @@ class CodexExecutor(Protocol):
     ) -> str | BridgeExecutionResult: ...
 
 
+class BridgeEventProjector(Protocol):
+    """Optional non-critical consumer of durable public bridge events."""
+
+    def project_pending(self) -> int: ...
+
+
 class CodexUserQuestion(RuntimeError):
     """A blocking structured question emitted by the Codex app server."""
 
@@ -1032,11 +1038,160 @@ class CodexBridgeService:
         store: BridgeStore | None = None,
         executor: CodexExecutor | None = None,
         instance_id: str | None = None,
+        projector: BridgeEventProjector | None = None,
     ):
         self.settings = settings
         self.store = store or BridgeStore()
         self.executor = executor or CodexSdkExecutor(settings)
         self.instance_id = instance_id or uuid.uuid4().hex
+        self.projector = projector or self._load_optional_projector()
+        self._projection_worker: asyncio.Task[None] | None = None
+        self._projection_wake = asyncio.Event()
+        self._projection_stop = asyncio.Event()
+        self._projection_idle = asyncio.Event()
+        self._projection_idle.set()
+
+    def _load_optional_projector(self) -> BridgeEventProjector | None:
+        """Construct the projection consumer only behind its explicit flag."""
+
+        try:
+            from gateway.codex_kanban_projection import (
+                CodexKanbanProjector,
+                load_kanban_projection_settings,
+            )
+
+            projection_settings = load_kanban_projection_settings()
+            if not projection_settings.enabled:
+                return None
+            return CodexKanbanProjector(self.store.path, projection_settings)
+        except Exception:
+            logger.warning(
+                "Kanban projection initialization failed; Codex execution remains active",
+                exc_info=True,
+            )
+            return None
+
+    def _projection_retry_settings(self) -> tuple[float, float, float]:
+        settings = getattr(self.projector, "settings", None)
+        initial = max(0.05, float(getattr(settings, "retry_initial_seconds", 1.0)))
+        maximum = max(initial, float(getattr(settings, "retry_max_seconds", 30.0)))
+        shutdown = max(0.1, float(getattr(settings, "shutdown_timeout_seconds", 5.0)))
+        return initial, maximum, shutdown
+
+    async def _record_projection_retry(
+        self, retry_count: int, next_retry_at: str | None, state: str
+    ) -> None:
+        recorder = getattr(self.projector, "record_retry_state", None)
+        if callable(recorder):
+            try:
+                await asyncio.to_thread(
+                    recorder, retry_count, next_retry_at, state
+                )
+            except Exception:
+                logger.debug("Could not persist projection retry state", exc_info=True)
+
+    async def _projection_has_pending(self) -> bool:
+        status = getattr(self.projector, "status", None)
+        if not callable(status):
+            return False
+        try:
+            report = await asyncio.to_thread(status)
+            return int(report.get("pending_count", 0)) > 0
+        except Exception:
+            logger.debug("Could not read projection pending count", exc_info=True)
+            return False
+
+    async def _projection_loop(self) -> None:
+        initial, maximum, _ = self._projection_retry_settings()
+        retry_count = 0
+        await self._record_projection_retry(0, None, "starting")
+        self._projection_wake.set()
+        try:
+            while not self._projection_stop.is_set():
+                await self._projection_wake.wait()
+                self._projection_wake.clear()
+                if self._projection_stop.is_set():
+                    break
+                self._projection_idle.clear()
+                try:
+                    await asyncio.to_thread(self.projector.project_pending)
+                except Exception:
+                    retry_count += 1
+                    delay = min(maximum, initial * (2 ** min(retry_count - 1, 20)))
+                    next_retry = (
+                        datetime.now(timezone.utc) + timedelta(seconds=delay)
+                    ).isoformat()
+                    await self._record_projection_retry(
+                        retry_count, next_retry, "backoff"
+                    )
+                    logger.warning(
+                        "Kanban projection failed; retrying in %.2fs while Codex remains active",
+                        delay,
+                        exc_info=True,
+                    )
+                    self._projection_idle.set()
+                    try:
+                        await asyncio.wait_for(self._projection_stop.wait(), timeout=delay)
+                    except asyncio.TimeoutError:
+                        self._projection_wake.set()
+                else:
+                    retry_count = 0
+                    await self._record_projection_retry(0, None, "idle")
+                    self._projection_idle.set()
+                    if await self._projection_has_pending():
+                        try:
+                            await asyncio.wait_for(
+                                self._projection_stop.wait(), timeout=initial
+                            )
+                        except asyncio.TimeoutError:
+                            self._projection_wake.set()
+        finally:
+            await self._record_projection_retry(0, None, "stopped")
+            self._projection_idle.set()
+
+    def start_projection(self) -> None:
+        """Start one autonomous drain/retry worker and immediately scan backlog."""
+
+        if self.projector is None or self._projection_stop.is_set():
+            return
+        if self._projection_worker is None or self._projection_worker.done():
+            self._projection_worker = asyncio.create_task(self._projection_loop())
+        self._projection_idle.clear()
+        self._projection_wake.set()
+
+    def _schedule_projection(self) -> None:
+        """Wake the read model without placing it on the execution path."""
+
+        if self.projector is None:
+            return
+        self.start_projection()
+        self._projection_idle.clear()
+        self._projection_wake.set()
+
+    async def wait_for_projection(self, timeout: float = 30.0) -> None:
+        """Wait for the current projection attempt, not the persistent worker."""
+
+        if self.projector is None:
+            return
+        await asyncio.wait_for(self._projection_idle.wait(), timeout=timeout)
+
+    async def stop_projection(self) -> None:
+        """Stop retry scheduling and settle the worker within a bounded timeout."""
+
+        worker = self._projection_worker
+        if worker is None:
+            return
+        self._projection_stop.set()
+        self._projection_wake.set()
+        _, _, timeout = self._projection_retry_settings()
+        try:
+            await asyncio.wait_for(asyncio.shield(worker), timeout=timeout)
+        except asyncio.TimeoutError:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+            logger.warning("Timed out stopping Codex Kanban projection worker")
+        finally:
+            self._projection_worker = None
 
     def _event(
         self,
@@ -1062,13 +1217,16 @@ class CodexBridgeService:
             idempotency_key=request.idempotency_key,
         )
 
-    @staticmethod
     async def _notify(
+        self,
         notify: Callable[[ProgressEvent], Any], event: ProgressEvent
     ) -> None:
-        result = notify(event)
-        if inspect.isawaitable(result):
-            await result
+        try:
+            result = notify(event)
+            if inspect.isawaitable(result):
+                await result
+        finally:
+            self._schedule_projection()
 
     async def execute(
         self,
@@ -1148,6 +1306,7 @@ class CodexBridgeService:
         await self._notify(notify, output_ready)
         done = self._event(request, "done", "Kết quả đã được route về đúng origin.", step="done")
         self.store.append_event(done, final_result=final, artifacts=outcome.artifacts)
+        self._schedule_projection()
         return final
 
     async def _invoke_executor(
@@ -1296,6 +1455,7 @@ class CodexBridgeService:
             request, "done", "Kết quả đã được route về đúng origin.", step="done"
         )
         self.store.append_event(done, final_result=final, artifacts=outcome.artifacts)
+        self._schedule_projection()
         self.store.update_reply(capture.mapping.reply_id, "done", final)
         return final
 
@@ -1328,6 +1488,20 @@ class GatewayCodexBridgeMixin:
         ):
             self._codex_bridge_service = CodexBridgeService(settings)
         return self._codex_bridge_service
+
+    async def _start_codex_bridge_projection(self) -> None:
+        """Start the optional projector at Gateway startup so backlog self-drains."""
+
+        settings = self._codex_bridge_settings()
+        if not settings.enabled:
+            return
+        service = self._ensure_codex_bridge_service(settings)
+        service.start_projection()
+
+    async def _stop_codex_bridge_projection(self) -> None:
+        service = getattr(self, "_codex_bridge_service", None)
+        if service is not None:
+            await service.stop_projection()
 
     def _build_bridge_request(
         self, event: Any, settings: CodexBridgeSettings

@@ -81,6 +81,15 @@ class ChattyProgressExecutor(FakeCodexExecutor):
         return self.result
 
 
+class FailingProjector:
+    def __init__(self):
+        self.calls = 0
+
+    def project_pending(self):
+        self.calls += 1
+        raise OSError("Kanban unavailable")
+
+
 class LocalGatewayHarness(GatewayCodexBridgeMixin):
     def __init__(self, settings, service, adapter):
         self.settings = settings
@@ -150,6 +159,84 @@ async def test_local_gateway_request_runs_once_and_returns_to_origin(tmp_path):
     assert phases[0:2] == ["captured", "working"]
     assert "output_ready" in phases
     assert phases[-1] == "done"
+
+
+@pytest.mark.asyncio
+async def test_kanban_projection_failure_does_not_stop_codex(tmp_path):
+    workspace = tmp_path / "repo-outage"
+    workspace.mkdir()
+    store = BridgeStore(tmp_path / "bridge-outage.db")
+    projector = FailingProjector()
+    request = BridgeRequest(
+        hermes_job_id="job-projection-outage",
+        idempotency_key="projection-outage-key",
+        origin=BridgeOrigin(
+            type="api_server",
+            conversation_id="conversation-outage",
+            message_id="message-outage",
+        ),
+        workspace=str(workspace),
+        prompt="Complete despite the unavailable projection",
+    )
+    service = CodexBridgeService(
+        _settings(workspace),
+        store=store,
+        executor=FakeCodexExecutor("Codex survived Kanban outage"),
+        instance_id="gateway-outage",
+        projector=projector,
+    )
+
+    assert await service.execute(request, AsyncMock()) == "Codex survived Kanban outage"
+    await service.wait_for_projection()
+
+    mapping = store.get_by_job_id(request.hermes_job_id)
+    assert mapping is not None
+    assert mapping.phase == "done"
+    assert mapping.final_result == "Codex survived Kanban outage"
+    assert [event["phase"] for event in store.list_events(request.hermes_job_id)][-2:] == [
+        "output_ready",
+        "done",
+    ]
+    assert projector.calls >= 1
+    await service.stop_projection()
+
+
+@pytest.mark.asyncio
+async def test_kanban_projection_feature_off_is_inert(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    workspace = tmp_path / "repo-projection-off"
+    workspace.mkdir()
+    store = BridgeStore(tmp_path / "bridge-projection-off.db")
+    request = BridgeRequest(
+        hermes_job_id="job-projection-off",
+        idempotency_key="projection-off-key",
+        origin=BridgeOrigin(
+            type="api_server",
+            conversation_id="conversation-off",
+            message_id="message-off",
+        ),
+        workspace=str(workspace),
+        prompt="Complete with projection disabled",
+    )
+    service = CodexBridgeService(
+        _settings(workspace),
+        store=store,
+        executor=FakeCodexExecutor("Projection stayed inert"),
+    )
+
+    assert service.projector is None
+    assert await service.execute(request, AsyncMock()) == "Projection stayed inert"
+    with sqlite3.connect(store.path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+    assert not any(name.startswith("bridge_projection_") for name in tables)
+    assert not (hermes_home / "kanban.db").exists()
 
 
 @pytest.mark.asyncio
