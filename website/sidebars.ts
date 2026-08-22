@@ -141,7 +141,6 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/bundled/apple/apple-apple-reminders',
                     'user-guide/skills/bundled/apple/apple-findmy',
                     'user-guide/skills/bundled/apple/apple-imessage',
-                    'user-guide/skills/bundled/apple/apple-macos-computer-use',
                   ],
                 },
                 {
@@ -158,6 +157,15 @@ const sidebars: SidebarsConfig = {
                 },
                 {
                   type: 'category',
+                  label: 'computer-use',
+                  key: 'skills-bundled-computer-use',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/computer-use/computer-use-computer-use',
+                  ],
+                },
+                {
+                  type: 'category',
                   label: 'creative',
                   key: 'skills-bundled-creative',
                   collapsed: true,
@@ -169,6 +177,7 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/bundled/creative/creative-claude-design',
                     'user-guide/skills/bundled/creative/creative-comfyui',
                     'user-guide/skills/bundled/creative/creative-design-md',
+                    'user-guide/skills/bundled/creative/creative-eli5',
                     'user-guide/skills/bundled/creative/creative-excalidraw',
                     'user-guide/skills/bundled/creative/creative-humanizer',
                     'user-guide/skills/bundled/creative/creative-manim-video',
@@ -587,6 +596,7 @@ const sidebars: SidebarsConfig = {
                   key: 'skills-optional-web-development',
                   collapsed: true,
                   items: [
+                    'user-guide/skills/optional/web-development/web-development-cloudflare-temporary-deploy',
                     'user-guide/skills/optional/web-development/web-development-page-agent',
                   ],
                 },
