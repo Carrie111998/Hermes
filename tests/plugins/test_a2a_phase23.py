@@ -132,7 +132,8 @@ class TestStreamResponseFormat:
         ]
 
     def test_artifact_update_keeps_deeply_nested_json_fence_as_text(self):
-        payload = "[" * 2_000 + "0" + "]" * 2_000
+        depth = protocol._MAX_STRUCTURED_JSON_DEPTH + 1
+        payload = "[" * depth + "0" + "]" * depth
         reply = f"```json\n{payload}\n```"
 
         ev = protocol.artifact_update("task-json", "ctx-json", reply)
@@ -140,6 +141,17 @@ class TestStreamResponseFormat:
         assert ev["artifactUpdate"]["artifact"]["parts"] == [
             {"text": reply, "mediaType": "text/plain"},
         ]
+
+    def test_artifact_update_serializes_unpaired_surrogate_json_as_text(self):
+        reply = '```json\n"\\ud800"\n```'
+
+        ev = protocol.artifact_update("task-json", "ctx-json", reply)
+        encoded = protocol.sse_data(ev, 7).encode("utf-8")
+
+        assert ev["artifactUpdate"]["artifact"]["parts"] == [
+            {"text": reply, "mediaType": "text/plain"},
+        ]
+        assert encoded
 
     def test_status_update_shape(self):
         ev = protocol.status_update("task-1", "ctx-1", protocol.STATE_WORKING)

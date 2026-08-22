@@ -81,7 +81,8 @@ Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
   compatibility and add data Parts for valid fenced JSON; consumers should
   prefer data Parts when present. Extraction accepts a fence info string of
   exactly `json` (ignoring surrounding horizontal whitespace), so attributes
-  and `jsonc` remain text-only, and skips payloads over 1 MiB of UTF-8 data.
+  and `jsonc` remain text-only. Unsafe Unicode, nesting deeper than 100
+  containers, and payloads over 1 MiB of UTF-8 data also remain text-only.
 - Every generated skill advertises `text/plain` and `application/json` as its
   input and output modes. These describe the platform boundary shared by all
   current toolsets rather than toolset-specific file or media capabilities.

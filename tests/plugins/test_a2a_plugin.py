@@ -421,8 +421,18 @@ class TestV1Task:
         ]
 
     def test_completed_task_keeps_deeply_nested_json_fence_as_text(self):
-        payload = "[" * 2_000 + "0" + "]" * 2_000
+        depth = protocol._MAX_STRUCTURED_JSON_DEPTH + 1
+        payload = "[" * depth + "0" + "]" * depth
         reply = f"```json\n{payload}\n```"
+
+        task = protocol.build_task("t-json", "c-json", protocol.STATE_COMPLETED, reply)
+
+        assert task["artifacts"][0]["parts"] == [
+            {"text": reply, "mediaType": "text/plain"},
+        ]
+
+    def test_completed_task_keeps_unpaired_surrogate_json_as_text(self):
+        reply = '```json\n"\\ud800"\n```'
 
         task = protocol.build_task("t-json", "c-json", protocol.STATE_COMPLETED, reply)
 

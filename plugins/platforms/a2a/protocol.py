@@ -272,6 +272,29 @@ _JSON_FENCE_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _MAX_STRUCTURED_JSON_BYTES = 1_048_576
+_MAX_STRUCTURED_JSON_DEPTH = 100
+
+
+def _safe_structured_json(data: Any) -> bool:
+    """Return whether data is safe to embed in the outbound JSON envelope."""
+    stack = [(data, 0)]
+    try:
+        while stack:
+            value, depth = stack.pop()
+            if isinstance(value, str):
+                value.encode("utf-8")
+            elif isinstance(value, list):
+                if depth >= _MAX_STRUCTURED_JSON_DEPTH:
+                    return False
+                stack.extend((item, depth + 1) for item in value)
+            elif isinstance(value, dict):
+                if depth >= _MAX_STRUCTURED_JSON_DEPTH:
+                    return False
+                stack.extend((item, depth + 1) for pair in value.items() for item in pair)
+        encoded = json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
+        return False
+    return len(encoded) <= _MAX_STRUCTURED_JSON_BYTES
 
 
 def _artifact_parts(agent_text: str) -> list[dict]:
@@ -285,7 +308,8 @@ def _artifact_parts(agent_text: str) -> list[dict]:
             data = json.loads(payload)
         except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
             continue
-        parts.append(data_part(data))
+        if _safe_structured_json(data):
+            parts.append(data_part(data))
     return parts
 
 
