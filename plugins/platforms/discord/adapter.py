@@ -432,6 +432,9 @@ _GATE_ENV_KEYS = (
     "DISCORD_ALLOW_BOTS",
     "GATEWAY_ALLOW_ALL_USERS",
     "GATEWAY_ALLOWED_USERS",
+    "DISCORD_THREAD_REQUIRE_MENTION",
+    "DISCORD_REQUIRE_MENTION",
+    "DISCORD_BOTS_REQUIRE_INLINE_MENTION",
 )
 
 
@@ -6553,7 +6556,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
-        return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
+        return self._gate_env("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
 
     def _discord_allow_any_attachment(self) -> bool:
         """Return whether Discord attachments bypass the SUPPORTED_DOCUMENT_TYPES allowlist.
@@ -6781,7 +6784,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION", "false").lower() in {
+        return self._gate_env("DISCORD_BOTS_REQUIRE_INLINE_MENTION", "false").lower() in {
             "true",
             "1",
             "yes",
@@ -6849,7 +6852,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
-        return os.getenv("DISCORD_THREAD_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
+        return self._gate_env("DISCORD_THREAD_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
 
     def _discord_free_response_test_keys(
         self, channel: Any, channel_keys: set[str], is_thread: bool,
@@ -10396,12 +10399,6 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     remains only for existing callers that construct adapters without config
     extras. Returns canonical WebSocket liveness settings to seed that extra.
     """
-    if "require_mention" in discord_cfg and not os.getenv("DISCORD_REQUIRE_MENTION"):
-        os.environ["DISCORD_REQUIRE_MENTION"] = str(discord_cfg["require_mention"]).lower()
-    if "thread_require_mention" in discord_cfg and not os.getenv("DISCORD_THREAD_REQUIRE_MENTION"):
-        os.environ["DISCORD_THREAD_REQUIRE_MENTION"] = str(discord_cfg["thread_require_mention"]).lower()
-    if "bots_require_inline_mention" in discord_cfg and not os.getenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION"):
-        os.environ["DISCORD_BOTS_REQUIRE_INLINE_MENTION"] = str(discord_cfg["bots_require_inline_mention"]).lower()
     platforms_cfg = yaml_cfg.get("platforms")
     platform_extra_cfg = {}
     if isinstance(platforms_cfg, dict):
@@ -10418,6 +10415,30 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     # a secondary profile's gates must never land in process-global env where
     # they'd become another profile's policy.
     _skip_env_bridge = _profile_scoped_config_load()
+    require_mention_cfg = (
+        discord_cfg["require_mention"] if "require_mention" in discord_cfg
+        else platform_extra_cfg.get("require_mention")
+    )
+    if require_mention_cfg is not None:
+        seeded_extra["require_mention"] = str(require_mention_cfg).lower()
+        if not _skip_env_bridge and not os.getenv("DISCORD_REQUIRE_MENTION"):
+            os.environ["DISCORD_REQUIRE_MENTION"] = str(require_mention_cfg).lower()
+    thread_require_mention_cfg = (
+        discord_cfg["thread_require_mention"] if "thread_require_mention" in discord_cfg
+        else platform_extra_cfg.get("thread_require_mention")
+    )
+    if thread_require_mention_cfg is not None:
+        seeded_extra["thread_require_mention"] = str(thread_require_mention_cfg).lower()
+        if not _skip_env_bridge and not os.getenv("DISCORD_THREAD_REQUIRE_MENTION"):
+            os.environ["DISCORD_THREAD_REQUIRE_MENTION"] = str(thread_require_mention_cfg).lower()
+    bots_require_inline_mention_cfg = (
+        discord_cfg["bots_require_inline_mention"] if "bots_require_inline_mention" in discord_cfg
+        else platform_extra_cfg.get("bots_require_inline_mention")
+    )
+    if bots_require_inline_mention_cfg is not None:
+        seeded_extra["bots_require_inline_mention"] = str(bots_require_inline_mention_cfg).lower()
+        if not _skip_env_bridge and not os.getenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION"):
+            os.environ["DISCORD_BOTS_REQUIRE_INLINE_MENTION"] = str(bots_require_inline_mention_cfg).lower()
     allowed_users_cfg = (
         discord_cfg["allow_from"] if "allow_from" in discord_cfg
         else platform_extra_cfg.get("allow_from")
