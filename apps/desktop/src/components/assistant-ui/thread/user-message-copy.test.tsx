@@ -14,6 +14,7 @@ stubThreadViewportSize()
 afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
 })
 
 function Harness({ prompt }: { prompt: string }) {
@@ -37,10 +38,15 @@ function Harness({ prompt }: { prompt: string }) {
 }
 
 describe('user message copy action', () => {
-  it('copies the exact prompt without opening the edit composer', async () => {
+  it('copies the exact prompt through the desktop clipboard bridge without opening the edit composer', async () => {
+    const writeClipboard = vi.fn().mockResolvedValue(true)
     const writeText = vi.fn().mockResolvedValue(undefined)
     const prompt = 'first line\n`literal code` and 한글'
 
+    // Electron exposes `hermesDesktop.writeClipboard`; the renderer's
+    // `navigator.clipboard` can throw once the document loses focus, so the
+    // bridge must win whenever it is present.
+    vi.stubGlobal('hermesDesktop', { writeClipboard })
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
       value: { writeText }
@@ -57,7 +63,8 @@ describe('user message copy action', () => {
 
     fireEvent.click(within(userMessageRoot).getByRole('button', { name: 'Copy' }))
 
-    await waitFor(() => expect(writeText).toHaveBeenCalledWith(prompt))
+    await waitFor(() => expect(writeClipboard).toHaveBeenCalledWith(prompt))
+    expect(writeText).not.toHaveBeenCalled()
     expect(container.querySelector('[data-slot="aui_edit-composer-root"]')).toBeNull()
     expect(screen.getByRole('button', { name: 'Edit message' })).toBeTruthy()
   })
