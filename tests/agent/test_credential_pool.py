@@ -263,6 +263,64 @@ def test_unmatched_api_key_hint_rotates_without_benching_innocent_key(tmp_path, 
         assert persisted.get("last_error_code") is None
 
 
+def test_codex_runtime_sync_does_not_overwrite_independent_manual_entry(tmp_path, monkeypatch):
+    """Runtime refresh must not copy singleton tokens into a manual account.
+
+    ``manual:device_code`` entries are independent accounts added with
+    ``hermes auth add``.  The singleton under ``providers`` shadows only the
+    seeded ``device_code`` entry.  Treating every manual entry as that shadow
+    silently replaces all accounts with the currently active login.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "singleton-at",
+                        "refresh_token": "singleton-rt",
+                    },
+                    "auth_mode": "chatgpt",
+                }
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "independent",
+                        "label": "account-b",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:device_code",
+                        "access_token": "account-b-at",
+                        "refresh_token": "account-b-rt",
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    manual = next(entry for entry in pool.entries() if entry.id == "independent")
+    synced = pool._sync_codex_entry_from_auth_store(manual)
+
+    assert synced is manual
+    assert synced.access_token == "account-b-at"
+    assert synced.refresh_token == "account-b-rt"
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    row = next(
+        entry
+        for entry in persisted["credential_pool"]["openai-codex"]
+        if entry["id"] == "independent"
+    )
+    assert row["access_token"] == "account-b-at"
+    assert row["refresh_token"] == "account-b-rt"
+
+
 def test_token_invalidated_marks_credential_dead(tmp_path, monkeypatch):
     """OpenAI Codex token_invalidated must mark the credential DEAD, not exhausted.
 
