@@ -938,3 +938,64 @@ def test_normalize_usage_missing_signal_quiet_for_anthropic_provider_chat_mode(c
         for r in caplog.records
         if r.name == "agent.usage_pricing" and "cache_observability" in r.getMessage()
     ]
+
+
+# ── Mode-audit witnesses: every other api_mode must stay quiet ────────────
+# The missing-signal log is scoped to the generic OpenAI-compatible branch.
+# These pin the quietness of the two remaining modes that DO reach
+# normalize_usage, so an adapter change that drops the always-present cache
+# field fails loudly here instead of producing a permanent misleading debug
+# line in production.
+
+
+def test_normalize_usage_missing_signal_quiet_for_bedrock_converse_shape(caplog):
+    """bedrock_converse reaches the generic branch via bedrock_adapter.py,
+    which always emits cache_read_input_tokens (even when 0) on its converted
+    OpenAI-style namespace — so the missing-signal log must never fire for
+    the Converse shape, including a genuine zero-cache response."""
+    import logging
+
+    # Mirrors agent/bedrock_adapter.py:795-804 exactly (zero-cache case).
+    from types import SimpleNamespace as NS
+
+    usage = NS(
+        prompt_tokens=100 + 0 + 0,
+        completion_tokens=10,
+        total_tokens=110,
+        cache_read_input_tokens=0,
+        cache_creation_input_tokens=0,
+    )
+    with caplog.at_level(logging.DEBUG, logger="agent.usage_pricing"):
+        normalized = normalize_usage(usage, provider="bedrock", api_mode="bedrock_converse")
+
+    assert normalized.cache_read_tokens == 0
+    assert not [
+        r
+        for r in caplog.records
+        if r.name == "agent.usage_pricing" and "cache_observability" in r.getMessage()
+    ]
+
+
+def test_normalize_usage_missing_signal_quiet_for_copilot_acp_shape(caplog):
+    """copilot_acp synthesizes a usage namespace carrying
+    prompt_tokens_details.cached_tokens (copilot_acp_client.py) — present,
+    even at 0, so the missing-signal log must stay quiet."""
+    import logging
+
+    from types import SimpleNamespace as NS
+
+    usage = NS(
+        prompt_tokens=0,
+        completion_tokens=0,
+        total_tokens=0,
+        prompt_tokens_details=NS(cached_tokens=0),
+    )
+    with caplog.at_level(logging.DEBUG, logger="agent.usage_pricing"):
+        normalized = normalize_usage(usage, provider="copilot", api_mode="chat_completions")
+
+    assert normalized.cache_read_tokens == 0
+    assert not [
+        r
+        for r in caplog.records
+        if r.name == "agent.usage_pricing" and "cache_observability" in r.getMessage()
+    ]

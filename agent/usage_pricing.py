@@ -1406,13 +1406,17 @@ def normalize_usage(
     # Presence-based (is not None), so a genuine cache miss that includes
     # the field with 0 stays quiet — checked at the NESTED level too, so a
     # proxy that strips only the inner cached_tokens key (container left
-    # behind) still fires. codex_responses is excluded: its cache
-    # signal lives in input_tokens_details, handled by the Responses branch
-    # above. Standard level-gated logger.debug.
+    # behind) still fires. Mode audit (every api_mode in the codebase):
+    # anthropic_messages / provider=anthropic and codex_responses are
+    # excluded below; bedrock_converse responses are pre-converted by
+    # bedrock_adapter.py to an OpenAI-style namespace that always carries
+    # cache_read_input_tokens (even when 0) so they stay quiet;
+    # copilot_acp synthesizes prompt_tokens_details.cached_tokens so it
+    # stays quiet; codex_app_server bypasses this loop entirely before any
+    # normalize_usage call. Standard level-gated logger.debug.
     _ptd = _usage_get(response_usage, "prompt_tokens_details", None)
     if (
-        mode != "anthropic_messages"
-        and mode != "codex_responses"
+        mode not in {"anthropic_messages", "codex_responses"}
         and provider_name != "anthropic"
         and _usage_get(_ptd, "cached_tokens", None) is None
         and _usage_get(response_usage, "cache_read_input_tokens", None) is None
@@ -1435,7 +1439,7 @@ def normalize_usage(
         except Exception:  # pragma: no cover - defensive: never break accounting
             _observed_keys = ["<unintrospectable>"]
         logger.debug(
-            "cache_observability provider=%s mode=%s cache_read_tokens=0 — "
+            "cache_observability provider=%s mode=%s — "
             "usage payload carries no cache-hit field; keys=%s (if this "
             "fires on every call, the provider is not sending "
             "prompt_tokens_details.cached_tokens — check its streaming "
