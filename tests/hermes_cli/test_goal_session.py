@@ -197,6 +197,70 @@ def test_an_inactive_goal_that_was_paused_reports_a_pause(monkeypatch):
     assert result["state"]["status"] == "hard_paused"
 
 
+def test_a_publication_blocker_returns_a_continuation_without_re_judging(monkeypatch):
+    """The verdict already exists; re-grading it would spend an aux call for nothing."""
+    judged = []
+
+    class Manager:
+        def __init__(self, session_id, *, default_max_turns):
+            self.state = _State()
+
+        def evaluate_after_turn(self, response, background_processes=None):
+            judged.append(response)
+            return {"verdict": "continue", "reason": "x", "should_continue": True,
+                    "continuation_prompt": "y"}
+
+    _install_fake_goals(monkeypatch, Manager)
+    from hermes_cli.goal_session import run_goal_turn
+
+    result = run_goal_turn(
+        "s1", "evaluate", response="done", blocked_reason="branch-not-pushed",
+        blocked_remedy="Push it.", blocked_paths=["a.py"], blocked_attempts_left=2,
+    )
+
+    assert judged == [], "the judge must not run again for a publication blocker"
+    decision = result["decision"]
+    assert decision["verdict"] == "continue"
+    assert "branch-not-pushed" in decision["continuation_prompt"]
+    assert "Push it." in decision["continuation_prompt"]
+    assert "a.py" in decision["continuation_prompt"]
+    assert "2 more time" in decision["continuation_prompt"]
+
+
+def test_a_publication_blocker_hard_pauses_once_the_budget_is_spent(monkeypatch):
+    """If naming the blocker did not clear it, a human must see it."""
+
+    class Manager:
+        def __init__(self, session_id, *, default_max_turns):
+            self.state = _State()
+
+        def evaluate_after_turn(self, response, background_processes=None):
+            raise AssertionError("the judge must not be called")
+
+    _install_fake_goals(monkeypatch, Manager)
+    from hermes_cli.goal_session import run_goal_turn
+
+    result = run_goal_turn("s1", "evaluate", response="done",
+                           blocked_reason="worktree-dirty", blocked_attempts_left=0)
+
+    assert result["decision"]["verdict"] == "hard_pause"
+    assert result["decision"]["should_continue"] is False
+    assert result["state"]["status"] == "hard_paused"
+
+
+def test_the_publication_continuation_forbids_new_work():
+    """The failure mode is an agent that reads 'blocked' as 'keep going'."""
+    from hermes_cli.goal_session import publication_continuation
+
+    text = publication_continuation("branch-not-pushed", "Push the branch.", 1)
+    assert "already verified this work as DONE" in text
+    assert "Do NOT start new work" in text
+    # A bulleted path list must not run into the sentence's period.
+    listed = publication_continuation("worktree-dirty", "Commit it.", 1, ["x.py", "  "])
+    assert listed.count("- x.py") == 1
+    assert "  - x.py." not in listed
+
+
 def test_a_paused_state_becomes_a_hard_pause(monkeypatch):
     class Manager:
         def __init__(self, session_id, *, default_max_turns):

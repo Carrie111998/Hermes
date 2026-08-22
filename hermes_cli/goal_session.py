@@ -105,6 +105,43 @@ def _judge_detail(state: Any, decision: Dict[str, Any]) -> str:
     return raw.removeprefix("judge error:").strip() or "unknown error"
 
 
+def publication_continuation(reason: str, remedy: str, attempts_left: int, paths: Iterable[str] = ()) -> str:
+    """Build the continuation that asks the agent to clear its own publication blocker.
+
+    An embedder that owns a publication step (promoting verified work to a
+    branch, uploading an artifact, filing a release) can find the work DONE and
+    still be unable to publish it. That is not a decision for a human — it is
+    the next step, and usually one the agent that did the work can take.
+
+    Routing it back through the goal loop rather than the embedder's own state
+    machine matters: the loop already owns continuations, attempt budgets, and
+    the boundary between "the agent should act" and "a human must". An embedder
+    that reimplements those grows a second supervisor that drifts from this one.
+
+    The prompt states the verdict already reached, so the agent does not restart
+    finished work; names the blocker and its remedy concretely; and forbids new
+    work, the failure mode being an agent that reads "blocked" as "keep going"
+    and grows the diff instead of shipping it.
+    """
+    listed = [str(item).strip() for item in paths if str(item).strip()]
+    blocker = str(reason or "").strip() or "publication was blocked"
+    if listed:
+        blocker = f"{blocker}:\n" + "\n".join(f"  - {item}" for item in listed)
+    remaining = max(0, int(attempts_left))
+    # A bulleted path list must not be followed by the sentence's period — it
+    # reads as part of the final filename.
+    blocked_sentence = f"Publication was blocked because {blocker}" + ("\n" if listed else ".")
+    return (
+        "[Publication] The goal supervisor has already verified this work as DONE. "
+        f"{blocked_sentence}\n"
+        f"{str(remedy or '').strip() or 'Resolve the blocker so the verified work can be published.'}\n\n"
+        "Do NOT start new work, expand the change, or re-verify what is already done — "
+        "the only remaining task is to clear this blocker so the finished work can be published. "
+        "If it is something you genuinely cannot resolve, say so plainly and stop rather than forcing it. "
+        f"Publication will be attempted {remaining} more time(s) before asking the operator."
+    )
+
+
 def run_goal_turn(
     session_id: str,
     action: str = "evaluate",
@@ -116,6 +153,10 @@ def run_goal_turn(
     max_turns: Optional[int] = None,
     reason: str = "",
     default_max_turns: int = 90,
+    blocked_reason: str = "",
+    blocked_remedy: str = "",
+    blocked_paths: Iterable[str] = (),
+    blocked_attempts_left: int = 0,
 ) -> Dict[str, Any]:
     """Drive one goal-protocol action for ``session_id`` and return an envelope.
 
@@ -126,6 +167,14 @@ def run_goal_turn(
     session holds no goal (a cancelled turn, a cleared session, a crash between
     turns), it is started from that objective instead of failing. The envelope
     then carries ``restarted: True``.
+
+    ``blocked_reason`` reports an embedder-side PUBLICATION precondition that
+    failed after the work was already judged done. It short-circuits the judge —
+    there is nothing new to grade, and grading it again wastes an auxiliary call
+    to re-reach a verdict that already exists — and returns a ``continue``
+    carrying a continuation that names the blocker and its remedy. When the
+    attempt budget is spent it returns ``hard_pause`` instead, because by then
+    the obstacle is not what the reason code claims and a human should see it.
 
     Never raises for an ordinary protocol condition: a missing goal, an unknown
     action, or an unavailable judge all come back as a structured envelope. Only
@@ -215,6 +264,46 @@ def run_goal_turn(
         }
 
     # --- evaluate -----------------------------------------------------------
+    if str(blocked_reason or "").strip():
+        # A publication precondition failed on work the judge already passed.
+        # Do NOT call the judge again: the verdict exists, the response has not
+        # changed, and re-grading it would spend an auxiliary call to reach the
+        # same answer. The mission's next step is the blocker, not a re-judgment.
+        state = manager.state
+        assert state is not None
+        attempts_left = int(blocked_attempts_left)
+        if attempts_left <= 0:
+            return {
+                "protocol_version": PROTOCOL_VERSION,
+                "session_id": session_id,
+                "state": _state_payload(state, status="hard_paused"),
+                "decision": {
+                    "verdict": "hard_pause",
+                    "reason": f"Publication remained blocked ({blocked_reason}) after every attempt.",
+                    "should_continue": False,
+                    "continuation_prompt": None,
+                    "failure_kind": "",
+                },
+                "error": None,
+                "restarted": restarted,
+            }
+        return {
+            "protocol_version": PROTOCOL_VERSION,
+            "session_id": session_id,
+            "state": _state_payload(state, status="active"),
+            "decision": {
+                "verdict": "continue",
+                "reason": f"Publication is blocked ({blocked_reason}); the agent must clear it.",
+                "should_continue": True,
+                "continuation_prompt": publication_continuation(
+                    blocked_reason, blocked_remedy, attempts_left, blocked_paths,
+                ),
+                "failure_kind": "",
+            },
+            "error": None,
+            "restarted": restarted,
+        }
+
     try:
         from hermes_cli.goals import gather_background_processes
 
