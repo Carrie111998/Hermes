@@ -80,6 +80,13 @@ class TestMediaOwnership:
 
         assert existing._media_owners == {}
 
+    def test_duplicate_url_maps_to_the_later_message(self):
+        existing = _event(raw="raw-1", media_urls=["/cache/same.jpg"])
+
+        merge_raw(existing, _event(raw="raw-2", media_urls=["/cache/same.jpg"]))
+
+        assert existing._media_owners == {"/cache/same.jpg": "raw-2"}
+
     def test_media_arriving_after_a_text_chunk_is_attributed(self):
         existing = _event("caption", raw="raw-1")
 

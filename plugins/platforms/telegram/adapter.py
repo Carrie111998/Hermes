@@ -9762,6 +9762,11 @@ class TelegramAdapter(BasePlatformAdapter):
             for url in (getattr(existing, "media_urls", None) or []):
                 owners[url] = getattr(existing, "raw_message", None)
             existing._media_owners = owners  # type: ignore[attr-defined]
+        # Identical URLs across merged events collapse here (last writer
+        # wins) while the caller still extends ``media_urls`` with every
+        # entry -- so a duplicated URL maps to the *later* message that
+        # carried it. Fine for distinct cached files; revisit if callers
+        # ever need per-entry ownership of repeated URLs.
         for url in (getattr(event, "media_urls", None) or []):
             owners[url] = getattr(event, "raw_message", None)
 
