@@ -2645,6 +2645,7 @@ from gateway.config import (
 )
 from gateway.session import (
     AsyncSessionStore,
+    TELEGRAM_FOREGROUND_ROUTE_METADATA,
     SessionEntry,
     SessionStore,
     SessionSource,
@@ -7829,6 +7830,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """True for the main Telegram DM (or General topic) when topic mode has made it a lobby."""
         if source.platform != Platform.TELEGRAM or source.chat_type != "dm":
             return False
+        # A detached foreground route is already an explicit isolated lane.
+        # Do not fold it back into the physical topic lobby.
+        if getattr(source, "session_route_id", None):
+            return False
         if not self._telegram_topic_mode_enabled(source):
             return False
         tid = str(source.thread_id or "")
@@ -7837,6 +7842,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _is_telegram_topic_lane(self, source: SessionSource) -> bool:
         """True for a user-created Telegram private-chat topic lane."""
         if source.platform != Platform.TELEGRAM or source.chat_type != "dm":
+            return False
+        # Topic bindings are one-to-one. Resolving a detached foreground
+        # route through the physical topic binding would immediately switch it
+        # back onto the still-running session it was created to escape.
+        if getattr(source, "session_route_id", None):
             return False
         if not self._telegram_topic_mode_enabled(source):
             return False
@@ -16350,6 +16360,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "new": self._busy_new_command,
                 "queue": self._busy_queue_command,
                 "steer": self._busy_steer_command,
+                "background": self._busy_background_command,
                 "egress": self._busy_egress_command,
                 "goal": self._busy_goal_command,
                 "loop": self._busy_loop_command,
@@ -16433,6 +16444,70 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # interrupt, no queued text.
         logger.info("Ignoring /start platform ping for active session %s", quick_key)
         return ""
+
+    async def _busy_background_command(
+        self, event: MessageEvent, quick_key: str, source: SessionSource
+    ) -> str:
+        """Detach a live Telegram turn, or preserve ``/bg <prompt>``.
+
+        The live agent cannot be moved onto another key after it starts: its
+        generation guards, turn lease, transcript target, and adapter owner
+        all intentionally close over the original key.  Instead, keep that
+        exact turn untouched and durably route subsequent Telegram input to a
+        fresh key.  The old turn therefore completes and delivers normally,
+        while the chat can immediately start independent foreground turns.
+        """
+        prompt = event.get_command_args().strip()
+        if prompt or source.platform != Platform.TELEGRAM:
+            return await self._handle_background_command(event)
+
+        state = self._peek_session_state(quick_key)
+        running_agent = state.turn.agent if state is not None else None
+        if running_agent is None:
+            return t("gateway.background.usage")
+        if running_agent is _AGENT_PENDING_SENTINEL:
+            return (
+                "⏳ The agent is still starting. Try `/bg` again once it is "
+                "shown as running."
+            )
+
+        # Always anchor the durable redirect on the physical Telegram lane,
+        # even when this is a second detach from an already-routed lane.
+        physical_source = dataclasses.replace(source, session_route_id=None)
+        physical_key = self.session_store._generate_session_key(physical_source)
+        route_id = f"fg_{os.urandom(6).hex()}"
+        routed_source = dataclasses.replace(source, session_route_id=route_id)
+
+        # Create the destination before publishing the redirect.  A failed
+        # create is a clean no-op rather than a pointer to a missing session.
+        try:
+            routed_entry = await self.async_session_store.get_or_create_session(
+                routed_source
+            )
+            stored = await self.async_session_store.set_session_metadata(
+                physical_key,
+                TELEGRAM_FOREGROUND_ROUTE_METADATA,
+                route_id,
+            )
+        except Exception:
+            logger.exception("Failed to detach Telegram foreground route")
+            return "⚠️ Could not detach the running agent. It is still running normally."
+        if not stored:
+            return (
+                "⏳ The running session has not finished initializing. "
+                "Try `/bg` again in a moment."
+            )
+
+        self._cache_session_source(routed_entry.session_key, routed_source)
+        detached_session_id = str(
+            getattr(running_agent, "session_id", None) or "current turn"
+        )
+        return (
+            "↗️ Detached the running agent into the background.\n\n"
+            f"It will keep running as `{detached_session_id}` and post its "
+            "result here. New messages now use a fresh foreground session "
+            f"(`{routed_entry.session_id}`)."
+        )
 
     async def _busy_egress_command(self, event: MessageEvent, quick_key: str, source):
         from hermes_cli.proxy_cli import format_status_text

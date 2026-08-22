@@ -10,8 +10,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
-from gateway.session import SessionSource
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent
+from gateway.session import (
+    TELEGRAM_FOREGROUND_ROUTE_METADATA,
+    SessionSource,
+    build_session_key,
+)
 
 
 def _make_event(text="/background", platform=Platform.TELEGRAM,
@@ -84,6 +88,112 @@ class TestHandleBackgroundCommand:
         event = _make_event(text="/background   ")
         result = await runner._handle_background_command(event)
         assert "Usage:" in result
+
+    @pytest.mark.asyncio
+    async def test_bare_busy_bg_detaches_exact_telegram_turn(self):
+        runner = _make_runner()
+        event = _make_event(text="/bg")
+        physical_key = build_session_key(event.source)
+        running_agent = MagicMock(session_id="20260822_020618_51467760")
+        runner._running_agents[physical_key] = running_agent
+        routed_entry = MagicMock(
+            session_key=f"{physical_key}:route:fg_abc123",
+            session_id="fresh-foreground-session",
+        )
+        runner.session_store._generate_session_key.return_value = physical_key
+        runner._async_session_store = MagicMock()
+        runner._async_session_store._store = runner.session_store
+        runner._async_session_store.get_or_create_session = AsyncMock(
+            return_value=routed_entry
+        )
+        runner._async_session_store.set_session_metadata = AsyncMock(
+            return_value=True
+        )
+        runner._cache_session_source = MagicMock()
+
+        result = await runner._busy_background_command(
+            event, physical_key, event.source
+        )
+
+        assert "Detached" in result
+        assert "20260822_020618_51467760" in result
+        assert runner._running_agents[physical_key] is running_agent
+        routed_source = (
+            runner._async_session_store.get_or_create_session.await_args.args[0]
+        )
+        assert routed_source.session_route_id.startswith("fg_")
+        runner._async_session_store.set_session_metadata.assert_awaited_once_with(
+            physical_key,
+            TELEGRAM_FOREGROUND_ROUTE_METADATA,
+            routed_source.session_route_id,
+        )
+
+    @pytest.mark.asyncio
+    async def test_busy_bg_with_prompt_still_spawns_isolated_task(self):
+        runner = _make_runner()
+        event = _make_event(text="/bg investigate this")
+        runner._handle_background_command = AsyncMock(return_value="started")
+
+        result = await runner._busy_background_command(
+            event, build_session_key(event.source), event.source
+        )
+
+        assert result == "started"
+        runner._handle_background_command.assert_awaited_once_with(event)
+
+
+class TestDetachedTelegramRouteIngress:
+    def test_persisted_route_rekeys_external_messages_before_guard(self):
+        adapter = MagicMock()
+        adapter.config = MagicMock()
+        adapter.config.extra = {
+            "group_sessions_per_user": True,
+            "thread_sessions_per_user": False,
+        }
+        adapter._owner_profile = None
+        adapter._session_key_profile.return_value = None
+        adapter._session_store = MagicMock()
+        adapter._session_store._resolve_profile_for_key.return_value = None
+        adapter._session_store.get_session_metadata.return_value = "fg_abc123"
+        event = _make_event(text="new foreground work")
+        physical_key = build_session_key(event.source)
+
+        BasePlatformAdapter._apply_persisted_session_route(adapter, event)
+
+        assert event.source.session_route_id == "fg_abc123"
+        assert build_session_key(event.source).endswith(":route:fg_abc123")
+        adapter._session_store.get_session_metadata.assert_called_once_with(
+            physical_key,
+            TELEGRAM_FOREGROUND_ROUTE_METADATA,
+            "",
+        )
+
+    def test_strict_internal_event_keeps_own_route(self):
+        adapter = MagicMock()
+        adapter._session_store = MagicMock()
+        event = _make_event(text="completion")
+        event.internal = True
+        event.metadata = {"gateway_session_key": build_session_key(event.source)}
+
+        BasePlatformAdapter._apply_persisted_session_route(adapter, event)
+
+        assert event.source.session_route_id is None
+        adapter._session_store.get_session_metadata.assert_not_called()
+
+    def test_detached_route_bypasses_physical_topic_binding(self):
+        runner = _make_runner()
+        runner._telegram_topic_mode_enabled = MagicMock(return_value=True)
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="67890",
+            chat_type="dm",
+            user_id="12345",
+            thread_id="42",
+            session_route_id="fg_abc123",
+        )
+
+        assert runner._is_telegram_topic_lane(source) is False
+        assert runner._is_telegram_topic_root_lobby(source) is False
 
 
 # ---------------------------------------------------------------------------
