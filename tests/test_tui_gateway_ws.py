@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import datetime
 import json
 import threading
 import time
@@ -183,6 +184,44 @@ def test_ws_transport_serializes_concurrent_sends():
 
         assert len(sent) == 2
         assert max_active_sends == 1
+        assert transport._closed is False
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
+
+
+def test_ws_transport_replies_with_error_for_unserializable_response(caplog):
+    sent = []
+
+    class FakeWS:
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    try:
+        transport = ws_mod.WSTransport(FakeWS(), loop, peer="serialization-test")
+
+        assert transport.write(
+            {
+                "jsonrpc": "2.0",
+                "id": "profiles",
+                "result": {"created": datetime.datetime(2026, 8, 22)},
+            }
+        ) is True
+        assert transport.write({"jsonrpc": "2.0", "id": "next", "result": {}}) is True
+
+        assert sent == [
+            {
+                "jsonrpc": "2.0",
+                "error": {"code": -32603, "message": "response serialization error"},
+                "id": "profiles",
+            },
+            {"jsonrpc": "2.0", "id": "next", "result": {}},
+        ]
+        assert "ws frame serialization failed" in caplog.text
         assert transport._closed is False
     finally:
         loop.call_soon_threadsafe(loop.stop)
