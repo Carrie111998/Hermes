@@ -1,0 +1,9 @@
+name: kernel
+version: 0.1.0
+description: "MershLab's own audit invariant: observes every outgoing model call via pre_api_request/post_api_request, records an append-only provenance-shaped log, and flags a session whose message history silently shrinks between two consecutive calls. Detects and records; cannot block, since Hermes's own hooks are observer-only by design. See plugins/kernel/kernel.py for the full scoping."
+author: MershLab
+license: MIT
+kind: backend
+provides_hooks:
+  - pre_api_request
+  - post_api_request
