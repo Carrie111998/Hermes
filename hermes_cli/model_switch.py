@@ -521,17 +521,17 @@ class DirectAlias(NamedTuple):
 
 # Built-in direct aliases (can be extended via config.yaml model_aliases:)
 _BUILTIN_DIRECT_ALIASES: dict[str, DirectAlias] = {
-    # OpenCode Zen exposes Ox Alpha under its exact preview slug. Keep the
-    # endpoint identity fixed while accepting the operator-facing spellings.
+    # Ox Alpha is the OpenRouter stealth route. Keep the endpoint identity
+    # fixed while accepting the operator-facing compatibility spelling.
     "alpha-0": DirectAlias(
-        model="x-preview-f-free",
-        provider="opencode-zen",
-        base_url="https://opencode.ai/zen/v1",
+        model="stealth/ox-alpha",
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
     ),
     "ox-alpha": DirectAlias(
-        model="x-preview-f-free",
-        provider="opencode-zen",
-        base_url="https://opencode.ai/zen/v1",
+        model="stealth/ox-alpha",
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
     ),
 }
 
@@ -3945,6 +3945,7 @@ def list_picker_providers(
     current_model: str = "",
     include_moa: bool = False,
     excluded_providers: list | None = None,
+    model_aliases: dict | None = None,
 ) -> List[dict]:
     """Interactive-picker variant of :func:`list_authenticated_providers`.
 
@@ -3999,4 +4000,11 @@ def list_picker_providers(
             continue
         filtered.append(p)
 
+    if model_aliases:
+        try:
+            from hermes_cli.inventory import apply_selection_inventory
+
+            filtered, _inventory = apply_selection_inventory(filtered, model_aliases)
+        except Exception:
+            pass
     return filtered

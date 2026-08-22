@@ -1451,7 +1451,7 @@ class TestLocalOllamaModelDiscovery:
         assert result.success is True
         assert result.api_key == "secret", result
 
-    def test_builtin_alpha_aliases_resolve_to_exact_zen_endpoint(self):
+    def test_builtin_alpha_aliases_resolve_to_exact_openrouter_endpoint(self):
         import hermes_cli.model_switch as model_switch
 
         original_aliases = dict(model_switch.DIRECT_ALIASES)
@@ -1459,8 +1459,8 @@ class TestLocalOllamaModelDiscovery:
         try:
             for alias in ("alpha-0", "ox-alpha"):
                 assert model_switch.resolve_alias(alias, "openrouter") == (
-                    "opencode-zen",
-                    "x-preview-f-free",
+                    "openrouter",
+                    "stealth/ox-alpha",
                     alias,
                 )
         finally:
