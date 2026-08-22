@@ -12,6 +12,7 @@ from session_bridge.claude_visibility import (
     build_claude_visibility_candidate,
     derive_claude_visibility_identity,
 )
+from session_bridge.codex_adapter import _CodexReadBudgetExceeded
 from session_bridge.config import BridgeConfig
 from session_bridge.coordinator import (
     ClaudeVisibilityCoordinator,
@@ -595,6 +596,79 @@ def test_run_once_records_sanitized_continuous_discovery_failure() -> None:
         }
     ]
     assert "secret" not in repr(result)
+
+
+def test_budget_exhaustion_records_only_sanitized_cycle_without_state_drift(
+    tmp_path, caplog
+) -> None:
+    database = SessionDB(tmp_path / "coordinator-budget.db")
+    store = SessionBridgeStore(
+        database,
+        clock=lambda: NOW,
+        local_timezone=timezone.utc,
+    )
+    registrar = FakeRegistrar()
+    sentinel = "sentinel-auth-payload-C:/secret/transcript.jsonl"
+
+    def snapshot(table: str) -> list[dict[str, object]]:
+        return [
+            dict(row)
+            for row in database._conn.execute(
+                f"SELECT * FROM {table} ORDER BY rowid"
+            ).fetchall()
+        ]
+
+    try:
+        jobs = snapshot("session_claude_visibility_jobs")
+        usage = snapshot("session_claude_registration_usage")
+
+        def inventory(_after: float):
+            raise _CodexReadBudgetExceeded(
+                "Codex sidebar deadline exhausted"
+            ) from RuntimeError(sentinel)
+
+        coordinator = ClaudeVisibilityCoordinator(
+            config=_config(continuous=True),
+            store=store,
+            inventory=inventory,
+            continuous_inventory=inventory,
+            registrar=registrar,
+            marker_secret=SECRET,
+            clock=lambda: NOW,
+        )
+
+        with caplog.at_level(logging.WARNING, logger="session_bridge.coordinator"):
+            result = coordinator.run_once(discover_continuous=True)
+
+        assert result.status == "degraded"
+        assert result.error_code == "provider_degraded"
+        assert result.degraded is True
+        assert registrar.claims == []
+        assert snapshot("session_claude_visibility_jobs") == jobs
+        assert snapshot("session_claude_registration_usage") == usage
+        status = store.claude_visibility_status(NOW)
+        assert status["last_cycle"] == {
+            "tracked": True,
+            "value": {
+                "sequence": 1,
+                "at": NOW,
+                "status": "degraded",
+                "error_code": "provider_degraded",
+                "empty_verified": False,
+            },
+        }
+        assert sentinel not in repr(result)
+        assert sentinel not in "\n".join(
+            record.getMessage() for record in caplog.records
+        )
+        assert "stage=inventory" in "\n".join(
+            record.getMessage() for record in caplog.records
+        )
+        assert "Codex sidebar deadline exhausted" in "\n".join(
+            record.getMessage() for record in caplog.records
+        )
+    finally:
+        database.close()
 
 
 def test_provider_exception_is_sanitized_degraded_result() -> None:

@@ -980,6 +980,7 @@ class ProductionBackend:
         )
         self._claude_visibility_preflight_command: tuple[str, ...] | None = None
         self._claude_visibility_preflight_at: float | None = None
+        self._claude_visibility_stop: threading.Event | None = None
         self._codex_client: RecoveringCodexAppServerClient | None = None
         self._sidebar_codex_client: CodexAppServerClient | None = None
         self._sidebar_registration_codex_client: CodexAppServerClient | None = None
@@ -1056,10 +1057,11 @@ class ProductionBackend:
                 self.config.claude_visibility.enabled
                 and self.config.claude_visibility.continuous
             ):
+                visibility_stop = threading.Event()
                 visibility_backend = ProductionBackend(
                     self.config, db_path=self._db_path
                 )
-                visibility_stop = threading.Event()
+                visibility_backend._claude_visibility_stop = visibility_stop
                 visibility_thread = threading.Thread(
                     target=_run_continuous_visibility_worker,
                     kwargs={
@@ -1111,6 +1113,10 @@ class ProductionBackend:
                 visibility_stop.set()
             if visibility_thread is not None:
                 visibility_thread.join(timeout=5.0)
+                if visibility_thread.is_alive():
+                    raise RuntimeError(
+                        "continuous Claude visibility worker did not stop"
+                    )
         # Raised outside the try so it keeps its own reason: the `except
         # RuntimeError` arm above would otherwise relabel it
         # service_start_failed. Either way it lands on EXIT_DEGRADED (3), which
@@ -3073,7 +3079,8 @@ class ProductionBackend:
             if len(codex_command) != 1:
                 raise RuntimeError("codex_direct_runtime_required")
             self._codex_client = RecoveringCodexAppServerClient(
-                lambda: CodexAppServerClient(codex_bin=codex_command[0])
+                lambda: CodexAppServerClient(codex_bin=codex_command[0]),
+                cancel_event=self._claude_visibility_stop,
             )
         codex = CodexSourceAdapter(
             self._codex_client,
@@ -3087,6 +3094,9 @@ class ProductionBackend:
             state_db_only=state_db_only,
             indexed_sources=indexed_by_native_id,
             known_visibility_source_ids=known_visibility_source_ids,
+            discovery_timeout=(
+                self.config.claude_visibility.discovery_timeout_seconds
+            ),
         )
         existing = {
             (item.projection.provider, item.source_session_id) for item in sources

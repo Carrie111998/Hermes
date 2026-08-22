@@ -32,6 +32,10 @@ from tools.environments.local import hermes_subprocess_env
 MIN_CODEX_VERSION = (0, 125, 0)
 
 
+class CodexRequestCancelled(RuntimeError):
+    """A fixed-text cooperative cancellation of one app-server request."""
+
+
 @dataclass
 class CodexAppServerError(RuntimeError):
     """Raised on JSON-RPC errors from the app-server."""
@@ -187,6 +191,7 @@ class CodexAppServerClient:
         self._stderr_lock = threading.Lock()
         self._closed = False
         self._initialized = False
+        self._monotonic = time.monotonic
 
         self._reader = threading.Thread(target=self._read_stdout, daemon=True)
         self._reader.start()
@@ -202,6 +207,7 @@ class CodexAppServerClient:
         client_version: str = "0.1",
         capabilities: Optional[dict] = None,
         timeout: float = 10.0,
+        cancel_event: threading.Event | None = None,
     ) -> dict:
         """Send `initialize` + `initialized` handshake. Returns the server's
         InitializeResponse (userAgent, codexHome, platformFamily, platformOs)."""
@@ -215,7 +221,9 @@ class CodexAppServerClient:
             },
             "capabilities": capabilities or {},
         }
-        result = self.request("initialize", params, timeout=timeout)
+        result = self.request(
+            "initialize", params, timeout=timeout, cancel_event=cancel_event
+        )
         self.notify("initialized")
         self._initialized = True
         return result
@@ -245,22 +253,45 @@ class CodexAppServerClient:
         method: str,
         params: Optional[dict] = None,
         timeout: float = 30.0,
+        cancel_event: threading.Event | None = None,
     ) -> dict:
         """Send a JSON-RPC request and block on the response. Returns `result`,
         raises CodexAppServerError on `error`."""
+        if cancel_event is not None and cancel_event.is_set():
+            raise CodexRequestCancelled("codex app-server request cancelled")
         rid = self._take_id()
         q: queue.Queue = queue.Queue(maxsize=1)
         with self._pending_lock:
             self._pending[rid] = _Pending(queue=q, method=method)
-        self._send({"id": rid, "method": method, "params": params or {}})
         try:
-            msg = q.get(timeout=timeout)
-        except queue.Empty:
+            self._send({"id": rid, "method": method, "params": params or {}})
+        except BaseException:
             with self._pending_lock:
                 self._pending.pop(rid, None)
-            raise TimeoutError(
-                f"codex app-server method {method!r} timed out after {timeout}s"
+            raise
+        deadline = self._monotonic() + timeout
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                with self._pending_lock:
+                    self._pending.pop(rid, None)
+                raise CodexRequestCancelled("codex app-server request cancelled")
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                with self._pending_lock:
+                    self._pending.pop(rid, None)
+                raise TimeoutError(
+                    f"codex app-server method {method!r} timed out after {timeout}s"
+                )
+            wait = (
+                min(remaining, 0.1)
+                if cancel_event is not None
+                else remaining
             )
+            try:
+                msg = q.get(timeout=wait)
+                break
+            except queue.Empty:
+                continue
         if "error" in msg:
             err = msg["error"]
             raise CodexAppServerError(

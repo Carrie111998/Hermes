@@ -7,6 +7,9 @@ covered by a separate live test gated on `codex --version`.
 
 from __future__ import annotations
 
+import queue
+import threading
+
 import pytest
 
 from hermes_cli.runtime_provider import (
@@ -141,6 +144,92 @@ class TestCodexAppServerModule:
         assert isinstance(err, RuntimeError)
         assert "boom" in str(err)
         assert "-32600" in str(err)
+
+
+class TestCodexAppServerRequests:
+    @staticmethod
+    def _client(monotonic):
+        from agent.transports import codex_app_server as cas
+
+        client = object.__new__(cas.CodexAppServerClient)
+        client._pending = {}
+        client._pending_lock = threading.Lock()
+        client._next_id = 1
+        client._closed = False
+        client._monotonic = monotonic
+        client._send = lambda _payload: None
+        return client
+
+    def test_request_cancellation_removes_pending_without_waiting_for_timeout(
+        self,
+    ) -> None:
+        from agent.transports import codex_app_server as cas
+
+        clock = {"now": 100.0}
+        stop = threading.Event()
+        client = self._client(lambda: clock["now"])
+
+        class CancellingQueue:
+            def get(self, timeout: float):
+                assert 0 < timeout <= 0.1
+                clock["now"] += timeout
+                stop.set()
+                raise queue.Empty
+
+        original_queue = cas.queue.Queue
+        cas.queue.Queue = lambda maxsize=0: CancellingQueue()
+        try:
+            with pytest.raises(cas.CodexRequestCancelled, match="request cancelled"):
+                client.request(
+                    "thread/read",
+                    {"threadId": "secret-must-not-appear"},
+                    timeout=30.0,
+                    cancel_event=stop,
+                )
+        finally:
+            cas.queue.Queue = original_queue
+
+        assert client._pending == {}
+
+    def test_request_send_failure_removes_pending_entry(self) -> None:
+        client = self._client(lambda: 100.0)
+
+        def fail_send(_payload: object) -> None:
+            raise BrokenPipeError("fixed transport failure")
+
+        client._send = fail_send
+
+        with pytest.raises(BrokenPipeError, match="fixed transport failure"):
+            client.request("thread/list", {"secret": "must-not-leak"})
+
+        assert client._pending == {}
+
+    def test_request_timeout_preserves_the_total_timeout_across_polling(self) -> None:
+        clock = {"now": 100.0}
+        client = self._client(lambda: clock["now"])
+        stop = threading.Event()
+        observed: list[float] = []
+
+        class TimeoutQueue:
+            def get(self, timeout: float):
+                observed.append(timeout)
+                clock["now"] += timeout
+                raise queue.Empty
+
+        from agent.transports import codex_app_server as cas
+
+        original_queue = cas.queue.Queue
+        cas.queue.Queue = lambda maxsize=0: TimeoutQueue()
+        try:
+            with pytest.raises(TimeoutError, match="timed out after 0.25s"):
+                client.request(
+                    "thread/list", {}, timeout=0.25, cancel_event=stop
+                )
+        finally:
+            cas.queue.Queue = original_queue
+
+        assert observed == [pytest.approx(0.1), pytest.approx(0.1), pytest.approx(0.05)]
+        assert client._pending == {}
 
 
 class TestCodexAppServerShutdown:

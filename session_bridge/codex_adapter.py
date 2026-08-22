@@ -925,11 +925,16 @@ class CodexSourceAdapter:
         self._inventory_cache = next_cache
         return summaries
 
-    def list_full_inventory(self, *, archived: bool) -> list[CodexThreadSummary]:
+    def list_full_inventory(
+        self,
+        *,
+        archived: bool,
+        deadline: float | None = None,
+    ) -> list[CodexThreadSummary]:
         """Return every inventory row without applying the changed-thread cache."""
 
-        self._ensure_initialized()
-        summaries = self._fetch_inventory(archived=archived)
+        self._ensure_initialized(deadline=deadline)
+        summaries = self._fetch_inventory(archived=archived, deadline=deadline)
         next_cache = dict(self._inventory_cache)
         for summary in summaries:
             next_cache[summary.native_id] = summary
@@ -943,13 +948,22 @@ class CodexSourceAdapter:
         state_db_only: bool = False,
         indexed_sources: Mapping[str, Any] | None = None,
         known_visibility_source_ids: frozenset[str] = frozenset(),
+        discovery_timeout: float = _REQUEST_TIMEOUT,
     ) -> tuple[Any, ...]:
         """Read active and archived Codex sources with optional indexed reuse."""
 
         cutoff = float(after)
         if not math.isfinite(cutoff):
             raise ValueError("Codex visibility cutoff must be finite")
-        self._ensure_initialized()
+        if (
+            isinstance(discovery_timeout, bool)
+            or not isinstance(discovery_timeout, (int, float))
+            or not math.isfinite(float(discovery_timeout))
+            or discovery_timeout <= 0
+        ):
+            raise ValueError("Codex visibility discovery timeout must be positive")
+        deadline = self._monotonic() + float(discovery_timeout)
+        self._ensure_initialized(deadline=deadline)
         combined: dict[str, CodexThreadSummary] = {}
         for archived in (False, True):
             summaries = (
@@ -958,9 +972,13 @@ class CodexSourceAdapter:
                     source_kinds=None,
                     state_db_only=True,
                     stop_after=cutoff,
+                    deadline=deadline,
                 )
                 if state_db_only
-                else self.list_full_inventory(archived=archived)
+                else self.list_full_inventory(
+                    archived=archived,
+                    deadline=deadline,
+                )
             )
             for summary in summaries:
                 if summary.last_active < cutoff:
@@ -980,6 +998,7 @@ class CodexSourceAdapter:
         from .store import SidebarSource
 
         sources: list[SidebarSource] = []
+        budget_exhausted = False
         for summary in summaries:
             source_session_id = canonical_session_id(
                 Provider.CODEX, summary.native_id
@@ -1065,17 +1084,25 @@ class CodexSourceAdapter:
                     or summary.trusted_origin_bridge_id is not None
                 )
             )
-            if structurally_excluded:
+            if budget_exhausted or structurally_excluded:
                 projection = self._project_state_db_summary(summary)
                 reconciled = summary
             else:
                 try:
                     projection, reconciled = self._read_sidebar_thread_details(
-                        summary, deadline=None
+                        summary, deadline=deadline
                     )
+                except _CodexReadBudgetExceeded:
+                    if indexed_sources is not None:
+                        raise
+                    budget_exhausted = True
+                    projection = self._project_state_db_summary(summary)
+                    reconciled = summary
                 except TimeoutError:
                     if indexed_sources is not None:
                         raise
+                    if float(self._monotonic()) >= deadline:
+                        budget_exhausted = True
                     projection = self._project_state_db_summary(summary)
                     reconciled = summary
             if reconciled.source_kind is None:
@@ -1420,7 +1447,7 @@ class CodexSourceAdapter:
         self._inventory_cache[wanted] = summary
         return self.project_thread(summary, response=response)
 
-    def _ensure_initialized(self) -> None:
+    def _ensure_initialized(self, *, deadline: float | None = None) -> None:
         if self._initialization_failed:
             raise RuntimeError(
                 "Codex app-server initialization outcome is unknown; replace the "
@@ -1444,7 +1471,21 @@ class CodexSourceAdapter:
             self._initialized = True
             return
         try:
-            initialize(capabilities={"experimentalApi": True})
+            initialize_kwargs: dict[str, Any] = {
+                "capabilities": {"experimentalApi": True}
+            }
+            if deadline is not None:
+                remaining = deadline - float(self._monotonic())
+                if remaining <= 0:
+                    raise _CodexReadBudgetExceeded(
+                        "Codex sidebar deadline exhausted"
+                    )
+                initialize_kwargs["timeout"] = remaining
+            initialize(**initialize_kwargs)
+            if deadline is not None and float(self._monotonic()) > deadline:
+                raise _CodexReadBudgetExceeded("Codex sidebar deadline exhausted")
+        except _CodexReadBudgetExceeded:
+            raise
         except Exception as exc:
             self._initialization_failed = True
             raise RuntimeError(
@@ -1472,6 +1513,7 @@ class CodexSourceAdapter:
         source_kinds: tuple[str, ...] | None = None,
         state_db_only: bool = False,
         stop_on_native_id: str | None = None,
+        deadline: float | None = None,
     ) -> list[CodexThreadSummary]:
         if source_kinds is None:
             summaries = self._fetch_inventory_pages(
@@ -1479,6 +1521,7 @@ class CodexSourceAdapter:
                 source_kinds=None,
                 state_db_only=state_db_only,
                 stop_on_native_id=stop_on_native_id,
+                deadline=deadline,
             )
             return self._refresh_trusted_origins(summaries)
         try:
@@ -1487,6 +1530,7 @@ class CodexSourceAdapter:
                 source_kinds=source_kinds,
                 state_db_only=state_db_only,
                 stop_on_native_id=stop_on_native_id,
+                deadline=deadline,
             )
         except Exception as exc:
             retry_without_filter = _is_source_kinds_schema_error(exc)
@@ -1500,6 +1544,7 @@ class CodexSourceAdapter:
             source_kinds=None,
             state_db_only=state_db_only,
             stop_on_native_id=stop_on_native_id,
+            deadline=deadline,
         )
         return self._refresh_trusted_origins(summaries)
 
@@ -1512,6 +1557,7 @@ class CodexSourceAdapter:
         stop_after: float | None = None,
         known_native_ids: frozenset[str] = frozenset(),
         stop_on_native_id: str | None = None,
+        deadline: float | None = None,
     ) -> list[CodexThreadSummary]:
         cursor: Any = None
         seen_cursors: set[str] = set()
@@ -1531,8 +1577,8 @@ class CodexSourceAdapter:
                 params["sourceKinds"] = list(source_kinds)
             if cursor is not None:
                 params["cursor"] = cursor
-            response = self._client.request(
-                "thread/list", params, timeout=_REQUEST_TIMEOUT
+            response = self._bounded_sidebar_request(
+                "thread/list", params, deadline=deadline
             )
             if not isinstance(response, dict):
                 raise ValueError("Codex thread/list response must be an object")
