@@ -135,3 +135,27 @@ class TestQuerySessionListingLaneScope:
         )
 
         assert [row["id"] for row in rows] == ["foreign_59"]
+
+    def test_unnamed_rows_do_not_consume_named_listing_limit(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "named-window.db")
+        lane_key = "agent:main:telegram:dm:lane"
+        try:
+            for i in range(3):
+                sid = f"named_{i}"
+                db.create_session(sid, "telegram", session_key=lane_key)
+                db.set_session_title(sid, f"Named {i}")
+            for i in range(50):
+                db.create_session(f"unnamed_{i}", "telegram", session_key=lane_key)
+
+            rows = query_session_listing(
+                db,
+                source="telegram",
+                session_key=lane_key,
+                limit=2,
+            )
+
+            assert [row["id"] for row in rows] == ["named_2", "named_1"]
+        finally:
+            db.close()

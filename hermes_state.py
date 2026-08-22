@@ -8947,6 +8947,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_pinned: bool = False,
         session_key: str = None,
         include_hidden: bool = False,
+        titled_only: bool = False,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -9001,6 +9002,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Pass ``session_key`` to restrict results to one stable gateway
         conversation scope (DM, group, channel, or thread, including the
         configured per-user isolation policy).
+
+        Pass ``titled_only=True`` to exclude null, empty, and whitespace-only
+        titles before LIMIT/OFFSET are applied. Picker callers use this so
+        recent unnamed sessions cannot displace older named conversations.
         """
         # Rows carry token/cost totals — drain queued deltas first so
         # listings (sidebar, /resume, dashboards) show exact counters.
@@ -9051,6 +9056,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             where_clauses.append("s.archived = 0")
         if not include_hidden:
             where_clauses.append("s.hidden = 0")
+        if titled_only:
+            where_clauses.append("NULLIF(TRIM(s.title), '') IS NOT NULL")
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         # Snapshot the filter params before the query builders below extend
