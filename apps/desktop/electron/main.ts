@@ -121,7 +121,12 @@ import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import { formatDesktopLogLine } from './desktop-log-line'
-import { resolveDesktopRemoteRoute } from './desktop-remote-route'
+import {
+  effectiveDialDigest,
+  registryTargetForRoute,
+  resolveDesktopRemoteRoute,
+  sshPayloadFieldsMatch
+} from './desktop-remote-route'
 import {
   buildPosixCleanupScript,
   buildWindowsCleanupScript,
@@ -221,6 +226,7 @@ import {
 import { selectPoolEvictions } from './pool-eviction'
 import { createPoolStopper } from './pool-stop'
 import { poolTouchKeys } from './pool-touch-scope'
+import { connectBatched, shouldFallBackToLegacy } from './posix-remote-bootstrap'
 import { createKeepAwake } from './power-save'
 import { PreviewReachRegistry } from './preview-reach'
 import {
@@ -9195,7 +9201,10 @@ async function reachablePreviewUrl(rawUrl: string): Promise<string> {
   }
 }
 
-function effectiveSshConfigFingerprint(sshConfig) {
+// `ssh -G` resolves ~/.ssh/config for a target WITHOUT connecting: no network,
+// no key, no agent prompt. It is the only way to tell whether two differently
+// spelled targets are the same machine.
+function sshEffectiveConfigDump(sshConfig) {
   const ssh =
     process.platform === 'win32'
       ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'OpenSSH', 'ssh.exe')
@@ -9212,9 +9221,67 @@ function effectiveSshConfigFingerprint(sshConfig) {
   }
 
   args.push('--', sshConfig.user ? `${sshConfig.user}@${sshConfig.host}` : sshConfig.host)
-  const output = execFileSync(ssh, args, { encoding: 'utf8', timeout: 10_000, windowsHide: true })
 
-  return crypto.createHash('sha256').update(output).digest('hex')
+  return execFileSync(ssh, args, { encoding: 'utf8', timeout: 10_000, windowsHide: true })
+}
+
+function effectiveSshConfigFingerprint(sshConfig) {
+  return crypto.createHash('sha256').update(sshEffectiveConfigDump(sshConfig)).digest('hex')
+}
+
+// A leftover v1 global SSH block can SPELL the same gateway differently from
+// the registry entry the roster dials - an ~/.ssh/config alias on one side, the
+// resolved host/user on the other. resolveDesktopRemoteRoute() compares the
+// STORED fields, so it cannot see through the alias, and the two spellings mint
+// two ssh scopes, two ownership ids, and two identical
+// `hermes serve --isolated` backends for one profile (#observed on Windows:
+// 78 authentications and two remote backends per cold start).
+//
+// `ssh -G` resolves both sides to their effective dial. Identical dial AND
+// identical remote Hermes path/profile means one gateway, so the legacy route
+// delegates to the registry pool instead of opening its own. Anything less -
+// a different port, user, key, jump host, remote path or remote profile - keeps
+// the historical behaviour. Deliberately limited to the GLOBAL v1 route and the
+// registry PRIMARY: a per-profile override is a deliberate choice by the user,
+// and two registry entries are never merged into each other.
+function registryPrimarySharingSshRoute(route, registry) {
+  if (route?.kind !== 'ssh' || route.connectionId || route.source !== 'settings') {
+    return null
+  }
+
+  const primary = registry.connections.find(connection => connection.id === registry.primary)
+
+  if (!primary || primary.kind !== 'ssh') {
+    return null
+  }
+
+  const entry = normalizeSshConfig({
+    mode: 'ssh',
+    host: primary.host,
+    user: primary.user,
+    port: primary.port,
+    keyPath: primary.keyPath,
+    remoteHermesPath: primary.remoteHermesPath,
+    remoteProfile: primary.remoteProfile
+  })
+
+  if (!entry || !sshPayloadFieldsMatch(entry, route.ssh)) {
+    return null
+  }
+
+  try {
+    if (effectiveDialDigest(sshEffectiveConfigDump(route.ssh)) !== effectiveDialDigest(sshEffectiveConfigDump(entry))) {
+      return null
+    }
+  } catch (error: any) {
+    // No ssh binary, an unreadable ~/.ssh/config, a malformed target: we cannot
+    // prove they are the same gateway, so we do not claim it.
+    sshRememberLog(`[ssh] could not compare effective SSH dials (${error?.message || error}); keeping the v1 route`)
+
+    return null
+  }
+
+  return primary.id
 }
 
 async function bootstrapSshConnection(profile, sshConfig, reuseToken, source) {
@@ -9222,6 +9289,15 @@ async function bootstrapSshConnection(profile, sshConfig, reuseToken, source) {
   const effectiveConfigFingerprint = effectiveSshConfigFingerprint(sshConfig)
   const resolvedConfig = { ...sshConfig, effectiveConfigFingerprint }
   const fingerprint = sshConfigFingerprint(scope, resolvedConfig)
+
+  // "joined" means a concurrent caller (v1 route + registry roster, or several
+  // windows) landed on the SAME (scope, fingerprint) and shares one bootstrap
+  // instead of dialling a second time.
+  const joined = sshBootstrapCoordinator.pending.get(scope)?.fingerprint === fingerprint
+
+  sshRememberLog(
+    `[ssh] bootstrap ${joined ? 'joined' : 'started'} scope=${JSON.stringify(scope)} source=${String(source || '')}`
+  )
 
   return sshBootstrapCoordinator.start(scope, fingerprint, lease =>
     bootstrapSshConnectionInner(profile, resolvedConfig, reuseToken, source, fingerprint, lease)
@@ -9237,9 +9313,30 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
     await teardownSshConnection(profile)
   }
 
+  // Windows OpenSSH has no ControlMaster, so EVERY ssh invocation is a fresh
+  // key authentication (and, with a vault-backed agent, a user-visible
+  // approval). On that platform the whole remote lifecycle runs as one batched
+  // exec instead of ~15 calls plus a two-call readiness poll.
+  const batched = process.platform === 'win32'
+  const remoteDashboardProfile = resolveRemoteSshDashboardProfile(sshConfig.remoteProfile, profile)
+
+  const connectionLabel =
+    typeof source === 'string' && source.startsWith('registry:')
+      ? source.slice('registry:'.length)
+      : `v1-${String(source || 'settings')}`
+
+  const phases: Record<string, number> = {}
+
+  const recordPhase = (name: string, ms: number) => {
+    phases[name] = (phases[name] || 0) + ms
+  }
+
   let ssh = sshConnections.get(scope)?.ssh
 
-  if (ssh && !(await ssh.isAlive())) {
+  // Without mux there is no master to interrogate: the batched bootstrap exec
+  // that follows IS the liveness test, and its failure path already tears the
+  // scope down. Probing here would just buy one more authentication.
+  if (ssh && !batched && !(await ssh.isAlive())) {
     try {
       await ssh.close()
     } catch {
@@ -9253,6 +9350,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
   const created = !ssh
 
   let removeForceCleanup = () => {}
+  const cycleStartedAt = Date.now()
 
   if (created) {
     ssh = new SshConnection(
@@ -9265,17 +9363,21 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
       }
     )
     removeForceCleanup = lease.onForceCleanup(() => ssh.close())
-    await ssh.open({ signal: lease.signal })
+    const openStartedAt = Date.now()
+    await ssh.open({ lazy: batched, signal: lease.signal })
+    recordPhase('open', Date.now() - openStartedAt)
   }
 
+  const invocationsAtStart = ssh.invocations || 0
   let result
 
-  try {
+  const runLegacyLifecycle = async () => {
     const platform = await detectRemotePlatform(ssh, sshConfig.remoteHermesPath || '')
     const lifecycle = platform.os === 'Windows' ? connectWindowsRemote : remoteLifecycle.connect
-    result = await lifecycle({
+
+    return lifecycle({
       ssh,
-      profile: resolveRemoteSshDashboardProfile(sshConfig.remoteProfile, profile),
+      profile: remoteDashboardProfile,
       remoteHermesPath: sshConfig.remoteHermesPath || '',
       ownershipId: sshOwnershipKey(profile),
       reuseToken: reuseToken || '',
@@ -9288,6 +9390,46 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
       rememberLog: sshRememberLog,
       signal: lease.signal
     })
+  }
+
+  try {
+    if (batched) {
+      try {
+        result = await connectBatched({
+          adoptServedToken: adoptServedDashboardToken,
+          cancelForward: (localPort, remotePort) => ssh.cancelForward(localPort, remotePort),
+          forward: (localPort, remotePort, options) => ssh.forward(localPort, remotePort, '127.0.0.1', options),
+          onPhase: recordPhase,
+          ownershipId: sshOwnershipKey(profile),
+          pickLocalPort,
+          probeReuseProof: sshProbeReuseProof,
+          probeWebSocket: wsUrl => probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket }),
+          profile: remoteDashboardProfile,
+          rememberLog: sshRememberLog,
+          remoteHermesPath: sshConfig.remoteHermesPath || '',
+          reuseToken: reuseToken || '',
+          signal: lease.signal,
+          ssh,
+          waitForHermes: (baseUrl, token) => waitForHermes(baseUrl, token, lease.signal, 'token')
+        })
+      } catch (error: any) {
+        if (!shouldFallBackToLegacy(error)) {
+          throw error
+        }
+
+        // The remote could not run the batched program at all (no python3, a
+        // Windows remote, a mangled response). Take the slow path rather than
+        // failing the connection - and say exactly why, since this is the one
+        // case where the authentication count goes back up.
+        sshRememberLog(
+          `[ssh] batched bootstrap unavailable, falling back to the per-call lifecycle: ${error?.message || error}`
+        )
+        recordPhase('fallback', 0)
+        result = await runLegacyLifecycle()
+      }
+    } else {
+      result = await runLegacyLifecycle()
+    }
   } catch (error: any) {
     if (created) {
       try {
@@ -9351,6 +9493,17 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
       `${result.hermesVersion || 'hermes (version unknown)'} at ${result.hermesPath || '?'}`
   )
 
+  const phaseTrace = Object.entries(phases)
+    .map(([name, ms]) => `${name}Ms=${ms}`)
+    .join(' ')
+
+  sshRememberLog(
+    `[ssh] ready connection=${connectionLabel} profile=${remoteDashboardProfile || 'default'} ` +
+      `scope=${JSON.stringify(scope)} reused=${Boolean(result.reused)} ` +
+      `sshInvocations=${(ssh.invocations || 0) - invocationsAtStart} totalMs=${Date.now() - cycleStartedAt}` +
+      `${phaseTrace ? ` ${phaseTrace}` : ''}`
+  )
+
   const connection = await buildRemoteConnection(
     result.baseUrl,
     'token',
@@ -9406,8 +9559,9 @@ function persistSshConnectionToken(profile, source, token) {
 //   3. global remote (connection.json `mode: 'remote'`)
 // A null/empty profile resolves the env/global remote, so legacy callers and
 // the connection test (which pass no profile) are unchanged.
-async function resolveRemoteBackend(profile) {
+async function resolveRemoteBackend(profile: any): Promise<any> {
   const config = readDesktopConnectionConfig()
+  const registry = readDesktopConnectionsRegistry()
 
   const route = resolveDesktopRemoteRoute({
     config,
@@ -9416,11 +9570,44 @@ async function resolveRemoteBackend(profile) {
       url: process.env.HERMES_DESKTOP_REMOTE_URL
     },
     profile,
-    registry: readDesktopConnectionsRegistry()
+    registry
   })
 
   if (!route) {
     return null
+  }
+
+  // A v1 route that resolves to exactly one registry entry is the SAME gateway
+  // the v2 roster dials. Bootstrapping it here under the legacy global ssh
+  // scope minted a second ownership id, so one connection ended up with two
+  // remote `hermes serve --isolated` backends for one profile. Delegate to the
+  // registry pool so both entry points join a single bootstrap.
+  let registryTarget = registryTargetForRoute(route, profile)
+  let delegationBasis = 'stored identity'
+
+  if (!registryTarget) {
+    const sharedPrimaryId = registryPrimarySharingSshRoute(route, registry)
+
+    if (sharedPrimaryId) {
+      registryTarget = registryTargetForRoute({ ...route, connectionId: sharedPrimaryId }, profile)
+      delegationBasis = 'effective ssh dial'
+    }
+  }
+
+  if (registryTarget) {
+    sshRememberLog(
+      `[ssh] route delegated connection=${registryTarget.connectionId} profile=${registryTarget.profile} ` +
+        `source=${route.source} kind=${route.kind} basis="${delegationBasis}"`
+    )
+
+    return ensureRegistryBackend(registryTarget.connectionId, registryTarget.profile)
+  }
+
+  if (route.kind === 'ssh') {
+    sshRememberLog(
+      `[ssh] route not delegated (no registry entry proves the same gateway) source=${route.source} ` +
+        `scope=${JSON.stringify(sshScopeKey(route.source === 'profile' ? profile : null))}`
+    )
   }
 
   let connection
@@ -9986,7 +10173,7 @@ async function ensureBackend(profile) {
 // a genuinely-local child when the v1 mode says remote; non-local connections
 // pool under the composite key from backendScopeKey() and reuse the same pool
 // entry lifecycle (LRU, idle reaper, touch) as per-profile local backends.
-async function ensureRegistryBackend(connectionId, profile) {
+async function ensureRegistryBackend(connectionId: any, profile: any): Promise<any> {
   const registry = readDesktopConnectionsRegistry()
   const id = String(connectionId || '').trim() || registry.primary
   const source = registry.connections.find(c => c.id === id)
@@ -12884,7 +13071,10 @@ async function probeSshProfileInventory(connection) {
   )
 
   try {
-    await ssh.open()
+    // The listing exec below is itself the reachability check, so on a
+    // no-ControlMaster client we skip the separate `ssh true` handshake rather
+    // than pay a second authentication for the same answer.
+    await ssh.open({ lazy: process.platform === 'win32' })
     const profiles = await remoteLifecycle.listRemoteHermesProfiles(ssh)
 
     if (profiles.length > 0) {

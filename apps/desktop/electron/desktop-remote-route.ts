@@ -4,6 +4,8 @@
  * discard dial details. Environment routes deliberately remain unregistered.
  */
 
+import crypto from 'node:crypto'
+
 import {
   connectionScopeKey,
   modeIsRemoteLike,
@@ -52,6 +54,74 @@ export interface DesktopRemoteRouteInput {
   env?: { token?: null | string; url?: null | string }
   profile?: null | string
   registry: ConnectionRegistry
+}
+
+export interface RegistryBackendTarget {
+  connectionId: string
+  profile: string
+}
+
+/**
+ * An exact v2 registry identity is authoritative for backend ownership.
+ * Returning it here lets the primary v1-compatible route delegate to the
+ * registry pool instead of opening the same SSH gateway a second time under
+ * the legacy global scope — two scopes meant two ownership ids, so one gateway
+ * spawned two identical `hermes serve --isolated` backends for one profile.
+ *
+ * `connectionId` is only ever set by resolveDesktopRemoteRoute() when the
+ * stored v1 route matches ONE registry entry byte-for-byte (host, user, port,
+ * key path, remote Hermes path, remote profile — or URL/auth/headers/org for
+ * gateway routes). An ambiguous or partial match leaves it undefined and this
+ * returns null, so the caller keeps the historical v1 path.
+ */
+export function registryTargetForRoute(
+  route: DesktopRemoteRoute | null,
+  profile?: null | string
+): null | RegistryBackendTarget {
+  const connectionId = String(route?.connectionId || '').trim()
+
+  if (!connectionId) {
+    return null
+  }
+
+  return {
+    connectionId,
+    profile: String(profile ?? '').trim() || 'default'
+  }
+}
+
+/**
+ * Digest of one `ssh -G` dump, ignoring the echoed `host <alias>` line.
+ *
+ * Two routes that resolve to the same effective configuration dial the SAME
+ * machine even when they are spelled differently - typically an ~/.ssh/config
+ * alias on one side and the resolved host/user on the other. Everything that
+ * decides WHERE and AS WHOM ssh connects (hostname, user, port, identityfile,
+ * proxyjump, ...) stays in the digest; only the alias the caller typed is
+ * dropped, because that is spelling, not destination.
+ *
+ * `hostname <resolved>` is deliberately NOT filtered: the pattern requires
+ * whitespace directly after `host`.
+ */
+export function effectiveDialDigest(sshConfigDump: string): string {
+  const lines = String(sshConfigDump || '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line && !/^host\s/i.test(line))
+
+  return crypto.createHash('sha256').update(lines.join('\n')).digest('hex')
+}
+
+/**
+ * Fields that `ssh -G` cannot answer for: they describe what Hermes does ONCE
+ * connected, not how to connect. Two routes may only be treated as one gateway
+ * when these agree exactly.
+ */
+export function sshPayloadFieldsMatch(left: any, right: any): boolean {
+  return (
+    String(left?.remoteHermesPath || '') === String(right?.remoteHermesPath || '') &&
+    String(left?.remoteProfile || '') === String(right?.remoteProfile || '')
+  )
 }
 
 type StoredRoute =

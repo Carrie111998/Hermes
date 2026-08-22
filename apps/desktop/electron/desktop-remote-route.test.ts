@@ -2,8 +2,14 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { normalizeRegistry, REGISTRY_VERSION } from './connection-registry'
-import { resolveDesktopRemoteRoute } from './desktop-remote-route'
+import { resolveRemoteSshDashboardProfile } from './connection-config'
+import { backendScopeKey, normalizeRegistry, REGISTRY_VERSION } from './connection-registry'
+import {
+  effectiveDialDigest,
+  registryTargetForRoute,
+  resolveDesktopRemoteRoute,
+  sshPayloadFieldsMatch
+} from './desktop-remote-route'
 
 const tokenA = { encoding: 'plain', value: 'token-a' }
 const tokenB = { encoding: 'plain', value: 'token-b' }
@@ -153,6 +159,157 @@ test('global SSH treats an omitted port as 22 and checks the primary route', () 
   assert.equal(route?.connectionId, 'ssh-primary')
 })
 
+test('an exact registry-backed primary SSH route delegates to the registry backend', () => {
+  const route = resolveDesktopRemoteRoute({
+    config: { mode: 'ssh', remote: { mode: 'ssh', host: 'box.test', user: 'hermes' } },
+    profile: 'default',
+    registry: registry('ssh-primary', [
+      { id: 'ssh-primary', kind: 'ssh', label: 'SSH primary', host: 'box.test', user: 'hermes', port: 22 }
+    ])
+  })
+
+  assert.deepEqual(registryTargetForRoute(route, 'default'), {
+    connectionId: 'ssh-primary',
+    profile: 'default'
+  })
+  assert.deepEqual(registryTargetForRoute(route, null), { connectionId: 'ssh-primary', profile: 'default' })
+  assert.deepEqual(registryTargetForRoute(route, '  '), { connectionId: 'ssh-primary', profile: 'default' })
+})
+
+test('a route without a registry identity keeps the historical v1 path', () => {
+  assert.equal(registryTargetForRoute(null, 'default'), null)
+  assert.equal(
+    registryTargetForRoute(
+      { kind: 'ssh', source: 'settings', ssh: { host: 'box.test', mode: 'ssh', user: 'hermes' } },
+      'default'
+    ),
+    null
+  )
+
+  // Two identical registry entries are ambiguous, so resolution deliberately
+  // drops the identity: delegating to an arbitrary one of them would move the
+  // backend under a scope the user never picked.
+  const ssh = { mode: 'ssh', host: 'box.test', user: 'hermes' }
+
+  const ambiguous = resolveDesktopRemoteRoute({
+    config: { mode: 'ssh', remote: ssh },
+    profile: 'default',
+    registry: registry('ssh-a', [
+      { id: 'ssh-a', kind: 'ssh', label: 'A', ...ssh },
+      { id: 'ssh-b', kind: 'ssh', label: 'B', ...ssh }
+    ])
+  })
+
+  assert.equal(ambiguous?.connectionId, 'ssh-a')
+
+  const unrelatedPrimary = resolveDesktopRemoteRoute({
+    config: { mode: 'ssh', remote: ssh },
+    profile: 'default',
+    registry: registry('other', [
+      { id: 'other', kind: 'ssh', label: 'Other', host: 'other.test', user: 'hermes' },
+      { id: 'ssh-a', kind: 'ssh', label: 'A', ...ssh }
+    ])
+  })
+
+  assert.equal(registryTargetForRoute(unrelatedPrimary, 'default'), null)
+})
+
+test('a global SSH route never merges into a registry entry that dials differently', () => {
+  const ssh = {
+    mode: 'ssh',
+    host: 'box.test',
+    user: 'hermes',
+    port: 2222,
+    keyPath: '/keys/a',
+    remoteHermesPath: '/srv/hermes',
+    remoteProfile: 'worker'
+  }
+
+  const variants = [
+    { ...ssh, port: 2200 },
+    { ...ssh, keyPath: '/keys/b' },
+    { ...ssh, remoteHermesPath: '/opt/hermes' },
+    { ...ssh, remoteProfile: 'other' },
+    { ...ssh, user: 'other' },
+    { ...ssh, host: 'other.test' }
+  ]
+
+  for (const [index, variant] of variants.entries()) {
+    const route = resolveDesktopRemoteRoute({
+      config: { mode: 'ssh', remote: ssh },
+      profile: 'default',
+      registry: registry(`ssh-${index}`, [{ id: `ssh-${index}`, kind: 'ssh', label: `SSH ${index}`, ...variant }])
+    })
+
+    assert.equal(registryTargetForRoute(route, 'default'), null)
+  }
+})
+
+test('a v1 route and a direct registry call join one bootstrap for the same pair', async () => {
+  const route = resolveDesktopRemoteRoute({
+    config: { mode: 'ssh', remote: { mode: 'ssh', host: 'box.test', user: 'hermes' } },
+    profile: 'default',
+    registry: registry('ssh-primary', [
+      { id: 'ssh-primary', kind: 'ssh', label: 'SSH primary', host: 'box.test', user: 'hermes', port: 22 }
+    ])
+  })
+
+  // Mirrors ensureRegistryBackend()'s pool: one composite key, one in-flight
+  // connection promise. The point of the delegation is that the legacy route
+  // now lands on that key instead of minting a second SSH scope.
+  const pool = new Map<string, Promise<string>>()
+  let bootstraps = 0
+
+  const ensureRegistryBackend = (connectionId: string, profile: string) => {
+    const key = backendScopeKey(connectionId, profile)
+    const existing = pool.get(key)
+
+    if (existing) {
+      return existing
+    }
+
+    bootstraps += 1
+    const promise = Promise.resolve(key)
+    pool.set(key, promise)
+
+    return promise
+  }
+
+  const target = registryTargetForRoute(route, 'default')
+
+  assert.ok(target)
+
+  const [viaV1, viaRegistry] = await Promise.all([
+    ensureRegistryBackend(target.connectionId, target.profile),
+    ensureRegistryBackend('ssh-primary', 'default')
+  ])
+
+  assert.equal(bootstraps, 1)
+  assert.equal(viaV1, viaRegistry)
+  assert.equal(viaV1, 'conn:ssh-primary::default')
+})
+
+test('the delegated default profile stays the remote root profile', () => {
+  const route = resolveDesktopRemoteRoute({
+    config: { mode: 'ssh', remote: { mode: 'ssh', host: 'box.test', user: 'hermes' } },
+    profile: 'default',
+    registry: registry('ssh-primary', [
+      { id: 'ssh-primary', kind: 'ssh', label: 'SSH primary', host: 'box.test', user: 'hermes', port: 22 }
+    ])
+  })
+
+  const target = registryTargetForRoute(route, 'default')
+
+  assert.ok(target)
+  const poolKey = backendScopeKey(target.connectionId, target.profile)
+
+  assert.equal(poolKey, 'conn:ssh-primary::default')
+  // The composite pool key is a DESKTOP routing label. What reaches the remote
+  // `hermes serve` must stay the root profile — never `conn:<id>::default`.
+  assert.equal(resolveRemoteSshDashboardProfile('', poolKey), '')
+  assert.equal(resolveRemoteSshDashboardProfile('', backendScopeKey(target.connectionId, 'writer')), 'writer')
+})
+
 test('profile route omits identity when two registry entries match exactly', () => {
   const block = { mode: 'remote', url: 'https://worker.test', authMode: 'token', token: tokenA }
 
@@ -230,6 +387,60 @@ test('URL route fails closed for different token, headers, kind, or Cloud org', 
 
     assert.equal(route?.connectionId, undefined)
   }
+})
+
+// A real `ssh -G` dump, trimmed to the keywords that decide the destination.
+function dump(overrides: Record<string, string> = {}) {
+  const fields: Record<string, string> = {
+    host: 'galaxybook2',
+    hostname: '100.124.139.54',
+    user: 'thibaut-roux',
+    port: '22',
+    addressfamily: 'any',
+    identityfile: '~/.ssh/id_ed25519',
+    proxyjump: 'none',
+    ...overrides
+  }
+
+  return Object.entries(fields)
+    .map(([key, value]) => `${key} ${value}`)
+    .join('\n')
+}
+
+test('an ssh.config alias and its resolved host have the same effective dial', () => {
+  // This is the shape that shipped two backends: connection.json kept the
+  // ~/.ssh/config alias while the registry entry stored the resolved host+user.
+  assert.equal(
+    effectiveDialDigest(dump({ host: 'galaxybook2' })),
+    effectiveDialDigest(dump({ host: '100.124.139.54' }))
+  )
+  assert.equal(effectiveDialDigest(dump()), effectiveDialDigest(`${dump()}\r\n`))
+})
+
+test('anything that changes where or as whom ssh connects breaks the dial match', () => {
+  const base = effectiveDialDigest(dump())
+
+  for (const override of [
+    { hostname: '10.0.0.9' },
+    { user: 'someone-else' },
+    { port: '2222' },
+    { identityfile: '~/.ssh/other' },
+    { proxyjump: 'bastion.test' }
+  ]) {
+    assert.notEqual(base, effectiveDialDigest(dump(override)), JSON.stringify(override))
+  }
+
+  // `hostname` must survive the `host ` filter, or every target on the same
+  // config file would look identical.
+  assert.notEqual(effectiveDialDigest('hostname a'), effectiveDialDigest('hostname b'))
+  assert.equal(effectiveDialDigest('host a\nhostname z'), effectiveDialDigest('host b\nhostname z'))
+})
+
+test('remote Hermes path and remote profile are never resolved by ssh -G', () => {
+  assert.equal(sshPayloadFieldsMatch({}, { remoteHermesPath: '', remoteProfile: '' }), true)
+  assert.equal(sshPayloadFieldsMatch({ remoteHermesPath: '/srv/hermes' }, { remoteHermesPath: '/srv/hermes' }), true)
+  assert.equal(sshPayloadFieldsMatch({ remoteHermesPath: '/srv/hermes' }, { remoteHermesPath: '/opt/hermes' }), false)
+  assert.equal(sshPayloadFieldsMatch({ remoteProfile: 'writer' }, { remoteProfile: '' }), false)
 })
 
 test('local config without overrides returns null', () => {

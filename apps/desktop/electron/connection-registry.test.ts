@@ -1085,6 +1085,96 @@ test('normalizeRegistry preserves stored headers on remote entries (v2 additive 
   })
 })
 
+test('normalizeRegistry keeps the served token on an ssh entry', () => {
+  // The ssh token is the SERVED dashboard token, written back after a
+  // bootstrap. Dropping it on read made it write-only: every start reported
+  // "no saved token", reaped the running remote backend and spawned a new one,
+  // so a reusable backend was never reused.
+  const registry = normalizeRegistry({
+    version: REGISTRY_VERSION,
+    primary: 'box',
+    connections: [
+      { id: 'local', kind: 'local', label: 'This device' },
+      {
+        id: 'box',
+        kind: 'ssh',
+        label: 'Alfred laptop',
+        host: '100.64.0.1',
+        user: 'hermes',
+        token: { encoding: 'safeStorage', value: 'envelope' }
+      }
+    ]
+  })
+
+  const ssh = registry.connections.find(c => c.id === 'box')
+
+  assert.ok(ssh)
+  assert.deepEqual(ssh.token, { encoding: 'safeStorage', value: 'envelope' })
+  assert.equal(ssh.host, '100.64.0.1')
+  assert.equal(ssh.user, 'hermes')
+
+  // Still absent when nothing was stored — no phantom field.
+  const fresh = normalizeRegistry({
+    version: REGISTRY_VERSION,
+    primary: 'box',
+    connections: [{ id: 'box', kind: 'ssh', label: 'Box', host: 'box.test' }]
+  })
+
+  assert.equal(fresh.connections.find(c => c.id === 'box')?.token, undefined)
+})
+
+test('normalizeConnectionInput keeps the served token when an ssh entry is renamed', () => {
+  const registry = normalizeRegistry({
+    version: REGISTRY_VERSION,
+    primary: 'local',
+    connections: [{ id: 'local', kind: 'local', label: 'This device' }]
+  })
+
+  const entry = normalizeConnectionInput(
+    {
+      id: 'box',
+      kind: 'ssh',
+      label: 'Renamed box',
+      host: 'box.test',
+      user: 'hermes',
+      token: { encoding: 'safeStorage', value: 'envelope' }
+    } as any,
+    registry
+  )
+
+  assert.equal(entry.kind, 'ssh')
+  assert.equal(entry.label, 'Renamed box')
+  assert.deepEqual(entry.token, { encoding: 'safeStorage', value: 'envelope' })
+
+  const withoutToken = normalizeConnectionInput(
+    { id: 'box2', kind: 'ssh', label: 'No token', host: 'other.test' } as any,
+    registry
+  )
+
+  assert.equal(withoutToken.token, undefined)
+})
+
+test('an ssh token survives a write/read round trip through the registry', () => {
+  const stored = { encoding: 'safeStorage', value: 'envelope' }
+
+  const registry = normalizeRegistry({
+    version: REGISTRY_VERSION,
+    primary: 'box',
+    connections: [
+      { id: 'local', kind: 'local', label: 'This device' },
+      { id: 'box', kind: 'ssh', label: 'Box', host: 'box.test' }
+    ]
+  })
+
+  const entry = registry.connections.find(c => c.id === 'box')
+
+  assert.ok(entry)
+  const saved = upsertConnection(registry, { ...entry, token: stored })
+  const reloaded = normalizeRegistry(JSON.parse(JSON.stringify(saved)))
+
+  assert.deepEqual(reloaded.connections.find(c => c.id === 'box')?.token, stored)
+})
+
 test('migrateV1ToRegistry carries v1 remote headers into the registry entry', () => {
   const registry = migrateV1ToRegistry({
     mode: 'remote',
