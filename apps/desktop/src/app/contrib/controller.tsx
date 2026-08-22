@@ -155,7 +155,7 @@ registry.registerMany([
   {
     id: 'sessions',
     area: 'panes',
-    title: 'Sesiones',
+    title: 'sessions',
     // Collapsible: leaves the grid on narrow viewports (edge overlay instead).
     // dock: where a RE-ADOPTED pane lands (healed from a stale dismissal) —
     // its default-ish spot beside main, not a random same-placement stack.
@@ -190,7 +190,7 @@ registry.registerMany([
   {
     id: 'terminal',
     area: 'panes',
-    title: 'Terminal',
+    title: 'terminal',
     // revealOnPreset: choosing a layout that places the terminal (e.g.
     // "Terminal deck") turns takeover on so the zone actually shows, instead of
     // staying collapsed behind the ⌃` toggle. height sizes the fixed track (a
@@ -212,7 +212,7 @@ registry.registerMany([
   {
     id: 'files',
     area: 'panes',
-    title: 'Archivos',
+    title: 'files',
     // dock: re-adoption target after a stale dismissal (see sessions).
     data: {
       placement: 'right',
@@ -228,7 +228,7 @@ registry.registerMany([
   {
     id: 'review',
     area: 'panes',
-    title: 'Revisión',
+    title: 'review',
     // The second right sidebar: hidden until ⌘G ($reviewOpen) — bound below
     // like the other chrome toggles; its zone collapses while hidden.
     data: {

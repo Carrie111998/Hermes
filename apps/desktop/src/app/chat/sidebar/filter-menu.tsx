@@ -206,7 +206,7 @@ export function SidebarFilterMenu({ className }: { className?: string }) {
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <Button
-          aria-label="Filtros"
+          aria-label="Filters"
           className={cn(
             className,
             'data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground data-[state=open]:opacity-100',
@@ -285,7 +285,7 @@ export function SidebarFilterMenu({ className }: { className?: string }) {
         <DropdownMenuSeparator />
 
         <DropdownMenuGroup>
-          <DropdownMenuLabel>Filtros</DropdownMenuLabel>
+          <DropdownMenuLabel>Filters</DropdownMenuLabel>
 
           <DropdownMenuSub>
             <DropdownMenuSubTrigger>Status</DropdownMenuSubTrigger>
