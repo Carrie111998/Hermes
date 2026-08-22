@@ -21,19 +21,23 @@ from unittest.mock import MagicMock
 
 import pytest
 
+pytest.importorskip("discord")
+
+import discord as discord_lib
+
 import plugins.platforms.discord.adapter as adapter_mod
 from plugins.platforms.discord.adapter import DiscordAdapter
 
 
 def _dm_message(sender_id="42", message_id="9001"):
     author = SimpleNamespace(id=int(sender_id), bot=False, name="stranger")
-    channel = MagicMock()
-    channel.__class__ = adapter_mod.discord.DMChannel if hasattr(adapter_mod, "discord") else MagicMock
     msg = MagicMock()
     msg.id = int(message_id)
     msg.author = author
-    msg.type = adapter_mod.discord.MessageType.default if hasattr(adapter_mod, "discord") else None
-    msg.channel = channel
+    msg.type = discord_lib.MessageType.default
+    # guild=None drives the is_dm branch; no real DMChannel is needed
+    # (is_dm = isinstance(channel, DMChannel) or guild is None).
+    msg.channel = MagicMock()
     msg.guild = None
     return msg
 
