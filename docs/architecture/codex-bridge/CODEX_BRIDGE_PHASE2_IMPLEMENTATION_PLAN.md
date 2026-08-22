@@ -193,27 +193,34 @@ existing Phase 1 pilot remains off because its config has no section.
 
 ## 7. Exact implementation surface
 
-New files:
+Internal package modules:
 
-- `gateway/codex_kanban_projection.py`
-  - fail-closed settings loader;
-  - additive projection schema;
-  - pending-event scan and durable cursor/dedupe;
+- `gateway/codex/protocol.py`, `settings.py`, `store.py`, `executor.py`,
+  `service.py`, and `gateway_mixin.py`
+  - stable bridge records and executor/projector protocols;
+  - fail-closed bridge config and legacy-worker gate;
+  - authoritative SQLite jobs, replies, and compact public events;
+  - Codex SDK boundary, orchestration, retry-isolated projection wakes, and
+    narrow Gateway integration.
+- `gateway/codex/kanban_settings.py`, `kanban_contract.py`,
+  `kanban_receipts.py`, `kanban_projection.py`, `kanban_reconciliation.py`,
+  and `kanban_cli.py`
+  - fail-closed settings and read-only dependency probe;
+  - additive projection queue/job/receipt schema, claims, cursors, and dedupe;
   - stable card creation and outcome-first phase projection;
-  - bounded/redacted target payloads;
-  - failure isolation and retry state.
+  - bounded/redacted target payloads and idempotent artifact mirroring;
+  - failure isolation, retry state, read-only status, and reconciliation CLI.
 - `tests/gateway/test_codex_kanban_projection.py`
   - config gate, schema, mapping, cursor, dedupe, restart, outcome-first data,
     needs-user action, and outage tests using temporary bridge/Kanban DBs.
 
-Scoped edits to clean Phase 1 files:
+Compatibility surfaces and scoped integration:
 
 - `gateway/codex_bridge.py`
-  - optional projector injection;
-  - lazy default construction only when the flag is enabled;
-  - fire-and-forget projection wake after durable event append;
-  - retain background task references and consume exceptions for clean asyncio
-    lifecycle behavior.
+  - re-exports the Phase 1/2 public surface from `gateway/codex/`.
+- `gateway/codex_kanban_projection.py`
+  - re-exports the Phase 2 public surface and preserves
+    `python -m gateway.codex_kanban_projection`.
 - `tests/gateway/test_codex_bridge.py`
   - service-level proof that a projector exception cannot stop Codex or alter
     the authoritative event/final-result lifecycle.

@@ -25,16 +25,24 @@ Codex phase transition awaits a Kanban write.
 
 ## Implemented surface
 
-- `gateway/codex_bridge.py`: sends isolated in-memory wakes only after durable
-  bridge events; owns one startup/retry worker with capped
-  exponential backoff and bounded shutdown; projector construction fails closed.
+- `gateway/codex_bridge.py`: compatibility facade preserving the Phase 1/2
+  imports used by Gateway, HTTP, canary, and tests.
+- `gateway/codex/protocol.py`, `settings.py`, `store.py`, `executor.py`,
+  `service.py`, and `gateway_mixin.py`: generic bridge contracts,
+  fail-closed config, authoritative SQLite state, SDK boundary, orchestration,
+  and the narrow Gateway integration. The service sends isolated in-memory
+  wakes only after durable bridge events and owns one retry worker with capped
+  exponential backoff and bounded shutdown.
 - `gateway/run.py`: starts the optional drain worker with Gateway startup and
   stops it during graceful Gateway shutdown.
-- `gateway/codex_kanban_projection.py`: explicit feature flag, durable queue,
-  stable job/card mapping, claim lease, projection cursor, notification cursor,
-  event receipts, outcome-first projection, needs-user projection, idempotent
-  artifact mirroring, a versioned dependency probe, operator-readable read-only
-  status, and read-only reconciliation CLI.
+- `gateway/codex_kanban_projection.py`: compatibility facade and stable
+  `python -m` entry point.
+- `gateway/codex/kanban_settings.py`, `kanban_contract.py`,
+  `kanban_receipts.py`, `kanban_projection.py`, `kanban_reconciliation.py`,
+  and `kanban_cli.py`: explicit feature flag, versioned dependency probe,
+  durable queue/claims/cursors/receipts, outcome-first card projection,
+  idempotent artifact mirroring, operator-readable status, and read-only
+  reconciliation CLI.
 - `tests/gateway/test_codex_bridge.py`: verifies feature-off behavior and that a
   projector outage cannot prevent Codex from reaching `done`.
 - `tests/gateway/test_codex_kanban_projection.py`: verifies config fail-closed,
@@ -42,8 +50,9 @@ Codex phase transition awaits a Kanban write.
   dashboard download bytes, and zero-write reconciliation.
 - `scripts/run_codex_kanban_projection_canary.py`: isolated outage/recovery and
   artifact-delivery acceptance canary.
-- `CODEX_BRIDGE_PHASE2_IMPLEMENTATION_PLAN.md`: architecture, state mapping,
-  tests, SLOs, rollout, rollback, and Definition of Done.
+- `docs/architecture/codex-bridge/CODEX_BRIDGE_PHASE2_IMPLEMENTATION_PLAN.md`:
+  architecture, state mapping, tests, SLOs, rollout, rollback, and Definition
+  of Done.
 
 No Telegram, Marrow, or Phase 3 surface was implemented. The dirty
 Kanban/dashboard/plugin/config work owned by the user was not edited, reverted,
