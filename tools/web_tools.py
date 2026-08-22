@@ -221,11 +221,23 @@ def _anthropic_native_endpoint_selected() -> bool:
 # constant so the whitelist early-returns and the availability chokepoint
 # stay in sync.
 #
-# NOTE: this intentionally includes ``xai``, which the registry's
-# ``_LEGACY_PREFERENCE`` does NOT — xai availability is probed via
-# ``has_xai_credentials()`` (env var OR auth.json OAuth), not a registered
-# WebSearchProvider. Keep the two sets aligned by hand: if xai ever ships as
-# a registered provider, drop it here so the registry path takes over.
+# NOTE: three members are intentionally absent from the registry's
+# ``_LEGACY_PREFERENCE`` and each is absent for a different reason:
+#   - ``xai``       — availability is probed via ``has_xai_credentials()``
+#                     (env var OR auth.json OAuth) rather than by the walk;
+#                     it is deliberately kept out of the credential-autodetect
+#                     order so an OAuth session is not treated as a web
+#                     credential.
+#   - ``keenable``  — a registered provider, but a keyless-ring member rather
+#                     than a member of the credential-autodetect preference
+#                     walk; the cheap env probe below is the availability
+#                     answer for it.
+#   - ``anthropic`` — a server-side Messages API binding, never a registered
+#                     WebSearchProvider: it cannot be dispatched locally at
+#                     all, so no registry lookup could ever answer for it.
+# Keep the sets aligned by hand: if any of them ever joins
+# ``_LEGACY_PREFERENCE`` as a registered provider, drop it here so the
+# registry path takes over.
 _LEGACY_WEB_BACKENDS = frozenset(
     {"parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "xai", "keenable", "anthropic"}
 )
@@ -472,6 +484,17 @@ def _is_backend_available(backend: str) -> bool:
         # Native server-side web tools execute inside the Anthropic Messages
         # API request, so a credential alone does not make them usable — the
         # active model must also be reached through Anthropic's own endpoint.
+        #
+        # Deliberately NOT given tavily's "explicitly configured ⇒ available"
+        # treatment above. That shortcut is sound for a client-side provider:
+        # selecting it means the user intends to use it, and the dispatcher can
+        # still print a precise "set TAVILY_API_KEY" error at call time. Here
+        # there is no dispatcher to reach — on a non-Anthropic transport the
+        # binding is stripped from the request before it goes out, so an
+        # "available" answer would advertise a capability that silently does
+        # nothing. Selecting anthropic is exactly the configuration this branch
+        # has to be able to answer False for; do not harmonize the asymmetry.
+        #
         # Both probes stay cheap (config read + env lookup): this function runs
         # while schemas are assembled and while `hermes tools` paints.
         # get_env_value() (via _has_env) covers both the process env and
@@ -975,12 +998,22 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
         backend = _get_search_backend()
         if backend == "anthropic":
-            return tool_error(
+            # Reached only when the binding was NOT attached to the request
+            # (non-Anthropic transport, or a compatible third-party endpoint):
+            # when it is attached, Anthropic runs the search server-side and
+            # this handler is never called. Trace it like every other
+            # web_search failure path so `hermes debug` shows why the call
+            # produced nothing.
+            error_text = (
                 "Anthropic web search is a server-side Messages API tool and "
                 "cannot be executed by Hermes locally. Use a model served by "
                 "Anthropic's own Messages API, or select another web search "
                 "backend with `hermes tools`."
             )
+            debug_call_data["error"] = error_text
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return tool_error(error_text)
         provider = _wsp_get_provider(backend) if backend else None
         if provider is None or not provider.supports_search():
             from tools.tool_backend_helpers import (
@@ -1496,6 +1529,12 @@ def check_web_api_key() -> bool:
     has credentials (issues #28651, #31873). Resolution funnels through
     :func:`_is_backend_available`, which delegates non-legacy names to the
     registry.
+
+    One selection cannot be served by any credential: Anthropic's native web
+    tools execute inside the Messages API request, so on a transport that
+    cannot carry them nothing else can run them either. When the effective
+    routing sends BOTH capabilities there, this reports the toolset as
+    unavailable rather than advertising web access the agent does not have.
     """
     # ``or ""``: a null ``web.backend`` value yields None from ``.get``, and
     # ``None.lower()`` would raise. Mirrors ``_get_backend``.
@@ -1507,14 +1546,26 @@ def check_web_api_key() -> bool:
     configured_backends.discard("")
     if any(_is_backend_available(backend) for backend in configured_backends):
         return True
-    # A shared ``web.backend`` is honored unconditionally by ``_get_backend()``,
-    # so once an explicit Anthropic selection is unusable no credential
-    # elsewhere can serve either capability: every dispatch resolves back to
-    # "anthropic" and fails. Reporting the toolset as available here would
-    # advertise web access the agent does not have. The per-capability
-    # overrides are already covered by the check above — they fall back to
-    # another backend on their own when unavailable.
-    if str(config.get("backend") or "").lower().strip() == "anthropic":
+    # Selection is strict on BOTH the shared key and the per-capability
+    # overrides: ``_get_backend()`` and ``_get_capability_backend()`` return a
+    # stored name with no availability probe and no fallback, so the raw config
+    # keys do not describe the runtime routing. Resolve the effective backends
+    # and bail only when EVERY capability lands on an Anthropic selection the
+    # active transport cannot execute — nothing else can serve either tool, so
+    # reporting the toolset as available would advertise web access the agent
+    # does not have. When only one capability is stuck on anthropic, the other
+    # still serves and the stuck tool explains itself at dispatch.
+    #
+    # Guarded on the config read so a never-configured install never pays for
+    # backend resolution (which now walks the keyless ring). The guard is
+    # exact: "anthropic" is in neither the autodetect ladder nor the keyless
+    # ring, so neither resolver can return it unless it was configured.
+    # ``_is_backend_available("anthropic")`` is already known False here — the
+    # name is in ``configured_backends`` and the probe above did not return.
+    if "anthropic" in configured_backends and all(
+        backend == "anthropic"
+        for backend in (_get_search_backend(), _get_extract_backend())
+    ):
         return False
     # Any built-in backend with credentials present. This is a boolean OR, so
     # unlike _get_backend() the probe order is irrelevant.
@@ -1522,6 +1573,13 @@ def check_web_api_key() -> bool:
     # a model credential and may coexist with an OpenRouter or other active
     # transport; treating it as a generic web-provider key would expose local
     # web functions that cannot execute on that transport.
+    #
+    # The subtraction is load-bearing, not decorative: it is what
+    # ``test_model_key_does_not_implicitly_replace_the_web_backend`` asserts —
+    # an ANTHROPIC_API_KEY with no web selection at all must leave web off.
+    # (It is NOT what keeps upstream's ``test_no_credentials_fails`` honest;
+    # ``tests/conftest.py``'s autouse ``_hermetic_environment`` strips
+    # credential-shaped env vars, so no key is visible there either way.)
     auto_detectable = _LEGACY_WEB_BACKENDS - {"anthropic"}
     if any(_is_backend_available(backend) for backend in auto_detectable):
         return True
@@ -1710,10 +1768,14 @@ def _anthropic_web_search_schema_overrides() -> dict:
 # Ceiling on how much fetched page text Anthropic may load into the context.
 #
 # The local ``web_extract`` path is bounded twice before a result reaches the
-# model: the auxiliary summariser, and ``max_result_size_chars`` on the registry
-# entry below.  The native fetch executes inside the Messages API request, so
-# neither guard ever sees it — an unbounded fetch would be injected whole and,
-# because it is preserved for replay, resent on every later turn of the session.
+# model: the ``web.extract_char_limit`` head+tail window applied per page
+# (``_truncate_with_footer``, default ``DEFAULT_EXTRACT_CHAR_LIMIT`` = 15000
+# chars, with the full text spilled to disk), and ``max_result_size_chars`` on
+# the registry entry below.  There is no LLM summarization on this path at all.
+#
+# The native fetch executes inside the Messages API request, so neither guard
+# ever sees it — an unbounded fetch would be injected whole and, because it is
+# preserved for replay, resent on every later turn of the session.
 # Bound it server-side at the same order of magnitude as the local cap
 # (100_000 chars, ~4 chars/token) so choosing this backend does not silently
 # change how much of a page can land in the context.
