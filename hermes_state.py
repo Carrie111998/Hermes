@@ -2137,6 +2137,61 @@ def preflight_db_writability(
             _ensure_writable(p)
 
 
+def _connect_repair_durable(db_path: Path) -> sqlite3.Connection:
+    """``sqlite3.connect`` for the repair/probe paths, with macOS write barriers.
+
+    These paths open ``state.db`` directly rather than through ``SessionDB``
+    (which routes via :func:`apply_wal_with_fallback`), so they inherited
+    SQLite's ``synchronous=NORMAL`` default and no ``checkpoint_fullfsync``.
+    On Darwin that is exactly the combination :func:`_enforce_macos_synchronous_full`
+    exists to prevent: ``fsync()`` there guarantees neither data-on-platter nor
+    write ordering, so a rewrite interrupted by process or OS termination can
+    leave half-written b-tree pages behind.
+
+    That matters more here than anywhere else in the module, because what runs
+    through these connections is ``REINDEX``, ``VACUUM`` and ``writable_schema``
+    surgery — the operations that rewrite nearly every page of the file.  The
+    2026-08-19 recurrence tore ``messages`` (root page 5) and
+    ``idx_messages_session``, reporting the unmistakable signature: repeated
+    "2nd reference to page", a rowid out of order, and long runs of leaked
+    "never used" pages.
+
+    Autocommit (``isolation_level=None``) is preserved: callers run DDL and
+    ``VACUUM``, which are illegal inside an implicit transaction.
+
+    Applying the barriers is best-effort *by necessity*: SQLite loads the
+    schema before it runs any statement, so on a malformed schema even
+    ``PRAGMA synchronous=FULL`` raises ``DatabaseError`` ("malformed database
+    schema (messages_fts) - table messages_fts already exists").  A malformed
+    database is precisely this helper's input, so raising there would leave
+    repair unable to open the file it exists to fix.  Strategies that go on to
+    rewrite the whole file call :func:`_reapply_durability_barriers` once the
+    schema parses again, which is the point at which the pragmas can stick.
+    """
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    _reapply_durability_barriers(conn)
+    return conn
+
+
+def _reapply_durability_barriers(conn: sqlite3.Connection) -> bool:
+    """Best-effort (re)application of the macOS write barriers.  Never raises.
+
+    Returns True when the pragmas were accepted.  Callers about to rewrite the
+    file wholesale (``VACUUM``, ``REINDEX``) should call this after the schema
+    becomes parseable, because a connection opened against a malformed schema
+    could not take them at open time.
+    """
+    try:
+        _apply_macos_checkpoint_barrier(conn)
+        _enforce_macos_synchronous_full(conn)
+        return True
+    except sqlite3.DatabaseError:
+        # Schema still unparseable — the pragmas cannot be set yet.
+        return False
+    except Exception:
+        return False
+
+
 def _db_opens_cleanly(db_path: Path) -> Optional[str]:
     """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
 
@@ -2148,7 +2203,7 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
     through the FTS triggers — is reported as unhealthy rather than slipping
     past as a false "ok" (#50502).
     """
-    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    conn = _connect_repair_durable(db_path)
     try:
         # Best-effort tokenizer load: a DB carrying the messages_fts_cjk
         # index needs the cjk_unicode61 extension before any statement can
@@ -2263,6 +2318,60 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         conn.close()
 
 
+def _live_writer_holds_db(db_path: Path) -> bool:
+    """True when a connection outside this call still holds ``db_path`` open.
+
+    Detection works by asking SQLite for the thing a repair actually needs and
+    a live writer cannot grant: ``PRAGMA locking_mode=EXCLUSIVE`` followed by
+    ``BEGIN IMMEDIATE``.  In WAL mode, entering exclusive locking mode
+    requires exclusive locks on the WAL index, so any other open connection —
+    reader or writer — makes it fail with SQLITE_BUSY.  Neither statement
+    parses the schema, so this works on the malformed databases repair exists
+    to handle.
+
+    Fails **open** (returns False) on anything other than a positive
+    busy/locked signal: refusing to repair a database that nobody is actually
+    holding would strand the very self-heal path this guard protects.
+
+    Scope: the WAL-index exclusive lock is what makes this detect a holder, so
+    the guard is effective in WAL mode. On SQLite builds carrying the WAL-reset
+    bug and on NFS/SMB, Hermes deliberately runs ``state.db`` in
+    ``journal_mode=DELETE`` (see :func:`apply_wal_with_fallback`); there a held
+    reader takes only a SHARED lock, ``BEGIN IMMEDIATE`` still acquires
+    RESERVED, and this probe returns False. In that mode repair is serialised
+    only by the cross-process repairer lock rather than by this holder probe.
+    The 2026-08 incident that motivated the guard was in WAL mode, which this
+    covers; broadening detection to DELETE mode is left to a follow-up.
+    """
+    probe = None
+    try:
+        probe = sqlite3.connect(str(db_path), timeout=0.0, isolation_level=None)
+        probe.execute("PRAGMA locking_mode=EXCLUSIVE")
+        probe.execute("BEGIN IMMEDIATE")
+        probe.execute("ROLLBACK")
+        return False
+    except sqlite3.OperationalError as exc:
+        lowered = str(exc).lower()
+        return "locked" in lowered or "busy" in lowered
+    except sqlite3.DatabaseError:
+        # Malformed/unreadable: no evidence of a live holder either way.
+        return False
+    except Exception:
+        return False
+    finally:
+        if probe is not None:
+            try:
+                # Drop exclusive locking mode before closing so the probe
+                # itself never leaves the file pinned.
+                probe.execute("PRAGMA locking_mode=NORMAL")
+            except Exception:
+                pass
+            try:
+                probe.close()
+            except Exception:
+                pass
+
+
 def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
     """Repair a state.db whose ``sqlite_master`` schema is malformed or whose
     FTS indexes reject writes.
@@ -2341,6 +2450,23 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
                 "schema surgery to avoid racing it"
             )
             return report
+
+        # The cross-process lock serialises repairers against each other; it
+        # says nothing about the gateway, Desktop or a CLI still holding the
+        # database open. Rewriting b-tree pages under a concurrent writer is
+        # what spread the 2026-08-18/19 damage out of the FTS shadow tables
+        # and into the canonical ones. The caller closes only its own
+        # connection — the incident process held seven descriptors on
+        # state.db — so probe for the rest before touching anything.
+        if _live_writer_holds_db(db_path):
+            report["error"] = (
+                "a live writer still holds state.db; skipped schema surgery "
+                "to avoid tearing b-tree pages under a concurrent writer. "
+                "Stop the gateway (hermes gateway stop) and retry."
+            )
+            logger.error("state.db repair skipped: %s", report["error"])
+            return report
+
         result = _repair_state_db_schema_locked(db_path, backup=backup, report=report)
         # Persist the outcome AFTER surgery, keyed on the post-attempt
         # fingerprint — that is the file state the NEXT attempt's exhaustion
@@ -2391,7 +2517,7 @@ def _repair_state_db_schema_locked(
     # content table. This is the recommended, least-destructive recovery for a
     # corrupt FTS index that rejects message writes while reads still succeed.
     try:
-        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        conn = _connect_repair_durable(db_path)
         try:
             # The cjk index can only be rebuilt with its tokenizer loaded;
             # best-effort (a tokenizer-less host skips it at the probe below).
@@ -2427,8 +2553,11 @@ def _repair_state_db_schema_locked(
     # rows using the existing index definition, fixing the mismatch without
     # touching data or FTS schema.
     try:
-        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        conn = _connect_repair_durable(db_path)
         try:
+            # REINDEX rewrites every index b-tree; take the barriers now that
+            # the schema parses, in case the open-time attempt was refused.
+            _reapply_durability_barriers(conn)
             conn.execute("REINDEX")
             conn.commit()
         finally:
@@ -2445,7 +2574,7 @@ def _repair_state_db_schema_locked(
 
     # ── Strategy 1: de-duplicate sqlite_master (keeps FTS index) ──
     try:
-        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        conn = _connect_repair_durable(db_path)
         try:
             conn.execute("PRAGMA writable_schema=ON")
             dupes = conn.execute(
@@ -2477,13 +2606,17 @@ def _repair_state_db_schema_locked(
 
     # ── Strategy 2: drop all FTS schema, VACUUM, rebuild on next open ──
     try:
-        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        conn = _connect_repair_durable(db_path)
         try:
             conn.execute("PRAGMA writable_schema=ON")
             conn.execute("DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'")
             _bump_schema_cookie(conn)
             conn.execute("PRAGMA writable_schema=OFF")
             conn.commit()
+            # The schema is repaired and parseable now, so the barriers can
+            # finally stick — and VACUUM, which rewrites the entire file, is
+            # the single most damaging operation to lose halfway.
+            _reapply_durability_barriers(conn)
             conn.execute("VACUUM")
         finally:
             conn.close()
