@@ -9,6 +9,7 @@ from plugins.memory.hindsight import (
     HindsightMemoryProvider,
     _RecallResult,
     _dedup_recalled_texts,
+    _recall_should_collapse,
     _recall_similarity,
 )
 
@@ -43,12 +44,21 @@ class TestDedupRecalledTexts:
         ])
         assert out == ["user prefers dark mode"]
 
-    def test_near_identical_rephrasing_collapses(self):
+    def test_filler_only_rephrasing_collapses(self):
+        # Differing tokens are all stopwords/filler -> restatement, collapse.
+        out = _dedup_recalled_texts([
+            "user prefers dark mode",
+            "the user prefers dark mode",
+        ])
+        assert out == ["user prefers dark mode"]
+
+    def test_content_word_rephrasing_keeps_both(self):
+        # 'color scheme' vs 'mode' differ by a content word -> update, keep both.
         out = _dedup_recalled_texts([
             "user prefers dark mode",
             "user prefers the dark color scheme",
         ])
-        assert out == ["user prefers dark mode"]
+        assert len(out) == 2
 
     def test_distinct_facts_are_all_kept(self):
         out = _dedup_recalled_texts([
@@ -125,6 +135,76 @@ def provider(tmp_path, monkeypatch):
     )
     p._client = client
     return p
+
+
+class TestReviewRegressions:
+    """Pins the failure shapes from the AI review of this PR.
+
+    Facts differing in a number, date, proper noun, or rare content word are
+    UPDATES, not restatements — they must never collapse. Double-negation
+    pairs over different targets must also stay distinct."""
+
+    def test_number_swapped_facts_both_kept(self):
+        out = _dedup_recalled_texts([
+            "user's daughter is 7",
+            "user's daughter is 8",
+        ])
+        assert len(out) == 2
+
+    def test_day_swapped_facts_both_kept(self):
+        out = _dedup_recalled_texts([
+            "meeting moved to tuesday",
+            "meeting moved to wednesday",
+        ])
+        assert len(out) == 2
+
+    def test_secret_id_swap_both_kept(self):
+        out = _dedup_recalled_texts([
+            "deploy key is abc123",
+            "deploy key is abc456",
+        ])
+        assert len(out) == 2
+
+    def test_double_negation_different_targets_both_kept(self):
+        # Both sides carry negation markers, but over DIFFERENT targets —
+        # the old polarity-only guard wrongly merged these.
+        out = _dedup_recalled_texts([
+            "user doesn't like dark mode",
+            "user doesn't like light mode",
+        ])
+        assert len(out) == 2
+
+    def test_double_negation_same_target_collapses(self):
+        # Same negated target, only filler differs -> collapse is safe.
+        out = _dedup_recalled_texts([
+            "never deploy on friday",
+            "never not deploy on the friday",
+        ])
+        assert len(out) == 1
+
+    def test_proper_noun_swap_both_kept(self):
+        out = _dedup_recalled_texts([
+            "Alice owns the deploy pipeline",
+            "Bob owns the deploy pipeline",
+        ])
+        assert len(out) == 2
+
+    def test_true_restatement_still_collapses_with_numbers(self):
+        # Same numbers + same content words, only filler differs -> collapse.
+        out = _dedup_recalled_texts([
+            "the build takes 42 seconds on the main runner",
+            "build takes 42 seconds on main runner",
+        ])
+        assert len(out) == 1
+
+    def test_similarity_threshold_documented(self):
+        # Two collapsible facts may differ ONLY by stopwords/filler; any
+        # single content-token difference blocks collapse. This documents
+        # the effective minimum edit distance: one content word = keep both.
+        assert not _recall_should_collapse(
+            "user prefers dark mode", "user prefers dark theme"
+        )
+        assert _recall_similarity("user prefers dark mode", "user prefers dark theme") >= 0.75
 
 
 class TestRecallToolDedup:

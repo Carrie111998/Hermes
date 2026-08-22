@@ -85,19 +85,42 @@ class _RecallResult:
 
 # Similarity threshold above which two recalled facts count as the same
 # assertion. Similarity is containment-based (see _recall_similarity), so a
-# restatement that drops/adds a few words — e.g. "user prefers dark mode" vs
-# "the user prefers dark mode" — still matches; genuinely different facts score
-# low and are never collapsed.
-_RECALL_DEDUP_SIMILARITY_THRESHOLD = 0.75
+# restatement that drops/adds a few filler words — e.g. "user prefers dark
+# mode" vs "the user prefers dark mode" — still matches. Facts differing in a
+# CONTENT token (a number, date, or proper noun) are NEVER collapsed regardless
+# of score: "daughter is 7" vs "daughter is 8" is an update, not a restatement,
+# and dropping it would freeze stale answers into the context.
+_RECALL_DEDUP_SIMILARITY_THRESHOLD = 0.9
+
+# Short facts (<= this many tokens) need a stricter score: with few tokens each
+# one carries more meaning, so a single differing word must block collapse.
+_RECALL_DEDUP_SHORT_FACT_TOKENS = 8
+_RECALL_DEDUP_SHORT_FACT_THRESHOLD = 0.95
 
 # Negation markers: if two near-duplicate facts differ in whether they carry
 # negation, they assert opposite things (e.g. "user likes X" vs "user doesn't
-# like X") — keep both, don't merge. Independent of the similarity score.
+# like X") — keep both, don't merge.
 _NEGATION_RE = re.compile(
     r"\b(?:n't|not|never|no|none|nothing|without|neither|nor|isn't|aren't|"
     r"wasn't|weren't|don't|doesn't|didn't|won't|can't|cannot|shouldn't)\b",
     re.IGNORECASE,
 )
+
+# Words so common they carry no identifying meaning. Used to decide whether two
+# facts that differ by exactly one token differ by CONTENT (keep both) or by
+# filler (safe to collapse). Negation markers are excluded here too: they are
+# handled by their own polarity/scope guards, and counting them as content
+# would shadow those guards.
+_STOPWORD_TOKENS = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "to", "of", "in", "on", "for", "with", "and", "or", "but", "at", "by",
+    "from", "up", "about", "into", "over", "after", "it", "its", "this",
+    "that", "these", "those", "their", "there", "here", "as", "s", "t",
+    # negation markers (see _NEGATION_RE)
+    "not", "never", "no", "none", "nothing", "without", "neither", "nor",
+    "isn", "aren", "wasn", "weren", "don", "doesn", "didn", "won", "can",
+    "cannot", "shouldn",
+})
 
 
 def _recall_token_set(text: str) -> set[str]:
@@ -115,8 +138,7 @@ def _recall_similarity(a: str, b: str) -> float:
 
     One fact is a restatement of the other when they share nearly all of their
     tokens (e.g. "user prefers dark mode" vs "the user prefers dark mode").
-    Symmetric max directional overlap: the fraction of the smaller token set
-    contained in the larger. Order-insensitive.
+    Fraction of the smaller token set contained in the larger; order-insensitive.
     """
     ta = _recall_token_set(a)
     tb = _recall_token_set(b)
@@ -125,26 +147,90 @@ def _recall_similarity(a: str, b: str) -> float:
     inter = len(ta & tb)
     if not inter:
         return 0.0
-    # Which fact is the smaller one? The restatement keeps the shorter fact's
-    # tokens; containment = fraction of the smaller set that's shared.
-    union = len(ta | tb)
     smaller = min(len(ta), len(tb))
     return inter / smaller if smaller else 0.0
+
+
+def _differing_tokens(a: str, b: str) -> set[str]:
+    """Tokens present in exactly one of the two facts."""
+    ta = _recall_token_set(a)
+    tb = _recall_token_set(b)
+    return ta ^ tb
+
+
+def _content_tokens(text: str) -> set[str]:
+    """Tokens of a fact excluding stopwords/filler."""
+    return {t for t in _recall_token_set(text) if t not in _STOPWORD_TOKENS}
+
+
+def _differs_by_content(candidate: str, keep: str) -> bool:
+    """True when the two facts disagree on a meaningful token.
+
+    A difference is CONTENT when any non-shared token is a number/date-like
+    value, a capitalized proper noun, or a rare (non-stopword) word — e.g.
+    "daughter is 7" vs "daughter is 8", "moved to tuesday" vs "moved to
+    wednesday", "key is abc123" vs "key is abc456". Those pairs are updates or
+    contradictions, never restatements, and must both be kept. Differences made
+    up only of stopwords/filler ("the user prefers X" vs "user prefers X") are
+    safe to collapse.
+    """
+    diff = _differing_tokens(keep, candidate)
+    if not diff:
+        return False
+    for token in diff:
+        # Digits: numbers, dates, IDs ("7" vs "8", "abc123" vs "abc456").
+        if any(ch.isdigit() for ch in token):
+            return True
+    # Proper nouns: a capitalized word away from sentence start / known names.
+    for text in (keep, candidate):
+        words = re.findall(r"[A-Za-z][A-Za-z0-9']*", text or "")
+        for i, w in enumerate(words):
+            if i > 0 and w[0].isupper() and w.lower() in {t.lower() for t in diff}:
+                return True
+    # Rare content words: any differing token outside the stopword set.
+    if any(t not in _STOPWORD_TOKENS for t in diff):
+        return True
+    return False
+
+
+def _threshold_for(keep: str, candidate: str) -> float:
+    """Similarity threshold for this pair — stricter on short facts."""
+    smaller = min(len(_recall_token_set(keep)), len(_recall_token_set(candidate)))
+    if smaller <= _RECALL_DEDUP_SHORT_FACT_TOKENS:
+        return _RECALL_DEDUP_SHORT_FACT_THRESHOLD
+    return _RECALL_DEDUP_SIMILARITY_THRESHOLD
 
 
 def _recall_should_collapse(candidate: str, keep: str) -> bool:
     """Should `candidate` be dropped because `keep` already represents it?
 
-    Collapses when the two are near-identical restatements, EXCEPT when their
-    polarity differs (one negates the other) — that's a contradiction and both
-    facts are preserved.
+    Collapses only true restatements — near-identical wording with no content
+    disagreement. Never collapses when:
+
+    - the pair differs on a content token (number, date, proper noun, rare
+      word): that's an update or a contradiction, keep both;
+    - their negation polarity differs ("likes X" vs "doesn't like X");
+    - EITHER side carries a negation marker but the non-marker remainder
+      differs at all (double-negation pairs over different targets, e.g.
+      "doesn't like dark mode" vs "doesn't like light mode", stay distinct).
+
+    Fail-open toward information preservation: ambiguous pairs are kept.
     """
-    if _recall_similarity(keep, candidate) < _RECALL_DEDUP_SIMILARITY_THRESHOLD:
+    if _differs_by_content(keep, candidate):
         return False
-    # Same assertion but opposite polarity -> contradiction, keep both.
-    if _recall_is_negation(keep) != _recall_is_negation(candidate):
+    keep_neg = _recall_is_negation(keep)
+    cand_neg = _recall_is_negation(candidate)
+    if keep_neg != cand_neg:
         return False
-    return True
+    if keep_neg and cand_neg:
+        # Both negative: only collapse when the CONTENT of the de-marked
+        # remainder matches — different targets ("never deploy friday" vs
+        # "never deploy sunday") stay distinct even though both are negative.
+        if _content_tokens(_NEGATION_RE.sub(" ", keep)) != _content_tokens(
+            _NEGATION_RE.sub(" ", candidate)
+        ):
+            return False
+    return _recall_similarity(keep, candidate) >= _threshold_for(keep, candidate)
 
 
 def _dedup_recalled_texts(texts: list[str]) -> list[str]:
