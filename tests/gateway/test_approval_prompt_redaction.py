@@ -115,10 +115,35 @@ class TestApprovalCommandWiring:
 
         self._assert_redacts_then_uses(run, "_approval_notify_sync", "send_exec_approval")
 
-    def test_sse_api_path_redacts_before_enqueue(self):
-        from gateway.platforms import api_server
+    def test_sse_api_path_redacts_before_enqueue(self, monkeypatch):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.api_server import APIServerAdapter
 
-        self._assert_redacts_then_uses(api_server, "_approval_notify", "put_nowait")
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        emitted = []
+        notify = adapter._make_run_approval_notify("run-redaction", emitted.append)
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False, raising=False)
+
+        notify({
+            "request_id": "approval-1",
+            "command": "export OPENAI_API_KEY=" + _FAKE_OPENAI + " && python s.py",
+            "description": "credential found: " + _FAKE_GHP,
+            "pattern_key": "shell-c",
+            "pattern_keys": ["shell-c"],
+            "smart_denied": False,
+            "allow_permanent": True,
+            "allow_session": True,
+            "untrusted_extra": "must not cross egress: " + _FAKE_GHP,
+        })
+
+        assert len(emitted) == 1
+        event = emitted[0]
+        assert _FAKE_OPENAI not in event["command"]
+        assert _FAKE_GHP not in event["description"]
+        assert "python s.py" in event["command"]
+        assert "untrusted_extra" not in event
+        assert event["request_id"] == "approval-1"
+        assert event["pattern_keys"] == ["shell-c"]
 
 
 class TestApprovalTextFallbackContract:

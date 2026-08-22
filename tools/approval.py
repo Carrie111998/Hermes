@@ -44,6 +44,14 @@ _approval_session_key: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_session_key",
     default="",
 )
+# Optional authorization namespace, distinct from the persisted session key.
+# API runs use a unique run id here so concurrent turns sharing one native
+# session cannot resolve or inherit each other's approvals. All non-approval
+# tools continue to read the stable identity from get_current_session_key().
+_approval_namespace_key: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_namespace_key",
+    default="",
+)
 _approval_turn_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_turn_id",
     default="",
@@ -196,6 +204,18 @@ def reset_current_session_key(token: contextvars.Token[str]) -> None:
     _approval_session_key.reset(token)
 
 
+def set_current_approval_namespace_key(
+    namespace_key: str,
+) -> contextvars.Token[str]:
+    """Bind a run-local namespace for approval queues and allowlists only."""
+    return _approval_namespace_key.set(namespace_key or "")
+
+
+def reset_current_approval_namespace_key(token: contextvars.Token[str]) -> None:
+    """Restore the prior run-local approval namespace."""
+    _approval_namespace_key.reset(token)
+
+
 def set_current_observability_context(
     *,
     turn_id: str = "",
@@ -237,6 +257,14 @@ def get_current_session_key(default: str = "default") -> str:
         return session_key
     from gateway.session_context import get_session_env
     return get_session_env("HERMES_SESSION_KEY", default)
+
+
+def get_current_approval_namespace_key(default: str = "default") -> str:
+    """Return the approval namespace, falling back to stable session identity."""
+    namespace_key = _approval_namespace_key.get()
+    if namespace_key:
+        return namespace_key
+    return get_current_session_key(default=default)
 
 
 def _get_session_platform() -> str:
@@ -2307,11 +2335,17 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
         return False
 
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
+    raw_temp_dir = os.path.abspath(tempfile.gettempdir())
+    temp_dir = os.path.realpath(raw_temp_dir)
     basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+    if not os.path.isabs(operand) or os.path.normpath(operand) != operand:
         return False
-
+    allowed_operand_dirs = {temp_dir}
+    if {raw_temp_dir, temp_dir} == {"/tmp", "/private/tmp"}:
+        # macOS exposes /tmp as a stable system alias for /private/tmp.
+        allowed_operand_dirs.add(raw_temp_dir)
+    if os.path.dirname(operand) not in allowed_operand_dirs:
+        return False
     target = os.path.realpath(operand)
     if os.path.dirname(target) != temp_dir:
         return False
@@ -2446,7 +2480,7 @@ def human_wait_window(session_key: str | None = None):
     Overlapping windows for the same session coalesce (pending counter), so
     two serialized approval prompts don't double-count the same wall clock.
     """
-    key = session_key if session_key is not None else get_current_session_key()
+    key = session_key if session_key is not None else get_current_approval_namespace_key()
     now = time.monotonic()
     with _human_wait_lock:
         state = _human_wait_state(key)
@@ -2488,7 +2522,7 @@ def human_wait_seconds(session_key: str | None = None) -> float:
     window that overstays that bound is itself wedged and must not keep
     extending a batch deadline (belt-and-braces for #79719).
     """
-    key = session_key if session_key is not None else get_current_session_key()
+    key = session_key if session_key is not None else get_current_approval_namespace_key()
     now = time.monotonic()
     # Resolve the clamp outside the lock: it reads the config cache, which
     # must never nest under _human_wait_lock.
@@ -2629,6 +2663,96 @@ def unregister_gateway_notify(session_key: str) -> None:
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
         entry.event.set()
+
+
+def allowed_gateway_approval_choices(approval_data: dict) -> list[str]:
+    """Return the authoritative choices for one queued approval request."""
+    explicit = approval_data.get("choices")
+    if isinstance(explicit, (list, tuple)):
+        allowed_values = {"once", "session", "always", "deny"}
+        choices = [
+            value for value in explicit
+            if isinstance(value, str) and value in allowed_values
+        ]
+        if choices:
+            return list(dict.fromkeys(choices))
+    if approval_data.get("smart_denied"):
+        return ["once", "deny"]
+    choices = ["once"]
+    if approval_data.get("allow_session") is not False:
+        choices.append("session")
+    if approval_data.get("allow_permanent") is not False:
+        choices.append("always")
+    choices.append("deny")
+    return choices
+
+
+def resolve_gateway_approval_exact(
+    session_key: str,
+    request_id: str,
+    choice: str,
+    *,
+    reason: Optional[str] = None,
+    before_wake=None,
+) -> dict:
+    """Atomically validate and resolve exactly one queued approval.
+
+    ``before_wake`` runs under the approval lock after queue mutation and
+    before the waiter is signalled. It must not call back into approval APIs.
+    This ordering lets transports publish ``approval.responded`` and the
+    correct remaining-pending status before the agent can enqueue a successor.
+    """
+    with _lock:
+        queue = _gateway_queues.get(session_key)
+        if not queue:
+            return {"status": "not_found", "resolved": 0, "pending": False}
+        entry = next(
+            (
+                candidate
+                for candidate in queue
+                if candidate.data.get("request_id") == request_id
+            ),
+            None,
+        )
+        if entry is None:
+            return {
+                "status": "not_found",
+                "resolved": 0,
+                "pending": bool(queue),
+            }
+        allowed_choices = allowed_gateway_approval_choices(entry.data)
+        if choice not in allowed_choices:
+            return {
+                "status": "choice_not_allowed",
+                "resolved": 0,
+                "pending": bool(queue),
+                "allowed_choices": allowed_choices,
+            }
+
+        queue.remove(entry)
+        if not queue:
+            _gateway_queues.pop(session_key, None)
+        entry.result = choice
+        if reason:
+            entry.reason = reason
+        resolution = {
+            "status": "resolved",
+            "resolved": 1,
+            "pending": bool(queue),
+            "request_id": request_id,
+            "choice": choice,
+            "allowed_choices": allowed_choices,
+        }
+        if before_wake is not None:
+            try:
+                before_wake(dict(resolution))
+            except Exception:
+                logger.exception(
+                    "Approval before_wake callback failed for request %s",
+                    request_id,
+                )
+        entry.event.set()
+        return resolution
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
@@ -2788,7 +2912,7 @@ def is_session_yolo_enabled(session_key: str) -> bool:
 
 def is_current_session_yolo_enabled() -> bool:
     """Return True when the active approval session has YOLO bypass enabled."""
-    return is_session_yolo_enabled(get_current_session_key(default=""))
+    return is_session_yolo_enabled(get_current_approval_namespace_key(default=""))
 
 
 def is_approved(session_key: str, pattern_key: str) -> bool:
@@ -3214,7 +3338,7 @@ def is_approval_bypass_active_for_session(session_key: str) -> bool:
 def is_approval_bypass_active() -> bool:
     """Return whether the current approval context has bypass enabled."""
     return is_approval_bypass_active_for_session(
-        get_current_session_key(default="")
+        get_current_approval_namespace_key(default="")
     )
 
 
@@ -3472,7 +3596,7 @@ def _run_approval_gate(
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
         return {"approved": True, "message": None}
 
-    session_key = get_current_session_key()
+    session_key = get_current_approval_namespace_key()
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
@@ -4060,7 +4184,9 @@ def _present_with_selected_transport(
 def _transport_denied_result(
     *, pattern_key: str, description: str, failure: str
 ) -> dict:
-    breaker_addendum = _denial_breaker_addendum(get_current_session_key())
+    breaker_addendum = _denial_breaker_addendum(
+        get_current_approval_namespace_key()
+    )
     return {
         "approved": False,
         "message": (
@@ -4600,7 +4726,7 @@ def check_all_command_guards(command: str, env_type: str,
     # Collect warnings that need approval
     warnings = []  # list of (pattern_key, description, is_tirith)
 
-    session_key = get_current_session_key()
+    session_key = get_current_approval_namespace_key()
 
     # Tirith block/warn → approvable warning with rich findings.
     # Previously, tirith "block" was a hard block with no approval prompt.
@@ -5090,7 +5216,7 @@ def check_execute_code_guard(code: str, env_type: str,
     if not is_gateway and not is_ask:
         return {"approved": True, "message": None}
 
-    session_key = get_current_session_key()
+    session_key = get_current_approval_namespace_key()
     # Built only now (past the early-return gates) so the common non-approval
     # paths don't pay to copy a potentially-large script into this string.
     command = f"execute_code <<'PY'\n{code}\nPY"
@@ -5429,7 +5555,7 @@ def request_elicitation_consent(
     Returns one of ``"accept" | "decline" | "cancel"``.
     """
     try:
-        session_key = get_current_session_key()
+        session_key = get_current_approval_namespace_key()
     except Exception as exc:  # pragma: no cover -- defensive
         logger.warning("Elicitation consent: session lookup failed: %s", exc)
         return "decline"

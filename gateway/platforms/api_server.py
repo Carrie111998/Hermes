@@ -1540,6 +1540,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # Transport-specific event sink for approval lifecycle events. Native
+        # session streams and /v1/runs use different queue shapes, so the
+        # shared approval bridge targets this run-scoped callable instead.
+        self._run_approval_event_sinks: Dict[str, Any] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         self._session_dbs: Dict[str, Any] = {}
         self._session_db_cache_lock = threading.Lock()
@@ -4711,6 +4715,7 @@ class APIServerAdapter(BasePlatformAdapter):
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
         message_id = f"msg_{uuid.uuid4().hex}"
         run_id = f"run_{uuid.uuid4().hex}"
+        approval_session_key = run_id
         self._set_run_status(
             run_id,
             "queued",
@@ -4742,6 +4747,16 @@ class APIServerAdapter(BasePlatformAdapter):
             except RuntimeError:
                 pass
 
+        def _emit_approval_event(event: Dict[str, Any]) -> None:
+            _enqueue(str(event.get("event") or "approval.request"), event)
+
+        self._run_approval_sessions[run_id] = approval_session_key
+        self._run_approval_event_sinks[run_id] = _emit_approval_event
+        approval_notify = self._make_run_approval_notify(
+            run_id,
+            _emit_approval_event,
+        )
+
         def _delta(delta: str) -> None:
             if delta:
                 _enqueue("assistant.delta", {"message_id": message_id, "delta": delta})
@@ -4770,6 +4785,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
                     active_run_id=run_id,
+                    approval_notify_callback=approval_notify,
                     gateway_session_key=gateway_session_key,
                     route=route,
                     session_model=session_model,
@@ -4845,6 +4861,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
             finally:
                 self._active_run_agents.pop(run_id, None)
+                self._run_approval_sessions.pop(run_id, None)
+                self._run_approval_event_sinks.pop(run_id, None)
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
 
@@ -7132,6 +7150,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         active_run_id: Optional[str] = None,
+        approval_notify_callback=None,
         gateway_session_key: Optional[str] = None,
         requested_model: Optional[str] = None,
         requested_provider: Optional[str] = None,
@@ -7197,7 +7216,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                 )
                 agent = None
+                approval_token = None
+                approval_session_key = active_run_id or ""
                 try:
+                    if approval_session_key and approval_notify_callback is not None:
+                        from tools.approval import (
+                            register_gateway_notify,
+                            set_current_approval_namespace_key,
+                        )
+
+                        approval_token = set_current_approval_namespace_key(
+                            approval_session_key
+                        )
+                        register_gateway_notify(
+                            approval_session_key,
+                            approval_notify_callback,
+                        )
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
@@ -7367,6 +7401,19 @@ class APIServerAdapter(BasePlatformAdapter):
                         # shutdown.  pop() is a no-op when _create_agent
                         # succeeded but the turn never reached registration.
                         self._shutdown_interruptible_agents.pop(id(agent), None)
+                    if approval_session_key and approval_notify_callback is not None:
+                        from tools.approval import (
+                            clear_session as clear_approval_session,
+                            reset_current_approval_namespace_key,
+                            unregister_gateway_notify,
+                        )
+
+                        try:
+                            unregister_gateway_notify(approval_session_key)
+                        finally:
+                            clear_approval_session(approval_session_key)
+                            if approval_token is not None:
+                                reset_current_approval_namespace_key(approval_token)
                     clear_session_vars(tokens)
 
         self._activate_admitted_request()
@@ -7491,6 +7538,56 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return _callback
 
+    def _make_run_approval_notify(self, run_id: str, emit_event):
+        """Build the shared, whitelisted approval.request bridge for an API run."""
+
+        def _approval_notify(approval_data: Dict[str, Any]) -> None:
+            source = approval_data if isinstance(approval_data, dict) else {}
+            smart_denied = bool(source.get("smart_denied"))
+            allow_permanent = source.get("allow_permanent") is not False
+            # This is an authenticated API egress boundary, not merely a UI
+            # convenience. Force-redact every free-text field we expose even
+            # when global redaction is disabled, and never forward unknown
+            # payload keys supplied by an approval producer.
+            event = {
+                "request_id": str(source.get("request_id") or ""),
+                "command": redact_sensitive_text(
+                    str(source.get("command") or ""), force=True
+                ),
+                "description": redact_sensitive_text(
+                    str(source.get("description") or ""), force=True
+                ),
+                "pattern_key": redact_sensitive_text(
+                    str(source.get("pattern_key") or ""), force=True
+                ),
+                "pattern_keys": [
+                    redact_sensitive_text(str(value), force=True)
+                    for value in (source.get("pattern_keys") or [])
+                    if isinstance(value, str)
+                ],
+                "smart_denied": smart_denied,
+                "allow_permanent": allow_permanent,
+                "allow_session": source.get("allow_session") is not False,
+                "event": "approval.request",
+                "run_id": run_id,
+                "timestamp": time.time(),
+                "choices": _approval_event_choices(
+                    smart_denied=smart_denied,
+                    allow_permanent=allow_permanent,
+                ),
+            }
+            self._set_run_status(
+                run_id,
+                "waiting_for_approval",
+                last_event="approval.request",
+            )
+            try:
+                emit_event(event)
+            except Exception:
+                pass
+
+        return _approval_notify
+
     @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
@@ -7601,6 +7698,25 @@ class APIServerAdapter(BasePlatformAdapter):
             if self._run_streams.get(run_id) is q:
                 q.put_nowait(event)
 
+        def _emit_approval_event(event: Dict[str, Any]) -> None:
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            try:
+                if running_loop is loop:
+                    _put_event_if_active(event)
+                else:
+                    loop.call_soon_threadsafe(_put_event_if_active, event)
+            except RuntimeError:
+                pass
+
+        self._run_approval_event_sinks[run_id] = _emit_approval_event
+        approval_notify = self._make_run_approval_notify(
+            run_id,
+            _emit_approval_event,
+        )
+
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
             if delta is None:
@@ -7664,41 +7780,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 self._active_run_agents[run_id] = agent
 
-                def _approval_notify(approval_data: Dict[str, Any]) -> None:
-                    event = dict(approval_data or {})
-                    # Redact credentials from the command before it enters the
-                    # SSE/API event stream — same egress bug as #48456, second
-                    # transport: API/desktop clients would otherwise receive the
-                    # raw command Tirith flagged. Reuse the gateway seam.
-                    if "command" in event:
-                        from gateway.run import _redact_approval_command
-
-                        event["command"] = _redact_approval_command(event.get("command"))
-                    event.update({
-                        "event": "approval.request",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "choices": _approval_event_choices(
-                            smart_denied=bool(event.get("smart_denied")),
-                            allow_permanent=event.get("allow_permanent") is not False,
-                        ),
-                    })
-                    self._set_run_status(
-                        run_id,
-                        "waiting_for_approval",
-                        last_event="approval.request",
-                    )
-                    try:
-                        loop.call_soon_threadsafe(q.put_nowait, event)
-                    except Exception:
-                        pass
-
                 def _run_sync():
                     from gateway.session_context import clear_session_vars
                     from tools.approval import (
                         register_gateway_notify,
-                        reset_current_session_key,
-                        set_current_session_key,
+                        reset_current_approval_namespace_key,
+                        set_current_approval_namespace_key,
                         unregister_gateway_notify,
                     )
 
@@ -7710,7 +7797,9 @@ class APIServerAdapter(BasePlatformAdapter):
                             # Bind approval/session identity for this API run via
                             # contextvars so concurrent runs do not share process
                             # environment state.
-                            approval_token = set_current_session_key(approval_session_key)
+                            approval_token = set_current_approval_namespace_key(
+                                approval_session_key
+                            )
                             session_tokens = self._bind_api_server_session(
                                 # chat_id carries the raw session id (the
                                 # X-Hermes-Session-Id equivalent) exactly like
@@ -7721,7 +7810,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 # background delegations stay forced-sync
                                 # (no wake target).
                                 chat_id=session_id or "",
-                                session_key=approval_session_key,
+                                session_key=gateway_session_key or session_id or "",
                                 session_id=session_id or "",
                                 browser_control_principal=(
                                     request_browser_control_principal
@@ -7730,7 +7819,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                     request_browser_control_transport_family
                                 ),
                             )
-                            register_gateway_notify(approval_session_key, _approval_notify)
+                            register_gateway_notify(approval_session_key, approval_notify)
                             # /v1/runs runs its own agent lifecycle (no
                             # TurnRunner, no _run_agent) — record turn process
                             # ownership so stop/cancel can reap only the
@@ -7753,7 +7842,9 @@ class APIServerAdapter(BasePlatformAdapter):
                             finally:
                                 if approval_token is not None:
                                     try:
-                                        reset_current_session_key(approval_token)
+                                        reset_current_approval_namespace_key(
+                                            approval_token
+                                        )
                                     except Exception:
                                         pass
                                 if session_tokens:
@@ -7885,9 +7976,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 # waits immediately; the in-thread unregister is harmlessly
                 # idempotent on normal completion.
                 try:
-                    from tools.approval import unregister_gateway_notify
+                    from tools.approval import (
+                        clear_session as clear_approval_session,
+                        unregister_gateway_notify,
+                    )
 
                     unregister_gateway_notify(approval_session_key)
+                    clear_approval_session(approval_session_key)
                 except Exception:
                     pass
                 # Sentinel: signal SSE stream to close
@@ -7898,6 +7993,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                self._run_approval_event_sinks.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
 
         self._activate_admitted_request()
@@ -8017,6 +8113,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=400,
             )
+        request_id = body.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            return web.json_response(
+                _openai_error(
+                    "A non-empty request_id is required to resolve an approval",
+                    code="invalid_approval_request_id",
+                ),
+                status=400,
+            )
 
         approval_session_key = self._run_approval_sessions.get(run_id)
         if not approval_session_key:
@@ -8028,48 +8133,76 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
-        resolve_all = (
-            _coerce_request_bool(body.get("all"), default=False)
-            or _coerce_request_bool(body.get("resolve_all"), default=False)
-        )
-        try:
-            from tools.approval import resolve_gateway_approval
+        def _publish_before_wake(resolution: Dict[str, Any]) -> None:
+            pending = bool(resolution.get("pending"))
+            self._set_run_status(
+                run_id,
+                "waiting_for_approval" if pending else "running",
+                last_event="approval.responded",
+            )
+            responded_event = {
+                "event": "approval.responded",
+                "run_id": run_id,
+                "request_id": request_id,
+                "timestamp": time.time(),
+                "choice": choice,
+                # Exact resolution always resolves one request. Keep this a
+                # bounded positive integer so malformed payloads cannot make a
+                # dashboard clear unrelated pending approvals.
+                "resolved": 1,
+            }
+            event_sink = self._run_approval_event_sinks.get(run_id)
+            if event_sink is not None:
+                try:
+                    event_sink(responded_event)
+                except Exception:
+                    pass
+                return
+            # Compatibility for tests/extensions that seed a /v1/runs queue
+            # directly instead of creating the run through _handle_runs.
+            q = self._run_streams.get(run_id)
+            if q is not None:
+                try:
+                    q.put_nowait(responded_event)
+                except Exception:
+                    pass
 
-            resolved = resolve_gateway_approval(
+        try:
+            from tools.approval import resolve_gateway_approval_exact
+
+            resolution = resolve_gateway_approval_exact(
                 approval_session_key,
+                request_id,
                 choice,
-                resolve_all=resolve_all,
+                before_wake=_publish_before_wake,
             )
         except Exception as exc:
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
-            return web.json_response(_openai_error(str(exc)), status=500)
+            return web.json_response(
+                _openai_error(_redact_api_error_text(exc)), status=500
+            )
 
-        if resolved <= 0:
+        if resolution.get("status") == "not_found":
             return web.json_response(
                 _openai_error(
-                    f"Run has no pending approval: {run_id}",
-                    code="approval_not_pending",
+                    "Approval request is stale or no longer pending",
+                    code="approval_request_stale",
                 ),
                 status=409,
             )
-
-        self._set_run_status(run_id, "running", last_event="approval.responded")
-        q = self._run_streams.get(run_id)
-        if q is not None:
-            try:
-                q.put_nowait({
-                    "event": "approval.responded",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "choice": choice,
-                    "resolved": resolved,
-                })
-            except Exception:
-                pass
-
+        if resolution.get("status") == "choice_not_allowed":
+            return web.json_response(
+                _openai_error(
+                    "Approval choice is not allowed for this request",
+                    code="approval_choice_not_allowed",
+                ),
+                status=400,
+            )
+        resolved = 1
         return web.json_response({
             "object": "hermes.run.approval_response",
             "run_id": run_id,
+            "request_id": request_id,
             "choice": choice,
             "resolved": resolved,
         })
@@ -8188,17 +8321,22 @@ class APIServerAdapter(BasePlatformAdapter):
             task_done = task is None or task.done()
             if task_done:
                 try:
-                    from tools.approval import unregister_gateway_notify
+                    from tools.approval import (
+                        clear_session as clear_approval_session,
+                        unregister_gateway_notify,
+                    )
 
                     approval_session_key = self._run_approval_sessions.get(run_id)
                     if approval_session_key:
                         unregister_gateway_notify(approval_session_key)
+                        clear_approval_session(approval_session_key)
                 except Exception:
                     pass
             # The transport TTL always bounds buffering. Live control state is
             # independent and survives until the executor-backed task returns.
             self._run_streams.pop(run_id, None)
             self._run_streams_created.pop(run_id, None)
+            self._run_approval_event_sinks.pop(run_id, None)
             if task_done:
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)

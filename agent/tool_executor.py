@@ -461,12 +461,12 @@ class _ConcurrentToolAuthorizationGate:
         self._session_key = session_key
         if self._session_key is None:
             try:
-                from tools.approval import get_current_session_key
+                from tools.approval import get_current_approval_namespace_key
 
-                # Snapshot the batch's session identity on the SUBMITTING
+                # Snapshot the batch's approval namespace on the SUBMITTING
                 # thread: excluded_seconds() is polled from the batch wait
                 # loop, whose context may differ from the workers'.
-                self._session_key = get_current_session_key()
+                self._session_key = get_current_approval_namespace_key()
             except Exception:
                 logger.debug(
                     "authorization gate could not snapshot the session key; "
