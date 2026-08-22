@@ -1738,6 +1738,7 @@ export interface Translations {
   sidebar: {
     nav: Record<string, string>
     searchAria: string
+    filters: string
     searchPlaceholder: string
     clearSearch: string
     noMatch: (query: string) => string
@@ -1844,6 +1845,8 @@ export interface Translations {
       copyId: string
       export: string
       branchFrom: string
+      untitledSession: string
+      newSessionTitle: string
       rename: string
       archive: string
       newWindow: string
@@ -2566,6 +2569,10 @@ export interface Translations {
     lastTabKeptTitle: string
     lastTabKeptBody: string
     toggleStripTab: (title: string) => string
+    paneSessions: string
+    paneTerminal: string
+    paneFiles: string
+    paneReview: string
     minimize: string
     restore: string
     closeRunningTitle: string

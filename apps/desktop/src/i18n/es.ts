@@ -1,11 +1,11 @@
-import type { Translations } from './types'
+import { defineLocale } from './define-locale'
 
 // Spanish locale for Hermes Desktop
 // Created by Tormen28 — partial translation with English fallback
-// Last updated: 2026-08-21
-// Usage: Add 'es' to types.ts, catalog.ts, and languages.ts
+// Last updated: 2026-08-22
+// Uses defineLocale() so missing keys inherit English at every depth.
 
-export const es: Partial<Translations> = {
+export const es = defineLocale({
   common: {
     apply: 'Aplicar',
     back: 'Atrás',
@@ -263,16 +263,6 @@ export const es: Partial<Translations> = {
       keys: 'Buscar claves API...',
       mcp: 'Buscar servidores MCP...',
       sessions: 'Buscar sesiones archivadas...'
-    },
-    sectionNames: {
-      model: 'Modelo',
-      chat: 'Chat',
-      appearance: 'Apariencia',
-      workspace: 'Espacio de trabajo',
-      safety: 'Seguridad',
-      memory: 'Memoria y contexto',
-      voice: 'Voz',
-      advanced: 'Avanzado'
     }
   },
 
@@ -333,6 +323,7 @@ export const es: Partial<Translations> = {
     searchAria: 'Buscar sesiones',
     searchPlaceholder: 'Buscar sesiones…',
     clearSearch: 'Limpiar búsqueda',
+    filters: 'Filtros',
     noMatch: query => `No hay sesiones que coincidan con "${query}".`,
     results: 'Resultados',
     pinned: 'Fijadas',
@@ -365,6 +356,10 @@ export const es: Partial<Translations> = {
     noFilterMatches: 'Ninguna sesión coincide con estos filtros',
     loadMore: 'Cargar más',
     loadCount: step => `Cargar ${step} más`,
+    row: {
+      untitledSession: 'Sesión sin título',
+      newSessionTitle: 'Nueva sesión',
+    },
     projects: {
       sectionLabel: 'Proyectos',
       home: 'Inicio',
@@ -397,33 +392,11 @@ export const es: Partial<Translations> = {
   },
 
   composer: {
-    askPlaceholder: 'Pregúntale a Hermes...',
-    instructionsPlaceholder: 'Agregar instrucciones...',
-    replyInstructionsPlaceholder: 'Instrucciones...',
-    placeholder: 'Escribe tu mensaje...',
-    sendTooltip: 'Enviar',
-    sendWithShiftEnterTooltip: 'Enviar',
-    attachTooltip: 'Adjuntar archivo',
-    toggleMarkdownPreview: 'Alternar vista previa de Markdown',
-    toggleMarkdownPreviewAria: () => 'Alternar vista previa de Markdown',
-    stopTooltip: 'Detener',
-    deleteFile: 'Eliminar archivo',
-    uploadFailed: 'Error al subir archivo',
-    clipboardTooltip: 'Pegar desde el portapapeles',
-    pressEnterToSend: 'Presiona Enter para enviar',
-    dragToReorder: 'Arrastra para reordenar',
-    missingProvider: 'Selecciona un proveedor de modelo.',
-    addAttachment: 'Agregar adjunto',
-    uploadFromDisk: 'Subir desde disco',
-    openImage: 'Abrir imagen',
-    openImageFailed: 'No se pudo abrir la imagen',
-    streaming: 'Transmitiendo…',
-    streamingComplete: 'Transmisión completada',
-    followUp: {
-      placeholder: 'Seguir conversación…',
-      send: 'Enviar',
-      cancel: 'Cancelar'
-    }
+    send: 'Enviar',
+    attachLabel: 'Adjuntar archivo',
+    stop: 'Detener',
+    removeAttachment: label => `Eliminar ${label}`,
+    pasteImage: 'Pegar desde el portapapeles',
   },
 
   prompts: {
@@ -798,6 +771,10 @@ export const es: Partial<Translations> = {
     lastTabKeptTitle: 'La última pestaña permanece',
     lastTabKeptBody: 'Esta zona necesita al menos una pestaña visible. Muestra otra pestaña primero, o colapsa toda la barra lateral.',
     toggleStripTab: title => `Alternar pestaña ${title}`,
+    paneSessions: 'Sesiones',
+    paneTerminal: 'Terminal',
+    paneFiles: 'Archivos',
+    paneReview: 'Revisión',
     minimize: 'Minimizar',
     restore: 'Restaurar',
     closeRunningTitle: '¿Cerrar pestaña en ejecución?',
@@ -812,4 +789,4 @@ export const es: Partial<Translations> = {
     pluginDisabledBody: 'Reactívalo en Configuración → Plugins para recuperar el panel.',
     missingPane: paneId => `panel faltante: ${paneId}`
   }
-}
+})
