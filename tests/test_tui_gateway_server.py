@@ -1,5 +1,6 @@
 import json
 import os
+import secrets
 import subprocess
 import sys
 import threading
@@ -12403,10 +12404,13 @@ def test_config_set_model_defers_while_running(monkeypatch):
     monkeypatch.setattr(server, "_apply_model_switch", _fake_apply)
 
     server._sessions["sid"] = _session(running=True)
-    server._sessions["sid"]["model_options_catalogue"] = frozenset(
-        {("anthropic", "anthropic/claude-sonnet-4.6")}
+    served = frozenset({("anthropic", "anthropic/claude-sonnet-4.6")})
+    served_at = time.monotonic()
+    server._sessions["sid"]["model_options_catalogue"] = served
+    server._sessions["sid"]["model_options_catalogue_at"] = served_at
+    server._sessions["sid"]["model_options_catalogue_proof"] = (
+        secrets.token_urlsafe(32)
     )
-    server._sessions["sid"]["model_options_catalogue_at"] = time.monotonic()
     try:
         resp = server.handle_request(
             {
@@ -12426,11 +12430,10 @@ def test_config_set_model_defers_while_running(monkeypatch):
         assert seen["called"]
         assert seen["kwargs"]["prepare_only"] is True
         catalogue_proof = seen["kwargs"]["catalogue_proof"]
-        assert catalogue_proof is not None
-        assert (
-            "anthropic",
-            "anthropic/claude-sonnet-4.6",
-        ) in catalogue_proof.entries
+        assert isinstance(catalogue_proof, str)
+        assert catalogue_proof == server._sessions["sid"][
+            "model_options_catalogue_proof"
+        ]
         pending = server._sessions["sid"].get("pending_model_switch")
         assert pending and pending["raw"] == (
             "anthropic/claude-sonnet-4.6 --provider anthropic"
@@ -14307,8 +14310,8 @@ def test_model_options_records_only_server_served_catalogue_pairs(monkeypatch):
                 model_input="qwen3.6:35b-65k",
             ),
         )
-        assert proof is not None
-        assert proof.entries is served
+        assert isinstance(proof, str)
+        assert proof == session["model_options_catalogue_proof"]
 
         session["model_options_catalogue_at"] -= (
             server._PICKER_CATALOGUE_PROOF_TTL_SECONDS + 1.0

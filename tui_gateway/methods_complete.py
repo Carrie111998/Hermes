@@ -4,6 +4,7 @@ Handler bodies are byte-identical to their pre-split server.py form; they
 are rebound onto server.py's globals at install time — see method_ctx.py.
 """
 
+import secrets
 import time
 
 from .method_ctx import HandlerRegistry
@@ -508,8 +509,11 @@ def _(rid, params: dict) -> dict:
                     model = str(model_id or "").strip()
                     if model:
                         served_pairs.update((identity, model) for identity in identities)
-            session["model_options_catalogue"] = frozenset(served_pairs)
-            session["model_options_catalogue_at"] = time.monotonic()
+            served = frozenset(served_pairs)
+            with _sessions_lock:
+                session["model_options_catalogue"] = served
+                session["model_options_catalogue_at"] = time.monotonic()
+                session["model_options_catalogue_proof"] = secrets.token_urlsafe(32)
         return _ok(rid, payload)
     except Exception as e:
         return _err(rid, 5033, str(e))

@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import queue
+import secrets
 import subprocess
 import sys
 import threading
@@ -4917,7 +4918,33 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
         )
 
 
-def _picker_catalogue_proof(session: dict, parsed_flags: Any) -> Any | None:
+def _gateway_catalogue_proof_is_current(
+    proof: str, provider: str, model: str
+) -> bool:
+    now = time.monotonic()
+    expected_pair = (provider.casefold(), model)
+    with _sessions_lock:
+        for session in _sessions.values():
+            recorded_proof = session.get("model_options_catalogue_proof")
+            if not (
+                isinstance(recorded_proof, str)
+                and secrets.compare_digest(recorded_proof, proof)
+            ):
+                continue
+            served = session.get("model_options_catalogue")
+            served_at = session.get("model_options_catalogue_at")
+            if not isinstance(served_at, (int, float)) or isinstance(served_at, bool):
+                return False
+            age = now - served_at
+            return (
+                0.0 <= age <= _PICKER_CATALOGUE_PROOF_TTL_SECONDS
+                and isinstance(served, frozenset)
+                and expected_pair in served
+            )
+    return False
+
+
+def _picker_catalogue_proof(session: dict, parsed_flags: Any) -> str | None:
     """Return fresh model.options evidence containing the requested pair."""
     try:
         model = str(parsed_flags.model_input or "").strip()
@@ -4926,21 +4953,21 @@ def _picker_catalogue_proof(session: dict, parsed_flags: Any) -> Any | None:
         return None
     if not model or not provider:
         return None
-    served = session.get("model_options_catalogue")
-    served_at = session.get("model_options_catalogue_at")
-    if not isinstance(served_at, (int, float)) or isinstance(served_at, bool):
-        return None
-    age = time.monotonic() - served_at
-    if not (
-        0.0 <= age <= _PICKER_CATALOGUE_PROOF_TTL_SECONDS
-        and isinstance(served, frozenset)
-        and (provider, model) in served
-    ):
-        return None
-
-    from hermes_cli.model_switch import PickerCatalogueProof
-
-    return PickerCatalogueProof(entries=served, served_at=float(served_at))
+    with _sessions_lock:
+        served = session.get("model_options_catalogue")
+        served_at = session.get("model_options_catalogue_at")
+        proof = session.get("model_options_catalogue_proof")
+        if not isinstance(served_at, (int, float)) or isinstance(served_at, bool):
+            return None
+        age = time.monotonic() - served_at
+        if not (
+            0.0 <= age <= _PICKER_CATALOGUE_PROOF_TTL_SECONDS
+            and isinstance(served, frozenset)
+            and (provider, model) in served
+            and isinstance(proof, str)
+        ):
+            return None
+        return proof
 
 
 def _apply_model_switch(
@@ -4948,7 +4975,7 @@ def _apply_model_switch(
     session: dict,
     raw_input: str,
     *,
-    catalogue_proof: Any | None = None,
+    catalogue_proof: str | None = None,
     confirm_expensive_model: bool = False,
     pin_session_override: bool = True,
     parsed_flags: Any | None = None,

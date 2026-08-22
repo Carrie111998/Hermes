@@ -1,12 +1,45 @@
 """Desktop picker catalogue proof for the live model-switch fast path."""
 
+import secrets
 import time
 from unittest.mock import patch
 
-from hermes_cli.model_switch import PickerCatalogueProof, switch_model
+import pytest
+
+from hermes_cli.model_switch import switch_model
+from tui_gateway import server as gateway_server
 
 
-def test_catalogue_proof_switch_skips_redundant_remote_model_probe():
+@pytest.fixture
+def catalogue_proof():
+    session_ids: list[str] = []
+
+    def issue(
+        entries: frozenset[tuple[str, str]], served_at: float | None = None
+    ) -> str:
+        proof = secrets.token_urlsafe(32)
+        session_id = f"test-catalogue-proof-{proof}"
+        with gateway_server._sessions_lock:
+            gateway_server._sessions[session_id] = {
+                "model_options_catalogue": entries,
+                "model_options_catalogue_at": (
+                    time.monotonic() if served_at is None else served_at
+                ),
+                "model_options_catalogue_proof": proof,
+            }
+        session_ids.append(session_id)
+        return proof
+
+    yield issue
+
+    with gateway_server._sessions_lock:
+        for session_id in session_ids:
+            gateway_server._sessions.pop(session_id, None)
+
+
+def test_catalogue_proof_switch_skips_redundant_remote_model_probe(
+    catalogue_proof,
+):
     """A server-proven picker pair must not repeat the provider /models call."""
     with (
         patch("hermes_cli.model_switch.resolve_alias", return_value=None),
@@ -29,11 +62,8 @@ def test_catalogue_proof_switch_skips_redundant_remote_model_probe():
             current_base_url="https://provider.example/v1",
             current_api_key="test-key",
             explicit_provider="openrouter",
-            catalogue_proof=PickerCatalogueProof(
-                entries=frozenset(
-                    {("openrouter", "anthropic/claude-sonnet-4.6")}
-                ),
-                served_at=time.monotonic(),
+            catalogue_proof=catalogue_proof(
+                frozenset({("openrouter", "anthropic/claude-sonnet-4.6")})
             ),
         )
 
@@ -80,22 +110,31 @@ def test_unproven_switch_retains_remote_model_validation():
     validate.assert_called_once()
 
 
-def test_unmatched_or_stale_catalogue_evidence_retains_remote_validation():
+def test_unmatched_or_stale_catalogue_evidence_retains_remote_validation(
+    catalogue_proof,
+):
     """Unrelated or stale catalogue evidence cannot bypass validation."""
     accepted = {"accepted": True, "persist": True, "recognized": True, "message": None}
+    valid = catalogue_proof(
+        frozenset({("openrouter", "anthropic/claude-sonnet-4.6")})
+    )
+    orphaned = catalogue_proof(
+        frozenset({("openrouter", "anthropic/claude-sonnet-4.6")})
+    )
+    with gateway_server._sessions_lock:
+        gateway_server._sessions.pop(f"test-catalogue-proof-{orphaned}")
     proofs = (
-        PickerCatalogueProof(
-            frozenset({("other-provider", "anthropic/claude-sonnet-4.6")}),
-            time.monotonic(),
+        catalogue_proof(
+            frozenset({("other-provider", "anthropic/claude-sonnet-4.6")})
         ),
-        PickerCatalogueProof(
-            frozenset({("openrouter", "other-model")}),
-            time.monotonic(),
-        ),
-        PickerCatalogueProof(
+        catalogue_proof(frozenset({("openrouter", "other-model")})),
+        catalogue_proof(
             frozenset({("openrouter", "anthropic/claude-sonnet-4.6")}),
             time.monotonic() - 301,
         ),
+        f"{valid}x",
+        orphaned,
+        "not-a-proof",
     )
     with (
         patch("hermes_cli.model_switch.resolve_alias", return_value=None),

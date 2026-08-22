@@ -60,29 +60,17 @@ logger = logging.getLogger(__name__)
 _PICKER_CATALOGUE_PROOF_TTL_SECONDS = 300.0
 
 
-@dataclass(frozen=True)
-class PickerCatalogueProof:
-    """Immutable snapshot of a server-recorded model.options catalogue."""
-
-    entries: frozenset[tuple[str, str]]
-    served_at: float
-
-
 def _picker_catalogue_proof_is_current(
-    proof: PickerCatalogueProof | None, provider: str, model: str
+    proof: str | None, provider: str, model: str
 ) -> bool:
-    """Accept only fresh evidence containing this resolved target."""
-    if not isinstance(proof, PickerCatalogueProof):
+    """Accept only evidence still present in the gateway session ledger."""
+    if not isinstance(proof, str):
         return False
-    if not isinstance(proof.entries, frozenset):
+    try:
+        from tui_gateway.server import _gateway_catalogue_proof_is_current
+    except ImportError:
         return False
-    if not isinstance(proof.served_at, (int, float)) or isinstance(proof.served_at, bool):
-        return False
-    age = time.monotonic() - proof.served_at
-    return (
-        0.0 <= age <= _PICKER_CATALOGUE_PROOF_TTL_SECONDS
-        and (provider.casefold(), model) in proof.entries
-    )
+    return _gateway_catalogue_proof_is_current(proof, provider, model)
 
 
 def _declared_model_ids(value: Any) -> list[str]:
@@ -1473,7 +1461,7 @@ def switch_model(
     explicit_provider: str = "",
     user_providers: dict = None,
     custom_providers: list | None = None,
-    catalogue_proof: PickerCatalogueProof | None = None,
+    catalogue_proof: str | None = None,
 ) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
 
@@ -1508,10 +1496,10 @@ def switch_model(
         explicit_provider: From --provider flag (empty = no explicit provider).
         user_providers: The ``providers:`` dict from config.yaml (for user endpoints).
         custom_providers: The ``custom_providers:`` list from config.yaml.
-        catalogue_proof: Fresh, immutable server-recorded picker catalogue.
-            The resolved provider/model pair must be present in it. The proof
-            skips only the redundant live ``/models`` probe; all other
-            resolution and safety checks remain.
+        catalogue_proof: Opaque token for a live gateway session's recent
+            picker catalogue. The resolved provider/model pair must remain in
+            that server-owned ledger. The proof skips only the redundant live
+            ``/models`` probe; all other resolution and safety checks remain.
 
     Returns:
         ModelSwitchResult with all information the caller needs.

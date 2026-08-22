@@ -29,6 +29,7 @@ import inspect
 import json
 import math
 import random
+import secrets
 import statistics
 import sys
 import threading
@@ -102,8 +103,9 @@ def _delay_schedule() -> list[list[float]]:
     ]
 
 
-def _switch_once(base_url: str, *, catalogue_validated: bool) -> None:
+def _switch_once(base_url: str, *, use_catalogue_proof: bool) -> None:
     from hermes_cli.model_switch import switch_model
+    from tui_gateway import server as gateway_server
 
     kwargs = {
         "raw_input": "bench-model",
@@ -113,37 +115,51 @@ def _switch_once(base_url: str, *, catalogue_validated: bool) -> None:
         "current_api_key": "benchmark-key",
         "explicit_provider": "openrouter",
     }
-    supports_fast_path = "catalogue_validated" in inspect.signature(switch_model).parameters
-    if catalogue_validated:
+    supports_fast_path = "catalogue_proof" in inspect.signature(switch_model).parameters
+    proof_session_id = ""
+    if use_catalogue_proof:
         if not supports_fast_path:
             raise RuntimeError(
-                "The after condition requires switch_model(catalogue_validated=...)."
+                "The after condition requires switch_model(catalogue_proof=...)."
             )
-        kwargs["catalogue_validated"] = True
+        proof = secrets.token_urlsafe(32)
+        proof_session_id = f"benchmark-catalogue-proof-{proof}"
+        with gateway_server._sessions_lock:
+            gateway_server._sessions[proof_session_id] = {
+                "model_options_catalogue": frozenset({("openrouter", "bench-model")}),
+                "model_options_catalogue_at": time.monotonic(),
+                "model_options_catalogue_proof": proof,
+            }
+        kwargs["catalogue_proof"] = proof
 
     # Keep the benchmark focused on the redundant remote /v1/models validation.
     # Credential resolution is deterministic, and models.dev enrichment is
     # cache-only in the served-picker path this benchmark represents.
-    with (
-        patch(
-            "hermes_cli.runtime_provider.resolve_runtime_provider",
-            return_value={
-                "api_key": "benchmark-key",
-                "api_mode": "chat_completions",
-                "base_url": base_url,
-            },
-        ),
-        patch("hermes_cli.model_switch.get_model_capabilities", return_value=None),
-        patch("hermes_cli.model_switch.get_model_info", return_value=None),
-    ):
-        result = switch_model(**kwargs)
+    try:
+        with (
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "api_key": "benchmark-key",
+                    "api_mode": "chat_completions",
+                    "base_url": base_url,
+                },
+            ),
+            patch("hermes_cli.model_switch.get_model_capabilities", return_value=None),
+            patch("hermes_cli.model_switch.get_model_info", return_value=None),
+        ):
+            result = switch_model(**kwargs)
+    finally:
+        if proof_session_id:
+            with gateway_server._sessions_lock:
+                gateway_server._sessions.pop(proof_session_id, None)
 
     if not result.success or result.new_model != "bench-model":
         raise RuntimeError(f"Benchmark switch failed: {result}")
 
 
 def measure(condition: str, output: Path) -> None:
-    catalogue_validated = condition == "after"
+    use_catalogue_proof = condition == "after"
     server = _CatalogueServer(("127.0.0.1", 0), _CatalogueHandler)
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
@@ -152,7 +168,7 @@ def measure(condition: str, output: Path) -> None:
     try:
         for _ in range(WARMUPS):
             server.next_delay_seconds = 0.005
-            _switch_once(base_url, catalogue_validated=catalogue_validated)
+            _switch_once(base_url, use_catalogue_proof=use_catalogue_proof)
 
         rows: list[Observation] = []
         for fold, delays in enumerate(_delay_schedule(), start=1):
@@ -160,7 +176,7 @@ def measure(condition: str, output: Path) -> None:
                 server.next_delay_seconds = delay_ms / 1_000.0
                 requests_before = server.request_count
                 started = time.perf_counter_ns()
-                _switch_once(base_url, catalogue_validated=catalogue_validated)
+                _switch_once(base_url, use_catalogue_proof=use_catalogue_proof)
                 latency_ms = (time.perf_counter_ns() - started) / 1_000_000.0
                 rows.append(
                     Observation(
