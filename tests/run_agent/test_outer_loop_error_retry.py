@@ -158,3 +158,39 @@ def test_successful_tool_iteration_resets_outer_loop_error_streak():
     assert api_call.call_count == 5
     assert result["final_response"] == "recovered after progress"
     assert sleep.call_args_list == [call(1), call(1), call(2)]
+
+
+def test_outer_loop_error_near_iteration_limit_is_failed_not_completed():
+    """A terminal outer-loop error must not be reported as a successful turn."""
+    agent = _make_agent()
+    agent.max_iterations = 2
+    response = _mock_response("ignored")
+    transport = agent._get_transport()
+    original_normalize = transport.normalize_response
+    normalize_calls = 0
+
+    def fail_outer_normalization(raw_response, **kwargs):
+        nonlocal normalize_calls
+        normalize_calls += 1
+        if normalize_calls == 2:
+            raise RuntimeError("normalization failed near iteration limit")
+        return original_normalize(raw_response, **kwargs)
+
+    with (
+        patch.object(agent, "_interruptible_api_call", return_value=response),
+        patch.object(
+            transport,
+            "normalize_response",
+            side_effect=fail_outer_normalization,
+        ),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("agent.conversation_loop._sleep_outer_loop_error_backoff") as sleep,
+    ):
+        result = agent.run_conversation("hello")
+
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert result["turn_exit_reason"].startswith("error_near_max_iterations(")
+    sleep.assert_not_called()

@@ -8398,6 +8398,7 @@ def run_conversation(
                 >= _MAX_CONSECUTIVE_OUTER_LOOP_ERRORS
                 or api_call_count >= agent.max_iterations - 1
             ):
+                failed = True
                 if _is_local_processing_error:
                     _turn_exit_reason = f"local_processing_error({error_msg[:80]})"
                     final_response = f"I apologize, but I encountered an error while processing the model response: {error_msg}"
@@ -8405,7 +8406,6 @@ def run_conversation(
                     consecutive_outer_loop_errors
                     >= _MAX_CONSECUTIVE_OUTER_LOOP_ERRORS
                 ):
-                    failed = True
                     _turn_exit_reason = (
                         "outer_loop_error_retry_exhausted"
                         f"({error_msg[:80]})"
