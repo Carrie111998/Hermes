@@ -11198,6 +11198,77 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 current = row["parent_session_id"] if hasattr(row, "keys") else row[0]
         return list(reversed(chain)) or [session_id]
 
+    def get_delegation_tree_usage(self, session_id: str) -> Dict[str, Any]:
+        """Sum token/cost usage across *session_id*'s entire lineage tree.
+
+        ``get_conversation_root`` already documents that compression
+        rotation AND delegate subagents both hang off ``parent_session_id``:
+        "walking to the root gives every segment of one user-facing
+        conversation (and its delegation tree) a single identifier."
+        Nothing walked back *down* from that root to sum usage, though —
+        the web insights dashboard (``hermes_cli/web_server.py``) only
+        aggregates globally across all sessions in a time window, and
+        session search (``hermes_cli/web_routers/sessions.py``)
+        deliberately stops at branch/delegate edges for relevance. Every
+        per-conversation view reads exactly one ``sessions`` row and
+        silently omits every subagent it spawned.
+
+        Measured impact (issue tracked in this repo): a 10-subagent
+        delegation fan-out undercounted input tokens by 2.35x
+        (3.66M read vs 8.62M actually spent) and cache-read tokens by
+        2.14x (86.8M vs 185.6M) when only the root row was read.
+
+        Returns summed counters plus the list of session ids visited, so
+        callers can render "N sessions, $X total" instead of one row.
+        """
+        root = self.get_conversation_root(session_id)
+        totals: Dict[str, Any] = {
+            "root_session_id": root,
+            "session_count": 0,
+            "session_ids": [],
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+            "estimated_cost_usd": 0.0,
+            "actual_cost_usd": 0.0,
+            "tool_call_count": 0,
+            "message_count": 0,
+        }
+        queue = [root]
+        seen: set = set()
+        with self._lock:
+            while queue:
+                sid = queue.pop(0)
+                if not sid or sid in seen:
+                    continue
+                seen.add(sid)
+                row = self._conn.execute(
+                    "SELECT * FROM sessions WHERE id = ?", (sid,)
+                ).fetchone()
+                if row is None:
+                    continue
+                session = dict(row)
+                totals["session_ids"].append(sid)
+                totals["session_count"] += 1
+                for key in (
+                    "input_tokens", "output_tokens", "cache_read_tokens",
+                    "cache_write_tokens", "reasoning_tokens",
+                    "tool_call_count", "message_count",
+                ):
+                    totals[key] += session.get(key) or 0
+                for key in ("estimated_cost_usd", "actual_cost_usd"):
+                    totals[key] += session.get(key) or 0.0
+                children = self._conn.execute(
+                    "SELECT id FROM sessions WHERE parent_session_id = ?", (sid,)
+                ).fetchall()
+                for child in children:
+                    child_id = dict(child)["id"]
+                    if child_id not in seen:
+                        queue.append(child_id)
+        return totals
+
     @staticmethod
     def _is_duplicate_replayed_user_message(messages: List[Dict[str, Any]], msg: Dict[str, Any]) -> bool:
         if msg.get("role") != "user":
