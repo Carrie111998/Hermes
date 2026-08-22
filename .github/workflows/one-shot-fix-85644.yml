@@ -144,3 +144,5 @@ jobs:
             --force-with-lease="refs/heads/$BRANCH:$TRIGGER_HEAD" \
             origin "HEAD:refs/heads/$BRANCH"
           echo "Published exact head $commit"
+
+# closure-sweep trigger: publish the verified runtime tree as a normal branch diff
