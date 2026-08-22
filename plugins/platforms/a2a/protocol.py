@@ -279,11 +279,11 @@ def _artifact_parts(agent_text: str) -> list[dict]:
     parts = [text_part(agent_text)]
     for match in _JSON_FENCE_RE.finditer(agent_text):
         payload = match.group("payload")
-        if len(payload.encode("utf-8")) > _MAX_STRUCTURED_JSON_BYTES:
-            continue
         try:
+            if len(payload.encode("utf-8")) > _MAX_STRUCTURED_JSON_BYTES:
+                continue
             data = json.loads(payload)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
             continue
         parts.append(data_part(data))
     return parts
