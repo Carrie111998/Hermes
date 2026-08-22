@@ -41,9 +41,13 @@ def _git(args, cwd, env=None):
 
 @pytest.fixture
 def repo(tmp_path, monkeypatch):
-    """origin (bare) + clone with .worktrees/, HOME redirected for archives."""
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    (tmp_path / "home").mkdir()
+    """origin + clone with distinct HOME and active Hermes profile roots."""
+    home = tmp_path / "home"
+    hermes_home = tmp_path / "active-hermes-home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    home.mkdir()
+    hermes_home.mkdir()
 
     origin = tmp_path / "origin.git"
     origin.mkdir()
@@ -159,7 +163,13 @@ class TestReclaim:
         records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
         worktree_gc.reclaim_worktrees(str(repo), records=records)
         assert not tree.exists()
-        archive_root = Path.home() / ".hermes" / "archive" / "worktree-prune"
+        legacy_archive_root = (
+            Path(os.environ["HOME"]) / ".hermes" / "archive" / "worktree-prune"
+        )
+        assert not list(legacy_archive_root.rglob("NOTES.md")), (
+            "archive must not escape the active HERMES_HOME profile"
+        )
+        archive_root = Path(os.environ["HERMES_HOME"]) / "archive" / "worktree-prune"
         archived = list(archive_root.rglob("NOTES.md"))
         assert archived, "untracked file must be archived, not destroyed"
         assert archived[0].read_text() == "important scribbles\n"
