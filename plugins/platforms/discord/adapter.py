@@ -1616,7 +1616,11 @@ class DiscordAdapter(BasePlatformAdapter):
                     parent_id = str(message.channel.parent_id)
                 free_channels = self._discord_free_response_channels()
                 channel_keys = self._discord_channel_keys(message, parent_id)
-                if "*" not in free_channels and not (channel_keys & free_channels):
+                is_thread = isinstance(message.channel, discord.Thread)
+                free_response_test_keys = self._discord_free_response_test_keys(
+                    message.channel, channel_keys, is_thread,
+                )
+                if "*" not in free_channels and not (free_response_test_keys & free_channels):
                     return False, False
 
         return True, role_authorized
@@ -2680,15 +2684,19 @@ class DiscordAdapter(BasePlatformAdapter):
             parent_id = self._get_parent_channel_id(message.channel)
             channel_keys = self._discord_channel_keys(message, parent_id)
             free_channels = self._discord_free_response_channels()
+            is_thread = isinstance(message.channel, discord.Thread)
             in_bot_thread = (
-                isinstance(message.channel, discord.Thread)
+                is_thread
                 and str(message.channel.id) in self._threads
                 and not self._discord_thread_require_mention()
+            )
+            free_response_test_keys = self._discord_free_response_test_keys(
+                message.channel, channel_keys, is_thread,
             )
             if (
                 self._discord_require_mention()
                 and "*" not in free_channels
-                and not (channel_keys & free_channels)
+                and not (free_response_test_keys & free_channels)
                 and not in_bot_thread
                 and not self._self_is_explicitly_mentioned(message)
             ):
@@ -6843,6 +6851,54 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_THREAD_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
 
+    def _discord_free_response_test_keys(
+        self, channel: Any, channel_keys: set[str], is_thread: bool,
+    ) -> set[str]:
+        """Return the channel keys used to test free-response eligibility.
+
+        Normally identical to ``channel_keys`` (own id/name + parent, so a
+        forum's ``free_response_channels`` entry cascades to every thread
+        under it — the documented behaviour). When the message is inside a
+        thread AND ``thread_require_mention`` is enabled, the parent-derived
+        keys are stripped: ``thread_require_mention`` exists specifically so
+        a *fresh* thread under a shared/free-response/allowed parent still
+        requires an explicit @mention (multi-bot thread isolation). Without
+        this, a brand-new forum thread under a watched parent silently
+        inherited the parent's free-response status and bypassed
+        ``thread_require_mention`` entirely, because the require-mention gate
+        never got a chance to run — the free-response check short-circuited
+        it first. See swarm bug: gatekeeper self-triggering on unmentioned
+        #workbench forum threads.
+        """
+        if not (is_thread and self._discord_thread_require_mention()):
+            return channel_keys
+        own_keys: set[str] = set()
+        chan_id = getattr(channel, "id", None)
+        if chan_id is not None:
+            own_keys.add(str(chan_id))
+        chan_name = str(getattr(channel, "name", "")).strip()
+        if chan_name:
+            own_keys.add(chan_name)
+            own_keys.add(f"#{chan_name}")
+        # Also drop any own-key that *collides* with a parent-derived key.
+        # Thread names are user-controlled: without this, anyone can name a
+        # new forum thread exactly after its parent channel and the
+        # name-form key re-inherits the parent's free-response entry,
+        # restoring the very bypass this method exists to close (only
+        # matters when free_response_channels is configured by name rather
+        # than by snowflake ID, which is a documented, supported form).
+        # The thread's own snowflake ID stays as the explicit escape hatch.
+        parent_keys: set[str] = set()
+        parent_id = getattr(channel, "parent_id", None)
+        if parent_id is not None:
+            parent_keys.add(str(parent_id))
+        parent_channel = getattr(channel, "parent", None)
+        parent_name = str(getattr(parent_channel, "name", "")).strip() if parent_channel else ""
+        if parent_name:
+            parent_keys.add(parent_name)
+            parent_keys.add(f"#{parent_name}")
+        return own_keys - parent_keys
+
     def _discord_history_backfill(self) -> bool:
         """Return whether history backfill is enabled for shared sessions."""
         configured = self.config.extra.get("history_backfill")
@@ -8132,9 +8188,12 @@ class DiscordAdapter(BasePlatformAdapter):
             voice_linked_ids = {str(ch_id) for ch_id in self._voice_text_channels.values()}
             current_channel_id = str(message.channel.id)
             is_voice_linked_channel = current_channel_id in voice_linked_ids
+            free_response_test_keys = self._discord_free_response_test_keys(
+                message.channel, channel_keys, is_thread,
+            )
             is_free_channel = (
                 "*" in free_channels
-                or bool(channel_keys & free_channels)
+                or bool(free_response_test_keys & free_channels)
                 or is_voice_linked_channel
             )
 
