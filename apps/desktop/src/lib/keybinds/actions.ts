@@ -66,6 +66,10 @@ export const KEYBIND_ACTIONS: readonly KeybindActionMeta[] = [
   // chord, so ship it unbound there (rebindable in the panel) rather than
   // stealing the long-standing sidebar binding.
   { id: 'composer.voice', category: 'composer', defaults: IS_MAC ? ['ctrl+b'] : [] },
+  // Push-to-talk dictation — the mic icon's one-shot record→transcribe→insert,
+  // NOT the conversation loop. Ships unbound: users assign a chord in the
+  // Shortcuts panel, so the default never collides with platform shortcuts.
+  { id: 'composer.dictate', category: 'composer', defaults: [] },
 
   // ── Profiles ─────────────────────────────────────────────────────────────
   { id: 'profile.default', category: 'profiles', defaults: ['mod+d'] },
