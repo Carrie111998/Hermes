@@ -179,10 +179,21 @@ subprocess.run(["op","read","op://Vault/Item/field"], timeout=30, capture_output
 # ~/.hermes/config.yaml
 terminal:
   env_passthrough:
-    - OP_SERVICE_ACCOUNT_TOKEN
+    - OP_SERVICE_ACCOUNT_TOKEN        # SA auth itself (scrubbed as a secret by default)
+    - OP_LOAD_DESKTOP_APP_SETTINGS    # set to "false": skip the desktop-app probe that wedges headless
+    - OP_CACHE                        # set to "false": belt-and-braces vs the op-daemon TCC spawn
 ```
 
-(Skills that declare `required_environment_variables: [OP_SERVICE_ACCOUNT_TOKEN]` in frontmatter get the same effect automatically on `skill_view`.)
+with matching values in `~/.hermes/.env`:
+
+```bash
+OP_LOAD_DESKTOP_APP_SETTINGS=false
+OP_CACHE=false
+```
+
+(Skills that declare `required_environment_variables: [OP_SERVICE_ACCOUNT_TOKEN]` in frontmatter get the same passthrough effect automatically on `skill_view` — but the two `OP_` behavior flags are non-secret so they're stripped unless listed in `env_passthrough`.)
+
+**Verified recipe (macOS 26.6.1, op 2.39.0, gateway on Hermes 2026.8.13):** with all three vars passed through, `op whoami` inside `execute_code` returns in ~0.1s; missing any one of the token / `OP_LOAD_DESKTOP_APP_SETTINGS=false`, it hangs until externally killed.
 
 **For long-lived unattended paths** (cron, LaunchAgents, HA `shell_command`), the most robust pattern is **resolve-and-stash**: resolve the secret once in an interactive shell, store it in a `chmod 600` file, read the file at runtime, keep `op` as a manual-only fallback. This removes `op` from the hot path entirely.
 
