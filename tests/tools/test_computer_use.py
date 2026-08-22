@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, cast
 from unittest.mock import MagicMock, patch
 
@@ -79,7 +80,7 @@ class TestRegistration:
         from tools.computer_use import cua_backend
 
         driver = tmp_path / "custom-cua-driver"
-        driver.write_text("#!/bin/sh\nexit 0\n")
+        driver.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         driver.chmod(0o755)
 
         monkeypatch.setenv("HERMES_CUA_DRIVER_CMD", str(driver))
@@ -817,6 +818,122 @@ class TestLazyMcpInstall:
             with pytest.raises(FeatureUnavailable):
                 cua_backend.CuaDriverBackend().start()
         mock_sess_start.assert_not_called()  # never reaches the MCP session
+
+
+class TestContractAutoRepair:
+    """An installed-but-incompatible driver is repaired automatically, once.
+
+    The 0.20 runtime-contract gate fails closed; when the failure is an old
+    installed driver (a state Hermes' own version-floor bump created),
+    start() runs the standard install/repair path once instead of failing
+    every computer_use call until the user runs the CLI by hand.
+    """
+
+    def _incompatible(self):
+        return {
+            "ready": False,
+            "binary": "/usr/local/bin/cua-driver",
+            "version": "0.19.3",
+            "reason": "Hermes computer use requires cua-driver 0.20.0 or newer",
+        }
+
+    def test_start_auto_repairs_incompatible_driver(self, monkeypatch):
+        from unittest.mock import MagicMock, patch
+        from tools.computer_use import cua_backend
+
+        monkeypatch.setattr(cua_backend, "_contract_repair_attempted", False)
+        backend = cua_backend.CuaDriverBackend()
+        backend._session = MagicMock()
+
+        with patch.object(
+                 cua_backend,
+                 "cua_driver_runtime_contract_status",
+                 side_effect=[self._incompatible(), {"ready": True}],
+             ), \
+             patch("hermes_cli.tools_config.install_cua_driver",
+                   return_value=True) as installer, \
+             patch.object(cua_backend, "_maybe_nudge_update"), \
+             patch("tools.lazy_deps.ensure"):
+            backend.start()
+
+        installer.assert_called_once_with(
+            upgrade=False, show_installer_progress=False
+        )
+        backend._session.start.assert_called_once()
+
+    def test_failed_repair_surfaces_original_error(self, monkeypatch):
+        from unittest.mock import patch
+        from tools.computer_use import cua_backend
+
+        monkeypatch.setattr(cua_backend, "_contract_repair_attempted", False)
+        with patch.object(
+                 cua_backend,
+                 "cua_driver_runtime_contract_status",
+                 return_value=self._incompatible(),
+             ), \
+             patch("hermes_cli.tools_config.install_cua_driver",
+                   return_value=False), \
+             patch("tools.lazy_deps.ensure") as mock_ensure:
+            with pytest.raises(RuntimeError, match="0.20.0 or newer"):
+                cua_backend.CuaDriverBackend().start()
+        mock_ensure.assert_not_called()
+
+    def test_repair_is_attempted_once_per_process(self, monkeypatch):
+        from unittest.mock import patch
+        from tools.computer_use import cua_backend
+
+        monkeypatch.setattr(cua_backend, "_contract_repair_attempted", False)
+        with patch.object(
+                 cua_backend,
+                 "cua_driver_runtime_contract_status",
+                 return_value=self._incompatible(),
+             ), \
+             patch("hermes_cli.tools_config.install_cua_driver",
+                   return_value=False) as installer, \
+             patch("tools.lazy_deps.ensure"):
+            for _ in range(2):
+                with pytest.raises(RuntimeError):
+                    cua_backend.CuaDriverBackend().start()
+        installer.assert_called_once()
+
+    def test_explicit_override_is_never_repaired(self, monkeypatch):
+        from unittest.mock import patch
+        from tools.computer_use import cua_backend
+
+        monkeypatch.setattr(cua_backend, "_contract_repair_attempted", False)
+        monkeypatch.setenv("HERMES_CUA_DRIVER_CMD", "/opt/custom/cua-driver")
+        with patch.object(
+                 cua_backend,
+                 "cua_driver_runtime_contract_status",
+                 return_value=self._incompatible(),
+             ), \
+             patch("hermes_cli.tools_config.install_cua_driver") as installer, \
+             patch("tools.lazy_deps.ensure"):
+            with pytest.raises(RuntimeError, match="HERMES_CUA_DRIVER_CMD"):
+                cua_backend.CuaDriverBackend().start()
+        installer.assert_not_called()
+
+    def test_missing_binary_is_not_repaired(self, monkeypatch):
+        from unittest.mock import patch
+        from tools.computer_use import cua_backend
+
+        monkeypatch.setattr(cua_backend, "_contract_repair_attempted", False)
+        state = {
+            "ready": False,
+            "binary": None,
+            "version": None,
+            "reason": "cua-driver is not installed",
+        }
+        with patch.object(
+                 cua_backend,
+                 "cua_driver_runtime_contract_status",
+                 return_value=state,
+             ), \
+             patch("hermes_cli.tools_config.install_cua_driver") as installer, \
+             patch("tools.lazy_deps.ensure"):
+            with pytest.raises(RuntimeError, match="not installed"):
+                cua_backend.CuaDriverBackend().start()
+        installer.assert_not_called()
 
 
 class TestCaptureAfterAppContext:
@@ -1745,11 +1862,11 @@ class TestImageMimeTypePropagation:
         image_part = MagicMock()
         image_part.type = "image"
         image_part.data = "iVBORw0K..."
-        image_part.mimeType = "image/png"
+        image_part.mime_type = "image/png"
 
         result = MagicMock()
-        result.isError = False
-        result.structuredContent = None
+        result.is_error = False
+        result.structured_content = None
         result.content = [image_part]
 
         out = _extract_tool_result(result)
@@ -2435,6 +2552,55 @@ class TestElementSpillFile:
         # Capture still succeeds and stays budget-capped without the file.
         assert out["truncated_elements"] == 20
         assert "elements_file" not in out
+
+
+class TestCaptureScreenshotPersistence:
+    """Image captures expose a bounded file for explicit user delivery."""
+
+    _PNG_B64 = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76L"
+        "AAAADUlEQVR4nGNgGAUgAAABCAABgukLHQAAAABJRU5ErkJggg=="
+    )
+
+    def _capture(self):
+        from tools.computer_use.backend import CaptureResult
+
+        return CaptureResult(
+            mode="vision",
+            width=8,
+            height=8,
+            png_b64=self._PNG_B64,
+            image_mime_type="image/png",
+            png_bytes_len=len(base64.b64decode(self._PNG_B64)),
+        )
+
+    def test_multimodal_capture_exposes_shareable_screenshot(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from tools.computer_use import tool as cu_tool
+
+        monkeypatch.setattr(
+            cu_tool, "_should_route_through_aux_vision", lambda: False,
+        )
+        out = cu_tool._capture_response(self._capture())
+
+        screenshot_path = out["meta"]["screenshot_path"]
+        assert screenshot_path in out["text_summary"]
+        assert "MEDIA:" not in out["text_summary"]
+        assert screenshot_path.startswith(str(tmp_path / "cache" / "images"))
+        assert Path(screenshot_path).read_bytes() == base64.b64decode(self._PNG_B64)
+
+    def test_capture_cache_is_bounded(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from tools.computer_use import tool as cu_tool
+
+        monkeypatch.setattr(cu_tool, "_MAX_CAPTURE_FILES", 2)
+        for _ in range(3):
+            assert cu_tool._persist_capture_image(self._capture()) is not None
+
+        captures = list((tmp_path / "cache" / "images").glob("computer_use_*.*"))
+        assert len(captures) == 2
 
 
 class TestBoundsScaleField:

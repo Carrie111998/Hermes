@@ -63,9 +63,11 @@ on macOS/Linux, `install.ps1` on Windows. Use `hermes computer-use
 status` to verify the install.
 
 Already have cua-driver? Hermes reuses it when it supports the 0.20 runtime
-contract. During setup and toolset enablement, Hermes checks the local version
-and manifest. It repairs an old or incomplete standard installation through
-the upstream installer. A binary selected with `HERMES_CUA_DRIVER_CMD` stays
+contract. During setup, toolset enablement, `hermes update`, and the first
+`computer_use` call of a session, Hermes checks the local version and
+manifest. It repairs an old or incomplete standard installation through
+the upstream installer (at most once per session at runtime). A binary
+selected with `HERMES_CUA_DRIVER_CMD` stays
 under your control, so Hermes reports the incompatibility and leaves it
 unchanged.
 
@@ -281,6 +283,23 @@ the model substitutes the platform's idiomatic shortcut and app name):
 
 During all of this, your cursor stays wherever you left it and the email
 app never comes to front.
+
+## Receiving the actual screenshot
+
+Screenshots taken during computer control are normally internal — they exist
+so the model can see the screen, and the agent replies in text. But every
+image capture also saves a bounded, shareable copy under Hermes' image cache
+and reports its path, so on attachment-capable surfaces (Telegram, Discord,
+Desktop, and other gateway platforms) you can simply ask:
+
+> *"Send me a screenshot of my screen."*
+
+and the agent delivers the real image as a native attachment, not just a
+description. On the CLI there is no attachment channel, so the agent gives
+you the saved file's path instead.
+
+Only the 20 most recent capture files are kept, and screenshots are never
+sent automatically — only when you ask for one.
 
 ## Provider compatibility
 
