@@ -1,7 +1,7 @@
 ---
 name: opensource-contribution
 description: "Screen a GitHub issue for duplicate-PR, assignee, and CLA blockers before carrying it to a PR."
-version: 0.1.0
+version: 0.2.0
 author: MershLab
 license: MIT
 platforms: [linux, macos, windows]
@@ -22,6 +22,10 @@ someone, and it does not check whether the repo requires a CLA you have
 not signed. Both are real, common reasons a finished PR gets closed
 unmerged, after the work is already done.
 
+Uses the `contrib_screen` toolset — a native Hermes plugin
+(`plugins/contrib-screen/`), not an external CLI. Nothing to install
+separately; it ships with this repo.
+
 ## When to Use
 
 Before starting work on any GitHub issue as an autonomous contribution
@@ -35,44 +39,71 @@ CLEAR by a screen run earlier in the same session.
 
 ### 1. Run the screen
 
-```bash
-contrib-screen screen <owner>/<repo>#<issue-number>
+Call the `contrib_screen` tool:
+
+```
+contrib_screen(target="<owner>/<repo>#<issue-number>", signed_orgs=["<org>", ...])
 ```
 
-This runs three checks — duplicate PR (via the issue's cross-reference
-timeline, broader than a keyword search), assignee, CLA/DCO — and appends
-a record of exactly what it checked and found to a local, append-only log
-(`~/.contrib-screen/log.jsonl`). If a specific org's CLA is already
-signed, pass `--signed-org <org>` so it stops blocking on that org every
-time. For scripted use, `--json` and the exit code (`0` CLEAR, `1`
-otherwise) are both machine-readable — prefer these over parsing the
-human-readable line.
+`signed_orgs` is optional — pass any orgs whose CLA is already signed so
+it stops blocking on them every time. This runs three checks — duplicate
+PR (via the issue's cross-reference timeline, broader than a keyword
+search), assignee, CLA/DCO — and appends a record of exactly what it
+checked and found to `$HERMES_HOME/contrib-screen/log.jsonl`. The tool
+result's `verdict` field is the machine-readable outcome
+(`clear`/`duplicate`/`assigned`/`cla_required`/`not_found`) — read that
+field, don't parse the human-readable `label`.
 
 Done when the verdict is known and recorded.
 
-### 2. Act on the verdict
+### 2. Check org-wide, not just this repo
 
-- **CLEAR** — proceed directly to `github-issue-to-pr`'s own procedure,
-  starting at its step 1, unmodified. Nothing about that skill changes.
-- **DUPLICATE** — a PR already references this issue. Read the URL the
-  log recorded (a cross-reference hit can come from a different repo
+`github-issue-to-pr`'s duplicate sweep and step 1 above both scope to
+*this* repo. A large org can have the same symptom already handled in a
+sibling repo. If `contrib_screen` returns CLEAR and the target org is
+worth checking further (multi-repo orgs, not a single-repo project): run
+a live, org-scoped GitHub search (`gh api` or the search API, `org:` +
+key symptom terms from the issue) before implementing anything. Only if
+that surfaces real candidate repos, `contrib_screen_index` those specific
+repos (never the whole org — see this tool's own description for why),
+then `contrib_screen_search` for a fuller check. Skip this step entirely
+for a single-repo org/project; it exists for the Microsoft/Google/NVIDIA
+-scale case.
+
+### 3. Act on the verdict
+
+- **CLEAR** (and step 2 found nothing org-wide) — proceed directly to
+  `github-issue-to-pr`'s own procedure, starting at its step 1,
+  unmodified. Nothing about that skill changes.
+- **DUPLICATE** — a PR already references this issue. Read the URL in
+  the result (a cross-reference hit can come from a different repo
   entirely, e.g. a changelog mention — treat this as "go look," not an
-  automatic skip, per `contrib-screen`'s own documented limitation). If
-  it genuinely covers the same issue, stop, do not open a second PR.
+  automatic skip). If it genuinely covers the same issue, stop, do not
+  open a second PR.
 - **ASSIGNED** — someone is already on this issue. Stop.
-- **CLA-blocking** — the repo requires a CLA not yet signed for that org.
-  Stop, unless `--signed-org` should have applied and didn't (recheck the
+- **CLA_REQUIRED** — the repo requires a CLA not yet signed for that org.
+  Stop, unless `signed_orgs` should have applied and didn't (recheck the
   org name).
 
 Done when either work has moved to `github-issue-to-pr`, or the candidate
 is skipped with the reason recorded.
 
-### 3. Record the final outcome
+### 4. Ground the drafted text in this org's real voice
+
+Once implementing (inside `github-issue-to-pr`'s own procedure), if the
+org has been indexed (step 2 ran), call `contrib_screen_voice` for a
+handful of real merged PR descriptions from this org before writing the
+PR body — write in a way consistent with how this org's own contributors
+actually write, not generic phrasing. Skip if the org was never indexed;
+don't index solely for this, it's a bonus once step 2's data already
+exists.
+
+### 5. Record the final outcome
 
 Regardless of which branch above was taken, once `github-issue-to-pr`'s
-own step 8 finishes (or this skill stopped at step 2), the outcome —
+own step 8 finishes (or this skill stopped at step 3), the outcome —
 repo, issue, verdict, and PR URL or the reason nothing was opened — is
-what a future sweep or a person checking status needs. `contrib-screen`'s
+what a future sweep or a person checking status needs. `contrib_screen`'s
 own log already covers the screening verdict; this step is only about not
 losing the *outcome* of what happened after, once the harness has
 somewhere durable to write it (see Known limitation below).
@@ -82,26 +113,26 @@ somewhere durable to write it (see Known limitation below).
 - Relying on `github-issue-to-pr`'s own duplicate sweep alone — it does
   not check assignee or CLA at all, which is the entire reason this skill
   exists.
-- Running `contrib-screen` but proceeding anyway on a non-CLEAR verdict.
+- Running `contrib_screen` but proceeding anyway on a non-CLEAR verdict.
 - Treating a DUPLICATE verdict as an automatic skip without reading the
-  URL the log recorded — it can be a false positive from an unrelated
-  repo mentioning the same issue number.
+  URL in the result — it can be a false positive from an unrelated repo
+  mentioning the same issue number.
+- Running `contrib_screen_index` against a whole large org "just in
+  case" — scope it to real candidate repos, found via a live search
+  first.
 
 ## Known limitation
 
-`contrib-screen` is not yet published anywhere pip-installable (no PyPI
-release, no pushed git remote as of this session) — step 1 will fail with
-a plain "command not found" until that's fixed, not a screening failure.
-Install from a local checkout in the meantime:
-`pip install /path/to/contrib-screen`. Step 3's durable outcome log has no
-home yet either (`kernel.py`'s append-only log, per the harness system
-design doc, is not built) — until it exists, record the outcome by hand
-or in the calling session's own notes, don't skip it silently.
+Step 5's durable outcome log has no home yet (`kernel.py`'s append-only
+log, per the harness system design doc, is not built) — until it exists,
+record the outcome by hand or in the calling session's own notes, don't
+skip it silently.
 
 ## Verification
 
-- [ ] `contrib-screen` run before any other action on the candidate.
-- [ ] Verdict recorded (log file, or `--json` output captured).
-- [ ] CLEAR hands off to `github-issue-to-pr`'s full, unmodified procedure.
+- [ ] `contrib_screen` run before any other action on the candidate.
+- [ ] For multi-repo orgs, an org-wide check ran before implementing.
+- [ ] CLEAR (both repo and org-wide) hands off to `github-issue-to-pr`'s
+      full, unmodified procedure.
 - [ ] Non-CLEAR stops here — no PR opened, reason recorded.
 - [ ] Final outcome recorded regardless of which path was taken.

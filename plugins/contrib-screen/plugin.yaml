@@ -1,0 +1,11 @@
+name: contrib-screen
+version: 0.1.0
+description: "Pre-flight checks and a searchable org index for open-source contribution work: duplicate PR, assignee, and CLA screening, plus org-scoped search and maintainer-voice grounding. MershLab, folded in as a native plugin, not a separate repo."
+author: MershLab
+license: MIT
+kind: backend
+provides_tools:
+  - contrib_screen
+  - contrib_screen_index
+  - contrib_screen_search
+  - contrib_screen_voice
