@@ -18143,8 +18143,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
 
-        if not is_internal and await asyncio.to_thread(
-            self._is_telegram_topic_root_lobby, source
+        # Topic-mode lobby reminders only apply to Telegram private DMs.
+        # Do not submit a guaranteed no-op group/channel check to the shared
+        # default executor: a busy pool delays plaintext dispatch and can
+        # starve e2e send capture (same constraint as adapter handle_message).
+        if (
+            not is_internal
+            and source.platform == Platform.TELEGRAM
+            and source.chat_type == "dm"
+            and await asyncio.to_thread(self._is_telegram_topic_root_lobby, source)
         ):
             # Debounce the lobby reminder so a user who forgets about
             # topic mode and fires ten prompts doesn't get ten copies.

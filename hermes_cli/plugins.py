@@ -104,6 +104,12 @@ class PluginToolOverrideError(PermissionError):
 
 logger = logging.getLogger(__name__)
 
+# The gateway runner is process-scoped: one live runner serves every profile
+# manager in a multiplexed gateway. Message injectors remain manager-scoped so
+# each profile keeps its own capability and configuration boundary.
+_gateway_lifecycle_owner: object | None = None
+_gateway_lifecycle_lock = threading.RLock()
+
 
 # ---------------------------------------------------------------------------
 # Plugin developer debug logging
@@ -1968,7 +1974,17 @@ class PluginContext:
         # manager's home, never the active profile's (#65593 constraint).
         return plugin_capability_granted(plugin_id, "tools.override", config=cfg)
 
-    # -- message injection --------------------------------------------------
+    # -- gateway runtime and message injection ------------------------------
+
+    @property
+    def gateway(self) -> Any | None:
+        """Return the live gateway runner, or ``None`` outside its lifetime.
+
+        The reference is published only after gateway startup has installed
+        its running loop and is withdrawn during shutdown. Plugins should
+        resolve it when needed instead of caching it across restarts.
+        """
+        return self._manager.gateway
 
     def inject_message(
         self,
@@ -3749,19 +3765,32 @@ class PluginManager:
         """Return whether a live gateway can accept plugin-triggered turns."""
         return self._gateway_message_injector is not None
 
+    @property
+    def gateway(self) -> object | None:
+        """Return the current gateway lifecycle owner, if one is running."""
+        with _gateway_lifecycle_lock:
+            return _gateway_lifecycle_owner
+
     def set_gateway_message_injector(
         self,
         owner: object,
         injector: Callable[..., bool],
     ) -> None:
         """Publish a live gateway injector and its lifecycle owner."""
+        global _gateway_lifecycle_owner
         self._gateway_message_injector = (owner, injector)
+        with _gateway_lifecycle_lock:
+            _gateway_lifecycle_owner = owner
 
     def clear_gateway_message_injector(self, owner: object) -> None:
         """Clear the injector only when it still belongs to ``owner``."""
+        global _gateway_lifecycle_owner
         registered = self._gateway_message_injector
         if registered is not None and registered[0] is owner:
             self._gateway_message_injector = None
+        with _gateway_lifecycle_lock:
+            if _gateway_lifecycle_owner is owner:
+                _gateway_lifecycle_owner = None
 
     def inject_gateway_message(self, **kwargs: Any) -> bool:
         """Submit a plugin-triggered turn to the live gateway."""
@@ -5672,7 +5701,7 @@ def _reset_plugin_managers_for_tests() -> None:
     slate (rather than adopting/injecting a specific manager) can call
     this instead of reaching into the module's private dict directly.
     """
-    global _plugin_manager
+    global _gateway_lifecycle_owner, _plugin_manager
     with _plugin_managers_lock:
         managers = list(dict.fromkeys(_plugin_managers_by_home.values()))
         if _plugin_manager is not None and _plugin_manager not in managers:
@@ -5685,6 +5714,8 @@ def _reset_plugin_managers_for_tests() -> None:
                 logger.debug("test plugin-manager unload failed", exc_info=True)
         _plugin_managers_by_home.clear()
         _plugin_manager = None
+        with _gateway_lifecycle_lock:
+            _gateway_lifecycle_owner = None
 
 
 def has_enabled_agent_plugin_mcp(raw_config: Mapping[str, Any]) -> bool:

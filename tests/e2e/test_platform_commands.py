@@ -113,7 +113,10 @@ class TestSlashCommands:
         if platform != Platform.TELEGRAM:
             pytest.skip("Shortcut scope is only verified for Telegram here")
 
-        monkeypatch.setenv("INVOCATION_ID", "e2e-systemd")
+        # Group chats must not take the systemd /restart shortcut. Clear the
+        # supervisor marker so Linux CI (which may inherit INVOCATION_ID)
+        # cannot engage service-restart side effects on this plaintext path.
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
         runner.request_restart = MagicMock(return_value=True)
         runner._handle_message_with_agent = AsyncMock(return_value="agent-handled")
 

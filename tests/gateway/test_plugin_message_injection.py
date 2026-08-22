@@ -541,14 +541,19 @@ def test_scheduler_rejects_submission_failure():
 
 def test_install_and_clear_gateway_injector_preserves_newer_owner():
     runner = _runner(_entry())
+    runner._gateway_loop = object()
     manager = PluginManager()
 
     with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
         runner._install_plugin_message_injector()
         assert manager.has_gateway_message_injector is True
+        assert manager.gateway is runner
+        assert manager.gateway._gateway_loop is runner._gateway_loop
+        assert manager.gateway._running is True
 
         runner._clear_plugin_message_injector()
         assert manager.has_gateway_message_injector is False
+        assert manager.gateway is None
 
         runner._install_plugin_message_injector()
 
@@ -558,5 +563,6 @@ def test_install_and_clear_gateway_injector_preserves_newer_owner():
         runner._clear_plugin_message_injector()
 
     assert manager.has_gateway_message_injector is True
+    assert manager.gateway is newer_owner
     assert manager.inject_gateway_message(value="kept") is True
     newer_injector.assert_called_once_with(value="kept")

@@ -139,6 +139,14 @@ The compatibility rules are:
   format must still replay. Do not add version literals to unrelated callback
   or context values.
 
+### Gateway lifecycle access
+
+`PluginContext.gateway` is a read-only accessor for the live gateway runner.
+It returns `None` in CLI mode and outside the gateway's running lifetime. The
+runner is published only after its event loop is installed and is withdrawn
+during shutdown, so background plugins should resolve the property when needed
+instead of caching the object across restarts.
+
 ### Deprecation policy
 
 A documented native plugin behavior may be deprecated only with all of the
