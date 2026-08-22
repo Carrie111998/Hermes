@@ -1,12 +1,12 @@
 /**
  * Focused tests for the kanban comment file-path linkifier.
  *
- * The @hermes/plugin-sdk host is mocked so revealFileInTree calls are asserted,
- * never really executed against a store.
+ * The @hermes/plugin-sdk host is mocked so revealFileInTree calls are
+ * asserted, never really executed against a store.
  */
 
-import { renderToStaticMarkup } from 'react-dom/server'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { cleanup, render, screen } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { isAbsoluteFilePath, LinkifiedFilePath } from './filepath-links'
 
@@ -18,25 +18,20 @@ vi.mock('@hermes/plugin-sdk', () => ({
   host: hostMock
 }))
 
-/** Render the component to static HTML and return the markup string. */
-function renderHtml(text: string): string {
-  const out = LinkifiedFilePath({ text })
-
-  return typeof out === 'string' ? out : renderToStaticMarkup(<>{out}</>)
+/** Render the component and return its accessible text content. */
+function renderText(text: string): string {
+  const { container } = render(<LinkifiedFilePath text={text} />)
+  return container.textContent ?? ''
 }
 
-/** Extract the path labels of every rendered file-path button. */
+/** Click every rendered file-path button and return the paths passed to the host. */
 function linkLabels(text: string): string[] {
-  const html = renderHtml(text)
-  const labels: string[] = []
-  const re = /aria-label="Reveal ([^"]*) in file tree"/g
-  let match: RegExpExecArray | null
-
-  while ((match = re.exec(html)) !== null) {
-    labels.push(match[1])
-  }
-
-  return labels
+  render(<LinkifiedFilePath text={text} />)
+  return screen
+    .queryAllByRole('button')
+    .map(button => button.getAttribute('aria-label') ?? '')
+    .filter(label => label.startsWith('Reveal '))
+    .map(label => label.replace(/^Reveal /, '').replace(/ in file tree$/, ''))
 }
 
 describe('isAbsoluteFilePath', () => {
@@ -65,8 +60,12 @@ describe('LinkifiedFilePath', () => {
     hostMock.revealFileInTree.mockClear()
   })
 
+  afterEach(() => {
+    cleanup()
+  })
+
   it('renders plain text unchanged when there are no absolute paths', () => {
-    expect(renderHtml('Updated the worker to v1.4.1')).toBe('Updated the worker to v1.4.1')
+    expect(renderText('Updated the worker to v1.4.1')).toBe('Updated the worker to v1.4.1')
   })
 
   it('wraps an absolute POSIX path in a reveal link', () => {
@@ -80,13 +79,12 @@ describe('LinkifiedFilePath', () => {
   })
 
   it('renders every file-path link as a clickable button', () => {
-    const html = renderHtml('Updated `/opt/data/skills/x/SKILL.md` to v1.4.1')
-    expect(html).toContain('kanban-filepath-link')
-    expect(html).toContain('<button')
+    render(<LinkifiedFilePath text="Updated `/opt/data/skills/x/SKILL.md`" />)
+    expect(screen.getByRole('button')).toBeTruthy()
   })
 
   it('does not call revealFileInTree at render time', () => {
-    renderHtml('Updated `/opt/data/skills/x/SKILL.md` to v1.4.1')
+    render(<LinkifiedFilePath text="Updated `/opt/data/skills/x/SKILL.md`" />)
     expect(hostMock.revealFileInTree).not.toHaveBeenCalled()
   })
 
