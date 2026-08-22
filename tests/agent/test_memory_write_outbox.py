@@ -1,0 +1,100 @@
+"""Behavior tests for durable external-provider memory write recovery."""
+
+import json
+
+from agent.memory_manager import MemoryManager
+from agent.memory_provider import MemoryProvider
+from agent.memory_write_outbox import MemoryWriteOutbox
+
+
+class _Provider(MemoryProvider):
+    def __init__(self, *, fail: bool) -> None:
+        self.fail = fail
+        self.calls = []
+
+    @property
+    def name(self) -> str:
+        return "external-test"
+
+    def is_available(self) -> bool:
+        return True
+
+    def initialize(self, session_id: str, **kwargs) -> None:
+        pass
+
+    def get_tool_schemas(self):
+        return []
+
+    def shutdown(self) -> None:
+        pass
+
+    def on_memory_write(self, action, target, content, metadata=None):
+        if self.fail:
+            raise RuntimeError("gateway unavailable")
+        self.calls.append((action, target, content, dict(metadata or {})))
+
+
+def test_outbox_deduplicates_and_bounds_pending_writes(tmp_path):
+    outbox = MemoryWriteOutbox(tmp_path, max_entries_per_provider=2)
+
+    first = outbox.enqueue("provider", "add", "memory", "one", {"session_id": "s1"})
+    duplicate = outbox.enqueue(
+        "provider",
+        "add",
+        "memory",
+        "one",
+        {"session_id": "s2", "tool_call_id": "retry"},
+    )
+    outbox.enqueue("provider", "add", "memory", "two", {})
+    bounded = outbox.enqueue("provider", "add", "memory", "three", {})
+
+    assert first["queued"] is True
+    assert duplicate["deduplicated"] is True
+    assert bounded["dropped"] == 1
+    assert outbox.pending_count("provider") == 2
+
+
+def test_failed_write_is_visible_and_replayed_after_restart(tmp_path, caplog):
+    warnings = []
+    failing = _Provider(fail=True)
+    manager = MemoryManager(
+        external_write_alerts=True,
+        warning_callback=warnings.append,
+        alert_cooldown_seconds=3600,
+    )
+    manager.add_provider(failing)
+    manager.initialize_all("session-1", hermes_home=str(tmp_path))
+
+    result = manager.notify_memory_tool_write(
+        json.dumps({"success": True}),
+        {"action": "add", "target": "user", "content": "likes tea"},
+        build_metadata=lambda: {"session_id": "session-1"},
+    )
+    visible = json.loads(result)
+
+    assert visible["success"] is True
+    assert visible["external_provider_writes"] == [{
+        "provider": "external-test",
+        "success": False,
+        "queued": True,
+        "error": "gateway unavailable",
+    }]
+    assert "on_memory_write failed" in caplog.text
+    assert len(warnings) == 1
+
+    manager.notify_memory_tool_write(
+        json.dumps({"success": True}),
+        {"action": "add", "target": "user", "content": "likes coffee"},
+    )
+    assert len(warnings) == 1, "persistent cooldown must suppress repeated outage alerts"
+
+    recovered = _Provider(fail=False)
+    restarted = MemoryManager()
+    restarted.add_provider(recovered)
+    restarted.initialize_all("session-2", hermes_home=str(tmp_path))
+
+    assert recovered.calls == [
+        ("add", "user", "likes tea", {"session_id": "session-1"}),
+        ("add", "user", "likes coffee", {}),
+    ]
+    assert MemoryWriteOutbox(tmp_path).pending_count("external-test") == 0
