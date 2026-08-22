@@ -72,8 +72,11 @@ def compose_user_api_content(
     from the bytes on the wire — which is the whole prompt-cache invariant:
     what turn N sends must be what turn N+1 replays.
 
-    Returns ``None`` when nothing is injected (multimodal/non-string content,
-    or no ephemeral context), meaning the message is sent as-is.
+    Returns ``None`` when nothing is injected and the user content needs no
+    reserved-fence neutralization (or for multimodal/non-string content),
+    meaning the message is sent as-is.  A forged reserved fence still receives
+    an ``api_content`` sidecar even without runtime context: user-owned fence
+    tokens must never reach the provider as an impersonable runtime boundary.
     """
     if not isinstance(content, str):
         return None
@@ -84,9 +87,10 @@ def compose_user_api_content(
             injections.append(fenced)
     if plugin_user_context:
         injections.append(plugin_user_context)
+    neutralized_content = neutralize_user_forged_memory_context(content)
     if not injections:
-        return None
-    return neutralize_user_forged_memory_context(content) + "\n\n" + "\n\n".join(injections)
+        return neutralized_content if neutralized_content != content else None
+    return neutralized_content + "\n\n" + "\n\n".join(injections)
 
 
 def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
