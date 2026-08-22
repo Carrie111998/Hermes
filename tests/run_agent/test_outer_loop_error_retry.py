@@ -91,7 +91,7 @@ def test_persistent_outer_loop_error_is_bounded_and_backed_off():
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
-        patch("agent.conversation_loop.time.sleep") as sleep,
+        patch("agent.conversation_loop._sleep_outer_loop_error_backoff") as sleep,
     ):
         result = agent.run_conversation("hello")
 
@@ -149,7 +149,7 @@ def test_successful_tool_iteration_resets_outer_loop_error_streak():
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
-        patch("agent.conversation_loop.time.sleep") as sleep,
+        patch("agent.conversation_loop._sleep_outer_loop_error_backoff") as sleep,
     ):
         result = agent.run_conversation("hello")
 

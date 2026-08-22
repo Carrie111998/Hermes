@@ -277,6 +277,11 @@ _API_CALL_MODULES = frozenset({
 _MAX_CONSECUTIVE_OUTER_LOOP_ERRORS = 3
 
 
+def _sleep_outer_loop_error_backoff(seconds: int) -> None:
+    """Pause between outer-loop retries without exposing global sleep to tests."""
+    time.sleep(seconds)
+
+
 def _moa_client_consumes_prepared_request(client: Any) -> bool:
     """True when ``client`` is the in-process MoA facade.
 
@@ -8420,7 +8425,7 @@ def run_conversation(
                 consecutive_outer_loop_errors,
                 _MAX_CONSECUTIVE_OUTER_LOOP_ERRORS,
             )
-            time.sleep(_outer_error_delay)
+            _sleep_outer_loop_error_backoff(_outer_error_delay)
         finally:
             if not _outer_loop_failed:
                 consecutive_outer_loop_errors = 0
