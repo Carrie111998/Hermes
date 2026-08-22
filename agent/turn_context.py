@@ -55,12 +55,16 @@ def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
     plugin_user_context: str,
+    *,
+    output_policy: str | None = None,
 ) -> Optional[str]:
     """Compose the API-bound content of the current turn's user message.
 
     Sources: memory-manager prefetch + ``pre_llm_call`` plugin context with
-    target="user_message" (the default). Both are appended to the *API copy*
-    of the user message only — the stored content stays clean.
+    target="user_message" (the default), plus a concise-evidence response
+    style sidecar when the current route explicitly selects it. All are
+    appended to the *API copy* of the current user message only — the stored
+    content stays clean.
 
     This is the single source of that composition. The prologue stamps the
     result onto the live message as ``api_content`` (persisted alongside the
@@ -81,6 +85,11 @@ def compose_user_api_content(
             injections.append(fenced)
     if plugin_user_context:
         injections.append(plugin_user_context)
+    if output_policy == "concise_evidence":
+        injections.append(
+            "[RESPONSE STYLE]\nConclusion first. No restatement or ceremony. "
+            "Preserve paths, IDs, numbers, verification evidence, and unresolved boundaries."
+        )
     if not injections:
         return None
     return content + "\n\n" + "\n\n".join(injections)
@@ -1381,7 +1390,10 @@ def build_turn_context(
     ):
         _turn_user_msg = messages[current_turn_user_idx]
         _api_content = compose_user_api_content(
-            _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context
+            _turn_user_msg.get("content", ""),
+            ext_prefetch_cache,
+            plugin_user_context,
+            output_policy=getattr(agent, "_route_output_policy", None),
         )
         if _api_content is not None and _api_content != _turn_user_msg.get("content"):
             _turn_user_msg["api_content"] = _api_content

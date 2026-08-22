@@ -642,3 +642,52 @@ def test_local_policy_does_not_change_cloud_multimodal_chain(tmp_path):
     assert route._candidate_ids(model_policies["local-deterministic"]) == [
         "ollama/qwen3-vl:2b"
     ]
+
+
+def test_apply_route_resolves_and_resets_output_policy_per_turn(tmp_path, monkeypatch):
+    _write_policy_tree(tmp_path)
+    contracts_path = tmp_path / "capability-contracts.json"
+    contracts = json.loads(contracts_path.read_text(encoding="utf-8"))
+    contracts["contracts"]["fast-economy"]["output_policy"] = "concise_evidence"
+    contracts["contracts"]["standard-reasoning"]["output_policy"] = "standard"
+    contracts["contracts"]["complex-execution"]["output_policy"] = "concise_evidence"
+    contracts["contracts"]["high-stakes-decision"]["output_policy"] = "concise_evidence"
+    contracts_path.write_text(json.dumps(contracts), encoding="utf-8")
+
+    class FakeAgent:
+        provider = "openai-codex"
+        model = "old"
+
+        def switch_model(self, model, provider, api_key, base_url, api_mode):
+            self.model = model
+            self.provider = provider
+
+    monkeypatch.setattr(
+        route,
+        "_runtime_for",
+        lambda candidate: {
+            "provider": candidate["provider"],
+            "api_key": "test-key",
+            "base_url": "https://example.invalid/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    agent = FakeAgent()
+    config = {"routing": {"enabled": True, "source_dir": str(tmp_path)}}
+
+    route.apply_route(agent, "translate this", config)
+    assert agent._route_output_policy == "concise_evidence"
+
+    route.apply_route(agent, "explain this concept", config)
+    assert agent._route_output_policy == "standard"
+
+    route.apply_route(agent, "modify the configuration file", config)
+    assert agent._route_output_policy == "full_evidence"
+
+    route.apply_route(agent, "review this investment decision", config)
+    assert agent._route_output_policy == "full_evidence"
+
+
+def test_reviewer_and_publishing_contracts_cannot_reduce_output_evidence():
+    assert route.resolve_output_policy("independent-review", {"output_policy": "concise_evidence"}) == "full_evidence"
+    assert route.resolve_output_policy("publishing", {"output_policy": "concise_evidence"}) == "full_evidence"

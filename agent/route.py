@@ -99,6 +99,17 @@ _WORKFLOW_RANK = {
     "expert-reviewed": 3,
     "multimodal": 2,
 }
+_OUTPUT_POLICIES = frozenset({"concise_evidence", "standard", "full_evidence"})
+_FULL_EVIDENCE_CONTRACTS = frozenset(
+    {
+        "independent-review",
+        "reviewer",
+        "publishing",
+        "complex-execution",
+        "high-stakes-decision",
+        "high-stakes",
+    }
+)
 
 
 class RoutingBlockedError(RuntimeError):
@@ -261,6 +272,14 @@ def _is_standalone_file_edit(message: Any) -> bool:
 def _routing_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
     value = (config or {}).get("routing")
     return value if isinstance(value, dict) else {}
+
+
+def resolve_output_policy(contract: str, contract_def: Mapping[str, Any] | None) -> str:
+    """Resolve a safe per-turn response style without shaping token limits."""
+    if contract in _FULL_EVIDENCE_CONTRACTS:
+        return "full_evidence"
+    policy = contract_def.get("output_policy") if isinstance(contract_def, Mapping) else None
+    return policy if isinstance(policy, str) and policy in _OUTPUT_POLICIES else "standard"
 
 
 def _config_dir(config: Mapping[str, Any] | None) -> Path:
@@ -1139,6 +1158,7 @@ def apply_route(agent: Any, message: Any, config: Mapping[str, Any] | None = Non
     # Per-turn request shaping; a cached agent must not carry a prior local
     # workflow's no-tools contract into the next cloud turn.
     agent._route_disable_tools = False
+    agent._route_output_policy = None
     agent._route_decision = None
     agent._review_evidence = None
     agent._workflow_dag_evidence = None
@@ -1174,6 +1194,10 @@ def apply_route(agent: Any, message: Any, config: Mapping[str, Any] | None = Non
     contracts = _load_policy(config, policy_bundle)[1]
     contracts_map = contracts.get("contracts") if isinstance(contracts.get("contracts"), Mapping) else {}
     contract_def = contracts_map.get(decision.contract) if isinstance(contracts_map, Mapping) else None
+    agent._route_output_policy = resolve_output_policy(
+        decision.contract,
+        contract_def if isinstance(contract_def, Mapping) else None,
+    )
     agent._route_disable_tools = bool(
         isinstance(contract_def, Mapping) and contract_def.get("tools") == "none"
     )

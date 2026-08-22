@@ -2276,6 +2276,7 @@ def run_conversation(
                         api_msg.get("content", ""),
                         _ext_prefetch_cache,
                         _plugin_user_context,
+                        output_policy=getattr(agent, "_route_output_policy", None),
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed
