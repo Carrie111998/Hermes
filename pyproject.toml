@@ -8,8 +8,9 @@ readme = "README.md"
 # Upper bound is load-bearing, not cosmetic. uv resolves the project's
 # Python from `requires-python`, and an inherited `UV_PYTHON` env var (or a
 # fresh distro whose newest interpreter uv auto-picks) will otherwise select
-# an untested minor. Hermes supports Python 3.14; keep the next minor out until
-# its native dependency wheels and the full test suite are covered.
+# an untested minor. Python 3.14 is supported for the core and normal `[all]`
+# profile; optional extras may have narrower dependency support. Keep the next
+# minor out until its native dependency wheels and full test suite are covered.
 requires-python = ">=3.11,<3.15"
 authors = [{ name = "Nous Research" }]
 license = "MIT"

@@ -841,6 +841,56 @@ class TestMinorLineFallForward:
     `hermes update` with no path to a fixed runtime.
     """
 
+    def test_fallback_bound_matches_project_python_cap(self):
+        import re
+        import tomllib
+
+        import hermes_cli.managed_uv as managed_uv
+
+        project = tomllib.loads(
+            (Path(__file__).parents[2] / "pyproject.toml").read_text()
+        )
+        specifier = project["project"]["requires-python"]
+        upper = re.search(r"<\s*(\d+)\.(\d+)", specifier)
+        assert upper is not None
+        assert (int(upper.group(1)), int(upper.group(2))) == (
+            3,
+            managed_uv._MAX_SUPPORTED_MINOR + 1,
+        )
+
+    def test_falls_forward_to_3_14_when_prior_minors_are_vulnerable(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.managed_uv as managed_uv
+
+        install_calls = []
+        fake_run, fake_probe = self._mapped_run(
+            resolutions={
+                "3.11": (3, 11, 14),
+                "3.12": (3, 12, 30),
+                "3.13": (3, 13, 30),
+                "3.14": (3, 14, 7),
+            },
+            fixed_versions={(3, 14, 7)},
+            install_calls=install_calls,
+        )
+        monkeypatch.setattr(managed_uv.subprocess, "run", fake_run)
+        monkeypatch.setattr(managed_uv, "probe_sqlite_runtime", fake_probe)
+        monkeypatch.setattr(
+            managed_uv,
+            "_list_available_patches",
+            lambda uv_bin, minor, **kw: [],
+        )
+
+        result = managed_uv._install_safe_python_generation(
+            "uv", project_root=tmp_path, current=self._current_3_11_14()
+        )
+
+        assert result is not None
+        _, _, candidate = result
+        assert candidate.python_version == (3, 14, 7)
+        assert install_calls == ["3.11", "3.12", "3.13", "3.14"]
+
     @staticmethod
     def _mapped_run(resolutions, fixed_versions, install_calls):
         """Fake subprocess.run/probe pair driven by explicit tables:
