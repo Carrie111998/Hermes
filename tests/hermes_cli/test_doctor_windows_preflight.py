@@ -77,7 +77,9 @@ class TestGitCredentialPromptCheck:
         assert "hang" in out
         assert "GIT_TERMINAL_PROMPT=0" in out
 
-    def test_info_when_non_interactive_helper_already_configured(self, monkeypatch, capsys):
+    def test_info_when_non_interactive_helper_already_configured(
+        self, monkeypatch, capsys
+    ):
         monkeypatch.setattr(doctor_mod, "_safe_which", lambda cmd: "/usr/bin/git")
         monkeypatch.delenv("GIT_TERMINAL_PROMPT", raising=False)
         monkeypatch.setattr(
@@ -95,7 +97,9 @@ class TestGitCredentialPromptCheck:
 
 class TestBashToolchainCheck:
     def test_ok_when_bash_found(self, monkeypatch, capsys):
-        fake_local = types.SimpleNamespace(_find_bash=lambda: r"C:\Program Files\Git\bin\bash.exe")
+        fake_local = types.SimpleNamespace(
+            _find_bash=lambda: r"C:\Program Files\Git\bin\bash.exe"
+        )
         monkeypatch.setitem(sys.modules, "tools.environments.local", fake_local)
 
         doctor_mod._check_windows_bash_toolchain()
@@ -106,7 +110,9 @@ class TestBashToolchainCheck:
 
     def test_warns_when_bash_not_found(self, monkeypatch, capsys):
         def _raise():
-            raise RuntimeError("Git Bash not found. Hermes Agent requires Git for Windows.")
+            raise RuntimeError(
+                "Git Bash not found. Hermes Agent requires Git for Windows."
+            )
 
         fake_local = types.SimpleNamespace(_find_bash=_raise)
         monkeypatch.setitem(sys.modules, "tools.environments.local", fake_local)
@@ -185,10 +191,22 @@ class TestWindowsEnvironmentSection:
     def test_runs_all_checks_on_windows(self, monkeypatch, capsys):
         monkeypatch.setattr(doctor_mod.sys, "platform", "win32")
         calls = []
-        monkeypatch.setattr(doctor_mod, "_check_windows_symlink_privilege", lambda: calls.append("symlink"))
-        monkeypatch.setattr(doctor_mod, "_check_windows_git_credential_prompt", lambda: calls.append("git"))
-        monkeypatch.setattr(doctor_mod, "_check_windows_bash_toolchain", lambda: calls.append("bash"))
-        monkeypatch.setattr(doctor_mod, "_check_windows_long_paths", lambda: calls.append("long_paths"))
+        monkeypatch.setattr(
+            doctor_mod,
+            "_check_windows_symlink_privilege",
+            lambda: calls.append("symlink"),
+        )
+        monkeypatch.setattr(
+            doctor_mod,
+            "_check_windows_git_credential_prompt",
+            lambda: calls.append("git"),
+        )
+        monkeypatch.setattr(
+            doctor_mod, "_check_windows_bash_toolchain", lambda: calls.append("bash")
+        )
+        monkeypatch.setattr(
+            doctor_mod, "_check_windows_long_paths", lambda: calls.append("long_paths")
+        )
 
         doctor_mod._check_windows_environment()
 
