@@ -1453,6 +1453,27 @@ class _ProviderAuthResolutionError(RuntimeError):
     """
 
 
+def _classify_provider_error(exc: BaseException) -> tuple:
+    """Return (log_fmt, user_msg) for a provider resolution error.
+
+    Walks the __cause__ chain to detect I/O failures that should not be
+    reported as authentication problems.  Falls back to the auth wording
+    when no OSError is found.
+    """
+    cause = exc
+    while cause is not None:
+        if isinstance(cause, (OSError, IOError)):
+            return (
+                "Provider resolution failed (I/O error) for %s: %s",
+                "\u26a0\ufe0f Provider resolution failed (I/O error): %s" % exc,
+            )
+        cause = getattr(cause, "__cause__", None)
+    return (
+        "Provider authentication failed for %s: %s",
+        "\u26a0\ufe0f Provider authentication failed: %s" % exc,
+    )
+
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -7341,11 +7362,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     # all (raw aiohttp 500, no JSON body).  Handling it
                     # here, once, covers every _run_agent() caller;
                     # /v1/runs has its own branch in its executor.
-                    logger.warning("Provider authentication failed for session=%s: %s",
-                                   session_id or "", exc)
+                    log_fmt, user_msg = _classify_provider_error(exc)
+                    logger.warning(log_fmt, session_id or "", exc)
                     return (
                         {
-                            "final_response": f"⚠️ Provider authentication failed: {exc}",
+                            "final_response": user_msg,
                             "messages": [],
                             "api_calls": 0,
                             "tools": [],
@@ -7844,8 +7865,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 # message the other endpoints give a provider auth/credential
                 # failure, instead of falling through to the generic
                 # except-Exception branch below.
-                logger.warning("Provider authentication failed for run=%s: %s", run_id, exc)
-                error_msg = f"⚠️ Provider authentication failed: {exc}"
+                log_fmt, user_msg = _classify_provider_error(exc)
+                logger.warning(log_fmt, f"run={run_id}", exc)
+                error_msg = user_msg
                 self._set_run_status(
                     run_id,
                     "failed",
