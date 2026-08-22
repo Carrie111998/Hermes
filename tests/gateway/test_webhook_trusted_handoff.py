@@ -318,6 +318,146 @@ async def test_atomic_handoff_claim_has_exactly_one_winner():
 
 
 @pytest.mark.asyncio
+async def test_duplicate_handoff_skips_route_script_after_adapter_restart(
+    served_profiles,
+):
+    payload = {
+        "_hermes": {
+            "target_profile": "market-analysis",
+            "handoff_depth": 1,
+            "delivery_id": "script-once",
+        },
+        "task": "run once",
+    }
+    body = json.dumps(payload).encode()
+    timestamp = str(int(time.time()))
+    script_calls: list[dict] = []
+
+    def run_script(_script, script_payload):
+        script_calls.append(script_payload)
+        return True, script_payload
+
+    first_adapter = _adapter(_trusted_route(script="fake-script"))
+    first_adapter._route_processor.run_route_script = run_script
+    first_adapter.handle_message = AsyncMock()
+    async with TestClient(TestServer(_app(first_adapter))) as client:
+        first = await client.post(
+            "/p/dispatcher/webhooks/relay",
+            data=body,
+            headers=_v2_headers(body, request_id="script-A", timestamp=timestamp),
+        )
+        assert first.status == 202
+
+    restarted_adapter = _adapter(_trusted_route(script="fake-script"))
+    restarted_adapter._route_processor.run_route_script = run_script
+    restarted_adapter.handle_message = pytest.fail
+    async with TestClient(TestServer(_app(restarted_adapter))) as client:
+        retry = await client.post(
+            "/p/dispatcher/webhooks/relay",
+            data=body,
+            headers=_v2_headers(body, request_id="script-B", timestamp=timestamp),
+        )
+        assert retry.status == 200
+        assert (await retry.json())["status"] == "duplicate"
+
+    assert len(script_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_handoffs_reserve_capacity_atomically(
+    served_profiles, monkeypatch
+):
+    from gateway import webhook_replay
+
+    real_claim = webhook_replay.claim_handoff_delivery
+
+    def slow_claim(**kwargs):
+        time.sleep(0.05)
+        return real_claim(**kwargs)
+
+    monkeypatch.setattr(webhook_replay, "claim_handoff_delivery", slow_claim)
+    adapter = _adapter(_trusted_route(max_handoff_concurrency=1))
+    events: list[MessageEvent] = []
+
+    async def capture(event: MessageEvent):
+        events.append(event)
+
+    adapter.handle_message = capture
+
+    def request_body(delivery_id: str) -> bytes:
+        return json.dumps(
+            {
+                "_hermes": {
+                    "target_profile": "market-analysis",
+                    "handoff_depth": 1,
+                    "delivery_id": delivery_id,
+                },
+                "task": delivery_id,
+            }
+        ).encode()
+
+    first_body = request_body("concurrent-A")
+    second_body = request_body("concurrent-B")
+    async with TestClient(TestServer(_app(adapter))) as client:
+        first, second = await asyncio.gather(
+            client.post(
+                "/p/dispatcher/webhooks/relay",
+                data=first_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Hub-Signature-256": _signature(first_body, "relay-secret"),
+                },
+            ),
+            client.post(
+                "/p/dispatcher/webhooks/relay",
+                data=second_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Hub-Signature-256": _signature(second_body, "relay-secret"),
+                },
+            ),
+        )
+        assert sorted((first.status, second.status)) == [202, 429]
+
+    await asyncio.sleep(0.05)
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_returns_duplicate_while_route_is_full(served_profiles):
+    from gateway.webhook_replay import claim_handoff_delivery
+
+    assert claim_handoff_delivery(
+        route_name="relay",
+        source_profile="dispatcher",
+        delivery_id="already-running",
+    )
+    adapter = _adapter(_trusted_route(max_handoff_concurrency=1))
+    adapter._active_handoffs["relay"].add("webhook:relay:other-run")
+    adapter.handle_message = pytest.fail
+    payload = {
+        "_hermes": {
+            "target_profile": "market-analysis",
+            "handoff_depth": 1,
+            "delivery_id": "already-running",
+        },
+        "task": "retry",
+    }
+    body = json.dumps(payload).encode()
+    async with TestClient(TestServer(_app(adapter))) as client:
+        retry = await client.post(
+            "/p/dispatcher/webhooks/relay",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Hub-Signature-256": _signature(body, "relay-secret"),
+            },
+        )
+        assert retry.status == 200
+        assert (await retry.json())["status"] == "duplicate"
+
+
+@pytest.mark.asyncio
 async def test_persisted_handoff_resolves_ingress_adapter_and_revalidates_bounds(
     served_profiles,
 ):
@@ -330,6 +470,9 @@ async def test_persisted_handoff_resolves_ingress_adapter_and_revalidates_bounds
         trusted_handoff_depth=1,
         transport_deliver="discord",
         transport_deliver_extra={"chat_id": "market-room"},
+        transport_delivery_policy_hash=adapter._delivery_policy_hash(
+            adapter._routes["relay"]
+        ),
         provenance={"source_profile": "descriptive-only-and-not-trusted"},
     )
     now = datetime.now()
@@ -384,6 +527,16 @@ async def test_persisted_handoff_resolves_ingress_adapter_and_revalidates_bounds
     adapter._routes["relay"]["deliver"] = "slack"
     assert runner._adapter_for_source(restored) is None
     adapter._routes["relay"]["deliver"] = "discord"
+
+    target.send.reset_mock()
+    adapter._routes["relay"]["deliver_extra"] = {"chat_id": "new-room"}
+    assert runner._adapter_for_source(restored) is None
+    target.send.assert_not_awaited()
+    adapter._routes["relay"]["deliver_extra"] = {"chat_id": "market-room"}
+
+    adapter._routes["relay"].pop("profile")
+    assert runner._adapter_for_source(restored) is None
+    adapter._routes["relay"]["profile"] = "dispatcher"
 
     adapter._routes["relay"]["allowed_target_profiles"] = ["server-development"]
     assert runner._adapter_for_source(restored) is None

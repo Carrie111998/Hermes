@@ -78,3 +78,17 @@ def claim_handoff_delivery(
             (replay_key, time.time()),
         )
         return cursor.rowcount == 1
+
+
+def is_handoff_delivery_claimed(
+    *, route_name: str, source_profile: str, delivery_id: str
+) -> bool:
+    """Return whether an authenticated handoff delivery was already claimed."""
+
+    replay_key = _replay_key(route_name, source_profile, delivery_id)
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM webhook_handoff_receipts WHERE replay_key = ?",
+            (replay_key,),
+        ).fetchone()
+        return row is not None

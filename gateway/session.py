@@ -195,6 +195,7 @@ class SessionSource:
     # restoring the adapter's process-local delivery cache.
     transport_deliver: Optional[str] = None
     transport_deliver_extra: Optional[Dict[str, Any]] = None
+    transport_delivery_policy_hash: Optional[str] = None
     # Platform-owned execution provenance persisted in ``origin_json`` for
     # operator diagnostics. This is descriptive only: authorization decisions
     # must never trust values restored from this mapping.
@@ -304,6 +305,8 @@ class SessionSource:
             d["transport_deliver"] = self.transport_deliver
         if self.transport_deliver_extra is not None:
             d["transport_deliver_extra"] = dict(self.transport_deliver_extra)
+        if self.transport_delivery_policy_hash is not None:
+            d["transport_delivery_policy_hash"] = self.transport_delivery_policy_hash
         if self.provenance:
             d["provenance"] = self.provenance
         if self.auto_thread_created:
@@ -341,6 +344,7 @@ class SessionSource:
                 if isinstance(data.get("transport_deliver_extra"), dict)
                 else None
             ),
+            transport_delivery_policy_hash=data.get("transport_delivery_policy_hash"),
             provenance=(
                 dict(data["provenance"])
                 if isinstance(data.get("provenance"), dict)

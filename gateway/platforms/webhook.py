@@ -231,6 +231,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # Trusted handoffs have a separate in-flight bound from request rate.
         # Entries are released by on_processing_complete at the true run end.
         self._active_handoffs: Dict[str, set[str]] = defaultdict(set)
+        self._handoff_locks: Dict[str, asyncio.Lock] = {}
 
         # Body size limit (auth-before-body pattern)
         self._max_body_bytes: int = int(
@@ -540,13 +541,14 @@ class WebhookAdapter(BasePlatformAdapter):
             return False
 
         transport_profile = getattr(source, "transport_profile", None)
-        configured_profile = route_config.get("profile")
+        configured_profile = route_config.get("profile", "default")
+        if not isinstance(configured_profile, str):
+            return False
+        configured_profile = configured_profile.strip()
         if (
-            not isinstance(transport_profile, str)
-            or (
-                isinstance(configured_profile, str)
-                and transport_profile != configured_profile
-            )
+            not configured_profile
+            or not isinstance(transport_profile, str)
+            or transport_profile != configured_profile
         ):
             return False
         secret = route_config.get("secret", self._global_secret)
@@ -572,10 +574,15 @@ class WebhookAdapter(BasePlatformAdapter):
 
         persisted_deliver = getattr(source, "transport_deliver", None)
         persisted_extra = getattr(source, "transport_deliver_extra", None)
+        persisted_policy_hash = getattr(
+            source, "transport_delivery_policy_hash", None
+        )
         if (
             not isinstance(persisted_deliver, str)
             or persisted_deliver != route_config.get("deliver", "log")
             or not isinstance(persisted_extra, dict)
+            or not isinstance(persisted_policy_hash, str)
+            or persisted_policy_hash != self._delivery_policy_hash(route_config)
         ):
             return False
 
@@ -595,10 +602,27 @@ class WebhookAdapter(BasePlatformAdapter):
         return True
 
     @staticmethod
+    def _delivery_policy_hash(route_config: dict) -> str:
+        """Fingerprint the static egress policy used to resolve a destination."""
+        policy = {
+            "deliver": route_config.get("deliver", "log"),
+            "deliver_extra": route_config.get("deliver_extra", {}),
+        }
+        encoded = json.dumps(
+            policy,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
     def _handoff_config_error(route_config: dict) -> Optional[str]:
         """Validate the static bounds required by a trusted handoff route."""
         if "allowed_target_profiles" not in route_config:
             return None
+        if route_config.get("deliver_only"):
+            return "cannot combine trusted profile handoffs with deliver_only"
         allowed = route_config.get("allowed_target_profiles")
         if (
             not isinstance(allowed, list)
@@ -1093,6 +1117,63 @@ class WebhookAdapter(BasePlatformAdapter):
                 }
             )
 
+        # Reserve privileged execution before route scripts or any other
+        # side-effectful processing. The per-route lock makes duplicate lookup,
+        # capacity enforcement, durable claim, and active-slot insertion one
+        # event-loop critical section. The SQLite claim remains the cross-process
+        # authority for duplicate IDs.
+        if handoff_target:
+            delivery_id = handoff_delivery_id
+            handoff_session_chat_id = f"webhook:{route_name}:{delivery_id}"
+            lock = self._handoff_locks.setdefault(route_name, asyncio.Lock())
+            try:
+                from gateway.webhook_replay import (
+                    claim_handoff_delivery,
+                    is_handoff_delivery_claimed,
+                )
+
+                async with lock:
+                    already_claimed = await asyncio.to_thread(
+                        is_handoff_delivery_claimed,
+                        route_name=route_name,
+                        source_profile=source_profile,
+                        delivery_id=delivery_id,
+                    )
+                    if already_claimed:
+                        return web.json_response(
+                            {"status": "duplicate", "delivery_id": delivery_id},
+                            status=200,
+                        )
+                    active = self._active_handoffs[route_name]
+                    max_concurrency = route_config.get("max_handoff_concurrency", 1)
+                    if len(active) >= max_concurrency:
+                        return web.json_response(
+                            {"error": "Trusted handoff concurrency limit exceeded"},
+                            status=429,
+                        )
+                    is_new_delivery = await asyncio.to_thread(
+                        claim_handoff_delivery,
+                        route_name=route_name,
+                        source_profile=source_profile,
+                        delivery_id=delivery_id,
+                    )
+                    if not is_new_delivery:
+                        return web.json_response(
+                            {"status": "duplicate", "delivery_id": delivery_id},
+                            status=200,
+                        )
+                    active.add(handoff_session_chat_id)
+            except Exception:
+                logger.exception(
+                    "[webhook] Failed to claim trusted handoff route=%s delivery=%s",
+                    route_name,
+                    delivery_id,
+                )
+                return web.json_response(
+                    {"error": "Trusted handoff replay protection unavailable"},
+                    status=503,
+                )
+
         if route_config.get("script"):
             # run_route_script shells out (subprocess.run, up to its timeout);
             # run it in a worker thread so it can't block the gateway event loop.
@@ -1102,6 +1183,10 @@ class WebhookAdapter(BasePlatformAdapter):
                 payload,
             )
             if not keep:
+                if handoff_target:
+                    self._active_handoffs[route_name].discard(
+                        handoff_session_chat_id
+                    )
                 logger.info(
                     "[webhook] script ignored event=%s route=%s",
                     event_type,
@@ -1151,55 +1236,22 @@ class WebhookAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[webhook] Skill loading failed: %s", e)
 
-        # Privileged handoffs use only the delivery identity inside the signed
-        # authority envelope. Ordinary routes keep their existing transport-ID
-        # behavior for compatibility.
-        delivery_id = handoff_delivery_id or request.headers.get(
-            "X-GitHub-Delivery",
-            request.headers.get(
-                "svix-id",
-                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
-            ),
-        )
+        # Ordinary routes keep their existing transport-ID behavior and
+        # in-memory cache. Trusted handoffs were durably claimed above.
+        if not handoff_target:
+            delivery_id = request.headers.get(
+                "X-GitHub-Delivery",
+                request.headers.get(
+                    "svix-id",
+                    request.headers.get(
+                        "X-Request-ID", str(int(time.time() * 1000))
+                    ),
+                ),
+            )
+            handoff_session_chat_id = f"webhook:{route_name}:{delivery_id}"
 
-        handoff_session_chat_id = f"webhook:{route_name}:{delivery_id}"
-        if handoff_target:
-            active = self._active_handoffs[route_name]
-            max_concurrency = route_config.get("max_handoff_concurrency", 1)
-            if len(active) >= max_concurrency:
-                return web.json_response(
-                    {"error": "Trusted handoff concurrency limit exceeded"},
-                    status=429,
-                )
-
-        # ── Idempotency ─────────────────────────────────────────
-        # Ordinary webhooks retain the in-memory transport-ID cache. Privileged
-        # handoffs atomically claim their authenticated ID in state.db so an
-        # unsigned header change or gateway restart cannot replay execution.
         now = time.time()
-        try:
-            if handoff_target:
-                from gateway.webhook_replay import claim_handoff_delivery
-
-                is_new_delivery = await asyncio.to_thread(
-                    claim_handoff_delivery,
-                    route_name=route_name,
-                    source_profile=source_profile,
-                    delivery_id=delivery_id,
-                )
-            else:
-                is_new_delivery = self._record_delivery_id(delivery_id, now)
-        except Exception:
-            logger.exception(
-                "[webhook] Failed to claim trusted handoff route=%s delivery=%s",
-                route_name,
-                delivery_id,
-            )
-            return web.json_response(
-                {"error": "Trusted handoff replay protection unavailable"},
-                status=503,
-            )
-        if not is_new_delivery:
+        if not handoff_target and not self._record_delivery_id(delivery_id, now):
             logger.info(
                 "[webhook] Skipping duplicate delivery %s", delivery_id
             )
@@ -1207,8 +1259,6 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"status": "duplicate", "delivery_id": delivery_id},
                 status=200,
             )
-        if handoff_target:
-            self._active_handoffs[route_name].add(handoff_session_chat_id)
 
         # ── Direct delivery mode (deliver_only) ─────────────────
         # Skip the agent entirely — the rendered prompt IS the message we
@@ -1303,6 +1353,9 @@ class WebhookAdapter(BasePlatformAdapter):
             source.transport_deliver = deliver_config["deliver"]
             source.transport_deliver_extra = dict(
                 deliver_config.get("deliver_extra") or {}
+            )
+            source.transport_delivery_policy_hash = self._delivery_policy_hash(
+                route_config
             )
             delivery_extra = deliver_config.get("deliver_extra") or {}
             delivery_chat_id = delivery_extra.get("chat_id")
