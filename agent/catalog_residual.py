@@ -43,7 +43,9 @@ _FILE_TOKEN_RE = re.compile(
 )
 _URL_RE = re.compile(r"https?://[^\s)\"'<>]{6,160}")
 _ISSUE_RE = re.compile(r"(?:^|[\s(])(#[1-9]\d{1,6})\b")
-_SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
+# Require at least one digit so hex-only English words ("acceded", "defaced")
+# are not admitted as commit identifiers.
+_SHA_RE = re.compile(r"\b(?=[0-9a-f]{7,40}\b)[0-9a-f]*\d[0-9a-f]*\b")
 _UUID_RE = re.compile(
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
     re.I,
@@ -506,11 +508,14 @@ def build_catalog_residual(
     body = "\n\n".join(sections)
     body = _redact(body)
     if len(body) > budget:
-        # Receipt must survive: trim from the middle of the packed body.
-        keep_tail = min(len(receipt) + 2, budget // 3)
-        head = body[: budget - keep_tail - 20].rstrip()
-        body = head + "\n...[catalog truncated]...\n" + receipt
-        body = body[:budget]
+        # Receipt is packed last and must survive a mid-body clip.
+        marker = "\n...[catalog truncated]...\n"
+        prefix_budget = max(0, budget - len(receipt) - len(marker))
+        head = body[:prefix_budget].rstrip()
+        body = head + marker + receipt
+        if len(body) > budget:
+            prefix = head + marker
+            body = prefix[: max(0, budget - len(receipt))] + receipt
     return body
 
 

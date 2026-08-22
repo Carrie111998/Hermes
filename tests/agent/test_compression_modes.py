@@ -7,10 +7,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.catalog_residual import (
+    CATALOG_BUDGET_CHARS,
     CATALOG_HEADING,
     HYBRID_INDEX_HEADING,
     LEAN_ANCHOR_HEADING,
     normalize_compression_mode,
+)
+from tools.session_search_tool import (
+    SESSION_SEARCH_DISCOVERY_CALL,
+    SESSION_SEARCH_DISCOVERY_HINT,
 )
 from agent.context_compressor import (
     COMPRESSED_SUMMARY_HAS_USER_TURN_KEY,
@@ -74,7 +79,7 @@ def _long_transcript(*, unique_middle: str = "spectral phoenix bait"):
             "role": "tool",
             "tool_call_id": "call-1",
             "content": f"{unique_middle} lives only in this compacted middle.\n"
-            + ("x" * 200),
+            + ("x" * 4200),
         },
         {
             "role": "user",
@@ -244,6 +249,8 @@ class TestCatalogMode:
         assert "session_search" in text
         assert "s_catalog_lean" in text
         taught = _session_search_call_from_footer(text)
+        assert SESSION_SEARCH_DISCOVERY_CALL in text
+        assert SESSION_SEARCH_DISCOVERY_HINT in text
         assert "session_id" not in taught
         assert taught["role_filter"] == "user,assistant,tool"
         assert "## Detailed Session Log" not in text
@@ -329,6 +336,8 @@ class TestCatalogMode:
         assert needle not in footer_text
         assert CATALOG_HEADING in footer_text
         taught = _session_search_call_from_footer(footer_text)
+        assert SESSION_SEARCH_DISCOVERY_CALL in footer_text
+        assert SESSION_SEARCH_DISCOVERY_HINT in footer_text
         assert "session_id" not in taught
         assert taught["role_filter"] == "user,assistant,tool"
         assert taught["query"] == "<keywords>"
@@ -345,6 +354,123 @@ class TestCatalogMode:
         assert result["count"] >= 1
         blob = json.dumps(result)
         assert needle in blob
+
+    def test_catalog_skips_when_window_smaller_than_budget(self):
+        msgs = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello."},
+            {"role": "user", "content": "Edit /tmp/tiny.py"},
+            {"role": "assistant", "content": "Editing."},
+            {"role": "user", "content": "Thanks"},
+            {"role": "assistant", "content": "Done."},
+            {"role": "user", "content": "live tail"},
+            {"role": "assistant", "content": "ack"},
+        ]
+        catalog = _compressor(mode="catalog")
+        skip_path = _compressor(mode="standard")
+        skip_path._ineffective_compression_count = 1
+        with patch("agent.context_compressor.call_llm") as llm:
+            catalog_out = catalog.compress(list(msgs))
+            skip_out = skip_path.compress(list(msgs), force=False)
+        llm.assert_not_called()
+        catalog_text = "\n".join(str(m.get("content") or "") for m in catalog_out)
+        skip_text = "\n".join(str(m.get("content") or "") for m in skip_out)
+        assert CATALOG_HEADING not in catalog_text
+        assert catalog._last_feasibility_skip is True
+        assert (
+            catalog._last_compression_telemetry.get("catalog_skip_reason")
+            == "window_smaller_than_budget"
+        )
+        assert len(catalog_text) <= len(skip_text)
+
+    def test_catalog_force_builds_residual_for_small_window(self):
+        msgs = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello."},
+            {"role": "user", "content": "Edit /tmp/tiny.py"},
+            {"role": "assistant", "content": "Editing."},
+            {"role": "user", "content": "Thanks"},
+            {"role": "assistant", "content": "Done."},
+            {"role": "user", "content": "live tail"},
+            {"role": "assistant", "content": "ack"},
+        ]
+        c = _compressor(mode="catalog")
+        with patch("agent.context_compressor.call_llm") as llm:
+            out = c.compress(msgs, force=True)
+        llm.assert_not_called()
+        text = "\n".join(str(m.get("content") or "") for m in out)
+        assert CATALOG_HEADING in text
+        assert "/tmp/tiny.py" in text
+        assert c._last_feasibility_skip is False
+        assert "catalog_skip_reason" not in (c._last_compression_telemetry or {})
+
+    def test_catalog_min_reclaim_skip_after_ineffective_strike(self):
+        c = _compressor(mode="catalog")
+        c._ineffective_compression_count = 1
+        msgs = _long_transcript()
+        middle_chars = sum(
+            len(str(m.get("content") or "")) for m in msgs[2:-2]
+        )
+        assert middle_chars >= CATALOG_BUDGET_CHARS
+        with patch("agent.context_compressor.call_llm") as llm:
+            out = c.compress(msgs, force=False)
+        llm.assert_not_called()
+        text = "\n".join(str(m.get("content") or "") for m in out)
+        assert CATALOG_HEADING not in text
+        assert c._last_feasibility_skip is True
+        assert (
+            c._last_compression_telemetry.get("catalog_skip_reason")
+            == "feasibility_min_reclaim"
+        )
+
+    def test_catalog_lean_two_pass_keeps_first_window_files(self):
+        first = _long_transcript()
+        for msg in first:
+            content = msg.get("content")
+            if isinstance(content, str):
+                msg["content"] = content.replace(
+                    "/tmp/project/app.py", "/tmp/first-only.py"
+                )
+            for tc in msg.get("tool_calls") or []:
+                args = tc.get("function", {}).get("arguments", "")
+                tc["function"]["arguments"] = args.replace(
+                    "/tmp/project/app.py", "/tmp/first-only.py"
+                )
+        c = _compressor(mode="catalog", tail_mode="lean")
+        with patch("agent.context_compressor.call_llm") as llm:
+            out1 = c.compress(first)
+        llm.assert_not_called()
+        text1 = "\n".join(str(m.get("content") or "") for m in out1)
+        assert CATALOG_HEADING in text1
+        assert "/tmp/first-only.py" in text1
+        assert text1.count("/tmp/first-only.py") >= 1
+
+        second = list(out1)
+        second.extend([
+            {"role": "user", "content": "Now work on /tmp/second-pass.py"},
+            {
+                "role": "assistant",
+                "content": "Working the second pass.\n" + ("x" * 4200),
+            },
+            {"role": "user", "content": "Continue second pass on /tmp/second-pass.py"},
+            {
+                "role": "assistant",
+                "content": "Still working second.\n" + ("y" * 4200),
+            },
+            {"role": "user", "content": "live second tail"},
+            {"role": "assistant", "content": "live second ack"},
+        ])
+        with patch("agent.context_compressor.call_llm") as llm:
+            out2 = c.compress(second)
+        llm.assert_not_called()
+        text2 = "\n".join(str(m.get("content") or "") for m in out2)
+        assert CATALOG_HEADING in text2
+        assert "/tmp/first-only.py" in text2
+        assert "/tmp/second-pass.py" in text2
+        files_section = text2.split("## Files", 1)[-1].split("## ", 1)[0]
+        assert files_section.count("/tmp/first-only.py") == 1
 
 
 class TestHybridMode:

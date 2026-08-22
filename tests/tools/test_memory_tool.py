@@ -336,6 +336,27 @@ class TestMemoryToolDispatcher:
         assert "the real one" in store.memory_entries
         assert "ignored" not in store.memory_entries
 
+    def test_user_requested_add_increments_counter(self, store):
+        normal = json.loads(
+            memory_tool(action="add", content="autonomous note", store=store)
+        )
+        assert normal["success"] is True
+        assert store.user_requested_write_count == 0
+        assert "user_requested_write_count" not in normal
+
+        requested = json.loads(
+            memory_tool(
+                action="add",
+                content="User prefers dark mode",
+                store=store,
+                user_requested=True,
+            )
+        )
+        assert requested["success"] is True
+        assert store.user_requested_write_count == 1
+        assert requested["user_requested_write_count"] == 1
+        assert "User prefers dark mode" in store.memory_entries
+
 
 class TestMemoryBatch:
     """The 'operations' batch shape: atomic, all-or-nothing, final-budget."""

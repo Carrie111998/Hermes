@@ -48,7 +48,9 @@ def test_memory_schema_routes_facts_skills_and_history():
     assert "create or patch" in description
     assert "autonomous routing" in description
     assert "explicit user-authored memory writes are still accepted" in description
+    assert "user_requested=true" in description
     assert "Do not write those to memory" not in description
+    assert MEMORY_SCHEMA["parameters"]["properties"]["user_requested"]["default"] is False
 
 
 def test_memory_store_accepts_explicit_task_progress_writes(tmp_path, monkeypatch):

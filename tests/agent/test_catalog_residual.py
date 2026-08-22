@@ -207,9 +207,12 @@ def test_hard_char_cap_and_receipt():
     assert len(body) <= 800
     assert CATALOG_HEADING in body
     assert CATALOG_RECEIPT_HEADING in body
-    assert "kept:" in body
-    assert "dropped:" in body
-    assert "over budget" in body
+    receipt_idx = body.rfind(CATALOG_RECEIPT_HEADING)
+    assert receipt_idx != -1
+    assert "kept:" in body[receipt_idx:]
+    assert "dropped:" in body[receipt_idx:]
+    assert "over budget" in body[receipt_idx:]
+    assert body[receipt_idx:].count(CATALOG_RECEIPT_HEADING) == 1
 
 
 def test_secret_redaction_in_catalog_and_index():
@@ -373,6 +376,24 @@ def test_reingest_parses_lean_anchor_index():
     assert "/tmp/first-only.py" in items["files"].values()
     assert "/tmp/second-pass.py" in items["files"].values()
     assert any("old.example/a" in value for value in items["identifiers"].values())
+
+
+def test_sha_identifiers_require_a_digit():
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "Words acceded and defaced are not SHAs; "
+                "use abcdef1 and 973d93f"
+            ),
+        }
+    ]
+    items = extract_catalog_items(messages)
+    identifiers = " ".join(items["identifiers"].values())
+    assert "acceded" not in identifiers
+    assert "defaced" not in identifiers
+    assert "abcdef1" in identifiers
+    assert "973d93f" in identifiers
 
 
 def test_merge_handles_into_anchor_index_keeps_first_window_files():

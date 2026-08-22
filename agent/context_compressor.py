@@ -32,6 +32,7 @@ from agent.auxiliary_client import (
     call_llm,
 )
 from agent.catalog_residual import (
+    CATALOG_BUDGET_CHARS,
     LEAN_ANCHOR_HEADING,
     append_hybrid_handle_index,
     build_catalog_residual,
@@ -50,6 +51,10 @@ from agent.model_metadata import (
 )
 from agent.redact import redact_sensitive_text
 from agent.turn_context import drop_stale_api_content
+from tools.session_search_tool import (
+    SESSION_SEARCH_DISCOVERY_CALL,
+    SESSION_SEARCH_DISCOVERY_HINT,
+)
 from tools.todo_tool import TODO_INJECTION_HEADER
 
 logger = logging.getLogger(__name__)
@@ -893,7 +898,7 @@ _LEAN_TAIL_DEMOTE_MIN_CHARS = 1_500
 def _lean_recovery_stub(tool_name: str, content_len: int, session_id: str) -> str:
     """One-line replacement for a demoted tail tool result."""
     hint = (
-        " Recover with session_search(query=..., role_filter='user,assistant,tool')"
+        f" Recover with {SESSION_SEARCH_DISCOVERY_CALL} — {SESSION_SEARCH_DISCOVERY_HINT}"
         if session_id else ""
     )
     return (
@@ -969,10 +974,8 @@ def _build_recovery_footer(session_id: str, region_len: int) -> str:
         f"session history for this session ({session_id}). If you need any "
         "detail this summary does not carry (exact command output, file "
         "contents, error text, earlier reasoning), recover it with: "
-        "session_search(query='<keywords>', role_filter='user,assistant,tool') "
-        "— discovery form; current-session context is implicit. Do not pass "
-        "session_id (that enters READ and ignores query). Do not guess at "
-        "lost specifics when you can look them up."
+        f"{SESSION_SEARCH_DISCOVERY_CALL} — {SESSION_SEARCH_DISCOVERY_HINT} "
+        "Do not guess at lost specifics when you can look them up."
     )
 
 
@@ -1335,6 +1338,11 @@ def _content_length_for_budget(raw_content: Any) -> int:
             # dicts — dimensions don't matter, only whether it's an image.
             total += len(p.get("text", "") or "")
     return total
+
+
+def _estimate_compacted_window_chars(messages: List[Dict[str, Any]]) -> int:
+    """Character length of a compacted middle, for catalog grow-clamp checks."""
+    return sum(_content_length_for_budget(msg.get("content")) for msg in messages)
 
 
 def _serialized_length_for_budget(value: Any) -> int:
@@ -7503,13 +7511,18 @@ This compaction should PRIORITISE preserving all information related to the focu
         # few lightweight messages, leaving the total token count essentially
         # unchanged.
         #
-        # Only fires after at least one prior real-usage ineffectiveness
-        # strike.  The check READS ``_ineffective_compression_count`` but
-        # never writes it: that strike counter is fed exclusively by real
-        # provider token counts (see the anti-thrashing verdict in
-        # _update_token_usage), and consumers latch at >= 2 to disable
-        # compression entirely.  Feasibility skips are tracked separately
-        # in ``_prellm_skip_count`` for observability.
+        # Min-reclaim fires after at least one prior real-usage
+        # ineffectiveness strike (all modes, including catalog). The check
+        # READS ``_ineffective_compression_count`` but never writes it: that
+        # strike counter is fed exclusively by real provider token counts
+        # (see the anti-thrashing verdict in _update_token_usage), and
+        # consumers latch at >= 2 to disable compression entirely.
+        # Feasibility skips are tracked separately in ``_prellm_skip_count``.
+        #
+        # Catalog also has a first-pass grow clamp: a middle smaller than
+        # CATALOG_BUDGET_CHARS can be replaced by a residual up to that
+        # budget and grow context. That clamp does not require a prior
+        # strike. Catalog still never calls the LLM summarizer.
         #
         # Skipped when ``force=True`` (manual /compress) so auth/error
         # handling paths are always exercised on explicit user request.
@@ -7526,11 +7539,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             )
 
         feasibility_skip = False
-        if (
-            compaction_mode != "catalog"
-            and not force
-            and self._ineffective_compression_count >= 1
-        ):
+        if not force and self._ineffective_compression_count >= 1:
             # _record_compression_regions already estimated this exact window
             # into the telemetry dict above; reuse it so the log line and
             # telemetry can never disagree. The regions helper no-ops when the
@@ -7546,6 +7555,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                 self._last_feasibility_skip = True
                 self._prellm_skip_count += 1
                 telemetry["prellm_skip_count"] = self._prellm_skip_count
+                if compaction_mode == "catalog":
+                    telemetry["catalog_skip_reason"] = "feasibility_min_reclaim"
                 if not self.quiet_mode:
                     logger.warning(
                         "Compression: middle section (%d tokens at indices "
@@ -7557,8 +7568,30 @@ This compaction should PRIORITISE preserving all information related to the focu
                         self.threshold_tokens, self._prellm_skip_count,
                     )
 
+        if (
+            compaction_mode == "catalog"
+            and not force
+            and not feasibility_skip
+        ):
+            window_chars = _estimate_compacted_window_chars(turns_to_summarize)
+            if window_chars < CATALOG_BUDGET_CHARS:
+                feasibility_skip = True
+                self._last_feasibility_skip = True
+                self._prellm_skip_count += 1
+                telemetry["prellm_skip_count"] = self._prellm_skip_count
+                telemetry["catalog_skip_reason"] = "window_smaller_than_budget"
+                if not self.quiet_mode:
+                    logger.warning(
+                        "Compression: catalog window (%d chars at indices "
+                        "%d-%d) is below CATALOG_BUDGET_CHARS (%d) — "
+                        "skipping catalog construction to avoid growing "
+                        "context. prellm_skip_count=%d",
+                        window_chars, compress_start, compress_end,
+                        CATALOG_BUDGET_CHARS, self._prellm_skip_count,
+                    )
+
         catalog_construction_failed = False
-        if compaction_mode == "catalog":
+        if compaction_mode == "catalog" and not feasibility_skip:
             # Extractive replacement — never call the auxiliary summarizer.
             # Construction failure is fail-closed: abort and return the
             # original messages. Do not inject a Standard static narrative,

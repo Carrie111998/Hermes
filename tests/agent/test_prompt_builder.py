@@ -48,6 +48,9 @@ class TestGuidanceConstants:
         assert "durable facts" in MEMORY_GUIDANCE
         assert "prefer session_search for task progress" in MEMORY_GUIDANCE
         assert "explicit user requests" in MEMORY_GUIDANCE
+        assert "user_requested=true" in MEMORY_GUIDANCE
+        assert "relocating the fact to session history" in MEMORY_GUIDANCE
+        assert "if it will go stale" in MEMORY_GUIDANCE
         assert "session_search" in MEMORY_GUIDANCE
         assert "skill_manage" in MEMORY_GUIDANCE
         assert "MEMORY/USER" in MEMORY_GUIDANCE
