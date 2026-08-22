@@ -58,6 +58,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -1625,7 +1626,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # _inject_browser_control_artifacts().
         self._browser_control_artifacts: Dict[str, ArtifactStore] = {}
         self._browser_control_artifact_limiter: Optional[ArtifactRateLimiter] = None
-        self._browser_handoff_attempts: Dict[str, List[float]] = {}
+        self._browser_handoff_attempts: "OrderedDict[str, List[float]]" = (
+            OrderedDict()
+        )
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -2218,18 +2221,31 @@ class APIServerAdapter(BasePlatformAdapter):
         peer = request.remote or "unknown"
         peer_key = "ip:" + hashlib.sha256(peer.encode("utf-8")).hexdigest()
         token_key = "token:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
-        limited = False
-        for key, limit in ((peer_key, 60), (token_key, 30)):
-            attempts = self._browser_handoff_attempts.setdefault(key, [])
+        buckets = self._browser_handoff_attempts
+        if not isinstance(buckets, OrderedDict):
+            buckets = OrderedDict(buckets)
+            self._browser_handoff_attempts = buckets
+
+        def record(key: str, limit: int) -> bool:
+            attempts = buckets.get(key)
+            if attempts is None:
+                # Hard cap first, then insert. OrderedDict gives O(1) LRU
+                # eviction even under distributed random-token probing.
+                while len(buckets) >= 2048:
+                    buckets.popitem(last=False)
+                attempts = []
+                buckets[key] = attempts
+            else:
+                buckets.move_to_end(key)
             attempts[:] = [stamp for stamp in attempts if now - stamp < 60]
             attempts.append(now)
-            limited = limited or len(attempts) > limit
-        if len(self._browser_handoff_attempts) > 2048:
-            self._browser_handoff_attempts = {
-                k: values for k, values in self._browser_handoff_attempts.items()
-                if values and now - values[-1] < 60
-            }
-        return limited
+            return len(attempts) > limit
+
+        # Once a peer is blocked, do not allocate a bucket for its arbitrary
+        # token. This prevents one attacker from growing token state at all.
+        if record(peer_key, 60):
+            return True
+        return record(token_key, 30)
 
     @staticmethod
     def _browser_handoff_response(body: str, status: int) -> "web.Response":
@@ -2266,9 +2282,13 @@ class APIServerAdapter(BasePlatformAdapter):
         return self._browser_handoff_response(body, status)
 
     async def _deliver_browser_handoff_wake(self, record_id: int) -> None:
-        from gateway.browser_handoff import BrowserHandoffStore, WAKE_MESSAGE
+        from gateway.browser_handoff import (
+            BrowserHandoffStore,
+            EXPIRED_WAKE_MESSAGE,
+            WAKE_MESSAGE,
+        )
         from gateway.session import SessionSource
-        from gateway.wake import deliver_wake
+        from gateway.wake import adapter_supports_push, deliver_wake
 
         store = BrowserHandoffStore()
         record = await asyncio.to_thread(store.claim_wake, record_id)
@@ -2286,23 +2306,29 @@ class APIServerAdapter(BasePlatformAdapter):
                 resolver = getattr(runner, "_adapter_for_source", None)
                 if callable(resolver):
                     adapter = resolver(source)
-                key_resolver = getattr(runner, "_session_key_for_source", None)
-                if callable(key_resolver):
-                    session_key = str(key_resolver(source) or "")
-                if session_key:
-                    entry = await runner.async_session_store.lookup_by_session_key(
-                        session_key
-                    )
-                    if entry is None or entry.session_id != record.session_id:
-                        # A /new, reset or replacement occurred while the human
-                        # had control. Never wake the replacement conversation.
-                        logger.warning(
-                            "[api_server] discarding browser handoff wake for "
-                            "stale session row %s",
-                            record_id,
+                if adapter is not None and adapter_supports_push(adapter):
+                    key_resolver = getattr(runner, "_session_key_for_source", None)
+                    if callable(key_resolver):
+                        session_key = str(key_resolver(source) or "")
+                    if session_key:
+                        entry = await runner.async_session_store.lookup_by_session_key(
+                            session_key
                         )
-                        delivered = True
-                        return
+                        if entry is None or entry.session_id != record.session_id:
+                            # A /new, reset or replacement occurred while the human
+                            # had control. Never wake the replacement conversation.
+                            logger.warning(
+                                "[api_server] discarding browser handoff wake for "
+                                "stale session row %s",
+                                record_id,
+                            )
+                            delivered = True
+                            return
+                else:
+                    # API-server sessions live under the raw session id and do
+                    # not have a gateway routing-key row to validate.
+                    adapter = self
+                    source = None
             # Programmatic/cron origins have no push adapter. The API server's
             # raw-session wake path resumes the exact SessionDB entry instead.
             if adapter is None:
@@ -2310,10 +2336,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 source = None
             await deliver_wake(
                 adapter,
-                text=WAKE_MESSAGE,
+                text=(
+                    EXPIRED_WAKE_MESSAGE
+                    if record.status == "expired"
+                    else WAKE_MESSAGE
+                ),
                 session_id=record.session_id,
                 session_key=session_key,
                 source=source,
+                profile=str(record.source.get("profile") or ""),
             )
             delivered = True
         except Exception:
@@ -2369,17 +2400,44 @@ class APIServerAdapter(BasePlatformAdapter):
         body, status = render_handoff_page(record)
         return self._browser_handoff_response(body, status)
 
+    def _browser_handoff_sweep_profiles(self) -> list[Optional[str]]:
+        runner_cfg = getattr(getattr(self, "gateway_runner", None), "config", None)
+        if not bool(getattr(runner_cfg, "multiplex_profiles", False)):
+            return [None]
+        from hermes_cli.profiles import profiles_to_serve
+
+        served = profiles_to_serve(
+            multiplex=True,
+            profile_allowlist=getattr(
+                runner_cfg, "multiplex_profile_allowlist", None
+            ),
+        )
+        return [None if name == "default" else name for name, _ in served]
+
     async def _sweep_browser_handoff_wakes(self) -> None:
-        from gateway.browser_handoff import BrowserHandoffStore
+        from gateway.browser_handoff import (
+            BrowserHandoffStore,
+            load_browser_handoff_config,
+        )
 
         while True:
             await asyncio.sleep(15)
-            try:
-                ids = await asyncio.to_thread(BrowserHandoffStore().pending_wake_ids)
-                for record_id in ids:
-                    self._schedule_browser_handoff_wake(record_id)
-            except Exception:
-                logger.debug("Browser handoff wake sweep failed", exc_info=True)
+            for profile in self._browser_handoff_sweep_profiles():
+                try:
+                    with self._profile_scope(profile):
+                        if not load_browser_handoff_config().enabled:
+                            continue
+                        ids = await asyncio.to_thread(
+                            BrowserHandoffStore().pending_wake_ids
+                        )
+                        for record_id in ids:
+                            self._schedule_browser_handoff_wake(record_id)
+                except Exception:
+                    logger.debug(
+                        "Browser handoff wake sweep failed for profile %s",
+                        profile or "default",
+                        exc_info=True,
+                    )
 
     def _http_route_table(self) -> List[tuple]:
         """Return (method, path, handler) rows registered by ``connect()``.
@@ -8541,20 +8599,21 @@ class APIServerAdapter(BasePlatformAdapter):
             if hasattr(sweep_task, "add_done_callback"):
                 sweep_task.add_done_callback(self._background_tasks.discard)
 
-            from gateway.browser_handoff import load_browser_handoff_config
-
-            if load_browser_handoff_config().enabled:
-                handoff_sweep_task = asyncio.create_task(
-                    self._sweep_browser_handoff_wakes()
+            # Always start one lightweight handoff sweep. It scopes each pass
+            # across every served profile and skips profiles where the feature
+            # is disabled; checking only the default profile here would strand
+            # secondary-profile handoffs after a restart.
+            handoff_sweep_task = asyncio.create_task(
+                self._sweep_browser_handoff_wakes()
+            )
+            try:
+                self._background_tasks.add(handoff_sweep_task)
+            except TypeError:
+                pass
+            if hasattr(handoff_sweep_task, "add_done_callback"):
+                handoff_sweep_task.add_done_callback(
+                    self._background_tasks.discard
                 )
-                try:
-                    self._background_tasks.add(handoff_sweep_task)
-                except TypeError:
-                    pass
-                if hasattr(handoff_sweep_task, "add_done_callback"):
-                    handoff_sweep_task.add_done_callback(
-                        self._background_tasks.discard
-                    )
 
             # Loud warning when a network-accessible API server runs against an
             # unsandboxed local terminal backend. The API server can drive the

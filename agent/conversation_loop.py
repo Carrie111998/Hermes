@@ -7395,6 +7395,10 @@ def run_conversation(
                 )
                 if _handoff_wait:
                     _turn_exit_reason = "waiting_for_browser_handoff"
+                    # Normal finalization tears down task browsers at every
+                    # turn boundary. This one must survive until Done, expiry,
+                    # or explicit session cleanup.
+                    agent._preserve_browser_after_turn = True
                     final_response = _handoff_wait
                     append_message(
                         messages, {"role": "assistant", "content": final_response}

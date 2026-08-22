@@ -35,6 +35,8 @@ The Browser Use provider will preserve `liveUrl` as `live_url` in the existing s
 
 The Browser Use CLI/backend path will reuse Hermes's existing Browser Use provider session instead of asking the harness to auto-provision a second, opaque browser. The harness attaches to that session's CDP endpoint, while Hermes retains its ID, expiry, and live URL. Handoff is available only when the active session has both a live Browser Use session and a non-empty `live_url`; local-browser handoff is outside this change.
 
+Every Hermes bot/task receives a deterministic private harness-daemon name and a distinct Browser Use cloud session key, even when the model omits the optional session name. Two bots that choose the same friendly session name still receive separate managed Chrome instances, so they can work concurrently in the background without sharing tabs, focus, cookies, or browser process state. Repeated calls from the same bot and friendly session reuse its instance. Local Chrome remains one shared browser and can isolate only tabs; the multi-bot guarantee therefore uses Browser Use cloud.
+
 ### Handoff manager
 
 A focused handoff manager owns lifecycle and persistence. It creates a cryptographically random token and persists only its SHA-256 digest with:
@@ -82,7 +84,7 @@ The Discord delivery path uses the connected Discord adapter when available and 
 
 The completion endpoint claims the pending handoff in one transaction, revokes its public capability, and uses Hermes's existing session wake mechanism to enqueue an internal continuation for the raw originating session ID. The continuation says that the owner completed the browser handoff and instructs Hermes to inspect the current page before taking the next action.
 
-The browser remains alive during the wait. Handoff completion does not automatically submit forms, close the browser, or assume success. Hermes must verify page state after waking. Normal task cleanup closes the browser later.
+The browser remains alive during the wait. Handoff completion does not automatically submit forms, close the browser, or assume success. Hermes must verify page state after waking. Normal task cleanup closes every cloud browser owned by that bot after the resumed task finishes; the inactivity reaper also closes abandoned instances after the handoff is completed, cancelled, or expired.
 
 ## State and Concurrency Rules
 
@@ -135,6 +137,7 @@ browser:
 Focused automated coverage will prove behavior rather than source layout:
 
 - Browser Use provider create responses preserve `liveUrl`; other providers remain valid without it.
+- Browser and daemon keys are stable within one bot/task but distinct across bots, including unnamed sessions and identical friendly session names.
 - Token plaintext is absent from SQLite and logs.
 - Pending GET renders the instruction and live controller; invalid, expired, completed, cancelled, and browser-mismatched tokens never expose `live_url`.
 - Completion is atomic and concurrent Done requests schedule exactly one wake.

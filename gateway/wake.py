@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any, Optional
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +62,7 @@ async def deliver_wake(
     session_id: str = "",
     session_key: str = "",
     source: Any = None,
+    profile: str = "",
 ) -> None:
     """Deliver a wake turn to the session behind ``adapter``.
 
@@ -103,11 +106,16 @@ async def deliver_wake(
             "deliver_wake: non-push adapter (supports_async_delivery=False) "
             "requires the raw session id to self-post the wake turn"
         )
-    await _self_post_chat_completion(adapter, text=text, session_id=session_id)
+    await _self_post_chat_completion(
+        adapter,
+        text=text,
+        session_id=session_id,
+        profile=profile,
+    )
 
 
 async def _self_post_chat_completion(
-    adapter: Any, *, text: str, session_id: str
+    adapter: Any, *, text: str, session_id: str, profile: str = ""
 ) -> None:
     """POST the wake text to the in-pod API server as a normal session turn.
 
@@ -134,7 +142,14 @@ async def _self_post_chat_completion(
 
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"  # bare IPv6 literal
-    url = f"http://{host}:{port}/v1/chat/completions"
+    clean_profile = str(profile or "").strip()
+    if clean_profile and clean_profile not in {"default", "custom"}:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", clean_profile):
+            raise ValueError("wake self-post received an invalid profile name")
+        route_prefix = f"/p/{quote(clean_profile, safe='')}"
+    else:
+        route_prefix = ""
+    url = f"http://{host}:{port}{route_prefix}/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "X-Hermes-Session-Id": session_id,

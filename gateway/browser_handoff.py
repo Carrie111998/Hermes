@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -36,6 +36,17 @@ _TOKEN_HEX_LENGTH = _TOKEN_BYTES * 2
 # Wake turns may legitimately use tools for several minutes. Reclaim only
 # after the existing wake self-post's 10-minute ceiling plus safety margin.
 _WAKE_RECLAIM_SECONDS = 900
+WAKE_MESSAGE = (
+    "The human browser handoff is complete. Resume this exact task now. "
+    "First inspect the current page with browser_exec and verify the requested "
+    "login, CAPTCHA, or other blocking step succeeded; then continue from "
+    "where you paused."
+)
+EXPIRED_WAKE_MESSAGE = (
+    "The browser handoff expired before the owner clicked Done. Inspect the "
+    "current browser if it is still available, then explain the blocker or "
+    "request a new handoff instead of assuming the human step succeeded."
+)
 
 
 class BrowserHandoffError(RuntimeError):
@@ -298,7 +309,7 @@ class BrowserHandoffStore:
                 """
                 UPDATE browser_handoffs
                 SET wake_status='delivering', wake_claimed_at=?
-                WHERE id=? AND status='completed' AND (
+                WHERE id=? AND status IN ('completed', 'expired') AND (
                     wake_status='pending' OR
                     (wake_status='delivering' AND COALESCE(wake_claimed_at, 0) < ?)
                 )
@@ -321,12 +332,20 @@ class BrowserHandoffStore:
             )
 
     def pending_wake_ids(self, limit: int = 20) -> list[int]:
-        reclaim_before = time.time() - _WAKE_RECLAIM_SECONDS
+        now = time.time()
+        reclaim_before = now - _WAKE_RECLAIM_SECONDS
         with self._lock, self._connect() as db:
+            # Expiry is a wake event. The agent already ended its turn at the
+            # handoff boundary and must not remain dormant forever.
+            db.execute(
+                "UPDATE browser_handoffs SET status='expired' "
+                "WHERE status='pending' AND expires_at<=?",
+                (now,),
+            )
             rows = db.execute(
                 """
                 SELECT id FROM browser_handoffs
-                WHERE status='completed' AND (
+                WHERE status IN ('completed', 'expired') AND (
                     wake_status='pending' OR
                     (wake_status='delivering' AND COALESCE(wake_claimed_at, 0) < ?)
                 ) ORDER BY id LIMIT ?
@@ -353,6 +372,39 @@ class BrowserHandoffStore:
                 (browser_id,),
             )
         return int(cur.rowcount)
+
+    def retains_browser(self, browser_id: str) -> bool:
+        if not browser_id:
+            return False
+        now = time.time()
+        with self._lock, self._connect() as db:
+            db.execute(
+                "UPDATE browser_handoffs SET status='expired' "
+                "WHERE browser_id=? AND status='pending' AND expires_at<=?",
+                (browser_id, now),
+            )
+            row = db.execute(
+                "SELECT 1 FROM browser_handoffs "
+                "WHERE browser_id=? AND (status='pending' OR ("
+                "status IN ('completed', 'expired') AND wake_status!='delivered'"
+                ")) LIMIT 1",
+                (browser_id,),
+            ).fetchone()
+        return row is not None
+
+
+def browser_handoff_retains_browser(browser_id: str) -> bool:
+    try:
+        return BrowserHandoffStore().retains_browser(browser_id)
+    except Exception:
+        logger.debug(
+            "Failed to check pending browser handoff for %s",
+            browser_id,
+            exc_info=True,
+        )
+        # Fail closed for resource retention: a database failure must not pin
+        # a paid browser indefinitely.
+        return False
 
 
 def _source_from_context() -> dict[str, Any]:
@@ -446,13 +498,12 @@ def create_browser_handoff(
 
     from gateway.session_context import get_session_env
     from tools.browser_tool import _get_session_info
+    from tools.browser_use_cli import _provider_session_cache_key
 
-    browser_key = (
-        f"bu-named-{session_name}"
-        if session_name
-        else (task_id or "browser-exec-default")
-    )
+    browser_key = _provider_session_cache_key(task_id, session_name)
     info = _get_session_info(browser_key) or {}
+    if isinstance(info, dict):
+        info["owner_task_id"] = str(task_id or "browser-exec-default")
     if not bool((info.get("features") or {}).get("browser_use")):
         raise BrowserHandoffError(
             "Human handoff is currently supported only for Browser Use cloud sessions"
@@ -486,6 +537,7 @@ def create_browser_handoff(
         except (TypeError, ValueError):
             logger.warning("Ignoring malformed Browser Use expires_at value")
     handoff_store = store or BrowserHandoffStore()
+    source = _source_from_context()
     record = handoff_store.create(
         token_digest=digest,
         session_id=session_id,
@@ -493,14 +545,22 @@ def create_browser_handoff(
         browser_id=browser_id,
         live_url=live_url,
         instruction=clean_instruction,
-        source=_source_from_context(),
+        source=source,
         ttl_seconds=ttl_seconds,
     )
-    link = f"{base_url}/browser-handoff/{token}"
+    profile = str(source.get("profile") or "").strip()
+    profile_prefix = (
+        f"/p/{quote(profile, safe='')}"
+        if profile and profile not in {"default", "custom"}
+        else ""
+    )
+    link = f"{base_url}{profile_prefix}/browser-handoff/{token}"
+    effective_minutes = max(1, int((record.expires_at - time.time() + 59) // 60))
     message = (
         f"yo i need u to do this: {clean_instruction}\n\n"
         f"Take control here (no login required): {link}\n\n"
-        f"This link expires in {cfg.ttl_minutes} minutes. "
+        f"This link expires in {effective_minutes} minute"
+        f"{'s' if effective_minutes != 1 else ''}. "
         "Click Done on the page when finished. Do not forward this link."
     )
     try:
@@ -512,7 +572,9 @@ def create_browser_handoff(
         "handoff_id": record.id,
         "expires_at": record.expires_at,
         "message": (
-            "I sent Alex a Discord DM with a 30-minute browser-control link. "
+            "I sent Alex a Discord DM with a browser-control link valid for "
+            f"about {effective_minutes} minute"
+            f"{'s' if effective_minutes != 1 else ''}. "
             "End this turn now and wait. The same Hermes session will be woken "
             "when Alex clicks Done; then inspect the current page before continuing."
         ),
@@ -577,11 +639,3 @@ font-size:17px;font-weight:700;cursor:pointer}}
 a{{color:#a9c7ff}}.fallback{{margin:.75em 0}}form{{margin-top:16px}}
 </style></head><body><main><h1>{html.escape(title)}</h1><p>{body}</p>{frame}</main></body></html>"""
     return doc, status
-
-
-WAKE_MESSAGE = (
-    "The human browser handoff is complete. Resume this exact task now. "
-    "First inspect the current page with browser_exec and verify the requested "
-    "login, CAPTCHA, or other blocking step succeeded; then continue from "
-    "where you paused."
-)

@@ -73,12 +73,12 @@ def test_push_wake_can_pin_exact_gateway_session():
     }
 
 
-async def _serve(handler):
+async def _serve(handler, path="/v1/chat/completions"):
     """Spin an in-process aiohttp server on an ephemeral loopback port."""
     from aiohttp import web
 
     app = web.Application()
-    app.router.add_post("/v1/chat/completions", handler)
+    app.router.add_post(path, handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -118,6 +118,34 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
     ]
 
 
+def test_deliver_wake_non_push_targets_multiplex_profile():
+    from aiohttp import web
+
+    seen = {}
+
+    async def handler(request):
+        seen["path"] = request.path
+        return web.json_response({"choices": []})
+
+    async def run():
+        runner, port = await _serve(
+            handler, "/p/worker/v1/chat/completions"
+        )
+        try:
+            adapter = ApiServerLikeAdapter(port=port)
+            await deliver_wake(
+                adapter,
+                text="resume",
+                session_id="raw-sid-42",
+                profile="worker",
+            )
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert seen["path"] == "/p/worker/v1/chat/completions"
+
+
 def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
     """HTTP 429 (max_concurrent_runs cap) is transient — retried with backoff."""
     from aiohttp import web
@@ -143,4 +171,3 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
 
     asyncio.run(run())
     assert calls["n"] == 2
-
