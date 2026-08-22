@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { atom } from 'nanostores'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -23,6 +23,7 @@ vi.mock('@/i18n', () => ({
         allProfiles: 'All profiles',
         clearDefaultProfile: 'Clear default',
         connectGateway: 'Manage gateways…',
+        editSoul: 'Edit SOUL.md…',
         failedLoadSoul: 'Failed to load SOUL.md',
         failedSaveSoul: 'Failed to save SOUL.md',
         importProfile: 'Import profile…',
@@ -45,6 +46,7 @@ vi.mock('@/store/profile', () => ({
   $homeProfile: atom(null),
   $profileColors: atom({}),
   $profileCreateRequest: atom(0),
+  $profileGlyphs: atom<Record<string, string>>({}),
   $profileOrder: atom([]),
   $profiles: atom([{ is_default: true, name: 'default' }]),
   $profileScope: atom('default'),
@@ -93,9 +95,12 @@ vi.mock('../../profiles/rename-profile-dialog', () => ({ RenameProfileDialog: ()
 const { $hasMultipleConnections } = await import('@/store/connections')
 const hasMultipleConnections = $hasMultipleConnections as ReturnType<typeof atom<boolean>>
 
+const { getProfileSoul } = await import('@/hermes')
+
 const {
   $activeGatewayProfile,
   $homeProfile,
+  $profileGlyphs,
   $profiles,
   selectProfile,
   setHomeProfile,
@@ -105,6 +110,7 @@ const {
 const profiles = $profiles as ReturnType<typeof atom<Array<{ is_default: boolean; name: string }>>>
 const activeGatewayProfile = $activeGatewayProfile as ReturnType<typeof atom<string>>
 const homeProfile = $homeProfile as ReturnType<typeof atom<null | string>>
+const glyphs = $profileGlyphs as ReturnType<typeof atom<Record<string, string>>>
 
 afterEach(() => {
   cleanup()
@@ -112,6 +118,7 @@ afterEach(() => {
   profiles.set([{ is_default: true, name: 'default' }])
   activeGatewayProfile.set('default')
   homeProfile.set(null)
+  glyphs.set({})
   vi.mocked(selectProfile).mockClear()
   vi.mocked(setHomeProfile).mockClear()
   vi.mocked(setShowAllProfiles).mockClear()
@@ -261,5 +268,78 @@ describe('designated home pill (#89887)', () => {
     fireEvent.click(screen.getByText('Clear default'))
 
     expect(setHomeProfile).toHaveBeenCalledWith(null)
+  })
+})
+
+describe('rail glyph overrides and edit entry (#79233)', () => {
+  const twoProfiles = () =>
+    profiles.set([
+      { is_default: true, name: 'default' },
+      { is_default: false, name: 'work' }
+    ])
+
+  it('the designated home pill renders its own overridden glyph', () => {
+    twoProfiles()
+    homeProfile.set('work')
+    glyphs.set({ work: 'briefcase' })
+    render(<ProfileRail />)
+
+    const icon = screen
+      .getByRole('button', { name: 'Switch to work' })
+      .querySelector('.codicon')
+
+    expect(icon?.className).toContain('codicon-briefcase')
+  })
+
+  it('an unset override keeps the home mark on the pill and squares', () => {
+    twoProfiles()
+    homeProfile.set('work')
+    render(<ProfileRail />)
+
+    const pillIcon = screen
+      .getByRole('button', { name: 'Switch to work' })
+      .querySelector('.codicon')
+
+    expect(pillIcon?.className).toContain('codicon-home')
+
+    // The named square still carries its initial (no codicon inside).
+    const square = screen.getByRole('button', { name: 'work' })
+
+    expect(square.querySelector('.codicon')).toBeNull()
+    expect(square.textContent).toBe('w')
+  })
+
+  it('a named square paints its override instead of the initial', () => {
+    twoProfiles()
+    glyphs.set({ work: 'rocket' })
+    render(<ProfileRail />)
+
+    const icon = screen.getByRole('button', { name: 'work' }).querySelector('.codicon')
+
+    expect(icon?.className).toContain('codicon-rocket')
+  })
+
+  it('the designated home pill menu offers editing its SOUL.md', () => {
+    twoProfiles()
+    homeProfile.set('work')
+    render(<ProfileRail />)
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: 'Switch to work' }))
+
+    // Same composition as the named squares' menu — the pill is a full
+    // profile surface now, not just a navigation toggle.
+    fireEvent.click(screen.getByText('Edit SOUL.md…'))
+
+    return waitFor(() => expect(vi.mocked(getProfileSoul)).toHaveBeenCalledWith('work'))
+  })
+
+  it('the classic toggle pill offers editing the built-in default SOUL.md too', () => {
+    twoProfiles()
+    render(<ProfileRail />)
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: 'Show all profiles' }))
+    fireEvent.click(screen.getByText('Edit SOUL.md…'))
+
+    return waitFor(() => expect(vi.mocked(getProfileSoul)).toHaveBeenCalledWith('default'))
   })
 })

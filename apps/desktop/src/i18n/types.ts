@@ -1527,6 +1527,9 @@ export interface Translations {
     rename: string
     renameMenu: string
     editSoul: string
+    glyphLabel: string
+    glyphAuto: string
+    glyphHint: string
     copySetup: string
     copying: string
     modelLabel: string

@@ -132,6 +132,31 @@ export function setProfileColor(name: string, color: null | string): void {
   $profileColors.set(next)
 }
 
+// ── Rail glyphs ────────────────────────────────────────────────────────────
+// Optional per-profile glyph override (#79233), chosen at creation time. Absent
+// keys keep the built-in marks — the default/home profile stays `home`, named
+// profiles keep their initial. Like colors, a local cosmetic preference keyed
+// by the canonical profile name.
+const PROFILE_GLYPHS_STORAGE_KEY = 'hermes.desktop.profileGlyphs'
+
+export const $profileGlyphs = atom<Record<string, string>>(storedStringRecord(PROFILE_GLYPHS_STORAGE_KEY))
+
+$profileGlyphs.subscribe(value => persistStringRecord(PROFILE_GLYPHS_STORAGE_KEY, value))
+
+// Set (or, with null, clear) a profile's glyph override.
+export function setProfileGlyph(name: string, glyph: null | string): void {
+  const key = normalizeProfileKey(name)
+  const next = { ...$profileGlyphs.get() }
+
+  if (glyph) {
+    next[key] = glyph
+  } else {
+    delete next[key]
+  }
+
+  $profileGlyphs.set(next)
+}
+
 // ── Home profile ───────────────────────────────────────────────────────────
 // Which profile is "home" for the rail's home pill and the switch-to-default
 // hotkey. A Desktop-local navigation preference (renderer-owned presentation);

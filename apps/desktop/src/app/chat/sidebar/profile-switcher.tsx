@@ -44,6 +44,7 @@ import { getProfileSoul, updateProfileSoul } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { PROFILE_SWATCHES, profileColorSoft, resolveProfileColor } from '@/lib/profile-color'
+import { resolveProfileGlyph } from '@/lib/profile-glyphs'
 import {
   REORDER_DRAG_TRANSITION_CSS,
   REORDER_RAIL_TRANSITION,
@@ -58,6 +59,7 @@ import {
   $homeProfile,
   $profileColors,
   $profileCreateRequest,
+  $profileGlyphs,
   $profileOrder,
   $profiles,
   $profileScope,
@@ -128,6 +130,7 @@ export function ProfileRail() {
   const gatewayProfile = useStore($activeGatewayProfile)
   const order = useStore($profileOrder)
   const colors = useStore($profileColors)
+  const glyphs = useStore($profileGlyphs)
   const multipleConnections = useStore($hasMultipleConnections)
   const navigate = useNavigate()
 
@@ -263,17 +266,23 @@ export function ProfileRail() {
         (designatedHome ? (
           <ProfilePill
             active={!isAll && activeKey === normalizeProfileKey(designatedHome.name)}
-            glyph="home"
+            glyph={resolveProfileGlyph(designatedHome.name, glyphs) ?? 'home'}
             label={p.switchToProfile(profileLabel(designatedHome))}
             menu={
-              <ContextMenuItem
-                onSelect={() => {
-                  setHomeProfile(null)
-                }}
-              >
-                <Codicon name="close" size="0.875rem" />
-                <span>{p.clearDefaultProfile}</span>
-              </ContextMenuItem>
+              <>
+                <ContextMenuItem onSelect={() => setPendingSoul(designatedHome.name)}>
+                  <Codicon name="edit" size="0.875rem" />
+                  <span>{p.editSoul}</span>
+                </ContextMenuItem>
+                <ContextMenuItem
+                  onSelect={() => {
+                    setHomeProfile(null)
+                  }}
+                >
+                  <Codicon name="close" size="0.875rem" />
+                  <span>{p.clearDefaultProfile}</span>
+                </ContextMenuItem>
+              </>
             }
             onSelect={() => selectProfile(designatedHome.name)}
           />
@@ -282,8 +291,14 @@ export function ProfileRail() {
           // profile) → return to default. So leaving a profile never lands on all.
           <ProfilePill
             active={isAll || onDefault}
-            glyph={isAll ? 'layers' : 'home'}
+            glyph={isAll ? 'layers' : (resolveProfileGlyph(defaultProfile.name, glyphs) ?? 'home')}
             label={onDefault ? p.showAllProfiles : p.switchToProfile(profileLabel(defaultProfile))}
+            menu={
+              <ContextMenuItem onSelect={() => setPendingSoul(defaultProfile.name)}>
+                <Codicon name="edit" size="0.875rem" />
+                <span>{p.editSoul}</span>
+              </ContextMenuItem>
+            }
             onSelect={() => (onDefault ? setShowAllProfiles(true) : selectProfile(defaultProfile.name))}
           />
         ) : (
@@ -294,8 +309,14 @@ export function ProfileRail() {
       {!multiProfile && home && (
         <ProfilePill
           active
-          glyph="home"
+          glyph={resolveProfileGlyph(home.name, glyphs) ?? 'home'}
           label={profileLabel(home)}
+          menu={
+            <ContextMenuItem onSelect={() => setPendingSoul(home.name)}>
+              <Codicon name="edit" size="0.875rem" />
+              <span>{p.editSoul}</span>
+            </ContextMenuItem>
+          }
           onSelect={() => selectProfile(home.name)}
         />
       )}
@@ -308,6 +329,7 @@ export function ProfileRail() {
           <ProfileDropdown
             activeKey={isAll ? null : activeKey}
             colors={colors}
+            glyphs={glyphs}
             onCreate={() => setCreateOpen(true)}
             onImport={() => void runImportProfileFlow()}
             onSelect={selectProfile}
@@ -336,6 +358,7 @@ export function ProfileRail() {
                     <ProfileSquare
                       active={!isAll && normalizeProfileKey(profile.name) === activeKey}
                       color={resolveProfileColor(profile.name, colors)}
+                      glyph={resolveProfileGlyph(profile.name, glyphs)}
                       isHome={
                         designatedHome != null &&
                         normalizeProfileKey(profile.name) === normalizeProfileKey(designatedHome.name)
@@ -528,6 +551,7 @@ function ImportProfileButton({ label }: { label: string }) {
 function ProfileDropdown({
   activeKey,
   colors,
+  glyphs,
   onCreate,
   onImport,
   onSelect,
@@ -535,6 +559,7 @@ function ProfileDropdown({
 }: {
   activeKey: null | string
   colors: Record<string, string>
+  glyphs: Record<string, string>
   onCreate: () => void
   onImport: () => void
   onSelect: (name: string) => void
@@ -563,6 +588,7 @@ function ProfileDropdown({
                 <ProfileGlyph
                   aria-hidden="true"
                   color={resolveProfileColor(activeProfile.name, colors)}
+                  glyph={resolveProfileGlyph(activeProfile.name, glyphs)}
                   isDefault={false}
                   name={activeProfile.name}
                 />
@@ -589,6 +615,7 @@ function ProfileDropdown({
           {profiles.map(profile => (
             <ProfileDropdownItem
               color={resolveProfileColor(profile.name, colors)}
+              glyph={resolveProfileGlyph(profile.name, glyphs)}
               key={profile.name}
               label={profileLabel(profile)}
               name={profile.name}
@@ -602,7 +629,17 @@ function ProfileDropdown({
 
 // One dropdown row per profile — its own component so each row can own a
 // hover-intent prewarm timer (see useProfilePrewarm).
-function ProfileDropdownItem({ color, label, name }: { color: null | string; label: string; name: string }) {
+function ProfileDropdownItem({
+  color,
+  glyph,
+  label,
+  name
+}: {
+  color: null | string
+  glyph?: null | string
+  label: string
+  name: string
+}) {
   const { cancelPrewarm, startPrewarm } = useProfilePrewarm(name)
 
   return (
@@ -613,7 +650,7 @@ function ProfileDropdownItem({ color, label, name }: { color: null | string; lab
       value={name}
     >
       <span className="flex min-w-0 items-center gap-1.5">
-        <ProfileGlyph aria-hidden="true" color={color} isDefault={false} name={name} />
+        <ProfileGlyph aria-hidden="true" color={color} glyph={glyph} isDefault={false} name={name} />
         <span className="truncate">{label}</span>
       </span>
     </DropdownMenuRadioItem>
@@ -626,8 +663,9 @@ interface ProfilePillProps {
   glyph: string
   label: string
   onSelect: () => void
-  // Optional right-click rows (the designated-home pill's clear-default action,
-  // #89887). When absent the pill stays a plain button with no context menu.
+  // Optional right-click rows: the Edit-SOUL entry (#79233) plus the
+  // designated-home pill's clear-default action (#89887). When absent the pill
+  // stays a plain button with no context menu.
   menu?: ReactNode
 }
 
@@ -673,6 +711,8 @@ function ProfilePill({ active, glyph, label, menu, onSelect }: ProfilePillProps)
 interface ProfileSquareProps {
   active: boolean
   color: null | string
+  // Codicon override (#79233) — replaces the initial when set.
+  glyph?: null | string
   // Whether this square is the user-designated home profile (#89887): the menu
   // row then offers clearing it instead of setting it.
   isHome: boolean
@@ -700,6 +740,7 @@ const LONG_PRESS_MS = 450
 function ProfileSquare({
   active,
   color,
+  glyph,
   isHome,
   label,
   onDelete,
@@ -815,7 +856,11 @@ function ProfileSquare({
                     }}
                     onPointerUp={clearPress}
                   >
-                    {label.replace(/[^a-z0-9]/gi, '').charAt(0) || '?'}
+                    {glyph ? (
+                      <Codicon name={glyph} size="0.75rem" />
+                    ) : (
+                      label.replace(/[^a-z0-9]/gi, '').charAt(0) || '?'
+                    )}
                   </button>
                 </TooltipTrigger>
               </ContextMenuTrigger>

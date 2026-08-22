@@ -2,6 +2,7 @@ import { atom } from 'nanostores'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { HermesConnection } from '@/global'
+import { resolveProfileGlyph } from '@/lib/profile-glyphs'
 import type { ProfileInfo } from '@/types/hermes'
 
 // Keep profile.ts's side-effecting imports inert: the gateway socket layer and
@@ -23,6 +24,7 @@ vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
 const {
   $activeGatewayProfile,
   $homeProfile,
+  $profileGlyphs,
   $profiles,
   designatedHomeProfile,
   ensureGatewayProfile,
@@ -31,6 +33,7 @@ const {
   refreshProfiles,
   resolveHomeProfile,
   setHomeProfile,
+  setProfileGlyph,
   switchToDefaultProfile
 } = await import('./profile')
 
@@ -341,5 +344,76 @@ describe('home profile preference (#89887)', () => {
     switchToDefaultProfile()
 
     expect(ensureGatewayForProfile).toHaveBeenCalledWith('default')
+  })
+})
+
+describe('profile glyph overrides (#79233)', () => {
+  const GLYPHS_KEY = 'hermes.desktop.profileGlyphs'
+
+  // Same self-contained localStorage as the home-preference tests above, so
+  // persistence is observable while the file-wide window stub is in force.
+  const stubStorageWindow = () => {
+    const store = new Map<string, string>()
+
+    vi.stubGlobal('window', {
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      hermesDesktop: { getConnection },
+      localStorage: {
+        getItem: (key: string) => store.get(key) ?? null,
+        setItem: (key: string, value: string) => void store.set(key, value),
+        removeItem: (key: string) => void store.delete(key)
+      }
+    })
+
+    return store
+  }
+
+  it('round-trips a pick through the atom and localStorage across a relaunch', async () => {
+    const store = stubStorageWindow()
+    setProfileGlyph('work', null) // start from a clean slate
+    setProfileGlyph('work', 'briefcase')
+
+    expect($profileGlyphs.get()).toEqual({ work: 'briefcase' })
+    expect(JSON.parse(store.get(GLYPHS_KEY) ?? '{}')).toEqual({ work: 'briefcase' })
+
+    // Relaunch: a fresh module registry seeds the atom from the same storage.
+    vi.resetModules()
+    const reloaded = await import('./profile')
+
+    expect(reloaded.$profileGlyphs.get()).toEqual({ work: 'briefcase' })
+  })
+
+  it('keys overrides by the canonical profile name', () => {
+    stubStorageWindow()
+    setProfileGlyph('work', null)
+    setProfileGlyph(' work ', 'beaker')
+
+    expect($profileGlyphs.get()).toEqual({ work: 'beaker' })
+  })
+
+  it('clearing removes the override so built-in marks return', () => {
+    const store = stubStorageWindow()
+    setProfileGlyph('work', 'briefcase')
+    setProfileGlyph('work', null)
+
+    // Records persist their empty shape ('{}'), unlike scalar preferences
+    // which drop their key — the atom is the authority either way.
+    expect($profileGlyphs.get()).toEqual({})
+    expect(JSON.parse(store.get(GLYPHS_KEY) ?? '"absent"')).toEqual({})
+  })
+
+  it('an override for a deleted profile is inert — lookups fall back per profile', () => {
+    // The store never rewrites other keys on delete (same contract as colors):
+    // a stale entry simply stops being looked up once the profile is gone.
+    const store = stubStorageWindow()
+    setProfileGlyph('ghost-profile', 'rocket')
+    setProfileGlyph('live', 'beaker')
+
+    // A profile absent from $profiles has no consumer, so its entry is never
+    // resolved; the live profile's pick still resolves through the same map.
+    expect(resolveProfileGlyph('live', $profileGlyphs.get())).toBe('beaker')
+    expect(resolveProfileGlyph('other-live', $profileGlyphs.get())).toBeNull()
+    expect(store.has(GLYPHS_KEY)).toBe(true)
   })
 })
