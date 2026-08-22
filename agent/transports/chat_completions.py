@@ -68,9 +68,10 @@ def _parse_leaked_tool_calls(content: Any) -> list["ToolCall"] | None:
     ``tool_calls`` for some local models (hermes-agent#5867): the model
     still decides to call a tool and formats the call correctly, but the
     endpoint returns it as plain text — one or more concatenated JSON
-    objects shaped ``{"name": ..., "arguments": {...}}``, whitespace
-    separated, with no enclosing array, ``arguments`` omitted for zero-arg
-    calls. Reproduced live against qwen2.5-coder:7b.
+    objects shaped ``{"name": ..., "arguments": {...}}`` (optionally with a
+    literal ``"type": "function"`` key, mirroring the real tool-call object
+    shape), whitespace separated, with no enclosing array, ``arguments``
+    omitted for zero-arg calls. Reproduced live against qwen2.5-coder:7b.
 
     Deliberately strict: the *entire* stripped content must decode as a
     sequence of such objects with nothing else around them, so this never
@@ -119,7 +120,13 @@ def _parse_leaked_tool_calls(content: Any) -> list["ToolCall"] | None:
         arguments = obj.get("arguments", {})
         if not isinstance(arguments, dict):
             return _recover_calls_before_trailing_narrative(calls, text, ws_start, idx)
-        if set(obj.keys()) - {"name", "arguments"}:
+        extra_keys = set(obj.keys()) - {"name", "arguments"}
+        if extra_keys and not (extra_keys == {"type"} and obj.get("type") == "function"):
+            # Exact match on {name, arguments} or {name, arguments, type:
+            # "function"} — the latter is the literal shape of a real
+            # OpenAI tool-call object, a common leak variant. Anything else
+            # still falls through to narrative recovery / rejection so the
+            # false-positive guarantee is unchanged.
             return _recover_calls_before_trailing_narrative(calls, text, ws_start, idx)
         calls.append(
             ToolCall(

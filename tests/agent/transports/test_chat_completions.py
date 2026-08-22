@@ -7,6 +7,7 @@ import httpx
 import pytest
 from openai import OpenAI
 
+from agent.chat_completion_helpers import build_assistant_message
 from agent.transports import get_transport
 from agent.transports.types import NormalizedResponse
 
@@ -631,6 +632,97 @@ class TestChatCompletionsNormalize:
         assert len(nr.tool_calls) == 1
         assert nr.tool_calls[0].name == "delegate_task"
         assert nr.content is None
+
+    def test_tool_call_leaked_with_literal_type_function_key_is_recovered(self, transport):
+        """A leaked call carrying a literal ``"type": "function"`` key (the
+        shape of a real OpenAI tool-call object) is still recovered — the
+        exact-match rule allows {name, arguments, type: "function"} in
+        addition to the bare {name, arguments} shape."""
+        r = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content='{"name": "todo_list", "arguments": {}, "type": "function"}',
+                    tool_calls=None,
+                    reasoning_content=None,
+                ),
+                finish_reason="stop",
+            )],
+            usage=None,
+        )
+        nr = transport.normalize_response(r)
+        assert nr.tool_calls is not None
+        assert len(nr.tool_calls) == 1
+        assert nr.tool_calls[0].name == "todo_list"
+
+    def test_tool_call_leaked_with_other_extra_key_is_not_recovered(self, transport):
+        """Guard: an extra key other than the allowed ``type: "function"``
+        still falls through to rejection/narrative-recovery, preserving the
+        false-positive guarantee."""
+        r = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content='{"name": "todo_list", "arguments": {}, "id": "call_1"}',
+                    tool_calls=None,
+                    reasoning_content=None,
+                ),
+                finish_reason="stop",
+            )],
+            usage=None,
+        )
+        nr = transport.normalize_response(r)
+        assert nr.tool_calls is None
+
+    def test_recovered_leaked_call_gets_stable_id_via_deterministic_fallback(self, transport):
+        """A recovered leaked call has ``id=None`` (no wire id to recover —
+        see ToolCall docstring). Pin that ``build_assistant_message()``
+        (the single consumer that stores/replays assistant tool_calls)
+        still lands a stable, non-empty id via its existing
+        ``_deterministic_call_id`` fallback, so the follow-up tool-result
+        message can pair to it by id (PR #87900 review comment)."""
+        r = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content='{"name": "todo_list", "arguments": {}}',
+                    tool_calls=None,
+                    reasoning_content=None,
+                ),
+                finish_reason="stop",
+            )],
+            usage=None,
+        )
+        normalized = transport.normalize_response(r)
+        assert normalized.tool_calls[0].id is None  # sanity: recovery leaves id unset
+
+        class _FakeAgent:
+            stream_delta_callback = None
+            _stream_callback = None
+            reasoning_callback = None
+            verbose_logging = False
+
+            def _extract_reasoning(self, _msg):
+                return None
+
+            def _strip_think_blocks(self, text):
+                return text
+
+            def _needs_thinking_reasoning_pad(self):
+                return False
+
+            def _split_responses_tool_id(self, _raw):
+                return (None, None)
+
+            def _derive_responses_function_call_id(self, _call_id, _resp_id):
+                return None
+
+            def _deterministic_call_id(self, name, args, idx):
+                return f"det_{name}_{idx}"
+
+        msg = build_assistant_message(_FakeAgent(), normalized, "tool_calls")
+
+        assert len(msg["tool_calls"]) == 1
+        echoed_id = msg["tool_calls"][0]["id"]
+        assert echoed_id  # non-empty — a follow-up tool result can pair to it
+        assert echoed_id == "det_todo_list_0"
 
     def test_leading_json_followed_by_same_paragraph_prose_is_not_recovered(self, transport):
         """Guard against false positives: JSON immediately followed by more
