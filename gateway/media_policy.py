@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 _STRICT_ENV = "HERMES_MEDIA_DELIVERY_STRICT"
 _ALLOW_DIRS_ENV = "HERMES_MEDIA_ALLOW_DIRS"
 _TRUST_RECENT_ENV = "HERMES_MEDIA_TRUST_RECENT_FILES"
+_EXTRA_EXTENSIONS_ENV = "HERMES_EXTRA_MEDIA_EXTENSIONS"
 
 
 def _load_gateway_cfg(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -84,5 +85,21 @@ def apply_media_policy_env(config: Optional[Dict[str, Any]] = None) -> None:
         trust_recent = gateway_cfg.get("trust_recent_files")
         if trust_recent is not None and not os.environ.get(_TRUST_RECENT_ENV):
             os.environ[_TRUST_RECENT_ENV] = "1" if trust_recent else "0"
+
+        media_cfg = gateway_cfg.get("media")
+        extra_exts = None
+        if isinstance(media_cfg, dict):
+            extra_exts = media_cfg.get("extra_extensions")
+        if not extra_exts:
+            extra_exts = gateway_cfg.get("extra_media_delivery_exts")
+        if extra_exts and not os.environ.get(_EXTRA_EXTENSIONS_ENV):
+            if isinstance(extra_exts, str):
+                extra_exts_str = extra_exts
+            elif isinstance(extra_exts, (list, tuple, set)):
+                extra_exts_str = ",".join(str(p) for p in extra_exts if p)
+            else:
+                extra_exts_str = ""
+            if extra_exts_str:
+                os.environ[_EXTRA_EXTENSIONS_ENV] = extra_exts_str
     except Exception:  # noqa: BLE001 - policy bridge must never break delivery
         logger.debug("apply_media_policy_env failed", exc_info=True)
