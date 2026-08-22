@@ -1853,6 +1853,13 @@ def _bump_schema_cookie(conn: sqlite3.Connection) -> None:
 
 _MAX_PERSISTENT_REPAIR_ATTEMPTS = 3
 _MAX_MALFORMED_BACKUPS = 3
+# Safety valve for SessionDB.get_delegation_tree_usage: caps how many
+# sessions one lineage-tree walk will visit so a pathological/corrupted
+# tree can't turn one read into an unbounded scan. Real observed fan-out
+# is ~10 direct children; this leaves generous headroom for legitimate
+# nested delegation while still being far below where the read-conn-pool
+# walk would become noticeable.
+_MAX_DELEGATION_TREE_NODES = 2000
 
 
 def _repair_ledger_path(db_path: Path) -> Path:
@@ -11220,7 +11227,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         Returns summed counters plus the list of session ids visited, so
         callers can render "N sessions, $X total" instead of one row.
+
+        Uses ``_read_ctx()`` (bounded read-only connection pool), NOT
+        ``self._lock`` / ``self._conn`` — that lock guards the single
+        shared writer connection and is documented at ``_read_ctx`` as
+        "a global choke point" because the gateway shares one SessionDB
+        across every agent. An unbounded multi-query walk holding that
+        lock would serialize every other session in the whole gateway
+        behind this one traversal for its entire duration.
+
+        Calls ``flush_token_counts()`` first: token deltas are applied by
+        an async background writer, so an in-flight session's row can
+        lag its queued counts — reading around the flush would silently
+        reintroduce the same undercount class this method exists to fix.
+
+        Traversal is capped at ``_MAX_DELEGATION_TREE_NODES`` sessions
+        (mirrors the 100-hop cap on the compression-chain walk above);
+        ``totals["truncated"]`` is True if the cap was hit, so callers
+        can tell a capped total from a complete one instead of silently
+        under-reporting again.
         """
+        self.flush_token_counts()
         root = self.get_conversation_root(session_id)
         totals: Dict[str, Any] = {
             "root_session_id": root,
@@ -11235,17 +11262,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             "actual_cost_usd": 0.0,
             "tool_call_count": 0,
             "message_count": 0,
+            "truncated": False,
         }
-        queue = [root]
+        # Named "pending", not "queue": this function lives in a module that
+        # `import queue`s the stdlib module for the read-conn pool (see
+        # _checkout_read_conn's queue.Empty/queue.Full) — a local `queue`
+        # would shadow it for this whole method, a landmine for the next
+        # edit that needs the module here.
+        pending = deque([root])
         seen: set = set()
-        with self._lock:
-            while queue:
-                sid = queue.pop(0)
+        with self._read_ctx() as conn:
+            while pending:
+                if len(seen) >= _MAX_DELEGATION_TREE_NODES:
+                    totals["truncated"] = True
+                    break
+                sid = pending.popleft()
                 if not sid or sid in seen:
                     continue
                 seen.add(sid)
-                row = self._conn.execute(
-                    "SELECT * FROM sessions WHERE id = ?", (sid,)
+                row = conn.execute(
+                    "SELECT input_tokens, output_tokens, cache_read_tokens, "
+                    "cache_write_tokens, reasoning_tokens, tool_call_count, "
+                    "message_count, estimated_cost_usd, actual_cost_usd "
+                    "FROM sessions WHERE id = ?",
+                    (sid,),
                 ).fetchone()
                 if row is None:
                     continue
@@ -11260,13 +11300,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     totals[key] += session.get(key) or 0
                 for key in ("estimated_cost_usd", "actual_cost_usd"):
                     totals[key] += session.get(key) or 0.0
-                children = self._conn.execute(
+                children = conn.execute(
                     "SELECT id FROM sessions WHERE parent_session_id = ?", (sid,)
                 ).fetchall()
                 for child in children:
                     child_id = dict(child)["id"]
                     if child_id not in seen:
-                        queue.append(child_id)
+                        pending.append(child_id)
         return totals
 
     @staticmethod
