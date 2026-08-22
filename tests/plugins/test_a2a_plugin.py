@@ -410,6 +410,16 @@ class TestV1Task:
             {"text": reply, "mediaType": "text/plain"},
         ]
 
+    def test_completed_task_keeps_oversized_json_fence_as_text(self):
+        payload = json.dumps("x" * protocol._MAX_STRUCTURED_JSON_BYTES)
+        reply = f"```json\n{payload}\n```"
+
+        task = protocol.build_task("t-json", "c-json", protocol.STATE_COMPLETED, reply)
+
+        assert task["artifacts"][0]["parts"] == [
+            {"text": reply, "mediaType": "text/plain"},
+        ]
+
     def test_completed_task_shape(self):
         task = protocol.build_task("t1", "c1", protocol.STATE_COMPLETED, "the answer")
         assert task["status"]["state"] == "TASK_STATE_COMPLETED"

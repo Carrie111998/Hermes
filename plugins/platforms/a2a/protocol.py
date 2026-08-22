@@ -271,14 +271,18 @@ _JSON_FENCE_RE = re.compile(
     r"(?m:^[ ]{0,3}(?P=fence)\x60*[ \t]*\r?$)",
     re.IGNORECASE | re.DOTALL,
 )
+_MAX_STRUCTURED_JSON_BYTES = 1_048_576
 
 
 def _artifact_parts(agent_text: str) -> list[dict]:
     """Preserve reply text and expose valid fenced JSON as structured Parts."""
     parts = [text_part(agent_text)]
     for match in _JSON_FENCE_RE.finditer(agent_text):
+        payload = match.group("payload")
+        if len(payload.encode("utf-8")) > _MAX_STRUCTURED_JSON_BYTES:
+            continue
         try:
-            data = json.loads(match.group("payload"))
+            data = json.loads(payload)
         except (TypeError, ValueError):
             continue
         parts.append(data_part(data))
