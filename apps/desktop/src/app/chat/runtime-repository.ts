@@ -3,6 +3,7 @@ import type { ExportedMessageRepository, ThreadMessage } from '@assistant-ui/rea
 import { useMemo, useRef } from 'react'
 
 import type { ChatMessage } from '@/lib/chat-messages'
+import { withUniqueToolCallIds } from '@/lib/chat-messages/tool-parts'
 import { coalesceToolOnlyAssistants, createToolMergeCache, toRuntimeMessage } from '@/lib/chat-runtime'
 
 // The exact fallback status ExportedMessageRepository.fromBranchableArray uses.
@@ -34,7 +35,15 @@ export function useRuntimeMessageRepository(messages: ChatMessage[]): ExportedMe
     let visibleParentId: string | null = null
     let headId: string | null = null
 
-    for (const message of coalesceToolOnlyAssistants(messages, toolMergeCacheRef.current)) {
+    // Duplicate toolCallIds inside one message's parts crash @assistant-ui/tap's
+    // useResources ("Duplicate key toolCallId-… in useResources") and take the
+    // workspace pane down with it (#87857). The streaming path can emit the same
+    // tool call twice (optimistic append racing the authoritative event), and
+    // hydration's withUniqueToolCallIds pass does not reach live state. Rename
+    // later duplicates at this boundary, before conversion — same contract as
+    // the seenIds guard below: a repeated id is an upstream bug that must not
+    // become a renderer crash.
+    for (const message of withUniqueToolCallIds(coalesceToolOnlyAssistants(messages, toolMergeCacheRef.current))) {
       // A repeated id is a transcript bug upstream, but it must not reach the
       // repository: MessageRepository throws on the second link ("A message
       // with the same id already exists in the parent tree") and takes the

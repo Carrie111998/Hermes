@@ -79,4 +79,37 @@ describe('useRuntimeMessageRepository', () => {
 
     expect(windowedParents.get('a-1')).toBe(windowedParents.get('a-2'))
   })
+
+  it('renames a duplicated toolCallId instead of crashing useResources (#87857)', () => {
+    // The streaming path can append the same tool call twice (optimistic write
+    // racing the authoritative event). @assistant-ui/tap's useResources throws
+    // on duplicate resource keys, so the repository must never emit two parts
+    // of one message keyed by the same `toolCallId-<id>`.
+    const duplicated: ChatMessage = {
+      id: 'assistant-dup',
+      role: 'assistant',
+      parts: [
+        { type: 'text', text: 'running…' },
+        { type: 'tool-call', toolCallId: 'call_00_DUP', toolName: 'terminal', args: {}, argsText: '' },
+        { type: 'tool-call', toolCallId: 'call_00_DUP', toolName: 'terminal', args: { done: true }, argsText: '{"done":true}' }
+      ]
+    }
+
+    const { result } = renderHook(() => useRuntimeMessageRepository([text('user-1', 'user', 'go'), duplicated]))
+
+    const assistant = result.current.messages.find(item => item.message.id === 'assistant-dup')
+    expect(assistant).toBeDefined()
+
+    // Every content part now carries a distinct key derivation input.
+    const toolParts = (assistant!.message.content as readonly unknown[]).filter(
+      (part): part is { type: string; toolCallId?: string } =>
+        typeof part === 'object' && part !== null && (part as { type?: string }).type === 'tool-call'
+    )
+    expect(toolParts).toHaveLength(2)
+    const ids = new Set(toolParts.map(part => part.toolCallId))
+    expect(ids.size).toBe(2)
+
+    // And the runtime can link it end to end without throwing.
+    expect(feedToRepository(result.current).map(item => item.id)).toEqual(['user-1', 'assistant-dup'])
+  })
 })
