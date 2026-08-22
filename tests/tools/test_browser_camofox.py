@@ -3,6 +3,7 @@
 import json
 from unittest.mock import MagicMock, patch
 
+import requests
 
 from tools.browser_camofox import (
     camofox_back,
@@ -112,6 +113,27 @@ class TestCamofoxNavigate:
         result = json.loads(camofox_navigate("https://example.com", task_id="t_err"))
         assert result["success"] is False
         assert "Cannot connect" in result["error"]
+
+    @patch("tools.browser_camofox.requests.get")
+    @patch("tools.browser_camofox.requests.post")
+    def test_recovers_from_gone_tab_after_backend_restart(self, mock_post, mock_get, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        stale = _mock_response(status=410)
+        stale.raise_for_status.side_effect = requests.HTTPError(response=stale)
+        mock_post.side_effect = [
+            _mock_response(json_data={"tabId": "old-tab", "url": "https://example.com"}),
+            stale,
+            _mock_response(json_data={"tabId": "new-tab", "url": "https://iana.org"}),
+        ]
+        mock_get.return_value = _mock_response(json_data={"snapshot": "", "refsCount": 0})
+
+        first = json.loads(camofox_navigate("https://example.com", task_id="gone-tab"))
+        second = json.loads(camofox_navigate("https://iana.org", task_id="gone-tab"))
+
+        assert first["success"] is True
+        assert second["success"] is True
+        assert second["url"] == "https://iana.org"
+        assert mock_post.call_count == 3
 
 
 # ---------------------------------------------------------------------------
