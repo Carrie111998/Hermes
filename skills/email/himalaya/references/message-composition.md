@@ -234,8 +234,11 @@ These are equivalent to the flag-based variants above but with no `--body` set, 
 # File path as positional arg (v2 MessageArg resolves path-or-stdin-or-inline)
 himalaya message send < message.eml
 
-# Or pipe stdin to message compose (when no --body / --body-file given, stdin is used)
-cat message.eml | himalaya message compose --from you@example.com --send
+# The pre-written RFC 822 message stays on the `message send` path —
+# `message compose` treats stdin as the BODY and rebuilds headers, so
+# piping a complete message into it would discard From/To/Subject.
+# If you want to compose fresh, use the flag-based form above; if you
+# want to send a prepared RFC 822 message, use `message send`.
 ```
 
 `message send` routes through the account's SMTP (or JMAP submission) backend; envelope sender comes from the `From:` header and recipients from `To:`/`Cc:`/`Bcc:`. Add `--save <mailbox>` to also append a copy to a mailbox (the name is resolved through the account's `[mailbox.alias]` map).
@@ -263,8 +266,10 @@ himalaya message send --save drafts < message.eml
 
 ```bash
 # Install mml: cargo install mml
-mml compose > message.mml   # interactive (or scripted)
-himalaya message send < message.mml
+# Use mml's --output so the spawned editor keeps a TTY (stdout redirection
+# breaks editor-driven composition — upstream MML explicitly rejects it).
+mml compose --from me@example.org /tmp/draft.mml
+himalaya message send < /tmp/draft.mml
 ```
 
 This is the cleanest path for attachments, PGP signing, and inline images.
@@ -274,4 +279,4 @@ This is the cleanest path for attachments, PGP signing, and inline images.
 - v2 reads `--body` from the inline string, `--body-file` from a path, or stdin when neither is given. Pick whichever fits the script.
 - For Hermes integration, prefer `message compose --send` over editor-driven flows — they're deterministic and don't need `$EDITOR`.
 - The `message add` subcommand (`himalaya message add --mailbox drafts --flag draft < message.eml`) still works for scripting: it stages a pre-written message into a mailbox with a given flag without routing through SMTP.
-- Use `himalaya message export --full` to inspect the raw MIME structure of received emails.
+- Use `himalaya message read 42 --raw` to inspect the raw RFC 5322 bytes of a received email (there is no `message export` subcommand in v2; `message read --raw` is the equivalent).

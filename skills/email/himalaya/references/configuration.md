@@ -222,6 +222,7 @@ Generate the app-specific password at https://appleid.apple.com.
    `envelope search "from alice"`.
 6. **Plain `password = "secret"`** — there's no such field in v2. Use
    `.raw` or `.command`.
-7. **`--json` placement** — v2 made it a **global** flag. It must come
-   *before* the subcommand: `himalaya --json envelope list`. Putting it
-   after the subcommand silently parses as the wrong thing.
+7. **`--json` placement** — v2 made it a **global** flag. Both placements
+   work: `himalaya --json envelope list` (pre-subcommand, the documented
+   convention) and `himalaya envelope list --json` (post-subcommand,
+   accepted for ergonomics). Neither is silently mis-parsed.

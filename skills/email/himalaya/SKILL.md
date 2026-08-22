@@ -89,10 +89,10 @@ imap.server = "imaps://imap.gmail.com:993"
 imap.sasl.plain.username = "you@gmail.com"
 imap.sasl.plain.password.command = "pass show email/gmail-app"
 
-smtp.server = "smtp://smtp.gmail.com:587"
-smtp.starttls = true
+smtp.server = "smtps://smtp.gmail.com:465"
 smtp.sasl.plain.username = "you@gmail.com"
 smtp.sasl.plain.password.command = "pass show email/gmail-app"
+# STARTTLS alternative: smtp.server = "smtp://smtp.gmail.com:587" + smtp.starttls = true
 
 mailbox.alias.inbox = "INBOX"
 mailbox.alias.sent = "[Gmail]/Sent Mail"
@@ -165,7 +165,7 @@ mailbox.alias.sent = "Sent Messages"
 - **Reading, listing, searching, flagging, copying** — all work directly through the terminal tool.
 - **Composing / replying / forwarding** — use the `message compose` / `message reply` / `message forward` subcommands (flag-based) or chain `mml` for rich MIME / attachments / PGP. To send a pre-written RFC 822 message, use `message send < message.eml` (or pipe it: `message send < message.eml` — same stdin path). For `message compose`, pipe a body via stdin by omitting both `--body` and `--body-file` (stdin is the fallback).
 - **Pitfall — `message write` is an alias, not an editor opener.** In v2, `himalaya message write` is a `visible_alias` of `message compose` and behaves identically (flag-based, no `$EDITOR`). The pre-v1.x editor-driven flow no longer exists. Use `mml compose` if you want interactive composition.
-- For programmatic output (parsing in scripts), pass `--json` for structured envelopes / messages. It's a global flag (pass before the subcommand for consistency); v2 also recognizes it after the subcommand for ergonomics.
+- For programmatic output (parsing in scripts), pass `--json` for structured envelopes / messages. It's a global flag — both `himalaya --json envelope list` and `himalaya envelope list --json` work in v2. The pre-subcommand form is the documented convention; the post-subcommand form is accepted for ergonomics.
 - **Pitfall — search query DSL:** the query is a positional `Vec<String>` that captures trailing tokens until end-of-input. Always put the query **last** on the command line. Quote-protect patterns containing `$`, shell metacharacters, or spaces.
 - **Pitfall — Gmail mailbox names:** `[Gmail]/Sent Mail` etc. contain `[`, `]`, and a space. Always quote in the shell.
 - **Pitfall — multiple accounts:** pass `-a <name>` or `--account <name>`. The account flagged `default = true` is used when omitted.
@@ -203,7 +203,7 @@ himalaya envelope list --has-attachment    # populate ATT column
 himalaya envelope search "from alice"
 himalaya envelope search "from alice and after 2026-01-01 order by date desc"
 himalaya envelope search "subject meeting or body invoice"
-himalaya envelope search --page-size=20 "from usvisascheduling"   # NOTE: --page-size=20 (equals form!)
+himalaya envelope search --page-size 20 "from usvisascheduling"
 ```
 
 ⚠️ **Quote-protect the query** — patterns with `$` (e.g. `"body $500"`) need single quotes so the shell doesn't expand `$5`.
@@ -332,7 +332,8 @@ For accounts configured with multiple backends (e.g. IMAP+JMAP), force one with 
 `--json` is a global flag that emits parsed JSON for any command:
 
 ```bash
-himalaya --json envelope list --page-size=5
+himalaya --json envelope list --page-size 5
+himalaya envelope list --json --page-size 5        # equivalent; --json works after subcommand too
 himalaya --json message read 42 | jq '.subject'
 himalaya --json mailbox list
 ```
