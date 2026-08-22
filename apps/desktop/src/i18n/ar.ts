@@ -1525,6 +1525,43 @@ export const ar = defineLocale({
     open: 'فتح'
   },
 
+  remoteAttach: {
+    title: 'الجلسات البعيدة',
+    subtitle: 'أرفق بجلسات تعمل على نسخة Hermes أخرى.',
+    close: 'إغلاق الجلسات البعيدة',
+    connectTitle: 'الاتصال بـ Hermes عن بُعد',
+    connectDescription: 'أدخل المضيف ورمز الإقران المكوّن من ستة أحرف الذي تعرضه النسخة البعيدة.',
+    hostLabel: 'المضيف',
+    hostPlaceholder: 'remote-host.local',
+    portLabel: 'المنفذ',
+    codeLabel: 'رمز الإقران',
+    codePlaceholder: 'ABC123',
+    codeHint: 'تتكوّن رموز الإقران من ستة أحرف أو أرقام ويمكن استخدامها مرة واحدة فقط.',
+    pairedUntil: date => `مقرون حتى ${date}`,
+    disconnect: 'قطع الاتصال',
+    refreshing: 'جارٍ تحديث الجلسات',
+    reconnecting: 'جارٍ إعادة الاتصال…',
+    sessions: 'الجلسات',
+    noSessions: 'لا توجد جلسات بعيدة متاحة.',
+    untitled: '(بدون عنوان)',
+    active: 'نشطة',
+    idle: 'خاملة',
+    attach: 'إرفاق',
+    detach: 'فك الإرفاق',
+    attachTo: title => `الإرفاق بـ ${title}`,
+    detachFrom: title => `فك الإرفاق من ${title}`,
+    eventLogLabel: 'سجل أحداث الجلسة البعيدة',
+    noEvents: 'في انتظار أحداث الجلسة البعيدة…',
+    message: 'رسالة',
+    emptyMessage: '(رسالة فارغة)',
+    statusChanged: status => `تغيّرت الحالة إلى ${status}`,
+    unknown: 'غير معروف',
+    unknownTool: 'أداة غير معروفة',
+    messageAria: 'أرسل رسالة إلى الجلسة البعيدة',
+    messagePlaceholder: 'أرسل رسالة إلى هذه الجلسة…',
+    sending: 'جارٍ الإرسال'
+  },
+
   artifactPreview: {
     versionOf: (current, total) => `الإصدار ${current} من ${total}`,
     olderVersion: 'إصدار أقدم',
@@ -1546,7 +1583,8 @@ export const ar = defineLocale({
       chat: 'المحادثة',
       settings: 'الإعدادات',
       cron: 'المهام المجدولة',
-      agents: 'الوكلاء'
+      agents: 'الوكلاء',
+      remote: 'الجلسات البعيدة'
     },
     searchAria: 'البحث في الجلسات',
     searchPlaceholder: 'البحث في الجلسات...',

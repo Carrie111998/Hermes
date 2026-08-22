@@ -89,6 +89,28 @@ Notes:
   24h token; five consecutive failures invalidate the code.
 - **Scoped tokens**: attach tokens carry `scope: "remote"` and expire after
   24h; expired tokens are pruned and rejected.
+- **Transport (TLS)**: the attach channel is plain **HTTP** (SSE over the
+  loopback listener, default port `8642`) unless you configure the host with a
+  TLS-terminating reverse-proxy and point the client at an `https://` URL.
+  **Never expose the host's API port to the public internet over plain HTTP**
+  — a bearer token sent in clear text over public transport lets anyone who
+  sniffs the link replay it. Mount the channel over the private network
+  (Tailscale, WireGuard, LAN) or a TLS proxy. In practice the designed
+  threat model is: private network transport + short-lived scoped token.
+- **Token at rest (CLI)**: the CLI saves the attach token in `config.yaml`
+  under `remote.connections.<name>` (see above). If the client machine is
+  multi-user or untrusted, protect `config.yaml` so other local users can't
+  read the token.
+- **Token at rest (Desktop)**: the Desktop client persists the connection
+  (host/port/token/expiry) in Electron's `localStorage`
+  (`hermes.desktop.remote-attach`). `localStorage` is **not** encrypted,
+  so a local XSS or same-machine malware that reads the renderer's storage
+  could recover the token until it expires. Mitigations that bound this:
+  the token is scoped to `/api/remote/*` only (it cannot touch any other API
+  surface), it expires after 24h, and a 401 clears it immediately. For
+  higher-assurance environments, prefer the CLI (config file with `chmod`)
+  or back the Desktop connection with OS-keychain storage when your runtime
+  exposes a `secureTokenStorage` bridge (`safeStorage`).
 - **No new surface**: reuses the existing API server (loopback listener by
   default), the existing session store, and the existing redaction utilities.
 - **No new env vars**: configuration stays in `config.yaml` / platform config.
