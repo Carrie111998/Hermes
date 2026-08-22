@@ -44,6 +44,25 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_DB",
 )
 
+# Subset of KANBAN_ENV_KEYS that identifies a run to the dispatcher/CLI —
+# i.e. the vars that let a process register/claim/mutate a task by inherited
+# identity alone (``_default_task_id`` env fallback, ``_worker_run_id``,
+# ``_check_kanban_mode``'s "am I a worker" probe, ``kanban_db_path``'s board
+# resolution). Deliberately EXCLUDES ``HERMES_KANBAN_WORKSPACE`` /
+# ``HERMES_KANBAN_WORKSPACES_ROOT``: those are directory-reference
+# conveniences, not identity — the kanban worker protocol instructs every
+# worker to run ``cd $HERMES_KANBAN_WORKSPACE`` in its own terminal calls, so
+# stripping it from terminal-spawned subprocesses would break that on-record
+# convention for zero security benefit (a bare path is not an identity that
+# lets a subprocess register/mutate a task).
+KANBAN_IDENTITY_ENV_KEYS: tuple[str, ...] = (
+    "HERMES_KANBAN_TASK",
+    "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_CLAIM_LOCK",
+    "HERMES_KANBAN_BOARD",
+    "HERMES_KANBAN_DB",
+)
+
 
 @contextmanager
 def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
@@ -136,6 +155,34 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
     for key in KANBAN_ENV_KEYS:
         cleaned.pop(key, None)
     cleaned[DELEGATED_CHILD_ENV_MARKER] = "1"
+    return cleaned
+
+
+def scrub_kanban_identity_env(
+    env: Mapping[str, str] | MutableMapping[str, str],
+) -> dict[str, str]:
+    """Strip only the run-identity subset of Kanban env vars (see
+    :data:`KANBAN_IDENTITY_ENV_KEYS`).
+
+    Used for the **terminal tool** spawn surface: unlike
+    :func:`scrub_kanban_env` (the full ``delegate_task`` child scrub, which
+    also removes workspace path vars and stamps the delegated-child marker),
+    this is applied unconditionally to every subprocess a kanban worker's own
+    ``terminal``/background exec spawns — not just ``delegate_task``
+    children. It does NOT set ``DELEGATED_CHILD_ENV_MARKER``: a worker
+    shelling out to another ``hermes`` CLI invocation is not a delegated
+    child, it is an ordinary subprocess of a normal terminal command that
+    must simply not be mistaken for a new dispatcher-spawned worker run.
+
+    Root cause fixed: a worker's own subprocess call (e.g. ``hermes chat -t
+    <tool> -q ...`` to probe a tool outside its profile) previously inherited
+    ``HERMES_KANBAN_TASK``/``RUN_ID``/``BOARD`` from the parent shell env and
+    self-registered as a new run against the SAME task id, tripping
+    block-loop detection with spurious block/comment noise (see t_30fe3850).
+    """
+    cleaned = dict(env)
+    for key in KANBAN_IDENTITY_ENV_KEYS:
+        cleaned.pop(key, None)
     return cleaned
 
 

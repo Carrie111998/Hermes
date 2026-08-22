@@ -531,15 +531,42 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
 
 
 def _scrub_delegated_child_kanban_env(env: dict[str, str]) -> dict[str, str]:
-    """Strip dispatcher-owned Kanban env from delegate_task child subprocesses."""
+    """Strip dispatcher-owned Kanban identity env from every spawned subprocess.
+
+    Two tiers, both applied unconditionally on this call (every caller —
+    ``_sanitize_subprocess_env``, ``_build_subprocess_env``, ``_make_run_env``
+    — routes through here):
+
+    * ``delegate_task`` children (``is_delegated_child_process_context()``):
+      full scrub via ``scrub_kanban_env`` — also strips
+      ``HERMES_KANBAN_WORKSPACE(_ROOT)`` and stamps the delegated-child
+      lineage marker so the fork boundary is detectable downstream.
+    * Every other subprocess this process spawns (an ordinary ``terminal``
+      tool call, background/PTY exec, or a non-terminal CLI/browser/ACP
+      spawn): strip only the run-identity subset
+      (``KANBAN_IDENTITY_ENV_KEYS`` — TASK/RUN_ID/CLAIM_LOCK/BOARD/DB),
+      unconditionally, regardless of delegated-child context.
+
+    The identity strip closes the bug where a kanban worker's own subprocess
+    call (e.g. probing a tool via ``hermes chat -t <tool> -q ...``) inherited
+    ``HERMES_KANBAN_TASK``/``RUN_ID``/``BOARD`` from the parent shell env and
+    self-registered as a NEW run against the SAME task id — see t_30fe3850.
+    ``HERMES_KANBAN_WORKSPACE`` is deliberately left alone on this path: the
+    worker protocol tells every worker to ``cd $HERMES_KANBAN_WORKSPACE`` in
+    its own terminal calls, and a bare directory path carries no run
+    identity, so stripping it would break that convention for no security
+    benefit.
+    """
     try:
         from agent.delegation_context import (
             is_delegated_child_process_context,
             scrub_kanban_env,
+            scrub_kanban_identity_env,
         )
 
         if is_delegated_child_process_context():
             return scrub_kanban_env(env)
+        return scrub_kanban_identity_env(env)
     except Exception:
         pass
     return env
