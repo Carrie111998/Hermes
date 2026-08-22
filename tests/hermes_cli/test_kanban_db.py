@@ -1239,6 +1239,64 @@ def _make_task(**overrides) -> "kb.Task":
 # ---------------------------------------------------------------------------
 
 
+def test_worktree_create_without_anchor_is_rejected_before_insert(kanban_home):
+    with kb.connect() as conn:
+        with pytest.raises(
+            ValueError, match="no workspace_path.*no default_workdir set"
+        ):
+            kb.create_task(
+                conn,
+                title="unanchored",
+                workspace_kind="worktree",
+            )
+
+        count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        assert count == 0
+
+
+def test_worktree_create_inherits_valid_board_default(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.write_board_metadata("default", default_workdir=str(repo))
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="anchored by board",
+            workspace_kind="worktree",
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    assert task.workspace_path == str(repo)
+
+
+@pytest.mark.parametrize(
+    ("default_workdir", "message"),
+    [
+        ("relative/repo", "is not absolute"),
+        ("{non_repo}", "is not inside a git repo"),
+    ],
+)
+def test_worktree_create_rejects_invalid_board_default(
+    kanban_home, tmp_path, default_workdir, message
+):
+    non_repo = tmp_path / "not-a-repo"
+    non_repo.mkdir()
+    value = default_workdir.format(non_repo=non_repo)
+    kb.write_board_metadata("default", default_workdir=value)
+
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match=message):
+            kb.create_task(
+                conn,
+                title="bad board anchor",
+                workspace_kind="worktree",
+            )
+        count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        assert count == 0
+
+
 
 
 # ---------------------------------------------------------------------------
