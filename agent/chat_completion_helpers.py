@@ -1822,6 +1822,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
+def _take_ephemeral_output_cap(agent) -> int | None:
+    """Return and clear the one-shot output-cap override for the next request."""
+    ephemeral_cap = getattr(agent, "_ephemeral_max_output_tokens", None)
+    if ephemeral_cap is not None:
+        agent._ephemeral_max_output_tokens = None
+    return ephemeral_cap
+
+
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     if tools_for_api is None:
@@ -1832,9 +1840,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         anthropic_messages = agent._prepare_anthropic_messages_for_api(api_messages)
         ctx_len = getattr(agent, "context_compressor", None)
         ctx_len = ctx_len.context_length if ctx_len else None
-        ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
-        if ephemeral_out is not None:
-            agent._ephemeral_max_output_tokens = None  # consume immediately
+        ephemeral_out = _take_ephemeral_output_cap(agent)
         anthropic_kwargs = _transport.build_kwargs(
             model=agent.model,
             messages=anthropic_messages,
@@ -1865,14 +1871,12 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         # set (length continuation boost, truncated tool-call boost, output-cap
         # clamp). Without consuming it here, Converse traffic always requested
         # the static cap and every retry re-truncated identically.
-        _bedrock_ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
-        if _bedrock_ephemeral_out is not None:
-            agent._ephemeral_max_output_tokens = None  # consume immediately
+        ephemeral_cap = _take_ephemeral_output_cap(agent)
         return _bt.build_kwargs(
             model=agent.model,
             messages=api_messages,
             tools=tools_for_api,
-            max_tokens=_bedrock_ephemeral_out or agent.max_tokens or 4096,
+            max_tokens=ephemeral_cap if ephemeral_cap is not None else (agent.max_tokens or 4096),
             region=region,
             guardrail_config=guardrail,
         )
@@ -2037,9 +2041,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         _profile = None
 
     if _profile:
-        _ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
-        if _ephemeral_out is not None:
-            agent._ephemeral_max_output_tokens = None
+        _ephemeral_out = _take_ephemeral_output_cap(agent)
 
         # Strip image parts for non-vision models that have provider profiles
         # (e.g. DeepSeek, Kimi). The legacy path below already does this, but
@@ -2072,9 +2074,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     # ── Legacy flag path ────────────────────────────────────────────
     # Reached only when get_provider_profile() returns None — i.e. a
     # completely unknown provider not in providers/ registry.
-    _ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
-    if _ephemeral_out is not None:
-        agent._ephemeral_max_output_tokens = None
+    _ephemeral_out = _take_ephemeral_output_cap(agent)
 
     # Strip image parts for non-vision models (no-op when vision-capable).
     _msgs_for_chat = agent._prepare_messages_for_non_vision_model(api_messages)

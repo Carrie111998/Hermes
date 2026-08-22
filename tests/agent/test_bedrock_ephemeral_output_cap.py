@@ -72,6 +72,16 @@ def test_static_cap_used_when_no_override_present(bedrock_agent):
     assert transport.seen_max_tokens == 8192
 
 
+def test_ephemeral_cap_is_selected_by_presence_not_truthiness(bedrock_agent):
+    agent, transport = bedrock_agent
+    agent._ephemeral_max_output_tokens = 0
+
+    build_api_kwargs(agent, [{"role": "user", "content": "hi"}])
+
+    assert transport.seen_max_tokens == 0
+    assert agent._ephemeral_max_output_tokens is None
+
+
 def test_falls_back_to_default_when_nothing_configured(bedrock_agent):
     agent, transport = bedrock_agent
     agent._ephemeral_max_output_tokens = None
