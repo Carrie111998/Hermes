@@ -1147,7 +1147,8 @@ class WakeWordDetector:
         else:
             logger.warning(
                 "wake word: leaving the engine open -- the capture thread is "
-                "still running and would be processing frames against it."
+                "still running and would be processing frames against it. "
+                "A later stop() closes it, once that thread has exited."
             )
 
     def _halt_thread(self) -> bool:
