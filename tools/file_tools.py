@@ -841,8 +841,22 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     return None
 
 
+def _protected_instruction_approval_target(
+        filepath: str, task_id: str = "default") -> tuple[str, str]:
+    """Return the canonical identity and qualified display for an approved write."""
+    try:
+        requested = os.path.normpath(str(_resolve_path_for_task(filepath, task_id)))
+    except (OSError, ValueError, RuntimeError):
+        requested = os.path.abspath(os.path.normpath(_expand_tilde(filepath)))
+    canonical = os.path.realpath(requested)
+    display = requested
+    if os.path.normcase(requested) != os.path.normcase(canonical):
+        display = f"{requested} -> {canonical}"
+    return os.path.normcase(canonical), display
+
+
 def _request_protected_instruction_approval(
-        reasons: list[str], task_id: str = "default") -> str | None:
+        targets: list[str], task_id: str = "default") -> str | None:
     """Ask the human to approve a write to protected instruction file(s).
 
     Returns ``None`` when approved, or a BLOCKED error string. This gate
@@ -851,15 +865,15 @@ def _request_protected_instruction_approval(
     here is one-operation approval EVERY time, with no persistent scope
     and no yolo bypass. Fail-closed when no human channel exists.
     """
-    targets = ", ".join(dict.fromkeys(reasons))
+    target_list = ", ".join(targets)
     description = (
-        f"Write to protected agent-instruction file(s): {targets}. "
+        f"Write to protected agent-instruction file(s): {target_list}. "
         "These files steer future agent behavior; approval is always "
         "required (not bypassed by auto-approve)."
     )
-    display = f"<write to {targets}>"
+    display = f"<write to {target_list}>"
     blocked = (
-        f"BLOCKED: write to protected agent-instruction file(s) ({targets}) "
+        f"BLOCKED: write to protected agent-instruction file(s) ({target_list}) "
         "{why} The user has NOT consented to this write. Do NOT retry it or "
         "attempt the same edit via another path (terminal, execute_code, "
         "etc.)."
@@ -953,15 +967,16 @@ def _check_protected_instruction_write(paths: list[str],
     enabled, extra = _protected_instruction_config()
     if not enabled:
         return None
-    reasons: list[str] = []
+    targets: dict[str, str] = {}
     for p in paths:
         reason = _protected_instruction_reason(
             p, task_id, enabled=enabled, extra_patterns=extra)
         if reason:
-            reasons.append(reason)
-    if not reasons:
+            identity, display = _protected_instruction_approval_target(p, task_id)
+            targets.setdefault(identity, display)
+    if not targets:
         return None
-    return _request_protected_instruction_approval(reasons, task_id)
+    return _request_protected_instruction_approval(list(targets.values()), task_id)
 
 
 def _check_approval_required_write(paths: list[str],
