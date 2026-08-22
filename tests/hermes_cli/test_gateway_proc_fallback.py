@@ -146,6 +146,25 @@ class TestProcFallback:
             pids = gateway_mod._scan_gateway_pids(set(), all_profiles=True)
 
         mock_ps.assert_called_once()
+        assert mock_ps.call_args[0][0] == ["ps", "-axww", "-o", "pid=,command="]
+        assert 12345 in pids
+
+    def test_falls_back_to_standard_ps_when_axww_fails(self):
+        ps_output = f"12345 {_GATEWAY_CMD}\n99999 {_OTHER_CMD}\n"
+        failed_result = MagicMock(returncode=1, stdout="")
+        success_result = MagicMock(returncode=0, stdout=ps_output)
+
+        with (
+            patch("hermes_cli.gateway.is_windows", return_value=False),
+            patch("os.path.isdir", return_value=False),
+            patch("hermes_cli.gateway._get_ancestor_pids", return_value=set()),
+            patch("subprocess.run", side_effect=[failed_result, success_result]) as mock_ps,
+        ):
+            pids = gateway_mod._scan_gateway_pids(set(), all_profiles=True)
+
+        assert mock_ps.call_count == 2
+        assert mock_ps.call_args_list[0][0][0] == ["ps", "-axww", "-o", "pid=,command="]
+        assert mock_ps.call_args_list[1][0][0] == ["ps", "-A", "-o", "pid=,command="]
         assert 12345 in pids
 
     def test_proc_permission_error_skips_pid(self):

@@ -450,7 +450,7 @@ def _scan_gateway_pids(
                     current_cmd = ""
         else:
             # Try /proc first (works in Docker without procps installed),
-            # fall back to ps -A eww.
+            # fall back to BSD/POSIX-compatible ps (ps -axww / ps -A).
             _found_via_proc = False
             if os.path.isdir("/proc"):
                 try:
@@ -476,12 +476,23 @@ def _scan_gateway_pids(
                     pass
 
             if not _found_via_proc:
+                # `ps -A eww` fails on macOS / BSD ps because `eww` is an illegal
+                # flag combination when used with `-A` (NousResearch/hermes-agent#73626).
+                # `ps -axww -o pid=,command=` works universally across BSD (macOS),
+                # FreeBSD, and Linux procps while preserving un-truncated command lines (`ww`).
                 result = subprocess.run(
-                    ["ps", "-A", "eww", "-o", "pid=,command="],
+                    ["ps", "-axww", "-o", "pid=,command="],
                     capture_output=True,
                     text=True,
                     timeout=10,
                 )
+                if result.returncode != 0:
+                    result = subprocess.run(
+                        ["ps", "-A", "-o", "pid=,command="],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
                 if result.returncode != 0:
                     return []
                 for line in result.stdout.split("\n"):
