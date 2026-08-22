@@ -275,14 +275,57 @@ async def send_and_capture(adapter, text: str, platform: Platform, **event_kwarg
 
     Polls for the send rather than waiting a fixed delay: handler DB work now
     hops to worker threads (AsyncSessionDB), so completion latency varies.
+
+    ``handle_message`` returns as soon as it has spawned its background tasks,
+    so an exception raised in one of them belongs to that task and nothing
+    re-raises it. The caller then sees only ``send`` never being called, and
+    the assertion reads "Expected 'mock' to have been called once. Called 0
+    times." — the same message whether the handler decided not to reply, timed
+    out, or crashed. Every background exception raised inside this window is
+    captured and attached to the failure so the next occurrence names its own
+    cause.
     """
     event = make_event(platform, text, **event_kwargs)
     adapter.send.reset_mock()
-    await adapter.handle_message(event)
-    for _ in range(40):  # up to ~2s; returns as soon as the send lands
-        if adapter.send.called:
-            break
-        await asyncio.sleep(0.05)
+
+    loop = asyncio.get_running_loop()
+    before = asyncio.all_tasks(loop)
+    captured: list[BaseException] = []
+    previous_handler = loop.get_exception_handler()
+
+    def _capture(running_loop, context):
+        exc = context.get("exception")
+        if exc is not None:
+            captured.append(exc)
+        if previous_handler is not None:
+            previous_handler(running_loop, context)
+        else:
+            running_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_capture)
+    try:
+        await adapter.handle_message(event)
+        for _ in range(40):  # up to ~2s; returns as soon as the send lands
+            if adapter.send.called:
+                break
+            await asyncio.sleep(0.05)
+
+        if not adapter.send.called:
+            # Tasks that finished inside the window report their own
+            # exception; the loop handler only sees the ones nobody retrieved.
+            for task in asyncio.all_tasks(loop) - before:
+                if task.done() and not task.cancelled():
+                    exc = task.exception()
+                    if exc is not None and exc not in captured:
+                        captured.append(exc)
+            if captured:
+                raise AssertionError(
+                    "handler produced no send because a background task "
+                    f"raised {captured[0]!r}"
+                ) from captured[0]
+    finally:
+        loop.set_exception_handler(previous_handler)
+
     return adapter.send
 
 
