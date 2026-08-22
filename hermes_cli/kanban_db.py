@@ -3419,6 +3419,9 @@ def create_task(
     # task would point cleanup at the user's source tree (#28818). The
     # containment guard in ``_cleanup_workspace`` is the safety rail, but
     # we also stop the bad state from being created in the first place.
+    workspace_inherited_from_board = False
+    board_slug: Optional[str] = None
+    board_default: Optional[str] = None
     if (
         workspace_path is None
         and project_repo is None
@@ -3429,16 +3432,14 @@ def create_task(
         board_default = board_meta.get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+            workspace_inherited_from_board = True
 
     # A worktree task without an explicit path or a resolved Project depends
     # entirely on the board default. Validate that anchor now instead of
     # persisting a task that is guaranteed to fail (and be archived) when the
     # dispatcher eventually tries to materialize its worktree.
     if workspace_kind == "worktree" and project_repo is None:
-        board_slug = board if board else get_current_board()
-        board_default = (
-            read_board_metadata(board_slug).get("default_workdir") or ""
-        ).strip()
+        board_slug = board_slug or (board if board else get_current_board())
         if workspace_path is None:
             raise ValueError(
                 "workspace_kind=worktree has no workspace_path, no resolved "
@@ -3447,7 +3448,8 @@ def create_task(
                 "<slug>, or create the task with "
                 "--workspace worktree:<absolute-repo-path>."
             )
-        if board_default and workspace_path == board_default:
+        if workspace_inherited_from_board and board_default:
+            board_default = str(board_default).strip()
             anchor = Path(board_default).expanduser()
             if not anchor.is_absolute():
                 raise ValueError(
