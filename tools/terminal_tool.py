@@ -1491,10 +1491,10 @@ def _safe_getcwd() -> str:
 # cwd looks when it leaks toward a Linux container's ``-w`` flag.
 _HOST_CWD_PREFIXES = ("/Users/", "/home/", "C:\\", "C:/")
 
-_CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox"})
+_CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "sprites", "vercel_sandbox"})
 
 
-def _is_unusable_container_cwd(cwd: str) -> bool:
+def _is_unusable_container_cwd(cwd: str, env_type: str | None = None) -> bool:
     """Return True if *cwd* is a host/relative path that won't work as the
     working directory inside a container sandbox.
 
@@ -1504,6 +1504,13 @@ def _is_unusable_container_cwd(cwd: str) -> bool:
     ``docker run -w`` and makes the container fail to start (exit 125).
     """
     if not cwd:
+        return False
+    # Sprites run as the non-root ``sprite`` user. Its real in-sandbox home
+    # must not be mistaken for a leaked Linux host cwd merely because it lives
+    # under /home.
+    if env_type == "sprites" and (
+        cwd == "/home/sprite" or cwd.startswith("/home/sprite/")
+    ):
         return False
     if any(cwd.startswith(p) for p in _HOST_CWD_PREFIXES):
         return True
@@ -1577,7 +1584,7 @@ def _get_env_config() -> Dict[str, Any]:
     env_type = os.getenv("TERMINAL_ENV", "local")
     
     mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
-    container_backend = env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}
+    container_backend = env_type in {"docker", "singularity", "modal", "daytona", "sprites", "vercel_sandbox"}
     docker_backend = env_type == "docker"
 
     # Docker/container-only env vars may be bridged from config.yaml even when
@@ -1606,13 +1613,15 @@ def _get_env_config() -> Dict[str, Any]:
         docker_extra_args = []
         docker_shm_size = "1g"
 
-    # Default cwd: local uses the host's current directory, ssh uses the
-    # remote home, Vercel uses its documented workspace root, and everything
-    # else starts in the backend's default root-like cwd.
+    # Default cwd: local uses the host's current directory, SSH uses the
+    # remote home, and cloud runtimes with a documented non-root user use
+    # that runtime's home/workspace. Everything else starts at /root.
     if env_type == "local":
         default_cwd = _safe_getcwd()
     elif env_type == "ssh":
         default_cwd = "~"
+    elif env_type == "sprites":
+        default_cwd = "/home/sprite"
     elif env_type == "vercel_sandbox":
         default_cwd = _VERCEL_SANDBOX_DEFAULT_CWD
     else:
@@ -1638,7 +1647,7 @@ def _get_env_config() -> Dict[str, Any]:
             cwd = "/workspace"
     elif env_type in _CONTAINER_BACKENDS and cwd:
         # Host paths and relative paths that won't work inside containers
-        if _is_unusable_container_cwd(cwd) and cwd != default_cwd:
+        if _is_unusable_container_cwd(cwd, env_type) and cwd != default_cwd:
             logger.info("Ignoring TERMINAL_CWD=%r for %s backend "
                         "(host/relative path won't work in sandbox). Using %r instead.",
                         cwd, env_type, default_cwd)
@@ -1672,7 +1681,7 @@ def _get_env_config() -> Dict[str, Any]:
         ).lower() in {"true", "1", "yes"},
         "local_persistent": os.getenv("TERMINAL_LOCAL_PERSISTENT", "false").lower() in {"true", "1", "yes"},
         # Container resource config (applies to docker, singularity, modal,
-        # daytona, and vercel_sandbox -- ignored for local/ssh)
+        # daytona, sprites, and vercel_sandbox -- ignored for local/ssh)
         "container_cpu": container_cpu,
         "container_memory": container_memory,     # MB (default 5GB)
         "container_disk": container_disk,        # MB (default 50GB)
@@ -1763,7 +1772,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     
     Args:
         env_type: One of "local", "docker", "singularity", "modal",
-            "daytona", "vercel_sandbox", "ssh"
+            "daytona", "sprites", "vercel_sandbox", "ssh"
         image: Docker/Singularity/Modal image name (ignored for local/ssh/vercel)
         cwd: Working directory
         timeout: Default command timeout
@@ -1911,6 +1920,14 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             persistent_filesystem=persistent, task_id=task_id,
         )
 
+    elif env_type == "sprites":
+        from tools.environments.sprites import SpritesEnvironment as _SpritesEnvironment
+        return _SpritesEnvironment(
+            cwd=cwd, timeout=timeout,
+            cpu=cpu, memory=memory, disk=disk,
+            persistent_filesystem=persistent, task_id=task_id,
+        )
+
     elif env_type == "vercel_sandbox":
         from tools.environments.vercel_sandbox import (
             VercelSandboxEnvironment as _VercelSandboxEnvironment,
@@ -1941,7 +1958,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     else:
         raise ValueError(
             f"Unknown environment type: {env_type}. Use 'local', 'docker', "
-            f"'singularity', 'modal', 'daytona', 'vercel_sandbox', or 'ssh'"
+            f"'singularity', 'modal', 'daytona', 'sprites', 'vercel_sandbox', or 'ssh'"
         )
 
 
@@ -2590,7 +2607,7 @@ def _resolve_command_cwd(
     if (
         recorded
         and env_type in _CONTAINER_BACKENDS
-        and _is_unusable_container_cwd(recorded)
+        and _is_unusable_container_cwd(recorded, env_type)
     ):
         logger.info(
             "Ignoring recorded session cwd %r for %s backend "
@@ -2705,7 +2722,7 @@ def terminal_tool(
         # Valid in-container override paths (RL/benchmark sandboxes that set
         # cwd to /workspace, /root, etc.) are absolute non-host paths and pass
         # through untouched.
-        if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
+        if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd, env_type):
             remapped = "/workspace" if host_cwd else config["cwd"]
             if cwd != remapped:
                 logger.info(
@@ -3789,6 +3806,18 @@ def check_terminal_requirements() -> bool:
 
             return True
 
+        elif env_type == "sprites":
+            from agent.secret_scope import get_secret
+
+            if not get_secret("SPRITE_TOKEN"):
+                logger.error(
+                    "Sprites backend selected but SPRITE_TOKEN is not configured. "
+                    "Run `hermes setup terminal` or store it in ~/.hermes/.env."
+                )
+                return False
+            # sprites-py is deliberately lazy-installed by environment creation.
+            return True
+
         elif env_type == "vercel_sandbox":
             return _check_vercel_sandbox_requirements(config)
 
@@ -3800,7 +3829,7 @@ def check_terminal_requirements() -> bool:
         else:
             logger.error(
                 "Unknown TERMINAL_ENV '%s'. Use one of: local, docker, singularity, "
-                "modal, daytona, vercel_sandbox, ssh.",
+                "modal, daytona, sprites, vercel_sandbox, ssh.",
                 env_type,
             )
             return False
@@ -3843,7 +3872,7 @@ if __name__ == "__main__":
     print(
         "  TERMINAL_ENV: "
         f"{os.getenv('TERMINAL_ENV', 'local')} "
-        "(local/docker/singularity/modal/daytona/vercel_sandbox/ssh)"
+        "(local/docker/singularity/modal/daytona/sprites/vercel_sandbox/ssh)"
     )
     print(f"  TERMINAL_DOCKER_IMAGE: {os.getenv('TERMINAL_DOCKER_IMAGE', default_img)}")
     print(f"  TERMINAL_SINGULARITY_IMAGE: {os.getenv('TERMINAL_SINGULARITY_IMAGE', f'docker://{default_img}')}")

@@ -33,8 +33,23 @@ class TestIsUnusableContainerCwd:
 
     def test_container_backends_set(self):
         assert tt._CONTAINER_BACKENDS == frozenset(
-            {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}
+            {"docker", "singularity", "modal", "daytona", "sprites", "vercel_sandbox"}
         )
+
+    def test_sprites_uses_actual_remote_home_by_default(self, monkeypatch):
+        monkeypatch.setenv("TERMINAL_ENV", "sprites")
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+        monkeypatch.setattr(tt, "_ensure_terminal_env_bridged", lambda: None)
+
+        assert tt._get_env_config()["cwd"] == "/home/sprite"
+
+    def test_sprites_home_subdirectory_is_valid_remote_cwd(self):
+        assert tt._is_unusable_container_cwd(
+            "/home/sprite/project", "sprites"
+        ) is False
+        assert tt._is_unusable_container_cwd(
+            "/home/host-user/project", "sprites"
+        ) is True
 
 
 class TestOverrideCwdSanitizedAtCallSite:

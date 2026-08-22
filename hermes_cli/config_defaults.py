@@ -448,7 +448,7 @@ DEFAULT_CONFIG = {
         # Vercel Sandbox runtime (vercel_sandbox backend only).
         # Supported: node24, node22, python3.13.
         "vercel_runtime": "node24",
-        # Container resource limits (docker, singularity, modal, daytona, vercel_sandbox — ignored for local/ssh)
+        # Container resource limits (docker, singularity, modal, daytona, sprites, vercel_sandbox — ignored for local/ssh)
         "container_cpu": 1,
         "container_memory": 5120,       # MB (default 5GB)
         "container_disk": 51200,        # MB (default 50GB)

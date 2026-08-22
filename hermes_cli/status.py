@@ -44,6 +44,19 @@ def redact_key(key: str) -> str:
     return mask_secret(key, empty=color("(not set)", Colors.DIM))
 
 
+def _sprites_status_lines() -> list[str]:
+    """Return non-secret status details for the Fly Sprites backend."""
+    token = bool((os.getenv("SPRITE_TOKEN") or "").strip())
+    api_url = (os.getenv("SPRITES_API_URL") or "").strip() or "https://api.sprites.dev"
+    sdk_ok = importlib.util.find_spec("sprites") is not None
+    sdk_label = "installed" if sdk_ok else "missing (install: pip install 'hermes-agent[sprites]')"
+    return [
+        f"  Token:        {'configured' if token else 'not configured'}",
+        f"  API URL:      {api_url}",
+        f"  SDK:          {sdk_label}",
+    ]
+
+
 def _format_iso_timestamp(value) -> str:
     """Format ISO timestamps for status output, converting to local timezone."""
     if not value or not isinstance(value, str):
@@ -461,6 +474,9 @@ def show_status(args):
     elif terminal_env == "daytona":
         daytona_image = os.getenv("TERMINAL_DAYTONA_IMAGE", "nikolaik/python-nodejs:python3.11-nodejs20")
         print(f"  Daytona Image: {daytona_image}")
+    elif terminal_env == "sprites":
+        for line in _sprites_status_lines():
+            print(line)
     elif terminal_env == "vercel_sandbox":
         runtime = os.getenv("TERMINAL_VERCEL_RUNTIME") or terminal_cfg.get("vercel_runtime") or "node24"
         persist = os.getenv("TERMINAL_CONTAINER_PERSISTENT")

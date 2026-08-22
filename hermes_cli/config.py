@@ -4710,6 +4710,9 @@ def show_config():
         print(f"  Daytona image: {terminal.get('daytona_image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
         daytona_key = get_env_value('DAYTONA_API_KEY')
         print(f"  API key:      {'configured' if daytona_key else '(not set)'}")
+    elif terminal.get('backend') == 'sprites':
+        print(f"  Sprite token: {'configured' if get_env_value('SPRITE_TOKEN') else '(not set)'}")
+        print(f"  API URL:      {get_env_value('SPRITES_API_URL') or 'https://api.sprites.dev'}")
     elif terminal.get('backend') == 'vercel_sandbox':
         print(f"  Vercel runtime: {terminal.get('vercel_runtime', 'node24')}")
         print(f"  Vercel auth:    {'configured' if get_env_value('VERCEL_OIDC_TOKEN') or (get_env_value('VERCEL_TOKEN') and get_env_value('VERCEL_PROJECT_ID') and get_env_value('VERCEL_TEAM_ID')) else '(not set)'}")

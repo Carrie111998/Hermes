@@ -190,7 +190,7 @@ The following patterns trigger approval prompts (defined in `tools/approval.py`)
 | `podman --remote`/`-r`/`--url`/`--connection`/`--identity`, `CONTAINER_HOST=` | Podman remote daemon redirect |
 
 :::info
-**Container bypass**: When running in `docker`, `singularity`, `modal`, `daytona`, or `vercel_sandbox` backends, dangerous command checks are **skipped** because the container itself is the security boundary. Destructive commands inside a container can't harm the host.
+**Sandbox bypass**: When running in `docker`, `singularity`, `modal`, `daytona`, `sprites`, or `vercel_sandbox` backends, dangerous command checks are **skipped** because the container/provider boundary protects the Hermes host. Provider sandboxes may still have outbound network access and do not necessarily inherit Docker's hardening.
 :::
 
 ### Approval Flow (CLI)
@@ -495,7 +495,7 @@ terminal:
 - **Ephemeral mode** (`container_persistent: false`): Uses tmpfs for workspace — everything is lost on cleanup
 
 :::tip
-For production gateway deployments, use `docker`, `modal`, `daytona`, or `vercel_sandbox` backend to isolate agent commands from your host system. This eliminates the need for dangerous command approval entirely.
+For production gateway deployments, use a sandboxed backend such as `docker`, `modal`, `daytona`, `sprites`, or `vercel_sandbox` to isolate agent commands from your host system. This eliminates host-dangerous-command approval, but you must still account for provider credentials and outbound network access.
 :::
 
 :::warning

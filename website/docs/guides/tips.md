@@ -217,7 +217,7 @@ When the agent triggers a dangerous command approval (`rm -rf`, `DROP TABLE`, et
 Hermes checks every command against a curated list of dangerous patterns before execution. This includes recursive deletes, SQL drops, piping curl to shell, and more. Don't disable this in production — it exists for good reasons.
 
 :::warning
-When running in a container backend (Docker, Singularity, Modal, Daytona), dangerous command checks are **skipped** because the container is the security boundary. Make sure your container images are properly locked down.
+When running in an isolated backend (Docker, Singularity, Modal, Daytona, Sprites, or Vercel Sandbox), dangerous command checks are **skipped** because the remote/container boundary protects the Hermes host. Provider sandboxes can still have outbound network access and their hardening differs from Docker, so review the selected backend's security and credential-sync behavior.
 :::
 
 ### Use Allowlists for Messaging Bots

@@ -72,6 +72,7 @@ The terminal tool can execute commands in different environments:
 | `singularity` | HPC containers | Cluster computing, rootless |
 | `modal` | Cloud execution | Serverless, scale |
 | `daytona` | Cloud sandbox workspace | Persistent remote dev environments |
+| `sprites` | Fly Sprite cloud environment | Persistent per-task cloud execution |
 | `vercel_sandbox` | Vercel Sandbox cloud microVM | Cloud execution with snapshot-backed filesystem persistence |
 
 ### Configuration
@@ -79,7 +80,7 @@ The terminal tool can execute commands in different environments:
 ```yaml
 # In ~/.hermes/config.yaml
 terminal:
-  backend: local    # or: docker, ssh, singularity, modal, daytona, vercel_sandbox
+  backend: local    # or: docker, ssh, singularity, modal, daytona, sprites, vercel_sandbox
   cwd: "."          # Working directory
   timeout: 180      # Command timeout in seconds
 ```
@@ -156,6 +157,31 @@ modal setup
 hermes config set terminal.backend modal
 ```
 
+### Fly Sprites
+
+```bash
+pip install 'hermes-agent[sprites]'
+hermes setup terminal  # choose Fly Sprites and enter SPRITE_TOKEN
+```
+
+Hermes creates or resumes one deterministically named Sprite per task. Sprite
+names are scoped to the active Hermes profile, and the runtime's actual home
+directory (normally `/home/sprite`) is detected before shell state or files are
+initialized. With `container_persistent: false`, Hermes destroys the Sprite at
+cleanup; otherwise it leaves the Sprite available for the next task session.
+
+The Sprite token stays in the host process and is never forwarded to commands.
+Unlike the other remote sync backends, Sprites intentionally synchronizes only
+skills and non-secret cache files—not credential files. Commands still have the
+Sprite's normal outbound network access, so treat downloaded or untrusted code
+as capable of reaching external services. Hermes skips host-dangerous-command
+guards for Sprites because commands cannot access the Hermes host filesystem.
+
+The native backend targets the official `sprites-py==0.5.0` API. The SDK does
+not expose per-command cancellation in that release; Hermes enforces command
+timeouts, but killing a foreground process handle cannot signal the remote
+command independently.
+
 ### Vercel Sandbox
 
 ```bash
@@ -190,7 +216,7 @@ Configure CPU, memory, disk, and persistence for all container backends:
 
 ```yaml
 terminal:
-  backend: docker  # or singularity, modal, daytona, vercel_sandbox
+  backend: docker  # or singularity, modal, daytona, sprites, vercel_sandbox
   container_cpu: 1              # CPU cores (default: 1)
   container_memory: 5120        # Memory in MB (default: 5GB)
   container_disk: 51200         # Disk in MB (default: 50GB)
@@ -201,7 +227,7 @@ When `container_persistent: true`, installed packages, files, and config survive
 
 ### Container Security
 
-All container backends run with security hardening:
+Isolation and hardening vary by backend. Docker applies:
 
 - Read-only root filesystem (Docker)
 - All Linux capabilities dropped
@@ -211,6 +237,10 @@ All container backends run with security hardening:
 - Persistent workspace via volumes, not writable root layer
 
 Docker can optionally receive an explicit env allowlist via `terminal.docker_forward_env`, but forwarded variables are visible to commands inside the container and should be treated as exposed to that session.
+
+Remote cloud backends rely on their provider's isolation boundary. Review each
+backend's credential and network behavior above rather than assuming Docker's
+capability, namespace, or read-only-root settings apply to it.
 
 ## Background Process Management
 

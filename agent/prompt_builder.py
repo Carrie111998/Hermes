@@ -1186,7 +1186,7 @@ WSL_ENVIRONMENT_HINT = (
 # runs. For these backends, host info (Windows/Linux/macOS, $HOME, cwd) is
 # misleading — the agent should only see the machine it can actually touch.
 _REMOTE_TERMINAL_BACKENDS = frozenset({
-    "docker", "singularity", "modal", "daytona", "ssh",
+    "docker", "singularity", "modal", "daytona", "sprites", "ssh",
     "vercel_sandbox", "managed_modal",
 })
 
@@ -1309,7 +1309,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
             }
 
         container_config = None
-        if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
+        if env_type in {"docker", "singularity", "modal", "daytona", "sprites", "vercel_sandbox"}:
             container_config = {
                 "container_cpu": config.get("container_cpu", 1),
                 "container_memory": config.get("container_memory", 5120),
@@ -1400,7 +1400,7 @@ def build_environment_hints() -> str:
       and a Windows-only note that `terminal` shells out to bash, not
       PowerShell).
     - For **remote / sandbox** terminal backends (docker, singularity,
-      modal, daytona, ssh, vercel_sandbox): host info is **suppressed**
+      modal, daytona, sprites, ssh, vercel_sandbox): host info is **suppressed**
       because the agent's tools can't touch the host — only the backend
       matters. A live probe inside the backend reports its OS, user, $HOME,
       and cwd. Falls back to a static summary if the probe fails.

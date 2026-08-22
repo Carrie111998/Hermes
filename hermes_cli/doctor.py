@@ -2179,6 +2179,27 @@ def run_doctor(args):
                 issues,
             )
 
+    # Fly Sprites (if using sprites backend)
+    if terminal_env == "sprites":
+        if os.getenv("SPRITE_TOKEN"):
+            check_ok("Fly Sprites token", "(configured)")
+        else:
+            _fail_and_issue(
+                "SPRITE_TOKEN not set",
+                "(required for TERMINAL_ENV=sprites)",
+                "Set SPRITE_TOKEN in ~/.hermes/.env or run `hermes setup terminal`",
+                issues,
+            )
+        if importlib.util.find_spec("sprites") is not None:
+            check_ok("sprites-py SDK", "(installed)")
+        else:
+            _fail_and_issue(
+                "sprites-py SDK not installed",
+                "(pip install 'hermes-agent[sprites]')",
+                "Install the Sprites optional dependency: pip install 'hermes-agent[sprites]'",
+                issues,
+            )
+
     # Vercel Sandbox (if using vercel_sandbox backend)
     if terminal_env == "vercel_sandbox":
         runtime = os.getenv("TERMINAL_VERCEL_RUNTIME", "node24").strip() or "node24"

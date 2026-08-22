@@ -1343,11 +1343,12 @@ def setup_terminal_backend(config: dict):
         "SSH - run on a remote machine",
         "Daytona - persistent cloud development environment",
         "Vercel Sandbox - cloud microVM with snapshot filesystem persistence",
+        "Fly Sprites - persistent cloud execution environment",
     ]
-    idx_to_backend = {0: "local", 1: "docker", 2: "modal", 3: "ssh", 4: "daytona", 5: "vercel_sandbox"}
-    backend_to_idx = {"local": 0, "docker": 1, "modal": 2, "ssh": 3, "daytona": 4, "vercel_sandbox": 5}
+    idx_to_backend = {0: "local", 1: "docker", 2: "modal", 3: "ssh", 4: "daytona", 5: "vercel_sandbox", 6: "sprites"}
+    backend_to_idx = {"local": 0, "docker": 1, "modal": 2, "ssh": 3, "daytona": 4, "vercel_sandbox": 5, "sprites": 6}
 
-    next_idx = 6
+    next_idx = 7
     if is_linux:
         terminal_choices.append("Singularity/Apptainer - HPC-friendly container")
         idx_to_backend[next_idx] = "singularity"
@@ -1594,6 +1595,26 @@ def setup_terminal_backend(config: dict):
                     print_info(f"  Error: {result.stderr.strip().splitlines()[-1]}")
 
         _prompt_vercel_sandbox_settings(config)
+
+    elif selected_backend == "sprites":
+        print_success("Terminal backend: Fly Sprites")
+        print_info("Persistent Fly cloud environments. Each task gets a deterministic Sprite.")
+        print_info("Requires the optional SDK: pip install 'hermes-agent[sprites]'")
+        try:
+            __import__("sprites")
+        except ImportError:
+            from tools.lazy_deps import ensure
+
+            try:
+                ensure("terminal.sprites", prompt=False)
+                print_success("sprites-py SDK installed")
+            except Exception as exc:
+                print_warning(f"SDK install failed: {exc}")
+                print_info("Install manually: pip install 'hermes-agent[sprites]'")
+
+        token = prompt("    Sprite token", get_env_value("SPRITE_TOKEN") or "", password=True)
+        if token:
+            save_env_value("SPRITE_TOKEN", token)
 
     elif selected_backend == "ssh":
         print_success("Terminal backend: SSH")
