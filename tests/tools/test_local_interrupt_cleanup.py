@@ -14,13 +14,16 @@ died.  See commit message for full context.
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 from tools.environments import local as local_mod
+from tools.environments.base import ProcessHandle
 from tools.environments.local import LocalEnvironment
 
 
@@ -203,76 +206,97 @@ def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
 
 
 def test_wait_for_process_closes_stdout_on_timeout():
-    """Regression test for the fd leak fixed 2026-08-11.
-
-    ``_wait_for_process`` used to close ``proc.stdout`` only on the
-    natural-completion path at the bottom of the function. The timeout
-    early-return, the interrupt early-return, and the KeyboardInterrupt/
-    SystemExit re-raise all skipped it, so every timed-out or interrupted
-    terminal command leaked one fd (the read end of the stdout pipe). On a
-    long-lived gateway process sharing that fd table across every plugin
-    (Telegram, Discord, Buzz, cron, config parsing, ...), those leaks
-    accumulated over ~3 days of uptime until the process hit its fd ulimit
-    and everything started failing at once with "Too many open files".
-    """
+    """Timeout cleanup closes the read end of the child stdout pipe."""
     env = LocalEnvironment(cwd="/tmp")
     proc = subprocess.Popen(
-        ["sleep", "5"],
+        [sys.executable, "-c", "import time; time.sleep(5)"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
         text=True,
         start_new_session=True,
     )
-    proc._hermes_pgid = os.getpgid(proc.pid)
+    if hasattr(os, "getpgid"):
+        setattr(proc, "_hermes_pgid", os.getpgid(proc.pid))
     try:
-        result = env._wait_for_process(proc, timeout=0.2)
-        assert result["returncode"] == 124, f"expected timeout returncode, got {result}"
-        assert proc.stdout.closed, (
-            "proc.stdout leaked on the timeout exit path — the fd-leak "
-            "regression from the 2026-08-11 'Too many open files' incident"
-        )
+        result = env._wait_for_process(proc, timeout=0)
+        assert result["returncode"] == 124
+        assert proc.stdout is not None
+        assert proc.stdout.closed
     finally:
         try:
             proc.wait(timeout=2)
         except Exception:
             pass
-        try:
-            env.cleanup()
-        except Exception:
-            pass
+        env.cleanup()
 
 
 def test_wait_for_process_closes_stdout_on_interrupt():
-    """Same fd-leak regression, but via the is_interrupted() early return
-    (agent-level interrupt) rather than the timeout path."""
+    """Agent interrupt cleanup closes the child stdout pipe."""
     from tools.interrupt import set_interrupt
 
     env = LocalEnvironment(cwd="/tmp")
     proc = subprocess.Popen(
-        ["sleep", "5"],
+        [sys.executable, "-c", "import time; time.sleep(5)"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
         text=True,
         start_new_session=True,
     )
-    proc._hermes_pgid = os.getpgid(proc.pid)
+    if hasattr(os, "getpgid"):
+        setattr(proc, "_hermes_pgid", os.getpgid(proc.pid))
     set_interrupt(True)
     try:
         result = env._wait_for_process(proc, timeout=60)
-        assert result["returncode"] == 130, f"expected interrupt returncode, got {result}"
-        assert proc.stdout.closed, (
-            "proc.stdout leaked on the interrupt exit path — the fd-leak "
-            "regression from the 2026-08-11 'Too many open files' incident"
-        )
+        assert result["returncode"] == 130
+        assert proc.stdout is not None
+        assert proc.stdout.closed
     finally:
         set_interrupt(False)
         try:
             proc.wait(timeout=2)
         except Exception:
             pass
-        try:
-            env.cleanup()
-        except Exception:
-            pass
+        env.cleanup()
+
+
+def test_drain_thread_eventually_closes_stdout_after_join_timeout(monkeypatch):
+    """A still-running reader owns the close after main-thread cleanup returns."""
+    release = threading.Event()
+    closed = threading.Event()
+
+    class BlockingStream:
+        def fileno(self):
+            raise OSError("iterator-backed stream")
+
+        def __iter__(self):
+            release.wait(timeout=10)
+            return iter(())
+
+        def close(self):
+            closed.set()
+
+    class FakeProc:
+        stdout = BlockingStream()
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            return None
+
+        def wait(self, timeout=None):
+            return None
+
+    proc = FakeProc()
+    env = object.__new__(LocalEnvironment)
+    monkeypatch.setattr(env, "_kill_process", lambda _proc: None)
+
+    result = env._wait_for_process(cast(ProcessHandle, proc), timeout=0)
+
+    assert result["returncode"] == 124
+    assert not closed.is_set()
+    release.set()
+    assert closed.wait(timeout=2), "drain thread did not close stdout after exiting"

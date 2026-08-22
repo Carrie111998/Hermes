@@ -1086,6 +1086,16 @@ class BaseEnvironment(ABC):
                 except Exception:
                     pass
 
+        def _close_stream(stream) -> None:
+            """Close a drained stdout stream without masking command results."""
+            close = getattr(stream, "close", None)
+            if not callable(close):
+                return
+            try:
+                close()
+            except Exception:
+                pass
+
         def _drain():
             # Resolve a real OS file descriptor up front.  Real subprocesses and
             # the SDK ``_ThreadedProcessHandle`` (os.pipe-backed) both return an
@@ -1102,7 +1112,10 @@ class BaseEnvironment(ABC):
             except Exception:
                 fd = None
             if not isinstance(fd, int) or fd < 0:
-                _drain_iterable(stream)
+                try:
+                    _drain_iterable(stream)
+                finally:
+                    _close_stream(stream)
                 return
             # select.select does NOT work on pipe fds on Windows (only sockets).
             # Use blocking os.read in a daemon thread instead — safe because
@@ -1123,6 +1136,7 @@ class BaseEnvironment(ABC):
                             output.append(tail)
                     except Exception:
                         pass
+                    _close_stream(stream)
                 return
             idle_after_exit = 0
             try:
@@ -1157,9 +1171,20 @@ class BaseEnvironment(ABC):
                         output.append(tail)
                 except Exception:
                     pass
+                _close_stream(stream)
 
         drain_thread = threading.Thread(target=_drain, daemon=True)
         drain_thread.start()
+
+        def _close_stdout_after_drain() -> None:
+            """Close our pipe reader once no drain thread is using it."""
+            if drain_thread.is_alive():
+                return
+            stream = proc.stdout
+            if stream is None:
+                return
+            _close_stream(stream)
+
         deadline = time.monotonic() + timeout
         _now = time.monotonic()
         _activity_state = {
@@ -1186,142 +1211,130 @@ class BaseEnvironment(ABC):
                 is_interrupted(),
             )
 
-        # Outer try/finally guarantees proc.stdout (the read end of the
-        # stdout pipe) is closed on EVERY exit path — natural completion,
-        # the interrupt/timeout early returns, and the KeyboardInterrupt/
-        # SystemExit re-raise below. Previously the close() only happened
-        # after the natural-completion path (bottom of this function), so
-        # every timed-out or interrupted command leaked one fd. On a
-        # long-lived gateway process sharing that fd table across every
-        # plugin (Telegram, Discord, Buzz, cron, config parsing, unrelated
-        # tool calls) those leaks accumulate silently until the process
-        # hits its fd ulimit and EVERYTHING sharing it starts failing with
-        # "Too many open files" at once (real incident, 2026-08-11).
         try:
-            try:
-                _poll_sleep = 0.005
-                while proc.poll() is None:
-                    _iter_count += 1
-                    if is_interrupted():
-                        if _DEBUG_INTERRUPT:
-                            logger.info(
-                                "[interrupt-debug] _wait_for_process INTERRUPT DETECTED "
-                                "tid=%s pid=%s iter=%d elapsed=%.1fs — killing process group",
-                                _tid, _pid, _iter_count, time.monotonic() - _activity_state["start"],
-                            )
-                        self._kill_process(proc)
-                        drain_thread.join(timeout=2)
-                        return self._finalize_wait_result(
-                            output,
-                            output.render(suffix="\n[Command interrupted]"),
-                            130,
-                        )
-                    if time.monotonic() > deadline:
-                        if _DEBUG_INTERRUPT:
-                            logger.info(
-                                "[interrupt-debug] _wait_for_process TIMEOUT "
-                                "tid=%s pid=%s iter=%d timeout=%ss",
-                                _tid, _pid, _iter_count, timeout,
-                            )
-                        self._kill_process(proc)
-                        drain_thread.join(timeout=2)
-                        timeout_msg = f"\n[Command timed out after {timeout}s]"
-                        return self._finalize_wait_result(
-                            output,
-                            output.render(suffix=timeout_msg).lstrip()
-                            if output.total_chars == 0
-                            else output.render(suffix=timeout_msg),
-                            124,
-                        )
-                    # Periodic activity touch so the gateway knows we're alive
-                    touch_activity_if_due(_activity_state, "terminal command running")
-
-                    # Heartbeat every ~30s: proves the loop is alive and reports
-                    # the activity-callback state (thread-local, can get clobbered
-                    # by nested tool calls or executor thread reuse).
-                    if _DEBUG_INTERRUPT and time.monotonic() - _last_heartbeat >= 30.0:
-                        _cb_now_none = get_activity_callback() is None
+            _poll_sleep = 0.005
+            while proc.poll() is None:
+                _iter_count += 1
+                if is_interrupted():
+                    if _DEBUG_INTERRUPT:
                         logger.info(
-                            "[interrupt-debug] _wait_for_process HEARTBEAT "
-                            "tid=%s pid=%s iter=%d elapsed=%.0fs "
-                            "interrupt=%s activity_cb=%s%s",
-                            _tid, _pid, _iter_count,
-                            time.monotonic() - _activity_state["start"],
-                            is_interrupted(),
-                            "set" if not _cb_now_none else "MISSING",
-                            " (LOST during run)" if _cb_now_none and not _cb_was_none else "",
+                            "[interrupt-debug] _wait_for_process INTERRUPT DETECTED "
+                            "tid=%s pid=%s iter=%d elapsed=%.1fs — killing process group",
+                            _tid, _pid, _iter_count, time.monotonic() - _activity_state["start"],
                         )
-                        _last_heartbeat = time.monotonic()
-                        _cb_was_none = _cb_now_none
-
-                    # Adaptive poll: start at 5ms so fast commands (echo, pwd,
-                    # date, cat short files) return in ~6ms instead of being
-                    # stuck waiting for the next 200ms tick. Back off
-                    # exponentially toward 200ms so long-running commands
-                    # (builds, tests, sleeps) don't pay measurable CPU in the
-                    # poll loop. For an `echo` this saves ~195ms per tool call;
-                    # for a 10s build the steady-state poll rate is identical
-                    # to the old behavior.
-                    time.sleep(_poll_sleep)
-                    if _poll_sleep < 0.2:
-                        _poll_sleep = min(_poll_sleep * 1.5, 0.2)
-            except (KeyboardInterrupt, SystemExit):
-                # Signal arrived (SIGTERM/SIGHUP/SIGINT) or sys.exit() was called
-                # while we were polling.  The local backend spawns subprocesses
-                # with os.setsid, which puts them in their own process group — so
-                # if we let the interrupt propagate without killing the child,
-                # python exits and the child is reparented to init (PPID=1) and
-                # keeps running as an orphan.  Killing the process group here
-                # guarantees the tool's side effects stop when the agent stops.
-                if _DEBUG_INTERRUPT:
-                    logger.info(
-                        "[interrupt-debug] _wait_for_process EXCEPTION_EXIT "
-                        "tid=%s pid=%s iter=%d elapsed=%.1fs — killing subprocess group before re-raise",
-                        _tid, _pid, _iter_count,
-                        time.monotonic() - _activity_state["start"],
-                    )
-                try:
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
-                except Exception:
-                    pass  # cleanup is best-effort
-                raise
+                    _close_stdout_after_drain()
+                    return self._finalize_wait_result(
+                        output,
+                        output.render(suffix="\n[Command interrupted]"),
+                        130,
+                    )
+                if time.monotonic() > deadline:
+                    if _DEBUG_INTERRUPT:
+                        logger.info(
+                            "[interrupt-debug] _wait_for_process TIMEOUT "
+                            "tid=%s pid=%s iter=%d timeout=%ss",
+                            _tid, _pid, _iter_count, timeout,
+                        )
+                    self._kill_process(proc)
+                    drain_thread.join(timeout=2)
+                    _close_stdout_after_drain()
+                    timeout_msg = f"\n[Command timed out after {timeout}s]"
+                    return self._finalize_wait_result(
+                        output,
+                        output.render(suffix=timeout_msg).lstrip()
+                        if output.total_chars == 0
+                        else output.render(suffix=timeout_msg),
+                        124,
+                    )
+                # Periodic activity touch so the gateway knows we're alive
+                touch_activity_if_due(_activity_state, "terminal command running")
 
-            # Drain thread now exits promptly after bash does (~300ms idle
-            # check).  A short join is enough; a long one would be a bug since
-            # it means the non-blocking loop itself stopped cooperating.
-            drain_thread.join(timeout=2)
+                # Heartbeat every ~30s: proves the loop is alive and reports
+                # the activity-callback state (thread-local, can get clobbered
+                # by nested tool calls or executor thread reuse).
+                if _DEBUG_INTERRUPT and time.monotonic() - _last_heartbeat >= 30.0:
+                    _cb_now_none = get_activity_callback() is None
+                    logger.info(
+                        "[interrupt-debug] _wait_for_process HEARTBEAT "
+                        "tid=%s pid=%s iter=%d elapsed=%.0fs "
+                        "interrupt=%s activity_cb=%s%s",
+                        _tid, _pid, _iter_count,
+                        time.monotonic() - _activity_state["start"],
+                        is_interrupted(),
+                        "set" if not _cb_now_none else "MISSING",
+                        " (LOST during run)" if _cb_now_none and not _cb_was_none else "",
+                    )
+                    _last_heartbeat = time.monotonic()
+                    _cb_was_none = _cb_now_none
 
+                # Adaptive poll: start at 5ms so fast commands (echo, pwd,
+                # date, cat short files) return in ~6ms instead of being
+                # stuck waiting for the next 200ms tick. Back off
+                # exponentially toward 200ms so long-running commands
+                # (builds, tests, sleeps) don't pay measurable CPU in the
+                # poll loop. For an `echo` this saves ~195ms per tool call;
+                # for a 10s build the steady-state poll rate is identical
+                # to the old behavior.
+                time.sleep(_poll_sleep)
+                if _poll_sleep < 0.2:
+                    _poll_sleep = min(_poll_sleep * 1.5, 0.2)
+        except (KeyboardInterrupt, SystemExit):
+            # Signal arrived (SIGTERM/SIGHUP/SIGINT) or sys.exit() was called
+            # while we were polling.  The local backend spawns subprocesses
+            # with os.setsid, which puts them in their own process group — so
+            # if we let the interrupt propagate without killing the child,
+            # python exits and the child is reparented to init (PPID=1) and
+            # keeps running as an orphan.  Killing the process group here
+            # guarantees the tool's side effects stop when the agent stops.
             if _DEBUG_INTERRUPT:
                 logger.info(
-                    "[interrupt-debug] _wait_for_process EXIT (natural) "
-                    "tid=%s pid=%s iter=%d elapsed=%.1fs returncode=%s",
+                    "[interrupt-debug] _wait_for_process EXCEPTION_EXIT "
+                    "tid=%s pid=%s iter=%d elapsed=%.1fs — killing subprocess group before re-raise",
                     _tid, _pid, _iter_count,
                     time.monotonic() - _activity_state["start"],
-                    proc.returncode,
                 )
-
-            # Join the stdin writer thread before reading its error list: a child
-            # that exits without reading stdin can otherwise race ahead of a
-            # recorded encode failure, silently dropping it. The thread cannot
-            # block long after child exit (write raises BrokenPipeError once the
-            # pipe closes); the timeout is a pure safety net.
-            stdin_thread = getattr(proc, "_hermes_stdin_thread", None)
-            if stdin_thread is not None:
-                stdin_thread.join(timeout=5)
-            rendered = output.render()
-            result = self._finalize_wait_result(output, rendered, proc.returncode)
-            stdin_errors = getattr(proc, "_hermes_stdin_errors", None)
-            if stdin_errors:
-                err = str(stdin_errors[0])
-                result["stdin_error"] = err
-                result["output"] = rendered + f"\n[stdin write failed: {err}]"
-            return result
-        finally:
             try:
-                proc.stdout.close()
+                self._kill_process(proc)
+                drain_thread.join(timeout=2)
+                _close_stdout_after_drain()
             except Exception:
-                pass
+                pass  # cleanup is best-effort
+            raise
+
+        # Drain thread now exits promptly after bash does (~300ms idle
+        # check).  A short join is enough; a long one would be a bug since
+        # it means the non-blocking loop itself stopped cooperating.
+        drain_thread.join(timeout=2)
+
+        _close_stdout_after_drain()
+
+        if _DEBUG_INTERRUPT:
+            logger.info(
+                "[interrupt-debug] _wait_for_process EXIT (natural) "
+                "tid=%s pid=%s iter=%d elapsed=%.1fs returncode=%s",
+                _tid, _pid, _iter_count,
+                time.monotonic() - _activity_state["start"],
+                proc.returncode,
+            )
+
+        # Join the stdin writer thread before reading its error list: a child
+        # that exits without reading stdin can otherwise race ahead of a
+        # recorded encode failure, silently dropping it. The thread cannot
+        # block long after child exit (write raises BrokenPipeError once the
+        # pipe closes); the timeout is a pure safety net.
+        stdin_thread = getattr(proc, "_hermes_stdin_thread", None)
+        if stdin_thread is not None:
+            stdin_thread.join(timeout=5)
+        rendered = output.render()
+        result = self._finalize_wait_result(output, rendered, proc.returncode)
+        stdin_errors = getattr(proc, "_hermes_stdin_errors", None)
+        if stdin_errors:
+            err = str(stdin_errors[0])
+            result["stdin_error"] = err
+            result["output"] = rendered + f"\n[stdin write failed: {err}]"
+        return result
 
     @staticmethod
     def _finalize_wait_result(collector: "_BoundedOutputCollector",
