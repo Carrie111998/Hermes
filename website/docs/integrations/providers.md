@@ -654,8 +654,10 @@ model:
   default: your-model-name
   provider: custom
   base_url: http://localhost:8000/v1
-  api_key: your-key-or-leave-empty-for-local
+  api_key: ${env:MY_SERVER_API_KEY}   # reference a key stored in .env
 ```
+
+Local servers that require **no** key can omit `api_key` entirely (Hermes sends a `no-key-required` placeholder). When your server does require one — llama.cpp/llama-server builds with `--api-key`, vLLM behind an auth proxy, a gateway that enforces a bearer token — store the secret in `~/.hermes/.env` (e.g. `hermes config set MY_SERVER_API_KEY <key>`) and reference it with `${env:MY_SERVER_API_KEY}` as above. See [Environment Variable Substitution](/user-guide/configuration#environment-variable-substitution) for the full mechanics and the one-command rotation flow.
 
 :::warning Legacy env vars
 `LLM_MODEL` in `.env` is **removed** — `config.yaml` is the single source of truth for model and endpoint configuration. `OPENAI_BASE_URL` is still honored, but **only** for the `openai-api` provider (it overrides the OpenAI endpoint for direct API-key access). For other providers and custom endpoints, use `hermes model` or set `model.base_url` in `config.yaml` directly. If you have stale entries in your `.env`, they are automatically cleared on the next `hermes setup` or config migration.
@@ -1271,6 +1273,12 @@ providers:
   local:
     api: http://localhost:8080/v1
     # api_key omitted — Hermes uses "no-key-required" for keyless local servers
+  local-keyed:
+    api: http://127.0.0.1:8080/v1
+    api_key: ${env:LLAMACPP_API_KEY}   # inline key, resolved from .env
+    default_model: qwen3.8-27b
+    models: [qwen3.8-27b]
+    context_length: 262144
   work:
     api: https://gpu-server.internal.corp/v1
     key_env: CORP_API_KEY
@@ -1280,6 +1288,8 @@ providers:
     key_env: ANTHROPIC_PROXY_KEY
     transport: anthropic_messages  # for Anthropic-compatible proxies
 ```
+
+A local server that **does** require a key (llama.cpp with `--api-key`, vLLM behind auth) is the `local-keyed` shape: keep the secret in `.env` and reference it inline — the reference is expanded at config load, so the key itself never appears in `config.yaml`.
 
 Each entry accepts: `api` (the endpoint base URL — `base_url`/`url` are accepted aliases), `name` (optional display name; defaults to the dict key), `key_env` or inline `api_key` or `key_cmd` (see below), `transport` (`chat_completions` / `anthropic_messages` / `codex_responses`), `default_model`, `models`, `context_length`, `discover_models`, `extra_body`, `extra_headers`, `ssl_ca_cert` / `ssl_verify`, and `enabled: false` to hide an entry without deleting it.
 

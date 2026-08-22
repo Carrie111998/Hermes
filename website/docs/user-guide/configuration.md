@@ -103,6 +103,29 @@ delegation:
 
 Multiple references in a single value work: `url: "${HOST}:${PORT}"`. If a referenced variable is not set, the placeholder is kept verbatim (`${UNDEFINED_VAR}` stays as-is) and a warning is logged. Bare `$VAR` is not expanded.
 
+### Recommended pattern: secrets in `.env`, references in `config.yaml`
+
+For provider keys — including local servers that require one — keep the secret in `~/.hermes/.env` and reference it from `config.yaml` instead of pasting the key into the config file:
+
+```bash
+# Bare key names (no dots) that look like secrets — ending in `_API_KEY`,
+# `_TOKEN`, or `_SECRET`, or on an internal allowlist (e.g. `TELEGRAM_BOT_TOKEN`,
+# `GITHUB_TOKEN`) — are saved to .env automatically:
+hermes config set LLAMACPP_API_KEY hq-...
+```
+
+```yaml
+# Then reference it anywhere in config.yaml (both ${VAR} and ${env:VAR} work):
+model:
+  api_key: ${env:LLAMACPP_API_KEY}
+```
+
+Dotted keys such as `model.api_key` are **not** auto-routed — `hermes config set model.api_key '${env:LLAMACPP_API_KEY}'` writes the reference verbatim into `config.yaml`, which is how you wire it up. Rotating the key later is one command: re-run the bare `hermes config set LLAMACPP_API_KEY <new-key>` and every `${env:LLAMACPP_API_KEY}` reference picks up the new value on the next config load.
+
+:::note Harmless startup warning
+Even when the variable **is** set in `.env`, some commands can print `Config ref '${env:NAME}': NAME is not set (check ~/.hermes/.env); keeping the literal placeholder` at startup. A few CLI paths take an early config snapshot before the env file is loaded into the process; the config cache detects the env file arriving and re-expands, so every later read — and the running agent — resolves the value correctly. Verify with `hermes config get model` (or a one-shot `hermes chat -q ...`): if the key resolves there, the warning is cosmetic.
+:::
+
 Cursor-style SecretRef syntax is also accepted: `${env:VAR_NAME}` resolves exactly like `${VAR_NAME}` (the `env:` prefix is stripped), so MCP or provider snippets copied from Cursor / Claude configs work unchanged in both `config.yaml` and the `mcp_servers` block. Other SecretRef sources (`${file:...}`, `${vault:...}`, `${bitwarden:...}`) are **not** resolved inline — external secret backends inject their values into the environment at startup via the `secrets:` block, so reference them as `${env:NAME}` instead; unknown prefixes warn once and stay verbatim.
 
 For AI provider setup (OpenRouter, Anthropic, Copilot, custom endpoints, self-hosted LLMs, fallback models, etc.), see [AI Providers](/integrations/providers).
