@@ -382,8 +382,14 @@ class TestV1Parts:
 
 
 class TestV1Task:
-    def test_completed_task_exposes_fenced_json_as_structured_data(self):
-        reply = 'Result:\n```json\n{"answer": 42, "markdown": "```"}\n````'
+    @pytest.mark.parametrize("info_separator", ["", " ", "\t"])
+    def test_completed_task_exposes_fenced_json_as_structured_data(
+        self, info_separator,
+    ):
+        reply = (
+            'Result:\n```'
+            f'{info_separator}json\n{{"answer": 42, "markdown": "```"}}\n````'
+        )
 
         task = protocol.build_task("t-json", "c-json", protocol.STATE_COMPLETED, reply)
 

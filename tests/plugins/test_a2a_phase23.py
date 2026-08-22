@@ -103,8 +103,14 @@ def _send_body(text, ctx="", method="message/send"):
 
 
 class TestStreamResponseFormat:
-    def test_artifact_update_exposes_fenced_json_as_structured_data(self):
-        reply = 'Summary\n````json\n[1, {"markdown": "```"}, 3]\n````'
+    @pytest.mark.parametrize("info_separator", ["", " ", "\t"])
+    def test_artifact_update_exposes_fenced_json_as_structured_data(
+        self, info_separator,
+    ):
+        reply = (
+            'Summary\n````'
+            f'{info_separator}json\n[1, {{"markdown": "```"}}, 3]\n````'
+        )
 
         ev = protocol.artifact_update("task-json", "ctx-json", reply)
 
