@@ -204,7 +204,14 @@ import {
   tokenNeedsRefresh
 } from './native-oauth'
 import { runNativeLogin } from './native-oauth-login'
-import { loadNativeTokenSet, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
+import {
+  loadNativeTokenSet,
+  type NativeTokenStoreIo,
+  persistNativeTokenSet,
+  restoreNativeTokenSecret,
+  snapshotNativeTokenSecret,
+  type StoredTokenSecret
+} from './native-token-store'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import {
   createParentStartMarkerResolver,
@@ -249,6 +256,34 @@ import {
 } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
+import {
+  authenticatedRegistryStatus,
+  type AuthenticatedRegistryStatusDependencies,
+  clearRegistryAuthCredentialsTransactionally,
+  createDraftRegistryAuthScope,
+  createRegistryAuthTargetConnectionId,
+  mintRegistryAuthTicket,
+  promoteAndPersistRegistryAuth,
+  readDurableRegistryAuthStatus,
+  registryAuthCandidateBinding,
+  RegistryAuthCleanupRetryQueue,
+  type RegistryAuthCredentialLifecycle,
+  type RegistryAuthCredentialSnapshot,
+  registryAuthPartition,
+  RegistryAuthReadinessAuthority,
+  registryAuthReadinessRequired,
+  registryAuthStorageKey,
+  removeRegistryConnectionTransactionally,
+  resolveRegistryAuthCandidateHeaders,
+  resolveRegistryAuthScopeAuthority,
+  runStructuredRegistryTest,
+  saveVerifiedRegistryConnection,
+  serializeRegistryAuthFailure,
+  teardownRemovedRegistryConnection,
+  testAuthenticatedRegistryConnection,
+  validateRegistryAuthScope,
+  verifyTokenRegistryAuth
+} from './registry-auth'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
   RemoteLivenessTracker,
@@ -5143,6 +5178,8 @@ const RENDER_TITLE_BLOCKED_RESOURCES = new Set([
 
 let linkTitleSession = null
 let oauthSession = null
+const registryOauthSessions = new Map<string, any>()
+const registryAuthReadiness = new RegistryAuthReadinessAuthority()
 let renderTitleInFlight = 0
 const renderTitleQueue = []
 
@@ -5931,8 +5968,13 @@ async function gatewayAuthProviders(baseUrl, headers = {}) {
 // see the 404 that identifies a backend predating /api/health (the auth gate
 // answers before the SPA catch-all). `probeIsCredentialed` tells
 // waitForHermesReady how to read a 401 — rejected session vs gated route.
-async function buildReadinessHealthProbe(baseUrl, authMode, token) {
-  const nativeAt = authMode === 'oauth' ? await ensureNativeAccessToken(baseUrl).catch(() => null) : null
+async function buildReadinessHealthProbe(
+  baseUrl: string,
+  authMode: string | undefined,
+  token: string | null | undefined,
+  authScope?: string
+) {
+  const nativeAt = authMode === 'oauth' ? await ensureNativeAccessToken(baseUrl, authScope).catch(() => null) : null
   const probeAuth = resolveReadinessProbeAuth(authMode, nativeAt, token)
 
   if (probeAuth.kind === 'bearer') {
@@ -5947,7 +5989,7 @@ async function buildReadinessHealthProbe(baseUrl, authMode, token) {
 
   if (probeAuth.kind === 'cookie') {
     return {
-      probeHealth: (url, options: any = {}) => fetchJsonViaOauthSession(url, options),
+      probeHealth: (url: string, options: any = {}) => fetchJsonViaOauthSession(url, { ...options, authScope }),
       probeIsCredentialed: true
     }
   }
@@ -5962,8 +6004,15 @@ async function buildReadinessHealthProbe(baseUrl, authMode, token) {
   return { probeHealth: fetchPublicJson, probeIsCredentialed: false }
 }
 
-async function waitForHermes(baseUrl, token, signal?, authMode?, headers = {}) {
-  const { probeHealth, probeIsCredentialed } = await buildReadinessHealthProbe(baseUrl, authMode, token)
+async function waitForHermes(
+  baseUrl: string,
+  token: string | null | undefined,
+  signal?: AbortSignal,
+  authMode?: string,
+  headers: Record<string, string> = {},
+  authScope?: string
+) {
+  const { probeHealth, probeIsCredentialed } = await buildReadinessHealthProbe(baseUrl, authMode, token, authScope)
 
   return waitForHermesReady(baseUrl, {
     token,
@@ -6735,7 +6784,21 @@ function installMediaPermissions() {
 
 const OAUTH_SESSION_PARTITION = 'persist:hermes-remote-oauth'
 
-function getOauthSession() {
+function getOauthSession(authScope?: string) {
+  if (authScope) {
+    const scope = validateRegistryAuthScope(authScope)
+    const existing = registryOauthSessions.get(scope)
+
+    if (existing || !app.isReady()) {
+      return existing || null
+    }
+
+    const scopedSession = session.fromPartition(registryAuthPartition(scope))
+    registryOauthSessions.set(scope, scopedSession)
+
+    return scopedSession
+  }
+
   if (oauthSession || !app.isReady()) {
     return oauthSession
   }
@@ -6793,8 +6856,8 @@ function warmOauthCookieStore() {
 // connection-config.ts (cookiesHaveSession / cookiesHaveLiveSession). See
 // that module for details.
 
-async function hasOauthSessionCookie(baseUrl) {
-  const sess = getOauthSession()
+async function hasOauthSessionCookie(baseUrl: string, authScope?: string) {
+  const sess = getOauthSession(authScope)
 
   if (!sess) {
     return false
@@ -6826,8 +6889,8 @@ async function hasOauthSessionCookie(baseUrl) {
 // the next authenticated request. Gating on the AT alone forces a needless full
 // re-login every ~15 min. Used for the Settings "connected" indicator and as a
 // cheap early-out before attempting a network round-trip in resolveRemoteBackend.
-async function hasLiveOauthSession(baseUrl) {
-  const sess = getOauthSession()
+async function hasLiveOauthSession(baseUrl: string, authScope?: string) {
+  const sess = getOauthSession(authScope)
 
   if (!sess) {
     return false
@@ -6876,8 +6939,8 @@ async function hasLiveOauthSession(baseUrl) {
   return readLive()
 }
 
-async function clearOauthSession(baseUrl) {
-  const sess = getOauthSession()
+async function clearOauthSession(baseUrl: string | undefined, authScope?: string) {
+  const sess = getOauthSession(authScope)
 
   if (!sess) {
     return
@@ -6916,7 +6979,10 @@ async function clearOauthSession(baseUrl) {
 //     ``/auth/login`` → portal ``/oauth/authorize`` (auto-approves org members)
 //     → ``/auth/callback``, which sets the gateway cookie with NO interactive
 //     prompt. This is the per-agent cloud cascade (decisions.md Q5).
-function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
+function openOauthLoginWindow(
+  baseUrl: string,
+  { silent = false, authScope = undefined as string | undefined } = {}
+) {
   return new Promise((resolve, reject) => {
     if (!app.isReady()) {
       reject(new Error('Desktop is not ready to start an OAuth login.'))
@@ -6924,7 +6990,7 @@ function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
       return
     }
 
-    const sess = getOauthSession()
+    const sess = getOauthSession(authScope)
 
     if (!sess) {
       reject(new Error('OAuth session partition is unavailable.'))
@@ -6972,7 +7038,7 @@ function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
         return
       }
 
-      if (await hasOauthSessionCookie(baseUrl)) {
+      if (await hasOauthSessionCookie(baseUrl, authScope)) {
         finish(null)
       }
     }
@@ -7057,7 +7123,7 @@ function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
 // authed REST against a gated gateway, including minting WS tickets.
 function fetchJsonViaOauthSession(url, options: any = {}) {
   return new Promise((resolve, reject) => {
-    const sess = getOauthSession()
+    const sess = getOauthSession(options.authScope)
 
     if (!sess) {
       reject(new Error('OAuth session partition is unavailable.'))
@@ -7210,40 +7276,56 @@ function _nativeTokenStoreIo(): NativeTokenStoreIo {
   }
 }
 
-function _persistNativeTokens(baseUrl: string, tokens: NativeTokenSet | null) {
-  persistNativeTokenSet(baseUrl, tokens, _nativeTokenStoreIo())
+function nativeTokenStorageKey(baseUrl: string, authScope?: string): string {
+  return authScope ? registryAuthStorageKey(authScope, baseUrl) : baseUrl
 }
 
-function _loadNativeTokens(baseUrl: string): NativeTokenSet | null {
-  const cached = _nativeTokens.get(baseUrl)
+function _persistNativeTokens(storageKey: string, tokens: NativeTokenSet | null) {
+  persistNativeTokenSet(storageKey, tokens, _nativeTokenStoreIo())
+}
+
+function _loadNativeTokens(baseUrl: string, authScope?: string): NativeTokenSet | null {
+  const storageKey = nativeTokenStorageKey(baseUrl, authScope)
+  const cached = _nativeTokens.get(storageKey)
 
   if (cached) {
     return cached
   }
 
-  const tokens = loadNativeTokenSet(baseUrl, _nativeTokenStoreIo())
+  const tokens = loadNativeTokenSet(storageKey, _nativeTokenStoreIo())
 
   if (tokens) {
-    _nativeTokens.set(baseUrl, tokens)
+    _nativeTokens.set(storageKey, tokens)
   }
 
   return tokens
 }
 
-function _storeNativeTokens(baseUrl: string, tokens: NativeTokenSet) {
-  _nativeTokens.set(baseUrl, tokens)
-  _persistNativeTokens(baseUrl, tokens)
+function _storeNativeTokens(baseUrl: string, tokens: NativeTokenSet, authScope?: string) {
+  const storageKey = nativeTokenStorageKey(baseUrl, authScope)
+  _persistNativeTokens(storageKey, tokens)
+  _nativeTokens.set(storageKey, tokens)
 }
 
-function _clearNativeTokens(baseUrl: string) {
-  _nativeTokens.delete(baseUrl)
-  _persistNativeTokens(baseUrl, null)
+function _clearNativeTokens(baseUrl: string, authScope?: string) {
+  const storageKey = nativeTokenStorageKey(baseUrl, authScope)
+  _persistNativeTokens(storageKey, null)
+  _nativeTokens.delete(storageKey)
+}
+
+function clearNativeTokensBestEffort(baseUrl: string, authScope?: string): void {
+  try {
+    _clearNativeTokens(baseUrl, authScope)
+  } catch {
+    // persistNativeTokenSet already records the durable-write failure. Automatic
+    // expiry cleanup deliberately remains best-effort so callers can re-login.
+  }
 }
 
 // True when we hold native bearer tokens for this gateway (the native-flow
 // analogue of hasLiveOauthSession's cookie check).
-function hasNativeSession(baseUrl: string): boolean {
-  return _loadNativeTokens(baseUrl) !== null
+function hasNativeSession(baseUrl: string, authScope?: string): boolean {
+  return _loadNativeTokens(baseUrl, authScope) !== null
 }
 
 // POST JSON WITHOUT the OAuth cookie partition — used for the native token +
@@ -7261,8 +7343,8 @@ function postJsonNoAuth(url: string, body: unknown, opts: any = {}) {
 // Return a valid native access token for baseUrl, refreshing via
 // /auth/native/refresh if the stored one is at/near expiry. Returns null when
 // there are no tokens or the refresh is terminally rejected (caller re-logins).
-async function ensureNativeAccessToken(baseUrl: string): Promise<string | null> {
-  const tokens = _loadNativeTokens(baseUrl)
+async function ensureNativeAccessToken(baseUrl: string, authScope?: string): Promise<string | null> {
+  const tokens = _loadNativeTokens(baseUrl, authScope)
 
   if (!tokens) {
     return null
@@ -7274,7 +7356,7 @@ async function ensureNativeAccessToken(baseUrl: string): Promise<string | null> 
 
   if (!tokens.refreshToken) {
     // Access token expired and no RT to rotate — force re-login.
-    _clearNativeTokens(baseUrl)
+    clearNativeTokensBestEffort(baseUrl, authScope)
 
     return null
   }
@@ -7287,20 +7369,298 @@ async function ensureNativeAccessToken(baseUrl: string): Promise<string | null> 
     )
 
     const rotated = parseTokenResponse(body)
-    _storeNativeTokens(baseUrl, rotated)
+    _storeNativeTokens(baseUrl, rotated, authScope)
 
     return rotated.accessToken
   } catch (error: any) {
     // A 401 means the RT is dead (session_expired) — drop tokens so the UI
     // prompts a fresh native login. A 503/transient keeps them for a retry.
     if (error && error.statusCode === 401) {
-      _clearNativeTokens(baseUrl)
+      clearNativeTokensBestEffort(baseUrl, authScope)
 
       return null
     }
 
     throw error
   }
+}
+
+type RegistryNativeTokenSnapshot = {
+  cached?: NativeTokenSet
+  hasCached: boolean
+  stored?: StoredTokenSecret
+}
+
+type ElectronRegistryAuthCredentialSnapshot = RegistryAuthCredentialSnapshot & {
+  cookies: readonly any[]
+  nativeTokens: RegistryNativeTokenSnapshot
+}
+
+function registryCookieUrl(cookie: any): string {
+  const scheme = cookie.secure ? 'https' : 'http'
+
+  return `${scheme}://${String(cookie.domain || '').replace(/^\./, '')}${cookie.path || '/'}`
+}
+
+function registryOauthSession(scope: string) {
+  const scopedSession = getOauthSession(scope)
+
+  if (!scopedSession) {
+    throw new Error('Registered gateway authentication session is unavailable.')
+  }
+
+  return scopedSession
+}
+
+async function readRegistryOauthCookies(scope: string, baseUrl: string): Promise<any[]> {
+  const cookies = await registryOauthSession(scope).cookies.get({ url: baseUrl })
+
+  return cookies.map((cookie: any) => ({ ...cookie }))
+}
+
+async function removeRegistryOauthCookies(scope: string, baseUrl: string): Promise<void> {
+  const scopedSession = registryOauthSession(scope)
+  const cookies = await scopedSession.cookies.get({ url: baseUrl })
+  await Promise.all(cookies.map((cookie: any) => scopedSession.cookies.remove(registryCookieUrl(cookie), cookie.name)))
+}
+
+async function writeRegistryOauthCookies(scope: string, cookies: readonly any[]): Promise<void> {
+  const scopedSession = registryOauthSession(scope)
+  await Promise.all(
+    cookies.map(cookie => {
+      const { hostOnly: _hostOnly, session: _session, ...details } = cookie
+
+      return scopedSession.cookies.set({ ...details, url: registryCookieUrl(cookie) })
+    })
+  )
+}
+
+function snapshotRegistryNativeTokens(scope: string, baseUrl: string): RegistryNativeTokenSnapshot {
+  const storageKey = registryAuthStorageKey(scope, baseUrl)
+  const cached = _nativeTokens.get(storageKey)
+
+  return {
+    cached: cached ? { ...cached } : undefined,
+    hasCached: _nativeTokens.has(storageKey),
+    stored: snapshotNativeTokenSecret(storageKey, _nativeTokenStoreIo())
+  }
+}
+
+function restoreRegistryNativeTokens(
+  scope: string,
+  baseUrl: string,
+  snapshot: RegistryNativeTokenSnapshot
+): void {
+  const storageKey = registryAuthStorageKey(scope, baseUrl)
+  restoreNativeTokenSecret(storageKey, snapshot.stored, _nativeTokenStoreIo())
+
+  if (snapshot.hasCached && snapshot.cached) {
+    _nativeTokens.set(storageKey, { ...snapshot.cached })
+  } else {
+    _nativeTokens.delete(storageKey)
+  }
+}
+
+async function snapshotRegistryAuthCredentials(
+  scope: string,
+  baseUrl: string
+): Promise<ElectronRegistryAuthCredentialSnapshot> {
+  return {
+    cookies: await readRegistryOauthCookies(scope, baseUrl),
+    nativeTokens: snapshotRegistryNativeTokens(scope, baseUrl)
+  }
+}
+
+async function restoreRegistryAuthCredentials(
+  scope: string,
+  baseUrl: string,
+  rawSnapshot: RegistryAuthCredentialSnapshot
+): Promise<void> {
+  const snapshot = rawSnapshot as ElectronRegistryAuthCredentialSnapshot
+  await removeRegistryOauthCookies(scope, baseUrl)
+  await writeRegistryOauthCookies(scope, snapshot.cookies)
+  restoreRegistryNativeTokens(scope, baseUrl, snapshot.nativeTokens)
+}
+
+async function clearRegistryAuthCredentialsExact(scope: string, baseUrl: string): Promise<void> {
+  await removeRegistryOauthCookies(scope, baseUrl)
+  const storageKey = registryAuthStorageKey(scope, baseUrl)
+  _persistNativeTokens(storageKey, null)
+  _nativeTokens.delete(storageKey)
+}
+
+const registryAuthCleanupRetries = new RegistryAuthCleanupRetryQueue()
+
+function reportRegistryAuthCleanupFailure(_error: unknown): void {
+  rememberLog('[registry-auth] credential cleanup failed; retained for retry')
+}
+
+function registryAuthCredentialLifecycle(): RegistryAuthCredentialLifecycle {
+  const lifecycle: RegistryAuthCredentialLifecycle = {
+    snapshot: snapshotRegistryAuthCredentials,
+    replace: async (fromScope, toScope, baseUrl) => {
+      const source = await snapshotRegistryAuthCredentials(fromScope, baseUrl)
+      await clearRegistryAuthCredentialsExact(toScope, baseUrl)
+      await writeRegistryOauthCookies(toScope, source.cookies)
+      restoreRegistryNativeTokens(toScope, baseUrl, source.nativeTokens)
+    },
+    restore: restoreRegistryAuthCredentials,
+    clear: (scope, baseUrl) =>
+      clearRegistryAuthCredentialsTransactionally({
+        clear: () => clearRegistryAuthCredentialsExact(scope, baseUrl),
+        restore: snapshot => restoreRegistryAuthCredentials(scope, baseUrl, snapshot),
+        snapshot: () => snapshotRegistryAuthCredentials(scope, baseUrl)
+      })
+  }
+
+  return lifecycle
+}
+
+async function retryRegistryAuthCleanup(lifecycle = registryAuthCredentialLifecycle()): Promise<void> {
+  await registryAuthCleanupRetries.retry(lifecycle, reportRegistryAuthCleanupFailure)
+}
+
+function registryAuthPayload(payload: any): {
+  baseUrl: string
+  connectionId: string
+  generation: number
+  headers: Record<string, string>
+  scope: string
+} {
+  const scopeAuthority = resolveRegistryAuthScopeAuthority({
+    authority: registryAuthReadiness,
+    baseUrl: payload?.url,
+    registry: readDesktopConnectionsRegistry(),
+    scope: payload?.scope
+  })
+
+  const storedHeaders = scopeAuthority.scope.startsWith('draft-')
+    ? {}
+    : decryptRemoteHeaders(
+        readDesktopConnectionsRegistry().connections.find(
+          (connection: any) => connection.id === scopeAuthority.connectionId
+        )?.headers
+      )
+
+  return {
+    ...scopeAuthority,
+    headers: resolveRegistryAuthCandidateHeaders(payload?.headers, storedHeaders) as Record<string, string>
+  }
+}
+
+function readAuthenticatedRegistryStatus(input: {
+  authMode: 'oauth' | 'token'
+  baseUrl: string
+  headers: Record<string, string>
+  scope: string
+  token?: string | null
+}) {
+  return authenticatedRegistryStatus(input, registryAuthStatusDependencies())
+}
+
+function registryAuthStatusDependencies(): AuthenticatedRegistryStatusDependencies<any> {
+  return {
+    readNativeAccessToken: ensureNativeAccessToken,
+    readBearerStatus: (url, bearer, headers) => fetchJson(url, null, { bearer, headers, timeoutMs: 8_000 }),
+    readOauthStatus: (url, scope, headers) =>
+      fetchJsonViaOauthSession(url, { authScope: scope, headers, timeoutMs: 8_000 }),
+    readTokenStatus: (url, token, headers) => fetchJson(url, token, { headers, timeoutMs: 8_000 })
+  }
+}
+
+async function loginRegistryAuthScope(payload: any) {
+  await retryRegistryAuthCleanup()
+  const { baseUrl, scope } = registryAuthPayload(payload)
+  let statusBody: any = null
+
+  try {
+    statusBody = await fetchPublicJson(`${baseUrl}/api/status`, { timeoutMs: 8_000 })
+  } catch {
+    // Compatibility fallback: older gateways may not expose native-flow
+    // discovery but still support the embedded cookie login.
+  }
+
+  if (resolveLoginStrategy(statusBody) === 'native') {
+    try {
+      const tokens = await runNativeLogin(baseUrl, {
+        openExternal: url => shell.openExternal(url),
+        postJson: (url, body, opts) => postJsonNoAuth(url, body, opts),
+        rememberLog
+      })
+
+      _storeNativeTokens(baseUrl, tokens, scope)
+
+      return { ok: true, baseUrl, connected: true }
+    } catch (error) {
+      rememberLog(
+        `[native-oauth] scoped native login failed (${error instanceof Error ? error.message : String(error)}); ` +
+          'falling back to embedded flow'
+      )
+    }
+  }
+
+  await openOauthLoginWindow(baseUrl, { authScope: scope })
+
+  return { ok: true, baseUrl, connected: await hasOauthSessionCookie(baseUrl, scope) }
+}
+
+async function verifyRegistryAuthScope(payload: any) {
+  await retryRegistryAuthCleanup()
+  const { baseUrl, connectionId, generation, headers, scope } = registryAuthPayload(payload)
+  const authMode = normAuthMode(payload?.authMode)
+  let status: any
+  let token = ''
+
+  if (authMode === 'oauth') {
+    status = await readAuthenticatedRegistryStatus({ authMode, baseUrl, headers, scope })
+
+    const ticket = await mintRegistryAuthTicket(scope, baseUrl, headers, mintGatewayWsTicket)
+    const wsUrl = buildGatewayWsUrlWithTicket(baseUrl, ticket)
+    const probe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket, headers })
+
+    if (!probe.ok) {
+      throw new Error(`The authenticated gateway WebSocket readiness check failed: ${probe.reason}`)
+    }
+  } else {
+    const candidateToken = typeof payload?.token === 'string' ? payload.token.trim() : ''
+
+    const storedToken = scope.startsWith('draft-')
+      ? ''
+      : decryptDesktopSecret(
+          readDesktopConnectionsRegistry().connections.find(
+            (connection: any) => connection.id === connectionId
+          )?.token
+        ) || ''
+
+    token = candidateToken || storedToken
+
+    const verified = await verifyTokenRegistryAuth({
+      baseUrl,
+      headers,
+      token,
+      readStatus: (url, value, requestHeaders) =>
+        fetchJson(url, value, { headers: requestHeaders, timeoutMs: 8_000 }) as Promise<{ version?: null | string }>,
+      resolveWebSocketUrl: (url, value) => resolveTestWsUrl(url, 'token', value),
+      probeWebSocket: (url, requestHeaders) =>
+        probeGatewayWebSocket(url, { WebSocketImpl: globalThis.WebSocket, headers: requestHeaders })
+    })
+
+    status = verified
+  }
+
+  const readinessCapability = registryAuthReadiness.issue(
+    registryAuthCandidateBinding({
+      authMode,
+      baseUrl,
+      connectionId,
+      generation,
+      headers,
+      scope,
+      token
+    })
+  )
+
+  return { ok: true, baseUrl, readinessCapability, version: status?.version || null }
 }
 
 // OAuth-session download that streams the response body straight to a
@@ -7556,9 +7916,9 @@ async function saveGatewayFileViaDataUrl(connection, profile, filePath, ctx: any
 // falling back to the OAuth cookie partition otherwise.
 // Throws (with statusCode 401) if the session cookie is missing/expired —
 // callers treat that as "needs re-login".
-async function mintGatewayWsTicket(baseUrl, headers = {}) {
+async function mintGatewayWsTicket(baseUrl: string, headers: Record<string, string> = {}, authScope?: string) {
   // Native flow: mint the ticket with the bearer token, no cookie involved.
-  const nativeAt = await ensureNativeAccessToken(baseUrl).catch(() => null)
+  const nativeAt = await ensureNativeAccessToken(baseUrl, authScope).catch(() => null)
 
   if (nativeAt) {
     const body = (await fetchJson(`${baseUrl}/api/auth/ws-ticket`, null, {
@@ -7580,7 +7940,8 @@ async function mintGatewayWsTicket(baseUrl, headers = {}) {
   const body = (await fetchJsonViaOauthSession(`${baseUrl}/api/auth/ws-ticket`, {
     method: 'POST',
     timeoutMs: 8_000,
-    headers
+    headers,
+    authScope
   })) as any
 
   const ticket = body?.ticket
@@ -8212,7 +8573,7 @@ function decryptRemoteHeaders(headers) {
  * normalizeRemoteHeaders at the registry/config layer.
  */
 function encryptIncomingRemoteHeaders(raw, existing, options: { allowPlainText?: boolean } = {}) {
-  const out = {}
+  const encryptedCandidate: Record<string, unknown> = {}
   const stored = normalizeRemoteHeaders(existing)
 
   for (const [name, value] of Object.entries(raw || {})) {
@@ -8226,26 +8587,24 @@ function encryptIncomingRemoteHeaders(raw, existing, options: { allowPlainText?:
       const trimmed = value.trim()
 
       if (trimmed) {
-        out[key] = encryptDesktopSecret(trimmed, { allowPlainText: options.allowPlainText === true })
+        encryptedCandidate[key] = encryptDesktopSecret(trimmed, { allowPlainText: options.allowPlainText === true })
       }
 
       continue
     }
 
     if (value === null) {
-      if (stored[key]) {
-        out[key] = stored[key]
-      }
+      encryptedCandidate[key] = null
 
       continue
     }
 
     if (value && typeof value === 'object') {
-      out[key] = value
+      encryptedCandidate[key] = value
     }
   }
 
-  return out
+  return resolveRegistryAuthCandidateHeaders(encryptedCandidate, stored)
 }
 
 function rememberRemoteWsHeaders(wsUrl, headers = {}) {
@@ -8634,7 +8993,57 @@ async function saveRegistryConnection(input: any = {}) {
     throw new Error('Remote gateway session token is required.')
   }
 
-  writeDesktopConnectionsRegistry(upsertConnection(registry, entry))
+  const persist = () => writeDesktopConnectionsRegistry(upsertConnection(registry, entry))
+  const draftScope = typeof input.authDraftScope === 'string' ? input.authDraftScope : undefined
+
+  if (entry.kind === 'remote') {
+    const scopeAuthority = resolveRegistryAuthScopeAuthority({
+      authority: registryAuthReadiness,
+      baseUrl: entry.url,
+      registry,
+      scope: draftScope || entry.id
+    })
+
+    const binding = registryAuthCandidateBinding({
+      authMode: entry.authMode,
+      baseUrl: scopeAuthority.baseUrl,
+      connectionId: scopeAuthority.connectionId,
+      generation: scopeAuthority.generation,
+      headers: decryptRemoteHeaders(entry.headers),
+      scope: scopeAuthority.scope,
+      token: decryptDesktopSecret(entry.token) || ''
+    })
+
+    const lifecycle = registryAuthCredentialLifecycle()
+    await registryAuthCleanupRetries.retry(lifecycle, reportRegistryAuthCleanupFailure)
+    await saveVerifiedRegistryConnection({
+      authority: registryAuthReadiness,
+      binding,
+      capability: typeof input.authReadinessCapability === 'string' ? input.authReadinessCapability : undefined,
+      connectionId: entry.id,
+      persist: draftScope
+        ? () =>
+            promoteAndPersistRegistryAuth({
+              baseUrl: scopeAuthority.baseUrl,
+              cleanupRetries: registryAuthCleanupRetries,
+              fromScope: draftScope,
+              lifecycle,
+              onCleanupFailure: reportRegistryAuthCleanupFailure,
+              persist,
+              toScope: entry.id
+            })
+        : persist,
+      readinessRequired: registryAuthReadinessRequired(existing, entry)
+    })
+
+    if (draftScope) {
+      registryOauthSessions.delete(draftScope)
+    }
+
+    registryAuthReadiness.invalidateScope(scopeAuthority.scope)
+  } else {
+    persist()
+  }
 
   // A dial-material edit (endpoint/auth/ssh routing — NOT a label rename)
   // leaves pooled backends under `conn:<id>::*` and renderer sockets pointing
@@ -8938,7 +9347,8 @@ async function buildRemoteConnection(
   remoteHost?,
   remoteKind = 'url',
   remoteIdentity?,
-  headers?
+  headers?,
+  authScope?: string
 ) {
   const baseUrl = normalizeRemoteBaseUrl(rawUrl)
   const remoteHeaders = decryptRemoteHeaders(headers)
@@ -8964,7 +9374,7 @@ async function buildRemoteConnection(
     // into "not signed in" even though mintGatewayWsTicket would succeed with
     // the stored bearer.
     if (
-      !oauthSessionIsLive(hasNativeSession(baseUrl), await hasLiveOauthSession(baseUrl)) &&
+      !oauthSessionIsLive(hasNativeSession(baseUrl, authScope), await hasLiveOauthSession(baseUrl, authScope)) &&
       oauthGuardMayHardFail(await gatewayAuthProviders(baseUrl, remoteHeaders))
     ) {
       const err = new Error(
@@ -8979,7 +9389,9 @@ async function buildRemoteConnection(
     let ticket
 
     try {
-      ticket = await mintGatewayWsTicket(baseUrl, remoteHeaders)
+      ticket = authScope
+        ? await mintRegistryAuthTicket(authScope, baseUrl, remoteHeaders, mintGatewayWsTicket)
+        : await mintGatewayWsTicket(baseUrl, remoteHeaders)
     } catch (error) {
       // For a Nous-managed Cloud agent, a 502/503/504 from the WS-ticket mint
       // means the backend server itself is down — the actionable Cloud-down
@@ -9013,6 +9425,7 @@ async function buildRemoteConnection(
       remoteHost: host || undefined,
       remoteIdentity,
       remoteKind,
+      authScope,
       headers: remoteHeaders,
       // No static token in OAuth mode; REST is cookie-authed via the partition.
       token: null,
@@ -10160,10 +10573,18 @@ async function connectRegistryBackend(source, profile, key, poolEntry) {
     undefined,
     source.kind === 'cloud' ? 'cloud' : 'url',
     undefined,
-    source.headers
+    source.headers,
+    source.id
   )
 
-  await waitForHermes(connection.baseUrl, connection.token, undefined, connection.authMode, connection.headers)
+  await waitForHermes(
+    connection.baseUrl,
+    connection.token,
+    undefined,
+    connection.authMode,
+    connection.headers,
+    source.id
+  )
   poolEntry.remoteBaseUrl = connection.baseUrl
 
   return {
@@ -12671,6 +13092,86 @@ ipcMain.handle('hermes:connection-config:test', async (_event, payload) => testD
 // the registry lands separately; these handlers only manage the persisted
 // list, so they are safe to ship ahead of the switchover.
 ipcMain.handle('hermes:connections:list', async () => sanitizeConnectionsRegistry())
+ipcMain.handle('hermes:connections:auth:create-draft', async (_event, payload) => {
+  const scope = createDraftRegistryAuthScope()
+  const requestedOwner = typeof payload?.ownerConnectionId === 'string' ? payload.ownerConnectionId : undefined
+
+  const owner = requestedOwner
+    ? readDesktopConnectionsRegistry().connections.find(
+        (connection: any) => connection.id === requestedOwner && connection.kind === 'remote'
+      )?.id
+    : undefined
+
+  if (requestedOwner && !owner) {
+    throw new Error('The draft target does not identify a registered remote connection.')
+  }
+
+  const targetConnectionId = owner || createRegistryAuthTargetConnectionId()
+  registryAuthReadiness.registerDraft(scope, targetConnectionId)
+
+  return { ok: true, scope, targetConnectionId }
+})
+ipcMain.handle('hermes:connections:auth:probe', async (_event, payload) => {
+  try {
+    const { baseUrl, scope } = registryAuthPayload(payload)
+
+    return { ...(await probeRemoteAuthMode(baseUrl)), scope }
+  } catch (error) {
+    return serializeRegistryAuthFailure(error, error instanceof Error ? error.message : 'Could not inspect gateway auth.')
+  }
+})
+ipcMain.handle('hermes:connections:auth:login', async (_event, payload) => {
+  try {
+    return await loginRegistryAuthScope(payload)
+  } catch (error) {
+    return serializeRegistryAuthFailure(error, error instanceof Error ? error.message : 'Could not sign in to the gateway.')
+  }
+})
+ipcMain.handle('hermes:connections:auth:verify', async (_event, payload) => {
+  try {
+    return await verifyRegistryAuthScope(payload)
+  } catch (error) {
+    return serializeRegistryAuthFailure(
+      error,
+      error instanceof Error ? error.message : 'Could not verify the gateway session.'
+    )
+  }
+})
+ipcMain.handle('hermes:connections:auth:status', async (_event, payload) => {
+  try {
+    await retryRegistryAuthCleanup()
+    const { baseUrl, connectionId, headers, scope } = registryAuthPayload(payload)
+    const entry = readDesktopConnectionsRegistry().connections.find((connection: any) => connection.id === connectionId)
+
+    if (!entry || entry.kind !== 'remote') {
+      throw new Error('The registered gateway authentication scope does not identify a remote connection.')
+    }
+
+    return await readDurableRegistryAuthStatus({
+      authMode: normAuthMode(entry.authMode),
+      baseUrl,
+      headers,
+      scope,
+      token: decryptDesktopSecret(entry.token)
+    }, registryAuthStatusDependencies())
+  } catch (error) {
+    return serializeRegistryAuthFailure(error, error instanceof Error ? error.message : 'Could not read gateway auth status.')
+  }
+})
+ipcMain.handle('hermes:connections:auth:clear', async (_event, payload) => {
+  try {
+    const lifecycle = registryAuthCredentialLifecycle()
+    await retryRegistryAuthCleanup(lifecycle)
+    const { baseUrl, scope } = registryAuthPayload(payload)
+    await lifecycle.clear(scope, baseUrl)
+    registryOauthSessions.delete(scope)
+    registryAuthReadiness.invalidateScope(scope)
+
+    return { ok: true, baseUrl, connected: false }
+  } catch (error) {
+    return serializeRegistryAuthFailure(error, error instanceof Error ? error.message : 'Could not clear gateway auth.')
+  }
+})
 ipcMain.handle('hermes:connections:save', async (_event, payload) => {
   const saved = await saveRegistryConnection(payload)
 
@@ -12678,17 +13179,42 @@ ipcMain.handle('hermes:connections:save', async (_event, payload) => {
 })
 ipcMain.handle('hermes:connections:remove', async (_event, id) => {
   const key = String(id || '')
-  const registry = removeConnection(readDesktopConnectionsRegistry(), key)
-  writeDesktopConnectionsRegistry(registry)
-  // Tear down anything the removed connection still had running: pooled
-  // backends under its composite keys and any ssh tunnel scopes it owned.
-  await stopRegistryConnectionBackends(key)
-  // And the renderer side: without this push, secondaries scoped to the
-  // removed connection keep their WebSocket open (remote/cloud have no local
-  // process to kill) and stream ghost events until page reload.
-  broadcastConnectionsChanged({ connectionId: key, reason: 'removed' })
+  const current = readDesktopConnectionsRegistry()
+  const removed = current.connections.find((connection: any) => connection.id === key)
+  const lifecycle = registryAuthCredentialLifecycle()
 
-  return { ok: true, registry: sanitizeConnectionsRegistry(registry) }
+  try {
+    await retryRegistryAuthCleanup(lifecycle)
+    const registry = removeConnection(current, key)
+    const baseUrl = removed?.url ? normalizeRemoteBaseUrl(removed.url) : undefined
+
+    await removeRegistryConnectionTransactionally({
+      credentials: baseUrl
+        ? {
+            clear: () => lifecycle.clear(key, baseUrl),
+            restore: snapshot => lifecycle.restore(key, baseUrl, snapshot),
+            snapshot: () => lifecycle.snapshot(key, baseUrl)
+          }
+        : undefined,
+      persistRemoval: () => writeDesktopConnectionsRegistry(registry)
+    })
+
+    registryOauthSessions.delete(key)
+    await teardownRemovedRegistryConnection({
+      authority: registryAuthReadiness,
+      scope: key,
+      stopBackends: () => stopRegistryConnectionBackends(key)
+    })
+
+    // And the renderer side: without this push, secondaries scoped to the
+    // removed connection keep their WebSocket open (remote/cloud have no local
+    // process to kill) and stream ghost events until page reload.
+    broadcastConnectionsChanged({ connectionId: key, reason: 'removed' })
+
+    return { ok: true, registry: sanitizeConnectionsRegistry(registry) }
+  } catch (error) {
+    return serializeRegistryAuthFailure(error, 'Could not remove the registered gateway connection.')
+  }
 })
 ipcMain.handle('hermes:connections:set-primary', async (_event, id) => {
   const registry = setPrimaryConnection(readDesktopConnectionsRegistry(), String(id || ''))
@@ -12708,9 +13234,10 @@ ipcMain.handle('hermes:connections:set-last-used', async (_event, id) => {
 
   return { ok: true, registry: sanitizeConnectionsRegistry(registry) }
 })
-ipcMain.handle('hermes:connections:test', async (_event, id) => {
-  const registry = readDesktopConnectionsRegistry()
-  const entry = registry.connections.find(c => c.id === String(id || ''))
+ipcMain.handle('hermes:connections:test', async (_event, id) =>
+  runStructuredRegistryTest(async () => {
+    const registry = readDesktopConnectionsRegistry()
+    const entry = registry.connections.find(c => c.id === String(id || ''))
 
   if (!entry) {
     throw new Error(`No connection with id "${String(id || '')}".`)
@@ -12732,9 +13259,18 @@ ipcMain.handle('hermes:connections:test', async (_event, id) => {
       sshInventoryAttemptedAt.delete(entry.id)
       sshRosterCache.delete(entry.id)
       await probeSshProfileInventory(entry)
+
+      return result
     }
 
-    return result
+    return {
+      ...result,
+      ...serializeRegistryAuthFailure(
+        new Error(result?.error || 'SSH connection test failed.'),
+        result?.error || 'SSH connection test failed.'
+      ),
+      reachable: false
+    }
   }
 
   // Remote/cloud/local probe built DIRECTLY from the registry entry. Routing
@@ -12744,10 +13280,10 @@ ipcMain.handle('hermes:connections:test', async (_event, id) => {
   // credential transmission + a false "reachable"), and testing the local
   // entry would probe whatever v1's global mode points at instead of the
   // app-managed local backend.
-  let baseUrl
-  let token = null
-  let authMode = 'token'
-  let testHeaders = {}
+  let baseUrl: string
+  let token: null | string = null
+  let authMode: 'oauth' | 'token' = 'token'
+  let testHeaders: Record<string, string> = {}
 
   if (entry.kind === 'local') {
     const local = await startHermes()
@@ -12768,31 +13304,30 @@ ipcMain.handle('hermes:connections:test', async (_event, id) => {
     }
   }
 
-  const status = (await fetchJson(`${baseUrl}/api/status`, token, { timeoutMs: 8_000, headers: testHeaders })) as any
-
-  // The Test button is the cheapest moment to (re)learn this backend's stable
-  // identity for the same-backend roster collapse + Settings hint.
-  rememberConnectionInstallId(entry.id, status)
-
-  // Same HTTP+WS two-leg check as testDesktopConnectionConfig: HTTP alone is
-  // a false positive when the WebSocket leg is blocked.
-  const wsUrl = await resolveTestWsUrl(baseUrl, authMode, token, {
-    mintTicket: url => mintGatewayWsTicket(url, testHeaders)
-  })
-
-  if (wsUrl && typeof globalThis.WebSocket === 'function') {
-    const probe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket, headers: testHeaders })
-
-    if (!probe.ok) {
-      throw new Error(
-        `Reached the gateway over HTTP, but the live WebSocket (/api/ws) connection failed: ${probe.reason} ` +
-          'The HTTP check can pass while the WebSocket is blocked by a proxy, firewall, or gateway auth/origin guard.'
-      )
-    }
-  }
-
-  return { ok: true, baseUrl, version: status?.version || null }
-})
+    return testAuthenticatedRegistryConnection(
+      {
+        authMode,
+        baseUrl,
+        headers: testHeaders,
+        scope: entry.kind === 'local' ? 'local' : entry.id,
+        token
+      },
+      {
+        ...registryAuthStatusDependencies(),
+        onStatus: status => {
+          rememberConnectionInstallId(entry.id, status)
+        },
+        resolveWebSocketUrl: (url, mode, value) =>
+          resolveTestWsUrl(url, mode, value, {
+            mintTicket: (ticketUrl: string) =>
+              mintRegistryAuthTicket(entry.id, ticketUrl, testHeaders, mintGatewayWsTicket)
+          }),
+        probeWebSocket: (url, headers) =>
+          probeGatewayWebSocket(url, { WebSocketImpl: globalThis.WebSocket, headers })
+      }
+    )
+  }, 'Could not test the registered gateway connection.')
+)
 
 // ── Union agent roster + registry ws-url + fan-out updates (phase 3-5) ─────
 
@@ -13029,7 +13564,13 @@ ipcMain.handle('hermes:gateway:ws-url-for', async (_event, payload) => {
     const connection: any = await ensureRegistryBackend(connectionId, profile)
 
     if (connection.authMode === 'oauth') {
-      const ticket = await mintGatewayWsTicket(connection.baseUrl, connection.headers)
+      const ticket = await mintRegistryAuthTicket(
+        connection.authScope || connectionId,
+        connection.baseUrl,
+        connection.headers,
+        mintGatewayWsTicket
+      )
+
       const wsUrl = buildGatewayWsUrlWithTicket(connection.baseUrl, ticket)
 
       rememberRemoteWsHeaders(wsUrl, connection.headers)
@@ -13137,7 +13678,7 @@ async function fetchJsonForBackend(
       throw new Error('File uploads are not supported against OAuth-gated remote backends yet.')
     }
 
-    const nativeAt = await ensureNativeAccessToken(descriptor.baseUrl).catch(() => null)
+    const nativeAt = await ensureNativeAccessToken(descriptor.baseUrl, descriptor.authScope).catch(() => null)
 
     if (nativeAt) {
       return fetchJson(url, null, {
@@ -13153,7 +13694,8 @@ async function fetchJsonForBackend(
       method: opts.method,
       body: opts.body,
       timeoutMs: opts.timeoutMs,
-      headers: descriptor.headers
+      headers: descriptor.headers,
+      authScope: descriptor.authScope
     })
   }
 

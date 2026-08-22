@@ -66,6 +66,59 @@ function readStore(io: NativeTokenStoreIo): Record<string, any> {
   }
 }
 
+function readStoreForTransaction(io: NativeTokenStoreIo): Record<string, any> {
+  try {
+    const parsed = JSON.parse(io.readStoreText())
+
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('Native token store is not an object map.')
+    }
+
+    return parsed
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') {
+      return {}
+    }
+
+    throw error
+  }
+}
+
+function writeStore(store: Record<string, any>, io: NativeTokenStoreIo): void {
+  try {
+    io.writeStoreText(JSON.stringify(store))
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+
+    io.rememberLog?.(`[native-oauth] failed to persist tokens: ${detail}`)
+    throw error
+  }
+}
+
+/** Snapshot the opaque encrypted envelope without decrypting or re-encrypting it. */
+export function snapshotNativeTokenSecret(storageKey: string, io: NativeTokenStoreIo): StoredTokenSecret | undefined {
+  const secret = readStoreForTransaction(io)[storageKey]
+
+  return secret && typeof secret === 'object' && !Array.isArray(secret) ? { ...secret } : undefined
+}
+
+/** Restore an exact encrypted envelope (or its prior absence) transactionally. */
+export function restoreNativeTokenSecret(
+  storageKey: string,
+  secret: StoredTokenSecret | undefined,
+  io: NativeTokenStoreIo
+): void {
+  const store = readStoreForTransaction(io)
+
+  if (secret) {
+    store[storageKey] = { ...secret }
+  } else {
+    delete store[storageKey]
+  }
+
+  writeStore(store, io)
+}
+
 /**
  * A gateway URL safe to write into a log line.
  *
@@ -118,13 +171,7 @@ export function persistNativeTokenSet(baseUrl: string, tokens: NativeTokenSet | 
     delete store[baseUrl]
   }
 
-  try {
-    io.writeStoreText(JSON.stringify(store))
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error)
-
-    io.rememberLog?.(`[native-oauth] failed to persist tokens: ${detail}`)
-  }
+  writeStore(store, io)
 }
 
 /**

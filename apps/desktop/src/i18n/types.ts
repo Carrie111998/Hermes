@@ -646,6 +646,8 @@ export interface Translations {
       removeConfirmDesc: (label: string) => string
       makePrimary: string
       testConnection: string
+      detectAuthentication: string
+      signInFailed: string
       testOk: string
       testFailed: string
       saveFailed: string
