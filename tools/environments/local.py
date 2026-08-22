@@ -363,6 +363,33 @@ _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 _ACTIVE_VENV_MARKER_VARS = ("VIRTUAL_ENV", "CONDA_PREFIX", "PYTHONHOME")
 
 
+# Env var names that were resolved into a *secret* at runtime, registered by
+# the resolving code itself rather than matched by a static name rule.
+#
+# The webhook adapter accepts ``secret: ${ANY_NAME}`` in operator config, so
+# the set of env vars holding gateway secrets is open-ended and cannot be
+# enumerated ahead of time. Registration closes the gap between "any name may
+# be referenced" and "only conventional names are stripped": whatever gets
+# resolved is stripped, whatever its spelling.
+#
+# Append-only and process-local. Adding a name can only ever remove a variable
+# from a subprocess environment, never expose one, so a lost registration
+# degrades to the previous name-based behaviour instead of failing open.
+_RESOLVED_SECRET_ENV_NAMES: set = set()
+
+
+def register_resolved_secret_env_name(name: str) -> None:
+    """Mark ``name`` as an env var whose value is used as a gateway secret.
+
+    Called by resolvers (e.g. the webhook adapter's ``${VAR}`` expansion) so
+    :func:`_is_hermes_internal_secret` strips the variable from every spawned
+    subprocess regardless of how the operator spelled it.
+    """
+    if name and isinstance(name, str):
+        _RESOLVED_SECRET_ENV_NAMES.add(name)
+        _RESOLVED_SECRET_ENV_NAMES.add(name.upper())
+
+
 def _is_hermes_internal_secret(key: str) -> bool:
     """Return True for Hermes-internal secrets injected under *dynamic* names.
 
@@ -384,6 +411,13 @@ def _is_hermes_internal_secret(key: str) -> bool:
       (``GATEWAY_RELAY_URL``, ``GATEWAY_RELAY_PLATFORMS``, …) are NOT matched
       and remain visible.
 
+    - ``HERMES_WEBHOOK_SECRET_*`` — HMAC secrets for the webhook platform
+      adapter, referenced from ``platforms.webhook.extra`` config as
+      ``secret: ${HERMES_WEBHOOK_SECRET_<NAME>}`` and resolved from the
+      environment at adapter load time. Only consumer is the in-process
+      webhook adapter; leaking one lets the holder forge signed webhook
+      POSTs into the gateway.
+
     ``code_execution_tool.py`` already catches these via substring matching on
     ``KEY`` / ``SECRET`` / ``TOKEN``; the terminal backend's narrower name-based
     blocklist did not, which is the leak this predicate closes.
@@ -404,6 +438,18 @@ def _is_hermes_internal_secret(key: str) -> bool:
     if upper.startswith("GATEWAY_RELAY_") and (
         upper.endswith("_SECRET") or upper.endswith("_KEY") or upper.endswith("_TOKEN")
     ):
+        return True
+    if upper.startswith("HERMES_WEBHOOK_SECRET_"):
+        # Webhook-platform HMAC secrets referenced from config.yaml as
+        # secret: ${HERMES_WEBHOOK_SECRET_<NAME>}; stripped unconditionally
+        # on every spawn surface (see docstring).
+        return True
+    if key in _RESOLVED_SECRET_ENV_NAMES or upper in _RESOLVED_SECRET_ENV_NAMES:
+        # Registered at resolution time by whoever pulled the value out of the
+        # environment and used it AS a secret. Name-based rules above cannot
+        # cover an operator who writes ``secret: ${WEBHOOK_HMAC}`` — a name no
+        # static registry knows and that the substring KEY/SECRET/TOKEN filter
+        # in code_execution_tool.py does not match either.
         return True
     return False
 

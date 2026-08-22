@@ -20,6 +20,12 @@ Each route defines:
 
 Security:
   - HMAC secret is required per route (validated at startup)
+  - Secrets may be written as whole-value ``${VAR}`` templates, resolved
+    once from the environment at adapter load time, so the key can live in
+    an env file / secret store instead of config.yaml. An unset or empty
+    variable refuses to start (never os.path.expandvars, which would leave
+    ``${MISSING}`` in place and fail open). Agent-created dynamic routes
+    are deliberately never expanded.
   - Rate limiting per route (fixed-window, configurable)
   - Idempotency cache prevents duplicate agent runs on webhook retries
   - Body size limits checked before reading payload
@@ -37,6 +43,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -169,6 +176,65 @@ def _hmac_str_equal(provided: str, expected: str) -> bool:
     return hmac.compare_digest(provided.encode(), expected.encode())
 
 
+_SECRET_ENV_TEMPLATE_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+
+
+def _resolve_secret_template(value: str, where: str) -> str:
+    """Resolve a whole-value ``${VAR}`` secret from the environment.
+
+    Only an entire value of the form ``${VAR}`` is treated as a template,
+    so a literal secret that merely contains a ``$`` is never rewritten.
+
+    Deliberately NOT ``os.path.expandvars``: that leaves ``${MISSING}`` in
+    place when the variable is unset, and the resulting non-empty string
+    sails past the "secret is required" startup check as if it were a real
+    secret — a fail-OPEN hole. An unset or empty variable raises here
+    instead, so the adapter refuses to serve a route whose HMAC secret
+    would be the literal text ``${MISSING}``.
+
+    Load-time resolution only (``WebhookAdapter.__init__``). Dynamic,
+    agent-created routes (``webhook_subscriptions.json``) are deliberately
+    NOT expanded: if the agent could set ``secret: ${SOME_VAR}`` on its own
+    routes it would gain an oracle for comparing arbitrary gateway env vars
+    against chosen signatures. Static routes come from config.yaml, written
+    by the operator.
+    """
+    if not value or not isinstance(value, str):
+        return value
+    match = _SECRET_ENV_TEMPLATE_RE.match(value.strip())
+    if not match:
+        return value
+    name = match.group(1)
+    # Route through gateway.config._getenv, not os.environ: under multiplexed
+    # profile startup a per-profile secret scope is installed, and the scoped
+    # value is the correct one. Imported lazily to keep this module importable
+    # without the gateway config package.
+    try:
+        from gateway.config import _getenv
+
+        resolved = _getenv(name, "") or ""
+    except Exception:
+        resolved = os.environ.get(name, "")
+    if resolved:
+        # Whatever name the operator chose now holds a live HMAC secret in the
+        # gateway process environment. Register it so the terminal/subprocess
+        # filters strip it; the static HERMES_WEBHOOK_SECRET_* rule only covers
+        # the conventional spelling.
+        try:
+            from tools.environments.local import register_resolved_secret_env_name
+
+            register_resolved_secret_env_name(name)
+        except Exception:
+            pass
+    if not resolved:
+        raise ValueError(
+            f"[webhook] {where} references ${{{name}}} but that environment "
+            f"variable is unset or empty. Refusing to serve with an "
+            f"unresolved secret."
+        )
+    return resolved
+
+
 def check_webhook_requirements() -> bool:
     """Check if webhook adapter dependencies are available."""
     return AIOHTTP_AVAILABLE
@@ -191,8 +257,28 @@ class WebhookAdapter(BasePlatformAdapter):
         _cfg_host = config.extra.get("host", DEFAULT_HOST)
         self._host: Optional[str] = _cfg_host or None
         self._port: int = int(config.extra.get("port", DEFAULT_PORT))
-        self._global_secret: str = config.extra.get("secret", "")
-        self._static_routes: Dict[str, dict] = config.extra.get("routes", {})
+        # ${VAR} secret templates resolve once, at load
+        # time. Resolution failures are RECORDED, not raised: __init__
+        # runs outside the try-block that guards connect() in
+        # gateway/run.py, so raising here would kill the whole gateway
+        # (crash-loop under Restart=always) instead of degrading to
+        # "webhook platform down". connect() re-raises; that path IS
+        # guarded. Failed templates become secret: "" (the key is kept
+        # so the route cannot silently inherit the global secret).
+        self._unresolved_secret_errors: List[str] = []
+        self._global_secret: str = self._resolve_config_secret(
+            config.extra.get("secret", ""), "global secret"
+        )
+        self._static_routes: Dict[str, dict] = {
+            _name: (
+                {**_route, "secret": self._resolve_config_secret(
+                    _route["secret"], f"route {_name!r}"
+                )}
+                if isinstance(_route, dict) and _route.get("secret")
+                else _route
+            )
+            for _name, _route in (config.extra.get("routes", {}) or {}).items()
+        }
         self._dynamic_routes: Dict[str, dict] = {}
         self._dynamic_routes_mtime: float = 0.0
         self._routes: Dict[str, dict] = dict(self._static_routes)
@@ -241,11 +327,33 @@ class WebhookAdapter(BasePlatformAdapter):
             script_timeout_seconds=self._script_timeout_seconds
         )
 
+    def _resolve_config_secret(self, value: Any, where: str) -> str:
+        """Resolve a ``${VAR}`` template from config, capturing failures.
+
+        Returns ``""`` when the template cannot be resolved and records
+        the reason; :meth:`connect` re-raises the recorded errors inside
+        the guarded startup path. See the note on ``__init__`` for why
+        raising here directly would crash-loop the whole gateway.
+        """
+        try:
+            return _resolve_secret_template(value, where)
+        except ValueError as exc:
+            self._unresolved_secret_errors.append(str(exc))
+            return ""
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # Fail-closed for ${VAR} secrets that did not
+        # resolve at load time. Recorded in __init__ (NOT guarded by the
+        # startup try-block) and re-raised here (guarded), so an
+        # unresolved secret takes down the webhook platform only,
+        # never the whole gateway.
+        if self._unresolved_secret_errors:
+            raise ValueError("; ".join(self._unresolved_secret_errors))
+
         # Load agent-created subscriptions before validating
         self._reload_dynamic_routes()
 
