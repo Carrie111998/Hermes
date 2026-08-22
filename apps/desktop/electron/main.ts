@@ -3953,35 +3953,55 @@ function preflightStateDb(hermesHome, rememberLog, updateRoot) {
       // catching corruption before mutation is negligible. Run it through
       // the repo's Python (stdlib sqlite3; venv may not ship a sqlite3
       // binary), never blocking the update if the probe itself fails.
-      let integrityOk = false
+      // Three states, deliberately: "could not check" must never look like
+      // "checked, and found damaged".  Both are non-ok, but only a probe that
+      // actually RAN and returned non-ok earns the .CORRUPT tag below.  A
+      // missing interpreter would otherwise brand a perfectly healthy backup
+      // as damaged — and that filename outlives the log line explaining it.
+      let integrityVerdict: 'ok' | 'corrupt' | 'unverified' = 'unverified'
       let integrityProblem = 'not-run'
       try {
         const pythonBin = findPythonForRoot(updateRoot)
         if (pythonBin) {
-          const code =
-            'import sqlite3,sys;' +
-            'c=sqlite3.connect(sys.argv[1], timeout=5);' +
-            'r=c.execute("PRAGMA integrity_check").fetchall();' +
-            'print("\\n".join(x[0] for x in r))'
+          const code = [
+            'import sqlite3, sys, pathlib',
+            'p = pathlib.Path(sys.argv[1])',
+            'try:',
+            // Read-only open: this runs while the backend is still alive, so
+            // adding a second READ-WRITE connection to a database another
+            // process is writing is exactly the shape behind the 2026-08-21
+            // corruption.  as_uri() escapes spaces and unicode in the path.
+            '    c = sqlite3.connect(p.as_uri() + "?mode=ro", uri=True, timeout=5)',
+            'except sqlite3.OperationalError:',
+            // A read-only WAL open needs an existing -shm, which disappears
+            // once no process holds the database.  Fall back rather than
+            // report a healthy database as unverified.
+            '    c = sqlite3.connect(str(p), timeout=5)',
+            'print("\\n".join(r[0] for r in c.execute("PRAGMA integrity_check")))',
+          ].join('\n')
           const probe = execFileSync(pythonBin, ['-c', code, stateDbPath], {
             encoding: 'utf8',
             timeout: 30_000, // 30s cap; 65MB DB takes ~0.4s
           })
           const lines = (probe || '').trim().split('\n').filter(Boolean)
           if (lines.length === 1 && lines[0] === 'ok') {
-            integrityOk = true
+            integrityVerdict = 'ok'
+            integrityProblem = ''
           } else {
+            integrityVerdict = 'corrupt'
             integrityProblem = (lines[0] || 'non-ok').slice(0, 300)
           }
         } else {
           integrityProblem = 'no-python-found'
         }
       } catch (integrityErr) {
+        // A probe malfunction (spawn failure, timeout, unreadable path) says
+        // nothing about the database — the verdict stays 'unverified'.
         integrityProblem = String(integrityErr && integrityErr.message ? integrityErr.message : integrityErr)
       }
       rememberLog(
-        `[updates] state.db pre-flight integrity: ok=${integrityOk}, ` +
-          `problem=${integrityProblem}`
+        `[updates] state.db pre-flight integrity: verdict=${integrityVerdict}` +
+          (integrityProblem ? `, problem=${integrityProblem}` : '')
       )
 
       if (!headerOk) {
@@ -3991,19 +4011,30 @@ function preflightStateDb(hermesHome, rememberLog, updateRoot) {
         )
       }
 
-      if (!integrityOk) {
+      if (integrityVerdict === 'corrupt') {
         rememberLog(
           '[updates] state.db INTEGRITY FAILED before update — ' +
-            'pre-existing corruption detected; emergency backup will be tagged as damaged'
+            'pre-existing corruption detected; emergency backup will be tagged .CORRUPT'
+        )
+      } else if (integrityVerdict === 'unverified') {
+        rememberLog(
+          '[updates] state.db integrity COULD NOT BE CHECKED — backup will be ' +
+            'tagged .UNVERIFIED; this is not evidence that the database is damaged'
         )
       }
 
       // Emergency timestamped backup, separate from the Python-level snapshot.
       const ts = new Date().toISOString().replace(/[:.]/g, '-')
 
+      const integritySuffix =
+        integrityVerdict === 'ok'
+          ? ''
+          : integrityVerdict === 'corrupt'
+            ? '.CORRUPT'
+            : '.UNVERIFIED'
       const emergencyPath = path.join(
         hermesHome,
-        `state.db.pre-update-emergency-${ts}${integrityOk ? '' : '.CORRUPT'}.bak`
+        `state.db.pre-update-emergency-${ts}${integritySuffix}.bak`
       )
 
       try {
