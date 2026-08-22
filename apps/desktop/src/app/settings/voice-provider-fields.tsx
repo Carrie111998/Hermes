@@ -46,18 +46,26 @@ export function VoiceProviderFields({ section, providerKey }: { section: 'tts' |
   // config-settings.tsx's autosave loop.
   const [config, setConfig] = useState<HermesConfigRecord | null>(null)
   const seeded = useRef(false)
-
-  // eslint-disable-next-line no-restricted-syntax -- one-shot config seed flag, not an atom mirror
-  useEffect(() => {
-    if (loadedConfig && !seeded.current) {
-      seeded.current = true
-      setConfig(loadedConfig)
-    }
-  }, [loadedConfig])
-
+  const lastRev = useRef<string | undefined>(undefined)
   const saveVersionRef = useRef(0)
   const [saveVersion, setSaveVersion] = useState(0)
 
+  // eslint-disable-next-line no-restricted-syntax -- one-shot config seed flag, not an atom mirror
+  useEffect(() => {
+    if (loadedConfig) {
+      const rev = (loadedConfig as Record<string, unknown>)._revision as string | undefined
+      if (!seeded.current || (saveVersionRef.current === 0 && rev && rev !== lastRev.current)) {
+        seeded.current = true
+        lastRev.current = rev
+        setConfig(loadedConfig)
+      }
+    }
+  }, [loadedConfig])
+
+  // lastRev is a plain mutable ref carrying the save-request's revision
+  // forward, not a reactive-value mirror; it's written once the async save
+  // resolves, not synced from a store.
+  // eslint-disable-next-line no-restricted-syntax
   useEffect(() => {
     if (!config || saveVersion === 0) {
       return
@@ -65,13 +73,25 @@ export function VoiceProviderFields({ section, providerKey }: { section: 'tts' |
 
     const timeout = window.setTimeout(() => {
       void saveHermesConfig(config)
-        .then(() => setHermesConfigCache(config))
+        .then(result => {
+          // Carry the server's new revision forward so the next autosave's
+          // expected_revision matches disk instead of replaying this draft's
+          // load-time revision and false-409ing against its own prior save.
+          const saved = result._revision ? { ...config, _revision: result._revision } : config
+
+          lastRev.current = result._revision ?? lastRev.current
+          setConfig(saved)
+          setHermesConfigCache(saved)
+        })
         .catch(err => notifyError(err, t.settings.config.autosaveFailed))
     }, 550)
 
     return () => window.clearTimeout(timeout)
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- copy is stable; avoid re-scheduling autosave on locale change
-  }, [config, saveVersion])
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- config intentionally excluded: updateConfig
+    // always bumps saveVersion in the same tick, so config is already fresh whenever this effect
+    // re-runs for a real edit. Keeping config out of the deps also means the post-save
+    // revision-carry-forward setConfig() above doesn't re-trigger this effect and loop.
+  }, [saveVersion])
 
   // ElevenLabs cloned/library voices from the live account, when available —
   // mirrors the Settings → Voice dynamic voice list.

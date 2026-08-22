@@ -527,7 +527,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile = null }: Model
   const fastOn = isFastTier(getNested(config ?? {}, 'agent.service_tier'))
 
   // Persist a single agent.* default by round-tripping the whole config record
-  // (PUT /api/config replaces it) — optimistic, with rollback on failure.
+  // (PUT /api/config deep-merges it server-side) — optimistic, with rollback on failure.
   const writeAgentDefault = useCallback(
     async (key: string, value: string) => {
       if (!config) {
@@ -539,7 +539,11 @@ export function ModelSettings({ onMainModelChanged, scopeProfile = null }: Model
       setConfig(next)
 
       try {
-        await saveHermesConfig(next, scopeProfile ?? undefined)
+        const result = await saveHermesConfig(next, scopeProfile ?? undefined)
+
+        if (result._revision) {
+          setConfig({ ...next, _revision: result._revision })
+        }
       } catch (err) {
         setConfig(prev)
         notifyError(err, m.defaultsFailed)

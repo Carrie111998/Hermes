@@ -33,7 +33,9 @@ class TestGetConfigOffLoop:
         assert resp.status_code == 200
         body = resp.json()
         assert isinstance(body, dict)
-        assert not any(k.startswith("_") for k in body)
+        # `_revision` is the deliberate exception: it's the CAS token issue
+        # #88913 added so PUT /api/config can reject stale-based overwrites.
+        assert not any(k.startswith("_") and k != "_revision" for k in body)
 
     def test_loop_stays_responsive_while_profile_lock_held(self):
         """Heartbeats on the request's event loop must keep ticking while

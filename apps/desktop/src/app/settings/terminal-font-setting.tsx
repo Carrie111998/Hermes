@@ -98,7 +98,10 @@ export function TerminalFontSetting() {
             return
           }
 
-          setHermesConfigCache(next)
+          // Carry the server's new revision forward so the next autosave's
+          // expected_revision matches disk instead of false-409ing against
+          // this save's own now-stale load-time revision.
+          setHermesConfigCache(result._revision ? { ...next, _revision: result._revision } : next)
         })
         .catch(error => {
           if (saveVersionRef.current !== version) {

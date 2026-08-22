@@ -1,6 +1,7 @@
 import { atom } from 'nanostores'
 
 import { resetLiveRuntimeTracking } from '@/app/contrib/hooks/use-background-sync'
+import { resetHermesConfigCache } from '@/app/hooks/use-config-record'
 import { resetSidebarBatchCapability } from '@/hermes'
 import { invalidateProfileScopedQueries } from '@/lib/query-client'
 import { clearArtifactRegistry } from '@/store/artifacts'
@@ -97,5 +98,6 @@ export function wipeSessionListsForGatewaySwitch(): void {
 
   // Narrowed: account/marketplace/onboarding caches are global, not gateway-
   // scoped, so a mode swap must not refetch them.
+  resetHermesConfigCache()
   invalidateProfileScopedQueries()
 }

@@ -6841,6 +6841,36 @@ async def update_memory_provider_config(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+def _compute_config_revision(raw_config: dict) -> str:
+    """Compute a deterministic revision token for raw config."""
+    try:
+        content = json.dumps(raw_config, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha256(content).hexdigest()[:16]
+    except Exception:
+        return "0000000000000000"
+
+
+def _protect_sensitive_config_fields(existing: dict, incoming: dict) -> None:
+    """Restore existing auth credentials over empty-string values in a blind
+    write (no verified expected_revision), so a caller that doesn't know
+    about CAS can't silently wipe them. A caller that *did* send a matching
+    expected_revision has proven it saw the current state, so an empty value
+    from it is a deliberate clear and must go through untouched — otherwise
+    users can never turn dashboard basic auth off (#88947 review)."""
+    if not isinstance(existing, dict) or not isinstance(incoming, dict):
+        return
+
+    existing_dashboard = existing.get("dashboard")
+    incoming_dashboard = incoming.get("dashboard")
+    if isinstance(existing_dashboard, dict) and isinstance(incoming_dashboard, dict):
+        existing_auth = existing_dashboard.get("basic_auth")
+        incoming_auth = incoming_dashboard.get("basic_auth")
+        if isinstance(existing_auth, dict) and isinstance(incoming_auth, dict):
+            for k, v in existing_auth.items():
+                if v and (not incoming_auth.get(k) or incoming_auth.get(k) == ""):
+                    incoming_auth[k] = v
+
+
 @app.get("/api/config")
 async def get_config(profile: Optional[str] = None):
     # _profile_scope blocks on the process-wide _SKILLS_PROFILE_LOCK and
@@ -6850,16 +6880,29 @@ async def get_config(profile: Optional[str] = None):
     # override stays scoped to the worker thread.
     def _run():
         with _profile_scope(profile):
-            return _normalize_config_for_web(load_config())
+            raw = read_raw_config()
+            rev = _compute_config_revision(raw)
+            norm = _normalize_config_for_web(load_config())
+            res = {k: v for k, v in norm.items() if not k.startswith("_")}
+            res["_revision"] = rev
+            return res
 
     config = await asyncio.to_thread(_run)
-    # Strip internal keys that the frontend shouldn't see or send back
-    return {k: v for k, v in config.items() if not k.startswith("_")}
+    return config
 
 
 @app.get("/api/config/defaults")
 async def get_defaults():
-    return DEFAULT_CONFIG
+    # Callers round-trip this straight into saveHermesConfig (e.g. the
+    # "reset to defaults" flow), so it needs the current disk revision —
+    # otherwise that save carries no expected_revision and skips the CAS
+    # check entirely, defeating the remote-overwrite guard for that path.
+    def _run():
+        raw = read_raw_config()
+        rev = _compute_config_revision(raw)
+        return {**DEFAULT_CONFIG, "_revision": rev}
+
+    return await asyncio.to_thread(_run)
 
 
 @app.get("/api/config/schema")
@@ -7581,6 +7624,10 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
     # Remove any _model_meta that might have leaked in (shouldn't happen
     # with the stripped GET response, but be defensive)
     config.pop("_model_meta", None)
+    # _revision is a CAS token the client round-trips from GET back into PUT
+    # (see expected_revision above) — it is not config data. Left in, it would
+    # deep-merge into the on-disk YAML as a literal top-level key.
+    config.pop("_revision", None)
 
     # Extract and remove model_context_length before processing model
     ctx_override = config.pop("model_context_length", 0)
@@ -7655,7 +7702,27 @@ async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
             # frontend can only overwrite what it explicitly sends.
             with _CONFIG_MUTATION_LOCK:
                 existing = read_raw_config()
-                incoming = _denormalize_config_from_web(body.config)
+                current_rev = _compute_config_revision(existing)
+
+                if body.expected_revision and body.expected_revision != current_rev:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Config has been modified on remote backend; please refetch before saving.",
+                    )
+
+                if body.patch is not None:
+                    incoming = _denormalize_config_from_web(body.patch)
+                elif body.config is not None:
+                    incoming = _denormalize_config_from_web(body.config)
+                else:
+                    raise HTTPException(status_code=400, detail="Either 'config' or 'patch' must be provided")
+
+                # A verified expected_revision proves the caller saw current
+                # disk state, so its empty strings are a deliberate clear.
+                # Without one, protect credentials from a blind overwrite.
+                if not body.expected_revision:
+                    _protect_sensitive_config_fields(existing, incoming)
+
                 merged = _deep_merge(existing, incoming)
                 # Compare normalized approvals.mode across the in-memory
                 # documents, not config blocks and not cache re-reads: the
@@ -7667,13 +7734,14 @@ async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
                 # it is the honest trigger.
                 approvals_mode_changed = _approval_mode_of(merged) != _approval_mode_of(existing)
                 save_config(merged)
+                new_rev = _compute_config_revision(merged)
         # REST saves bypass the config.set RPC (which re-emits itself), so
         # refresh live sessions' cached approval/YOLO indicators after a mode
         # change. Own-profile saves only: a profile-scoped save targets a
         # different HERMES_HOME than this process's gateway sessions.
         if approvals_mode_changed and not _is_other_profile(body.profile or profile):
             _broadcast_gateway_session_info()
-        return {"ok": True}
+        return {"ok": True, "_revision": new_rev}
 
     try:
         return await asyncio.to_thread(_run)
