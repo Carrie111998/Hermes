@@ -175,7 +175,13 @@ def finalize_turn(
         _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
         iteration_limit_fallback = True
         preserved_verification_fallback = True
-    elif final_response is None and budget_fallback_eligible:
+    # A no-tool empty response sets ``final_response`` to "" before recovery.
+    # If later tool turns consume the call cap, that stale blank must not make
+    # the turn look answered and suppress this final fallback (#92552).
+    elif (
+        final_response is None
+        or (isinstance(final_response, str) and not final_response.strip())
+    ) and budget_fallback_eligible:
         # Budget exhausted — ask the model for a summary via one extra
         # API call with tools stripped.  _handle_max_iterations injects a
         # user message and makes a single toolless request.

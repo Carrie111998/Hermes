@@ -11229,10 +11229,21 @@ def _run_prompt_submit(
                 )
 
                 raw = result.get("final_response", "")
+                # The iteration-summary fallback is useful assistant text, but
+                # it does not mean the requested work completed. Preserve it
+                # while exposing recoverable error semantics to clients.
+                _iteration_limit_incomplete = (
+                    result.get("completed") is False
+                    and str(result.get("turn_exit_reason") or "").startswith(
+                        "max_iterations_reached("
+                    )
+                )
                 status = (
                     "interrupted"
                     if result.get("interrupted")
-                    else "error" if result.get("error") else "complete"
+                    else "error"
+                    if result.get("error") or _iteration_limit_incomplete
+                    else "complete"
                 )
                 # When the backend produced no visible response AND reported a
                 # real error (e.g. invalid model slug → provider 4xx), surface
@@ -11306,7 +11317,11 @@ def _run_prompt_submit(
                     # inflight payload is the only carrier of the failure.
                     _fail_inflight_turn(
                         session,
-                        result.get("error") if isinstance(result, dict) else raw,
+                        (
+                            result.get("error")
+                            if isinstance(result, dict) and result.get("error")
+                            else raw
+                        ),
                         error_surface=_error_surface,
                     )
                     turn_error_retained = True
