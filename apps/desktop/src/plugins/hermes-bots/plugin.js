@@ -4888,6 +4888,36 @@ function formatGroupChatLine(entry, viewerName) {
   return `${groupSpeakerLabel(entry.from.name)}${suffix}${source}: ${entry.text}${attached}`
 }
 
+function groupEntryMember(entry, members) {
+  if (entry?.from?.kind === 'user') {
+    return null
+  }
+
+  const name = String(entry?.from?.name || '')
+  const source = String(entry?.from?.source || '')
+  const current = (Array.isArray(members) ? members : []).find(
+    member =>
+      member.name === name &&
+      (source ? (member.connectionLabel || member.connectionId) === source : !member.remoteSource)
+  )
+
+  if (current) {
+    return current
+  }
+
+  return {
+    name,
+    ...(source
+      ? {
+          connectionId: source,
+          connectionLabel: source,
+          remoteSource: true,
+          sourceScoped: true
+        }
+      : {})
+  }
+}
+
 /** The full per-turn payload for one member: participation rules + the room
  *  delta. Rules travel in the turn payload (not SOUL) so every existing bot
  *  can join a group chat without a profile migration. */
@@ -10486,14 +10516,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                   // names and disambiguating handles come from the roster (the
                   // primary "default" profile renders as Hermes, remote dupes
                   // carry their @name-device handle) instead of raw profile ids.
-                  const member = isUser
-                    ? null
-                    : members.find(b =>
-                        b.name === entry.from.name &&
-                        (entry.from.source
-                          ? (b.connectionLabel || b.connectionId) === entry.from.source
-                          : !b.remoteSource)
-                      ) || null
+                  const member = groupEntryMember(entry, members)
                   const meta = isUser ? null : botRosterMeta(member || { name: entry.from.name }, allMeta)
                   const display = isUser ? 'You' : displayName(member || { name: entry.from.name }, meta)
                   const entryKey = `${entry.at}:${index}`
