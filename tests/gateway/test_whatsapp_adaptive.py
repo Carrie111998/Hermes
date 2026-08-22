@@ -908,6 +908,72 @@ async def test_ordinary_model_once_new_clears_pending_state(
 
 
 @pytest.mark.asyncio
+async def test_ordinary_stale_finalizer_cannot_release_replacement_turn(
+    monkeypatch, tmp_path
+):
+    """A late ordinary T1 finalizer cannot clear replacement T2 state."""
+    runner, store = _lifecycle_runner(monkeypatch, tmp_path)
+    source = SessionSource(
+        platform=Platform.WHATSAPP,
+        chat_id="ordinary-replacement-running-state",
+        user_id="a",
+        chat_type="dm",
+    )
+    store.get_or_create_session(source)
+    key = runner._session_key_for_source(source)
+    t1_entered = asyncio.Event()
+    t1_release = asyncio.Event()
+    t2_entered = asyncio.Event()
+    t2_release = asyncio.Event()
+    generations = {}
+
+    async def blocked_agent(event, route_source, quick_key, run_generation):
+        generations[event.text] = run_generation
+        if event.text == "t1":
+            t1_entered.set()
+            await t1_release.wait()
+            raise asyncio.CancelledError
+        t2_entered.set()
+        await t2_release.wait()
+        return "t2 complete"
+
+    monkeypatch.setattr(runner, "_handle_message_with_agent", blocked_agent)
+    t1_task = asyncio.create_task(
+        runner._handle_message(MessageEvent(text="t1", source=source))
+    )
+    await asyncio.wait_for(t1_entered.wait(), timeout=2)
+    t1_generation = generations["t1"]
+
+    await runner._interrupt_and_clear_session(
+        key,
+        source,
+        interrupt_reason="/stop",
+        invalidation_reason="ordinary_replacement_running_state",
+    )
+
+    t2_task = asyncio.create_task(
+        runner._handle_message(MessageEvent(text="t2", source=source))
+    )
+    await asyncio.wait_for(t2_entered.wait(), timeout=2)
+    t2_generation = generations["t2"]
+    assert t2_generation != t1_generation
+    assert runner._is_session_running(key)
+
+    t1_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await t1_task
+
+    state = runner._session_state(key)
+    assert runner._is_session_running(key)
+    assert state.turn.agent is _AGENT_PENDING_SENTINEL
+    assert state.persistent.run_generation == t2_generation
+
+    t2_release.set()
+    assert await t2_task == "t2 complete"
+    assert not runner._is_session_running(key)
+
+
+@pytest.mark.asyncio
 async def test_concurrent_a_b_direct_agentic_has_one_routing_owner(monkeypatch):
     runner = _ownership_runner(monkeypatch)
     source = SimpleNamespace(platform=Platform.WHATSAPP, chat_id="chat", user_id="a")

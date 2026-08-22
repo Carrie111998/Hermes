@@ -18334,19 +18334,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # must not strand the marker. SIGKILL/OOM skips finally, leaving the
             # marker for the next unclean startup's recovery pass.
             await self._clear_durable_active_turn(event)
-            # Unconditional release covers every exit path. _release_running_agent_state
-            # is idempotent (pop-on-absent is harmless) and, called without a
-            # run_generation guard, always clears the slot regardless of which
-            # generation it holds. This evicts the zombie left when session_reset
-            # bumps the generation (N -> N+1) mid-flight: gen-N's guarded release
-            # inside _run_agent returns False, and the old sentinel-only check here
-            # missed the leftover real agent — locking the session out forever (#28686).
+            # Ordinary finalization releases only its own generation, so a late
+            # gen-N unwind cannot clear a replacement gen-(N+1) turn. Control
+            # invalidation paths already release the invalidated slot explicitly;
+            # the adaptive owner branch below uses its owner token instead.
             if _adaptive_owned:
                 self._release_whatsapp_adaptive_routing_owner(
                     event, _quick_key, restore=False
                 )
             elif not _adaptive_owner:
-                self._release_running_agent_state(_quick_key)
+                self._release_running_agent_state(
+                    _quick_key, run_generation=_run_generation
+                )
             # Turn lease (#64934): release THIS turn's lease token — keyed by
             # (routing key, run generation) so this unwind can only ever free
             # the lease its own turn acquired, never a newer turn's.
