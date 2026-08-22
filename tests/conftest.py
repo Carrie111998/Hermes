@@ -492,6 +492,17 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # hermes_state's live-DB guard stays armed in them even when the test
     # strips pytest's own PYTEST_* vars from the child env.
     monkeypatch.setenv("HERMES_TEST_ISOLATION", str(fake_hermes_home))
+    #    Never let a test write node/npm/npx symlinks into the developer's real
+    #    ~/.local/bin. HOME is deliberately NOT sandboxed (see the note above),
+    #    so any test that reaches a real install — e.g. via
+    #    hermes_cli.dep_ensure.ensure_dependency shelling out to
+    #    scripts/install.sh — would overwrite the real links with ones pointing
+    #    into this tmpdir, which is deleted when the test ends. That leaves
+    #    node/npx unresolvable on the machine until repaired by hand, and it
+    #    self-perpetuates: the next run finds no node and reinstalls, breaking
+    #    them again. The installer honours this flag; the shell side also
+    #    refuses independently (scripts/install.sh, scripts/lib/node-bootstrap.sh).
+    monkeypatch.setenv("HERMES_NODE_SKIP_LINKS", "1")
     # And never let a developer-shell (or leaked child) bypass disarm the
     # guard for in-process code under test.
     monkeypatch.delenv("HERMES_STATE_DB_GUARD_BYPASS", raising=False)
