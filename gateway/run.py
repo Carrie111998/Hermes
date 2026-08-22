@@ -2327,6 +2327,12 @@ os.environ["HERMES_TURN_LEASE_TIMEOUT"] = str(
 os.environ["HERMES_RECONNECT_STABLE_AFTER_SECONDS"] = str(
     _DEFAULT_CONFIG["agent"]["reconnect_stable_after"]
 )
+# Like its neighbour this is a process-env write at import time, so it is
+# inherited by everything the gateway spawns. That is inert rather than a
+# leak worth avoiding: nothing outside this module reads the var, and a
+# child that does re-import this module runs this same seed before reading
+# it, so it recomputes default → config.yaml instead of trusting what it
+# inherited. Left as a plain module-level write for that reason.
 
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
@@ -4267,8 +4273,9 @@ async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None
 # secondary-profile reconnects share this policy — tune in one place).
 _RECONNECT_BACKOFF_CAP = 300
 
-# Seconds a platform may sit continuously in the reconnect queue before the
-# watcher flags it NEEDS_ATTENTION in runtime status. Retrying never stops
+# Seconds a platform's instability may last before the watcher flags it
+# NEEDS_ATTENTION in runtime status. Not continuous queue residency: the
+# clock survives a reconnect that does not hold, per the flap horizon below. Retrying never stops
 # (auto-pause was deliberately removed — a transient outage must self-heal
 # without operator action); this only makes a *long-lived* retry loop loud so
 # owners and fleet monitoring can distinguish hour one from week three.
@@ -4293,6 +4300,20 @@ _RECONNECT_ATTENTION_AFTER_SECONDS = _float_env(
 _RECONNECT_STABLE_AFTER_SECONDS = _float_env(
     "HERMES_RECONNECT_STABLE_AFTER_SECONDS", 900
 )
+
+# Both horizons are resolved once, at import, and are therefore process-wide.
+# Under ``gateway.multiplex_profiles`` that means the multiplexing profile's
+# values win for every profile the process serves — the YAML→env bridge is
+# first-writer-wins across profiles (#72348), and nothing here reads a secret
+# scope. Documented rather than fixed, because what these clocks measure is a
+# platform *connection* and multiplex does not give a secondary profile one:
+# adapters belong to the process, per-profile adapters and credentials are
+# explicitly a later phase (see ``GatewayConfig.multiplex_profiles``), and
+# ``self._failed_platforms`` is keyed by bare platform name with no profile
+# dimension. There is no secondary-profile reconnect for a secondary horizon
+# to govern. When per-profile adapters do land, this pair needs a per-profile
+# answer together with the rest of the ``agent.*`` bridge above it, not one
+# key at a time.
 
 
 def _reconnect_backoff(attempt: int) -> int:
