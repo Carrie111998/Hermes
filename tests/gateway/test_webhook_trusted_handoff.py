@@ -15,7 +15,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.authz_mixin import GatewayAuthorizationMixin
-from gateway.platforms.base import MessageEvent, SendResult
+from gateway.platforms.base import MessageEvent, ProcessingOutcome, SendResult
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
 from gateway.session import (
     SessionContext,
@@ -23,6 +23,7 @@ from gateway.session import (
     SessionSource,
     build_session_context_prompt,
 )
+from tests.gateway.restart_test_helpers import make_restart_runner
 
 
 def _signature(body: bytes, secret: str) -> str:
@@ -378,11 +379,15 @@ async def test_concurrent_handoffs_reserve_capacity_atomically(
     monkeypatch.setattr(webhook_replay, "claim_handoff_delivery", slow_claim)
     adapter = _adapter(_trusted_route(max_handoff_concurrency=1))
     events: list[MessageEvent] = []
+    processing_started = asyncio.Event()
+    processing_release = asyncio.Event()
 
-    async def capture(event: MessageEvent):
+    async def process(event: MessageEvent):
         events.append(event)
+        processing_started.set()
+        await processing_release.wait()
 
-    adapter.handle_message = capture
+    adapter.set_message_handler(process)
 
     def request_body(delivery_id: str) -> bytes:
         return json.dumps(
@@ -418,6 +423,8 @@ async def test_concurrent_handoffs_reserve_capacity_atomically(
             ),
         )
         assert sorted((first.status, second.status)) == [202, 429]
+        await asyncio.wait_for(processing_started.wait(), timeout=1)
+        processing_release.set()
 
     await asyncio.sleep(0.05)
     assert len(events) == 1
@@ -557,6 +564,41 @@ async def test_post_claim_exception_releases_handoff_capacity(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("start_processing", [False, None])
+async def test_handoff_releases_capacity_when_processing_never_starts(
+    served_profiles, monkeypatch, start_processing
+):
+    adapter = _adapter(_trusted_route(max_handoff_concurrency=1))
+    if start_processing is False:
+        adapter.set_message_handler(AsyncMock())
+        monkeypatch.setattr(
+            adapter, "_start_session_processing", lambda *_args, **_kwargs: False
+        )
+    payload = {
+        "_hermes": {
+            "target_profile": "market-analysis",
+            "handoff_depth": 1,
+            "delivery_id": f"no-processing-{start_processing}",
+        },
+        "task": "must release capacity",
+    }
+    body = json.dumps(payload).encode()
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/p/dispatcher/webhooks/relay",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Hub-Signature-256": _signature(body, "relay-secret"),
+            },
+        )
+        assert response.status == 202
+
+    await asyncio.sleep(0.05)
+    assert not adapter._active_handoffs.get("relay")
+
+
+@pytest.mark.asyncio
 async def test_persisted_handoff_resolves_ingress_adapter_and_revalidates_bounds(
     served_profiles,
 ):
@@ -657,6 +699,108 @@ async def test_persisted_handoff_resolves_ingress_adapter_and_revalidates_bounds
     adapter._routes["relay"]["allowed_target_profiles"] = ["server-development"]
     assert runner._adapter_for_source(restored) is None
     assert adapter.toolsets_for_source(restored) is None
+
+
+@pytest.mark.asyncio
+async def test_auto_resumed_handoff_reserves_route_capacity_until_completion(
+    served_profiles,
+):
+    adapter = _adapter(_trusted_route(max_handoff_concurrency=1))
+    runner, _ = make_restart_runner(adapter)
+    runner.config = GatewayConfig(
+        multiplex_profiles=True,
+        multiplex_profile_allowlist=[
+            "dispatcher",
+            "market-analysis",
+            "server-development",
+        ],
+    )
+    runner.adapters = {Platform.WEBHOOK: adapter}
+    runner._adapter_for_source = lambda _source: adapter
+    runner._persist_active_agents = lambda: None
+    adapter.gateway_runner = runner
+
+    source = SessionSource(
+        platform=Platform.WEBHOOK,
+        chat_id="webhook:relay:trusted-handoff:restored-A",
+        profile="market-analysis",
+        transport_profile="dispatcher",
+        trusted_handoff_depth=1,
+        transport_deliver="discord",
+        transport_deliver_extra={"chat_id": "market-room"},
+        transport_delivery_policy_hash=adapter._delivery_policy_hash(
+            adapter._routes["relay"]
+        ),
+        provenance={"ingress_route": "relay"},
+    )
+    pending_entry = SessionEntry(
+        session_key="market-analysis:webhook:restored-A",
+        session_id="restart-session",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.WEBHOOK,
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+
+    resume_gate = asyncio.Event()
+
+    async def hold_resumed_run(event: MessageEvent) -> None:
+        if event.internal:
+            async def finish_resumed_run() -> None:
+                await resume_gate.wait()
+                await adapter.on_processing_complete(
+                    event, ProcessingOutcome.SUCCESS
+                )
+
+            adapter._session_tasks[pending_entry.session_key] = asyncio.create_task(
+                finish_resumed_run()
+            )
+        else:
+            await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    adapter.handle_message = hold_resumed_run
+    assert runner._schedule_resume_pending_sessions() == 1
+    resume_task = next(iter(runner._background_tasks))
+    await asyncio.sleep(0)
+    assert adapter._active_handoffs["relay"] == {source.chat_id}
+
+    def signed_body(delivery_id: str) -> tuple[bytes, dict[str, str]]:
+        body = json.dumps(
+            {
+                "_hermes": {
+                    "target_profile": "market-analysis",
+                    "handoff_depth": 1,
+                    "delivery_id": delivery_id,
+                },
+                "task": "do work",
+            }
+        ).encode()
+        return body, {
+            "Content-Type": "application/json",
+            "X-Hub-Signature-256": _signature(body, "relay-secret"),
+        }
+
+    body_b, headers_b = signed_body("restored-concurrent-B")
+    async with TestClient(TestServer(_app(adapter))) as client:
+        while_resumed = await client.post(
+            "/p/dispatcher/webhooks/relay", data=body_b, headers=headers_b
+        )
+        assert while_resumed.status == 429
+
+        resume_gate.set()
+        await resume_task
+        assert not adapter._active_handoffs.get("relay")
+
+        after_completion = await client.post(
+            "/p/dispatcher/webhooks/relay", data=body_b, headers=headers_b
+        )
+        assert after_completion.status == 202
+
+    await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio

@@ -606,6 +606,47 @@ class WebhookAdapter(BasePlatformAdapter):
         self._prune_delivery_info(now)
         return True
 
+    def reserve_restored_source(self, source) -> bool:
+        """Reserve route capacity before a trusted handoff is auto-resumed."""
+        if getattr(source, "transport_profile", None) is None:
+            return True
+        if not self.validate_restored_source(source):
+            return False
+
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        parts = chat_id.split(":", 2)
+        if len(parts) != 3 or parts[0] != "webhook":
+            return False
+        route_name = parts[1]
+        route_config = self._routes.get(route_name)
+        if not isinstance(route_config, dict):
+            return False
+
+        # Startup scheduling and live HTTP admission run on the same event
+        # loop. This no-await check-and-add is therefore atomic with the
+        # lock-protected live path once that path reaches its critical section.
+        active = self._active_handoffs[route_name]
+        if chat_id in active:
+            return True
+        if len(active) >= route_config.get("max_handoff_concurrency", 1):
+            return False
+        active.add(chat_id)
+        return True
+
+    def release_restored_source(self, source) -> None:
+        """Release a startup reservation that did not reach normal cleanup."""
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        parts = chat_id.split(":", 2)
+        if len(parts) != 3 or parts[0] != "webhook":
+            return
+        route_name = parts[1]
+        active = self._active_handoffs.get(route_name)
+        if active is None:
+            return
+        active.discard(chat_id)
+        if not active:
+            self._active_handoffs.pop(route_name, None)
+
     @staticmethod
     def _delivery_policy_hash(route_config: dict) -> str:
         """Fingerprint the static egress policy used to resolve a destination."""
@@ -1423,6 +1464,37 @@ class WebhookAdapter(BasePlatformAdapter):
         task = asyncio.create_task(self.handle_message(event))
         if handoff_target:
             handoff_admission_transferred = True
+
+            def _release_if_processing_did_not_start(completed_task) -> None:
+                failed = completed_task.cancelled()
+                if not failed:
+                    try:
+                        failed = completed_task.exception() is not None
+                    except (asyncio.CancelledError, asyncio.InvalidStateError):
+                        failed = True
+                try:
+                    from gateway.session import build_session_key
+
+                    session_key = build_session_key(
+                        event.source,
+                        group_sessions_per_user=self.config.extra.get(
+                            "group_sessions_per_user", True
+                        ),
+                        thread_sessions_per_user=self.config.extra.get(
+                            "thread_sessions_per_user", False
+                        ),
+                        profile=self._session_key_profile(event.source),
+                    )
+                    owner = self._session_tasks.get(session_key)
+                except Exception:
+                    owner = None
+                    failed = True
+                if failed or owner is None:
+                    self._active_handoffs[route_name].discard(
+                        handoff_session_chat_id
+                    )
+
+            task.add_done_callback(_release_if_processing_did_not_start)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
@@ -1470,11 +1542,7 @@ class WebhookAdapter(BasePlatformAdapter):
             if isinstance(provenance, dict):
                 route_name = provenance.get("ingress_route")
                 if isinstance(route_name, str):
-                    active = self._active_handoffs.get(route_name)
-                    if active is not None:
-                        active.discard(event.source.chat_id)
-                        if not active:
-                            self._active_handoffs.pop(route_name, None)
+                    self.release_restored_source(event.source)
 
     async def _end_webhook_session(
         self, event: "MessageEvent", session_chat_id: str
