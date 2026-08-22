@@ -1831,7 +1831,8 @@ def fetch_openrouter_models(
 
     # Surface all remaining free tool-capable models from the live catalog (#89150).
     # Allows free-tier users to discover all available free models without
-    # dumping the entire 400+ paid catalog.
+    # dumping the entire 400+ paid catalog. Sorted alphabetically for stable ordering.
+    extra_free: list[str] = []
     for mid, live_item in live_by_id.items():
         if mid in seen_ids:
             continue
@@ -1839,8 +1840,11 @@ def fetch_openrouter_models(
             continue
         if not _openrouter_model_supports_tools(live_item):
             continue
-        curated.append((mid, "free"))
+        extra_free.append(mid)
         seen_ids.add(mid)
+
+    for mid in sorted(extra_free):
+        curated.append((mid, "free"))
 
     if not curated:
         return list(_openrouter_catalog_cache or fallback)
