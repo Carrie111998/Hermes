@@ -38,22 +38,20 @@ def _carrier() -> Path:
 
 
 def _run_block(path: Path) -> str:
+    """Extract the carrier's sole final run block without parsing heredocs.
+
+    Carrier payloads intentionally contain raw heredoc/triple-quoted lines
+    that are not valid YAML indentation. The run block is the final field in
+    every one-shot carrier, so consume to EOF and remove the YAML content
+    indent only where it is actually present.
+    """
     lines = path.read_text().splitlines()
     starts = [i for i, line in enumerate(lines) if line.strip() == "run: |"]
     assert len(starts) == 1
     start = starts[0]
     key_indent = len(lines[start]) - len(lines[start].lstrip())
-    content_indent = key_indent + 2
-    body: list[str] = []
-    for line in lines[start + 1 :]:
-        if line.strip():
-            indent = len(line) - len(line.lstrip())
-            if indent <= key_indent:
-                break
-            assert indent >= content_indent
-            body.append(line[content_indent:])
-        else:
-            body.append("")
+    prefix = " " * (key_indent + 2)
+    body = [line[len(prefix) :] if line.startswith(prefix) else line for line in lines[start + 1 :]]
     assert body
     return "\n".join(body) + "\n"
 
