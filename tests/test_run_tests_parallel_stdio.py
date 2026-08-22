@@ -67,3 +67,81 @@ def test_glyph_safe_stdio_noop_without_reconfigure(monkeypatch) -> None:
     print("✓ still fine")
 
     assert "✓ still fine" in plain.getvalue()
+
+
+def test_nonzero_child_without_output_gets_infrastructure_diagnostic(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A child killed before pytest starts must not render as a blank failure."""
+    mod = _load_runner()
+    test_file = tmp_path / "test_never_started.py"
+    test_file.write_text("def test_never_started():\n    assert True\n", encoding="utf-8")
+
+    class _SilentFailedProcess:
+        pid = 12345
+        returncode = 9
+
+        def communicate(self, timeout=None):
+            return "", None
+
+    monkeypatch.setattr(mod.subprocess, "Popen", lambda *args, **kwargs: _SilentFailedProcess())
+    monkeypatch.setattr(mod, "_kill_tree", lambda *args, **kwargs: None)
+
+    _file, rc, output, summary, _wall = mod._run_one_file_once(
+        test_file, [], tmp_path, 30
+    )
+
+    assert rc == 9
+    assert summary == {}
+    assert "produced no output" in output
+    assert "infrastructure" in output.lower()
+
+
+def test_exit_five_without_output_stays_per_file_no_collection(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Pytest's no-collection exit remains tolerated for one gated file."""
+    mod = _load_runner()
+    test_file = tmp_path / "test_platform_gated.py"
+    test_file.write_text("", encoding="utf-8")
+
+    class _NoCollectionProcess:
+        pid = 12345
+        returncode = 5
+
+        def communicate(self, timeout=None):
+            return "", None
+
+    monkeypatch.setattr(mod.subprocess, "Popen", lambda *args, **kwargs: _NoCollectionProcess())
+    monkeypatch.setattr(mod, "_kill_tree", lambda *args, **kwargs: None)
+
+    _file, rc, output, summary, _wall = mod._run_one_file_once(
+        test_file, [], tmp_path, 30
+    )
+
+    assert rc == 0
+    assert summary == {}
+    assert "infrastructure failure" not in output
+
+
+def test_worker_exception_is_printed_in_inline_failure_box(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    """A Popen-level runner crash must be visible at the failing progress line."""
+    mod = _load_runner()
+    test_file = tmp_path / "test_never_spawned.py"
+    test_file.write_text("def test_never_spawned():\n    assert True\n", encoding="utf-8")
+
+    def _raise_before_pytest(*args, **kwargs):
+        raise OSError("simulated process creation failure")
+
+    monkeypatch.setattr(mod, "_run_one_file", _raise_before_pytest)
+    monkeypatch.setattr(mod.sys, "argv", [str(_RUNNER_PATH), "--files", str(test_file), "-j", "1"])
+
+    assert mod.main() == 1
+    output = capsys.readouterr().out
+    box_start = output.index("Failed:")
+    box_end = output.index("Repro:", box_start)
+    inline_box = output[box_start:box_end]
+    assert "runner crashed before pytest completed" in inline_box
+    assert "simulated process creation failure" in inline_box

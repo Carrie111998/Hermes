@@ -460,6 +460,13 @@ def _run_one_file_once(
         # runner over one suite.
         shutil.rmtree(temproot, ignore_errors=True)
 
+    if rc not in (0, 5) and not output.strip():
+        output = (
+            "runner infrastructure failure: pytest subprocess exited with "
+            f"code {rc} and produced no output. It may have been terminated "
+            "before collection or failed to start; this file did not run.\n"
+        )
+
     if rc == 5:
         # No tests collected in THIS file — legitimate per-file: a
         # platform-gated or fully-marker-filtered file (e.g. a win32-only
@@ -1081,17 +1088,21 @@ def main() -> int:
         try:
             fpath, rc, output, summary, subproc_wall = fut.result()
         except Exception as exc:  # noqa: BLE001 — must always advance counter
+            crash_output = f"runner crashed before pytest completed: {exc!r}"
             with lock:
                 files_done += 1
                 tests_done += n_tests
                 fail_count += 1
-                failures.append((file, f"runner crashed: {exc!r}", {}))
+                failures.append((file, crash_output, {}))
                 _print_progress(
                     tests_done, approx_total_tests, file, 1,
                     time.monotonic() - started_at,
                     repo_root, tests_passed, tests_failed,
                     test_counts,
                     subproc_wall=0.0,
+                )
+                _print_inline_failure(
+                    file, crash_output, repo_root, pytest_passthrough
                 )
             return
         with lock:

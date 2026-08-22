@@ -75,7 +75,6 @@ def _write_cmd(path: Path, text: str) -> None:
         handle.write(text)
 
 
-@pytest.mark.live_system_guard_bypass
 @pytest.mark.skipif(
     os.name != "nt" or POWERSHELL is None,
     reason="needs Windows and PowerShell",
@@ -107,18 +106,6 @@ def test_venv_sweep_stops_managed_runtime_children_but_not_unrelated_processes(
     unrelated_script = tmp_path / "unrelated.cmd"
     _write_cmd(unrelated_script, "@ping -t 127.0.0.1 >nul\n")
 
-    # Keep the test away from real gateway tasks and real Hermes launchers
-    # while still exercising the installer's actual process enumeration and
-    # per-PID taskkill behavior.
-    _write_cmd(fake_bin / "schtasks.cmd", "@exit /b 0\n")
-    _write_cmd(
-        fake_bin / "taskkill.cmd",
-        "@echo off\n"
-        'echo %* | "%SystemRoot%\\System32\\findstr.exe" /I '
-        '/C:"/IM hermes.exe" >nul\n'
-        "if not errorlevel 1 exit /b 0\n"
-        '"%SystemRoot%\\System32\\taskkill.exe" %*\n',
-    )
     _write_cmd(
         fake_bin / "uv.cmd",
         "@echo off\n"
@@ -152,20 +139,58 @@ def test_venv_sweep_stops_managed_runtime_children_but_not_unrelated_processes(
             "OS": "Windows_NT",
             "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
         }
+        # Define command functions inside the child PowerShell scope instead
+        # of relying on PATH shims. In a prior native-Windows full run those
+        # shims did not isolate this test: installer output proved it observed
+        # and disabled the operator's real \Hermes_Gateway Scheduled Task.
+        # Functions have higher command precedence and fail closed here. The
+        # task function returns no rows; taskkill allows only the process root
+        # created above. The production installer still performs its real CIM
+        # enumeration and real /T kill.
+        def _ps_literal(value: Path | str) -> str:
+            return str(value).replace("'", "''")
+
+        powershell_probe = f"""
+            $ErrorActionPreference = 'Stop'
+            $allowedPid = '{parent.pid}'
+            $realTaskkill = '{_ps_literal(Path(os.environ['SystemRoot']) / 'System32' / 'taskkill.exe')}'
+
+            function schtasks {{
+                param([Parameter(ValueFromRemainingArguments=$true)][object[]] $Rest)
+                return
+            }}
+
+            function taskkill {{
+                param([Parameter(ValueFromRemainingArguments=$true)][object[]] $Rest)
+                $tokens = @($Rest | ForEach-Object {{ [string]$_ }})
+                $joined = $tokens -join ' '
+                if (($tokens -contains '/IM') -and $joined -match '(?i)hermes\\.exe') {{
+                    return
+                }}
+                $pidIndex = -1
+                for ($i = 0; $i -lt $tokens.Count; $i++) {{
+                    if ($tokens[$i] -eq '/PID') {{ $pidIndex = $i; break }}
+                }}
+                if ($pidIndex -ge 0 -and $pidIndex + 1 -lt $tokens.Count -and
+                    $tokens[$pidIndex + 1] -eq $allowedPid) {{
+                    & $realTaskkill @tokens
+                    if ($LASTEXITCODE -ne 0) {{
+                        throw "taskkill failed for allowed test PID $allowedPid"
+                    }}
+                    return
+                }}
+                throw "blocked taskkill outside test-owned PID: $joined"
+            }}
+
+            & '{_ps_literal(INSTALL_PS1)}' `
+                -Stage venv `
+                -NonInteractive `
+                -InstallDir '{_ps_literal(install_dir)}' `
+                -HermesHome '{_ps_literal(hermes_home)}'
+            exit $LASTEXITCODE
+        """
         result = subprocess.run(
-            [
-                POWERSHELL,
-                "-NoProfile",
-                "-File",
-                str(INSTALL_PS1),
-                "-Stage",
-                "venv",
-                "-NonInteractive",
-                "-InstallDir",
-                str(install_dir),
-                "-HermesHome",
-                str(hermes_home),
-            ],
+            [POWERSHELL, "-NoProfile", "-Command", powershell_probe],
             cwd=tmp_path,
             env=env,
             capture_output=True,
