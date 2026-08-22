@@ -13,7 +13,9 @@ function gitReturning(stdout: string, code = 0): RunGit {
  * A git fake that answers per subcommand, so a test can say "ancestry fails,
  * but the count would have claimed skew" — which is the shape of #92233.
  */
-function gitAnswering(answers: Record<string, { code?: number; stdout?: string }>): {
+function gitAnswering(
+  answers: Record<string, { code?: number; stderr?: string; stdout?: string }>
+): {
   calls: string[][]
   git: RunGit
 } {
@@ -24,7 +26,11 @@ function gitAnswering(answers: Record<string, { code?: number; stdout?: string }
 
     const answer = answers[args[0]] ?? {}
 
-    return { code: answer.code ?? 0, stderr: '', stdout: answer.stdout ?? '' }
+    return {
+      code: answer.code ?? 0,
+      stderr: answer.stderr ?? '',
+      stdout: answer.stdout ?? ''
+    }
   }
 
   return { calls, git }
@@ -156,6 +162,41 @@ describe('detectBundleSkew', () => {
     expect(await detectBundleSkew(STAMP, git, REPO)).toEqual({
       desktopCommitsBehind: null,
       outOfSync: false
+    })
+  })
+
+  // Shallow clones, measured against git 2.55 rather than assumed. A stamp
+  // commit from BEFORE the graft boundary is not an object the clone has, so
+  // `--is-ancestor` exits 128 with "Not a valid object name" — the same
+  // unknowable bucket as any other missing commit, not a shallow-specific
+  // failure. A stamp INSIDE the shallow graph is answered normally, so
+  // `--fetch-depth`-limited CI checkouts do not lose skew detection wholesale;
+  // only builds stamped deeper than the checkout goes do.
+  it('is quiet on a shallow clone whose stamp predates the graft boundary', async () => {
+    const { calls, git } = gitAnswering({
+      'merge-base': {
+        code: 128,
+        stderr: `fatal: Not a valid object name ${STAMP.commit}`
+      },
+      'rev-list': { stdout: '7\n' }
+    })
+
+    expect(await detectBundleSkew(STAMP, git, REPO)).toEqual({
+      desktopCommitsBehind: null,
+      outOfSync: false
+    })
+    expect(calls).toHaveLength(1)
+  })
+
+  it('still detects skew on a shallow clone when the stamp is in the graph', async () => {
+    const { git } = gitAnswering({
+      'merge-base': { code: 0 },
+      'rev-list': { stdout: '2\n' }
+    })
+
+    expect(await detectBundleSkew(STAMP, git, REPO)).toEqual({
+      desktopCommitsBehind: 2,
+      outOfSync: true
     })
   })
 })
