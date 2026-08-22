@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $chatTerminalRunRequest, $terminalTakeover, takeChatTerminalRunRequest } from '@/app/right-sidebar/store'
@@ -63,32 +63,47 @@ describe('assistant markdown Run affordance security boundary', () => {
     expect($terminalTakeover.get()).toBe(true)
   })
 
-  it('coalesces an in-flight repeat click but allows a later deliberate rerun', () => {
-    render(<MarkdownTextContent allowRunCommands isRunning={false} text={fenced('bash', 'echo once')} />)
-    const run = screen.getByRole('button', { name: 'Run' })
+  it('disables every Run while one request is pending and allows a later deliberate rerun', () => {
+    const text = `${fenced('bash', 'echo once')}\n\n${fenced('bash', 'echo two')}`
+    render(<MarkdownTextContent allowRunCommands isRunning={false} text={text} />)
 
-    fireEvent.click(run)
+    const [firstRun, secondRun] = screen.getAllByRole('button', { name: 'Run' }) as HTMLButtonElement[]
+
+    fireEvent.click(firstRun)
     const first = $chatTerminalRunRequest.get()
     const count = $terminals.get().length
     expect(first).not.toBeNull()
+    expect(firstRun.disabled).toBe(true)
+    expect(secondRun.disabled).toBe(true)
 
-    fireEvent.click(run)
+    fireEvent.click(secondRun)
     expect($terminals.get()).toHaveLength(count)
     expect($chatTerminalRunRequest.get()).toEqual(first)
 
-    expect(takeChatTerminalRunRequest(first!.terminalId)).toBe('echo once')
-    fireEvent.click(run)
+    act(() => {
+      expect(takeChatTerminalRunRequest(first!.terminalId)).toBe('echo once')
+    })
+    expect(firstRun.disabled).toBe(false)
+    expect(secondRun.disabled).toBe(false)
 
+    fireEvent.click(firstRun)
     expect($terminals.get()).toHaveLength(count + 1)
     expect($chatTerminalRunRequest.get()?.command).toBe('echo once')
     expect($chatTerminalRunRequest.get()?.terminalId).not.toBe(first!.terminalId)
   })
 
   it('hides Run for unsafe invisible payloads, streaming, missing bridge, and output/data fences', () => {
-    render(<MarkdownTextContent allowRunCommands isRunning={false} text={fenced('bash', `echo safe\u202E ; id`)} />)
-    expect(screen.queryByRole('button', { name: 'Run' })).toBeNull()
+    for (const unsafe of [
+      `echo safe\u202E ; id`,
+      `echo safe\u034fid`,
+      `echo safe\u2062id`,
+      `echo safe${String.fromCodePoint(0xe0069)}id`
+    ]) {
+      render(<MarkdownTextContent allowRunCommands isRunning={false} text={fenced('bash', unsafe)} />)
+      expect(screen.queryByRole('button', { name: 'Run' })).toBeNull()
+      cleanup()
+    }
 
-    cleanup()
     render(<MarkdownTextContent allowRunCommands isRunning text={fenced('bash', 'echo partial')} />)
     expect(screen.queryByRole('button', { name: 'Run' })).toBeNull()
 

@@ -53,7 +53,12 @@ describe('chat terminal Run queue', () => {
       'echo ok\0id',
       `echo safe\u202E ; rm -rf /`,
       `echo safe\u2066id\u2069`,
-      `echo safe\u200b && id`
+      `echo safe\u200b && id`,
+      `echo safe\u034fid`,
+      `echo safe\u2061id`,
+      `echo safe\u2062id`,
+      `echo safe${String.fromCodePoint(0xe0069)}id`,
+      `echo safe${String.fromCodePoint(0xe0100)}id`
     ]) {
       expect(isRunnableChatTerminalCommandText(unsafe)).toBe(false)
     }
@@ -74,6 +79,23 @@ describe('chat terminal Run queue', () => {
     expect($terminals.get().find(term => term.id === newId)).toMatchObject({ cwd: '/workspace', kind: 'user' })
     expect($chatTerminalRunRequest.get()).toEqual({ command: 'echo hello', terminalId: newId })
     expect($terminalTakeover.get()).toBe(true)
+  })
+
+  it('delivers a request queued before the terminal-session subscription attaches', () => {
+    const terminalId = queueChatCommandInFreshTerminal('echo queued')!
+    const write = vi.fn(async () => true)
+
+    const unsubscribe = $chatTerminalRunRequest.subscribe(request => {
+      if (request?.terminalId === terminalId) {
+        deliverChatTerminalRunRequest(terminalId, 'pty-late', write)
+      }
+    })
+
+    expect(write).toHaveBeenCalledTimes(1)
+    expect(write).toHaveBeenCalledWith('pty-late', 'echo queued\r')
+    expect($chatTerminalRunRequest.get()).toBeNull()
+
+    unsubscribe()
   })
 
   it('binds delivery to the target id, writes exact bytes + Enter, and clears before the bridge call', () => {

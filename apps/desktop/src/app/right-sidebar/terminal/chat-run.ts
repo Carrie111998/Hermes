@@ -5,25 +5,26 @@ import { $chatTerminalRunRequest, setTerminalTakeover, takeChatTerminalRunReques
 import { createTerminal } from './terminals'
 
 // Eligibility guard, not a shell-safety classifier. Clicking Run is explicit
-// user authorization for the visible command; this only rejects text whose
-// hidden/control bytes could differ materially from what the user approved.
-function isUnsafeTerminalDisplayCodeUnit(code: number): boolean {
-  return (
-    (code >= 0x00 && code <= 0x08) ||
-    (code >= 0x0b && code <= 0x1f) ||
-    (code >= 0x7f && code <= 0x9f) ||
-    code === 0x061c ||
-    (code >= 0x200b && code <= 0x200f) ||
-    (code >= 0x2028 && code <= 0x202e) ||
-    code === 0x2060 ||
-    (code >= 0x2066 && code <= 0x2069) ||
-    code === 0xfeff
-  )
-}
+// user authorization for the visible command; reject bytes that can materially
+// differ from what the terminal visibly presents. Newline and tab stay allowed.
+const DEFAULT_IGNORABLE_CODE_POINT_RE = /\p{Default_Ignorable_Code_Point}/u
 
 function hasUnsafeTerminalDisplayChars(command: string): boolean {
-  for (let index = 0; index < command.length; index += 1) {
-    if (isUnsafeTerminalDisplayCodeUnit(command.charCodeAt(index))) {
+  if (DEFAULT_IGNORABLE_CODE_POINT_RE.test(command)) {
+    return true
+  }
+
+  for (const char of command) {
+    const code = char.codePointAt(0)
+
+    if (
+      code !== undefined &&
+      ((code >= 0x00 && code <= 0x08) ||
+        (code >= 0x0b && code <= 0x1f) ||
+        (code >= 0x7f && code <= 0x9f) ||
+        code === 0x2028 ||
+        code === 0x2029)
+    ) {
       return true
     }
   }
@@ -31,7 +32,8 @@ function hasUnsafeTerminalDisplayChars(command: string): boolean {
   return false
 }
 
-// Interactive PTY injection is intentionally bounded; oversized fences remain copy-only.
+// 32 Ki UTF-16 code units is a deliberate one-click injection guardrail, not a
+// PTY/shell line-buffer limit. Oversized fences remain available through Copy.
 export const MAX_CHAT_RUN_CHARS = 32_768
 
 export function isRunnableChatTerminalCommandText(command: string): boolean {

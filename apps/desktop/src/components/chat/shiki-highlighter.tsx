@@ -1,9 +1,11 @@
 'use client'
 
 import type { SyntaxHighlighterProps } from '@assistant-ui/react-streamdown'
+import { useStore } from '@nanostores/react'
 import { type ComponentProps, type FC, lazy, Suspense, useMemo } from 'react'
 import type ShikiHighlighter from 'react-shiki'
 
+import { $chatTerminalRunRequest } from '@/app/right-sidebar/store'
 import {
   hasEmbeddedTerminalBridge,
   isRunnableChatTerminalCommandText,
@@ -154,6 +156,24 @@ const PlainCode: FC<{ code: string }> = ({ code }) => {
   )
 }
 
+const RunButton: FC<{ command: string; label: string }> = ({ command, label }) => {
+  const pending = useStore($chatTerminalRunRequest)
+
+  return (
+    <Button
+      aria-label={label}
+      className="pointer-events-none opacity-0 group-hover/code:pointer-events-auto group-hover/code:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100"
+      disabled={pending !== null}
+      onClick={() => queueChatCommandInFreshTerminal(command)}
+      size="xs"
+      type="button"
+      variant="ghost"
+    >
+      {label}
+    </Button>
+  )
+}
+
 export const SyntaxHighlighter: FC<HermesSyntaxHighlighterProps> = ({
   components: { Pre },
   language,
@@ -186,18 +206,7 @@ export const SyntaxHighlighter: FC<HermesSyntaxHighlighterProps> = ({
   return (
     <CodeCard data-streaming={defer ? 'true' : undefined}>
       <div className="absolute right-1.5 top-1.5 z-10 flex items-center gap-1">
-        {runnable && (
-          <Button
-            aria-label={t.common.run}
-            className="pointer-events-none opacity-0 group-hover/code:pointer-events-auto group-hover/code:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100"
-            onClick={() => queueChatCommandInFreshTerminal(trimmed)}
-            size="xs"
-            type="button"
-            variant="ghost"
-          >
-            {t.common.run}
-          </Button>
-        )}
+        {runnable && <RunButton command={trimmed} label={t.common.run} />}
         <CopyButton
           appearance="inline"
           className="h-5 gap-0 rounded-md px-1 opacity-0 transition-opacity group-hover/code:opacity-100 focus-visible:opacity-100"
