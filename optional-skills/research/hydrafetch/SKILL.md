@@ -53,7 +53,7 @@ export HYDRAFETCH_API_KEY="hf_..."   # from https://app.hydrafetch.com
 Everything goes through the `terminal` tool as an HTTPS call. Scrape one page to Markdown:
 
 ```bash
-curl -sS https://api.hydrafetch.com/v1/web/scrape \
+curl -sS --max-time 120 https://api.hydrafetch.com/v1/web/scrape \
   -H "X-API-Key: $HYDRAFETCH_API_KEY" \
   -H 'content-type: application/json' \
   -d '{"url":"https://example.com/article","formats":["markdown"]}' \
@@ -85,16 +85,16 @@ Base URL `https://api.hydrafetch.com`. Full spec at <https://api.hydrafetch.com/
 2. **Discover before fetching.** Map a site, filter the list, then scrape only what you need. Crawling everything and discarding most of it is the commonest way to waste credits.
 
    ```bash
-   curl -sS https://api.hydrafetch.com/v1/web/map \
+   curl -sS --max-time 120 https://api.hydrafetch.com/v1/web/map \
      -H "X-API-Key: $HYDRAFETCH_API_KEY" \
      -H 'content-type: application/json' \
-     -d '{"url":"https://example.com"}' | jq -r '.data.links[]'
+     -d '{"url":"https://example.com"}' | jq -r '.data.links[].url'
    ```
 
 3. **Use `extract` when the shape must be guaranteed.** The JSON Schema is enforced, so you get fields you can rely on rather than prose to re-parse. It is the expensive call because a model runs behind it — use `scrape` and read the Markdown when a guarantee is not needed.
 
    ```bash
-   curl -sS https://api.hydrafetch.com/v1/web/extract \
+   curl -sS --max-time 120 https://api.hydrafetch.com/v1/web/extract \
      -H "X-API-Key: $HYDRAFETCH_API_KEY" \
      -H 'content-type: application/json' \
      -d '{"urls":["https://example.com/product/1"],
@@ -105,13 +105,13 @@ Base URL `https://api.hydrafetch.com`. Full spec at <https://api.hydrafetch.com/
 4. **Never loop over `scrape` for many pages.** Batch takes a URL list and returns a job id to poll. Per-page options go inside `scrapeOptions`, and the id comes back as `batchId`:
 
    ```bash
-   JOB=$(curl -sS https://api.hydrafetch.com/v1/web/batch \
+   JOB=$(curl -sS --max-time 120 https://api.hydrafetch.com/v1/web/batch \
      -H "X-API-Key: $HYDRAFETCH_API_KEY" \
      -H 'content-type: application/json' \
      -d '{"urls":["https://a.example/1","https://a.example/2"],
           "scrapeOptions":{"formats":["markdown"]}}' | jq -r '.batchId')
 
-   curl -sS "https://api.hydrafetch.com/v1/web/batch/$JOB" \
+   curl -sS --max-time 120 "https://api.hydrafetch.com/v1/web/batch/$JOB" \
      -H "X-API-Key: $HYDRAFETCH_API_KEY" | jq '.data.status'
    ```
 
@@ -125,13 +125,14 @@ Base URL `https://api.hydrafetch.com`. Full spec at <https://api.hydrafetch.com/
 - **Do not invent missing values.** Keep nullable fields null. A plausible wrong price or headcount propagates silently in a way an empty field does not.
 - **`batch` options are nested.** `formats` at the top level is ignored; it belongs in `scrapeOptions`. The response field is `batchId`, not an id under `data`.
 - **A 503 on a scrape usually means the origin is genuinely unreachable** — a dead domain or a broken certificate — and retrying will not fix it.
+- **Always set a timeout.** The examples pass `--max-time 120`, which is what the official SDKs use. Without it a stalled origin holds the call open until whatever outer timeout you have fires, and that is the most common way one of these calls goes wrong in practice.
 - **Do not retry 400 or 422 unchanged.** They are validation failures, and a repeat costs another request. A 402 means the workspace is out of credits; say so rather than retrying.
 - **Be a polite client.** The API paces itself per host, but you choose the targets. Respect robots.txt and site terms, and do not point a crawl at a third party's site at volume without reason.
 
 ## Verification
 
 ```bash
-curl -sS https://api.hydrafetch.com/v1/web/scrape \
+curl -sS --max-time 120 https://api.hydrafetch.com/v1/web/scrape \
   -H "X-API-Key: $HYDRAFETCH_API_KEY" \
   -H 'content-type: application/json' \
   -d '{"url":"https://example.com","formats":["markdown"]}' \
