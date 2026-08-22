@@ -553,8 +553,25 @@ def _mask_control_split_tokens(text: str, mask_fn) -> str:
                     body = body[:clips - body_start]
                     if not body:
                         continue
-        if (all(c in _TOKEN_BODY_CHARS or keep[start_orig + k]
-                for k, c in enumerate(span))
+        # Live chars must be token-body chars, AND stripped regions must be
+        # KIND-UNIFORM: all bare controls, or all complete-CSI bytes. An
+        # orphan ESC followed by a later color sequence leaves live text
+        # between two stripped regions that is not provably part of one
+        # smuggled token — bridging across it deletes arbitrary bytes
+        # (``sk-aaaaa\x1bNOT_TOKEN_TEXT\x1b[31mbbbbbbbbbb`` erased
+        # NOT_TOKEN_TEXT; review finding on #81012). Kind-uniform spans keep
+        # both smuggling shapes covered: bare-control splits (#77484) bridge
+        # only their own kind, color-glued fragments (#81012) only theirs.
+        kinds = 0  # bit set from keep values: 1 = bare control · 2 = CSI byte
+        clean_join = True
+        for k, c in enumerate(span):
+            kd = keep[start_orig + k]
+            if kd:
+                kinds |= kd
+            elif c not in _TOKEN_BODY_CHARS:
+                clean_join = False
+                break
+        if (clean_join and kinds != 3
                 and (end_orig >= n or text[end_orig] != "=")):
             matches.append((start_orig, end_orig, mask_fn(body)))
     for start_orig, end_orig, replacement in reversed(matches):
@@ -569,8 +586,12 @@ def _strip_shadow(text: str):
 
     - ``cleaned`` is a copy of ``text`` with every complete ANSI CSI
       sequence and every bare control/zero-width char removed.
-    - ``keep[i]`` is truthy when ``text[i]`` was stripped noise (a byte
-      belonging to an ANSI CSI sequence or a bare control char).
+    - ``keep[i]`` classifies ``text[i]``: 0 = live char kept in the shadow,
+      1 = bare control char (stripped individually), 2 = byte belonging to a
+      complete ANSI CSI sequence (stripped as a unit). Any truthy value means
+      strippable noise, preserving the historical contract; the KIND
+      distinction lets the join pass refuse candidate spans whose stripped
+      regions MIX kinds (see the gate in _mask_control_split_tokens).
     - ``orig_idx`` maps each shadow index back to its index in ``text``.
 
     Stripping complete CSI sequences — not just the bare ``\\x1b`` byte — is
@@ -585,7 +606,14 @@ def _strip_shadow(text: str):
     out_chars = []
     keep = bytearray(len(text))
     orig_idx = []
-    rem = _ANSI_CSI_SEQ_RE.search
+    # .match, NOT .search: at an ESC that does NOT begin a CSI sequence,
+    # search(text, i) jumps ahead to a LATER CSI and marks everything from
+    # this ESC through that sequence as strippable noise — blessing arbitrary
+    # live bytes between the two regions and letting the greedy join delete
+    # them (``sk-aaaaa\x1bNOT_TOKEN_TEXT\x1b[31mbbbbbbbbbb`` erased
+    # NOT_TOKEN_TEXT). With .match a sequence is stripped only when it starts
+    # AT this ESC; otherwise the bare-control path strips just the ESC byte.
+    rem = _ANSI_CSI_SEQ_RE.match
     i = 0
     ctrl = _CONTROL_CHARS_RE.match
     while i < len(text):
@@ -593,7 +621,7 @@ def _strip_shadow(text: str):
             m = rem(text, i)
             if m:
                 for j in range(i, m.end()):
-                    keep[j] = 1
+                    keep[j] = 2
                 i = m.end()
                 continue
         c = text[i]

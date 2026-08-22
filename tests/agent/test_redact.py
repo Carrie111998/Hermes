@@ -263,6 +263,16 @@ class TestControlCharSplitTokens:
         assert a not in result
         assert b not in result
 
+    def test_non_csi_esc_before_later_csi_live_text_survives(self):
+        # Review finding on #81012: at an ESC that does NOT begin a CSI
+        # sequence, the shadow builder must strip a CSI only when it starts
+        # AT that ESC. Jumping ahead to a LATER CSI marked the live text
+        # between the two regions as strippable noise, blessed it through
+        # the span validation, and the greedy join deleted it.
+        text = "sk-" + "a" * 5 + "\x1bNOT_TOKEN_TEXT\x1b[31m" + "b" * 10
+        result = redact_sensitive_text(text, force=True)
+        assert "NOT_TOKEN_TEXT" in result
+
 
 class TestEnvLookupPreserved:
     """Programmatic env var lookups must not be corrupted (issue #2852)."""
