@@ -1964,7 +1964,9 @@ class DockerEnvironment(BaseEnvironment):
             return None
         lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
         if not lines:
-            return None
+            return self._find_legacy_reusable_container(
+                task_label, profile_label, egress_label,
+            )
         # Multiple matches are unusual (one (task, profile) should produce one
         # container) but can happen if a previous Hermes process crashed
         # mid-cleanup. Prefer a running one if present; otherwise pick the
@@ -1996,6 +1998,122 @@ class DockerEnvironment(BaseEnvironment):
             if state == "running" and running is None:
                 running = (cid, state)
         return running or first
+
+    def _find_legacy_reusable_container(
+        self,
+        task_label: str,
+        profile_label: str,
+        egress_label: str,
+    ) -> Optional[tuple[str, str]]:
+        """Find a pre-fingerprint persistent container by its bind sources.
+
+        Containers created before ``hermes-task-key`` cannot pass the strict
+        identity-label lookup.  The readable task label is lossy, so it is
+        only a candidate selector: both persistent bind sources must match the
+        paths this environment resolved for ``/root`` and ``/workspace``.
+        """
+        if not self._persistent:
+            return None
+        expected_mounts = self._persistent_bind_sources()
+        if set(expected_mounts) != {"/root", "/workspace"}:
+            return None
+
+        filters = [
+            "--filter", "label=hermes-agent=1",
+            "--filter", f"label=hermes-task-id={task_label}",
+            "--filter", f"label=hermes-profile={profile_label}",
+        ]
+        if egress_label != "off":
+            filters.extend(["--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"])
+        fmt = (
+            '{{.ID}}\t{{.State}}\t{{.Label "'
+            + _TASK_IDENTITY_LABEL_KEY
+            + '"}}\t{{.Label "'
+            + _EGRESS_LABEL_KEY
+            + '"}}'
+        )
+        try:
+            result = subprocess.run(
+                [self._docker_exe, "ps", "-a", *filters, "--format", fmt],
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=10,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.debug("legacy docker ps probe failed: %s", e)
+            return None
+        if result.returncode != 0:
+            return None
+
+        matches: list[tuple[str, str]] = []
+        # A healthy task has at most one candidate. Bound daemon inspections
+        # when stale/crashed processes left an abnormal number behind.
+        for line in result.stdout.splitlines()[:20]:
+            parts = line.split("\t", 3)
+            if len(parts) != 4:
+                continue
+            cid, state, task_key, legacy_egress = parts
+            if task_key not in ("", "<no value>"):
+                continue
+            if egress_label == "off" and legacy_egress not in ("", "<no value>", "off"):
+                continue
+            if self._legacy_mounts_match(cid, expected_mounts):
+                matches.append((cid, state.lower()))
+        return next((item for item in matches if item[1] == "running"), None) or (
+            matches[0] if matches else None
+        )
+
+    def _persistent_bind_sources(self) -> dict[str, str]:
+        """Return the effective persistent bind source for required targets."""
+        sources: dict[str, str] = {}
+        args = self._all_run_args
+        for index, arg in enumerate(args[:-1]):
+            if arg not in ("-v", "--volume"):
+                continue
+            spec = str(args[index + 1])
+            for destination in ("/root", "/workspace"):
+                marker = f":{destination}"
+                split_at = spec.rfind(marker)
+                if split_at >= 0 and spec[split_at + len(marker):] in ("", ":ro", ":rw"):
+                    sources[destination] = spec[:split_at]
+        return sources
+
+    def _legacy_mounts_match(
+        self,
+        container_id: str,
+        expected_mounts: dict[str, str],
+    ) -> bool:
+        """Return whether a legacy container has the exact expected binds."""
+        try:
+            result = subprocess.run(
+                [self._docker_exe, "inspect", "--format", "{{json .Mounts}}", container_id],
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=10,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+            mounts = json.loads(result.stdout) if result.returncode == 0 else None
+        except (subprocess.TimeoutExpired, OSError, ValueError, TypeError):
+            return False
+        if not isinstance(mounts, list):
+            return False
+        actual = {
+            str(mount.get("Destination")): str(mount.get("Source"))
+            for mount in mounts
+            if isinstance(mount, dict) and mount.get("Type") == "bind"
+        }
+
+        def _normalized(path: str) -> str:
+            return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+        return all(
+            destination in actual
+            and _normalized(actual[destination]) == _normalized(source)
+            for destination, source in expected_mounts.items()
+        )
 
     def cleanup(self, *, force_remove: bool = False):
         """Tear down the container according to persist mode and *force_remove*.
