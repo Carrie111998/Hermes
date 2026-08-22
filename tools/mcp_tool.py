@@ -211,6 +211,23 @@ def _rotate_mcp_stderr_log(log_path: Path) -> None:
     their handles valid — O_APPEND seeks to EOF on every write, so those
     writers simply continue into the fresh file.
 
+    Known, accepted bounds (documented so the next reader does not
+    "fix" them blindly):
+
+    - Regrowth within one process lifetime is unbounded. The cached fd
+      is reused forever after first open, so a gateway that stays up for
+      months can regrow past the cap until its next restart. Extending
+      the bound to runtime would need a periodic size check plus this
+      same copy-truncate (never rename); at the observed tens-of-MB-per-
+      week rate that is months of headroom, so capping at open time is
+      the honest 90% fix.
+    - The open lock is per-process. Two gateway profiles rotating
+      concurrently can interleave shift/copy/truncate steps — worst case
+      a torn backup, or lines appended in the copy window landing in
+      neither backup nor current file. Benign for stderr diagnostics;
+      cross-process locking would cost more than the data is worth.
+      Accepted deliberately.
+
     Best-effort: any failure leaves the previous unbounded-append
     behaviour in place and is logged at DEBUG only.
     """
