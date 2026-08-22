@@ -33,7 +33,7 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { transcribeAudio } from '@/hermes'
 import { useI18n } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
-import { NEW_SESSION_TITLE, sessionTitle } from '@/lib/chat-runtime'
+import { newSessionTitle, sessionTitle } from '@/lib/chat-runtime'
 import { createComposerAttachmentScope, draftTitleFor } from '@/store/composer'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
@@ -391,14 +391,14 @@ export function tileStoredRow(storedSessionId: string): SessionInfo | undefined 
 function tileTitle(storedSessionId: string): string {
   const stored = tileStoredRow(storedSessionId)
 
-  return stored ? sessionTitle(stored) : NEW_SESSION_TITLE
+  return stored ? sessionTitle(stored) : newSessionTitle()
 }
 
 /** The `@session` link payload for a tile tab drag — id + owning profile + title.
  *  Resolved at drag time, so an unsent tab drags under its draft name. */
 function tileDragPayload(storedSessionId: string): SessionDragPayload {
   const stored = tileStoredRow(storedSessionId)
-  const title = stored ? sessionTitle(stored) : draftTitleFor(storedSessionId) || NEW_SESSION_TITLE
+  const title = stored ? sessionTitle(stored) : draftTitleFor(storedSessionId) || newSessionTitle()
 
   return { id: storedSessionId, profile: stored?.profile ?? '', title }
 }

@@ -41,7 +41,7 @@ import { useContributions } from '@/contrib/react/use-contributions'
 import { registry } from '@/contrib/registry'
 import { discoverRuntimePlugins } from '@/contrib/runtime-loader'
 import { translateNow } from '@/i18n'
-import { NEW_SESSION_TITLE, sessionTitle as storedSessionTitle } from '@/lib/chat-runtime'
+import { sessionTitle as storedSessionTitle } from '@/lib/chat-runtime'
 import { Download, FileText, LayoutDashboard, PanelBottom, PanelTop, Terminal, Upload, Zap } from '@/lib/icons'
 import { type KeybindContribution, KEYBINDS_AREA } from '@/lib/keybinds/actions'
 import { TRANSCRIPT_DIRECTIVE_AREA, type TranscriptDirectiveContribution } from '@/lib/transcript-directives'
@@ -155,7 +155,7 @@ registry.registerMany([
   {
     id: 'sessions',
     area: 'panes',
-    title: 'sessions',
+    title: translateNow('zones.paneSessions'),
     // Collapsible: leaves the grid on narrow viewports (edge overlay instead).
     // dock: where a RE-ADOPTED pane lands (healed from a stale dismissal) —
     // its default-ish spot beside main, not a random same-placement stack.
@@ -177,7 +177,7 @@ registry.registerMany([
     id: 'workspace',
     area: 'panes',
     // Live-retitled to the loaded session by syncWorkspaceTitle below.
-    title: NEW_SESSION_TITLE,
+    title: translateNow('sidebar.row.newSessionTitle'),
     data: {
       placement: 'main',
       minWidth: '22vw',
@@ -190,7 +190,7 @@ registry.registerMany([
   {
     id: 'terminal',
     area: 'panes',
-    title: 'terminal',
+    title: translateNow('zones.paneTerminal'),
     // revealOnPreset: choosing a layout that places the terminal (e.g.
     // "Terminal deck") turns takeover on so the zone actually shows, instead of
     // staying collapsed behind the ⌃` toggle. height sizes the fixed track (a
@@ -212,7 +212,7 @@ registry.registerMany([
   {
     id: 'files',
     area: 'panes',
-    title: 'files',
+    title: translateNow('zones.paneFiles'),
     // dock: re-adoption target after a stale dismissal (see sessions).
     data: {
       placement: 'right',
@@ -228,7 +228,7 @@ registry.registerMany([
   {
     id: 'review',
     area: 'panes',
-    title: 'review',
+    title: translateNow('zones.paneReview'),
     // The second right sidebar: hidden until ⌘G ($reviewOpen) — bound below
     // like the other chrome toggles; its zone collapses while hidden.
     data: {
@@ -484,7 +484,7 @@ const syncWorkspaceTitle = () => {
     area: 'panes',
     // The placeholder, not the draft's live name — `tabTitle` below renders
     // that. Keeping it here would re-register the pane on every keystroke.
-    title: stored ? storedSessionTitle(stored) : NEW_SESSION_TITLE,
+    title: stored ? storedSessionTitle(stored) : translateNow('sidebar.row.newSessionTitle'),
     data: {
       // The tab's status dot — the SAME primitive the sidebar row and session
       // tiles render, so the main tab never disagrees with its sidebar row. A
