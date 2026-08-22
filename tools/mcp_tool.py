@@ -569,6 +569,14 @@ _PARKED_RETRY_INTERVAL = 300     # base seconds between parked self-probes
 # reconnects are unaffected — they fire immediately), so a chronically
 # dead server settles into at most one probe per _PARKED_RETRY_INTERVAL_MAX.
 _PARKED_RETRY_INTERVAL_MAX = 3600
+# Top rung of the doubling ladder: the streak counter stops growing here
+# because the interval is already pinned at _PARKED_RETRY_INTERVAL_MAX.
+_PARKED_PROBE_STREAK_CAP = max(
+    0,
+    math.ceil(
+        math.log2(_PARKED_RETRY_INTERVAL_MAX / _PARKED_RETRY_INTERVAL)
+    ),
+)
 _RECYCLED_RECONNECT_TIMEOUT = 15.0
 # Jitter applied to reconnect backoff sleeps. Without it, every server that
 # lost the same backend retries in lockstep (thundering herd) and log lines
@@ -2466,11 +2474,21 @@ class MCPServerTask:
         free for stdio transports (each probe spawns the process), so a
         server parked on a permanent-looking failure settles to one probe
         per hour instead of one per 5 minutes, forever.
+
+        The streak itself is clamped at the doubling ladder's top rung:
+        past it the interval is pinned at the cap, so the counter stops
+        growing and the ``2 ** streak`` arithmetic stays tiny.
+
+        Returns a jittered value (+/- ``_BACKOFF_JITTER``), mirroring the
+        reconnect backoff: after a gateway restart, every parked server
+        wakes from the same base cadence, and without jitter they would
+        all self-probe in lockstep at 300s/600s/... — a thundering herd
+        of process spawns.
         """
-        return min(
+        return _jittered(min(
             _PARKED_RETRY_INTERVAL * (2 ** self._parked_probe_streak),
             _PARKED_RETRY_INTERVAL_MAX,
-        )
+        ))
 
     def _is_http(self) -> bool:
         """Check if this server uses HTTP transport."""
@@ -3029,8 +3047,13 @@ class MCPServerTask:
             # A probe that leads to another park (the server is still dead)
             # must lengthen the next wait: bump the failure streak so the
             # backoff ladder in _parked_probe_interval() doubles the
-            # interval. Explicit reconnects never touch the streak.
-            self._parked_probe_streak += 1
+            # interval. Explicit reconnects never touch the streak. The
+            # streak is clamped at the ladder's top rung — past it the
+            # interval is pinned at the cap, so the counter stops growing.
+            self._parked_probe_streak = min(
+                self._parked_probe_streak + 1,
+                _PARKED_PROBE_STREAK_CAP,
+            )
         return "reconnect"
 
     async def _run_stdio(self, config: dict):
