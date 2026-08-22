@@ -3,6 +3,12 @@ import { useEffect } from 'react'
 import { getLatestSessionMessages, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
 import { toChatMessages } from '@/lib/chat-messages'
 import { publishSessionState, setSessionTileDelegate } from '@/store/session-states'
+import {
+  $sessions,
+  sessionMatchesStoredId,
+  setCurrentCwdTransient,
+  setWorkspaceCwdOwner
+} from '@/store/session'
 import type { SessionResumeResponse } from '@/types/hermes'
 
 import type { usePromptActions } from '../../session/hooks/use-prompt-actions'
@@ -116,6 +122,20 @@ export function useSessionTileDelegate({
         const existing = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
         const cached = existing ? sessionStateByRuntimeIdRef.current.get(existing) : undefined
 
+        // resumeTile is the sidebar/tab switch path. Unlike the primary resume
+        // (use-session-actions) it never published the conversation's cwd, so
+        // `$currentCwd` — and with it the Files pane — stayed pinned to the
+        // previous conversation's folder on every switch (#76696 class). Publish
+        // it on both branches, preferring the persisted DB cwd over the warm
+        // snapshot (written at session.create time, never refreshed later).
+        const publishWorkspaceCwd = (cwd: unknown) => {
+          const stored = $sessions.get().find(s => sessionMatchesStoredId(s, storedSessionId))
+          const dbCwd = stored?.cwd?.trim()
+          const resolved = dbCwd || (typeof cwd === 'string' ? cwd : '') || ''
+          setCurrentCwdTransient(resolved)
+          setWorkspaceCwdOwner(storedSessionId)
+        }
+
         // Warm path: reuse a live binding — but only when it still carries a
         // transcript (or is mid-turn, where messages legitimately stream in).
         // A binding whose cached state has no messages is either a released
@@ -123,6 +143,7 @@ export function useSessionTileDelegate({
         // post-sleep/wake tile permanently empty. Fall through to a real
         // resume instead — it's idempotent for a genuinely live session.
         if (existing && cached?.storedSessionId === storedSessionId && (cached.busy || cached.messages.length > 0)) {
+          publishWorkspaceCwd(cached?.cwd)
           publishSessionState(existing, cached)
 
           return existing
@@ -161,6 +182,11 @@ export function useSessionTileDelegate({
           }),
           storedSessionId
         )
+
+        // Cold path: the resume response carries the backend-confirmed cwd
+        // (DB-truth via _lazy_resume_info), so publish it directly — the
+        // publishWorkspaceCwd helper prefers the $sessions DB row anyway.
+        publishWorkspaceCwd(resumed?.info?.cwd)
 
         return runtimeId
       },

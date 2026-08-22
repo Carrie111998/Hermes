@@ -68,7 +68,8 @@ import {
   setSessionStartedAt,
   setTurnStartedAt,
   setWorkspaceCwdOwner,
-  setYoloActive
+  setYoloActive,
+  getCurrentModelSource
 } from '@/store/session'
 import { requestForSessionProfile } from '@/store/session-request-router'
 import {
@@ -203,6 +204,15 @@ async function desktopSessionCreateParams(cwd: string): Promise<Record<string, u
     provider: $currentProvider.get().trim()
   }
 
+  // Only send model/provider when the user explicitly selected them (manual
+  // source). Otherwise the composer's sticky model — which syncs from the
+  // last-viewed session's model via syncRuntimeMetadataToView — would pollute
+  // every new session with the previous session's model instead of using the
+  // profile default.
+  const modelSource = getCurrentModelSource()
+  const explicitModel = modelSource === 'manual' ? selection.model : ''
+  const explicitProvider = modelSource === 'manual' ? selection.provider : ''
+
   const profile = $newChatProfile.get() ?? normalizeProfileKey($activeGatewayProfile.get())
   await ensureGatewayProfile(profile)
 
@@ -211,8 +221,8 @@ async function desktopSessionCreateParams(cwd: string): Promise<Record<string, u
     source: 'desktop',
     ...(cwd && { cwd }),
     ...(profile ? { profile } : {}),
-    ...(selection.model
-      ? { model: selection.model, ...(selection.provider ? { provider: selection.provider } : {}) }
+    ...(explicitModel
+      ? { model: explicitModel, ...(explicitProvider ? { provider: explicitProvider } : {}) }
       : {}),
     ...(selection.effort ? { reasoning_effort: selection.effort } : {}),
     fast: selection.fast

@@ -14,7 +14,15 @@
  *   - `window` (⇧⌘-click) — pop into its own window; falls back to `tab` when
  *     the bridge has no session-window support.
  */
-import { $activeSessionId, $selectedStoredSessionId, markSessionRead } from '@/store/session'
+import {
+  $activeSessionId,
+  $sessions,
+  $selectedStoredSessionId,
+  markSessionRead,
+  sessionMatchesStoredId,
+  setCurrentCwdTransient,
+  setWorkspaceCwdOwner
+} from '@/store/session'
 import {
   focusedSessionNeedsRoute,
   focusOpenSession,
@@ -105,6 +113,20 @@ export function openSession(
 
     return
   }
+
+  // Every open must rebind the Files pane to the conversation's own workspace,
+  // including the fast paths below (focusOpenSession) that jump to a session
+  // already on screen. Those only front the tab and never publish, so switching
+  // back to an open session kept the previous session's folder in the right
+  // rail (#76696). Publish unconditionally (even when cwd is empty — clears the
+  // pane rather than leaving the previous session's folder pinned). Window and
+  // main intents are handled above: a pop-out window gets its own renderer with
+  // its own cwd atom, and the main intent triggers a full resume that publishes
+  // cwd independently.
+  const openedStored = $sessions.get().find(s => sessionMatchesStoredId(s, storedSessionId))
+  const openedCwd = openedStored?.cwd?.trim()
+  setCurrentCwdTransient(openedCwd || '')
+  setWorkspaceCwdOwner(storedSessionId)
 
   // A `stack` open arrives from outside the workspace, so unlike a sidebar
   // click it can't assume main is spendable: it behaves like `tab`, except main
