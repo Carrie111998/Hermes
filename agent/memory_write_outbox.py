@@ -125,23 +125,40 @@ class MemoryWriteOutbox:
             before = conn.execute(
                 "SELECT COUNT(*) FROM pending_writes WHERE provider = ?", (provider,)
             ).fetchone()[0]
-            conn.execute(
-                """
-                DELETE FROM pending_writes
-                WHERE provider = ? AND id NOT IN (
+            overflow = max(0, before - self._max_entries)
+            dropped = 0
+            if overflow:
+                # A leased row may still be inside a provider callback. Never
+                # evict it: doing so makes a later callback failure impossible
+                # to release/replay. Prefer the oldest unclaimed rows, which
+                # also causes a newly inserted row to be rejected when every
+                # older row is in flight.
+                eligible = conn.execute(
+                    """
                     SELECT id FROM pending_writes
-                    WHERE provider = ? ORDER BY id DESC LIMIT ?
-                )
-                """,
-                (provider, provider, self._max_entries),
-            )
+                    WHERE provider = ? AND claim_token = ''
+                    ORDER BY id LIMIT ?
+                    """,
+                    (provider, overflow),
+                ).fetchall()
+                if eligible:
+                    placeholders = ",".join("?" for _ in eligible)
+                    dropped = conn.execute(
+                        f"DELETE FROM pending_writes WHERE id IN ({placeholders})",
+                        tuple(row["id"] for row in eligible),
+                    ).rowcount
             after = conn.execute(
                 "SELECT COUNT(*) FROM pending_writes WHERE provider = ?", (provider,)
             ).fetchone()[0]
+            queued = conn.execute(
+                "SELECT 1 FROM pending_writes WHERE provider = ? AND fingerprint = ?",
+                (provider, fingerprint),
+            ).fetchone() is not None
         return {
-            "queued": True,
+            "queued": queued,
             "deduplicated": not inserted,
-            "dropped": max(0, before - after),
+            "dropped": dropped,
+            "overflow": max(0, after - self._max_entries),
         }
 
     def pending_count(self, provider: str) -> int:
@@ -207,13 +224,49 @@ class MemoryWriteOutbox:
                         "error": "",
                         "blocked": True,
                     }
+                stop_renewal = threading.Event()
+                ownership_lost = threading.Event()
+                renewal_interval = min(5.0, max(0.05, self._claim_lease_seconds / 3.0))
+
+                def _renew_claim() -> None:
+                    while not stop_renewal.wait(renewal_interval):
+                        try:
+                            with self._connect() as renewal_conn:
+                                renewed = renewal_conn.execute(
+                                    """
+                                    UPDATE pending_writes SET claim_until = ?
+                                    WHERE id = ? AND claim_token = ?
+                                    """,
+                                    (
+                                        time.time() + self._claim_lease_seconds,
+                                        row["id"],
+                                        claim_token,
+                                    ),
+                                ).rowcount
+                            if renewed != 1:
+                                ownership_lost.set()
+                                return
+                        except sqlite3.Error:
+                            # A transient SQLite writer can consume one renewal
+                            # interval. Keep trying; the guarded final mutation
+                            # below is the authority on ownership.
+                            continue
+
+                renewer = threading.Thread(
+                    target=_renew_claim,
+                    daemon=True,
+                    name=f"memory-outbox-lease-{provider}",
+                )
+                renewer.start()
                 try:
                     metadata = json.loads(row["metadata_json"])
                     deliver(row["action"], row["target"], row["content"], metadata)
                 except Exception as exc:
+                    stop_renewal.set()
+                    renewer.join()
                     error = str(exc)
                     with self._connect() as conn:
-                        conn.execute(
+                        released = conn.execute(
                             """
                             UPDATE pending_writes
                             SET attempts = attempts + 1, last_error = ?,
@@ -221,18 +274,27 @@ class MemoryWriteOutbox:
                             WHERE id = ? AND claim_token = ?
                             """,
                             (error, row["id"], claim_token),
-                        )
+                        ).rowcount
                     return {
                         "replayed": replayed,
                         "remaining": self.pending_count(provider),
                         "error": error,
-                        "blocked": False,
+                        "blocked": released != 1 or ownership_lost.is_set(),
                     }
+                stop_renewal.set()
+                renewer.join()
                 with self._connect() as conn:
-                    conn.execute(
+                    deleted = conn.execute(
                         "DELETE FROM pending_writes WHERE id = ? AND claim_token = ?",
                         (row["id"], claim_token),
-                    )
+                    ).rowcount
+                if deleted != 1 or ownership_lost.is_set():
+                    return {
+                        "replayed": replayed,
+                        "remaining": self.pending_count(provider),
+                        "error": "provider write claim ownership was lost during delivery",
+                        "blocked": True,
+                    }
                 replayed += 1
 
     def should_alert(self, provider: str, cooldown_seconds: float) -> bool:

@@ -1148,13 +1148,14 @@ class MemoryManager:
             enqueue_result = self._write_outbox.enqueue(
                 provider, action, target, content, metadata
             )
-            if enqueue_result["dropped"]:
+            if enqueue_result["dropped"] or enqueue_result.get("overflow"):
                 logger.warning(
                     "Memory provider '%s' outbox reached its %d-entry bound; "
-                    "dropped %d oldest write(s)",
+                    "discarded %d unclaimed write(s), with %d entry(s) still over bound",
                     provider,
                     self._outbox_max_entries,
                     enqueue_result["dropped"],
+                    enqueue_result.get("overflow", 0),
                 )
             return bool(enqueue_result["queued"])
         except Exception:

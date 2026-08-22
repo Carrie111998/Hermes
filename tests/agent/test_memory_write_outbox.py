@@ -2,6 +2,7 @@
 
 import json
 import threading
+import time
 
 from agent.memory_manager import MemoryManager
 from agent.memory_provider import MemoryProvider
@@ -167,4 +168,74 @@ def test_concurrent_replay_claims_each_row_once(tmp_path):
     assert blocked["blocked"] is True
     assert blocked["remaining"] == 1
     assert len(calls) == 1
+    assert first.pending_count("provider") == 0
+
+
+def test_bound_never_evicts_claimed_head(tmp_path):
+    first = MemoryWriteOutbox(tmp_path, max_entries_per_provider=1)
+    second = MemoryWriteOutbox(tmp_path, max_entries_per_provider=1)
+    first.enqueue("provider", "add", "memory", "old", {})
+    started = threading.Event()
+    release = threading.Event()
+
+    def fail_after_release(action, target, content, metadata):
+        started.set()
+        assert release.wait(timeout=5)
+        raise RuntimeError("still unavailable")
+
+    result = {}
+    worker = threading.Thread(
+        target=lambda: result.update(first.replay("provider", fail_after_release))
+    )
+    worker.start()
+    assert started.wait(timeout=5)
+
+    overflow = second.enqueue("provider", "add", "memory", "new", {})
+    assert overflow["queued"] is False
+    assert overflow["dropped"] == 1
+
+    release.set()
+    worker.join(timeout=5)
+    assert worker.is_alive() is False
+    assert result["error"] == "still unavailable"
+    assert first.pending_count("provider") == 1
+
+    delivered = []
+    replayed = second.replay(
+        "provider",
+        lambda action, target, content, metadata: delivered.append(content),
+    )
+    assert replayed["replayed"] == 1
+    assert delivered == ["old"]
+
+
+def test_claim_is_renewed_while_delivery_exceeds_lease(tmp_path):
+    first = MemoryWriteOutbox(tmp_path, claim_lease_seconds=1)
+    second = MemoryWriteOutbox(tmp_path, claim_lease_seconds=1)
+    first.enqueue("provider", "add", "memory", "one", {})
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def slow_deliver(action, target, content, metadata):
+        calls.append(content)
+        started.set()
+        assert release.wait(timeout=5)
+
+    first_result = {}
+    worker = threading.Thread(
+        target=lambda: first_result.update(first.replay("provider", slow_deliver))
+    )
+    worker.start()
+    assert started.wait(timeout=5)
+    time.sleep(1.25)
+
+    blocked = second.replay("provider", slow_deliver)
+    assert blocked["blocked"] is True
+    assert calls == ["one"]
+
+    release.set()
+    worker.join(timeout=5)
+    assert worker.is_alive() is False
+    assert first_result["replayed"] == 1
     assert first.pending_count("provider") == 0
