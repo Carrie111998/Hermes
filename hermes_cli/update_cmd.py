@@ -4002,6 +4002,13 @@ def _detect_venv_python_processes(
         pass
 
     matches: list[tuple[int, str, str]] = []
+
+    def _looks_like_python_image(value: str) -> bool:
+        return re.fullmatch(
+            r"python(?:w|[0-9.]*w?)?(?:\.exe)?",
+            value.lower(),
+        ) is not None
+
     native_rows = _windows_process_image_rows()
     if native_rows is None:
         try:
@@ -4009,16 +4016,28 @@ def _detect_venv_python_processes(
             # unavailable Toolhelp API. Keep the base implementation's broad
             # metadata contract here so a native-enumeration failure cannot
             # weaken holder detection.
-            proc_rows = (
-                (proc, {**proc.info, "_native": False})
-                for proc in psutil.process_iter(["pid", "exe", "name", "cmdline", "cwd"])
-            )
+            proc_rows = []
+            for proc in psutil.process_iter(["pid", "exe", "name", "cmdline", "cwd"]):
+                try:
+                    info = {**(proc.info or {}), "_native": False}
+                except Exception:
+                    continue
+                proc_rows.append((proc, info))
         except Exception:
             return []
     else:
 
         def _native_proc_rows():
             for candidate_pid, candidate_name, candidate_exe in native_rows:
+                if candidate_pid in skip or not candidate_exe:
+                    continue
+                candidate_exe_norm = str(candidate_exe).lower()
+                if not (
+                    candidate_exe_norm.startswith(venv_prefix)
+                    or _looks_like_python_image(candidate_name)
+                    or _looks_like_python_image(Path(str(candidate_exe)).name)
+                ):
+                    continue
                 try:
                     yield psutil.Process(candidate_pid), {
                         "pid": candidate_pid,
@@ -4041,14 +4060,8 @@ def _detect_venv_python_processes(
         if not exe:
             continue
         snapshot_exe_norm = str(exe).lower()
-        process_is_python = re.fullmatch(
-            r"python(?:w|[0-9.]*w?)?(?:\.exe)?",
-            process_name,
-        ) is not None
-        executable_is_python = re.fullmatch(
-            r"python(?:w|[0-9.]*w?)?(?:\.exe)?",
-            Path(str(exe)).name.lower(),
-        ) is not None
+        process_is_python = _looks_like_python_image(process_name)
+        executable_is_python = _looks_like_python_image(Path(str(exe)).name)
         # Revalidate native rows that can matter. This closes the
         # Toolhelp-snapshot → psutil PID-reuse window without routing every
         # process back through psutil's slow executable lookup.

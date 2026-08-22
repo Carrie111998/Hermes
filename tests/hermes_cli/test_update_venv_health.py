@@ -131,9 +131,17 @@ def test_detect_venv_python_native_path_catches_arbitrary_venv_executable(_winp,
     holder = _proc(303, venv_exe, "custom-runner.exe", [venv_exe, "worker.py"])
     me = MagicMock()
     me.parents.return_value = []
+    constructed_pids = []
+
+    def process(pid=None):
+        if pid is None:
+            return me
+        constructed_pids.append(pid)
+        return holder
+
     fake_psutil = types.SimpleNamespace(
         process_iter=MagicMock(side_effect=AssertionError("fallback must not run")),
-        Process=lambda pid=None: me if pid is None else holder,
+        Process=process,
     )
 
     with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.object(
@@ -149,6 +157,32 @@ def test_detect_venv_python_native_path_catches_arbitrary_venv_executable(_winp,
         ]
 
     fake_psutil.process_iter.assert_not_called()
+    assert constructed_pids == [303]
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_detect_venv_python_fallback_mid_iteration_error_never_raises(_winp, tmp_path):
+    holder = _proc(
+        707,
+        str(tmp_path / "venv" / "Scripts" / "python.exe"),
+        "python.exe",
+    )
+    me = MagicMock()
+    me.parents.return_value = []
+
+    def broken_process_iter(_attrs):
+        yield holder
+        raise OSError("process table changed")
+
+    fake_psutil = types.SimpleNamespace(
+        process_iter=broken_process_iter,
+        Process=lambda *a, **k: me,
+    )
+
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.object(
+        update_module, "_windows_process_image_rows", return_value=None
+    ), patch.dict(sys.modules, {"psutil": fake_psutil}):
+        assert cli_main._detect_venv_python_processes() == []
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
