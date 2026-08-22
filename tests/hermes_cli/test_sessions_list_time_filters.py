@@ -51,6 +51,35 @@ def test_list_sessions_rich_composes_time_source_and_limit(db):
     assert [row["id"] for row in rows] == ["cli-new"]
 
 
+@pytest.mark.parametrize("order_by_last_active", [False, True])
+def test_list_sessions_rich_filters_projected_compression_tip_workspace(
+    db, order_by_last_active
+):
+    _create_at(db, "root", 100.0, cwd="C:/work/old-repo")
+    db.end_session("root", "compression")
+    _create_at(db, "tip", 150.0, cwd="C:/work/new-repo")
+    db._conn.execute(
+        "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
+        ("root", "tip"),
+    )
+    _create_at(db, "competitor", 200.0, cwd="C:/work/other-repo")
+    db._conn.commit()
+
+    matching = db.list_sessions_rich(
+        workspace_query="new-repo",
+        order_by_last_active=order_by_last_active,
+        limit=1,
+    )
+    stale = db.list_sessions_rich(
+        workspace_query="old-repo",
+        order_by_last_active=order_by_last_active,
+        limit=1,
+    )
+
+    assert [row["id"] for row in matching] == ["tip"]
+    assert stale == []
+
+
 def _list_args(**overrides):
     values = {
         "sessions_action": "list",
