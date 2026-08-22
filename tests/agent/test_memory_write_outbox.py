@@ -1,6 +1,7 @@
 """Behavior tests for durable external-provider memory write recovery."""
 
 import json
+import threading
 
 from agent.memory_manager import MemoryManager
 from agent.memory_provider import MemoryProvider
@@ -32,6 +33,18 @@ class _Provider(MemoryProvider):
         if self.fail:
             raise RuntimeError("gateway unavailable")
         self.calls.append((action, target, content, dict(metadata or {})))
+
+
+class _FailingThenOrderedProvider(_Provider):
+    def __init__(self, failures: int) -> None:
+        super().__init__(fail=False)
+        self.failures = failures
+
+    def on_memory_write(self, action, target, content, metadata=None):
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("gateway unavailable")
+        super().on_memory_write(action, target, content, metadata)
 
 
 def test_outbox_deduplicates_and_bounds_pending_writes(tmp_path):
@@ -98,3 +111,60 @@ def test_failed_write_is_visible_and_replayed_after_restart(tmp_path, caplog):
         ("add", "user", "likes coffee", {}),
     ]
     assert MemoryWriteOutbox(tmp_path).pending_count("external-test") == 0
+
+
+def test_new_write_queues_behind_failed_fifo_head(tmp_path):
+    failing = _FailingThenOrderedProvider(failures=2)
+    manager = MemoryManager()
+    manager.add_provider(failing)
+    manager.initialize_all("session-1", hermes_home=str(tmp_path))
+
+    manager.notify_memory_tool_write(
+        json.dumps({"success": True}),
+        {"action": "remove", "target": "user", "old_text": "old"},
+    )
+    result = manager.notify_memory_tool_write(
+        json.dumps({"success": True}),
+        {"action": "add", "target": "user", "content": "new"},
+    )
+
+    assert failing.calls == []
+    assert json.loads(result)["external_provider_writes"][0]["queued"] is True
+
+    failing.failures = 0
+    restarted = MemoryManager()
+    restarted.add_provider(failing)
+    restarted.initialize_all("session-2", hermes_home=str(tmp_path))
+
+    assert [call[:3] for call in failing.calls] == [
+        ("remove", "user", ""),
+        ("add", "user", "new"),
+    ]
+
+
+def test_concurrent_replay_claims_each_row_once(tmp_path):
+    first = MemoryWriteOutbox(tmp_path)
+    second = MemoryWriteOutbox(tmp_path)
+    first.enqueue("provider", "add", "memory", "one", {})
+    delivery_started = threading.Barrier(2)
+    release_delivery = threading.Event()
+    calls = []
+
+    def deliver(action, target, content, metadata):
+        calls.append((action, target, content, metadata))
+        delivery_started.wait(timeout=5)
+        assert release_delivery.wait(timeout=5)
+
+    worker = threading.Thread(target=lambda: first.replay("provider", deliver))
+    worker.start()
+    delivery_started.wait(timeout=5)
+
+    blocked = second.replay("provider", deliver)
+    release_delivery.set()
+    worker.join(timeout=5)
+
+    assert worker.is_alive() is False
+    assert blocked["blocked"] is True
+    assert blocked["remaining"] == 1
+    assert len(calls) == 1
+    assert first.pending_count("provider") == 0

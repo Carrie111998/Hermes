@@ -1097,7 +1097,20 @@ class MemoryManager:
         for provider in self._providers:
             if provider.name == "builtin":
                 continue
-            self._replay_provider_writes(provider)
+            replay = self._replay_provider_writes(provider)
+            if replay["remaining"]:
+                error = replay["error"] or "provider write replay is already in progress"
+                queued = self._queue_provider_write(
+                    provider.name, action, target, content, dict(metadata or {})
+                )
+                failures.append({
+                    "provider": provider.name,
+                    "success": False,
+                    "queued": queued,
+                    "error": error[:500],
+                })
+                self._alert_external_write_failure(provider.name, error, queued)
+                continue
             try:
                 self._deliver_memory_write(
                     provider, action, target, content, dict(metadata or {})
@@ -1109,30 +1122,9 @@ class MemoryManager:
                     "Memory provider '%s' on_memory_write failed: %s",
                     provider.name, e,
                 )
-                queued = False
-                try:
-                    if self._write_outbox is not None:
-                        enqueue_result = self._write_outbox.enqueue(
-                            provider.name,
-                            action,
-                            target,
-                            content,
-                            dict(metadata or {}),
-                        )
-                        queued = bool(enqueue_result["queued"])
-                        if enqueue_result["dropped"]:
-                            logger.warning(
-                                "Memory provider '%s' outbox reached its %d-entry bound; "
-                                "dropped %d oldest write(s)",
-                                provider.name,
-                                self._outbox_max_entries,
-                                enqueue_result["dropped"],
-                            )
-                except Exception:
-                    logger.exception(
-                        "Failed to persist memory write for provider '%s'",
-                        provider.name,
-                    )
+                queued = self._queue_provider_write(
+                    provider.name, action, target, content, dict(metadata or {})
+                )
                 failures.append({
                     "provider": provider.name,
                     "success": False,
@@ -1141,6 +1133,33 @@ class MemoryManager:
                 })
                 self._alert_external_write_failure(provider.name, str(e), queued)
         return failures
+
+    def _queue_provider_write(
+        self,
+        provider: str,
+        action: str,
+        target: str,
+        content: str,
+        metadata: Dict[str, Any],
+    ) -> bool:
+        try:
+            if self._write_outbox is None:
+                return False
+            enqueue_result = self._write_outbox.enqueue(
+                provider, action, target, content, metadata
+            )
+            if enqueue_result["dropped"]:
+                logger.warning(
+                    "Memory provider '%s' outbox reached its %d-entry bound; "
+                    "dropped %d oldest write(s)",
+                    provider,
+                    self._outbox_max_entries,
+                    enqueue_result["dropped"],
+                )
+            return bool(enqueue_result["queued"])
+        except Exception:
+            logger.exception("Failed to persist memory write for provider '%s'", provider)
+            return False
 
     def _deliver_memory_write(
         self,
@@ -1158,9 +1177,9 @@ class MemoryManager:
         else:
             provider.on_memory_write(action, target, content)
 
-    def _replay_provider_writes(self, provider: MemoryProvider) -> None:
+    def _replay_provider_writes(self, provider: MemoryProvider) -> Dict[str, Any]:
         if self._write_outbox is None or provider.name == "builtin":
-            return
+            return {"replayed": 0, "remaining": 0, "error": "", "blocked": False}
         result = self._write_outbox.replay(
             provider.name,
             lambda action, target, content, metadata: self._deliver_memory_write(
@@ -1180,6 +1199,7 @@ class MemoryManager:
                 result["remaining"],
                 result["error"],
             )
+        return result
 
     def _alert_external_write_failure(self, provider: str, error: str, queued: bool) -> None:
         if (

@@ -7,6 +7,7 @@ import json
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict
 
@@ -14,10 +15,17 @@ from typing import Any, Callable, Dict
 class MemoryWriteOutbox:
     """Persist failed provider writes and replay them in FIFO order."""
 
-    def __init__(self, hermes_home: str | Path, *, max_entries_per_provider: int = 1000) -> None:
+    def __init__(
+        self,
+        hermes_home: str | Path,
+        *,
+        max_entries_per_provider: int = 1000,
+        claim_lease_seconds: float = 300.0,
+    ) -> None:
         self._path = Path(hermes_home) / "memories" / "provider_write_outbox.sqlite3"
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._max_entries = max(1, int(max_entries_per_provider))
+        self._claim_lease_seconds = max(1.0, float(claim_lease_seconds))
         self._lock = threading.RLock()
         self._initialize()
 
@@ -41,6 +49,8 @@ class MemoryWriteOutbox:
                     created_at REAL NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     last_error TEXT NOT NULL DEFAULT '',
+                    claim_token TEXT NOT NULL DEFAULT '',
+                    claim_until REAL NOT NULL DEFAULT 0,
                     UNIQUE(provider, fingerprint)
                 )
                 """
@@ -57,6 +67,19 @@ class MemoryWriteOutbox:
                 "CREATE INDEX IF NOT EXISTS idx_pending_provider_fifo "
                 "ON pending_writes(provider, id)"
             )
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(pending_writes)")
+            }
+            if "claim_token" not in columns:
+                conn.execute(
+                    "ALTER TABLE pending_writes "
+                    "ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''"
+                )
+            if "claim_until" not in columns:
+                conn.execute(
+                    "ALTER TABLE pending_writes "
+                    "ADD COLUMN claim_until REAL NOT NULL DEFAULT 0"
+                )
 
     @staticmethod
     def _fingerprint(
@@ -137,17 +160,53 @@ class MemoryWriteOutbox:
         replayed = 0
         with self._lock:
             while True:
+                claim_token = uuid.uuid4().hex
+                now = time.time()
+                blocked = False
                 with self._connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
                     row = conn.execute(
                         """
-                        SELECT id, action, target, content, metadata_json
+                        SELECT id, action, target, content, metadata_json,
+                               claim_token, claim_until
                         FROM pending_writes WHERE provider = ? ORDER BY id LIMIT 1
                         """,
                         (provider,),
                     ).fetchone()
+                    if row is not None:
+                        blocked = bool(
+                            row["claim_token"] and float(row["claim_until"]) > now
+                        )
+                        if not blocked:
+                            claimed = conn.execute(
+                                """
+                                UPDATE pending_writes
+                                SET claim_token = ?, claim_until = ?
+                                WHERE id = ? AND (claim_token = '' OR claim_until <= ?)
+                                """,
+                                (
+                                    claim_token,
+                                    now + self._claim_lease_seconds,
+                                    row["id"],
+                                    now,
+                                ),
+                            ).rowcount
+                            blocked = claimed != 1
                 if row is None:
                     self.clear_alert(provider)
-                    return {"replayed": replayed, "remaining": 0, "error": ""}
+                    return {
+                        "replayed": replayed,
+                        "remaining": 0,
+                        "error": "",
+                        "blocked": False,
+                    }
+                if blocked:
+                    return {
+                        "replayed": replayed,
+                        "remaining": self.pending_count(provider),
+                        "error": "",
+                        "blocked": True,
+                    }
                 try:
                     metadata = json.loads(row["metadata_json"])
                     deliver(row["action"], row["target"], row["content"], metadata)
@@ -157,17 +216,23 @@ class MemoryWriteOutbox:
                         conn.execute(
                             """
                             UPDATE pending_writes
-                            SET attempts = attempts + 1, last_error = ? WHERE id = ?
+                            SET attempts = attempts + 1, last_error = ?,
+                                claim_token = '', claim_until = 0
+                            WHERE id = ? AND claim_token = ?
                             """,
-                            (error, row["id"]),
+                            (error, row["id"], claim_token),
                         )
                     return {
                         "replayed": replayed,
                         "remaining": self.pending_count(provider),
                         "error": error,
+                        "blocked": False,
                     }
                 with self._connect() as conn:
-                    conn.execute("DELETE FROM pending_writes WHERE id = ?", (row["id"],))
+                    conn.execute(
+                        "DELETE FROM pending_writes WHERE id = ? AND claim_token = ?",
+                        (row["id"], claim_token),
+                    )
                 replayed += 1
 
     def should_alert(self, provider: str, cooldown_seconds: float) -> bool:
