@@ -330,10 +330,12 @@ class ByteRoverMemoryProvider(MemoryProvider):
             return
 
         label = "User profile" if target == "user" else "Agent memory"
-        _run_brv(
+        result = _run_brv(
             ["curate", "--", f"[{label}] {content}"],
             timeout=_CURATE_TIMEOUT, cwd=self._cwd,
         )
+        if result.get("success") is not True:
+            raise RuntimeError(result.get("error") or "ByteRover memory write failed")
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         """Extract insights before context compression discards turns."""

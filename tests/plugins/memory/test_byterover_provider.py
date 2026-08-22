@@ -31,3 +31,16 @@ def test_memory_write_propagates_backend_failure(monkeypatch):
         provider.on_memory_write("add", "memory", "remember this")
 
 
+def test_memory_write_propagates_unsuccessful_cli_result(monkeypatch):
+    provider = ByteRoverMemoryProvider({"auto_extract": True})
+    provider._auto_extract = True
+
+    monkeypatch.setattr(
+        "plugins.memory.byterover._run_brv",
+        lambda *args, **kwargs: {"success": False, "error": "backend rejected"},
+    )
+
+    with pytest.raises(RuntimeError, match="backend rejected"):
+        provider.on_memory_write("add", "memory", "remember this")
+
+
