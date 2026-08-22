@@ -198,7 +198,21 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       const replaySessionId = approvalReplaySessionId(event.type, activeSessionIdRef.current, sessionId)
 
       if (replaySessionId) {
-        void replayPendingApproval($gateway.get(), replaySessionId).catch(() => undefined)
+        // A restored approval never carried its approval.request push on this
+        // connection (reconnect, missed frame, or the push predating the
+        // client), so the replay IS the delivery here. Flag the session the
+        // same way the push handler does — otherwise the approval bar mounts
+        // while the sidebar row stays visually idle (the "bar but no
+        // needs-input outline" bug).
+        void replayPendingApproval($gateway.get(), replaySessionId)
+          .then(restored => {
+            if (restored && replaySessionId) {
+              deps.updateSessionState(replaySessionId, state =>
+                state.needsInput ? state : { ...state, needsInput: true }
+              )
+            }
+          })
+          .catch(() => undefined)
       }
 
       // Mid-turn compaction does not emit another message.start. The first

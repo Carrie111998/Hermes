@@ -1,6 +1,9 @@
 import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
+import { $clarifyRequests } from '@/store/clarify'
+import { $mcpSetupRequests } from '@/store/mcp-setup'
 import { flashPetActivity, setPetActivity } from '@/store/pet'
+import { $approvalRequests, $secretRequests, $sudoRequests } from '@/store/prompts'
 import { pruneDelegateFallbackSubagents, upsertSubagent } from '@/store/subagents'
 import { reportMcpToolResult } from '@/store/suggestion-providers/repair'
 import { invalidateSkillSuggestionIndex } from '@/store/suggestion-providers/skill'
@@ -74,8 +77,26 @@ export function handleToolEvent(ctx: GatewayEventContext): boolean {
       // A pending clarify blocks the turn, so the first tool.complete after
       // one is the clarify resolving — drop the "needs input" flag here so
       // the sidebar indicator clears as soon as it's answered, not only at
-      // message.complete.
-      updateSessionState(sessionId, state => (state.needsInput ? { ...state, needsInput: false } : state))
+      // message.complete. GUARDED: only clear when NO blocking prompt is
+      // still parked for this session. The unguarded version raced the next
+      // turn's approval/clarify push (or a replay restore): a completing
+      // tool from the PREVIOUS turn landed after the new request and
+      // instantly darkened the row while its bar was still up.
+      updateSessionState(sessionId, state => {
+        if (!state.needsInput) {
+          return state
+        }
+
+        const key = sessionId ?? ''
+        const stillPrompting =
+          $approvalRequests.get()[key] != null ||
+          $sudoRequests.get()[key] != null ||
+          $secretRequests.get()[key] != null ||
+          $mcpSetupRequests.get()[key] != null ||
+          $clarifyRequests.get()[key] != null
+
+        return stillPrompting ? state : { ...state, needsInput: false }
+      })
 
       // terminal/process tool calls are the only things that spawn or reap
       // background processes — sync the composer status stack right after.

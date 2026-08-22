@@ -1,10 +1,13 @@
 import { useStore } from '@nanostores/react'
 
+import { Codicon } from '@/components/ui/codicon'
 import { type Translations, useI18n } from '@/i18n'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
+import { $clarifyRequests } from '@/store/clarify'
 import { $sessionColorById, sessionColorFor } from '@/store/session-color'
 import { $sessionDotStateById, type SessionDotState } from '@/store/session-dot-state'
+import { $sessionStates } from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
 
 // A pure lookup table: each state maps to its className, aria-label, and title.
@@ -27,11 +30,17 @@ const DOT_BASE = 'size-1.5 rounded-full'
 // filled means producing, hollow means open but quiet. The two states this
 // replaces differed by 30% opacity and were, in practice, the same dot.
 const DOT_VARIANTS: Record<SessionDotState, DotVariant> = {
-  // Amber — a clarify/approval is blocking the turn. The one "act now" color,
-  // and the only state the user is required to do something about.
+  // A clarify/approval is blocking the turn — the one state the user is
+  // required to do something about. It stops being a dot and becomes a
+  // terminal glyph in the highlight-picker color (the same token the accent
+  // picker drives), so "a console is waiting on you" reads at a glance and the
+  // mark follows whatever accent the user has picked. The row itself carries a
+  // matching outline (see the needs-input handling in session-row.tsx /
+  // session-switcher.tsx); the status filter's legend keeps the amber dot via
+  // `sessionDotClassName`, which stays a plain circle on purpose.
   'needs-input': {
     ariaLabel: r => r.needsInput,
-    className: `${DOT_BASE} bg-amber-500`,
+    className: 'flex items-center text-(--dt-primary)',
     role: 'status',
     title: r => r.waitingForAnswer
   },
@@ -137,6 +146,33 @@ export function SessionStatusDot({ storedSessionId, session, branchStem, classNa
     storedSessionId ? (states[storedSessionId] ?? 'idle') : 'draft'
   )
 
+  // The needs-input mark picks its glyph by WHAT is blocking: a clarify
+  // question (the ask form with answer choices) shows the edit/pencil — "a
+  // question awaits your answer" — while every other blocking prompt
+  // (command approvals, sudo, secrets) keeps the terminal glyph.
+  //
+  // ID SPANNING: the dot receives the STORED session id (all four call
+  // sites), but $clarifyRequests is keyed by the RUNTIME id and each request's
+  // sessionId field is also a runtime id. Bridge through $sessionStates, whose
+  // entries carry storedSessionId: map stored → its live runtime ids first,
+  // then match requests against those. Without the bridge nothing ever
+  // matches and the glyph silently stays 'terminal'.
+  const clarifyParked = useStoreSelector($sessionStates, states => {
+    if (storedSessionId == null) {
+      return false
+    }
+
+    const runtimeIds = new Set(
+      Object.entries(states)
+        .filter(([, state]) => state.storedSessionId === storedSessionId)
+        .map(([runtimeId]) => runtimeId)
+    )
+
+    return Object.values($clarifyRequests.get()).some(request => request.sessionId != null && runtimeIds.has(request.sessionId))
+  })
+
+  const needsInputGlyph = clarifyParked ? 'edit' : 'terminal'
+
   const variant = DOT_VARIANTS[dotState]
 
   return (
@@ -151,6 +187,18 @@ export function SessionStatusDot({ storedSessionId, session, branchStem, classNa
         // keeps every row's title on one left edge, so a session finishing
         // can't shift the list under the pointer.
         <span aria-hidden="true" className={variant.className} style={color ? { backgroundColor: color } : undefined} />
+      ) : dotState === 'needs-input' ? (
+        // The blocking-prompt mark: a terminal glyph in the highlight-picker
+        // color instead of a dot. Sized to the dot's visual weight (the glyph
+        // optically matches the 6px circle's ink) so the row's rhythm holds.
+        <span
+          aria-label={variant.ariaLabel?.(r)}
+          className={variant.className}
+          role={variant.role}
+          title={variant.title?.(r)}
+        >
+          <Codicon aria-hidden="true" name={needsInputGlyph} size="0.875rem" />
+        </span>
       ) : (
         <span
           aria-label={variant.ariaLabel?.(r)}

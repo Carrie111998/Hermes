@@ -8750,6 +8750,15 @@ def _session_pending_kind(sid: str) -> str:
 def _session_live_status(sid: str, session: dict) -> str:
     if _session_pending_kind(sid):
         return "waiting"
+    # Gateway command approvals park in tools.approval._gateway_queues, NOT in
+    # the _pending prompt registry checked above — so a session blocked on an
+    # approval bar reported "working" here, and the desktop's 1.5s active-list
+    # poll republished needsInput:false ~one poll tick after approval.request
+    # had lit the sidebar row (the highlight flashed, then vanished). Ask the
+    # approval module directly; same read-only snapshot _session_live_info
+    # already attaches to session.info as pending_approval.
+    if _pending_approval_request_payload(str(session.get("session_key") or "")):
+        return "waiting"
     ready = session.get("agent_ready")
     # Unset + build never started = a lazy watch session sitting idle, not a
     # session stuck mid-construction.

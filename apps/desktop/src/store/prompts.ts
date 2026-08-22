@@ -112,6 +112,9 @@ const secret = keyedPromptStore<SecretRequest>()
 const $approvalInlineAnchors = atom<Record<string, number>>({})
 
 export const $approvalRequest = approval.$active
+export const $approvalRequests = approval.$all
+export const $sudoRequests = sudo.$all
+export const $secretRequests = secret.$all
 export const setApprovalRequest = approval.set
 export const clearApprovalRequest = approval.clear
 
@@ -126,9 +129,9 @@ export async function receiveApprovalRequest(gateway: ApprovalGateway | null, re
   }
 }
 
-export async function replayPendingApproval(gateway: ApprovalGateway | null, sessionId: string | null): Promise<void> {
+export async function replayPendingApproval(gateway: ApprovalGateway | null, sessionId: string | null): Promise<ApprovalRequest | null> {
   if (!gateway || !sessionId) {
-    return
+    return null
   }
 
   const rawResult = await gateway.request('approval.pending', {
@@ -141,10 +144,10 @@ export async function replayPendingApproval(gateway: ApprovalGateway | null, ses
   const pending = Array.isArray(result?.approvals) ? result.approvals[0] : undefined
 
   if (!pending || typeof pending.request_id !== 'string') {
-    return
+    return null
   }
 
-  await receiveApprovalRequest(gateway, {
+  const request: ApprovalRequest = {
     allowPermanent: pending.allow_permanent !== false,
     choices: Array.isArray(pending.choices) ? pending.choices.filter(choice => typeof choice === 'string') : undefined,
     command: typeof pending.command === 'string' ? pending.command : '',
@@ -152,7 +155,14 @@ export async function replayPendingApproval(gateway: ApprovalGateway | null, ses
     requestId: pending.request_id,
     sessionId,
     smartDenied: pending.smart_denied === true
-  })
+  }
+
+  await receiveApprovalRequest(gateway, request)
+
+  // Return what we parked so callers can react to a real restore — the
+  // event-dispatch caller flags the session's needsInput from it, since the
+  // replay path never carried the approval.request push that sets the flag.
+  return request
 }
 
 /** The prompt request for one specific session — the tile counterpart of the

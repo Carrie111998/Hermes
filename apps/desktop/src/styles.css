@@ -1039,6 +1039,17 @@
   --arc-c1: var(--dt-foreground);
 }
 
+/* A session waiting on the user (approval / sudo / secret / clarify): the
+   row's running arc recolors from the neutral gray sweep to the accent-picker
+   color (--dt-primary), so "this console needs YOU" reads in the user's own
+   highlight hue. Same compositor travel animation — only the palette changes.
+   Pairs with the terminal glyph + ring-(--dt-primary) outline on the same row. */
+.arc-awaiting {
+  --arc-c0: color-mix(in srgb, var(--dt-primary) 0%, transparent);
+  --arc-c1: var(--dt-primary);
+  --arc-c2: color-mix(in srgb, var(--dt-primary) 28%, transparent);
+}
+
 /* Landed `memory` tool row — gold → purple on the brain glyph + title.
    Pair with `text-transparent` so the scaffold label color can't win. */
 .tool-memory-legendary-title {

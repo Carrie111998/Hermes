@@ -15,7 +15,8 @@ import {
   reasoningPart,
   renderMediaTags,
   sealOpenToolParts,
-  upsertToolPart
+  upsertToolPart,
+  withUniqueToolCallIds
 } from '@/lib/chat-messages'
 import {
   dedupeGeneratedImageEchoesInParts,
@@ -134,7 +135,7 @@ export function useMessageStream({
 
           return {
             ...state,
-            messages: nextMessages,
+            messages: withUniqueToolCallIds(nextMessages),
             streamId,
             sawAssistantPayload: true,
             awaitingResponse: false

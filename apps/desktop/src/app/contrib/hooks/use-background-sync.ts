@@ -9,6 +9,7 @@ import { sessionMessagesSignature } from '@/lib/session-signatures'
 import { $changeEventsAvailable, $cronChangeTick, $sessionsChangeTick } from '@/store/live-sync'
 import { $onBattery, batteryPollInterval } from '@/store/power'
 import { refreshActiveProfile } from '@/store/profile'
+import { $approvalRequests } from '@/store/prompts'
 import {
   $activeSessionId,
   $busy,
@@ -207,16 +208,25 @@ export function rehydrateLiveSessionStatuses(
     // Avoid re-arming the watchdog on every poll. Publish only when the
     // authoritative live snapshot differs from the renderer mirror; normal
     // gateway events continue to own subsequent transitions.
+    // Guard: a snapshot that says "working" must never clear needsInput while
+    // a blocking prompt is still parked for the session. Older gateways
+    // report command approvals as working (their _session_live_status predates
+    // the gateway-queues check), so trusting the snapshot blindly darkened the
+    // sidebar row ~one 1.5s poll tick after approval.request lit it. The
+    // parked prompt itself is the newer, more specific information — same
+    // precedence as the busy-refusal above.
+    const parkedApproval = Boolean($approvalRequests.get()[runtimeSessionId])
+
     if (
       !existing ||
       existing.storedSessionId !== storedSessionId ||
       existing.busy !== busy ||
-      existing.needsInput !== needsInput
+      existing.needsInput !== (needsInput || parkedApproval)
     ) {
       publishSessionState(runtimeSessionId, {
         ...(existing ?? createClientSessionState(storedSessionId)),
         busy,
-        needsInput,
+        needsInput: needsInput || parkedApproval,
         storedSessionId
       })
     }

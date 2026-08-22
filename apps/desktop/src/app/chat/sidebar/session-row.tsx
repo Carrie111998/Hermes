@@ -30,7 +30,7 @@ import { $projects } from '@/store/projects'
 import { $pullRequestsByBranch, sessionPrKey } from '@/store/pull-requests'
 import { $sessionDotStateById, hasLiveTurn, showsRunningArc } from '@/store/session-dot-state'
 import { $sessionListDensity } from '@/store/session-list-density'
-import { $openStoredSessionIds } from '@/store/session-states'
+import { $openStoredSessionIds, $sessionStates } from '@/store/session-states'
 import { sessionCostUsd } from '@/store/sidebar-archive'
 import { $todoProgressBySession } from '@/store/todos'
 
@@ -256,6 +256,47 @@ function SidebarSessionRowImpl({
   // whenever any session's status changes, but a row only repaints on its own.
   const dotState = useStoreSelector($sessionDotStateById, states => states[session.id] ?? 'idle')
   const liveTurn = hasLiveTurn(dotState)
+  // A blocking prompt (approval / sudo / secret / clarify) — the one state that
+  // asks something OF the user. The row outlines itself in the highlight-picker
+  // color and the lead slot swaps its dot for a terminal glyph, so the row
+  // reads as "a console is waiting on you" without touching any other state.
+  const needsInput = dotState === 'needs-input'
+  // The running arc means "this session is PRODUCING right now". needs-input
+  // alone doesn't run it (nothing is happening — the turn is parked on you).
+  //
+  // Parallel-work detection: the parked prompt's OWN tool call (the terminal
+  // awaiting approval, or the clarify tool) stays phase 'running' while the
+  // prompt is up, so a naive "busy → run arc" lit the strip permanently on
+  // every prompt. The real signal is OPEN TOOL COUNT: count tool-call parts
+  // without a result across the session's live messages. One open part = the
+  // prompt itself, nothing else is happening — no arc. Two or more = other
+  // tool calls are still executing alongside the prompt — arc runs.
+
+  const parallelWork = useStoreSelector($sessionStates, states => {
+    const state = states[session.id]
+
+    if (!state?.busy || !state.needsInput) {
+      return false
+    }
+
+    let open = 0
+
+    for (const message of state.messages) {
+      for (const part of message.parts) {
+        if (part.type === 'tool-call' && !('result' in part)) {
+          open += 1
+
+          if (open > 1) {
+            return true
+          }
+        }
+      }
+    }
+
+    return false
+  })
+
+  const runArc = showsRunningArc(dotState) || (needsInput && parallelWork)
 
   // Card header line: the workspace this belongs to — the project when it
   // resolves (same function the session color reads, so name and tint agree;
@@ -362,6 +403,12 @@ function SidebarSessionRowImpl({
           // the title and the status dot down with it.
           openUnfocused && 'bg-(--ui-row-open-background)',
           liveTurn && 'text-foreground',
+          // A blocking prompt outlines the WHOLE row in the highlight-picker
+          // color — the same token the accent picker drives — so the session
+          // that needs the user reads at a glance. An inset ring: rows sit
+          // `gap-px` apart in a clipping scroller, so an outset ring would
+          // lose its left/right runs to the clip.
+          needsInput && 'ring-1 ring-inset ring-(--dt-primary)',
           // Opaque surface while lifted so the dragged row erases what's under
           // it (translucency let the rows below bleed through). data-glass-opaque
           // keeps that true when window glass thins the field.
@@ -401,7 +448,7 @@ function SidebarSessionRowImpl({
         style={style}
         {...rest}
       >
-        {showsRunningArc(dotState) && <span aria-hidden="true" className="arc-border arc-row" />}
+        {runArc && <span aria-hidden="true" className="arc-border arc-row" />}
         <SidebarRowBody
           // Every trailing figure lives in the actions slot, which the row
           // measures — so the title needs a gap from it and nothing else. Hover
@@ -470,7 +517,7 @@ function SidebarSessionRowImpl({
                 )}
               </SidebarRowGrab>
             ) : (
-              <SidebarRowLead className="overflow-hidden">
+              <SidebarRowLead className={cn('overflow-hidden', needsInput && 'text-(--dt-primary)')}>
                 {lead ?? <SessionStatusDot branchStem={branchStem} session={session} storedSessionId={session.id} />}
               </SidebarRowLead>
             )

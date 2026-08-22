@@ -67,6 +67,8 @@ interface Option<T extends string = string> {
   /** A status dot's full className, from the row's own vocabulary. */
   dot?: string
   icon?: string
+  /** Color for `icon` — defaults to the menu's muted ink. */
+  iconClass?: string
   id: T
   label: string
 }
@@ -104,8 +106,16 @@ const PR_FILTERS: Option<PullRequestBucket>[] = [
   { icon: 'circle-slash', id: 'none', label: 'No PR' }
 ]
 
+// The status filter's legend mirrors what a LIVE needs-input row paints: the
+// terminal glyph in the highlight-picker color (the amber dot lives on only in
+// `sessionDotClassName`, which nothing renders for this state anymore).
 const STATUS_FILTERS: Option<SessionStatusBucket>[] = [
-  { dot: sessionDotClassName('needs-input'), id: 'needs-input', label: 'Needs input' },
+  {
+    icon: 'terminal',
+    iconClass: 'text-(--dt-primary)',
+    id: 'needs-input',
+    label: 'Needs input'
+  },
   { dot: sessionDotClassName('working'), id: 'working', label: 'Working' },
   { dot: sessionDotClassName('unread'), id: 'unread', label: 'Unread' },
   { dot: sessionDotClassName('draft'), id: 'draft', label: 'Draft' },
@@ -117,7 +127,9 @@ function OptionGlyph({ option }: { option: Option }) {
     return <span aria-hidden="true" className={cn('shrink-0', option.dot)} />
   }
 
-  return option.icon ? <Codicon className="text-(--ui-text-tertiary)" name={option.icon} size="0.8125rem" /> : null
+  return option.icon ? (
+    <Codicon className={cn(option.iconClass ?? 'text-(--ui-text-tertiary)')} name={option.icon} size="0.8125rem" />
+  ) : null
 }
 
 /** Every option row — single or multi select — leaves the menu open, so a whole

@@ -5,6 +5,7 @@ import { useNavigate } from 'react-router'
 
 import { sessionTitle } from '@/lib/chat-runtime'
 import { cn } from '@/lib/utils'
+import { $sessionDotStateById } from '@/store/session-dot-state'
 import { $switcherIndex, $switcherOpen, $switcherSessions, closeSwitcher } from '@/store/session-switcher'
 
 import { SessionStatusDot } from './chat/session-status-dot'
@@ -17,6 +18,9 @@ export function SessionSwitcher() {
   const open = useStore($switcherOpen)
   const sessions = useStore($switcherSessions)
   const index = useStore($switcherIndex)
+  // The same reduced status the row dot paints, so the switcher's outline
+  // agrees with the sidebar's: a blocking prompt outlines the row here too.
+  const dotStates = useStore($sessionDotStateById)
   const navigate = useNavigate()
 
   const activeRef = useRef<HTMLDivElement>(null)
@@ -60,7 +64,10 @@ export function SessionSwitcher() {
                 'row-hover flex items-center rounded leading-tight',
                 HUD_ITEM,
                 HUD_TEXT,
-                selected ? 'bg-accent text-accent-foreground' : 'text-(--ui-text-secondary)'
+                selected ? 'bg-accent text-accent-foreground' : 'text-(--ui-text-secondary)',
+                // A blocking prompt outlines the row in the highlight-picker
+                // color — same treatment as the sidebar row, same source.
+                dotStates[session.id] === 'needs-input' && 'ring-1 ring-inset ring-(--dt-primary)'
               )}
               key={session.id}
               onMouseDown={e => {
