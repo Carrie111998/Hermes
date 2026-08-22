@@ -10,6 +10,7 @@ No LLM, no real platform connections.
 """
 
 import asyncio
+import logging
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -313,16 +314,40 @@ async def send_and_capture(adapter, text: str, platform: Platform, **event_kwarg
         if not adapter.send.called:
             # Tasks that finished inside the window report their own
             # exception; the loop handler only sees the ones nobody retrieved.
-            for task in asyncio.all_tasks(loop) - before:
+            spawned = asyncio.all_tasks(loop) - before
+            for task in spawned:
                 if task.done() and not task.cancelled():
                     exc = task.exception()
                     if exc is not None and exc not in captured:
                         captured.append(exc)
+
+            # A task that is still running is neither done nor captured, so
+            # without this the third case — the handler simply did not finish
+            # in time — reads exactly like the handler declining to reply.
+            still_running = [task for task in spawned if not task.done()]
+            pending_note = ""
+            if still_running:
+                names = ", ".join(sorted(t.get_name() for t in still_running)[:5])
+                pending_note = (
+                    f" ({len(still_running)} background task(s) still running: "
+                    f"{names})"
+                )
+
             if captured:
                 raise AssertionError(
                     "handler produced no send because a background task "
-                    f"raised {captured[0]!r}"
+                    f"raised {captured[0]!r}{pending_note}"
                 ) from captured[0]
+            if still_running:
+                # Deliberately not an error: a handler may legitimately leave
+                # fire-and-forget work behind while correctly sending nothing,
+                # and the caller's own assertion stays the one that decides.
+                # pytest surfaces this with the report of a failing test,
+                # which is the only time it matters.
+                logging.getLogger(__name__).warning(
+                    "send_and_capture: poll window expired with no send;%s",
+                    pending_note,
+                )
     finally:
         loop.set_exception_handler(previous_handler)
 
