@@ -2034,6 +2034,9 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
     try:
         connected = await adapter.connect()
         if not connected:
+            reason = getattr(adapter, "connect_refusal_reason", None)
+            if reason:
+                return _error(f"Matrix connect failed: {reason}")
             return _error("Matrix connect failed")
         return await _matrix_send_core(
             adapter, chat_id, message, media_files, metadata

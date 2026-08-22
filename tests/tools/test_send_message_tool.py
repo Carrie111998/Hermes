@@ -825,6 +825,47 @@ class TestMatrixMediaLiveAdapterReuse:
             ("disconnect",),
         ]
 
+    def test_ephemeral_connect_refusal_surfaces_lease_reason(self):
+        """When an ephemeral connect() fails closed, the error returned to the
+        caller names the lease holder instead of a bare 'Matrix connect failed'
+        (diagnosability regression from the liveness-probe removal)."""
+
+        class RefusingAdapter:
+            def __init__(self, _config):
+                pass
+
+            async def connect(self):
+                return False
+
+            @property
+            def connect_refusal_reason(self):
+                return (
+                    "E2EE crypto lease held by another process "
+                    "(PID 99999) — refusing to open the crypto DB to prevent "
+                    "E2EE split brain"
+                )
+
+            async def disconnect(self):
+                pass
+
+        fake_module = SimpleNamespace(MatrixAdapter=RefusingAdapter)
+
+        with patch(
+            "gateway.run._gateway_runner_ref", return_value=None
+        ), patch.dict(sys.modules, {"plugins.platforms.matrix.adapter": fake_module}):
+            result = asyncio.run(
+                _send_matrix_via_adapter(
+                    SimpleNamespace(enabled=True, token="tok", extra={}),
+                    "!room:example.com",
+                    "hello",
+                )
+            )
+
+        assert result.get("success") is not True
+        assert "Matrix connect failed" in result["error"]
+        assert "E2EE crypto lease held by another process" in result["error"]
+        assert "PID 99999" in result["error"]
+
     def test_ephemeral_refused_when_crypto_lease_held(self):
         """The crypto lease is held by another live process (e.g. a gateway that
         started between the old probe and the connect): the real
@@ -853,6 +894,11 @@ class TestMatrixMediaLiveAdapterReuse:
         # The crypto DB was never opened and no second OlmMachine was built.
         database_cls.create.assert_not_called()
         olm_mock.assert_not_called()
+        # connect() surfaces WHY it refused — naming the holder PID — so a
+        # caller can report a diagnosable error instead of "connect failed".
+        assert adapter.connect_refusal_reason
+        assert "E2EE crypto lease held by another process" in adapter.connect_refusal_reason
+        assert "PID 99999" in adapter.connect_refusal_reason
         # The lease was keyed on the resolved store + account + device identity
         # (not the import-frozen module path alone).
         expected_identity = f"{matrix_mod._CRYPTO_DB_PATH}:@bot:example.org:DEV123"
@@ -886,6 +932,10 @@ class TestMatrixMediaLiveAdapterReuse:
         assert adapter._crypto_db is None
         database_cls.create.assert_not_called()
         olm_mock.assert_not_called()
+        # The acquisition-failure reason is surfaced too (not just the
+        # lease-held case).
+        assert adapter.connect_refusal_reason
+        assert "crypto lease acquisition failed" in adapter.connect_refusal_reason
 
     def test_connect_releases_lease_when_crypto_setup_fails(self):
         """If a later crypto-setup step raises after the lease was acquired,

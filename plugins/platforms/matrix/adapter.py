@@ -1171,6 +1171,23 @@ class _CryptoStateStore:
         return list(self._joined_rooms)
 
 
+def _lease_holder_description(existing: Optional[dict]) -> str:
+    """Describe the live process holding a crypto lease for diagnostics.
+
+    Prefers the holder's PID plus the leading command (from the persisted
+    ``argv`` record); falls back to the PID alone, then to "unknown".
+    """
+    if not existing:
+        return "unknown"
+    pid = existing.get("pid", "unknown")
+    argv = existing.get("argv") or []
+    if argv:
+        command = " ".join(str(a) for a in argv[:2] if str(a).strip())
+        if command:
+            return f"PID {pid} ({command})"
+    return f"PID {pid}"
+
+
 class MatrixAdapter(BasePlatformAdapter):
     """Gateway adapter for Matrix (any homeserver)."""
 
@@ -1222,6 +1239,11 @@ class MatrixAdapter(BasePlatformAdapter):
         # OlmMachine on the shared crypto store (see #46310). None when the
         # lease is not held.
         self._crypto_lease_identity: Optional[str] = None
+        # Human-readable reason the most recent connect() refused (e.g. the
+        # crypto lease held by another live process). None when the last
+        # connect() succeeded or has not run. Surfaced to callers (send_message)
+        # so a generic "connect failed" becomes diagnosable.
+        self._connect_refusal_reason: Optional[str] = None
         self._sync_task: Optional[asyncio.Task] = None
         self._invite_join_tasks: Dict[str, asyncio.Task] = {}
         self._closing = False
@@ -1716,6 +1738,18 @@ class MatrixAdapter(BasePlatformAdapter):
     # Required overrides
     # ------------------------------------------------------------------
 
+    @property
+    def connect_refusal_reason(self) -> Optional[str]:
+        """Human-readable reason the most recent ``connect()`` refused, or None.
+
+        Set on the fail-closed crypto-lease paths so callers (e.g.
+        ``send_message_tool``) can surface *why* connect returned False
+        (which live process holds the lease) instead of a bare
+        "connect failed". Cleared at the top of every connect() so a later
+        success does not carry a stale refusal.
+        """
+        return self._connect_refusal_reason
+
     def _release_crypto_lease(self) -> None:
         """Release the inter-process crypto lease if this adapter holds it.
 
@@ -1736,6 +1770,7 @@ class MatrixAdapter(BasePlatformAdapter):
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to the Matrix homeserver and start syncing."""
         self._device_id_unverified = False
+        self._connect_refusal_reason = None
         if self._client is not None:
             try:
                 await self.disconnect()
@@ -1961,14 +1996,27 @@ class MatrixAdapter(BasePlatformAdapter):
                             "OlmMachines on one store, #46310): %s",
                             exc,
                         )
+                        self._connect_refusal_reason = (
+                            "crypto lease acquisition failed "
+                            f"({exc}) — refusing to open the crypto DB to "
+                            "prevent E2EE split brain (two OlmMachines on one "
+                            "store, #46310)"
+                        )
                         await api.session.close()
                         return False
                     if not acquired:
+                        holder = _lease_holder_description(existing)
                         logger.error(
-                            "Matrix: crypto lease held by PID %s — refusing to "
+                            "Matrix: crypto lease held by %s — refusing to "
                             "open crypto DB to prevent E2EE split brain (two "
                             "OlmMachines on one store, #46310)",
-                            existing.get("pid") if existing else "unknown",
+                            holder,
+                        )
+                        self._connect_refusal_reason = (
+                            f"E2EE crypto lease held by another process "
+                            f"({holder}) — refusing to open the crypto DB to "
+                            "prevent E2EE split brain (two OlmMachines on one "
+                            "store, #46310)"
                         )
                         await api.session.close()
                         return False
