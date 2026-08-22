@@ -715,3 +715,43 @@ class TestBackslashDoublingDrift:
         result, count, strategy, err = self.replace(content, old, new)
         assert count == 0
         assert err is not None and "apostrophe" in err
+
+
+class TestReplaceAllNoByteLoss:
+    """Regression for #92132: line-based fuzzy strategies stepping by one line
+    produce overlapping match spans that _apply_replacements slices at stale
+    offsets under replace_all=True, silently dropping bytes."""
+
+    def _assert_no_loss(self, content, old, new):
+        """replace_all must never lose bytes between non-overlapping matches."""
+        out, count, strategy, err = fuzzy_find_and_replace(content, old, new, replace_all=True)
+        assert err is None, err
+        assert count >= 1
+        return out, count, strategy
+
+    def test_line_trimmed_recurring_lines_no_overlap(self):
+        content = "  a\n  a\n  a\n"
+        old = "a\na"
+        out, count, strategy = self._assert_no_loss(content, old, "Z")
+        assert strategy == "line_trimmed"
+        # Non-overlapping str.replace semantics: first occurrence replaced,
+        # the remaining un-paired line stays.
+        assert out == "  Z\n  a\n"
+        assert count == 1
+
+    def test_line_trimmed_replace_all_does_not_lose_adjacent(self):
+        content = "x\ny\nx\ny\n"
+        old = "x\ny"
+        out, count, strategy, err = fuzzy_find_and_replace(content, old, "XY", replace_all=True)
+        assert err is None
+        assert count == 2
+        assert out == "XY\nXY\n"
+        # The prior bug under-counted bytes and dropped the second block.
+
+    def test_trimmed_boundary_recurring_lines_no_overlap(self):
+        content = "  a\n  a\n  a\n"
+        old = "a\na"
+        out, count, strategy, err = fuzzy_find_and_replace(content, old, "Z", replace_all=True)
+        assert err is None
+        assert count == 1
+        assert out == "  Z\n  a\n"

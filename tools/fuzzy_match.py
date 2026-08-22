@@ -713,7 +713,8 @@ def _strategy_trimmed_boundary(content: str, pattern: str) -> List[Tuple[int, in
     matches = []
     pattern_line_count = len(pattern_lines)
     
-    for i in range(len(content_lines) - pattern_line_count + 1):
+    i = 0
+    while i <= len(content_lines) - pattern_line_count:
         block_lines = content_lines[i:i + pattern_line_count]
         
         # Trim first and last of this block
@@ -728,6 +729,13 @@ def _strategy_trimmed_boundary(content: str, pattern: str) -> List[Tuple[int, in
                 content_lines, i, i + pattern_line_count, len(content)
             )
             matches.append((start_pos, end_pos))
+            # Advance past the whole matched block (like _strategy_exact and
+            # _find_normalized_matches) so recurrences with shared boundary
+            # lines don't produce overlapping spans that _apply_replacements
+            # slices at stale offsets under replace_all=True (#92132).
+            i += pattern_line_count
+        else:
+            i += 1
     
     return matches
 
@@ -979,7 +987,8 @@ def _find_normalized_matches(content: str, content_lines: List[str],
     
     matches = []
     
-    for i in range(len(content_normalized_lines) - num_pattern_lines + 1):
+    i = 0
+    while i <= len(content_normalized_lines) - num_pattern_lines:
         # Check if this block matches
         block = '\n'.join(content_normalized_lines[i:i + num_pattern_lines])
         
@@ -989,6 +998,14 @@ def _find_normalized_matches(content: str, content_lines: List[str],
                 content_lines, i, i + num_pattern_lines, len(content)
             )
             matches.append((start_pos, end_pos))
+            # Advance past the whole matched block, not just one line. Stepping
+            # by 1 yields overlapping spans when the pattern recurs with shared
+            # lines (e.g. "a\na" in "a\na\na"), which _apply_replacements then
+            # slices at stale offsets under replace_all=True and silently drops
+            # bytes — mirror _strategy_exact (see its advance-past-match note).
+            i += num_pattern_lines
+        else:
+            i += 1
     
     return matches
 
