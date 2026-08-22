@@ -1,8 +1,8 @@
 import { atom } from 'nanostores'
 
 import { resetLiveRuntimeTracking } from '@/app/contrib/hooks/use-background-sync'
-import { resetSidebarBatchCapability } from '@/hermes'
 import { resetHermesConfigCache } from '@/app/hooks/use-config-record'
+import { resetSidebarBatchCapability } from '@/hermes'
 import { invalidateProfileScopedQueries } from '@/lib/query-client'
 import { clearArtifactRegistry } from '@/store/artifacts'
 import { invalidateCronJobsRequests, setCronJobs } from '@/store/cron'

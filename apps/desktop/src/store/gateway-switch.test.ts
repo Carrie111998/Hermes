@@ -20,7 +20,9 @@ import { $stalledSessionIds } from '@/store/session-states'
 import { $gatewaySwitching, wipeSessionListsForGatewaySwitch } from './gateway-switch'
 
 vi.mock('@/lib/query-client', () => ({
-  invalidateProfileScopedQueries: vi.fn()
+  invalidateProfileScopedQueries: vi.fn(),
+  queryClient: { removeQueries: vi.fn() },
+  writeCache: vi.fn(() => vi.fn())
 }))
 
 vi.mock(import('@/store/profile'), async importOriginal => {
