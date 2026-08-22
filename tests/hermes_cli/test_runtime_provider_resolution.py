@@ -1249,6 +1249,59 @@ class TestProviderEntryApiKeyEnvAlias:
         assert normalized is not None
         assert "extra_body" in _VALID_CUSTOM_PROVIDER_FIELDS
         assert normalized["extra_body"] == entry["extra_body"]
+
+
+class TestProviderEntryParallelToolCalls:
+    @pytest.mark.parametrize("configured", [True, False])
+    def test_canonical_provider_preserves_explicit_boolean(self, configured):
+        from hermes_cli.config import _normalize_custom_provider_entry
+
+        normalized = _normalize_custom_provider_entry(
+            {
+                "api": "https://api.vendor.example.com/v1",
+                "parallel_tool_calls": configured,
+            },
+            provider_key="vendor",
+        )
+
+        assert normalized is not None
+        assert normalized["parallel_tool_calls"] is configured
+
+    @pytest.mark.parametrize("configured", ["true", 1, 0, None, [], {}])
+    def test_non_boolean_value_is_omitted(self, configured):
+        from hermes_cli.config import _normalize_custom_provider_entry
+
+        normalized = _normalize_custom_provider_entry(
+            {
+                "api": "https://api.vendor.example.com/v1",
+                "parallel_tool_calls": configured,
+            },
+            provider_key="vendor",
+        )
+
+        assert normalized is not None
+        assert "parallel_tool_calls" not in normalized
+
+    def test_legacy_schema_accepts_parallel_tool_calls(self):
+        from hermes_cli.config import _VALID_CUSTOM_PROVIDER_FIELDS
+
+        assert "parallel_tool_calls" in _VALID_CUSTOM_PROVIDER_FIELDS
+
+    @pytest.mark.parametrize("configured", [True, False])
+    def test_legacy_to_canonical_conversion_preserves_boolean(self, configured):
+        from hermes_cli.config import _custom_provider_entry_to_provider_config
+
+        provider_config = _custom_provider_entry_to_provider_config(
+            {
+                "name": "vendor",
+                "base_url": "https://api.vendor.example.com/v1",
+                "parallel_tool_calls": configured,
+            },
+            provider_key="vendor",
+        )
+
+        assert provider_config is not None
+        assert provider_config["parallel_tool_calls"] is configured
 # =============================================================================
 # Tencent TokenHub — API-key provider runtime resolution
 # =============================================================================
