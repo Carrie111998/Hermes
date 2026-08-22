@@ -9849,6 +9849,11 @@ def _claim_parked_notifications(sid: str, session: dict) -> int:
     if claimed:
         from tools.process_registry import process_registry
 
+        # Re-queued at the TAIL, so a returning owner sees its parked
+        # completion after any newly-produced events rather than in original
+        # emission order. Harmless for completions, which are independent
+        # terminal events; revisit if a consumer ever needs FIFO across the
+        # park boundary.
         for evt in claimed:
             process_registry.completion_queue.put(evt)
     return len(claimed)
