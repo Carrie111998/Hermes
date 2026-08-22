@@ -2311,6 +2311,69 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         return tool_error(str(e))
 
 
+def _patch_contract_error(message: str, code: str) -> str:
+    """Return a stable malformed-input envelope without echoing arguments."""
+    return json.dumps(
+        {
+            "error": message,
+            "success": False,
+            "failure": {
+                "kind": "malformed_input",
+                "class": "patch_contract",
+                "code": code,
+                "tool": "patch",
+            },
+        },
+        ensure_ascii=False,
+    )
+
+
+def _validate_patch_contract(args: dict) -> str | None:
+    """Validate the mode-dependent patch contract before any file-side work."""
+    mode = args.get("mode", "replace")
+    if mode == "replace":
+        invalid_fields = []
+        for field in ("path", "old_string", "new_string"):
+            value = args.get(field)
+            if not isinstance(value, str) or (field != "new_string" and not value):
+                invalid_fields.append(field)
+        if invalid_fields:
+            return _patch_contract_error(
+                "patch mode='replace': required string field(s) invalid: "
+                + ", ".join(invalid_fields),
+                f"patch.replace.{invalid_fields[0]}.invalid",
+            )
+        if args["old_string"] == args["new_string"]:
+            return _patch_contract_error(
+                "patch mode='replace': old_string and new_string must differ.",
+                "patch.replace.no_change",
+            )
+        if "patch" in args:
+            return _patch_contract_error(
+                "patch mode='replace' cannot include the patch payload.",
+                "patch.replace.incompatible_fields",
+            )
+    elif mode == "patch":
+        payload = args.get("patch")
+        if not isinstance(payload, str) or not payload.strip():
+            return _patch_contract_error(
+                "patch mode='patch': 'patch' is required and must be nonempty text.",
+                "patch.patch.patch.invalid",
+            )
+        incompatible = [
+            field for field in ("path", "old_string", "new_string") if field in args
+        ]
+        if args.get("replace_all") is True:
+            incompatible.append("replace_all")
+        if incompatible:
+            return _patch_contract_error(
+                "patch mode='patch' cannot include replace-mode fields: "
+                + ", ".join(incompatible),
+                "patch.patch.incompatible_fields",
+            )
+    return None
+
+
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
                task_id: str = "default", cross_profile: bool = False,
@@ -2321,6 +2384,19 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     targets under another profile's skills/plugins/cron/memories
     directory. Same shape as ``write_file``'s flag.
     """
+    contract_args = {"mode": mode, "replace_all": replace_all}
+    for key, value in (
+        ("path", path),
+        ("old_string", old_string),
+        ("new_string", new_string),
+        ("patch", patch),
+    ):
+        if value is not None:
+            contract_args[key] = value
+    contract_error = _validate_patch_contract(contract_args)
+    if contract_error:
+        return contract_error
+
     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
     _paths_to_check = []
     # Paths whose CONTENT will be text-written (Update/Add + explicit path).
@@ -2798,31 +2874,11 @@ def _handle_write_file(args, **kw):
 
 
 def _handle_patch(args, **kw):
+    contract_error = _validate_patch_contract(args)
+    if contract_error:
+        return contract_error
     tid = kw.get("task_id") or "default"
     mode = args.get("mode", "replace")
-    if mode == "replace":
-        missing = []
-        if not args.get("path"):
-            missing.append("path")
-        if not args.get("old_string"):
-            missing.append("old_string")
-        if "new_string" not in args or args.get("new_string") is None:
-            missing.append("new_string")
-        if missing:
-            return tool_error(
-                "patch: mode='replace' is missing required field(s): "
-                f"{', '.join(missing)}. This tool call was not executed. Do not "
-                "re-emit the same incomplete call — set all three fields together. "
-                f"Available tools in this toolset: {_FILE_TOOLSET_TOOL_NAMES}."
-            )
-    elif mode == "patch":
-        if not args.get("patch"):
-            return tool_error(
-                "patch: mode='patch' is missing required field 'patch'. This tool "
-                "call was not executed. Do not re-emit the same empty call — set "
-                "'patch' to real V4A patch content. Available tools in this "
-                f"toolset: {_FILE_TOOLSET_TOOL_NAMES}."
-            )
     return patch_tool(
         mode=mode, path=args.get("path"),
         old_string=args.get("old_string"), new_string=args.get("new_string"),

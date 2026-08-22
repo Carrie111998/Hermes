@@ -119,6 +119,90 @@ def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution()
 
 
 
+def test_second_structurally_equivalent_malformed_failure_blocks_before_execution():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True)
+    )
+    first_args = {"mode": "replace", "old_string": "private-a", "new_string": "x"}
+    second_args = {"mode": "replace", "old_string": "private-b", "new_string": "y"}
+    malformed = json.dumps(
+        {
+            "error": "path is required",
+            "success": False,
+            "failure": {
+                "kind": "malformed_input",
+                "class": "patch_contract",
+                "code": "patch.replace.path.invalid",
+                "tool": "patch",
+            },
+        }
+    )
+
+    assert controller.before_call("patch", first_args).action == "allow"
+    controller.after_call("patch", first_args, malformed, failed=True)
+
+    blocked = controller.before_call("patch", second_args)
+    assert blocked.action == "block"
+    assert blocked.code == "structurally_equivalent_malformed_input_block"
+    metadata = blocked.to_metadata()
+    assert "private-a" not in json.dumps(metadata)
+    assert "private-b" not in json.dumps(metadata)
+
+
+def test_corrected_success_clears_tool_malformed_streak():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True)
+    )
+    bad = {"mode": "replace", "old_string": "a", "new_string": "b"}
+    good = {"mode": "replace", "path": "x.py", "old_string": "a", "new_string": "b"}
+    malformed = json.dumps(
+        {"error": "bad", "failure": {"kind": "malformed_input", "class": "patch_contract", "code": "patch.replace.path.invalid"}}
+    )
+
+    controller.after_call("patch", bad, malformed, failed=True)
+    controller.after_call("patch", good, '{"success":true}', failed=False)
+
+    assert controller.before_call("patch", {**bad, "old_string": "other"}).action == "allow"
+
+
+def test_external_transient_failures_are_not_malformed():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True)
+    )
+    args1 = {"url": "https://one.invalid"}
+    args2 = {"url": "https://two.invalid"}
+    controller.after_call(
+        "web_extract", args1, '{"error":"upstream timeout"}', failed=True
+    )
+
+    assert controller.before_call("web_extract", args2).action == "allow"
+
+
+def test_guardrail_state_updates_are_concurrency_safe():
+    import concurrent.futures
+
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True)
+    )
+    malformed = json.dumps(
+        {"error": "bad", "failure": {"kind": "malformed_input", "class": "patch_contract", "code": "patch.replace.path.invalid"}}
+    )
+
+    def record(i):
+        controller.after_call(
+            "patch", {"mode": "replace", "old_string": str(i), "new_string": "x"}, malformed, failed=True
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(record, range(32)))
+
+    decision = controller.before_call(
+        "patch", {"mode": "replace", "old_string": "next", "new_string": "x"}
+    )
+    assert decision.action == "block"
+    assert decision.count == 32
+
+
 def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=2)

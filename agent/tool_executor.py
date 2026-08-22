@@ -599,6 +599,16 @@ def _run_agent_tool_execution_middleware(
             state["blocked"] = False
             state["args"] = final_args
 
+        # Built-in mode-dependent contracts cannot be expressed portably in
+        # provider JSON schemas. Validate them before plugin approvals,
+        # checkpoints, path resolution, or handler execution.
+        if function_name == "patch":
+            from tools.file_tools import _validate_patch_contract
+
+            contract_error = _validate_patch_contract(final_args)
+            if contract_error:
+                return contract_error
+
         def _begin() -> None:
             _begin_tool_execution(
                 agent,
