@@ -79,39 +79,34 @@ jobs:
           export PATH="/tmp/hermes-tools:$PATH"
 
           cp "$CARRIER" /tmp/carrier.yml
-          python3 - <<'PY'
+          uv run --python 3.11 python - <<'PY'
           from pathlib import Path
+          import os
+          import subprocess
 
-          lines = Path('/tmp/carrier.yml').read_text().splitlines()
-          starts = [i for i, line in enumerate(lines) if line.strip() == 'run: |']
-          if not starts:
+          import yaml
+
+          document = yaml.safe_load(Path('/tmp/carrier.yml').read_text())
+          steps = document['jobs']['repair']['steps']
+          carrier_steps = [
+              step for step in steps
+              if isinstance(step, dict) and isinstance(step.get('run'), str)
+              and '\n' in step['run']
+          ]
+          if not carrier_steps:
               raise SystemExit('carrier has no literal run block')
-          for number, start in enumerate(starts):
-              key_indent = len(lines[start]) - len(lines[start].lstrip())
-              prefix = ' ' * (key_indent + 2)
-              end = len(lines)
-              for index in range(start + 1, len(lines)):
-                  line = lines[index]
-                  stripped = line.lstrip()
-                  indent = len(line) - len(stripped)
-                  if indent == 6 and stripped.startswith('- '):
-                      end = index
-                      break
-              body = [
-                  line[len(prefix):] if line.startswith(prefix) else line
-                  for line in lines[start + 1:end]
-              ]
-              while body and not body[-1].strip():
-                  body.pop()
-              if not body:
-                  raise SystemExit(f'empty carrier run block {number}')
-              Path(f'/tmp/carrier-{number}.sh').write_text('\n'.join(body) + '\n')
-          PY
 
-          for script in /tmp/carrier-*.sh; do
-            bash -n "$script"
-            bash "$script"
-          done
+          for number, step in enumerate(carrier_steps):
+              script = Path(f'/tmp/carrier-{number}.sh')
+              script.write_text(step['run'].rstrip() + '\n')
+              environment = os.environ.copy()
+              environment.update({
+                  str(key): str(value)
+                  for key, value in (step.get('env') or {}).items()
+              })
+              subprocess.run(['bash', '-n', str(script)], check=True, env=environment)
+              subprocess.run(['bash', str(script)], check=True, env=environment)
+          PY
 
           python3 - <<'PY'
           from pathlib import Path
