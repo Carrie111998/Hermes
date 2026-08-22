@@ -73,11 +73,9 @@ export function isConclusion(n: StarmapNode, memoryProvider?: null | string): bo
   if ((memoryProvider ?? '').trim().toLowerCase() !== 'honcho') {
     return false
   }
-
   if ((n.memorySource ?? '').toLowerCase() !== 'honcho') {
     return false
   }
-
   return DERIVED_LEVELS.has((n.memoryLevel ?? '').trim().toLowerCase())
 }
 

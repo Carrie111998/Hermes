@@ -1,3 +1,4 @@
+import { useStore } from '@nanostores/react'
 import { useEffect, useRef, useState } from 'react'
 
 import { ArchiveSkillConfirmDialog, fireOptimistic } from '@/app/learning/archive-skill-confirm-dialog'
@@ -7,8 +8,9 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { deleteLearningNode, editLearningNode, getLearningNode } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { notifyError } from '@/store/notifications'
-import { evictStarmapNode, loadStarmapGraph } from '@/store/starmap'
+import { notifyError, notify } from '@/store/notifications'
+import { $profiles, normalizeProfileKey, profileLabel } from '@/store/profile'
+import { evictStarmapNode, loadStarmapGraph, $starmapSelectedProfiles } from '@/store/starmap'
 
 import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
 
@@ -25,6 +27,10 @@ export interface NodeMenuTarget {
   /** Memory nodes only: 'memory' | 'profile' | a provider name ('honcho', …).
    *  Provider-backed nodes are read-only — the menu offers no Edit/Delete. */
   memorySource?: string
+  /** Multi-profile mode: which profile this node belongs to. */
+  profile?: string
+  /** Multi-profile mode: the original node id without the profile prefix. */
+  _originalId?: string
   x: number
   y: number
 }
@@ -52,6 +58,9 @@ interface NodeContextMenuProps {
   /** Feature B — /recall: insert this node's knowledge into the CURRENT chat's
    *  composer for review. Available for ALL node kinds. */
   onRecallIntoChat?: (target: NodeMenuTarget) => void
+  /** Cross-profile insert: copy this node's content into another profile's memory.
+   *  Available when in multi-profile mode and the node kind is 'memory'. */
+  onInsertIntoProfile?: (target: NodeMenuTarget, profileName: string) => void
   /** Most-recently-active sessions (already capped + ordered) for the
    *  "Add to a session" submenu. Empty/undefined hides that action. */
   recentSessions?: RecallSessionOption[]
@@ -67,8 +76,10 @@ interface EditState {
 /** Right-click actions for a star-map node: provenance, edit (modal), delete (confirm).
  *  Provider-backed memory nodes are read-only (their storage lives in the
  *  provider's backend), so Edit/Delete are replaced by a hint. */
-export function NodeContextMenu({ onAddToSession, onClose, onNodeRemoved, onRecallIntoChat, onShowProvenance, onStartConversation, recentSessions, target }: NodeContextMenuProps) {
+export function NodeContextMenu({ onAddToSession, onClose, onInsertIntoProfile, onNodeRemoved, onRecallIntoChat, onShowProvenance, onStartConversation, recentSessions, target }: NodeContextMenuProps) {
   const { t } = useI18n()
+  const profiles = useStore($profiles)
+  const selectedProfiles = useStore($starmapSelectedProfiles)
   const [editing, setEditing] = useState<EditState | null>(null)
   const [deleting, setDeleting] = useState<Omit<NodeMenuTarget, 'x' | 'y'> | null>(null)
   const [loading, setLoading] = useState(false)
@@ -77,10 +88,23 @@ export function NodeContextMenu({ onAddToSession, onClose, onNodeRemoved, onReca
   // Whether the "Add to a session" submenu is expanded. Reset whenever the menu
   // retargets (a new right-click) so it never opens pre-expanded on another node.
   const [showSessions, setShowSessions] = useState(false)
+  // Whether the cross-profile insert submenu is expanded.
+  const [showCrossProfileInsert, setShowCrossProfileInsert] = useState(false)
 
   useEffect(() => {
     setShowSessions(false)
+    setShowCrossProfileInsert(false)
   }, [target?.id])
+
+  // In multi-profile mode, get the profiles the node can be inserted into
+  // (all selected profiles except the node's own profile).
+  // Guard against profiles not being an array (defensive)
+  const crossProfileTargets = Array.isArray(profiles) && Array.isArray(selectedProfiles)
+    ? profiles.filter(p => {
+        const key = normalizeProfileKey(p.name)
+        return selectedProfiles.includes(key) && key !== target?.profile
+      })
+    : []
 
   // Bumped on profile switch so an in-flight openEdit fetch from profile A can't
   // reopen the editor with A's node content after switching to B.
@@ -216,6 +240,51 @@ export function NodeContextMenu({ onAddToSession, onClose, onNodeRemoved, onReca
                         type="button"
                       >
                         {session.title}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+            {/* Cross-profile insert — in multi-profile mode, offer to insert this
+                node's content into another selected profile's memory. */}
+            {onInsertIntoProfile && target.profile && crossProfileTargets.length > 0 ? (
+              <div>
+                <button
+                  aria-expanded={showCrossProfileInsert}
+                  className="flex w-full cursor-pointer items-center justify-between rounded-md px-2 py-1 text-left text-xs hover:bg-(--ui-control-active-background) hover:text-foreground"
+                  onClick={() => setShowCrossProfileInsert(open => !open)}
+                  type="button"
+                >
+                  <span>{t.starmap.insertIntoProfile(crossProfileTargets.length === 1 ? profileLabel(crossProfileTargets[0]) : '…')}</span>
+                  <span className="ml-2 text-muted-foreground">{showCrossProfileInsert ? '▾' : '▸'}</span>
+                </button>
+                {showCrossProfileInsert ? (
+                  <div className="ml-2 border-l border-(--ui-stroke-secondary) pl-1">
+                    {crossProfileTargets.length > 1 ? (
+                      <button
+                        className="block w-full cursor-pointer rounded-md px-2 py-1 text-left text-xs font-medium hover:bg-(--ui-control-active-background) hover:text-foreground"
+                        onClick={() => {
+                          crossProfileTargets.forEach(p => onInsertIntoProfile(target, normalizeProfileKey(p.name)))
+                          onClose()
+                        }}
+                        type="button"
+                      >
+                        {t.starmap.insertIntoAllSelected}
+                      </button>
+                    ) : null}
+                    {crossProfileTargets.map(profile => (
+                      <button
+                        className="block w-full cursor-pointer truncate rounded-md px-2 py-1 text-left text-xs hover:bg-(--ui-control-active-background) hover:text-foreground"
+                        key={normalizeProfileKey(profile.name)}
+                        onClick={() => {
+                          onInsertIntoProfile(target, normalizeProfileKey(profile.name))
+                          onClose()
+                        }}
+                        title={profileLabel(profile)}
+                        type="button"
+                      >
+                        {profileLabel(profile)}
                       </button>
                     ))}
                   </div>

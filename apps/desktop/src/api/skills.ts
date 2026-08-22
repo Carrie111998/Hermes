@@ -42,9 +42,9 @@ export function setSkillEnabled(
   })
 }
 
-export function getStarmapGraph(): Promise<StarmapGraph> {
+export function getStarmapGraph(profile?: string): Promise<StarmapGraph> {
   return hermesApi<StarmapGraph>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     // Backend REST contract — stays /api/learning even though the UI feature is
     // now "star map". Renaming this would break against an un-upgraded backend.
     path: '/api/learning/graph'
@@ -84,6 +84,31 @@ export function editLearningNode(
     path: '/api/learning/node',
     method: 'PUT',
     body: { content, id }
+  })
+}
+
+/** Fetch a merged learning graph from multiple profiles. Each node/edge/card
+ *  is tagged with its source profile, and node ids are prefixed to avoid
+ *  collisions. */
+export function getStarmapGraphMultiProfile(profiles: string[]): Promise<StarmapGraph> {
+  const params = new URLSearchParams({ profiles: profiles.join(',') })
+
+  return hermesApi<StarmapGraph>({
+    path: `/api/learning/graph?${params.toString()}`
+  })
+}
+
+/** Cross-profile memory insertion: copy a node's content from one profile
+ *  into another profile's MEMORY.md. */
+export function crossInsertLearningNode(
+  id: string,
+  sourceProfile: string,
+  targetProfile: string
+): Promise<{ message: string; ok: boolean }> {
+  return hermesApi<{ message: string; ok: boolean }>({
+    body: { id, source_profile: sourceProfile, target_profile: targetProfile },
+    method: 'POST',
+    path: '/api/learning/node/cross-insert'
   })
 }
 
@@ -159,9 +184,11 @@ export interface LearningRecallDraft {
   truncated: boolean
 }
 
-export function getLearningRecallDraft(id: string): Promise<LearningRecallDraft> {
+export function getLearningRecallDraft(id: string, profile?: string): Promise<LearningRecallDraft> {
   return window.hermesDesktop.api<LearningRecallDraft>({
-    ...profileScoped(),
+    // Scope to the node's OWN profile when given (cross-profile recall from a
+    // merged multi-profile graph); otherwise fall back to the active profile.
+    ...profileScoped(profile),
     path: `/api/learning/recall-draft?id=${encodeURIComponent(id)}`
   })
 }
