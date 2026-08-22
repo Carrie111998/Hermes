@@ -5535,6 +5535,16 @@ def _get_usage(agent) -> dict:
         "total": g("session_total_tokens"),
         "calls": g("session_api_calls"),
     }
+    # Per-session token budget (#91713): surface remaining budget in the TUI
+    # usage payload when a cap is configured, so the TUI status shows headroom
+    # alongside the CLI/gateway /usage views. Absent keys when unset (unlimited).
+    from agent.session_budget import budget_remaining_tokens as _budget_remaining
+
+    _sb_remaining = _budget_remaining(agent)
+    if _sb_remaining is not None:
+        usage["budget_remaining"] = _sb_remaining
+        usage["budget_total"] = getattr(agent, "session_budget_tokens", None)
+        usage["budget_action"] = getattr(agent, "session_budget_action", "abort")
     comp = getattr(agent, "context_compressor", None)
     if comp:
         # context_used is the *current-window* occupancy. Do NOT fall back to

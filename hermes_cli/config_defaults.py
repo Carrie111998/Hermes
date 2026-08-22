@@ -54,6 +54,19 @@ DEFAULT_CONFIG = {
         # implicit provider stale timeouts are capped to the remaining
         # budget. CLI one-shot equivalent: `hermes chat --run-budget N`.
         "run_budget_seconds": None,
+        # Optional cumulative token budget per session (#91713). Counted
+        # across ALL API calls of the session (input + output), including
+        # auxiliary forks (background review, MoA). null/0 = unlimited
+        # (default, current behavior). When set to a positive integer and
+        # breached: `abort` ends the current turn with an explanatory message
+        # and refuses further turns until the budget is raised/cleared;
+        # `warn` emits a one-time warning and keeps going. Remaining budget is
+        # surfaced in the usage/status view when set. Complements the
+        # context-size cap (compression.threshold_tokens) and the wall-clock
+        # run budget above — this is the guard against the rapid-small-calls
+        # runaway that trips neither.
+        "session_budget_tokens": None,
+        "session_budget_action": "abort",  # abort | warn
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has

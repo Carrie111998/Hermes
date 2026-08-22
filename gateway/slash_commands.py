@@ -5392,6 +5392,15 @@ class GatewaySlashCommandsMixin:
             lines.append(t("gateway.usage.label_input_tokens", count=f"{input_tokens:,}"))
             lines.append(t("gateway.usage.label_output_tokens", count=f"{output_tokens:,}"))
             lines.append(t("gateway.usage.label_total", count=f"{agent.session_total_tokens:,}"))
+            from agent.session_budget import (
+                budget_remaining_tokens as _budget_remaining,
+            )
+            _sb_remaining = _budget_remaining(agent)
+            if _sb_remaining is not None:
+                lines.append(
+                    f"Session budget remaining: {_sb_remaining:,} / "
+                    f"{agent.session_budget_tokens:,} ({agent.session_budget_action})"
+                )
             lines.append(t("gateway.usage.label_api_calls", count=agent.session_api_calls))
 
             # Context window and compressions

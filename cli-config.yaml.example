@@ -958,6 +958,17 @@ agent:
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration
   max_turns: 500
 
+  # Cumulative token budget per session (input + output across ALL API calls,
+  # including auxiliary forks like background review and MoA).
+  # null / 0 = unlimited (default, current behavior). Set a positive integer
+  # to cap a single runaway session — catches the rapid-small-calls loop that
+  # neither compression.threshold_tokens (context size) nor a wall-clock
+  # budget bounds. On breach: `abort` ends the turn and refuses further turns
+  # until the budget is raised/cleared; `warn` warns once and continues.
+  # Remaining budget is shown in /usage when set.
+  # session_budget_tokens: 5000000
+  # session_budget_action: abort   # abort | warn
+
   # Inactivity timeout for gateway agent runs (seconds, 0 = unlimited).
   # The agent can run indefinitely when actively calling tools or receiving
   # API responses.  Only fires after the agent has been idle for this duration.
