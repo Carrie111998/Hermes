@@ -100,6 +100,29 @@ def test_daily_and_idle_idle_but_before_boundary_does_not_reset():
         assert store._is_session_expired(entry) is False
 
 
+def test_daily_and_idle_resets_only_after_the_later_gate_crosses():
+    """The AND result is independent of whether daily or idle becomes true first."""
+    store = _make_store(SessionResetPolicy(mode="daily_and_idle", at_hour=4, idle_minutes=60))
+
+    # Idle is already true at 03:30, but the prior day's daily boundary still
+    # applies. Once 04:00 is crossed, both gates hold and the reset occurs.
+    entry_idle_first = _entry(datetime(2026, 8, 23, 2, 0, 0))
+    # The daily boundary is crossed at 04:00, but the idle deadline (04:30)
+    # has not. The reset waits until the idle gate is crossed too.
+    entry_daily_first = _entry(datetime(2026, 8, 23, 3, 30, 0))
+
+    with pytest.MonkeyPatch().context() as mp:
+        mp.setattr("gateway.session._now", lambda: datetime(2026, 8, 23, 3, 30, 0))
+        assert store._is_session_expired(entry_idle_first) is False
+
+        mp.setattr("gateway.session._now", lambda: datetime(2026, 8, 23, 4, 1, 0))
+        assert store._is_session_expired(entry_idle_first) is True
+        assert store._is_session_expired(entry_daily_first) is False
+
+        mp.setattr("gateway.session._now", lambda: datetime(2026, 8, 23, 4, 31, 0))
+        assert store._is_session_expired(entry_daily_first) is True
+
+
 # Exact-boundary case: activity AT the boundary timestamp is NOT past it.
 def test_daily_and_idle_activity_exactly_at_boundary_survives():
     policy = SessionResetPolicy(mode="daily_and_idle", at_hour=4, idle_minutes=10)
