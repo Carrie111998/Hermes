@@ -113,6 +113,7 @@ import time
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
@@ -184,8 +185,51 @@ _OSV_MALWARE_CHECK_TIMEOUT_S = 12.0
 #
 # Fallback is os.devnull if opening the log file fails for any reason.
 
+# Copy-rotate bounds on the shared stderr log.  Misbehaving stdio servers
+# (a fast crash-loop, e.g. one launched without its credentials) can emit
+# megabytes per revival cycle; observed growth is tens of MB per week with
+# no upper bound, on a log most users never read.
+_MCP_STDERR_LOG_MAX_BYTES = 20 * 1024 * 1024
+_MCP_STDERR_LOG_BACKUPS = 2
+
 _mcp_stderr_log_fh: Optional[Any] = None
 _mcp_stderr_log_lock = threading.Lock()
+
+
+def _rotate_mcp_stderr_log(log_path: Path) -> None:
+    """Rotate an oversized ``mcp-stderr.log`` before it is opened.
+
+    Runs once per process, inside the open lock and *before* any file
+    descriptor is handed to a subprocess — the only safe rotation point.
+    Once asyncio wires a child's stderr to the fd, runtime rotation would
+    detach the log from every live server (they keep writing to the
+    renamed inode), so bounding happens exclusively at open time.
+
+    Copy-rotate (copy + truncate) rather than rename: other processes
+    (a second gateway profile) may hold the same inode open in append
+    mode; rename would orphan their writes, while copy + truncate keeps
+    their handles valid — O_APPEND seeks to EOF on every write, so those
+    writers simply continue into the fresh file.
+
+    Best-effort: any failure leaves the previous unbounded-append
+    behaviour in place and is logged at DEBUG only.
+    """
+    try:
+        if not log_path.exists() or log_path.stat().st_size < _MCP_STDERR_LOG_MAX_BYTES:
+            return
+        for i in range(_MCP_STDERR_LOG_BACKUPS - 1, 0, -1):
+            src = log_path.with_suffix(f".log.{i}")
+            dst = log_path.with_suffix(f".log.{i + 1}")
+            if src.exists():
+                src.replace(dst)
+        shutil.copyfile(log_path, log_path.with_suffix(".log.1"))
+        # Truncate via a fresh append-mode open: write_text() would
+        # replace the inode and orphan every existing append-mode writer
+        # in other processes.
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.truncate(0)
+    except Exception as exc:  # pragma: no cover — best-effort
+        logger.debug("mcp-stderr.log rotation failed (continuing unbounded): %s", exc)
 
 
 def _get_mcp_stderr_log() -> Any:
@@ -205,6 +249,7 @@ def _get_mcp_stderr_log() -> Any:
             log_dir = get_hermes_home() / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
             log_path = log_dir / "mcp-stderr.log"
+            _rotate_mcp_stderr_log(log_path)
             # Line-buffered so server output lands on disk promptly; errors=
             # "replace" tolerates garbled binary output from misbehaving
             # servers.
