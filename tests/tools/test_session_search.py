@@ -1,12 +1,14 @@
 """Tests for the single-shape session_search tool.
 
-Three calling shapes:
-  1. DISCOVERY — pass query → FTS5 + anchored window + bookends per hit
+Four calling shapes:
+  1. DISCOVERY — pass query → FTS5 + adaptive/full hydration
   2. SCROLL    — pass session_id + around_message_id → just the window
-  3. BROWSE    — no args → recent sessions chronologically
+  3. READ      — pass session_id → whole or head/tail-truncated session
+  4. BROWSE    — no args → recent sessions chronologically
 
 All run zero LLM calls.
 """
+import inspect
 import json
 import time
 
@@ -72,6 +74,8 @@ class TestSchema:
         assert "query" in params
         assert "limit" in params
         assert params["sort"]["enum"] == ["newest", "oldest"]
+        assert params["detail"]["enum"] == ["adaptive", "full"]
+        assert params["detail"]["default"] == "adaptive"
         # Scroll shape
         assert "session_id" in params
         assert "around_message_id" in params
@@ -80,6 +84,22 @@ class TestSchema:
         assert "role_filter" in params
         # Mode is inferred from which args are set — no explicit mode param
         assert "mode" not in params
+
+    def test_detail_parameter_is_appended_for_positional_compatibility(self):
+        parameters = list(inspect.signature(session_search).parameters)
+        historical_prefix = [
+            "query",
+            "role_filter",
+            "limit",
+            "db",
+            "current_session_id",
+            "session_id",
+            "around_message_id",
+            "window",
+            "sort",
+            "profile",
+        ]
+        assert parameters == [*historical_prefix, "detail"]
 
 
 class TestFormatTimestamp:
@@ -176,17 +196,22 @@ class TestDiscoveryShape:
         assert "context" not in requested_fields
         assert len(result["results"]) == 1
         hit = result["results"][0]
+        assert hit["detail"] == "full"
         assert "bookend_start" in hit
         assert hit["messages"]
         assert "bookend_end" in hit
 
-    def test_discovery_result_has_bookends_and_window(self, db):
+    def test_full_detail_returns_bookends_and_window_for_every_hit(self, db):
         _seed_modpack_sessions(db)
-        result = json.loads(session_search(query="modpack", limit=3, db=db))
+        result = json.loads(session_search(
+            query="modpack", limit=3, detail="full", db=db
+        ))
         assert result["success"] is True
         assert result["mode"] == "discover"
+        assert result["detail"] == "full"
         assert result["count"] >= 1
         for hit in result["results"]:
+            assert hit["detail"] == "full"
             assert "bookend_start" in hit
             assert "messages" in hit
             assert "bookend_end" in hit
@@ -194,6 +219,72 @@ class TestDiscoveryShape:
             assert "snippet" in hit
             assert "messages_before" in hit
             assert "messages_after" in hit
+
+    def test_default_discovery_keeps_top_full_and_compacts_lower_hits(self, db):
+        _seed_modpack_sessions(db)
+
+        result = json.loads(session_search(query="modpack", limit=3, db=db))
+
+        assert result["success"] is True
+        assert result["detail"] == "adaptive"
+        assert len(result["results"]) == 3
+
+        top, *lower = result["results"]
+        assert top["detail"] == "full"
+        assert "bookend_start" in top
+        assert len(top["messages"]) > 1
+        assert "bookend_end" in top
+
+        for hit in lower:
+            assert hit["detail"] == "compact"
+            assert hit["bookend_start"] == []
+            assert len(hit["messages"]) == 1
+            assert hit["messages"][0]["id"] == hit["match_message_id"]
+            assert hit["messages"][0]["anchor"] is True
+            assert hit["bookend_end"] == []
+
+    def test_adaptive_detail_preserves_ranking_and_reduces_payload(self, db):
+        now = int(time.time())
+        for session_index in range(3):
+            session_id = f"payload_{session_index}"
+            db.create_session(session_id, source="cli")
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (now - session_index, session_id),
+            )
+            for message_index in range(8):
+                db.append_message(
+                    session_id,
+                    role="user" if message_index % 2 == 0 else "assistant",
+                    content=f"opening {session_index}-{message_index} " + "o" * 2500,
+                )
+            db.append_message(
+                session_id,
+                role="user",
+                content=f"payloadneedle anchor {session_index} " + "a" * 3500,
+            )
+            for message_index in range(8):
+                db.append_message(
+                    session_id,
+                    role="assistant" if message_index % 2 == 0 else "user",
+                    content=f"closing {session_index}-{message_index} " + "c" * 2500,
+                )
+        db._conn.commit()
+
+        adaptive_json = session_search(query="payloadneedle", limit=3, db=db)
+        full_json = session_search(
+            query="payloadneedle", limit=3, detail="full", db=db
+        )
+        adaptive = json.loads(adaptive_json)
+        full = json.loads(full_json)
+
+        assert [r["session_id"] for r in adaptive["results"]] == [
+            r["session_id"] for r in full["results"]
+        ]
+        assert [r["match_message_id"] for r in adaptive["results"]] == [
+            r["match_message_id"] for r in full["results"]
+        ]
+        assert len(adaptive_json.encode("utf-8")) < len(full_json.encode("utf-8")) * 0.6
 
 
     def test_current_session_filtered_out(self, db):
@@ -960,6 +1051,29 @@ class TestNewResetLineageDiscovery:
         ))
         assert result["count"] == 0
 
+    def test_branched_parent_still_excluded(self, db):
+        """/branch verbatim-copies the transcript into the child, so the
+        parent's content IS the branch child's live context — it must not
+        surface as a same-lineage recall hit (unlike /new-reset parents)."""
+        db.create_session("s_p", source="cli")
+        db.append_message(
+            "s_p", role="user", content="zephyr crystal cache design",
+        )
+        db.end_session("s_p", "branched")
+        db.create_session(
+            "s_q", source="cli", parent_session_id="s_p",
+            model_config={"_branched_from": "s_p"},
+        )
+        # /branch copies history into the child
+        db.append_message(
+            "s_q", role="user", content="zephyr crystal cache design",
+        )
+        result = json.loads(session_search(
+            query="zephyr crystal", db=db, current_session_id="s_q",
+        ))
+        sids = [r["session_id"] for r in result.get("results", [])]
+        assert "s_p" not in sids
+
     def test_title_match_reset_parent_not_dropped(self, db):
         _seed_gateway_new_reset_chain(db)
         result = json.loads(session_search(
@@ -1010,4 +1124,23 @@ class TestNewResetLineageBrowse:
         sids = [r["session_id"] for r in result["results"]]
         assert "s_delegate" not in sids
         assert "s_main" in sids
+
+    def test_browse_lists_legacy_premarker_reset_child(self, db):
+        """A pre-marker reset child (no _reset_from, admitted by the SQL
+        same-key heuristic because its parent ended at a reset boundary on
+        the same session_key) must not be re-hidden by a Python re-check.
+        Regression guard for the follow-up to #85756."""
+        db.create_session("s_old", source="telegram", session_key="tg:legacy:1")
+        db.append_message("s_old", role="user", content="legacy era chat")
+        db.end_session("s_old", "session_reset")
+        # Legacy child: parent link + same session_key, NO _reset_from marker,
+        # still live (end_reason=None).
+        db.create_session(
+            "s_legacy_child", source="telegram",
+            parent_session_id="s_old", session_key="tg:legacy:1",
+        )
+        db.append_message("s_legacy_child", role="user", content="current era chat")
+        result = json.loads(session_search(db=db, current_session_id="s_other"))
+        sids = [r["session_id"] for r in result["results"]]
+        assert "s_legacy_child" in sids
 
