@@ -12,6 +12,7 @@
 import { useStore } from '@nanostores/react'
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 
+import { $pluginDiscoveryReady } from '@/contrib/plugins-store'
 import { $registryVersion } from '@/contrib/registry'
 import { matchesQuery, useMediaQuery } from '@/hooks/use-media-query'
 import { persistString, persistStringRecord, storedString, storedStringRecord } from '@/lib/storage'
@@ -19,7 +20,7 @@ import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { setAppearance } from '@/store/translucency'
 
 import { $accentOverride } from './accent-override'
-import { $backendThemes, $pendingSkinApply } from './backend-sync'
+import { $backendSkinReady, $backendThemes, $pendingSkinApply } from './backend-sync'
 import { harmonize, hexToRgb, mix, readableOn } from './color'
 import { BUILTIN_THEME_LIST, DEFAULT_SKIN_NAME, DEFAULT_TYPOGRAPHY, nousTheme } from './presets'
 import { retintTheme } from './retint'
@@ -38,8 +39,8 @@ const PROFILE_MODES_KEY = 'hermes-desktop-profile-modes-v1'
 // Last active profile, recorded so the boot-time paint can pick that profile's
 // theme before the gateway reports which profile actually launched.
 const LAST_PROFILE_KEY = 'hermes-desktop-active-profile-v1'
-// Skins that no longer exist. A profile still pointing at one falls back to
-// DEFAULT_SKIN_NAME rather than painting a name nothing resolves.
+// Skins that no longer exist. Preserve every other stored name because custom
+// backend skins register after the renderer performs its boot-time paint.
 const RETIRED_SKINS = new Set(['nous-light', 'default', 'gold'])
 
 export type ThemeMode = 'light' | 'dark' | 'system'
@@ -50,7 +51,7 @@ const resolveMode = (mode: ThemeMode, systemDark = matchesQuery('(prefers-color-
   mode === 'system' ? (systemDark ? 'dark' : 'light') : mode
 
 const normalizeSkin = (name: string | null): string =>
-  name && resolveTheme(name) && !RETIRED_SKINS.has(name) ? name : DEFAULT_SKIN_NAME
+  name && !RETIRED_SKINS.has(name) ? name : DEFAULT_SKIN_NAME
 
 /**
  * A stored mode, or `system` when there isn't one.
@@ -357,7 +358,9 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   // grid, and `/skin` without a reload.
   const userThemes = useStore($userThemes)
   const backendThemes = useStore($backendThemes)
+  const backendSkinReady = useStore($backendSkinReady)
   const registryVersion = useStore($registryVersion)
+  const pluginDiscoveryReady = useStore($pluginDiscoveryReady)
 
   const availableThemes = useMemo(
     () =>
@@ -386,6 +389,33 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     setThemeNameState(skinPref.resolve(profileKey))
     setModeState(modePref.resolve(profileKey))
   }, [profileKey])
+
+  // Boot must accept unresolved names because backend and disk-plugin themes
+  // register asynchronously. Once both initial registries are ready, the merged
+  // registry is authoritative: preserve names that now resolve and repair
+  // stale/typo values to the Desktop default.
+  useEffect(() => {
+    if (!backendSkinReady || !pluginDiscoveryReady) {
+      return
+    }
+
+    const stored = skinPref.resolve(profileKey)
+
+    if (resolveTheme(stored)) {
+      return
+    }
+
+    skinPref.assign(profileKey, DEFAULT_SKIN_NAME)
+    setThemeNameState(DEFAULT_SKIN_NAME)
+  }, [
+    backendSkinReady,
+    backendThemes,
+    profileKey,
+    registryVersion,
+    pluginDiscoveryReady,
+    themeName,
+    userThemes
+  ])
 
   // Appearance is per-profile localStorage, and every desktop window is another
   // renderer on the same origin — so a switch made in the HUD (or any peer

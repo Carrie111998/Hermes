@@ -1,9 +1,13 @@
 import { act, cleanup, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
+import { $pluginDiscoveryReady, markPluginDiscoveryReady } from '@/contrib/plugins-store'
+import { registry } from '@/contrib/registry'
+
 import { __resetBackendSkinSync, ingestBackendSkin } from './backend-sync'
 import { skinPref, ThemeProvider, useTheme } from './context'
-import { everforestTheme } from './presets'
+import { DEFAULT_SKIN_NAME, everforestTheme } from './presets'
+import { THEMES_AREA } from './user-themes'
 
 // The live-authoring loop: Hermes writes/edits one skin file and every surface
 // repaints. An in-place edit keeps the NAME — only the palette moves.
@@ -14,10 +18,27 @@ const bloomberg = (foreground: string) => ({
 
 const cssVar = (name: string) => window.document.documentElement.style.getPropertyValue(name)
 
+let observedThemeName = ''
+
+function ThemeNameProbe() {
+  observedThemeName = useTheme().themeName
+
+  return null
+}
+
+const renderThemeNameProbe = () =>
+  render(
+    <ThemeProvider>
+      <ThemeNameProbe />
+    </ThemeProvider>
+  )
+
 describe('ThemeProvider ← backend skin sync', () => {
   beforeEach(() => {
     window.localStorage.clear()
     __resetBackendSkinSync()
+    $pluginDiscoveryReady.set(false)
+    observedThemeName = ''
   })
 
   afterEach(cleanup)
@@ -68,12 +89,71 @@ describe('ThemeProvider ← backend skin sync', () => {
     )
     expect(cssVar('--theme-foreground')).toBe('#ff9f0a')
   })
+
+  it('repairs an unresolved stored skin after the backend registry is ready', () => {
+    skinPref.assign('default', 'typo-skin')
+    renderThemeNameProbe()
+
+    // Boot preserves the unresolved name while backend themes are still absent.
+    expect(observedThemeName).toBe('typo-skin')
+
+    act(() => ingestBackendSkin({ name: 'default', colors: {} }, { apply: false }))
+
+    // The backend alone is not enough: a persisted theme may still arrive from
+    // the initial disk-plugin scan.
+    expect(observedThemeName).toBe('typo-skin')
+
+    act(() => markPluginDiscoveryReady())
+
+    expect(observedThemeName).toBe(DEFAULT_SKIN_NAME)
+    expect(skinPref.resolve('default')).toBe(DEFAULT_SKIN_NAME)
+  })
+
+  it('keeps a stored custom skin when the backend registers it', () => {
+    skinPref.assign('default', 'bloomberg')
+    renderThemeNameProbe()
+
+    act(() => {
+      ingestBackendSkin(bloomberg('#ff9f0a'), { apply: false })
+      markPluginDiscoveryReady()
+    })
+
+    expect(observedThemeName).toBe('bloomberg')
+    expect(skinPref.resolve('default')).toBe('bloomberg')
+  })
+
+  it('waits for the initial plugin scan before repairing an unresolved skin', () => {
+    skinPref.assign('default', 'plugin-theme')
+    const view = renderThemeNameProbe()
+
+    act(() => ingestBackendSkin({ name: 'default', colors: {} }, { apply: false }))
+    expect(observedThemeName).toBe('plugin-theme')
+
+    let dispose = () => {}
+
+    act(() => {
+      dispose = registry.register({
+        area: THEMES_AREA,
+        data: { ...everforestTheme, label: 'Plugin theme', name: 'plugin-theme' },
+        id: 'plugin-theme'
+      })
+      markPluginDiscoveryReady()
+    })
+
+    expect(observedThemeName).toBe('plugin-theme')
+    expect(skinPref.resolve('default')).toBe('plugin-theme')
+
+    view.unmount()
+    dispose()
+  })
 })
 
 describe('ThemeProvider highlight preview', () => {
   beforeEach(() => {
     window.localStorage.clear()
     __resetBackendSkinSync()
+    $pluginDiscoveryReady.set(false)
+    observedThemeName = ''
   })
 
   afterEach(cleanup)
