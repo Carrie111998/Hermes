@@ -237,6 +237,11 @@ def accept_suggestion(ref: str, *, origin: Optional[Dict[str, Any]] = None) -> O
         create_job_with_scheduler_registration,
     )
 
+    # Keep the check, durable job creation, and status transition atomic so
+    # concurrent acceptors cannot create duplicate jobs. The scheduler path
+    # must not call suggestion-store functions while this lock is held.
+    # Registration may perform disk/DB I/O, so this intentionally widens the
+    # critical section instead of releasing the lock before the job exists.
     with _suggestions_lock:
         s = get_suggestion(ref)
         if not s or s.get("status") != _STATUS_PENDING:
