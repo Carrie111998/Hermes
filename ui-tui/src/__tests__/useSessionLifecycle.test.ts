@@ -7,7 +7,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { turnController } from '../app/turnController.js'
 import { getTurnState, resetTurnState } from '../app/turnStore.js'
 import { patchUiState, resetUiState } from '../app/uiStore.js'
-import { withSessionIntro } from '../domain/messages.js'
 import {
   hydrateLiveSessionInflight,
   liveSessionInflightMessages,
@@ -15,6 +14,7 @@ import {
   signalFreshSessionBoundary,
   writeActiveSessionFile
 } from '../app/useSessionLifecycle.js'
+import { withSessionIntro } from '../domain/messages.js'
 
 describe('session intro visibility', () => {
   const info = { version: 'test' } as any
