@@ -3987,6 +3987,20 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         )
         return {"resolved": False, "choice": None, "notify_failed": True}
 
+    # Birth record: a prompt was RAISED and dispatched. Symmetric with the
+    # BLOCKED outcome logged on timeout/deny — without this, a prompt whose
+    # delivery silently failed (dead client transport) leaves no trace until
+    # the timeout fires, and looks identical to user silence (#91980).
+    logger.warning(
+        "Approval prompt RAISED (session=%s surface=%s pattern=%s command=%.120r) "
+        "— awaiting user decision for up to %ss",
+        session_key,
+        surface,
+        primary_key,
+        command,
+        _get_approval_timeout(),
+    )
+
     # Block until the user responds or the canonical approval timeout elapses
     # (default 300s). Poll in short slices so we can fire activity heartbeats
     # every ~10s to the agent's inactivity tracker — otherwise the gateway
