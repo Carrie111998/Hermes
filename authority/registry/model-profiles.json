@@ -146,6 +146,70 @@
       "supports_vision": true,
       "routing_role": "local-only",
       "capability_source": "Local Ollama verification: text and vision; 262144 context"
+    },
+    "fal/flux-2-pro": {
+      "vendor_family": "fal",
+      "supported_reasoning": [],
+      "thinking_map": {
+        "off": "off",
+        "low": "off",
+        "medium": "off",
+        "high": "off",
+        "deep": "off"
+      },
+      "context_window": 4096,
+      "supports_tools": false,
+      "supports_images": false,
+      "routing_role": "image-generation-only",
+      "capability_source": "FAL catalog: flux-2-pro text-to-image model; generation-only, no reasoning"
+    },
+    "fal/nano-banana-pro": {
+      "vendor_family": "fal",
+      "supported_reasoning": [],
+      "thinking_map": {
+        "off": "off",
+        "low": "off",
+        "medium": "off",
+        "high": "off",
+        "deep": "off"
+      },
+      "context_window": 4096,
+      "supports_tools": false,
+      "supports_images": false,
+      "routing_role": "image-generation-only",
+      "capability_source": "FAL catalog: nano-banana-pro text-to-image model; generation-only"
+    },
+    "fal/gpt-image-2": {
+      "vendor_family": "fal",
+      "supported_reasoning": [],
+      "thinking_map": {
+        "off": "off",
+        "low": "off",
+        "medium": "off",
+        "high": "off",
+        "deep": "off"
+      },
+      "context_window": 4096,
+      "supports_tools": false,
+      "supports_images": false,
+      "routing_role": "image-generation-only",
+      "capability_source": "FAL catalog: gpt-image-2 text-to-image model; generation-only"
+    },
+    "fal/recraft/v4/pro/text-to-image": {
+      "vendor_family": "fal",
+      "supported_reasoning": [],
+      "thinking_map": {
+        "off": "off",
+        "low": "off",
+        "medium": "off",
+        "high": "off",
+        "deep": "off"
+      },
+      "context_window": 4096,
+      "supports_tools": false,
+      "supports_images": false,
+      "routing_role": "image-generation-only",
+      "capability_source": "FAL catalog: recraft/v4/pro/text-to-image model; generation-only"
     }
   }
 }

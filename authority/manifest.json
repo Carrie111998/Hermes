@@ -2,15 +2,15 @@
   "schema_version": 1,
   "authority_root": "/Users/zhengsy/Documents/Hermes/2026-08-21/hermes-routing-authority/hermes-route-worktree/authority",
   "install_root": "/Users/zhengsy/.hermes/hermes-agent",
-  "base_commit": "8794e5a21c980a0f26532cb4883284b786cb3f25",
-  "authority_commit": "6f95603d3f",
+  "base_commit": "efb6b40f94ebce3c1f0cfe197942b17d68e2136b",
+  "authority_commit": "8b6fac1906+working-tree-reconciled-efb6b40f94",
   "patch_file": "route-authority.patch",
-  "patch_sha256": "e72b9c18c6fead8e1362800f46bd355bbf4a71f9f3ee7198a0693aabf9790dd0",
+  "patch_sha256": "19213ea3e88b1edb790510b5b06d1b8af1a650e3480b256388c16c508cf9dad7",
   "registry_dir": "registry",
   "managed_files": [
     {
       "path": "agent/agent_init.py",
-      "sha256": "75b88f5b0739f08217c1b44c9a9523102c162d63b43d928808dc1b49c98428c6"
+      "sha256": "86db3d50a5a71ede724cb4638322529f50207052d74fa1e9d56d0f20d0f8e26f"
     },
     {
       "path": "agent/conversation_loop.py",

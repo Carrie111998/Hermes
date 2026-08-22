@@ -123,7 +123,7 @@ def test_preview_mode_activates_explicit_candidate(
     )
 
     assert agent.runtime_registry.status == "candidate"
-    assert agent.runtime_registry.version == "2026-08-20.8"
+    assert agent.runtime_registry.version == "2026-08-22.14"
     assert agent.runtime_registry.inactive_reason is None
     assert agent.runtime_snapshot is not None
     assert agent.runtime_snapshot.is_candidate is True
@@ -139,7 +139,7 @@ def test_published_snapshot_activates_in_production(monkeypatch, tmp_path: Path)
     )
 
     assert agent.runtime_registry.status == "active"
-    assert agent.runtime_registry.version == "2026-08-20.8"
+    assert agent.runtime_registry.version == "2026-08-22.14"
     assert agent.runtime_snapshot is not None
     assert agent.runtime_snapshot.promotion_state == "PUBLISHED"
 

@@ -1,5 +1,5 @@
 diff --git a/agent/agent_init.py b/agent/agent_init.py
-index d8a5bd75e9..f7abc7fd2f 100644
+index b862fb56435..1b3288574d6 100644
 --- a/agent/agent_init.py
 +++ b/agent/agent_init.py
 @@ -27,7 +27,8 @@ import threading
@@ -149,14 +149,14 @@ index d8a5bd75e9..f7abc7fd2f 100644
      # Codex commentary visibility (display.show_commentary, default true).
      # When true, completed Codex phase=commentary messages are delivered as
      # visible mid-turn updates through the interim message path. When false,
-@@ -3027,4 +3151,4 @@ def init_agent(
+@@ -3035,4 +3159,4 @@ def init_agent(
  
  
  
 -__all__ = ["init_agent"]
 +__all__ = ["_initialize_runtime_registry", "init_agent"]
 diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
-index 951b874701..f380dd7d85 100644
+index 951b8747010..f380dd7d852 100644
 --- a/agent/conversation_loop.py
 +++ b/agent/conversation_loop.py
 @@ -1813,6 +1813,30 @@ def run_conversation(
@@ -230,7 +230,7 @@ index 951b874701..f380dd7d85 100644
      # result dict is returned exactly as before.
 diff --git a/agent/route.py b/agent/route.py
 new file mode 100644
-index 0000000000..2913cb437c
+index 00000000000..2913cb437c6
 --- /dev/null
 +++ b/agent/route.py
 @@ -0,0 +1,1337 @@
@@ -1573,7 +1573,7 @@ index 0000000000..2913cb437c
 +    return applied
 diff --git a/agent/runtime_registry.py b/agent/runtime_registry.py
 new file mode 100644
-index 0000000000..e95f13127c
+index 00000000000..e95f13127c2
 --- /dev/null
 +++ b/agent/runtime_registry.py
 @@ -0,0 +1,1148 @@
@@ -2726,7 +2726,7 @@ index 0000000000..e95f13127c
 +    "validate_registry_promotion",
 +]
 diff --git a/agent/tool_executor.py b/agent/tool_executor.py
-index e7bb9126db..c2545de8b1 100644
+index e7bb9126db5..c2545de8b1b 100644
 --- a/agent/tool_executor.py
 +++ b/agent/tool_executor.py
 @@ -581,6 +581,26 @@ def _run_agent_tool_execution_middleware(
@@ -2779,7 +2779,7 @@ index e7bb9126db..c2545de8b1 100644
                          function_name,
                          next_args,
 diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
-index cf3769c0c7..d6d360acf6 100644
+index cf3769c0c77..d6d360acf62 100644
 --- a/hermes_cli/config_defaults.py
 +++ b/hermes_cli/config_defaults.py
 @@ -9,6 +9,10 @@ DEFAULT_CONFIG = {
@@ -2794,7 +2794,7 @@ index cf3769c0c7..d6d360acf6 100644
      # SQLite journal mode used by every Hermes database opener. WAL is the
      # normal default; set DELETE for weak-fsync/shared filesystems where WAL is
 diff --git a/hermes_cli/update_cmd.py b/hermes_cli/update_cmd.py
-index 1b8c967dd7..548fe16e3b 100644
+index 1b8c967dd75..548fe16e3b5 100644
 --- a/hermes_cli/update_cmd.py
 +++ b/hermes_cli/update_cmd.py
 @@ -4948,6 +4948,57 @@ def _rebuild_desktop_after_update(
@@ -2871,7 +2871,7 @@ index 1b8c967dd7..548fe16e3b 100644
  
          # Verify HEAD actually moved (issue #79678). ``merge --ff-only``
 diff --git a/run_agent.py b/run_agent.py
-index f5c4de1274..305e92b237 100644
+index f5c4de1274c..305e92b2372 100644
 --- a/run_agent.py
 +++ b/run_agent.py
 @@ -432,6 +432,18 @@ class AIAgent:
@@ -2925,7 +2925,7 @@ index f5c4de1274..305e92b237 100644
          )
  
 diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
-index 8699edb984..29d2ba030b 100644
+index 8699edb9847..29d2ba030b8 100644
 --- a/tools/delegate_tool.py
 +++ b/tools/delegate_tool.py
 @@ -3605,6 +3605,7 @@ def delegate_task(

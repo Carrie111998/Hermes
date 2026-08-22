@@ -85,6 +85,15 @@
       "reasoning_intent": "low",
       "max_tokens": 512,
       "timeout_ms": 6000
+    },
+    "image-generation": {
+      "quality": "image-generation",
+      "modality": [
+        "text"
+      ],
+      "tools": "none",
+      "context_class": "short",
+      "reasoning_intent": "off"
     }
   }
 }

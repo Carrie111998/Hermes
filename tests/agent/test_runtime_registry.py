@@ -159,6 +159,31 @@ def test_published_registry_load_returns_immutable_snapshot(tmp_path: Path) -> N
     assert snapshot.bundle["route_policy"]["default_route"]["level"] == "L1"
 
 
+def test_capability_contract_accepts_declared_output_policy(tmp_path: Path) -> None:
+    _write_registry(tmp_path)
+    payload = json.loads(json.dumps(PAYLOADS["capability-contracts.json"]))
+    payload["contracts"]["basic"]["output_policy"] = "concise_evidence"
+    _rewrite_payload(tmp_path, "capability-contracts.json", payload)
+
+    snapshot = load_registry(tmp_path)
+
+    assert snapshot.bundle["capability_contracts"]["contracts"]["basic"]["output_policy"] == "concise_evidence"
+
+
+@pytest.mark.parametrize("value", ["brief", "", 1, None])
+def test_capability_contract_rejects_invalid_output_policy(tmp_path: Path, value: object) -> None:
+    _write_registry(tmp_path)
+    payload = json.loads(json.dumps(PAYLOADS["capability-contracts.json"]))
+    payload["contracts"]["basic"]["output_policy"] = value
+    _rewrite_payload(tmp_path, "capability-contracts.json", payload)
+
+    with pytest.raises(RegistryLoadError) as exc_info:
+        load_registry(tmp_path)
+
+    assert exc_info.value.code == "invalid_schema"
+    assert exc_info.value.path == "capability-contracts.json.contracts.basic.output_policy"
+
+
 def test_ready_for_review_is_rejected_in_production(tmp_path: Path) -> None:
     _write_registry(tmp_path, promotion_state="READY_FOR_REVIEW")
 
@@ -663,7 +688,7 @@ def test_current_live_registry_fixture_loads_in_explicit_preview() -> None:
 
     snapshot = RegistryLoader(root).load(mode="preview")
 
-    assert snapshot.registry_version == "2026-08-20.8"
+    assert snapshot.registry_version == "2026-08-22.14"
     assert snapshot.promotion_state == "READY_FOR_REVIEW"
     assert snapshot.is_candidate is True
     assert snapshot.source == "preview"

@@ -34,15 +34,18 @@
     },
     "standard-reasoning": {
       "primary": "openai-codex/gpt-5.6-luna",
-      "soft_failover": [],
+      "soft_failover": [
+        "minimax-cn/MiniMax-M3"
+      ],
       "hard_failover": [
         "deepseek/deepseek-v4-flash"
       ]
     },
     "complex-execution": {
-      "primary": "openai-codex/gpt-5.6-terra",
+      "primary": "minimax-cn/MiniMax-M3",
       "soft_failover": [
-        "openai-codex/gpt-5.6-sol"
+        "openai-codex/gpt-5.6-luna",
+        "openai-codex/gpt-5.6-terra"
       ],
       "hard_failover": [
         "deepseek/deepseek-v4-pro"
@@ -78,7 +81,7 @@
       },
       "rules": {
         "minimax": [
-          "openai-codex/gpt-5.6-sol"
+          "openai-codex/gpt-5.6-terra"
         ],
         "openai": [
           "minimax-cn/MiniMax-M3"
@@ -94,11 +97,23 @@
     "publishing": {
       "primary": "openai-codex/gpt-5.6-terra",
       "soft_failover": [
-        "openai-codex/gpt-5.6-sol"
+        "openai-codex/gpt-5.6-luna"
       ],
       "hard_failover": [
         "deepseek/deepseek-v4-pro"
       ]
+    },
+    "image-generation": {
+      "primary_pool": [
+        "fal/flux-2-pro",
+        "fal/nano-banana-pro",
+        "fal/gpt-image-2",
+        "fal/recraft/v4/pro/text-to-image"
+      ],
+      "primary_pool_mode": "flexible_available_primary",
+      "soft_failover": [],
+      "hard_failover": [],
+      "note": "Image-generation role uses the FAL catalog only. Reasoning profiles (MiniMax, GPT, Gemini, DeepSeek) are explicitly excluded from the primary_pool; image generation is a generation-only modality and does not route through the reasoning chain."
     }
   }
 }

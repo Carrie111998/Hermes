@@ -560,6 +560,18 @@ def _validate_model_profile_payload(value: Mapping[str, Any], path: str) -> None
             _require_bool(profile[key], f"{item_path}.{key}")
         if "supports_vision" in profile:
             _require_bool(profile["supports_vision"], f"{item_path}.supports_vision")
+        # ``supports_image_generation`` is a forward-compatible capability
+        # flag introduced for image-generation-only profiles (FAL catalog).
+        # It is optional so legacy fixtures authored before the field
+        # existed continue to validate unchanged; a missing value is
+        # treated as ``False`` by every downstream consumer.  When the
+        # field IS present, however, it must be a real boolean — strings
+        # / ints / ``None`` fail closed with ``invalid_schema``.
+        if "supports_image_generation" in profile:
+            _require_bool(
+                profile["supports_image_generation"],
+                f"{item_path}.supports_image_generation",
+            )
         for key in ("routing_role", "capability_source", "contract", "capability_contract"):
             if key in profile:
                 _require_string(profile[key], f"{item_path}.{key}")
@@ -575,6 +587,13 @@ def _validate_capability_payload(value: Mapping[str, Any], path: str) -> None:
         _validate_string_list(contract["modality"], f"{item_path}.modality", nonempty=True)
         for key in ("tools", "context_class", "reasoning_intent"):
             _require_string(contract[key], f"{item_path}.{key}")
+        if "output_policy" in contract:
+            output_policy = _require_string(contract["output_policy"], f"{item_path}.output_policy")
+            if output_policy not in {"concise_evidence", "standard", "full_evidence"}:
+                raise _schema_error(
+                    f"{item_path}.output_policy",
+                    "output_policy must be concise_evidence, standard, or full_evidence",
+                )
         for key in ("max_tokens", "timeout_ms"):
             if key in contract:
                 if _require_int(contract[key], f"{item_path}.{key}") <= 0:
@@ -1000,6 +1019,52 @@ def _validate_cross_file_references(payloads: Mapping[str, Any]) -> None:
         for field in ("contract", "capability_contract"):
             if field in policy:
                 require_ref(policy[field], contracts, f"{item_path}.{field}", "capability contract")
+
+    # Cross-file role gate: ``multimodal-extraction`` routes vision
+    # *understanding* traffic.  Image-generation-only profiles
+    # (``routing_role='image-generation-only'`` or
+    # ``supports_image_generation=True``) are closed to understanding
+    # traffic and have no business being named as the primary /
+    # failover of a multimodal-extraction policy.  Fail closed with a
+    # structured ``invalid_cross_file_role`` error pointing at the
+    # offending policy entry so a future contributor can locate the
+    # mismatch without spelunking through every payload.
+    multimodal_policy = policies.get("multimodal-extraction")
+    if multimodal_policy is not None:
+        gate_path = "model-policies.json.policies.multimodal-extraction"
+        for field in ("primary", "primary_pool", "soft_failover", "hard_failover", "failover"):
+            if field not in multimodal_policy:
+                continue
+            values = (
+                [multimodal_policy[field]]
+                if field == "primary"
+                else multimodal_policy[field]
+            )
+            for index, model in enumerate(values):
+                if model == "dynamic":
+                    continue
+                if model not in profiles:
+                    # Reference is dangling; the prior loop already
+                    # surfaced that as ``dangling_reference``.  Don't
+                    # double-report.
+                    continue
+                referenced = profiles[model]
+                is_generation_only = referenced.get("routing_role") == "image-generation-only"
+                is_image_gen = bool(referenced.get("supports_image_generation"))
+                if is_generation_only or is_image_gen:
+                    entry_path = (
+                        f"{gate_path}.{field}"
+                        if field == "primary"
+                        else f"{gate_path}.{field}[{index}]"
+                    )
+                    raise RegistryLoadError(
+                        (
+                            f"profile {model!r} is image-generation-only and cannot "
+                            f"serve multimodal-extraction at {entry_path}"
+                        ),
+                        code="invalid_cross_file_role",
+                        path=entry_path,
+                    )
 
     for profile_name, profile in profiles.items():
         item_path = f"model-profiles.json.profiles.{profile_name}"

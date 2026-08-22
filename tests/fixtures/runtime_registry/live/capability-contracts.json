@@ -19,7 +19,8 @@
       ],
       "tools": "basic",
       "context_class": "standard",
-      "reasoning_intent": "low"
+      "reasoning_intent": "low",
+      "output_policy": "concise_evidence"
     },
     "standard-reasoning": {
       "quality": "standard",
@@ -28,7 +29,8 @@
       ],
       "tools": "basic",
       "context_class": "standard",
-      "reasoning_intent": "high"
+      "reasoning_intent": "high",
+      "output_policy": "standard"
     },
     "complex-execution": {
       "quality": "complex",
@@ -37,7 +39,8 @@
       ],
       "tools": "full",
       "context_class": "standard",
-      "reasoning_intent": "deep"
+      "reasoning_intent": "deep",
+      "output_policy": "full_evidence"
     },
     "multimodal-extraction": {
       "quality": "visual",
@@ -55,7 +58,8 @@
       ],
       "tools": "full",
       "context_class": "standard",
-      "reasoning_intent": "deep"
+      "reasoning_intent": "deep",
+      "output_policy": "full_evidence"
     },
     "independent-review": {
       "quality": "review",
@@ -64,7 +68,8 @@
       ],
       "tools": "read",
       "context_class": "standard",
-      "reasoning_intent": "deep"
+      "reasoning_intent": "deep",
+      "output_policy": "full_evidence"
     },
     "publishing": {
       "quality": "publish",
@@ -73,7 +78,8 @@
       ],
       "tools": "full",
       "context_class": "standard",
-      "reasoning_intent": "medium"
+      "reasoning_intent": "medium",
+      "output_policy": "full_evidence"
     },
     "routing-classifier": {
       "quality": "classifier",
@@ -84,7 +90,17 @@
       "context_class": "short",
       "reasoning_intent": "low",
       "max_tokens": 512,
-      "timeout_ms": 6000
+      "timeout_ms": 6000,
+      "output_policy": "concise_evidence"
+    },
+    "image-generation": {
+      "quality": "image-generation",
+      "modality": [
+        "text"
+      ],
+      "tools": "none",
+      "context_class": "short",
+      "reasoning_intent": "off"
     }
   }
 }
