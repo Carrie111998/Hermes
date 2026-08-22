@@ -4887,6 +4887,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_get_origin_url",
         "_has_upstream_remote",
         "_install_psutil_android_compat",
+        "_installed_gateway_profile_homes",
         "_invalidate_update_cache",
         "_is_android_python",
         "_is_fork",
