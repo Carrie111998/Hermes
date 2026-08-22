@@ -251,8 +251,9 @@ external provider tools too.
 
 With only `memory_enabled: false` (user profile still on), the tool stays —
 it backs the profile store — but the system prompt swaps the full memory
-guidance for a narrower profile-only block, so the model is only instructed to
-save user-profile facts and never steered at the disabled notes store.
+guidance for a narrower profile-only block. The tool schema advertises only the
+`user` target, and direct or staged writes to disabled `MEMORY.md` are rejected.
+The inverse configuration advertises only `memory` and rejects `USER.md` writes.
 
 ## Controlling memory writes (`write_approval`)
 
@@ -266,7 +267,7 @@ first, set `memory.write_approval: true`. It's a simple on/off gate applied to
 | `false` (default) | Write freely — the gate is off (the pre-gate behaviour). |
 | `true` | Require approval before anything is saved. In the interactive CLI, foreground writes prompt you inline (entries are small enough to read in full). Everywhere else — messaging platforms, scripts, and the background self-improvement review — writes are **staged** for review with `/memory pending`. |
 
-> To turn memory off entirely (not just gate it), set `memory_enabled: false`.
+> To turn memory off entirely (not just gate it), set both `memory_enabled: false` and `user_profile_enabled: false`. When both built-in stores are disabled, the built-in `memory` tool is automatically hidden.
 
 Review staged writes from the CLI or any messaging platform:
 
