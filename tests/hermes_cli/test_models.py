@@ -320,6 +320,11 @@ class TestCheckNousFreeTierCache:
         assert result2 is True
         assert mock_account.call_count == 1
 
+    @patch("hermes_cli.nous_account.get_nous_portal_account_info")
+    def test_cache_only_cold_lookup_does_not_call_portal(self, mock_account):
+        assert check_nous_free_tier(cached_only=True) is False
+        mock_account.assert_not_called()
+
 
     @patch("hermes_cli.nous_account.get_nous_portal_account_info")
     def test_force_fresh_bypasses_cache(self, mock_account):

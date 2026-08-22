@@ -34,7 +34,12 @@ Substrate facts (verified May 2026):
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from threading import Lock, Thread
 from typing import Any, Optional
+
+
+_pricing_prewarm_lock = Lock()
+_pricing_prewarm_thread: Optional[Thread] = None
 
 
 # ─── Public types ───────────────────────────────────────────────────────
@@ -119,6 +124,7 @@ def build_models_payload(
     picker_hints: bool = False,
     canonical_order: bool = False,
     pricing: bool = False,
+    pricing_cache_only: bool = False,
     capabilities: bool = False,
     featured: bool = False,
     force_fresh_nous_tier: bool = False,
@@ -149,6 +155,9 @@ def build_models_payload(
       show $/Mtok columns and gate paid models on free accounts —
       mirroring the ``hermes model`` CLI picker. Adds network calls
       (pricing fetch + Nous tier check); only set for interactive pickers.
+    - ``pricing_cache_only``: when pricing is enabled, use only values already
+      resident in process caches. Normal picker opens use this while a
+      background worker warms cold pricing endpoints.
     - ``capabilities``: add a per-row ``capabilities`` map
       ``{model: {fast, reasoning}}`` so pickers can gate the model-options
       controls (fast toggle / reasoning) to what each model actually
@@ -267,7 +276,11 @@ def build_models_payload(
     if canonical_order:
         rows = _reorder_canonical(rows)
     if pricing:
-        _apply_pricing(rows, force_fresh_nous_tier=force_fresh_nous_tier)
+        _apply_pricing(
+            rows,
+            force_fresh_nous_tier=force_fresh_nous_tier,
+            cached_only=pricing_cache_only,
+        )
     if capabilities:
         _apply_capabilities(rows)
     if featured:
@@ -299,19 +312,23 @@ def build_model_options_payload(
       cache so live catalogs repopulate fully
     """
     refresh = bool(refresh)
-    return build_models_payload(
+    payload = build_models_payload(
         ctx,
         explicit_only=bool(explicit_only),
         include_unconfigured=bool(include_unconfigured),
         picker_hints=True,
         canonical_order=True,
         pricing=True,
+        pricing_cache_only=not refresh,
         capabilities=True,
         featured=True,
         refresh=refresh,
         probe_custom_providers=refresh,
         probe_current_custom_provider=not refresh,
     )
+    if not refresh:
+        _prewarm_pricing_async(payload["providers"])
+    return payload
 
 
 # ─── Public: auxiliary-task pickers ─────────────────────────────────────
@@ -819,6 +836,7 @@ def _apply_pricing(
     rows: list[dict],
     *,
     force_fresh_nous_tier: bool = False,
+    cached_only: bool = False,
 ) -> None:
     """Enrich each provider row with per-model pricing + Nous tier gating.
 
@@ -854,7 +872,8 @@ def _apply_pricing(
         if not models:
             continue
         try:
-            raw_pricing = get_pricing_for_provider(slug) or {}
+            pricing_kwargs = {"cached_only": True} if cached_only else {}
+            raw_pricing = get_pricing_for_provider(slug, **pricing_kwargs) or {}
         except Exception:
             raw_pricing = {}
         if not raw_pricing:
@@ -907,9 +926,12 @@ def _apply_pricing(
         if slug == "nous":
             try:
                 if nous_free_tier is None:
-                    nous_free_tier = check_nous_free_tier(
-                        force_fresh=force_fresh_nous_tier
-                    )
+                    tier_kwargs = {
+                        "force_fresh": force_fresh_nous_tier,
+                    }
+                    if cached_only:
+                        tier_kwargs["cached_only"] = True
+                    nous_free_tier = check_nous_free_tier(**tier_kwargs)
                 row["free_tier"] = bool(nous_free_tier)
                 if nous_free_tier:
                     _selectable, unavailable = partition_nous_models_by_tier(
@@ -923,6 +945,34 @@ def _apply_pricing(
                 # is never blocked from picking a model.
                 row["free_tier"] = False
                 row["unavailable_models"] = []
+
+
+def _prewarm_pricing_async(rows: list[dict]) -> Optional[Thread]:
+    """Warm picker pricing caches without delaying the current payload."""
+    global _pricing_prewarm_thread
+
+    with _pricing_prewarm_lock:
+        if _pricing_prewarm_thread is not None and _pricing_prewarm_thread.is_alive():
+            return _pricing_prewarm_thread
+
+        # The worker mutates only private copies while the pricing helpers
+        # populate their shared process caches.
+        worker_rows = [
+            {**row, "models": list(row.get("models") or [])}
+            for row in rows
+        ]
+
+        def _worker() -> None:
+            _apply_pricing(worker_rows)
+
+        thread = Thread(
+            target=_worker,
+            name="hermes-picker-pricing-prewarm",
+            daemon=True,
+        )
+        _pricing_prewarm_thread = thread
+        thread.start()
+        return thread
 
 
 def _moa_provider_row(current_provider: str = "") -> dict | None:

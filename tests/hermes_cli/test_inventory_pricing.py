@@ -5,6 +5,9 @@ columns + Free/Pro badges and gate paid models on free Nous accounts, the
 same way the `hermes model` CLI picker does.
 """
 
+from threading import Event
+from time import monotonic
+
 import hermes_cli.inventory as inv
 import hermes_cli.models as models_mod
 
@@ -99,5 +102,77 @@ def test_apply_pricing_omits_sale_when_original_not_cheaper(monkeypatch):
     rows = [{"slug": "nous", "models": ["a/eq"]}]
     inv._apply_pricing(rows)
     assert "discount_percent" not in rows[0]["pricing"]["a/eq"]
+
+
+def test_model_options_cold_pricing_fetch_runs_off_the_request_path(monkeypatch):
+    """A cold pricing endpoint must not delay the first picker payload."""
+    fetch_started = Event()
+    release_fetch = Event()
+
+    def fake_pricing(_slug, *, force_refresh=False, cached_only=False):
+        if cached_only:
+            return {}
+        fetch_started.set()
+        release_fetch.wait(timeout=5)
+        return {}
+
+    row = {
+        "slug": "openrouter",
+        "name": "OpenRouter",
+        "models": ["vendor/model"],
+        "total_models": 1,
+        "is_current": True,
+        "is_user_defined": False,
+        "source": "built-in",
+    }
+    monkeypatch.setattr(models_mod, "get_pricing_for_provider", fake_pricing)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.list_authenticated_providers",
+        lambda **_kwargs: [row],
+    )
+    monkeypatch.setattr(inv, "_moa_provider_row", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(inv, "_apply_capabilities", lambda _rows: None)
+    monkeypatch.setattr(inv, "_apply_featured", lambda _rows: None)
+    monkeypatch.setattr(inv, "_pricing_prewarm_thread", None)
+
+    try:
+        started_at = monotonic()
+        payload = inv.build_model_options_payload(
+            inv.ConfigContext(
+                current_provider="openrouter",
+                current_model="vendor/model",
+                current_base_url="",
+                user_providers={},
+                custom_providers=[],
+            )
+        )
+        elapsed = monotonic() - started_at
+        assert payload["providers"][0]["slug"] == "openrouter"
+        assert "pricing" not in payload["providers"][0]
+        assert elapsed < 2.0, f"cold picker blocked for {elapsed:.2f}s"
+        assert fetch_started.wait(timeout=1), "pricing should prewarm in the background"
+    finally:
+        release_fetch.set()
+        thread = inv._pricing_prewarm_thread
+        if thread is not None:
+            thread.join(timeout=2)
+
+
+def test_cached_only_pricing_returns_a_warm_value_without_fetching(monkeypatch):
+    """Cache-only picker reads preserve pricing once the prewarm completes."""
+    cache_key = "https://openrouter.ai/api"
+    expected = {"vendor/model": {"prompt": "0.000001", "completion": "0.000002"}}
+    monkeypatch.setattr(models_mod, "_pricing_cache", {cache_key: expected})
+    monkeypatch.setattr(models_mod, "_pricing_cache_retry_after", {})
+    monkeypatch.setattr(models_mod, "_pricing_provider_cache_keys", {})
+    monkeypatch.setattr(
+        models_mod,
+        "fetch_models_with_pricing",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("network fetch started")),
+    )
+
+    assert models_mod.get_pricing_for_provider(
+        "openrouter", cached_only=True
+    ) == expected
 
 
