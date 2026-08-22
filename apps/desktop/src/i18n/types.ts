@@ -1504,6 +1504,7 @@ export interface Translations {
     failedExport: string
     allProfiles: string
     showAllProfiles: string
+    sharedProfiles: string
     switchToProfile: (name: string) => string
     switchToConnection: (name: string) => string
     switchConnectionFailed: (name: string) => string
@@ -1783,6 +1784,10 @@ export interface Translations {
       noColor: string
       menuAddFolder: string
       menuSetActive: string
+      menuBindProfiles: string
+      bindProfilesTitle: string
+      bindProfilesDesc: (name: string) => string
+      bindProfilesNone: string
       menuDelete: string
       moveToProject: string
       movedTo: (name: string) => string
