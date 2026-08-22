@@ -219,6 +219,11 @@ describe('createSlashHandler', () => {
     expect(createSlashHandler(ctx)('/personality')).toBe(true)
     expect(ctx.gateway.rpc).not.toHaveBeenCalled()
 
+    // The reopen is deferred past dispatchSubmission's post-handler clearIn
+    // (useSubmission.ts): a synchronous setInput here would be wiped by that
+    // clear and bare /personality would dead-end again.
+    expect(ctx.composer.setInput).not.toHaveBeenCalled()
+
     await Promise.resolve()
     expect(ctx.composer.setInput).toHaveBeenCalledWith('/personality ')
   })
