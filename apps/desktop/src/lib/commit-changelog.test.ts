@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { buildCommitChangelog, parseCommitHeader } from './commit-changelog'
+import { buildCommitChangelog, groupsFromReleaseNotes, parseCommitHeader } from './commit-changelog'
 
 describe('parseCommitHeader', () => {
   it('extracts type, scope, and subject from a conventional header', () => {
@@ -110,5 +110,31 @@ describe('buildCommitChangelog', () => {
 
     const totalItems = groups.reduce((sum, g) => sum + g.items.length, 0)
     expect(totalItems).toBe(3)
+  })
+})
+
+describe('groupsFromReleaseNotes', () => {
+  it('maps known section ids through and passes labels and items verbatim', () => {
+    const groups = groupsFromReleaseNotes([
+      { id: 'new', label: "What's new", items: ['A'] },
+      { id: 'fixed', label: 'Fixed', items: ['B', 'C'] }
+    ])
+
+    expect(groups).toEqual([
+      { id: 'new', label: "What's new", items: ['A'] },
+      { id: 'fixed', label: 'Fixed', items: ['B', 'C'] }
+    ])
+  })
+
+  it('coerces unknown section ids to the other group', () => {
+    const groups = groupsFromReleaseNotes([{ id: 'wrangling', label: 'Wrangling', items: ['A'] }])
+
+    expect(groups).toEqual([{ id: 'other', label: 'Wrangling', items: ['A'] }])
+  })
+
+  it('drops empty sections and returns [] for null or undefined input', () => {
+    expect(groupsFromReleaseNotes(null)).toEqual([])
+    expect(groupsFromReleaseNotes(undefined)).toEqual([])
+    expect(groupsFromReleaseNotes([{ id: 'fixed', label: 'Fixed', items: [] }])).toEqual([])
   })
 })

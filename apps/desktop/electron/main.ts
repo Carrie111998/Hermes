@@ -249,6 +249,7 @@ import {
 } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
+import { parseReleaseNotes } from './release-notes'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
   RemoteLivenessTracker,
@@ -2817,6 +2818,7 @@ async function checkUpdates() {
       currentSha,
       targetSha,
       commits: [],
+      releaseNotes: null,
       dirty: dirtyStr.length > 0,
       hermesRoot: updateRoot,
       fetchedAt: Date.now()
@@ -2886,6 +2888,7 @@ async function checkUpdates() {
   // the shallow log to the fetched tip so the range walk can't enumerate the
   // contaminated ancestry — so "See what's new" stays useful and honest.
   const commits = behind !== 0 ? await readCommitLog(updateRoot, branch, isShallow) : []
+  const releaseNotes = behind !== 0 ? await readReleaseNotes(updateRoot, branch) : null
 
   return {
     supported: true,
@@ -2896,6 +2899,7 @@ async function checkUpdates() {
     currentSha,
     targetSha,
     commits,
+    releaseNotes,
     dirty: dirtyStr.length > 0,
     hermesRoot: updateRoot,
     fetchedAt: Date.now()
@@ -2975,6 +2979,34 @@ async function readCommitLog(cwd, branch, isShallow) {
 
       return { sha, summary, author, at: Number.parseInt(at, 10) * 1000 }
     })
+}
+
+// Read the plain-English release notes committed at release time. Missing on
+// old branches and pre-release checkouts; callers fall back to parsing raw
+// commit subjects when this returns null. The update check runs on every new
+// commit while the notes file only changes at releases, so the file is only
+// read when the remote blob differs from the user's current one; otherwise
+// the overlay would re-show notes for the release the user is already on.
+async function readReleaseNotes(cwd: string, branch: string) {
+  const [localNotes, remoteNotes] = await Promise.all([
+    runGit(['rev-parse', 'HEAD:RELEASE_NOTES.md'], { cwd }),
+    runGit(['rev-parse', `origin/${branch}:RELEASE_NOTES.md`], { cwd })
+  ])
+
+  const localSha = localNotes.code === 0 ? localNotes.stdout.trim() : null
+  const remoteSha = remoteNotes.code === 0 ? remoteNotes.stdout.trim() : null
+
+  if (!notesChangedForUpdate(localSha, remoteSha)) {
+    return null
+  }
+
+  const { stdout, code } = await runGit(['show', `origin/${branch}:RELEASE_NOTES.md`], { cwd })
+
+  if (code !== 0) {
+    return null
+  }
+
+  return parseReleaseNotes(stdout)
 }
 
 let updateInFlight = false

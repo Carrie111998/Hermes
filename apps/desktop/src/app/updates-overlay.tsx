@@ -14,9 +14,15 @@ import {
 import { ErrorIcon, ErrorState } from '@/components/ui/error-state'
 import { Loader } from '@/components/ui/loader'
 import { Progress } from '@/components/ui/progress'
-import type { DesktopUpdateBlocker, DesktopUpdateCommit, DesktopUpdateStage, DesktopUpdateStatus } from '@/global'
+import type {
+  DesktopUpdateBlocker,
+  DesktopUpdateCommit,
+  DesktopUpdateReleaseNotes,
+  DesktopUpdateStage,
+  DesktopUpdateStatus
+} from '@/global'
 import { useI18n } from '@/i18n'
-import { buildCommitChangelog, type CommitGroup } from '@/lib/commit-changelog'
+import { buildCommitChangelog, type CommitGroup, groupsFromReleaseNotes } from '@/lib/commit-changelog'
 import { AlertCircle, Check, Copy, Terminal } from '@/lib/icons'
 import { resolveUpdateCopy, type UpdateTarget } from '@/lib/update-copy'
 import { cn } from '@/lib/utils'
@@ -139,6 +145,7 @@ export function UpdatesOverlay() {
             onInstall={handleInstall}
             onLater={() => handleClose(false)}
             onRetryCheck={() => void check()}
+            releaseNotes={status?.releaseNotes ?? null}
             status={status}
             target={target}
             updateAvailable={updateAvailable}
@@ -156,6 +163,7 @@ function IdleView({
   onInstall,
   onLater,
   onRetryCheck,
+  releaseNotes,
   status,
   target,
   updateAvailable
@@ -166,6 +174,7 @@ function IdleView({
   onInstall: () => void
   onLater: () => void
   onRetryCheck: () => void
+  releaseNotes: DesktopUpdateReleaseNotes | null
   status: DesktopUpdateStatus | null
   target: UpdateTarget
   updateAvailable: boolean
@@ -231,7 +240,11 @@ function IdleView({
     )
   }
 
-  const groups = buildCommitChangelog(commits)
+  // Plain-English release notes (from origin/<branch>:RELEASE_NOTES.md) are
+  // preferred when the branch ships them. Otherwise fall back to parsing raw
+  // commit subjects, which is what pre-release checkouts and old branches see.
+  const noteGroups = groupsFromReleaseNotes(releaseNotes?.sections)
+  const groups = noteGroups.length > 0 ? noteGroups : buildCommitChangelog(commits)
   const shownItems = totalItems(groups)
   const remaining = Math.max(0, behind - shownItems)
 

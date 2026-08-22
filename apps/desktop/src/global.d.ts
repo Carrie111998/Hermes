@@ -545,6 +545,17 @@ export interface DesktopUpdateCommit {
   at: number
 }
 
+/** One group of the committed RELEASE_NOTES.md, already human-readable. */
+export interface DesktopUpdateReleaseNotesSection {
+  id: string
+  label: string
+  items: string[]
+}
+
+export interface DesktopUpdateReleaseNotes {
+  sections: DesktopUpdateReleaseNotesSection[]
+}
+
 export interface DesktopUpdateStatus {
   supported: boolean
   updateAvailable?: boolean
@@ -562,6 +573,9 @@ export interface DesktopUpdateStatus {
   currentVersion?: string
   targetSha?: string
   commits?: DesktopUpdateCommit[]
+  /** Plain-English notes from origin/<branch>:RELEASE_NOTES.md when present.
+   *  Shown instead of parsing commit subjects; null/undefined falls back. */
+  releaseNotes?: DesktopUpdateReleaseNotes | null
   dirty?: boolean
   fetchedAt?: number
 }

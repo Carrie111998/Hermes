@@ -18,14 +18,27 @@ Usage:
 
     # Override CalVer date (e.g. for a belated release)
     python scripts/release.py --bump minor --publish --date 2026.3.15
+
+Environment (optional):
+    RELEASE_NOTES_API_KEY   API key for the OpenAI-compatible endpoint. Must be
+                            set by whoever publishes the release (their Nous
+                            inference API key); it is read from the environment
+                            only and never committed or printed. Without it,
+                            the raw changelog ships unchanged.
+    RELEASE_NOTES_API_BASE  Endpoint base URL (default:
+                            https://inference-api.nousresearch.com/v1).
+                            Forks can point this at their own endpoint.
+    RELEASE_NOTES_MODEL     Model name (default z-ai/glm-5.3 on the Nous gateway).
 """
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import urllib.request
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +46,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = REPO_ROOT / "hermes_cli" / "__init__.py"
 PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
+
+# Plain-English release notes committed to the repo. The desktop app reads this
+# file off the branch it updates to and shows it in the update overlay instead
+# of raw commit subjects. Regenerated (and overwritten) on every release.
+RELEASE_NOTES_FILE = REPO_ROOT / "RELEASE_NOTES.md"
 
 # ──────────────────────────────────────────────────────────────────────
 # Git email → GitHub username mapping
@@ -2278,9 +2296,18 @@ def categorize_commit(subject: str) -> str:
 
 
 def clean_subject(subject: str) -> str:
-    """Clean up a commit subject for display."""
-    # Remove conventional commit prefix
-    cleaned = re.sub(r"^(feat|fix|docs|chore|refactor|test|perf|ci|build|improve|add|update|cleanup|hotfix|breaking|enhance|optimize|bugfix|bug|feature|tests|deps|bump)[\s:(!]+\s*", "", subject, flags=re.IGNORECASE)
+    """Clean up a commit subject for display.
+
+    Strips a Conventional Commits header including any scope, so
+    "fix(ledger): claim rows" becomes "Claim rows" rather than the dangling
+    "Ledger): claim rows" the old prefix-only regex produced.
+    """
+    cleaned = re.sub(
+        r"^(?:feat|fix|docs|chore|refactor|test|perf|ci|build|improve|add|update|cleanup|hotfix|breaking|enhance|optimize|bugfix|bug|feature|tests|deps|bump)\s*(?:\([^)]*\))?\s*!?\s*:\s*",
+        "",
+        subject,
+        flags=re.IGNORECASE,
+    )
     # Remove trailing issue refs that are redundant with PR links
     cleaned = cleaned.strip()
     # Capitalize first letter
@@ -2475,6 +2502,232 @@ def generate_changelog(commits, tag_name, semver, repo_url="https://github.com/N
     return "\n".join(lines)
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Plain-English release notes (LLM translation pass)
+# ──────────────────────────────────────────────────────────────────────
+#
+# Commit subjects are written for maintainers, not users. Before publishing a
+# release, translate the categorized entries into plain language with one LLM
+# call and commit the result as RELEASE_NOTES.md; the desktop app renders that
+# file in its update overlay instead of raw subjects. Everything is optional:
+# without RELEASE_NOTES_API_KEY the release ships exactly as it did before.
+
+PLAIN_GROUPS = [
+    ("new", "What's new"),
+    ("fixed", "Fixed"),
+    ("faster", "Faster"),
+    ("improved", "Improved"),
+    ("other", "Other improvements"),
+]
+
+PLAIN_GROUP_LABELS = {label: gid for gid, label in PLAIN_GROUPS}
+
+# Commit types that never say anything useful to an end user. Mirrors the
+# desktop app's HIDDEN_TYPES so both surfaces agree on what is noise.
+_HIDDEN_TYPES = {
+    "build", "chore", "ci", "dep", "deps", "doc", "docs",
+    "lint", "release", "style", "test", "tests", "wip",
+}
+
+# Entry ordering: breaking and features first, "other" last. Within a bucket,
+# newest commits first (git log order). Cap so the translation call stays
+# small; the raw categorized changelog below the highlights still lists
+# everything.
+_CATEGORY_PRIORITY = ["breaking", "features", "fixes", "improvements", "other"]
+
+_PLAIN_MAX_ITEMS = 60
+
+_PLAIN_SYSTEM_PROMPT = (
+    "You turn developer commit messages into release notes that a non-technical "
+    "user can actually understand. Rewrite every item you are given. Rules:\n"
+    "- One short plain-English sentence per item, 14 words max.\n"
+    "- Say what changed for the user, not what changed in the code.\n"
+    "- No jargon, no internal subsystem or code names, no file paths, no commit "
+    "hashes, no parentheses, no ALL-CAPS identifiers.\n"
+    "- Never repeat the input wording unless it is already plain.\n"
+    "- Assign each item a group from exactly this set: new, fixed, faster, "
+    "improved, other.\n"
+    "- new = a feature or capability the user gains. fixed = a bug fix. faster = "
+    "a performance win. improved = a tweak or polish. other = anything else.\n"
+    "- Reply with ONLY a JSON object in this exact shape: "
+    '{"items":[{"index":0,"group":"fixed","text":"..."}]}.\n'
+    "- One entry per input item, using the same index numbers, in the same order.\n"
+    "- No prose, no markdown fences, nothing outside the JSON object."
+)
+
+
+def _env_flag(name: str) -> str:
+    return (os.environ.get(name) or "").strip()
+
+
+def _plain_note_candidates(commits: list[dict]) -> list[dict]:
+    """Filter noise, order by usefulness, cap for the translation call."""
+    ordered: list[dict] = []
+    for priority in _CATEGORY_PRIORITY:
+        for commit in commits:
+            if commit["category"] == priority:
+                ordered.append(commit)
+
+    return ordered[:_PLAIN_MAX_ITEMS]
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Parse a model reply that should be a lone JSON object.
+
+    Tolerates markdown fences and stray prose by extracting the outermost
+    brace pair, which keeps the contract with the model lenient.
+    """
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", stripped).strip()
+    try:
+        parsed = json.loads(stripped)
+        return parsed if isinstance(parsed, dict) else None
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    start = stripped.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(stripped)):
+        if stripped[i] == "{":
+            depth += 1
+        elif stripped[i] == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    parsed = json.loads(stripped[start:i + 1])
+                    return parsed if isinstance(parsed, dict) else None
+                except (json.JSONDecodeError, ValueError):
+                    return None
+    return None
+
+
+def translate_entries_to_plain_english(entries: list[dict]) -> list[dict] | None:
+    """One LLM call that rewrites commit entries into plain-English items.
+
+    Returns a list of {"index", "group", "text"} aligned with the input, or
+    None when the translation is unavailable or failed, in which case the
+    caller ships the raw changelog unchanged.
+
+    The API key is read from RELEASE_NOTES_API_KEY only; it is never
+    hardcoded, committed, or printed. The base and model default to the Nous
+    inference gateway (https://inference-api.nousresearch.com/v1,
+    z-ai/glm-5.3); forks or alternate deployments can point RELEASE_NOTES_*
+    at their own endpoint.
+    """
+    api_key = _env_flag("RELEASE_NOTES_API_KEY")
+    if not api_key:
+        print("  · Plain release notes skipped: RELEASE_NOTES_API_KEY not set.")
+        return None
+
+    api_base = _env_flag("RELEASE_NOTES_API_BASE") or "https://inference-api.nousresearch.com/v1"
+    model = _env_flag("RELEASE_NOTES_MODEL") or "z-ai/glm-5.3"
+
+    payload_entries = [
+        {"index": i, "subject": clean_subject(e["subject"]), "category": e["category"]}
+        for i, e in enumerate(entries)
+    ]
+    user_prompt = json.dumps({"entries": payload_entries}, ensure_ascii=False)
+
+    body = json.dumps(
+        {
+            "model": model,
+            "temperature": 0.2,
+            "messages": [
+                {"role": "system", "content": _PLAIN_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    url = f"{api_base.rstrip('/')}/chat/completions"
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    last_error = "unknown error"
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=180) as response:
+                reply = json.loads(response.read().decode("utf-8"))
+            content = reply["choices"][0]["message"]["content"]
+            parsed = _extract_json_object(content)
+            if not parsed or not isinstance(parsed.get("items"), list):
+                last_error = "reply was not the expected JSON object"
+                continue
+            items = parsed["items"]
+            if len(items) != len(entries):
+                last_error = f"reply carried {len(items)} items, expected {len(entries)}"
+                continue
+            by_index = {}
+            valid_groups = {gid for gid, _ in PLAIN_GROUPS}
+            for item in items:
+                idx = item.get("index")
+                group = str(item.get("group") or "").lower()
+                text = str(item.get("text") or "").strip()
+                if not isinstance(idx, int) or group not in valid_groups or not text:
+                    last_error = "reply contained a malformed item"
+                    break
+                by_index[idx] = {"index": idx, "group": group, "text": text}
+            else:
+                if len(by_index) != len(entries):
+                    last_error = "reply item indexes do not cover the input"
+                else:
+                    return [by_index[i] for i in range(len(entries))]
+        except Exception as exc:  # noqa: BLE001 - release tooling, best effort
+            last_error = str(exc)
+
+    print(f"  · Plain release notes skipped: translation failed ({last_error}).")
+    return None
+
+
+def build_plain_release_notes(items: list[dict], semver: str, calver: str) -> str:
+    """Render translated items into the RELEASE_NOTES.md markdown."""
+    groups: dict[str, list[str]] = {gid: [] for gid, _ in PLAIN_GROUPS}
+    for item in items:
+        groups[item["group"]].append(item["text"])
+
+    lines = [f"# Hermes v{semver} ({calver})", ""]
+    for gid, label in PLAIN_GROUPS:
+        entries = groups[gid]
+        if not entries:
+            continue
+        lines.append(f"## {label}")
+        lines.append("")
+        for text in entries:
+            lines.append(f"- {text}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def build_highlights_markdown(items: list[dict]) -> str:
+    """Render translated items as the Highlights section of the GitHub body."""
+    groups: dict[str, list[str]] = {gid: [] for gid, _ in PLAIN_GROUPS}
+    for item in items:
+        groups[item["group"]].append(item["text"])
+
+    lines = ["## ✨ Highlights", ""]
+    for gid, label in PLAIN_GROUPS:
+        entries = groups[gid]
+        if not entries:
+            continue
+        lines.append(f"### {label}")
+        lines.append("")
+        for text in entries:
+            lines.append(f"- {text}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Hermes Agent Release Tool")
     parser.add_argument("--bump", choices=["major", "minor", "patch"],
@@ -2535,12 +2788,32 @@ def main():
     print(f"{'='*60}")
     print()
 
-    # Generate changelog
-    changelog = generate_changelog(
+    # Generate the raw categorized changelog, then optionally translate the
+    # entries into plain English for end users. Translation is best effort:
+    # without a key, or on failure, the release ships the raw changelog exactly
+    # as it did before this feature existed.
+    raw_changelog = generate_changelog(
         commits, tag_name, new_version,
         prev_tag=prev_tag,
         first_release=args.first_release,
     )
+
+    plain_notes_md = ""
+    translated_items = None
+    candidates = _plain_note_candidates(commits)
+    if candidates:
+        translated_items = translate_entries_to_plain_english(candidates)
+    if translated_items:
+        plain_notes_md = build_plain_release_notes(translated_items, new_version, calver_date)
+
+    changelog = raw_changelog
+    if translated_items:
+        highlights = build_highlights_markdown(translated_items)
+        first_section = raw_changelog.find("## ")
+        if first_section != -1:
+            changelog = raw_changelog[:first_section] + highlights + raw_changelog[first_section:]
+        else:
+            changelog = raw_changelog + "\n" + highlights
 
     if args.output:
         Path(args.output).write_text(changelog, encoding="utf-8")
@@ -2548,30 +2821,44 @@ def main():
     else:
         print(changelog)
 
+    if plain_notes_md and not args.publish:
+        print(f"\n{'='*60}")
+        print(f"  Plain release notes preview (committed on --publish)")
+        print(f"{'='*60}")
+        print(plain_notes_md)
+
     if args.publish:
         print(f"\n{'='*60}")
         print("  Publishing release...")
         print(f"{'='*60}")
 
-        # Update version files
+        # Update version files and stage everything the release must ship:
+        # the version files on a bump, plus RELEASE_NOTES.md when the plain
+        # translation pass produced one.
+        files_to_stage = []
         if args.bump:
             update_version_files(new_version, calver_date)
             print(f"  ✓ Updated version files to v{new_version} ({calver_date})")
+            files_to_stage.extend([str(VERSION_FILE), str(PYPROJECT_FILE)])
 
-            # Commit version bump
-            add_files = [str(VERSION_FILE), str(PYPROJECT_FILE)]
-            add_result = git_result("add", *add_files)
+        if plain_notes_md:
+            RELEASE_NOTES_FILE.write_text(plain_notes_md, encoding="utf-8")
+            print(f"  ✓ Plain release notes written to {RELEASE_NOTES_FILE.name}")
+            files_to_stage.append(str(RELEASE_NOTES_FILE))
+
+        if files_to_stage:
+            add_result = git_result("add", *files_to_stage)
             if add_result.returncode != 0:
-                print(f"  ✗ Failed to stage version files: {add_result.stderr.strip()}")
+                print(f"  ✗ Failed to stage release files: {add_result.stderr.strip()}")
                 return
 
             commit_result = git_result(
-                "commit", "-m", f"chore: bump version to v{new_version} ({calver_date})"
+                "commit", "-m", f"chore: release v{new_version} ({calver_date})"
             )
             if commit_result.returncode != 0:
-                print(f"  ✗ Failed to commit version bump: {commit_result.stderr.strip()}")
+                print(f"  ✗ Failed to commit release files: {commit_result.stderr.strip()}")
                 return
-            print("  ✓ Committed version bump")
+            print("  ✓ Committed release files")
 
         # Create annotated tag
         tag_result = git_result(

@@ -177,3 +177,30 @@ export function buildCommitChangelog(
 
   return result
 }
+
+/** One section of the committed RELEASE_NOTES.md, structurally compatible
+ *  with the desktop's DesktopUpdateReleaseNotesSection. */
+export interface ReleaseNotesSectionInput {
+  id: string
+  label: string
+  items: string[]
+}
+
+const VALID_GROUP_IDS: ReadonlySet<string> = new Set(['new', 'fixed', 'faster', 'improved', 'other'])
+
+/**
+ * Convert parsed RELEASE_NOTES.md sections into render-ready groups. Kept
+ * here so the update overlay's "notes over raw subjects" preference is a pure
+ * function the same test file covers.
+ */
+export function groupsFromReleaseNotes(
+  sections: readonly ReleaseNotesSectionInput[] | null | undefined
+): CommitGroup[] {
+  return (sections ?? [])
+    .filter(section => section.items.length > 0)
+    .map(section => ({
+      id: (VALID_GROUP_IDS.has(section.id) ? section.id : 'other') as CommitGroupId,
+      label: section.label,
+      items: section.items
+    }))
+}
