@@ -7,9 +7,8 @@ and the whole machine (dashboard included) became unreachable.
 
 Covers the two safeguards added in response:
 
-1. :func:`hermes_cli.kanban_db.derive_default_max_in_progress` /
-   :func:`hermes_cli.kanban_db.resolve_max_in_progress` — memory-derived
-   default global concurrency cap when the operator never set one.
+1. :func:`hermes_cli.kanban_db.resolve_max_in_progress` — explicit quotas are
+   honored, while an unset quota remains uncapped.
 2. The live memory-pressure guard inside ``dispatch_once`` — critical
    pressure spawns nothing; elevated pressure spawns at most one; unknown
    imposes no restriction (fail-open).
@@ -74,11 +73,11 @@ def test_resolve_max_in_progress_explicit_config_wins(monkeypatch):
     assert kb.resolve_max_in_progress(1) == 1
 
 
-def test_resolve_max_in_progress_derives_when_unset(monkeypatch):
+def test_resolve_max_in_progress_unset_is_uncapped(monkeypatch):
     monkeypatch.setattr(
         kb, "_system_memory_sample", lambda: {"mem_total_kib": 1 * GIB}
     )
-    assert kb.resolve_max_in_progress(None) == 2
+    assert kb.resolve_max_in_progress(None) is None
 
 
 def test_resolve_max_in_progress_unset_and_unknown_memory_is_uncapped(monkeypatch):
@@ -209,6 +208,30 @@ def test_dispatch_elevated_pressure_does_not_widen_tighter_budget(
 
     assert not spawns
     assert not res.spawned
+
+
+def test_dispatch_elevated_pressure_holds_at_adaptive_base_capacity(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    monkeypatch.setattr(
+        kb, "_system_memory_sample", lambda: _pressure_sample("elevated")
+    )
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        for title, assignee in (("running-a", "alice"), ("running-b", "bob")):
+            task_id = kb.create_task(conn, title=title, assignee=assignee)
+            kb.claim_task(conn, task_id)
+        kb.create_task(conn, title="deferred", assignee="carol")
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=4)
+
+    assert not spawns
+    assert not res.spawned
+    assert res.memory_pressure == "elevated"
 
 
 def test_dispatch_unknown_pressure_imposes_no_restriction(

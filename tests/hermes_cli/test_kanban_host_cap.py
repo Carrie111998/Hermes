@@ -70,16 +70,15 @@ def test_run_daemon_resolves_and_passes_max_in_progress(
         return kb.DispatchResult()
 
     monkeypatch.setattr(kb, "dispatch_once", fake_dispatch_once)
-    # No explicit config → the derived default must flow through.
+    # No explicit config → worker-count dispatch remains uncapped.
     monkeypatch.setattr(kb, "configured_max_in_progress", lambda: None)
-    monkeypatch.setattr(kb, "derive_default_max_in_progress", lambda sample=None: 3)
 
     def on_tick(res):
         stop.set()
 
     kb.run_daemon(interval=0.01, stop_event=stop, on_tick=on_tick)
 
-    assert captured.get("max_in_progress") == 3
+    assert captured.get("max_in_progress") is None
 
 
 def test_run_daemon_explicit_config_wins(kanban_home, monkeypatch):

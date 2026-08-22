@@ -300,7 +300,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
-| `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
+| `kanban_heartbeat` | Update liveness and the live progress projection during long operations. Pure side-effect. | — |
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |
 | `kanban_attach_url` | Attach a file to a task by URL. | `url` |
@@ -405,6 +405,79 @@ That final `kanban_complete` / `kanban_block` call is part of the worker
 protocol. If the worker process exits with status 0 while the task is still
 `running`, the dispatcher treats that as a protocol violation and emits a
 `protocol_violation` event.
+
+## Live worker observability
+
+Every task response (including the dashboard board feed, `GET /tasks/{id}`,
+and a worker's `kanban_show`) carries a compact, backward-compatible live
+projection. The task row is the current board view and its active run keeps the
+same fields as attempt history, so operators can see progress without scraping
+worker logs.
+
+| Field | Meaning |
+|---|---|
+| `current_step` | Short, user-safe description of the work currently being attempted. |
+| `progress_percent` | Optional worker estimate, bounded to `0`–`100`; it is not a measured completion guarantee. |
+| `last_heartbeat_at` | Unix timestamp of the most recent liveness update. |
+| `files_changed` | Deduplicated, bounded list of files the worker reported changing. |
+| `latest_log` | Latest bounded, user-safe activity line. This is a status hint, not a raw process log. |
+| `progress_updated_at` | Unix timestamp of the latest progress-field update. |
+| `heartbeat_age_seconds` | Age of the most recent heartbeat, calculated by the server. |
+| `worker_state` | Derived execution label described below. |
+| `is_stalled` | Whether a `running` task has exceeded the stalled-warning heartbeat threshold. |
+| `stalled_after_seconds` | Effective warning threshold used to calculate `is_stalled`. |
+
+Older boards migrate these nullable columns on startup. Clients should tolerate
+`null` for fields an older task or worker has not populated; absence of a
+percentage is intentionally different from `0%`.
+
+### Worker updates
+
+Call `kanban_heartbeat` before and during a long operation. Besides its
+optional note, it accepts `current_step`, `progress_percent`, `latest_log`, and
+`files_changed`; supplied fields update the live projection atomically with the
+heartbeat. Progress is scoped to the worker's active run, so a late callback
+from a reclaimed worker cannot overwrite a successor's card.
+
+```
+kanban_heartbeat(
+    current_step="Running focused Kanban tests",
+    progress_percent=60,
+    files_changed=["hermes_cli/kanban_db.py", "tests/hermes_cli/test_kanban_observability.py"],
+    latest_log="Focused test collection finished",
+)
+```
+
+Use a concise, non-sensitive status line. Do not place raw terminal output,
+credentials, prompts, or private source material in these fields. Short work
+normally needs no extra heartbeat; for a long-running command, send one every
+few minutes and at least hourly for work that might exceed an hour.
+
+### Execution labels and stalled warnings
+
+`worker_state` distinguishes useful live states without changing the task
+lifecycle: `working` means the worker is actively progressing;
+`waiting_tool` and `waiting_model` identify a live wait inferred from the
+current step; `reviewing` is an active reviewer lease; and `awaiting_review`
+means output is finished and the card is in `review` or `output_ready`.
+`stalled` takes precedence only for a `running` task whose heartbeat age is over
+the configured warning threshold. Other task lifecycle states retain their
+normal labels (for example `blocked`, `done`, or `Waiting for dependencies`).
+
+The default warning threshold is five minutes:
+
+```yaml
+# ~/.hermes/config.yaml
+kanban:
+  stalled_heartbeat_seconds: 300
+```
+
+This is an operator-facing warning only: it highlights a card and is returned
+by the status APIs, but does not kill or requeue the worker. Recovery remains
+separate and is controlled by `kanban.dispatch_stale_timeout_seconds` (four
+hours by default) plus normal claim/crash handling. This separation lets a
+human distinguish work in progress, an expected tool/model wait, a genuinely
+stuck worker, and completed output waiting for review.
 
 **Agent-side prevention:** Before the worker exits, Hermes injects up to two
 synthetic nudges when it detects the model is about to stop without a terminal

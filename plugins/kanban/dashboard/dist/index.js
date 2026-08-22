@@ -87,7 +87,7 @@
   }
 
   // Board column display order; any backend status not listed here renders after these.
-  const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "review", "done"];
+  const COLUMN_ORDER = ["triage", "todo", "ready", "working", "running", "output_ready", "blocked", "review", "done"];
   // English fallback dictionaries — used when the i18n catalog is missing
   // a key, and as defaults for the get*() helpers below so callers running
   // outside any React component (where there's no `t`) still get sane text.
@@ -95,7 +95,9 @@
     triage: "Triage",
     todo: "Todo",
     ready: "Ready",
+    working: "Working",
     running: "In Progress",
+    output_ready: "Output Ready",
     blocked: "Blocked",
     review: "Review",
     done: "Done",
@@ -105,7 +107,9 @@
     triage: "Raw ideas — a specifier will flesh out the spec",
     todo: "Waiting on dependencies or unassigned",
     ready: "Dependencies satisfied; assign a profile to dispatch",
+    working: "Current chat/controller is actively producing the output",
     running: "Claimed by a worker — in-flight",
+    output_ready: "Usable output delivered; verification may continue asynchronously",
     blocked: "Worker asked for human input",
     review: "Implementation complete — awaiting review",
     done: "Completed",
@@ -173,7 +177,9 @@
     triage: "hermes-kanban-dot-triage",
     todo: "hermes-kanban-dot-todo",
     ready: "hermes-kanban-dot-ready",
+    working: "hermes-kanban-dot-working",
     running: "hermes-kanban-dot-running",
+    output_ready: "hermes-kanban-dot-output-ready",
     blocked: "hermes-kanban-dot-blocked",
     review: "hermes-kanban-dot-review",
     done: "hermes-kanban-dot-done",
@@ -2975,14 +2981,19 @@
   // Values below are seconds.
   const STALENESS = {
     ready:   { amber: 1 * 60 * 60,   red: 24 * 60 * 60 },
+    working: { amber: 10 * 60,        red: 60 * 60 },
     running: { amber: 10 * 60,       red: 60 * 60 },
+    output_ready: { amber: 60 * 60, red: 24 * 60 * 60 },
     blocked: { amber: 1 * 60 * 60,   red: 24 * 60 * 60 },
     todo:    { amber: 7 * 24 * 60 * 60, red: 30 * 24 * 60 * 60 },
   };
 
   function stalenessClass(task) {
+    if (task && task.is_stalled) return "hermes-kanban-card--stale-red";
     if (!task || !task.age) return "";
     const age = task.status === "running"
+      ? task.heartbeat_age_seconds
+      : task.status === "working"
       ? task.age.started_age_seconds
       : task.age.created_age_seconds;
     const tier = STALENESS[task.status];
@@ -3044,7 +3055,12 @@
       props.toggleSelected(t.id, true);
     };
 
-    const progress = t.progress;
+    const childProgress = t.progress;
+    const hasLiveProgress = t.current_step || t.progress_percent != null || t.last_heartbeat_at;
+    const progressPercent = t.progress_percent == null
+      ? null
+      : Math.max(0, Math.min(100, Number(t.progress_percent) || 0));
+    const workerState = String(t.worker_state || "").replace(/_/g, " ");
     const needsAssignee = t.status === "ready" && !t.assignee;
 
     return h("div", {
@@ -3060,7 +3076,7 @@
       draggable: true,
       tabIndex: 0,
       role: "button",
-      "aria-label": `${t.title || "untitled"} — ${t.id} — ${t.status}`,
+      "aria-label": `${t.title || "untitled"} — ${t.id} — ${t.display_status || t.status}`,
       onDragStart: handleDragStart,
       onClick: handleClick,
       onKeyDown: handleKeyDown,
@@ -3106,14 +3122,21 @@
               ? h(Badge, { variant: "outline", className: "hermes-kanban-tag",
                            title: `Tenant: ${t.tenant}. Free-form tag for grouping tasks (customer, project, team).` }, t.tenant)
               : null,
-            progress
+            t.output_delivered
+              ? h(Badge, {
+                  variant: "outline",
+                  className: "hermes-kanban-output-badge",
+                  title: "Usable output has already been delivered; verification may still be running.",
+                }, "Output ready")
+              : null,
+            childProgress
               ? h("span", {
                   className: cn(
                     "hermes-kanban-progress",
-                    progress.done === progress.total ? "hermes-kanban-progress--full" : "",
+                    childProgress.done === childProgress.total ? "hermes-kanban-progress--full" : "",
                   ),
-                  title: `${progress.done} of ${progress.total} child tasks done`,
-                }, `${progress.done}/${progress.total}`)
+                  title: `${childProgress.done} of ${childProgress.total} child tasks done`,
+                }, `${childProgress.done}/${childProgress.total}`)
               : null,
             needsAssignee
               ? h(Badge, {
@@ -3125,6 +3148,52 @@
           ),
           h("div", { className: "hermes-kanban-card-title" },
             t.title || tx(i18n, "untitled", "(untitled)")),
+          hasLiveProgress
+            ? h("div", { className: "hermes-kanban-live-progress" },
+                h("div", { className: "hermes-kanban-live-progress-head" },
+                  workerState
+                    ? h("span", {
+                        className: cn(
+                          "hermes-kanban-worker-state",
+                          t.is_stalled ? "hermes-kanban-worker-state--stalled" : "",
+                        ),
+                      }, workerState)
+                    : null,
+                  h("span", {
+                    className: "hermes-kanban-current-step",
+                    title: t.current_step || "",
+                  }, t.current_step || "Worker active"),
+                  progressPercent != null
+                    ? h("span", { className: "hermes-kanban-progress-percent" }, `${progressPercent}%`)
+                    : null,
+                ),
+                progressPercent != null
+                  ? h("div", {
+                      className: "hermes-kanban-progress-track",
+                      role: "progressbar",
+                      "aria-valuemin": 0,
+                      "aria-valuemax": 100,
+                      "aria-valuenow": progressPercent,
+                    },
+                      h("span", {
+                        className: "hermes-kanban-progress-fill",
+                        style: { width: `${progressPercent}%` },
+                      }),
+                    )
+                  : null,
+                t.last_heartbeat_at
+                  ? h("div", {
+                      className: cn(
+                        "hermes-kanban-heartbeat",
+                        t.is_stalled ? "hermes-kanban-heartbeat--stalled" : "",
+                      ),
+                      title: `Last heartbeat: ${new Date(t.last_heartbeat_at * 1000).toLocaleString()}`,
+                    }, t.is_stalled
+                      ? `No heartbeat for ${Math.max(1, Math.floor((t.heartbeat_age_seconds || 0) / 60))}m`
+                      : `Heartbeat ${timeAgo ? timeAgo(t.last_heartbeat_at) : "recently"}`)
+                  : null,
+              )
+            : null,
           h("div", { className: "hermes-kanban-card-row hermes-kanban-card-meta" },
             t.assignee
               ? h("span", { className: "hermes-kanban-assignee",
@@ -3866,6 +3935,79 @@
     );
   }
 
+  function WorkerObservabilitySection(props) {
+    const { t: i18n } = useI18n();
+    const task = props.task;
+    const files = Array.isArray(task.files_changed) ? task.files_changed : [];
+    const percent = task.progress_percent == null
+      ? null
+      : Math.max(0, Math.min(100, Number(task.progress_percent) || 0));
+    if (!task.current_step && percent == null && !task.last_heartbeat_at && !task.latest_log && files.length === 0) {
+      return null;
+    }
+    const state = String(task.worker_state || task.status || "unknown").replace(/_/g, " ");
+    return h("div", {
+      className: cn(
+        "hermes-kanban-section hermes-kanban-observability",
+        task.is_stalled ? "hermes-kanban-observability--stalled" : "",
+      ),
+    },
+      h("div", { className: "hermes-kanban-section-head" },
+        tx(i18n, "workerActivity", "Worker activity"),
+        h("span", {
+          className: cn(
+            "hermes-kanban-worker-state",
+            task.is_stalled ? "hermes-kanban-worker-state--stalled" : "",
+          ),
+        }, state),
+      ),
+      h("div", { className: "hermes-kanban-observability-grid" },
+        h(MetaRow, {
+          label: tx(i18n, "currentStep", "Current step"),
+          value: task.current_step || "—",
+        }),
+        h(MetaRow, {
+          label: tx(i18n, "progress", "Progress"),
+          value: percent == null ? "—" : `${percent}% (estimate)`,
+        }),
+        h(MetaRow, {
+          label: tx(i18n, "lastHeartbeat", "Last heartbeat"),
+          value: task.last_heartbeat_at
+            ? `${timeAgo ? timeAgo(task.last_heartbeat_at) : task.last_heartbeat_at}`
+            : "—",
+        }),
+      ),
+      percent != null
+        ? h("div", {
+            className: "hermes-kanban-progress-track hermes-kanban-progress-track--drawer",
+            role: "progressbar",
+            "aria-valuemin": 0,
+            "aria-valuemax": 100,
+            "aria-valuenow": percent,
+          }, h("span", {
+            className: "hermes-kanban-progress-fill",
+            style: { width: `${percent}%` },
+          }))
+        : null,
+      task.latest_log
+        ? h("div", { className: "hermes-kanban-latest-log" },
+            h("span", { className: "hermes-kanban-latest-log-label" },
+              tx(i18n, "latestLog", "Latest activity")),
+            h("code", null, task.latest_log),
+          )
+        : null,
+      files.length > 0
+        ? h("div", { className: "hermes-kanban-files-changed" },
+            h("div", { className: "hermes-kanban-latest-log-label" },
+              `${tx(i18n, "filesChanged", "Files changed")} (${files.length})`),
+            h("ul", null, files.map(function (path) {
+              return h("li", { key: path }, h("code", null, path));
+            })),
+          )
+        : null,
+    );
+  }
+
   function TaskDetail(props) {
     const { t: i18n } = useI18n();
     const t = props.data.task;
@@ -3877,7 +4019,7 @@
 
     return h("div", { className: "hermes-kanban-drawer-body" },
       h("div", { className: "hermes-kanban-drawer-title" },
-        h("span", { className: cn("hermes-kanban-dot", COLUMN_DOT[t.status]) }),
+        h("span", { className: cn("hermes-kanban-dot", COLUMN_DOT[t.board_status || t.status]) }),
         props.editing
           ? h(TitleEditor, {
               initial: t.title || "",
@@ -3893,7 +4035,7 @@
             }, t.title || tx(i18n, "untitled", "(untitled)")),
       ),
       h("div", { className: "hermes-kanban-drawer-meta" },
-        h(MetaRow, { label: tx(i18n, "status", "Status"), value: t.status }),
+        h(MetaRow, { label: tx(i18n, "status", "Status"), value: t.display_status || t.status }),
         h(AssigneeEditor, { task: t, onPatch: props.onPatch }),
         h(PriorityEditor, { task: t, onPatch: props.onPatch }),
         h(ModelEditor, { task: t, onPatch: props.onPatch }),
@@ -3914,6 +4056,7 @@
         }) : null,
         t.created_by ? h(MetaRow, { label: tx(i18n, "createdBy", "Created by"), value: t.created_by }) : null,
       ),
+      h(WorkerObservabilitySection, { task: t }),
       h(StatusActions, {
         task: t,
         onPatch: props.onPatch,

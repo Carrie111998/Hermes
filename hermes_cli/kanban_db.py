@@ -99,8 +99,11 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
-VALID_INITIAL_STATUSES = {"running", "blocked"}
+VALID_STATUSES = {
+    "triage", "todo", "scheduled", "ready", "working", "running", "blocked",
+    "output_ready", "review", "done", "archived",
+}
+VALID_INITIAL_STATUSES = {"running", "working", "blocked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -208,6 +211,107 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
         invoke_hook(event, task_id=task_id, profile_name=profile_name, **fields)
     except Exception as exc:  # pragma: no cover - defensive
         _log.debug("kanban lifecycle hook %s failed: %s", event, exc)
+
+
+def _authorize_kanban_completion(
+    task_id: str,
+    metadata: Optional[dict],
+    *,
+    summary: Optional[str],
+    result: Optional[str],
+) -> tuple[bool, Optional[dict], Optional[str]]:
+    """Run the vetoable pre-completion boundary before any board mutation.
+
+    Installs without a completion policy remain backward compatible. When a
+    policy hook is registered it must return an explicit allow/deny result;
+    an exception or empty result fails closed instead of silently bypassing
+    governance. Hooks run before the SQLite write transaction.
+    """
+    event = "pre_kanban_task_complete"
+    if not _kanban_observer_consumed(event):
+        return True, metadata, None
+    try:
+        from hermes_cli.lifecycle import invoke_hook
+        from hermes_cli import plugins as plugin_runtime
+        from hermes_cli.profiles import get_active_profile_name
+        try:
+            profile_name = get_active_profile_name()
+        except Exception:
+            profile_name = os.environ.get("HERMES_PROFILE") or "default"
+        expected_callbacks = len(plugin_runtime.iter_hook_callbacks(event))
+        responses = invoke_hook(
+            event,
+            task_id=task_id,
+            profile_name=profile_name,
+            metadata=metadata if isinstance(metadata, dict) else {},
+            summary=summary,
+            result=result,
+            board=get_current_board(),
+        )
+    except Exception as exc:
+        return False, metadata, f"completion policy failed: {type(exc).__name__}"
+    if len(responses) < expected_callbacks:
+        return False, metadata, "one or more completion policies failed or returned no authorization"
+    if not responses:
+        return False, metadata, "completion policy returned no authorization"
+    updated = dict(metadata or {})
+    explicit_allow = False
+    for response in responses:
+        if not isinstance(response, dict):
+            continue
+        if response.get("allow") is False:
+            return False, metadata, str(response.get("reason") or "completion denied by policy")
+        if response.get("allow") is True:
+            explicit_allow = True
+            replacement = response.get("metadata")
+            if isinstance(replacement, dict):
+                updated = replacement
+    if not explicit_allow:
+        return False, metadata, "completion policy did not explicitly allow completion"
+    return True, updated, None
+
+
+_COMPLETION_PRECONDITION_COLUMNS = (
+    "status",
+    "current_run_id",
+    "assignee",
+    "title",
+    "body",
+    "priority",
+    "workspace_kind",
+    "workspace_path",
+    "branch_name",
+    "project_id",
+    "tenant",
+    "skills",
+    "model_override",
+    "provider_override",
+    "reasoning_effort",
+)
+
+
+def _completion_precondition_snapshot(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[dict[str, Any]]:
+    """Capture the bounded task inputs/state that completion authorization saw."""
+    row = conn.execute(
+        f"SELECT {', '.join(_COMPLETION_PRECONDITION_COLUMNS)} FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {column: row[column] for column in _COMPLETION_PRECONDITION_COLUMNS}
+
+
+def _completion_preconditions_match(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected: dict[str, Any],
+) -> bool:
+    """Re-check authorization inputs while the final write transaction is held."""
+    current = _completion_precondition_snapshot(conn, task_id)
+    return current is not None and current == expected
 
 
 def _kanban_observer_consumed(event: str) -> bool:
@@ -375,6 +479,12 @@ DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 # so any genuinely active worker keeps its heartbeat fresh as a side
 # effect of normal API traffic.
 DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
+
+# UI/operator warning threshold. This is deliberately lower than the one-hour
+# reclaim backstop above: "stalled" is an attention signal, not permission to
+# kill or requeue a worker. Operators can tune it through
+# ``kanban.stalled_heartbeat_seconds`` without changing recovery semantics.
+DEFAULT_STALLED_HEARTBEAT_SECONDS = 5 * 60
 
 # Grace added to a claim when a reclaim is deferred because the previous
 # host-local worker is still alive after a termination attempt. Releasing the
@@ -1049,6 +1159,18 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
 # Data classes
 # ---------------------------------------------------------------------------
 
+def _decode_string_list(value: Any) -> list[str]:
+    """Decode a bounded JSON string list from an additive SQLite column."""
+    if not value:
+        return []
+    try:
+        decoded = json.loads(value) if isinstance(value, str) else value
+    except (TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(decoded, list):
+        return []
+    return [str(item) for item in decoded if str(item).strip()][:50]
+
 @dataclass
 class Task:
     """In-memory view of a row from the ``tasks`` table."""
@@ -1086,6 +1208,14 @@ class Task:
     last_failure_error: Optional[str] = None
     max_runtime_seconds: Optional[int] = None
     last_heartbeat_at: Optional[int] = None
+    # Live worker observability. ``current_step_key`` below is the durable
+    # workflow stage; these fields describe what the active worker is doing
+    # inside that stage and are safe to update frequently.
+    current_step: Optional[str] = None
+    progress_percent: Optional[int] = None
+    latest_log: Optional[str] = None
+    files_changed: Optional[list[str]] = None
+    progress_updated_at: Optional[int] = None
     current_run_id: Optional[int] = None
     workflow_template_id: Optional[str] = None
     current_step_key: Optional[str] = None
@@ -1194,6 +1324,21 @@ class Task:
             last_heartbeat_at=(
                 row["last_heartbeat_at"] if "last_heartbeat_at" in keys else None
             ),
+            current_step=(
+                row["current_step"] if "current_step" in keys else None
+            ),
+            progress_percent=(
+                row["progress_percent"] if "progress_percent" in keys else None
+            ),
+            latest_log=(
+                row["latest_log"] if "latest_log" in keys else None
+            ),
+            files_changed=_decode_string_list(
+                row["files_changed"] if "files_changed" in keys else None
+            ),
+            progress_updated_at=(
+                row["progress_updated_at"] if "progress_updated_at" in keys else None
+            ),
             current_run_id=(
                 row["current_run_id"] if "current_run_id" in keys else None
             ),
@@ -1259,6 +1404,11 @@ class Run:
     worker_pid: Optional[int]
     max_runtime_seconds: Optional[int]
     last_heartbeat_at: Optional[int]
+    current_step: Optional[str]
+    progress_percent: Optional[int]
+    latest_log: Optional[str]
+    files_changed: Optional[list[str]]
+    progress_updated_at: Optional[int]
     started_at: int
     ended_at: Optional[int]
     outcome: Optional[str]
@@ -1283,6 +1433,19 @@ class Run:
             worker_pid=row["worker_pid"],
             max_runtime_seconds=row["max_runtime_seconds"],
             last_heartbeat_at=row["last_heartbeat_at"],
+            current_step=(row["current_step"] if "current_step" in row.keys() else None),
+            progress_percent=(
+                row["progress_percent"] if "progress_percent" in row.keys() else None
+            ),
+            latest_log=(row["latest_log"] if "latest_log" in row.keys() else None),
+            files_changed=_decode_string_list(
+                row["files_changed"] if "files_changed" in row.keys() else None
+            ),
+            progress_updated_at=(
+                row["progress_updated_at"]
+                if "progress_updated_at" in row.keys()
+                else None
+            ),
             started_at=int(row["started_at"]),
             ended_at=(int(row["ended_at"]) if row["ended_at"] is not None else None),
             outcome=row["outcome"],
@@ -1363,6 +1526,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
     last_heartbeat_at    INTEGER,
+    current_step         TEXT,
+    progress_percent     INTEGER,
+    latest_log           TEXT,
+    files_changed        TEXT,
+    progress_updated_at  INTEGER,
     -- Pointer into task_runs for the currently-active run (NULL if no
     -- run is in-flight). Denormalised for cheap reads.
     current_run_id       INTEGER,
@@ -1467,6 +1635,11 @@ CREATE TABLE IF NOT EXISTS task_runs (
     worker_pid          INTEGER,
     max_runtime_seconds INTEGER,
     last_heartbeat_at   INTEGER,
+    current_step        TEXT,
+    progress_percent    INTEGER,
+    latest_log          TEXT,
+    files_changed       TEXT,
+    progress_updated_at INTEGER,
     started_at          INTEGER NOT NULL,
     ended_at            INTEGER,
     outcome             TEXT,
@@ -2598,6 +2771,20 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "last_heartbeat_at", "last_heartbeat_at INTEGER"
         )
+    if "current_step" not in cols:
+        _add_column_if_missing(conn, "tasks", "current_step", "current_step TEXT")
+    if "progress_percent" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "progress_percent", "progress_percent INTEGER"
+        )
+    if "latest_log" not in cols:
+        _add_column_if_missing(conn, "tasks", "latest_log", "latest_log TEXT")
+    if "files_changed" not in cols:
+        _add_column_if_missing(conn, "tasks", "files_changed", "files_changed TEXT")
+    if "progress_updated_at" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "progress_updated_at", "progress_updated_at INTEGER"
+        )
     if "current_run_id" not in cols:
         _add_column_if_missing(
             conn, "tasks", "current_run_id", "current_run_id INTEGER"
@@ -2707,6 +2894,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_events_run "
         "ON task_events(run_id, id)"
     )
+
+    # Per-run observability mirrors the denormalised task projection. Existing
+    # attempts remain readable with NULL fields; active and future attempts
+    # are updated together with their task row.
+    run_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone() is not None
+    if run_table_exists:
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        for name, declaration in (
+            ("current_step", "current_step TEXT"),
+            ("progress_percent", "progress_percent INTEGER"),
+            ("latest_log", "latest_log TEXT"),
+            ("files_changed", "files_changed TEXT"),
+            ("progress_updated_at", "progress_updated_at INTEGER"),
+        ):
+            if name not in run_cols:
+                _add_column_if_missing(conn, "task_runs", name, declaration)
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -2874,7 +3081,9 @@ _REBUILD_SPECS = {
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
-        " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
+        " last_heartbeat_at INTEGER, current_step TEXT,"
+        " progress_percent INTEGER, latest_log TEXT, files_changed TEXT,"
+        " progress_updated_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
         " error TEXT)",
         (
@@ -3447,6 +3656,23 @@ def create_task(
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                elif initial_status == "working":
+                    # Interactive controllers (for example the current Codex
+                    # chat) execute immediately without taking a dispatcher
+                    # claim. ``running`` remains reserved for worker leases
+                    # and their stale-claim recovery semantics.
+                    task_status = "working"
+                    if parents:
+                        missing = _find_missing_parents(conn, parents)
+                        if missing:
+                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                        rows = conn.execute(
+                            "SELECT status FROM tasks WHERE id IN "
+                            "(" + ",".join("?" * len(parents)) + ")",
+                            parents,
+                        ).fetchall()
+                        if any(r["status"] != "done" for r in rows):
+                            task_status = "todo"
                 elif triage:
                     task_status = "triage"
                 else:
@@ -4372,6 +4598,26 @@ def _end_run(
             run_id,
         ),
     )
+    terminal_projection = {
+        "completed": ("Completed", 100),
+        "output_ready": ("Output delivered", 100),
+        "review_requested": ("Waiting for review", 100),
+    }.get(outcome)
+    if terminal_projection is not None:
+        final_step, final_percent = terminal_projection
+        final_log = (summary or error or "").strip().splitlines()
+        conn.execute(
+            "UPDATE task_runs SET current_step = ?, progress_percent = ?, "
+            "latest_log = COALESCE(?, latest_log), progress_updated_at = ? "
+            "WHERE id = ?",
+            (
+                final_step,
+                final_percent,
+                final_log[0][:800] if final_log else None,
+                now,
+                run_id,
+            ),
+        )
     conn.execute(
         "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
     )
@@ -4416,20 +4662,31 @@ def _synthesize_ended_run(
     ).fetchone()
     profile = trow["assignee"] if trow else None
     step_key = trow["current_step_key"] if trow else None
+    terminal_projection = {
+        "completed": ("Completed", 100),
+        "output_ready": ("Output delivered", 100),
+        "review_requested": ("Waiting for review", 100),
+    }.get(outcome)
+    final_step, final_percent = terminal_projection or (None, None)
+    final_log_lines = (summary or error or "").strip().splitlines()
+    final_log = final_log_lines[0][:800] if final_log_lines else None
     cur = conn.execute(
         """
         INSERT INTO task_runs (
             task_id, profile, step_key,
             status, outcome,
             summary, error, metadata,
+            current_step, progress_percent, latest_log, progress_updated_at,
             started_at, ended_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             task_id, profile, step_key,
             outcome, outcome,
             summary, error,
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            final_step, final_percent, final_log,
+            now if terminal_projection is not None else None,
             now, now,
         ),
     )
@@ -4681,12 +4938,17 @@ def claim_task(
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
+                   started_at    = COALESCE(started_at, ?),
+                   current_step = 'Starting worker',
+                   progress_percent = 1,
+                   latest_log = 'Worker claimed task',
+                   files_changed = COALESCE(files_changed, '[]'),
+                   progress_updated_at = ?
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, now, task_id),
         )
         if cur.rowcount != 1:
             return None
@@ -4702,8 +4964,9 @@ def claim_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                last_heartbeat_at, current_step, progress_percent,
+                latest_log, files_changed, progress_updated_at, started_at
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, NULL, 'Starting worker', 1, ?, '[]', ?, ?)
             """,
             (
                 task_id,
@@ -4712,6 +4975,8 @@ def claim_task(
                 lock,
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
+                "Worker claimed task",
+                now,
                 now,
             ),
         )
@@ -4781,12 +5046,16 @@ def claim_review_task(
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
+                   started_at    = COALESCE(started_at, ?),
+                   current_step = 'Reviewing output',
+                   latest_log = 'Reviewer claimed task',
+                   progress_percent = COALESCE(progress_percent, 100),
+                   progress_updated_at = ?
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, now, task_id),
         )
         if cur.rowcount != 1:
             return None
@@ -4800,8 +5069,9 @@ def claim_review_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                last_heartbeat_at, current_step, progress_percent,
+                latest_log, files_changed, progress_updated_at, started_at
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, NULL, 'Reviewing output', 100, ?, '[]', ?, ?)
             """,
             (
                 task_id,
@@ -4810,6 +5080,8 @@ def claim_review_task(
                 lock,
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
+                "Reviewer claimed task",
+                now,
                 now,
             ),
         )
@@ -5349,6 +5621,123 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def publish_task_output(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: str,
+    metadata: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+    with_reason: bool = False,
+) -> bool | tuple[bool, Optional[str]]:
+    """Commit a user-visible artifact/result before review or governance.
+
+    ``output_ready`` is a durable delivery boundary, not a success verdict.
+    The implementing run is closed and its proof/artifacts are retained, but
+    the workspace is not cleaned and dependent tasks are not promoted. A
+    caller may subsequently complete the task (basic lane) or request review
+    on the same card (async/mandatory lanes).
+    """
+    def _ret(ok: bool, reason: Optional[str] = None):
+        return (ok, reason) if with_reason else ok
+
+    clean_summary = str(summary or "").strip()
+    if not clean_summary:
+        return _ret(False, "Output Ready requires a non-empty summary.")
+    if metadata is not None and not isinstance(metadata, dict):
+        return _ret(False, "Output Ready metadata must be an object.")
+    now = int(time.time())
+    with write_txn(conn):
+        if not _parents_satisfied(conn, task_id):
+            return _ret(False, "Waiting dependency: one or more parent tasks are not done.")
+        row = conn.execute(
+            "SELECT status, claim_lock, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return _ret(False, "Execution failed: task not found.")
+        if row["status"] not in {"working", "running", "ready", "blocked", "output_ready"}:
+            return _ret(
+                False,
+                f"Execution failed: task status {row['status']!r} cannot publish output.",
+            )
+        if (
+            row["status"] == "running"
+            and row["claim_lock"] is not None
+            and expected_run_id is None
+        ):
+            return _ret(
+                False,
+                "Execution failed: live worker ownership requires expected_run_id to publish output.",
+            )
+        if expected_run_id is not None and row["current_run_id"] != int(expected_run_id):
+            return _ret(False, "Execution failed: active run changed before output publication.")
+        params: tuple[Any, ...]
+        run_guard = ""
+        if expected_run_id is None:
+            params = (task_id,)
+        else:
+            params = (task_id, int(expected_run_id))
+            run_guard = " AND current_run_id = ?"
+        cur = conn.execute(
+            "UPDATE tasks SET status='output_ready', claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, block_kind=NULL, "
+            "current_step='Output delivered', progress_percent=100, "
+            "latest_log=?, progress_updated_at=? "
+            "WHERE id=? AND status IN ('working','running','ready','blocked','output_ready')"
+            + run_guard,
+            (
+                clean_summary.splitlines()[0][:800],
+                now,
+                *params,
+            ),
+        )
+        if cur.rowcount != 1:
+            return _ret(False, "Execution failed: task changed before output publication.")
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="output_ready",
+            status="output_ready",
+            summary=clean_summary,
+            metadata=metadata,
+        )
+        if run_id is None:
+            run_id = _synthesize_ended_run(
+                conn,
+                task_id,
+                outcome="output_ready",
+                summary=clean_summary,
+                metadata=metadata,
+            )
+        lines = clean_summary.splitlines()
+        payload: dict[str, Any] = {
+            "summary": lines[0][:400] if lines else clean_summary[:400],
+            "delivery_state": "output_ready",
+        }
+        if isinstance(metadata, dict):
+            artifacts = metadata.get("artifacts")
+            if isinstance(artifacts, (list, tuple)):
+                payload["artifacts"] = [
+                    str(item).strip() for item in artifacts
+                    if isinstance(item, str) and str(item).strip()
+                ][:12]
+            workflow = metadata.get("workflow_v2")
+            if isinstance(workflow, dict):
+                payload["review_policy"] = workflow.get("review_policy")
+        _append_event(conn, task_id, "output_ready", payload, run_id=run_id)
+    task = get_task(conn, task_id)
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_output_ready",
+        task_id,
+        board=get_current_board(),
+        assignee=task.assignee if task else None,
+        run_id=run_id,
+        summary=clean_summary,
+    )
+    return _ret(True, None)
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5359,8 +5748,9 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
-) -> bool:
-    """Transition ``running|ready|blocked|review -> done`` and record ``result``.
+    with_reason: bool = False,
+) -> bool | tuple[bool, Optional[str]]:
+    """Transition ``running|ready|blocked|output_ready|review -> done`` and record ``result``.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
@@ -5391,12 +5781,55 @@ def complete_task(
     Any suspected phantom references are recorded as a
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
+
+    With ``with_reason=True`` the return is ``(ok, lifecycle_reason)`` so model
+    tools, the CLI, and the dashboard can distinguish governance waits,
+    dependencies, user input, and execution failures instead of reporting the
+    lossy ``unknown id or already terminal`` fallback.
     """
+    def completion_result(
+        ok: bool,
+        reason: Optional[str] = None,
+    ) -> bool | tuple[bool, Optional[str]]:
+        return (ok, reason) if with_reason else ok
+
     now = int(time.time())
+    authorization_preconditions = _completion_precondition_snapshot(conn, task_id)
+    if authorization_preconditions is None:
+        return completion_result(False, "Execution failed: task not found.")
+    if authorization_preconditions["status"] not in {"running", "ready", "blocked", "output_ready", "review"}:
+        return completion_result(
+            False,
+            (
+                "Execution failed: task status "
+                f"{authorization_preconditions['status']!r} cannot transition to done."
+            ),
+        )
+    authorized, metadata, authorization_error = _authorize_kanban_completion(
+        task_id,
+        metadata,
+        summary=summary,
+        result=result,
+    )
+    if not authorized:
+        _log.warning("completion denied for %s: %s", task_id, authorization_error)
+        reason = str(authorization_error or "completion denied by policy").strip()
+        if not reason.startswith((
+            "Waiting for Marrow:",
+            "Local review fallback:",
+            "Waiting dependency:",
+            "Needs user:",
+            "Execution failed:",
+        )):
+            reason = f"Execution failed: {reason}"
+        return completion_result(False, reason)
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
-        return False
+        return completion_result(
+            False,
+            "Waiting dependency: one or more parent tasks are not done.",
+        )
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -5429,11 +5862,25 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        # Authorization executes outside SQLite's write lock so plugins never
+        # hold up the board. Revalidate every proof-pinned task input plus
+        # status/current run after BEGIN IMMEDIATE and before the Done write.
+        # Any concurrent edit/claim/review transition forces a safe retry.
+        if not _completion_preconditions_match(
+            conn, task_id, authorization_preconditions
+        ):
+            return completion_result(
+                False,
+                "Execution failed: task state changed during completion authorization; reload and retry.",
+            )
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
         # ``review`` or ``running``.
         if not _parents_satisfied(conn, task_id):
-            return False
+            return completion_result(
+                False,
+                "Waiting dependency: one or more parent tasks changed and are not done.",
+            )
         prior = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
@@ -5446,15 +5893,21 @@ def complete_task(
                    SET status       = 'done',
                        result       = ?,
                        completed_at = ?,
+                       current_step = 'Completed',
+                       progress_percent = 100,
+                       latest_log = ?,
+                       progress_updated_at = ?,
                        claim_lock   = NULL,
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ('running', 'ready', 'blocked', 'output_ready', 'review')
                 """,
-                (result, now, task_id),
+                (result, now,
+                 ((summary if summary is not None else result) or "Completed").splitlines()[0][:800],
+                 now, task_id),
             )
         else:
             cur = conn.execute(
@@ -5463,19 +5916,31 @@ def complete_task(
                    SET status       = 'done',
                        result       = ?,
                        completed_at = ?,
+                       current_step = 'Completed',
+                       progress_percent = 100,
+                       latest_log = ?,
+                       progress_updated_at = ?,
                        claim_lock   = NULL,
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ('running', 'ready', 'blocked', 'output_ready', 'review')
                    AND current_run_id = ?
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (result, now,
+                 ((summary if summary is not None else result) or "Completed").splitlines()[0][:800],
+                 now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
-            return False
+            return completion_result(
+                False,
+                (
+                    "Execution failed: active run or task status changed before the "
+                    "done transition; reload and retry."
+                ),
+            )
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
@@ -5589,7 +6054,7 @@ def complete_task(
             run_id=run_id,
             summary=(summary if summary is not None else result),
         )
-    return True
+    return completion_result(True, None)
 
 
 # ---------------------------------------------------------------------------
@@ -6251,7 +6716,7 @@ def block_task(
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
+    """Transition ``working``/``running``/``ready`` → ``blocked`` (or route elsewhere).
 
     ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
     un-typed block) drives routing instead of every block landing in one
@@ -6317,7 +6782,7 @@ def block_task(
                        worker_pid    = NULL,
                        block_kind    = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('working', 'running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, task_id) if expected_run_id is None
                 else (kind, task_id, int(expected_run_id)),
@@ -6375,7 +6840,7 @@ def block_task(
                        block_kind    = ?,
                        block_recurrences = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('working', 'running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, recurrences, task_id) if expected_run_id is None
                 else (kind, recurrences, task_id, int(expected_run_id)),
@@ -6414,7 +6879,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ('working', 'running', 'ready')
                     """,
                     (kind, recurrences, task_id),
                 )
@@ -6429,7 +6894,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ('working', 'running', 'ready')
                        AND current_run_id = ?
                     """,
                     (kind, recurrences, task_id, int(expected_run_id)),
@@ -6607,14 +7072,14 @@ def request_review(
                    worker_pid    = NULL
             """ + assignee_sql + """
              WHERE id = ?
-               AND status IN ('running', 'ready')
+               AND status IN ('working', 'running', 'ready', 'output_ready')
             """ + run_guard,
             params,
         )
         if cur.rowcount != 1:
             return _ret(
                 False,
-                "task is not in running/ready (or expected_run_id did not "
+                "task is not in running/ready/output_ready (or expected_run_id did not "
                 "match the current run)",
             )
         run_id = _end_run(
@@ -8369,11 +8834,219 @@ def _defer_reclaim_for_live_worker(
         _append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
 
 
+def _bounded_progress_text(value: Any, limit: int) -> Optional[str]:
+    if value is None:
+        return None
+    text = re.sub(r"\s+", " ", str(redact_review_value(value))).strip()
+    return text[:limit] or None
+
+
+def _merge_progress_files(existing: Any, values: Optional[Iterable[str]]) -> list[str]:
+    merged = _decode_string_list(existing)
+    if values is None:
+        return merged
+    seen = {item.casefold() for item in merged}
+    for raw in values:
+        clean = _bounded_progress_text(raw, 500)
+        if not clean or clean.casefold() in seen:
+            continue
+        merged.append(clean)
+        seen.add(clean.casefold())
+    return merged[-50:]
+
+
+def update_worker_progress(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    current_step: Optional[str] = None,
+    progress_percent: Optional[int] = None,
+    latest_log: Optional[str] = None,
+    files_changed: Optional[Iterable[str]] = None,
+    expected_run_id: Optional[int] = None,
+    touch_heartbeat: bool = False,
+    event_kind: str = "progress",
+    event_payload_extra: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """Persist a bounded live-progress projection for one active worker.
+
+    The task row is the cheap board/status read model; the active run mirrors
+    the same values for attempt history. Updates are ownership-pinned when an
+    ``expected_run_id`` is supplied so a late callback from a reclaimed worker
+    cannot overwrite its successor's progress.
+    """
+    step = _bounded_progress_text(current_step, 200)
+    log_line = _bounded_progress_text(latest_log, 800)
+    percent: Optional[int]
+    if progress_percent is None:
+        percent = None
+    else:
+        try:
+            percent = max(0, min(100, int(progress_percent)))
+        except (TypeError, ValueError):
+            return False
+    now = int(time.time())
+    has_progress = any(
+        value is not None
+        for value in (step, percent, log_line, files_changed)
+    )
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id, files_changed FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "running":
+            return False
+        run_id = row["current_run_id"]
+        if expected_run_id is not None and run_id != int(expected_run_id):
+            return False
+        merged_files = _merge_progress_files(row["files_changed"], files_changed)
+        encoded_files = json.dumps(merged_files, ensure_ascii=False)
+        cur = conn.execute(
+            "UPDATE tasks SET "
+            "last_heartbeat_at = CASE WHEN ? THEN ? ELSE last_heartbeat_at END, "
+            "current_step = COALESCE(?, current_step), "
+            "progress_percent = COALESCE(?, progress_percent), "
+            "latest_log = COALESCE(?, latest_log), "
+            "files_changed = ?, "
+            "progress_updated_at = CASE WHEN ? THEN ? ELSE progress_updated_at END "
+            "WHERE id = ? AND status = 'running'"
+            + ("" if expected_run_id is None else " AND current_run_id = ?"),
+            (
+                1 if touch_heartbeat else 0,
+                now,
+                step,
+                percent,
+                log_line,
+                encoded_files,
+                1 if has_progress else 0,
+                now,
+                task_id,
+                *(() if expected_run_id is None else (int(expected_run_id),)),
+            ),
+        )
+        if cur.rowcount != 1:
+            return False
+        if run_id is not None:
+            conn.execute(
+                "UPDATE task_runs SET "
+                "last_heartbeat_at = CASE WHEN ? THEN ? ELSE last_heartbeat_at END, "
+                "current_step = COALESCE(?, current_step), "
+                "progress_percent = COALESCE(?, progress_percent), "
+                "latest_log = COALESCE(?, latest_log), files_changed = ?, "
+                "progress_updated_at = CASE WHEN ? THEN ? ELSE progress_updated_at END "
+                "WHERE id = ?",
+                (
+                    1 if touch_heartbeat else 0,
+                    now,
+                    step,
+                    percent,
+                    log_line,
+                    encoded_files,
+                    1 if has_progress else 0,
+                    now,
+                    int(run_id),
+                ),
+            )
+        payload: dict[str, Any] = {}
+        if step is not None:
+            payload["current_step"] = step
+        if percent is not None:
+            payload["progress_percent"] = percent
+        if log_line is not None:
+            payload["latest_log"] = log_line
+        if files_changed is not None:
+            payload["files_changed"] = merged_files
+        if event_payload_extra:
+            payload.update(dict(event_payload_extra))
+        _append_event(
+            conn,
+            task_id,
+            event_kind,
+            payload or None,
+            run_id=int(run_id) if run_id is not None else None,
+        )
+    return True
+
+
+def task_observability(
+    task: Task,
+    *,
+    now: Optional[int] = None,
+    stalled_after_seconds: int = DEFAULT_STALLED_HEARTBEAT_SECONDS,
+) -> dict[str, Any]:
+    """Return stable API/UI fields describing one task's live execution."""
+    current_time = int(time.time()) if now is None else int(now)
+    heartbeat_anchor = task.last_heartbeat_at or task.started_at
+    heartbeat_age = (
+        max(0, current_time - int(heartbeat_anchor))
+        if heartbeat_anchor is not None
+        else None
+    )
+    threshold = max(1, int(stalled_after_seconds or DEFAULT_STALLED_HEARTBEAT_SECONDS))
+    is_stalled = bool(
+        task.status == "running"
+        and heartbeat_age is not None
+        and heartbeat_age > threshold
+    )
+    terminal_step = {
+        "triage": "Waiting for triage",
+        "todo": "Waiting for dependencies",
+        "scheduled": "Scheduled",
+        "ready": "Waiting for worker",
+        "review": "Waiting for review",
+        "output_ready": "Output delivered",
+        "blocked": "Blocked",
+        "done": "Completed",
+    }.get(task.status)
+    step = terminal_step or task.current_step
+    lowered = (step or "").casefold()
+    if is_stalled:
+        worker_state = "stalled"
+    elif task.status == "running" and "review" in lowered:
+        worker_state = "reviewing"
+    elif task.status == "running" and (
+        lowered.startswith("running ") or "tool" in lowered
+    ):
+        worker_state = "waiting_tool"
+    elif task.status == "running" and "model" in lowered:
+        worker_state = "waiting_model"
+    elif task.status == "running":
+        worker_state = "working"
+    elif task.status in {"review", "output_ready"}:
+        worker_state = "awaiting_review"
+    elif task.status == "working":
+        worker_state = "working"
+    else:
+        worker_state = task.status
+    percent = task.progress_percent
+    if task.status in {"triage", "todo", "scheduled", "ready"} and task.current_run_id is None:
+        percent = 0 if task.started_at is not None else None
+    if percent is None and task.status in {"output_ready", "review", "done"}:
+        percent = 100
+    return {
+        "current_step": step,
+        "progress_percent": percent,
+        "last_heartbeat_at": task.last_heartbeat_at,
+        "heartbeat_age_seconds": heartbeat_age,
+        "files_changed": list(task.files_changed or []),
+        "latest_log": task.latest_log,
+        "progress_updated_at": task.progress_updated_at,
+        "worker_state": worker_state,
+        "is_stalled": is_stalled,
+        "stalled_after_seconds": threshold,
+    }
+
+
 def heartbeat_worker(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     note: Optional[str] = None,
+    current_step: Optional[str] = None,
+    progress_percent: Optional[int] = None,
+    latest_log: Optional[str] = None,
+    files_changed: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
@@ -8386,38 +9059,19 @@ def heartbeat_worker(
     Returns True on success, False if the task is not in a state that
     should be heartbeating (not running, or claim expired).
     """
-    now = int(time.time())
-    with write_txn(conn):
-        if expected_run_id is None:
-            cur = conn.execute(
-                "UPDATE tasks SET last_heartbeat_at = ? "
-                "WHERE id = ? AND status = 'running'",
-                (now, task_id),
-            )
-        else:
-            cur = conn.execute(
-                "UPDATE tasks SET last_heartbeat_at = ? "
-                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
-                (now, task_id, int(expected_run_id)),
-            )
-        if cur.rowcount != 1:
-            return False
-        run_id = (
-            int(expected_run_id)
-            if expected_run_id is not None
-            else _current_run_id(conn, task_id)
-        )
-        if run_id is not None:
-            conn.execute(
-                "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
-                (now, run_id),
-            )
-        _append_event(
-            conn, task_id, "heartbeat",
-            {"note": note} if note else None,
-            run_id=run_id,
-        )
-    return True
+    clean_note = _bounded_progress_text(note, 800)
+    return update_worker_progress(
+        conn,
+        task_id,
+        current_step=current_step,
+        progress_percent=progress_percent,
+        latest_log=latest_log if latest_log is not None else clean_note,
+        files_changed=files_changed,
+        expected_run_id=expected_run_id,
+        touch_heartbeat=True,
+        event_kind="heartbeat",
+        event_payload_extra={"note": clean_note} if clean_note else None,
+    )
 
 
 def enforce_max_runtime(
@@ -9656,9 +10310,31 @@ def _system_memory_sample() -> dict:
     """
     try:
         from gateway.lifecycle_ledger import sample_memory
-        return sample_memory() or {}
+        sample = sample_memory() or {}
+        if sample.get("mem_total_kib") is not None:
+            return sample
     except Exception:
-        return {}
+        sample = {}
+    # ``lifecycle_ledger`` intentionally uses /proc and therefore returns an
+    # empty system sample on Windows/macOS. Hermes already depends on psutil,
+    # so use it as the cross-platform read path. Without this fallback an
+    # explicit burst cap behaved as an unconditional cap on the user's
+    # Windows workstation because live pressure was always "unknown".
+    try:
+        import psutil
+
+        vm = psutil.virtual_memory()
+        sample["mem_total_kib"] = int(vm.total // 1024)
+        sample["mem_available_kib"] = int(vm.available // 1024)
+        swap = psutil.swap_memory()
+        sample["swap_used_kib"] = int(swap.used // 1024)
+        try:
+            sample["rss_kib"] = int(psutil.Process().memory_info().rss // 1024)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return sample
 
 
 def derive_default_max_in_progress(sample: Optional[Mapping[str, Any]] = None) -> Optional[int]:
@@ -9684,14 +10360,14 @@ def derive_default_max_in_progress(sample: Optional[Mapping[str, Any]] = None) -
 def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:
     """Return the effective global concurrency cap for a dispatch tick.
 
-    An explicit operator-configured value always wins. When unset, fall back
-    to the memory-derived default (see :func:`derive_default_max_in_progress`).
-    Callers that parse config (gateway dispatcher, ``hermes kanban dispatch``)
-    should route through this so both paths agree.
+    An explicit operator-configured value is honored for deployments that want
+    a quota. When unset, return ``None``: ordinary dispatch is uncapped by a
+    worker count. The live memory-pressure guard in ``dispatch_once`` remains
+    an independent host-safety mechanism.
     """
     if configured is not None:
         return configured
-    return derive_default_max_in_progress()
+    return None
 
 
 def configured_max_in_progress() -> Optional[int]:
@@ -9699,8 +10375,8 @@ def configured_max_in_progress() -> Optional[int]:
 
     Small shared parser so every dispatch entry point (gateway watcher, CLI
     dispatch, standalone daemon) agrees on what "explicitly configured"
-    means: a positive integer wins, anything else falls through to the
-    memory-derived default via :func:`resolve_max_in_progress`.
+    means a positive integer wins; an unset/invalid value means no configured
+    worker-count quota.
     """
     try:
         from hermes_cli.config import load_config_readonly
@@ -9998,9 +10674,8 @@ def _dispatch_once_locked(
     #
     # max_in_progress is a HOST-level cap, not a per-board one (OOF-30):
     # workers are OS processes sharing one machine's memory, so running
-    # workers on every other board count against the same budget. Without
-    # this, N active boards multiply the cap by N — exactly the fan-out
-    # the memory-derived default exists to prevent.
+    # workers on every other board count against the same explicitly configured
+    # budget. Without this, N active boards could multiply an operator's cap.
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
@@ -10026,6 +10701,24 @@ def _dispatch_once_locked(
         return result
     if pressure == "elevated":
         result.memory_pressure = pressure
+        # Adaptive base lane: the configured max is the healthy-host burst
+        # ceiling. Under elevated pressure keep at most two background
+        # workers alive across all boards, while the foreground Codex chat
+        # remains responsive. This also prevents the old behaviour where
+        # "one new worker per tick" eventually crept all the way to the burst
+        # ceiling despite memory never recovering.
+        adaptive_running = (
+            count_running_tasks(conn) + count_running_tasks_other_boards(board)
+        )
+        adaptive_remaining = max(2 - adaptive_running, 0)
+        if adaptive_remaining == 0:
+            _log.warning(
+                "kanban dispatch: memory is elevated and adaptive base "
+                "capacity (2 workers) is full; deferring new workers"
+            )
+            return result
+        if spawn_budget is None or spawn_budget > adaptive_remaining:
+            spawn_budget = adaptive_remaining
         if spawn_budget is None or spawn_budget > 1:
             _log.warning(
                 "kanban dispatch: system memory pressure is elevated; "
@@ -10940,10 +11633,10 @@ def run_daemon(
     ``stop_event`` (a :class:`threading.Event`) and ``on_tick`` (a
     callable receiving the :class:`DispatchResult`) are test hooks.
 
-    Each tick resolves ``kanban.max_in_progress`` (explicit config, else
-    the memory-derived default) exactly like the gateway-embedded
-    dispatcher and ``hermes kanban dispatch`` — the standalone daemon must
-    not be the one uncapped entry point (OOF-30).
+    Each tick resolves ``kanban.max_in_progress`` exactly like the
+    gateway-embedded dispatcher and ``hermes kanban dispatch``. An unset value
+    intentionally leaves worker-count dispatch uncapped; live memory pressure
+    remains enforced by ``dispatch_once``.
     """
     import signal
     import threading

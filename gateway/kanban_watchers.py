@@ -204,7 +204,7 @@ class GatewayKanbanWatchersMixin:
         For each subscription row, fetches ``task_events`` newer than the
         stored cursor with kind in the terminal set (``completed``,
         ``blocked``, ``gave_up``, ``crashed``, ``timed_out``,
-        ``review_requested``, ``block_loop_detected``). Sends one
+        ``output_ready``, ``review_requested``, ``block_loop_detected``). Sends one
         message per new event to ``(platform, chat_id, thread_id)``,
         then advances the cursor. The subscription is removed only when the
         task is ``archived``. A ``done`` task can be reopened for review or
@@ -239,7 +239,11 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        TERMINAL_KINDS = (
+            "completed", "output_ready", "blocked", "gave_up", "crashed",
+            "timed_out", "status", "archived", "unblocked",
+            "block_loop_detected", "review_requested",
+        )
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -577,6 +581,18 @@ class GatewayKanbanWatchersMixin:
                                 f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
                                 f" — {title}{handoff}"
                             )
+                        elif kind == "output_ready":
+                            handoff = ""
+                            if ev.payload and ev.payload.get("summary"):
+                                handoff = f"\n{str(ev.payload['summary'])[:200]}"
+                                wake_handoff = str(ev.payload["summary"])[:200]
+                            policy = ""
+                            if ev.payload and ev.payload.get("review_policy"):
+                                policy = f" ({ev.payload['review_policy']} review policy)"
+                            msg = (
+                                f"📦 {board_tag}{tag}Kanban {sub['task_id']} output ready{policy}"
+                                f" — {title}{handoff}"
+                            )
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
@@ -781,7 +797,10 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        _WAKE_KINDS = (
+                            "completed", "output_ready", "gave_up", "crashed",
+                            "timed_out", "blocked",
+                        )
                         _wake_kinds = (
                             {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                             if wake_agent
@@ -1315,19 +1334,10 @@ class GatewayKanbanWatchersMixin:
                     max_in_progress = None
                 else:
                     logger.info("kanban dispatcher: max_in_progress=%s", max_in_progress)
-        # When the operator never set kanban.max_in_progress, fall back to a
-        # memory-derived default (OOF-30/OOF-77): unbounded fan-out on small
-        # hosted VMs has repeatedly swap-thrashed the whole machine. Explicit
-        # config always wins; None stays None on hosts where total memory
-        # can't be read (macOS/Windows dev machines).
+        # An unset max_in_progress means no configured worker quota. The
+        # dispatch_once runtime pressure guard remains responsible for
+        # protecting a host that is actually under memory stress.
         effective_max_in_progress = _kb.resolve_max_in_progress(max_in_progress)
-        if max_in_progress is None and effective_max_in_progress is not None:
-            logger.info(
-                "kanban dispatcher: kanban.max_in_progress unset; using "
-                "memory-derived default max_in_progress=%d "
-                "(set kanban.max_in_progress in config.yaml to override)",
-                effective_max_in_progress,
-            )
         max_in_progress = effective_max_in_progress
 
         raw_failure_limit = kanban_cfg.get("failure_limit", _kb.DEFAULT_FAILURE_LIMIT)

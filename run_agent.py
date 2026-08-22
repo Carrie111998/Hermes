@@ -3640,6 +3640,17 @@ class AIAgent:
             changed = getattr(self, "_turn_file_mutation_paths", None)
             if changed is not None:
                 changed.update(landed_paths)
+            if os.environ.get("HERMES_KANBAN_TASK"):
+                try:
+                    from tools.kanban_tools import (
+                        record_current_worker_file_changes_from_env,
+                    )
+                    record_current_worker_file_changes_from_env(landed_paths)
+                except Exception:
+                    logging.debug(
+                        "kanban file-progress projection failed",
+                        exc_info=True,
+                    )
             # Feed the checkpoint agent-write ledger so /rollback's safe mode
             # can tell Hermes-authored content from later user hand-edits.
             mgr = getattr(self, "_checkpoint_mgr", None)
@@ -4025,7 +4036,7 @@ class AIAgent:
                     heartbeat_current_worker_from_env,
                     inject_new_comments_from_env,
                 )
-                heartbeat_current_worker_from_env()
+                heartbeat_current_worker_from_env(self._last_activity_desc)
                 # Fold any new operator notes into the running turn (OUT-OF-BAND
                 # steer) so the user can talk to a live task without a restart.
                 inject_new_comments_from_env(self)

@@ -148,19 +148,42 @@ def _conn(board: Optional[str] = None):
 # tasks into ``todo`` and makes the dashboard look like the Scheduled column
 # disappeared.
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+    "triage", "todo", "scheduled", "ready", "working", "running", "output_ready",
+    "blocked", "review", "done",
 ]
 
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
 
+def _stalled_after_seconds() -> int:
+    try:
+        from hermes_cli.config import load_config
+
+        raw = ((load_config() or {}).get("kanban") or {}).get(
+            "stalled_heartbeat_seconds",
+            kanban_db.DEFAULT_STALLED_HEARTBEAT_SECONDS,
+        )
+        return max(30, int(raw))
+    except (TypeError, ValueError, OSError):
+        return kanban_db.DEFAULT_STALLED_HEARTBEAT_SECONDS
+
+
 def _task_dict(
     task: kanban_db.Task,
     *,
     latest_summary: Optional[str] = None,
+    stalled_after_seconds: Optional[int] = None,
 ) -> dict[str, Any]:
     d = asdict(task)
+    d.update(kanban_db.task_observability(
+        task,
+        stalled_after_seconds=(
+            stalled_after_seconds
+            if stalled_after_seconds is not None
+            else _stalled_after_seconds()
+        ),
+    ))
     # Add derived age metrics so the UI can colour stale cards without
     # computing deltas client-side.
     try:
@@ -174,6 +197,36 @@ def _task_dict(
     d["latest_summary"] = latest_summary
     # Keep body short on list endpoints; full body comes from /tasks/:id.
     return d
+
+
+def _decorate_flow_v2_state(
+    task: kanban_db.Task,
+    data: dict[str, Any],
+    *,
+    output_delivered: bool,
+    reviewing: bool,
+) -> dict[str, Any]:
+    """Add user-facing phase without weakening the kernel task status.
+
+    A review worker legitimately holds a normal ``running`` lease, but moving
+    that card back to the generic In Progress column hides the fact that its
+    output was already delivered. Keep ``data['status']`` authoritative for
+    mutations/recovery while exposing a board/display phase for the UI.
+    """
+    board_status = "review" if reviewing else task.status
+    display_status = task.status
+    if reviewing:
+        display_status = "reviewing"
+    elif task.status == "review":
+        display_status = "review pending"
+    elif task.status == "output_ready":
+        display_status = "output ready"
+    if output_delivered and task.status in {"output_ready", "review", "running"}:
+        display_status += " · output delivered"
+    data["board_status"] = board_status
+    data["display_status"] = display_status
+    data["output_delivered"] = bool(output_delivered)
+    return data
 
 
 def _event_dict(event: kanban_db.Event) -> dict[str, Any]:
@@ -225,6 +278,11 @@ def _run_dict(r: kanban_db.Run) -> dict[str, Any]:
         "worker_pid": r.worker_pid,
         "max_runtime_seconds": r.max_runtime_seconds,
         "last_heartbeat_at": r.last_heartbeat_at,
+        "current_step": r.current_step,
+        "progress_percent": r.progress_percent,
+        "latest_log": r.latest_log,
+        "files_changed": r.files_changed,
+        "progress_updated_at": r.progress_updated_at,
         "started_at": r.started_at,
         "ended_at": r.ended_at,
         "outcome": r.outcome,
@@ -460,13 +518,45 @@ def get_board(
         # for boards with hundreds of tasks). Truncated to a card-size
         # preview here — the full text is available via /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        stalled_after_seconds = _stalled_after_seconds()
+        output_delivered_ids = {
+            row["task_id"]
+            for row in conn.execute(
+                "SELECT DISTINCT task_id FROM task_events WHERE kind = 'output_ready'"
+            ).fetchall()
+        }
+        # Batch-detect review-sourced live claims. This avoids an N+1 lookup
+        # while preserving the kernel's generic ``running`` lease semantics.
+        reviewing_ids: set[str] = set()
+        live_claim_rows = conn.execute(
+            "SELECT t.id AS task_id, e.payload AS payload "
+            "FROM tasks t JOIN task_events e "
+            "ON e.task_id = t.id AND e.run_id = t.current_run_id "
+            "WHERE t.status = 'running' AND e.kind = 'claimed'"
+        ).fetchall()
+        for row in live_claim_rows:
+            try:
+                claim_payload = json.loads(row["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                claim_payload = {}
+            if isinstance(claim_payload, dict) and claim_payload.get("source_status") == "review":
+                reviewing_ids.add(row["task_id"])
 
         for t in tasks:
             full = summary_map.get(t.id)
             preview = (
                 full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
             )
-            d = _task_dict(t, latest_summary=preview)
+            d = _decorate_flow_v2_state(
+                t,
+                _task_dict(
+                    t,
+                    latest_summary=preview,
+                    stalled_after_seconds=stalled_after_seconds,
+                ),
+                output_delivered=t.id in output_delivered_ids,
+                reviewing=t.id in reviewing_ids,
+            )
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -477,7 +567,7 @@ def get_board(
                 # needs the summary.
                 d["diagnostics"] = diags
                 d["warnings"] = _warnings_summary_from_diagnostics(diags)
-            col = t.status if t.status in columns else "todo"
+            col = d["board_status"] if d["board_status"] in columns else "todo"
             columns[col].append(d)
 
         # Stable per-column ordering already applied by list_tasks
@@ -547,7 +637,26 @@ def get_task(
         # operators can read the complete worker handoff without making
         # a second round-trip. Cards on /board carry a 200-char preview.
         full_summary = kanban_db.latest_summary(conn, task_id)
-        task_d = _task_dict(task, latest_summary=full_summary)
+        output_delivered = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'output_ready' LIMIT 1",
+            (task_id,),
+        ).fetchone() is not None
+        reviewing = False
+        if task.status == "running" and task.current_run_id is not None:
+            reviewing = (
+                kanban_db._retry_status_for_run(conn, task_id, task.current_run_id)
+                == "review"
+            )
+        task_d = _decorate_flow_v2_state(
+            task,
+            _task_dict(
+                task,
+                latest_summary=full_summary,
+                stalled_after_seconds=_stalled_after_seconds(),
+            ),
+            output_delivered=output_delivered,
+            reviewing=reviewing,
+        )
         links = _links_for(conn, task_id)
         child_ids = links["children"]
         child_summaries = kanban_db.latest_summaries(conn, child_ids)
@@ -896,13 +1005,19 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if payload.status is not None:
             s = payload.status
             ok = True
+            completion_reason: Optional[str] = None
             if s == "done":
-                ok = kanban_db.complete_task(
+                completion = kanban_db.complete_task(
                     conn, task_id,
                     result=payload.result,
                     summary=payload.summary,
                     metadata=payload.metadata,
+                    with_reason=True,
                 )
+                if isinstance(completion, tuple):
+                    ok, completion_reason = completion
+                else:  # Compatibility with plugin/test shims around the DB API.
+                    ok = bool(completion)
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "scheduled":
@@ -949,6 +1064,8 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             else:
                 raise HTTPException(status_code=400, detail=f"unknown status: {s}")
             if not ok:
+                if s == "done" and completion_reason:
+                    raise HTTPException(status_code=409, detail=completion_reason)
                 # For ``ready``, name the blocking parent(s) so the dashboard
                 # can render an actionable toast instead of a silent no-op.
                 # See #26744.
@@ -1340,13 +1457,19 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         entry.update(ok=False, error="archive refused")
                 if payload.status is not None and not payload.archive:
                     s = payload.status
+                    completion_reason: Optional[str] = None
                     if s == "done":
-                        ok = kanban_db.complete_task(
+                        completion = kanban_db.complete_task(
                             conn, tid,
                             result=payload.result,
                             summary=payload.summary,
                             metadata=payload.metadata,
+                            with_reason=True,
                         )
+                        if isinstance(completion, tuple):
+                            ok, completion_reason = completion
+                        else:  # Compatibility with plugin/test shims around the DB API.
+                            ok = bool(completion)
                     elif s == "blocked":
                         ok = kanban_db.block_task(conn, tid)
                     elif s == "review":
@@ -1387,7 +1510,14 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         results.append(entry)
                         continue
                     if not ok:
-                        entry.update(ok=False, error=f"transition to {s!r} refused")
+                        entry.update(
+                            ok=False,
+                            error=(
+                                completion_reason
+                                if s == "done" and completion_reason
+                                else f"transition to {s!r} refused"
+                            ),
+                        )
                 if payload.assignee is not None:
                     try:
                         if payload.reclaim_first:
@@ -1578,7 +1708,12 @@ def list_active_workers(
                 r.claim_lock,
                 r.claim_expires,
                 r.last_heartbeat_at,
-                r.max_runtime_seconds
+                r.max_runtime_seconds,
+                r.current_step,
+                r.progress_percent,
+                r.latest_log,
+                r.files_changed,
+                r.progress_updated_at
             FROM task_runs r
             JOIN tasks t ON t.id = r.task_id
             WHERE r.ended_at IS NULL
@@ -1587,8 +1722,17 @@ def list_active_workers(
             ORDER BY r.started_at ASC
             """,
         ).fetchall()
-        workers = [
-            {
+        checked_at = int(time.time())
+        stalled_after = _stalled_after_seconds()
+        workers = []
+        for row in rows:
+            heartbeat_anchor = row["last_heartbeat_at"] or row["started_at"]
+            heartbeat_age = (
+                max(0, checked_at - int(heartbeat_anchor))
+                if heartbeat_anchor is not None else None
+            )
+            files_changed = kanban_db._decode_string_list(row["files_changed"])
+            workers.append({
                 "run_id": row["run_id"],
                 "task_id": row["task_id"],
                 "task_title": row["task_title"],
@@ -1601,10 +1745,17 @@ def list_active_workers(
                 "claim_expires": row["claim_expires"],
                 "last_heartbeat_at": row["last_heartbeat_at"],
                 "max_runtime_seconds": row["max_runtime_seconds"],
-            }
-            for row in rows
-        ]
-        return {"workers": workers, "count": len(workers), "checked_at": int(time.time())}
+                "current_step": row["current_step"],
+                "progress_percent": row["progress_percent"],
+                "latest_log": row["latest_log"],
+                "files_changed": files_changed,
+                "progress_updated_at": row["progress_updated_at"],
+                "heartbeat_age_seconds": heartbeat_age,
+                "is_stalled": bool(
+                    heartbeat_age is not None and heartbeat_age > stalled_after
+                ),
+            })
+        return {"workers": workers, "count": len(workers), "checked_at": checked_at}
     finally:
         conn.close()
 

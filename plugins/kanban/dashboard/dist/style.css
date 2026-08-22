@@ -174,6 +174,9 @@
 .hermes-kanban-dot-todo     { background: var(--color-muted-foreground); }
 .hermes-kanban-dot-ready    { background: #d4b348; }  /* amber */
 .hermes-kanban-dot-running  { background: #3fb97d; }  /* green */
+.hermes-kanban-dot-working  { background: #25b7c7; }  /* cyan — foreground controller owns execution */
+.hermes-kanban-dot-output-ready { background: #9a6ee8; }  /* violet — delivered, verification pending */
+.hermes-kanban-output-badge { color: #c4b5fd; border-color: #8b5cf6; background: #6d28d922; }
 .hermes-kanban-dot-blocked  { background: var(--color-destructive, #d14a4a); }
 .hermes-kanban-dot-review   { background: #48b0c4; }  /* cyan — awaiting review */
 .hermes-kanban-dot-done     { background: #4a8cd1; }  /* blue */
@@ -273,6 +276,75 @@
   color: var(--color-foreground);
   word-break: break-word;
 }
+
+.hermes-kanban-live-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 0.22rem;
+  padding: 0.32rem 0.4rem;
+  border-radius: var(--radius-sm, 0.25rem);
+  background: color-mix(in srgb, var(--color-ring) 7%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-ring) 20%, var(--color-border));
+}
+.hermes-kanban-live-progress-head {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 0;
+}
+.hermes-kanban-worker-state {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  padding: 0.04rem 0.28rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, #3fb97d 18%, transparent);
+  border: 1px solid color-mix(in srgb, #3fb97d 42%, transparent);
+  color: var(--color-foreground);
+  font-size: 0.6rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.hermes-kanban-worker-state--stalled {
+  background: color-mix(in srgb, var(--color-destructive, #d14a4a) 18%, transparent);
+  border-color: color-mix(in srgb, var(--color-destructive, #d14a4a) 55%, transparent);
+  color: #ffb4b4;
+}
+.hermes-kanban-current-step {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-foreground);
+  font-size: 0.68rem;
+}
+.hermes-kanban-progress-percent {
+  flex: none;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.64rem;
+  color: var(--color-muted-foreground);
+}
+.hermes-kanban-progress-track {
+  width: 100%;
+  height: 0.24rem;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-foreground) 10%, transparent);
+}
+.hermes-kanban-progress-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #25b7c7, #3fb97d);
+  transition: width 180ms ease;
+}
+.hermes-kanban-heartbeat {
+  font-size: 0.62rem;
+  color: var(--color-muted-foreground);
+}
+.hermes-kanban-heartbeat--stalled { color: #ff9d9d; }
 
 .hermes-kanban-card-meta {
   font-size: 0.7rem;
@@ -511,6 +583,53 @@
   font-weight: 600;
   letter-spacing: 0.07em;
   color: var(--color-muted-foreground);
+}
+
+.hermes-kanban-observability {
+  padding: 0.55rem 0.6rem;
+  border: 1px solid color-mix(in srgb, var(--color-ring) 35%, var(--color-border));
+  border-radius: var(--radius-sm, 0.25rem);
+  background: color-mix(in srgb, var(--color-ring) 6%, transparent);
+}
+.hermes-kanban-observability--stalled {
+  border-color: color-mix(in srgb, var(--color-destructive, #d14a4a) 60%, var(--color-border));
+  background: color-mix(in srgb, var(--color-destructive, #d14a4a) 8%, transparent);
+}
+.hermes-kanban-observability .hermes-kanban-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.hermes-kanban-observability-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.hermes-kanban-progress-track--drawer { height: 0.36rem; }
+.hermes-kanban-latest-log {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.hermes-kanban-latest-log-label {
+  color: var(--color-muted-foreground);
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+.hermes-kanban-latest-log code,
+.hermes-kanban-files-changed code {
+  font-size: 0.7rem;
+  color: var(--color-foreground);
+  overflow-wrap: anywhere;
+}
+.hermes-kanban-files-changed ul {
+  margin: 0.2rem 0 0;
+  padding-left: 1.1rem;
+  max-height: 8rem;
+  overflow: auto;
 }
 
 .hermes-kanban-pre {

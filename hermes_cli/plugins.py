@@ -281,6 +281,11 @@ VALID_HOOKS: Set[str] = {
     # kanban_task_completed adds: summary: str | None.
     # kanban_task_blocked adds:   reason: str | None.
     "kanban_task_claimed",
+    # Durable user-delivery boundary; review/governance may continue later.
+    "kanban_task_output_ready",
+    # Vetoable policy boundary fired before complete_task opens its write txn.
+    # Callers require an explicit {allow: bool} response when subscribed.
+    "pre_kanban_task_complete",
     "kanban_task_completed",
     "kanban_task_blocked",
     # Kanban worker-lifecycle, task-mutation, and dispatcher-tick observers

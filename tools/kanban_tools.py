@@ -31,6 +31,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import time
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -296,9 +298,99 @@ def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
 
 _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
 _auto_heartbeat_last_attempt: float = 0.0
+_AUTO_PROGRESS_SAME_STEP_INTERVAL_SECONDS = 15.0
+_auto_progress_last_write: float = 0.0
+_auto_progress_signature: Optional[str] = None
+_auto_progress_percent: int = 1
+_auto_progress_task_id: Optional[str] = None
 
 
-def heartbeat_current_worker_from_env() -> bool:
+def _progress_projection(activity: str) -> tuple[str, str, int]:
+    """Map the agent's internal activity clock to a compact operator view."""
+    text = re.sub(r"\s+", " ", str(activity or "")).strip()[:800]
+    lowered = text.casefold()
+    if lowered.startswith("executing tool:"):
+        tool = text.split(":", 1)[1].strip() or "tool"
+        return f"Running {tool}", text, 5
+    if lowered.startswith("tool completed:"):
+        tool = text.split(":", 1)[1].strip() or "tool"
+        return f"Finished {tool}", text, 5
+    if "waiting for" in lowered and ("api" in lowered or "model" in lowered):
+        return "Waiting for model", text, 2
+    if lowered.startswith("starting api call"):
+        return "Waiting for model", text, 2
+    if "receiving" in lowered and ("stream" in lowered or "response" in lowered):
+        return "Generating response", text, 3
+    if "tool results posted" in lowered:
+        return "Evaluating tool results", text, 3
+    return text[:200] or "Working", text or "Worker active", 1
+
+
+def progress_current_worker_from_env(
+    activity: str,
+    *,
+    files_changed: Optional[list[str]] = None,
+    force: bool = False,
+) -> bool:
+    """Best-effort live progress update for the current Kanban worker."""
+    global _auto_progress_last_write
+    global _auto_progress_signature
+    global _auto_progress_percent
+    global _auto_progress_task_id
+
+    tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not tid:
+        return False
+    step, log_line, increment = _progress_projection(activity)
+    signature = f"{step}\x00{log_line}"
+    now = time.monotonic()
+    if _auto_progress_task_id != tid:
+        _auto_progress_task_id = tid
+        _auto_progress_last_write = 0.0
+        _auto_progress_signature = None
+        _auto_progress_percent = 1
+    if (
+        not force
+        and signature == _auto_progress_signature
+        and (now - _auto_progress_last_write) < _AUTO_PROGRESS_SAME_STEP_INTERVAL_SECONDS
+    ):
+        return False
+    _auto_progress_last_write = now
+    _auto_progress_signature = signature
+    _auto_progress_percent = min(95, max(1, _auto_progress_percent + increment))
+    try:
+        kb, conn = _connect()
+        try:
+            return bool(kb.update_worker_progress(
+                conn,
+                tid,
+                current_step=step,
+                progress_percent=_auto_progress_percent,
+                latest_log=log_line,
+                files_changed=files_changed,
+                expected_run_id=_worker_run_id(tid),
+            ))
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("auto-progress: bridge failed", exc_info=True)
+        return False
+
+
+def record_current_worker_file_changes_from_env(paths: list[str]) -> bool:
+    """Project landed file mutations into the active task/run."""
+    clean = [str(path) for path in paths if str(path).strip()]
+    if not clean:
+        return False
+    label = f"Updated {len(clean)} file{'s' if len(clean) != 1 else ''}"
+    return progress_current_worker_from_env(
+        label,
+        files_changed=clean,
+        force=True,
+    )
+
+
+def heartbeat_current_worker_from_env(activity: Optional[str] = None) -> bool:
     """Best-effort: extend the kanban claim + bump board heartbeat for the
     current dispatcher-spawned worker, using identity from env vars.
 
@@ -323,6 +415,8 @@ def heartbeat_current_worker_from_env() -> bool:
     tid = os.environ.get("HERMES_KANBAN_TASK")
     if not tid:
         return False
+    if activity:
+        progress_current_worker_from_env(activity)
     import time as _time
     now = _time.monotonic()
     if (now - _auto_heartbeat_last_attempt) < _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS:
@@ -486,7 +580,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
     """Compact task shape for board-listing tools."""
     parents = kb.parent_ids(conn, task.id)
     children = kb.child_ids(conn, task.id)
-    return {
+    payload = {
         "id": task.id,
         "title": task.title,
         "assignee": task.assignee,
@@ -508,6 +602,8 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "parent_count": len(parents),
         "child_count": len(children),
     }
+    payload.update(kb.task_observability(task))
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -536,7 +632,7 @@ def _handle_show(args: dict, **kw) -> str:
             children = kb.child_ids(conn, tid)
 
             def _task_dict(t):
-                return {
+                payload = {
                     "id": t.id, "title": t.title, "body": t.body,
                     "assignee": t.assignee, "status": t.status,
                     "tenant": t.tenant, "priority": t.priority,
@@ -550,6 +646,8 @@ def _handle_show(args: dict, **kw) -> str:
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
                 }
+                payload.update(kb.task_observability(t))
+                return payload
 
             def _run_dict(r):
                 return {
@@ -557,6 +655,12 @@ def _handle_show(args: dict, **kw) -> str:
                     "status": r.status, "outcome": r.outcome,
                     "summary": r.summary, "error": r.error,
                     "metadata": r.metadata,
+                    "last_heartbeat_at": r.last_heartbeat_at,
+                    "current_step": r.current_step,
+                    "progress_percent": r.progress_percent,
+                    "latest_log": r.latest_log,
+                    "files_changed": r.files_changed,
+                    "progress_updated_at": r.progress_updated_at,
                     "started_at": r.started_at, "ended_at": r.ended_at,
                 }
 
@@ -766,12 +870,17 @@ def _handle_complete(args: dict, **kw) -> str:
                 )
 
             try:
-                ok = kb.complete_task(
+                completion = kb.complete_task(
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    with_reason=True,
                 )
+                if isinstance(completion, tuple):
+                    ok, completion_reason = completion
+                else:  # Compatibility with plugin/test shims around the DB API.
+                    ok, completion_reason = bool(completion), None
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
                     f"kanban_complete could not preserve the declared artifacts: "
@@ -801,7 +910,8 @@ def _handle_complete(args: dict, **kw) -> str:
                 )
             if not ok:
                 return tool_error(
-                    f"could not complete {tid} (unknown id or already terminal)"
+                    completion_reason
+                    or f"Execution failed: could not complete {tid}; reload task state and retry."
                 )
             run = kb.latest_run(conn, tid)
             return _ok(task_id=tid, run_id=run.id if run else None)
@@ -1043,6 +1153,12 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     if ownership_err:
         return ownership_err
     note = args.get("note")
+    current_step = args.get("current_step")
+    progress_percent = args.get("progress_percent")
+    files_changed = args.get("files_changed")
+    latest_log = args.get("latest_log")
+    if files_changed is not None and not isinstance(files_changed, list):
+        return tool_error("files_changed must be an array of paths")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1059,6 +1175,10 @@ def _handle_heartbeat(args: dict, **kw) -> str:
                 conn,
                 tid,
                 note=note,
+                current_step=current_step,
+                progress_percent=progress_percent,
+                latest_log=latest_log,
+                files_changed=files_changed,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -1998,6 +2118,26 @@ KANBAN_HEARTBEAT_SCHEMA = {
                     "Optional short note describing current progress. "
                     "Shown in the event log."
                 ),
+            },
+            "current_step": {
+                "type": "string",
+                "description": "Short human-readable description of the current step.",
+            },
+            "progress_percent": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 100,
+                "description": "Best-effort completion estimate for this task.",
+            },
+            "latest_log": {
+                "type": "string",
+                "description": "One bounded, user-safe latest activity line.",
+            },
+            "files_changed": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 50,
+                "description": "Files changed so far by this worker.",
             },
             "board": _board_schema_prop(),
         },

@@ -273,6 +273,32 @@ def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):
         )
 
 
+def test_active_reviewer_stays_in_review_with_output_delivered(client):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="output first", assignee="builder")
+        assert kb.publish_task_output(conn, task_id, summary="Usable artifact")
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="Usable artifact",
+            reviewer="reviewer",
+        )
+        claimed = kb.claim_review_task(conn, task_id)
+        assert claimed is not None and claimed.status == "running"
+
+    board = client.get("/api/plugins/kanban/board").json()
+    review_column = next(col for col in board["columns"] if col["name"] == "review")
+    card = next(task for task in review_column["tasks"] if task["id"] == task_id)
+    assert card["status"] == "running"  # authoritative worker lease
+    assert card["board_status"] == "review"
+    assert card["display_status"] == "reviewing · output delivered"
+    assert card["output_delivered"] is True
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{task_id}").json()["task"]
+    assert detail["display_status"] == "reviewing · output delivered"
+    assert detail["output_delivered"] is True
+
+
 def test_reopening_parent_demotes_ready_child(client):
     """Reopening a completed parent must invalidate ready children immediately.
 
@@ -1228,5 +1254,3 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
-

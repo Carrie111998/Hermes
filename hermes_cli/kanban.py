@@ -57,7 +57,7 @@ def _fmt_task_line(t: kb.Task) -> str:
 
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
-    return {
+    payload = {
         "id": t.id,
         "title": t.title,
         "body": t.body,
@@ -82,6 +82,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
     }
+    payload.update(kb.task_observability(t))
+    return payload
 
 
 def _run_state_kwargs(args: argparse.Namespace) -> Optional[dict[str, str]]:
@@ -1739,6 +1741,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
                     "error": r.error,
                     "metadata": r.metadata,
                     "worker_pid": r.worker_pid,
+                    "last_heartbeat_at": r.last_heartbeat_at,
+                    "current_step": r.current_step,
+                    "progress_percent": r.progress_percent,
+                    "latest_log": r.latest_log,
+                    "files_changed": r.files_changed,
+                    "progress_updated_at": r.progress_updated_at,
                     "started_at": r.started_at,
                     "ended_at": r.ended_at,
                 }
@@ -1780,6 +1788,22 @@ def _cmd_show(args: argparse.Namespace) -> int:
         else:
             print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
     print(f"  created:   {_fmt_ts(task.created_at)} by {task.created_by or '-'}")
+    observability = kb.task_observability(task)
+    if observability["current_step"]:
+        percent = observability["progress_percent"]
+        suffix = f" ({percent}%, estimate)" if percent is not None else ""
+        print(f"  activity:  {observability['current_step']}{suffix}")
+    if task.last_heartbeat_at:
+        print(f"  heartbeat: {_fmt_ts(task.last_heartbeat_at)}")
+    if observability["is_stalled"]:
+        print(
+            f"  warning:   stalled — no heartbeat for "
+            f"{observability['heartbeat_age_seconds']}s"
+        )
+    if task.latest_log:
+        print(f"  latest:    {task.latest_log}")
+    if task.files_changed:
+        print(f"  files:     {', '.join(task.files_changed)}")
 
     # Diagnostics section — surface active distress signals at the top
     # of show output so CLI users see them before scrolling through
@@ -2292,15 +2316,25 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
-            if not kb.complete_task(
+            completion = kb.complete_task(
                 conn, tid,
                 result=args.result,
                 summary=summary,
                 metadata=metadata,
                 expected_run_id=_worker_run_id_for(tid),
-            ):
+                with_reason=True,
+            )
+            if isinstance(completion, tuple):
+                completed, completion_reason = completion
+            else:  # Compatibility with tests/third-party shims around the DB API.
+                completed, completion_reason = bool(completion), None
+            if not completed:
                 failed.append(tid)
-                print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+                print(
+                    completion_reason
+                    or f"Execution failed: cannot complete {tid}; reload task state and retry.",
+                    file=sys.stderr,
+                )
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1

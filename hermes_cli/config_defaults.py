@@ -2665,13 +2665,10 @@ DEFAULT_CONFIG = {
         # across every active board and across both the ready and review
         # dispatch lanes (workers are OS processes sharing one machine's
         # memory, so the cap bounds the machine, not each board; OOF-30).
-        # Unset (None) means
-        # "derive from system memory" (OOF-30/OOF-77): the dispatcher caps
-        # concurrency at roughly MemTotal / 512 MiB, clamped to [2, 8] —
-        # e.g. 2 workers on a 1 GiB VM. On hosts where total memory can't
-        # be read (macOS/Windows), unset falls back to no cap. Set an
-        # explicit value to override the derived default in either
-        # direction.
+        # Unset (None) means no worker-count quota. The dispatcher still has
+        # an independent live memory-pressure safety guard; it is not a fixed
+        # concurrency limit and only defers new work while the host is under
+        # actual pressure.
         "max_in_progress": None,
         # Per-profile concurrency cap (#21582). When set to a positive int,
         # no single profile can have more than N workers running at once,
@@ -2697,6 +2694,11 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Operator-facing warning threshold only: a running card with no
+        # heartbeat beyond this age is labelled ``stalled`` in dashboard and
+        # status APIs. This does not terminate or requeue the worker; recovery
+        # remains governed by dispatch_stale_timeout_seconds and claim TTLs.
+        "stalled_heartbeat_seconds": 300,
         # Orphaned-card reconciliation: each dispatcher tick, requeue
         # 'running' cards whose claim bookkeeping is broken (claim_lock or
         # claim_expires NULL with a dead/gone worker) — zombies invisible
