@@ -46,6 +46,33 @@ class AccountUsageSnapshot:
         return bool(self.windows or self.details) and not self.unavailable_reason
 
 
+def account_usage_to_dict(snapshot: AccountUsageSnapshot) -> dict[str, Any]:
+    """Return the redacted, JSON-safe account-usage contract for UI surfaces."""
+    windows = []
+    for window in snapshot.windows:
+        used = None if window.used_percent is None else max(0.0, min(100.0, float(window.used_percent)))
+        windows.append(
+            {
+                "label": window.label,
+                "used_percent": used,
+                "remaining_percent": None if used is None else 100.0 - used,
+                "reset_at": window.reset_at.isoformat() if window.reset_at else None,
+                "detail": window.detail,
+            }
+        )
+    return {
+        "available": snapshot.available,
+        "provider": snapshot.provider,
+        "source": snapshot.source,
+        "fetched_at": snapshot.fetched_at.isoformat(),
+        "title": snapshot.title,
+        "plan": snapshot.plan,
+        "windows": windows,
+        "details": list(snapshot.details),
+        "unavailable_reason": snapshot.unavailable_reason,
+    }
+
+
 def _title_case_slug(value: Optional[str]) -> Optional[str]:
     cleaned = str(value or "").strip()
     if not cleaned:

@@ -51,12 +51,15 @@ test('detectRemoteDisplay does not treat WSLg as remote', () => {
   )
 })
 
-test('detectRemoteDisplay flags SSH sessions on any platform', () => {
+test('detectRemoteDisplay flags SSH sessions except native macOS WindowServer', () => {
   assert.equal(
     detectRemoteDisplay({ env: { SSH_CONNECTION: '1.2.3.4 5 6.7.8.9 22' }, platform: 'linux' }),
     'ssh-session'
   )
-  assert.equal(detectRemoteDisplay({ env: { SSH_CLIENT: '1.2.3.4 5 22' }, platform: 'darwin' }), 'ssh-session')
+  // A macOS app always renders through the local WindowServer. Launching it
+  // from an SSH-inherited shell does not make the GUI display remote, and
+  // disabling acceleration here forces costly software compositing.
+  assert.equal(detectRemoteDisplay({ env: { SSH_CLIENT: '1.2.3.4 5 22' }, platform: 'darwin' }), null)
   assert.equal(detectRemoteDisplay({ env: { SSH_TTY: '/dev/pts/0' }, platform: 'win32' }), 'ssh-session')
 })
 
@@ -74,6 +77,15 @@ test('detectRemoteDisplay honors the HERMES_DESKTOP_DISABLE_GPU override both wa
   // Force-on even on a local display.
   assert.match(
     String(detectRemoteDisplay({ env: { HERMES_DESKTOP_DISABLE_GPU: '1', DISPLAY: ':0' }, platform: 'linux' })),
+    /override/
+  )
+  assert.match(
+    String(
+      detectRemoteDisplay({
+        env: { HERMES_DESKTOP_DISABLE_GPU: 'true', SSH_CLIENT: '1.2.3.4 5 22' },
+        platform: 'darwin'
+      })
+    ),
     /override/
   )
   // Force-off even over SSH (escape hatch when a remote display has working accel).

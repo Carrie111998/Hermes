@@ -383,10 +383,9 @@ registry.registerMany([
 // zone. Review collapses to nothing while its pane is hidden (⌘G off).
 //
 // Preview tiles are DYNAMIC panes (like session tiles), so no preset names one:
-// they're registered by watchPreviewTiles as tabs open, and dockPaneBeside lands
-// each one directly beside the file tree wherever that currently lives — so a
-// file double-click still slides a preview open as its own pane next to the
-// tree, never as a tab stacked into the files sidebar.
+// the first preview docks beside the workspace, then later files center-dock into
+// that preview zone as ordinary tabs. The file browser remains its own outer
+// sidebar, so toggling Files never hides the open preview tab group.
 const DEFAULT_TREE = split(
   'row',
   [

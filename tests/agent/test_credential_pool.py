@@ -39,6 +39,210 @@ def _jwt_with_claims(claims: dict) -> str:
 
 
 
+def test_prioritize_moves_selected_credential_first_and_persists(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: None)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "work",
+                        "label": "Work",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "«redacted:key-work»",
+                    },
+                    {
+                        "id": "personal",
+                        "label": "Personal",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "«redacted:key-personal»",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("anthropic")
+    assert pool.prioritize("personal") is True
+    assert [(entry.id, entry.priority) for entry in pool.entries()] == [
+        ("personal", 0),
+        ("work", 1),
+    ]
+    assert load_pool("anthropic").entries()[0].id == "personal"
+    assert pool.prioritize("missing") is False
+
+
+def test_prioritize_seeded_anthropic_credential_survives_normalization(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: None)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "pkce",
+                        "label": "Hermes OAuth",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "hermes_pkce",
+                        "access_token": "«redacted:pkce»",
+                    },
+                    {
+                        "id": "claude",
+                        "label": "Claude Code",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "claude_code",
+                        "access_token": "«redacted:claude»",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_singletons",
+        lambda _provider, _entries: (False, {"hermes_pkce", "claude_code"}),
+    )
+    assert load_pool("anthropic").prioritize("claude") is True
+    reloaded = load_pool("anthropic")
+    assert reloaded.entries()[0].id == "claude"
+    selected = reloaded.select()
+    assert selected is not None
+    assert selected.id == "claude"
+
+
+def test_anthropic_normalization_clears_duplicate_preferred_markers(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "pkce",
+                        "label": "Hermes OAuth",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "hermes_pkce",
+                        "access_token": "«redacted:pkce»",
+                        "preferred": True,
+                    },
+                    {
+                        "id": "claude",
+                        "label": "Claude Code",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "claude_code",
+                        "access_token": "«redacted:claude»",
+                        "preferred": True,
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_singletons",
+        lambda _provider, _entries: (False, {"hermes_pkce", "claude_code"}),
+    )
+    pool = load_pool("anthropic")
+    preferred = [entry for entry in pool.entries() if entry.extra.get("preferred") is True]
+    assert [entry.id for entry in preferred] == ["pkce"]
+
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted_preferred = [
+        entry["id"]
+        for entry in persisted["credential_pool"]["anthropic"]
+        if entry.get("preferred") is True
+    ]
+    assert persisted_preferred == ["pkce"]
+
+
+
+def test_anthropic_normalization_clears_duplicate_ids_preferred_markers():
+    from agent.credential_pool import PooledCredential, _normalize_pool_priorities
+
+    entries = [
+        PooledCredential.from_dict(
+            "anthropic",
+            {
+                "id": "same",
+                "label": "First",
+                "source": "hermes_pkce",
+                "priority": 0,
+                "access_token": "«redacted:first»",
+                "preferred": True,
+            },
+        ),
+        PooledCredential.from_dict(
+            "anthropic",
+            {
+                "id": "same",
+                "label": "Second",
+                "source": "claude_code",
+                "priority": 1,
+                "access_token": "«redacted:second»",
+                "preferred": True,
+            },
+        ),
+    ]
+
+    assert _normalize_pool_priorities("anthropic", entries) is True
+    assert sum(entry.extra.get("preferred") is True for entry in entries) == 1
+
+
+
+def test_prefer_eligible_credential_persists_only_available_entry(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {"id": "first", "priority": 0, "access_token": "one", "source": "manual"},
+                    {"id": "second", "priority": 1, "access_token": "two", "source": "manual"},
+                    {
+                        "id": "blocked",
+                        "priority": 2,
+                        "access_token": "three",
+                        "source": "manual",
+                        "last_status": "exhausted",
+                    },
+                ]
+            },
+        },
+    )
+
+    from hermes_cli.auth import prefer_eligible_credential
+
+    assert prefer_eligible_credential("openai-codex", "blocked") == "unavailable"
+    assert prefer_eligible_credential("openai-codex", "second") == "saved"
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    entries = persisted["credential_pool"]["openai-codex"]
+    assert entries[0]["id"] == "second"
+    assert entries[0]["preferred"] is True
+    assert all(entry.get("preferred") is not True for entry in entries[1:])
+
+
+
 def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     # Prevent auto-seeding from Codex CLI tokens on the host

@@ -1,7 +1,10 @@
 import { useStore } from '@nanostores/react'
-import { type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useRef, useState } from 'react'
+import { type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useRef, useState } from 'react'
 
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { Button } from '@/components/ui/button'
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
 import {
   ContextMenu,
   ContextMenuContent,
@@ -20,9 +23,11 @@ import {
   closeFileActionDialog,
   copyFilePath,
   downloadRemoteFile,
+  executeFileCreate,
   executeFileDelete,
   executeFileRename,
   type FileActionTarget,
+  requestFileCreate,
   requestFileDelete,
   revealFile,
   shouldOfferRemoteFileDownload,
@@ -41,6 +46,17 @@ export function isRenameShortcut(event: KeyboardEvent | ReactKeyboardEvent): boo
  *  / containing folder). Shared so every file menu reads consistently. */
 export function pickRevealLabel(finder: string, explorer: string, fileManager: string): string {
   return IS_MAC ? finder : IS_WIN ? explorer : fileManager
+}
+
+export function parentPathForEntry(path: string, isDirectory: boolean): string {
+  if (isDirectory) return path
+  const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+
+  if (slash < 0) return path
+  if (slash === 0) return '/'
+  if (slash === 2 && /^[a-zA-Z]:[\\/]/u.test(path)) return path.slice(0, 3)
+
+  return path.slice(0, slash)
 }
 
 interface FileEntryContextMenuProps {
@@ -72,6 +88,13 @@ export function FileEntryContextMenu({ children, isDirectory, name, path, relati
       {/* Don't restore focus to the row on close: "Rename" mounts an autofocused
           inline input, and the default focus-return would blur it immediately. */}
       <ContextMenuContent onCloseAutoFocus={event => event.preventDefault()}>
+        <ContextMenuItem onSelect={() => requestFileCreate(parentPathForEntry(path, isDirectory), false)}>
+          New File
+        </ContextMenuItem>
+        <ContextMenuItem onSelect={() => requestFileCreate(parentPathForEntry(path, isDirectory), true)}>
+          New Folder
+        </ContextMenuItem>
+        <ContextMenuSeparator />
         {localFs && (
           <>
             <ContextMenuItem onSelect={() => void revealFile(path)}>{revealLabel}</ContextMenuItem>
@@ -110,21 +133,80 @@ export function FileActionDialogs() {
   const { t } = useI18n()
   const dialog = useStore($fileActionDialog)
   const deleting = dialog?.kind === 'delete'
+  const creating = dialog?.kind === 'create'
+  const [name, setName] = useState('')
+  const [creatingBusy, setCreatingBusy] = useState(false)
+  const createRequest = useRef(0)
+
+  useEffect(() => {
+    if (creating) {
+      createRequest.current += 1
+      setName('')
+      setCreatingBusy(false)
+    }
+  }, [creating, dialog && dialog.kind === 'create' ? dialog.parentPath : null])
+
+  const create = async () => {
+    if (!creating || creatingBusy || !name.trim()) return
+    const request = ++createRequest.current
+    const activeDialog = dialog
+    setCreatingBusy(true)
+    try {
+      await executeFileCreate(dialog.parentPath, name.trim(), dialog.isDirectory)
+      if (createRequest.current === request && $fileActionDialog.get() === activeDialog) {
+        closeFileActionDialog()
+      }
+    } catch (error) {
+      if (createRequest.current === request) {
+        notifyError(error, translateNow('errors.genericFailure'))
+      }
+    } finally {
+      if (createRequest.current === request) setCreatingBusy(false)
+    }
+  }
 
   return (
-    <ConfirmDialog
-      confirmLabel={t.fileMenu.delete}
-      description={t.fileMenu.deleteBody}
-      destructive
-      onClose={closeFileActionDialog}
-      onConfirm={() => {
-        if (deleting) {
-          return executeFileDelete(dialog.path)
-        }
-      }}
-      open={deleting}
-      title={deleting ? t.fileMenu.deleteTitle(dialog.name) : ''}
-    />
+    <>
+      <ConfirmDialog
+        confirmLabel={t.fileMenu.delete}
+        description={t.fileMenu.deleteBody}
+        destructive
+        onClose={closeFileActionDialog}
+        onConfirm={() => {
+          if (deleting) {
+            return executeFileDelete(dialog.path)
+          }
+        }}
+        open={deleting}
+        title={deleting ? t.fileMenu.deleteTitle(dialog.name) : ''}
+      />
+      <Dialog onOpenChange={open => !open && !creatingBusy && closeFileActionDialog()} open={creating}>
+        <DialogContent className="w-[min(26rem,92vw)]">
+          <DialogHeader>
+            <DialogTitle>{creating && dialog.isDirectory ? 'New Folder' : 'New File'}</DialogTitle>
+          </DialogHeader>
+          <Input
+            aria-label={creating && dialog.isDirectory ? 'Folder name' : 'File name'}
+            autoFocus
+            onChange={event => setName(event.target.value)}
+            onKeyDown={event => {
+              if (event.key === 'Enter') {
+                event.preventDefault()
+                void create()
+              }
+            }}
+            placeholder={creating && dialog.isDirectory ? 'Folder name' : 'File name'}
+            value={name}
+          />
+          <DialogFooter>
+            <Button disabled={creatingBusy} onClick={closeFileActionDialog} variant="ghost">Cancel</Button>
+            <Button disabled={creatingBusy || !name.trim()} onClick={() => void create()}>
+              {creatingBusy ? 'Creating…' : 'Create'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   )
 }
 

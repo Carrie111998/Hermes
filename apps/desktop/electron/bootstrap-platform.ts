@@ -76,9 +76,12 @@ function detectRemoteDisplay(options: { env?: NodeJS.ProcessEnv; platform?: Node
     return null
   }
 
-  // Launched from an SSH session → the display is X11-forwarded or otherwise
-  // remote. Covers the common `ssh user@box` + GUI-forwarding case.
-  if (env.SSH_CONNECTION || env.SSH_CLIENT || env.SSH_TTY) {
+  // Launched from an SSH session. On Linux this commonly means X11/Wayland
+  // forwarding, and on Windows it can mean a non-console session. macOS is the
+  // exception: native apps always present through the local WindowServer, even
+  // when their parent shell inherited SSH_* variables. Disabling acceleration
+  // there forces full software compositing and is dramatically more expensive.
+  if (platform !== 'darwin' && (env.SSH_CONNECTION || env.SSH_CLIENT || env.SSH_TTY)) {
     return 'ssh-session'
   }
 

@@ -169,6 +169,7 @@ _EXTRA_KEYS = frozenset({
     "token_type", "scope", "client_id", "portal_base_url", "obtained_at",
     "expires_in", "agent_key_id", "agent_key_expires_in", "agent_key_reused",
     "agent_key_obtained_at", "tls", "secret_source", "secret_fingerprint",
+    "preferred",
     # Classified failure semantics for the last exhaustion, as decided by
     # agent/error_classifier.py. The raw HTTP status is not enough to size a
     # cooldown: providers return 403 for both an edge throttle (transient,
@@ -729,6 +730,33 @@ class CredentialPool:
     def entries(self) -> List[PooledCredential]:
         with self._lock:
             return list(self._entries)
+
+    def prioritize(self, credential_id: str) -> bool:
+        """Persist one credential as the provider's first selection candidate.
+
+        This changes ordering only. Exhausted/dead credentials remain ineligible
+        until their normal recovery or an explicit reset/re-auth, so a UI switch
+        cannot accidentally revive a revoked token.
+        """
+        wanted = str(credential_id or "").strip()
+        if not wanted:
+            return False
+        with self._lock:
+            selected = next((entry for entry in self._entries if entry.id == wanted), None)
+            if selected is None:
+                return False
+            ordered = [selected, *(entry for entry in self._entries if entry.id != wanted)]
+            self._entries = [
+                replace(
+                    entry,
+                    priority=index,
+                    extra={**entry.extra, "preferred": entry.id == wanted},
+                )
+                for index, entry in enumerate(ordered)
+            ]
+            self._current_id = wanted
+            self._persist()
+            return True
 
     def _current_unlocked(self) -> Optional[PooledCredential]:
         if not self._current_id:
@@ -2475,12 +2503,33 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
         "claude_code": 3,
         "env:ANTHROPIC_API_KEY": 4,
     }
+    all_preferred = sorted(
+        (entry for entry in entries if entry.extra.get("preferred") is True),
+        key=lambda entry: (entry.priority, entry.id),
+    )
+    preferred_entry = all_preferred[0] if all_preferred else None
+    changed = False
+    if len(all_preferred) > 1:
+        for index, entry in enumerate(entries):
+            if entry.extra.get("preferred") is True and entry is not preferred_entry:
+                entries[index] = replace(entry, extra={**entry.extra, "preferred": False})
+                changed = True
+    preferred_entries = [preferred_entry] if preferred_entry is not None else []
+    preferred_ids = {entry.id for entry in preferred_entries}
     manual_entries = sorted(
-        (entry for entry in entries if _is_manual_source(entry.source)),
+        (
+            entry
+            for entry in entries
+            if entry.id not in preferred_ids and _is_manual_source(entry.source)
+        ),
         key=lambda entry: entry.priority,
     )
     seeded_entries = sorted(
-        (entry for entry in entries if not _is_manual_source(entry.source)),
+        (
+            entry
+            for entry in entries
+            if entry.id not in preferred_ids and not _is_manual_source(entry.source)
+        ),
         key=lambda entry: (
             source_rank.get(entry.source, len(source_rank)),
             entry.priority,
@@ -2488,9 +2537,8 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
         ),
     )
 
-    ordered = [*manual_entries, *seeded_entries]
+    ordered = [*preferred_entries, *manual_entries, *seeded_entries]
     id_to_idx = {entry.id: idx for idx, entry in enumerate(entries)}
-    changed = False
     for new_priority, entry in enumerate(ordered):
         if entry.priority != new_priority:
             entries[id_to_idx[entry.id]] = replace(entry, priority=new_priority)

@@ -4,6 +4,7 @@ import { $connection } from '@/store/session'
 
 import {
   desktopDefaultCwd,
+  createDesktopEntry,
   desktopFileDiff,
   desktopFsCacheKey,
   desktopGitRoot,
@@ -20,8 +21,11 @@ const readFileText = vi.fn(async () => ({ path: '/local/file.txt', text: 'local'
 const readFileDataUrl = vi.fn(async () => 'data:text/plain;base64,bG9jYWw=')
 const gitRoot = vi.fn(async () => '/local')
 const selectPaths = vi.fn(async () => ['/local'])
+const createEntry = vi.fn(async (parent: string, name: string) => ({
+  path: parent.endsWith('/') || parent.endsWith('\\') ? `${parent}${name}` : `${parent}/${name}`
+}))
 
-const api = vi.fn(async ({ path }: { path: string }) => {
+const api = vi.fn(async ({ path, body }: { body?: Record<string, unknown>; path: string }) => {
   if (path.startsWith('/api/fs/list?')) {
     return { entries: [{ name: 'remote', path: '/remote', isDirectory: true }] }
   }
@@ -46,6 +50,11 @@ const api = vi.fn(async ({ path }: { path: string }) => {
     return { diff: 'remote diff' }
   }
 
+  if (path === '/api/fs/create') {
+    const parent = String(body?.parent_path || '').replace(/[\\/]+$/u, '')
+    return { ok: true, path: `${parent}/${String(body?.name || '')}` }
+  }
+
   throw new Error(`unexpected path ${path}`)
 })
 
@@ -53,6 +62,7 @@ function stubBridge() {
   vi.stubGlobal('window', {
     hermesDesktop: {
       api,
+      createEntry,
       gitRoot,
       readDir,
       readFileDataUrl,
@@ -112,6 +122,60 @@ describe('desktop filesystem facade', () => {
     expect(readFileText).not.toHaveBeenCalled()
     expect(readFileDataUrl).not.toHaveBeenCalled()
     expect(gitRoot).not.toHaveBeenCalled()
+  })
+
+  it('creates files and folders through the local hardened bridge', async () => {
+    $connection.set({ mode: 'local' } as never)
+
+    await expect(createDesktopEntry('/work', 'notes.md', false)).resolves.toBe('/work/notes.md')
+    await expect(createDesktopEntry('/work', 'docs', true)).resolves.toBe('/work/docs')
+
+    expect(createEntry).toHaveBeenCalledWith('/work', 'notes.md', false)
+    expect(createEntry).toHaveBeenCalledWith('/work', 'docs', true)
+  })
+
+  it('creates files and folders on the active remote gateway', async () => {
+    $connection.set({ mode: 'remote', profile: 'station' } as never)
+
+    await expect(createDesktopEntry('/srv/project', 'notes.md', false)).resolves.toBe('/srv/project/notes.md')
+    await expect(createDesktopEntry('/srv/project', 'docs', true)).resolves.toBe('/srv/project/docs')
+
+    expect(api).toHaveBeenCalledWith({
+      body: { is_directory: false, name: 'notes.md', parent_path: '/srv/project' },
+      method: 'POST',
+      path: '/api/fs/create',
+      profile: 'station'
+    })
+    expect(api).toHaveBeenCalledWith({
+      body: { is_directory: true, name: 'docs', parent_path: '/srv/project' },
+      method: 'POST',
+      path: '/api/fs/create',
+      profile: 'station'
+    })
+  })
+
+  it('preserves POSIX and Windows filesystem roots', async () => {
+    $connection.set({ mode: 'local' } as never)
+
+    await expect(createDesktopEntry('/', 'root.txt', false)).resolves.toBe('/root.txt')
+    await expect(createDesktopEntry('C:\\', 'root.txt', false)).resolves.toBe('C:\\root.txt')
+    expect(createEntry).toHaveBeenCalledWith('/', 'root.txt', false)
+    expect(createEntry).toHaveBeenCalledWith('C:\\', 'root.txt', false)
+  })
+
+  it('rejects traversal and separator characters in new entry names', async () => {
+    $connection.set({ mode: 'local' } as never)
+
+    await expect(createDesktopEntry('/work', '../secret', false)).rejects.toThrow('Invalid name')
+    await expect(createDesktopEntry('/work', 'bad/name', true)).rejects.toThrow('Invalid name')
+    await expect(createDesktopEntry('/work', 'bad\\name', true)).rejects.toThrow('Invalid name')
+    await expect(createDesktopEntry('/work', 'existing.txt:stream', false)).rejects.toThrow('Invalid name')
+    await expect(createDesktopEntry('/work', 'NUL.txt', false)).rejects.toThrow('Invalid name')
+    await expect(createDesktopEntry('/work', 'name.', false)).rejects.toThrow('Invalid name')
+    await expect(createDesktopEntry('/work', 'name ', false)).rejects.toThrow('Invalid name')
+    await expect(createDesktopEntry('/work', 'name.\t', false)).rejects.toThrow('Invalid name')
+    await expect(createDesktopEntry('/work', 'COM¹.txt', false)).rejects.toThrow('Invalid name')
+    expect(createEntry).not.toHaveBeenCalled()
   })
 
   it('does not retry the same unreadable path through the local facade', async () => {

@@ -222,6 +222,12 @@ class FsWriteText(BaseModel):
     content: str
 
 
+class FsCreate(BaseModel):
+    parent_path: str
+    name: str
+    is_directory: bool = False
+
+
 # --- from web_server.py (originally lines 2826-2856) ---
 
 class GitPathBody(BaseModel):

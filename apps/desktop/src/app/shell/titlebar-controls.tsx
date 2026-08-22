@@ -3,8 +3,9 @@ import { type ComponentProps, type MouseEvent, type ReactNode, useEffect, useSta
 import { useLocation, useNavigate } from 'react-router'
 
 import { hudTargetSessionId } from '@/app/hud/handoff'
+import { createTerminal } from '@/app/right-sidebar/terminal/terminals'
 import { toggleLayoutEditMode } from '@/components/pane-shell/edit-mode'
-import { resetLayoutTree } from '@/components/pane-shell/tree/store'
+import { isPaneVisible, resetLayoutTree, togglePaneVisible } from '@/components/pane-shell/tree/store'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
@@ -24,6 +25,7 @@ import {
   toggleSidebarOpen
 } from '@/store/layout'
 import { $unreadSessionCount } from '@/store/session-dot-state'
+import { useTheme } from '@/themes/context'
 
 import { appViewForPath, isOverlayView } from '../routes'
 
@@ -34,6 +36,7 @@ import {
   titlebarToolClusterClass
 } from './titlebar'
 import { TitlebarIcon } from './titlebar-icon'
+import { toggleTerminalFromTitlebar } from './terminal-titlebar-action'
 
 export interface TitlebarTool {
   id: string
@@ -132,6 +135,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
   const location = useLocation()
   const modHeld = useModifierHeld()
   const hapticsMuted = useStore($hapticsMuted)
+  const { resolvedMode, setMode } = useTheme()
   const fileBrowserOpen = useStore($fileBrowserOpen)
   const panesFlipped = useStore($panesFlipped)
   const sidebarOpen = useStore($sidebarOpen)
@@ -201,6 +205,20 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
   // Static system tools — always pinned to the screen's right edge.
   const systemTools: TitlebarTool[] = [
     {
+      actionId: 'view.showTerminal',
+      icon: <TitlebarIcon name="terminal" />,
+      id: 'terminal',
+      label: 'Toggle terminal',
+      onSelect: () => {
+        triggerHaptic('tap')
+        toggleTerminalFromTitlebar({
+          create: () => createTerminal(),
+          isVisible: () => isPaneVisible('terminal'),
+          toggle: () => togglePaneVisible('terminal')
+        })
+      }
+    },
+    {
       className: 'group/tool',
       // Hover + held ⌘/Ctrl morphs the glyph into its reset form (see
       // LayoutGlyph) — the mod-click telegraphs itself before it happens.
@@ -249,6 +267,16 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
       onSelect: () => {
         triggerHaptic('open')
         onOpenSettings()
+      }
+    },
+    {
+      actionId: 'appearance.toggleMode',
+      icon: <TitlebarIcon name="color-mode" />,
+      id: 'theme-mode',
+      label: resolvedMode === 'dark' ? 'Switch to light theme' : 'Switch to dark theme',
+      onSelect: () => {
+        triggerHaptic('tap')
+        setMode(resolvedMode === 'dark' ? 'light' : 'dark')
       }
     }
   ]

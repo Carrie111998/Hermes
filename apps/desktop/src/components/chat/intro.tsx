@@ -1,5 +1,6 @@
-import { type CSSProperties, useState } from 'react'
+import { type CSSProperties, useEffect, useRef, useState } from 'react'
 
+import { useMediaQuery } from '@/hooks/use-media-query'
 import { capitalize, normalize } from '@/lib/text'
 
 import introCopyJsonl from './intro-copy.jsonl?raw'
@@ -158,14 +159,60 @@ function resolveCopy(personality?: string, seed?: number): IntroCopy {
 
 export function Intro({ personality, seed }: IntroProps) {
   const [mountSeed] = useState(() => Math.floor(Math.random() * 100000))
+  const reducedMotion = useMediaQuery('(prefers-reduced-motion: reduce)')
+  const videoRef = useRef<HTMLVideoElement>(null)
   const copy = resolveCopy(personality, mountSeed + (seed ?? 0))
+
+  useEffect(() => {
+    if (!reducedMotion || !videoRef.current) {
+      return
+    }
+
+    videoRef.current.pause()
+    videoRef.current.currentTime = 0
+  }, [reducedMotion])
+
+  useEffect(() => {
+    const syncPlayback = () => {
+      const video = videoRef.current
+
+      if (!video || reducedMotion) {
+        return
+      }
+
+      if (globalThis.document.visibilityState === 'hidden') {
+        video.pause()
+
+        return
+      }
+
+      void video.play().catch(() => undefined)
+    }
+
+    globalThis.document.addEventListener('visibilitychange', syncPlayback)
+    syncPlayback()
+
+    return () => globalThis.document.removeEventListener('visibilitychange', syncPlayback)
+  }, [reducedMotion])
 
   return (
     <div
-      className="pointer-events-none flex w-full min-w-0 flex-col items-center justify-center px-0.5 py-6 text-center text-muted-foreground sm:px-6 lg:px-8"
+      className="pointer-events-none flex w-full min-w-0 -translate-y-[4vh] flex-col items-center justify-center px-0.5 py-6 text-center text-muted-foreground sm:px-6 lg:px-8"
       data-slot="aui_intro"
     >
-      <div className="w-full min-w-0">
+      <video
+        aria-hidden="true"
+        autoPlay={!reducedMotion}
+        className="mb-5 h-[min(27vh,15rem)] w-auto max-w-[min(27vw,15rem)] shrink-0 object-contain object-bottom opacity-95 [filter:saturate(0.94)_contrast(1.02)] motion-reduce:[animation:none]"
+        data-slot="homepage-orb-video"
+        loop={!reducedMotion}
+        muted
+        playsInline
+        preload={reducedMotion ? 'metadata' : 'auto'}
+        ref={videoRef}
+        src="./portal-figure-orb.webm"
+      />
+      <div className="w-full min-w-0 translate-y-1.5">
         <p
           aria-label={WORDMARK}
           className="fit-text mx-auto mb-1 w-[calc(100%-1rem)] font-['Collapse'] font-bold uppercase leading-[0.9] tracking-[0.08em] text-midground mix-blend-plus-lighter dark:text-foreground/90"
@@ -177,7 +224,14 @@ export function Intro({ personality, seed }: IntroProps) {
           <span aria-hidden="true">{WORDMARK}</span>
         </p>
 
-        <p className="m-0 text-center leading-normal tracking-tight">{copy.body}</p>
+        <p
+          className="m-0 mt-2 font-mono text-[0.6875rem] font-medium tracking-[0.32em] text-(--ui-text-tertiary) uppercase"
+          data-slot="homepage-brand-subtitle"
+        >
+          {'AGK {OS}'}
+        </p>
+
+        <p className="m-0 mt-2 text-center leading-normal tracking-tight">{copy.body}</p>
       </div>
     </div>
   )

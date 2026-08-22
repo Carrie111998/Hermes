@@ -133,6 +133,59 @@ export function registerFsIpc({
     return installDesktopPluginFromGit(resolveGitBinary(), identifier, desktopPluginsRoot, Boolean(payload?.force))
   })
 
+  // Create exactly one empty file or directory. The target is path-hardened,
+  // its parent must already exist, and exclusive creation prevents truncating
+  // or replacing an existing entry.
+  ipcMain.handle('hermes:fs:createEntry', async (_event, parentPath, newName, isDirectory) => {
+    const rawParent = String(parentPath || '').trim()
+    const rawName = String(newName || '')
+    const name = rawName.trim()
+    const windowsBase = name.split('.', 1)[0]?.toUpperCase()
+    const windowsReserved = /^(CON|PRN|AUX|NUL|COM(?:[1-9]|[¹²³])|LPT(?:[1-9]|[¹²³]))$/u.test(windowsBase || '')
+
+    if (
+      !rawParent ||
+      !name ||
+      name === '.' ||
+      name === '..' ||
+      name.includes('/') ||
+      name.includes('\\') ||
+      name.includes(':') ||
+      name.endsWith('.') ||
+      rawName.endsWith('.') ||
+      rawName.endsWith(' ') ||
+      windowsReserved ||
+      name.includes('\0')
+    ) {
+      throw new Error('Invalid path')
+    }
+
+    const parent = resolveRequestedPathForIpc(expandUserPath(rawParent), { purpose: 'Create file or folder' })
+
+    if (!directoryExists(parent)) {
+      throw new Error('Parent directory does not exist')
+    }
+
+    const resolved = path.join(parent, name)
+
+    try {
+      await fs.promises.lstat(resolved)
+      throw new Error(`"${name}" already exists`)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw error
+      }
+    }
+
+    if (Boolean(isDirectory)) {
+      await fs.promises.mkdir(resolved)
+    } else {
+      await fs.promises.writeFile(resolved, '', { encoding: 'utf8', flag: 'wx' })
+    }
+
+    return { path: resolved }
+  })
+
   // Rename a file/folder in place. The renderer passes the existing path + a new
   // base name; the destination is resolved in the SAME parent dir so a rename can
   // never move the item elsewhere or traverse out. Rejects on a name collision.

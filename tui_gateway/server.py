@@ -215,6 +215,13 @@ _LONG_HANDLERS = frozenset(
         "subscription.resume",
         "subscription.upgrade",
         "usage.bars",
+        # Provider quota probes perform blocking HTTP requests. The footer polls
+        # this RPC, so running it inline would periodically freeze every other
+        # socket request (including prompt/cancel/layout actions).
+        "account.usage",
+        # CPU sampling intentionally waits 100ms for a meaningful interval;
+        # never spend that delay on the socket reader thread.
+        "system.resources",
         "session.usage",
         "billing.step_up",
         "browser.manage",
@@ -264,6 +271,10 @@ _LONG_HANDLERS = frozenset(
         # publish an authorization URL. Keep them off the reader thread.
         "mcp.servers.test",
         "mcp.servers.oauth.start",
+        # Provider OAuth start/submit perform remote device-code or PKCE HTTP
+        # exchanges. Keep them off the socket reader so cancel/poll remain live.
+        "auth.oauth.start",
+        "auth.oauth.submit",
         "process.list",
         # profiles.list runs list_profiles() (recursive skill-tree walk per
         # profile) and opens each profile's state.db for the last-session

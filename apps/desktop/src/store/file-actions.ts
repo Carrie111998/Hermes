@@ -3,6 +3,7 @@ import { atom } from 'nanostores'
 import { translateNow } from '@/i18n'
 import {
   copyTextToClipboard,
+  createDesktopEntry,
   isDesktopFsRemoteMode,
   renameDesktopPath,
   revealDesktopPath,
@@ -29,9 +30,15 @@ export interface FileActionTarget {
 
 // Delete routes through a single confirm dialog (rendered once). Rename is
 // INLINE (VS Code style — an input in the row), driven by `$renamingPath`.
-export type FileActionDialog = { kind: 'delete' } & FileActionTarget
+export type FileActionDialog =
+  | ({ kind: 'delete' } & FileActionTarget)
+  | { kind: 'create'; isDirectory: boolean; parentPath: string }
 
 export const $fileActionDialog = atom<FileActionDialog | null>(null)
+
+export function requestFileCreate(parentPath: string, isDirectory: boolean): void {
+  $fileActionDialog.set({ kind: 'create', isDirectory, parentPath })
+}
 
 export function requestFileDelete(target: FileActionTarget): void {
   $fileActionDialog.set({ kind: 'delete', ...target })
@@ -106,6 +113,13 @@ export function toRelativePath(path: string, relativeTo: string): string {
 }
 
 // ── Dialog-confirmed mutations (called by FileActionDialogs) ──────────────────
+
+export async function executeFileCreate(parentPath: string, name: string, isDirectory: boolean): Promise<string> {
+  const path = await createDesktopEntry(parentPath, name, isDirectory)
+  notifyWorkspaceChanged()
+
+  return path
+}
 
 export async function executeFileRename(path: string, newName: string): Promise<void> {
   await renameDesktopPath(path, newName)

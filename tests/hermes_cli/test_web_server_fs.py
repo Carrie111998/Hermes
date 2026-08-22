@@ -77,6 +77,66 @@ def test_fs_download_rejects_sensitive_files(client, tmp_path):
     assert response.status_code == 403
 
 
+def test_fs_create_makes_empty_file_and_directory_without_overwrite(client, tmp_path):
+    file_path = tmp_path / "notes.md"
+    folder_path = tmp_path / "docs"
+
+    file_response = client.post(
+        "/api/fs/create", json={"parent_path": str(tmp_path), "name": "notes.md", "is_directory": False}
+    )
+    folder_response = client.post(
+        "/api/fs/create", json={"parent_path": str(tmp_path), "name": "docs", "is_directory": True}
+    )
+
+    assert file_response.status_code == 200
+    assert file_path.read_text() == ""
+    assert folder_response.status_code == 200
+    assert folder_path.is_dir()
+
+    file_path.write_text("keep")
+    collision = client.post(
+        "/api/fs/create", json={"parent_path": str(tmp_path), "name": "notes.md", "is_directory": False}
+    )
+    assert collision.status_code == 409
+    assert file_path.read_text() == "keep"
+
+
+def test_fs_create_requires_existing_parent(client, tmp_path):
+    response = client.post(
+        "/api/fs/create",
+        json={"parent_path": str(tmp_path / "missing"), "name": "notes.md", "is_directory": False},
+    )
+
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize("name", ["existing.txt:stream", "NUL.txt", "CON", "COM1.log", "COM¹.log", "LPT³", "name.", "name ", "name.\t"])
+def test_fs_create_rejects_windows_special_leaf_names(client, tmp_path, name):
+    response = client.post(
+        "/api/fs/create",
+        json={"parent_path": str(tmp_path), "name": name, "is_directory": False},
+    )
+
+    assert response.status_code == 400
+
+
+def test_fs_create_rejects_dangling_symlink_leaf(client, tmp_path):
+    link = tmp_path / "dangling"
+    try:
+        link.symlink_to(tmp_path / "missing-target")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+
+    response = client.post(
+        "/api/fs/create",
+        json={"parent_path": str(tmp_path), "name": "dangling", "is_directory": False},
+    )
+
+    assert response.status_code == 409
+    assert link.is_symlink()
+    assert not (tmp_path / "missing-target").exists()
+
+
 def test_fs_endpoints_require_auth(tmp_path):
     client = TestClient(web_server.app)
     target = tmp_path / "secret.txt"
@@ -85,7 +145,11 @@ def test_fs_endpoints_require_auth(tmp_path):
     list_response = client.get("/api/fs/list", params={"path": str(tmp_path)})
     read_response = client.get("/api/fs/read-text", params={"path": str(target)})
     default_response = client.get("/api/fs/default-cwd")
+    create_response = client.post(
+        "/api/fs/create", json={"parent_path": str(tmp_path), "name": "new.txt", "is_directory": False}
+    )
 
     assert list_response.status_code == 401
     assert read_response.status_code == 401
     assert default_response.status_code == 401
+    assert create_response.status_code == 401
