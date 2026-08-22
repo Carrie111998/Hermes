@@ -53,7 +53,7 @@ def has_binary_extension(path: str) -> bool:
 OPAQUE_DOCUMENT_EXTENSIONS = frozenset({
     ".doc", ".docx", ".docm",
     ".xls", ".xlsx", ".xlsm", ".xlsb",
-    ".ppt", ".pps", ".pot", ".pptx", ".pptm", ".ppsx", ".ppsm",
+    ".ppt", ".pps", ".pptx", ".pptm", ".ppsx", ".ppsm",
     ".odt", ".ods", ".odp",
     ".rtf", ".epub",
 })
@@ -73,3 +73,8 @@ def has_opaque_document_extension(path: str) -> bool:
 def is_pdf_path(path: str) -> bool:
     """True when the path has a .pdf extension. Pure string check, no I/O."""
     return path.lower().endswith(".pdf")
+
+
+def is_pot_path(path: str) -> bool:
+    """True for the ambiguous gettext/PowerPoint .pot extension."""
+    return path.lower().endswith(".pot")

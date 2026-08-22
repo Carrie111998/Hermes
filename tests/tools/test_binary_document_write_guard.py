@@ -42,11 +42,11 @@ class TestExtensionHelpers:
     def test_opaque_document_extensions(self):
         for p in ("a.docx", "b.XLSX", "c.pptx", "d.doc", "e.odt", "f.ods", "g.odp",
                   "h.docm", "i.xlsm", "j.xlsb", "k.pptm", "l.ppsx", "m.ppsm",
-                  "n.pps", "o.pot", "p.rtf", "q.epub"):
+                  "n.pps", "p.rtf", "q.epub"):
             assert has_opaque_document_extension(p) is True, f"{p} should be opaque"
 
     def test_non_opaque_paths(self):
-        for p in ("a.txt", "b.py", "c.pdf", "d.md", "noext", "e.csv"):
+        for p in ("a.txt", "b.py", "c.pdf", "d.md", "noext", "e.csv", "messages.pot"):
             assert has_opaque_document_extension(p) is False
 
     def test_is_pdf_path(self):
@@ -74,6 +74,21 @@ class TestCheckBinaryDocumentWrite:
 
     def test_plain_text_allowed(self, tmp_path: Path):
         assert _check_binary_document_write(str(tmp_path / "notes.txt")) is None
+
+    def test_new_gettext_pot_allowed(self, tmp_path: Path):
+        assert _check_binary_document_write(str(tmp_path / "messages.pot")) is None
+
+    def test_existing_gettext_pot_allowed(self, tmp_path: Path):
+        pot = tmp_path / "messages.pot"
+        pot.write_text('msgid "hello"\nmsgstr ""\n', encoding="utf-8")
+        assert _check_binary_document_write(str(pot)) is None
+
+    def test_existing_ole_powerpoint_pot_rejected(self, tmp_path: Path):
+        pot = tmp_path / "slides.pot"
+        pot.write_bytes(bytes.fromhex("D0CF11E0A1B11AE1") + b"legacy powerpoint")
+        err = _check_binary_document_write(str(pot))
+        assert err is not None
+        assert "PowerPoint" in err
 
 
 class TestWriteFileToolGuard:
@@ -128,6 +143,21 @@ class TestWriteFileToolGuard:
         result = json.loads(write_file_tool(str(target), "hello world"))
         assert not result.get("error")
         assert target.read_text() == "hello world"
+
+    def test_write_file_allows_gettext_pot(self, tmp_path: Path):
+        target = tmp_path / "messages.pot"
+        content = 'msgid "hello"\nmsgstr ""\n'
+        result = json.loads(write_file_tool(str(target), content))
+        assert not result.get("error")
+        assert target.read_text() == content
+
+    def test_write_file_rejects_ole_powerpoint_pot(self, tmp_path: Path):
+        target = tmp_path / "slides.pot"
+        original = bytes.fromhex("D0CF11E0A1B11AE1") + b"legacy powerpoint"
+        target.write_bytes(original)
+        result = json.loads(write_file_tool(str(target), "replacement text"))
+        assert result.get("error")
+        assert target.read_bytes() == original
 
 
 class TestPatchToolGuard:
@@ -186,3 +216,13 @@ class TestPatchToolGuard:
         )
         assert not result.get("error")
         assert target.read_text() == "hello there"
+
+    def test_patch_replace_allows_gettext_pot(self, tmp_path: Path):
+        target = tmp_path / "messages.pot"
+        target.write_text('msgid "hello"\nmsgstr ""\n', encoding="utf-8")
+        result = json.loads(
+            patch_tool(mode="replace", path=str(target),
+                       old_string='msgid "hello"', new_string='msgid "goodbye"')
+        )
+        assert not result.get("error")
+        assert target.read_text(encoding="utf-8").startswith('msgid "goodbye"')

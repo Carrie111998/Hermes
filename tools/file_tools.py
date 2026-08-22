@@ -16,6 +16,7 @@ from tools.binary_extensions import (
     has_binary_extension,
     has_opaque_document_extension,
     is_pdf_path,
+    is_pot_path,
 )
 from tools.file_operations import (
     ShellFileOperations,
@@ -29,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
+_OLE_COMPOUND_MAGIC = bytes.fromhex("D0CF11E0A1B11AE1")
 
 
 def _expand_tilde(path: str) -> str:
@@ -2187,6 +2189,9 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
     - Opaque container formats (.doc/.docx/.xls/.xlsx/.ppt/.pptx/.odt/.ods/
       .odp): always rejected — text bytes are never a valid document, whether
       creating or overwriting.
+    - .pot: rejected only when an existing file has the OLE compound signature
+      used by legacy PowerPoint templates. The extension also belongs to
+      plain-text gettext templates, which text tools must be able to author.
     - .pdf: rejected only when OVERWRITING an existing regular file. Raw PDF
       syntax is text-authorable, so new-file creation stays allowed.
     """
@@ -2200,6 +2205,26 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
             "python-docx/openpyxl/python-pptx via the terminal to create or edit "
             "this document."
         )
+    if is_pot_path(filepath):
+        try:
+            resolved = Path(_resolve_path_for_task(filepath, task_id))
+        except Exception:
+            resolved = Path(_expand_tilde(filepath))
+        try:
+            is_ole_template = False
+            if resolved.is_file():
+                with resolved.open("rb") as existing:
+                    is_ole_template = existing.read(8) == _OLE_COMPOUND_MAGIC
+            if is_ole_template:
+                return (
+                    f"Refusing to overwrite legacy PowerPoint template '{filepath}' "
+                    "with plain text. The existing .pot file is an OLE compound "
+                    "document; use the powerpoint skill or a compatible library via "
+                    "the terminal to modify it. Plain-text gettext .pot files remain "
+                    "writable."
+                )
+        except OSError:
+            pass
     if is_pdf_path(filepath):
         try:
             resolved = Path(_resolve_path_for_task(filepath, task_id))
