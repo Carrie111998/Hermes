@@ -129,10 +129,11 @@ _HIGH_CONCURRENCY_WARNED = False
 MAX_DEPTH = 1  # flat by default: parent (0) -> child (1); grandchild rejected unless max_spawn_depth raised.
 # Configurable depth cap consulted by _get_max_spawn_depth; MAX_DEPTH
 # stays as the default fallback and is still the symbol tests import.
-_MIN_SPAWN_DEPTH = 1
+_MIN_SPAWN_DEPTH = 0
 # No upper ceiling on spawn depth — like max_concurrent_children, depth has a
-# floor of 1 and no ceiling. Deeper trees multiply API cost, so the default
+# floor of 0 and no ceiling. Deeper trees multiply API cost, so the default
 # stays flat (MAX_DEPTH = 1); raising the config knob is an explicit opt-in.
+# max_spawn_depth=0 disables spawning entirely (parent-only mode).
 
 
 # ---------------------------------------------------------------------------
@@ -971,7 +972,7 @@ def _get_child_timeout() -> Optional[float]:
 
 
 def _get_max_spawn_depth() -> int:
-    """Read delegation.max_spawn_depth from config, floored at 1 (no ceiling).
+    """Read delegation.max_spawn_depth from config, floored at 0 (no ceiling).
 
     depth 0 = parent agent.  max_spawn_depth = N means agents at depths
     0..N-1 can spawn; depth N is the leaf floor.  Default 1 is flat:
