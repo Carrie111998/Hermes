@@ -1158,7 +1158,11 @@ export const ja = defineLocale({
     edit: '編集',
     archive: 'アーカイブ',
     skillArchivedTitle: 'スキルをアーカイブしました',
-    skillArchivedMessage: 'hermes curator restore で復元できます。'
+    skillArchivedMessage: 'hermes curator restore で復元できます。',
+    botFilterLabel: 'ボットで絞り込み',
+    botFilterAllBots: 'すべてのボット',
+    botAssignmentPending: 'このボットのスキルはまだ読み込まれていません',
+    botAssignmentToggle: (skill, bot, enabled) => `${bot}で${skill}を${enabled ? 'オン' : 'オフ'}にする`,
   },
 
   starmap: {

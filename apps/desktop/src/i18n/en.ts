@@ -1250,6 +1250,10 @@ export const en: Translations = {
     archive: 'Archive',
     skillArchivedTitle: 'Skill archived',
     skillArchivedMessage: 'Restorable via hermes curator restore.',
+    botFilterLabel: 'Filter by bot',
+    botFilterAllBots: 'All bots',
+    botAssignmentPending: "This bot's skills haven't loaded yet",
+    botAssignmentToggle: (skill, bot, enabled) => `Turn ${skill} ${enabled ? 'on' : 'off'} for ${bot}`,
     hub: {
       searchPlaceholder: 'Search the skill hub',
       search: 'Search',
