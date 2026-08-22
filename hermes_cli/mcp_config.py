@@ -91,8 +91,9 @@ def _save_mcp_server(name: str, server_config: dict) -> bool:
     """Add or update a server entry in config.yaml.
 
     Returns False when a high-signal exfiltration-shaped stdio command is
-    rejected. MCP stdio servers are user-chosen local commands, so this blocks
-    shell+egress payloads rather than whitelisting command families.
+    rejected or when the exact entry cannot be verified after saving. MCP stdio
+    servers are user-chosen local commands, so validation blocks shell+egress
+    payloads rather than whitelisting command families.
     """
     issues = validate_mcp_server_entry(name, server_config)
     if issues:
