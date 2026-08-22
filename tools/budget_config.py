@@ -69,7 +69,24 @@ def _configured_mcp_result_size() -> int:
 
 
 def _configured_semantic_compression() -> tuple[bool, int, int]:
-    """Read opt-in semantic-compression settings from ``tool_budget`` safely."""
+    """Read opt-in semantic-compression settings from config safely.
+
+    Accepts the setting under EITHER of the two recognised key paths so
+    downstream behaviour follows the user's intent whichever block they
+    landed it in:
+
+    * ``tool_budget.semantic_compress`` -- the canonical home (matches the
+      wider ``tool_budget:`` configurable-caps section).
+    * ``tool_output.semantic_compress`` -- a sibling block used by the
+      tool-output limits reader; keys here took shape before the budget
+      section did, and end users have set the flag here.
+
+    Either side enabling it flips the runtime flag on (logical OR).
+    Threshold/min-reduction knobs are read from ``tool_budget`` only -- a
+    single home keeps the override pattern simple. Fail-open: any
+    exception, missing key, or non-True value lands on the defaults
+    (compression OFF, default threshold/minimum).
+    """
     enabled = False
     threshold = DEFAULT_SEMANTIC_COMPRESS_THRESHOLD_CHARS
     minimum = DEFAULT_SEMANTIC_COMPRESS_MIN_REDUCTION_CHARS
@@ -77,15 +94,23 @@ def _configured_semantic_compression() -> tuple[bool, int, int]:
         from hermes_cli.config import load_config_readonly
 
         data = load_config_readonly()
-        block = data.get("tool_budget") if isinstance(data, dict) else None
-        if isinstance(block, dict):
-            enabled = block.get("semantic_compress") is True
-            raw_threshold = block.get("semantic_compress_threshold_chars")
-            raw_minimum = block.get("semantic_compress_min_reduction_chars")
-            if raw_threshold is not None and int(raw_threshold) > 0:
-                threshold = int(raw_threshold)
-            if raw_minimum is not None and int(raw_minimum) >= 0:
-                minimum = int(raw_minimum)
+        if isinstance(data, dict):
+            tool_budget = data.get("tool_budget")
+            tool_output = data.get("tool_output")
+            if isinstance(tool_budget, dict):
+                if tool_budget.get("semantic_compress") is True:
+                    enabled = True
+                raw_threshold = tool_budget.get("semantic_compress_threshold_chars")
+                raw_minimum = tool_budget.get("semantic_compress_min_reduction_chars")
+                if raw_threshold is not None and int(raw_threshold) > 0:
+                    threshold = int(raw_threshold)
+                if raw_minimum is not None and int(raw_minimum) >= 0:
+                    minimum = int(raw_minimum)
+            if not enabled and isinstance(tool_output, dict):
+                # Mirror the same strict-truthiness check used above so a
+                # noisy `false`/`0`/absent value does NOT flip the flag on.
+                if tool_output.get("semantic_compress") is True:
+                    enabled = True
     except Exception:
         pass
     return enabled, threshold, minimum

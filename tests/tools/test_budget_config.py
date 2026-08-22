@@ -79,6 +79,56 @@ class TestBudgetConfigDefaults:
         assert config.semantic_compress_threshold == 30_000
         assert config.semantic_compress_min_reduction == 600
 
+    def test_tool_output_config_enables_semantic_compression(self, tmp_path, monkeypatch):
+        """tool_output.semantic_compress: true must activate compression too.
+
+        Closes the gap where budget_config only read tool_budget.semantic_compress
+        and silently ignored the user's tool_output.semantic_compress setting
+        (key-path mismatch).
+        """
+        (tmp_path / "config.yaml").write_text(
+            "tool_output:\n  semantic_compress: true\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        config = budget_for_context_window(None)
+        assert config.semantic_compress is True
+
+    def test_either_keypath_enables_semantic_compression(self, tmp_path, monkeypatch):
+        """Each key path is independent — checking ONE must yield True even when the other is absent.
+
+        Mirrors the existing mcp_result_size_chars coverage pattern: any one
+        recognised key, even if alone, must drive the runtime setting.
+        """
+        # Only the tool_output key is present
+        (tmp_path / "config.yaml").write_text(
+            "tool_output:\n  semantic_compress: true\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        config_only_tool_output = budget_for_context_window(None)
+        assert config_only_tool_output.semantic_compress is True
+
+        # And when BOTH are present (user-config case)
+        (tmp_path / "config.yaml").write_text(
+            "tool_budget:\n  semantic_compress: true\ntool_output:\n  semantic_compress: true\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        config_both = budget_for_context_window(None)
+        assert config_both.semantic_compress is True
+
+    def test_semantic_compress_falsy_values_stay_disabled(self, tmp_path, monkeypatch):
+        """Truthiness is strict: non-True values (False / 'false' / 0 / null)
+        must NOT enable semantic compression. Fail-open default remains off.
+        """
+        for body in (
+            "tool_output:\n  semantic_compress: false\n",
+            "tool_output:\n  semantic_compress: \"false\"\n",
+            "tool_output:\n  semantic_compress: 0\n",
+            "tool_output:\n",
+        ):
+            (tmp_path / "config.yaml").write_text(body)
+            monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+            assert budget_for_context_window(None).semantic_compress is False, body
+
 
 # ---------------------------------------------------------------------------
 # Immutability (frozen=True)
