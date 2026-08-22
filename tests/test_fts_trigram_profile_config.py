@@ -271,3 +271,229 @@ def test_optimize_storage_retires_disabled_trigram_without_deleting_messages(
         assert _object_exists(reenabled._conn, "messages_fts_trigram")
     finally:
         reenabled.close()
+
+
+def test_config_resolution_failure_preserves_existing_trigram_quarantine(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "resolution-failure"
+    db_path = _write_config(home, True)
+
+    enabled = SessionDB(db_path=db_path)
+    enabled.create_session("s1", source="test")
+    enabled.append_message("s1", role="user", content="canonical survives")
+    enabled.close()
+
+    _write_config(home, False)
+    quarantined = SessionDB(db_path=db_path)
+    try:
+        assert quarantined._conn is not None
+        assert quarantined._trigram_available is False
+        assert quarantined._conn.execute(
+            "SELECT 1 FROM state_meta WHERE key = 'fts_trigram_stale'"
+        ).fetchone() is not None
+    finally:
+        quarantined.close()
+
+    from hermes_cli import config as config_module
+
+    def _resolution_failed(*args, **kwargs):
+        raise config_module.ConfigResolutionError("deliberate test failure")
+
+    monkeypatch.setattr(
+        config_module,
+        "resolve_effective_config_value",
+        _resolution_failed,
+    )
+    reopened = SessionDB(db_path=db_path)
+    try:
+        assert reopened._conn is not None
+        assert reopened._trigram_enabled is False
+        assert reopened._trigram_available is False
+        assert reopened._conn.execute(
+            "SELECT 1 FROM state_meta WHERE key = 'fts_trigram_stale'"
+        ).fetchone() is not None
+        trigger_count = reopened._conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'messages_fts_trigram%'"
+        ).fetchone()[0]
+        assert trigger_count == 0
+        assert reopened.search_messages("canonical")
+    finally:
+        reopened.close()
+
+
+def test_config_resolution_failure_defaults_on_only_without_quarantine(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import config as config_module
+
+    def _resolution_failed(*args, **kwargs):
+        raise config_module.ConfigResolutionError("deliberate test failure")
+
+    monkeypatch.setattr(
+        config_module,
+        "resolve_effective_config_value",
+        _resolution_failed,
+    )
+    db = SessionDB(db_path=tmp_path / "fresh" / "state.db")
+    try:
+        assert db._conn is not None
+        assert db._trigram_enabled is True
+        assert db._trigram_available is True
+    finally:
+        db.close()
+
+
+def test_state_trigram_gate_uses_only_public_config_resolver(tmp_path, monkeypatch):
+    from hermes_cli import config as config_module
+    from hermes_state import _trigram_fts_enabled_from_config
+
+    monkeypatch.setattr(
+        config_module,
+        "resolve_effective_config_value",
+        lambda *args, **kwargs: False,
+    )
+
+    def _private_helper_must_not_escape(*args, **kwargs):
+        raise AssertionError("state layer reached a private config helper")
+
+    for name in (
+        "_deep_merge",
+        "_expand_env_vars",
+        "_normalize_max_turns_config",
+        "_normalize_root_model_keys",
+        "read_user_config_raw",
+    ):
+        monkeypatch.setattr(config_module, name, _private_helper_must_not_escape)
+
+    assert _trigram_fts_enabled_from_config(tmp_path / "state.db") is False
+
+
+def test_repeated_sessiondb_opens_reuse_effective_config_cache(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import config as config_module
+
+    home = tmp_path / "cached-profile"
+    db_path = _write_config(home, False)
+    config_module._LOAD_CONFIG_CACHE.clear()
+    config_module._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    config_module._CONFIG_RESOLUTION_FAILURE_CACHE.clear()
+
+    calls = 0
+    original = config_module.fast_safe_load
+
+    def _counting_load(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(config_module, "fast_safe_load", _counting_load)
+
+    first = SessionDB(db_path=db_path)
+    first.close()
+    second = SessionDB(db_path=db_path)
+    second.close()
+
+    assert calls == 1
+
+
+def test_repeated_sessiondb_opens_without_config_run_pipeline_once(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import config as config_module
+
+    home = tmp_path / "missing-config-profile"
+    home.mkdir()
+    db_path = home / "state.db"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "missing-managed"))
+    config_module._LOAD_CONFIG_CACHE.clear()
+    config_module._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    config_module._CONFIG_RESOLUTION_FAILURE_CACHE.clear()
+
+    calls = 0
+    original = config_module._normalize_root_model_keys
+
+    def _counting_normalizer(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        config_module,
+        "_normalize_root_model_keys",
+        _counting_normalizer,
+    )
+
+    first = SessionDB(db_path=db_path)
+    first.close()
+    second = SessionDB(db_path=db_path)
+    second.close()
+
+    assert calls == 1
+
+
+def test_malformed_managed_config_preserves_existing_trigram_quarantine(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import config as config_module
+    from hermes_cli import managed_scope
+
+    profile = tmp_path / "managed-failure-profile"
+    managed = tmp_path / "managed"
+    profile.mkdir()
+    managed.mkdir()
+    db_path = profile / "state.db"
+    (profile / "config.yaml").write_text(
+        "sessions:\n  trigram_fts: true\n",
+        encoding="utf-8",
+    )
+    managed_path = managed / "config.yaml"
+    managed_path.write_text(
+        "sessions:\n  trigram_fts: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    managed_scope.invalidate_managed_cache()
+
+    enabled = SessionDB(db_path=db_path)
+    enabled.close()
+
+    managed_path.write_text(
+        "sessions:\n  trigram_fts: false\n",
+        encoding="utf-8",
+    )
+    managed_scope.invalidate_managed_cache()
+    disabled = SessionDB(db_path=db_path)
+    try:
+        assert disabled._conn is not None
+        assert disabled._trigram_available is False
+        assert disabled._conn.execute(
+            "SELECT 1 FROM state_meta WHERE key = 'fts_trigram_stale'"
+        ).fetchone() is not None
+    finally:
+        disabled.close()
+
+    managed_path.write_text("sessions: [\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    managed_scope.invalidate_managed_cache()
+    # Reproduce the dangerous ordering: a general fail-open read caches the
+    # user-only value before SessionDB asks for strict resolution.
+    assert config_module.load_config_readonly()["sessions"]["trigram_fts"] is True
+    unresolved = SessionDB(db_path=db_path)
+    try:
+        assert unresolved._conn is not None
+        assert unresolved._trigram_enabled is False
+        assert unresolved._trigram_available is False
+        assert unresolved._conn.execute(
+            "SELECT 1 FROM state_meta WHERE key = 'fts_trigram_stale'"
+        ).fetchone() is not None
+        trigger_count = unresolved._conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE 'messages_fts_trigram%'"
+        ).fetchone()[0]
+        assert trigger_count == 0
+    finally:
+        unresolved.close()

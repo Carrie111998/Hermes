@@ -235,19 +235,43 @@ def _reject_denylisted_env_var(key: str) -> None:
         )
 
 _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
-# (path, mtime_ns, size) -> cached expanded config dict.
+# (path, mtime_ns, size, ctime_ns, mode) -> cached expanded config dict.
 # load_config() returns a deepcopy of the cached value when the file
 # hasn't changed since the last load, skipping yaml.safe_load +
 # _deep_merge + _normalize_* + _expand_env_vars (~13 ms/call).
 # save_config() + migrate_config() write via atomic_yaml_write which
 # produces a fresh inode, so stat() sees a new mtime_ns and the next
 # load repopulates automatically — no explicit invalidation hook.
-# Cached tuple is (user_mtime_ns, user_size, managed_mtime_ns, managed_size,
+# Cached tuple is (user mtime/size/ctime/mode, managed mtime/size/ctime/mode,
 # merged_value, env_ref_snapshot) — the managed-file signature is folded in so
 # editing the managed-scope config.yaml invalidates the cache (see
 # managed_scope), and the env snapshot invalidates it when a referenced ${VAR}
 # changes value (late .env load, in-process rotation — #58514).
-_LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str, Optional[str]]]] = {}
+_LOAD_CONFIG_CACHE: Dict[
+    str,
+    Tuple[
+        int,
+        int,
+        int,
+        int,
+        int,
+        int,
+        int,
+        int,
+        Dict[str, Any],
+        Dict[str, Optional[str]],
+    ],
+] = {}
+# Explicit-path consumers such as SessionDB need to distinguish a successfully
+# resolved default from a config that only fell back because the current user
+# file could not be parsed. Cache that failure on the user's
+# mtime/size/ctime/mode signature so repeated short-lived opens fail fast while
+# content or permission repairs invalidate immediately.
+_CONFIG_RESOLUTION_FAILURE_CACHE: Dict[str, Tuple[int, int, int, int]] = {}
+
+
+class ConfigResolutionError(RuntimeError):
+    """The current effective config could not be resolved from its sources."""
 # (path, mtime_ns, size) -> cached raw yaml dict. Same pattern as
 # _LOAD_CONFIG_CACHE but for read_raw_config() — used when callers want
 # the user's on-disk values without defaults merged in.
@@ -3422,7 +3446,7 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
 def load_config() -> Dict[str, Any]:
     """Load configuration from ~/.hermes/config.yaml.
 
-    Cached on the config file's (mtime_ns, size). Returns a deepcopy of
+    Cached on source file metadata (mtime, size, ctime and mode). Returns a deepcopy of
     the cached value when unchanged, since most call sites mutate the
     result (e.g. ``cfg["model"]["default"] = ...`` before ``save_config``).
     The cache is keyed on ``str(config_path)`` so profile switches
@@ -3457,6 +3481,42 @@ def load_config_readonly() -> Dict[str, Any]:
     safety guarantee is purely documented, not enforced — be careful.
     """
     return _load_config_impl(want_deepcopy=False)
+
+
+def resolve_effective_config_value(
+    config_path: Path,
+    *keys: str,
+    default: Any = None,
+) -> Any:
+    """Resolve one value from an explicit profile config, with shared caching.
+
+    This is the public boundary for behavioral readers that own an explicit
+    ``config.yaml`` path rather than the process-global ``HERMES_HOME``. It
+    applies the same defaults, normalizers, environment expansion and managed
+    overlay as :func:`load_config`, while reusing the same mtime/size/env-aware
+    cache. Only the selected value is defensively copied, so hot read-only
+    callers cannot mutate the shared cache and do not pay for a full config
+    deepcopy on every open.
+
+    A missing config is a successful resolution of defaults. A present config
+    that cannot be read or parsed raises :class:`ConfigResolutionError` even
+    when the general CLI loader has a last-known-good fallback; safety-sensitive
+    consumers need to distinguish current-source failure from an intentional
+    default.
+    """
+    try:
+        config = _load_config_impl(
+            want_deepcopy=False,
+            config_path=Path(config_path),
+            require_resolved=True,
+        )
+    except ConfigResolutionError:
+        raise
+    except Exception as exc:
+        raise ConfigResolutionError(
+            f"Could not resolve effective config at {config_path}"
+        ) from exc
+    return copy.deepcopy(cfg_get(config, *keys, default=default))
 
 
 def write_platform_config_field(
@@ -3611,17 +3671,33 @@ def apply_terminal_config_to_env(
     return target
 
 
-def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+def _load_config_impl(
+    *,
+    want_deepcopy: bool,
+    config_path: Optional[Path] = None,
+    require_resolved: bool = False,
+) -> Dict[str, Any]:
     with _CONFIG_LOCK:
-        ensure_hermes_home()
-        config_path = get_config_path()
+        if config_path is None:
+            ensure_hermes_home()
+            config_path = get_config_path()
+        else:
+            config_path = Path(config_path).expanduser()
         path_key = str(config_path)
+        resolution_failed = False
 
         try:
             st = config_path.stat()
-            user_sig: Optional[Tuple[int, int]] = (st.st_mtime_ns, st.st_size)
+            user_sig: Optional[Tuple[int, int, int, int]] = (
+                st.st_mtime_ns,
+                st.st_size,
+                st.st_ctime_ns,
+                stat.S_IMODE(st.st_mode),
+            )
+            user_failure_sig = user_sig
         except FileNotFoundError:
             user_sig = None
+            user_failure_sig = None
 
         # Managed scope: fold the managed config file's (mtime, size) into the
         # cache signature so editing /etc/hermes/config.yaml invalidates the
@@ -3632,34 +3708,57 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         managed_cfg_path = (managed_dir / "config.yaml") if managed_dir else None
         try:
             mst = managed_cfg_path.stat() if managed_cfg_path else None
-            managed_sig = (mst.st_mtime_ns, mst.st_size) if mst else (0, 0)
+            managed_sig = (
+                (
+                    mst.st_mtime_ns,
+                    mst.st_size,
+                    mst.st_ctime_ns,
+                    stat.S_IMODE(mst.st_mode),
+                )
+                if mst
+                else (0, 0, 0, 0)
+            )
         except OSError:
-            managed_sig = (0, 0)
+            managed_sig = (0, 0, 0, 0)
 
         # Combined cache signature: user file + managed file. None only when the
         # user config is absent AND no managed file exists (nothing to cache on).
         if user_sig is not None:
-            cache_sig: Optional[Tuple[int, int, int, int]] = (
-                user_sig[0],
-                user_sig[1],
-                managed_sig[0],
-                managed_sig[1],
+            cache_sig: Optional[Tuple[int, int, int, int, int, int, int, int]] = (
+                *user_sig,
+                *managed_sig,
             )
-        elif managed_sig != (0, 0):
-            cache_sig = (0, 0, managed_sig[0], managed_sig[1])
+        elif managed_sig != (0, 0, 0, 0):
+            cache_sig = (0, 0, 0, 0, *managed_sig)
         else:
-            cache_sig = None
+            # Cache fully resolved defaults too. We still stat on every call,
+            # so creating either source file changes this sentinel and
+            # invalidates safely without rerunning the full config pipeline on
+            # every short-lived SessionDB or other readonly config open.
+            cache_sig = (0, 0, 0, 0, 0, 0, 0, 0)
+
+        if require_resolved:
+            managed_scope.require_managed_config_resolved()
 
         cached = _LOAD_CONFIG_CACHE.get(path_key)
-        if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
+        if (
+            require_resolved
+            and user_failure_sig is not None
+            and _CONFIG_RESOLUTION_FAILURE_CACHE.get(path_key)
+            == user_failure_sig
+        ):
+            raise ConfigResolutionError(
+                f"Current config source at {config_path} is unresolved"
+            )
+        if cached is not None and cache_sig is not None and cached[:8] == cache_sig:
             # File signatures match, but the cached expansion is only valid if
             # every ${VAR} it was expanded against still has the same value.
             # Without this, a load_config() that ran before load_hermes_dotenv()
             # pins unexpanded literals (e.g. auxiliary.<task>.api_key) for the
             # life of the process (#58514).
-            env_snapshot = cached[5] if len(cached) > 5 else {}
+            env_snapshot = cached[9] if len(cached) > 9 else {}
             if all(os.environ.get(k) == v for k, v in env_snapshot.items()):
-                return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
+                return copy.deepcopy(cached[8]) if want_deepcopy else cached[8]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
 
@@ -3676,6 +3775,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                     user_config.pop("max_turns", None)
 
                 config = _deep_merge(config, user_config)
+                _CONFIG_RESOLUTION_FAILURE_CACHE.pop(path_key, None)
             except Exception as e:
                 # Last-known-good fallback (port of openai/codex#31188's
                 # invariant: a parse failure in a policy/config file must not
@@ -3690,11 +3790,17 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 # Fresh processes with no last-known-good keep the existing
                 # DEFAULT_CONFIG fallback.
                 lkg = _LAST_EXPANDED_CONFIG_BY_PATH.get(path_key)
+                if user_failure_sig is not None:
+                    _CONFIG_RESOLUTION_FAILURE_CACHE[path_key] = user_failure_sig
                 _warn_config_parse_failure(
                     config_path,
                     e,
                     fallback="last-known-good" if lkg is not None else "defaults",
                 )
+                if require_resolved:
+                    raise ConfigResolutionError(
+                        f"Current config source at {config_path} is unresolved"
+                    ) from e
                 if lkg is not None:
                     # save_config() stores the pre-expansion normalized dict
                     # (env-ref templates preserved); the load path stores the
@@ -3711,11 +3817,13 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                         # signature and triggers a normal reload.
                         _empty_env: Dict[str, Optional[str]] = {}
                         _LOAD_CONFIG_CACHE[path_key] = (
-                            cache_sig[0], cache_sig[1],
-                            cache_sig[2], cache_sig[3],
+                            *cache_sig,
                             lkg_copy, _empty_env,
                         )
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
+                resolution_failed = True
+        else:
+            _CONFIG_RESOLUTION_FAILURE_CACHE.pop(path_key, None)
 
         normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
         expanded = _expand_env_vars(normalized)
@@ -3724,7 +3832,11 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         # against the process environment, never against user-config-defined refs.
         # This deliberately inverts the usual env-over-config precedence for the
         # keys the managed layer pins — see docs/design/managed-scope.md §4.1.
-        managed_config = managed_scope.load_managed_config()
+        managed_config = (
+            managed_scope.load_managed_config_strict()
+            if require_resolved
+            else managed_scope.load_managed_config()
+        )
         if managed_config:
             # Normalize the managed overlay through the same canonicalization as
             # the user config BEFORE merging (parity with
@@ -3739,14 +3851,15 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 managed_normalized["model"] = {"default": managed_normalized["model"]}
             managed_expanded = _expand_env_vars(managed_normalized)
             expanded = _deep_merge(expanded, managed_expanded)
-        _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
+        if not resolution_failed:
+            _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # Cache stores a separate deepcopy so subsequent ``load_config()``
             # (deepcopy=True) callers can mutate freely without affecting the
             # cached value, and ``load_config_readonly()`` (deepcopy=False)
             # callers all see the same stable cached object. The cached tuple is
-            # (user_mtime, user_size, managed_mtime, managed_size, value,
-            # env_ref_snapshot). The snapshot records the environment values
+            # (user and managed mtime/size/ctime/mode, value, env_ref_snapshot).
+            # The snapshot records the environment values
             # this expansion was made against so later loads can detect env
             # drift (late .env load, in-process rotation) — see cache hit above.
             cached_copy = copy.deepcopy(expanded)
