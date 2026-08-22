@@ -1,0 +1,6 @@
+Trigger the trusted base-branch workflow for the guarded bot activity transcript patch.
+Rerun after normalizing the VM assertion and adding group-chat regression coverage.
+Rerun against the clean upstream base workflow.
+Validate the committed implementation directly.
+Finalize the clean one-commit feature branch.
+Run after refreshing the PR base workflow.

@@ -1,0 +1,108 @@
+name: Finalize bot-scoped group activity transcripts
+
+on:
+  push:
+    branches:
+      - codex/bot-scoped-activity-transcripts
+    paths:
+      - .github/workflows/codex-finalize-bot-activity-scope.yml
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the complete feature history
+        uses: actions/checkout@v4
+        with:
+          ref: codex/bot-scoped-activity-transcripts
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Restore the known-good feature and isolate bot switches
+        shell: bash
+        run: |
+          git reset --hard 58b92b4b2e75979682940059ff27e6d9d166d9c0
+          git clean -fdx
+          python3 - <<'PY'
+          from pathlib import Path
+
+          plugin = Path('apps/desktop/src/plugins/hermes-bots/plugin.js')
+          source = plugin.read_text(encoding='utf-8')
+          old = """            }
+          })
+        : null,
+      jsx(GroupChatSettingsDialog, {"""
+          new = """            }
+          }, groupMemberKey(selectedActivityMember))
+        : null,
+      jsx(GroupChatSettingsDialog, {"""
+          count = source.count(old)
+          if count != 1:
+              raise SystemExit(f'expected exactly one activity drawer render anchor, found {count}')
+          plugin.write_text(source.replace(old, new, 1), encoding='utf-8')
+
+          test = Path('apps/desktop/src/plugins/hermes-bots/tests/group-activity-transcript.test.mjs')
+          tests = test.read_text(encoding='utf-8')
+          anchor = "  assert.match(source, /private model reasoning is never displayed/)\n"
+          assertion = "  assert.match(source, /}, groupMemberKey\\(selectedActivityMember\\)\\)/)\n"
+          if assertion in tests:
+              raise SystemExit('scope-remount regression assertion unexpectedly already exists')
+          count = tests.count(anchor)
+          if count != 1:
+              raise SystemExit(f'expected exactly one transcript source-contract anchor, found {count}')
+          tests = tests.replace(
+              anchor,
+              anchor
+              + "  // A bot switch remounts the drawer so the newly selected bot cannot\n"
+              + "  // inherit the previous bot's transcript snapshot while loading.\n"
+              + assertion,
+              1,
+          )
+          test.write_text(tests, encoding='utf-8')
+          PY
+
+      - name: Parse the plugin
+        run: node --check apps/desktop/src/plugins/hermes-bots/plugin.js
+
+      - name: Run focused transcript and group-chat regressions
+        run: |
+          node --test \
+            apps/desktop/src/plugins/hermes-bots/tests/group-activity-transcript.test.mjs \
+            apps/desktop/src/plugins/hermes-bots/tests/group-activity.test.mjs \
+            apps/desktop/src/plugins/hermes-bots/tests/group-chat.test.mjs \
+            apps/desktop/src/plugins/hermes-bots/tests/group-room-ux.test.mjs \
+            apps/desktop/src/plugins/hermes-bots/tests/group-mention-composer.test.mjs
+
+      - name: Run the complete Bots plugin suite
+        run: node --test apps/desktop/src/plugins/hermes-bots/tests/*.test.mjs
+
+      - name: Rewrite the branch as one clean feature commit
+        shell: bash
+        run: |
+          git diff --check
+          git reset --soft 0287dfb0c2874c8716d27cf6a654a42b716be5e0
+          expected=$'apps/desktop/src/plugins/hermes-bots/plugin.js\napps/desktop/src/plugins/hermes-bots/tests/group-activity-transcript.test.mjs'
+          actual="$(git diff --cached --name-only | sort)"
+          if [ "$actual" != "$expected" ]; then
+            printf 'Unexpected final diff. Expected:\n%s\nActual:\n%s\n' "$expected" "$actual" >&2
+            exit 1
+          fi
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat(desktop): add bot-scoped group activity transcripts'
+          final_sha="$(git rev-parse HEAD)"
+          git push --force origin "$final_sha:codex/bot-scoped-activity-transcripts"
+          # A second guarded push makes this finalizer authoritative over any
+          # older branch-specific cleanup job that was already in flight.
+          sleep 45
+          git push --force origin "$final_sha:codex/bot-scoped-activity-transcripts"
