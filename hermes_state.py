@@ -3535,6 +3535,42 @@ def _looks_like_python_executable(program: str) -> bool:
     return False
 
 
+_HERMES_EXECUTABLES = frozenset({"hermes", "hermes-agent", "hermes-acp"})
+_PYTHON_OPTIONS_WITH_OPERANDS = frozenset(
+    {"-Q", "-W", "-X", "--check-hash-based-pycs", "--jit"}
+)
+
+
+def _python_execution_target(argv: Sequence[str]) -> Optional[Tuple[str, str]]:
+    """Return the Python module or script selected by interpreter options."""
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            index += 1
+            return ("script", argv[index]) if index < len(argv) else None
+        if arg in ("-c", "-m"):
+            index += 1
+            if index >= len(argv) or arg == "-c":
+                return None
+            return "module", argv[index]
+        if arg in _PYTHON_OPTIONS_WITH_OPERANDS:
+            index += 2
+            continue
+        if (
+            arg.startswith(("-Q", "-W", "-X"))
+            or arg.startswith("--check-hash-based-pycs=")
+            or arg.startswith("--jit=")
+        ):
+            index += 1
+            continue
+        if arg.startswith("-"):
+            index += 1
+            continue
+        return "script", arg
+    return None
+
+
 def _looks_like_hermes(argv: Sequence[str]) -> bool:
     """Return whether argv identifies Hermes in the program position.
 
@@ -3545,18 +3581,21 @@ def _looks_like_hermes(argv: Sequence[str]) -> bool:
     """
     if not argv:
         return False
-    program = os.path.basename(argv[0]).lower()
-    if program.startswith("hermes"):
+    program = os.path.basename(argv[0]).lower().removesuffix(".exe")
+    if program in _HERMES_EXECUTABLES:
         return True
     if not _looks_like_python_executable(program):
         return False
-    for arg in argv[1:]:
-        normalized = arg.lower().replace("\\", "/")
-        if normalized == "hermes_cli.main" or normalized.endswith(
-            "/hermes_cli/main.py"
-        ):
-            return True
-    return False
+    target = _python_execution_target(argv)
+    if target is None:
+        return False
+    kind, value = target
+    normalized = value.lower().replace("\\", "/")
+    if kind == "module":
+        return normalized == "hermes_cli.main"
+    return normalized == "hermes_cli/main.py" or normalized.endswith(
+        "/hermes_cli/main.py"
+    )
 
 
 # Lifecycle statuses surfaced by session pickers. Classification looks ONLY at

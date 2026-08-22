@@ -101,6 +101,11 @@ class TestRuntimeFtsRebuild:
             ),
             ("tmux", "new-session", "/opt/hermes-agent/.venv/bin/hermes gateway"),
             ("python3", "/opt/hermes-agent/tools/check_state.py"),
+            ("hermes-monitor", "gateway"),
+            ("hermesctl", "serve"),
+            ("python3", "worker.py", "hermes_cli.main"),
+            ("python3", "-m", "other.module", "hermes_cli.main"),
+            ("python3", "-c", "hermes_cli.main"),
         ),
     )
     def test_uninspectable_non_hermes_process_is_not_a_holder(self, argv):
@@ -111,12 +116,16 @@ class TestRuntimeFtsRebuild:
         (
             ("/usr/local/bin/hermes", "gateway"),
             ("/usr/local/bin/hermes-agent", "serve"),
+            ("/usr/local/bin/hermes-acp", "--stdio"),
             ("/usr/bin/python3", "-m", "hermes_cli.main", "gateway"),
+            ("/usr/bin/python3", "-W", "ignore", "-m", "hermes_cli.main"),
+            ("/usr/bin/python3", "-Xdev", "-m", "hermes_cli.main"),
             (
                 "/opt/hermes-agent/.venv/bin/python",
                 "/opt/hermes-agent/hermes_cli/main.py",
                 "gateway",
             ),
+            ("python.exe", "--", "hermes_cli/main.py", "gateway"),
         ),
     )
     def test_uninspectable_hermes_process_remains_a_holder(self, argv):
