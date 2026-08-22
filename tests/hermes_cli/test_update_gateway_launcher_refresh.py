@@ -20,13 +20,23 @@ against a faked ``sys.platform``.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
+import hermes_cli.gateway  # noqa: F401  (see below)
 import hermes_cli.gateway_windows as gateway_windows
 import hermes_cli.main as cli_main
+
+# ``hermes_cli.gateway`` binds ``get_hermes_home`` from ``hermes_cli.config`` at
+# module level, so whichever test imports it first decides that binding for the
+# whole session.  A test below patches ``hermes_cli.config.get_hermes_home``
+# with a ``mock.patch`` context manager; if ``hermes_cli.gateway`` were first
+# imported inside that ``with`` block it would keep the Mock after the block
+# exits, and every later caller of ``_profile_suffix`` would get a ``str``
+# instead of a ``Path``.  Importing it here makes the binding deterministic.
 
 
 # ---------------------------------------------------------------------------
@@ -252,3 +262,132 @@ def test_refresh_is_a_no_op_off_windows(monkeypatch):
     )
 
     cli_main._refresh_windows_gateway_launchers()
+
+
+# ---------------------------------------------------------------------------
+# The refresh is a content replace, not a touch (#91956 review)
+# ---------------------------------------------------------------------------
+
+STOCK_CMD = b"@echo off\r\npython.exe -m hermes_cli.main gateway run\r\n"
+STOCK_VBS = b'CreateObject("WScript.Shell").Run "...", 0, False\r\n'
+
+
+def _stub_renderer(monkeypatch):
+    """Stand in for ``_write_task_script`` with something that really writes.
+
+    The real renderer resolves ``get_python_path()``/``PROJECT_ROOT`` and a
+    profile argv, none of which this behaviour depends on. What it does depend
+    on is that the render *replaces file content*, which is exactly what a stub
+    that writes a fixed stock pair reproduces.
+    """
+    def _render():
+        path = gateway_windows.get_task_script_path()
+        path.write_bytes(STOCK_CMD)
+        path.with_suffix(".vbs").write_bytes(STOCK_VBS)
+        return path
+
+    monkeypatch.setattr(gateway_windows, "_write_task_script", _render)
+
+
+@pytest.fixture
+def windows_refresh(profile_root, monkeypatch):
+    """A refresh that runs its real path resolution on any host.
+
+    ``get_task_script_path`` calls ``_assert_windows``, so the platform has to
+    be faked for the path derivation (and therefore the backup) to run at all
+    off Windows.
+    """
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(cli_main, "_is_windows", lambda: True)
+    _stub_renderer(monkeypatch)
+    return profile_root
+
+
+def _script_path_for(home):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(str(home))
+    try:
+        return gateway_windows.get_task_script_path()
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_a_wrapped_launcher_is_saved_before_it_is_replaced(
+    windows_refresh, monkeypatch, capsys
+):
+    """A host that wrapped the generated .cmd (local supervisor / watchdog)
+    gets its wrapper flattened by the refresh. Healing a legacy launcher means
+    we cannot decline to rewrite, so the previous copy has to survive."""
+    _install_only(monkeypatch, [windows_refresh])
+    script = _script_path_for(windows_refresh)
+    wrapper = b'wscript.exe //B //Nologo "Hermes_Gateway_hidden.vbs"\r\n'
+    script.write_bytes(wrapper)
+
+    cli_main._refresh_windows_gateway_launchers()
+
+    backup = script.with_name(script.name + ".pre-refresh.bak")
+    assert script.read_bytes() == STOCK_CMD
+    assert backup.read_bytes() == wrapper
+    assert str(backup) in capsys.readouterr().out
+
+
+def test_a_second_update_does_not_overwrite_the_saved_wrapper(
+    windows_refresh, monkeypatch
+):
+    """The trap in a naive backup: update #2 finds a stock script, copies THAT
+    over the backup, and the user's wrapper is gone for good. Only a launcher
+    whose content actually changed is preserved, so #2 copies nothing."""
+    _install_only(monkeypatch, [windows_refresh])
+    script = _script_path_for(windows_refresh)
+    wrapper = b"REM the only copy of this that will ever exist\r\n"
+    script.write_bytes(wrapper)
+
+    cli_main._refresh_windows_gateway_launchers()
+    cli_main._refresh_windows_gateway_launchers()
+
+    assert script.with_name(script.name + ".pre-refresh.bak").read_bytes() == wrapper
+
+
+def test_an_unchanged_launcher_is_not_backed_up(windows_refresh, monkeypatch, capsys):
+    _install_only(monkeypatch, [windows_refresh])
+    script = _script_path_for(windows_refresh)
+    script.write_bytes(STOCK_CMD)
+    script.with_suffix(".vbs").write_bytes(STOCK_VBS)
+
+    cli_main._refresh_windows_gateway_launchers()
+
+    assert not script.with_name(script.name + ".pre-refresh.bak").exists()
+    assert "previous launcher saved" not in capsys.readouterr().out
+
+
+def test_a_launcher_that_did_not_exist_is_created_without_a_backup(
+    windows_refresh, monkeypatch
+):
+    """Creating a file is not destructive, so there is nothing to preserve."""
+    _install_only(monkeypatch, [windows_refresh])
+    script = _script_path_for(windows_refresh)
+    vbs = script.with_suffix(".vbs")
+    assert not vbs.exists()
+
+    cli_main._refresh_windows_gateway_launchers()
+
+    assert vbs.read_bytes() == STOCK_VBS
+    assert not vbs.with_name(vbs.name + ".pre-refresh.bak").exists()
+
+
+def test_each_profile_keeps_its_backup_in_its_own_home(windows_refresh, monkeypatch):
+    """The reported host had a wrapper on one profile only; a backup written to
+    the wrong home would be as lost as no backup at all."""
+    other = windows_refresh / "profiles" / "arthur_tutor"
+    _install_only(monkeypatch, [windows_refresh, other])
+    wrappers = {}
+    for home in (windows_refresh, other):
+        script = _script_path_for(home)
+        wrappers[script] = f"REM wrapper for {home.name}\r\n".encode()
+        script.write_bytes(wrappers[script])
+
+    cli_main._refresh_windows_gateway_launchers()
+
+    for script, original in wrappers.items():
+        assert script.with_name(script.name + ".pre-refresh.bak").read_bytes() == original

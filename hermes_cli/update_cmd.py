@@ -4768,6 +4768,52 @@ def _installed_gateway_profile_homes() -> list:
     return homes
 
 
+def _snapshot_launcher_scripts(script_path) -> dict:
+    """Read the ``.cmd``/``.vbs`` launcher pair before a refresh rewrites it.
+
+    Returns ``{path: bytes or None}``; ``None`` means the file does not exist
+    yet (creating one is not destructive, so there is nothing to preserve).
+    """
+    snapshot = {}
+    for path in (script_path, script_path.with_suffix(".vbs")):
+        try:
+            snapshot[path] = path.read_bytes()
+        except OSError:
+            snapshot[path] = None
+    return snapshot
+
+
+def _preserve_replaced_launchers(snapshot: dict) -> list:
+    """Save any launcher whose content the refresh actually replaced.
+
+    ``_write_task_script`` renders from the current template, so the refresh is
+    a content *replace*, not a touch: on a host that wrapped the generated
+    ``.cmd`` (a local supervisor or a watchdog pointing its ``/TR`` at it) the
+    wrapper is flattened back to the stock script.  Healing a legacy launcher
+    is the whole point of this function — a pre-aa2ae36c3f ``pythonw`` script
+    also looks "customized" — so refusing to rewrite is not an option.  Keeping
+    a copy is.
+
+    Only a *changed* file is preserved.  That is what keeps a second update
+    from overwriting the user's saved wrapper with the stock content the first
+    update wrote: by then the on-disk script already matches the template, so
+    nothing is copied and the original backup survives.
+    """
+    saved = []
+    for path, old in snapshot.items():
+        if old is None:
+            continue
+        try:
+            if path.read_bytes() == old:
+                continue
+            backup = path.with_name(path.name + ".pre-refresh.bak")
+            backup.write_bytes(old)
+            saved.append(backup)
+        except OSError as exc:
+            logger.debug("Could not preserve replaced launcher %s: %s", path, exc)
+    return saved
+
+
 def _refresh_windows_gateway_launchers() -> None:
     """Regenerate installed Windows gateway launcher scripts after update.
 
@@ -4793,6 +4839,10 @@ def _refresh_windows_gateway_launchers() -> None:
     gateway, with the one mechanism designed to heal it permanently skipping
     it.  Each profile is scoped and caught independently so one bad profile
     cannot cost the others their refresh.
+
+    Because the render is a content replace, a launcher whose content actually
+    changed is copied to ``<name>.pre-refresh.bak`` first, so a host that
+    wrapped the generated script can get its wrapper back.
     """
     if not _m()._is_windows():
         return
@@ -4801,10 +4851,21 @@ def _refresh_windows_gateway_launchers() -> None:
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
         refreshed = 0
+        preserved = []
         for home in _m()._installed_gateway_profile_homes():
             token = set_hermes_home_override(str(home))
             try:
+                try:
+                    snapshot = _snapshot_launcher_scripts(
+                        gateway_windows.get_task_script_path()
+                    )
+                except Exception as exc:
+                    # Resolving the path must never cost a profile its refresh;
+                    # healing the launcher matters more than preserving a copy.
+                    logger.debug("Could not snapshot launchers for %s: %s", home, exc)
+                    snapshot = {}
                 gateway_windows._write_task_script()
+                preserved.extend(_preserve_replaced_launchers(snapshot))
                 refreshed += 1
             except Exception as exc:
                 logger.debug(
@@ -4819,6 +4880,8 @@ def _refresh_windows_gateway_launchers() -> None:
                 "  ✓ Refreshed Windows gateway launcher scripts "
                 f"({refreshed} profiles)"
             )
+        for backup in preserved:
+            print(f"    previous launcher saved to {backup}")
     except Exception as exc:
         logger.debug("Could not refresh Windows gateway launchers after update: %s", exc)
 
