@@ -188,6 +188,74 @@ def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) 
     return False
 
 
+def _land_pre_api_steer(
+    agent: Any, messages: List[Dict[str, Any]], steer_text: str
+) -> bool:
+    """Land a queued /steer on THIS iteration, cache- and alternation-safe.
+
+    Returns True when the steer was delivered into ``messages`` so the model
+    sees it on the request about to be built; False when no safe landing spot
+    exists this iteration (caller re-parks it for a later drain point).
+
+    Two cache-safe channels, both AFTER the cached system prefix so the
+    per-conversation prompt cache is never invalidated (AGENTS.md: "rebuilds
+    the system prompt mid-conversation invalidates that cache"; the notice is
+    delivered on the message list, never by mutating ``effective_system``):
+
+    1. **Tail is a ``role:"tool"`` message** — append the steer marker to that
+       tool result's content, exactly like the post-tool drain. The tail tool
+       result is the freshest message, so appending to it does not rewrite any
+       byte the previous request already cached.
+
+    2. **Tail is a bare ``role:"assistant"`` message** (no unpaired
+       ``tool_calls``) — append the steer as a genuine ``role:"user"`` turn.
+       This is the owner's starvation case: a long single-purpose stretch
+       (thinking-prefill continuations, model narrating step-by-step without
+       tools, self-improvement/background-review runs) leaves an assistant
+       tail with no tool batch to piggyback on, so the old code re-parked the
+       steer indefinitely. Appending user-after-assistant preserves strict
+       role alternation and touches nothing in the cached prefix. It is NOT a
+       synthetic/fabricated message (which AGENTS.md forbids) — it carries the
+       user's own out-of-band input, the same genuine-user-input-mid-loop
+       shape already sanctioned by ``_apply_active_turn_redirect``.
+
+    Any other tail (a ``user`` turn, an assistant row still carrying unpaired
+    ``tool_calls``, or an empty list) has no alternation-safe slot, so the
+    caller re-parks and the existing post-tool / next-turn drains deliver it.
+    """
+    if not messages:
+        return False
+    tail = messages[-1]
+    if not isinstance(tail, dict):
+        return False
+    from agent.prompt_builder import format_steer_marker
+
+    marker = format_steer_marker(steer_text)
+    role = tail.get("role")
+    if role == "tool":
+        existing = tail.get("content", "")
+        if isinstance(existing, str):
+            tail["content"] = existing + marker
+        else:
+            # Anthropic multimodal content blocks — append a text block.
+            try:
+                blocks = list(existing) if existing else []
+                blocks.append({"type": "text", "text": marker.lstrip()})
+                tail["content"] = blocks
+            except Exception:
+                return False
+        logger.debug("Pre-API steer landed on tail tool result")
+        return True
+    if role == "assistant" and not tail.get("tool_calls"):
+        # Genuine user input delivered mid-turn on a fresh user turn. The
+        # marker keeps provenance + one-shot-replay semantics identical to the
+        # tool-piggyback channel; the user role only strengthens its authority.
+        append_message(messages, {"role": "user", "content": marker.lstrip()})
+        logger.debug("Pre-API steer landed as user turn after assistant tail")
+        return True
+    return False
+
+
 def _restore_user_after_reference_handoff(
     messages: List[Dict[str, Any]], user_message: Any
 ) -> bool:
@@ -2105,41 +2173,26 @@ def run_conversation(
         # was thinking), drain it now — before we build api_messages — so
         # the model sees the steer text on THIS iteration.  Without this,
         # steers sent during an API call only land after the NEXT tool batch,
-        # which may never come if the model returns a final response.
+        # which may never come during a long single-purpose stretch (one
+        # multi-minute tool call, thinking-prefill continuations, or a
+        # self-improvement / background-review run that keeps narrating
+        # without emitting a tool batch).
         #
-        # We scan backwards for the last tool-role message in the messages
-        # list.  If found, the steer is appended there.  If not (first
-        # iteration, no tools yet), the steer stays pending for the next
-        # tool batch — injecting into a user message would break role
-        # alternation, and there's no tool output to piggyback on.
+        # ``_land_pre_api_steer`` delivers on the message list AFTER the
+        # cached system prefix, so it never busts the prompt cache:
+        #   * tail is a ``tool`` result  → append the marker to its content
+        #   * tail is a bare ``assistant`` → append the marker as a genuine
+        #     ``user`` turn (alternation-safe, and the owner's starvation fix)
+        # Any other tail (a ``user`` turn already awaiting a reply, or an
+        # assistant row with unpaired ``tool_calls`` whose results come next)
+        # has no alternation-safe slot yet, so we re-park and the existing
+        # post-tool / next-turn drains deliver it.
         _pre_api_steer = agent._drain_pending_steer()
         if _pre_api_steer:
-            _injected = False
-            for _si in range(len(messages) - 1, -1, -1):
-                _sm = messages[_si]
-                if isinstance(_sm, dict) and _sm.get("role") == "tool":
-                    from agent.prompt_builder import format_steer_marker
-                    marker = format_steer_marker(_pre_api_steer)
-                    existing = _sm.get("content", "")
-                    if isinstance(existing, str):
-                        _sm["content"] = existing + marker
-                    else:
-                        # Multimodal content blocks — append text block
-                        try:
-                            blocks = list(existing) if existing else []
-                            blocks.append({"type": "text", "text": marker})
-                            _sm["content"] = blocks
-                        except Exception:
-                            pass
-                    _injected = True
-                    logger.debug(
-                        "Pre-API-call steer drain: injected into tool msg at index %d",
-                        _si,
-                    )
-                    break
-            if not _injected:
-                # No tool message to inject into — put it back so
-                # the post-tool-execution drain picks it up later.
+            _landed = _land_pre_api_steer(agent, messages, _pre_api_steer)
+            if not _landed:
+                # No alternation-safe landing spot this iteration — put it
+                # back so a later drain point picks it up.
                 _lock = getattr(agent, "_pending_steer_lock", None)
                 if _lock is not None:
                     with _lock:

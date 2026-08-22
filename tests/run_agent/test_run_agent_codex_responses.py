@@ -10,6 +10,7 @@ sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 import run_agent
+from agent.prompt_builder import STEER_MARKER_OPEN
 
 
 @pytest.fixture(autouse=True)
@@ -1873,6 +1874,43 @@ def test_codex_incomplete_opaque_state_updated_in_place(monkeypatch):
             (i.get("id") if isinstance(i, dict) else getattr(i, "id", None)) == "rs_2"
             for i in items
         )
+
+
+def test_queued_steer_lands_on_next_assistant_tail_provider_request(monkeypatch):
+    """Exercise queued steer delivery through production run_conversation.
+
+    A replayable Codex incomplete response continues with a bare assistant tail.
+    A steer accepted while that response is in flight must become one marked
+    user turn on the next provider request without changing the system prefix.
+    """
+    agent = _build_agent(monkeypatch)
+    requests = []
+
+    def _provider_call(api_kwargs):
+        requests.append(api_kwargs)
+        if len(requests) == 1:
+            assert agent.steer("switch to the focused path") is True
+            return _codex_incomplete_with_reasoning("Still working...", "rs_steer")
+        return _codex_message_response("Done after steering.")
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _provider_call)
+
+    result = agent.run_conversation("Perform the task")
+
+    assert result["completed"] is True
+    assert len(requests) == 2
+    assert requests[1]["instructions"].encode() == requests[0]["instructions"].encode()
+
+    marked_users = [
+        item
+        for item in requests[1]["input"]
+        if isinstance(item, dict)
+        and item.get("role") == "user"
+        and STEER_MARKER_OPEN in str(item.get("content", ""))
+    ]
+    assert len(marked_users) == 1
+    assert "switch to the focused path" in str(marked_users[0]["content"])
+    assert requests[1]["input"][-1] == marked_users[0]
 
 
 def test_normalize_codex_response_marks_commentary_only_message_as_incomplete(monkeypatch):
