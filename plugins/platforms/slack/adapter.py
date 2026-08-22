@@ -1340,6 +1340,7 @@ class SlackAdapter(BasePlatformAdapter):
                 return
 
             logger.warning("[Slack] Socket Mode unhealthy (%s); reconnecting", reason)
+            stale_task = self._socket_mode_task
             try:
                 await asyncio.wait_for(
                     self._stop_socket_mode_handler(),
@@ -1351,6 +1352,8 @@ class SlackAdapter(BasePlatformAdapter):
                     "starting a replacement",
                     self._socket_stop_timeout_s,
                 )
+                if stale_task is not None and not stale_task.done():
+                    stale_task.cancel()
             except Exception as exc:  # pragma: no cover - defensive recovery
                 logger.warning(
                     "[Slack] Error closing stale Socket Mode handler: %s; "
