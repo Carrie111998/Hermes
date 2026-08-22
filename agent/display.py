@@ -1375,6 +1375,12 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
     # treat them as successes since failures would be JSON-encoded strings.
     if not isinstance(result, str):
         return False, ""
+    # A parseable JSON object was already evaluated above (structured error
+    # branch). Don't re-scan its raw text: an explicit ``"error": null`` on a
+    # successful result (e.g. web_extract) would otherwise match the literal
+    # ``"error"`` marker below and be mis-flagged as a failure (#91166).
+    if isinstance(data, dict):
+        return False, ""
     lower = result[:500].lower()
     if '"error"' in lower or '"failed"' in lower or result.startswith("Error"):
         return True, " [error]"

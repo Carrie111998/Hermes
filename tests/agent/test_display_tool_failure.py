@@ -96,6 +96,30 @@ class TestDetectToolFailureStructured:
         result = json.dumps({"success": True, "data": "hello"})
         assert _detect_tool_failure("web_search", result) == (False, "")
 
+    def test_explicit_null_error_not_flagged(self):
+        """A successful result with an explicit ``"error": null`` field must
+        not trip the string heuristic — web_extract returns this on success
+        (#91166). The structured dict branch already evaluates the field, so
+        the 500-char literal scan must be skipped for JSON dicts.
+        """
+        result = json.dumps({
+            "success": True,
+            "error": None,
+            "data": "extracted page content here",
+        })
+        assert _detect_tool_failure("web_extract", result) == (False, "")
+
+    def test_short_json_with_error_null_and_failure_marker_still_flags(self):
+        """A genuinely failing short JSON result with a real error string is
+        still flagged — only the null-error case is exempted."""
+        result = json.dumps({
+            "success": False,
+            "error": "rate limited",
+        })
+        is_failure, suffix = _detect_tool_failure("web_extract", result)
+        assert is_failure is True
+        assert suffix == " [rate limited]"
+
 
 
 class TestGetCuteToolMessageFailureSuffix:
