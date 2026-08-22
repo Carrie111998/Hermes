@@ -202,6 +202,61 @@ def test_existing_plain_target_on_matching_anchor_branch_fails_closed(
     assert kb._git_toplevel(target) == canonical
 
 
+@pytest.mark.parametrize("source_status", ["ready", "review"])
+def test_dispatch_workspace_ownership_failure_stays_with_task(
+    kanban_home, tmp_path, monkeypatch, all_assignees_spawnable, source_status
+):
+    repo = _make_repo(tmp_path)
+    canonical = _add_worktree(repo, tmp_path / "canonical", "anchor/main")
+    spawned = []
+
+    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "ok")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title=f"ambiguous {source_status} workspace",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(canonical),
+            branch_name=f"wt/{source_status}-ambiguous",
+        )
+        target = canonical / ".worktrees" / tid
+        target.mkdir(parents=True)
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ?, status = ? WHERE id = ?",
+            (str(target), source_status, tid),
+        )
+        conn.commit()
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *args, **kwargs: spawned.append((args, kwargs)),
+            failure_limit=2,
+        )
+        task = kb.get_task(conn, tid)
+        run = conn.execute(
+            "SELECT outcome, status, error FROM task_runs "
+            "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+
+    assert not spawned
+    assert not result.spawned
+    assert not result.auto_blocked
+    assert task is not None
+    assert task.status == source_status
+    assert task.consecutive_failures == 1
+    assert task.last_failure_error is not None
+    assert task.last_failure_error.startswith("workspace: ")
+    assert "repository ownership is ambiguous" in task.last_failure_error
+    assert run is not None
+    assert run["outcome"] == "spawn_failed"
+    assert run["status"] == "spawn_failed"
+    assert "repository ownership is ambiguous" in run["error"]
+
+
 def test_decompose_worktree_children_get_own_workspace(kanban_home):
     with kb.connect() as conn:
         root = kb.create_task(conn, title="build the feature", triage=True)
@@ -260,7 +315,6 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     assert head == "wt/sibling"
-
 
 
 
