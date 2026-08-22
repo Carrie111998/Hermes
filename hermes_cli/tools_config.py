@@ -3237,6 +3237,11 @@ def _plugin_voice_providers(kind: str) -> list[dict]:
         _ensure_plugins_discovered()
         providers = list_providers()
     except Exception:
+        logger.debug(
+            "plugin voice provider discovery failed for kind=%s; noisy "
+            "provider disappears from the picker",
+            kind, exc_info=True,
+        )
         return []
 
     rows: list[dict] = []
@@ -3247,6 +3252,10 @@ def _plugin_voice_providers(kind: str) -> list[dict]:
         try:
             schema = provider.get_setup_schema()
         except Exception:
+            logger.debug(
+                "plugin voice provider %r failed to load its setup schema; "
+                "dropped from the picker", name, exc_info=True,
+            )
             continue
         if not isinstance(schema, dict):
             continue

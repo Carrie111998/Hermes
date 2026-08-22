@@ -39,6 +39,34 @@ export function voiceProviderKeys(
 }
 
 /**
+ * Config-presence-only keys: fields present in the live config for a provider
+ * but with NO schema entry (neither the curated Voice section nor a backend
+ * config_fields declaration). These render through inferFieldSchema() as
+ * generic inputs, so callers should mark them "(detected)" rather than
+ * presenting them as a fully-supported schema field.
+ */
+export function detectedConfigKeys(
+  section: 'tts' | 'stt',
+  providerKey: string,
+  schema: Record<string, unknown> = {},
+  config: HermesConfigRecord | null = null
+): string[] {
+  const prefix = `${section}.${providerKey}.`
+  const declared = new Set(VOICE_KEYS.filter(key => key.startsWith(prefix)))
+  Object.keys(schema)
+    .filter(key => key.startsWith(prefix))
+    .forEach(key => declared.add(key))
+
+  const providerConfig = config ? getNested(config, `${section}.${providerKey}`) : undefined
+  if (!providerConfig || typeof providerConfig !== 'object' || Array.isArray(providerConfig)) {
+    return []
+  }
+  return Object.keys(providerConfig)
+    .map(key => `${prefix}${key}`)
+    .filter(key => !declared.has(key))
+}
+
+/**
  * Inline voice/model settings for one TTS (or STT) provider, rendered inside
  * the Capabilities → toolset config panel underneath the provider's API-key
  * fields. Reads and writes the same `tts.<provider>.*` config keys as
@@ -57,6 +85,10 @@ export function VoiceProviderFields({ section, providerKey }: { section: 'tts' |
 
   const keys = useMemo(
     () => voiceProviderKeys(section, providerKey, schemaResponse?.fields ?? {}, loadedConfig ?? null),
+    [section, providerKey, schemaResponse?.fields, loadedConfig]
+  )
+  const detectedKeys = useMemo(
+    () => detectedConfigKeys(section, providerKey, schemaResponse?.fields ?? {}, loadedConfig ?? null),
     [section, providerKey, schemaResponse?.fields, loadedConfig]
   )
 
@@ -142,9 +174,15 @@ export function VoiceProviderFields({ section, providerKey }: { section: 'tts' |
         const value = getNested(config, key)
         const field = schema[key] ?? inferFieldSchema(value)
         const isElVoice = key === 'tts.elevenlabs.voice_id'
+        const isDetected = !schema[key] && detectedKeys.includes(key)
 
         return (
           <ConfigField
+            descriptionExtra={
+              isDetected ? (
+                <span className="text-muted-foreground text-xs italic">{t.settings.config.detected}</span>
+              ) : undefined
+            }
             enumOptions={enumOptionsFor(key, value, config, isElVoice ? (elVoices ?? undefined) : undefined)}
             key={key}
             onChange={next => updateConfig(setNested(config, key, next))}
