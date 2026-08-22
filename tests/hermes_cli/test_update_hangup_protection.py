@@ -48,6 +48,34 @@ def test_update_completion_rejects_untrusted_action_identity(monkeypatch, capsys
     assert capsys.readouterr().out == "✓ Update complete!\n"
 
 
+def test_update_completion_flushes_action_receipt(monkeypatch):
+    """The dashboard may restart its own parent immediately after completion."""
+    monkeypatch.setenv("HERMES_ACTION_ID", "a" * 32)
+    monkeypatch.setattr("hermes_cli.update_cmd._branch_head_suffix", lambda: "")
+    visible = io.StringIO()
+
+    class _BufferedActionLog:
+        def __init__(self):
+            self.pending = ""
+
+        def write(self, data):
+            self.pending += data
+            return len(data)
+
+        def flush(self):
+            visible.write(self.pending)
+            self.pending = ""
+
+    monkeypatch.setattr(sys, "stdout", _BufferedActionLog())
+
+    _print_update_completion("✓ Update complete!")
+
+    assert visible.getvalue().splitlines() == [
+        "✓ Update complete!",
+        f"=== hermes-update completed {'a' * 32} ===",
+    ]
+
+
 # -----------------------------------------------------------------------------
 # _UpdateOutputStream
 # -----------------------------------------------------------------------------

@@ -5502,6 +5502,18 @@ async def get_action_status(name: str, lines: int = 200):
         running = False
         exit_code = result.get("exit_code") if result else None
         pid = result.get("pid") if result else None
+        if name == "hermes-update" and result is None:
+            # A successful self-update restarts this dashboard process. That
+            # loses the in-memory Popen/result maps and may close the redirected
+            # action log before the child prints its completion marker. The
+            # updater mirrors every write to update.log, so use that durable
+            # stream when reconciling from the restarted server process.
+            durable_tail = _tail_lines(
+                _ACTION_LOG_DIR / "update.log",
+                min(max(lines, 1), 2000),
+            )
+            if durable_tail:
+                tail = durable_tail
     else:
         exit_code = proc.poll()
         running = exit_code is None
