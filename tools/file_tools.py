@@ -783,6 +783,36 @@ def _protected_instruction_config() -> tuple[bool, list[str]]:
     return enabled, [str(p) for p in extra if p]
 
 
+def _qualified_lexical_path(filepath: str, task_id: str = "default") -> str:
+    """Qualify a task path without dereferencing its final symlink."""
+    container_paths = _uses_container_paths(task_id)
+    expanded = _expand_tilde(filepath)
+    if container_paths:
+        return str(_normalize_without_host_deref(
+            expanded if posixpath.isabs(expanded)
+            else posixpath.join(
+                str(_resolve_base_dir(task_id, container_paths=True)), expanded
+            )
+        ))
+    if sys.platform == "win32":
+        from tools.environments.local import _msys_to_windows_path
+        import ntpath
+
+        expanded = _expand_tilde(_msys_to_windows_path(filepath))
+        return ntpath.normpath(
+            expanded if ntpath.isabs(expanded)
+            else ntpath.join(
+                str(_resolve_base_dir(task_id, container_paths=False)), expanded
+            )
+        )
+    return os.path.normpath(
+        expanded if os.path.isabs(expanded)
+        else os.path.join(
+            str(_resolve_base_dir(task_id, container_paths=False)), expanded
+        )
+    )
+
+
 def _protected_instruction_reason(filepath: str, task_id: str = "default",
                                   *, enabled: bool | None = None,
                                   extra_patterns: list[str] | None = None) -> str | None:
@@ -799,7 +829,10 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     if not enabled:
         return None
 
-    normalized = os.path.normpath(_expand_tilde(filepath))
+    try:
+        normalized = _qualified_lexical_path(filepath, task_id)
+    except (OSError, ValueError, RuntimeError):
+        normalized = os.path.abspath(os.path.normpath(_expand_tilde(filepath)))
     try:
         resolved = os.path.realpath(str(_resolve_path_for_task(filepath, task_id)))
     except (OSError, ValueError, RuntimeError):
@@ -842,43 +875,20 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
 
 
 def _protected_instruction_approval_target(
-        filepath: str, task_id: str = "default") -> tuple[str, str]:
-    """Return the canonical identity and qualified display for an approved write."""
+        filepath: str, task_id: str = "default") -> tuple[str, str, bool]:
+    """Return canonical identity, qualified display, and alias status."""
     try:
-        container_paths = _uses_container_paths(task_id)
-        expanded = _expand_tilde(filepath)
-        if container_paths:
-            requested = _normalize_without_host_deref(
-                expanded if posixpath.isabs(expanded)
-                else posixpath.join(
-                    str(_resolve_base_dir(task_id, container_paths=True)), expanded
-                )
-            )
-        elif sys.platform == "win32":
-            from tools.environments.local import _msys_to_windows_path
-            import ntpath
-
-            expanded = _expand_tilde(_msys_to_windows_path(filepath))
-            requested = ntpath.normpath(
-                expanded if ntpath.isabs(expanded)
-                else ntpath.join(
-                    str(_resolve_base_dir(task_id, container_paths=False)), expanded
-                )
-            )
-        else:
-            requested = os.path.normpath(
-                expanded if os.path.isabs(expanded)
-                else os.path.join(
-                    str(_resolve_base_dir(task_id, container_paths=False)), expanded
-                )
-            )
+        requested = _qualified_lexical_path(filepath, task_id)
     except (OSError, ValueError, RuntimeError):
         requested = os.path.abspath(os.path.normpath(_expand_tilde(filepath)))
     canonical = os.path.realpath(requested)
-    display = requested
-    if os.path.normcase(requested) != os.path.normcase(canonical):
-        display = f"{requested} -> {canonical}"
-    return os.path.normcase(canonical), json.dumps(display, ensure_ascii=False)
+    is_alias = os.path.normcase(requested) != os.path.normcase(canonical)
+    display = f"{requested} -> {canonical}" if is_alias else requested
+    return (
+        os.path.normcase(canonical),
+        json.dumps(display, ensure_ascii=False),
+        is_alias,
+    )
 
 
 def _request_protected_instruction_approval(
@@ -993,18 +1003,22 @@ def _check_protected_instruction_write(paths: list[str],
     enabled, extra = _protected_instruction_config()
     if not enabled:
         return None
-    targets: dict[str, str] = {}
+    targets: dict[str, tuple[str, bool]] = {}
     for p in paths:
         reason = _protected_instruction_reason(
             p, task_id, enabled=enabled, extra_patterns=extra)
         if reason:
-            identity, display = _protected_instruction_approval_target(p, task_id)
+            identity, display, is_alias = _protected_instruction_approval_target(
+                p, task_id
+            )
             previous = targets.get(identity)
-            if previous is None or (" -> " in display and " -> " not in previous):
-                targets[identity] = display
+            if previous is None or (is_alias and not previous[1]):
+                targets[identity] = (display, is_alias)
     if not targets:
         return None
-    return _request_protected_instruction_approval(list(targets.values()), task_id)
+    return _request_protected_instruction_approval(
+        [display for display, _is_alias in targets.values()], task_id
+    )
 
 
 def _check_approval_required_write(paths: list[str],

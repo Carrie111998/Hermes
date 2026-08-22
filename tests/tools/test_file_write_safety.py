@@ -581,6 +581,26 @@ class TestProtectedInstructionFiles:
         assert not res.get("error"), res
         assert approvals["calls"] == []
 
+    def test_relative_regular_file_in_real_hermes_home_not_gated(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        import tools.file_tools as ft
+        fake_home = tmp_path / ".hermes"
+        fake_home.mkdir()
+        monkeypatch.setattr(
+            ft, "_get_real_hermes_home", lambda: str(fake_home.resolve())
+        )
+        monkeypatch.setattr(
+            ft,
+            "_resolve_base_dir",
+            lambda task_id, container_paths=None: tmp_path,
+        )
+
+        res = self._write(".hermes/scratch.txt", "ok")
+
+        assert not res.get("error"), res
+        assert approvals["calls"] == []
+
     def test_protected_basename_in_real_hermes_home_is_gated(
         self, tmp_path, approvals, monkeypatch
     ):
