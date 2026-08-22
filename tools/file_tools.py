@@ -810,11 +810,7 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     # below; protected basenames and configured patterns must still apply to
     # live instruction files and pre-run scripts inside the active home.
     real_home = _get_real_hermes_home()
-    in_real_home = bool(
-        real_home
-        and (resolved == real_home
-             or resolved.startswith(real_home + os.sep))
-    )
+    real_home_key = os.path.normcase(real_home) if real_home else None
 
     import fnmatch
     for candidate in (normalized, resolved):
@@ -825,7 +821,13 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         for pattern in extra_patterns:
             if fnmatch.fnmatch(base_lower, pattern.lower()):
                 return base
-        if in_real_home:
+        candidate_key = os.path.normcase(os.path.abspath(candidate))
+        candidate_in_real_home = bool(
+            real_home_key
+            and (candidate_key == real_home_key
+                 or candidate_key.startswith(real_home_key + os.sep))
+        )
+        if candidate_in_real_home:
             continue
         # Project-local .hermes config dirs (e.g. <repo>/.hermes/config.yaml)
         # are loaded as project context and steer behavior the same way.

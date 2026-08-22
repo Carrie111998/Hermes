@@ -534,6 +534,28 @@ class TestProtectedInstructionFiles:
         res = self._write(proj / "config.yaml")
         assert res.get("error") and "BLOCKED" in res["error"]
 
+    def test_project_local_hermes_symlink_into_real_home_is_gated(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        import tools.file_tools as ft
+        fake_home = tmp_path / "active" / ".hermes"
+        target = fake_home / "notes" / "config.yaml"
+        target.parent.mkdir(parents=True)
+        target.write_text("original", encoding="utf-8")
+        project_home = tmp_path / "project" / ".hermes"
+        project_home.mkdir(parents=True)
+        link = project_home / "config.yaml"
+        link.symlink_to(target)
+        monkeypatch.setattr(
+            ft, "_get_real_hermes_home", lambda: str(fake_home.resolve())
+        )
+        approvals["answer"] = "deny"
+
+        res = self._write(link, "injected")
+
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert target.read_text(encoding="utf-8") == "original"
+
     def test_checkout_nested_under_hermes_dir_not_gated(self, tmp_path, approvals):
         """A repo living UNDER a .hermes dir (e.g. ~/.hermes/hermes-agent)
         must not have every write gated — only files directly inside a
