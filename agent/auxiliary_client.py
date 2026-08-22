@@ -3361,6 +3361,18 @@ def _relay_sync_completion(
 ) -> Any:
     callback = create or (lambda request: client.chat.completions.create(**request))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    if str(provider or "").lower() == "azure-foundry":
+        from agent.azure_identity_adapter import execute_with_quota
+        context = _RELAY_AUX_CALL_CONTEXT.get() or {}
+        from agent.aux_accounting import azure_request_class
+        return execute_with_quota(
+            base_url=str(getattr(client, "base_url", "") or ""),
+            deployment=str(kwargs.get("model") or ""),
+            request_class=azure_request_class(context.get("task")),
+            payload=kwargs,
+            request_identity=f"{context.get('request_id','aux')}:{context.get('attempt_count',0)}",
+            send=lambda admitted: _run_protected_sync_provider_call(callback, admitted),
+        )
     # Protected compression calls isolate only the provider callback and stream
     # aggregation.  The owning thread remains free to unwind its lease/DB
     # transaction on hard cancel without touching the process-shared client.
@@ -3389,6 +3401,16 @@ async def _relay_async_completion(
 ) -> Any:
     callback = create or (lambda request: client.chat.completions.create(**request))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    if str(provider or "").lower() == "azure-foundry":
+        from agent.azure_identity_adapter import execute_with_quota_async
+        from agent.aux_accounting import azure_request_class
+        context = _RELAY_AUX_CALL_CONTEXT.get() or {}
+        return await execute_with_quota_async(
+            base_url=str(getattr(client, "base_url", "") or ""), deployment=str(kwargs.get("model") or ""),
+            request_class=azure_request_class(context.get("task")), payload=kwargs,
+            request_identity=f"{context.get('request_id','aux')}:{context.get('attempt_count',0)}",
+            send=callback,
+        )
     if route is None:
         return await callback(kwargs)
     provider_name, fallback_model, metadata = route
@@ -3412,6 +3434,16 @@ def _relay_sync_stream(
     api_mode: str | None = None,
 ) -> Any:
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    if str(provider or "").lower() == "azure-foundry":
+        from agent.azure_identity_adapter import execute_with_quota
+        from agent.aux_accounting import azure_request_class
+        context = _RELAY_AUX_CALL_CONTEXT.get() or {}
+        return execute_with_quota(
+            base_url=str(getattr(client, "base_url", "") or ""), deployment=str(kwargs.get("model") or ""),
+            request_class=azure_request_class(context.get("task")), payload=kwargs,
+            request_identity=f"{context.get('request_id','aux-stream')}:{context.get('attempt_count',0)}",
+            send=lambda request: client.chat.completions.create(**request),
+        )
     if route is None:
         return client.chat.completions.create(**kwargs)
     provider_name, fallback_model, metadata = route
@@ -9654,6 +9686,10 @@ def _call_llm_impl(
             # Retries exhausted — fall through to first_err fallback handling.
             raise _last_transient
     except Exception as first_err:
+        if str(request_provider or "").lower() == "azure-foundry":
+            # Native Azure requests are pinned to the admitted deployment;
+            # the generic auxiliary fallback chain must never reroute them.
+            raise
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)

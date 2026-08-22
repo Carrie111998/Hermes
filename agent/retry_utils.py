@@ -87,6 +87,50 @@ def parse_retry_after_seconds(value_or_headers: Any) -> Optional[float]:
     return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
 
 
+def azure_retry_delay(headers: Any, attempt: int, *, now: Optional[datetime] = None,
+                      jitter_fn=None, max_delay: float = 120.0) -> tuple[float, str]:
+    """Azure retry precedence: milliseconds, Retry-After, then bounded jitter.
+
+    ``attempt`` is the cumulative lifecycle attempt (1..5), never a wrapper-
+    local counter.  A zero-valued provider header is rejected so HTTP 429 can
+    never spin in an immediate retry loop.
+    """
+    if attempt < 1 or attempt >= 5:
+        raise ValueError("azure_retry_attempts_exhausted")
+    getter = getattr(headers, "get", None)
+    ms = None
+    if callable(getter):
+        ms = getter("retry-after-ms")
+        if ms is None:
+            ms = getter("Retry-After-Ms")
+    if ms is not None and not isinstance(ms, bool):
+        try:
+            delay = float(ms) / 1000.0
+            if delay > 0:
+                return min(delay, max_delay), "retry-after-ms"
+        except (TypeError, ValueError):
+            pass
+    raw = getter("Retry-After") if callable(getter) else None
+    if raw is None and callable(getter):
+        raw = getter("retry-after")
+    if raw is not None:
+        try:
+            delay = float(raw)
+        except (TypeError, ValueError):
+            try:
+                when = parsedate_to_datetime(str(raw))
+                base = now or datetime.now(timezone.utc)
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+                delay = (when - base).total_seconds()
+            except (TypeError, ValueError):
+                delay = -1
+        if delay > 0:
+            return min(delay, max_delay), "retry-after"
+    fn = jitter_fn or jittered_backoff
+    return max(0.001, min(float(fn(attempt, base_delay=2.0, max_delay=max_delay)), max_delay)), "exponential"
+
+
 def jittered_backoff(
     attempt: int,
     *,

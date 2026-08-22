@@ -569,3 +569,89 @@ __all__ = [
     "materialize_bearer_for_http",
     "reset_credential_cache",
 ]
+
+
+def _quota_payload(payload, request_class):
+    """Copy and enforce the trusted output ceiling at the final send owner."""
+    from agent.azure_quota_controller import trusted_output_ceiling
+    admitted = dict(payload)
+    key = next((name for name in ("max_output_tokens", "max_completion_tokens", "max_tokens") if name in admitted), None)
+    requested = admitted.get(key) if key else None
+    ceiling = trusted_output_ceiling(request_class, requested)
+    if request_class != "embeddings":
+        if key is None:
+            key = "max_output_tokens" if "input" in admitted and "messages" not in admitted else "max_tokens"
+        admitted[key] = ceiling
+    return admitted, ceiling
+
+
+def execute_with_quota(*, base_url, deployment, request_class, payload, send,
+                       request_identity=None, cancelled=lambda: False):
+    """Execute one native Azure SDK request under the shared quota ledger."""
+    from agent.azure_quota_controller import AzureQuotaController, default_controller_path
+    from hermes_cli.config import get_hermes_home, load_config_readonly
+
+    cfg = load_config_readonly() or {}
+    quota = ((cfg.get("azure_foundry") or {}).get("quota") or {})
+    ctl = AzureQuotaController(
+        default_controller_path(get_hermes_home()),
+        hard_cap=int(quota.get("hard_token_cap", 1_000_000)),
+        max_depth=int(quota.get("max_queue_depth", 128)),
+        max_wait=float(quota.get("max_wait_seconds", 120)),
+        stale_after=float(quota.get("stale_reservation_seconds", 300)),
+    )
+    payload, requested = _quota_payload(payload, request_class)
+    admission = ctl.admit(base_url=base_url, deployment=deployment,
+                          request_class=request_class, payload=payload,
+                          requested_output=requested, request_identity=request_identity,
+                          cancelled=cancelled)
+    try:
+        response = send(payload)
+    except BaseException:
+        # Once send starts Azure may have incurred usage. Unknown remains fully
+        # reserved; never pretend cancellation or transport failure was free.
+        ctl.reconcile(admission, usage_tokens=None, status="send_error",
+                      cancelled=bool(cancelled()))
+        raise
+    usage = getattr(response, "usage", None)
+    if isinstance(usage, dict):
+        used = usage.get("total_tokens")
+    else:
+        used = getattr(usage, "total_tokens", None)
+    raw_response = getattr(response, "response", None)
+    headers = getattr(raw_response, "headers", None) or getattr(response, "headers", None) or {}
+    ctl.reconcile(admission, usage_tokens=used, headers=headers,
+                  cancelled=bool(cancelled()))
+    return response
+
+
+async def execute_with_quota_async(*, base_url, deployment, request_class, payload, send,
+                                  request_identity=None, cancelled=lambda: False):
+    """Async sibling preserving the same atomic provider-owned ledger."""
+    from agent.azure_quota_controller import AzureQuotaController, default_controller_path
+    from hermes_cli.config import get_hermes_home, load_config_readonly
+    cfg = load_config_readonly() or {}; quota = ((cfg.get("azure_foundry") or {}).get("quota") or {})
+    ctl = AzureQuotaController(default_controller_path(get_hermes_home()),
+        hard_cap=int(quota.get("hard_token_cap", 1_000_000)),
+        max_depth=int(quota.get("max_queue_depth", 128)),
+        max_wait=float(quota.get("max_wait_seconds", 120)),
+        stale_after=float(quota.get("stale_reservation_seconds", 300)))
+    payload, requested = _quota_payload(payload, request_class)
+    admission = ctl.admit(base_url=base_url, deployment=deployment,
+        request_class=request_class, payload=payload, requested_output=requested,
+        request_identity=request_identity, cancelled=cancelled)
+    try:
+        response = await send(payload)
+    except BaseException:
+        ctl.reconcile(admission, usage_tokens=None, status="send_error", cancelled=bool(cancelled()))
+        raise
+    usage = getattr(response, "usage", None)
+    used = usage.get("total_tokens") if isinstance(usage, dict) else getattr(usage, "total_tokens", None)
+    raw_response = getattr(response, "response", None)
+    headers = getattr(raw_response, "headers", None) or getattr(response, "headers", None) or {}
+    ctl.reconcile(admission, usage_tokens=used, headers=headers, cancelled=bool(cancelled()))
+    return response
+
+
+__all__.append("execute_with_quota")
+__all__.append("execute_with_quota_async")

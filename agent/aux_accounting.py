@@ -42,6 +42,23 @@ _accounting: ContextVar[Optional[tuple]] = ContextVar(
 # conversation_loop's update_token_counts delta (tokens AND cost).
 _EXCLUDED_TASKS = frozenset({"moa_reference", "moa_aggregator"})
 
+_AZURE_REQUEST_CLASSES = {
+    "title_generation": "title", "title": "title",
+    "compression": "compression", "summarization": "summarisation",
+    "summary": "summarisation", "vision": "vision", "browser_vision": "vision",
+    "classification": "classification", "triage": "triage",
+    "monitor": "monitor", "recovery": "recovery", "planning": "planning",
+    "review": "guarded_review", "guarded_review": "guarded_review",
+    "tool_followup": "tool_followup", "moa_reference": "planning",
+    "moa_aggregator": "planning", "web_extract": "classification",
+    "session_search": "classification", "embeddings": "embeddings",
+}
+
+
+def azure_request_class(task: str | None) -> str:
+    """Map every auxiliary task label to a trusted, non-widenable class."""
+    return _AZURE_REQUEST_CLASSES.get(str(task or "").strip().lower(), "classification")
+
 
 def set_accounting_context(session_db: Any, session_id: Optional[str]):
     """Publish the active session's accounting handles for aux usage recording.

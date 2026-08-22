@@ -7,6 +7,15 @@ verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
+    "azure_foundry": {
+        # Native provider admission only; credentials remain in .env/Entra.
+        "quota": {
+            "hard_token_cap": 1_000_000,
+            "max_queue_depth": 128,
+            "max_wait_seconds": 120,
+            "stale_reservation_seconds": 300,
+        },
+    },
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],

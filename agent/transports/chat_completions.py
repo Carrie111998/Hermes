@@ -509,9 +509,10 @@ class ChatCompletionsTransport(ProviderTransport):
         # ── Provider profile: single-path when present ──────────────────
         _profile = params.get("provider_profile")
         if _profile:
-            return self._build_kwargs_from_profile(
+            built = self._build_kwargs_from_profile(
                 _profile, model, sanitized, tools, params
             )
+            return self._apply_azure_output_ceiling(built, params)
 
         # ── Legacy fallback (unregistered / unknown provider) ───────────
         # Reached only when get_provider_profile() returned None.
@@ -711,6 +712,19 @@ class ChatCompletionsTransport(ProviderTransport):
             cache_scope_id=params.get("cache_scope_id"),
         )
 
+        return self._apply_azure_output_ceiling(api_kwargs, params)
+
+    @staticmethod
+    def _apply_azure_output_ceiling(api_kwargs, params):
+        """Clamp, never widen, output for trusted Azure request classes."""
+        request_class = params.get("azure_request_class")
+        if not request_class:
+            return api_kwargs
+        from agent.azure_quota_controller import trusted_output_ceiling
+        requested = api_kwargs.get("max_completion_tokens", api_kwargs.get("max_tokens"))
+        ceiling = trusted_output_ceiling(request_class, requested)
+        key = "max_completion_tokens" if "max_completion_tokens" in api_kwargs else "max_tokens"
+        api_kwargs[key] = ceiling
         return api_kwargs
 
     def _build_kwargs_from_profile(self, profile, model, sanitized, tools, params):

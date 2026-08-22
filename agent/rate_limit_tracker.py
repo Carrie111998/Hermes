@@ -129,6 +129,12 @@ def parse_rate_limit_headers(
     )
 
 
+def azure_token_ceiling(headers: Mapping[str, Any], hard_cap: int) -> Optional[int]:
+    """Return the trusted Azure TPM admission ceiling, ignoring malformed data."""
+    from agent.azure_quota_controller import ceiling_from_headers
+    return ceiling_from_headers(headers, hard_cap)
+
+
 # ── Formatting ──────────────────────────────────────────────────────────
 
 

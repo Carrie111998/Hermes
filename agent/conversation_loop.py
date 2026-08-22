@@ -2803,6 +2803,10 @@ def run_conversation(
         api_start_time = time.time()
         retry_count = 0
         max_retries = agent._api_max_retries
+        if agent.provider == "azure-foundry":
+            # This counter is the request lifecycle owner; SDK retries are
+            # disabled, and Azure wrappers must not reset it.
+            max_retries = 5
         _retry = TurnRetryState()
 
         finish_reason = "stop"
@@ -3096,6 +3100,22 @@ def run_conversation(
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
+                        )
+                    if agent.provider == "azure-foundry":
+                        from agent.azure_identity_adapter import execute_with_quota
+                        # The existing SDK/Entra transport remains the sole
+                        # sender; this provider wrapper only admits/reconciles.
+                        return execute_with_quota(
+                            base_url=agent.base_url,
+                            deployment=agent.model,
+                            request_class=("tool_followup" if api_call_count > 1 else "primary"),
+                            payload=next_api_kwargs,
+                            request_identity=f"{api_request_id}:{retry_count}",
+                            cancelled=lambda: bool(agent._interrupt_requested),
+                            send=lambda admitted: (
+                                agent._interruptible_streaming_api_call(admitted, on_first_delta=_stop_spinner)
+                                if _use_streaming else agent._interruptible_api_call(admitted)
+                            ),
                         )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
@@ -4667,6 +4687,12 @@ def run_conversation(
                     context_length=_ctx_len,
                     num_messages=len(api_messages) if api_messages else 0,
                 )
+                if agent.provider == "azure-foundry":
+                    # Azure quota is deployment-scoped. Credential/model
+                    # rotation or provider fallback would evade the admitted
+                    # bucket and is therefore forbidden for this lifecycle.
+                    classified.should_rotate_credential = False
+                    classified.should_fallback = False
                 logger.debug(
                     "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
                     classified.reason.value, classified.status_code,
@@ -6456,10 +6482,17 @@ def run_conversation(
 
                 # For rate limits, respect the Retry-After header if present
                 _retry_after = None
+                _azure_retry_reason = None
                 if is_rate_limited:
                     _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
+                    if agent.provider == "azure-foundry":
+                        from agent.retry_utils import azure_retry_delay
+                        wait_time, _azure_retry_reason = azure_retry_delay(
+                            _resp_headers or {}, retry_count, max_delay=120.0
+                        )
+                        _retry_after = wait_time
                     if _resp_headers and hasattr(_resp_headers, "get"):
-                        _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
+                        _ra_raw = None if agent.provider == "azure-foundry" else (_resp_headers.get("retry-after") or _resp_headers.get("Retry-After"))
                         if _ra_raw:
                             try:
                                 # Cap at 10 minutes. Anthropic Tier 1 input-token
@@ -6486,6 +6519,8 @@ def run_conversation(
                         _policy_note = " (Z.AI Coding overload adaptive long backoff)"
                     elif _backoff_policy == "zai_coding_overload_short":
                         _policy_note = " (Z.AI Coding overload short retry)"
+                    elif _azure_retry_reason:
+                        _policy_note = f" (Azure {_azure_retry_reason})"
                     _wait_reason = "Provider overloaded" if _is_zai_coding_overload and not is_rate_limited else "Rate limited"
                     _rate_limit_status = f"⏱️ {_wait_reason}. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries}){_policy_note}..."
                     # Normal retries are buffered to avoid noisy transient chatter. Long
