@@ -241,3 +241,35 @@ test('the limit event carries its count under a name of its own', () => {
   assert.doesNotMatch(loop, /at: stoppedBy === 'rounds'/)
   assert.match(source, /const count = event\?\.count \?\? '\?'/)
 })
+
+test('every field the room persists is read back on hydrate', () => {
+  // Live test: room budgets did not survive a restart. durableGroupChatRooms
+  // wrote `limits`, the gateway merge carried it, and the hydrate path rebuilt
+  // the room field by field without it. A persisted field has three sites, and
+  // two of three is a field that silently resets.
+  const durable = source.slice(source.indexOf('function durableGroupChatRooms('))
+  const durableBody = durable.slice(0, durable.indexOf('\n}\n'))
+
+  const hydrateAt = source.indexOf("ctx.storage?.get?.('group-chats')")
+  assert.ok(hydrateAt > 0, 'the hydrate path must stay findable')
+  const hydrateBody = source.slice(hydrateAt, hydrateAt + 2000)
+
+  // Fields written inside the `durable[name] = { … }` literal.
+  const written = [...durableBody.matchAll(/^\s{6}(\w+):/gm)].map(m => m[1])
+  assert.ok(written.length >= 6, `expected the durable shape to have fields, saw ${written.length}`)
+
+  // Runtime-only by design: the hydrate path resets these on purpose.
+  const runtimeOnly = new Set(['epoch', 'running'])
+  const missing = written.filter(f => !runtimeOnly.has(f) && !new RegExp(`\\b${f}:`).test(hydrateBody))
+
+  assert.deepEqual(missing, [], 'these fields are written but never read back')
+})
+
+test('a room budget survives the write and read round trip', () => {
+  const durable = source.slice(source.indexOf('function durableGroupChatRooms('))
+  const durableBody = durable.slice(0, durable.indexOf('\n}\n'))
+  assert.match(durableBody, /limits: durableGroupChatLimits\(room\.limits\)/)
+
+  const hydrateAt = source.indexOf("ctx.storage?.get?.('group-chats')")
+  assert.match(source.slice(hydrateAt, hydrateAt + 2000), /limits: durableGroupChatLimits\(room\.limits\)/)
+})
