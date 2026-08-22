@@ -626,6 +626,13 @@ _POLLING_PROGRESS_TIMEOUT = 60.0
 # dead request is still noticed quickly. Kept modest deliberately — this is
 # also how long a user waits to be told the attachment failed.
 _MEDIA_SEND_READ_TIMEOUT = 60.0
+# A server-supplied flood penalty can be hours long.  send() is also used by
+# gateway startup recovery before the inbound restore gate is released, so
+# honoring such a penalty here freezes every platform, not only Telegram.
+# Short penalties keep the existing retry behavior; longer ones fail the send
+# immediately so the caller can persist/retry it without holding a coroutine
+# (and the global startup gate) open for the full penalty.
+_FLOOD_RETRY_SLEEP_CEILING = 30.0
 _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar(
     "telegram_polling_generation", default=None
 )
@@ -5449,6 +5456,19 @@ class TelegramAdapter(BasePlatformAdapter):
                             if _send_attempt < 2:
                                 wait = float(retry_after) if retry_after is not None else 1.0
                                 safe_send_error = _redact_telegram_error_text(send_err)
+                                if wait > _FLOOD_RETRY_SLEEP_CEILING:
+                                    logger.warning(
+                                        "[%s] Telegram flood control on send "
+                                        "(attempt %d/3) requested %.1fs, exceeding "
+                                        "the %.0fs retry ceiling; failing without "
+                                        "sleeping: %s",
+                                        self.name,
+                                        _send_attempt + 1,
+                                        wait,
+                                        _FLOOD_RETRY_SLEEP_CEILING,
+                                        safe_send_error,
+                                    )
+                                    raise
                                 logger.warning(
                                     "[%s] Telegram flood control on send (attempt %d/3), retrying in %.1fs: %s",
                                     self.name,
