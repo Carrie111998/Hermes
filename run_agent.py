@@ -1171,7 +1171,8 @@ class AIAgent:
         """Emit buffered retry messages — call on terminal failure.
 
         Surfaces the full retry/fallback trace so the user can see what
-        was tried before the turn gave up.
+        was tried before the turn gave up, and closes it by naming the
+        model the turn actually died on.
         """
         try:
             buf = getattr(self, "_retry_status_buffer", None)
@@ -1190,6 +1191,16 @@ class AIAgent:
                         self._vprint(f"{self.log_prefix}{msg}", force=True)
                 except Exception:
                     pass
+            # Switch lines are emitted live at the switch, not buffered, so
+            # without this the flushed trace — the only post-mortem a client
+            # reconnecting after the failure gets — would never name the model
+            # the turn ended on. End the record with that identity.
+            model = getattr(self, "model", None)
+            provider = getattr(self, "provider", None)
+            if model:
+                self._emit_status(
+                    f"⏹ Ended on {model}" + (f" via {provider}" if provider else "")
+                )
         except Exception:
             pass
 

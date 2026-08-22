@@ -230,3 +230,51 @@ def test_flush_swallows_callback_exceptions():
     assert seen == ["first", "second"]
     # Buffer drained regardless of failures.
     assert agent._retry_status_buffer == []
+
+
+def test_terminal_trace_ends_on_the_model_that_failed():
+    """The switch lines are live now rather than buffered, so the flushed
+    trace — all a client reconnecting after the failure gets — would otherwise
+    carry no model identity at all."""
+    agent = _make_bare_agent()
+    agent.model = "gpt-4o"
+    agent.provider = "openai"
+    emitted = []
+    agent._emit_status = lambda msg: emitted.append(msg)
+
+    agent._buffer_status("⏳ Retrying...")
+    agent._flush_status_buffer()
+
+    assert emitted[-1] == "⏹ Ended on gpt-4o via openai"
+
+
+def test_no_identity_line_when_there_is_no_trace_to_end():
+    """An empty buffer means the turn never degraded — nothing to close."""
+    agent = _make_bare_agent()
+    agent.model = "gpt-4o"
+    agent.provider = "openai"
+    emitted = []
+    agent._emit_status = lambda msg: emitted.append(msg)
+
+    agent._flush_status_buffer()
+
+    assert emitted == []
+
+
+def test_emit_status_swallows_its_own_exceptions():
+    """Load-bearing for the switch notice: ``try_activate_fallback`` emits it
+    with no guard of its own, on the argument that ``_emit_status`` cannot
+    raise. If it could, a status hiccup would land in that function's ``except``
+    and cascade down the rest of the fallback chain.
+    """
+    agent = _make_bare_agent()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated status failure")
+
+    agent._vprint = boom          # CLI channel fails
+    agent.status_callback = boom  # gateway channel fails too
+
+    # Both channels raising, and still nothing escapes.
+    agent._emit_status("🔄 Switched to fallback model: a via p → b via q")
+
