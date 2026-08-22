@@ -1,10 +1,21 @@
 """Turn-end guard for kanban workers.
 
-Kanban workers must end with ``kanban_complete`` or ``kanban_block``. Models
-(especially GLM / Qwen families) sometimes narrate the next step
-("Let me write the report now") and stop with ``finish_reason=stop`` and no
-tool calls. Hermes treats that as a clean exit → ``rc=0`` → dispatcher
-``protocol_violation``.
+Kanban workers must end with a terminal board tool. Models (especially GLM /
+Qwen families) sometimes narrate the next step ("Let me write the report
+now") and stop with ``finish_reason=stop`` and no tool calls. Hermes treats
+that as a clean exit → ``rc=0`` → dispatcher ``protocol_violation``.
+
+Terminal tools are not just ``kanban_complete`` / ``kanban_block``: a
+review-lane run also concludes legitimately via ``kanban_request_review``
+(implementer hands work to review) or ``kanban_request_changes`` (reviewer
+sends work back). Per the sdlc-review skill contract, a reviewer's verdict
+IS its terminal action — the task is reassigned to a new run/owner the
+instant that tool call succeeds. Treating only complete/block as terminal
+made this guard misfire on every legitimate review verdict: it nudged the
+reviewer to call ``kanban_complete``/``kanban_block`` on a task that had
+already moved on to a successor run, which is refused by run-ownership
+checks and just burns the nudge budget (see t_f1fd29d2 / t_198e5bca —
+Bouncer self-diagnosed after being nudged post-``kanban_request_changes``).
 
 This module is policy-only: when a kanban worker tries to finish without a
 terminal board tool, return a bounded synthetic nudge so the conversation
@@ -17,7 +28,12 @@ import os
 from typing import Any, Iterable, Optional
 
 
-_TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+_TERMINAL_KANBAN_TOOLS = frozenset({
+    "kanban_complete",
+    "kanban_block",
+    "kanban_request_review",
+    "kanban_request_changes",
+})
 
 _DEFAULT_MAX_ATTEMPTS = 2
 

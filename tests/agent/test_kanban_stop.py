@@ -74,6 +74,74 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
+def test_no_nudge_after_kanban_request_changes(clear_kanban_env):
+    """A reviewer's changes_requested verdict is itself terminal (t_198e5bca).
+
+    Before the fix, ``_TERMINAL_KANBAN_TOOLS`` only recognized
+    ``kanban_complete`` / ``kanban_block``, so a reviewer that correctly
+    called ``kanban_request_changes`` to send a review-lane task back to
+    its implementer got nudged to call ``kanban_complete``/``kanban_block``
+    on a task that had already been reassigned to a successor run — a call
+    that run-ownership checks refuse, burning the bounded nudge budget on
+    a run that was already legitimately closed.
+    """
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_198e5bca")
+    messages = [
+        {"role": "user", "content": "work kanban task t_198e5bca"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {
+                        "name": "kanban_request_changes",
+                        "arguments": '{"reason": "fix the exit-checker"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "name": "kanban_request_changes",
+            "tool_call_id": "1",
+            "content": "ok",
+        },
+    ]
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_no_nudge_after_kanban_request_review(clear_kanban_env):
+    """An implementer's review handoff is also terminal for this run."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {
+                        "name": "kanban_request_review",
+                        "arguments": '{"summary": "ready for review"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "name": "kanban_request_review",
+            "tool_call_id": "1",
+            "content": "ok",
+        },
+    ]
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
 
 
 
