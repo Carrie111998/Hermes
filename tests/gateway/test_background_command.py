@@ -5,6 +5,7 @@ background session) across gateway messenger platforms.
 """
 
 import asyncio
+import dataclasses
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -115,7 +116,7 @@ class TestHandleBackgroundCommand:
             event, physical_key, event.source
         )
 
-        assert "Detached" in result
+        assert "background" in result
         assert "20260822_020618_51467760" in result
         assert runner._running_agents[physical_key] is running_agent
         routed_source = (
@@ -140,6 +141,73 @@ class TestHandleBackgroundCommand:
 
         assert result == "started"
         runner._handle_background_command.assert_awaited_once_with(event)
+
+    @pytest.mark.asyncio
+    async def test_back_moves_named_current_agent_to_fresh_route(self):
+        runner = _make_runner()
+        event = _make_event(text="/back sess-live")
+        physical_key = build_session_key(event.source)
+        running_agent = MagicMock(session_id="sess-live")
+        runner._running_agents[physical_key] = running_agent
+        routed_entry = MagicMock(
+            session_key=f"{physical_key}:route:fg_new",
+            session_id="fresh-session",
+        )
+        runner.session_store._generate_session_key.side_effect = build_session_key
+        runner._async_session_store = MagicMock(_store=runner.session_store)
+        runner._async_session_store.get_or_create_session = AsyncMock(
+            return_value=routed_entry
+        )
+        runner._async_session_store.set_session_metadata = AsyncMock(
+            return_value=True
+        )
+        runner._cache_session_source = MagicMock()
+
+        result = await runner._handle_back_command(event)
+
+        assert "sess-live" in result
+        assert "background" in result
+        assert runner._running_agents[physical_key] is running_agent
+
+    @pytest.mark.asyncio
+    async def test_front_routes_chat_to_named_background_agent(self):
+        runner = _make_runner()
+        physical_source = _make_event(text="unused").source
+        physical_key = build_session_key(physical_source)
+        old_route = "fg_old"
+        new_route = "fg_new"
+        background_key = f"{physical_key}:route:{old_route}"
+        event = _make_event(text="/front sess-background")
+        event.source = dataclasses.replace(event.source, session_route_id=new_route)
+        running_agent = MagicMock(session_id="sess-background")
+        runner._running_agents[background_key] = running_agent
+        runner.session_store._generate_session_key.side_effect = build_session_key
+        runner._async_session_store = MagicMock(_store=runner.session_store)
+        runner._async_session_store.set_session_metadata = AsyncMock(
+            return_value=True
+        )
+
+        result = await runner._handle_front_command(event)
+
+        assert "foreground" in result
+        runner._async_session_store.set_session_metadata.assert_awaited_once_with(
+            physical_key,
+            TELEGRAM_FOREGROUND_ROUTE_METADATA,
+            old_route,
+        )
+
+    @pytest.mark.asyncio
+    async def test_front_rejects_agent_from_another_chat(self):
+        runner = _make_runner()
+        event = _make_event(text="/front foreign")
+        foreign_source = _make_event(chat_id="other-chat").source
+        foreign_key = build_session_key(foreign_source)
+        runner._running_agents[foreign_key] = MagicMock(session_id="foreign")
+        runner.session_store._generate_session_key.side_effect = build_session_key
+
+        result = await runner._handle_front_command(event)
+
+        assert "different chat" in result
 
 
 class TestDetachedTelegramRouteIngress:

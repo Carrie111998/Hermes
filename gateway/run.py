@@ -2645,7 +2645,6 @@ from gateway.config import (
 )
 from gateway.session import (
     AsyncSessionStore,
-    TELEGRAM_FOREGROUND_ROUTE_METADATA,
     SessionEntry,
     SessionStore,
     SessionSource,
@@ -16380,6 +16379,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "deny": self._handle_deny_command,
                 "pause": self._handle_pause_command,
                 "agents": self._handle_agents_command,
+                "back": self._handle_back_command,
+                "front": self._handle_front_command,
                 "background": self._handle_background_command,
                 "kanban": self._handle_kanban_command,
                 "subgoal": self._handle_subgoal_command,
@@ -16471,42 +16472,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "shown as running."
             )
 
-        # Always anchor the durable redirect on the physical Telegram lane,
-        # even when this is a second detach from an already-routed lane.
-        physical_source = dataclasses.replace(source, session_route_id=None)
-        physical_key = self.session_store._generate_session_key(physical_source)
-        route_id = f"fg_{os.urandom(6).hex()}"
-        routed_source = dataclasses.replace(source, session_route_id=route_id)
-
-        # Create the destination before publishing the redirect.  A failed
-        # create is a clean no-op rather than a pointer to a missing session.
-        try:
-            routed_entry = await self.async_session_store.get_or_create_session(
-                routed_source
-            )
-            stored = await self.async_session_store.set_session_metadata(
-                physical_key,
-                TELEGRAM_FOREGROUND_ROUTE_METADATA,
-                route_id,
-            )
-        except Exception:
-            logger.exception("Failed to detach Telegram foreground route")
-            return "⚠️ Could not detach the running agent. It is still running normally."
-        if not stored:
-            return (
-                "⏳ The running session has not finished initializing. "
-                "Try `/bg` again in a moment."
-            )
-
-        self._cache_session_source(routed_entry.session_key, routed_source)
-        detached_session_id = str(
-            getattr(running_agent, "session_id", None) or "current turn"
-        )
-        return (
-            "↗️ Detached the running agent into the background.\n\n"
-            f"It will keep running as `{detached_session_id}` and post its "
-            "result here. New messages now use a fresh foreground session "
-            f"(`{routed_entry.session_id}`)."
+        return await self._detach_live_telegram_agent(
+            event, quick_key, running_agent
         )
 
     async def _busy_egress_command(self, event: MessageEvent, quick_key: str, source):
@@ -17611,6 +17578,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
+
+        if canonical == "back":
+            return await self._handle_back_command(event)
+
+        if canonical == "front":
+            return await self._handle_front_command(event)
 
         if canonical == "platform":
             return await self._handle_platform_command(event)
