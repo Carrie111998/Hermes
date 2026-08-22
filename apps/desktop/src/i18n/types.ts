@@ -2401,6 +2401,7 @@ export interface Translations {
       starmap: string
       openStarmap: string
       turnRunning: string
+      tokensPerSecond: string
       contextUsage: string
       contextUsagePanel: {
         categories: {

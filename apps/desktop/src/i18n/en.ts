@@ -2826,6 +2826,7 @@ export const en: Translations = {
       starmap: 'Memory Graph',
       openStarmap: 'Open memory graph',
       turnRunning: 'Running',
+      tokensPerSecond: 'Output speed of the last response (tokens per second)',
       contextUsage: 'Context usage',
       contextUsagePanel: {
         categories: {
