@@ -106,12 +106,21 @@ async def deliver_wake(
             "deliver_wake: non-push adapter (supports_async_delivery=False) "
             "requires the raw session id to self-post the wake turn"
         )
-    await _self_post_chat_completion(
-        adapter,
-        text=text,
-        session_id=session_id,
-        profile=profile,
-    )
+    if str(profile or "").strip() not in {"", "default", "custom"}:
+        await _self_post_chat_completion(
+            adapter,
+            text=text,
+            session_id=session_id,
+            profile=profile,
+        )
+    else:
+        # Preserve the long-standing internal call contract for ordinary
+        # single-profile wake paths and test/operator monkeypatches.
+        await _self_post_chat_completion(
+            adapter,
+            text=text,
+            session_id=session_id,
+        )
 
 
 async def _self_post_chat_completion(
