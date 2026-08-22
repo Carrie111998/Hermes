@@ -1382,6 +1382,65 @@ class TestMultiAgentRouting:
         assert protocol.extract_text(terminal["artifacts"][0]) == "dev reply"
         assert adapter.tasks.get(terminal["id"])["state"] == protocol.STATE_COMPLETED
 
+    def test_forward_decodes_child_stdout_as_utf8(self, monkeypatch):
+        """Non-ASCII replies survive regardless of the host's ANSI code page.
+
+        subprocess.run(text=True) without an explicit encoding decodes using the
+        locale code page on Windows, which silently mangles or drops output the
+        page cannot represent (e.g. Greek under cp737). Regression test for the
+        empty-but-COMPLETED task that produced.
+        """
+        import subprocess as _sp
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {"dev": {"profile": "dev", "tenant": "dev"}}
+        }))
+        agent = adapter._agents["dev"]
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(returncode=0, stdout="ΔΟΚΙΜΗ café ✓", stderr="")
+
+        monkeypatch.setattr(_sp, "run", fake_run)
+        monkeypatch.setattr(adapter, "_latest_a2a_session", lambda *a, **k: None)
+
+        reply, state = adapter._forward_to_profile(agent, "peer-x", "ctx-1", "hi")
+
+        assert captured.get("encoding") == "utf-8", "child stdout must be decoded as UTF-8"
+        assert state == protocol.STATE_COMPLETED
+        assert reply == "ΔΟΚΙΜΗ café ✓"
+
+    def test_forward_reports_failure_when_child_produces_no_output(self, monkeypatch):
+        """An empty reply is a failure, not a successful empty answer.
+
+        Reporting STATE_COMPLETED with no text makes a dead child look like an
+        agent that chose to say nothing, which callers cannot distinguish from
+        a real answer.
+        """
+        import subprocess as _sp
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {"dev": {"profile": "dev", "tenant": "dev"}}
+        }))
+        agent = adapter._agents["dev"]
+
+        def fake_run(cmd, **kwargs):
+            return SimpleNamespace(returncode=0, stdout="   \n", stderr="boom")
+
+        monkeypatch.setattr(_sp, "run", fake_run)
+        monkeypatch.setattr(adapter, "_latest_a2a_session", lambda *a, **k: None)
+
+        reply, state = adapter._forward_to_profile(agent, "peer-x", "ctx-1", "hi")
+
+        assert state == protocol.STATE_FAILED
+        assert "no output" in reply
+        assert "boom" in reply
+
 
 class TestClientTenantAndDiscovery:
     def test_rpc_body_echoes_tenant_from_agent_card(self, monkeypatch):

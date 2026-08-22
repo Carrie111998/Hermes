@@ -877,6 +877,7 @@ class A2AAdapter(BasePlatformAdapter):
             try:
                 proc = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=timeout,
+                    encoding="utf-8", errors="replace",
                     env=env, check=False, stdin=subprocess.DEVNULL,
                 )
             except subprocess.TimeoutExpired:
@@ -891,7 +892,14 @@ class A2AAdapter(BasePlatformAdapter):
                 if session_id:
                     self._profile_sessions[key] = session_id
                     self._title_forward_session(profile, session_id, session_title)
-            return security.redact_outbound((proc.stdout or "").strip()), protocol.STATE_COMPLETED
+            _out = (proc.stdout or "").strip()
+            if not _out:
+                _err = (proc.stderr or "").strip()
+                _detail = f" stderr: {_err[-400:]}" if _err else ""
+                return security.redact_outbound(
+                    f"[profile produced no output (rc={proc.returncode}){_detail}]"
+                ), protocol.STATE_FAILED
+            return security.redact_outbound(_out), protocol.STATE_COMPLETED
 
     def _finalize_task(self, pending: dict, state: str, reply: str) -> tuple[str, str]:
         """Record the outcome of a dispatched task. Returns (state, reply) after
