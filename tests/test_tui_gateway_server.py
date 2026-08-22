@@ -410,7 +410,7 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
     monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _BrokenSupervisor())
     monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
     monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
-    monkeypatch.setattr(server, "_start_agent_build", lambda _sid, _session: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda _sid, _session, **kwargs: None)
     monkeypatch.setattr(server, "_wait_agent", lambda _session, _rid: None)
     # The deferred inline-fallback thread now waits via the patient variant.
     monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda _session, _rid, _sid: None)
@@ -920,6 +920,92 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
         server._sessions.pop(sid, None)
 
     assert seen == [str(profile_home)]
+
+
+def test_speculative_agent_build_failure_is_silent(monkeypatch):
+    """A speculative (view-only) build that fails because the session's stored
+    model/provider is unavailable must NOT emit the intrusive ``error`` event —
+    the user is only browsing the transcript. The failure is still recorded as
+    ``agent_error`` so it surfaces when they actually continue the session."""
+    import threading
+    import uuid
+
+    emitted = []
+    ready = threading.Event()
+    sid = f"test-sid-{uuid.uuid4().hex[:8]}"
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("Unknown provider 'custom:gemma-imatrix'")
+
+    monkeypatch.setattr(server, "_make_agent", _boom)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_SlashWorker", lambda *args: None)
+    monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: emitted.append(a))
+    monkeypatch.setattr(server, "_set_session_context", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_clear_session_context", lambda *a, **k: None)
+
+    session = {
+        "agent_ready": ready,
+        "session_key": f"test-key-{uuid.uuid4().hex[:8]}",
+        "profile_home": None,
+    }
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session, speculative=True)
+        assert ready.wait(timeout=15), "agent_ready never set after speculative build"
+        assert session.get("agent_error") and "Unknown provider" in session["agent_error"]
+        error_events = [e for e in emitted if e and e[0] == "error"]
+        assert not error_events, (
+            f"speculative build must not emit error event, got: {error_events}"
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_non_speculative_agent_build_failure_emits_error(monkeypatch):
+    """A build triggered by real intent to run (e.g. prompt.submit) that fails
+    must still surface the ``error`` event — only the speculative pre-warm is
+    silent. Mirrors the contract in test_agent_build_failure_surfaces_error_and_drops_turn."""
+    import threading
+    import uuid
+
+    emitted = []
+    ready = threading.Event()
+    sid = f"test-sid-{uuid.uuid4().hex[:8]}"
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("Unknown provider 'custom:gemma-imatrix'")
+
+    monkeypatch.setattr(server, "_make_agent", _boom)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_SlashWorker", lambda *args: None)
+    monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: emitted.append(a))
+    monkeypatch.setattr(server, "_set_session_context", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_clear_session_context", lambda *a, **k: None)
+
+    session = {
+        "agent_ready": ready,
+        "session_key": f"test-key-{uuid.uuid4().hex[:8]}",
+        "profile_home": None,
+    }
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert ready.wait(timeout=15), "agent_ready never set after build"
+        assert session.get("agent_error") and "Unknown provider" in session["agent_error"]
+        error_events = [e for e in emitted if e and e[0] == "error"]
+        assert error_events, "non-speculative build failure must emit error event"
+        assert "agent init failed" in str(error_events[0][2].get("message", ""))
+    finally:
+        server._sessions.pop(sid, None)
 
 
 def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path):
@@ -3562,7 +3648,7 @@ def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
     monkeypatch.setattr(
         server,
         "_start_agent_build",
-        lambda _sid, _session: build_started.set(),
+        lambda _sid, _session, **kwargs: build_started.set(),
     )
     monkeypatch.setattr(
         server,
@@ -3657,7 +3743,7 @@ def test_session_resume_deferred_history_failure_can_retry(monkeypatch):
     monkeypatch.setattr(
         server,
         "_start_agent_build",
-        lambda _sid, _session: build_started.set(),
+        lambda _sid, _session, **kwargs: build_started.set(),
     )
 
     try:
@@ -3716,7 +3802,7 @@ def test_session_resume_deferred_history_close_cancels_build(monkeypatch):
     monkeypatch.setattr(
         server,
         "_start_agent_build",
-        lambda _sid, _session: build_started.set(),
+        lambda _sid, _session, **kwargs: build_started.set(),
     )
 
     response = {}
@@ -13210,7 +13296,7 @@ def test_interrupt_before_agent_ready_prevents_late_turn_start(monkeypatch):
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
         monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
-        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session, **kwargs: None)
         monkeypatch.setattr(server, "_wait_agent", lambda session, rid: None)
         monkeypatch.setattr(
             server,
@@ -13280,7 +13366,7 @@ def test_cancelled_turn_before_agent_ready_emits_error_event(monkeypatch):
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
         monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
-        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session, **kwargs: None)
         monkeypatch.setattr(server, "_wait_agent", lambda session, rid: None)
         monkeypatch.setattr(
             server,
@@ -13352,7 +13438,7 @@ def test_session_not_running_before_agent_ready_emits_error_event(monkeypatch):
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
         monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
-        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session, **kwargs: None)
         monkeypatch.setattr(server, "_wait_agent", lambda session, rid: None)
         monkeypatch.setattr(
             server,
@@ -13438,7 +13524,7 @@ def test_slow_agent_build_delivers_prompt_instead_of_timing_out(monkeypatch):
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
         monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
-        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session, **kwargs: None)
         monkeypatch.setattr(
             server,
             "_run_prompt_submit",
@@ -13513,7 +13599,7 @@ def test_slow_agent_build_emits_keyed_progress_notice(monkeypatch):
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
         monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
-        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session, **kwargs: None)
         monkeypatch.setattr(
             server,
             "_run_prompt_submit",
@@ -13575,7 +13661,7 @@ def test_agent_build_failure_surfaces_error_and_drops_turn(monkeypatch):
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
         monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
-        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session, **kwargs: None)
         monkeypatch.setattr(
             server,
             "_run_prompt_submit",
@@ -18329,7 +18415,7 @@ def test_close_sessions_for_transport_skips_session_rebound_before_claim(
 
 
 def test_session_create_records_close_on_disconnect_flag(monkeypatch):
-    monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda sid, session, **kwargs: None)
     server._sessions.clear()
     try:
         on = server.handle_request(
@@ -18345,7 +18431,7 @@ def test_session_create_records_close_on_disconnect_flag(monkeypatch):
 
 
 def test_session_create_records_source(monkeypatch):
-    monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda sid, session, **kwargs: None)
     server._sessions.clear()
     try:
         sid = server.handle_request(
@@ -20267,7 +20353,7 @@ def test_session_branch_keeps_reasoning_fields(monkeypatch, tmp_path):
         db.create_session("session-key", source="tui")
         monkeypatch.setattr(server, "_get_db", lambda: db)
         monkeypatch.setattr(server, "_new_session_key", lambda: "branch-key")
-        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session, **kwargs: None)
         monkeypatch.setattr(server, "_wait_agent", lambda session, rid: None)
         monkeypatch.setattr(
             server, "_claim_active_session_slot", lambda *args, **kwargs: (None, None)
