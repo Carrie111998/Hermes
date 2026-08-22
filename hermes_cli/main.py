@@ -6680,27 +6680,27 @@ def _warn_if_gateway_stale() -> None:
 
     Best-effort only: never raises, never blocks the desktop launch.
     """
-    stamp_file = _desktop_stamp_path()
+    from datetime import datetime, timezone
+
     try:
+        stamp_file = _desktop_stamp_path()
         stamp = json.loads(stamp_file.read_text(encoding="utf-8"))
         built_at = stamp.get("builtAt")
-    except (OSError, json.JSONDecodeError):
-        return
 
-    if not built_at:
-        return
+        if not isinstance(built_at, str) or not built_at:
+            return
 
-    try:
-        from datetime import datetime
         stamp_dt = datetime.fromisoformat(built_at)
-    except ValueError:
-        return
+        # A naive builtAt has no UTC offset, so `.timestamp()` would interpret
+        # it as LOCAL time while psutil returns epoch seconds — reject it to
+        # avoid off-by-hours false positives/negatives away from UTC.
+        if stamp_dt.tzinfo is None or stamp_dt.utcoffset() is None:
+            return
 
-    # Read the gateway PID file — same source of truth the rest of the
-    # codebase uses (gateway/status.py get_running_pid).
-    from hermes_constants import get_hermes_home
-    pid_file = get_hermes_home() / "gateway.pid"
-    try:
+        # Read the gateway PID file — same source of truth the rest of the
+        # codebase uses (gateway/status.py get_running_pid).
+        from hermes_constants import get_hermes_home
+        pid_file = get_hermes_home() / "gateway.pid"
         pid_data = json.loads(pid_file.read_text(encoding="utf-8"))
         gateway_pid = int(pid_data["pid"])
     except (OSError, json.JSONDecodeError, KeyError, ValueError, TypeError):
@@ -6717,16 +6717,10 @@ def _warn_if_gateway_stale() -> None:
     except Exception:
         return
 
-    try:
-        stamp_epoch = stamp_dt.timestamp()
-    except Exception:
-        return
-
-    if gateway_start_epoch >= stamp_epoch:
+    if gateway_start_epoch >= stamp_dt.timestamp():
         return  # gateway is newer than or equal to stamp — fine
 
-    from datetime import datetime as _dt, timezone as _tz
-    start_str = _dt.fromtimestamp(gateway_start_epoch, tz=_tz.utc).isoformat()
+    start_str = datetime.fromtimestamp(gateway_start_epoch, tz=timezone.utc).isoformat()
 
     print()
     print(f"⚠ Gateway (PID {gateway_pid}) was started at {start_str}")

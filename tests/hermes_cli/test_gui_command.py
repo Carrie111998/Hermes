@@ -776,6 +776,10 @@ def test_gui_password_store_bridge_is_linux_only(tmp_path, monkeypatch):
          pytest.raises(SystemExit):
         cli_main.cmd_gui(_ns())
 
+    mock_detect.assert_not_called()
+    launch_env = mock_run.call_args_list[1].kwargs["env"]
+    assert "HERMES_DESKTOP_PASSWORD_STORE" not in launch_env
+
     # ── Gateway-stale detection tests ──────────────────────────────────────
 
 
@@ -859,6 +863,33 @@ def test_warn_if_gateway_stale_invalid_built_at(tmp_path, monkeypatch, capsys):
     """Stamp has a ``builtAt`` that isn't parseable ISO → silent return."""
     home = _freeze_hermes_home(tmp_path, monkeypatch)
     _write_stamp(home, "not-a-valid-iso-date")
+
+    cli_main._warn_if_gateway_stale()
+
+    out = capsys.readouterr().out
+    assert out == ""
+
+
+def test_warn_if_gateway_stale_built_at_not_string(tmp_path, monkeypatch, capsys):
+    """Stamp has a non-string ``builtAt`` (e.g. numeric) → silent return."""
+    home = _freeze_hermes_home(tmp_path, monkeypatch)
+    import json
+    (home / "desktop-build-stamp.json").write_text(
+        json.dumps({"contentHash": "abc123", "sourceMode": False, "builtAt": 12345}) + "\n",
+        encoding="utf-8",
+    )
+
+    cli_main._warn_if_gateway_stale()
+
+    out = capsys.readouterr().out
+    assert out == ""
+
+
+def test_warn_if_gateway_stale_naive_built_at(tmp_path, monkeypatch, capsys):
+    """Stamp has a naive ``builtAt`` (no UTC offset) → rejected to avoid
+    timezone confusion between local-time interpretation and epoch seconds."""
+    home = _freeze_hermes_home(tmp_path, monkeypatch)
+    _write_stamp(home, "2026-08-22T12:00:00")  # no +00:00 suffix
 
     cli_main._warn_if_gateway_stale()
 
