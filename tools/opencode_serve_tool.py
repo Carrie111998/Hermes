@@ -41,6 +41,7 @@ import httpx
 
 from hermes_constants import get_hermes_home
 from tools.registry import registry, tool_error
+from utils import atomic_write_text
 
 MAX_SUMMARY_CHARS = 8000
 
@@ -69,7 +70,7 @@ def _load_sessions() -> dict[str, str]:
 def _save_sessions(sessions: dict[str, str]) -> None:
     store = _session_store()
     store.parent.mkdir(parents=True, exist_ok=True)
-    store.write_text(json.dumps(sessions, indent=2))
+    atomic_write_text(store, json.dumps(sessions, indent=2))
 
 
 def _ensure_session(client: httpx.Client, project: str, title: str) -> str | None:
