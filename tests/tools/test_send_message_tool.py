@@ -724,6 +724,7 @@ class TestSendTelegramHtmlDetection:
     def _make_bot(self):
         bot = MagicMock()
         bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
+        bot.shutdown = AsyncMock()
         bot.send_photo = AsyncMock()
         bot.send_video = AsyncMock()
         bot.send_voice = AsyncMock()
@@ -743,6 +744,7 @@ class TestSendTelegramHtmlDetection:
         kwargs = bot.send_message.await_args.kwargs
         assert kwargs["parse_mode"] == "HTML"
         assert kwargs["text"] == "<b>Hello</b> world"
+        bot.shutdown.assert_awaited_once()
 
 
     def test_transient_bad_gateway_retries_text_send(self, monkeypatch):

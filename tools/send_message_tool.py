@@ -1339,6 +1339,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
     already contains HTML tags, it is sent with ``parse_mode='HTML'``
     instead, bypassing MarkdownV2 conversion.
     """
+    bot = None
     try:
         from telegram import Bot
         from telegram.constants import ParseMode
@@ -1649,6 +1650,12 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         return {"error": "python-telegram-bot not installed. Run: pip install python-telegram-bot"}
     except Exception as e:
         return _error(f"Telegram send failed: {e}")
+    finally:
+        if bot is not None:
+            try:
+                await bot.shutdown()
+            except Exception:
+                logger.debug("Telegram standalone bot shutdown failed", exc_info=True)
 
 
 # _send_slack moved to the slack plugin as _standalone_send
