@@ -43,6 +43,12 @@ _DOCKER_SEARCH_PATHS = [
 _docker_executable: Optional[str] = None  # resolved once, cached
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EGRESS_LABEL_KEY = "hermes-egress"
+_WINDOWS_DAEMON_MOUNT_RE = re.compile(
+    r"^/(?:mnt|host_mnt)/([A-Za-z])(?:/(.*))?$"
+)
+_WINDOWS_DESKTOP_MOUNT_RE = re.compile(
+    r"^/run/desktop/mnt/host/([A-Za-z])(?:/(.*))?$"
+)
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -2107,6 +2113,14 @@ class DockerEnvironment(BaseEnvironment):
         }
 
         def _normalized(path: str) -> str:
+            if os.name == "nt":
+                normalized_slashes = path.replace("\\", "/")
+                match = _WINDOWS_DAEMON_MOUNT_RE.match(normalized_slashes)
+                if match is None:
+                    match = _WINDOWS_DESKTOP_MOUNT_RE.match(normalized_slashes)
+                if match is not None:
+                    tail = match.group(2) or ""
+                    path = f"{match.group(1)}:/{tail}"
             return os.path.normcase(os.path.realpath(os.path.abspath(path)))
 
         return all(

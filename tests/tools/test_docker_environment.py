@@ -825,9 +825,17 @@ def test_colliding_readable_task_labels_do_not_reuse_container(monkeypatch):
     assert first._labels["hermes-task-key"] != second._labels["hermes-task-key"]
 
 
-@pytest.mark.parametrize("mounts_match", [True, False])
+@pytest.mark.parametrize(
+    ("mounts_match", "windows_daemon_prefix"),
+    [
+        (True, "mnt"),
+        (True, "host_mnt"),
+        (True, "run/desktop/mnt/host"),
+        (False, "mnt"),
+    ],
+)
 def test_legacy_persistent_container_reuse_requires_matching_bind_sources(
-    monkeypatch, tmp_path, mounts_match,
+    monkeypatch, tmp_path, mounts_match, windows_daemon_prefix,
 ):
     from tools.environments import base as base_env
 
@@ -844,6 +852,14 @@ def test_legacy_persistent_container_reuse_requires_matching_bind_sources(
     expected_home = str(sandbox / "home")
     expected_workspace = str(sandbox / "workspace")
 
+    def _daemon_mount_source(path):
+        if os.name != "nt":
+            return path
+        drive, tail = os.path.splitdrive(path)
+        assert drive
+        tail = tail.lstrip("\\/").replace("\\", "/")
+        return f"/{windows_daemon_prefix}/{drive[0].lower()}/{tail}"
+
     def _run(cmd, **kwargs):
         calls.append(list(cmd) if isinstance(cmd, list) else cmd)
         if not isinstance(cmd, list) or len(cmd) < 2:
@@ -859,8 +875,16 @@ def test_legacy_persistent_container_reuse_requires_matching_bind_sources(
         if cmd[1] == "inspect" and "{{json .Mounts}}" in cmd:
             home_source = expected_home if mounts_match else str(tmp_path / "other" / "home")
             mounts = [
-                {"Type": "bind", "Source": home_source, "Destination": "/root"},
-                {"Type": "bind", "Source": expected_workspace, "Destination": "/workspace"},
+                {
+                    "Type": "bind",
+                    "Source": _daemon_mount_source(home_source),
+                    "Destination": "/root",
+                },
+                {
+                    "Type": "bind",
+                    "Source": _daemon_mount_source(expected_workspace),
+                    "Destination": "/workspace",
+                },
             ]
             return subprocess.CompletedProcess(
                 cmd, 0, stdout=json.dumps(mounts), stderr="",
