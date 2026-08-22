@@ -72,11 +72,15 @@ class TestFreeRuntime:
         assert rt["default_headers"]["Authorization"] == ""
 
     def test_go_provider_heals_to_zen(self):
-        # Free slugs only exist on the Zen relay; a Go selection must be
-        # routed to Zen (the Go relay rejects the model outright).
+        # Known Zen-only free slugs picked under Go still heal to Zen.
         rt = opencode_zen_free_runtime("opencode-go", "x-preview-f-free")
         assert rt is not None
         assert rt["base_url"] == "https://opencode.ai/zen/v1"
+
+    def test_go_native_free_slug_stays_on_go(self):
+        # ox-alpha-free is in the live Go catalog and not on Zen. Remapping
+        # it to /zen/v1 401s "Model ox-alpha-free is not supported".
+        assert opencode_zen_free_runtime("opencode-go", "ox-alpha-free") is None
 
     def test_paid_model_returns_none(self):
         assert opencode_zen_free_runtime("opencode-zen", "claude-sonnet-5") is None

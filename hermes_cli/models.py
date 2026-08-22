@@ -5356,6 +5356,21 @@ _OPENCODE_ZEN_FREE_BASE_URL = "https://opencode.ai/zen/v1"
 # (big-pickle is OpenCode's rotating free stealth slot.)
 _OPENCODE_KEYLESS_EXTRA_SLUGS = frozenset({"big-pickle"})
 
+# Slugs that actually exist on the Zen relay's free tier (live GET
+# /zen/v1/models, 2026-08-22). Go now publishes its own free slugs
+# (notably ox-alpha-free) that are NOT on Zen. Remapping those to
+# /zen/v1 yields 401 "Model … is not supported".
+_OPENCODE_ZEN_LIVE_FREE_SLUGS = frozenset({
+    "x-preview-f-free",
+    "deepseek-v4-flash-free",
+    "muse-spark-1.2-contributor-free",
+    "mimo-v2.5-free",
+    "hy3-free",
+    "nemotron-3-ultra-free",
+    "nemotron-3.5-lightning-free",
+    "laguna-s-2.1-free",
+}) | _OPENCODE_KEYLESS_EXTRA_SLUGS
+
 
 def is_opencode_zen_free_model(model_id: Optional[str]) -> bool:
     """True when ``model_id`` is an OpenCode Zen free-tier slug.
@@ -5409,6 +5424,13 @@ def opencode_zen_free_runtime(provider_id: Optional[str], model_id: Optional[str
         return None
     if family != "opencode-free" and not is_opencode_zen_free_model(model_id):
         return None
+    # Go-native free slugs must stay on the Go relay. Healing every *-free
+    # selection onto Zen was correct when Go served no free models; it is
+    # now wrong for ox-alpha-free (in the live Go catalog, absent from Zen).
+    if family == "opencode-go":
+        bare = str(model_id or "").strip().rsplit("/", 1)[-1].lower()
+        if bare not in _OPENCODE_ZEN_LIVE_FREE_SLUGS:
+            return None
     normalized = normalize_opencode_model_id(provider_id, model_id)
     api_mode = opencode_model_api_mode("opencode-zen", normalized)
     base_url = normalize_opencode_base_url(
