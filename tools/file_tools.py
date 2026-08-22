@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath
 
 from agent.file_safety import get_read_block_error
 from tools.binary_extensions import (
+    OLE_COMPOUND_MAGIC,
     has_binary_extension,
     has_opaque_document_extension,
     is_pdf_path,
@@ -30,7 +31,6 @@ logger = logging.getLogger(__name__)
 
 
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
-_OLE_COMPOUND_MAGIC = bytes.fromhex("D0CF11E0A1B11AE1")
 
 
 def _expand_tilde(path: str) -> str:
@@ -2223,7 +2223,7 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
                 host_path = Path(resolved)
                 if host_path.is_file():
                     with host_path.open("rb") as existing:
-                        prefix = existing.read(len(_OLE_COMPOUND_MAGIC))
+                        prefix = existing.read(len(OLE_COMPOUND_MAGIC))
             except OSError as exc:
                 return (
                     f"Refusing to write '{filepath}' because its existing .pot file "
@@ -2231,7 +2231,7 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
                 )
         else:
             inspected = file_ops.read_file_prefix(
-                str(resolved), len(_OLE_COMPOUND_MAGIC)
+                str(resolved), len(OLE_COMPOUND_MAGIC)
             )
             if inspected.error:
                 return (
@@ -2240,7 +2240,7 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
                 )
             prefix = b"" if inspected.missing else inspected.content
 
-        if prefix == _OLE_COMPOUND_MAGIC:
+        if prefix == OLE_COMPOUND_MAGIC:
             return (
                 f"Refusing to overwrite legacy PowerPoint template '{filepath}' "
                 "with plain text. The existing .pot file is an OLE compound "
