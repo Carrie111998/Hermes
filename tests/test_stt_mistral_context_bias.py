@@ -89,10 +89,10 @@ def test_global_context_bias_is_the_fallback_source(fake_sdk, audio, monkeypatch
 
 
 def test_refused_vocabulary_is_retried_without_it(fake_sdk, audio, monkeypatch, caplog):
-    _config(monkeypatch, language="fr", mistral={"context_bias": ["Le Jockey Tricolore"]})
+    _config(monkeypatch, language="fr", mistral={"context_bias": ["Soundboks"]})
     fake_sdk._failures = [Exception(
-        "API error occurred: Status 400. Body: {\"message\":\"Context bias item "
-        "'Le Jockey Tricolore' must not contain commas or whitespace\"}"
+        "API error occurred: Status 400. Body: {\"message\":\"Context bias "
+        "rejected\"}"
     )]
     result = tt._transcribe_mistral(audio, "m")
     assert result["success"] is True and result["transcript"] == "bonjour"
@@ -107,3 +107,28 @@ def test_real_outage_is_not_blamed_on_the_vocabulary(fake_sdk, audio, monkeypatc
     result = tt._transcribe_mistral(audio, "m")
     assert result["success"] is False
     assert len(fake_sdk.calls) == 1  # no second call on a genuine failure
+
+
+def test_a_multi_word_entry_is_split_instead_of_being_refused(fake_sdk, audio, monkeypatch):
+    """A space in an entry is a guaranteed 400. Splitting it up front spares
+    every transcription the refused request and its retry."""
+    _config(monkeypatch, mistral={"context_bias": ["Le Jockey Tricolore", "Soundboks"]})
+    result = tt._transcribe_mistral(audio, "m")
+    assert result["success"] is True
+    (call,) = fake_sdk.calls  # one request, no retry
+    assert call["context_bias"] == ["Le", "Jockey", "Tricolore", "Soundboks"]
+
+
+def test_an_unrelated_400_is_not_blamed_on_the_vocabulary(fake_sdk, audio, monkeypatch, caplog):
+    """A 400 alone proves nothing. When dropping the vocabulary does not help,
+    the original error is what surfaces — the operator's config is not accused,
+    and the second error does not stand in for the first."""
+    _config(monkeypatch, mistral={"context_bias": ["Soundboks"]})
+    unrelated = "API error occurred: Status 400. Body: {\"message\":\"unknown model 'm'\"}"
+    fake_sdk._failures = [Exception(unrelated), Exception(unrelated)]
+    with caplog.at_level("WARNING"):
+        result = tt._transcribe_mistral(audio, "m")
+    assert result["success"] is False
+    assert len(fake_sdk.calls) == 2                   # the retry is still attempted
+    assert "unknown model" in caplog.text             # the real cause is reported
+    assert "refused the transcription vocabulary" not in caplog.text

@@ -2363,25 +2363,50 @@ def _transcribe_openai(
 # ---------------------------------------------------------------------------
 
 
+_BIAS_TOKEN_SPLIT = re.compile(r"[,\s]+")
+_BIAS_SPLIT_WARNED: set = set()
+
+
 def _resolve_mistral_context_bias() -> list:
     """Resolve the Voxtral vocabulary bias: ``stt.mistral.context_bias`` then
-    ``stt.context_bias``. Each entry is one token — the API rejects any item
-    holding a space or a comma."""
+    ``stt.context_bias``.
+
+    Each entry must be a single token: the API answers 400 to any item holding
+    a space or a comma. A multi-word entry is therefore split into its tokens
+    here rather than sent as-is — left alone, one misconfigured line would cost
+    a refused request plus a retry on *every* transcription.
+    """
     stt_config = _load_stt_config()
     for source in (_get_stt_section(stt_config, "mistral"), stt_config):
         raw = source.get("context_bias")
-        if isinstance(raw, (list, tuple)):
-            terms = [str(term).strip() for term in raw if str(term).strip()]
-            if terms:
-                return terms
+        if not isinstance(raw, (list, tuple)):
+            continue
+        terms: list = []
+        for entry in raw:
+            tokens = [tok for tok in _BIAS_TOKEN_SPLIT.split(str(entry).strip()) if tok]
+            if len(tokens) > 1 and str(entry) not in _BIAS_SPLIT_WARNED:
+                # Once per distinct entry: a misconfiguration deserves to be
+                # seen, not to be repeated on every voice message.
+                _BIAS_SPLIT_WARNED.add(str(entry))
+                logger.warning(
+                    "STT context_bias entry %r is not a single token — sending "
+                    "it as %s instead. Split it in the config to silence this.",
+                    entry, tokens,
+                )
+            terms.extend(tokens)
+        if terms:
+            return terms
     return []
 
 
-def _is_context_bias_rejection(err: Exception) -> bool:
-    """Whether *err* is the server refusing the vocabulary rather than failing.
+def _may_be_context_bias_rejection(err: Exception) -> bool:
+    """Whether *err* is worth one retry without the vocabulary.
 
-    A 400 on a request that only differs from a working one by its vocabulary
-    is the vocabulary's fault; 5xx, timeouts and auth errors are not.
+    A candidate test, not a verdict. The server names the vocabulary only
+    sometimes, so a bare 400 has to qualify too — which means this alone cannot
+    tell a refused vocabulary from an unrelated bad request. What settles it is
+    the retry itself, in :func:`_transcribe_mistral`. 5xx, timeouts and auth
+    errors never qualify.
     """
     message = str(err).lower()
     return "context_bias" in message or "context bias" in message or "status 400" in message
@@ -2443,14 +2468,22 @@ def _transcribe_mistral(
             # A vocabulary the server refuses (bad shape, too many terms) must
             # never cost the transcription: retry once without it. Anything
             # that isn't the vocabulary's fault falls through untouched.
-            if not (context_bias and _is_context_bias_rejection(bias_err)):
+            if not (context_bias and _may_be_context_bias_rejection(bias_err)):
                 raise
+            try:
+                result = _complete([])
+            except Exception:
+                # It fails without the vocabulary too, so the vocabulary was
+                # not the problem: report the original error, and never claim
+                # the operator's configuration was at fault.
+                raise bias_err from None
+            # Only now is the diagnosis earned — the same request succeeded
+            # once the vocabulary was dropped.
             logger.warning(
-                "Mistral rejected the transcription vocabulary (%d terms) — "
-                "retrying without it: %s", len(context_bias), bias_err,
+                "Mistral refused the transcription vocabulary (%d terms) — "
+                "transcribed without it: %s", len(context_bias), bias_err,
             )
             context_bias = []
-            result = _complete([])
 
         transcript_text = _extract_transcript_text(result)
         logger.info(
