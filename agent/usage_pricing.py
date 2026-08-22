@@ -1396,6 +1396,58 @@ def normalize_usage(
                 _usage_get(completion_details, "reasoning_tokens", 0)
             )
 
+    # Cache observability for OpenAI-compatible wires: a chat_completions
+    # payload carrying NONE of the known cache-hit fields (nested
+    # prompt_tokens_details, Anthropic-style top-level, DeepSeek/Kimi
+    # variants) means the provider stripped or never sent the field — most
+    # often on streaming usage chunks (#89770). Hermes-side accounting
+    # preserves these fields end-to-end, so when this fires the recovery is
+    # provider-side; the keys list shows what the payload did carry.
+    # Presence-based (is not None), so a genuine cache miss that includes
+    # the field with 0 stays quiet — checked at the NESTED level too, so a
+    # proxy that strips only the inner cached_tokens key (container left
+    # behind) still fires. Mode audit (every api_mode in the codebase):
+    # anthropic_messages / provider=anthropic and codex_responses are
+    # excluded below; bedrock_converse responses are pre-converted by
+    # bedrock_adapter.py to an OpenAI-style namespace that always carries
+    # cache_read_input_tokens (even when 0) so they stay quiet;
+    # copilot_acp synthesizes prompt_tokens_details.cached_tokens so it
+    # stays quiet; codex_app_server bypasses this loop entirely before any
+    # normalize_usage call. Standard level-gated logger.debug.
+    _ptd = _usage_get(response_usage, "prompt_tokens_details", None)
+    if (
+        logger.isEnabledFor(logging.DEBUG)
+        and mode not in {"anthropic_messages", "codex_responses"}
+        and provider_name != "anthropic"
+        and _usage_get(_ptd, "cached_tokens", None) is None
+        and _usage_get(response_usage, "cache_read_input_tokens", None) is None
+        and _usage_get(response_usage, "prompt_cache_hit_tokens", None) is None
+        and _usage_get(response_usage, "cached_tokens", None) is None
+        and logger.isEnabledFor(logging.DEBUG)
+    ):
+        try:
+            if isinstance(response_usage, dict):
+                _observed_keys = sorted(str(k) for k in response_usage.keys())
+            elif hasattr(response_usage, "model_dump"):
+                _observed_keys = sorted(str(k) for k in response_usage.model_dump())
+            else:
+                _observed_keys = sorted(
+                    attr
+                    for attr in dir(response_usage)
+                    if not attr.startswith("_")
+                    and not callable(getattr(response_usage, attr, None))
+                )
+        except Exception:  # pragma: no cover - defensive: never break accounting
+            _observed_keys = ["<unintrospectable>"]
+        logger.debug(
+            "cache_observability provider=%s mode=%s — "
+            "usage payload carries no cache-hit field; keys=%s (if this "
+            "fires on every call, the provider is not sending "
+            "prompt_tokens_details.cached_tokens — check its streaming "
+            "usage chunk)",
+            provider_name, mode, _observed_keys,
+        )
+
     # Cache observability for MiniMax's Anthropic wire: on MiniMax-M3,
     # usage.cache_read_input_tokens carries a constant +128 floor and
     # cache_creation_input_tokens is always 0, so cache_read is NOT a
