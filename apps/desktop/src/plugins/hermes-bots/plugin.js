@@ -113,6 +113,13 @@ const EN_MESSAGES = {
     cancel: 'Cancel',
     working: 'Working\u2026',
     retry: 'retry',
+    failedToSet: 'Failed to set ',
+    serverTestFailed: 'Server test failed after setup',
+    configuredSuffix: ' configured',
+    authenticatedSuffix: ' authenticated',
+    restartGatewayForSetup: ') — restart the gateway to enable in-app setup',
+    signInAction: 'Sign in…',
+    setUpAction: 'Set up…',
   },
   avatar: {
     imageTooLargeMax: 'Image too large (max 15MB).',
@@ -122,6 +129,18 @@ const EN_MESSAGES = {
     classicShapes: 'Classic shapes',
     describeYourAvatar: 'Describe your avatar…',
     leaveBlankToGenerate: 'Leave blank to generate from the agent\u2019s name and description.',
+    chooseAnImage: 'Choose an image…',
+    unlockTip: 'Unlock — the face follows the agent’s name again',
+    lockTip: 'Keep this exact face even if the name changes',
+    unlock: 'Unlock',
+    lockFace: 'Lock face',
+    lockedNote: 'Face locked — renaming won’t change it.',
+    followsNameNote: 'Face follows the name.',
+    blobFaceTip: 'Blob face — drawn from the agent’s name',
+    generating: 'Generating…',
+    generate: 'Generate',
+    noImageModel: 'No image model available. If you just enabled one (or updated Hermes), restart the gateway: Ctrl+K → "Restart gateway".',
+    checkingBackend: 'Checking image backend…',
   },
   pets: {
     noPetsInThe: 'No pets in the petdex gallery. Run `hermes pets` to explore.',
@@ -143,6 +162,14 @@ const EN_MESSAGES = {
     editProfile: 'Edit Profile',
     duplicate: 'Duplicate',
     newChatWithThis: 'New chat with this agent',
+    workingNow: 'Working on a task right now',
+    activeRecently: 'Active in the last 90s',
+    pinnedToTop: 'pinned to top',
+    unpin: 'Unpin',
+    pinToTop: 'Pin to top',
+    unhideBot: 'Unhide Bot',
+    hideBot: 'Hide Bot',
+    manageGroups: 'Manage groups…',
   },
   model: {
     lastMessageCameFrom: (p0) => `Last message came from @${p0} (bot-to-bot)`,
@@ -160,6 +187,7 @@ const EN_MESSAGES = {
     skillsEnabled: (p0, p1) => `Skills (${p0}/${p1} enabled)`,
     filterSkills: 'Filter skills…',
     noMcpServersConfigured: 'No MCP servers configured or in the catalog.',
+    catalogInstalled: 'catalog · installed',
   },
   hub: {
     toolsetsEnabledUncheckingAll: (p0, p1) => `Toolsets (${p0}/${p1} enabled — unchecking all restores the default)`,
@@ -171,6 +199,11 @@ const EN_MESSAGES = {
     searchingCommunityWellKnown: 'Searching community + well-known sources — can take ~10s…',
     noHubSkillsMatched: 'No hub skills matched.',
     added: '✓ added',
+    hideBrowser: 'hide the hub browser',
+    browseFull: 'browse the full hub ▾',
+    pickerHint: 'Hit "+ Add to this Agent" on any skill — it installs and appears in the list above. Drag the corner to resize.',
+    searching: 'Searching…',
+    search: 'Search',
   },
   profile: {
     installing: (p0) => `Installing "${p0}"…`,
@@ -179,6 +212,8 @@ const EN_MESSAGES = {
     appearanceAndRoleFor: (p0, p1) => `Appearance and role for ${p0} (${p1}).`,
     savedLookLocallyRemote: 'Saved look locally; remote persistence failed',
     whatShouldThisAgent: 'What should this agent help with?',
+    saving: 'Saving…',
+    save: 'Save',
   },
   agentNew: {
     namedTeammateDesc: 'A named teammate with its own memory, skills, and chat. It can message your other agents.',
@@ -186,8 +221,8 @@ const EN_MESSAGES = {
     couldNotCleanUp: (p0) => `Could not clean up draft profile "${p0}"`,
     agentCreatedOn: (p0, p1) => `Agent "${p0}" created on ${p1}`,
     agentCreated: (p0) => `Agent "${p0}" created`,
-    anAgentNamedAlready: (p0, p1) => `An agent named "${p0}" already exists on ${p1}.`,
-    anAgentNamedAlready2: (p0) => `An agent named "${p0}" already exists.`,
+    nameTakenOnTarget: (p0, p1) => `An agent named "${p0}" already exists on ${p1}.`,
+    nameTakenHere: (p0) => `An agent named "${p0}" already exists.`,
     theAgentIsCreated: (p0) => `The agent is created on ${p0} and appears in the roster as a Connections bot. Chat routes to that machine.`,
     cloneFromProfileOn: (p0) => `Clone from profile (on ${p0})`,
     newAgent: 'New Agent',
@@ -199,11 +234,21 @@ const EN_MESSAGES = {
     freshProfileBundledSkills: 'Fresh profile (bundled skills)',
     createEmptyIsChecked: '“Create empty” is checked — no bundled skills will be installed.',
     leavingAllOrNone: 'Leaving all (or none) checked keeps the default toolset behavior.',
+    cloneFromProfile: 'Clone from profile',
+    inheritedFromLaunch: 'inherited from launch profile',
+    soulPlaceholder: 'Leave blank to auto-generate from name/title/description + agent-messaging roster.',
+    sharedKeysNote: 'Subscriptions, OAuth logins, and API keys stay shared (not copied), so token refreshes never invalidate each other. Uncheck for an isolated snapshot copy.',
+    nameTakenBeforeCaps: 'That name is taken — pick another before configuring capabilities.',
+    nameFirstNote: 'Name the agent first — a draft profile is created when you open this tab (discarded if you cancel).',
+    catalogNeedsNewerGateway: 'Capability catalog needs a newer gateway (restart it after updating Hermes).',
+    mcpCopyNote: 'Configured servers copy from the main profile; catalog entries are the bundled MCP menu. Entries needing API keys route through setup first (credentials follow the shared keys setting).',
+    creating: 'Creating…',
+    createAgent: 'Create Agent',
   },
   cron: {
     catalogFromUncheckedSkills: (p0) => `Catalog from ${p0} — unchecked skills are disabled after creation.`,
-    once: (p0) => `Once (${p0})`,
-    once2: (p0, p1) => `Once (${p0}${p1})`,
+    onceLabel: (p0) => `Once (${p0})`,
+    onceValueUnit: (p0, p1) => `Once (${p0}${p1})`,
     everyDays: (p0) => `Every ${p0} days`,
     everyH: (p0) => `Every ${p0}h`,
     everyM: (p0) => `Every ${p0}m`,
@@ -231,6 +276,15 @@ const EN_MESSAGES = {
     friday: 'Friday',
     saturday: 'Saturday',
     sunday: 'Sunday',
+    daily: 'Daily',
+    hourly: 'Hourly',
+    runsTopOfHour: 'Runs at the top of every hour',
+    rawSchedule: 'Raw schedule \u2014 every Nm/Nh/Nd or 5-field cron',
+    unitMinutes: 'minute(s)',
+    unitHours: 'hour(s)',
+    unitDays: 'day(s)',
+    timesTotal: (p0) => `, ${p0} time(s) total`,
+    timeOfDay: (p0, p1) => `${p0 % 12 === 0 ? 12 : p0 % 12}:${String(p1).padStart(2, '0')} ${p0 < 12 ? 'AM' : 'PM'}`,
     minutesFromNow: 'minutes from now',
     hoursFromNow: 'hours from now',
     daysFromNow: 'days from now',
@@ -240,13 +294,18 @@ const EN_MESSAGES = {
     every1dEvery2h: 'every 1d \u00b7 every 2h \u00b7 0 9 * * * (cron)',
     stopAfter: 'Stop after',
     runsBlankForever: 'runs (blank = forever)',
-    newCronjob: 'New Cronjob',
+    newCronjobTitle: 'New Cronjob',
     nameThisCronjob: 'Name this cronjob',
     whatShouldThisCronjob: 'What should this cronjob do each time it runs?',
     cronjobs: 'Cronjobs',
-    newCronjob2: 'New Cronjob',
+    newCronjobTip: 'New Cronjob',
     couldNotLoadCronjobs: 'Could not load cronjobs. The list may still be there.',
     retry: 'Retry',
+    scheduling: 'Scheduling…',
+    createCronjob: 'Create Cronjob',
+    refreshFailed: 'Could not refresh cronjobs. Showing the last list we had.',
+    createForBotTip: 'Create a cronjob for this bot',
+    runHistoryOnly: 'Run history only',
   },
   groups: {
     membershipsSync: 'A bot can join multiple group chats. Memberships sync to every machine.',
@@ -264,6 +323,31 @@ const EN_MESSAGES = {
     newGroupChat: 'New Group Chat',
     searchBotsToAdd: 'Search bots to add…',
     removeFromSelection: 'Remove from selection',
+    newGroup: 'New group…',
+    namePlaceholderExample: 'Group name (e.g. Research)',
+    name: 'Group name',
+    noBotsYet: 'No bots yet — create agents first.',
+    pickAtLeastTwo: 'Pick at least 2 bots',
+    orTypeOwnAnswer: 'Or type your own answer…',
+    typeAnswer: 'Type your answer…',
+    sending: 'Sending…',
+    respond: 'Respond',
+    answer: 'Answer',
+    hideRoomActivity: 'Hide room activity',
+    showRoomActivity: 'Show room activity',
+    you: 'You',
+    hideFullHandle: 'Hide full handle',
+    showFullHandle: 'Show full handle',
+    dropToAttachThread: 'Drop to attach to this thread reply',
+    dropToAttachRoom: 'Drop to attach — every responding bot sees it',
+    waitingForAnswer: 'Waiting for your answer…',
+    roomWorking: 'The room is working…',
+    disbanding: 'Disbanding…',
+    disbanded: 'Disbanded',
+    noMessagesYet: 'No messages yet — say hi to the room',
+    openGroupChat: 'Open Group Chat',
+    deleteGroup: 'Delete Group',
+    deleteGroupChatTitle: 'Delete group chat?',
   },
   thread: {
     botNeedsInput: 'A bot in this room needs your input',
@@ -280,9 +364,9 @@ const EN_MESSAGES = {
     openThisThread: 'Open this thread',
     collapseThisThread: 'Collapse this thread',
     collapseThread: 'Collapse thread',
-    replyInThread: 'Reply in thread…',
+    replyInThreadPlaceholder: 'Reply in thread…',
     reply: 'Reply',
-    replyInThread2: 'Reply in thread',
+    replyInThreadLink: 'Reply in thread',
     saySomethingEveryBot: 'Say something — every bot in this group hears the room.',
     newThread: 'New Thread',
     disbandGroupChat: 'Disband group chat?',
@@ -308,11 +392,25 @@ const EN_MESSAGES = {
     createYourFirstTeammate: 'Create your first teammate.',
     deleteBotAndProfile: 'Delete bot and profile?',
     botModeAOne: 'Bot Mode — a one-chat-per-agent roster with avatars, routines, group chats, and bot-to-bot messaging. Ships with the app; disable here if unwanted.',
-    bots2: 'Bots',
+    paneTitle: 'Bots',
     cronjobs: 'Cronjobs',
-    newAgent2: 'New Agent…',
+    newAgentCommand: 'New Agent…',
     openTheBotsPane: 'Open the Bots pane and hit “New Agent”.',
     thisChatNeverResets: 'This chat never resets',
+    rosterRefreshFailed: 'Roster refresh failed — showing the last good list.',
+    waitingReconnect: ' Waiting for the gateway to reconnect…',
+    toastsOn: 'Activity toasts on — click to silence',
+    toastsOff: 'Activity toasts off — click to enable',
+    hideHiddenAgain: 'Hide hidden bots again',
+    hideHidden: 'Hide hidden bots',
+    showHidden: 'Show hidden bots',
+    gatewayError: 'gateway error',
+    waitingGatewayLong: 'Waiting for the gateway connection… (remote gateways can take a few seconds; retries automatically)',
+    allBotsHidden: 'All bots are hidden — use the eye button above to show them.',
+    deleting: 'Deleting…',
+    deleted: 'Deleted',
+    botChatsContinuous: 'Bot chats are one continuous conversation — compacting instead. ',
+    useSessionsMode: 'For a throwaway session with this agent, use Sessions mode.',
   },
   a11y: {
     activeNow: 'Active now',
@@ -337,6 +435,13 @@ const DE_MESSAGES = {
     cancel: 'Abbrechen',
     working: 'Arbeite\u2026',
     retry: 'erneut versuchen',
+    failedToSet: 'Konnte nicht gesetzt werden: ',
+    serverTestFailed: 'Server-Test nach der Einrichtung fehlgeschlagen',
+    configuredSuffix: ' konfiguriert',
+    authenticatedSuffix: ' authentifiziert',
+    restartGatewayForSetup: ') — starte das Gateway neu, um die Einrichtung in der App zu aktivieren',
+    signInAction: 'Anmelden…',
+    setUpAction: 'Einrichten…',
   },
   avatar: {
     imageTooLargeMax: 'Bild zu groß (max. 15 MB).',
@@ -346,6 +451,18 @@ const DE_MESSAGES = {
     classicShapes: 'Klassische Formen',
     describeYourAvatar: 'Beschreibe deinen Avatar…',
     leaveBlankToGenerate: 'Leer lassen, um aus Name und Beschreibung des Agents zu generieren.',
+    chooseAnImage: 'Bild auswählen…',
+    unlockTip: 'Entsperren — das Gesicht folgt wieder dem Namen des Agents',
+    lockTip: 'Genau dieses Gesicht behalten, auch wenn sich der Name ändert',
+    unlock: 'Entsperren',
+    lockFace: 'Gesicht sperren',
+    lockedNote: 'Gesicht gesperrt — Umbenennen ändert es nicht.',
+    followsNameNote: 'Das Gesicht folgt dem Namen.',
+    blobFaceTip: 'Blob-Gesicht — aus dem Namen des Agents gezeichnet',
+    generating: 'Wird erzeugt…',
+    generate: 'Erzeugen',
+    noImageModel: 'Kein Bildmodell verfügbar. Wenn du gerade eines aktiviert (oder Hermes aktualisiert) hast, starte das Gateway neu: Strg+K → „Restart gateway“.',
+    checkingBackend: 'Prüfe Bild-Backend…',
   },
   pets: {
     noPetsInThe: 'Keine Pets in der Petdex-Galerie. Führe `hermes pets` aus, um zu stöbern.',
@@ -367,6 +484,14 @@ const DE_MESSAGES = {
     editProfile: 'Profil bearbeiten',
     duplicate: 'Duplizieren',
     newChatWithThis: 'Neuer Chat mit diesem Agent',
+    workingNow: 'Arbeitet gerade an einer Aufgabe',
+    activeRecently: 'In den letzten 90 s aktiv',
+    pinnedToTop: 'oben angepinnt',
+    unpin: 'Lösen',
+    pinToTop: 'Oben anpinnen',
+    unhideBot: 'Bot einblenden',
+    hideBot: 'Bot ausblenden',
+    manageGroups: 'Gruppen verwalten…',
   },
   model: {
     lastMessageCameFrom: (p0) => `Letzte Nachricht kam von @${p0} (Bot-zu-Bot)`,
@@ -384,6 +509,7 @@ const DE_MESSAGES = {
     skillsEnabled: (p0, p1) => `Skills (${p0}/${p1} aktiviert)`,
     filterSkills: 'Skills filtern…',
     noMcpServersConfigured: 'Keine MCP-Server konfiguriert oder im Katalog.',
+    catalogInstalled: 'Katalog · installiert',
   },
   hub: {
     toolsetsEnabledUncheckingAll: (p0, p1) => `Toolsets (${p0}/${p1} aktiviert — alle abwählen stellt den Standard wieder her)`,
@@ -395,6 +521,11 @@ const DE_MESSAGES = {
     searchingCommunityWellKnown: 'Suche in Community + bekannten Quellen — kann ~10 s dauern…',
     noHubSkillsMatched: 'Keine passenden Hub-Skills.',
     added: '✓ hinzugefügt',
+    hideBrowser: 'Hub-Browser ausblenden',
+    browseFull: 'den ganzen Hub durchstöbern ▾',
+    pickerHint: 'Klick bei einem Skill auf „+ Add to this Agent“ — er wird installiert und erscheint in der Liste oben. Zieh an der Ecke, um die Größe zu ändern.',
+    searching: 'Suche…',
+    search: 'Suchen',
   },
   profile: {
     installing: (p0) => `Installiere "${p0}"…`,
@@ -403,14 +534,16 @@ const DE_MESSAGES = {
     appearanceAndRoleFor: (p0, p1) => `Aussehen und Rolle für ${p0} (${p1}).`,
     savedLookLocallyRemote: 'Look lokal gespeichert; Remote-Speicherung fehlgeschlagen',
     whatShouldThisAgent: 'Wobei soll dieser Agent helfen?',
+    saving: 'Wird gespeichert…',
+    save: 'Speichern',
   },
   agentNew: {
     draftAgentDiscarded: (p0) => `Entwurfs-Agent "${p0}" verworfen`,
     couldNotCleanUp: (p0) => `Entwurfs-Profil "${p0}" konnte nicht aufgeräumt werden`,
     agentCreatedOn: (p0, p1) => `Agent "${p0}" auf ${p1} erstellt`,
     agentCreated: (p0) => `Agent "${p0}" erstellt`,
-    anAgentNamedAlready: (p0, p1) => `Ein Agent namens "${p0}" existiert auf ${p1} bereits.`,
-    anAgentNamedAlready2: (p0) => `Ein Agent namens "${p0}" existiert bereits.`,
+    nameTakenOnTarget: (p0, p1) => `Ein Agent namens "${p0}" existiert auf ${p1} bereits.`,
+    nameTakenHere: (p0) => `Ein Agent namens "${p0}" existiert bereits.`,
     theAgentIsCreated: (p0) => `Der Agent wird auf ${p0} erstellt und erscheint in der Übersicht als Connections-Bot. Der Chat wird zu diesem Rechner geroutet.`,
     cloneFromProfileOn: (p0) => `Aus Profil klonen (auf ${p0})`,
     namedTeammateDesc: 'Ein benannter Teamkollege mit eigenem Gedächtnis, eigenen Skills und eigenem Chat. Kann deine anderen Agenten anschreiben.',
@@ -423,11 +556,21 @@ const DE_MESSAGES = {
     freshProfileBundledSkills: 'Frisches Profil (mitgelieferte Skills)',
     createEmptyIsChecked: '„Leer erstellen“ ist aktiviert — es werden keine mitgelieferten Skills installiert.',
     leavingAllOrNone: 'Alle (oder keine) angehakt zu lassen behält das Standard-Toolset-Verhalten bei.',
+    cloneFromProfile: 'Aus Profil klonen',
+    inheritedFromLaunch: 'vom Startprofil geerbt',
+    soulPlaceholder: 'Leer lassen, um aus Name/Titel/Beschreibung + Agent-Messaging-Liste automatisch zu erzeugen.',
+    sharedKeysNote: 'Abos, OAuth-Anmeldungen und API-Schlüssel bleiben geteilt (werden nicht kopiert), damit Token-Erneuerungen sich nicht gegenseitig entwerten. Abwählen für eine isolierte Kopie.',
+    nameTakenBeforeCaps: 'Dieser Name ist vergeben — wähle einen anderen, bevor du Fähigkeiten konfigurierst.',
+    nameFirstNote: 'Benenne den Agent zuerst — beim Öffnen dieses Tabs wird ein Entwurfsprofil angelegt (verworfen, wenn du abbrichst).',
+    catalogNeedsNewerGateway: 'Der Fähigkeiten-Katalog braucht ein neueres Gateway (starte es nach dem Hermes-Update neu).',
+    mcpCopyNote: 'Konfigurierte Server werden aus dem Hauptprofil kopiert; Katalog-Einträge sind das mitgelieferte MCP-Menü. Einträge, die API-Schlüssel brauchen, laufen zuerst durch die Einrichtung (Zugangsdaten folgen der Einstellung für geteilte Schlüssel).',
+    creating: 'Wird erstellt…',
+    createAgent: 'Agent erstellen',
   },
   cron: {
     catalogFromUncheckedSkills: (p0) => `Katalog von ${p0} — abgewählte Skills sind nach dem Erstellen deaktiviert.`,
-    once: (p0) => `Einmal (${p0})`,
-    once2: (p0, p1) => `Einmal (${p0}${p1})`,
+    onceLabel: (p0) => `Einmal (${p0})`,
+    onceValueUnit: (p0, p1) => `Einmal (${p0}${p1})`,
     everyDays: (p0) => `Alle ${p0} Tage`,
     everyH: (p0) => `Alle ${p0}h`,
     everyM: (p0) => `Alle ${p0}m`,
@@ -455,6 +598,15 @@ const DE_MESSAGES = {
     friday: 'Freitag',
     saturday: 'Samstag',
     sunday: 'Sonntag',
+    daily: 'T\u00e4glich',
+    hourly: 'St\u00fcndlich',
+    runsTopOfHour: 'L\u00e4uft zu jeder vollen Stunde',
+    rawSchedule: 'Roher Zeitplan \u2014 jede Nm/Nh/Nd oder 5-Feld-Cron',
+    unitMinutes: 'Minute(n)',
+    unitHours: 'Stunde(n)',
+    unitDays: 'Tag(e)',
+    timesTotal: (p0) => `, ${p0} Mal insgesamt`,
+    timeOfDay: (p0, p1) => `${String(p0).padStart(2, '0')}:${String(p1).padStart(2, '0')} Uhr`,
     minutesFromNow: 'Minuten ab jetzt',
     hoursFromNow: 'Stunden ab jetzt',
     daysFromNow: 'Tage ab jetzt',
@@ -464,13 +616,18 @@ const DE_MESSAGES = {
     every1dEvery2h: 'alle 1d \u00b7 alle 2h \u00b7 0 9 * * * (Cron)',
     stopAfter: 'Stoppen nach',
     runsBlankForever: 'Durchläufen (leer = für immer)',
-    newCronjob: 'Neuer Cronjob',
+    newCronjobTitle: 'Neuer Cronjob',
     nameThisCronjob: 'Diesen Cronjob benennen',
     whatShouldThisCronjob: 'Was soll dieser Cronjob bei jedem Durchlauf tun?',
     cronjobs: 'Cronjobs',
-    newCronjob2: 'Neuer Cronjob',
+    newCronjobTip: 'Neuer Cronjob',
     couldNotLoadCronjobs: 'Cronjobs konnten nicht geladen werden. Die Liste ist vielleicht trotzdem da.',
     retry: 'Erneut versuchen',
+    scheduling: 'Wird eingeplant…',
+    createCronjob: 'Cronjob erstellen',
+    refreshFailed: 'Cronjobs konnten nicht aktualisiert werden. Es wird die zuletzt bekannte Liste gezeigt.',
+    createForBotTip: 'Einen Cronjob für diesen Bot erstellen',
+    runHistoryOnly: 'Nur Ausführungsverlauf',
   },
   groups: {
     openSChat: (p0) => `Chat von ${p0} öffnen`,
@@ -488,6 +645,31 @@ const DE_MESSAGES = {
     newGroupChat: 'Neuer Gruppenchat',
     searchBotsToAdd: 'Bots zum Hinzufügen suchen…',
     removeFromSelection: 'Aus der Auswahl entfernen',
+    newGroup: 'Neue Gruppe…',
+    namePlaceholderExample: 'Gruppenname (z. B. Research)',
+    name: 'Gruppenname',
+    noBotsYet: 'Noch keine Bots — erstelle zuerst Agents.',
+    pickAtLeastTwo: 'Wähle mindestens 2 Bots',
+    orTypeOwnAnswer: 'Oder tippe deine eigene Antwort…',
+    typeAnswer: 'Tippe deine Antwort…',
+    sending: 'Wird gesendet…',
+    respond: 'Antworten',
+    answer: 'Antwort',
+    hideRoomActivity: 'Raum-Aktivität ausblenden',
+    showRoomActivity: 'Raum-Aktivität anzeigen',
+    you: 'Du',
+    hideFullHandle: 'Vollen Handle ausblenden',
+    showFullHandle: 'Vollen Handle anzeigen',
+    dropToAttachThread: 'Loslassen, um an diese Thread-Antwort anzuhängen',
+    dropToAttachRoom: 'Loslassen zum Anhängen — jeder antwortende Bot sieht es',
+    waitingForAnswer: 'Wartet auf deine Antwort…',
+    roomWorking: 'Der Raum arbeitet…',
+    disbanding: 'Wird aufgelöst…',
+    disbanded: 'Aufgelöst',
+    noMessagesYet: 'Noch keine Nachrichten — sag dem Raum Hallo',
+    openGroupChat: 'Gruppenchat öffnen',
+    deleteGroup: 'Gruppe löschen',
+    deleteGroupChatTitle: 'Gruppenchat löschen?',
   },
   thread: {
     noBotsMatch: (p0) => `Keine Bots passen zu “${p0}”`,
@@ -504,9 +686,9 @@ const DE_MESSAGES = {
     openThisThread: 'Diesen Thread öffnen',
     collapseThisThread: 'Diesen Thread einklappen',
     collapseThread: 'Thread einklappen',
-    replyInThread: 'Im Thread antworten…',
+    replyInThreadPlaceholder: 'Im Thread antworten…',
     reply: 'Antworten',
-    replyInThread2: 'Im Thread antworten',
+    replyInThreadLink: 'Im Thread antworten',
     saySomethingEveryBot: 'Sag etwas — jeder Bot in dieser Gruppe hört mit.',
     newThread: 'Neuer Thread',
     disbandGroupChat: 'Gruppenchat auflösen?',
@@ -532,11 +714,25 @@ const DE_MESSAGES = {
     createYourFirstTeammate: 'Erstelle deinen ersten Teamkollegen.',
     deleteBotAndProfile: 'Bot und Profil löschen?',
     botModeAOne: 'Bot-Modus — eine Übersicht mit einem Chat pro Agent, inklusive Avataren, Routinen, Gruppenchats und Bot-zu-Bot-Nachrichten. Ist in der App enthalten; hier deaktivieren, wenn nicht gewünscht.',
-    bots2: 'Bots',
+    paneTitle: 'Bots',
     cronjobs: 'Cronjobs',
-    newAgent2: 'Neuer Agent…',
+    newAgentCommand: 'Neuer Agent…',
     openTheBotsPane: 'Öffne das Bots-Panel und klicke auf „Neuer Agent“.',
     thisChatNeverResets: 'Dieser Chat wird nie zurückgesetzt',
+    rosterRefreshFailed: 'Liste konnte nicht aktualisiert werden — es wird die letzte gültige gezeigt.',
+    waitingReconnect: ' Warte auf die erneute Gateway-Verbindung…',
+    toastsOn: 'Aktivitäts-Hinweise an — zum Stummschalten klicken',
+    toastsOff: 'Aktivitäts-Hinweise aus — zum Aktivieren klicken',
+    hideHiddenAgain: 'Ausgeblendete Bots wieder verbergen',
+    hideHidden: 'Ausgeblendete Bots verbergen',
+    showHidden: 'Ausgeblendete Bots anzeigen',
+    gatewayError: 'Gateway-Fehler',
+    waitingGatewayLong: 'Warte auf die Gateway-Verbindung… (Remote-Gateways können ein paar Sekunden brauchen; wird automatisch wiederholt)',
+    allBotsHidden: 'Alle Bots sind ausgeblendet — nutze das Auge oben, um sie anzuzeigen.',
+    deleting: 'Wird gelöscht…',
+    deleted: 'Gelöscht',
+    botChatsContinuous: 'Bot-Chats sind eine durchgehende Unterhaltung — es wird stattdessen komprimiert. ',
+    useSessionsMode: 'Für eine Wegwerf-Sitzung mit diesem Agent nutze den Sitzungs-Modus.',
   },
   a11y: {
     activeNow: 'Jetzt aktiv',
@@ -556,6 +752,36 @@ function resolveMessage(bundle, key, args) {
   }
 
   return typeof value === 'string' ? value : key
+}
+
+/** Keys already reported, so a missing string warns once instead of per render. */
+const missingMessages = new Set()
+
+/** `resolveMessage` (and the host's own resolver) echo the dot-path back when a
+ *  bundle has no entry, so a DE bundle lagging behind EN would ship
+ *  "misc.couldNotDeleteProfile" straight into the UI. Fall back to the English
+ *  text instead, and say so once per key so the gap is visible in the console
+ *  rather than only in a screenshot from a user. */
+function withEnglishFallback(key, args, translated) {
+  if (translated !== key) {
+    return translated
+  }
+
+  const english = resolveMessage(EN_MESSAGES, key, args)
+
+  if (!missingMessages.has(key)) {
+    missingMessages.add(key)
+
+    if (typeof console !== 'undefined' && typeof console.warn === 'function') {
+      console.warn(
+        english === key
+          ? `[${ID}] no message for "${key}" in any bundle — rendering the raw key`
+          : `[${ID}] no message for "${key}" in the active locale — falling back to English`
+      )
+    }
+  }
+
+  return english
 }
 
 let t = (key, ...args) => resolveMessage(EN_MESSAGES, key, args)
@@ -3148,19 +3374,23 @@ function McpSetupButton({ profile, entry, onDone, ensureProfile }) {
       const r = await mcpRpc('mcp.servers.set_api_key', { profile, name: entry.name, env_var: k, value: val })
       if (!r.ok) {
         setPhase('error')
-        setMessage(r.error || ('Failed to set ' + k))
+        setMessage(r.error || (t('misc.failedToSet') + k))
         return
       }
     }
-    // Verify via test.
-    const t = await mcpRpc('mcp.servers.test', { profile, name: entry.name })
-    if (t.ok && t.result && (t.result.ok || (t.result.result && t.result.result.ok))) {
+    // Verify via test. NOT named `t`: that shadows the translator for this
+    // whole function body, including the calls above it.
+    const probe = await mcpRpc('mcp.servers.test', { profile, name: entry.name })
+    if (probe.ok && probe.result && (probe.result.ok || (probe.result.result && probe.result.result.ok))) {
       setPhase('done')
-      host.notify({ kind: 'success', message: entry.name + ' configured' })
+      host.notify({ kind: 'success', message: entry.name + t('misc.configuredSuffix') })
       onDone && onDone()
     } else {
       setPhase('error')
-      setMessage((t.result && (t.result.error || (t.result.result && t.result.result.error))) || 'Server test failed after setup')
+      setMessage(
+        (probe.result && (probe.result.error || (probe.result.result && probe.result.result.error))) ||
+          t('misc.serverTestFailed')
+      )
     }
   }
 
@@ -3218,7 +3448,7 @@ function McpSetupButton({ profile, entry, onDone, ensureProfile }) {
         clearInterval(pollRef.current)
         pollRef.current = null
         setPhase('done')
-        host.notify({ kind: 'success', message: entry.name + ' authenticated' })
+        host.notify({ kind: 'success', message: entry.name + t('misc.authenticatedSuffix') })
         onDone && onDone()
       } else if (status === 'error') {
         clearInterval(pollRef.current)
@@ -3232,7 +3462,7 @@ function McpSetupButton({ profile, entry, onDone, ensureProfile }) {
   if (supported === false) {
     return jsx('span', {
       className: 'ml-1.5 text-[0.65rem] text-(--ui-text-quaternary)',
-      children: t('misc.needsSetup') + requires.join(', ') + ') \u2014 restart the gateway to enable in-app setup'
+      children: t('misc.needsSetup') + requires.join(', ') + t('misc.restartGatewayForSetup')
     })
   }
   if (phase === 'done') {
@@ -3278,7 +3508,7 @@ function McpSetupButton({ profile, entry, onDone, ensureProfile }) {
   return jsx('button', {
     className: 'ml-1.5 text-[0.65rem] text-(--ui-accent,#4f9cf9) underline',
     onClick: () => void (isOAuth ? beginOAuth() : beginKeys()),
-    children: isOAuth ? 'Sign in\u2026' : 'Set up\u2026'
+    children: isOAuth ? t('misc.signInAction') : t('misc.setUpAction')
   })
 }
 
@@ -3649,19 +3879,19 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
                         variant: 'ghost',
                         size: 'sm',
                         title: locked
-                          ? 'Unlock — the face follows the agent\u2019s name again'
-                          : 'Keep this exact face even if the name changes',
+                          ? t('avatar.unlockTip')
+                          : t('avatar.lockTip'),
                         onClick: () => onShape(blobShapeString(locked ? '' : pickerName, kind)),
                         children: [
                           jsx(Codicon, { name: locked ? 'unlock' : 'lock', className: 'mr-1 text-[0.8rem]' }),
-                          locked ? 'Unlock' : 'Lock face'
+                          locked ? t('avatar.unlock') : t('avatar.lockFace')
                         ]
                       })
                     ]
                   }),
                   jsx('div', {
                     className: 'text-center text-[0.65rem] text-(--ui-text-quaternary)',
-                    children: locked ? 'Face locked — renaming won\u2019t change it.' : 'Face follows the name.'
+                    children: locked ? t('avatar.lockedNote') : t('avatar.followsNameNote')
                   }),
                   jsx(Button, {
                     type: 'button',
@@ -3689,7 +3919,7 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
                     'button',
                     {
                       type: 'button',
-                      title: s === 'blobatar' ? 'Blob face — drawn from the agent\u2019s name' : undefined,
+                      title: s === 'blobatar' ? t('avatar.blobFaceTip') : undefined,
                       className: cn(
                         'flex items-center justify-center rounded-md transition-colors hover:bg-(--chrome-action-hover)',
                         s === shape && !image && 'ring-1 ring-(--ui-accent)'
@@ -3753,7 +3983,7 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
                     genBusy
                       ? jsx(GlyphSpinner, { spinner: 'breathe', className: 'mr-1 text-[0.8rem]' })
                       : jsx(Codicon, { name: 'sparkle', className: 'mr-1 text-[0.8rem]' }),
-                    genBusy ? 'Generating…' : 'Generate'
+                    genBusy ? t('avatar.generating') : t('avatar.generate')
                   ]
                 }),
                 describe.trim()
@@ -3768,8 +3998,8 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
               className: 'px-2 py-3 text-center text-xs leading-5 text-(--ui-text-tertiary)',
               children:
                 imagen === false
-                  ? 'No image model available. If you just enabled one (or updated Hermes), restart the gateway: Ctrl+K → "Restart gateway".'
-                  : 'Checking image backend…'
+                  ? t('avatar.noImageModel')
+                  : t('avatar.checkingBackend')
             })
         : null,
 
@@ -3779,7 +4009,7 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
             variant: 'secondary',
             className: 'w-full justify-center',
             onClick: upload,
-            children: [jsx(Codicon, { name: 'device-camera', className: 'mr-1 text-[0.8rem]' }), 'Choose an image…']
+            children: [jsx(Codicon, { name: 'device-camera', className: 'mr-1 text-[0.8rem]' }), t('avatar.chooseAnImage')]
           })
         : null,
 
@@ -6597,7 +6827,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
               activeNow
                 ? jsx('span', {
                     className: 'hermes-bots-pulse size-1.5 shrink-0 rounded-full bg-(--ui-accent,#4f9cf9)',
-                    title: workerActive ? 'Working on a task right now' : 'Active in the last 90s'
+                    title: workerActive ? t('roster.workingNow') : t('roster.activeRecently')
                   })
                 : null,
               rowAgeTs
@@ -6651,10 +6881,10 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
               saveBotMeta(bot.name, { pinned: !pinned })
               host.notify({
                 kind: 'info',
-                message: `${displayName(bot, meta)} ${pinned ? 'unpinned' : 'pinned to top'}`
+                message: `${displayName(bot, meta)} ${pinned ? 'unpinned' : t('roster.pinnedToTop')}`
               })
             },
-            children: meta?.pinned ? 'Unpin' : 'Pin to top'
+            children: meta?.pinned ? t('roster.unpin') : t('roster.pinToTop')
           }),
           jsx(ContextMenuItem, {
             onSelect: () => {
@@ -6674,14 +6904,14 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
                   : `${displayName(bot, meta)} hidden — use the eye button in the Bots header to see hidden bots`
               })
             },
-            children: meta?.hidden ? 'Unhide Bot' : 'Hide Bot'
+            children: meta?.hidden ? t('roster.unhideBot') : t('roster.hideBot')
           }),
           jsx(ContextMenuSeparator, {}),
           jsx(ContextMenuItem, { onSelect: () => onEdit(bot), children: t('roster.editProfile') }),
           !bot.remoteSource
             ? jsx(ContextMenuItem, {
                 onSelect: () => onGroup(bot),
-                children: groups.length ? t('model.groups', groups.join(', ')) : 'Manage groups…'
+                children: groups.length ? t('model.groups', groups.join(', ')) : t('roster.manageGroups')
               })
             : null,
           jsx(ContextMenuItem, {
@@ -7165,7 +7395,7 @@ function AdvancedProfileConfig({ bot, state, setState }) {
                                 m.fromCatalog && !needsSetup
                                   ? jsx('span', {
                                       className: 'ml-1.5 text-[0.65rem] text-(--ui-text-quaternary)',
-                                      children: m.installed ? 'catalog · installed' : 'catalog'
+                                      children: m.installed ? t('caps.catalogInstalled') : 'catalog'
                                     })
                                   : null,
                                 needsSetup
@@ -7333,7 +7563,7 @@ function HubSkillsSection({ forProfile, onInstalled }) {
             type: 'button',
             className: 'text-[0.65rem] text-(--ui-text-quaternary) hover:text-(--ui-text-secondary)',
             onClick: () => setBrowseHub(v => !v),
-            children: browseHub ? 'hide the hub browser' : 'browse the full hub ▾'
+            children: browseHub ? t('hub.hideBrowser') : t('hub.browseFull')
           })
         ]
       }),
@@ -7379,7 +7609,7 @@ function HubSkillsSection({ forProfile, onInstalled }) {
                 children:
                   installing
                     ? t('profile.installing', installing)
-                    : 'Hit "+ Add to this Agent" on any skill — it installs and appears in the list above. Drag the corner to resize.'
+                    : t('hub.pickerHint')
               })
             ]
           })
@@ -7404,7 +7634,7 @@ function HubSkillsSection({ forProfile, onInstalled }) {
             variant: 'secondary',
             disabled: searching || !query.trim(),
             onClick: () => void search(),
-            children: searching ? 'Searching…' : 'Search'
+            children: searching ? t('hub.searching') : t('hub.search')
           })
         ]
       }),
@@ -7721,7 +7951,7 @@ function EditProfileDialog({ bot, open, onClose }) {
         jsxs(DialogFooter, {
           children: [
             jsx(Button, { variant: 'ghost', disabled: busy, onClick: onClose, children: t('misc.cancel') }),
-            jsx(Button, { disabled: busy, onClick: submit, children: busy ? 'Saving…' : 'Save' })
+            jsx(Button, { disabled: busy, onClick: submit, children: busy ? t('profile.saving') : t('profile.save') })
           ]
         })
       ]
@@ -8135,8 +8365,8 @@ function CreateAgentDialog({ open, onClose, roster }) {
               ? jsx('div', {
                   className: 'text-xs text-(--ui-accent)',
                   children: remoteTarget
-                    ? t('agentNew.anAgentNamedAlready', slug, targetLabel)
-                    : t('agentNew.anAgentNamedAlready2', slug)
+                    ? t('agentNew.nameTakenOnTarget', slug, targetLabel)
+                    : t('agentNew.nameTakenHere', slug)
                 })
               : null,
             // Multi-connection desktops choose WHERE the agent lives. Hidden
@@ -8283,7 +8513,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
                           className: 'grid gap-3.5',
                           children: [
                             labeled(
-                              remoteTarget ? t('agentNew.cloneFromProfileOn', targetLabel) : 'Clone from profile',
+                              remoteTarget ? t('agentNew.cloneFromProfileOn', targetLabel) : t('agentNew.cloneFromProfile'),
                               jsxs(Select, {
                                 disabled: remoteTarget,
                                 value: remoteTarget ? 'default' : cloneFrom,
@@ -8319,14 +8549,14 @@ function CreateAgentDialog({ open, onClose, roster }) {
                                   setModel(patch.model)
                                 }
                               },
-                              placeholderModel: 'inherited from launch profile'
+                              placeholderModel: t('agentNew.inheritedFromLaunch')
                             }),
                             labeled(
                               'SOUL.md (optional — replaces the generated persona)',
                               jsx(Textarea, {
                                 className: 'min-h-24 font-mono text-xs leading-5',
                                 placeholder:
-                                  'Leave blank to auto-generate from name/title/description + agent-messaging roster.',
+                                  t('agentNew.soulPlaceholder'),
                                 value: soul,
                                 onChange: event => setSoul(event.target.value)
                               })
@@ -8344,7 +8574,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
                             jsx('div', {
                               className: 'pl-6 pt-0.5 text-[0.7rem] leading-5 text-(--ui-text-tertiary)',
                               children:
-                                'Subscriptions, OAuth logins, and API keys stay shared (not copied), so token refreshes never invalidate each other. Uncheck for an isolated snapshot copy.'
+                                t('agentNew.sharedKeysNote')
                             }),
                             jsxs('label', {
                               className: 'flex items-center gap-2 text-xs text-(--ui-text-secondary)',
@@ -8363,8 +8593,8 @@ function CreateAgentDialog({ open, onClose, roster }) {
                           ? jsx('div', {
                               className: 'px-2 py-3 text-center text-xs text-(--ui-text-tertiary)',
                               children: taken
-                                ? 'That name is taken — pick another before configuring capabilities.'
-                                : 'Name the agent first — a draft profile is created when you open this tab (discarded if you cancel).'
+                                ? t('agentNew.nameTakenBeforeCaps')
+                                : t('agentNew.nameFirstNote')
                             })
                           : !createdForCaps
                             ? jsx('div', {
@@ -8393,7 +8623,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
                         ? jsx('div', {
                             className: 'px-2 py-3 text-center text-xs text-(--ui-text-tertiary)',
                             children:
-                              'Capability catalog needs a newer gateway (restart it after updating Hermes).'
+                              t('agentNew.catalogNeedsNewerGateway')
                           })
                         : !caps
                           ? jsx('div', {
@@ -8500,7 +8730,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
                                                         ? jsx('span', {
                                                             className: 'ml-1.5 text-[0.65rem] text-(--ui-text-quaternary)',
                                                             children: m.installed
-                                                              ? 'catalog · installed'
+                                                              ? t('caps.catalogInstalled')
                                                               : 'catalog'
                                                           })
                                                         : null,
@@ -8547,7 +8777,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
                                       jsx('div', {
                                         className: 'text-[0.65rem] leading-4 text-(--ui-text-quaternary)',
                                         children:
-                                          'Configured servers copy from the main profile; catalog entries are the bundled MCP menu. Entries needing API keys route through setup first (credentials follow the shared keys setting).'
+                                          t('agentNew.mcpCopyNote')
                                       })
                                     ]
                                   })
@@ -8577,7 +8807,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
             jsx(Button, {
               disabled: busy || !valid || taken,
               onClick: submit,
-              children: busy ? 'Creating…' : 'Create Agent'
+              children: busy ? t('agentNew.creating') : t('agentNew.createAgent')
             })
           ]
         })
@@ -8733,13 +8963,13 @@ function scheduleLabel(schedule) {
   const once = /^once in (.+)$/.exec(schedule || '')
 
   if (once) {
-    return t('cron.once', once[1])
+    return t('cron.onceLabel', once[1])
   }
 
   const bare = /^(\d+)([mhd])$/.exec(schedule || '')
 
   if (bare) {
-    return t('cron.once2', bare[1], bare[2])
+    return t('cron.onceValueUnit', bare[1], bare[2])
   }
 
   const match = /^every (\d+)m$/.exec(schedule || '')
@@ -8749,12 +8979,12 @@ function scheduleLabel(schedule) {
 
     if (minutes % 1440 === 0) {
       const d = minutes / 1440
-      return d === 1 ? 'Daily' : t('cron.everyDays', d)
+      return d === 1 ? t('cron.daily') : t('cron.everyDays', d)
     }
 
     if (minutes % 60 === 0) {
       const h = minutes / 60
-      return h === 1 ? 'Hourly' : t('cron.everyH', h)
+      return h === 1 ? t('cron.hourly') : t('cron.everyH', h)
     }
 
     return t('cron.everyM', minutes)
@@ -8861,7 +9091,10 @@ function RoutineRow({ job, profile }) {
 // Structured schedule picker: frequency first, then only the detail that
 // frequency needs (time of day, weekday, day of month, interval). Emits a
 // Hermes-native schedule string; Advanced exposes it raw.
-const FREQUENCIES = [
+// Built per call, not once at module load: `t` is still the English fallback
+// until register() wires ctx.i18n, so a module-level array would freeze these
+// labels in English for the life of the process.
+const frequencies = () => [
   { id: 'once', label: t('cron.onceIn') },
   { id: 'hourly', label: t('cron.everyHour') },
   { id: 'daily', label: t('cron.everyDay') },
@@ -8872,7 +9105,7 @@ const FREQUENCIES = [
   { id: 'advanced', label: t('cron.advanced') }
 ]
 
-const WEEKDAYS = [
+const weekdays = () => [
   { id: '1', label: t('cron.monday') },
   { id: '2', label: t('cron.tuesday') },
   { id: '3', label: t('cron.wednesday') },
@@ -8882,17 +9115,21 @@ const WEEKDAYS = [
   { id: '0', label: t('cron.sunday') }
 ]
 
-const TIMES = (() => {
+// Ids stay locale-independent (`${h}:${m}`) because composeSchedule parses
+// them; only the label goes through the bundle, so German reads 24-hour time.
+const times = () => {
   const out = []
   for (let h = 0; h < 24; h++) {
     for (const m of [0, 30]) {
-      const ampm = h < 12 ? 'AM' : 'PM'
-      const h12 = h % 12 === 0 ? 12 : h % 12
-      out.push({ id: `${h}:${m}`, label: `${h12}:${String(m).padStart(2, '0')} ${ampm}`, h, m })
+      out.push({ id: `${h}:${m}`, label: t('cron.timeOfDay', h, m), h, m })
     }
   }
   return out
-})()
+}
+
+const DEFAULT_TIME_ID = '9:0'
+const pickTime = id => times().find(x => x.id === id)
+const pickWeekday = id => weekdays().find(w => w.id === id) || weekdays()[0]
 
 /** Compose the Hermes schedule string from picker state. */
 function composeSchedule(state) {
@@ -8923,32 +9160,34 @@ function composeSchedule(state) {
 }
 
 function scheduleSummary(state) {
-  const t = TIMES.find(x => x.id === state.time)
-  const tl = t ? t.label : '9:00 AM'
+  // NOT named `t`: that shadowed the translator for this whole function body,
+  // so every t('cron.…') call below threw "t is not a function".
+  const slot = pickTime(state.time) || pickTime(DEFAULT_TIME_ID)
+  const tl = slot ? slot.label : ''
 
-  const unitWord = u => (u === 'm' ? 'minute(s)' : u === 'd' ? 'day(s)' : 'hour(s)')
+  const unitWord = u => (u === 'm' ? t('cron.unitMinutes') : u === 'd' ? t('cron.unitDays') : t('cron.unitHours'))
   const cap =
     state.freq !== 'once' && String(state.repeatN || '').trim()
-      ? `, ${Math.max(1, parseInt(state.repeatN, 10) || 1)} time(s) total`
+      ? t('cron.timesTotal', Math.max(1, parseInt(state.repeatN, 10) || 1))
       : ''
 
   switch (state.freq) {
     case 'once':
       return t('cron.runsOnceFromNow', Math.max(1, parseInt(state.onceN, 10) || 1), unitWord(state.onceUnit))
     case 'hourly':
-      return 'Runs at the top of every hour' + cap
+      return t('cron.runsTopOfHour') + cap
     case 'daily':
       return t('cron.runsEveryDayAt', tl) + cap
     case 'weekdays':
       return t('cron.runsMondayFridayAt', tl) + cap
     case 'weekly':
-      return t('cron.runsEveryAt', (WEEKDAYS.find(w => w.id === state.weekday) || WEEKDAYS[0]).label, tl) + cap
+      return t('cron.runsEveryAt', pickWeekday(state.weekday).label, tl) + cap
     case 'monthly':
       return t('cron.runsOnDayOf', state.monthday || '1', tl) + cap
     case 'interval':
       return t('cron.runsEvery', Math.max(1, parseInt(state.intervalN, 10) || 1), unitWord(state.intervalUnit)) + cap
     default:
-      return 'Raw schedule \u2014 every Nm/Nh/Nd or 5-field cron'
+      return t('cron.rawSchedule')
   }
 }
 
@@ -8975,8 +9214,8 @@ function SchedulePicker({ state, setState }) {
       jsxs('div', {
         style: { display: 'grid', gridTemplateColumns: needsTime ? '1fr 1fr' : '1fr', gap: '8px' },
         children: [
-          pickerSelect(state.freq, v => upd({ freq: v }), FREQUENCIES),
-          needsTime ? pickerSelect(state.time, v => upd({ time: v }), TIMES) : null
+          pickerSelect(state.freq, v => upd({ freq: v }), frequencies()),
+          needsTime ? pickerSelect(state.time, v => upd({ time: v }), times()) : null
         ]
       }),
       state.freq === 'once'
@@ -8998,7 +9237,7 @@ function SchedulePicker({ state, setState }) {
           })
         : null,
       state.freq === 'weekly'
-        ? pickerSelect(state.weekday, v => upd({ weekday: v }), WEEKDAYS)
+        ? pickerSelect(state.weekday, v => upd({ weekday: v }), weekdays())
         : null,
       state.freq === 'monthly'
         ? labeled(
@@ -9147,7 +9386,7 @@ function CreateRoutineDialog({ bot, open, onClose }) {
       children: [
         jsxs(DialogHeader, {
           children: [
-            jsx(DialogTitle, { children: t('cron.newCronjob') }),
+            jsx(DialogTitle, { children: t('cron.newCronjobTitle') }),
             jsx(DialogDescription, {
               children: `A recurring task ${displayName({ name: bot }, $botMeta.get()[bot])} runs on a schedule. Runs land in its own chat history.`
             })
@@ -9178,7 +9417,7 @@ function CreateRoutineDialog({ bot, open, onClose }) {
             labeled(
               'Send results to',
               pickerSelect(target, setTarget, [
-                { id: 'history', label: 'Run history only' },
+                { id: 'history', label: t('cron.runHistoryOnly') },
                 { id: 'bot-chat', label: `${displayName({ name: bot }, $botMeta.get()[bot])}\u2019s chat (bot responds)` }
               ])
             ),
@@ -9216,7 +9455,7 @@ function CreateRoutineDialog({ bot, open, onClose }) {
             jsx(Button, {
               disabled: busy || !name.trim() || !instruction.trim() || !schedule.trim(),
               onClick: submit,
-              children: busy ? 'Scheduling…' : 'Create Cronjob'
+              children: busy ? t('cron.scheduling') : t('cron.createCronjob')
             })
           ]
         })
@@ -9270,7 +9509,7 @@ function RoutinesPane() {
   }
   const jobs = view.jobs
   const staleNotice = error && !view.live && view.all.length
-    ? 'Could not refresh cronjobs. Showing the last list we had.'
+    ? t('cron.refreshFailed')
     : null
   const filterHint = routineFilterHint(view.all, jobs)
 
@@ -9306,7 +9545,7 @@ function RoutinesPane() {
             ]
           }),
           jsx(Tip, {
-            label: t('cron.newCronjob2'),
+            label: t('cron.newCronjobTip'),
             children: jsx('button', {
               type: 'button',
               className:
@@ -9364,7 +9603,7 @@ function RoutinesPane() {
                   variant: 'secondary',
                   size: 'sm',
                   onClick: openCreate,
-                  children: filterHint ? 'Create a cronjob for this bot' : 'Create Cronjob'
+                  children: filterHint ? t('cron.createForBotTip') : t('cron.createCronjob')
                 })
               ]
             })
@@ -9522,7 +9761,7 @@ function GroupDialog({ bot, onClose }) {
           children: [
             jsx(Input, {
               autoFocus: true,
-              placeholder: groups.length ? 'New group…' : 'Group name (e.g. Research)',
+              placeholder: groups.length ? t('groups.newGroup') : t('groups.namePlaceholderExample'),
               value: name,
               onChange: event => setName(event.target.value)
             }),
@@ -9615,7 +9854,7 @@ function GroupImageControls({ image, onImage, seedName, seedMembers }) {
             size: 'sm',
             disabled: busy,
             onClick: generate,
-            children: busy ? 'Generating…' : 'Generate'
+            children: busy ? t('avatar.generating') : t('avatar.generate')
           })
         : null,
       image
@@ -9734,7 +9973,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
   const atCap = selected.length >= GROUP_CHAT_MAX_MEMBERS
   const placeholder = selected.length
     ? selected.map(bot => displayName(bot, botRosterMeta(bot, allMeta))).join(', ')
-    : 'Group name'
+    : t('groups.name')
   const canCreate = selected.length >= 2 && Boolean(name.trim() || selected.length)
 
   const create = () => {
@@ -9882,7 +10121,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
                 })
               : jsx('div', {
                   className: 'px-1.5 py-3 text-center text-xs text-(--ui-text-tertiary)',
-                  children: query.trim() ? t('thread.noBotsMatch', query.trim()) : 'No bots yet — create agents first.'
+                  children: query.trim() ? t('thread.noBotsMatch', query.trim()) : t('groups.noBotsYet')
                 })
           })
         }),
@@ -9915,7 +10154,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
             jsx(Button, { variant: 'secondary', onClick: onClose, children: t('misc.cancel') }),
             jsx(Button, {
               disabled: !canCreate,
-              title: selected.length < 2 ? 'Pick at least 2 bots' : undefined,
+              title: selected.length < 2 ? t('groups.pickAtLeastTwo') : undefined,
               onClick: create,
               children: `Create Group${selected.length ? ` (${selected.length})` : ''}`
             })
@@ -10290,7 +10529,7 @@ function GroupClarifyCard({ entry, members }) {
               ? null
               : jsx(Input, {
                   'aria-label': t('thread.answer', entry.member),
-                  placeholder: q.choices.length ? 'Or type your own answer…' : 'Type your answer…',
+                  placeholder: q.choices.length ? t('groups.orTypeOwnAnswer') : t('groups.typeAnswer'),
                   value: drafts[q.qid] || '',
                   onChange: event => {
                     const value = event.target.value
@@ -10314,7 +10553,7 @@ function GroupClarifyCard({ entry, members }) {
           size: 'sm',
           disabled: sending || !allAnswered || !member,
           onClick: () => void submit(),
-          children: sending ? 'Sending…' : isApproval ? 'Respond' : 'Answer'
+          children: sending ? t('groups.sending') : isApproval ? t('groups.respond') : t('groups.answer')
         })
       })
     ]
@@ -10534,7 +10773,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
         type: 'button',
         'aria-expanded': activityOpen,
         'aria-controls': `group-activity:${group}`,
-        title: activityOpen ? 'Hide room activity' : 'Show room activity',
+        title: activityOpen ? t('groups.hideRoomActivity') : t('groups.showRoomActivity'),
         className:
           'flex w-full items-center gap-1.5 px-2.5 py-1 text-left text-[0.7rem] text-(--ui-text-quaternary) transition-colors hover:text-foreground',
         onClick: () => setActivityOpen(prev => !prev),
@@ -10690,13 +10929,13 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                           ? (b.connectionLabel || b.connectionId) === entry.from.source
                           : !b.remoteSource)
                       ) || null
-                  const display = isUser ? 'You' : displayName(member || { name: entry.from.name }, meta)
+                  const display = isUser ? t('groups.you') : displayName(member || { name: entry.from.name }, meta)
                   const entryKey = `${entry.at}:${index}`
                   const revealed = !isUser && revealedSpeaker === entryKey
                   // Clicked: append the gateway name so same-named agents on
                   // two connections are tellable apart on demand.
                   const label = isUser
-                    ? 'You'
+                    ? t('groups.you')
                     : revealed
                       ? `${display}${entry.from.source ? `-${entry.from.source}` : ''} (@${botHandle(entry.from.name, member || undefined)})`
                       : display
@@ -10742,7 +10981,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                                     type: 'button',
                                     className:
                                       'cursor-pointer border-0 bg-transparent p-0 text-left text-[0.7rem] font-semibold text-(--ui-accent,#4f9cf9)',
-                                    title: revealed ? 'Hide full handle' : 'Show full handle',
+                                    title: revealed ? t('groups.hideFullHandle') : t('groups.showFullHandle'),
                                     onClick: () => setRevealedSpeaker(revealed ? null : entryKey),
                                     children: label
                                   }),
@@ -10902,7 +11141,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
                   jsx(GroupMentionInput, {
                     'aria-label': t('a11y.replyInThread'),
                     autoFocus: true,
-                    placeholder: t('thread.replyInThread'),
+                    placeholder: t('thread.replyInThreadPlaceholder'),
                     members,
                     value: replyDrafts[id] || '',
                     onChange: text => setReplyDrafts(prev => ({ ...prev, [id]: text })),
@@ -10925,7 +11164,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
             className:
               'w-fit px-2 pb-1 text-left text-[0.65rem] text-(--ui-accent,#4f9cf9) transition-colors hover:underline',
             onClick: () => setReplyThread(id),
-            children: t('thread.replyInThread2')
+            children: t('thread.replyInThreadLink')
           }, `replylink:${id}`)
     )
 
@@ -10958,7 +11197,7 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
         ? jsx('div', {
             className:
               'pointer-events-none absolute inset-0 z-40 flex items-center justify-center border-2 border-dashed border-(--ui-accent,#4f9cf9) text-sm font-medium text-(--ui-accent,#4f9cf9)',
-            children: replyThread ? 'Drop to attach to this thread reply' : 'Drop to attach — every responding bot sees it'
+            children: replyThread ? t('groups.dropToAttachThread') : t('groups.dropToAttachRoom')
           }, 'dropzone')
         : null,
       header,
@@ -10983,10 +11222,10 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
               ? jsx('div', {
                   className: 'px-2 py-1 text-[0.7rem] italic text-(--ui-text-quaternary)',
                   children: roomClarifies.length
-                    ? 'Waiting for your answer…'
+                    ? t('groups.waitingForAnswer')
                     : room.turn
                       ? `${groupSpeakerLabel(room.turn)} is thinking…`
-                      : 'The room is working…'
+                      : t('groups.roomWorking')
                 }, 'working')
               : null,
             // Scroll anchor (#89835): rooms opened at scroll position 0, mid-
@@ -11052,8 +11291,8 @@ function GroupChatWorkspace({ group, members, onBack, visible = true }) {
         }),
         destructive: true,
         confirmLabel: t('thread.disband'),
-        busyLabel: 'Disbanding…',
-        doneLabel: 'Disbanded',
+        busyLabel: t('groups.disbanding'),
+        doneLabel: t('groups.disbanded'),
         onClose: () => setConfirmDisband(false),
         onConfirm: async () => {
           await disbandGroupChat(group, members)
@@ -11200,8 +11439,8 @@ function GroupRow({ active, group, members, needsYou, onOpen, onDisband }) {
   const lastFrom = last?.from?.name || ''
   const lastHandle = botHandle(lastFrom || 'bot', members.find(member => member?.name === lastFrom))
   const preview = last
-    ? `${last.from?.kind === 'user' ? 'You' : `@${lastHandle}`}: ${stripPreviewMarkdown(last.text) || '…'}`
-    : 'No messages yet — say hi to the room'
+    ? `${last.from?.kind === 'user' ? t('groups.you') : `@${lastHandle}`}: ${stripPreviewMarkdown(last.text) || '…'}`
+    : t('groups.noMessagesYet')
   const faces = members.slice(0, 3)
 
   const row = jsxs('button', {
@@ -11301,13 +11540,13 @@ function GroupRow({ active, group, members, needsYou, onOpen, onDisband }) {
         children: [
           jsx(ContextMenuItem, {
             onSelect: () => onOpen(group),
-            children: 'Open Group Chat'
+            children: t('groups.openGroupChat')
           }),
           jsx(ContextMenuSeparator, {}),
           jsx(ContextMenuItem, {
             className: 'text-destructive focus:text-destructive',
             onSelect: () => onDisband({ name: group, members }),
-            children: 'Delete Group'
+            children: t('groups.deleteGroup')
           })
         ]
       })
@@ -11422,7 +11661,7 @@ function BotsPane() {
   }
 
   const staleNotice = error && !live && roster.length
-    ? 'Roster refresh failed — showing the last good list.' + (gatewayUp ? '' : ' Waiting for the gateway to reconnect…')
+    ? t('pane.rosterRefreshFailed') + (gatewayUp ? '' : t('pane.waitingReconnect'))
     : null
 
   const groupChatMembers = groupChatName ? groupChatMemberBots(groupChatName, roster, allMeta) : []
@@ -11445,7 +11684,7 @@ function BotsPane() {
             className: 'flex items-center gap-0.5',
             children: [
               jsx(Tip, {
-                label: activityToasts ? 'Activity toasts on — click to silence' : 'Activity toasts off — click to enable',
+                label: activityToasts ? t('pane.toastsOn') : t('pane.toastsOff'),
                 children: jsx('button', {
                   type: 'button',
                   className:
@@ -11460,11 +11699,11 @@ function BotsPane() {
               hiddenBots.length
                 ? jsx(Tip, {
                     label: showHidden
-                      ? 'Hide hidden bots again'
+                      ? t('pane.hideHiddenAgain')
                       : t('pane.showHiddenBot', hiddenBots.length, hiddenBots.length === 1 ? '' : 's'),
                     children: jsxs('button', {
                       type: 'button',
-                      'aria-label': showHidden ? 'Hide hidden bots' : 'Show hidden bots',
+                      'aria-label': showHidden ? t('pane.hideHidden') : t('pane.showHidden'),
                       className: cn(
                         'relative flex size-6 items-center justify-center rounded-md transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
                         showHidden ? 'text-foreground' : 'text-(--ui-text-tertiary)'
@@ -11613,8 +11852,8 @@ function BotsPane() {
               children: [
                 jsx('div', {
                   children: gatewayUp
-                    ? t('pane.rosterUnavailableIfYour', error instanceof Error ? error.message : 'gateway error')
-                    : 'Waiting for the gateway connection… (remote gateways can take a few seconds; retries automatically)'
+                    ? t('pane.rosterUnavailableIfYour', error instanceof Error ? error.message : t('pane.gatewayError'))
+                    : t('pane.waitingGatewayLong')
                 }),
                 jsx(Button, {
                   variant: 'secondary',
@@ -11639,7 +11878,7 @@ function BotsPane() {
                   role: 'status',
                   children: query.trim()
                     ? t('thread.noBotsMatch', query.trim())
-                    : 'All bots are hidden — use the eye button above to show them.'
+                    : t('pane.allBotsHidden')
                 })
               : jsx(ScrollArea, {
                   className: 'hermes-bots-roster min-h-0 flex-1',
@@ -11719,8 +11958,8 @@ function BotsPane() {
           : null,
         destructive: true,
         confirmLabel: t('misc.delete'),
-        busyLabel: 'Deleting…',
-        doneLabel: 'Deleted',
+        busyLabel: t('pane.deleting'),
+        doneLabel: t('pane.deleted'),
         onClose: () => setDeleting(null),
         onConfirm: async () => {
           if (!deleting) {
@@ -11735,14 +11974,14 @@ function BotsPane() {
       }),
       jsx(ConfirmDialog, {
         open: Boolean(deletingGroup),
-        title: 'Delete group chat?',
+        title: t('groups.deleteGroupChatTitle'),
         description: deletingGroup
           ? `This removes “${deletingGroup.name}” from its bots and clears the shared room log. The bots and their individual chats are kept.`
           : null,
         destructive: true,
-        confirmLabel: 'Delete Group',
-        busyLabel: 'Deleting…',
-        doneLabel: 'Deleted',
+        confirmLabel: t('groups.deleteGroup'),
+        busyLabel: t('pane.deleting'),
+        doneLabel: t('pane.deleted'),
         onClose: () => setDeletingGroup(null),
         onConfirm: async () => {
           if (!deletingGroup) return
@@ -11759,7 +11998,11 @@ function BotsPane() {
 export default {
   id: ID,
   name: 'Bots',
-  description: t('pane.botModeAOne'),
+  // Getter, not a value: the object literal is evaluated at module load, before
+  // register() swaps in the locale-aware translator.
+  get description() {
+    return t('pane.botModeAOne')
+  },
   register(ctx) {
     pluginCtx = ctx
     groupChatSyncDisposed = false
@@ -11768,7 +12011,7 @@ export default {
     // test harness) without `ctx.i18n` keeps the English fallback above.
     if (ctx.i18n) {
       ctx.i18n.register({ en: EN_MESSAGES, de: DE_MESSAGES })
-      t = (key, ...args) => ctx.i18n.t(key, ...args)
+      t = (key, ...args) => withEnglishFallback(key, args, ctx.i18n.t(key, ...args))
     }
     startFaceClock()
     // Disabling the plugin (or a hot reload) must actually stop the clock —
@@ -11969,7 +12212,7 @@ export default {
     ctx.register({
       id: 'pane',
       area: 'panes',
-      title: t('pane.bots2'),
+      title: t('pane.paneTitle'),
       // dock: explicit adoption gesture — CENTER-STACK into the sessions zone
       // so the sidebar grows a SESSIONS | BOTS tab strip instead of splitting
       // two cramped panes down the column. Center is safe now: insertAtGroup
@@ -12053,7 +12296,7 @@ export default {
       area: PALETTE_AREA,
       data: {
         id: `${ID}.new-agent`,
-        label: t('pane.newAgent2'),
+        label: t('pane.newAgentCommand'),
         keywords: ['bot', 'agent', 'profile', 'teammate', 'create'],
         run: () => {
           host.notify({ kind: 'info', message: t('pane.openTheBotsPane') })
@@ -12100,8 +12343,8 @@ export default {
                 kind: 'info',
                 title: t('pane.thisChatNeverResets'),
                 message:
-                  'Bot chats are one continuous conversation — compacting instead. ' +
-                  'For a throwaway session with this agent, use Sessions mode.'
+                  t('pane.botChatsContinuous') +
+                  t('pane.useSessionsMode')
               })
 
               return { ...draft, text: '/compact' }

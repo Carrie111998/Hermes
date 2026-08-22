@@ -1155,8 +1155,8 @@ test('source contract: active group styling suppresses bot styling', () => {
 
 test('source contract: group roster rows expose a confirmed Delete Group action', () => {
   assert.match(pluginSource, /function GroupRow\(\{ active, group, members, needsYou, onOpen, onDisband \}\)/)
-  assert.match(pluginSource, /children: 'Delete Group'/)
-  assert.match(pluginSource, /title: 'Delete group chat\?'/)
+  assert.match(pluginSource, /children: t\('groups\.deleteGroup'\)/)
+  assert.match(pluginSource, /title: t\('groups\.deleteGroupChatTitle'\)/)
   assert.match(pluginSource, /await disbandGroupChat\(deletingGroup\.name, deletingGroup\.members\)/)
 })
 
@@ -1608,7 +1608,7 @@ test('group room preview renders the bot HANDLE, not the raw profile name', () =
   // #89484: the room line read "@default: …" while the bot answers to
   // @hermes, so users concluded mention routing was broken.
   assert.match(pluginSource, /const lastHandle = botHandle\(lastFrom \|\| 'bot', members\.find\(/)
-  assert.match(pluginSource, /\? `\$\{last\.from\?\.kind === 'user' \? 'You' : `@\$\{lastHandle\}`\}/)
+  assert.match(pluginSource, /\? `\$\{last\.from\?\.kind === 'user' \? t\('groups\.you'\) : `@\$\{lastHandle\}`\}/)
   assert.doesNotMatch(pluginSource, /`@\$\{last\.from\?\.name \|\| 'bot'\}`/)
 })
 
