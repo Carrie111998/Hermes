@@ -143,3 +143,48 @@ async def test_a_long_lived_connection_resets_the_failure_count(monkeypatch):
     # left this test green until it checked how many lines appeared.
     assert len(seen) == 3, f"expected one line per failure, got {seen}"
     assert set(seen) == {1}, f"failure count did not reset: {seen}"
+
+
+@pytest.mark.asyncio
+async def test_removing_the_ceiling_did_not_remove_the_pacing(monkeypatch):
+    """Unbounded retries must still back off, or the fix is a hot loop.
+
+    A transport that fails INSTANTLY is the dangerous shape: with no ceiling
+    and no growth, the run loop would spin as fast as the event loop allows
+    against a server that is down. `backoff` is initialised once before the
+    loop and only reset by a connection that stayed up, so the delays have to
+    climb and then cap.
+
+    The other tests patch sleep to a no-op, so none of them can see this.
+    """
+    from tools import mcp_tool
+
+    delays: list[float] = []
+    attempts = 0
+    real_sleep = asyncio.sleep
+
+    async def record(delay):
+        delays.append(delay)
+        await real_sleep(0)
+
+    async def fails_instantly(_self, _config):
+        nonlocal attempts
+        attempts += 1
+        if attempts >= 10:
+            raise asyncio.CancelledError
+        raise ConnectionError("refused")
+
+    task = mcp_tool.MCPServerTask("test")
+    task._ready.set()
+    monkeypatch.setattr(mcp_tool.MCPServerTask, "_run_http", fails_instantly, raising=False)
+    monkeypatch.setattr(mcp_tool.MCPServerTask, "_is_http", lambda _self: True, raising=False)
+    monkeypatch.setattr(mcp_tool.asyncio, "sleep", record)
+
+    with pytest.raises(asyncio.CancelledError):
+        await task.run({"url": "https://example.invalid/mcp"})
+
+    assert delays, "an instantly-failing transport must still sleep between attempts"
+    assert delays == sorted(delays), f"backoff must not shrink: {delays}"
+    assert delays[0] < delays[-1], f"backoff must grow: {delays}"
+    assert max(delays) <= mcp_tool._MAX_BACKOFF_SECONDS, f"backoff must cap: {delays}"
+    assert sum(delays) > 30, f"nine instant failures must span real time, not spin: {delays}"
