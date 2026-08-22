@@ -27,6 +27,7 @@ from hermes_state import (
     SCHEMA_SQL,
     SessionDB,
     _FTS_TRIGGERS,
+    _looks_like_hermes,
 )
 
 
@@ -87,6 +88,40 @@ def _base_fts_triggers(db_path):
 
 
 class TestRuntimeFtsRebuild:
+    @pytest.mark.parametrize(
+        "argv",
+        (
+            ("journalctl", "-u", "hermes-agent.service"),
+            ("grep", "hermes-agent", "/var/log/syslog"),
+            (
+                "/usr/sbin/tailscaled",
+                "be-child",
+                "ssh",
+                "--cmd=python -m hermes_cli.main gateway",
+            ),
+            ("tmux", "new-session", "/opt/hermes-agent/.venv/bin/hermes gateway"),
+            ("python3", "/opt/hermes-agent/tools/check_state.py"),
+        ),
+    )
+    def test_uninspectable_non_hermes_process_is_not_a_holder(self, argv):
+        assert not _looks_like_hermes(argv)
+
+    @pytest.mark.parametrize(
+        "argv",
+        (
+            ("/usr/local/bin/hermes", "gateway"),
+            ("/usr/local/bin/hermes-agent", "serve"),
+            ("/usr/bin/python3", "-m", "hermes_cli.main", "gateway"),
+            (
+                "/opt/hermes-agent/.venv/bin/python",
+                "/opt/hermes-agent/hermes_cli/main.py",
+                "gateway",
+            ),
+        ),
+    )
+    def test_uninspectable_hermes_process_remains_a_holder(self, argv):
+        assert _looks_like_hermes(argv)
+
     def test_foreign_holder_detection_includes_deleted_wal(
         self, db, tmp_path, monkeypatch
     ):
@@ -199,19 +234,19 @@ class TestRuntimeFtsRebuild:
                 path = path.replace("/proc", str(proc_root))
             return real_listdir(path)
         monkeypatch.setattr(hermes_state.os, "listdir", _listdir)
-        # _read_proc_cmdline opens /proc/<pid>/cmdline directly; redirect
+        # _read_proc_argv opens /proc/<pid>/cmdline directly; redirect
         # it to our fake proc tree.
-        def _fake_cmdline(pid):
+        def _fake_argv(pid):
             fake_path = str(proc_root / str(pid) / "cmdline")
             try:
                 with open(fake_path, "rb") as f:
                     raw = f.read()
                 if not raw:
                     return None
-                return raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+                return raw.decode("utf-8", "replace").rstrip("\x00").split("\x00")
             except OSError:
                 return None
-        monkeypatch.setattr(hermes_state, "_read_proc_cmdline", _fake_cmdline)
+        monkeypatch.setattr(hermes_state, "_read_proc_argv", _fake_argv)
 
         holders = db._foreign_state_db_holders()
         # Should include PID 222 with the cmdline info
