@@ -71,11 +71,9 @@ def _resolve_provider_config(
     providers = config.get("providers", {})
     providers = providers if isinstance(providers, dict) else {}
 
-    try:
-        from hermes_cli.config import is_provider_enabled
-    except Exception:  # pragma: no cover - defensive
-        def is_provider_enabled(_cfg):  # type: ignore[misc]
-            return True
+    # Hard dependency, deliberately NOT guarded: a missing/renamed
+    # is_provider_enabled must fail loudly, never fall open to "enabled".
+    from hermes_cli.config import is_provider_enabled
 
     def _explicit() -> dict[str, Any] | None:
         entry = providers.get(provider_id)
