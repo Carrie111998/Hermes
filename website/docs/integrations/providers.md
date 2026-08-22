@@ -1297,7 +1297,21 @@ providers:
     transport: anthropic_messages  # for Anthropic-compatible proxies
 ```
 
-Each entry accepts: `api` (the endpoint base URL — `base_url`/`url` are accepted aliases), `name` (optional display name; defaults to the dict key), `key_env` or inline `api_key` or `key_cmd` (see below), `transport` (`chat_completions` / `anthropic_messages` / `codex_responses`), `default_model`, `models`, `context_length`, `discover_models`, `extra_body`, `extra_headers`, `ssl_ca_cert` / `ssl_verify`, and `enabled: false` to hide an entry without deleting it.
+Each entry accepts: `api` (the endpoint base URL — `base_url`/`url` are accepted aliases), `name` (optional display name; defaults to the dict key), `key_env` or inline `api_key` or `key_cmd` (see below), `transport` (`chat_completions` / `anthropic_messages` / `codex_responses`), `default_model`, `models`, `context_length`, `discover_models`, `parallel_tool_calls`, `extra_body`, `extra_headers`, `ssl_ca_cert` / `ssl_verify`, and `enabled: false` to hide an entry without deleting it.
+
+For OpenAI-compatible Chat Completions endpoints, `parallel_tool_calls` controls the top-level request field when tools are available:
+
+```yaml
+providers:
+  local:
+    api: http://localhost:8080/v1
+    transport: chat_completions
+    parallel_tool_calls: true   # send true when tools are present
+    # parallel_tool_calls: false  # send false when tools are present
+    # omitted                     # do not send the request field
+```
+
+Hermes omits the request field when no tools are present, regardless of the configured boolean.
 
 #### Command-minted credentials (`key_cmd`)
 
