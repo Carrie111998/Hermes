@@ -961,6 +961,28 @@ class TestBuildAnthropicKwargs:
         assert kwargs["max_tokens"] >= 16000 + 4096
         assert "output_config" not in kwargs
 
+    def test_strongest_reasoning_does_not_fall_below_high_on_manual_path(self):
+        """A max ask on the manual-thinking wire must use the strongest budget.
+
+        OpenCode provider defaults now resolve to max. MiniMax/Qwen-style
+        Anthropic-compatible models still take the manual path, so an omitted
+        budget entry would fall back to 8000 - weaker than explicit high.
+        """
+        for effort in ("ultra", "max", "xhigh"):
+            kwargs = build_anthropic_kwargs(
+                model="MiniMax-M3",
+                messages=[{"role": "user", "content": "think hard"}],
+                tools=None,
+                max_tokens=4096,
+                reasoning_config={"enabled": True, "effort": effort},
+            )
+            assert kwargs["thinking"] == {
+                "type": "enabled",
+                "budget_tokens": 32000,
+            }
+            assert kwargs["temperature"] == 1
+            assert kwargs["max_tokens"] >= 32000 + 4096
+
     def test_reasoning_config_maps_to_adaptive_thinking_for_4_6_models(self):
         kwargs = build_anthropic_kwargs(
             model="claude-opus-4-6",
