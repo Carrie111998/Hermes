@@ -44,6 +44,7 @@ VERDICT_LABELS = {
     Verdict.DUPLICATE: "DUPLICATE - a PR already references this issue",
     Verdict.ASSIGNED: "ASSIGNED - someone is already on this",
     Verdict.CLA_REQUIRED: "CLA REQUIRED - sign before proceeding",
+    Verdict.AI_POLICY_REJECT: "AI POLICY REJECT - this repo does not accept AI-generated contributions",
     Verdict.NOT_FOUND: "NOT FOUND - check the owner/repo/issue number",
 }
 
@@ -65,8 +66,11 @@ CONTRIB_SCREEN_SCHEMA = {
     "description": (
         "Pre-flight check on one GitHub issue before starting contribution "
         "work: is there already a PR referencing it, is it assigned, does "
-        "the repo require a CLA. Run this before implementing anything. "
-        "Every check is appended to a local audit log."
+        "the repo require a CLA, and does the repo state it doesn't accept "
+        "AI-generated contributions at all (checked against CONTRIBUTING.md "
+        "and AGENTS.md). A CLEAR verdict may still carry a disclose/constrain "
+        "note in `reasons` — read that even on CLEAR. Run this before "
+        "implementing anything. Every check is appended to a local audit log."
     ),
     "parameters": {
         "type": "object",
