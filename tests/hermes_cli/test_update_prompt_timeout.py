@@ -171,6 +171,35 @@ class TestUnattendedLatch:
         assert update_cmd._prompt_proven_unattended is False
 
 
+class TestUnansweredReport:
+    """The report must name the bound the run actually waited on.
+
+    ``_read_line_with_timeout`` already takes a per-prompt ``timeout``, so a
+    report that reads the module constant instead would start lying the first
+    time a call site overrides it. These pin the two resolutions apart.
+    """
+
+    def test_it_reports_the_module_default_when_no_bound_is_given(self, capsys):
+        update_cmd._report_unanswered_prompt(
+            "Restore local changes now?", "Not restoring."
+        )
+        out = capsys.readouterr().out
+        assert "after %ds" % int(update_cmd._UPDATE_PROMPT_TIMEOUT_SECONDS) in out
+
+    def test_it_reports_an_overridden_bound(self, capsys):
+        update_cmd._report_unanswered_prompt(
+            "Add official repo as 'upstream' remote?",
+            "Not adding it.",
+            timeout=12,
+        )
+        out = capsys.readouterr().out
+        assert "after 12s" in out
+        assert (
+            "after %ds" % int(update_cmd._UPDATE_PROMPT_TIMEOUT_SECONDS)
+            not in out
+        )
+
+
 # ── the reported call site ─────────────────────────────────────────────
 
 

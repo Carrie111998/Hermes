@@ -2084,22 +2084,43 @@ def _read_line_with_timeout(
     thread.join(timeout)
 
     if thread.is_alive():
+        # The reader is abandoned here, not stopped. There is no portable way
+        # to cancel a thread parked on input(), and closing stdin under it
+        # would break the console for everything downstream, so it keeps its
+        # claim on stdin for the life of the process. A line typed after the
+        # timeout therefore races between this thread and any git subprocess
+        # that inherits the same handle.
+        #
+        # Accepted rather than fixed. The run has just produced evidence that
+        # nobody is typing, and the alternative (routing every later
+        # subprocess to DEVNULL on the strength of one timeout) would change
+        # how git behaves in a run that merely paused, which is a bigger
+        # claim than one unanswered prompt supports. Whoever comes back late
+        # gets the report below, which says the run stopped asking.
         _prompt_proven_unattended = True
         return default, True
     return box.get("value", default), False
 
 
-def _report_unanswered_prompt(what: str, consequence: str) -> None:
+def _report_unanswered_prompt(
+    what: str, consequence: str, timeout: Optional[float] = None
+) -> None:
     """Explain a timed-out prompt in the log an unattended run leaves behind.
 
     Without this the scheduled-task transcript ends at a bare prompt line,
     which is indistinguishable from a crash. #92303 asked for this even in the
     do-nothing-else version of the fix.
+
+    ``timeout`` resolves exactly as it does in ``_read_line_with_timeout``, so
+    a caller that overrides the bound for one prompt reports the number it
+    actually waited instead of the module default.
     """
+    if timeout is None:
+        timeout = _UPDATE_PROMPT_TIMEOUT_SECONDS
     print()
     print(
         "\u26a0 No answer to '%s' after %ds, so this run is being treated as "
-        "unattended." % (what, int(_UPDATE_PROMPT_TIMEOUT_SECONDS))
+        "unattended." % (what, int(timeout))
     )
     print("  %s" % consequence)
     print(
