@@ -67,6 +67,28 @@ def test_custom_provider_on_official_nim_host_is_supported():
     assert agent._needs_nim_tool_reasoning()
 
 
+def test_local_nim_qwen_tool_call_pins_reasoning_content():
+    agent = _agent(
+        model="qwen/qwen3-next-80b-a3b-thinking",
+        base_url="http://localhost:8000/v1",
+        reasoning_config={"enabled": True},
+    )
+    message = agent._build_assistant_message(_tool_message(), "tool_calls")
+    assert agent._needs_nim_tool_reasoning()
+    assert message["reasoning_content"] == " "
+
+
+def test_local_nim_deepseek_respects_disabled_reasoning():
+    agent = _agent(
+        base_url="http://localhost:8000/v1",
+        reasoning_config={"enabled": False},
+    )
+    message = agent._build_assistant_message(_tool_message(), "tool_calls")
+    assert not agent._needs_nim_tool_reasoning()
+    assert not agent._needs_deepseek_tool_reasoning()
+    assert "reasoning_content" not in message
+
+
 @pytest.mark.parametrize("reasoning_config", [None, {"enabled": False}, {"effort": "none"}])
 def test_nim_echo_requires_enabled_reasoning(reasoning_config):
     agent = _agent(reasoning_config=reasoning_config)

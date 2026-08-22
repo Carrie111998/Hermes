@@ -7906,8 +7906,12 @@ class AIAgent:
 
         # NVIDIA NIM re-exports DeepSeek alongside strict instruct models and
         # has its own reasoning enable/disable contract. Let the NIM gate own
-        # this endpoint instead of the generic model-name rule below.
-        if base_url_host_matches(self.base_url, "integrate.api.nvidia.com"):
+        # both hosted and local/on-prem NVIDIA endpoints instead of the generic
+        # model-name rule below.
+        provider = (self.provider or "").strip().lower()
+        if provider in {"nvidia", "nvidia-nim"} or base_url_host_matches(
+            self.base_url, "integrate.api.nvidia.com"
+        ):
             return self._needs_nim_tool_reasoning()
 
         from agent.message_sanitization import matches_reasoning_echo_family
@@ -7940,9 +7944,13 @@ class AIAgent:
         from agent.nim_reasoning import is_nim_thinking_model
         from utils import base_url_host_matches
 
-        if not base_url_host_matches(self.base_url, "integrate.api.nvidia.com"):
-            return False
-        if (self.provider or "").lower() not in {"nvidia", "nvidia-nim", "custom"}:
+        provider = (self.provider or "").strip().lower()
+        official_host = base_url_host_matches(
+            self.base_url, "integrate.api.nvidia.com"
+        )
+        if provider not in {"nvidia", "nvidia-nim"} and not (
+            provider == "custom" and official_host
+        ):
             return False
         config = self.reasoning_config
         if not isinstance(config, dict):
