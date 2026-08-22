@@ -3645,6 +3645,72 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
         return False, "; ".join(missing[:4])
     return True, ""
 
+def _windows_process_name_rows() -> list[tuple[int, str]] | None:
+    """Return ``(pid, image_name)`` rows via Toolhelp, or ``None`` on failure.
+
+    Toolhelp snapshots process names without opening every process. This is a
+    critical performance boundary on Windows hosts where psutil's per-process
+    ``name``/``exe`` probes can stall for minutes behind security software.
+    Callers retain psutil for exact executable/cmdline/cwd verification of the
+    small candidate set. ``None`` requests the existing fail-safe fallback.
+    """
+    if not _m()._is_windows():
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.Process32FirstW.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_PROCESSENTRY32W),
+        ]
+        kernel32.Process32FirstW.restype = wintypes.BOOL
+        kernel32.Process32NextW.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_PROCESSENTRY32W),
+        ]
+        kernel32.Process32NextW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+        if snapshot == wintypes.HANDLE(-1).value:
+            return None
+        rows: list[tuple[int, str]] = []
+        try:
+            entry = _PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(entry)
+            if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+                return None
+            while True:
+                rows.append((int(entry.th32ProcessID), str(entry.szExeFile)))
+                entry.dwSize = ctypes.sizeof(entry)
+                if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                    break
+        finally:
+            kernel32.CloseHandle(snapshot)
+        return rows
+    except Exception:
+        return None
+
+
 def _detect_venv_python_processes(
     *, exclude_pids: set[int] | None = None
 ) -> list[tuple[int, str, str]]:
@@ -3710,42 +3776,82 @@ def _detect_venv_python_processes(
         pass
 
     matches: list[tuple[int, str, str]] = []
-    try:
-        proc_iter = psutil.process_iter(["pid", "exe", "name", "cmdline", "cwd"])
-    except Exception:
-        return []
-    for proc in proc_iter:
+    native_rows = _windows_process_name_rows()
+    if native_rows is None:
         try:
-            info = proc.info
+            # Fail-safe compatibility path for non-Windows tests or an
+            # unavailable Toolhelp API.
+            proc_rows = ((proc, proc.info) for proc in psutil.process_iter(["pid", "name"]))
+        except Exception:
+            return []
+    else:
+
+        def _native_proc_rows():
+            for candidate_pid, candidate_name in native_rows:
+                try:
+                    yield psutil.Process(candidate_pid), {
+                        "pid": candidate_pid,
+                        "name": candidate_name,
+                    }
+                except Exception:
+                    continue
+
+        proc_rows = _native_proc_rows()
+
+    for proc, info in proc_rows:
+        pid = info.get("pid")
+        process_name = str(info.get("name") or "").lower()
+        if pid is None or int(pid) in skip:
+            continue
+        python_names = {"python", "python.exe", "pythonw", "pythonw.exe"}
+        if process_name not in python_names and process_name not in {"hermes", "hermes.exe"}:
+            continue
+        try:
+            exe = proc.exe()
         except Exception:
             continue
-        pid = info.get("pid")
-        exe = info.get("exe")
-        if not exe or pid is None or int(pid) in skip:
+        if not exe:
             continue
         try:
             exe_norm = str(Path(exe).resolve()).lower()
         except (OSError, ValueError):
             exe_norm = str(exe).lower()
-        cmdline_raw = " ".join(info.get("cmdline") or [])
-        cmdline_low = cmdline_raw.lower()
-        cwd_low = str(info.get("cwd") or "").lower().rstrip(os.sep) + os.sep
-
         # Primary match: the executable itself lives under this venv
         # (venv\Scripts\python(w).exe — the desktop backend / gateway case).
         is_holder = exe_norm.startswith(venv_prefix)
+        cmdline_raw = ""
+
         # Fallback: uv/base-interpreter trampolines run a python whose exe is
         # OUTSIDE the venv but which still imports from it and holds its .pyd
         # files. Catch those by what they're running: a cmdline that references
         # this venv's path, or a `-m hermes_cli.main ...` invocation tied to
         # this install (install root in the cmdline or as the working dir).
-        if not is_holder and venv_prefix in cmdline_low:
-            is_holder = True
-        if not is_holder and "hermes_cli.main" in cmdline_low:
-            if root_prefix in cmdline_low or cwd_low.startswith(root_prefix):
+        if not is_holder:
+            executable_name = Path(str(exe)).name.lower()
+            if process_name not in python_names and executable_name not in python_names:
+                continue
+            try:
+                cmdline_raw = " ".join(proc.cmdline() or [])
+            except Exception:
+                cmdline_raw = ""
+            cmdline_low = cmdline_raw.lower()
+            if venv_prefix in cmdline_low:
                 is_holder = True
+            elif "hermes_cli.main" in cmdline_low:
+                cwd_low = ""
+                try:
+                    cwd_low = str(proc.cwd() or "").lower().rstrip(os.sep) + os.sep
+                except Exception:
+                    pass
+                if root_prefix in cmdline_low or cwd_low.startswith(root_prefix):
+                    is_holder = True
         if not is_holder:
             continue
+        if not cmdline_raw:
+            try:
+                cmdline_raw = " ".join(proc.cmdline() or [])
+            except Exception:
+                cmdline_raw = ""
         name = info.get("name") or Path(exe).name
         # Return the FULL cmdline: callers match against it (the Desktop
         # preflight's pausable-gateway exemption parses for `gateway run`).

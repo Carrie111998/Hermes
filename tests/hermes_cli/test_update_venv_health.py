@@ -24,6 +24,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from hermes_cli import main as cli_main
+from hermes_cli import update_cmd as update_module
 
 
 # ---------------------------------------------------------------------------
@@ -52,11 +53,11 @@ def _proc(pid: int, exe: str, name: str, cmdline: list[str] | None = None, cwd: 
     proc = MagicMock()
     proc.info = {
         "pid": pid,
-        "exe": exe,
         "name": name,
-        "cmdline": cmdline or [],
-        "cwd": cwd,
     }
+    proc.exe.return_value = exe
+    proc.cmdline.return_value = cmdline or []
+    proc.cwd.return_value = cwd
     return proc
 
 
@@ -80,10 +81,67 @@ def test_detect_venv_python_excludes_self_and_ancestors(_winp, tmp_path):
         ),
         Process=lambda *a, **k: me,
     )
-    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
-        sys.modules, {"psutil": fake_psutil}
-    ):
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.object(
+        update_module, "_windows_process_name_rows", return_value=None
+    ), patch.dict(sys.modules, {"psutil": fake_psutil}):
         assert cli_main._detect_venv_python_processes() == []
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_detect_venv_python_defers_expensive_queries_to_python_candidates(_winp, tmp_path):
+    unrelated = _proc(101, r"C:\Program Files\nodejs\node.exe", "node.exe")
+    trampoline = _proc(
+        102,
+        r"C:\Users\test\AppData\Roaming\uv\python\python.exe",
+        "python.exe",
+        ["python.exe", "-m", "hermes_cli.main", "serve"],
+        str(tmp_path),
+    )
+    attrs_seen = []
+    me = MagicMock()
+    me.parents.return_value = []
+    fake_psutil = types.SimpleNamespace(
+        process_iter=lambda attrs: attrs_seen.extend(attrs) or iter([unrelated, trampoline]),
+        Process=lambda *a, **k: me,
+    )
+
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.object(
+        update_module, "_windows_process_name_rows", return_value=None
+    ), patch.dict(sys.modules, {"psutil": fake_psutil}):
+        assert cli_main._detect_venv_python_processes() == [
+            (102, "python.exe", "python.exe -m hermes_cli.main serve")
+        ]
+
+    assert attrs_seen == ["pid", "name"]
+    unrelated.exe.assert_not_called()
+    unrelated.cmdline.assert_not_called()
+    unrelated.cwd.assert_not_called()
+    trampoline.exe.assert_called_once_with()
+    trampoline.cmdline.assert_called_once_with()
+    trampoline.cwd.assert_called_once_with()
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_detect_venv_python_uses_native_name_prefilter(_winp, tmp_path):
+    venv_py = str(tmp_path / "venv" / "Scripts" / "python.exe")
+    holder = _proc(303, venv_py, "python.exe", [venv_py, "worker.py"])
+    me = MagicMock()
+    me.parents.return_value = []
+    fake_psutil = types.SimpleNamespace(
+        process_iter=MagicMock(side_effect=AssertionError("fallback must not run")),
+        Process=lambda pid=None: me if pid is None else holder,
+    )
+
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.object(
+        update_module,
+        "_windows_process_name_rows",
+        return_value=[(303, "python.exe"), (404, "node.exe")],
+    ), patch.dict(sys.modules, {"psutil": fake_psutil}):
+        assert cli_main._detect_venv_python_processes() == [
+            (303, "python.exe", f"{venv_py} worker.py")
+        ]
+
+    fake_psutil.process_iter.assert_not_called()
 
 
 
