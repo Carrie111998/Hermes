@@ -9288,117 +9288,120 @@ function GroupDialog({ bot, onClose }) {
  *  a live preview (image, else the organization glyph), Upload / Generate /
  *  Remove. Reuses the bot-avatar pipeline (device picker, 256px normalize,
  *  image.generate probe) so room pictures cost the same as bot avatars. */
-/** One axis of the room budget: a number, or off. Rounds and messages get a
- *  second row when they are off, holding the safety brake — which is itself
- *  switchable, because a room the user deliberately unbounds should actually
- *  be unbounded. */
+/** One row of the room budget, built on the same shape the app's own settings
+ *  rows use (src/app/settings/primitives.tsx: ListRow / ToggleRow): a
+ *  container-queried grid, label and description on the left, the control
+ *  right-aligned. Plugins cannot import those primitives, so the structure is
+ *  mirrored here rather than invented.
+ *
+ *  Rounds and messages get a second row when they are off, holding the safety
+ *  brake, which is itself switchable: a room the user deliberately unbounds
+ *  should actually be unbounded. */
 function GroupLimitRow({ label, hint, value, fallback, ceiling, onChange, brake }) {
   const off = value === null
   const shown = off ? '' : String(value ?? fallback)
 
+  const numberField = (props) =>
+    jsx(Input, {
+      className: 'w-20 text-right',
+      inputMode: 'numeric',
+      max: ceiling,
+      min: 1,
+      type: 'number',
+      ...props
+    })
+
+  const control = (children) => jsx('div', { className: 'flex items-center justify-end gap-2', children })
+
   return jsxs('div', {
-    className: 'flex flex-col gap-1 py-1.5',
+    className: '@container',
     children: [
       jsxs('div', {
-        className: 'flex items-center gap-2',
+        className: 'grid gap-3 py-3 @2xl:grid-cols-[minmax(0,1fr)_minmax(15rem,22rem)] @2xl:items-center',
         children: [
           jsxs('div', {
-            className: 'flex-1 min-w-0',
+            className: 'min-w-0',
             children: [
-              jsx('div', { className: 'text-xs text-foreground', children: label }),
-              hint ? jsx('div', { className: 'text-[0.65rem] text-(--ui-text-tertiary)', children: hint }) : null
-            ]
-          }),
-          jsx(Input, {
-            'aria-label': label,
-            className: 'w-16 text-right',
-            disabled: off,
-            inputMode: 'numeric',
-            max: ceiling,
-            min: 1,
-            placeholder: off ? '\u221e' : String(fallback),
-            type: 'number',
-            value: shown,
-            onChange: event => {
-              const raw = event.target.value.trim()
-              if (!raw) {
-                onChange(undefined)
-                return
-              }
-              const n = Math.floor(Number(raw))
-              onChange(Number.isFinite(n) && n > 0 ? Math.min(n, ceiling) : undefined)
-            }
-          }),
-          // The switch alone is not readable in the dark theme: "on" is a
-          // slightly different dark track. Name the state next to it.
-          jsxs('div', {
-            className: 'flex shrink-0 items-center gap-1.5',
-            children: [
-              jsx('span', {
-                className: off
-                  ? 'w-12 text-right text-[0.65rem] text-(--ui-warning,#d68b00)'
-                  : 'w-12 text-right text-[0.65rem] text-(--ui-text-tertiary)',
-                children: off ? 'no limit' : 'limit'
+              jsx('div', {
+                className: 'text-[length:var(--conversation-text-font-size)] font-medium text-foreground',
+                children: label
               }),
-              jsx(Tip, {
-                label: off ? `No limit on ${label.toLowerCase()}` : `Limit ${label.toLowerCase()}`,
-                children: jsx(Switch, {
-                  'aria-label': `Limit ${label.toLowerCase()}`,
-                  checked: !off,
-                  onCheckedChange: on => onChange(on ? fallback : null)
-                })
-              })
+              hint
+                ? jsx('div', {
+                    className:
+                      'mt-1 text-[length:var(--conversation-caption-font-size)] leading-(--conversation-caption-line-height) text-(--ui-text-tertiary)',
+                    children: hint
+                  })
+                : null
             ]
+          }),
+          jsx('div', {
+            className: 'min-w-0 @2xl:justify-self-end',
+            children: control([
+              numberField({
+                'aria-label': label,
+                disabled: off,
+                placeholder: off ? '\u221e' : String(fallback),
+                value: shown,
+                onChange: event => {
+                  const raw = event.target.value.trim()
+                  if (!raw) {
+                    onChange(undefined)
+                    return
+                  }
+                  const n = Math.floor(Number(raw))
+                  onChange(Number.isFinite(n) && n > 0 ? Math.min(n, ceiling) : undefined)
+                }
+              }),
+              jsx(Switch, {
+                'aria-label': `Limit ${label.toLowerCase()}`,
+                checked: !off,
+                onCheckedChange: on => {
+                  haptic('tap')
+                  onChange(on ? fallback : null)
+                }
+              })
+            ])
           })
         ]
       }),
       off && brake
         ? jsxs('div', {
-            className: 'flex items-center gap-2 pl-3 border-l border-(--ui-border)',
+            className:
+              'grid gap-3 border-l border-(--ui-border) pb-3 pl-3 @2xl:grid-cols-[minmax(0,1fr)_minmax(15rem,22rem)] @2xl:items-center',
             children: [
               jsx('div', {
-                className: 'flex-1 min-w-0 text-[0.65rem] text-(--ui-text-tertiary)',
-                children: brake.value === null ? 'No safety stop' : 'Safety stop after'
+                className:
+                  'min-w-0 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)',
+                children: brake.value === null ? `No safety stop on ${label.toLowerCase()}` : 'Safety stop after'
               }),
-              jsx(Input, {
-                'aria-label': `Safety stop for ${label.toLowerCase()}`,
-                className: 'w-16 text-right',
-                disabled: brake.value === null,
-                inputMode: 'numeric',
-                max: ceiling,
-                min: 1,
-                placeholder: String(brake.fallback),
-                type: 'number',
-                value: brake.value === null ? '' : String(brake.value ?? brake.fallback),
-                onChange: event => {
-                  const raw = event.target.value.trim()
-                  if (!raw) {
-                    brake.onChange(undefined)
-                    return
-                  }
-                  const n = Math.floor(Number(raw))
-                  brake.onChange(Number.isFinite(n) && n > 0 ? Math.min(n, ceiling) : undefined)
-                }
-              }),
-              jsxs('div', {
-                className: 'flex shrink-0 items-center gap-1.5',
-                children: [
-                  jsx('span', {
-                    className:
-                      brake.value === null
-                        ? 'w-12 text-right text-[0.65rem] text-(--ui-warning,#d68b00)'
-                        : 'w-12 text-right text-[0.65rem] text-(--ui-text-tertiary)',
-                    children: brake.value === null ? 'none' : 'brake'
+              jsx('div', {
+                className: 'min-w-0 @2xl:justify-self-end',
+                children: control([
+                  numberField({
+                    'aria-label': `Safety stop for ${label.toLowerCase()}`,
+                    disabled: brake.value === null,
+                    placeholder: brake.value === null ? '\u221e' : String(brake.fallback),
+                    value: brake.value === null ? '' : String(brake.value ?? brake.fallback),
+                    onChange: event => {
+                      const raw = event.target.value.trim()
+                      if (!raw) {
+                        brake.onChange(undefined)
+                        return
+                      }
+                      const n = Math.floor(Number(raw))
+                      brake.onChange(Number.isFinite(n) && n > 0 ? Math.min(n, ceiling) : undefined)
+                    }
                   }),
-                  jsx(Tip, {
-                    label: brake.value === null ? 'No safety stop at all' : 'Stop the room after this many',
-                    children: jsx(Switch, {
-                      'aria-label': `Safety stop for ${label.toLowerCase()}`,
-                      checked: brake.value !== null,
-                      onCheckedChange: on => brake.onChange(on ? brake.fallback : null)
-                    })
+                  jsx(Switch, {
+                    'aria-label': `Safety stop for ${label.toLowerCase()}`,
+                    checked: brake.value !== null,
+                    onCheckedChange: on => {
+                      haptic('tap')
+                      brake.onChange(on ? brake.fallback : null)
+                    }
                   })
-                ]
+                ])
               })
             ]
           })

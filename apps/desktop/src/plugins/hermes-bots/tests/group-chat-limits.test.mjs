@@ -183,23 +183,29 @@ test('the room header label is what the create dialog and settings also write', 
   assert.match(source, /children: groupChatBudgetLabel\(room\)/, 'the header shows the same resolved budget')
 })
 
-test('every switch is paired with the state in words', () => {
-  // Radix renders "on" as a slightly different dark track, which is not
-  // readable in the dark theme. First live test: the toggles looked off while
-  // every limit was active.
-  const editor = source.slice(source.indexOf('function GroupLimitRow('))
-  const body = editor.slice(0, editor.indexOf('\nfunction '))
+test('the budget row mirrors the app\'s own settings row', () => {
+  // src/app/settings/primitives.tsx (ListRow / ToggleRow) is the canonical
+  // shape for a labelled control. Plugins cannot import it, so the structure
+  // is mirrored. Diverging from it is what made the switches unreadable in
+  // the first live test.
+  const row = source.slice(source.indexOf('function GroupLimitRow('))
+  const body = row.slice(0, row.indexOf('\n/** The room budget editor'))
 
-  assert.match(body, /children: off \? 'no limit' : 'limit'/)
-  assert.match(body, /children: brake\.value === null \? 'none' : 'brake'/)
+  assert.match(body, /@container/)
+  assert.match(body, /grid gap-3 py-3 @2xl:grid-cols-\[minmax\(0,1fr\)_minmax\(15rem,22rem\)\] @2xl:items-center/)
+  assert.match(body, /text-\[length:var\(--conversation-text-font-size\)\] font-medium text-foreground/)
+  assert.match(body, /@2xl:justify-self-end/)
+})
 
-  const switches = [...body.matchAll(/jsx\(Switch, \{/g)]
-  const labels = [...body.matchAll(/text-\(--ui-warning,#d68b00\)'\n\s*: 'w-12/g)]
-  assert.equal(switches.length, 2, 'the row has a limit switch and a brake switch')
-  assert.equal(labels.length, switches.length, 'each switch carries its own state word')
+test('switching an axis fires the same haptic the app uses elsewhere', () => {
+  const row = source.slice(source.indexOf('function GroupLimitRow('))
+  const body = row.slice(0, row.indexOf('\n/** The room budget editor'))
+  const taps = [...body.matchAll(/haptic\('tap'\)/g)]
+
+  assert.equal(taps.length, 2, 'both the limit switch and the brake switch give feedback')
 })
 
 test('a switched-off axis shows the infinity placeholder, not an empty box', () => {
-  const editor = source.slice(source.indexOf('function GroupLimitRow('))
-  assert.match(editor.slice(0, 3000), /placeholder: off \? '\\u221e' : String\(fallback\)/)
+  const row = source.slice(source.indexOf('function GroupLimitRow('))
+  assert.match(row.slice(0, 4000), /placeholder: off \? '\\u221e' : String\(fallback\)/)
 })
