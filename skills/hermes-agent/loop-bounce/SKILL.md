@@ -1,9 +1,10 @@
 ---
 name: loop-bounce
-description: Use when the agent gets stuck in a reasoning/tool-call loop, repeats identical calls, or produces the same error repeatedly — breaks the loop, then escalates through a 3-attempt ladder before reporting failure.
+description: Break agent loops and escalate to stronger models via a 3-attempt ladder.
 version: 2.0.0
 author: Hermes Agent
 license: MIT
+platforms: [all]
 metadata:
   hermes:
     tags: [hermes, fallback, loop-detection, model-escalation, delegation]
