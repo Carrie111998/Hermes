@@ -1,6 +1,11 @@
 """Reasoning summary-part boundary repair (agent/reasoning_summaries.py)."""
 
-from agent.reasoning_summaries import reasoning_summary_titles, separate_glued_reasoning_blocks
+from agent.reasoning_summaries import (
+    REASONING_SUMMARY_MAX_TITLE_CHARS,
+    REASONING_SUMMARY_MAX_TITLES,
+    reasoning_summary_titles,
+    separate_glued_reasoning_blocks,
+)
 
 
 def test_reasoning_summary_titles_prefers_ordered_unique_headings():
@@ -14,6 +19,19 @@ def test_reasoning_summary_titles_uses_plain_provider_summary():
         "Planning the implementation"
     ]
     assert reasoning_summary_titles(None) == []
+
+
+def test_reasoning_summary_titles_bound_output_and_clean_emphasis():
+    titles = reasoning_summary_titles(
+        "\n".join(
+            ["***Italic heading***"]
+            + [f"**Title {index} {'x' * 200}**" for index in range(20)]
+        )
+    )
+
+    assert titles[0] == "Italic heading"
+    assert len(titles) == REASONING_SUMMARY_MAX_TITLES
+    assert all(len(title) <= REASONING_SUMMARY_MAX_TITLE_CHARS for title in titles)
 
 
 def _stream(deltas):

@@ -1697,6 +1697,59 @@ def test_run_conversation_exposes_codex_summary_titles(monkeypatch):
     assert titled[1]["titles"] == ["Inspecting files", "Running tests"]
 
 
+def test_reasoning_progress_keeps_titles_additive_and_delegation_content_based():
+    from agent.conversation_loop import _notify_reasoning_progress
+
+    message = SimpleNamespace(
+        content="Visible first line\nmore",
+        reasoning="**Provider summary**\nDetails",
+    )
+
+    fixed_events = []
+    fixed_callback = lambda event, name, preview, args: fixed_events.append(
+        (event, name, preview, args)
+    )
+    _notify_reasoning_progress(
+        SimpleNamespace(
+            tool_progress_callback=fixed_callback,
+            api_mode="codex_responses",
+            _delegate_depth=0,
+        ),
+        message,
+    )
+    assert fixed_events == [
+        ("reasoning.available", "_thinking", "**Provider summary**\nDetails", None)
+    ]
+
+    non_codex_events = []
+    _notify_reasoning_progress(
+        SimpleNamespace(
+            tool_progress_callback=lambda *args, **kwargs: non_codex_events.append(
+                (args, kwargs)
+            ),
+            api_mode="chat_completions",
+            _delegate_depth=0,
+        ),
+        message,
+    )
+    assert non_codex_events == [
+        (("reasoning.available", "_thinking", "Visible first line\nmore", None), {})
+    ]
+
+    delegated_events = []
+    _notify_reasoning_progress(
+        SimpleNamespace(
+            tool_progress_callback=lambda *args, **kwargs: delegated_events.append(
+                (args, kwargs)
+            ),
+            api_mode="codex_responses",
+            _delegate_depth=1,
+        ),
+        message,
+    )
+    assert delegated_events == [(('_thinking', 'Visible first line'), {})]
+
+
 
 
 

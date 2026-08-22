@@ -31,7 +31,15 @@ stream in line with the path that keeps the structure.
 
 from __future__ import annotations
 
-__all__ = ["reasoning_summary_titles", "separate_glued_reasoning_blocks"]
+REASONING_SUMMARY_MAX_TITLES = 8
+REASONING_SUMMARY_MAX_TITLE_CHARS = 120
+
+__all__ = [
+    "REASONING_SUMMARY_MAX_TITLE_CHARS",
+    "REASONING_SUMMARY_MAX_TITLES",
+    "reasoning_summary_titles",
+    "separate_glued_reasoning_blocks",
+]
 
 
 def reasoning_summary_titles(text: object) -> list[str]:
@@ -42,16 +50,24 @@ def reasoning_summary_titles(text: object) -> list[str]:
     already the provider's display summary and is used as the sole title.
     """
     lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
-    headings = [line[2:-2].strip() for line in lines if line.startswith("**") and line.endswith("**")]
+    headings = [
+        line[2:-2].strip().strip("*").strip()
+        for line in lines
+        if line.startswith("**") and line.endswith("**")
+    ]
     candidates = headings or lines[:1]
     titles: list[str] = []
     seen: set[str] = set()
     for candidate in candidates:
         title = " ".join(candidate.split())
+        if len(title) > REASONING_SUMMARY_MAX_TITLE_CHARS:
+            title = title[: REASONING_SUMMARY_MAX_TITLE_CHARS - 3].rstrip() + "..."
         key = title.casefold()
         if title and key not in seen:
             seen.add(key)
             titles.append(title)
+            if len(titles) == REASONING_SUMMARY_MAX_TITLES:
+                break
     return titles
 
 
