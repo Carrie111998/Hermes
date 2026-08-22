@@ -9,7 +9,9 @@ results that were produced before it fired.  These tests pin the contract:
        restarts/kills the process never orphans the tool-call block).
     2. The SEQUENTIAL tool path flushes each tool result to the session DB
        immediately after appending it — BEFORE the next tool dispatches.
-    3. The CONCURRENT tool path flushes each tool result in append order.
+    3. The CONCURRENT tool path batches explicitly no-effect results in
+       append order, while retaining per-result durability for effect-capable
+       or unknown tools.
 
 These exercise the REAL production dispatch surfaces:
 
@@ -535,15 +537,28 @@ def test_failed_tool_result_persist_blocks_completion_projection(executor_mode):
 
 def test_segmented_batch_stops_before_later_segment_after_persist_failure():
     agent = _make_agent()
-    first = _mock_tool_call(call_id="first")
-    second = _mock_tool_call(call_id="second")
-    assistant_message = SimpleNamespace(tool_calls=[first, second])
+    first = _mock_tool_call(name="web_search", call_id="first")
+    second = _mock_tool_call(name="web_search", call_id="second")
+    later = _mock_tool_call(
+        name="write_file",
+        arguments='{"path":"later.txt","content":"later"}',
+        call_id="later",
+    )
+    assistant_message = SimpleNamespace(tool_calls=[first, second, later])
     messages: list = []
-    agent._flush_messages_to_session_db = MagicMock(return_value=False)
+    flushed_batches: list[list[str]] = []
+
+    def _failed_flush(flush_messages, conversation_history=None):
+        flushed_batches.append(
+            [message["tool_call_id"] for message in flush_messages if message.get("role") == "tool"]
+        )
+        return False
+
+    agent._flush_messages_to_session_db = MagicMock(side_effect=_failed_flush)
 
     with (
-        patch.object(agent, "_invoke_tool", return_value="first result") as invoke,
-        patch("run_agent.handle_function_call", return_value="second result") as dispatch,
+        patch.object(agent, "_invoke_tool", return_value="read-only result") as invoke,
+        patch("run_agent.handle_function_call", return_value="later result") as dispatch,
         patch(
             "agent.tool_executor.maybe_persist_tool_result",
             side_effect=lambda **kwargs: kwargs["content"],
@@ -554,20 +569,93 @@ def test_segmented_batch_stops_before_later_segment_after_persist_failure():
             assistant_message,
             messages,
             "task-1",
-            segments=[("parallel", [first]), ("sequential", [second])],
+            segments=[("parallel", [first, second]), ("sequential", [later])],
         )
 
-    invoke.assert_called_once()
+    assert invoke.call_count == 2
     dispatch.assert_not_called()
+    assert [message["tool_call_id"] for message in messages] == ["first", "second"]
+    assert flushed_batches == [["first", "second"]]
     assert getattr(agent, "_incremental_persistence_failed", False) is True
 
 
+def test_segmented_batch_batches_read_only_segment_and_flushes_later_side_effects_per_result():
+    agent = _make_agent()
+    first = _mock_tool_call(name="web_search", call_id="first")
+    second = _mock_tool_call(name="web_search", call_id="second")
+    third = _mock_tool_call(
+        name="write_file",
+        arguments='{"path":"first.txt","content":"first"}',
+        call_id="third",
+    )
+    fourth = _mock_tool_call(
+        name="write_file",
+        arguments='{"path":"second.txt","content":"second"}',
+        call_id="fourth",
+    )
+    assistant_message = SimpleNamespace(tool_calls=[first, second, third, fourth])
+    messages: list = []
+    flushed_batches: list[list[str]] = []
+    invoked_ids: list[str] = []
+    dispatched_ids: list[str] = []
+
+    def _fake_invoke(function_name, function_args, effective_task_id, tool_call_id, **kwargs):
+        invoked_ids.append(tool_call_id)
+        return f"result-{tool_call_id}"
+
+    def _fake_dispatch(function_name, function_args, effective_task_id, **kwargs):
+        tool_call_id = kwargs["tool_call_id"]
+        dispatched_ids.append(tool_call_id)
+        return f"result-{tool_call_id}"
+
+    def _record_flush(flush_messages, conversation_history=None):
+        flushed_batches.append(
+            [message["tool_call_id"] for message in flush_messages if message.get("role") == "tool"]
+        )
+
+    agent._flush_messages_to_session_db = MagicMock(side_effect=_record_flush)
+
+    with (
+        patch.object(agent, "_invoke_tool", side_effect=_fake_invoke),
+        patch("run_agent.handle_function_call", side_effect=_fake_dispatch),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        execute_tool_calls_segmented(
+            agent,
+            assistant_message,
+            messages,
+            "task-1",
+            segments=[
+                ("parallel", [first, second]),
+                ("sequential", [third, fourth]),
+            ],
+        )
+
+    assert sorted(invoked_ids) == ["first", "second"]
+    assert dispatched_ids == ["third", "fourth"]
+    assert [message["tool_call_id"] for message in messages] == [
+        "first",
+        "second",
+        "third",
+        "fourth",
+    ]
+    assert flushed_batches == [
+        ["first", "second"],
+        ["first", "second", "third"],
+        ["first", "second", "third", "fourth"],
+    ]
+
+
 # ---------------------------------------------------------------------------
-# Contract 3: the CONCURRENT path flushes each collected tool result in append
-# order.  Dispatch goes through agent._invoke_tool (the real concurrent
-# surface), which we mock for determinism.
+# Contract 3: the CONCURRENT path batches no-effect tool results before
+# projecting completions, while effect-capable/unknown batches retain
+# per-result durability. Dispatch goes through agent._invoke_tool (the real
+# concurrent surface), which we mock for determinism.
 # ---------------------------------------------------------------------------
-def test_execute_tool_calls_concurrent_flushes_each_tool_result_in_order():
+def test_execute_tool_calls_concurrent_batches_no_effect_results_before_completion_projections():
     agent = _make_agent()
     tool_calls = [
         _mock_tool_call(name="web_search", call_id="c1"),
@@ -576,22 +664,32 @@ def test_execute_tool_calls_concurrent_flushes_each_tool_result_in_order():
     messages: list = []
     assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
 
-    invoked_ids: list = []
+    event_order: list[tuple] = []
 
     def _fake_invoke(function_name, function_args, effective_task_id, tool_call_id, **kwargs):
-        invoked_ids.append(tool_call_id)
-        return f"result-{tool_call_id}"
+        return f"read-only result {tool_call_id}"
 
-    # Each flush must observe exactly one more tool result than the previous
-    # flush, in append order — i.e. the tail tool_call_id sequence is c1, c2.
-    flushed_tool_ids: list = []
-    flush_lengths: list = []
+    flushed_batches: list[list[tuple[str, str]]] = []
 
     def _record_flush(flush_messages, conversation_history=None):
-        flushed_tool_ids.append(flush_messages[-1]["tool_call_id"])
-        flush_lengths.append(len([m for m in flush_messages if m.get("role") == "tool"]))
+        batch = [
+            (message["tool_call_id"], message["content"])
+            for message in flush_messages
+            if message.get("role") == "tool"
+        ]
+        flushed_batches.append(batch)
+        event_order.append(("flush", tuple(tool_call_id for tool_call_id, _ in batch)))
+
+    def _record_progress(event, function_name, *_args, **_kwargs):
+        if event == "tool.completed":
+            event_order.append(("progress", function_name))
+
+    def _record_completion(tool_call_id, function_name, *_args):
+        event_order.append(("complete", tool_call_id))
 
     agent._flush_messages_to_session_db = MagicMock(side_effect=_record_flush)
+    agent.tool_progress_callback = _record_progress
+    agent.tool_complete_callback = _record_completion
 
     with (
         patch.object(agent, "_invoke_tool", side_effect=_fake_invoke) as inv,
@@ -602,15 +700,159 @@ def test_execute_tool_calls_concurrent_flushes_each_tool_result_in_order():
     ):
         agent._execute_tool_calls_concurrent(assistant_message, messages, "task-1")
 
-    # Proves the real concurrent dispatch surface was exercised.
     assert inv.call_count == 2, "concurrent path did not dispatch via _invoke_tool"
-    assert sorted(invoked_ids) == ["c1", "c2"]
+    assert [message["tool_call_id"] for message in messages] == ["c1", "c2"]
+    assert flushed_batches == [[
+        ("c1", "read-only result c1"),
+        ("c2", "read-only result c2"),
+    ]]
+    agent._flush_messages_to_session_db.assert_called_once()
+    assert event_order == [
+        ("flush", ("c1", "c2")),
+        ("progress", "web_search"),
+        ("complete", "c1"),
+        ("progress", "web_search"),
+        ("complete", "c2"),
+    ]
 
-    # Results appended in deterministic order.
-    assert [m["tool_call_id"] for m in messages] == ["c1", "c2"]
 
-    # Each tool result was flushed exactly once, in append order, with the
-    # running tool count growing by one each time (1 then 2).  Removing either
-    # production flush call breaks one of these assertions.
-    assert flushed_tool_ids == ["c1", "c2"]
-    assert flush_lengths == [1, 2]
+def test_execute_tool_calls_concurrent_tool_search_unwraps_read_only_name_before_batch_flush():
+    agent = _make_agent()
+    tool_calls = [
+        _mock_tool_call(
+            name="tool_call",
+            arguments='{"name":"read_file","arguments":{"path":"notes.md"}}',
+            call_id="c1",
+        ),
+        _mock_tool_call(
+            name="web_search",
+            arguments='{"query":"direct read"}',
+            call_id="c2",
+        ),
+    ]
+    messages: list = []
+    assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
+    invoked: dict[str, tuple[str, dict]] = {}
+    flushed_batches: list[list[str]] = []
+
+    def _fake_invoke(function_name, function_args, effective_task_id, tool_call_id, **kwargs):
+        invoked[tool_call_id] = (function_name, function_args)
+        return f"result-{tool_call_id}"
+
+    def _record_flush(flush_messages, conversation_history=None):
+        flushed_batches.append(
+            [message["tool_call_id"] for message in flush_messages if message.get("role") == "tool"]
+        )
+
+    agent._flush_messages_to_session_db = MagicMock(side_effect=_record_flush)
+
+    with (
+        patch(
+            "tools.tool_search.resolve_underlying_call",
+            return_value=("read_file", {"path": "notes.md"}, None),
+        ),
+        patch(
+            "agent.tool_executor._tool_search_scoped_names",
+            return_value=frozenset({"read_file"}),
+        ),
+        patch.object(agent, "_invoke_tool", side_effect=_fake_invoke),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        agent._execute_tool_calls_concurrent(assistant_message, messages, "task-1")
+
+    assert invoked["c1"] == ("read_file", {"path": "notes.md"})
+    assert invoked["c2"] == ("web_search", {"query": "direct read"})
+    assert [message["tool_call_id"] for message in messages] == ["c1", "c2"]
+    assert flushed_batches == [["c1", "c2"]]
+    agent._flush_messages_to_session_db.assert_called_once()
+
+
+@pytest.mark.parametrize("effect_capable_name", ["write_file", "mcp_test_fs_write"])
+def test_execute_tool_calls_concurrent_retains_per_result_flush_when_any_tool_may_have_side_effect(
+    effect_capable_name,
+):
+    agent = _make_agent()
+    tool_calls = [
+        _mock_tool_call(name="web_search", call_id="c1"),
+        _mock_tool_call(
+            name=effect_capable_name,
+            arguments='{"path":"target.txt","content":"changed"}',
+            call_id="c2",
+        ),
+    ]
+    messages: list = []
+    assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
+    flushed_batches: list[list[str]] = []
+
+    def _fake_invoke(function_name, function_args, effective_task_id, tool_call_id, **kwargs):
+        return f"result-{tool_call_id}"
+
+    def _record_flush(flush_messages, conversation_history=None):
+        flushed_batches.append(
+            [message["tool_call_id"] for message in flush_messages if message.get("role") == "tool"]
+        )
+
+    agent._flush_messages_to_session_db = MagicMock(side_effect=_record_flush)
+
+    with (
+        patch.object(agent, "_invoke_tool", side_effect=_fake_invoke) as invoke,
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        agent._execute_tool_calls_concurrent(assistant_message, messages, "task-1")
+
+    assert invoke.call_count == 2
+    assert [message["tool_call_id"] for message in messages] == ["c1", "c2"]
+    assert flushed_batches == [["c1"], ["c1", "c2"]]
+    assert agent._flush_messages_to_session_db.call_count == 2
+
+
+def test_execute_tool_calls_concurrent_read_only_batch_flush_failure_blocks_completion_projections():
+    agent = _make_agent()
+    tool_calls = [
+        _mock_tool_call(name="web_search", call_id="c1"),
+        _mock_tool_call(name="web_search", call_id="c2"),
+    ]
+    messages: list = []
+    assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
+    flushed_batches: list[list[str]] = []
+    completion_events: list[str] = []
+
+    def _fake_invoke(function_name, function_args, effective_task_id, tool_call_id, **kwargs):
+        return f"result-{tool_call_id}"
+
+    def _failed_flush(flush_messages, conversation_history=None):
+        flushed_batches.append(
+            [message["tool_call_id"] for message in flush_messages if message.get("role") == "tool"]
+        )
+        return False
+
+    def _record_progress(event, *_args, **_kwargs):
+        if event == "tool.completed":
+            completion_events.append(event)
+
+    agent._flush_messages_to_session_db = MagicMock(side_effect=_failed_flush)
+    agent.tool_progress_callback = _record_progress
+    agent.tool_complete_callback = MagicMock()
+
+    with (
+        patch.object(agent, "_invoke_tool", side_effect=_fake_invoke) as invoke,
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        agent._execute_tool_calls_concurrent(assistant_message, messages, "task-1")
+
+    assert invoke.call_count == 2
+    assert [message["tool_call_id"] for message in messages] == ["c1", "c2"]
+    assert flushed_batches == [["c1", "c2"]]
+    agent._flush_messages_to_session_db.assert_called_once()
+    assert getattr(agent, "_incremental_persistence_failed", False) is True
+    assert completion_events == []
+    agent.tool_complete_callback.assert_not_called()
