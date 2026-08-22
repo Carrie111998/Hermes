@@ -60,6 +60,30 @@ class TestOpenRouterProfile:
         assert first["session_id"] == "cron_job42"
         assert first["session_id"] == second["session_id"]
 
+    def test_sticky_session_id_omitted_for_custom_openai_compatible_base_url(self):
+        """OpenRouter profile must not leak session_id to strict local routers."""
+        p = get_provider_profile("openrouter")
+        body = p.build_extra_body(
+            session_id="sess123",
+            base_url="http://localhost:20128/v1",
+            model="z-ai/glm-5.2",
+        )
+        assert "session_id" not in body
+
+    def test_sticky_session_id_sent_for_openrouter_base_url(self):
+        p = get_provider_profile("openrouter")
+        body = p.build_extra_body(
+            session_id="sess123",
+            base_url="https://openrouter.ai/api/v1",
+            model="z-ai/glm-5.2",
+        )
+        assert body["session_id"] == "sess123"
+
+    def test_sticky_session_id_sent_when_base_url_unset(self):
+        p = get_provider_profile("openrouter")
+        body = p.build_extra_body(session_id="sess123", model="z-ai/glm-5.2")
+        assert body["session_id"] == "sess123"
+
 
 
 

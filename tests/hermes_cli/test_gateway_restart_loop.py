@@ -695,6 +695,30 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_python_heredoc_with_css_paths_not_blocked(self):
+        """Quoted python heredoc bodies with path-like CSS/text must not trip
+        the referenced-script walk (#hermes-cloud production hotfix)."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        cmd = """python3 << 'PY'
+import paramiko
+css = '''
+.ssp-review { font-family: "Source Sans 3", system-ui, sans-serif; max-width: 760px; }
+</style>
+'''
+print('/')
+print('/tmp')
+ssh.exec_command('cat /tmp/a.php > /tmp/b.php')
+PY"""
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(
+                cmd, cwd="/home/deploy"
+            )
+            is False
+        )
+
     def test_nul_byte_in_path_token_does_not_crash_guard(self):
         """Residual #76762 class: when a NUL byte survives into the *path
         token itself* (tokenized binary-adjacent command text), ``os.open``

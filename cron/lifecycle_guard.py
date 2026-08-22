@@ -41,6 +41,8 @@ import re
 import shlex
 import stat
 from pathlib import Path
+
+from tools.shell_heredoc import strip_inert_heredoc_bodies
 from typing import Callable, Iterator, Optional
 
 logger = logging.getLogger(__name__)
@@ -375,6 +377,7 @@ def _iter_referenced_shell_scripts(
     cwd: Optional[str] = None,
 ) -> Iterator[Path]:
     """Yield scripts executed directly or through a POSIX shell."""
+    command = strip_inert_heredoc_bodies(command)
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
         if index is None:
@@ -429,6 +432,7 @@ def _iter_referenced_shell_scripts(
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
     """Yield code passed through ``sh|bash|... -c`` for recursive scanning."""
+    command = strip_inert_heredoc_bodies(command)
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
         if index is None or Path(segment[index]).name not in _SHELL_EXECUTABLES:

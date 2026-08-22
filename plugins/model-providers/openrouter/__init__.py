@@ -134,7 +134,13 @@ class OpenRouterProfile(ProviderProfile):
         # also stays stable for installs that opt out of the default
         # ``compression.in_place: true`` and across delegate-subagent trees.
         sticky_key = _cache_scope_from_session_id(get_conversation_context() or session_id)
-        if sticky_key:
+        # Only OpenRouter understands the top-level session_id sticky key. When
+        # this profile fronts a custom OpenAI-compatible endpoint (e.g. a local
+        # router like OmniRoute), the field is forwarded to strict upstreams
+        # (OpenAI, NVIDIA) which reject the whole request with 400 "Unknown
+        # parameter: session_id".
+        base_url = str(context.get("base_url") or "")
+        if sticky_key and (not base_url or "openrouter.ai" in base_url):
             body["session_id"] = sticky_key
         prefs = context.get("provider_preferences")
         if prefs:
