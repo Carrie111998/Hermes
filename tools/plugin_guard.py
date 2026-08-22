@@ -56,13 +56,22 @@ from tools.skills_guard import (
     scan_file,
 )
 
-PLUGIN_SCANNER_VERSION = "plugin-guard-v1"
+PLUGIN_SCANNER_VERSION = "plugin-guard-v2"
 
-# Directories that are never scanned (VCS internals, caches, vendored envs).
+# Directories that are never scanned (VCS internals, caches, vendored envs,
+# and non-payload trees that product repos commonly ship next to plugin.yaml).
 EXCLUDED_DIRS = {
     ".git", "__pycache__", "node_modules", ".venv", "venv",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
+    ".github", "tests", "promo",
 }
+
+# Relative path prefixes skipped even when a parent directory is otherwise
+# owned. Benchmark evidence dumps are not plugin payload.
+EXCLUDED_PREFIXES = (
+    "references/results/",
+    "references/results",
+)
 
 # Code file extensions where "reads an env secret" / "HTTP call with a key
 # variable" is the NORMAL, documented plugin pattern (provider plugins read
@@ -94,6 +103,7 @@ CODE_EXEMPT_PATTERN_IDS = {
     # Plugins legitimately write their own settings into config.yaml during
     # post_setup, and encode credentials (e.g. HTTP Basic auth) with base64.
     "agent_config_mod",
+    "hermes_config_mod",
     "encoded_exfil",
 }
 
@@ -112,6 +122,11 @@ SEVERITY_REMAP = {
     "binary_file": "high",
     "hermes_env_access": "medium",
     "curl_pipe_shell": "high",
+    # Profile plugins list AGENTS.md / SOUL.md and document ~/.hermes/config.yaml.
+    # A mention is not persistence; actually writing secrets still trips
+    # read_secrets_file / hermes_env_access.
+    "agent_config_mod": "medium",
+    "hermes_config_mod": "medium",
 }
 
 # Structural limits — plugins are real codebases, far larger than skills.
@@ -121,7 +136,69 @@ MAX_PLUGIN_SINGLE_FILE_KB = 1024       # 1MB single file
 
 
 def _is_excluded(rel_parts: Tuple[str, ...]) -> bool:
-    return any(part in EXCLUDED_DIRS for part in rel_parts)
+    if any(part in EXCLUDED_DIRS for part in rel_parts):
+        return True
+    rel = "/".join(rel_parts)
+    return any(rel == prefix.rstrip("/") or rel.startswith(prefix if prefix.endswith("/") else prefix + "/") for prefix in EXCLUDED_PREFIXES)
+
+
+def _distribution_owned_roots(plugin_dir: Path) -> list[Path] | None:
+    """Return payload roots from distribution.yaml, or None to scan the tree."""
+    manifest = plugin_dir / "distribution.yaml"
+    if not manifest.is_file():
+        return None
+    try:
+        import yaml
+    except ImportError:
+        return None
+    try:
+        data = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None
+    owned = data.get("distribution_owned")
+    if not isinstance(owned, list) or not owned:
+        return None
+    roots: list[Path] = []
+    for item in owned:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        rel = item.strip().lstrip("./")
+        if not rel or rel.startswith("/") or ".." in Path(rel).parts:
+            continue
+        roots.append(plugin_dir / rel)
+    return roots or None
+
+
+def _iter_plugin_files(plugin_dir: Path):
+    """Yield files that belong to the plugin payload."""
+    roots = _distribution_owned_roots(plugin_dir)
+    if roots is None:
+        candidates = [plugin_dir]
+    else:
+        candidates = roots
+    seen: set[Path] = set()
+    for root in candidates:
+        if root.is_file():
+            files = [root]
+        elif root.is_dir():
+            files = [path for path in root.rglob("*") if path.is_file() or path.is_symlink()]
+        else:
+            continue
+        for path in files:
+            try:
+                resolved = path.resolve()
+            except OSError:
+                continue
+            if resolved in seen:
+                continue
+            try:
+                rel_parts = path.relative_to(plugin_dir).parts
+            except ValueError:
+                continue
+            if _is_excluded(rel_parts):
+                continue
+            seen.add(resolved)
+            yield path
 
 
 def _filter_findings(findings: List[Finding], rel_path: str) -> List[Finding]:
@@ -145,12 +222,10 @@ def _check_plugin_structure(plugin_dir: Path) -> List[Finding]:
     file_count = 0
     total_size = 0
 
-    for f in plugin_dir.rglob("*"):
+    for f in _iter_plugin_files(plugin_dir):
         try:
             rel_parts = f.relative_to(plugin_dir).parts
         except ValueError:
-            continue
-        if _is_excluded(rel_parts):
             continue
         rel = "/".join(rel_parts)
 
@@ -265,14 +340,12 @@ def scan_plugin(plugin_dir: Path, source: str = "") -> ScanResult:
 
     if plugin_dir.is_dir():
         all_findings.extend(_check_plugin_structure(plugin_dir))
-        for f in sorted(plugin_dir.rglob("*")):
+        for f in sorted(_iter_plugin_files(plugin_dir), key=lambda path: str(path)):
             if not f.is_file() or f.is_symlink():
                 continue
             try:
                 rel_parts = f.relative_to(plugin_dir).parts
             except ValueError:
-                continue
-            if _is_excluded(rel_parts):
                 continue
             rel = "/".join(rel_parts)
             raw = scan_file(f, rel_path=rel)
