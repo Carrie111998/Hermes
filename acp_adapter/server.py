@@ -16,6 +16,7 @@ from typing import Any, Deque, Optional
 from urllib.parse import unquote, urlparse
 
 import acp
+from acp.exceptions import RequestError
 from acp.schema import (
     AgentCapabilities,
     AgentMessageChunk,
@@ -1131,7 +1132,7 @@ class HermesACPAgent(acp.Agent):
         server_names: set[str] = set()
         for server in mcp_servers or []:
             if server.name in server_names:
-                raise ValueError(f"duplicate ACP MCP server name: {server.name}")
+                raise RequestError.invalid_params({"serverName": server.name})
             server_names.add(server.name)
 
     async def _register_session_mcp_servers(
