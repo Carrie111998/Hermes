@@ -20,7 +20,7 @@ import threading
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set, Any
+from typing import Dict, List, Optional, Set, Any, Union, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -3835,11 +3835,19 @@ class TelegramAdapter(BasePlatformAdapter):
                 _transport_kwargs: dict = {}
                 if _pool_limits is not None:
                     _transport_kwargs["limits"] = _pool_limits
+                # Pass connect/read timeouts to the fallback transport so they
+                # apply at the socket level, preventing indefinite hangs during
+                # DNS resolution or TCP connect (issue #78586).
+                connect_timeout = request_kwargs.get("connect_timeout", 10.0)
+                read_timeout = request_kwargs.get("read_timeout", 20.0)
                 request = HTTPXRequest(
                     **request_kwargs,
                     httpx_kwargs={
                         "transport": TelegramFallbackTransport(
-                            fallback_ips, **_transport_kwargs
+                            fallback_ips,
+                            connect_timeout=connect_timeout,
+                            read_timeout=read_timeout,
+                            **_transport_kwargs,
                         )
                     },
                 )
@@ -3847,7 +3855,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     **request_kwargs,
                     httpx_kwargs={
                         "transport": TelegramFallbackTransport(
-                            fallback_ips, **_transport_kwargs
+                            fallback_ips,
+                            connect_timeout=connect_timeout,
+                            read_timeout=read_timeout,
+                            **_transport_kwargs,
                         )
                     },
                 )
@@ -4759,7 +4770,7 @@ class TelegramAdapter(BasePlatformAdapter):
     async def send_or_update_status(
         self,
         chat_id: str,
-        status_key: str,
+        status_key: Union[str, Tuple[Any, Any, Any]],
         content: str,
         *,
         metadata: Optional[Dict[str, Any]] = None,
@@ -4772,8 +4783,25 @@ class TelegramAdapter(BasePlatformAdapter):
         subsequent calls with the same (chat_id, status_key) edit that same
         message in place. If the edit fails (message deleted, too old, etc.)
         we drop the cached id and send fresh.
+        
+        Issue #92210: Include topic/thread information in the status key to
+        prevent collisions between different threads/topics, and bound the
+        cache size to prevent unlimited growth.
         """
-        key = (str(chat_id), str(status_key))
+        from typing import Union, Tuple
+        # Extract thread/topic identifier from metadata for keying
+        thread_id = self._metadata_thread_id(metadata) if metadata else None
+        # Build key: when thread_id is None, maintain backward compatibility with
+        # existing 2-tuple key format (chat_id, status_key) for unit tests.
+        # When thread_id is not None, include it to prevent cross-topic collisions:
+        # (chat_id, thread_id, status_key)
+        if thread_id is None:
+            key = (str(chat_id), str(status_key))
+        else:
+            key = (str(chat_id), str(thread_id), str(status_key))
+        # Bound the cache size to prevent unlimited growth (simple reset when too large)
+        if len(self._status_message_ids) > 1000:
+            self._status_message_ids.clear()
         cached_id = self._status_message_ids.get(key)
         if cached_id is not None:
             result = await self.edit_message(

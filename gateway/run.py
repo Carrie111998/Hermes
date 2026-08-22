@@ -4255,8 +4255,11 @@ class TurnRunner:
                 _redact_gateway_user_facing_secrets(str(message or ""))[:160],
             )
             return
+        # Compose status key per turn: (session_id, run_generation, event_type)
+        # so that same-turn updates edit in place, while new turns send fresh bubbles.
+        status_key = (ctx.session_id, ctx.run_generation, event_type)
         _fut = safe_schedule_threadsafe(
-            _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared_message, ctx._status_thread_metadata),
+            _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, status_key, prepared_message, ctx._status_thread_metadata),
             ctx._loop_for_step,
             logger=logger,
             log_message=f"status_callback ({event_type}) scheduling error",
