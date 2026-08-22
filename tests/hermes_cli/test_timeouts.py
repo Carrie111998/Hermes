@@ -104,3 +104,94 @@ def test_resolved_api_call_timeout_priority(monkeypatch, tmp_path):
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# Named custom providers resolve at runtime as provider="custom" — the config
+# key ("mlx-lm") is NOT what AIAgent.provider carries.  Timeout lookups must
+# therefore fall back to matching the provider entry by base_url, exactly like
+# get_custom_provider_context_length() does for context_length (#15779).
+# Observed 2026-08-21: providers.mlx-lm.stale_timeout_seconds silently ignored.
+# ---------------------------------------------------------------------------
+
+_NAMED_CUSTOM_CONFIG = """\
+    providers:
+      mlx-lm:
+        name: mlx-lm (local, fast)
+        base_url: http://127.0.0.1:8001/v1
+        api_key: local
+        request_timeout_seconds: 1200
+        stale_timeout_seconds: 900
+        models:
+          slow-model:
+            stale_timeout_seconds: 1500
+            timeout_seconds: 1600
+    """
+
+
+def _isolate(monkeypatch, tmp_path, body):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    _write_config(tmp_path, body)
+    import importlib
+    from hermes_cli import config as cfg_mod
+    importlib.reload(cfg_mod)
+    from hermes_cli import timeouts as to_mod
+    return importlib.reload(to_mod)
+
+
+def test_named_custom_provider_timeouts_resolve_by_base_url(monkeypatch, tmp_path):
+    to = _isolate(monkeypatch, tmp_path, _NAMED_CUSTOM_CONFIG)
+    url = "http://127.0.0.1:8001/v1"
+    assert to.get_provider_stale_timeout("custom", "any-model", base_url=url) == 900.0
+    assert to.get_provider_request_timeout("custom", "any-model", base_url=url) == 1200.0
+
+
+def test_named_custom_provider_per_model_override_by_base_url(monkeypatch, tmp_path):
+    to = _isolate(monkeypatch, tmp_path, _NAMED_CUSTOM_CONFIG)
+    url = "http://127.0.0.1:8001/v1"
+    assert to.get_provider_stale_timeout("custom", "slow-model", base_url=url) == 1500.0
+    assert to.get_provider_request_timeout("custom", "slow-model", base_url=url) == 1600.0
+
+
+def test_base_url_match_tolerates_trailing_slash_and_case(monkeypatch, tmp_path):
+    to = _isolate(monkeypatch, tmp_path, _NAMED_CUSTOM_CONFIG)
+    assert to.get_provider_stale_timeout("custom", "m", base_url="HTTP://127.0.0.1:8001/v1/") == 900.0
+
+
+def test_unmatched_base_url_yields_none(monkeypatch, tmp_path):
+    to = _isolate(monkeypatch, tmp_path, _NAMED_CUSTOM_CONFIG)
+    assert to.get_provider_stale_timeout("custom", "m", base_url="http://127.0.0.1:9999/v1") is None
+    assert to.get_provider_stale_timeout("custom", "m") is None  # no base_url → no guess
+
+
+def test_explicit_provider_key_still_wins_over_base_url(monkeypatch, tmp_path):
+    # Same base_url on two entries: an explicit provider id must be honored,
+    # not overridden by a base_url scan.
+    to = _isolate(monkeypatch, tmp_path, """\
+        providers:
+          mlx-lm:
+            base_url: http://127.0.0.1:8001/v1
+            stale_timeout_seconds: 900
+          other:
+            base_url: http://127.0.0.1:8001/v1
+            stale_timeout_seconds: 5
+        """)
+    url = "http://127.0.0.1:8001/v1"
+    assert to.get_provider_stale_timeout("other", "m", base_url=url) == 5.0
+    assert to.get_provider_stale_timeout("mlx-lm", "m", base_url=url) == 900.0
+
+
+def test_agent_stale_timeout_uses_base_url_for_custom_provider(monkeypatch, tmp_path):
+    """End-to-end through AIAgent: provider='custom' + matching base_url → config wins
+    over the reasoning-model floor and the env var."""
+    to = _isolate(monkeypatch, tmp_path, _NAMED_CUSTOM_CONFIG)
+    monkeypatch.setenv("HERMES_API_CALL_STALE_TIMEOUT", "123")
+    import importlib, run_agent as ra_mod
+    importlib.reload(ra_mod)
+    agent = object.__new__(ra_mod.AIAgent)
+    agent.provider = "custom"
+    agent.model = "/models/Qwen3.8-27B-MLX-4bit"  # reasoning floor would give 180
+    agent.base_url = "http://127.0.0.1:8001/v1"
+    assert agent._resolved_api_call_stale_timeout_base() == (900.0, False)
+    assert agent._resolved_api_call_timeout() == 1200.0

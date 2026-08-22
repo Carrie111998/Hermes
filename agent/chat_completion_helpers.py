@@ -830,7 +830,9 @@ def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
     watchdog shares the exact same patience budget as the OpenAI/Anthropic
     stale-stream detector below.
     """
-    _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
+    _cfg_stale = get_provider_stale_timeout(
+        agent.provider, agent.model, base_url=getattr(agent, "base_url", None)
+    )
     if _cfg_stale is not None:
         _base = _cfg_stale
     else:
@@ -5027,7 +5029,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
 
     # Provider-configured stale timeout takes priority over env default.
-    _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
+    _cfg_stale = get_provider_stale_timeout(
+        agent.provider, agent.model, base_url=getattr(agent, "base_url", None)
+    )
     if _cfg_stale is not None:
         _stream_stale_timeout_base = _cfg_stale
     else:
