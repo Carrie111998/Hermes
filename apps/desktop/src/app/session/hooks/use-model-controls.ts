@@ -111,7 +111,6 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
       // response for a previous profile must stand down when it resolves.
       if (force) {
         profileRefreshEpochRef.current += 1
-        selectionEpochByTargetRef.current.clear()
       }
 
       const profileRefreshEpoch = profileRefreshEpochRef.current
@@ -196,6 +195,12 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
       const selectionEpoch = (selectionEpochByTargetRef.current.get(selectionTarget) ?? 0) + 1
       selectionEpochByTargetRef.current.set(selectionTarget, selectionEpoch)
 
+      const clearSelectionEpoch = () => {
+        if (selectionEpochByTargetRef.current.get(selectionTarget) === selectionEpoch) {
+          selectionEpochByTargetRef.current.delete(selectionTarget)
+        }
+      }
+
       const selectionIsCurrent = () =>
         selectionEpochByTargetRef.current.get(selectionTarget) === selectionEpoch &&
         $activeGatewayProfile.get() === liveGatewayProfile &&
@@ -232,7 +237,10 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
       // No live session yet: the pick is pure UI state. session.create reads
       // $currentModel/$currentProvider and applies it as that session's override.
       if (!liveSessionId) {
-        return commitSelection()
+        const committed = commitSelection()
+        clearSelectionEpoch()
+
+        return committed
       }
 
       try {
@@ -258,6 +266,7 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
           key: 'model',
           value: `${selection.model} --provider ${selection.provider} ${scope}`
         }
+
         const result = await requestGateway<ModelSwitchGatewayResponse>('config.set', params)
 
         if (result?.confirm_required) {
@@ -297,6 +306,11 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         }
 
         return false
+      } finally {
+        // The entry coordinates only concurrent selections for this target.
+        // Drop a settled latest selection so closed/reused tiles do not retain
+        // state; a newer overlapping selection owns a different epoch.
+        clearSelectionEpoch()
       }
     },
     [copy.modelSwitchFailed, requestGateway, updateModelOptionsCache]

@@ -57,6 +57,33 @@ _UNCAPPED_PICKER_PROVIDERS: frozenset[str] = frozenset({"opencode-zen", "opencod
 
 logger = logging.getLogger(__name__)
 
+_PICKER_CATALOGUE_PROOF_TTL_SECONDS = 300.0
+
+
+@dataclass(frozen=True)
+class PickerCatalogueProof:
+    """Immutable snapshot of a server-recorded model.options catalogue."""
+
+    entries: frozenset[tuple[str, str]]
+    served_at: float
+
+
+def _picker_catalogue_proof_is_current(
+    proof: PickerCatalogueProof | None, provider: str, model: str
+) -> bool:
+    """Accept only fresh evidence containing this resolved target."""
+    if not isinstance(proof, PickerCatalogueProof):
+        return False
+    if not isinstance(proof.entries, frozenset):
+        return False
+    if not isinstance(proof.served_at, (int, float)) or isinstance(proof.served_at, bool):
+        return False
+    age = time.monotonic() - proof.served_at
+    return (
+        0.0 <= age <= _PICKER_CATALOGUE_PROOF_TTL_SECONDS
+        and (provider.casefold(), model) in proof.entries
+    )
+
 
 def _declared_model_ids(value: Any) -> list[str]:
     """Return configured model IDs from supported config shapes.
@@ -1446,7 +1473,7 @@ def switch_model(
     explicit_provider: str = "",
     user_providers: dict = None,
     custom_providers: list | None = None,
-    catalogue_validated: bool = False,
+    catalogue_proof: PickerCatalogueProof | None = None,
 ) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
 
@@ -1481,11 +1508,10 @@ def switch_model(
         explicit_provider: From --provider flag (empty = no explicit provider).
         user_providers: The ``providers:`` dict from config.yaml (for user endpoints).
         custom_providers: The ``custom_providers:`` list from config.yaml.
-        catalogue_validated: The gateway has just served this exact
-            provider/model pair from its own picker catalogue. This skips the
-            redundant live ``/models`` probe only; credential resolution,
-            provider routing, normalisation, safety guards, and runtime client
-            construction still run normally.
+        catalogue_proof: Fresh, immutable server-recorded picker catalogue.
+            The resolved provider/model pair must be present in it. The proof
+            skips only the redundant live ``/models`` probe; all other
+            resolution and safety checks remain.
 
     Returns:
         ModelSwitchResult with all information the caller needs.
@@ -2054,7 +2080,7 @@ def switch_model(
     # same provider's live /models endpoint again adds a full network round-trip
     # without adding evidence. Only that server-owned proof may take this fast
     # path; typed CLI and slash-command input retain the live validation below.
-    if catalogue_validated:
+    if _picker_catalogue_proof_is_current(catalogue_proof, target_provider, new_model):
         validation = {
             "accepted": True,
             "persist": True,

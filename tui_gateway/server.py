@@ -4917,31 +4917,30 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
         )
 
 
-def _picker_catalogue_validates(session: dict, parsed_flags: Any) -> bool:
-    """Whether model.options served this exact provider/model pair.
-
-    The proof is recorded by the gateway handler itself. Clients cannot opt
-    into the fast path by adding a JSON-RPC flag, and model names remain
-    case-sensitive because providers may treat differently cased ids as
-    distinct routes.
-    """
+def _picker_catalogue_proof(session: dict, parsed_flags: Any) -> Any | None:
+    """Return fresh model.options evidence containing the requested pair."""
     try:
         model = str(parsed_flags.model_input or "").strip()
         provider = str(parsed_flags.explicit_provider or "").strip().casefold()
     except Exception:
-        return False
+        return None
     if not model or not provider:
-        return False
+        return None
     served = session.get("model_options_catalogue")
     served_at = session.get("model_options_catalogue_at")
     if not isinstance(served_at, (int, float)) or isinstance(served_at, bool):
-        return False
+        return None
     age = time.monotonic() - served_at
-    return (
+    if not (
         0.0 <= age <= _PICKER_CATALOGUE_PROOF_TTL_SECONDS
-        and isinstance(served, (set, frozenset))
+        and isinstance(served, frozenset)
         and (provider, model) in served
-    )
+    ):
+        return None
+
+    from hermes_cli.model_switch import PickerCatalogueProof
+
+    return PickerCatalogueProof(entries=served, served_at=float(served_at))
 
 
 def _apply_model_switch(
@@ -4949,7 +4948,7 @@ def _apply_model_switch(
     session: dict,
     raw_input: str,
     *,
-    catalogue_validated: bool = False,
+    catalogue_proof: Any | None = None,
     confirm_expensive_model: bool = False,
     pin_session_override: bool = True,
     parsed_flags: Any | None = None,
@@ -4957,11 +4956,11 @@ def _apply_model_switch(
     prepare_only: bool = False,
 ) -> dict:
     from hermes_cli.model_switch import (
+        MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL,
+        MODEL_SWITCH_ERROR_TEXT,
         parse_model_switch_args,
         resolve_persist_behavior,
         switch_model,
-        MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL,
-        MODEL_SWITCH_ERROR_TEXT,
     )
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -5047,8 +5046,8 @@ def _apply_model_switch(
         user_providers=user_provs,
         custom_providers=custom_provs,
     )
-    if catalogue_validated:
-        switch_kwargs["catalogue_validated"] = True
+    if catalogue_proof is not None:
+        switch_kwargs["catalogue_proof"] = catalogue_proof
     result = switch_model(**switch_kwargs)
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
@@ -5302,7 +5301,7 @@ def _apply_pending_model_switch(sid: str, session: dict) -> None:
             sid,
             session,
             pending["raw"],
-            catalogue_validated=bool(pending.get("catalogue_validated")),
+            catalogue_proof=pending.get("catalogue_proof"),
             confirm_expensive_model=bool(pending.get("confirm_expensive_model")),
         )
         # A queued pick is a deliberate user action; honour the expensive-model
@@ -12076,7 +12075,7 @@ def _(rid, params: dict) -> dict:
                 # the new model without waiting for the swap or interrupting.
                 if session.get("running"):
                     parsed = parse_model_switch_args(value)
-                    catalogue_validated = _picker_catalogue_validates(session, parsed)
+                    catalogue_proof = _picker_catalogue_proof(session, parsed)
                     # Resolve and run selection guards without mutating the live
                     # agent. This closes the old gap where a guarded model was
                     # painted as queued, then silently dropped at turn start
@@ -12085,7 +12084,7 @@ def _(rid, params: dict) -> dict:
                         params.get("session_id", ""),
                         session,
                         value,
-                        catalogue_validated=catalogue_validated,
+                        catalogue_proof=catalogue_proof,
                         confirm_expensive_model=bool(
                             params.get("confirm_expensive_model", False)
                         ),
@@ -12108,7 +12107,7 @@ def _(rid, params: dict) -> dict:
                         )
                     session["pending_model_switch"] = {
                         "raw": value,
-                        "catalogue_validated": catalogue_validated,
+                        "catalogue_proof": catalogue_proof,
                         "confirm_expensive_model": bool(
                             params.get("confirm_expensive_model", False)
                         ),
@@ -12133,7 +12132,7 @@ def _(rid, params: dict) -> dict:
                         },
                     )
                 parsed_flags = parse_model_switch_args(value)
-                catalogue_validated = _picker_catalogue_validates(session, parsed_flags)
+                catalogue_proof = _picker_catalogue_proof(session, parsed_flags)
                 explicit_provider = parsed_flags.explicit_provider
                 if session.get("agent") is None and not explicit_provider.strip():
                     session_id = params.get("session_id", "")
@@ -12147,7 +12146,7 @@ def _(rid, params: dict) -> dict:
                     params.get("session_id", ""),
                     session,
                     value,
-                    catalogue_validated=catalogue_validated,
+                    catalogue_proof=catalogue_proof,
                     confirm_expensive_model=bool(
                         params.get("confirm_expensive_model", False)
                     ),

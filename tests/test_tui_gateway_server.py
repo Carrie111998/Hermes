@@ -12425,12 +12425,17 @@ def test_config_set_model_defers_while_running(monkeypatch):
         assert result["value"] == "anthropic/claude-sonnet-4.6"
         assert seen["called"]
         assert seen["kwargs"]["prepare_only"] is True
-        assert seen["kwargs"]["catalogue_validated"] is True
+        catalogue_proof = seen["kwargs"]["catalogue_proof"]
+        assert catalogue_proof is not None
+        assert (
+            "anthropic",
+            "anthropic/claude-sonnet-4.6",
+        ) in catalogue_proof.entries
         pending = server._sessions["sid"].get("pending_model_switch")
         assert pending and pending["raw"] == (
             "anthropic/claude-sonnet-4.6 --provider anthropic"
         )
-        assert pending["catalogue_validated"] is True
+        assert pending["catalogue_proof"] is catalogue_proof
     finally:
         server._sessions.pop("sid", None)
 
@@ -12485,9 +12490,10 @@ def test_apply_pending_model_switch_runs_queued_pick(monkeypatch):
 
     session = _session(running=False)
     session["agent"] = object()
+    catalogue_proof = object()
     session["pending_model_switch"] = {
         "raw": "anthropic/claude-sonnet-4.6",
-        "catalogue_validated": True,
+        "catalogue_proof": catalogue_proof,
         "confirm_expensive_model": False,
     }
 
@@ -12495,7 +12501,10 @@ def test_apply_pending_model_switch_runs_queued_pick(monkeypatch):
     assert calls == [
         (
             "anthropic/claude-sonnet-4.6",
-            {"catalogue_validated": True, "confirm_expensive_model": False},
+            {
+                "catalogue_proof": catalogue_proof,
+                "confirm_expensive_model": False,
+            },
         )
     ]
     assert "pending_model_switch" not in session
@@ -14291,24 +14300,26 @@ def test_model_options_records_only_server_served_catalogue_pairs(monkeypatch):
         assert ("custom:local-ollama", "qwen3.6:35b-65k") in served
         assert ("local ollama", "qwen3.6:8b") in served
         assert ("local-ollama", "not-served") not in served
-        assert server._picker_catalogue_validates(
+        proof = server._picker_catalogue_proof(
             session,
             types.SimpleNamespace(
                 explicit_provider="custom:local-ollama",
                 model_input="qwen3.6:35b-65k",
             ),
         )
+        assert proof is not None
+        assert proof.entries is served
 
         session["model_options_catalogue_at"] -= (
             server._PICKER_CATALOGUE_PROOF_TTL_SECONDS + 1.0
         )
-        assert not server._picker_catalogue_validates(
+        assert server._picker_catalogue_proof(
             session,
             types.SimpleNamespace(
                 explicit_provider="custom:local-ollama",
                 model_input="qwen3.6:35b-65k",
             ),
-        )
+        ) is None
     finally:
         server._sessions.pop("catalogue-session", None)
 
