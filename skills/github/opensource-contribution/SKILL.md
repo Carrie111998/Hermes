@@ -1,14 +1,14 @@
 ---
 name: opensource-contribution
 description: "Screen a GitHub issue for duplicate-PR, assignee, and CLA blockers before carrying it to a PR."
-version: 0.2.0
+version: 0.3.0
 author: MershLab
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [GitHub, Issues, Pull-Requests, Screening, MershLab]
-    related_skills: [github-issue-to-pr, github-pr-workflow, github-auth]
+    related_skills: [github-issue-to-pr, github-pr-workflow, github-auth, ast-grep]
 ---
 
 # Open Source Contribution Gate
@@ -74,7 +74,12 @@ for a single-repo org/project; it exists for the Microsoft/Google/NVIDIA
 
 - **CLEAR** (and step 2 found nothing org-wide) — proceed directly to
   `github-issue-to-pr`'s own procedure, starting at its step 1,
-  unmodified. Nothing about that skill changes.
+  unmodified. Nothing about that skill changes. Its own step 5 ("search
+  sibling call sites for the same bug shape, fix the whole class") is a
+  structural question answered with a text/regex search by default —
+  load the `ast-grep` skill for that step specifically when the fix
+  needs to find the same *pattern*, not the same *string*, across the
+  codebase.
 - **DUPLICATE** — a PR already references this issue. Read the URL in
   the result (a cross-reference hit can come from a different repo
   entirely, e.g. a changelog mention — treat this as "go look," not an
@@ -88,7 +93,26 @@ for a single-repo org/project; it exists for the Microsoft/Google/NVIDIA
 Done when either work has moved to `github-issue-to-pr`, or the candidate
 is skipped with the reason recorded.
 
-### 4. Ground the drafted text in this org's real voice
+### 4. Claim the issue before starting real work
+
+`contrib_screen` catches an *existing* PR; it does not stop two
+overlapping runs (an unattended sweep re-firing before the previous
+run's PR exists yet, or a founder-triggered run overlapping a scheduled
+one) from both picking the same CLEAR issue at the same moment — a real
+gap, found by comparing against OpenClaw's own `gh-issues` skill
+(`internal-docs/harness/openclaw/skill-survey.md`, private repo).
+
+Before proceeding to `github-issue-to-pr`, check for and write a claim
+file at `$HERMES_HOME/contrib-screen/claims/<owner>-<repo>-<issue>.json`
+(`{"claimed_at": "<ISO 8601 UTC timestamp>"}`). If a claim already exists
+and is less than 2 hours old, stop — another run is already on this
+issue, treat it the same as an ASSIGNED verdict. If it's missing or
+older than 2 hours (stale, the other run likely failed or was killed),
+write a fresh claim and proceed. No explicit cleanup on success needed —
+staleness alone keeps this correct, same as the precedent this pattern
+is taken from.
+
+### 5. Ground the drafted text in this org's real voice
 
 Once implementing (inside `github-issue-to-pr`'s own procedure), if the
 org has been indexed (step 2 ran), call `contrib_screen_voice` for a
@@ -98,7 +122,7 @@ actually write, not generic phrasing. Skip if the org was never indexed;
 don't index solely for this, it's a bonus once step 2's data already
 exists.
 
-### 5. Record the final outcome
+### 6. Record the final outcome
 
 Regardless of which branch above was taken, once `github-issue-to-pr`'s
 own step 8 finishes (or this skill stopped at step 3), the outcome —
@@ -120,10 +144,13 @@ somewhere durable to write it (see Known limitation below).
 - Running `contrib_screen_index` against a whole large org "just in
   case" — scope it to real candidate repos, found via a live search
   first.
+- Skipping the claim file because `contrib_screen` already said CLEAR —
+  CLEAR means no *existing* PR, not that no other run is about to start
+  one right now.
 
 ## Known limitation
 
-Step 5's durable outcome log has no home yet (`kernel.py`'s append-only
+Step 6's durable outcome log has no home yet (`kernel.py`'s append-only
 log, per the harness system design doc, is not built) — until it exists,
 record the outcome by hand or in the calling session's own notes, don't
 skip it silently.
@@ -132,7 +159,10 @@ skip it silently.
 
 - [ ] `contrib_screen` run before any other action on the candidate.
 - [ ] For multi-repo orgs, an org-wide check ran before implementing.
+- [ ] A claim file was checked and written before `github-issue-to-pr`
+      started, not skipped.
 - [ ] CLEAR (both repo and org-wide) hands off to `github-issue-to-pr`'s
       full, unmodified procedure.
-- [ ] Non-CLEAR stops here — no PR opened, reason recorded.
+- [ ] Non-CLEAR (including an unexpired existing claim) stops here — no
+      PR opened, reason recorded.
 - [ ] Final outcome recorded regardless of which path was taken.
