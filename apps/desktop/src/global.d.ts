@@ -2,6 +2,7 @@ import type { GatewayWsUrlResult } from '@hermes/shared'
 import type { TranslucencyState } from '@hermes/shared/translucency'
 
 import type { WakeIndicatorState } from './lib/wake-indicator'
+import type { PoolLimits } from '../electron/pool-limits'
 import type {
   PetOverlayBounds,
   PetOverlayControl,
@@ -46,6 +47,14 @@ declare global {
       // Keepalive: mark a pool profile backend as recently used so the idle
       // reaper spares it while its chat is active.
       touchBackend: (profile?: string | null) => Promise<{ ok: boolean }>
+      // Pool sizing (Settings → Advanced): device-local, live-applied by the
+      // main process. get resolves the limits currently in force; set applies
+      // (and persists) new ones, evicting/reaping to converge immediately.
+      getPoolLimits: () => Promise<PoolLimits>
+      setPoolLimits: (limits: { maxBackends?: number; idleMs?: number }) => Promise<{
+        ok: boolean
+        limits: PoolLimits
+      }>
       getGatewayWsUrl: (profile?: null | string) => Promise<GatewayWsUrlResult>
       // Open (or focus) a standalone OS window for a single chat session so
       // the user can work with multiple chats side by side. Returns ok:false
