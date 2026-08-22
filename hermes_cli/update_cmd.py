@@ -1602,9 +1602,8 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
     _m()._record_bytecode_fingerprint()
     _m()._refresh_bootstrap_cache_scripts(branch)
 
-    # Reinstall Python dependencies. Prefer .[all], but if one optional extra
-    # breaks on this machine, keep base deps and reinstall the remaining extras
-    # individually so update does not silently strip working capabilities.
+    # Refresh Python dependencies from the hash-verified lockfile first. The
+    # shared helper falls back to the editable install cascade when needed.
     #
     # Self-lock deferral (relocated preflight — #86735): the ZIP code swap
     # above is already committed; defer only the dependency sync when this
@@ -1623,7 +1622,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
     if not uv_bin:
         uv_bin = _ensure_uv_for_termux(pip_cmd)
     if uv_bin:
-        uv_env = {**os.environ, "VIRTUAL_ENV": str(_m().PROJECT_ROOT / "venv")}
+        uv_env = _m()._project_uv_install_env()
         if _m()._is_termux_env(uv_env):
             uv_env.pop("PYTHONPATH", None)
             uv_env.pop("PYTHONHOME", None)
@@ -6132,13 +6131,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 ).exists()
                 if venv_python_missing and repair_uv:
                     print("→ Recreating virtual environment...")
+                    repair_env = _m()._project_uv_install_env()
                     subprocess.run(
                         [repair_uv, "venv", "venv"],
                         cwd=_m().PROJECT_ROOT,
                         check=False,
+                        env=repair_env,
                     )
                 if repair_uv:
-                    repair_env = {**os.environ, "VIRTUAL_ENV": str(_m().PROJECT_ROOT / "venv")}
+                    repair_env = _m()._project_uv_install_env()
                     _m()._install_python_dependencies_with_optional_fallback(
                         [repair_uv, "pip"], env=repair_env, group="all"
                     )
@@ -6440,9 +6441,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
         if is_fork and branch == "main":
             _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
 
-        # Reinstall Python dependencies. Prefer .[all], but if one optional extra
-        # breaks on this machine, keep base deps and reinstall the remaining extras
-        # individually so update does not silently strip working capabilities.
+        # Refresh Python dependencies from the hash-verified lockfile first.
+        # The shared helper falls back to the editable install cascade.
         #
         # Self-lock deferral (relocated preflight — #86735): if THIS process
         # holds a native extension the sync must rewrite, defer NOW — after
@@ -6476,7 +6476,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         install_group = "all"
 
         if uv_bin:
-            uv_env = {**os.environ, "VIRTUAL_ENV": str(_m().PROJECT_ROOT / "venv")}
+            uv_env = _m()._project_uv_install_env()
             if _m()._is_termux_env(uv_env):
                 uv_env.pop("PYTHONPATH", None)
                 uv_env.pop("PYTHONHOME", None)

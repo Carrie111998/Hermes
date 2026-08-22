@@ -8900,10 +8900,7 @@ def _default_venv_install_target() -> tuple[list[str], dict[str, str] | None]:
     except Exception:
         uv_bin = None
     if uv_bin:
-        from hermes_constants import project_venv_dir
-
-        venv_dir = project_venv_dir(PROJECT_ROOT) or PROJECT_ROOT / "venv"
-        env = {**os.environ, "VIRTUAL_ENV": str(venv_dir)}
+        env = _project_uv_install_env()
         if _is_termux_env(env):
             env.pop("PYTHONPATH", None)
             env.pop("PYTHONHOME", None)
@@ -9431,6 +9428,59 @@ def _repair_venv_via_import_probes(
     return "failed"
 
 
+def _project_uv_install_env(
+    env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Return a sanitized environment for Hermes-owned project uv commands.
+
+    Keep every update tier on the same project venv selected by the canonical
+    layout helper. Inherited uv selectors must not redirect a sync or its
+    editable-install fallback to another interpreter.
+    """
+    from hermes_constants import project_venv_dir, venv_python_path
+
+    env_dir = project_venv_dir(PROJECT_ROOT) or PROJECT_ROOT / "venv"
+    install_env = {**(env if env is not None else os.environ)}
+    install_env["UV_PROJECT_ENVIRONMENT"] = str(env_dir)
+    install_env["VIRTUAL_ENV"] = str(env_dir)
+    env_python = venv_python_path(env_dir, windows=_is_windows())
+    if env_python.exists():
+        install_env["UV_PYTHON"] = str(env_python)
+    else:
+        install_env.pop("UV_PYTHON", None)
+    return install_env
+
+
+def _sync_project_dependencies_from_lockfile(
+    uv_bin: str,
+    *,
+    env: dict[str, str] | None,
+    group: str,
+    scripts_dir: Path | None,
+) -> dict[str, str] | None:
+    """Try the hash-verified lockfile tier used by source installers.
+
+    ``--inexact`` preserves lazy-installed backends, provider SDKs, and
+    user-added packages. ``--locked`` refuses to rewrite a stale lockfile;
+    failure returns control to the existing editable-install cascade.
+    """
+    if not (PROJECT_ROOT / "uv.lock").is_file():
+        return None
+
+    sync_env = _project_uv_install_env(env)
+    cmd = [uv_bin, "sync", "--locked", "--inexact", "--extra", group]
+    print("  → Syncing dependencies from uv.lock (hash-verified)...")
+    try:
+        _run_quarantined_install(cmd, env=sync_env, scripts_dir=scripts_dir)
+    except (subprocess.CalledProcessError, OSError):
+        print(
+            "  ⚠ Lockfile sync failed or unavailable — falling back to "
+            "editable install..."
+        )
+        return None
+    return sync_env
+
+
 def _install_python_dependencies_with_optional_fallback(
     install_cmd_prefix: list[str],
     *,
@@ -9439,24 +9489,43 @@ def _install_python_dependencies_with_optional_fallback(
 ) -> None:
     """Install base deps plus as many optional extras as the environment supports.
 
-    By default this targets ``.[all]``; Termux callers can pass
-    ``group='termux-all'`` to use the curated Android-compatible profile.
+    Uv callers first try ``uv sync --locked --inexact`` from ``uv.lock``.
+    Missing or stale lockfiles, sync failures, and plain pip callers use the
+    editable-install cascade. Termux deliberately stays on its curated pip
+    path because its Android-compatible psutil prebuild can conflict with an
+    exact locked sync.
 
     On Windows, pre-renames live ``hermes.exe`` / ``hermes-gateway.exe`` shims
     in the venv Scripts dir before each install attempt so uv can write fresh
     copies (Windows blocks REPLACE on a running .exe but allows RENAME). See
     ``_quarantine_running_hermes_exe`` for the rationale.
     """
+    uv_caller = len(install_cmd_prefix) == 2 and install_cmd_prefix[1] == "pip"
+    install_env = _project_uv_install_env(env) if uv_caller else env
     scripts_dir = _venv_scripts_dir() if _is_windows() else None
 
     def _install(args: list[str]) -> None:
         _run_quarantined_install(
-            install_cmd_prefix + args, env=env, scripts_dir=scripts_dir
+            install_cmd_prefix + args, env=install_env, scripts_dir=scripts_dir
         )
+
+    if uv_caller and not _is_termux_env(install_env):
+        sync_env = _sync_project_dependencies_from_lockfile(
+            install_cmd_prefix[0],
+            env=install_env,
+            group=group,
+            scripts_dir=scripts_dir,
+        )
+        if sync_env is not None:
+            _verify_core_dependencies_installed(
+                install_cmd_prefix, env=sync_env, group=group
+            )
+            _verify_console_scripts_installed(install_cmd_prefix, env=sync_env)
+            return
 
     try:
         _install(["install", "-e", f".[{group}]"])
-        _verify_console_scripts_installed(install_cmd_prefix, env=env)
+        _verify_console_scripts_installed(install_cmd_prefix, env=install_env)
         return
     except subprocess.CalledProcessError:
         print(
@@ -9493,8 +9562,10 @@ def _install_python_dependencies_with_optional_fallback(
     # stage. Reinstall with --reinstall to force resolution if anything is
     # missing, then re-verify so the failure surfaces here instead of
     # downstream.
-    _verify_core_dependencies_installed(install_cmd_prefix, env=env, group=group)
-    _verify_console_scripts_installed(install_cmd_prefix, env=env)
+    _verify_core_dependencies_installed(
+        install_cmd_prefix, env=install_env, group=group
+    )
+    _verify_console_scripts_installed(install_cmd_prefix, env=install_env)
 
 
 def _load_console_script_names() -> list[str]:
@@ -11412,11 +11483,23 @@ def cmd_dashboard(args):
         import uvicorn  # noqa: F401
     except ImportError as e:
         print("Web UI dependencies not installed (need fastapi + uvicorn).")
+        in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+        if in_venv:
+            repair_lines = (
+                f"  UV_PROJECT_ENVIRONMENT={sys.prefix} "
+                "uv sync --locked --inexact --extra web\n"
+                f"  (fallback: {sys.executable} -m pip install -e '.[web]')"
+            )
+        else:
+            repair_lines = (
+                f"  {sys.executable} -m pip install -e '.[web]'\n"
+                "If `pip` is missing in this venv, use:  "
+                "uv pip install -e '.[web]'"
+            )
         print(
-            f"Re-install the package into this interpreter so metadata updates apply:\n"
+            "Install the web extra into this interpreter's environment:\n"
             f"  cd {PROJECT_ROOT}\n"
-            f"  {sys.executable} -m pip install -e .\n"
-            "If `pip` is missing in this venv, use:  uv pip install -e ."
+            + repair_lines
         )
         print(f"Import error: {e}")
         sys.exit(1)
