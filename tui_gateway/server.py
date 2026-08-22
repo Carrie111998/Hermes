@@ -7013,11 +7013,19 @@ def _agent_session_db(sid: str, session_db=None):
     if home:
         from hermes_state import SessionDB
 
-        return SessionDB(db_path=Path(home) / "state.db")
+        wanted = Path(home) / "state.db"
+        if session_db is not None and Path(session_db.db_path).resolve() == wanted.resolve():
+            return session_db
+        return SessionDB(db_path=wanted)
     from hermes_state import session_db_for_named_profile
 
     base = session_db if session_db is not None else _get_db()
-    return session_db_for_named_profile(base, name) or base
+    bound = session_db_for_named_profile(base, name)
+    if bound is not None:
+        return bound
+    if not name or name in {"default", "custom"}:
+        return base
+    return bound
 
 
 def _make_agent(

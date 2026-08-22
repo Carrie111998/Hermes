@@ -238,3 +238,87 @@ def test_agent_session_db_does_not_fallback_to_launch_on_open_failure(homes, mon
         with server._sessions_lock:
             server._sessions.pop(sid, None)
         launch.close()
+
+
+def test_agent_session_db_name_only_does_not_fallback_to_launch_on_open_failure(
+    homes, monkeypatch
+):
+    """Named-profile bind with only profile_name must raise, not reuse launch."""
+    root, _profile = homes
+    from tui_gateway import server
+
+    launch = SessionDB(db_path=root / "state.db")
+    sid = "sid-worker"
+    monkeypatch.setattr(server, "_get_db", lambda: launch)
+
+    class Boom(Exception):
+        pass
+
+    def boom_db(**_kwargs):
+        raise Boom("profile store unavailable")
+
+    monkeypatch.setattr("hermes_state.SessionDB", boom_db)
+    with server._sessions_lock:
+        server._sessions[sid] = {"profile_name": "worker"}
+    try:
+        with pytest.raises(Boom):
+            server._agent_session_db(sid, launch)
+        assert _ids(root / "state.db") == set()
+    finally:
+        with server._sessions_lock:
+            server._sessions.pop(sid, None)
+        launch.close()
+
+
+def test_agent_session_db_name_only_does_not_fallback_on_profile_dir_failure(
+    homes, monkeypatch
+):
+    """get_profile_dir / resolve failure must not bind the agent to launch."""
+    root, _profile = homes
+    from tui_gateway import server
+
+    launch = SessionDB(db_path=root / "state.db")
+    sid = "sid-worker"
+    monkeypatch.setattr(server, "_get_db", lambda: launch)
+
+    class Boom(Exception):
+        pass
+
+    def boom_dir(_name):
+        raise Boom("profile dir unavailable")
+
+    monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", boom_dir)
+    with server._sessions_lock:
+        server._sessions[sid] = {"profile_name": "worker"}
+    try:
+        with pytest.raises(Boom):
+            server._agent_session_db(sid, launch)
+        assert _ids(root / "state.db") == set()
+    finally:
+        with server._sessions_lock:
+            server._sessions.pop(sid, None)
+        launch.close()
+
+
+def test_agent_session_db_reuses_existing_handle_for_profile_home(homes, monkeypatch):
+    """Deferred builds must keep the dedicated handle they already opened."""
+    root, profile = homes
+    from tui_gateway import server
+
+    launch = SessionDB(db_path=root / "state.db")
+    existing = SessionDB(db_path=profile / "state.db")
+    sid = "sid-worker"
+    monkeypatch.setattr(server, "_get_db", lambda: launch)
+    with server._sessions_lock:
+        server._sessions[sid] = {"profile_home": str(profile)}
+    db = None
+    try:
+        db = server._agent_session_db(sid, existing)
+        assert db is existing
+    finally:
+        with server._sessions_lock:
+            server._sessions.pop(sid, None)
+        if db is not None and db is not existing:
+            db.close()
+        existing.close()
+        launch.close()

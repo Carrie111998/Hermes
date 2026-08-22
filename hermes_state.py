@@ -407,16 +407,13 @@ def session_db_for_named_profile(current: "SessionDB | None", profile_name: str 
     name = (profile_name or "").strip()
     if current is None or not name or name in {"default", "custom"}:
         return current
-    try:
-        from hermes_cli.profiles import get_profile_dir
+    from hermes_cli.profiles import get_profile_dir
 
-        wanted = (get_profile_dir(name) / "state.db").resolve()
-        current_path = Path(current.db_path).resolve()
-        if current_path == wanted:
-            return current
-        return SessionDB(db_path=wanted)
-    except Exception:
+    wanted = (get_profile_dir(name) / "state.db").resolve()
+    current_path = Path(current.db_path).resolve()
+    if current_path == wanted:
         return current
+    return SessionDB(db_path=wanted)
 
 
 # ---------------------------------------------------------------------------
