@@ -150,6 +150,26 @@ class TestOpenRouterProfile:
         assert tl == {"verbosity": "high"}
 
 
+class TestMindsHubProfile:
+    def test_discovery(self):
+        p = get_provider_profile("mindshub")
+        assert p is not None
+        assert p.name == "mindshub"
+
+    def test_base_url(self):
+        p = get_provider_profile("mindshub")
+        assert p.base_url == "https://api.mindshub.ai/v1"
+
+    def test_no_special_temperature(self):
+        p = get_provider_profile("mindshub")
+        assert p.fixed_temperature is None
+
+    def test_reasoning_effort_passthrough(self):
+        p = get_provider_profile("mindshub")
+        _, tl = p.build_api_kwargs_extras(reasoning_config={"enabled": True, "effort": "high"})
+        assert tl == {"reasoning_effort": "high"}
+
+
 class TestNousProfile:
     def test_tags(self):
         from agent.portal_tags import nous_portal_tags
