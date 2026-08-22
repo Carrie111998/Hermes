@@ -7434,12 +7434,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     "error": kwargs.get("is_error", False),
                 })
             elif event_type == "reasoning.available":
-                _push({
+                event = {
                     "event": "reasoning.available",
                     "run_id": run_id,
                     "timestamp": ts,
                     "text": preview or "",
-                })
+                }
+                titles = kwargs.get("titles")
+                if isinstance(titles, list) and titles:
+                    event["titles"] = titles
+                _push(event)
             elif event_type in {"subagent.start", "subagent.complete"}:
                 event = {
                     "event": event_type,

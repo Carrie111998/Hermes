@@ -31,7 +31,28 @@ stream in line with the path that keeps the structure.
 
 from __future__ import annotations
 
-__all__ = ["separate_glued_reasoning_blocks"]
+__all__ = ["reasoning_summary_titles", "separate_glued_reasoning_blocks"]
+
+
+def reasoning_summary_titles(text: object) -> list[str]:
+    """Extract display titles from a provider-supplied reasoning summary.
+
+    Codex summary parts conventionally start with a complete bold heading. If
+    a provider returns plain summary text instead, its first non-empty line is
+    already the provider's display summary and is used as the sole title.
+    """
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    headings = [line[2:-2].strip() for line in lines if line.startswith("**") and line.endswith("**")]
+    candidates = headings or lines[:1]
+    titles: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        title = " ".join(candidate.split())
+        key = title.casefold()
+        if title and key not in seen:
+            seen.add(key)
+            titles.append(title)
+    return titles
 
 
 def separate_glued_reasoning_blocks(previous: str, delta: str) -> str:

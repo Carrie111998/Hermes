@@ -88,6 +88,7 @@ from agent.retry_utils import (
     zai_coding_overload_retry_ceiling,
 )
 from agent.repetition_guard import is_repetition_dominated
+from agent.reasoning_summaries import reasoning_summary_titles
 from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
@@ -6718,23 +6719,36 @@ def run_conversation(
 
             # Notify progress callback of model's thinking (used by subagent
             # delegation to relay the child's reasoning to the parent display).
-            if (assistant_message.content and agent.tool_progress_callback):
-                _think_text = assistant_message.content.strip()
+            if agent.tool_progress_callback:
+                _think_text = (assistant_message.content or "").strip()
                 # Strip reasoning XML tags that shouldn't leak to parent display
                 _think_text = re.sub(
                     r'</?(?:REASONING_SCRATCHPAD|think|reasoning)>', '', _think_text
                 ).strip()
+                _summary_text = ""
+                _summary_titles = []
+                if agent.api_mode == "codex_responses":
+                    _summary_text = (getattr(assistant_message, "reasoning", None) or "").strip()
+                    _summary_titles = reasoning_summary_titles(_summary_text)
                 # For subagents: relay first line to parent display (existing behaviour).
                 # For all agents with a structured callback: emit reasoning.available event.
                 first_line = _think_text.split('\n')[0][:80] if _think_text else ""
-                if first_line and getattr(agent, '_delegate_depth', 0) > 0:
+                if getattr(agent, '_delegate_depth', 0) > 0:
+                    if first_line:
+                        try:
+                            agent.tool_progress_callback("_thinking", first_line)
+                        except Exception:
+                            pass
+                elif _think_text or _summary_titles:
                     try:
-                        agent.tool_progress_callback("_thinking", first_line)
-                    except Exception:
-                        pass
-                elif _think_text:
-                    try:
-                        agent.tool_progress_callback("reasoning.available", "_thinking", _think_text[:500], None)
+                        kwargs = {"titles": _summary_titles} if _summary_titles else {}
+                        agent.tool_progress_callback(
+                            "reasoning.available",
+                            "_thinking",
+                            (_summary_text or _think_text)[:500],
+                            None,
+                            **kwargs,
+                        )
                     except Exception:
                         pass
             

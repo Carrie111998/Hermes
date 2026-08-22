@@ -1,6 +1,19 @@
 """Reasoning summary-part boundary repair (agent/reasoning_summaries.py)."""
 
-from agent.reasoning_summaries import separate_glued_reasoning_blocks
+from agent.reasoning_summaries import reasoning_summary_titles, separate_glued_reasoning_blocks
+
+
+def test_reasoning_summary_titles_prefers_ordered_unique_headings():
+    assert reasoning_summary_titles(
+        "**Inspecting files**\nDetails\n\n**Running tests**\nMore details\n\n**inspecting files**"
+    ) == ["Inspecting files", "Running tests"]
+
+
+def test_reasoning_summary_titles_uses_plain_provider_summary():
+    assert reasoning_summary_titles("  Planning the implementation  \nSupporting detail") == [
+        "Planning the implementation"
+    ]
+    assert reasoning_summary_titles(None) == []
 
 
 def _stream(deltas):
