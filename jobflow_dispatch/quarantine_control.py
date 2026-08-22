@@ -118,11 +118,13 @@ class _KernelLock:
         timeout: float,
         poll_interval: float,
         exclusive: bool,
+        offsets: tuple[int, ...] | None = None,
     ):
         self.path = Path(path)
         self.timeout = float(timeout)
         self.poll_interval = float(poll_interval)
         self.exclusive = bool(exclusive)
+        self.offsets = offsets
         self.handle = None
         self.held = False
         self.offset: int | None = None
@@ -185,12 +187,13 @@ class _KernelLock:
             raise RuntimeError("cross-process dispatch locking unavailable")
         if self.exclusive:
             acquired: list[int] = []
+            offsets = self.offsets or tuple(range(_LOCK_FILE_SIZE))
             while True:
                 try:
-                    for offset in range(_LOCK_FILE_SIZE):
+                    for offset in offsets:
                         self._try_lock(handle, offset)
                         acquired.append(offset)
-                    self.offset = 0
+                    self.offset = offsets[0]
                     self.handle = handle
                     self.held = True
                     return self
@@ -229,7 +232,8 @@ class _KernelLock:
                 if fcntl is not None:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
                 elif self.exclusive:
-                    for offset in reversed(range(_LOCK_FILE_SIZE)):
+                    offsets = self.offsets or tuple(range(_LOCK_FILE_SIZE))
+                    for offset in reversed(offsets):
                         self._unlock(handle, offset)
                 elif self.offset is not None:
                     self._unlock(handle, self.offset)
@@ -313,11 +317,13 @@ class QuarantineControlStore:
             self._initialize_database_file()
         self._wait_for_control_pair()
 
-        self._upgrade_legacy_lock_file()
-        initialization_lock = self._kernel_lock(exclusive=False).acquire()
+        initialization_lock = self._kernel_lock(
+            exclusive=True, offsets=(0,)
+        ).acquire()
         try:
             if initialization_lock.handle is None:
                 raise RuntimeError("dispatch initialization lock is not held")
+            self._upgrade_legacy_lock_file()
             self._initialize_or_verify_store(initialization_lock.handle)
         finally:
             initialization_lock.release()
@@ -334,10 +340,12 @@ class QuarantineControlStore:
     def _upgrade_legacy_lock_file(self) -> None:
         size = self.lock_path.stat().st_size
         if size == _LOCK_FILE_SIZE:
-            with open(self.lock_path, "ab") as handle:
-                handle.write(_EMPTY_LOCK_IDENTITY_MARKER)
-                handle.flush()
-                os.fsync(handle.fileno())
+            with open(self.lock_path, "r+b") as handle:
+                handle.seek(_LOCK_FILE_SIZE)
+                if not handle.read(1):
+                    handle.write(_EMPTY_LOCK_IDENTITY_MARKER)
+                    handle.flush()
+                    os.fsync(handle.fileno())
             size = self.lock_path.stat().st_size
         if size < _CONTROL_LOCK_FILE_SIZE:
             raise RuntimeError("dispatch lock file is truncated or corrupt")
@@ -464,12 +472,10 @@ class QuarantineControlStore:
                 os.fsync(handle.fileno())
         except FileExistsError:
             pass
+        deadline = time.monotonic() + min(self.timeout, 0.25)
         size = self.lock_path.stat().st_size
-        if size == _LOCK_FILE_SIZE:
-            with open(self.lock_path, "ab") as handle:
-                handle.write(_EMPTY_LOCK_IDENTITY_MARKER)
-                handle.flush()
-                os.fsync(handle.fileno())
+        while size < _CONTROL_LOCK_FILE_SIZE and time.monotonic() < deadline:
+            time.sleep(self.poll_interval)
             size = self.lock_path.stat().st_size
         if size < _CONTROL_LOCK_FILE_SIZE:
             raise RuntimeError("dispatch lock file is truncated or corrupt")
@@ -519,13 +525,18 @@ class QuarantineControlStore:
         return self._connect_unchecked()
 
     def _kernel_lock(
-        self, timeout: float | None = None, *, exclusive: bool
+        self,
+        timeout: float | None = None,
+        *,
+        exclusive: bool,
+        offsets: tuple[int, ...] | None = None,
     ) -> _KernelLock:
         return _KernelLock(
             self.lock_path,
             timeout=self.timeout if timeout is None else float(timeout),
             poll_interval=self.poll_interval,
             exclusive=exclusive,
+            offsets=offsets,
         )
 
     @contextlib.contextmanager

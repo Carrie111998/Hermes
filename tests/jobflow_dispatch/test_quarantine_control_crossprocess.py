@@ -189,6 +189,48 @@ def test_simultaneous_first_open_converges_on_one_durable_identity(tmp_path):
 
 
 @pytest.mark.timeout(60)
+def test_initialization_lock_does_not_wait_for_active_dispatch_admission(tmp_path):
+    repo = Path(__file__).resolve().parents[2]
+    db = tmp_path / "dispatch.db"
+    ready = tmp_path / "ready"
+    release = tmp_path / "release"
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import sys,time; "
+            "from jobflow_dispatch.quarantine_control import QuarantineControlStore; "
+            "s=QuarantineControlStore(Path(sys.argv[1]), poll_interval=.005); "
+            "cm=s.dispatch_section(boundary='child'); cm.__enter__(); "
+            "Path(sys.argv[2]).write_text('ready'); "
+            "\nwhile not Path(sys.argv[3]).exists(): time.sleep(.005)\n"
+            "cm.__exit__(None,None,None)",
+            str(db),
+            str(ready),
+            str(release),
+        ],
+        cwd=repo,
+        env=_env(repo),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + 20
+    while not ready.exists() and child.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ready.exists(), child.communicate(timeout=2)
+
+    from jobflow_dispatch.quarantine_control import QuarantineControlStore
+
+    store = QuarantineControlStore(db, timeout=0.2, poll_interval=0.005)
+    assert store.fence_state()["fenced"] is False
+
+    release.write_text("release", encoding="utf-8")
+    stdout, stderr = child.communicate(timeout=20)
+    assert child.returncode == 0, f"stdout={stdout}\nstderr={stderr}"
+
+
+@pytest.mark.timeout(60)
 def test_fresh_process_refuses_replaced_database(tmp_path):
     import shutil
 
