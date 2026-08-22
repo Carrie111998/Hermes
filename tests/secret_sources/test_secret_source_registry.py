@@ -213,6 +213,59 @@ class TestApplyAll:
         assert sources[0].name == "dummy"
         assert not any("secrets.sources names unknown source(s)" in r.message for r in caplog.records)
 
+    def test_suppressed_warning_is_parked_not_dropped(self, caplog):
+        """warn_unknown=False defers the diagnosis; it must not delete it."""
+        import logging
+        reg.register_source(_make_source(name="dummy"))
+        cfg = {"sources": ["passward", "dummy"], "dummy": {"enabled": True}}
+
+        reg._ordered_enabled_sources(cfg, warn_unknown=False)
+
+        with caplog.at_level(logging.WARNING, logger="agent.secret_sources.registry"):
+            reported = reg.warn_unresolved_source_names()
+
+        assert reported == ["passward"], (
+            "a misspelled secrets.sources entry produced no diagnostic at any "
+            "point — the user's source silently does nothing"
+        )
+        assert any(
+            "unknown source(s): passward" in r.message for r in caplog.records
+        )
+
+    def test_a_late_registering_plugin_source_is_never_warned_about(self, caplog):
+        """#89078 itself: the name is unknown at bootstrap, known by discovery."""
+        import logging
+        cfg = {"sources": ["passbolt"], "passbolt": {"enabled": True}}
+        reg._ordered_enabled_sources(cfg, warn_unknown=False)
+
+        # ...the plugin loads and registers its source.
+        reg.register_source(_make_source(name="passbolt"))
+
+        with caplog.at_level(logging.WARNING, logger="agent.secret_sources.registry"):
+            reported = reg.warn_unresolved_source_names()
+
+        assert reported == []
+        assert not any(
+            "unknown source(s)" in r.message for r in caplog.records
+        ), "warned about a source the plugin did register"
+
+    def test_the_deferred_report_fires_once(self, caplog):
+        import logging
+        reg._ordered_enabled_sources({"sources": ["nope"]}, warn_unknown=False)
+        assert reg.warn_unresolved_source_names() == ["nope"]
+
+        caplog.clear()  # the first report is expected; only the second matters
+        with caplog.at_level(logging.WARNING, logger="agent.secret_sources.registry"):
+            assert reg.warn_unresolved_source_names() == []
+        assert not any("unknown source(s)" in r.message for r in caplog.records)
+
+    def test_repeated_bootstrap_passes_collapse_to_one_report(self):
+        """Both apply_all call sites run early; the user sees one line."""
+        cfg = {"sources": ["nope", "alsonope"]}
+        for _ in range(3):
+            reg._ordered_enabled_sources(cfg, warn_unknown=False)
+        assert reg.warn_unresolved_source_names() == ["alsonope", "nope"]
+
     def test_apply_all_forwards_warn_unknown_flag(self, tmp_path, caplog):
         import logging
         reg.register_source(_make_source(name="dummy", secrets={"K": "v"}))

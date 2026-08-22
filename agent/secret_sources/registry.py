@@ -163,6 +163,11 @@ def register_source(
         target[name] = source
         if scope is None:
             _SOURCE_ORIGINS[name] = "builtin" if builtin else "plugin"
+    # A name parked as "unknown" during bootstrap is resolved the moment its
+    # plugin registers — the #89078 case. Drop it so the post-discovery
+    # report only names sources that never arrived.
+    with _pending_unknown_lock:
+        _pending_unknown_sources.discard(name)
     return True
 
 
@@ -280,7 +285,10 @@ def _reset_registry_for_tests() -> None:
         _SOURCE_ORIGINS.clear()
         _SCOPED_SOURCES.clear()
         _BUILTINS_LOADED = False
-
+    # Parked unknown-source names are process-global; leaving them behind
+    # leaks one test's misconfiguration into the next one's report.
+    with _pending_unknown_lock:
+        _pending_unknown_sources.clear()
 
 # ---------------------------------------------------------------------------
 # Orchestrated apply
@@ -340,6 +348,40 @@ def _fetch_with_timeout(
         res.error_kind = ErrorKind.INTERNAL
         return res
     return result
+
+
+# Names from ``secrets.sources`` that were unknown during early bootstrap.
+# Not yet a diagnosis: a plugin-provided source registers later in the same
+# process. Discharged by register_source(), reported by
+# warn_unresolved_source_names() once plugin discovery has run.
+_pending_unknown_sources: set = set()
+_pending_unknown_lock = threading.Lock()
+
+
+def warn_unresolved_source_names(*, scope: Optional[str] = None) -> List[str]:
+    """Warn about ``secrets.sources`` names still unknown after discovery.
+
+    The bootstrap pass parks unknown names instead of warning, because
+    plugins have not registered yet at that point (#89078). Call this once
+    plugin discovery is complete: anything still missing from ``_SOURCES``
+    is a real misconfiguration — a typo, or a plugin that is disabled or
+    failed to load — which is exactly the case #89078 asked to keep warning
+    about. Returns the names reported, and clears the pending set so a
+    second call is silent.
+    """
+    with _pending_unknown_lock:
+        pending = sorted(_pending_unknown_sources)
+        _pending_unknown_sources.clear()
+    # Same effective set the resolver uses, so a scope-registered plugin
+    # source is not reported as missing just because it is not global.
+    known = {source.name for source in list_sources(scope=scope)}
+    still_unknown = [n for n in pending if n not in known]
+    if still_unknown:
+        logger.warning(
+            "secrets.sources names unknown source(s): %s (known: %s)",
+            ", ".join(still_unknown), ", ".join(sorted(known)) or "none",
+        )
+    return still_unknown
 
 
 def _ordered_enabled_sources(
