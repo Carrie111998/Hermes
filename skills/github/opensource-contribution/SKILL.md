@@ -102,15 +102,17 @@ one) from both picking the same CLEAR issue at the same moment — a real
 gap, found by comparing against OpenClaw's own `gh-issues` skill
 (`internal-docs/harness/openclaw/skill-survey.md`, private repo).
 
-Before proceeding to `github-issue-to-pr`, check for and write a claim
-file at `$HERMES_HOME/contrib-screen/claims/<owner>-<repo>-<issue>.json`
-(`{"claimed_at": "<ISO 8601 UTC timestamp>"}`). If a claim already exists
-and is less than 2 hours old, stop — another run is already on this
-issue, treat it the same as an ASSIGNED verdict. If it's missing or
-older than 2 hours (stale, the other run likely failed or was killed),
-write a fresh claim and proceed. No explicit cleanup on success needed —
-staleness alone keeps this correct, same as the precedent this pattern
-is taken from.
+Call `contrib_screen_claim(target=...)` before proceeding to
+`github-issue-to-pr`. This is a real tool (atomic file creation, not a
+check-then-write race), not prose to follow by hand — the same
+discipline `contrib_screen` itself applies to duplicate/assignee/CLA
+checks, extended here so the claim step can't be gotten subtly wrong the
+way manual file I/O could. If the result's `claimed` field is `false`,
+another run already has this issue (default staleness window: 2 hours,
+override with `ttl_hours` if a specific run's normal duration is known to
+be longer) — stop, treat it the same as an ASSIGNED verdict. If `true`,
+proceed. No explicit cleanup needed on success — staleness alone keeps
+this correct.
 
 ### 5. Ground the drafted text in this org's real voice
 
