@@ -70,7 +70,7 @@
       "author": "AnubisQuantumCipher",
       "tags": ["mathematics", "verification", "formal-methods", "lean", "interval-arithmetic", "evidence", "tools"],
       "repo": "AnubisQuantumCipher/hermes-jackal-verified",
-      "ref": "3941d1964d2a0b393157850d9e3658a074c9870f",
+      "ref": "a72e4b53075a10dc077e47613d0e4d5dae35de0e",
       "homepage": "https://github.com/AnubisQuantumCipher/hermes-jackal-verified",
       "capabilities": ["tools", "skills"],
       "api_version": 1,
