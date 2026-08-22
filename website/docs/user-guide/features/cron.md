@@ -689,6 +689,17 @@ cronjob(
 
 The first run has no previous output, so the prompt runs as-is. On later runs the previous output is prepended with continuity framing ("avoid repeating what was already reported"). It combines freely with upstream jobs (`context_from=["<other_job_id>"]` plus `continuity=true`), and `continuity=false` on update turns it off while preserving other `context_from` entries. Internally the flag is stored as the reserved `self` entry in `context_from`.
 
+Continuity injects at most 8,000 characters by default. If the saved output is
+longer, Hermes keeps the newest characters so the next run still sees the most
+recent report. Adjust the positive character limit globally in `config.yaml`:
+
+```yaml
+cron:
+  continuity_max_chars: 16000
+```
+
+Or run `hermes config set cron.continuity_max_chars 16000`.
+
 From the CLI: `hermes cron create "every 6h" "Scan for news" --continuity`, and `hermes cron edit <job_id> --continuity` / `--no-continuity` to toggle it on an existing job. The same toggle appears in the dashboard's cron editor and the desktop Bot Mode routine dialog.
 
 **When to use it:**
