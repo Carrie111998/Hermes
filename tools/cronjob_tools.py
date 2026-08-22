@@ -631,9 +631,16 @@ def _execute_job_now(
     Returns {"claimed": bool, "success": bool, "error": str|None}.
     """
     job_id = job["id"]
+    admission = None
+    handed_off = False
     try:
         from cron.scheduler import run_one_job
+        from jobflow_dispatch.quarantine_control import default_control_store
 
+        admission = default_control_store().dispatch_section(
+            boundary="manual-immediate-fire"
+        )
+        admission.__enter__()
         previous_next_run_at = job.get("next_run_at")
 
         # At-most-once claim: bail without running if a tick/other fire owns it.
@@ -665,8 +672,10 @@ def _execute_job_now(
         )
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
-        # also clears the fire claim) and returns True iff it processed the job.
-        processed = run_one_job(job)
+        # also clears the fire claim) and releases this retained admission only
+        # after its durable execution row is running.
+        handed_off = True
+        processed = run_one_job(job, _dispatch_admission=admission)
         refreshed = get_job(job_id) or {}
         ok = refreshed.get("last_status") == "ok"
         return {
@@ -682,6 +691,9 @@ def _execute_job_now(
         except Exception:
             pass
         return {"claimed": True, "success": False, "error": str(e)}
+    finally:
+        if admission is not None and not handed_off:
+            admission.__exit__(None, None, None)
 
 
 def cronjob(

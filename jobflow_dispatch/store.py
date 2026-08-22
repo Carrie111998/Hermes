@@ -25,6 +25,7 @@ from pathlib import Path
 import sqlite3
 import threading
 from typing import Any
+import uuid
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS activations (
@@ -39,6 +40,21 @@ CREATE TABLE IF NOT EXISTS activations (
 );
 CREATE INDEX IF NOT EXISTS activations_pending
     ON activations (activity_id, state);
+CREATE TABLE IF NOT EXISTS activation_wake_outbox (
+    message_key    TEXT NOT NULL,
+    activity_id    TEXT NOT NULL,
+    outbox_token   TEXT NOT NULL UNIQUE,
+    job_id         TEXT NOT NULL,
+    caller         TEXT NOT NULL,
+    reason         TEXT,
+    requested_at   REAL NOT NULL,
+    PRIMARY KEY (message_key, activity_id),
+    FOREIGN KEY (message_key, activity_id)
+        REFERENCES activations (message_key, activity_id)
+        ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS activation_wake_outbox_pending
+    ON activation_wake_outbox (requested_at, message_key, activity_id);
 """
 
 #: Longest a single cron run can legitimately take (``_DEFAULT_SCRIPT_TIMEOUT``
@@ -94,6 +110,17 @@ class ActivationRow:
     claimed_at: float | None
     completed_at: float | None
     outcome: str | None
+
+
+@dataclass(frozen=True)
+class WakeOutboxRow:
+    message_key: str
+    activity_id: str
+    outbox_token: str
+    job_id: str
+    caller: str
+    reason: str | None
+    requested_at: float
 
 
 def _identity(value: Any, name: str) -> str:
@@ -160,6 +187,7 @@ class ActivationStore:
             conn = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA busy_timeout=5000")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA journal_size_limit=33554432")
@@ -220,6 +248,113 @@ class ActivationStore:
                 conn.rollback()
                 raise
 
+    def claim_for_wake(
+        self,
+        message_key: Any,
+        activity_id: Any,
+        *,
+        job_id: Any,
+        caller: Any,
+        reason: Any = None,
+        now: Any,
+        correlation_id: str | None = None,
+    ) -> WakeOutboxRow | None:
+        """Atomically claim work and record the wake that must be delivered."""
+        key = _identity(message_key, "message_key")
+        activity = _identity(activity_id, "activity_id")
+        job = _identity(job_id, "job_id")
+        owner = _identity(caller, "caller")
+        detail = None if reason is None else str(reason)
+        stamp = _timestamp(now)
+        token = uuid.uuid4().hex
+
+        conn = self._get_conn()
+        with self._write_lock:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT state, claimed_at FROM activations "
+                    "WHERE message_key = ? AND activity_id = ?",
+                    (key, activity),
+                ).fetchone()
+                if row is not None:
+                    if row["state"] == "completed":
+                        conn.commit()
+                        return None
+                    held_for = stamp - (row["claimed_at"] or 0.0)
+                    if held_for <= self.lease_seconds:
+                        conn.commit()
+                        return None
+
+                conn.execute(
+                    """
+                    INSERT INTO activations
+                        (message_key, activity_id, correlation_id, state,
+                         claimed_at, completed_at, outcome)
+                    VALUES (?, ?, ?, 'claimed', ?, NULL, NULL)
+                    ON CONFLICT(message_key, activity_id) DO UPDATE SET
+                        state = 'claimed',
+                        claimed_at = excluded.claimed_at,
+                        correlation_id = COALESCE(
+                            excluded.correlation_id, activations.correlation_id
+                        )
+                    """,
+                    (key, activity, correlation_id, stamp),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO activation_wake_outbox
+                        (message_key, activity_id, outbox_token, job_id,
+                         caller, reason, requested_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(message_key, activity_id) DO UPDATE SET
+                        outbox_token = excluded.outbox_token,
+                        job_id = excluded.job_id,
+                        caller = excluded.caller,
+                        reason = excluded.reason,
+                        requested_at = excluded.requested_at
+                    """,
+                    (key, activity, token, job, owner, detail, stamp),
+                )
+                conn.commit()
+                return WakeOutboxRow(
+                    message_key=key,
+                    activity_id=activity,
+                    outbox_token=token,
+                    job_id=job,
+                    caller=owner,
+                    reason=detail,
+                    requested_at=stamp,
+                )
+            except Exception:
+                conn.rollback()
+                raise
+
+    def pending_wake_outbox(self) -> list[WakeOutboxRow]:
+        rows = self._get_conn().execute(
+            "SELECT * FROM activation_wake_outbox "
+            "ORDER BY requested_at, message_key, activity_id"
+        ).fetchall()
+        return [_wake_outbox_row(row) for row in rows]
+
+    def ack_wake_outbox(self, outbox: WakeOutboxRow) -> bool:
+        if not isinstance(outbox, WakeOutboxRow):
+            raise ValueError("exact WakeOutboxRow capability is required")
+        conn = self._get_conn()
+        with self._write_lock:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.execute(
+                    "DELETE FROM activation_wake_outbox "
+                    "WHERE message_key = ? AND activity_id = ? AND outbox_token = ?",
+                    (outbox.message_key, outbox.activity_id, outbox.outbox_token),
+                )
+                conn.commit()
+                return cursor.rowcount == 1
+            except Exception:
+                conn.rollback()
+                raise
+
     def complete(
         self,
         message_key: Any,
@@ -246,6 +381,11 @@ class ActivationStore:
                 )
                 if cursor.rowcount == 0:
                     raise KeyError(f"activation missing: {key}/{activity}")
+                conn.execute(
+                    "DELETE FROM activation_wake_outbox "
+                    "WHERE message_key = ? AND activity_id = ?",
+                    (key, activity),
+                )
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -294,6 +434,14 @@ class ActivationStore:
         ).fetchone()
         return _row(row) if row is not None else None
 
+    def claim_census(self) -> list[ActivationRow]:
+        """Return every durable claim in deterministic order, without pagination."""
+        rows = self._get_conn().execute(
+            "SELECT * FROM activations WHERE state = 'claimed' "
+            "ORDER BY activity_id, message_key"
+        ).fetchall()
+        return [_row(row) for row in rows]
+
 
 def is_available(
     store: ActivationStore, message_key: str, activity_id: str, now: float
@@ -326,4 +474,16 @@ def _row(row: sqlite3.Row) -> ActivationRow:
         claimed_at=row["claimed_at"],
         completed_at=row["completed_at"],
         outcome=row["outcome"],
+    )
+
+
+def _wake_outbox_row(row: sqlite3.Row) -> WakeOutboxRow:
+    return WakeOutboxRow(
+        message_key=row["message_key"],
+        activity_id=row["activity_id"],
+        outbox_token=row["outbox_token"],
+        job_id=row["job_id"],
+        caller=row["caller"],
+        reason=row["reason"],
+        requested_at=float(row["requested_at"]),
     )

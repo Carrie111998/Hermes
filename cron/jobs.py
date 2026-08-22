@@ -9,6 +9,7 @@ import contextlib
 import copy
 from contextvars import ContextVar
 from dataclasses import dataclass
+import hashlib
 import json
 import logging
 import shutil
@@ -39,6 +40,7 @@ from typing import Optional, Dict, List, Any, Set, Tuple, Union
 logger = logging.getLogger(__name__)
 
 from hermes_time import now as _hermes_now
+from jobflow_dispatch.quarantine_control import default_control_store
 from utils import atomic_replace
 
 try:
@@ -1072,6 +1074,226 @@ def save_jobs(jobs: List[Dict[str, Any]]):
         _save_jobs_unlocked(jobs)
 
 
+def _canonical_job_rows_digest(rows: List[Dict[str, Any]]) -> str:
+    """Return the canonical SHA256 digest used by exact-row scheduler CAS."""
+    try:
+        raw = json.dumps(
+            rows,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("scheduler rows must be finite canonical JSON") from exc
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _validate_unique_job_names(names: Union[List[str], Tuple[str, ...]]) -> Tuple[str, ...]:
+    if not isinstance(names, (list, tuple)):
+        raise ValueError("job names must be a list or tuple")
+    normalized = tuple(names)
+    if any(not isinstance(name, str) or not name for name in normalized):
+        raise ValueError("job names must be non-empty strings")
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("job names must be unique")
+    return normalized
+
+
+def _exact_rows_by_name(
+    all_jobs: List[Dict[str, Any]], names: Union[List[str], Tuple[str, ...]]
+) -> List[Dict[str, Any]]:
+    """Select exact durable rows, requiring one and only one row per name."""
+    requested = _validate_unique_job_names(names)
+    selected: List[Dict[str, Any]] = []
+    for name in requested:
+        matches = [row for row in all_jobs if row.get("name") == name]
+        if len(matches) != 1:
+            raise ValueError(
+                f"scheduler job name {name!r} resolved to {len(matches)} rows; exactly one required"
+            )
+        selected.append(copy.deepcopy(matches[0]))
+    return sorted(selected, key=lambda row: row["name"])
+
+
+def snapshot_jobs_by_name(names: Tuple[str, ...]) -> List[Dict[str, Any]]:
+    """Return exact full durable rows, sorted by name, one per unique name."""
+    if not isinstance(names, tuple):
+        raise ValueError("snapshot job names must be a tuple")
+    return _exact_rows_by_name(load_jobs(), names)
+
+
+def _require_dispatch_barrier(barrier: Any) -> Dict[str, Any]:
+    """Require the exact retained production barrier capability, not a proof dict."""
+    from jobflow_dispatch.quarantine_control import DispatchBarrier
+
+    if not isinstance(barrier, DispatchBarrier):
+        raise RuntimeError("exact retained DispatchBarrier capability is required")
+    proof = barrier.assert_held()
+    if (
+        proof.get("schema_version") != 1
+        or proof.get("complete") is not True
+        or proof.get("barrier_token") != barrier.token
+        or proof.get("coverage") != "due_row_capture_through_submission"
+    ):
+        raise RuntimeError("dispatch barrier proof is incomplete or invalid")
+    return proof
+
+
+def pause_jobs_cas(
+    names: List[str],
+    expected_digest: str,
+    *,
+    reason: str,
+    dispatch_barrier: Any,
+) -> Dict[str, Any]:
+    """Atomically pause eligible exact rows under a retained dispatch barrier."""
+    barrier_proof = _require_dispatch_barrier(dispatch_barrier)
+    requested = _validate_unique_job_names(names)
+    if not isinstance(names, list):
+        raise ValueError("pause job names must be a list")
+    if not isinstance(expected_digest, str) or len(expected_digest) != 64:
+        raise ValueError("expected scheduler digest must be a SHA256 hex string")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("pause reason must be a non-empty string")
+
+    with _jobs_lock():
+        all_jobs = load_jobs()
+        before = _exact_rows_by_name(all_jobs, requested)
+        observed_digest = _canonical_job_rows_digest(before)
+        if observed_digest != expected_digest:
+            raise ValueError("scheduler prestate digest CAS mismatch")
+
+        paused_at = _hermes_now().isoformat()
+        changed_ids: List[str] = []
+        selected_names = set(requested)
+        for row in all_jobs:
+            if row.get("name") not in selected_names:
+                continue
+            if row.get("enabled") is True or row.get("state") == "scheduled":
+                row["enabled"] = False
+                row["state"] = "paused"
+                row["paused"] = True
+                row["paused_at"] = paused_at
+                row["paused_reason"] = reason
+                changed_ids.append(str(row["id"]))
+
+        after = _exact_rows_by_name(all_jobs, requested)
+        _save_jobs_unlocked(all_jobs)
+        durable = _exact_rows_by_name(load_jobs(), requested)
+        if durable != after:
+            raise RuntimeError("scheduler pause durable exact readback mismatch")
+
+        return {
+            "schema_version": 1,
+            "complete": True,
+            "source": "cron.jobs",
+            "control_transaction_id": uuid.uuid4().hex,
+            "dispatch_barrier": barrier_proof,
+            "pause_reason": reason,
+            "before_rows": before,
+            "after_rows": after,
+            "changed_job_ids": sorted(changed_ids),
+            "digest_proof": {
+                "algorithm": "sha256",
+                "expected_before": expected_digest,
+                "observed_before": observed_digest,
+                "after": _canonical_job_rows_digest(after),
+                "durable_readback": _canonical_job_rows_digest(durable),
+            },
+        }
+
+
+def restore_jobs_cas(
+    *,
+    expected_paused_rows: List[Dict[str, Any]],
+    target_rows: List[Dict[str, Any]],
+    dependency_order: List[str],
+    dispatch_barrier: Any,
+) -> Dict[str, Any]:
+    """Atomically restore exact rows under the retained dispatch barrier."""
+    barrier_proof = _require_dispatch_barrier(dispatch_barrier)
+    if not isinstance(expected_paused_rows, list) or not expected_paused_rows:
+        raise ValueError("expected paused rows must be a non-empty list")
+    if not isinstance(target_rows, list) or not target_rows:
+        raise ValueError("restore target rows must be a non-empty list")
+    if any(not isinstance(row, dict) for row in expected_paused_rows + target_rows):
+        raise ValueError("scheduler CAS rows must be objects")
+
+    expected = sorted(copy.deepcopy(expected_paused_rows), key=lambda row: row.get("name", ""))
+    expected_names = _validate_unique_job_names([row.get("name") for row in expected])
+    target = sorted(copy.deepcopy(target_rows), key=lambda row: row.get("name", ""))
+    target_names = _validate_unique_job_names([row.get("name") for row in target])
+    order = _validate_unique_job_names(dependency_order)
+    if not isinstance(dependency_order, list):
+        raise ValueError("dependency order must be a list")
+    if set(order) != set(target_names):
+        raise ValueError("dependency order must name every restore target exactly once")
+    if "jobflow-matcher" in order and order[-1] != "jobflow-matcher":
+        raise ValueError("jobflow-matcher must be restored last")
+
+    expected_by_name = {row["name"]: row for row in expected}
+    target_by_name = {row["name"]: row for row in target}
+    for name, row in target_by_name.items():
+        paused = expected_by_name.get(name)
+        if paused is None or str(paused.get("id")) != str(row.get("id")):
+            raise ValueError("restore target IDs/names do not match expected paused rows")
+        allowed = {"enabled", "state", "paused", "paused_at", "paused_reason"}
+        changed = {
+            key for key in set(paused) | set(row)
+            if paused.get(key) != row.get(key)
+        }
+        if changed - allowed:
+            raise ValueError("restore target differs outside containment fields")
+
+    with _jobs_lock():
+        all_jobs = load_jobs()
+        observed = _exact_rows_by_name(all_jobs, expected_names)
+        if observed != expected:
+            raise ValueError("scheduler current-row CAS mismatch")
+
+        index_by_name = {row.get("name"): index for index, row in enumerate(all_jobs)}
+        restored_ids: List[str] = []
+        for name in order:
+            replacement = copy.deepcopy(target_by_name[name])
+            all_jobs[index_by_name[name]] = replacement
+            restored_ids.append(str(replacement["id"]))
+
+        _save_jobs_unlocked(all_jobs)
+        durable_scope = _exact_rows_by_name(load_jobs(), expected_names)
+        expected_scope = sorted(
+            [
+                copy.deepcopy(target_by_name.get(row["name"], row))
+                for row in expected
+            ],
+            key=lambda row: row["name"],
+        )
+        if durable_scope != expected_scope:
+            raise RuntimeError("scheduler restore durable exact readback mismatch")
+        durable_targets = [
+            copy.deepcopy(row) for row in durable_scope if row["name"] in set(target_names)
+        ]
+
+        return {
+            "schema_version": 1,
+            "complete": True,
+            "source": "cron.jobs",
+            "control_transaction_id": uuid.uuid4().hex,
+            "dispatch_barrier": barrier_proof,
+            "restored_job_ids": restored_ids,
+            "before_rows": observed,
+            "after_rows": durable_targets,
+            "durable_rows": durable_scope,
+            "digest_proof": {
+                "algorithm": "sha256",
+                "expected_paused": _canonical_job_rows_digest(expected),
+                "observed_before": _canonical_job_rows_digest(observed),
+                "target": _canonical_job_rows_digest(target),
+                "durable_readback": _canonical_job_rows_digest(durable_scope),
+            },
+        }
+
+
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     """Normalize and validate a cron job workdir.
 
@@ -1733,6 +1955,16 @@ def trigger_job(
     caller: Optional[str] = None,
     reason: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    """Schedule a job only after entering the canonical dispatch boundary."""
+    with default_control_store().dispatch_section(boundary="trigger-job"):
+        return _trigger_job_admitted(job_id, caller=caller, reason=reason)
+
+
+def _trigger_job_admitted(
+    job_id: str,
+    caller: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """Schedule a job to run on the next scheduler tick.
 
     Sets ``next_run_at = NOW`` and emits a ``cron_triggered`` event capturing
@@ -1784,6 +2016,17 @@ def trigger_job(
 
 
 def request_run(
+    job_id: str,
+    *,
+    caller: str,
+    reason: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Request an enabled job only inside the canonical dispatch boundary."""
+    with default_control_store().dispatch_section(boundary="request-run"):
+        return _request_run_admitted(job_id, caller=caller, reason=reason)
+
+
+def _request_run_admitted(
     job_id: str,
     *,
     caller: str,

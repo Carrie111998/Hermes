@@ -10,8 +10,6 @@ operator opts in via HERMES_JOBFLOW_EVENT_DISPATCH.
 
 from __future__ import annotations
 
-import sqlite3
-
 import pytest
 
 from events.schema import Event, EventType, Priority
@@ -171,16 +169,73 @@ class TestClaimIsReleasedWhenTheWakeFails:
     the work stalls until the lease expires — now two hours.
     """
 
-    def test_full_wake_channel_releases_the_claim(self, store, woken):
+    def test_duplicate_wake_collapses_outbox_but_keeps_the_claim(self, store, woken):
         d = _dispatcher(store, woken)
-        d._waker = lambda job_id, **kw: False  # channel full
+        d._waker = lambda job_id, **kw: False  # exact job already queued
 
         d.handle(_event())
 
         key = "tailor/inbox/20260810T01_TAILOR_REQUEST_main_aa.json"
-        assert store.get(key, "jobflow.tailor.generate") is None, (
-            "claim must be released so the reconciler can resurface the work"
+        assert store.get(key, "jobflow.tailor.generate") is not None
+        assert store.pending_wake_outbox() == []
+
+    def test_raised_wake_failure_retains_a_recoverable_outbox(self, store, woken):
+        d = _dispatcher(store, woken)
+        d._waker = lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk full"))
+
+        d._dispatch(_event())
+
+        key = "tailor/inbox/20260810T01_TAILOR_REQUEST_main_aa.json"
+        assert store.get(key, "jobflow.tailor.generate") is not None
+        pending = store.pending_wake_outbox()
+        assert [(row.message_key, row.job_id) for row in pending] == [
+            (key, "job-for-jobflow.tailor.generate")
+        ]
+        assert woken == []
+
+    def test_restart_replays_claimed_outbox_without_waiting_for_redelivery(
+        self, store, woken
+    ):
+        d = _dispatcher(store, woken)
+        d._waker = lambda *_a, **_k: (_ for _ in ()).throw(SystemExit("crash"))
+
+        with pytest.raises(SystemExit, match="crash"):
+            d._dispatch(_event())
+
+        restarted_store = ActivationStore(store.db_path, lease_seconds=900)
+        restarted = _dispatcher(restarted_store, woken)
+        restarted._recover_wake_outbox()
+
+        assert woken == [
+            ("job-for-jobflow.tailor.generate", "mailbox_message")
+        ]
+        assert restarted_store.pending_wake_outbox() == []
+        key = "tailor/inbox/20260810T01_TAILOR_REQUEST_main_aa.json"
+        assert restarted_store.get(key, "jobflow.tailor.generate") is not None
+
+    def test_outbox_ack_is_exact_and_cannot_delete_a_replacement(self, store):
+        first = store.claim_for_wake(
+            "tailor/inbox/message.json",
+            "jobflow.tailor.generate",
+            job_id="job-1",
+            caller="jobflow-dispatcher",
+            reason="mailbox_message",
+            now=1,
         )
+        assert first is not None
+        store.release(first.message_key, first.activity_id)
+        second = store.claim_for_wake(
+            first.message_key,
+            first.activity_id,
+            job_id="job-1",
+            caller="jobflow-dispatcher",
+            reason="mailbox_message",
+            now=2,
+        )
+        assert second is not None
+
+        assert store.ack_wake_outbox(first) is False
+        assert store.pending_wake_outbox() == [second]
 
     def test_unresolvable_job_releases_the_claim(self, store, woken):
         d = _dispatcher(store, woken, resolver=lambda a: None)
@@ -300,273 +355,105 @@ class TestShadowNeverTouchesTheLedger:
 
         assert woken == []
 
-class _ReleaseFails:
-    """Claims succeed, releases do not — an orphan claim, manufactured."""
+class TestAtomicClaimOutbox:
+    def test_unresolvable_activity_creates_neither_claim_nor_outbox(
+        self, store, woken
+    ):
+        _dispatcher(store, woken, resolver=lambda _activity: None).handle(_event())
 
-    def __init__(self, inner):
-        self._inner = inner
-        self.lease_seconds = inner.lease_seconds
-        self.release_calls = 0
+        key = "tailor/inbox/20260810T01_TAILOR_REQUEST_main_aa.json"
+        assert store.get(key, "jobflow.tailor.generate") is None
+        assert store.pending_wake_outbox() == []
 
-    def get(self, message_key, activity_id):
-        return self._inner.get(message_key, activity_id)
+    def test_outbox_is_removed_only_after_a_successful_wake(self, store, woken):
+        _dispatcher(store, woken).handle(_event())
 
-    def claim(self, *a, **kw):
-        return self._inner.claim(*a, **kw)
+        assert len(woken) == 1
+        assert store.pending_wake_outbox() == []
 
-    def release(self, *a, **kw):
-        self.release_calls += 1
-        raise sqlite3.OperationalError("database is locked")
+    def test_pending_outbox_replays_before_the_next_event(self, store, woken):
+        outbox = store.claim_for_wake(
+            "tailor/inbox/pending.json",
+            "jobflow.tailor.generate",
+            job_id="job-pending",
+            caller="jobflow-dispatcher",
+            reason="mailbox_message",
+            now=1,
+        )
+        assert outbox is not None
 
+        _dispatcher(store, woken).handle(
+            _event(file="tailor/inbox/new.json", correlation_id="new")
+        )
 
-class _ReleaseFailsThenRecovers(_ReleaseFails):
-    """The contention case: SQLITE_BUSY for a while, then the writer lets go.
+        assert woken[0] == ("job-pending", "mailbox_message")
+        assert store.pending_wake_outbox() == []
 
-    This is the failure the retry exists for. ``_ReleaseFails`` models the
-    permanent fault; this one models the transient one, which is the far more
-    likely of the two given ``PRAGMA busy_timeout=5000``.
-    """
+    def test_startup_replays_pending_outbox_without_any_new_event(self, store, woken):
+        outbox = store.claim_for_wake(
+            "tailor/inbox/pending.json",
+            "jobflow.tailor.generate",
+            job_id="job-pending",
+            caller="jobflow-dispatcher",
+            reason="mailbox_message",
+            now=1,
+        )
+        assert outbox is not None
 
-    def __init__(self, inner, failures):
-        super().__init__(inner)
-        self._failures = failures
+        restarted = _dispatcher(
+            ActivationStore(store.db_path, lease_seconds=900), woken
+        )
+        restarted.startup()
 
-    def release(self, *a, **kw):
-        self.release_calls += 1
-        if self.release_calls <= self._failures:
-            raise sqlite3.OperationalError("database is locked")
-        return self._inner.release(*a, **kw)
+        assert woken == [("job-pending", "mailbox_message")]
+        assert restarted.store.pending_wake_outbox() == []
 
+    def test_idle_poll_retries_pending_outbox_without_an_event(self, store, woken):
+        class _IdleBus:
+            def _execute(self, *_args, **_kwargs):
+                return None
 
-class TestOrphanClaimIsLoud:
-    """A failed release is the one dispatcher fault that costs work, not latency.
+            def subscribe(self, **_kwargs):
+                return []
 
-    Everywhere else the reconciler is the safety net, so a dropped wake is just
-    a delay. Not here: the claim committed, so the reconciler SKIPS the message,
-    and no worker was woken. It stays invisible for a full lease. Swallowing the
-    exception is right for loop stability; swallowing it quietly is not.
-    """
+        outbox = store.claim_for_wake(
+            "tailor/inbox/pending.json",
+            "jobflow.tailor.generate",
+            job_id="job-pending",
+            caller="jobflow-dispatcher",
+            reason="mailbox_message",
+            now=1,
+        )
+        assert outbox is not None
+        dispatcher = JobFlowDispatcher(
+            _IdleBus(),
+            ActivationStore(store.db_path, lease_seconds=900),
+            resolve_job_id=lambda activity_id: f"job-for-{activity_id}",
+            waker=lambda job_id, **kw: woken.append(
+                (job_id, kw.get("reason"))
+            ) or True,
+            mode="on",
+        )
 
-    def test_the_failure_is_greppable_by_a_stable_marker(self, store, woken, caplog):
-        import logging
+        assert dispatcher.poll() == 0
+        assert woken == [("job-pending", "mailbox_message")]
+        assert dispatcher.store.pending_wake_outbox() == []
 
-        d = _dispatcher(_ReleaseFails(store), woken, resolver=lambda a: None)
-        with caplog.at_level(logging.ERROR):
-            d.handle(_event())
+    @pytest.mark.parametrize("mode", ["off", "shadow"])
+    def test_inert_modes_do_not_replay_pending_outbox(self, store, woken, mode):
+        outbox = store.claim_for_wake(
+            "tailor/inbox/pending.json",
+            "jobflow.tailor.generate",
+            job_id="job-pending",
+            caller="jobflow-dispatcher",
+            reason="mailbox_message",
+            now=1,
+        )
+        assert outbox is not None
 
-        assert JobFlowDispatcher.ORPHAN_MARKER in caplog.text
-
-    def test_it_names_the_work_and_the_cost(self, store, woken, caplog):
-        """Which message, which activity, and how long it is invisible."""
-        import logging
-
-        d = _dispatcher(_ReleaseFails(store), woken, resolver=lambda a: None)
-        with caplog.at_level(logging.ERROR):
-            d.handle(_event())
-
-        assert "tailor/inbox/20260810T01_TAILOR_REQUEST_main_aa.json" in caplog.text
-        assert "jobflow.tailor.generate" in caplog.text
-        assert "900" in caplog.text, "the lease is how long the work stays hidden"
-
-    def test_it_is_logged_at_error_not_warning(self, store, woken, caplog):
-        """Warning is for a wake that was merely refused; this one loses work."""
-        import logging
-
-        d = _dispatcher(_ReleaseFails(store), woken, resolver=lambda a: None)
-        with caplog.at_level(logging.DEBUG):
-            d.handle(_event())
-
-        orphan = [r for r in caplog.records
-                  if JobFlowDispatcher.ORPHAN_MARKER in r.getMessage()]
-        assert orphan and all(r.levelno >= logging.ERROR for r in orphan)
-
-    def test_a_release_fault_still_never_stalls_the_loop(self, store, woken):
-        """Loudness must not come at the cost of the fail-closed guarantee."""
-        d = _dispatcher(_ReleaseFails(store), woken, resolver=lambda a: None)
-
-        d._dispatch(_event())  # must not raise
+        dispatcher = _dispatcher(store, woken, mode=mode)
+        dispatcher.startup()
+        dispatcher.handle(_event())
 
         assert woken == []
-
-    def test_a_successful_release_says_nothing(self, store, woken, caplog):
-        """No marker on the happy path, or grepping for it finds noise."""
-        import logging
-
-        d = _dispatcher(store, woken, resolver=lambda a: None)
-        with caplog.at_level(logging.DEBUG):
-            d.handle(_event())
-
-        assert JobFlowDispatcher.ORPHAN_MARKER not in caplog.text
-
-    def test_the_marker_is_only_reached_after_the_retries(self, store, woken, caplog):
-        """Loudness is the LAST resort, not the first response."""
-        import logging
-
-        ledger = _ReleaseFails(store)
-        d = _dispatcher(ledger, woken, resolver=lambda a: None)
-        with caplog.at_level(logging.ERROR):
-            d.handle(_event())
-
-        assert ledger.release_calls == JobFlowDispatcher.RELEASE_ATTEMPTS
-        assert JobFlowDispatcher.ORPHAN_MARKER in caplog.text
-
-
-class TestReleaseRetriesBeforeConcedingAnOrphan:
-    """Prevent the orphan, don't just report it.
-
-    P4 made a failed release greppable. That makes an orphan findable after the
-    fact; it does not make one rarer. This is the one dispatcher fault that costs
-    WORK rather than latency — the reconciler skips the message because it looks
-    claimed, and no worker was ever woken, so it stays invisible to BOTH paths
-    for a full lease (7200s) against a reconciler that runs every 6h.
-
-    The plausible cause is transient: SQLITE_BUSY past the store's
-    ``busy_timeout=5000`` under contention. A short bounded backoff usually
-    clears it, which turns most would-be orphans into a few hundred milliseconds
-    of latency — the cheap failure this subsystem is designed around.
-    """
-
-    KEY = "tailor/inbox/20260810T01_TAILOR_REQUEST_main_aa.json"
-    ACTIVITY = "jobflow.tailor.generate"
-
-    def test_a_release_that_recovers_on_the_last_attempt_leaves_no_orphan(
-        self, store, woken, caplog
-    ):
-        """The whole point: contention that clears must not strand the work."""
-        import logging
-
-        failures = JobFlowDispatcher.RELEASE_ATTEMPTS - 1
-        assert failures >= 1, (
-            "a budget of one attempt is not a retry — this test would pass "
-            "vacuously, and so would the orphan-prevention it stands for"
-        )
-        ledger = _ReleaseFailsThenRecovers(store, failures=failures)
-        d = _dispatcher(ledger, woken, resolver=lambda a: None)
-
-        with caplog.at_level(logging.DEBUG):
-            d.handle(_event())
-
-        assert ledger.release_calls == JobFlowDispatcher.RELEASE_ATTEMPTS
-        assert store.get(self.KEY, self.ACTIVITY) is None, (
-            "the claim was handed back, so the reconciler can resurface the work"
-        )
-        assert JobFlowDispatcher.ORPHAN_MARKER not in caplog.text, (
-            "a recovered release is not an orphan; marking it would make the "
-            "marker useless for finding real ones"
-        )
-
-    def test_a_release_that_recovers_immediately_stops_retrying(self, store, woken):
-        """One transient failure costs one retry, not the full budget."""
-        ledger = _ReleaseFailsThenRecovers(store, failures=1)
-        d = _dispatcher(ledger, woken, resolver=lambda a: None)
-
-        d.handle(_event())
-
-        assert ledger.release_calls == 2
-        assert store.get(self.KEY, self.ACTIVITY) is None
-
-    def test_the_retry_budget_is_bounded(self, store, woken):
-        """Retrying must not become a way to stall the subscriber loop.
-
-        Each attempt can already cost a full ``busy_timeout`` inside SQLite, so
-        the bound that matters is the ATTEMPT count; the backoff is deliberately
-        a small fraction of it. Asserted together because a future edit that
-        raises either in isolation changes the worst-case loop stall.
-        """
-        slept = []
-        ledger = _ReleaseFails(store)
-        d = _dispatcher(ledger, woken, resolver=lambda a: None,
-                        sleep=slept.append)
-
-        d._dispatch(_event())
-
-        assert ledger.release_calls == JobFlowDispatcher.RELEASE_ATTEMPTS
-        assert len(slept) == JobFlowDispatcher.RELEASE_ATTEMPTS - 1, (
-            "one backoff between attempts, and none after the last failure"
-        )
-        assert sum(slept) <= 1.0, (
-            f"worst-case added delay per release is {sum(slept)}s; the retry "
-            "budget must stay small next to the 5s busy_timeout it sits behind"
-        )
-
-    def test_there_is_a_backoff_for_every_retry(self):
-        """An off-by-one here would raise IndexError inside a fault handler."""
-        assert (
-            len(JobFlowDispatcher.RELEASE_BACKOFF_SECONDS)
-            >= JobFlowDispatcher.RELEASE_ATTEMPTS - 1
-        )
-
-    def test_a_budget_longer_than_the_backoff_still_reaches_the_marker(
-        self, store, woken, caplog, monkeypatch
-    ):
-        """The degrade path for the mis-edit the previous test forbids.
-
-        Indexing the backoff blind would raise IndexError from inside the fault
-        handler. That escapes ``_release`` and skips the ORPHAN_MARKER log — so
-        a botched constant bump would silently remove the only trace a stranded
-        claim leaves, which is worse than the mis-edit itself.
-        """
-        import logging
-
-        monkeypatch.setattr(
-            JobFlowDispatcher,
-            "RELEASE_ATTEMPTS",
-            len(JobFlowDispatcher.RELEASE_BACKOFF_SECONDS) + 3,
-        )
-        ledger = _ReleaseFails(store)
-        d = _dispatcher(ledger, woken, resolver=lambda a: None)
-
-        with caplog.at_level(logging.ERROR):
-            d._dispatch(_event())  # directly: an IndexError must be able to escape
-
-        assert ledger.release_calls == JobFlowDispatcher.RELEASE_ATTEMPTS
-        assert JobFlowDispatcher.ORPHAN_MARKER in caplog.text
-
-    def test_the_backoff_grows(self):
-        """Re-issuing at a fixed interval loses the same race repeatedly."""
-        backoff = JobFlowDispatcher.RELEASE_BACKOFF_SECONDS
-        assert all(b > 0 for b in backoff)
-        assert list(backoff) == sorted(backoff)
-
-    def test_exhausted_retries_still_never_stall_the_loop(self, store, woken):
-        """Calls ``_dispatch`` directly ON PURPOSE.
-
-        ``handle()`` swallows exceptions, so routing through it would let this
-        pass even if the retry loop re-raised on exhaustion. The final swallow
-        has to be the dispatcher's own, and the failure has to be able to escape
-        for this assertion to mean anything.
-        """
-        d = _dispatcher(_ReleaseFails(store), woken, resolver=lambda a: None)
-
-        d._dispatch(_event())  # must not raise
-
-        assert woken == []
-
-    def test_a_recovered_release_is_reported_without_the_marker(
-        self, store, woken, caplog
-    ):
-        """Contention that clears is still worth seeing — it precedes the real ones."""
-        import logging
-
-        d = _dispatcher(_ReleaseFailsThenRecovers(store, failures=1), woken,
-                        resolver=lambda a: None)
-        with caplog.at_level(logging.WARNING):
-            d.handle(_event())
-
-        assert "succeeded on attempt 2" in caplog.text
-        assert JobFlowDispatcher.ORPHAN_MARKER not in caplog.text
-
-    def test_the_wake_refusal_path_retries_too(self, store, woken):
-        """Both release call sites go through ``_release``, not just the resolver one.
-
-        The wake-channel refusal is the likelier release in production: it fires
-        under load, which is exactly when the ledger is contended.
-        """
-        ledger = _ReleaseFailsThenRecovers(store, failures=1)
-        d = _dispatcher(ledger, woken)
-        d._waker = lambda job_id, **kw: False  # channel full
-
-        d._dispatch(_event())
-
-        assert ledger.release_calls == 2
-        assert store.get(self.KEY, self.ACTIVITY) is None
+        assert store.pending_wake_outbox() == [outbox]

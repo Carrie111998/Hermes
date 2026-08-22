@@ -23,6 +23,8 @@ import threading
 from abc import ABC, abstractmethod
 from typing import Any
 
+from jobflow_dispatch.quarantine_control import default_control_store
+
 
 class CronScheduler(ABC):
     """Axis-B trigger provider. Decides WHEN a due cron job fires.
@@ -278,13 +280,31 @@ class CronScheduler(ABC):
         from cron.executions import create_execution
         from cron.scheduler import run_one_job
 
-        if not claim_job_for_fire(job_id):
-            return False  # another machine already claimed this fire
-        job = get_job(job_id)
-        if job is None:
-            return False  # job removed (e.g. repeat-N exhausted) between arm and fire
-        job["execution_id"] = create_execution(job_id, source=self.name)["id"]
-        return run_one_job(job, adapters=adapters, loop=loop)
+        # One retained section spans the store-level fire claim through the
+        # durable running execution row. run_one_job releases this exact admission
+        # at that handoff rather than holding it through the model run.
+        admission = default_control_store().dispatch_section(
+            boundary="external-provider-fire"
+        )
+        admission.__enter__()
+        handed_off = False
+        try:
+            if not claim_job_for_fire(job_id):
+                return False  # another machine already claimed this fire
+            job = get_job(job_id)
+            if job is None:
+                return False  # job removed (e.g. repeat-N exhausted) between arm and fire
+            job["execution_id"] = create_execution(job_id, source=self.name)["id"]
+            handed_off = True
+            return run_one_job(
+                job,
+                adapters=adapters,
+                loop=loop,
+                _dispatch_admission=admission,
+            )
+        finally:
+            if not handed_off:
+                admission.__exit__(None, None, None)
 
     def reconcile(self) -> None:
         """Converge the external registry toward jobs.json (the desired state):

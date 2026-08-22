@@ -52,6 +52,7 @@ from events.subscribers.base import BaseSubscriber
 from jobflow_dispatch.activate import resolve_job_id_for_activity
 from jobflow_dispatch.contracts import message_key as canonical_key, route_mailbox
 from jobflow_dispatch.store import is_available
+from jobflow_dispatch.quarantine_control import default_control_store
 
 logger = logging.getLogger(__name__)
 
@@ -72,38 +73,6 @@ class JobFlowDispatcher(BaseSubscriber):
     subscriber_id = "jobflow-dispatcher"
     poll_interval_seconds = 5
     event_types = [EventType.MAILBOX_MESSAGE]
-
-    #: Grep marker for a claim that committed but could not be handed back.
-    #: Distinct from every other dispatcher failure because it is the only one
-    #: that strands real work: the message is invisible to BOTH activation paths
-    #: until its lease lapses. Nothing else reports it, so this string is the
-    #: only trace it leaves.
-    ORPHAN_MARKER = "ORPHAN_CLAIM"
-
-    #: Total ``store.release`` attempts before conceding an orphan.
-    #:
-    #: Deliberately small, because the retry is NOT the expensive part. The
-    #: plausible fault is SQLITE_BUSY, and ``ActivationStore`` already sets
-    #: ``PRAGMA busy_timeout=5000`` — so a contention failure has ALREADY blocked
-    #: up to five seconds inside SQLite before it reaches us. Three attempts is
-    #: therefore ~15s of contention coverage, against a ledger whose every write
-    #: is one indexed row inside ``BEGIN IMMEDIATE`` (sub-millisecond). Anything
-    #: that survives that is not transient contention, and a fourth attempt buys
-    #: another five seconds of stalled event loop for no realistic gain.
-    #:
-    #: This is why k is 3 here and 10 in the WinError-5 precedent: there an
-    #: attempt was a cheap file rename, so a high k cost nothing. Here each
-    #: attempt can cost a full busy_timeout.
-    RELEASE_ATTEMPTS = 3
-
-    #: Backoff before each retry: 0.1s then 0.2s, 0.3s of added delay worst case.
-    #:
-    #: Kept far below the busy_timeout on purpose. It exists for the failures
-    #: that come back IMMEDIATELY rather than after the timeout — notably a WAL
-    #: snapshot conflict on the ``BEGIN IMMEDIATE`` upgrade, which SQLite does not
-    #: retry for us — where a bare re-issue would just lose the same race again.
-    #: Where the timeout did fire, it has already done all the waiting needed.
-    RELEASE_BACKOFF_SECONDS = (0.1, 0.2)
 
     def __init__(
         self,
@@ -131,10 +100,32 @@ class JobFlowDispatcher(BaseSubscriber):
             waker = request_wake
         self._waker = waker
 
+    def startup(self) -> None:
+        """Replay committed claim-to-wake handoffs before event polling starts."""
+        if self._mode != MODE_ON:
+            return
+        try:
+            self._recover_wake_outbox()
+        except Exception:
+            # Keep startup live so the regular idle poll can retry the durable
+            # outbox even when the wake store is transiently unavailable.
+            logger.exception("jobflow dispatch outbox startup recovery failed")
+
+    def poll(self) -> int:
+        """Retry durable handoffs on every poll, including completely idle polls."""
+        if self._mode == MODE_ON:
+            try:
+                self._recover_wake_outbox()
+            except Exception:
+                logger.exception("jobflow dispatch outbox idle recovery failed")
+        return super().poll()
+
     def handle(self, event: Event) -> None:
         if self._mode == MODE_OFF:
             return
         try:
+            if self._mode == MODE_ON:
+                self._recover_wake_outbox()
             self._dispatch(event)
         except Exception:
             # A dispatcher fault must never stall the subscriber loop; the
@@ -164,39 +155,70 @@ class JobFlowDispatcher(BaseSubscriber):
                 self._observe(key, activity_id, now)
                 continue
 
-            if not self.store.claim(
-                key, activity_id, now=now, correlation_id=correlation_id
+            # This exact retained section spans the first durable claim through
+            # the durable wake handoff (or claim release), so a barrier cannot
+            # observe and fence the system in the middle of claim-through-wake.
+            with default_control_store().dispatch_section(
+                boundary="jobflow-dispatcher"
             ):
-                continue  # already claimed or completed — at-least-once absorbed
+                # Resolve before claiming so an unresolvable mapping never creates
+                # ledger state. The retained dispatch admission prevents a fence from
+                # landing between this resolve and the atomic claim+outbox commit.
+                try:
+                    job_id = self._resolve_job_id(activity_id)
+                except Exception:
+                    logger.exception("dispatch: resolving %s failed", activity_id)
+                    continue
+                if not job_id:
+                    continue
 
-            # From here on, any path that does NOT deliver a wake must hand the
-            # claim back. A committed claim with no wake is the worst state:
-            # the reconciler skips it (it looks claimed) and no worker was ever
-            # woken, so the work stalls until the lease expires.
-            try:
-                job_id = self._resolve_job_id(activity_id)
-            except Exception:
-                logger.exception("dispatch: resolving %s failed", activity_id)
-                self._release(key, activity_id)
-                continue
-            if not job_id:
-                self._release(key, activity_id)
-                continue
-
-            if self._waker(job_id, caller=self.subscriber_id, reason="mailbox_message") is False:
-                # Overwhelmingly the benign case: the job is ALREADY queued, so a
-                # burst of N messages collapses to one wake and the other N-1 land
-                # here. That is the mechanism that makes event dispatch cheaper
-                # than polling, not a fault — the first live burst logged 14 of
-                # these for one run. Logged at INFO so a real problem stays
-                # visible: request_wake's other False (channel full) already emits
-                # its own WARNING from cron/wake_channel.py with more detail, so
-                # demoting here loses no signal.
-                logger.info(
-                    "dispatch: %s (%s) already queued — collapsing, releasing claim",
-                    job_id, activity_id,
+                outbox = self.store.claim_for_wake(
+                    key,
+                    activity_id,
+                    job_id=job_id,
+                    caller=self.subscriber_id,
+                    reason="mailbox_message",
+                    now=now,
+                    correlation_id=correlation_id,
                 )
-                self._release(key, activity_id)
+                if outbox is None:
+                    continue  # already claimed or completed — at-least-once absorbed
+
+                try:
+                    self._deliver_outbox(outbox)
+                except Exception:
+                    logger.exception("dispatch: durable wake for %s failed", job_id)
+                    # Keep both the claim and its durable outbox. A later event or a
+                    # restarted subscriber replays it without waiting for lease expiry.
+                    continue
+
+    def _deliver_outbox(self, outbox: Any) -> None:
+        woke = self._waker(
+            outbox.job_id,
+            caller=outbox.caller,
+            reason=outbox.reason,
+        )
+        # False means this exact job already has a durable wake. That existing
+        # wake satisfies the handoff; keeping the per-message outbox would replay
+        # forever while the queue intentionally collapses duplicates by job ID.
+        if woke is False:
+            logger.info(
+                "dispatch: %s (%s) already queued — collapsing durable outbox",
+                outbox.job_id,
+                outbox.activity_id,
+            )
+        if not self.store.ack_wake_outbox(outbox):
+            raise RuntimeError("activation wake outbox changed before acknowledgement")
+
+    def _recover_wake_outbox(self) -> None:
+        pending = getattr(self.store, "pending_wake_outbox", None)
+        if pending is None:
+            return
+        with default_control_store().dispatch_section(
+            boundary="jobflow-dispatcher-outbox-recovery"
+        ):
+            for outbox in pending():
+                self._deliver_outbox(outbox)
 
     def _observe(self, key: str, activity_id: str, now: float) -> None:
         """Record what ``on`` would have done, without touching the ledger.
@@ -224,63 +246,3 @@ class JobFlowDispatcher(BaseSubscriber):
         logger.info(
             "dispatch[shadow]: would wake %s (%s) for %s", job_id, activity_id, key
         )
-
-    def _release(self, key: str, activity_id: str) -> None:
-        """Hand the claim back, retrying a bounded number of times.
-
-        A failed release is the one dispatcher fault that costs WORK rather than
-        latency, so it is worth spending a little of the subscriber loop's time
-        to prevent one instead of merely reporting it. The plausible cause —
-        SQLITE_BUSY under contention — is exactly the kind a short backoff
-        clears.
-
-        ``store.release`` DELETEs ``WHERE ... AND state != 'completed'``, so it
-        is idempotent: a retry after a partial or ambiguous failure cannot
-        resurrect completed work or corrupt a row a later claim installed.
-        """
-        for attempt in range(1, self.RELEASE_ATTEMPTS + 1):
-            try:
-                self.store.release(key, activity_id)
-            except Exception:
-                if attempt < self.RELEASE_ATTEMPTS:
-                    logger.warning(
-                        "dispatch: release of %s (%s) failed on attempt %d/%d — retrying",
-                        key, activity_id, attempt, self.RELEASE_ATTEMPTS,
-                        exc_info=True,
-                    )
-                    # Clamped, not indexed blind: raising RELEASE_ATTEMPTS
-                    # without extending the backoff would otherwise raise
-                    # IndexError from inside a fault handler, which escapes
-                    # _release and skips the ORPHAN_MARKER log — losing exactly
-                    # the trace this method exists to leave. A test asserts the
-                    # two stay in step; this makes the failure mode degrade
-                    # rather than detonate.
-                    backoff = self.RELEASE_BACKOFF_SECONDS[
-                        min(attempt - 1, len(self.RELEASE_BACKOFF_SECONDS) - 1)
-                    ]
-                    self._sleep(backoff)
-                    continue
-                # Still swallowed, and swallowed LAST: a release fault must
-                # never stall the subscriber loop, retries included. But the
-                # claim committed, so the reconciler SKIPS the message and
-                # nothing woke it. Logged with a stable marker so the stranded
-                # work can be found afterwards, since nothing else reports it.
-                logger.exception(
-                    "dispatch: %s %s (%s) — claim committed but could not be "
-                    "released after %d attempts; invisible to the reconciler "
-                    "for up to %ss",
-                    self.ORPHAN_MARKER,
-                    key,
-                    activity_id,
-                    self.RELEASE_ATTEMPTS,
-                    getattr(self.store, "lease_seconds", "?"),
-                )
-                return
-            else:
-                if attempt > 1:
-                    logger.warning(
-                        "dispatch: release of %s (%s) succeeded on attempt %d — "
-                        "transient ledger contention, no orphan",
-                        key, activity_id, attempt,
-                    )
-                return
