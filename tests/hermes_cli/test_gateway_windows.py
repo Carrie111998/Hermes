@@ -296,6 +296,7 @@ def test_install_scheduled_task_recreates_instead_of_change(monkeypatch, tmp_pat
     assert "/Change" not in [arg for call in calls for arg in call]
     assert calls[0][:4] == ("/Delete", "/F", "/TN", "Hermes_Gateway_alice")
     assert calls[1][0] == "/Create"
+    assert "/IT" in calls[1] and "/NP" not in calls[1]
     assert "/XML" in calls[1]
     assert "/SC" not in calls[1]
     assert "<Delay>PT30S</Delay>" in xml_seen["text"]
@@ -390,7 +391,6 @@ def test_resolve_task_user_passes_through_qualified_username(monkeypatch):
 
 
 
-
 # ---------------------------------------------------------------------------
 # stop() drain semantics — issue #33778
 #
@@ -401,6 +401,7 @@ def test_resolve_task_user_passes_through_qualified_username(monkeypatch):
 # the gateway's marker-watcher thread to drain + exit cleanly, then escalates
 # to taskkill if drain times out.
 # ---------------------------------------------------------------------------
+
 
 
 
