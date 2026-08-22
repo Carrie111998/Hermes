@@ -31,7 +31,7 @@ Behavioral settings live in `$HERMES_HOME/mem0.json` (set them via `hermes memor
 | `agent_id` | `hermes` | Agent identifier |
 | `rerank` | `false` | Rerank search results for relevance (platform mode only) |
 | `shared_pool.enabled` | `false` | Enable the agent-scoped shared "company knowledge" pool (`mem0_search_shared` / `mem0_add_shared`) |
-| `shared_pool.authorized_submitters` | `[]` | Operator identifiers allowed to WRITE to the shared pool. Empty = any operator may contribute |
+| `shared_pool.authorized_submitters` | `[]` | Operator identifiers allowed to WRITE to the shared pool. **Empty (the default) means ANY operator may contribute — only set it and list specific operator IDs if you actually want to restrict writes.** Matching is case-insensitive. IDs are whatever each gateway resolves for the operator (Telegram/Discord id, CLI username, email-style id, …), so use the exact id your gateway reports |
 
 The plugin has three connection modes:
 
@@ -161,18 +161,22 @@ For a **team agent** — one Hermes agent that talks to several operators (e.g. 
 {
   "shared_pool": {
     "enabled": true,
-    "authorized_submitters": ["operator-a@example.com", "operator-b@example.com"]
+    "authorized_submitters": ["telegram:123456789", "cli:kyle", "operator-b@example.com"]
   }
 }
 ```
 
+> Operator identifiers (`user_id`) are whatever each gateway resolves for the operator — a Telegram/Discord numeric id, a CLI username, an email-style id, etc. Use the exact id form your gateway reports; matching is case-insensitive but otherwise exact.
+
 When enabled, two extra tools are registered:
 
-- **`mem0_search_shared`** – reads the agent-scoped shared pool. It returns **only true agent-scoped company facts** (records written via `mem0_add_shared` / written with no per-user scope). Per-user private memories (`mem0_search` / `mem0_add`) are individually scoped and **never** surface in the company view — so a user's private notes stay isolated from the shared pool.
-- **`mem0_add_shared`** – writes a company-wide fact into the shared pool (scoped to `agent_id`, with no `user_id`). Whether a given operator may call it is enforced in code:
+- **`mem0_search_shared`** – reads the agent-scoped shared pool. It returns only records that are **positively tagged as shared** — `mem0_add_shared` writes each company fact with `metadata.scope="shared"` and **no** `user_id` — and then further excludes anything that carries a per-user scope. This two-belt check (positive shared marker, and no user identity) keeps the company view an intersection, so per-user private memories (`mem0_search` / `mem0_add`) are individually scoped and stay out of the company view, even if the backend changes how it reports user identity.
+- **`mem0_add_shared`** – writes a company-wide fact into the shared pool (scoped to `agent_id`, with no `user_id`, tagged `metadata.scope="shared"`). Whether a given operator may call it is enforced in code:
+
+  > **Security note:** an empty `authorized_submitters` (the default) means **any** operator may write to the shared pool. If you need to restrict who can contribute company facts, list the specific operator IDs — do not rely on the default.
 
   - If `shared_pool.authorized_submitters` is **empty** (default), any operator may contribute.
-  - If it is **non-empty**, only operators whose `user_id` appears in the list may write. Everyone else gets a refusal from `mem0_add_shared` and can still read via `mem0_search_shared`.
+  - If it is **non-empty**, only operators whose `user_id` appears in the list may write (matched case-insensitively and gateway-agnostically — the id is whatever each gateway resolved for the operator, e.g. a Telegram/Discord numeric id, a CLI username, or an email-style id, so an entry that differs only in casing is not silently refused). Everyone else gets a refusal from `mem0_add_shared` and can still read via `mem0_search_shared`.
 
 This enables the common pattern: **everyone reads company knowledge, only specified team members write it.** Private per-user memory (`mem0_search` / `mem0_add`) is unaffected.
 

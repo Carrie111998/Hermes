@@ -94,6 +94,35 @@ def _result_has_user_id(result: dict) -> bool:
     return bool(md.get("user_id"))
 
 
+def _result_is_shared(result: dict) -> bool:
+    """True if a search result is a genuine shared-pool (company) record.
+
+    Shared writes are tagged positively with ``metadata.scope == "shared"``
+    (see _write_shared_metadata). This is the primary signal the shared read
+    path uses, so the company view is an intersection: a record must be
+    positively tagged as shared AND carry no per-user scope. Relying on the
+    positive marker (rather than only the absence of user_id) means the
+    isolation boundary survives backend result-shape drift — a renamed or
+    nested user_id field cannot silently admit a private note into the
+    company view.
+    """
+    md = result.get("metadata") or {}
+    return md.get("scope") == "shared"
+
+
+def _result_is_shared_pool_record(result: dict) -> bool:
+    """Two-belt shared-pool membership check.
+
+    Belt 1: positively tagged as shared (metadata.scope == "shared").
+    Belt 2: carries no per-user scope (no user_id top-level or in metadata),
+            so a shared-tagged record that also has a user_id is still
+            excluded from the company view. Shared records are written with
+            no user_id, so both belts normally agree; belt 2 defends against
+            a mis-tag or a record that deliberately carries both.
+    """
+    return _result_is_shared(result) and not _result_has_user_id(result)
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -459,6 +488,19 @@ class Mem0MemoryProvider(MemoryProvider):
         # per-channel filtered views without coupling identity to the channel.
         return {"channel": self._channel} if self._channel else {}
 
+    def _write_shared_metadata(self) -> Dict[str, Any]:
+        # Shared-pool writes are tagged with a POSITIVE scope marker
+        # ("scope": "shared") in addition to the usual channel. The shared
+        # read path filters on this marker as its primary signal (not merely
+        # the absence of a user_id), so the company view is an intersection —
+        # records positively tagged as shared that also carry no per-user
+        # scope — rather than a set-difference. This survives backend result
+        # shape drift (a renamed/nested user_id field no longer silently
+        # admits a private note into the company view).
+        md = self._write_metadata()
+        md["scope"] = "shared"
+        return md
+
     def _shared_submitters_filter(self) -> Dict[str, Any]:
         """Return the agent-scoped filter used by the shared pool.
 
@@ -473,10 +515,16 @@ class Mem0MemoryProvider(MemoryProvider):
 
         If shared_pool.authorized_submitters is empty (default), any operator
         may contribute. Otherwise the current user_id must be listed.
+        Comparison is case-insensitive (.casefold() on both sides) and
+        gateway-agnostic: user_id is whatever this gateway resolved for the
+        operator (a Telegram/Discord id, a CLI username, an email-style id,
+        etc.), and an allowlist entry that differs only in casing must still
+        match.
         """
         if not self._shared_pool_submitters:
             return True
-        return self._user_id in self._shared_pool_submitters
+        want = self._user_id.casefold()
+        return any(want == s.casefold() for s in self._shared_pool_submitters)
 
     def system_prompt_block(self) -> str:
         # Mirror the precedence in _create_backend (oss > host > platform) so
@@ -716,14 +764,15 @@ class Mem0MemoryProvider(MemoryProvider):
                 if not results:
                     return json.dumps({"result": "No shared memories found."})
                 # The shared pool is the set of TRUE agent-scoped company facts:
-                # records written with no user_id (via mem0_add_shared). The
-                # underlying search matches on agent_id and would also surface
-                # per-user records, so drop any result that carries a user_id
-                # (i.e. an operator's private memory) — those must stay private
-                # and never leak into the company view.
+                # records written via mem0_add_shared. These are positively
+                # tagged metadata.scope="shared" and carry no user_id. Keep only
+                # records that pass BOTH belts — positively tagged as shared AND
+                # free of any per-user scope — so an operator's private memory
+                # can never leak into the company view, even if the backend
+                # result shape changes the way user identity is carried.
                 shared_only = [
                     r for r in results
-                    if not _result_has_user_id(r)
+                    if _result_is_shared_pool_record(r)
                 ]
                 if not shared_only:
                     return json.dumps({"result": "No shared memories found."})
@@ -751,13 +800,16 @@ class Mem0MemoryProvider(MemoryProvider):
                 )
             try:
                 # Agent-scoped write: user_id absent, agent_id set. Lands in the
-                # shared pool visible to every operator of this agent.
+                # shared pool visible to every operator of this agent. Also
+                # tagged with metadata.scope="shared" so the read path can
+                # identify shared records by a positive marker, not merely by
+                # the absence of a per-user scope.
                 result = self._backend.add(
                     [{"role": "user", "content": content}],
                     user_id=None,  # agent-scoped (shared) — no per-user principal
                     agent_id=self._agent_id,
                     infer=False,
-                    metadata=self._write_metadata(),
+                    metadata=self._write_shared_metadata(),
                 )
                 self._record_success()
                 event_id = result.get("event_id") if isinstance(result, dict) else None

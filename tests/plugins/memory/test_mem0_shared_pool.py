@@ -97,7 +97,8 @@ class TestSharedPoolRegistration:
 class TestSharedPoolSearch:
     def test_search_uses_agent_id_only_filter(self):
         backend = FakeBackend(
-            search_results=[{"id": "s1", "memory": "All remote access requires MFA", "score": 0.9}]
+            search_results=[{"id": "s1", "memory": "All remote access requires MFA", "score": 0.9,
+                             "metadata": {"scope": "shared"}}]
         )
         provider = _provider(backend, shared_enabled=True)
         result = json.loads(provider.handle_tool_call("mem0_search_shared", {"query": "remote access"}))
@@ -109,14 +110,17 @@ class TestSharedPoolSearch:
         assert "user_id" not in backend.captured[0][2]["filters"]
 
     def test_search_excludes_per_user_records(self):
-        # Agent-scoped (shared) records carry NO user_id; per-user records carry
-        # user_id (as a promoted top-level key). Only the former may appear in
-        # the company view.
+        # Shared records are written with no user_id AND positively tagged
+        # metadata.scope="shared"; per-user records carry user_id. Only shared
+        # records (both belts) may appear in the company view.
         backend = FakeBackend(
             search_results=[
-                {"id": "share1", "memory": "Company policy: MFA required", "score": 0.9},   # shared — no user_id
-                {"id": "priv1", "memory": "Kyle likes early meetings", "score": 0.8, "user_id": "kyle"},  # per-user
-                {"id": "priv2", "memory": "Bob's client is secret", "score": 0.7, "metadata": {"user_id": "bob"}},  # per-user
+                {"id": "share1", "memory": "Company policy: MFA required", "score": 0.9,
+                 "metadata": {"scope": "shared"}},   # shared — tagged, no user_id
+                {"id": "priv1", "memory": "Kyle likes early meetings", "score": 0.8,
+                 "user_id": "kyle", "metadata": {"scope": "shared"}},  # per-user — user_id wins
+                {"id": "priv2", "memory": "Bob's client is secret", "score": 0.7,
+                 "metadata": {"user_id": "bob"}},  # per-user — untagged, has user_id
             ]
         )
         provider = _provider(backend, shared_enabled=True)
@@ -124,6 +128,32 @@ class TestSharedPoolSearch:
         ids = [item["id"] for item in result["results"]]
         assert ids == ["share1"]  # per-user records filtered out
         assert result["count"] == 1
+
+    def test_search_drops_untagged_agent_records(self):
+        # A record with no positive shared marker is NOT admitted — even if it
+        # has no user_id — because it is indistinguishable from a private note
+        # (isolation-by-intersection, not isolation-by-drop).
+        backend = FakeBackend(
+            search_results=[
+                {"id": "mystery", "memory": "Some agent-scoped note without a marker", "score": 0.9},
+            ]
+        )
+        provider = _provider(backend, shared_enabled=True)
+        result = json.loads(provider.handle_tool_call("mem0_search_shared", {"query": "note"}))
+        assert result.get("result") == "No shared memories found."
+
+    def test_search_drops_shared_tagged_record_that_also_has_user_id(self):
+        # Belt 2: even a positively shared-tagged record is excluded if it also
+        # carries a per-user scope.
+        backend = FakeBackend(
+            search_results=[
+                {"id": "tagged", "memory": "Company policy: MFA", "score": 0.9,
+                 "metadata": {"scope": "shared", "user_id": "kyle"}},
+            ]
+        )
+        provider = _provider(backend, shared_enabled=True)
+        result = json.loads(provider.handle_tool_call("mem0_search_shared", {"query": "MFA"}))
+        assert result.get("result") == "No shared memories found."
 
     def test_search_returns_no_shared_when_all_results_are_per_user(self):
         backend = FakeBackend(
@@ -154,6 +184,9 @@ class TestSharedPoolAddAuthorization:
         assert backend.captured[0][2]["user_id"] is None
         assert backend.captured[0][2]["agent_id"] == "hermes"
         assert backend.captured[0][2]["infer"] is False
+        # Positively tagged as shared so the read path can identify it without
+        # relying only on the absence of a user_id.
+        assert backend.captured[0][2]["metadata"]["scope"] == "shared"
 
     def test_unlisted_operator_refused_when_allowlist_set(self):
         backend = FakeBackend()
@@ -211,6 +244,17 @@ class TestSharedPoolHelpers:
     def test_authorized_checks_user_id_against_allowlist(self):
         assert _provider(user_id="a", submitters=["a", "b"])._shared_pool_authorized() is True
         assert _provider(user_id="c", submitters=["a", "b"])._shared_pool_authorized() is False
+
+    def test_authorized_matches_case_insensitively(self):
+        # Operator identifiers can arrive from any gateway with case variance
+        # (email-style ids, username-cased CLI ids, etc.). The allowlist must
+        # not silently refuse a differently-cased (but otherwise equal) id.
+        assert _provider(user_id="Admin@Example.com",
+                         submitters=["admin@example.com"])._shared_pool_authorized() is True
+        assert _provider(user_id="admin@example.com",
+                         submitters=["ADMIN@EXAMPLE.COM"])._shared_pool_authorized() is True
+        assert _provider(user_id="nobody@example.com",
+                         submitters=["admin@example.com"])._shared_pool_authorized() is False
 
     def test_filter_is_agent_id_only(self):
         assert _provider(agent_id="foxtrot")._shared_submitters_filter() == {"agent_id": "foxtrot"}
