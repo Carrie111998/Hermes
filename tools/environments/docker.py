@@ -114,6 +114,7 @@ def _load_hermes_env_vars() -> dict[str, str]:
 # safely through `docker ps --filter label=key=value`. Profile and task names
 # can technically contain other characters; sanitize defensively.
 _LABEL_VALUE_OK_RE = re.compile(r"[^A-Za-z0-9_.-]")
+_TASK_IDENTITY_LABEL_KEY = "hermes-task-key"
 _WINDOWS_PATH_INVALID_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WINDOWS_RESERVED_PATH_STEMS = frozenset(
     {"CON", "PRN", "AUX", "NUL"}
@@ -165,6 +166,41 @@ def _sandbox_task_component(task_id: str) -> str:
     stem = cleaned[:50].rstrip(" .") or "task"
     digest = hashlib.sha256(raw.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
     return f"{stem}-{digest}"
+
+
+def _sandbox_task_dir(
+    docker_root: Path,
+    task_id: str,
+    *,
+    allow_legacy: Optional[bool] = None,
+) -> Path:
+    """Resolve persistent storage while preserving valid POSIX legacy paths."""
+    raw = str(task_id or "default")
+    portable = docker_root / _sandbox_task_component(raw)
+    if portable.name == raw:
+        return portable
+
+    if allow_legacy is None:
+        allow_legacy = os.name != "nt"
+    legacy_is_single_component = (
+        raw not in {"", ".", ".."}
+        and "/" not in raw
+        and "\x00" not in raw
+    )
+    if allow_legacy and legacy_is_single_component:
+        legacy = docker_root / raw
+        try:
+            if legacy.is_dir():
+                return legacy
+        except OSError:
+            pass
+    return portable
+
+
+def _task_identity_fingerprint(task_id: str) -> str:
+    """Return a collision-resistant label value for the unsanitized task ID."""
+    raw = str(task_id or "default")
+    return hashlib.sha256(raw.encode("utf-8", errors="surrogatepass")).hexdigest()[:48]
 
 
 def _get_active_profile_name() -> str:
@@ -1017,7 +1053,7 @@ class DockerEnvironment(BaseEnvironment):
         self._home_dir: Optional[str] = None
         writable_args = []
         if self._persistent:
-            sandbox = get_sandbox_dir() / "docker" / _sandbox_task_component(task_id)
+            sandbox = _sandbox_task_dir(get_sandbox_dir() / "docker", task_id)
             self._home_dir = str(sandbox / "home")
             os.makedirs(self._home_dir, exist_ok=True)
             writable_args.extend([
@@ -1407,9 +1443,11 @@ class DockerEnvironment(BaseEnvironment):
         # container-start time and never changes for the container's lifetime.
         profile_name = _sanitize_label_value(_get_active_profile_name())
         task_label = _sanitize_label_value(task_id)
+        task_fingerprint = _task_identity_fingerprint(task_id)
         label_args = [
             "--label", "hermes-agent=1",
             "--label", f"hermes-task-id={task_label}",
+            "--label", f"{_TASK_IDENTITY_LABEL_KEY}={task_fingerprint}",
             "--label", f"hermes-profile={profile_name}",
             "--label", f"{_EGRESS_LABEL_KEY}={egress_label}",
         ]
@@ -1422,6 +1460,7 @@ class DockerEnvironment(BaseEnvironment):
         self._labels = {
             "hermes-agent": "1",
             "hermes-task-id": task_label,
+            _TASK_IDENTITY_LABEL_KEY: task_fingerprint,
             "hermes-profile": profile_name,
             _EGRESS_LABEL_KEY: egress_label,
         }
@@ -1440,7 +1479,7 @@ class DockerEnvironment(BaseEnvironment):
         reused = False
         if persist_across_processes:
             existing = self._find_reusable_container(
-                task_label, profile_name, egress_label,
+                task_label, task_fingerprint, profile_name, egress_label,
             )
             if existing is not None:
                 container_id, state = existing
@@ -1698,9 +1737,13 @@ class DockerEnvironment(BaseEnvironment):
 
         # 1. Try label-based reuse (another process may have recreated it).
         task_label = self._labels.get("hermes-task-id", "")
+        task_fingerprint = self._labels.get(_TASK_IDENTITY_LABEL_KEY, "")
         profile_label = self._labels.get("hermes-profile", "")
         existing = self._find_reusable_container(
-            task_label, profile_label, self._labels.get(_EGRESS_LABEL_KEY, "off"),
+            task_label,
+            task_fingerprint,
+            profile_label,
+            self._labels.get(_EGRESS_LABEL_KEY, "off"),
         )
         if existing is not None:
             cid, state = existing
@@ -1863,6 +1906,7 @@ class DockerEnvironment(BaseEnvironment):
     def _find_reusable_container(
         self,
         task_label: str,
+        task_fingerprint: str,
         profile_label: str,
         egress_label: str,
     ) -> Optional[tuple[str, str]]:
@@ -1882,6 +1926,7 @@ class DockerEnvironment(BaseEnvironment):
             filters = [
                 "--filter", "label=hermes-agent=1",
                 "--filter", f"label=hermes-task-id={task_label}",
+                "--filter", f"label={_TASK_IDENTITY_LABEL_KEY}={task_fingerprint}",
                 "--filter", f"label=hermes-profile={profile_label}",
             ]
             if egress_label != "off":

@@ -57,6 +57,46 @@ def test_persistent_sandbox_uses_portable_task_component(monkeypatch, tmp_path):
     assert os.path.isdir(env._workspace_dir)
 
 
+@pytest.mark.linux_only
+def test_persistent_sandbox_preserves_existing_posix_legacy_state(monkeypatch, tmp_path):
+    from tools.environments import base as base_env
+
+    docker_root = tmp_path / "docker"
+    legacy = docker_root / "session:legacy"
+    (legacy / "home").mkdir(parents=True)
+    (legacy / "workspace").mkdir()
+    marker = legacy / "workspace" / "state.txt"
+    marker.write_text("preserved", encoding="utf-8")
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(base_env, "get_sandbox_dir", lambda: tmp_path)
+    _mock_subprocess_run(monkeypatch)
+
+    env = _make_dummy_env(
+        task_id="session:legacy",
+        persistent_filesystem=True,
+        persist_across_processes=False,
+    )
+
+    assert env._home_dir == str(legacy / "home")
+    assert env._workspace_dir == str(legacy / "workspace")
+    assert (legacy / "workspace" / "state.txt").read_text(encoding="utf-8") == "preserved"
+
+
+def test_sandbox_task_dir_uses_portable_path_when_legacy_is_not_allowed(tmp_path):
+    docker_root = tmp_path / "docker"
+    legacy = docker_root / "session:legacy"
+
+    selected = docker_env._sandbox_task_dir(
+        docker_root,
+        "session:legacy",
+        allow_legacy=False,
+    )
+
+    assert selected != legacy
+    assert ":" not in selected.name
+
+
 def _mock_subprocess_run(monkeypatch):
     """Mock subprocess.run to intercept docker run -d and docker version calls.
 
@@ -652,6 +692,7 @@ def test_labels_attribute_populated_after_init(monkeypatch):
     assert env._labels == {
         "hermes-agent": "1",
         "hermes-task-id": "abc",
+        "hermes-task-key": docker_env._task_identity_fingerprint("abc"),
         "hermes-profile": "default",
         "hermes-egress": "off",
     }
@@ -732,6 +773,55 @@ def test_reuse_attaches_to_running_container_without_docker_run(monkeypatch):
     assert not start_invocations, (
         f"docker start should be skipped when container already running, got: {start_invocations}"
     )
+
+
+def test_colliding_readable_task_labels_do_not_reuse_container(monkeypatch):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    docker_env._cgroup_limits_ok = True
+    containers = []
+    run_calls = []
+
+    def _run(cmd, **kwargs):
+        if not isinstance(cmd, list) or len(cmd) < 2:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[1] == "version":
+            return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+        if cmd[1] == "ps":
+            filters = {
+                part.removeprefix("label=")
+                for part in cmd
+                if isinstance(part, str) and part.startswith("label=")
+            }
+            matches = [container for container in containers if filters <= container["labels"]]
+            stdout = "".join(
+                f"{container['id']}\trunning\t<no value>\n" for container in matches
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        if cmd[1] == "run":
+            run_calls.append(cmd)
+            labels = {
+                cmd[index + 1]
+                for index, value in enumerate(cmd[:-1])
+                if value == "--label"
+            }
+            container_id = f"fresh-{len(containers) + 1}"
+            containers.append({"id": container_id, "labels": labels})
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{container_id}\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    first = _make_dummy_env(task_id="session:a")
+    second = _make_dummy_env(task_id="session?a")
+
+    assert docker_env._sanitize_label_value(
+        "session:a"
+    ) == docker_env._sanitize_label_value("session?a")
+    assert first._container_id == "fresh-1"
+    assert second._container_id == "fresh-2"
+    assert len(run_calls) == 2
+    assert first._labels["hermes-task-key"] != second._labels["hermes-task-key"]
 
 
 def test_egress_enabled_does_not_reuse_pre_egress_container(monkeypatch):
