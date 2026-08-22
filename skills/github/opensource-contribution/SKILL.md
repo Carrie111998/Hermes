@@ -1,7 +1,7 @@
 ---
 name: opensource-contribution
 description: "Screen a GitHub issue for duplicate-PR, assignee, and CLA blockers before carrying it to a PR."
-version: 0.3.0
+version: 0.3.1
 author: MershLab
 license: MIT
 platforms: [linux, macos, windows]
@@ -46,13 +46,15 @@ contrib_screen(target="<owner>/<repo>#<issue-number>", signed_orgs=["<org>", ...
 ```
 
 `signed_orgs` is optional — pass any orgs whose CLA is already signed so
-it stops blocking on them every time. This runs three checks — duplicate
+it stops blocking on them every time. This runs four checks — duplicate
 PR (via the issue's cross-reference timeline, broader than a keyword
-search), assignee, CLA/DCO — and appends a record of exactly what it
-checked and found to `$HERMES_HOME/contrib-screen/log.jsonl`. The tool
-result's `verdict` field is the machine-readable outcome
-(`clear`/`duplicate`/`assigned`/`cla_required`/`not_found`) — read that
-field, don't parse the human-readable `label`.
+search), assignee, CLA/DCO, and AI-contribution governance (the org's
+stated stance in `CONTRIBUTING.md`/`AGENTS.md`, reject/disclose/constrain)
+— and appends a record of exactly what it checked and found to
+`$HERMES_HOME/contrib-screen/log.jsonl`. The tool result's `verdict`
+field is the machine-readable outcome
+(`clear`/`duplicate`/`assigned`/`cla_required`/`ai_policy_reject`/`not_found`)
+— read that field, don't parse the human-readable `label`.
 
 Done when the verdict is known and recorded.
 
@@ -89,6 +91,14 @@ for a single-repo org/project; it exists for the Microsoft/Google/NVIDIA
 - **CLA_REQUIRED** — the repo requires a CLA not yet signed for that org.
   Stop, unless `signed_orgs` should have applied and didn't (recheck the
   org name).
+- **AI_POLICY_REJECT** — the repo's `CONTRIBUTING.md`/`AGENTS.md` states it
+  does not accept AI-generated contributions. Stop unconditionally — this
+  is not a judgment call to override, the org has said so explicitly.
+  Note that a CLEAR verdict can still carry a non-blocking `disclose` or
+  `constrain` reason in the result's `reasons` field (say so in the PR
+  body, or make sure the change is actually understood end-to-end before
+  submitting) — read `reasons` even on CLEAR, don't only branch on
+  `verdict`.
 
 Done when either work has moved to `github-issue-to-pr`, or the candidate
 is skipped with the reason recorded.
@@ -152,10 +162,13 @@ somewhere durable to write it (see Known limitation below).
 
 ## Known limitation
 
-Step 6's durable outcome log has no home yet (`kernel.py`'s append-only
-log, per the harness system design doc, is not built) — until it exists,
-record the outcome by hand or in the calling session's own notes, don't
-skip it silently.
+Step 6's durable outcome log still has no home. `plugins/kernel/` now
+exists, but don't reach for it here — its append-only log records
+outgoing-model-call provenance for the audit invariant, not skill-level
+outcomes (repo/issue/verdict/PR URL); using it for this would be a scope
+mismatch, not a fit. Until a real outcome store exists, record the
+outcome by hand or in the calling session's own notes, don't skip it
+silently.
 
 ## Verification
 
