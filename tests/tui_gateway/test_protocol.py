@@ -243,15 +243,17 @@ def test_clarify_block_registers_exact_target_without_replacing_transport(
     )
 
     emitted = []
+    emitted_ready = threading.Event()
     registered = []
     ready = threading.Event()
     transport = object()
     server._sessions["observer-session"] = {"transport": transport}
-    monkeypatch.setattr(
-        server,
-        "_emit",
-        lambda event, sid, payload: emitted.append((event, sid, dict(payload))),
-    )
+
+    def capture_emit(event, sid, payload):
+        emitted.append((event, sid, dict(payload)))
+        emitted_ready.set()
+
+    monkeypatch.setattr(server, "_emit", capture_emit)
     service = get_pending_interaction_service()
 
     def observe(event):
@@ -277,6 +279,7 @@ def test_clarify_block_registers_exact_target_without_replacing_transport(
     try:
         thread.start()
         assert ready.wait(2)
+        assert emitted_ready.wait(2)
         target = registered[0].target
         assert emitted[0][2]["request_id"] == target.request_id
         assert server._sessions["observer-session"]["transport"] is transport
