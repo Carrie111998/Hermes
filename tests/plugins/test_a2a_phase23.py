@@ -104,7 +104,7 @@ def _send_body(text, ctx="", method="message/send"):
 
 class TestStreamResponseFormat:
     def test_artifact_update_exposes_fenced_json_as_structured_data(self):
-        reply = 'Summary\n```json\n[1, {"markdown": "```"}, 3]\n```'
+        reply = 'Summary\n````json\n[1, {"markdown": "```"}, 3]\n````'
 
         ev = protocol.artifact_update("task-json", "ctx-json", reply)
 
