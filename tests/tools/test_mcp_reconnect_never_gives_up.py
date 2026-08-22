@@ -184,7 +184,18 @@ async def test_removing_the_ceiling_did_not_remove_the_pacing(monkeypatch):
         await task.run({"url": "https://example.invalid/mcp"})
 
     assert delays, "an instantly-failing transport must still sleep between attempts"
-    assert delays == sorted(delays), f"backoff must not shrink: {delays}"
-    assert delays[0] < delays[-1], f"backoff must grow: {delays}"
-    assert max(delays) <= mcp_tool._MAX_BACKOFF_SECONDS, f"backoff must cap: {delays}"
-    assert sum(delays) > 30, f"nine instant failures must span real time, not spin: {delays}"
+
+    # Pin the SCHEDULE, not just its shape. "sorted, grows, under the cap"
+    # admits anything monotonic: a `backoff * 1.5` schedule gives
+    # 1, 1.5, 2.25 ... 25.6, which is sorted, grows, stays under 60, and sums
+    # past 30 -- every assertion satisfied while the cap is never reached and
+    # the doubling is gone. Raised by CodeRabbit on this PR; verified by
+    # working the 1.5x case by hand before taking the suggestion.
+    cap = mcp_tool._MAX_BACKOFF_SECONDS
+    expected: list[float] = []
+    nxt = delays[0]
+    for _ in delays:
+        expected.append(nxt)
+        nxt = min(nxt * 2, cap)
+    assert delays == expected, f"unexpected backoff schedule: {delays}"
+    assert delays[-1] == cap, f"backoff must actually reach its cap: {delays}"
