@@ -32,9 +32,11 @@ structured-output capability is known. The operator references are the
 A Gemini `429 RESOURCE_EXHAUSTED` or equivalent fast-lane quota failure is
 handled as one bounded AGENTIC handoff. The fast request is not retried by
 the adaptive router, the same turn never re-enters the fast lane, and the
-normal Hermes provider fallback chain is disabled for that handoff so the
-failure cannot cycle back into FAST. Other fast-lane failures fail closed to
-the normal agentic lane.
+normal Hermes provider fallback chain remains active for the AGENTIC handoff.
+Because the adaptive decision is consumed once at the gateway boundary, a
+normal fallback that happens to use Gemini is still an AGENTIC runtime call,
+not a second adaptive-router invocation. Other fast-lane failures fail closed
+to the normal agentic lane.
 
 If the normal Hermes runtime is configured to use the same provider/model as
 the fast lane, the adaptive router still runs only once and does not dispatch

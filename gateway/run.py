@@ -5725,10 +5725,7 @@ class TurnRunner:
         # serialization (_running_agents) keeps this safe post-lock.
         if reused_cached_agent and agent is not None:
             self._runner._apply_fallback_chain_to_agent(
-                agent,
-                None
-                if ctx.disable_provider_fallback
-                else self._runner._refresh_fallback_model(),
+                agent, self._runner._refresh_fallback_model(),
             )
 
         # Lock released — now schedule cleanup of any cross-process-evicted
@@ -5785,7 +5782,7 @@ class TurnRunner:
                 gateway_session_key=ctx.session_key,
                 session_db=getattr(self._runner._session_db, "_db", self._runner._session_db),
                 # Reload from disk — do not reuse the startup snapshot (#60955).
-                fallback_model=self._runner._refresh_fallback_model() if not ctx.disable_provider_fallback else None,
+                fallback_model=self._runner._refresh_fallback_model(),
                 skip_context_files=skip_context_files,
                 # Keep the persona even with minimal context: soul identity is
                 # a single small file, not part of the expensive walk.
@@ -6866,12 +6863,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return bool(token and state is not None and state.turn.routing_owner == token)
 
     def _release_whatsapp_adaptive_routing_owner(
-        self, event: MessageEvent, session_key: str
+        self, event: MessageEvent, session_key: str, *, restore: bool = True
     ) -> bool:
         """Release only the adaptive sentinel owned by *event*."""
         token = getattr(event, "_whatsapp_adaptive_routing_owner", None)
         if not token or not self._adaptive_routing_owner_matches(event, session_key):
             return False
+        if restore:
+            self._restore_pending_one_turn_model_override(
+                session_key, owner_token=token
+            )
         return self._release_running_agent_state(session_key)
 
     def _running_agent_items(self) -> List[tuple]:
@@ -18135,7 +18136,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._release_whatsapp_adaptive_routing_owner(event, _quick_key)
                 return _adaptive_decision.response or ""
             event._whatsapp_adaptive_reason = _adaptive_decision.reason
-            event._whatsapp_adaptive_disable_fallback = True
             event._whatsapp_adaptive_route = AdaptiveRoute.AGENTIC.value
 
         # ── Claim this session before any await ───────────────────────
@@ -18218,6 +18218,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and self._adaptive_routing_owner_matches(event, _quick_key)
             )
             self._restore_moa_one_shot(event, _quick_key)
+            if _adaptive_owned:
+                self._restore_pending_one_turn_model_override(
+                    _quick_key, owner_token=_adaptive_owner
+                )
+            elif not _adaptive_owner:
+                self._restore_pending_one_turn_model_override(
+                    _quick_key, run_generation=_run_generation
+                )
             # Normal completion/exception/interrupt owns and clears this exact
             # durable marker.  Its event-owned CAS token is independent of the
             # routing owner, so /stop or /new invalidating routing ownership
@@ -18233,7 +18241,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # missed the leftover real agent — locking the session out forever (#28686).
             if _adaptive_owned:
                 self._release_whatsapp_adaptive_routing_owner(
-                    event, _quick_key
+                    event, _quick_key, restore=False
                 )
             elif not _adaptive_owner:
                 self._release_running_agent_state(_quick_key)
@@ -18265,15 +18273,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pass
 
     def _restore_pending_one_turn_model_override(
-        self, session_key: str, *, owner_token: Optional[str] = None
+        self,
+        session_key: str,
+        *,
+        owner_token: Optional[str] = None,
+        run_generation: Optional[int] = None,
     ) -> None:
         """Restore a per-session model override after ``/model --once`` runs."""
         if not session_key:
             return
         try:
             _otr_state = self._peek_session_state(session_key)
+            if owner_token is None and run_generation is None:
+                return
             if owner_token is not None and (
                 _otr_state is None or _otr_state.turn.routing_owner != owner_token
+            ):
+                return
+            if run_generation is not None and not self._is_session_run_current(
+                session_key, run_generation
             ):
                 return
             snapshot = _otr_state.conversation.one_turn_restore if _otr_state else None
@@ -20379,9 +20397,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
-                disable_provider_fallback=bool(
-                    getattr(event, "_whatsapp_adaptive_disable_fallback", False)
-                ),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -28095,7 +28110,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
-        disable_provider_fallback: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -28116,7 +28130,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
-                disable_provider_fallback=disable_provider_fallback,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -28130,7 +28143,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
-                disable_provider_fallback=disable_provider_fallback,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -28274,7 +28286,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
-        disable_provider_fallback: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -28584,7 +28595,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
-            disable_provider_fallback=disable_provider_fallback,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to

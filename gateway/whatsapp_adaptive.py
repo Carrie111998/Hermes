@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import threading
 from dataclasses import dataclass
 from enum import Enum
@@ -52,6 +53,35 @@ ROUTER_REASON_VALUES = frozenset(
 # earn its way into the contract before it can authorize a direct answer.
 SAFE_DIRECT_REASONS = frozenset({"simple"})
 ROUTER_FIELDS = frozenset({"route", "response", "reason", "confidence"})
+
+# DIRECT is an allowlist, not a model-mediated denylist. The router may
+# recommend DIRECT for any text, but only a small set of demonstrably bounded
+# conversational shapes can receive that authorization. Everything else
+# remains AGENTIC, including unknown intent.
+_SAFE_DIRECT_INPUT_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"(?:hi|hello|hey|olá|ola|oi)(?:\s+(?:there|hermes|aí|ai))?[!.?]*",
+        r"(?:good\s+morning|good\s+afternoon|good\s+evening|bom\s+dia|boa\s+tarde|boa\s+noite)[!.?]*",
+        r"(?:how\s+are\s+you(?:\s+doing)?|como\s+você\s+está|como\s+voce\s+esta|tudo\s+bem)(?:\s+(?:today|hoje))?[!.?]*",
+        r"(?:thanks|thank\s+you|obrigado|obrigada)(?:\s+(?:so\s+much|muito))?[!.?]*",
+        r"(?:nice\s+to\s+meet\s+you|prazer\s+em\s+conhecer\s+você|prazer\s+em\s+conhecer\s+voce|can\s+we\s+chat|podemos\s+conversar|let['’]s\s+chat)[!.?]*",
+        r"(?:what\s+can\s+you\s+do|o\s+que\s+você\s+pode\s+fazer|o\s+que\s+voce\s+pode\s+fazer)[!.?]*",
+        r"(?:tell\s+me\s+a\s+joke|conte\s+uma\s+piada)[!.?]*",
+        r"(?:i['’]?m\s+(?:fine|good|happy|bored|curious)|eu\s+estou\s+(?:bem|feliz|entediado|entediada|curioso|curiosa))[!.?]*",
+    )
+)
+
+_DIRECT_INPUT_RISK_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\b(?:ignore|disregard|bypass|override|jailbreak|prompt\s+injection|system\s+prompt|developer\s+message|router|direct)\b",
+        r"\b(?:tool|function|shell|terminal|command|script|file|filesystem|runtime|server|database|api|browser|inspect|debug|log|logs)\b",
+        r"\b(?:delete|remove|create|change|update|send|execute|run|install|deploy|restart|approve|deny|buy|pay|book|schedule|call|email|upload|download)\b",
+        r"\b(?:latest|current|weather|news|price|stock|search|browse|internet|live|real[- ]time)\b",
+        r"\b(?:step\s+by\s+step|first|then|several|multiple|workflow|automate|diagnos|medical|legal|financial|credential|password|secret)\b",
+    )
+)
 
 # The schema is intentionally small.  ``response`` is the direct answer from
 # the same call that selected DIRECT; it is never used as an instruction or as
@@ -290,6 +320,24 @@ def _response_content(response: Any) -> str:
     return content if isinstance(content, str) else str(content or "")
 
 
+def is_deterministically_eligible_for_direct(message: str) -> bool:
+    """Authorize DIRECT only for a bounded, low-risk original input.
+
+    This is intentionally conservative. The router's structured answer is a
+    recommendation; it cannot expand this input-side policy. A future
+    conversational shape must be added here with a regression test before it
+    can enter the fast lane.
+    """
+    normalized = " ".join(str(message or "").strip().split())
+    if not normalized or len(normalized) > 240:
+        return False
+    if any(pattern.fullmatch(normalized) for pattern in _SAFE_DIRECT_INPUT_PATTERNS):
+        return True
+    if any(pattern.search(normalized) for pattern in _DIRECT_INPUT_RISK_PATTERNS):
+        return False
+    return False
+
+
 def _parse_decision(response: Any) -> AdaptiveDecision:
     raw = _response_content(response).strip()
     if raw.startswith("```"):
@@ -413,7 +461,12 @@ class WhatsAppFastRouter:
                     timeout=self.config.timeout_seconds,
                 )
                 response = client.chat.completions.create(**request)
-            return _parse_decision(response)
+            decision = _parse_decision(response)
+            if decision.route is AdaptiveRoute.DIRECT and not is_deterministically_eligible_for_direct(
+                message
+            ):
+                return AdaptiveDecision(AdaptiveRoute.AGENTIC, reason="unknown")
+            return decision
         except GeminiAPIError as exc:
             if is_gemini_quota_exhausted(exc):
                 return AdaptiveDecision(
@@ -451,5 +504,6 @@ __all__ = [
     "WhatsAppFastRouter",
     "build_fast_router_messages",
     "discover_flash_lite_model",
+    "is_deterministically_eligible_for_direct",
     "is_gemini_quota_exhausted",
 ]
