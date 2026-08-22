@@ -395,6 +395,15 @@ class TestV1Task:
             },
         ]
 
+    def test_completed_task_keeps_tab_indented_json_fence_as_text(self):
+        reply = 'Literal example:\n\t```json\n{"answer": 42}\n\t```'
+
+        task = protocol.build_task("t-json", "c-json", protocol.STATE_COMPLETED, reply)
+
+        assert task["artifacts"][0]["parts"] == [
+            {"text": reply, "mediaType": "text/plain"},
+        ]
+
     def test_completed_task_shape(self):
         task = protocol.build_task("t1", "c1", protocol.STATE_COMPLETED, "the answer")
         assert task["status"]["state"] == "TASK_STATE_COMPLETED"

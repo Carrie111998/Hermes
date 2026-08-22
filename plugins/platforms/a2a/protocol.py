@@ -266,9 +266,9 @@ def data_part(data: Any, media_type: str = "application/json") -> dict:
 
 
 _JSON_FENCE_RE = re.compile(
-    r"(?m:^[ \t]{0,3}```json[ \t]*\r?\n)"
+    r"(?m:^[ ]{0,3}```json[ \t]*\r?\n)"
     r"(?P<payload>.*?)"
-    r"(?m:^[ \t]{0,3}```[ \t]*\r?$)",
+    r"(?m:^[ ]{0,3}```[ \t]*\r?$)",
     re.IGNORECASE | re.DOTALL,
 )
 

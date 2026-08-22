@@ -116,6 +116,15 @@ class TestStreamResponseFormat:
             },
         ]
 
+    def test_artifact_update_keeps_tab_indented_closing_fence_as_text(self):
+        reply = 'Literal example:\n```json\n[1, 2, 3]\n\t```'
+
+        ev = protocol.artifact_update("task-json", "ctx-json", reply)
+
+        assert ev["artifactUpdate"]["artifact"]["parts"] == [
+            {"text": reply, "mediaType": "text/plain"},
+        ]
+
     def test_status_update_shape(self):
         ev = protocol.status_update("task-1", "ctx-1", protocol.STATE_WORKING)
         assert set(ev.keys()) == {"statusUpdate"}
