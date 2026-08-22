@@ -150,4 +150,15 @@ describe('host.revealPane', () => {
     disposers.forEach(dispose => dispose())
     $dismissedPanes.set(new Set())
   })
+
+  it('un-hides a chrome-hidden plugin pane', async () => {
+    const { $hiddenTreePanes, setTreePaneHidden } = await import('@/components/pane-shell/tree/store')
+
+    setTreePaneHidden('plugin:reveal-target', true)
+    expect($hiddenTreePanes.get()).toContain('plugin:reveal-target')
+
+    host.revealPane('plugin:reveal-target')
+
+    expect($hiddenTreePanes.get()).not.toContain('plugin:reveal-target')
+  })
 })
