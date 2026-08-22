@@ -11,8 +11,23 @@ from __future__ import annotations
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
 
 import pytest
+
+
+def _clear_worker_tool_evidence(task_id: str) -> None:
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "DELETE FROM task_events WHERE task_id = ? AND kind = 'tool_evidence'",
+            (task_id,),
+        )
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -63,9 +78,14 @@ def worker_env(monkeypatch, tmp_path):
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
         kb.claim_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        assert run is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+    from tools import kanban_tools as kt
+    kt.record_successful_worker_tool("read_file", runtime="hermes")
     return tid
 
 
@@ -130,6 +150,195 @@ def test_complete_happy_path(worker_env):
         assert run.metadata == {"files": 2}
     finally:
         conn.close()
+
+
+def test_complete_rejects_narrative_without_current_run_material_evidence(
+    worker_env,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    _clear_worker_tool_evidence(worker_env)
+    out = json.loads(kt._handle_complete({"summary": "narrative only"}))
+
+    assert "successful material tool result" in out.get("error", "")
+    assert "remains in flight" in out.get("error", "")
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+        kinds = [event.kind for event in kb.list_events(conn, worker_env)]
+        assert "protocol_violation" in kinds
+        assert "blocked" not in kinds
+    finally:
+        conn.close()
+
+
+def test_complete_accepts_successful_hermes_dispatch_result(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    _clear_worker_tool_evidence(worker_env)
+    kt.record_worker_tool_result(
+        "read_file",
+        json.dumps({"ok": True, "text": "data"}),
+    )
+
+    out = json.loads(kt._handle_complete({"summary": "verified work"}))
+    assert out.get("ok") is True
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "done"
+        evidence = [
+            event
+            for event in kb.list_events(conn, worker_env)
+            if event.kind == "tool_evidence"
+        ]
+        assert len(evidence) == 1
+        assert evidence[0].payload == {
+            "tool": "read_file",
+            "runtime": "hermes",
+        }
+    finally:
+        conn.close()
+
+
+def test_mcp_completion_waits_for_cross_process_codex_receipt(worker_env):
+    from tools import kanban_tools as kt
+
+    _clear_worker_tool_evidence(worker_env)
+
+    def delayed_receipt():
+        time.sleep(0.1)
+        kt.record_successful_worker_tool(
+            "exec_command",
+            runtime="codex_app_server",
+        )
+
+    writer = threading.Thread(target=delayed_receipt)
+    writer.start()
+    try:
+        out = json.loads(kt._handle_complete({"summary": "codex work done"}))
+    finally:
+        writer.join(timeout=2)
+
+    assert not writer.is_alive()
+    assert out.get("ok") is True
+
+
+@pytest.mark.parametrize(
+    "failed_result",
+    [
+        None,
+        "Error: permission denied",
+        json.dumps({"status": "cancelled"}),
+        json.dumps({"exit_code": 1, "stdout": ""}),
+        json.dumps({"success": False}),
+    ],
+)
+def test_failed_tool_results_never_count_as_material_evidence(
+    worker_env,
+    failed_result,
+):
+    from tools import kanban_tools as kt
+
+    _clear_worker_tool_evidence(worker_env)
+    kt.record_worker_tool_result("terminal", failed_result)
+
+    assert kt._worker_material_tool_evidence() == []
+    out = json.loads(kt._handle_complete({"summary": "not done"}))
+    assert "successful material tool result" in out.get("error", "")
+
+
+def test_successful_decomposition_counts_as_material_evidence(worker_env):
+    from tools import kanban_tools as kt
+
+    _clear_worker_tool_evidence(worker_env)
+    kt.record_worker_tool_result(
+        "kanban_create",
+        json.dumps({"ok": True, "task_id": "t_child"}),
+    )
+
+    out = json.loads(kt._handle_complete({"summary": "decomposed work"}))
+    assert out.get("ok") is True
+
+
+def test_real_dispatch_boundary_records_successful_result(
+    worker_env,
+    monkeypatch,
+):
+    import model_tools
+    from tools import kanban_tools as kt
+
+    _clear_worker_tool_evidence(worker_env)
+    monkeypatch.setattr(
+        model_tools.registry,
+        "dispatch",
+        lambda *args, **kwargs: json.dumps({"ok": True, "text": "live"}),
+    )
+
+    model_tools.handle_function_call(
+        "read_file",
+        {"path": "/tmp/evidence"},
+        skip_pre_tool_call_hook=True,
+    )
+
+    assert kt._worker_material_tool_evidence() == ["read_file"]
+
+
+def test_historical_run_evidence_is_rejected(
+    worker_env,
+    monkeypatch,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        old_run = kb.latest_run(conn, worker_env)
+        assert old_run is not None
+        kb._set_worker_pid(conn, worker_env, 98765)
+        monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+        assert kb.detect_crashed_workers(conn) == [worker_env]
+        kb.claim_task(conn, worker_env)
+        current_run = kb.latest_run(conn, worker_env)
+        assert current_run is not None
+        assert current_run.id != old_run.id
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(current_run.id))
+    assert kt._worker_material_tool_evidence() == []
+    out = json.loads(kt._handle_complete({"summary": "stale evidence"}))
+    assert "successful material tool result" in out.get("error", "")
+
+
+def test_other_task_receipt_does_not_authorize_current_task(
+    worker_env,
+    monkeypatch,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    _clear_worker_tool_evidence(worker_env)
+    current_run_id = os.environ["HERMES_KANBAN_RUN_ID"]
+    conn = kb.connect()
+    try:
+        other = kb.create_task(conn, title="other", assignee="test-worker")
+        kb.claim_task(conn, other)
+        other_run = kb.latest_run(conn, other)
+        assert other_run is not None
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", other)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(other_run.id))
+    kt.record_successful_worker_tool("read_file", runtime="hermes")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", worker_env)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", current_run_id)
+
+    assert kt._worker_material_tool_evidence() == []
+    out = json.loads(kt._handle_complete({"summary": "other task evidence"}))
+    assert "successful material tool result" in out.get("error", "")
 
 
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):

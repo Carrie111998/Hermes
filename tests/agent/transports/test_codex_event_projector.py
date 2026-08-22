@@ -75,6 +75,12 @@ class TestProjectionInvariants:
 class TestCommandExecutionProjection:
     """Real captured notification → assistant tool_call + tool result."""
 
+    def test_command_completed_produces_two_messages(self) -> None:
+        p = CodexEventProjector()
+        r = p.project(COMMAND_EXEC_COMPLETED)
+        assert len(r.messages) == 2
+        assert r.is_tool_iteration is True
+        assert r.material_tool_name == "exec_command"
 
     def test_first_message_is_assistant_tool_call(self) -> None:
         p = CodexEventProjector()
@@ -98,6 +104,19 @@ class TestCommandExecutionProjection:
         assert tool["tool_call_id"] == assistant["tool_calls"][0]["id"]
         assert "hello" in tool["content"]
 
+    def test_nonzero_exit_code_annotated_in_tool_result(self) -> None:
+        item = {**COMMAND_EXEC_COMPLETED["params"]["item"], "exitCode": 2,
+                "aggregatedOutput": "boom"}
+        notif = {
+            "method": "item/completed",
+            "params": {**COMMAND_EXEC_COMPLETED["params"], "item": item},
+        }
+        p = CodexEventProjector()
+        projected = p.project(notif)
+        msgs = projected.messages
+        assert "[exit 2]" in msgs[1]["content"]
+        assert "boom" in msgs[1]["content"]
+        assert projected.material_tool_name is None
 
 
 
@@ -160,8 +179,9 @@ class TestFileChangeProjection:
             ],
         }
         p = CodexEventProjector()
-        msgs = p.project({"method": "item/completed",
-                          "params": {"item": item}}).messages
+        projected = p.project({"method": "item/completed",
+                               "params": {"item": item}})
+        msgs = projected.messages
         assert len(msgs) == 2
         tc = msgs[0]["tool_calls"][0]
         assert tc["function"]["name"] == "apply_patch"
@@ -169,6 +189,7 @@ class TestFileChangeProjection:
         assert len(args["changes"]) == 2
         assert all("kind" in c and "path" in c for c in args["changes"])
         assert "applied" in msgs[1]["content"]
+        assert projected.material_tool_name == "apply_patch"
 
 
 class TestMcpToolCallProjection:
@@ -183,11 +204,13 @@ class TestMcpToolCallProjection:
             "result": {"content": [{"text": "found"}]},
             "error": None,
         }
-        msgs = CodexEventProjector().project(
+        projected = CodexEventProjector().project(
             {"method": "item/completed", "params": {"item": item}}
-        ).messages
+        )
+        msgs = projected.messages
         assert msgs[0]["tool_calls"][0]["function"]["name"] == "mcp.obsidian.search_notes"
         assert "found" in msgs[1]["content"]
+        assert projected.material_tool_name == "mcp.obsidian.search_notes"
 
     def test_mcp_error_surfaced(self) -> None:
         item = {
@@ -196,10 +219,32 @@ class TestMcpToolCallProjection:
             "arguments": {}, "result": None,
             "error": {"code": -1, "message": "no"},
         }
-        msgs = CodexEventProjector().project(
+        projected = CodexEventProjector().project(
             {"method": "item/completed", "params": {"item": item}}
-        ).messages
+        )
+        msgs = projected.messages
         assert "error" in msgs[1]["content"]
+        assert projected.material_tool_name is None
+
+    def test_mcp_business_error_does_not_become_material_evidence(self) -> None:
+        """FastMCP may return a Hermes tool_error as successful transport data."""
+        item = {
+            "type": "mcpToolCall", "id": "m3",
+            "server": "hermes-tools", "tool": "kanban_create",
+            "status": "completed", "arguments": {}, "error": None,
+            "result": {
+                "content": [
+                    {"type": "text", "text": '{"error":"title is required"}'},
+                ],
+                "isError": False,
+            },
+        }
+
+        projected = CodexEventProjector().project(
+            {"method": "item/completed", "params": {"item": item}}
+        )
+
+        assert projected.material_tool_name is None
 
 
 class TestUserAndOpaqueProjection:
