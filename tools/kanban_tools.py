@@ -1359,6 +1359,13 @@ def _handle_create(args: dict, **kw) -> str:
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
     body = args.get("body")
+    if body:
+        # Same write-path contract as _handle_comment/_handle_complete/
+        # _handle_block: card bodies persist into the board's SQLite and
+        # board DBs are routinely snapshotted, so a credential pasted into
+        # a task body must be masked at the tool boundary (#92354).
+        # redact_sensitive_text passes secret-free text through unchanged.
+        body = redact_sensitive_text(str(body), force=True)
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
     # Stamp the originating session id when the agent loop runs under
