@@ -20,6 +20,17 @@ _SUBAGENT_TOOL_NAMES = frozenset({"delegate_task"})
 # configured" - true for MCP, memory and skills, and false for the
 # conversation. Every session has one, so hiding the row at zero makes an empty
 # transcript indistinguishable from a breakdown that never measured it (#87903).
+#
+# The membership rule, stated so a later addition argues from the same
+# principle rather than from "this one felt important": a category belongs
+# here when zero is a MEASUREMENT of something every session has, not the
+# ABSENCE of something optional. "conversation" qualifies because a session
+# cannot not have a transcript, so zero means "nothing said yet" and is worth
+# showing. "mcp", "memory", "skills" and "subagent_definitions" do not: zero
+# there means the user configured none, which is what dropping the row already
+# communicates, and a permanent 0-token row would be noise on most hosts.
+# "system_prompt" and "tool_definitions" are always present too but are never
+# zero in practice, so adding them would buy nothing.
 _ALWAYS_REPORTED = frozenset({"conversation"})
 
 _CATEGORY_COLORS = {
