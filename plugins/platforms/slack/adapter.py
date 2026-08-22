@@ -52,6 +52,7 @@ from gateway.platforms.base import (
     SUPPORTED_VIDEO_TYPES,
     _TEXT_INJECT_EXTENSIONS,
     is_host_excluded_by_no_proxy,
+    normalize_command_padding,
     resolve_proxy_url,
     safe_url_for_log,
     _ssrf_redirect_guard,
@@ -6698,11 +6699,7 @@ class SlackAdapter(BasePlatformAdapter):
         # WYSIWYG thread composer) is normalized on bare commands while
         # preserving argument whitespace on parameterized commands.
         if is_command_text:
-            cmd_tokens = command_probe_text.strip().split(maxsplit=1)
-            if len(cmd_tokens) == 1:
-                command_probe_text = command_probe_text.strip()
-            else:
-                command_probe_text = command_probe_text.rstrip("\r\n")
+            command_probe_text = normalize_command_padding(command_probe_text)
             text = command_probe_text
             msg_type = MessageType.COMMAND
 
