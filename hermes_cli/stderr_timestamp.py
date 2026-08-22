@@ -47,8 +47,11 @@ def _rotation_config() -> tuple[int, int]:
             max_mb = int(cfg_max)
         if cfg_backups is not None:
             backups = int(cfg_backups)
-    except Exception:
-        pass
+    except Exception as exc:  # pragma: no cover - defensive
+        # Signal rather than silently reverting to hardcoded defaults: if
+        # hermes_logging renames its reader, rotation still works but no
+        # longer tracks logging.max_size_mb / backup_count.
+        print(f"stderr_timestamp: using default rotation sizes ({exc})", file=sys.stderr)
     return max(max_mb, 1), max(backups, 0)
 
 
@@ -103,7 +106,7 @@ class _RotatingWriter:
 
     def _rotate(self) -> None:
         """Rename current file to .1, shift older backups up, start a fresh one."""
-        self.delete()
+        self.close()
         for index in range(self._backup_count, 0, -1):
             target = self._path.with_name(f"{self._path.name}.{index}")
             source = self._path.with_name(f"{self._path.name}.{index - 1}") if index > 1 else self._path
@@ -118,6 +121,10 @@ class _RotatingWriter:
         self._open()
 
     def write(self, text: str) -> None:
+        # A single line longer than max_bytes still lands whole (rotation only
+        # happens BEFORE writing, and only when the file is non-empty): an
+        # oversize line may exceed the cap by its own length. That trades a
+        # bounded overshoot for never truncating a diagnostic mid-line.
         if self._io is None:
             self._open()
         assert self._io is not None
@@ -129,8 +136,9 @@ class _RotatingWriter:
     def flush(self) -> None:
         """No-op — writes are unbuffered (BinaryIO opened with buffering=0)."""
 
-    def delete(self) -> None:
-        """Close the underlying log (used when the child stream ends)."""
+    def close(self) -> None:
+        """Close the underlying handle. Rotated .N backups intentionally
+        survive; this never deletes anything."""
         if self._io is not None:
             self._io.close()
             self._io = None
@@ -143,7 +151,7 @@ def _copy_stderr_with_timestamps(stderr: BinaryIO, log_path: Path) -> None:
             line = raw_line.decode("utf-8", errors="replace")
             _write_timestamped_line(writer, line)
     finally:
-        writer.delete()
+        writer.close()
 
 
 def _command_exit_code(returncode: int) -> int:
@@ -255,7 +263,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"failed to start stderr-timestamped command: {exc}",
             )
         finally:
-            writer.delete()
+            writer.close()
         return 127
 
     assert proc.stderr is not None

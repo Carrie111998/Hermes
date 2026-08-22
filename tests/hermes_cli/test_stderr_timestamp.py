@@ -176,7 +176,7 @@ def test_rotating_writer_rotates_at_max_size(tmp_path, monkeypatch):
         for _ in range(8):
             writer.write(chunk)
     finally:
-        writer.delete()
+        writer.close()
 
     # The live file must never exceed the configured cap by much.
     assert log_path.stat().st_size <= 2 * 1024 * 1024
@@ -196,9 +196,30 @@ def test_rotating_writer_honors_config_override(tmp_path, monkeypatch):
         for _ in range(12):
             writer.write(chunk)
     finally:
-        writer.delete()
+        writer.close()
     backups = sorted(
         p for p in tmp_path.iterdir() if p.name.startswith("gateway.error.log.")
     )
     # With backup_count=2 only .1 and .2 should survive.
     assert len(backups) <= 2
+
+
+def test_rotation_config_reads_logging_keys(tmp_path):
+    """logging.max_size_mb / backup_count in config.yaml drive the writer."""
+    import json as _json
+
+    cfg_dir = tmp_path / "homedir" / ".hermes"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "config.yaml").write_text(
+        _json.dumps({"logging": {"max_size_mb": 1, "backup_count": 2}})
+    )
+    # hermes_logging's canonical reader resolves the home via the supported
+    # context-local override API.
+    import hermes_constants
+
+    token = hermes_constants.set_hermes_home_override(cfg_dir)
+    try:
+        max_mb, backups = stderr_timestamp._rotation_config()
+    finally:
+        hermes_constants.reset_hermes_home_override(token)
+    assert (max_mb, backups) == (1, 2)
