@@ -1,9 +1,10 @@
 """Temporary read-only compiler for one authority-repair branch.
 
-The upstream PR e2e checkout is the available complete repository. This test
-executes every literal shell step in the branch's sole ``one-shot-fix-*.yml``
-carrier with every push intercepted, then emits the exact tested product diff
-as a gzip/base64 failure artifact. Compiler and workflow-carrier files are
+This file is explicitly macOS-marked because that CI lane has a complete,
+locked repository environment without the Linux suite's current runner backlog.
+It executes every literal shell step in the branch's sole one-shot carrier with
+all pushes intercepted, then emits the exact tested product diff as a
+checksummed gzip/base64 failure artifact. Compiler and workflow files are
 excluded from that artifact.
 """
 
@@ -17,6 +18,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tarfile
 
 import pytest
@@ -45,12 +47,7 @@ def _carrier() -> Path:
 
 
 def _run_blocks(path: Path) -> list[str]:
-    """Extract every literal ``run: |`` block without parsing heredocs.
-
-    Raw heredoc/triple-quoted lines may be intentionally unindented and are
-    therefore not valid input to a YAML parser. A block ends only at the next
-    step-list item (six-space ``- ...``) or EOF.
-    """
+    """Extract literal ``run: |`` blocks without interpreting raw heredocs."""
     lines = path.read_text().splitlines()
     starts = [i for i, line in enumerate(lines) if line.strip() == "run: |"]
     assert starts, f"no literal run blocks in {path}"
@@ -77,23 +74,52 @@ def _run_blocks(path: Path) -> list[str]:
     return blocks
 
 
-def _install_read_only_git(tmp_path: Path) -> Path:
+def _install_tool_shims(tmp_path: Path) -> Path:
+    """Install read-only Git plus narrow GNU compatibility for macOS."""
     real_git = shutil.which("git")
     assert real_git
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    wrapper = bindir / "git"
-    wrapper.write_text(
+
+    git_wrapper = bindir / "git"
+    git_wrapper.write_text(
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         "args=(\"$@\")\n"
-        "if [[ ${args[0]:-} == push ]]; then echo '[materializer] blocked git push' >&2; exit 0; fi\n"
+        "if [[ ${args[0]:-} == push ]]; then\n"
+        "  echo '[materializer] blocked git push' >&2\n"
+        "  exit 0\n"
+        "fi\n"
         "for i in \"${!args[@]}\"; do\n"
-        "  if [[ ${args[$i]} == origin ]]; then args[$i]=https://github.com/andrexibiza/hermes-agent.git; fi\n"
+        "  if [[ ${args[$i]} == origin ]]; then\n"
+        "    args[$i]=https://github.com/andrexibiza/hermes-agent.git\n"
+        "  fi\n"
         "done\n"
         f"exec {real_git!s} \"${{args[@]}}\"\n"
     )
-    wrapper.chmod(0o755)
+    git_wrapper.chmod(0o755)
+
+    sha_wrapper = bindir / "sha256sum"
+    sha_wrapper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import hashlib, pathlib, sys\n"
+        "for raw in sys.argv[1:]:\n"
+        "    path = pathlib.Path(raw)\n"
+        "    print(f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {raw}')\n"
+    )
+    sha_wrapper.chmod(0o755)
+
+    base64_wrapper = bindir / "base64"
+    base64_wrapper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import base64, pathlib, sys\n"
+        "args = sys.argv[1:]\n"
+        "decode = any(arg in ('-d', '-D', '--decode') for arg in args)\n"
+        "paths = [arg for arg in args if not arg.startswith('-')]\n"
+        "data = pathlib.Path(paths[-1]).read_bytes() if paths else sys.stdin.buffer.read()\n"
+        "sys.stdout.buffer.write(base64.b64decode(data) if decode else base64.b64encode(data))\n"
+    )
+    base64_wrapper.chmod(0o755)
     return bindir
 
 
@@ -130,11 +156,17 @@ def _product_diff() -> tuple[bytes, dict[str, object]]:
     return payload.getvalue(), manifest
 
 
+@pytest.mark.macos_only
 def test_materialize_exact_authority_repair_tree(tmp_path: Path) -> None:
     carrier = _carrier()
     blocks = _run_blocks(carrier)
+    supplements = [
+        (path.name, path.read_text())
+        for path in sorted(Path(".github/workflows").glob("materialize-*.py"))
+    ]
+
     env = os.environ.copy()
-    env["PATH"] = f"{_install_read_only_git(tmp_path)}:{env['PATH']}"
+    env["PATH"] = f"{_install_tool_shims(tmp_path)}:{env['PATH']}"
     env["CURRENT_MAIN"] = CURRENT_MAIN
     env["BRANCH"] = BRANCH_BY_CARRIER[carrier.name]
     env["TRIGGER_HEAD"] = subprocess.check_output(
@@ -147,6 +179,13 @@ def test_materialize_exact_authority_repair_tree(tmp_path: Path) -> None:
         script.write_text(body)
         subprocess.run(["bash", "-n", str(script)], check=True)
         subprocess.run(["bash", str(script)], check=True, env=env, timeout=1800)
+
+    # A carrier may reset to exact current main and thereby remove supplemental
+    # transformer files. Execute only bytes captured before that reset.
+    for name, content in supplements:
+        supplement = tmp_path / name
+        supplement.write_text(content)
+        subprocess.run([sys.executable, str(supplement)], check=True, env=env, timeout=1800)
 
     artifact, manifest = _product_diff()
     digest = hashlib.sha256(artifact).hexdigest()
