@@ -1363,6 +1363,55 @@ def _state_db_damage_is_fts_only(message: str) -> bool:
     )
 
 
+def _restore_state_db_from_snapshot(snap_state, state_path, label: str):
+    """Put a snapshot's state.db back when the post-update check found damage.
+
+    Both update flows reach the same dead end differently -- the git path
+    knows the id of the snapshot it took, the ZIP path scans every snapshot
+    newest-first -- but once either has a *candidate* file the remaining
+    work is identical: verify the candidate, copy it over, verify the
+    result, and say which of those happened.  That half was duplicated, and
+    it is the half that had to stay in step, since both copies re-verify
+    after the copy specifically so a bad snapshot cannot quietly replace a
+    bad database with another one.
+
+    The differing half is left where it is on purpose.  The two flows
+    genuinely disagree about which snapshot to trust and owe the user
+    different explanations when there is none, so folding them together
+    would mean inventing a strategy neither one has.
+
+    Returns None when *snap_state* is itself corrupt -- nothing was
+    attempted, so a caller working through several snapshots should keep
+    looking -- True when the copy landed and re-verified, and False when an
+    attempt was made and did not succeed.
+    """
+    from hermes_cli.backup import verify_sqlite_integrity
+
+    if not verify_sqlite_integrity(
+        snap_state, check_header=True, run_pragma=True
+    ).get("valid"):
+        return None
+
+    try:
+        import shutil as _shutil
+
+        _shutil.copy2(snap_state, state_path)
+    except OSError as exc:
+        print(f"  ✗ Auto-restore file copy failed: {exc}")
+        return False
+
+    if verify_sqlite_integrity(
+        state_path, check_header=True, run_pragma=True
+    ).get("valid"):
+        print(f"  ✓ Auto-restored from {label}")
+        return True
+
+    print(
+        "  ✗ Auto-restore FAILED — restored copy also failed integrity"
+    )
+    return False
+
+
 def _print_state_db_repair_hint(message: str) -> None:
     """Name a concrete repair command for a state.db the update found corrupt.
 
@@ -1831,36 +1880,17 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
                     for _snap_dir in _snap_dirs:
                         _snap_state = _snap_dir / "state.db"
                         if _snap_state.exists():
-                            _snap_ok = verify_sqlite_integrity(
-                                _snap_state, check_header=True, run_pragma=True
+                            # None means that snapshot is corrupt too, so
+                            # keep walking back; anything else was an
+                            # attempt and settles it.
+                            _outcome = _restore_state_db_from_snapshot(
+                                _snap_state,
+                                _state_path,
+                                f"snapshot {_snap_dir.name}",
                             )
-                            if _snap_ok.get("valid"):
-                                try:
-                                    import shutil as _shutil
-
-                                    _shutil.copy2(_snap_state, _state_path)
-                                    _restored_ok = verify_sqlite_integrity(
-                                        _state_path,
-                                        check_header=True,
-                                        run_pragma=True,
-                                    )
-                                    if _restored_ok.get("valid"):
-                                        _state_restored = True
-                                        print(
-                                            "  ✓ Auto-restored from snapshot "
-                                            f"{_snap_dir.name}"
-                                        )
-                                    else:
-                                        print(
-                                            "  ✗ Auto-restore FAILED — restored "
-                                            "copy also failed integrity"
-                                        )
-                                    break
-                                except OSError as _exc:
-                                    print(
-                                        f"  ✗ Auto-restore file copy failed: {_exc}"
-                                    )
-                                    break
+                            if _outcome is not None:
+                                _state_restored = _outcome
+                                break
                 if not _state_restored:
                     # Every branch above either restored the file or ran out
                     # of options without telling the user what they can do
@@ -6714,38 +6744,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             / "state.db"
                         )
                         if _snap_state.exists():
-                            _snap_ok = verify_sqlite_integrity(
-                                _snap_state, check_header=True, run_pragma=True
+                            _outcome = _restore_state_db_from_snapshot(
+                                _snap_state,
+                                _state_path,
+                                f"pre-update snapshot ({_pre_snap_id})",
                             )
-                            if _snap_ok.get("valid"):
-                                try:
-                                    import shutil as _shutil
-
-                                    _shutil.copy2(_snap_state, _state_path)
-                                    _restored_ok = verify_sqlite_integrity(
-                                        _state_path,
-                                        check_header=True,
-                                        run_pragma=True,
-                                    )
-                                    if _restored_ok.get("valid"):
-                                        _state_restored = True
-                                        print(
-                                            "  ✓ Auto-restored from pre-update "
-                                            f"snapshot ({_pre_snap_id})"
-                                        )
-                                    else:
-                                        print(
-                                            "  ✗ Auto-restore FAILED — restored "
-                                            "copy also failed integrity"
-                                        )
-                                except OSError as _exc:
-                                    print(
-                                        f"  ✗ Auto-restore file copy failed: {_exc}"
-                                    )
-                            else:
+                            if _outcome is None:
                                 print(
                                     "  ✗ Pre-update snapshot also failed integrity"
                                 )
+                            else:
+                                _state_restored = _outcome
                         else:
                             print(
                                 "  ⚠ Pre-update snapshot does not contain state.db"

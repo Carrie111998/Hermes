@@ -15,6 +15,9 @@ search index, and ``hermes sessions repair`` already rebuilds it in place.
 from __future__ import annotations
 
 import inspect
+import shutil
+import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -284,4 +287,112 @@ class TestBothUpdatePathsAreWired:
         source = inspect.getsource(func)
 
         assert "_state_restored = False" in source
-        assert "_state_restored = True" in source
+        assert "_restore_state_db_from_snapshot(" in source, (
+            f"{func.__name__} must go through the shared restore helper"
+        )
+        assert "_state_restored = _outcome" in source, (
+            f"{func.__name__} ignores the restore outcome, so a successful "
+            "restore would still print the repair hint"
+        )
+
+
+def _make_db(path):
+    """A small but genuinely valid SQLite file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT)")
+        conn.execute("INSERT INTO messages (body) VALUES ('kept')")
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+class TestRestoreFromSnapshot:
+    """The half both update flows share, tested on real files.
+
+    The flows disagree about which snapshot to trust, but once either has a
+    candidate they do the same four things, and the ordering of those four
+    is load-bearing: verifying the copy *after* writing it is what stops a
+    corrupt snapshot from replacing a corrupt database with another one.
+    """
+
+    def test_a_good_snapshot_is_copied_and_confirmed(self, tmp_path, capsys):
+        state = tmp_path / "state.db"
+        state.write_bytes(b"not a database at all")
+        snap = _make_db(tmp_path / "snap" / "state.db")
+
+        outcome = update_cmd._restore_state_db_from_snapshot(
+            snap, state, "snapshot 20260822-0100"
+        )
+
+        assert outcome is True
+        assert state.read_bytes() == snap.read_bytes()
+        assert "snapshot 20260822-0100" in capsys.readouterr().out
+
+    def test_a_corrupt_snapshot_is_left_alone_and_reported_as_no_attempt(
+        self, tmp_path, capsys
+    ):
+        """None, not False: the ZIP path keeps walking back on this."""
+        state = _make_db(tmp_path / "state.db")
+        original = state.read_bytes()
+        snap = tmp_path / "snap" / "state.db"
+        snap.parent.mkdir(parents=True, exist_ok=True)
+        snap.write_bytes(b"garbage" * 64)
+
+        outcome = update_cmd._restore_state_db_from_snapshot(
+            snap, state, "snapshot 20260822-0100"
+        )
+
+        assert outcome is None
+        assert state.read_bytes() == original
+        # Nothing was attempted, so the caller owns the explanation.
+        assert capsys.readouterr().out == ""
+
+    def test_a_failed_copy_is_an_attempt_that_did_not_work(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        state = tmp_path / "state.db"
+        state.write_bytes(b"not a database at all")
+        snap = _make_db(tmp_path / "snap" / "state.db")
+
+        def _boom(*_args, **_kwargs):
+            raise OSError("Errno 13 Permission denied")
+
+        monkeypatch.setattr(shutil, "copy2", _boom)
+
+        outcome = update_cmd._restore_state_db_from_snapshot(
+            snap, state, "snapshot 20260822-0100"
+        )
+
+        assert outcome is False
+        assert "Permission denied" in capsys.readouterr().out
+
+    def test_a_copy_that_lands_corrupt_is_not_reported_as_restored(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """The re-verify is the point of this helper.
+
+        A snapshot can pass its own check and still not survive the copy
+        (a truncated write, a full disk).  Announcing a restore that did
+        not happen is the same false reassurance the repair hint exists to
+        avoid, one layer down.
+        """
+        state = tmp_path / "state.db"
+        state.write_bytes(b"not a database at all")
+        snap = _make_db(tmp_path / "snap" / "state.db")
+
+        def _truncating_copy(_src, dst):
+            Path(dst).write_bytes(b"SQLite format 3\x00" + b"\x00" * 16)
+
+        monkeypatch.setattr(shutil, "copy2", _truncating_copy)
+
+        outcome = update_cmd._restore_state_db_from_snapshot(
+            snap, state, "snapshot 20260822-0100"
+        )
+
+        assert outcome is False
+        out = capsys.readouterr().out
+        assert "Auto-restore FAILED" in out
+        assert "Auto-restored" not in out
