@@ -76,11 +76,21 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         if proxy_url and "proxy" not in transport_kwargs:
             transport_kwargs["proxy"] = proxy_url
         transport_kwargs.setdefault("limits", self._POOL_LIMITS)
-        # Configure timeouts at the transport level so they apply to socket
-        # connect/read operations directly, preventing indefinite hangs during
-        # DNS resolution or TCP connect (issue #78586).
-        timeout = httpx.Timeout(connect=connect_timeout, read=read_timeout)
-        transport_kwargs["timeout"] = timeout
+        # httpx.AsyncHTTPTransport takes no `timeout` kwarg (removed well
+        # before 0.28.1) — passing one raises TypeError at construction time,
+        # which previously made every fallback-enabled Telegram adapter fail
+        # to start (#78586). Timeouts apply per-request via the `timeout`
+        # extension instead; see _ensure_timeout_extension below, which is
+        # applied to every request this transport dispatches (client-level
+        # timeout would be silently ignored here since PTB/httpx skip it
+        # whenever a custom `transport` is supplied).
+        self._timeout = httpx.Timeout(
+            read_timeout,
+            connect=connect_timeout,
+            read=read_timeout,
+            write=read_timeout,
+            pool=read_timeout,
+        )
         self._transport_kwargs = transport_kwargs
         self._primary = httpx.AsyncHTTPTransport(**transport_kwargs)
         # Built on demand and discarded on failure — see _reset_fallback.
@@ -114,7 +124,29 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         except Exception as exc:  # closing a broken pool must never mask the real error
             logger.debug("[Telegram] Error closing fallback transport %s: %s", ip, exc)
 
+    def _ensure_timeout_extension(self, request: httpx.Request) -> None:
+        """Attach this transport's connect/read/write/pool timeout to `request`.
+
+        httpx applies the timeout an `AsyncClient` computes by stashing it on
+        `request.extensions["timeout"]` before calling the transport; a
+        transport itself falls back to a 5s default for any leg missing from
+        that dict. Since the timeout can no longer be configured on the
+        `AsyncHTTPTransport` instances directly (see __init__), it is set here
+        instead so every request — primary or rewritten for a fallback IP —
+        carries it explicitly.
+        """
+        request.extensions.setdefault(
+            "timeout",
+            {
+                "connect": self._timeout.connect,
+                "read": self._timeout.read,
+                "write": self._timeout.write,
+                "pool": self._timeout.pool,
+            },
+        )
+
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self._ensure_timeout_extension(request)
         if request.url.host != _TELEGRAM_API_HOST or not self._fallback_ips:
             return await self._primary.handle_async_request(request)
 
