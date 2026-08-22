@@ -2,11 +2,11 @@
 skill-sleep — Stage 2: PROPOSE
 
 Read task cards + current SKILL.md + rejected buffer, assemble an optimizer
-prompt, call `omp -p` (muse-spark-1.2) to generate a bounded candidate diff,
+prompt, call coding agent (`omp -p` or `agy -p`) to generate a bounded candidate diff,
 and output candidate.diff + proposal.json.
 
 Uses subprocess with list-form args (no shell injection).
-Checks NINEROUTER_KEY exists (no value logged).
+Checks NINEROUTER_KEY exists when using omp (no value logged).
 Scans diff for secret patterns before writing.
 """
 
@@ -61,6 +61,85 @@ def contains_secret(text: str) -> tuple[bool, str]:
             # only show pattern, never the matched secret
             return True, pat.pattern[:40]
     return False, ""
+
+
+# ── Friction Coverage Check ────────────────────────────────────────────────
+
+STOP_WORDS = {
+    "a", "an", "the", "and", "or", "in", "on", "at", "to", "for", "with", "by",
+    "from", "of", "is", "are", "was", "were", "be", "been", "this", "that",
+    "these", "those", "it", "its", "as", "if", "not", "no", "yes", "do", "does",
+    "did", "done", "have", "has", "had", "can", "could", "should", "would",
+    "user_correction", "tool_error", "tool_retry", "assistant_error", "retry",
+    "terminal", "exit_code", "output", "failed", "fail", "error", "exception",
+    "traceback", "status", "non-zero", "please", "thanks", "hello", "hi",
+    "session", "sessions", "message", "messages", "system", "command", "commands",
+    "default", "example", "examples", "information", "context", "response", "responses",
+    "result", "results", "environment", "setting", "settings", "preference", "preferences",
+    "不对", "错了", "错误", "重新", "重做", "修改", "修复", "这个", "那个",
+    "一下", "我们", "你们", "他们", "怎么", "什么", "可以", "需要", "应该",
+    "已经", "因为", "所以", "如果", "但是", "而且", "进行", "使用", "执行",
+    "会话", "消息", "环境", "系统", "默认", "设置",
+}
+
+
+def extract_friction_keywords(text: str) -> set[str]:
+    """Extract meaningful terms (English tokens >= 3 chars, Chinese segments >= 2 chars)."""
+    tokens: set[str] = set()
+    # Chinese phrases / words (2 to 8 chars)
+    cn_matches = re.findall(r"[\u4e00-\u9fa5]{2,8}", text)
+    for m in cn_matches:
+        if m not in STOP_WORDS:
+            tokens.add(m)
+            if len(m) >= 4:
+                tokens.add(m[:2])
+                tokens.add(m[2:4])
+                tokens.add(m[-2:])
+    # English identifiers / paths / domain terms
+    en_matches = re.findall(r"[a-zA-Z0-9_./-]{3,}", text)
+    for m in en_matches:
+        clean = m.strip("./_-").lower()
+        if len(clean) >= 3 and clean not in STOP_WORDS and not clean.isdigit():
+            tokens.add(clean)
+    return tokens
+
+
+def check_task_covered_in_skill(task: dict[str, Any], skill_content: str) -> tuple[bool, str]:
+    """Check if a task's friction topic is already covered by pitfalls or rules in SKILL.md."""
+    evidence = task.get("friction_evidence") or []
+    req = str(task.get("user_request") or "")
+    combined = " ".join(str(e) for e in evidence) + " " + req
+    task_kw = extract_friction_keywords(combined)
+    if not task_kw:
+        return False, ""
+
+    for line in skill_content.splitlines():
+        line_clean = line.strip()
+        if not line_clean or line_clean.startswith("#"):
+            continue
+        line_kw = extract_friction_keywords(line_clean)
+        overlap = task_kw & line_kw
+        # Match if at least 2 distinct keywords overlap
+        if len(overlap) >= 2:
+            return True, f"pitfall line covers friction ({sorted(list(overlap))}): {line_clean[:80]}"
+        # Or match if a specific path/identifier (containing '/' or '_') is present in overlap
+        if len(overlap) >= 1 and any("/" in kw or "_" in kw or len(kw) >= 12 for kw in overlap):
+            return True, f"pitfall line matches key identifier ({sorted(list(overlap))}): {line_clean[:80]}"
+
+    return False, ""
+
+
+def find_covered_tasks(
+    tasks: list[dict[str, Any]],
+    skill_content: str,
+) -> list[tuple[int, dict[str, Any], str]]:
+    """Return list of (1-based index, task_dict, reason) for covered tasks."""
+    covered = []
+    for idx, t in enumerate(tasks, 1):
+        is_cov, reason = check_task_covered_in_skill(t, skill_content)
+        if is_cov:
+            covered.append((idx, t, reason))
+    return covered
 
 
 # ── Tasks loading ───────────────────────────────────────────────────────────
@@ -247,9 +326,9 @@ def render_prompt(
     return result
 
 
-def extract_diff_and_meta(omp_output: str) -> tuple[str, str, list[str]]:
-    """Parse omp output: extract unified diff + summary + focused_on."""
-    text = omp_output.strip()
+def extract_diff_and_meta(agent_output: str) -> tuple[str, str, list[str]]:
+    """Parse agent output: extract unified diff + summary + focused_on."""
+    text = agent_output.strip()
 
     # summary: first "summary: ..." line
     summary = ""
@@ -304,10 +383,10 @@ def is_valid_diff(diff: str) -> bool:
     return has_header
 
 
-# ── omp call ─────────────────────────────────────────────────────────────────
+# ── Agent calls ─────────────────────────────────────────────────────────────
 
 
-def call_omp(
+def _call_omp(
     prompt_path: Path,
     workdir: str,
     model: str,
@@ -353,6 +432,74 @@ def call_omp(
     return output
 
 
+def _call_agy(
+    prompt_path: Path,
+    workdir: str,
+    timeout: int,
+) -> str:
+    """Call `agy -p <prompt_text>` and return stdout."""
+    try:
+        prompt_text = Path(prompt_path).read_text(encoding="utf-8")
+    except OSError as e:
+        print(f"ERROR: cannot read prompt file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    cmd = [
+        "agy",
+        "-p",
+        prompt_text,
+    ]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ, "HERMES_NO_COLOR": "1"},
+        )
+    except FileNotFoundError:
+        print("ERROR: 'agy' not found in PATH", file=sys.stderr)
+        print("       Install Antigravity CLI (agy)", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print(f"ERROR: agy timed out after {timeout}s", file=sys.stderr)
+        sys.exit(1)
+
+    # agy prints to stdout; combine stdout+stderr for robustness
+    output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+    if proc.returncode != 0:
+        print(f"WARN: agy exited {proc.returncode}: {(proc.stderr or '')[:500]}", file=sys.stderr)
+
+    if not output.strip():
+        print("ERROR: agy produced no output", file=sys.stderr)
+        sys.exit(1)
+
+    return output
+
+
+def call_agent(
+    agent: str,
+    prompt_path: Path,
+    workdir: str,
+    model: str,
+    timeout: int,
+) -> str:
+    """分发调用指定的 coding agent（omp 或 agy）。"""
+    if agent == "omp":
+        return _call_omp(prompt_path, workdir, model, timeout)
+    elif agent == "agy":
+        return _call_agy(prompt_path, workdir, timeout)
+    else:
+        print(f"ERROR: unsupported agent '{agent}' (expected 'omp' or 'agy')", file=sys.stderr)
+        sys.exit(1)
+
+
+# 向后兼容别名
+call_omp = _call_omp
+
+
 # ── Output writing ───────────────────────────────────────────────────────────
 
 
@@ -387,15 +534,22 @@ def write_proposal_json(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="skill-sleep PROPOSE: generate bounded candidate diff via omp optimizer")
+    p = argparse.ArgumentParser(description="skill-sleep PROPOSE: generate bounded candidate diff via agent optimizer")
+    p.add_argument(
+        "--agent",
+        choices=["omp", "agy"],
+        default="omp",
+        help="Coding agent to use: omp or agy (default: omp)",
+    )
     p.add_argument("--tasks", required=False, default=None, help="Path to tasks.json (from MINE stage)")
     p.add_argument("--skill", required=False, default=None, help="Path to target SKILL.md (default: inferred from task card)")
     p.add_argument("--output-dir", required=False, default=".", help="Output directory for candidate.diff + proposal.json")
     p.add_argument("--rejected-dir", required=False, default=None, help="Rejected buffer dir (default: ./rejected if exists)")
-    p.add_argument("--model", required=False, default=DEFAULT_MODEL, help=f"omp model (default: {DEFAULT_MODEL})")
+    p.add_argument("--model", required=False, default=DEFAULT_MODEL, help=f"Agent model (omp only, default: {DEFAULT_MODEL})")
     p.add_argument("--template", required=False, default=None, help="Prompt template path (default: templates/propose_prompt.md)")
-    p.add_argument("--timeout", type=int, default=300, help="Timeout for omp call in seconds (default: 300)")
-    p.add_argument("--dry-run", action="store_true", help="Skip omp call; emit placeholder diff for testing")
+    p.add_argument("--timeout", type=int, default=300, help="Timeout for agent call in seconds (default: 300)")
+    p.add_argument("--force", action="store_true", help="Force proposal generation even if friction already appears covered in SKILL.md")
+    p.add_argument("--dry-run", action="store_true", help="Skip agent call; emit placeholder diff for testing")
     return p
 
 
@@ -403,8 +557,8 @@ if __name__ == "__main__":
     parser = build_parser()
     args = parser.parse_args()
 
-    # --help already handled; check key only for real runs
-    if not args.dry_run:
+    # --help already handled; check key only for real runs when agent is omp
+    if not args.dry_run and args.agent == "omp":
         if not os.environ.get("NINEROUTER_KEY"):
             print("ERROR: NINEROUTER_KEY not set", file=sys.stderr)
             print("      omp (muse-spark) requires NINEROUTER_KEY in env.", file=sys.stderr)
@@ -425,14 +579,35 @@ if __name__ == "__main__":
 
     print(f"[propose] Loading tasks from {tasks_path} ...")
     tasks_data = load_tasks(tasks_path)
-    total_cards = int(tasks_data.get("total_cards", len(tasks_data.get("tasks", []))))
+    tasks_list = tasks_data.get("tasks", [])
+    total_cards = int(tasks_data.get("total_cards", len(tasks_list)))
     print(f"[propose] Got {total_cards} task card(s)")
+
+    if total_cards == 0 or not tasks_list:
+        print("[propose] No task cards to optimize — skipping diff generation")
+        sys.exit(0)
 
     skill_path = resolve_skill_path(args.skill, tasks_data)
     print(f"[propose] Target skill: {skill_path}")
 
     skill_content = load_skill_content(skill_path)
     print(f"[propose] Skill content: {len(skill_content)} chars")
+
+    # Content-based deduplication check
+    covered_tasks = find_covered_tasks(tasks_list, skill_content)
+    if covered_tasks:
+        if len(covered_tasks) == len(tasks_list) and not args.force:
+            print(f"[propose] Notice: all {len(covered_tasks)} task card(s) friction already covered in SKILL.md pitfalls / rules:")
+            for idx, t, reason in covered_tasks:
+                print(f"  - Task {idx} ({t.get('skill_name', '?')}) — {reason}")
+            print("[propose] Skipping proposal generation — skill already contains relevant guardrails (pass --force to override).")
+            sys.exit(0)
+        else:
+            print(f"[propose] Notice: {len(covered_tasks)} task card(s) already covered in SKILL.md:")
+            for idx, t, reason in covered_tasks:
+                print(f"  - Task {idx} ({t.get('skill_name', '?')}) — {reason}")
+            if args.force:
+                print("[propose] --force enabled: proceeding with proposal generation despite coverage.")
 
     rejected_context = load_rejected_context(args.rejected_dir)
     print(f"[propose] Rejected context: {len(rejected_context)} chars")
@@ -444,10 +619,10 @@ if __name__ == "__main__":
     print(f"[propose] Prompt assembled: {len(prompt_text)} chars")
 
     # Call optimizer
-    omp_output = ""
+    agent_output = ""
     if args.dry_run:
-        print("[propose] Dry-run: skipping omp call, using placeholder diff")
-        omp_output = (
+        print(f"[propose] Dry-run: skipping {args.agent} call, using placeholder diff")
+        agent_output = (
             "summary: 补充分支部署与远程路径检查的 pitfalls\n"
             "focused_on: pitfall: 远程部署不要直接写 /home/momo，先检查目标路径\n"
             "focused_on: rule: scp 前用 ssh 检查远端目录是否存在\n"
@@ -465,16 +640,19 @@ if __name__ == "__main__":
         with tempfile.TemporaryDirectory(prefix="skill-sleep-propose-") as tmpdir:
             prompt_path = Path(tmpdir) / "prompt.md"
             prompt_path.write_text(prompt_text, encoding="utf-8")
-            print(f"[propose] Calling omp --model {args.model} (timeout {args.timeout}s) ...")
-            omp_output = call_omp(prompt_path, tmpdir, args.model, args.timeout)
-            print(f"[propose] omp output: {len(omp_output)} chars")
+            if args.agent == "omp":
+                print(f"[propose] Calling omp --model {args.model} (timeout {args.timeout}s) ...")
+            else:
+                print(f"[propose] Calling agy (timeout {args.timeout}s) ...")
+            agent_output = call_agent(args.agent, prompt_path, tmpdir, args.model, args.timeout)
+            print(f"[propose] {args.agent} output: {len(agent_output)} chars")
 
-    diff, summary, focused_on = extract_diff_and_meta(omp_output)
+    diff, summary, focused_on = extract_diff_and_meta(agent_output)
 
     if not diff or not is_valid_diff(diff):
-        print("ERROR: could not extract a valid unified diff from omp output", file=sys.stderr)
+        print(f"ERROR: could not extract a valid unified diff from {args.agent} output", file=sys.stderr)
         print("       Raw output (first 2000 chars):", file=sys.stderr)
-        print(omp_output[:2000], file=sys.stderr)
+        print(agent_output[:2000], file=sys.stderr)
         sys.exit(1)
 
     added = count_added_lines(diff)

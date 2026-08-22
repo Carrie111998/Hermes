@@ -244,3 +244,123 @@ def test_cron_sessions_skipped_in_pipeline(tmp_path):
     assert len(cards) == 1
     out = mine.write_task_cards(mine.deduplicate(cards), str(tmp_path), total_sessions_scanned=len(user_sessions))
     assert Path(out).exists()
+
+
+# ── P11: Seen Fingerprint Deduplication ────────────────────────────────────
+
+
+def test_compute_fingerprint_deterministic():
+    sid = "sess_100"
+    ev1 = ["user_correction: 不对，重新执行", "tool_error: terminal — exit_code 1"]
+    ev2 = ["user_correction: 不对，重新执行", "tool_error: terminal — exit_code 1"]
+    ev3 = ["user_correction: 不同的摩擦证据"]
+
+    fp1 = mine.compute_fingerprint(sid, ev1)
+    fp2 = mine.compute_fingerprint(sid, ev2)
+    fp3 = mine.compute_fingerprint(sid, ev3)
+    fp_diff_sid = mine.compute_fingerprint("sess_200", ev1)
+
+    assert fp1 == fp2
+    assert fp1 != fp3
+    assert fp1 != fp_diff_sid
+    assert fp1.startswith("sess_100:")
+    parts = fp1.split(":", 1)
+    assert len(parts[1]) == 12
+
+
+def test_load_and_save_seen_fingerprints(tmp_path):
+    seen_file = tmp_path / "seen.json"
+
+    # Non-existent file returns empty set
+    assert mine.load_seen_fingerprints(seen_file) == set()
+
+    # Save and reload
+    fps = {"sess_1:1234567890ab", "sess_2:cdef12345678"}
+    mine.save_seen_fingerprints(seen_file, fps)
+    loaded = mine.load_seen_fingerprints(seen_file)
+    assert loaded == fps
+
+    # Test loading legacy/alternative list format
+    seen_file.write_text(json.dumps(["fp_a", "fp_b"]), encoding="utf-8")
+    assert mine.load_seen_fingerprints(seen_file) == {"fp_a", "fp_b"}
+
+    # Corrupted JSON returns empty set without crashing
+    seen_file.write_text("invalid json {", encoding="utf-8")
+    assert mine.load_seen_fingerprints(seen_file) == set()
+
+
+def test_filter_seen_cards():
+    c1 = TaskCard("s1", "sess_1", "req1", ["user_correction: 不对"], [], 100.0)
+    c2 = TaskCard("s2", "sess_2", "req2", ["tool_error: terminal — fail"], [], 200.0)
+
+    fp1 = mine.compute_fingerprint(c1.session_id, c1.friction_evidence)
+
+    # With fp1 in seen set
+    fresh, seen = mine.filter_seen_cards([c1, c2], {fp1})
+    assert len(fresh) == 1
+    assert fresh[0].session_id == "sess_2"
+    assert len(seen) == 1
+    assert seen[0].session_id == "sess_1"
+
+
+def test_mine_seen_dedup_run_twice(tmp_path):
+    # Simulate a single friction session
+    mock_session = _session("sess_fixed_id", title="skill: test-skill", messages=[_msg("user", "不对，错了")])
+
+    seen_file = tmp_path / "seen.json"
+    run1_dir = tmp_path / "run1"
+    run2_dir = tmp_path / "run2"
+    run3_dir = tmp_path / "run3"
+
+    # Run 1: First run — card should be produced and fingerprint recorded
+    with patch("pipeline.mine.export_sessions", return_value=[mock_session]):
+        out1, fresh1, seen1 = mine.run_mine(
+            seen_file=str(seen_file),
+            output_dir=str(run1_dir),
+        )
+    assert len(fresh1) == 1
+    assert len(seen1) == 0
+    assert (run1_dir / "tasks.json").exists()
+    data1 = json.loads((run1_dir / "tasks.json").read_text(encoding="utf-8"))
+    assert data1["total_cards"] == 1
+    assert len(data1["tasks"]) == 1
+    assert seen_file.exists()
+    seen_fps = mine.load_seen_fingerprints(seen_file)
+    assert len(seen_fps) == 1
+
+    # Run 2: Second run with same session — card should be marked seen and skipped
+    with patch("pipeline.mine.export_sessions", return_value=[mock_session]):
+        out2, fresh2, seen2 = mine.run_mine(
+            seen_file=str(seen_file),
+            output_dir=str(run2_dir),
+        )
+    assert len(fresh2) == 0
+    assert len(seen2) == 1
+    assert (run2_dir / "tasks.json").exists()
+    data2 = json.loads((run2_dir / "tasks.json").read_text(encoding="utf-8"))
+    assert data2["total_cards"] == 0
+    assert data2["seen_cards_skipped"] == 1
+    assert len(data2["tasks"]) == 0
+
+    # Run 3: Third run with --reset-seen — card should be fresh again
+    with patch("pipeline.mine.export_sessions", return_value=[mock_session]):
+        out3, fresh3, seen3 = mine.run_mine(
+            seen_file=str(seen_file),
+            output_dir=str(run3_dir),
+            reset_seen=True,
+        )
+    assert len(fresh3) == 1
+    assert len(seen3) == 0
+    assert (run3_dir / "tasks.json").exists()
+    data3 = json.loads((run3_dir / "tasks.json").read_text(encoding="utf-8"))
+    assert data3["total_cards"] == 1
+    assert len(data3["tasks"]) == 1
+
+
+def test_mine_parser_seen_args():
+    parser = mine.build_parser()
+    args = parser.parse_args(["--seen-file", "/tmp/custom-seen.json", "--reset-seen"])
+    assert args.seen_file == "/tmp/custom-seen.json"
+    assert args.reset_seen is True
+
+

@@ -11,6 +11,7 @@ CLI API, not raw SQLite. Always runs with --redact for transcript safety.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -352,7 +353,65 @@ def detect_friction(session: dict) -> list[TaskCard]:
     ]
 
 
-# ── Deduplication ───────────────────────────────────────────────────────────
+# ── Deduplication & Seen Tracking ──────────────────────────────────────────
+
+DEFAULT_SEEN_FILE = str(Path.home() / ".hermes" / "skill-sleep-seen.json")
+
+
+def compute_fingerprint(session_id: str, friction_evidence: list[str]) -> str:
+    """Compute deterministic fingerprint for a task card: session_id + evidence sha256 first 12 chars."""
+    raw = "\n".join(str(e) for e in friction_evidence)
+    ev_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    return f"{session_id}:{ev_hash}"
+
+
+def load_seen_fingerprints(seen_file: str | Path) -> set[str]:
+    """Load set of seen fingerprints from JSON file."""
+    p = Path(seen_file).expanduser()
+    if not p.exists():
+        return set()
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return set(str(x) for x in data)
+        if isinstance(data, dict):
+            fps = data.get("fingerprints", [])
+            if isinstance(fps, list):
+                return set(str(x) for x in fps)
+            if isinstance(fps, dict):
+                return set(str(x) for x in fps.keys())
+        return set()
+    except Exception as e:
+        print(f"[mine] WARN: could not read seen file {p}: {e}", file=sys.stderr)
+        return set()
+
+
+def save_seen_fingerprints(seen_file: str | Path, fingerprints: set[str]) -> None:
+    """Save set of seen fingerprints to JSON file."""
+    p = Path(seen_file).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "total_seen": len(fingerprints),
+        "fingerprints": sorted(list(fingerprints)),
+    }
+    p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def filter_seen_cards(
+    cards: list[TaskCard],
+    seen_fps: set[str],
+) -> tuple[list[TaskCard], list[TaskCard]]:
+    """Split cards into (fresh_cards, seen_cards) based on fingerprint."""
+    fresh: list[TaskCard] = []
+    seen: list[TaskCard] = []
+    for card in cards:
+        fp = compute_fingerprint(card.session_id, card.friction_evidence)
+        if fp in seen_fps:
+            seen.append(card)
+        else:
+            fresh.append(card)
+    return fresh, seen
 
 
 def deduplicate(cards: list[TaskCard]) -> list[TaskCard]:
@@ -378,12 +437,14 @@ def write_task_cards(
     output_dir: str,
     *,
     total_sessions_scanned: int = 0,
+    seen_cards_skipped: int = 0,
 ) -> str:
     path = Path(output_dir) / "tasks.json"
     data = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "total_sessions_scanned": total_sessions_scanned,
         "total_cards": len(cards),
+        "seen_cards_skipped": seen_cards_skipped,
         "tasks": [c.to_dict() for c in cards],
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -398,6 +459,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="skill-sleep MINE: extract friction signals from Hermes sessions")
     p.add_argument("--after", default="7d", help='Time window: "7d", "24h", or ISO datetime (default: 7d)')
     p.add_argument("--output-dir", default=".", help="Output directory for tasks.json")
+    p.add_argument("--seen-file", default=DEFAULT_SEEN_FILE, help=f"Path to seen fingerprints file (default: {DEFAULT_SEEN_FILE})")
+    p.add_argument("--reset-seen", action="store_true", help="Reset/clear seen fingerprints record")
     p.add_argument("--no-redact", action="store_true", help="Disable transcript redaction (not recommended)")
     p.add_argument("--timeout", type=int, default=60, help="Timeout for hermes export (default: 60s)")
     return p
@@ -427,14 +490,30 @@ def resolve_after(arg: str) -> str:
     return "7d"
 
 
-if __name__ == "__main__":
-    parser = build_parser()
-    args = parser.parse_args()
-    after = resolve_after(args.after)
+def run_mine(
+    after: str = "7d",
+    output_dir: str = ".",
+    seen_file: str | None = None,
+    reset_seen: bool = False,
+    no_redact: bool = False,
+    timeout: int = 60,
+) -> tuple[str, list[TaskCard], list[TaskCard]]:
+    """Run the MINE pipeline and return (output_path, fresh_cards, seen_cards)."""
+    after_val = resolve_after(after)
+    target_seen_file = seen_file or DEFAULT_SEEN_FILE
 
-    print(f"[mine] Scanning sessions since {after} ...")
+    if reset_seen:
+        print(f"[mine] Resetting seen fingerprints at {target_seen_file}")
+        seen_fps: set[str] = set()
+        save_seen_fingerprints(target_seen_file, seen_fps)
+    else:
+        seen_fps = load_seen_fingerprints(target_seen_file)
+        if seen_fps:
+            print(f"[mine] Loaded {len(seen_fps)} seen fingerprint(s) from {target_seen_file}")
 
-    sessions = export_sessions(after, redact=not args.no_redact, timeout=args.timeout)
+    print(f"[mine] Scanning sessions since {after_val} ...")
+
+    sessions = export_sessions(after_val, redact=not no_redact, timeout=timeout)
 
     user_sessions = [s for s in sessions if not str(s.get("id", "")).startswith("cron_")]
     skipped = len(sessions) - len(user_sessions)
@@ -447,10 +526,45 @@ if __name__ == "__main__":
     print(f"[mine] Raw friction episodes: {len(all_cards)}")
 
     deduped = deduplicate(all_cards)
-    print(f"[mine] After dedup: {len(deduped)} task cards")
+    print(f"[mine] After intra-run dedup: {len(deduped)} task cards")
 
-    for card in deduped:
+    fresh_cards, seen_cards = filter_seen_cards(deduped, seen_fps)
+    if seen_cards:
+        print(f"[mine] Skipped {len(seen_cards)} seen task card(s) (already processed in previous run):")
+        for sc in seen_cards:
+            fp = compute_fingerprint(sc.session_id, sc.friction_evidence)
+            print(f"  [seen] {sc.skill_name} ({sc.session_id}) — fingerprint: {fp}")
+
+    print(f"[mine] Fresh candidate task cards: {len(fresh_cards)}")
+    for card in fresh_cards:
+        fp = compute_fingerprint(card.session_id, card.friction_evidence)
         print(f"  {card}")
 
-    output_path = write_task_cards(deduped, args.output_dir, total_sessions_scanned=len(user_sessions))
+    # Record newly seen fingerprints
+    new_fps = {compute_fingerprint(c.session_id, c.friction_evidence) for c in fresh_cards}
+    if new_fps:
+        updated_fps = seen_fps | new_fps
+        save_seen_fingerprints(target_seen_file, updated_fps)
+        print(f"[mine] Updated seen file with {len(new_fps)} new fingerprint(s): {target_seen_file}")
+
+    output_path = write_task_cards(
+        fresh_cards,
+        output_dir,
+        total_sessions_scanned=len(user_sessions),
+        seen_cards_skipped=len(seen_cards),
+    )
     print(f"[mine] Wrote {output_path}")
+    return output_path, fresh_cards, seen_cards
+
+
+if __name__ == "__main__":
+    parser = build_parser()
+    args = parser.parse_args()
+    run_mine(
+        after=args.after,
+        output_dir=args.output_dir,
+        seen_file=args.seen_file,
+        reset_seen=args.reset_seen,
+        no_redact=args.no_redact,
+        timeout=args.timeout,
+    )

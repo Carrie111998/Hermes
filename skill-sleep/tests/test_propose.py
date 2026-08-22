@@ -260,12 +260,16 @@ def test_call_omp_uses_list_args(tmp_path):
         assert "--model" in args
 
 
+def test_call_omp_internal_alias():
+    assert propose._call_omp is propose.call_omp
+
+
 def test_call_omp_not_found(tmp_path):
     prompt = tmp_path / "prompt.md"
     prompt.write_text("hello", encoding="utf-8")
     with patch("pipeline.propose.subprocess.run", side_effect=FileNotFoundError):
         with pytest.raises(SystemExit):
-            propose.call_omp(prompt, str(tmp_path), propose.DEFAULT_MODEL, 10)
+            propose._call_omp(prompt, str(tmp_path), propose.DEFAULT_MODEL, 10)
 
 
 def test_call_omp_timeout(tmp_path):
@@ -273,7 +277,7 @@ def test_call_omp_timeout(tmp_path):
     prompt.write_text("hello", encoding="utf-8")
     with patch("pipeline.propose.subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="omp", timeout=1)):
         with pytest.raises(SystemExit):
-            propose.call_omp(prompt, str(tmp_path), propose.DEFAULT_MODEL, 10)
+            propose._call_omp(prompt, str(tmp_path), propose.DEFAULT_MODEL, 10)
 
 
 def test_call_omp_empty_output_exits(tmp_path):
@@ -282,7 +286,81 @@ def test_call_omp_empty_output_exits(tmp_path):
     mock = MagicMock(returncode=0, stdout="   ", stderr="")
     with patch("pipeline.propose.subprocess.run", return_value=mock):
         with pytest.raises(SystemExit):
-            propose.call_omp(prompt, str(tmp_path), propose.DEFAULT_MODEL, 10)
+            propose._call_omp(prompt, str(tmp_path), propose.DEFAULT_MODEL, 10)
+
+
+# ── call_agy (mocked) ─────────────────────────────────────────────────────
+
+
+def test_call_agy_uses_list_args(tmp_path):
+    prompt = tmp_path / "prompt.md"
+    prompt_content = "optimizer prompt content for agy"
+    prompt.write_text(prompt_content, encoding="utf-8")
+    mock = MagicMock(returncode=0, stdout="summary: test\n```diff\n--- a/SKILL.md\n+++ b/SKILL.md\n@@ -1 +1 @@\n+line\n```\n", stderr="")
+    with patch("pipeline.propose.subprocess.run", return_value=mock) as sp:
+        out = propose._call_agy(prompt, str(tmp_path), 10)
+        assert "summary: test" in out
+        args = sp.call_args[0][0]
+        kwargs = sp.call_args[1]
+        assert isinstance(args, list)
+        assert args == ["agy", "-p", prompt_content]
+        assert "--model" not in args
+        assert "--effort" not in args
+        assert kwargs.get("cwd") == str(tmp_path)
+        assert kwargs.get("timeout") == 10
+
+
+def test_call_agy_not_found(tmp_path):
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("hello", encoding="utf-8")
+    with patch("pipeline.propose.subprocess.run", side_effect=FileNotFoundError):
+        with pytest.raises(SystemExit):
+            propose._call_agy(prompt, str(tmp_path), 10)
+
+
+def test_call_agy_timeout(tmp_path):
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("hello", encoding="utf-8")
+    with patch("pipeline.propose.subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="agy", timeout=1)):
+        with pytest.raises(SystemExit):
+            propose._call_agy(prompt, str(tmp_path), 10)
+
+
+def test_call_agy_empty_output_exits(tmp_path):
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("hello", encoding="utf-8")
+    mock = MagicMock(returncode=0, stdout="   ", stderr="")
+    with patch("pipeline.propose.subprocess.run", return_value=mock):
+        with pytest.raises(SystemExit):
+            propose._call_agy(prompt, str(tmp_path), 10)
+
+
+# ── call_agent dispatcher ──────────────────────────────────────────────────
+
+
+def test_call_agent_dispatches_omp(tmp_path):
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("hello", encoding="utf-8")
+    with patch("pipeline.propose._call_omp", return_value="omp output") as m_omp:
+        out = propose.call_agent("omp", prompt, str(tmp_path), "model-x", 15)
+        assert out == "omp output"
+        m_omp.assert_called_once_with(prompt, str(tmp_path), "model-x", 15)
+
+
+def test_call_agent_dispatches_agy(tmp_path):
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("hello", encoding="utf-8")
+    with patch("pipeline.propose._call_agy", return_value="agy output") as m_agy:
+        out = propose.call_agent("agy", prompt, str(tmp_path), "model-x", 15)
+        assert out == "agy output"
+        m_agy.assert_called_once_with(prompt, str(tmp_path), 15)
+
+
+def test_call_agent_unsupported_exits(tmp_path):
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("hello", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        propose.call_agent("unknown", prompt, str(tmp_path), "model-x", 15)
 
 
 # ── write_candidate_diff ──────────────────────────────────────────────────
@@ -337,6 +415,31 @@ def test_cli_dry_run_generates_outputs(tmp_path):
     assert hit is False
 
 
+def test_cli_dry_run_agy(tmp_path):
+    tasks_path = _write_tasks(tmp_path, [_sample_task()])
+    skill = tmp_path / "SKILL.md"
+    skill.write_text("# Skill\n## Pitfalls\n- foo\n", encoding="utf-8")
+    outdir = tmp_path / "out_agy"
+    cmd = [
+        sys.executable,
+        str(ROOT / "pipeline" / "propose.py"),
+        "--agent",
+        "agy",
+        "--tasks",
+        tasks_path,
+        "--skill",
+        str(skill),
+        "--output-dir",
+        str(outdir),
+        "--dry-run",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    assert proc.returncode == 0, proc.stderr
+    assert "[propose] Dry-run: skipping agy call" in proc.stdout
+    assert (outdir / "candidate.diff").exists()
+    assert (outdir / "proposal.json").exists()
+
+
 def test_cli_missing_tasks_exits(tmp_path):
     skill = tmp_path / "SKILL.md"
     skill.write_text("# Skill\n", encoding="utf-8")
@@ -376,6 +479,29 @@ def test_cli_ninerouter_check(tmp_path):
     assert "NINEROUTER_KEY" in proc.stderr
 
 
+def test_cli_agy_no_ninerouter_required(tmp_path):
+    tasks_path = _write_tasks(tmp_path, [_sample_task()])
+    skill = tmp_path / "SKILL2.md"
+    skill.write_text("# Skill\n", encoding="utf-8")
+    cmd = [
+        sys.executable,
+        str(ROOT / "pipeline" / "propose.py"),
+        "--agent",
+        "agy",
+        "--tasks",
+        tasks_path,
+        "--skill",
+        str(skill),
+        "--output-dir",
+        str(tmp_path / "out_agy_nokey"),
+        "--dry-run",
+    ]
+    env = {k: v for k, v in os.environ.items() if k != "NINEROUTER_KEY"}
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15, env=env)
+    assert proc.returncode == 0
+    assert "NINEROUTER_KEY" not in proc.stderr
+
+
 def test_cli_output_dir_writes_valid_json(tmp_path):
     tasks_path = _write_tasks(tmp_path, [_sample_task(), _sample_task(skill="other")])
     skill = tmp_path / "SKILL.md"
@@ -405,3 +531,151 @@ def test_help_exits_zero():
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
     assert proc.returncode == 0
     assert "--tasks" in proc.stdout
+    assert "--agent" in proc.stdout
+    assert "--force" in proc.stdout
+
+
+# ── P11: Friction Coverage & Skip Tests ────────────────────────────────────
+
+
+def test_extract_friction_keywords():
+    text = "user_correction: 远程部署不要直接写 /home/momo，先检查目标路径"
+    kw = propose.extract_friction_keywords(text)
+    assert "远程部署" in kw or "远程" in kw
+    assert "momo" in kw or "home/momo" in kw
+
+
+def test_check_task_covered_in_skill_matching():
+    task = _sample_task(
+        skill="hermes-agent",
+        req="部署到远程服务器",
+        evidence=["user_correction: 远程部署不要直接写 /home/momo，先检查目标路径"],
+    )
+    skill_content = (
+        "# Hermes Agent\n\n"
+        "## Pitfalls\n"
+        "- 远程部署不要直接写 /home/momo，先检查目标路径是否存在\n"
+        "- scp 传输后删除临时文件\n"
+    )
+    is_cov, reason = propose.check_task_covered_in_skill(task, skill_content)
+    assert is_cov is True
+    assert "pitfall line" in reason
+
+
+def test_check_task_covered_in_skill_not_matching():
+    task = _sample_task(
+        skill="hermes-agent",
+        req="deploy website",
+        evidence=["tool_error: terminal — connection refused on port 8080"],
+    )
+    skill_content = (
+        "# Hermes Agent\n\n"
+        "## Pitfalls\n"
+        "- Always check file permissions before writing\n"
+    )
+    is_cov, reason = propose.check_task_covered_in_skill(task, skill_content)
+    assert is_cov is False
+    assert reason == ""
+
+
+def test_find_covered_tasks():
+    t1 = _sample_task(
+        skill="hermes-agent",
+        evidence=["user_correction: 远程部署不要直接写 /home/momo，先检查目标路径"],
+    )
+    t2 = _sample_task(
+        skill="hermes-agent",
+        evidence=["tool_error: terminal — unknown fatal error xyz987"],
+    )
+    skill_content = (
+        "# Hermes Agent\n\n"
+        "## Pitfalls\n"
+        "- 远程部署不要直接写 /home/momo，先检查目标路径是否存在\n"
+    )
+    covered = propose.find_covered_tasks([t1, t2], skill_content)
+    assert len(covered) == 1
+    assert covered[0][0] == 1  # 1-based index of t1
+
+
+def test_cli_dry_run_skips_when_all_covered(tmp_path):
+    t1 = _sample_task(
+        skill="hermes-agent",
+        evidence=["user_correction: 远程部署不要直接写 /home/momo，先检查目标路径"],
+    )
+    tasks_path = _write_tasks(tmp_path, [t1])
+    skill = tmp_path / "SKILL.md"
+    skill.write_text(
+        "# Hermes Agent\n\n## Pitfalls\n- 远程部署不要直接写 /home/momo，先检查目标路径\n",
+        encoding="utf-8",
+    )
+    outdir = tmp_path / "out_cov"
+    cmd = [
+        sys.executable,
+        str(ROOT / "pipeline" / "propose.py"),
+        "--tasks",
+        tasks_path,
+        "--skill",
+        str(skill),
+        "--output-dir",
+        str(outdir),
+        "--dry-run",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    assert proc.returncode == 0
+    assert "Notice: all 1 task card(s) friction already covered" in proc.stdout
+    assert "Skipping proposal generation" in proc.stdout
+    assert not (outdir / "candidate.diff").exists()
+
+
+def test_cli_dry_run_force_overrides_coverage(tmp_path):
+    t1 = _sample_task(
+        skill="hermes-agent",
+        evidence=["user_correction: 远程部署不要直接写 /home/momo，先检查目标路径"],
+    )
+    tasks_path = _write_tasks(tmp_path, [t1])
+    skill = tmp_path / "SKILL.md"
+    skill.write_text(
+        "# Hermes Agent\n\n## Pitfalls\n- 远程部署不要直接写 /home/momo，先检查目标路径\n",
+        encoding="utf-8",
+    )
+    outdir = tmp_path / "out_cov_force"
+    cmd = [
+        sys.executable,
+        str(ROOT / "pipeline" / "propose.py"),
+        "--tasks",
+        tasks_path,
+        "--skill",
+        str(skill),
+        "--output-dir",
+        str(outdir),
+        "--force",
+        "--dry-run",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    assert proc.returncode == 0
+    assert "--force enabled" in proc.stdout
+    assert (outdir / "candidate.diff").exists()
+    assert (outdir / "proposal.json").exists()
+
+
+def test_cli_dry_run_empty_tasks_skips(tmp_path):
+    tasks_path = _write_tasks(tmp_path, [])
+    skill = tmp_path / "SKILL.md"
+    skill.write_text("# Hermes Agent\n", encoding="utf-8")
+    outdir = tmp_path / "out_empty"
+    cmd = [
+        sys.executable,
+        str(ROOT / "pipeline" / "propose.py"),
+        "--tasks",
+        tasks_path,
+        "--skill",
+        str(skill),
+        "--output-dir",
+        str(outdir),
+        "--dry-run",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    assert proc.returncode == 0
+    assert "No task cards to optimize" in proc.stdout
+    assert not (outdir / "candidate.diff").exists()
+
