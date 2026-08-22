@@ -2045,6 +2045,8 @@ export interface Translations {
       done: string
       doneTip: string
     }
+    quoteSelected: string
+    addImageToChat: string
   }
 
   statusStack: {
@@ -2714,6 +2716,7 @@ export interface Translations {
       goForward: string
       sendEdited: string
       attachingFile: string
+      quoteInChat: string
     }
     approval: {
       gatewayDisconnected: string

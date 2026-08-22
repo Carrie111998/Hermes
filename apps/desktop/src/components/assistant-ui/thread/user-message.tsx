@@ -4,6 +4,7 @@ import { type FC, type ReactNode, useCallback, useEffect, useRef, useState } fro
 import { DirectiveContent } from '@/components/assistant-ui/directive-text'
 import { messageAttachmentRefs, messageContentText } from '@/components/assistant-ui/thread/content'
 import { ReactionBadge, ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
+import { MessageQuoteButton } from '@/components/assistant-ui/thread/message-selection-quote'
 import { MessageTimelineTimestamp } from '@/components/assistant-ui/thread/timeline-timestamp'
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
 import { useMessageReactions } from '@/components/assistant-ui/thread/use-message-reactions'
@@ -568,6 +569,7 @@ export const UserMessage: FC<{
                     )}
                   </div>
                 )}
+              <MessageQuoteButton messageId={messageId} />
               </div>
             </ReactionPicker>
             {/* Below the bubble, same register as the assistant action row:
