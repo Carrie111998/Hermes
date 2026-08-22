@@ -140,6 +140,8 @@ def test_deliver_runs_canonical_bot_chat_lane():
     assert "--create-if-missing" in argv
     assert "-Q" in argv
     assert "--query-file" in argv
+    assert calls["kwargs"]["encoding"] == "utf-8"
+    assert calls["kwargs"]["errors"] == "replace"
     # Message rides a temp file, never inline argv (quote/expansion safety).
     assert not any("the output" in str(a) for a in argv)
 
