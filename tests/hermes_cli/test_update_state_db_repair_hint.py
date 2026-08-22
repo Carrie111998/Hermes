@@ -18,7 +18,7 @@ import inspect
 
 import pytest
 
-from hermes_cli import update_cmd
+from hermes_cli import backup, update_cmd
 
 
 # The exact string PRAGMA integrity_check produced on the reporter's database
@@ -64,6 +64,73 @@ class TestDamageClassification:
     def test_non_fts_damage_is_not_claimed_as_fts(self, message):
         assert update_cmd._state_db_damage_is_fts_only(message) is False
 
+    @pytest.mark.parametrize(
+        "message",
+        [
+            # Both kinds at once, in either order.  verify_sqlite_integrity
+            # joins every finding PRAGMA integrity_check returned into one
+            # string, so this is what a doubly-damaged database looks like
+            # by the time it reaches us -- not a hypothetical.
+            "integrity check failed: malformed inverted index for FTS5 table "
+            "main.messages_fts_trigram; row 12 missing from index "
+            "sqlite_autoindex_sessions_1",
+            "integrity check failed: row 12 missing from index "
+            "sqlite_autoindex_sessions_1; malformed inverted index for FTS5 "
+            "table main.messages_fts_trigram",
+            # The page damage is in the middle of a run of FTS findings,
+            # which is where an "is an FTS phrase present" test is blindest.
+            "integrity check failed: malformed inverted index for FTS5 table "
+            "main.messages_fts; wrong # of entries in index "
+            "idx_messages_session; malformed inverted index for FTS5 table "
+            "main.messages_fts_cjk",
+        ],
+    )
+    def test_mixed_damage_is_not_claimed_as_fts_only(self, message):
+        """The false-reassurance entry path this classifier must not have.
+
+        Telling someone whose b-tree lost rows that their messages are
+        intact is worse than saying nothing, so a report that names any
+        non-FTS finding falls through to the generic hint no matter how
+        many FTS findings accompany it.
+        """
+        assert update_cmd._state_db_damage_is_fts_only(message) is False
+
+    def test_a_truncated_report_is_not_claimed_as_fts_only(self):
+        """A quoted-prefix report cannot be classified honestly.
+
+        ``verify_sqlite_integrity`` quotes the first
+        ``INTEGRITY_CHECK_MAX_REPORTED_ERRORS`` findings and discloses the
+        rest as a count.  The finding that did not fit is exactly the one
+        that could contradict the ones that did, so the reassuring claim is
+        refused even though every *visible* finding is FTS.
+        """
+        message = (
+            "integrity check failed: "
+            + "; ".join(
+                "malformed inverted index for FTS5 table main.messages_fts"
+                for _ in range(backup.INTEGRITY_CHECK_MAX_REPORTED_ERRORS)
+            )
+            + f"; (3 {backup.INTEGRITY_CHECK_OMITTED_SUFFIX})"
+        )
+
+        assert update_cmd._state_db_damage_is_fts_only(message) is False
+
+    def test_a_complete_all_fts_report_is_still_recognised(self):
+        """The tightening must not cost the case the hint exists for.
+
+        Several FTS indexes damaged together is the common shape of #88252
+        (trigram, cjk and the base index are separate FTS5 tables), and it
+        is still fully recoverable by a rebuild.
+        """
+        message = (
+            "integrity check failed: malformed inverted index for FTS5 table "
+            "main.messages_fts; malformed inverted index for FTS5 table "
+            "main.messages_fts_trigram; malformed inverted index for FTS5 "
+            "table main.messages_fts_cjk"
+        )
+
+        assert update_cmd._state_db_damage_is_fts_only(message) is True
+
     def test_generic_malformed_image_is_not_treated_as_fts(self):
         """The load-bearing negative case.
 
@@ -80,6 +147,66 @@ class TestDamageClassification:
             update_cmd._state_db_damage_is_fts_only("database disk image is malformed")
             is False
         )
+
+
+class TestIntegrityReportTruncationIsDisclosed:
+    """The producer must keep telling the classifier when it held back.
+
+    ``_state_db_damage_is_fts_only`` refuses to reassure on a report that
+    discloses omitted findings.  That guard is only worth anything while
+    ``verify_sqlite_integrity`` actually discloses them -- a silent
+    ``[:5]`` would hand the classifier a message that looks complete and
+    quietly restore the over-claim.
+    """
+
+    def _report(self, errors):
+        rows = [(e,) for e in errors]
+
+        class _Cursor:
+            def fetchall(self_inner):
+                return rows
+
+        class _Conn:
+            def execute(self_inner, _sql):
+                return _Cursor()
+
+            def close(self_inner):
+                pass
+
+        return _Conn()
+
+    def test_a_short_report_discloses_the_count(self, tmp_path, monkeypatch):
+        db = tmp_path / "state.db"
+        db.write_bytes(backup._SQLITE_HEADER + b"\x00" * 4096)
+        errors = [f"row {n} missing from index idx_messages" for n in range(9)]
+        monkeypatch.setattr(
+            backup.sqlite3, "connect", lambda *a, **k: self._report(errors)
+        )
+
+        message = backup.verify_sqlite_integrity(db)["message"]
+
+        omitted = len(errors) - backup.INTEGRITY_CHECK_MAX_REPORTED_ERRORS
+        assert f"({omitted} {backup.INTEGRITY_CHECK_OMITTED_SUFFIX})" in message
+        assert update_cmd._state_db_damage_is_fts_only(message) is False
+
+    def test_a_complete_report_says_nothing_about_omissions(
+        self, tmp_path, monkeypatch
+    ):
+        db = tmp_path / "state.db"
+        db.write_bytes(backup._SQLITE_HEADER + b"\x00" * 4096)
+        errors = [
+            "malformed inverted index for FTS5 table main.messages_fts",
+            "malformed inverted index for FTS5 table main.messages_fts_cjk",
+        ]
+        monkeypatch.setattr(
+            backup.sqlite3, "connect", lambda *a, **k: self._report(errors)
+        )
+
+        message = backup.verify_sqlite_integrity(db)["message"]
+
+        assert backup.INTEGRITY_CHECK_OMITTED_SUFFIX not in message
+        # And the round trip still reaches the reassuring hint.
+        assert update_cmd._state_db_damage_is_fts_only(message) is True
 
 
 class TestHintOutput:

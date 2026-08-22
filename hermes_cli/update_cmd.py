@@ -1317,7 +1317,7 @@ def _abort_zip_update_if_dirty_tree() -> None:
     print("  To inspect: git status --porcelain")
     _m().sys.exit(1)
 def _state_db_damage_is_fts_only(message: str) -> bool:
-    """True when an integrity-check message blames only the FTS5 index.
+    """True when *every* integrity-check finding blames the FTS5 index.
 
     ``PRAGMA integrity_check`` reports FTS5 damage in the shape
     ``malformed inverted index for FTS5 table main.messages_fts_trigram``
@@ -1328,13 +1328,39 @@ def _state_db_damage_is_fts_only(message: str) -> bool:
     entries in index``, a bad header), which is why the caller only makes
     the "your history is intact" claim for this class.
 
+    **The test is per finding, not per message.** ``integrity_check`` emits
+    one row per problem and ``verify_sqlite_integrity`` joins them with
+    ``"; "``, so a database damaged both ways arrives as a single string
+    holding an FTS phrase *and* a page-damage phrase.  Asking only whether
+    an FTS phrase appears anywhere answers yes there, and tells a user with
+    real b-tree loss that their messages are intact -- the precise false
+    reassurance this hint exists to prevent.  So the message is split back
+    into its findings and the claim is made only when every one is FTS.
+
+    A report that discloses omitted findings is refused for the same
+    reason: the finding that did not fit is exactly the one that could
+    contradict the ones that did.
+
     Deliberately a text test rather than a reuse of
     ``SessionDB._is_fts_write_corruption_error``: that classifier takes a
     ``sqlite3.DatabaseError`` raised by a failed *write*, and here there is
     no exception -- only the string ``verify_sqlite_integrity`` returned.
     """
+    from hermes_cli.backup import INTEGRITY_CHECK_OMITTED_SUFFIX
+
     lowered = message.lower()
-    return "fts5" in lowered or "inverted index" in lowered
+    if INTEGRITY_CHECK_OMITTED_SUFFIX in lowered:
+        return False
+
+    _, marker, tail = lowered.partition("integrity check failed:")
+    findings = [part.strip() for part in (tail if marker else lowered).split(";")]
+    findings = [part for part in findings if part]
+    if not findings:
+        return False
+
+    return all(
+        "fts5" in finding or "inverted index" in finding for finding in findings
+    )
 
 
 def _print_state_db_repair_hint(message: str) -> None:
@@ -1364,8 +1390,8 @@ def _print_state_db_repair_hint(message: str) -> None:
     else:
         print("  → Try:  hermes sessions repair")
         print(
-            "    It backs up first, refuses to touch a database that is "
-            "actually healthy, and tries the least destructive fix first."
+            "    It typically backs up first, re-checks the database before "
+            "acting, and tries the least destructive fix first."
         )
 
 
