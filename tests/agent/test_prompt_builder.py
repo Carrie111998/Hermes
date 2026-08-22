@@ -50,8 +50,9 @@ class TestGuidanceConstants:
         assert "session_search" in MEMORY_GUIDANCE
         assert "like a diary" not in MEMORY_GUIDANCE
         assert ">80%" not in MEMORY_GUIDANCE
-        # Skill authoring lives in SKILLS_GUIDANCE / MEMORY_SKILL_WRITING_GUIDANCE
-        # behind skill_manage gating — not in the memory-only block (#74249).
+        # Skill authoring lives in SKILLS_GUIDANCE behind skill_manage
+        # gating — not in the memory-only block (#74249). The old "save it as
+        # a skill" phrasing was removed from prompts entirely (#82154).
         assert "save it as a skill" not in MEMORY_GUIDANCE
 
     def test_session_search_guidance_is_simple_cross_session_recall(self):
@@ -1033,6 +1034,51 @@ class TestOpenAIModelExecutionGuidance:
     def test_guidance_is_string(self):
         assert isinstance(OPENAI_MODEL_EXECUTION_GUIDANCE, str)
         assert len(OPENAI_MODEL_EXECUTION_GUIDANCE) > 100
+
+    def test_guidance_covers_external_write_readback(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "read" in text and "back" in text
+        assert "successful tool call is not a successful task" in text
+
+    def test_guidance_covers_count_reconciliation(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "has_more" in text
+        assert "hard assertions" in text
+
+    def test_guidance_covers_literal_preservation(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "normalize" in text
+        assert "malformed" in text
+
+    def test_guidance_covers_retry_differently(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "suspiciously narrow" in text
+        assert "retry" in text
+
+    def test_guidance_gates_completion_on_verification(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "plausible subset" in text
+
+
+class TestExecutionGuidanceModels:
+    """Behavior contracts for the default auto-match model list."""
+
+    def test_includes_historical_families(self):
+        from agent.prompt_builder import EXECUTION_GUIDANCE_MODELS
+        for fam in ("gpt", "codex", "grok"):
+            assert fam in EXECUTION_GUIDANCE_MODELS
+
+    def test_includes_composio_eval_families(self):
+        from agent.prompt_builder import EXECUTION_GUIDANCE_MODELS
+        for fam in ("deepseek", "kimi", "qwen", "glm", "minimax", "mimo", "mistral"):
+            assert fam in EXECUTION_GUIDANCE_MODELS
+
+    def test_excludes_google_and_claude(self):
+        # Gemini/Gemma get GOOGLE_MODEL_OPERATIONAL_GUIDANCE instead;
+        # Claude doesn't exhibit the targeted failure modes.
+        from agent.prompt_builder import EXECUTION_GUIDANCE_MODELS
+        for fam in ("gemini", "gemma", "claude"):
+            assert fam not in EXECUTION_GUIDANCE_MODELS
 
 
 class TestParallelToolCallGuidance:
