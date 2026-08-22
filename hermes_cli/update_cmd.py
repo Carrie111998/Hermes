@@ -3665,6 +3665,180 @@ def _record_npm_lockfile_hash(hermes_root: Path) -> None:
     except OSError:
         logger.debug("Could not write npm lockfile hash cache")
 
+def _python_manifests_digest() -> str | None:
+    """Return a checkout-specific digest for the reviewed Python resolution."""
+    lock_file = _m().PROJECT_ROOT / "uv.lock"
+    pyproject = _m().PROJECT_ROOT / "pyproject.toml"
+    if not lock_file.exists() and not pyproject.exists():
+        return None
+    digest = hashlib.sha256()
+    for path in (pyproject, lock_file):
+        if not path.exists():
+            continue
+        digest.update(path.name.encode())
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(b"<unreadable>")
+    return digest.hexdigest()
+
+
+def _python_lock_hash_file(hermes_root: Path | None = None) -> Path:
+    root = hermes_root or get_hermes_home()
+    cache_key = hashlib.sha256(str(_m().PROJECT_ROOT).encode()).hexdigest()[:12]
+    return root / f".python_lock_hash_{cache_key}"
+
+
+def _python_lockfile_changed(hermes_root: Path | None = None) -> bool:
+    """Fail closed when no successful reconciliation has been recorded."""
+    current = _python_manifests_digest()
+    if current is None:
+        return False
+    try:
+        cache_file = _python_lock_hash_file(hermes_root)
+        return (
+            not cache_file.exists()
+            or cache_file.read_text(encoding="utf-8").strip() != current
+        )
+    except OSError:
+        return True
+
+
+def _record_python_lockfile_hash(hermes_root: Path | None = None) -> None:
+    digest = _python_manifests_digest()
+    if digest is None:
+        return
+    try:
+        _python_lock_hash_file(hermes_root).write_text(digest, encoding="utf-8")
+    except OSError:
+        logger.debug("Could not write python lockfile hash cache")
+
+
+def _python_environment_inventory(python_exe: Path) -> tuple[dict[str, str], dict]:
+    """Read installed distributions and marker values from the target venv."""
+    probe = (
+        "import importlib.metadata as m, json, os, platform, re, sys\n"
+        "canonical = lambda name: re.sub(r'[-_.]+', '-', name).lower()\n"
+        "installed = {canonical(d.metadata['Name']): d.version "
+        "for d in m.distributions() if d.metadata.get('Name')}\n"
+        "version = platform.python_version()\n"
+        "markers = {'implementation_name': sys.implementation.name, "
+        "'implementation_version': version, 'os_name': os.name, "
+        "'platform_machine': platform.machine(), "
+        "'platform_python_implementation': platform.python_implementation(), "
+        "'platform_release': platform.release(), 'platform_system': platform.system(), "
+        "'platform_version': platform.version(), 'python_full_version': version, "
+        "'python_version': '.'.join(version.split('.')[:2]), "
+        "'sys_platform': sys.platform}\n"
+        "print(json.dumps({'installed': installed, 'markers': markers}))\n"
+    )
+    result = subprocess.run(
+        [str(python_exe), "-c", probe],
+        cwd=_m().PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=True,
+    )
+    payload = json.loads(result.stdout)
+    return payload["installed"], payload["markers"]
+
+
+def _reconcile_installed_python_packages_with_lock(
+    install_cmd_prefix: list[str], *, env: dict[str, str] | None = None
+) -> bool:
+    """Converge installed registry packages without pruning independent extras."""
+    lock_file = _m().PROJECT_ROOT / "uv.lock"
+    if not lock_file.is_file():
+        return True
+
+    try:
+        import tomllib
+
+        from packaging.markers import Marker
+        from packaging.utils import canonicalize_name
+
+        target_venv = Path((env or {}).get("VIRTUAL_ENV", _m().PROJECT_ROOT / "venv"))
+        target_python = venv_python_path(target_venv, windows=_m()._is_windows())
+        if not target_python.exists():
+            if install_cmd_prefix and not _m()._is_uv_command(install_cmd_prefix):
+                target_python = Path(install_cmd_prefix[0])
+            if not target_python.exists():
+                raise OSError(f"target interpreter not found: {target_python}")
+
+        installed, marker_env = _python_environment_inventory(target_python)
+        with lock_file.open("rb") as handle:
+            lock_data = tomllib.load(handle)
+
+        locked_versions: dict[str, set[str]] = {}
+        for package in lock_data.get("package", []):
+            source = package.get("source") or {}
+            if not isinstance(source, dict) or not source.get("registry"):
+                continue
+            markers = package.get("resolution-markers") or []
+            if markers and not any(Marker(marker).evaluate(marker_env) for marker in markers):
+                continue
+            name = canonicalize_name(package["name"])
+            locked_versions.setdefault(name, set()).add(str(package["version"]))
+
+        requirements: list[str] = []
+        for name, installed_version in sorted(installed.items()):
+            versions = locked_versions.get(name)
+            if not versions:
+                continue
+            if len(versions) != 1:
+                print(
+                    f"  ⚠ Cannot reconcile {name}: uv.lock has multiple applicable "
+                    f"versions ({', '.join(sorted(versions))})."
+                )
+                return False
+            locked_version = next(iter(versions))
+            if installed_version != locked_version:
+                requirements.append(f"{name}=={locked_version}")
+
+        if requirements:
+            command = list(install_cmd_prefix) + ["install", "--no-deps"]
+            if _m()._is_uv_command(install_cmd_prefix):
+                command += ["--python", str(target_python)]
+            command += requirements
+            scripts_dir = _m()._venv_scripts_dir() if _m()._is_windows() else None
+            _m()._run_quarantined_install(
+                command,
+                env=env,
+                scripts_dir=scripts_dir,
+                strict_quarantine=True,
+            )
+
+            installed_after, _ = _python_environment_inventory(target_python)
+            for requirement in requirements:
+                name, locked_version = requirement.rsplit("==", 1)
+                if installed_after.get(name) != locked_version:
+                    print(
+                        "  ⚠ Python lock reconciliation did not reach the locked versions."
+                    )
+                    return False
+        return True
+    except (OSError, ValueError, KeyError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
+        print(f"  ⚠ Python lock reconciliation failed: {exc}")
+        logger.debug("Python lock reconciliation failed", exc_info=True)
+        return False
+
+
+def _reconcile_and_record_python_lockfile(
+    install_cmd_prefix: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    hermes_root: Path | None = None,
+) -> bool:
+    """Record the manifest only after the target venv reaches locked versions."""
+    if not _reconcile_installed_python_packages_with_lock(
+        install_cmd_prefix, env=env
+    ):
+        return False
+    _record_python_lockfile_hash(hermes_root)
+    return True
+
 def _repair_node_deps_on_current_checkout(
     print_completion,
     *,
@@ -7868,6 +8042,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # otherwise "Already up to date!" gaslights the user while their
             # install stays bricked.
             healthy, detail = _venv_core_imports_healthy()
+            python_lock_changed = _python_lockfile_changed()
             # The Windows shim hand-off spawns this child precisely to run a
             # sync its parent could not. The parent already pulled, so the
             # checkout is current BY DESIGN and venv health is not the
@@ -7881,7 +8056,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print("⚠ Checkout is current, but the venv is unhealthy:")
                 print(f"  {detail}")
                 print("→ Repairing Python dependencies...")
-            if handed_off_sync or not healthy:
+            elif python_lock_changed:
+                print("→ Python lock state is unverified; reconciling dependencies...")
+            if handed_off_sync or not healthy or python_lock_changed:
+                full_repair = handed_off_sync or not healthy
                 # Self-lock deferral (#86735): the repair rewrites the venv
                 # too — same mapped-extension hazard as the update sync.
                 _m()._abort_dependency_sync_if_self_locked(_windows_gateway_resume)
@@ -7897,7 +8075,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         _m().PROJECT_ROOT / "venv", windows=_m()._is_windows()
                     )
                 ).exists()
-                if venv_python_missing and repair_uv:
+                if full_repair and venv_python_missing and repair_uv:
                     print("→ Recreating virtual environment...")
                     subprocess.run(
                         [repair_uv, "venv", "venv"],
@@ -7911,35 +8089,52 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
                     repair_env = managed_python_env()
                     repair_env["VIRTUAL_ENV"] = str(_m().PROJECT_ROOT / "venv")
-                    _m()._install_python_dependencies_with_optional_fallback(
-                        [repair_uv, "pip"], env=repair_env, group="all"
-                    )
-                    _m()._refresh_active_lazy_features(
-                        [repair_uv, "pip"],
-                        env=repair_env,
-                        features=active_lazy_features,
-                    )
-                    _m()._restore_active_tool_dependencies(
-                        active_tool_dependencies,
-                        [repair_uv, "pip"],
-                        env=repair_env,
-                    )
+                    if full_repair:
+                        _m()._install_python_dependencies_with_optional_fallback(
+                            [repair_uv, "pip"], env=repair_env, group="all"
+                        )
+                        _m()._refresh_active_lazy_features(
+                            [repair_uv, "pip"],
+                            env=repair_env,
+                            features=active_lazy_features,
+                        )
+                        _m()._restore_active_tool_dependencies(
+                            active_tool_dependencies,
+                            [repair_uv, "pip"],
+                            env=repair_env,
+                        )
                 else:
-                    _m()._install_python_dependencies_with_optional_fallback(
-                        [sys.executable, "-m", "pip"], group="all"
-                    )
-                    _m()._refresh_active_lazy_features(
-                        [sys.executable, "-m", "pip"],
-                        features=active_lazy_features,
-                    )
-                    _m()._restore_active_tool_dependencies(
-                        active_tool_dependencies,
-                        [sys.executable, "-m", "pip"],
-                    )
-                _m()._clear_update_incomplete_marker()
+                    if full_repair:
+                        _m()._install_python_dependencies_with_optional_fallback(
+                            [sys.executable, "-m", "pip"], group="all"
+                        )
+                        _m()._refresh_active_lazy_features(
+                            [sys.executable, "-m", "pip"],
+                            features=active_lazy_features,
+                        )
+                        _m()._restore_active_tool_dependencies(
+                            active_tool_dependencies,
+                            [sys.executable, "-m", "pip"],
+                        )
+                install_prefix = [repair_uv, "pip"] if repair_uv else [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                ]
+                reconcile_env = repair_env if repair_uv else None
+                lock_reconciled = _reconcile_and_record_python_lockfile(
+                    install_prefix, env=reconcile_env
+                )
+                if lock_reconciled:
+                    _m()._clear_update_incomplete_marker()
+                else:
+                    print("  Re-run `hermes update` to retry lock reconciliation.")
                 healthy_after, detail_after = _venv_core_imports_healthy()
-                if healthy_after:
-                    print("✓ Dependencies repaired!")
+                if healthy_after and lock_reconciled:
+                    if full_repair:
+                        print("✓ Dependencies repaired!")
+                    else:
+                        print("✓ Python lock state reconciled!")
                     _check_and_apply_config_migration(
                         assume_yes=assume_yes,
                         gateway_mode=gateway_mode,
@@ -7947,8 +8142,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     )
                     _print_update_completion("✓ Update complete!")
                 else:
-                    print(f"⚠ Venv still unhealthy after repair: {detail_after}")
-                    print("  Close all Hermes windows/gateways and re-run: hermes update")
+                    if not healthy_after:
+                        print(f"⚠ Venv still unhealthy after repair: {detail_after}")
+                        print("  Close all Hermes windows/gateways and re-run: hermes update")
             else:
                 _repair_node_deps_on_current_checkout(
                     _print_update_completion,
@@ -8330,11 +8526,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
             )
             _m()._verify_console_scripts_installed(install_prefix, env=lazy_env)
 
-        # Core ``.[all]`` install finished. Clear the generic core breadcrumb
+        lock_reconciled = _reconcile_and_record_python_lockfile(
+            install_prefix, env=lazy_env
+        )
+        if not lock_reconciled:
+            print("  Re-run `hermes update` to retry lock reconciliation.")
+
+        # Core ``.[all]`` install and lock reconciliation finished. Clear the generic core breadcrumb
         # before the lazy-refresh phase — that phase uses its own marker so a
         # later lazy failure cannot be "healed" by clearing the core marker
         # based on a narrow 7-package import probe (#58004 review).
-        _m()._clear_update_incomplete_marker()
+        if lock_reconciled:
+            _m()._clear_update_incomplete_marker()
 
         # The update process is still the old Python interpreter process. Run
         # one final cache/module refresh immediately before lazy backend
