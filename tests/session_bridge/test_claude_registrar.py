@@ -26,6 +26,7 @@ from session_bridge.claude_registrar import (
     PtyCleanupResult,
     WindowsConPtyFactory,
     _PtyReadinessTimeout,
+    _RegistrarCancelled,
     _PtyResponseTimeout,
     _WinPtyProcess,
     _claude_main_repl_ready,
@@ -86,6 +87,204 @@ def claim(**changes: Any) -> ClaudeVisibilityClaim:
         launch_permitted=True,
     )
     return replace(base, **changes)
+
+
+def test_cancelled_claim_retries_without_spawning_or_creation_ambiguity() -> None:
+    store = FakeStore()
+    factory = FakeFactory()
+    stop = threading.Event()
+    stop.set()
+
+    result = registrar(FakeSource(), factory, store).process(claim(), stop=stop)
+
+    assert result.status == "retry"
+    assert result.error_code == "session_bridge_unavailable"
+    assert factory.spawns == []
+    assert [call[0] for call in store.calls] == ["retry"]
+
+
+def test_cancelled_reconciliation_does_not_write_exact_absence() -> None:
+    store = FakeStore()
+    stop = threading.Event()
+    stop.set()
+    item = claim(
+        lease_kind="reconciliation",
+        launch_permitted=False,
+        registration_reserved=False,
+        requires_exact_id_reconciliation=True,
+    )
+
+    result = registrar(FakeSource(), FakeFactory(), store).process(item, stop=stop)
+
+    assert result.status == "retry"
+    assert result.error_code == "session_bridge_unavailable"
+    assert [call[0] for call in store.calls] == ["retry"]
+
+
+def test_cancellation_during_reconciliation_lookup_does_not_record_absence() -> None:
+    stop = threading.Event()
+    store = FakeStore()
+    item = claim(
+        lease_kind="reconciliation",
+        launch_permitted=False,
+        registration_reserved=False,
+        requires_exact_id_reconciliation=True,
+    )
+
+    class CancellingSource(FakeSource):
+        def find_native_session(self, native_id: str) -> Path | None:
+            stop.set()
+            return super().find_native_session(native_id)
+
+    result = registrar(CancellingSource(), FakeFactory(), store).process(
+        item, stop=stop
+    )
+
+    assert result.status == "retry"
+    assert result.error_code == "session_bridge_unavailable"
+    assert [call[0] for call in store.calls] == ["retry"]
+
+
+def test_cancellation_during_existing_exact_lookup_does_not_commit() -> None:
+    stop = threading.Event()
+    store = FakeStore()
+    item = claim()
+
+    class CancellingSource(FakeSource):
+        def find_native_session(self, native_id: str) -> Path | None:
+            found = super().find_native_session(native_id)
+            stop.set()
+            return found
+
+    result = registrar(
+        CancellingSource([projection_for(item)]), FakeFactory(), store
+    ).process(item, stop=stop)
+
+    assert result.status == "retry"
+    assert result.error_code == "session_bridge_unavailable"
+    assert [call[0] for call in store.calls] == ["retry"]
+
+
+def test_cancellation_during_exact_lookup_still_prevents_spawn() -> None:
+    stop = threading.Event()
+    store = FakeStore()
+
+    class CancellingSource(FakeSource):
+        def find_native_session(self, native_id: str) -> Path | None:
+            stop.set()
+            return super().find_native_session(native_id)
+
+    factory = FakeFactory()
+
+    result = registrar(CancellingSource(), factory, store).process(claim(), stop=stop)
+
+    assert factory.spawns == []
+    assert result.status == "retry"
+    assert result.error_code == "session_bridge_unavailable"
+    assert [call[0] for call in store.calls] == ["retry"]
+
+
+def test_post_spawn_cancellation_binds_token_and_cleans_up_as_ambiguous() -> None:
+    stop = threading.Event()
+    store = FakeStore()
+
+    class CancellingPty(FakePty):
+        def __init__(self) -> None:
+            super().__init__()
+            self.bound_stop: object | None = None
+
+        def set_cancel_event(self, value: object) -> None:
+            self.bound_stop = value
+
+        def read_until_ready(
+            self, timeout: float, *, accept_workspace_trust: bool = False
+        ) -> str:
+            stop.set()
+            raise _RegistrarCancelled()
+
+    process = CancellingPty()
+    factory = FakeFactory(process)
+
+    result = registrar(FakeSource(), factory, store).process(claim(), stop=stop)
+
+    assert process.bound_stop is stop
+    assert process.terminated is True
+    assert process.closed is True
+    assert result.status == "retry"
+    assert result.error_code == "creation_ambiguous"
+    assert [call[0] for call in store.calls] == ["retry"]
+
+
+def test_cancellation_during_prompt_settle_cannot_commit_and_cleans_up() -> None:
+    stop = threading.Event()
+    store = FakeStore()
+
+    class CancelAfterPromptWrite(FakePty):
+        def write(self, data: str) -> None:
+            super().write(data)
+            stop.set()
+
+    process = CancelAfterPromptWrite()
+
+    result = registrar(FakeSource(), FakeFactory(process), store).process(
+        claim(), stop=stop
+    )
+
+    assert process.prompt_input_waits == []
+    assert process.terminated is True
+    assert process.closed is True
+    assert result.status == "retry"
+    assert result.error_code == "creation_ambiguous"
+    assert [call[0] for call in store.calls] == ["retry"]
+
+
+def test_cancellation_interrupts_transcript_discovery_poll() -> None:
+    stop = threading.Event()
+    store = FakeStore()
+    item = claim()
+    process = FakePty()
+
+    class CancellingSource(FakeSource):
+        def find_native_session(self, native_id: str) -> Path | None:
+            found = super().find_native_session(native_id)
+            if len(self.lookups) == 2:
+                stop.set()
+            return found
+
+    source = CancellingSource([None, None])
+
+    result = registrar(
+        source,
+        FakeFactory(process),
+        store,
+        discovery_timeout=30.0,
+    ).process(item, stop=stop)
+
+    assert source.lookups == [item.reserved_claude_uuid, item.reserved_claude_uuid]
+    assert result.status == "retry"
+    assert result.error_code == "creation_ambiguous"
+    assert [call[0] for call in store.calls] == ["retry"]
+
+
+def test_post_spawn_cancellation_cannot_commit_discovered_transcript() -> None:
+    stop = threading.Event()
+    store = FakeStore()
+    item = claim()
+
+    class CancellingSource(FakeSource):
+        def find_native_session(self, native_id: str) -> Path | None:
+            found = super().find_native_session(native_id)
+            if len(self.lookups) == 2:
+                stop.set()
+            return found
+
+    source = CancellingSource([None, projection_for(item)])
+
+    result = registrar(source, FakeFactory(FakePty()), store).process(item, stop=stop)
+
+    assert result.status == "retry"
+    assert result.error_code == "creation_ambiguous"
+    assert [call[0] for call in store.calls] == ["retry"]
 
 
 def test_claude_visibility_claim_rejects_positional_construction() -> None:
@@ -328,6 +527,7 @@ def registrar(
 ):
     startup_theme = kwargs.pop("startup_theme", "light")
     sleep = kwargs.pop("sleep", lambda _value: None)
+    discovery_timeout = kwargs.pop("discovery_timeout", 0.0)
     return ClaudeNativeRegistrar(
         store or FakeStore(),
         source,
@@ -339,7 +539,7 @@ def registrar(
         sleep=sleep,
         process_timeout=2.0,
         exit_timeout=1.0,
-        discovery_timeout=0.0,
+        discovery_timeout=discovery_timeout,
         retry_delay=5.0,
         **kwargs,
     )
@@ -1593,6 +1793,77 @@ def test_fixed_launch_failure_codes_and_cleanup(
 # test_winpty_slow_drip_after_candidate_stays_bounded_by_global_timeout, which
 # checks `elapsed < 1.0` -- keep their own small value and must NOT use this.
 _READER_EOF_GUARD_SECONDS = 30.0
+
+
+def test_winpty_fallback_reader_observes_cancellation_while_read_is_blocked() -> None:
+    stop = threading.Event()
+    read_started = threading.Event()
+    release_read = threading.Event()
+    finished = threading.Event()
+    errors: list[BaseException] = []
+
+    class Process:
+        def read(self, _size: int = 1024) -> str:
+            read_started.set()
+            release_read.wait()
+            raise EOFError
+
+    wrapped = _WinPtyProcess(Process())
+    wrapped.set_cancel_event(stop)
+
+    def read() -> None:
+        try:
+            wrapped.read_until(30.0)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    reader = threading.Thread(target=read)
+    reader.start()
+    try:
+        assert read_started.wait(1.0)
+        stop.set()
+        assert finished.wait(1.0)
+    finally:
+        release_read.set()
+        reader.join(2.0)
+
+    assert reader.is_alive() is False
+    assert len(errors) == 1
+    assert str(errors[0]) == "visibility registrar cancelled"
+
+
+def test_winpty_timed_read_observes_bound_cancellation() -> None:
+    stop = threading.Event()
+
+    class Process:
+        def read_with_timeout(self, _size: int, _timeout: float) -> None:
+            stop.set()
+            return None
+
+    wrapped = _WinPtyProcess(Process())
+    wrapped.set_cancel_event(stop)
+
+    with pytest.raises(RuntimeError, match="^visibility registrar cancelled$"):
+        wrapped.read_until(30.0)
+
+
+def test_winpty_wait_observes_bound_cancellation() -> None:
+    stop = threading.Event()
+
+    class Process:
+        exitstatus = None
+
+        def isalive(self) -> bool:
+            stop.set()
+            return True
+
+    wrapped = _WinPtyProcess(Process())
+    wrapped.set_cancel_event(stop)
+
+    with pytest.raises(RuntimeError, match="^visibility registrar cancelled$"):
+        wrapped.wait(30.0)
 
 
 def test_winpty_wrapper_uses_real_read_signature_without_unbounded_keyword() -> None:
@@ -3223,6 +3494,110 @@ def test_real_windows_conpty_timeout_terminates_and_releases_resources(
     assert cleanup.registrar_reader_stopped is True
     assert cleanup.transport_reader_stopped is True
     assert process._reader_thread is None
+
+
+@pytest.mark.skipif(not _real_conpty_available(), reason="Windows ConPTY unavailable")
+def test_detached_redirected_registrar_cancellation_is_ambiguous_and_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child_marker = "SESSION_BRIDGE_DETACHED_CONPTY_CHILD"
+    if os.environ.get(child_marker) != "1":
+        stdout_path = tmp_path / "detached-stdout.txt"
+        stderr_path = tmp_path / "detached-stderr.txt"
+        env = {**os.environ, child_marker: "1"}
+        command = [
+            sys.executable,
+            "-m",
+            "pytest",
+            f"{Path(__file__).resolve()}::test_detached_redirected_registrar_cancellation_is_ambiguous_and_cleans_up",
+            "-q",
+            "-s",
+        ]
+        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+            child = subprocess.Popen(
+                command,
+                cwd=Path(__file__).resolve().parents[2],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            return_code = child.wait(timeout=_REAL_CONPTY_GUARD_SECONDS)
+        output = stdout_path.read_text(encoding="utf-8", errors="replace")
+        errors = stderr_path.read_text(encoding="utf-8", errors="replace")
+        assert return_code == 0, errors
+        assert "DETACHED_CONPTY_CANCELLATION_OK" in output
+        return
+
+    value = replace(candidate(), source_cwd=str(tmp_path), git_root=str(tmp_path))
+    identity = derive_claude_visibility_identity(value, SECRET)
+    item = replace(
+        claim(),
+        job_id=identity.job_id,
+        reserved_claude_uuid=identity.claude_uuid,
+        signed_marker=identity.signed_marker,
+        source_cwd=value.source_cwd,
+        git_root=value.git_root,
+    )
+    record = tmp_path / "detached-cancel.json"
+    fixture = Path(__file__).parent / "fixtures" / "fake_interactive_claude.py"
+    monkeypatch.setenv("FAKE_CLAUDE_RECORD", str(record))
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "timeout_after_native_creation")
+    stop = threading.Event()
+    store = FakeStore()
+
+    class CapturingFactory(WindowsConPtyFactory):
+        process: _WinPtyProcess | None = None
+        spawn_count = 0
+
+        def spawn(self, argv: list[str], *, cwd: str) -> _WinPtyProcess:
+            self.spawn_count += 1
+            spawned = super().spawn(argv, cwd=cwd)
+            assert isinstance(spawned, _WinPtyProcess)
+            self.process = spawned
+            return spawned
+
+    factory = CapturingFactory()
+
+    def cancel_after_creation() -> None:
+        _wait_for_fixture_event(record, "native_created", _REAL_CONPTY_GUARD_SECONDS)
+        stop.set()
+
+    canceller = threading.Thread(target=cancel_after_creation)
+    canceller.start()
+    try:
+        result = ClaudeNativeRegistrar(
+            cast(Any, store),
+            cast(Any, FakeSource()),
+            marker_secret=SECRET,
+            startup_theme="light",
+            pty_factory=factory,
+            claude_command=(sys.executable, str(fixture)),
+            clock=lambda: 100.0,
+            monotonic=time.monotonic,
+            sleep=time.sleep,
+            process_timeout=_REAL_CONPTY_GUARD_SECONDS,
+            exit_timeout=5.0,
+            discovery_timeout=0.0,
+            retry_delay=5.0,
+        ).process(item, stop=stop)
+    finally:
+        canceller.join(_REAL_CONPTY_GUARD_SECONDS)
+
+    assert canceller.is_alive() is False
+    assert result.status == "retry"
+    assert result.error_code == "creation_ambiguous"
+    assert factory.spawn_count == 1
+    assert [call[0] for call in store.calls] == ["retry"]
+    assert factory.process is not None
+    cleanup = factory.process.close(5.0)
+    assert cleanup.process_dead is True
+    assert cleanup.succeeded
+    assert cleanup.registrar_reader_stopped is True
+    assert cleanup.transport_reader_stopped is True
+    assert factory.process._reader_thread is None
+    print("DETACHED_CONPTY_CANCELLATION_OK")
 
 
 @pytest.mark.skipif(not _real_conpty_available(), reason="Windows ConPTY unavailable")

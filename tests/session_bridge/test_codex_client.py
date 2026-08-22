@@ -178,6 +178,98 @@ def test_cancellation_is_not_recovered_or_replayed() -> None:
     assert first.closed is False
 
 
+def test_per_request_cancellation_is_forwarded_without_recovery_or_replay() -> None:
+    stop = threading.Event()
+
+    class CancellingClient(_FakeClient):
+        def request(
+            self,
+            method: str,
+            params: dict[str, Any] | None = None,
+            timeout: float = 30.0,
+            *,
+            cancel_event: threading.Event | None = None,
+        ) -> dict[str, Any]:
+            self.calls.append((method, params or {}, timeout))
+            assert cancel_event is stop
+            stop.set()
+            raise CodexRequestCancelled("codex app-server request cancelled")
+
+    first = CancellingClient({"thread/list": []})
+    factory, created = _factory([first])
+    client = RecoveringCodexAppServerClient(factory)
+
+    with pytest.raises(CodexRequestCancelled, match="request cancelled"):
+        client.request("thread/list", {}, cancel_event=stop)
+
+    assert created == [first]
+    assert len(first.calls) == 1
+    assert first.closed is False
+
+
+def test_per_initialize_cancellation_is_forwarded_but_not_retained_for_replay() -> None:
+    stop = threading.Event()
+
+    class InitializingClient(_FakeClient):
+        def initialize(
+            self,
+            *,
+            cancel_event: threading.Event | None = None,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            expected = stop if self is first else None
+            assert cancel_event is expected
+            return super().initialize(**kwargs)
+
+    first = InitializingClient({"thread/list": [TimeoutError("dead transport")]})
+    second = InitializingClient({"thread/list": [{"data": []}]})
+    factory, created = _factory([first, second])
+    client = RecoveringCodexAppServerClient(factory)
+
+    client.initialize(
+        capabilities={"experimentalApi": True},
+        cancel_event=stop,
+    )
+    assert client.request("thread/list", {}) == {"data": []}
+
+    assert created == [first, second]
+    assert first.initialize_calls == [{"capabilities": {"experimentalApi": True}}]
+    assert second.initialize_calls == [
+        {
+            "capabilities": {"experimentalApi": True},
+            "timeout": pytest.approx(30.0),
+        }
+    ]
+
+
+def test_notification_delegates_to_current_client() -> None:
+    first = _FakeClient({})
+    first.take_notification = lambda timeout=0.0: {"timeout": timeout}
+    factory, _created = _factory([first])
+    client = RecoveringCodexAppServerClient(factory)
+
+    assert client.take_notification(timeout=0.25) == {"timeout": 0.25}
+
+
+def test_per_request_cancellation_stops_before_replacement_factory() -> None:
+    stop = threading.Event()
+
+    class ClosingClient(_FakeClient):
+        def close(self) -> None:
+            super().close()
+            stop.set()
+
+    first = ClosingClient({"thread/list": [TimeoutError("dead transport")]})
+    factory, created = _factory([first, _FakeClient({"thread/list": [{"data": []}]})])
+    client = RecoveringCodexAppServerClient(factory)
+
+    with pytest.raises(CodexRequestCancelled, match="request cancelled"):
+        client.request("thread/list", {}, cancel_event=stop)
+
+    assert created == [first]
+    assert first.closed is True
+
+
 def test_inflight_cancellation_is_not_recovered_or_replayed() -> None:
     stop = threading.Event()
 

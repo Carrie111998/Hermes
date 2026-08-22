@@ -13,6 +13,7 @@ import re
 import time
 from typing import Any, Protocol
 
+from agent.transports.codex_app_server import CodexRequestCancelled
 from agent.transports.codex_event_projector import CodexEventProjector
 
 from .models import (
@@ -66,10 +67,19 @@ _MARKER_CANDIDATE_RE = re.compile(
 
 class _RequestClient(Protocol):
     def request(
-        self, method: str, params: dict[str, Any], timeout: float
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        timeout: float = 30.0,
+        *,
+        cancel_event: Any = None,
     ) -> dict[str, Any]: ...
 
     def take_notification(self, timeout: float = 0.0) -> dict[str, Any] | None: ...
+
+
+class _VisibilityInventoryCancelled(RuntimeError):
+    """Internal control flow for cancellation of Codex visibility inventory."""
 
 
 @dataclass(frozen=True)
@@ -723,12 +733,17 @@ class CodexSourceAdapter:
         return projection
 
     def _read_sidebar_thread_details(
-        self, summary: CodexThreadSummary, *, deadline: float | None
+        self,
+        summary: CodexThreadSummary,
+        *,
+        deadline: float | None,
+        stop: Any = None,
     ) -> tuple[SessionProjection, CodexThreadSummary]:
         response = self._bounded_sidebar_request(
             "thread/read",
             {"threadId": summary.native_id, "includeTurns": True},
             deadline=deadline,
+            stop=stop,
         )
         thread = _thread_from_response(response)
         reconciled = _reconcile_summary_metadata(summary, thread)
@@ -865,6 +880,7 @@ class CodexSourceAdapter:
         params: dict[str, Any],
         *,
         deadline: float | None,
+        stop: Any = None,
     ) -> dict[str, Any]:
         timeout = _REQUEST_TIMEOUT
         if deadline is not None:
@@ -872,7 +888,18 @@ class CodexSourceAdapter:
             if remaining <= 0:
                 raise _CodexReadBudgetExceeded("Codex sidebar deadline exhausted")
             timeout = min(timeout, remaining)
-        response = self._client.request(method, params, timeout=timeout)
+        try:
+            if stop is None:
+                response = self._client.request(method, params, timeout=timeout)
+            else:
+                response = self._client.request(
+                    method,
+                    params,
+                    timeout=timeout,
+                    cancel_event=stop,
+                )
+        except CodexRequestCancelled:
+            raise _VisibilityInventoryCancelled() from None
         if deadline is not None and float(self._monotonic()) > deadline:
             raise _CodexReadBudgetExceeded("Codex sidebar deadline exhausted")
         return response
@@ -941,6 +968,18 @@ class CodexSourceAdapter:
         self._inventory_cache = next_cache
         return summaries
 
+    def _fetch_visibility_full_inventory(
+        self, *, archived: bool, deadline: float, stop: Any = None
+    ) -> list[CodexThreadSummary]:
+        summaries = self._fetch_inventory(
+            archived=archived, deadline=deadline, stop=stop
+        )
+        next_cache = dict(self._inventory_cache)
+        for summary in summaries:
+            next_cache[summary.native_id] = summary
+        self._inventory_cache = next_cache
+        return summaries
+
     def list_claude_visibility_sources(
         self,
         *,
@@ -949,6 +988,7 @@ class CodexSourceAdapter:
         indexed_sources: Mapping[str, Any] | None = None,
         known_visibility_source_ids: frozenset[str] = frozenset(),
         discovery_timeout: float = _REQUEST_TIMEOUT,
+        stop: Any = None,
     ) -> tuple[Any, ...]:
         """Read active and archived Codex sources with optional indexed reuse."""
 
@@ -963,7 +1003,9 @@ class CodexSourceAdapter:
         ):
             raise ValueError("Codex visibility discovery timeout must be positive")
         deadline = self._monotonic() + float(discovery_timeout)
-        self._ensure_initialized(deadline=deadline)
+        if stop is not None and stop.is_set():
+            raise _VisibilityInventoryCancelled()
+        self._ensure_initialized(deadline=deadline, stop=stop)
         combined: dict[str, CodexThreadSummary] = {}
         for archived in (False, True):
             summaries = (
@@ -973,11 +1015,11 @@ class CodexSourceAdapter:
                     state_db_only=True,
                     stop_after=cutoff,
                     deadline=deadline,
+                    stop=stop,
                 )
                 if state_db_only
-                else self.list_full_inventory(
-                    archived=archived,
-                    deadline=deadline,
+                else self._fetch_visibility_full_inventory(
+                    archived=archived, deadline=deadline, stop=stop
                 )
             )
             for summary in summaries:
@@ -1090,7 +1132,7 @@ class CodexSourceAdapter:
             else:
                 try:
                     projection, reconciled = self._read_sidebar_thread_details(
-                        summary, deadline=deadline
+                        summary, deadline=deadline, stop=stop
                     )
                 except _CodexReadBudgetExceeded:
                     if indexed_sources is not None:
@@ -1447,7 +1489,9 @@ class CodexSourceAdapter:
         self._inventory_cache[wanted] = summary
         return self.project_thread(summary, response=response)
 
-    def _ensure_initialized(self, *, deadline: float | None = None) -> None:
+    def _ensure_initialized(
+        self, *, deadline: float | None = None, stop: Any = None
+    ) -> None:
         if self._initialization_failed:
             raise RuntimeError(
                 "Codex app-server initialization outcome is unknown; replace the "
@@ -1481,10 +1525,16 @@ class CodexSourceAdapter:
                         "Codex sidebar deadline exhausted"
                     )
                 initialize_kwargs["timeout"] = remaining
+            if stop is not None:
+                initialize_kwargs["cancel_event"] = stop
             initialize(**initialize_kwargs)
+            if stop is not None and stop.is_set():
+                raise _VisibilityInventoryCancelled()
             if deadline is not None and float(self._monotonic()) > deadline:
                 raise _CodexReadBudgetExceeded("Codex sidebar deadline exhausted")
-        except _CodexReadBudgetExceeded:
+        except CodexRequestCancelled:
+            raise _VisibilityInventoryCancelled() from None
+        except (_CodexReadBudgetExceeded, _VisibilityInventoryCancelled):
             raise
         except Exception as exc:
             self._initialization_failed = True
@@ -1514,6 +1564,7 @@ class CodexSourceAdapter:
         state_db_only: bool = False,
         stop_on_native_id: str | None = None,
         deadline: float | None = None,
+        stop: Any = None,
     ) -> list[CodexThreadSummary]:
         if source_kinds is None:
             summaries = self._fetch_inventory_pages(
@@ -1522,6 +1573,7 @@ class CodexSourceAdapter:
                 state_db_only=state_db_only,
                 stop_on_native_id=stop_on_native_id,
                 deadline=deadline,
+                stop=stop,
             )
             return self._refresh_trusted_origins(summaries)
         try:
@@ -1531,6 +1583,7 @@ class CodexSourceAdapter:
                 state_db_only=state_db_only,
                 stop_on_native_id=stop_on_native_id,
                 deadline=deadline,
+                stop=stop,
             )
         except Exception as exc:
             retry_without_filter = _is_source_kinds_schema_error(exc)
@@ -1545,6 +1598,7 @@ class CodexSourceAdapter:
             state_db_only=state_db_only,
             stop_on_native_id=stop_on_native_id,
             deadline=deadline,
+            stop=stop,
         )
         return self._refresh_trusted_origins(summaries)
 
@@ -1558,6 +1612,7 @@ class CodexSourceAdapter:
         known_native_ids: frozenset[str] = frozenset(),
         stop_on_native_id: str | None = None,
         deadline: float | None = None,
+        stop: Any = None,
     ) -> list[CodexThreadSummary]:
         cursor: Any = None
         seen_cursors: set[str] = set()
@@ -1565,6 +1620,8 @@ class CodexSourceAdapter:
         raw_entry_count = 0
         trusted_origins = self._load_trusted_origins()
         while True:
+            if stop is not None and stop.is_set():
+                raise _VisibilityInventoryCancelled()
             params: dict[str, Any] = {"archived": archived}
             if state_db_only:
                 params.update({
@@ -1578,7 +1635,7 @@ class CodexSourceAdapter:
             if cursor is not None:
                 params["cursor"] = cursor
             response = self._bounded_sidebar_request(
-                "thread/list", params, deadline=deadline
+                "thread/list", params, deadline=deadline, stop=stop
             )
             if not isinstance(response, dict):
                 raise ValueError("Codex thread/list response must be an object")

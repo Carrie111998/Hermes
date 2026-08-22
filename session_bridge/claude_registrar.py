@@ -83,6 +83,13 @@ class _PtyReadinessTimeout(TimeoutError):
         self.reason = reason
 
 
+class _RegistrarCancelled(RuntimeError):
+    """Internal control flow for cancellation of one native registration."""
+
+    def __init__(self) -> None:
+        super().__init__("visibility registrar cancelled")
+
+
 class _PtyResponseTimeout(TimeoutError):
     """Bounded, non-transcript diagnostic for a Claude response timeout."""
 
@@ -115,6 +122,8 @@ def build_characterization_auth_recovery_prompt(
 
 
 class InteractivePty(Protocol):
+    def set_cancel_event(self, stop: Any) -> None: ...
+
     def read_until_ready(
         self, timeout: float, *, accept_workspace_trust: bool = False
     ) -> str: ...
@@ -475,6 +484,7 @@ class _WinPtyProcess:
         self._reader_thread: threading.Thread | None = None
         self._reader_result: queue.Queue[str | BaseException | None] | None = None
         self._reader_stop = threading.Event()
+        self._cancel_event: Any = None
         self._prompt_input_buffer = ""
         self._close_lock = threading.Lock()
         self._direct_native_pty = direct_native_pty
@@ -503,6 +513,13 @@ class _WinPtyProcess:
         ):
             raise RuntimeError("unsupported pywinpty resource layout")
         return fileobj, server, reader
+
+    def set_cancel_event(self, stop: Any) -> None:
+        self._cancel_event = stop
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise _RegistrarCancelled()
 
     def read_until(self, timeout: float, *, prompt: str | None = None) -> str:
         timed_read = getattr(self._process, "read_with_timeout", None)
@@ -556,6 +573,7 @@ class _WinPtyProcess:
         candidate_seen = False
         chunks: list[str] = []
         while True:
+            self._raise_if_cancelled()
             now = time.monotonic()
             wake_at = (
                 deadline if settle_deadline is None else min(deadline, settle_deadline)
@@ -570,7 +588,7 @@ class _WinPtyProcess:
                 self._stop_reader()
                 raise TimeoutError
             try:
-                value = result.get(timeout=remaining)
+                value = result.get(timeout=min(remaining, 0.01))
             except queue.Empty:
                 continue
             if value is None:
@@ -603,6 +621,7 @@ class _WinPtyProcess:
         candidate_seen = False
         settle_deadline: float | None = None
         while True:
+            self._raise_if_cancelled()
             now = time.monotonic()
             wake_at = (
                 deadline if settle_deadline is None else min(deadline, settle_deadline)
@@ -663,6 +682,7 @@ class _WinPtyProcess:
         ready_settle_deadline: float | None = None
         readiness_output = ""
         while True:
+            self._raise_if_cancelled()
             now = time.monotonic()
             wake_at = (
                 deadline
@@ -773,6 +793,7 @@ class _WinPtyProcess:
         )
         chunks = [initial_output] if initial_output else []
         while True:
+            self._raise_if_cancelled()
             now = time.monotonic()
             wake_at = (
                 deadline if settle_deadline is None else min(deadline, settle_deadline)
@@ -836,6 +857,7 @@ class _WinPtyProcess:
     def wait(self, timeout: float) -> int | None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            self._raise_if_cancelled()
             if not self._process.isalive():  # type: ignore[attr-defined]
                 value = getattr(self._process, "exitstatus", None)
                 if value is None:
@@ -1008,10 +1030,16 @@ class ClaudeNativeRegistrar:
         self._retry_delay = retry_delay
         self._poll_interval = poll_interval
 
-    def process(self, claim: ClaudeVisibilityClaim) -> ClaudeRegistrarOutcome:
+    def process(
+        self, claim: ClaudeVisibilityClaim, *, stop: Any = None
+    ) -> ClaudeRegistrarOutcome:
         if not claim.claimed:
             return ClaudeRegistrarOutcome(
                 claim.status, claim.job_id, claim.reserved_claude_uuid
+            )
+        if stop is not None and stop.is_set():
+            return self._retry(
+                claim, "session_bridge_unavailable", "visibility cycle cancelled"
             )
         try:
             self._validate_claim_authority(claim)
@@ -1029,8 +1057,8 @@ class ClaudeNativeRegistrar:
             return self._fail(claim, "bridge_conflict", "claim identity conflict")
 
         if claim.lease_kind == "reconciliation":
-            return self._reconcile(claim, candidate, identity)
-        return self._launch(claim, candidate, identity)
+            return self._reconcile(claim, candidate, identity, stop=stop)
+        return self._launch(claim, candidate, identity, stop=stop)
 
     def resume_auth_recovery(
         self, claim: Mapping[str, Any], prompt: str
@@ -1225,6 +1253,13 @@ class ClaudeNativeRegistrar:
             raise TimeoutError
         return remaining
 
+    def _wait_or_cancel(self, stop: Any, seconds: float) -> None:
+        if stop is None:
+            self._sleep(seconds)
+            return
+        if stop.wait(seconds):
+            raise _RegistrarCancelled()
+
     def _materialize_claim(
         self, claim: ClaudeVisibilityClaim
     ) -> tuple[ClaudeVisibilityCandidate, ClaudeVisibilityIdentity]:
@@ -1295,6 +1330,8 @@ class ClaudeNativeRegistrar:
         claim: ClaudeVisibilityClaim,
         candidate: ClaudeVisibilityCandidate,
         identity: ClaudeVisibilityIdentity,
+        *,
+        stop: Any = None,
     ) -> ClaudeRegistrarOutcome:
         try:
             found = self._read_exact(identity.claude_uuid)
@@ -1309,6 +1346,10 @@ class ClaudeNativeRegistrar:
                 claim,
                 "native_transcript_not_indexed",
                 "exact transcript lookup unavailable",
+            )
+        if stop is not None and stop.is_set():
+            return self._retry(
+                claim, "session_bridge_unavailable", "visibility cycle cancelled"
             )
         if found is None:
             evidence = hashlib.sha256(
@@ -1338,6 +1379,8 @@ class ClaudeNativeRegistrar:
         claim: ClaudeVisibilityClaim,
         candidate: ClaudeVisibilityCandidate,
         identity: ClaudeVisibilityIdentity,
+        *,
+        stop: Any = None,
     ) -> ClaudeRegistrarOutcome:
         try:
             existing = self._read_exact(identity.claude_uuid)
@@ -1352,6 +1395,10 @@ class ClaudeNativeRegistrar:
                 claim,
                 "native_transcript_not_indexed",
                 "exact transcript lookup unavailable",
+            )
+        if stop is not None and stop.is_set():
+            return self._retry(
+                claim, "session_bridge_unavailable", "visibility cycle cancelled"
             )
         if existing is not None:
             return self._validate_and_commit(claim, candidate, identity, existing)
@@ -1381,6 +1428,9 @@ class ClaudeNativeRegistrar:
         try:
             process = self._factory.spawn(argv, cwd=candidate.source_cwd)
             launched = True
+            set_cancel_event = getattr(process, "set_cancel_event", None)
+            if callable(set_cancel_event):
+                set_cancel_event(stop)
             deadline = self._monotonic() + self._process_timeout
             startup = process.read_until_ready(
                 self._remaining_process_time(deadline), accept_workspace_trust=True
@@ -1406,7 +1456,7 @@ class ClaudeNativeRegistrar:
                 )
             else:
                 process.write(_interactive_prompt_frame(prompt))
-                self._sleep(_PROMPT_SUBMIT_DELAY_SECONDS)
+                self._wait_or_cancel(stop, _PROMPT_SUBMIT_DELAY_SECONDS)
                 paste_auto_submitted = False
                 try:
                     prompt_input = process.read_until_prompt_input(
@@ -1487,6 +1537,12 @@ class ClaudeNativeRegistrar:
                             )
                         else:
                             clean_exit = True
+        except _RegistrarCancelled:
+            pending = (
+                "retry",
+                "creation_ambiguous" if launched else "session_bridge_unavailable",
+                "visibility cycle cancelled",
+            )
         except FileNotFoundError:
             pending = (
                 "retry",
@@ -1567,6 +1623,10 @@ class ClaudeNativeRegistrar:
                 )
             except (OSError, RuntimeError):
                 found = None
+            if stop is not None and stop.is_set():
+                return self._retry(
+                    claim, "creation_ambiguous", "visibility cycle cancelled"
+                )
             if found is not None:
                 return self._validate_and_commit(claim, candidate, identity, found)
             if self._monotonic() >= deadline:
@@ -1581,7 +1641,12 @@ class ClaudeNativeRegistrar:
                     "native_transcript_not_indexed",
                     "native transcript not indexed",
                 )
-            self._sleep(self._poll_interval)
+            try:
+                self._wait_or_cancel(stop, self._poll_interval)
+            except _RegistrarCancelled:
+                return self._retry(
+                    claim, "creation_ambiguous", "visibility cycle cancelled"
+                )
 
     def _read_exact(self, native_id: str) -> _ExactTranscript | None:
         finder = getattr(self._source, "find_native_sessions_by_stem", None)

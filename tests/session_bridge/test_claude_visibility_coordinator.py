@@ -4,6 +4,9 @@ import logging
 from dataclasses import replace
 from datetime import timezone
 from decimal import Decimal
+from threading import Event
+
+import pytest
 
 from hermes_state import SessionDB
 from session_bridge.claude_visibility import (
@@ -16,6 +19,7 @@ from session_bridge.codex_adapter import _CodexReadBudgetExceeded
 from session_bridge.config import BridgeConfig
 from session_bridge.coordinator import (
     ClaudeVisibilityCoordinator,
+    _VisibilityCycleCancelled,
     _claude_visibility_enqueue_gates,
 )
 from session_bridge.models import (
@@ -493,17 +497,122 @@ def test_disabled_config_short_circuits_every_dependency() -> None:
     assert calls == []
 
 
+def test_run_once_cancelled_before_discovery_does_not_claim_or_record_cycle() -> None:
+    store = FakeStore()
+    coordinator, inventory_calls = _coordinator(
+        [_source("new")], store=store, config=_config(continuous=True)
+    )
+    stop = Event()
+    stop.set()
+
+    with pytest.raises(RuntimeError, match="^visibility_cycle_cancelled$"):
+        coordinator.run_once(discover_continuous=True, stop=stop)
+
+    assert inventory_calls == []
+    assert store.status_calls == 0
+    assert store.claim_calls == 0
+    assert store.cycle_records == []
+
+
+def test_run_once_inventory_receives_stop_and_cancellation_does_not_record() -> None:
+    store = FakeStore()
+    stop = Event()
+    seen_stops: list[object] = []
+
+    def continuous_inventory(_after: float, *, stop: object = None):
+        seen_stops.append(stop)
+        assert isinstance(stop, Event)
+        stop.set()
+        raise _VisibilityCycleCancelled()
+
+    coordinator = ClaudeVisibilityCoordinator(
+        config=_config(continuous=True),
+        store=store,
+        inventory=lambda _after: [_source("manual")],
+        continuous_inventory=continuous_inventory,
+        registrar=FakeRegistrar(),
+        marker_secret=SECRET,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(RuntimeError, match="^visibility_cycle_cancelled$"):
+        coordinator.run_once(discover_continuous=True, stop=stop)
+
+    assert seen_stops == [stop]
+    assert store.enqueued == []
+    assert store.claim_calls == 0
+    assert store.cycle_records == []
+
+
+def test_run_once_cancelled_after_discovery_does_not_claim_or_record_cycle() -> None:
+    store = FakeStore()
+    stop = Event()
+
+    def inventory(_after: float, *, stop: object = None):
+        assert isinstance(stop, Event)
+        stop.set()
+        return [_source("new")]
+
+    coordinator = ClaudeVisibilityCoordinator(
+        config=_config(continuous=True),
+        store=store,
+        inventory=lambda _after: [_source("manual")],
+        continuous_inventory=inventory,
+        registrar=FakeRegistrar(),
+        marker_secret=SECRET,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(RuntimeError, match="^visibility_cycle_cancelled$"):
+        coordinator.run_once(discover_continuous=True, stop=stop)
+
+    assert store.enqueued == []
+    assert store.claim_calls == 0
+    assert store.cycle_records == []
+
+
+def test_run_once_cancelled_after_status_does_not_claim_or_record_cycle() -> None:
+    stop = Event()
+
+    class CancellingStatusStore(FakeStore):
+        def claude_visibility_status(self, now: float):
+            value = super().claude_visibility_status(now)
+            stop.set()
+            return value
+
+    store = CancellingStatusStore()
+    coordinator, _calls = _coordinator([], store=store)
+
+    with pytest.raises(RuntimeError, match="^visibility_cycle_cancelled$"):
+        coordinator.run_once(stop=stop)
+
+    assert store.claim_calls == 0
+    assert store.cycle_records == []
+
+
 def test_run_once_claims_once_and_calls_registrar_once_only_for_claim() -> None:
     claim = ClaudeVisibilityClaim(status="claimed", lease_kind="launch", job_id="job")
     store = FakeStore(claim=claim)
-    registrar = FakeRegistrar()
+    stop = Event()
+
+    class StopAwareRegistrar(FakeRegistrar):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stops = []
+
+        def process(self, claim, *, stop=None):
+            self.stops.append(stop)
+            return super().process(claim)
+
+    registrar = StopAwareRegistrar()
     coordinator, _calls = _coordinator([], store=store, registrar=registrar)
 
-    result = coordinator.run_once()
+    result = coordinator.run_once(stop=stop)
 
     assert result.status == "visible"
     assert store.claim_calls == 1
     assert registrar.claims == [claim]
+    assert registrar.stops == [stop]
     assert store.cycle_records == [
         {
             "status": "visible",

@@ -54,7 +54,12 @@ from .claude_visibility_codes import (
     CLAUDE_VISIBILITY_FATAL_CODES,
     CLAUDE_VISIBILITY_RETRY_CODES,
 )
-from .codex_adapter import CodexSourceAdapter, CodexTargetAdapter, SidebarThreadVerifier
+from .codex_adapter import (
+    CodexSourceAdapter,
+    CodexTargetAdapter,
+    SidebarThreadVerifier,
+    _VisibilityInventoryCancelled,
+)
 from .codex_client import RecoveringCodexAppServerClient
 from .config import BridgeConfig, is_canonical_sidebar_string
 from .context_pack import ContextPackBuilder
@@ -62,6 +67,7 @@ from .coordinator import (
     ClaudeVisibilityCoordinator,
     ClaudeVisibilityRunResult,
     SessionBridgeCoordinator,
+    _VisibilityCycleCancelled,
 )
 from .listener_watchdog import (
     DEAF_LISTENER_REASON,
@@ -196,7 +202,7 @@ _CLAUDE_LINEAGE_CODE = re.compile(r"[a-z][a-z0-9_]{0,127}")
 
 def _run_continuous_visibility_worker(
     *,
-    run_once: Callable[[], object],
+    run_once: Callable[..., object],
     close: Callable[[], object],
     stop: Any,
     interval_seconds: float = 60.0,
@@ -208,7 +214,9 @@ def _run_continuous_visibility_worker(
         while not stop.is_set():
             started = monotonic()
             try:
-                run_once()
+                run_once(stop=stop)
+            except _VisibilityCycleCancelled:
+                break
             except Exception:
                 _LOG.exception("continuous Claude visibility cycle failed")
             elapsed = max(0.0, monotonic() - started)
@@ -924,7 +932,7 @@ class _Backend(Protocol):
     def set_claude_visibility_continuous(
         self, *, enabled: bool
     ) -> Mapping[str, Any]: ...
-    def claude_visibility_run_once(self) -> Mapping[str, Any]: ...
+    def claude_visibility_run_once(self, *, stop: Any = None) -> Mapping[str, Any]: ...
     def characterize_claude_visibility(
         self, cleanup_token: Mapping[str, Any] | None = None
     ) -> Mapping[str, Any]: ...
@@ -1070,7 +1078,7 @@ class ProductionBackend:
                         "stop": visibility_stop,
                     },
                     name="session-bridge-claude-visibility",
-                    daemon=True,
+                    daemon=False,
                 )
                 visibility_thread.start()
             import uvicorn
@@ -2355,7 +2363,7 @@ class ProductionBackend:
         )
         return {"enabled": self.config.claude_visibility.enabled, "continuous": value}
 
-    def claude_visibility_run_once(self) -> Mapping[str, Any]:
+    def claude_visibility_run_once(self, *, stop: Any = None) -> Mapping[str, Any]:
         if not self.config.claude_visibility.enabled:
             return {
                 "enabled": False,
@@ -2364,7 +2372,11 @@ class ProductionBackend:
                 "degraded": False,
                 "fatal": False,
             }
-        result = self._claude_visibility_runtime().run_once(discover_continuous=True)
+        if stop is not None and stop.is_set():
+            raise _VisibilityCycleCancelled()
+        result = self._claude_visibility_runtime().run_once(
+            discover_continuous=True, stop=stop
+        )
         return _public_claude_run(
             result, continuous=self.config.claude_visibility.continuous
         )
@@ -3030,15 +3042,16 @@ class ProductionBackend:
             coordinator = ClaudeVisibilityCoordinator(
                 config=self.config,
                 store=store,
-                inventory=lambda after: self._claude_visibility_inventory(
+                inventory=lambda after, **_kwargs: self._claude_visibility_inventory(
                     after,
                     marker_secret=marker_secret,
                     state_db_only=True,
                 ),
-                continuous_inventory=lambda after: self._claude_visibility_inventory(
+                continuous_inventory=lambda after, **kwargs: self._claude_visibility_inventory(
                     after,
                     marker_secret=marker_secret,
                     state_db_only=True,
+                    stop=kwargs.get("stop"),
                 ),
                 registrar=registrar,
                 marker_secret=marker_secret,
@@ -3058,10 +3071,18 @@ class ProductionBackend:
         *,
         marker_secret: bytes,
         state_db_only: bool = False,
+        stop: Any = None,
     ) -> Sequence[SidebarSource]:
+        def cancelled() -> None:
+            if stop is not None and stop.is_set():
+                raise _VisibilityCycleCancelled()
+
+        cancelled()
         store = self._require_store()
         sources = list(store.list_claude_visibility_hermes_sources(after, None))
+        cancelled()
         indexed_codex = store.list_claude_visibility_codex_sources(after, None)
+        cancelled()
         indexed_by_native_id: dict[str, SidebarSource] = {}
         for source in indexed_codex:
             native_id = source.projection.native_id
@@ -3089,15 +3110,20 @@ class ProductionBackend:
                 marker_secret=marker_secret
             ),
         )
-        page = codex.list_claude_visibility_sources(
-            after=after,
-            state_db_only=state_db_only,
-            indexed_sources=indexed_by_native_id,
-            known_visibility_source_ids=known_visibility_source_ids,
-            discovery_timeout=(
-                self.config.claude_visibility.discovery_timeout_seconds
-            ),
-        )
+        try:
+            page = codex.list_claude_visibility_sources(
+                after=after,
+                state_db_only=state_db_only,
+                indexed_sources=indexed_by_native_id,
+                known_visibility_source_ids=known_visibility_source_ids,
+                discovery_timeout=(
+                    self.config.claude_visibility.discovery_timeout_seconds
+                ),
+                stop=stop,
+            )
+        except _VisibilityInventoryCancelled:
+            raise _VisibilityCycleCancelled() from None
+        cancelled()
         existing = {
             (item.projection.provider, item.source_session_id) for item in sources
         }

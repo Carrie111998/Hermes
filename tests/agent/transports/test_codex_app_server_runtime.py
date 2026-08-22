@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from threading import Event, Lock, Thread
 
 import pytest
 
@@ -144,6 +145,113 @@ class TestCodexAppServerModule:
         assert isinstance(err, RuntimeError)
         assert "boom" in str(err)
         assert "-32600" in str(err)
+
+    def test_initialize_cancellation_after_response_skips_initialized_notification(
+        self,
+    ) -> None:
+        from agent.transports.codex_app_server import (
+            CodexAppServerClient,
+            CodexRequestCancelled,
+        )
+
+        client = object.__new__(CodexAppServerClient)
+        client._initialized = False
+        stop = Event()
+        notifications: list[str] = []
+
+        def request(*_args, **_kwargs):
+            stop.set()
+            return {"userAgent": "synthetic"}
+
+        client.request = request
+        client.notify = notifications.append
+
+        with pytest.raises(CodexRequestCancelled):
+            client.initialize(cancel_event=stop)
+
+        assert notifications == []
+        assert client._initialized is False
+
+    def test_initialize_cancellation_during_initialized_notification_is_preserved(
+        self,
+    ) -> None:
+        from agent.transports.codex_app_server import (
+            CodexAppServerClient,
+            CodexRequestCancelled,
+        )
+
+        client = object.__new__(CodexAppServerClient)
+        client._initialized = False
+        stop = Event()
+        notifications: list[str] = []
+        client.request = lambda *_args, **_kwargs: {"userAgent": "synthetic"}
+
+        def notify(method: str) -> None:
+            notifications.append(method)
+            stop.set()
+            raise CodexRequestCancelled()
+
+        client.notify = notify
+
+        with pytest.raises(CodexRequestCancelled):
+            client.initialize(cancel_event=stop)
+
+        assert notifications == ["initialized"]
+        assert client._initialized is False
+
+    def test_cancelled_request_drops_late_response(self) -> None:
+        from agent.transports.codex_app_server import (
+            CodexAppServerClient,
+            CodexRequestCancelled,
+        )
+
+        client = object.__new__(CodexAppServerClient)
+        client._next_id = 1
+        client._pending = {}
+        client._pending_lock = Lock()
+        client._monotonic = __import__("time").monotonic
+        request_sent = Event()
+        client._send = lambda _message: request_sent.set()
+        stop = Event()
+        result: list[BaseException] = []
+
+        def request() -> None:
+            try:
+                client.request("thread/list", timeout=30.0, cancel_event=stop)
+            except BaseException as exc:
+                result.append(exc)
+
+        thread = Thread(target=request)
+        thread.start()
+        assert request_sent.wait(1.0)
+        stop.set()
+        thread.join(1.0)
+
+        assert thread.is_alive() is False
+        assert len(result) == 1
+        assert isinstance(result[0], CodexRequestCancelled)
+        assert client._pending == {}
+
+        client._dispatch({"id": 1, "result": {"data": [{"id": "late"}]}})
+        assert client._pending == {}
+
+    def test_request_send_failure_removes_pending_request(self) -> None:
+        from agent.transports.codex_app_server import CodexAppServerClient
+
+        client = object.__new__(CodexAppServerClient)
+        client._next_id = 1
+        client._pending = {}
+        client._pending_lock = Lock()
+
+        def fail_send(_message):
+            raise RuntimeError("synthetic send failure")
+
+        client._send = fail_send
+
+        with pytest.raises(RuntimeError, match="synthetic send failure"):
+            client.request("thread/list")
+
+        assert client._pending == {}
 
 
 class TestCodexAppServerRequests:

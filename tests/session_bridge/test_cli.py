@@ -58,7 +58,7 @@ from session_bridge.config import (
     ServiceConfig,
     SidebarConfig,
 )
-from session_bridge.coordinator import ScanSummary
+from session_bridge.coordinator import ScanSummary, _VisibilityCycleCancelled
 from session_bridge.mirror import MirrorPolicy, enqueue_mirror_job
 from session_bridge.models import (
     BridgeMarkerPayload,
@@ -5125,6 +5125,48 @@ def test_bounded_run_logs_incomplete_timeout_cleanup(
     assert "reaped=False" in caplog.text
 
 
+def test_claude_visibility_inventory_passes_stop_to_codex_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(BridgeConfig())
+    stop = Event()
+    captured: dict[str, object] = {}
+
+    class Store:
+        def list_claude_visibility_hermes_sources(
+            self, _after: float, _limit: int | None
+        ) -> tuple[()]:
+            return ()
+
+        def list_claude_visibility_codex_sources(
+            self, _after: float, _limit: int | None
+        ) -> tuple[()]:
+            return ()
+
+        def list_claude_visibility_source_ids(self) -> frozenset[str]:
+            return frozenset()
+
+    class Adapter:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def list_claude_visibility_sources(self, **kwargs: object) -> tuple[()]:
+            captured.update(kwargs)
+            return ()
+
+    backend._codex_client = object()
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+    monkeypatch.setattr("session_bridge.cli.CodexSourceAdapter", Adapter)
+
+    assert backend._claude_visibility_inventory(
+        150.0,
+        marker_secret=b"m" * 32,
+        state_db_only=True,
+        stop=stop,
+    ) == ()
+    assert captured["stop"] is stop
+
+
 def test_claude_visibility_inventory_reuses_indexed_codex_and_fast_state_db(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5190,6 +5232,7 @@ def test_claude_visibility_inventory_reuses_indexed_codex_and_fast_state_db(
             indexed_sources: Mapping[str, cli_module.SidebarSource],
             known_visibility_source_ids: frozenset[str],
             discovery_timeout: float,
+            stop: object = None,
         ) -> tuple[cli_module.SidebarSource, ...]:
             captured.update({
                 "after": after,
@@ -5197,6 +5240,7 @@ def test_claude_visibility_inventory_reuses_indexed_codex_and_fast_state_db(
                 "indexed_sources": indexed_sources,
                 "known_visibility_source_ids": known_visibility_source_ids,
                 "discovery_timeout": discovery_timeout,
+                "stop": stop,
             })
             return (indexed,)
 
@@ -5216,9 +5260,8 @@ def test_claude_visibility_inventory_reuses_indexed_codex_and_fast_state_db(
         "state_db_only": True,
         "indexed_sources": {"indexed-codex": indexed},
         "known_visibility_source_ids": frozenset({"codex:indexed-codex"}),
-        "discovery_timeout": (
-            config.claude_visibility.discovery_timeout_seconds
-        ),
+        "discovery_timeout": config.claude_visibility.discovery_timeout_seconds,
+        "stop": None,
     }
 
 
@@ -6921,6 +6964,7 @@ def test_production_serve_preserves_sidebar_cutover_configuration_failure(
 def test_continuous_visibility_worker_keeps_start_to_start_interval() -> None:
     calls: list[str] = []
     waits: list[float] = []
+    seen_stops: list[object] = []
     moments = iter((10.0, 46.5))
 
     class StopAfterOneCycle:
@@ -6931,16 +6975,108 @@ def test_continuous_visibility_worker_keeps_start_to_start_interval() -> None:
             waits.append(timeout)
             return True
 
+    stop = StopAfterOneCycle()
+
+    def run_once(*, stop: object) -> None:
+        seen_stops.append(stop)
+        calls.append("run")
+
     _run_continuous_visibility_worker(
-        run_once=lambda: calls.append("run"),
+        run_once=run_once,
         close=lambda: calls.append("close"),
-        stop=StopAfterOneCycle(),
+        stop=stop,
         interval_seconds=60.0,
         monotonic=lambda: next(moments),
     )
 
     assert calls == ["run", "close"]
+    assert seen_stops == [stop]
     assert waits == [pytest.approx(23.5)]
+
+
+def test_continuous_visibility_worker_treats_cancellation_as_normal_shutdown(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    stop = Event()
+    calls: list[str] = []
+
+    def run_once(*, stop: object) -> None:
+        calls.append("run")
+        assert isinstance(stop, Event)
+        stop.set()
+        raise _VisibilityCycleCancelled()
+
+    with caplog.at_level("ERROR", logger="session_bridge.cli"):
+        _run_continuous_visibility_worker(
+            run_once=run_once,
+            close=lambda: calls.append("close"),
+            stop=stop,
+        )
+
+    assert calls == ["run", "close"]
+    assert caplog.records == []
+
+
+def test_claude_visibility_run_once_cancelled_before_runtime_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = BridgeConfig()
+    backend = ProductionBackend(
+        replace(
+            config, claude_visibility=replace(config.claude_visibility, enabled=True)
+        )
+    )
+    stop = Event()
+    stop.set()
+    runtime_calls: list[str] = []
+
+    monkeypatch.setattr(
+        backend,
+        "_claude_visibility_runtime",
+        lambda: runtime_calls.append("runtime") or object(),
+    )
+
+    with pytest.raises(_VisibilityCycleCancelled):
+        backend.claude_visibility_run_once(stop=stop)
+
+    assert runtime_calls == []
+
+
+def test_claude_visibility_run_once_passes_stop_to_coordinator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = BridgeConfig()
+    backend = ProductionBackend(
+        replace(
+            config, claude_visibility=replace(config.claude_visibility, enabled=True)
+        )
+    )
+    stop = Event()
+    calls: list[dict[str, object]] = []
+
+    class Runtime:
+        def run_once(self, **kwargs: object) -> object:
+            calls.append(kwargs)
+            return type(
+                "Result",
+                (),
+                {
+                    "enabled": True,
+                    "status": "no_due_job",
+                    "job_id": None,
+                    "error_code": None,
+                    "degraded": False,
+                    "fatal": False,
+                    "discovery": None,
+                },
+            )()
+
+    monkeypatch.setattr(backend, "_claude_visibility_runtime", lambda: Runtime())
+
+    result = backend.claude_visibility_run_once(stop=stop)
+
+    assert result["status"] == "no_due_job"
+    assert calls == [{"discover_continuous": True, "stop": stop}]
 
 
 def test_continuous_sidebar_recovery_worker_drains_then_uses_idle_wait() -> None:
@@ -7046,7 +7182,10 @@ class _FakeListenerWatchdog:
 
 
 def _stub_serve_transport(
-    monkeypatch: pytest.MonkeyPatch, *, fires: bool = False
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fires: bool = False,
+    run_hook: object | None = None,
 ) -> _RecordedServeTransport:
     """Keep serve() off a real socket.
 
@@ -7070,6 +7209,8 @@ def _stub_serve_transport(
 
         def run(self) -> None:
             record.ran = True
+            if callable(run_hook):
+                run_hook()
             record.should_exit = self.should_exit
 
     def _build_watchdog(**kwargs: object) -> _FakeListenerWatchdog:
@@ -7125,7 +7266,10 @@ def test_production_serve_quiesces_inflight_visibility_request(
     class VisibilityBackend:
         _claude_visibility_stop: Event | None = None
 
-        def claude_visibility_run_once(self) -> dict[str, object]:
+        def claude_visibility_run_once(
+            self, *, stop: Event | None = None
+        ) -> dict[str, object]:
+            assert stop is self._claude_visibility_stop
             assert self._claude_visibility_stop is not None
             client = RecoveringCodexAppServerClient(
                 lambda: BlockingClient(),
@@ -7169,6 +7313,110 @@ def test_production_serve_quiesces_inflight_visibility_request(
     assert len(request_threads) == 1
     assert request_threads[0].is_alive() is False
     assert close_calls == ["client", "backend"]
+
+
+def test_production_serve_does_not_start_local_sidebar_recovery_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = BridgeConfig(sidebar=SidebarConfig(enabled=True, continuous=True))
+    state_db = Path("C:/hermetic/session-bridge.db")
+    backend = ProductionBackend(
+        replace(
+            config,
+            claude_visibility=replace(
+                config.claude_visibility,
+                enabled=True,
+                continuous=True,
+            ),
+        ),
+        db_path=state_db,
+    )
+    threads: list[object] = []
+    visibility_db_paths: list[Path | None] = []
+
+    class VisibilityBackend:
+        def claude_visibility_run_once(
+            self, *, stop: Event | None = None
+        ) -> dict[str, object]:
+            if stop is not None:
+                stop.set()
+            return {"status": "idle"}
+
+        def close(self) -> None:
+            return None
+
+    visibility_backend = VisibilityBackend()
+
+    class FakeThread:
+        def __init__(
+            self,
+            *,
+            target: object,
+            kwargs: dict[str, object],
+            name: str,
+            daemon: bool,
+        ) -> None:
+            self.target = target
+            self.kwargs = kwargs
+            self.name = name
+            self.daemon = daemon
+            self.started = False
+            self.join_timeout: float | None = None
+            threads.append(self)
+
+        def start(self) -> None:
+            self.started = True
+
+        def join(self, timeout: float) -> None:
+            self.join_timeout = timeout
+
+        def is_alive(self) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        backend,
+        "_apply_sidebar_create_reservation_cutover",
+        lambda **_kwargs: {},
+    )
+    monkeypatch.setattr(backend, "_provider_runtime", lambda **_kwargs: object())
+    monkeypatch.setattr(backend, "_require_catalog", lambda: object())
+    monkeypatch.setattr(backend, "_require_store", lambda: object())
+    monkeypatch.setattr("session_bridge.cli.resolve_bearer_token", lambda: "token")
+    monkeypatch.setattr("session_bridge.cli.create_app", lambda **_kwargs: object())
+
+    def build_visibility_backend(
+        _config: BridgeConfig, *, db_path: Path | None = None
+    ) -> VisibilityBackend:
+        visibility_db_paths.append(db_path)
+        return visibility_backend
+
+    monkeypatch.setattr(
+        "session_bridge.cli.ProductionBackend",
+        build_visibility_backend,
+    )
+    monkeypatch.setattr("session_bridge.cli.threading.Thread", FakeThread)
+    _stub_serve_transport(monkeypatch)
+
+    backend.serve()
+
+    started = [thread for thread in threads if thread.started]
+    thread = next(
+        thread
+        for thread in started
+        if thread.name == "session-bridge-claude-visibility"
+    )
+    assert thread.daemon is False
+    assert thread.join_timeout == 5.0
+    assert thread.target is cli_module._run_continuous_visibility_worker
+    assert thread.kwargs["run_once"] == visibility_backend.claude_visibility_run_once
+    assert thread.kwargs["close"] == visibility_backend.close
+    assert thread.kwargs["stop"].is_set() is True
+    assert visibility_db_paths == [state_db]
+    assert all(thread.name != "session-bridge-sidebar-recovery" for thread in started)
+    assert all(
+        thread.target is not cli_module._run_continuous_sidebar_recovery_worker
+        for thread in started
+    )
 
 
 def test_production_serve_fails_closed_when_visibility_worker_does_not_stop(
@@ -7232,109 +7480,6 @@ def test_production_serve_fails_closed_when_visibility_worker_does_not_stop(
         match="^continuous Claude visibility worker did not stop$",
     ):
         backend.serve()
-
-
-def test_production_serve_does_not_start_local_sidebar_recovery_worker(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = BridgeConfig(
-        sidebar=SidebarConfig(enabled=True, continuous=True),
-    )
-    state_db = Path("C:/hermetic/session-bridge.db")
-    backend = ProductionBackend(
-        replace(
-            config,
-            claude_visibility=replace(
-                config.claude_visibility,
-                enabled=True,
-                continuous=True,
-            ),
-        ),
-        db_path=state_db,
-    )
-    threads: list[object] = []
-    visibility_db_paths: list[Path | None] = []
-
-    class VisibilityBackend:
-        def claude_visibility_run_once(self) -> dict[str, object]:
-            return {"status": "idle"}
-
-        def close(self) -> None:
-            return None
-
-    visibility_backend = VisibilityBackend()
-
-    class FakeThread:
-        def __init__(
-            self,
-            *,
-            target: object,
-            kwargs: dict[str, object],
-            name: str,
-            daemon: bool,
-        ) -> None:
-            self.target = target
-            self.kwargs = kwargs
-            self.name = name
-            self.daemon = daemon
-            self.started = False
-            self.join_timeout: float | None = None
-            threads.append(self)
-
-        def start(self) -> None:
-            self.started = True
-
-        def join(self, timeout: float) -> None:
-            self.join_timeout = timeout
-
-        def is_alive(self) -> bool:
-            return False
-
-    monkeypatch.setattr(
-        backend,
-        "_apply_sidebar_create_reservation_cutover",
-        lambda **_kwargs: {},
-    )
-    monkeypatch.setattr(backend, "_provider_runtime", lambda **_kwargs: object())
-    monkeypatch.setattr(backend, "_require_catalog", lambda: object())
-    monkeypatch.setattr(backend, "_require_store", lambda: object())
-    monkeypatch.setattr("session_bridge.cli.resolve_bearer_token", lambda: "token")
-    monkeypatch.setattr("session_bridge.cli.create_app", lambda **_kwargs: object())
-    def build_visibility_backend(
-        _config: BridgeConfig, *, db_path: Path | None = None
-    ) -> VisibilityBackend:
-        visibility_db_paths.append(db_path)
-        return visibility_backend
-
-    monkeypatch.setattr(
-        "session_bridge.cli.ProductionBackend",
-        build_visibility_backend,
-    )
-    monkeypatch.setattr("session_bridge.cli.threading.Thread", FakeThread)
-    _stub_serve_transport(monkeypatch)
-
-    backend.serve()
-
-    started = [thread for thread in threads if thread.started]
-    thread = next(
-        thread
-        for thread in started
-        if thread.name == "session-bridge-claude-visibility"
-    )
-    assert thread.name == "session-bridge-claude-visibility"
-    assert thread.daemon is True
-    assert thread.started is True
-    assert thread.join_timeout == 5.0
-    assert thread.target is cli_module._run_continuous_visibility_worker
-    assert thread.kwargs["run_once"] == visibility_backend.claude_visibility_run_once
-    assert thread.kwargs["close"] == visibility_backend.close
-    assert thread.kwargs["stop"].is_set() is True
-    assert visibility_db_paths == [state_db]
-    assert all(thread.name != "session-bridge-sidebar-recovery" for thread in started)
-    assert all(
-        thread.target is not cli_module._run_continuous_sidebar_recovery_worker
-        for thread in started
-    )
 
 
 def _serve_backend(monkeypatch: pytest.MonkeyPatch, **config_kwargs) -> ProductionBackend:

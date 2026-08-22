@@ -7,14 +7,22 @@ import json
 import math
 import os
 from pathlib import Path
+from threading import Event, Thread
 from typing import Any
 
 import pytest
 
-from agent.transports.codex_app_server import CodexAppServerClient
+from agent.transports.codex_app_server import (
+    CodexAppServerClient,
+    CodexRequestCancelled,
+)
 from hermes_state import SessionDB
 import session_bridge.codex_adapter as codex_adapter_module
-from session_bridge.codex_adapter import CodexSourceAdapter, CodexThreadSummary
+from session_bridge.codex_adapter import (
+    CodexSourceAdapter,
+    CodexThreadSummary,
+    _VisibilityInventoryCancelled,
+)
 from session_bridge.models import (
     BridgeMarkerPayload,
     OriginKind,
@@ -36,7 +44,12 @@ class FakeRequestClient:
         self.calls: list[tuple[str, dict[str, Any], float]] = []
 
     def request(
-        self, method: str, params: dict[str, Any], timeout: float
+        self,
+        method: str,
+        params: dict[str, Any],
+        timeout: float,
+        *,
+        cancel_event: Event | None = None,
     ) -> dict[str, Any]:
         self.calls.append((method, deepcopy(params), timeout))
         response = self.responses[method].pop(0)
@@ -61,7 +74,9 @@ class FakeInitializingClient(FakeRequestClient):
         super().__init__(responses)
         self.initialize_calls: list[dict[str, Any]] = []
 
-    def initialize(self, **kwargs: Any) -> dict[str, Any]:
+    def initialize(
+        self, *, cancel_event: Event | None = None, **kwargs: Any
+    ) -> dict[str, Any]:
         self.initialize_calls.append(deepcopy(kwargs))
         return {"userAgent": "synthetic"}
 
@@ -675,6 +690,154 @@ class TestInventory:
             assert params["sortDirection"] == "desc"
             assert params["useStateDbOnly"] is True
             assert "cursor" not in params
+
+    def test_precancelled_visibility_inventory_does_not_initialize_client(
+        self,
+    ) -> None:
+        client = FakeInitializingClient({})
+        stop = Event()
+        stop.set()
+
+        with pytest.raises(_VisibilityInventoryCancelled):
+            CodexSourceAdapter(client, marker_secret=SECRET).list_claude_visibility_sources(
+                after=250, state_db_only=True, stop=stop
+            )
+
+        assert client.initialize_calls == []
+        assert client.calls == []
+
+    def test_continuous_visibility_cancels_active_initialization(self) -> None:
+        stop = Event()
+        entered = Event()
+
+        class BlockingInitializeClient(FakeRequestClient):
+            def __init__(self) -> None:
+                super().__init__({})
+                self.received_stop: Event | None = None
+
+            def initialize(
+                self,
+                *,
+                cancel_event: Event | None = None,
+                **_kwargs: Any,
+            ) -> dict[str, Any]:
+                self.received_stop = cancel_event
+                entered.set()
+                assert cancel_event is not None
+                assert cancel_event.wait(1.0)
+                raise CodexRequestCancelled()
+
+        client = BlockingInitializeClient()
+        result: list[BaseException] = []
+
+        def inventory() -> None:
+            try:
+                CodexSourceAdapter(
+                    client, marker_secret=SECRET
+                ).list_claude_visibility_sources(
+                    after=250, state_db_only=True, stop=stop
+                )
+            except BaseException as exc:
+                result.append(exc)
+
+        thread = Thread(target=inventory)
+        thread.start()
+        assert entered.wait(1.0)
+        stop.set()
+        thread.join(1.0)
+
+        assert thread.is_alive() is False
+        assert client.received_stop is stop
+        assert len(result) == 1
+        assert isinstance(result[0], _VisibilityInventoryCancelled)
+        assert client.calls == []
+
+    def test_continuous_visibility_cancels_between_inventory_pages(self) -> None:
+        stop = Event()
+
+        class CancellingClient(FakeInitializingClient):
+            def request(
+                self,
+                method: str,
+                params: dict[str, Any],
+                timeout: float,
+                *,
+                cancel_event: Event | None = None,
+            ) -> dict[str, Any]:
+                response = super().request(method, params, timeout)
+                stop.set()
+                return response
+
+        client = CancellingClient({
+            "thread/list": [
+                {"data": [], "nextCursor": "must-not-be-read"},
+                {"data": []},
+            ]
+        })
+
+        with pytest.raises(_VisibilityInventoryCancelled):
+            CodexSourceAdapter(client, marker_secret=SECRET).list_claude_visibility_sources(
+                after=250, state_db_only=True, stop=stop
+            )
+
+        assert [call[0] for call in client.calls] == ["thread/list"]
+
+    def test_continuous_visibility_cancels_active_thread_read(self) -> None:
+        stop = Event()
+        entered = Event()
+
+        class BlockingReadClient(FakeInitializingClient):
+            def request(
+                self,
+                method: str,
+                params: dict[str, Any],
+                timeout: float,
+                *,
+                cancel_event: Event | None = None,
+            ) -> dict[str, Any]:
+                if method == "thread/read":
+                    self.calls.append((method, params, timeout))
+                    entered.set()
+                    assert stop.wait(1.0)
+                    raise CodexRequestCancelled()
+                return super().request(method, params, timeout)
+
+        row = {
+            "id": "active-read",
+            "cwd": "C:/work/active-read",
+            "createdAt": 290,
+            "updatedAt": 300,
+            "source": "vscode",
+        }
+        client = BlockingReadClient({
+            "thread/list": [{"data": [row]}, {"data": []}],
+        })
+        result: list[BaseException] = []
+
+        def inventory() -> None:
+            try:
+                CodexSourceAdapter(
+                    client, marker_secret=SECRET
+                ).list_claude_visibility_sources(
+                    after=250, state_db_only=True, stop=stop
+                )
+            except BaseException as exc:
+                result.append(exc)
+
+        thread = Thread(target=inventory)
+        thread.start()
+        assert entered.wait(1.0)
+        stop.set()
+        thread.join(1.0)
+
+        assert thread.is_alive() is False
+        assert len(result) == 1
+        assert isinstance(result[0], _VisibilityInventoryCancelled)
+        assert [call[0] for call in client.calls] == [
+            "thread/list",
+            "thread/list",
+            "thread/read",
+        ]
 
     def test_continuous_visibility_uses_preview_when_full_read_times_out(
         self,

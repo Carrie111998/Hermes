@@ -224,6 +224,8 @@ class CodexAppServerClient:
         result = self.request(
             "initialize", params, timeout=timeout, cancel_event=cancel_event
         )
+        if cancel_event is not None and cancel_event.is_set():
+            raise CodexRequestCancelled("codex app-server request cancelled")
         self.notify("initialized")
         self._initialized = True
         return result

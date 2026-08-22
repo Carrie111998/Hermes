@@ -56,9 +56,14 @@ class RecoveringCodexAppServerClient:
     def _initialized(self) -> bool:
         return self._logical_initialized
 
-    def initialize(self, **kwargs: Any) -> dict[str, Any]:
+    def initialize(
+        self,
+        *,
+        cancel_event: threading.Event | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         with self._lock:
-            result = self._initialize_current(kwargs)
+            result = self._initialize_current(kwargs, cancel_event=cancel_event)
             self._initialize_kwargs = dict(kwargs)
             return result
 
@@ -67,6 +72,8 @@ class RecoveringCodexAppServerClient:
         method: str,
         params: dict[str, Any] | None = None,
         timeout: float = 30.0,
+        *,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         if (
             isinstance(timeout, bool)
@@ -77,39 +84,43 @@ class RecoveringCodexAppServerClient:
             raise ValueError("Codex app-server request timeout must be positive")
         deadline = self._monotonic() + float(timeout)
         with self._lock:
-            self._raise_if_cancelled()
+            self._raise_if_cancelled(cancel_event)
             if not self._logical_initialized and self._initialize_kwargs is not None:
                 self._initialize_current(
                     self._initialize_kwargs,
-                    timeout=self._remaining(deadline),
+                    timeout=self._remaining(deadline, cancel_event),
+                    cancel_event=cancel_event,
                 )
             try:
                 result = self._request_current(
                     method,
                     params,
-                    timeout=self._remaining(deadline),
+                    timeout=self._remaining(deadline, cancel_event),
+                    cancel_event=cancel_event,
                 )
             except Exception as exc:
                 if not self._is_transport_failure(exc):
                     raise
                 if method not in self._REPLAYABLE_METHODS:
                     try:
-                        self._replace(deadline=deadline)
+                        self._replace(deadline=deadline, cancel_event=cancel_event)
                     except Exception:
                         pass
                     raise
-                self._replace(deadline=deadline)
+                self._replace(deadline=deadline, cancel_event=cancel_event)
                 if self._initialize_kwargs is not None:
                     self._initialize_current(
                         self._initialize_kwargs,
-                        timeout=self._remaining(deadline),
+                        timeout=self._remaining(deadline, cancel_event),
+                        cancel_event=cancel_event,
                     )
                 result = self._request_current(
                     method,
                     params,
-                    timeout=self._remaining(deadline),
+                    timeout=self._remaining(deadline, cancel_event),
+                    cancel_event=cancel_event,
                 )
-            self._remaining(deadline)
+            self._remaining(deadline, cancel_event)
             return result
 
     def close(self) -> None:
@@ -129,8 +140,22 @@ class RecoveringCodexAppServerClient:
             method = getattr(self._client, "stderr_tail", None)
             return list(method(n)) if callable(method) else []
 
-    def _replace(self, *, deadline: float | None = None) -> None:
+    def take_notification(self, timeout: float = 0.0) -> dict[str, Any] | None:
+        with self._lock:
+            method = getattr(self._client, "take_notification", None)
+            if not callable(method):
+                return None
+            result = method(timeout=timeout)
+            return result if isinstance(result, dict) else None
+
+    def _replace(
+        self,
+        *,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         old = self._client
+        close_error: BaseException | None = None
         try:
             close = getattr(old, "close")
             if deadline is not None and self._accepts_keyword(close, "timeout"):
@@ -140,27 +165,33 @@ class RecoveringCodexAppServerClient:
                 close(timeout=max(0.1, deadline - self._monotonic()))
             else:
                 close()
-        finally:
-            self._client = self._factory()
-            self._logical_initialized = not callable(
-                getattr(self._client, "initialize", None)
-            )
+        except BaseException as exc:
+            close_error = exc
+        self._raise_if_cancelled(cancel_event)
+        self._client = self._factory()
+        self._logical_initialized = not callable(
+            getattr(self._client, "initialize", None)
+        )
+        if close_error is not None:
+            raise close_error
 
     def _initialize_current(
         self,
         kwargs: dict[str, Any],
         *,
         timeout: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         method = getattr(self._client, "initialize", None)
         if callable(method):
             call_kwargs = dict(kwargs)
             if timeout is not None and self._accepts_keyword(method, "timeout"):
                 call_kwargs["timeout"] = timeout
-            if self._cancel_event is not None and self._accepts_keyword(
+            active_cancel_event = cancel_event or self._cancel_event
+            if active_cancel_event is not None and self._accepts_keyword(
                 method, "cancel_event"
             ):
-                call_kwargs["cancel_event"] = self._cancel_event
+                call_kwargs["cancel_event"] = active_cancel_event
             result = method(**call_kwargs)
         else:
             result = {}
@@ -175,29 +206,38 @@ class RecoveringCodexAppServerClient:
         params: dict[str, Any] | None,
         *,
         timeout: float,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
-        self._raise_if_cancelled()
+        self._raise_if_cancelled(cancel_event)
         request = self._client.request
-        if self._cancel_event is not None and self._accepts_keyword(
+        active_cancel_event = cancel_event or self._cancel_event
+        if active_cancel_event is not None and self._accepts_keyword(
             request, "cancel_event"
         ):
             return request(
                 method,
                 params,
                 timeout,
-                cancel_event=self._cancel_event,
+                cancel_event=active_cancel_event,
             )
         return request(method, params, timeout)
 
-    def _remaining(self, deadline: float) -> float:
-        self._raise_if_cancelled()
+    def _remaining(
+        self,
+        deadline: float,
+        cancel_event: threading.Event | None = None,
+    ) -> float:
+        self._raise_if_cancelled(cancel_event)
         remaining = deadline - self._monotonic()
         if remaining <= 0:
             raise TimeoutError("Codex app-server request deadline exhausted")
         return remaining
 
-    def _raise_if_cancelled(self) -> None:
-        if self._cancel_event is not None and self._cancel_event.is_set():
+    def _raise_if_cancelled(
+        self, cancel_event: threading.Event | None = None
+    ) -> None:
+        active_cancel_event = cancel_event or self._cancel_event
+        if active_cancel_event is not None and active_cancel_event.is_set():
             raise CodexRequestCancelled("codex app-server request cancelled")
 
     @staticmethod

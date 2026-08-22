@@ -246,11 +246,13 @@ class ClaudeVisibilityRunResult:
 
 
 class _ClaudeVisibilityInventory(Protocol):
-    def __call__(self, after: float) -> Sequence[SidebarSource]: ...
+    def __call__(
+        self, after: float, *, stop: Any = None
+    ) -> Sequence[SidebarSource]: ...
 
 
 class _ClaudeVisibilityRegistrar(Protocol):
-    def process(self, claim: ClaudeVisibilityClaim) -> object: ...
+    def process(self, claim: ClaudeVisibilityClaim, *, stop: Any = None) -> object: ...
 
 
 class _ClaudeVisibilityStore(Protocol):
@@ -372,6 +374,13 @@ def _claude_visibility_enqueue_gates(
     return open_reasons, tuple(sorted(fatal))
 
 
+class _VisibilityCycleCancelled(RuntimeError):
+    """Internal control flow for a stopped continuous visibility cycle."""
+
+    def __init__(self) -> None:
+        super().__init__("visibility_cycle_cancelled")
+
+
 class ClaudeVisibilityCoordinator:
     """Discovery and single-claim delivery orchestration for Claude visibility."""
 
@@ -424,7 +433,7 @@ class ClaudeVisibilityCoordinator:
             pass
 
     def _discover(
-        self, *, days: int, limit: int, manual: bool
+        self, *, days: int, limit: int, manual: bool, stop: Any = None
     ) -> ClaudeVisibilityDiscoveryResult:
         if not self._config.claude_visibility.enabled:
             return ClaudeVisibilityDiscoveryResult(enabled=False, reasons=("disabled",))
@@ -477,7 +486,13 @@ class ClaudeVisibilityCoordinator:
                 )
         try:
             inventory = self._inventory if manual else self._continuous_inventory
-            sources = tuple(inventory(after))
+            sources = tuple(
+                inventory(after)
+                if manual or stop is None
+                else inventory(after, stop=stop)
+            )
+        except _VisibilityCycleCancelled:
+            raise
         except Exception as exc:
             self._log_visibility_discovery_degraded("inventory", exc)
             return ClaudeVisibilityDiscoveryResult(
@@ -627,7 +642,7 @@ class ClaudeVisibilityCoordinator:
             duplicates=duplicates,
         )
 
-    def continuous_once(self) -> ClaudeVisibilityApplyResult:
+    def continuous_once(self, *, stop: Any = None) -> ClaudeVisibilityApplyResult:
         if not self._config.claude_visibility.enabled:
             return ClaudeVisibilityApplyResult(enabled=False, mode="disabled")
         if not self._config.claude_visibility.continuous:
@@ -636,6 +651,7 @@ class ClaudeVisibilityCoordinator:
             days=self._config.claude_visibility.backfill_days,
             limit=1,
             manual=False,
+            stop=stop,
         )
         if discovery.degraded:
             return ClaudeVisibilityApplyResult(
@@ -646,6 +662,8 @@ class ClaudeVisibilityCoordinator:
                 exclusions=discovery.exclusions,
                 fatal_reasons=discovery.reasons,
             )
+        if stop is not None and stop.is_set():
+            raise _VisibilityCycleCancelled()
         try:
             candidate = next(iter(discovery.candidates), None)
             if candidate is None:
@@ -696,10 +714,12 @@ class ClaudeVisibilityCoordinator:
         )
 
     def run_once(
-        self, *, discover_continuous: bool = False
+        self, *, discover_continuous: bool = False, stop: Any = None
     ) -> ClaudeVisibilityRunResult:
         if not self._config.claude_visibility.enabled:
             return ClaudeVisibilityRunResult(enabled=False, status="disabled")
+        if stop is not None and stop.is_set():
+            raise _VisibilityCycleCancelled()
 
         def recorded(
             result: ClaudeVisibilityRunResult, *, registrar_result: bool = False
@@ -745,7 +765,7 @@ class ClaudeVisibilityCoordinator:
             discovery = (
                 None
                 if open_reasons or fatal_reasons
-                else self.continuous_once()
+                else self.continuous_once(stop=stop)
             )
         else:
             discovery = None
@@ -772,6 +792,8 @@ class ClaudeVisibilityCoordinator:
                 else self._store.claude_visibility_status(float(self._clock()))
             )
             _open, fatal_reasons = _claude_visibility_enqueue_gates(status)
+            if stop is not None and stop.is_set():
+                raise _VisibilityCycleCancelled()
             if fatal_reasons:
                 return recorded(
                     ClaudeVisibilityRunResult(
@@ -791,6 +813,8 @@ class ClaudeVisibilityCoordinator:
                 policy.reserved_cost_per_attempt_usd,
                 policy.max_attempts,
             )
+        except _VisibilityCycleCancelled:
+            raise
         except Exception as exc:
             self._log_visibility_discovery_degraded("claim", exc)
             return recorded(
@@ -836,7 +860,11 @@ class ClaudeVisibilityCoordinator:
                 )
             )
         try:
-            outcome = self._registrar.process(claim)
+            outcome = (
+                self._registrar.process(claim)
+                if stop is None
+                else self._registrar.process(claim, stop=stop)
+            )
             status = str(getattr(outcome, "status"))
             error_code = getattr(outcome, "error_code", None)
             if status not in _CLAUDE_VISIBILITY_REGISTRAR_STATUSES:
