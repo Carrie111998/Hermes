@@ -720,7 +720,13 @@ class ChatCompletionsTransport(ProviderTransport):
         # Request overrides last (service_tier etc.)
         overrides = params.get("request_overrides")
         if overrides:
-            api_kwargs.update(overrides)
+            api_kwargs.update(
+                {
+                    k: v
+                    for k, v in overrides.items()
+                    if k != "parallel_tool_calls" or bool(tools)
+                }
+            )
 
         _add_prompt_cache_key(
             api_kwargs,
@@ -857,6 +863,8 @@ class ChatCompletionsTransport(ProviderTransport):
         overrides = params.get("request_overrides")
         if overrides:
             for k, v in overrides.items():
+                if k == "parallel_tool_calls" and not tools:
+                    continue
                 if k == "extra_body" and isinstance(v, dict):
                     extra_body.update(v)
                 else:

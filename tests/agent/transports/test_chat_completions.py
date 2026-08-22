@@ -230,6 +230,45 @@ class TestChatCompletionsBuildKwargs:
         kw = transport.build_kwargs(model="gpt-4o", messages=msgs, tools=tools)
         assert kw["tools"] == tools
 
+    @pytest.mark.parametrize("profile_path", [True, False], ids=["profile", "legacy"])
+    @pytest.mark.parametrize("configured", [True, False, None], ids=["true", "false", "unset"])
+    @pytest.mark.parametrize("tools", [[{"type": "function", "function": {"name": "test", "parameters": {}}}], [], None], ids=["tools", "empty-tools", "no-tools"])
+    def test_parallel_tool_calls_requires_tools(
+        self, transport, profile_path, configured, tools
+    ):
+        from providers import get_provider_profile
+
+        request_overrides = {
+            "service_tier": "priority",
+            "extra_body": {"caller_only": True},
+        }
+        if configured is not None:
+            request_overrides["parallel_tool_calls"] = configured
+        original_overrides = {
+            "service_tier": "priority",
+            "extra_body": {"caller_only": True},
+        }
+        if configured is not None:
+            original_overrides["parallel_tool_calls"] = configured
+
+        profile = get_provider_profile("custom") if profile_path else None
+
+        kw = transport.build_kwargs(
+            model="vendor-model",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=tools,
+            request_overrides=request_overrides,
+            provider_profile=profile,
+        )
+
+        if tools and configured is not None:
+            assert kw["parallel_tool_calls"] is configured
+        else:
+            assert "parallel_tool_calls" not in kw
+        assert kw["service_tier"] == "priority"
+        assert kw["extra_body"]["caller_only"] is True
+        assert request_overrides == original_overrides
+
     def test_openrouter_provider_prefs(self, transport):
         from providers import get_provider_profile
         profile = get_provider_profile("openrouter")
