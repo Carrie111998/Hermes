@@ -78,6 +78,27 @@ def test_format_turn_completion_corrupt_includes_recovery_options():
     assert "Freeing disk space will not help" in explanation
 
 
+def test_format_turn_completion_corrupt_uses_active_profile_home(tmp_path):
+    """Formatter recovery paths must target the active profile."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from run_agent import AIAgent
+
+    profile_home = tmp_path / "profiles" / "isolated"
+    token = set_hermes_home_override(profile_home)
+    try:
+        explanation = AIAgent._format_turn_completion_explanation(
+            "session_persistence_failed", "corrupt"
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    state_db_path = profile_home / "state.db"
+    backups_path = profile_home / "backups"
+    assert f'sqlite3 "{state_db_path}" ".recover"' in explanation
+    assert f"{backups_path}/" in explanation
+    assert "~/.hermes" not in explanation
+
+
 def test_format_turn_completion_disk_still_advises_space():
     """The 'disk' cause still gives disk-space advice (unchanged)."""
     from run_agent import AIAgent
