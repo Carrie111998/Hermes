@@ -456,14 +456,13 @@ Nous Portal subscribers can route incoming voice messages through the managed Op
 
 ```yaml
 stt:
-  provider: "openai"
-  use_gateway: true
+  provider: "nous"
   language: "ru"               # Set this to the language you normally speak
   openai:
     model: "gpt-4o-mini-transcribe"
 ```
 
-Hermes uses your Nous Portal OAuth token to call the managed OpenAI-compatible transcription endpoint. Restart the gateway after changing the configuration.
+`provider: "nous"` is the canonical Tool Gateway selection: Hermes uses your Nous Portal OAuth token and routes transcription through the managed OpenAI-compatible endpoint. `gpt-4o-mini-transcribe` is a good current choice for this path; available and recommended models may change. Restart the gateway after changing the configuration.
 :::
 
 :::info Zero Config
