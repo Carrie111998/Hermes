@@ -977,6 +977,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       }
     };
 
+    // Declared after installWebglAddon, which references it — safe because
+    // both consts initialize before any call site runs (the first call is
+    // installWebglAddon() below). The two are mutually recursive (the rAF
+    // below calls installWebglAddon), so a declaration-order swap would
+    // only move the forward reference; the comment makes it explicit.
     const recoverFromWebglContextLoss = () => {
       disposeWebglAddon();
       try {
@@ -1684,10 +1689,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         // xterm's primary-buffer scrollback — after Chat was display:none,
         // xterm can resume with the viewport parked above the live tail,
         // presenting an entirely black pane even though the PTY is fine.
-        // Re-anchor only on the explicit inactive → active path so ordinary
-        // resizes preserve a user's intentional history position.
+        // Re-anchor only on the explicit inactive → active path AND only
+        // while the user was already pinned to the bottom (stickToBottomRef,
+        // maintained by onScroll): a reader parked mid-scrollback keeps
+        // their history position across tab switches.
         webglRecoverRef.current?.();
-        termRef.current?.scrollToBottom();
+        if (stickToBottomRef.current) {
+          termRef.current?.scrollToBottom();
+        }
         const host = hostRef.current;
         const active = typeof document !== "undefined"
           ? document.activeElement
@@ -1775,7 +1784,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       }
       // Retry WebGL if a context loss left us on the canvas fallback, and
       // re-anchor to the live tail (tab suspension can park the viewport
-      // above it, presenting a black pane even with a live PTY).
+      // above it, presenting a black pane even with a live PTY). The
+      // re-anchor is gated on stick-to-bottom state so a reader parked
+      // mid-scrollback keeps their position on tab return; the repaint
+      // below is unconditional (renderer-level, not navigation).
       webglRecoverRef.current?.();
       const term = termRef.current;
       if (!term) return;
@@ -1784,10 +1796,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       } catch {
         /* ignore */
       }
-      try {
-        term.scrollToBottom();
-      } catch {
-        /* ignore */
+      if (stickToBottomRef.current) {
+        try {
+          term.scrollToBottom();
+        } catch {
+          /* ignore */
+        }
       }
     };
     document.addEventListener("visibilitychange", onVisible);

@@ -70,14 +70,21 @@ class FakeTerminal {
     return { dispose() {} };
   }
 
-  onScroll() {
+  onScrollHandler: (() => void) | null = null;
+
+  onScroll(handler: () => void) {
+    this.onScrollHandler = handler;
     return { dispose() {} };
   }
 
+  scrollPos = { baseY: 0, viewportY: 0 };
+
   get buffer() {
-    // Minimal active-buffer surface for the resume follow-scroll pin
-    // (isViewportPinnedToBottom reads viewportY/baseY).
-    return { active: { baseY: 0, viewportY: 0 } };
+    // Minimal active-buffer surface for the resume follow-scroll pin and
+    // the stick-to-bottom re-anchor gate (isViewportPinnedToBottom reads
+    // viewportY/baseY); tests mutate scrollPos before invoking the
+    // captured onScroll handler to simulate the user scrolling up.
+    return { active: { ...this.scrollPos } };
   }
 
   scrollToBottom = vi.fn();
@@ -350,6 +357,64 @@ describe("ChatPage", () => {
     );
 
     expect(terminal.scrollToBottom).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a mid-scrollback reader's position on Chat return", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    const page = (isActive: boolean) => (
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive={isActive} />
+      </MemoryRouter>
+    );
+
+    await render(page(true));
+    await vi.waitFor(() => expect(FakeTerminal.instances).toHaveLength(1));
+    const terminal = FakeTerminal.instances[0];
+    // Simulate the user scrolling up into the backlog: the captured onScroll
+    // handler releases the stick-to-bottom pin (viewportY < baseY).
+    terminal.scrollPos = { baseY: 120, viewportY: 40 };
+    terminal.onScrollHandler?.();
+    terminal.scrollToBottom.mockClear();
+
+    await act(async () => root.render(page(false)));
+    await act(async () => root.render(page(true)));
+
+    // The WebGL retry still runs, but the viewport is NOT yanked to the tail.
+    expect(terminal.scrollToBottom).not.toHaveBeenCalled();
+  });
+
+  it("keeps a mid-scrollback reader's position when the browser tab returns", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+
+    await render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive />
+      </MemoryRouter>,
+    );
+    await vi.waitFor(() => expect(FakeTerminal.instances).toHaveLength(1));
+    const terminal = FakeTerminal.instances[0];
+    terminal.scrollPos = { baseY: 120, viewportY: 40 };
+    terminal.onScrollHandler?.();
+    terminal.scrollToBottom.mockClear();
+
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "hidden",
+    });
+    await act(async () =>
+      document.dispatchEvent(new Event("visibilitychange")),
+    );
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "visible",
+    });
+    await act(async () =>
+      document.dispatchEvent(new Event("visibilitychange")),
+    );
+
+    // The fallback repaint still happens; the re-anchor does not.
+    expect(terminal.scrollToBottom).not.toHaveBeenCalled();
+    expect(terminal.refresh).toHaveBeenCalledWith(0, terminal.rows - 1);
   });
 
   it("treats loopback 4401 closes as stale-token reload candidates", async () => {
