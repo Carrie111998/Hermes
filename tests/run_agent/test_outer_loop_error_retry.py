@@ -100,6 +100,8 @@ def test_persistent_outer_loop_error_is_bounded_and_backed_off():
     assert outer_failures == 3
     assert "encountered repeated errors" in result["final_response"]
     assert "permanent normalization failure" in result["final_response"]
+    assert result["failed"] is True
+    assert result["completed"] is False
     assert sleep.call_args_list == [call(1), call(2)]
 
 

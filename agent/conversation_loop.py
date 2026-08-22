@@ -8405,6 +8405,7 @@ def run_conversation(
                     consecutive_outer_loop_errors
                     >= _MAX_CONSECUTIVE_OUTER_LOOP_ERRORS
                 ):
+                    failed = True
                     _turn_exit_reason = (
                         "outer_loop_error_retry_exhausted"
                         f"({error_msg[:80]})"
