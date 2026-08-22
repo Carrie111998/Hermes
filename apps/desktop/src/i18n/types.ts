@@ -1505,6 +1505,8 @@ export interface Translations {
     allProfiles: string
     showAllProfiles: string
     switchToProfile: (name: string) => string
+    setDefaultProfile: string
+    clearDefaultProfile: string
     switchToConnection: (name: string) => string
     switchConnectionFailed: (name: string) => string
     manageProfiles: string
