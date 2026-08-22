@@ -86,6 +86,58 @@ class TestCryptoLease:
         assert record is not None
         assert record["pid"] == os.getpid()
 
+    def test_reclaims_empty_file(self, tmp_path, monkeypatch):
+        """A zero-byte lease file (writer killed between O_EXCL and json.dump)
+        is reclaimed atomically and this process wins the lease."""
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_path = _lock_path()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text("")
+
+        acquired, record = status.acquire_crypto_lease(STORE_PATH, IDENTITY)
+
+        assert acquired is True
+        assert record is not None
+        assert record["pid"] == os.getpid()
+        assert json.loads(lock_path.read_text())["pid"] == os.getpid()
+
+    def test_empty_file_race_second_acquirer_loses(self, tmp_path, monkeypatch):
+        """A concurrent writer caught between O_EXCL and json.dump() must not
+        have its 0-byte file unlinked by this reader.  The reader's tombstone
+        os.replace() is atomic; when it hits FileNotFoundError it falls through
+        to O_EXCL and loses to the winner's fresh lock (the old unlink() would
+        have deleted the winner's file and let both processes win)."""
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_path = _lock_path()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text("")
+
+        winner_record = {
+            "pid": 424242,
+            "start_time": 456,
+            "kind": "hermes-gateway",
+            "scope": status._CRYPTO_LEASE_SCOPE,
+        }
+        real_replace = os.replace
+
+        def racing_replace(src, dst, *args, **kwargs):
+            if str(src) == str(lock_path):
+                # Simulate the winner completing removal + O_EXCL create
+                # between our empty-file check and our reclaim attempt.
+                lock_path.write_text(json.dumps(winner_record))
+                raise FileNotFoundError(2, "No such file or directory", str(src))
+            return real_replace(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(status.os, "replace", racing_replace)
+
+        acquired, existing = status.acquire_crypto_lease(STORE_PATH, IDENTITY)
+
+        assert acquired is False
+        assert existing is not None
+        assert existing["pid"] == 424242
+        # The winner's fresh lock must remain untouched on disk.
+        assert json.loads(lock_path.read_text())["pid"] == 424242
+
     def test_rejects_live_foreign_process(self, tmp_path, monkeypatch):
         """A lease held by another live PID is rejected fail-closed (False)."""
         monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))

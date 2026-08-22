@@ -1583,6 +1583,32 @@ def _foreign_lock_record_is_stale(existing: dict[str, Any]) -> bool:
     return stale
 
 
+def _reclaim_lock_atomically(lock_path: Path) -> None:
+    """Reclaim a stale/corrupt lock file atomically via a tombstone rename.
+
+    ``unlink()`` + a subsequent ``O_EXCL`` create is not atomic: two racing
+    starters can both observe "removed" (the second ``unlink()`` silently
+    deleting the first racer's freshly created lock) and both win the lock.
+    ``os.replace()`` is atomic — exactly one racer claims the existing file;
+    the loser gets ``FileNotFoundError`` and falls through to the ``O_EXCL``
+    create below, where at most one process succeeds.
+    """
+    tombstone = lock_path.with_name(lock_path.name + ".stale")
+    try:
+        os.replace(lock_path, tombstone)
+    except FileNotFoundError:
+        # Another racer already claimed the stale file (and may have created a
+        # fresh one) — let O_EXCL below decide the winner.
+        pass
+    except OSError:
+        pass
+    else:
+        try:
+            tombstone.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, Any]] = None) -> tuple[bool, Optional[dict[str, Any]]]:
     """Acquire a machine-local lock keyed by scope + identity.
 
@@ -1613,11 +1639,11 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
         # Lock file exists but is empty or contains invalid JSON — treat as
         # stale.  This happens when a previous process was killed between
         # O_CREAT|O_EXCL and the subsequent json.dump() (e.g. DNS failure
-        # during rapid Slack reconnect retries).
-        try:
-            lock_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        # during rapid Slack reconnect retries).  Reclaim ATOMICALLY via the
+        # tombstone rename (not unlink) so a concurrent writer caught between
+        # O_CREAT|O_EXCL and json.dump() cannot have its 0-byte file unlinked
+        # by this reader — unlink()+O_EXCL would let both win.
+        _reclaim_lock_atomically(lock_path)
     if existing:
         try:
             existing_pid = int(existing["pid"])
@@ -1637,27 +1663,9 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
             return True, existing
 
         if _foreign_lock_record_is_stale(existing):
-            # Remove the stale lock ATOMICALLY by renaming it to a tombstone
-            # instead of unlinking. With unlink()+O_EXCL, two racing starters
-            # could both observe "removed" (the second unlink() silently
-            # deleting the first racer's freshly-created lock) and both win.
-            # os.replace() is atomic: exactly one racer claims the stale
-            # file; the loser gets FileNotFoundError and falls through to
-            # the O_EXCL create below, where at most one process succeeds.
-            tombstone = lock_path.with_name(lock_path.name + ".stale")
-            try:
-                os.replace(lock_path, tombstone)
-            except FileNotFoundError:
-                # Another racer already claimed the stale lock (and may have
-                # created a fresh one) — let O_EXCL below decide the winner.
-                pass
-            except OSError:
-                pass
-            else:
-                try:
-                    tombstone.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            # Reclaim the stale lock ATOMICALLY via a tombstone rename so two
+            # racing starters cannot both win (see _reclaim_lock_atomically).
+            _reclaim_lock_atomically(lock_path)
         else:
             return False, existing
 
@@ -1743,11 +1751,10 @@ def acquire_crypto_lease(
     if existing is None and lock_path.exists():
         # Lock file exists but is empty or contains invalid JSON — treat as
         # stale (a previous process was killed between O_CREAT|O_EXCL and the
-        # subsequent json.dump()).
-        try:
-            lock_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        # subsequent json.dump()).  Reclaim ATOMICALLY via the tombstone rename
+        # (not unlink) so a concurrent writer between O_CREAT|O_EXCL and
+        # json.dump() cannot have its 0-byte file unlinked by this reader.
+        _reclaim_lock_atomically(lock_path)
     if existing:
         try:
             existing_pid = int(existing["pid"])
@@ -1761,21 +1768,8 @@ def acquire_crypto_lease(
 
         if _foreign_lock_record_is_stale(existing):
             # Reclaim the stale lease ATOMICALLY via a tombstone rename so two
-            # racing starters cannot both win (same guard as acquire_scoped_lock).
-            tombstone = lock_path.with_name(lock_path.name + ".stale")
-            try:
-                os.replace(lock_path, tombstone)
-            except FileNotFoundError:
-                # Another racer already claimed the stale file — let O_EXCL below
-                # decide the winner.
-                pass
-            except OSError:
-                pass
-            else:
-                try:
-                    tombstone.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            # racing starters cannot both win (see _reclaim_lock_atomically).
+            _reclaim_lock_atomically(lock_path)
         else:
             # A live foreign process holds the lease — fail closed.
             return False, existing
