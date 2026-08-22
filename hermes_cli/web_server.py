@@ -2513,6 +2513,56 @@ def _decode_chat_image_upload(payload: ChatImageUpload) -> tuple[bytes, str, str
     return data, mime_type, ext
 
 
+class GuidedLaunchRequest(BaseModel):
+    profile: str
+    conversation_id: str
+    session_id: str
+    board: str
+    task_id: str
+    brief: str
+    lease_id: str
+    approval_surface: str
+    approval_decision: str
+    approval_expires_at: int
+    lease_expires_at: int
+    expires_at: int
+
+
+@app.post("/api/chat/guided-launch")
+async def mint_dashboard_guided_launch(payload: GuidedLaunchRequest, request: Request):
+    """Mint one authenticated, replay-safe task-bound chat launch.
+
+    The response URL contains only an opaque one-shot token plus immutable
+    selectors. The exact brief remains server-side and is injected into the
+    resumed TUI only after the WebSocket atomically consumes every binding.
+    """
+    _require_token(request)
+    from hermes_cli.guided_launch import GuidedLaunchInvalid, mint_guided_launch
+
+    try:
+        token, claim = mint_guided_launch(**payload.model_dump())
+    except GuidedLaunchInvalid as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    query = urllib.parse.urlencode(
+        {
+            "guided": token,
+            "profile": claim["profile"],
+            "conversation": claim["conversation_id"],
+            "resume": claim["session_id"],
+            "board": claim["board"],
+            "task": claim["task_id"],
+            "lease": claim["lease_id"],
+            "brief_sha256": claim["brief_sha256"],
+        }
+    )
+    return {
+        "launch_token": token,
+        "expires_at": claim["expires_at"],
+        "href": f"/chat?{query}",
+    }
+
+
 @app.post("/api/chat/image-upload")
 async def upload_chat_image(payload: ChatImageUpload, profile: Optional[str] = None):
     """Persist a browser-provided chat image where the embedded TUI can read it.
@@ -17242,6 +17292,37 @@ async def pty_ws(ws: WebSocket) -> None:
     await ws.accept()
     _log.info("pty accepted peer=%s mode=%s cred=%s", peer, mode, cred)
 
+    # A guided launch is an opaque, single-consumption admission contract. Burn
+    # it before resolving argv or spawning a PTY, and require every immutable
+    # selector from the minted href to match. Any wrong profile, tamper, expiry,
+    # denial/timeout, or replay therefore produces zero agent action.
+    guided_claim: Optional[Dict[str, Any]] = None
+    guided_token = ws.query_params.get("guided") or None
+    if guided_token:
+        from hermes_cli.guided_launch import (
+            GuidedLaunchInvalid,
+            consume_guided_launch,
+        )
+
+        if (ws.query_params.get("fresh") or "").strip():
+            await ws.close(code=4411, reason="guided launch cannot be fresh")
+            return
+        try:
+            guided_claim = consume_guided_launch(
+                guided_token,
+                profile=ws.query_params.get("profile") or "",
+                conversation_id=ws.query_params.get("conversation") or "",
+                session_id=ws.query_params.get("resume") or "",
+                board=ws.query_params.get("board") or "",
+                task_id=ws.query_params.get("task") or "",
+                lease_id=ws.query_params.get("lease") or "",
+                brief_sha256=ws.query_params.get("brief_sha256") or "",
+            )
+        except GuidedLaunchInvalid as exc:
+            _log.warning("guided pty refused: %s peer=%s", exc, peer)
+            await ws.close(code=4411, reason="guided launch rejected")
+            return
+
     # On native Windows, the POSIX PTY bridge can't be imported.  Tell the
     # client and close cleanly rather than pretending the feature works.
     if not _PTY_BRIDGE_AVAILABLE:
@@ -17297,6 +17378,17 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.close(code=1011)
         return
 
+    if guided_claim is not None:
+        # HERMES_TUI_QUERY is an existing TUI startup seam. Its event handler
+        # submits at most once per process after the canonical resumed session
+        # is ready, so reconnects through the keep-alive PTY cannot duplicate
+        # the turn. The opaque launch was already consumed above.
+        from hermes_cli.guided_launch import guided_launch_prompt
+
+        env = dict(env or {})
+        env["HERMES_TUI_QUERY"] = guided_launch_prompt(guided_claim)
+        env["HERMES_GUIDED_LAUNCH_TASK"] = str(guided_claim["task_id"])
+        env["HERMES_GUIDED_LAUNCH_LEASE"] = str(guided_claim["lease_id"])
 
     attach_token = ws.query_params.get("attach") or None
     registry_resume = raw_resume
