@@ -8,8 +8,6 @@ import { hudFrostFor, type TranslucencyState } from './translucency'
 
 export interface HudIpcDeps {
   isMac: boolean
-  isWindows: boolean
-  glassSupported: boolean
   /** Main's authoritative translucency state (Settings → Appearance). */
   getTranslucencyState: () => TranslucencyState
   getHudWindow: () => BrowserWindow | null
@@ -20,8 +18,6 @@ export interface HudIpcDeps {
 
 export function registerHudIpc({
   isMac,
-  isWindows,
-  glassSupported,
   getTranslucencyState,
   getHudWindow,
   openHudWindow,
@@ -76,10 +72,14 @@ export function registerHudIpc({
     if (isMac && typeof hudWindow.setVibrancy === 'function') {
       hudWindow.setVibrancy(frost.vibrancy)
     }
-
-    if (isWindows && glassSupported && typeof hudWindow.setBackgroundMaterial === 'function') {
-      hudWindow.setBackgroundMaterial(frost.backgroundMaterial)
-    }
+    // Windows HUD deliberately never calls setBackgroundMaterial. On a
+    // `transparent: true` window Electron's setBackgroundMaterial is a
+    // one-way door: issuing 'none' flips the backing to an opaque state and
+    // there is no way back to transparency, so any frost hand-off leaves the
+    // HUD as a persistent opaque slab over the whole window (see
+    // electron/electron#49443 and electron/electron#48421, plus the DWM
+    // full-rectangle material behaviour). The HUD therefore stays CSS-only on
+    // Windows, exactly as it was before glass landed for the chat windows.
   }
 
   ipcMain.handle('hermes:hud:open', async (_event, request) => {

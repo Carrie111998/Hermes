@@ -2736,19 +2736,6 @@ button[data-slot='aui_msg-reactions'] svg {
   background: color-mix(in srgb, var(--ui-bg-chrome) var(--translucency-glass-keep, 100%), transparent);
 }
 
-/* The band spans the window edge to edge under glass. The 8px side inset keeps
-   the sheet clear of the bar's corner controls when it is an opaque panel —
-   but the frost is the WINDOW, so an inset sheet leaves a hairline of bare
-   untinted material down both sides. Nothing to hold off the material's edge:
-   the window's own rounded corners are where the band ends. */
-:root[data-hermes-glass-on] [data-hud-shell] {
-  --hud-band-inset: 0px;
-}
-
-:root[data-hermes-glass-on] [data-hud-shell] [data-hud-glass] {
-  border-radius: 0.75rem 0.75rem 0 0;
-}
-
 /* Engaged, the field steps up the same way the docked thread's does — but
    never below the resting tint, so a high lever cannot make focusing the
    composer paint MORE transparent than glancing at it. */
