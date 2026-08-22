@@ -1,8 +1,9 @@
-"""Temporary exact-tree materializer for #89252.
+"""Temporary read-only compiler for one authority-repair branch.
 
-Runs the claimant/generation carrier inside upstream PR CI with every push
-intercepted, then emits the exact tested product diff as a compressed,
-checksummed failure artifact.  This file and workflow carriers are excluded.
+The upstream PR e2e checkout is the available complete repository. This test
+executes the branch's sole ``one-shot-fix-*.yml`` carrier with every push
+intercepted, then emits the exact tested product diff as a gzip/base64 failure
+artifact. The compiler and workflow carriers are excluded from that artifact.
 """
 
 from __future__ import annotations
@@ -20,8 +21,13 @@ import tarfile
 import pytest
 
 CURRENT_MAIN = "b6bcb3e791c673e63974029bbab40cc9326803ff"
-CARRIER = Path(".github/workflows/one-shot-fix-89252.yml")
-SELF = "tests/test__authority_repair_materializer.py"
+SELF = "tests/e2e/test__authority_repair_materializer.py"
+
+
+def _carrier() -> Path:
+    candidates = sorted(Path(".github/workflows").glob("one-shot-fix-*.yml"))
+    assert len(candidates) == 1, [str(path) for path in candidates]
+    return candidates[0]
 
 
 def _run_block(path: Path) -> str:
@@ -66,15 +72,20 @@ def _install_read_only_git(tmp_path: Path) -> Path:
 
 
 def _product_diff() -> tuple[bytes, dict[str, object]]:
-    raw = subprocess.check_output(["git", "diff", "--name-status", CURRENT_MAIN, "HEAD"], text=True)
+    raw = subprocess.check_output(
+        ["git", "diff", "--name-status", CURRENT_MAIN, "HEAD"], text=True
+    )
     entries: list[tuple[str, str]] = []
     for line in raw.splitlines():
         if not line.strip():
             continue
         status, path = line.split("\t", 1)
-        if path == SELF or path.startswith(".github/workflows/") or path.startswith("contributors/emails/"):
+        if path == SELF or path.startswith("tests/test__authority_repair_materializer.py"):
+            continue
+        if path.startswith(".github/workflows/") or path.startswith("contributors/emails/"):
             continue
         entries.append((status, path))
+
     manifest: dict[str, object] = {
         "base": CURRENT_MAIN,
         "entries": entries,
@@ -93,13 +104,15 @@ def _product_diff() -> tuple[bytes, dict[str, object]]:
     return payload.getvalue(), manifest
 
 
-def test_materialize_transport_claim_generation(tmp_path: Path) -> None:
+def test_materialize_exact_authority_repair_tree(tmp_path: Path) -> None:
     script = tmp_path / "carrier.sh"
-    script.write_text(_run_block(CARRIER))
+    script.write_text(_run_block(_carrier()))
     subprocess.run(["bash", "-n", str(script)], check=True)
+
     env = os.environ.copy()
     env["PATH"] = f"{_install_read_only_git(tmp_path)}:{env['PATH']}"
     subprocess.run(["bash", str(script)], check=True, env=env, timeout=1800)
+
     artifact, manifest = _product_diff()
     digest = hashlib.sha256(artifact).hexdigest()
     encoded = base64.b64encode(artifact).decode()
