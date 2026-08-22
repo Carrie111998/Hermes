@@ -30,7 +30,7 @@ The following is the complete skill definition that Hermes loads when this skill
 
 # Himalaya CLI v2.x
 
-Himalaya is a Rust CLI for managing email from the terminal. **This skill targets himalaya v2.x** (v2.0.0+, post the v1→v2 breaking changes). The skill previously documented the v1.x schema; commands like `himalaya folder list` and `himalaya envelope list from x` no longer work in v2 and will trip agents loading the skill on first attempt.
+Himalaya is a Rust CLI for managing email from the terminal. **This skill targets himalaya v2.x** (v2.0.0+, post the v1→v2 breaking changes). The skill previously documented the v1.x schema; commands like `himalaya mailbox list` (formerly `himalaya folder list` in v1.x) and `himalaya envelope list from x` no longer work in v2 and will trip agents loading the skill on first attempt.
 
 This skill is separate from the Hermes Email gateway adapter. The gateway adapter lets people email the agent and uses Hermes' built-in IMAP/SMTP adapter; this skill lets the agent operate a mailbox from terminal tools and requires the external `himalaya` CLI.
 
@@ -39,7 +39,7 @@ This skill is separate from the Hermes Email gateway adapter. The gateway adapte
 | v1.x (don't use) | v2.x (current) |
 |---|---|
 | `folder list` | `mailbox list` |
-| `folder.aliases.sent` (singular, TOML sub-table) | `mailbox.alias.sent` (plural, dotted key under account) |
+| `folder.aliases.sent` (v1.x; replaced by `mailbox.alias.sent`) | `mailbox.alias.sent` (plural, dotted key under account) |
 | `[accounts.X] backend = { type=imap, host=..., port=..., auth={...} }` | Flat keys: `imap.server`, `imap.sasl.plain.username`, `imap.sasl.plain.password.command` |
 | `envelope list from x` (positional filters) | `envelope list`; filters moved to separate `envelope search "from x"` subcommand with its own DSL |
 | `message write` (no piped input) / `message reply` | `message compose --to ... --subject ... --body ...`; rich MIME via piped `mml`; `message write` is an alias of `message compose` (no editor) |
@@ -268,11 +268,9 @@ To send a **pre-written RFC 822 message** (full headers + body, e.g. one produce
 
 ```bash
 himalaya message send < message.eml
-# or
-himalaya message send --save drafts < message.eml
 ```
 
-`message send` reads the full message verbatim (headers + body); it does NOT take `--body` / `--body-file` / `--subject`. For richer composition (multipart MIME, attachments, signing/encryption), chain a standalone composer like `mml` into `message send` via stdin or process substitution; see `references/message-composition.md`.
+> ⚠️ `message send --save drafts` is a footgun in v2.0.0: `MessageSendCommand::execute` routes via SMTP unconditionally and only appends a copy *after* delivery (`handler::route(..., true)`). The `--save drafts` is a "send, then copy," not "save without sending." For a true draft, use `message add --mailbox drafts --flag draft < message.eml` (see `references/message-composition.md`).
 
 ### Reply to a message
 

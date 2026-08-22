@@ -262,13 +262,20 @@ himalaya message compose \
 himalaya message compose --to x@y.com --subject "Draft" --body "WIP" --save drafts
 
 # Save a pre-written RFC 822 message to drafts WITHOUT sending it.
-# ⚠️ Do NOT use `himalaya message send --save drafts < message.eml` — v2.0.0's
-# MessageSendCommand routes via SMTP and only appends a copy *after* delivery
-# (`handler::route(..., true)`). For a true "save without sending", use the
-# `message add` subcommand which stages the message into a mailbox with a
-# given flag without routing through SMTP:
+# For a true "save without sending", use the `message add` subcommand
+# which stages the message into a mailbox with a given flag without
+# routing through SMTP (see the warning callout below for why
+# `message send` with `--save drafts` does NOT do what you'd expect).
 himalaya message add --mailbox drafts --flag draft < message.eml
 ```
+
+> ⚠️ **Why not `himalaya message send --save drafts < message.eml`?**
+> v2.0.0's `MessageSendCommand::execute` calls `handler::::route(..., true)`
+> unconditionally — `--save drafts` means "send, then append a copy,"
+> not "save without sending." Under a "Save a draft" heading, that
+> recipe would silently deliver the unfinished message. Use `message
+> add --mailbox drafts --flag draft` (shown above) for true draft
+> staging.
 
 ### Rich MIME via external composer (mml)
 

@@ -216,8 +216,9 @@ Generate the app-specific password at https://appleid.apple.com.
    Add `| tr -d '\n'` if SASL auth fails mysteriously.
 3. **Gmail folder names with `[Gmail]/`** — must be quoted in shell:
    `himalaya -m "[Gmail]/Sent Mail"`. Better: define `mailbox.alias.sent`.
-4. **`backend = { type = "imap", host = ..., ... }`** — that's v1.x TOML.
-   v2 uses flat keys `imap.server`, `imap.sasl.plain.username`, etc.
+4. **Nested `[accounts.X] backend = { ... }` table** — that's v1.x TOML.
+   v2 uses flat per-backend keys like `imap.server`,
+   `imap.sasl.plain.username`, `imap.sasl.plain.password.command`.
 5. **`envelope list from alice`** — that's v1 positional. v2 uses
    `envelope search "from alice"`.
 6. **Plain `password = "secret"`** — there's no such field in v2. Use
