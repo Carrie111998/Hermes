@@ -20094,3 +20094,66 @@ def test_command_dispatch_resolves_a_project_skill_from_the_session(tmp_path, mo
     assert seen.get("project") == str(repo.resolve())
     assert resp["result"]["type"] == "skill"
     assert resp["result"]["name"] == "repo-only"
+
+
+def _slash_scope_pin_probe(method, params):
+    """Run a completion RPC and report the cwd pin the skill scan ran under.
+
+    Reads the contextvar itself rather than ``find_project_root()``, so it
+    observes the scope's own contract — WHICH cwd wins — and stays meaningful
+    on trees where the resolver does not yet honour the pin.
+    """
+    seen = {}
+
+    import agent.skill_commands as sc
+
+    real = sc.scan_skill_commands
+
+    def _probe():
+        from agent.runtime_cwd import _session_cwd_override
+
+        seen["pin"] = _session_cwd_override()
+        return {}
+
+    sc.scan_skill_commands = _probe
+    sc._skill_commands = {}
+    try:
+        server.handle_request({"id": "1", "method": method, "params": params})
+    finally:
+        sc.scan_skill_commands = real
+        sc._skill_commands = {}
+    return seen.get("pin")
+
+
+def test_completion_scope_prefers_the_session_record_over_the_client_cwd(tmp_path):
+    """The session's pinned cwd is the authority; the client param is not.
+
+    The skill scan decides which PROJECT's skills are offered and invoked, so
+    a buggy or hostile renderer must not be able to point it at an arbitrary
+    directory once a session exists. ``session.cwd.set`` / workspace moves
+    keep the record current, so honouring it never serves a stale workspace.
+    """
+    repo_a = tmp_path / "session-project"
+    repo_a.mkdir()
+    repo_b = tmp_path / "client-claimed"
+    repo_b.mkdir()
+
+    server._sessions["auth-sid"] = {"cwd": str(repo_a)}
+    try:
+        pin = _slash_scope_pin_probe(
+            "commands.catalog", {"session_id": "auth-sid", "cwd": str(repo_b)}
+        )
+    finally:
+        server._sessions.pop("auth-sid", None)
+
+    assert pin == os.path.abspath(str(repo_a))
+
+
+def test_completion_scope_falls_back_to_the_client_cwd_before_any_session(tmp_path):
+    """Pre-session (no record yet), the client's cwd param still scopes the scan."""
+    repo = tmp_path / "pre-session-project"
+    repo.mkdir()
+
+    pin = _slash_scope_pin_probe("commands.catalog", {"cwd": str(repo)})
+
+    assert pin == os.path.abspath(str(repo))

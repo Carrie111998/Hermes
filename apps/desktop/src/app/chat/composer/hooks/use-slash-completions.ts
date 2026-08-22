@@ -83,7 +83,9 @@ export function useSlashCompletions(options: {
   // Two sessions in different projects get different catalogs, so a cached
   // response is only valid for the workspace that produced it. Mirrors the
   // `@` path cache, which is scoped the same way for the same reason.
-  const scope = `${cwd ?? ''}|${sessionId ?? ''}`
+  // JSON.stringify, not a `|` join: a delimiter that can appear inside a cwd
+  // lets two different (cwd, sessionId) pairs collide on one cache key.
+  const scope = JSON.stringify([cwd ?? '', sessionId ?? ''])
 
   const fetcher = useCallback(
     async (query: string): Promise<CompletionPayload> => {

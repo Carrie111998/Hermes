@@ -187,4 +187,21 @@ describe('useSlashCompletions', () => {
     expect(request).toHaveBeenCalledTimes(2)
     expect(request).toHaveBeenLastCalledWith('commands.catalog', { cwd: '/repo-b', session_id: 'b' })
   })
+
+  // A raw `${cwd}|${sessionId}` join lets a delimiter inside the cwd forge
+  // another scope's key: ('/repo|x', 'sid') and ('/repo', 'x|sid') both
+  // serialize to '/repo|x|sid'. Directories with `|` in their name are legal
+  // on POSIX filesystems, so these are two REAL distinct scopes.
+  it('does not collide cache keys when a cwd contains the delimiter', async () => {
+    const request = vi.fn().mockResolvedValue(CATALOG)
+
+    const first = harness({ request } as unknown as HermesGateway, { cwd: '/repo|x', sessionId: 'sid' })
+    await completions(first, '')
+    expect(request).toHaveBeenCalledTimes(1)
+
+    cleanup()
+    const second = harness({ request } as unknown as HermesGateway, { cwd: '/repo', sessionId: 'x|sid' })
+    await completions(second, '')
+    expect(request).toHaveBeenCalledTimes(2)
+  })
 })
