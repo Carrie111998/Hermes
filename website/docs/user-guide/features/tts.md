@@ -14,7 +14,7 @@ If you have a paid [Nous Portal](https://portal.nousresearch.com) subscription, 
 
 ## Text-to-Speech
 
-Convert text to speech with eleven providers:
+Convert text to speech with twelve providers:
 
 | Provider | Quality | Cost | API Key |
 |----------|---------|------|---------|
@@ -29,6 +29,7 @@ Convert text to speech with eleven providers:
 | **NeuTTS** | Good | Free (local) | None needed |
 | **KittenTTS** | Good | Free (local) | None needed |
 | **Piper** | Good | Free (local) | None needed |
+| **Kokoro** | Excellent | Free (local) | None needed |
 
 ### Platform Delivery
 
@@ -44,7 +45,7 @@ Convert text to speech with eleven providers:
 ```yaml
 # In ~/.hermes/config.yaml
 tts:
-  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "mistral" | "gemini" | "xai" | "deepinfra" | "neutts" | "kittentts" | "piper"
+  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "mistral" | "gemini" | "xai" | "deepinfra" | "neutts" | "kittentts" | "piper" | "kokoro"
   speed: 1.0                    # Global speed multiplier (provider-specific settings override this)
   edge:
     voice: "en-US-AriaNeural"   # 322 voices, 74 languages
@@ -103,6 +104,15 @@ tts:
     # noise_w_scale: 0.8
     # volume: 1.0                               # 0.5 = half as loud
     # normalize_audio: true
+  kokoro:
+    voice: af_heart                             # flagship American female; see VOICES.md for 54 voices
+    lang: en-us                                 # en-us, en-gb, ja, zh, es, fr, hi, it, pt
+    model: int8                                 # int8 (default, 114MB) / fp16 (163MB) / fp32 (325MB)
+    speed: 1.0                                  # 0.5 - 2.0
+    # model_path: /path/to/custom.onnx          # override auto-download with a custom model file
+    # voices_path: /path/to/voices-v1.0.bin     # override auto-download with a custom voices file
+    # models_dir: ''                            # default: ~/.hermes/cache/kokoro-models/
+    # use_cuda: false                           # requires onnxruntime-gpu; falls back to CPU if unavailable
 ```
 
 MiniMax TTS selects its region, endpoint, and credential together:
@@ -255,6 +265,55 @@ tts:
 ```
 
 **Advanced knobs** (`tts.piper.length_scale` / `noise_scale` / `noise_w_scale` / `volume` / `normalize_audio`, `use_cuda`) correspond 1:1 to Piper's `SynthesisConfig`. They're ignored on older `piper-tts` versions.
+
+### Kokoro (local, high-quality neural TTS)
+
+Kokoro is a high-quality local neural TTS engine (82M parameters, Apache-licensed) that runs via ONNX Runtime. It needs no API key and bundles espeak-ng through the `espeakng-loader` dependency (prebuilt DLLs for Linux, macOS, and Windows — no system espeak-ng install required).
+
+**Install via `hermes tools`** → Voice & TTS → Kokoro — Hermes runs `pip install kokoro-onnx soundfile` for you. Or install manually: `pip install kokoro-onnx soundfile`.
+
+**Switch to Kokoro:**
+
+```yaml
+tts:
+  provider: kokoro
+  kokoro:
+    voice: af_heart          # flagship American female voice
+    lang: en-us
+```
+
+On the first TTS call, Hermes downloads the model files (`kokoro-v1.0.int8.onnx` ~114MB + `voices-v1.0.bin`) into `~/.hermes/cache/kokoro-models/`. Subsequent calls reuse the cached model.
+
+**Choosing a model variant.** The default `int8` model (114MB) is optimized for CPU inference — fastest on CPU and the lightest footprint. Users with a dedicated GPU can switch to `fp32` (325MB, fastest on GPU) or `fp16` (163MB):
+
+```yaml
+tts:
+  kokoro:
+    model: fp32              # int8 (default) / fp16 / fp32
+```
+
+**GPU acceleration.** By default Kokoro runs on CPU (faster-than-realtime for conversational use). To use a CUDA GPU, install `onnxruntime-gpu` and enable:
+
+```yaml
+tts:
+  kokoro:
+    use_cuda: true
+```
+
+If the CUDA provider isn't available, Hermes falls back to CPU automatically.
+
+**Picking a voice.** Kokoro ships 54 voices across American English, British English, Japanese, Mandarin Chinese, Spanish, French, Hindi, Italian, and Portuguese. See the [full voice catalog](https://github.com/thewh1teagle/kokoro-onnx/blob/main/VOICES.md). Voice names follow the pattern `<lang><gender>_<name>` (e.g. `af_heart` = American female "Heart", `am_michael` = American male "Michael").
+
+**Using a custom model.** Set `tts.kokoro.model_path` to an absolute path to your own `.onnx` file (and optionally `voices_path` for a custom `.bin`):
+
+```yaml
+tts:
+  kokoro:
+    model_path: /path/to/kokoro-v1.0.onnx
+    voices_path: /path/to/voices-v1.0.bin
+```
+
+**Speed control** (`tts.kokoro.speed`, default `1.0`) adjusts the speech rate. The model can also pass a per-call `speed` parameter through the `text_to_speech` tool.
 
 ### Custom command providers
 
