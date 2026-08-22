@@ -6,6 +6,7 @@ handling without requiring a running terminal environment.
 
 import json
 import logging
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -94,7 +95,9 @@ class TestWriteFileHandler:
         from tools.file_tools import write_file_tool
         result = json.loads(write_file_tool("/tmp/out.txt", "hello world!\n"))
         assert result["status"] == "ok"
-        mock_ops.write_file.assert_called_once_with("/tmp/out.txt", "hello world!\n")
+        mock_ops.write_file.assert_called_once_with(
+            os.path.realpath("/tmp/out.txt"), "hello world!\n"
+        )
 
     @patch("tools.file_tools._get_file_ops")
     def test_permission_error_returns_error_json_without_error_log(self, mock_get, caplog):
@@ -185,7 +188,9 @@ class TestPatchHandler:
             old_string="foo", new_string="bar"
         ))
         assert result["status"] == "ok"
-        mock_ops.patch_replace.assert_called_once_with("/tmp/f.py", "foo", "bar", False)
+        mock_ops.patch_replace.assert_called_once_with(
+            os.path.realpath("/tmp/f.py"), "foo", "bar", False
+        )
 
 
     @patch("tools.file_tools._get_file_ops")
@@ -207,7 +212,7 @@ class TestPatchHandler:
         from tools.file_tools import patch_tool
         result = json.loads(patch_tool(mode="invalid_mode"))
         assert "error" in result
-        assert "Unknown mode" in result["error"]
+        assert "must be either 'replace' or 'patch'" in result["error"]
 
     # -- _handle_patch (dict-args handler, one layer above patch_tool) ------
     # The tests above call patch_tool() directly and already prove it
@@ -259,7 +264,9 @@ class TestPatchHandler:
             _handle_patch({"mode": "replace", "path": "/tmp/f.py", "old_string": "a", "new_string": ""})
         )
         assert result["status"] == "ok"
-        mock_ops.patch_replace.assert_called_once_with("/tmp/f.py", "a", "", False)
+        mock_ops.patch_replace.assert_called_once_with(
+            os.path.realpath("/tmp/f.py"), "a", "", False
+        )
 
     def test_handler_patch_mode_missing_patch_field_errors(self):
         from tools.file_tools import _handle_patch
@@ -270,17 +277,13 @@ class TestPatchHandler:
 
     @patch("tools.file_tools._get_file_ops")
     def test_handler_unknown_mode_defers_to_patch_tool(self, mock_get):
-        """mode values other than 'replace'/'patch' are intentionally NOT
-        handled by this guard -- they fall through unchanged to
-        patch_tool()'s own pre-existing validation, covered above by
-        test_unknown_mode_errors. This test just confirms the handler
-        doesn't intercept or duplicate that path."""
+        """Unknown modes are rejected by the shared contract validator."""
         mock_get.return_value = MagicMock()
 
         from tools.file_tools import _handle_patch
         result = json.loads(_handle_patch({"mode": "invalid_mode"}))
         assert "error" in result
-        assert "Unknown mode" in result["error"]
+        assert "must be either 'replace' or 'patch'" in result["error"]
 
     @patch("tools.file_tools._get_file_ops")
     def test_patch_v4a_rejects_traversal_in_update_header(self, mock_get):

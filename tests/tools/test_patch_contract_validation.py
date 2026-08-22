@@ -87,6 +87,13 @@ def test_patch_mode_rejects_ambiguous_replace_fields(field, value):
     assert result["failure"]["code"] == "patch.patch.incompatible_fields"
 
 
+@pytest.mark.parametrize("mode", ["", "merge", 7])
+def test_unknown_or_invalid_mode_is_rejected(mode):
+    args = {"mode": mode}
+    result = _failure(args)
+    assert result["failure"]["code"] == "patch.mode.invalid"
+
+
 def test_validation_precedes_path_resolution_approval_and_mutation():
     args = {"mode": "replace", "path": 7, "old_string": "old", "new_string": "new"}
     with (

@@ -2380,6 +2380,78 @@ class TestConcurrentToolExecution:
         ]
         assert outcome.blocked is False
 
+    def test_patch_contract_validation_and_retry_guard_precede_dispatch(
+        self, agent, monkeypatch
+    ):
+        from agent import relay_tools, tool_executor
+        from agent.tool_guardrails import ToolCallGuardrailConfig, ToolCallGuardrailController
+
+        dispatched = []
+        agent._tool_guardrails = ToolCallGuardrailController(
+            ToolCallGuardrailConfig(hard_stop_enabled=True)
+        )
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            lambda _name, args, **_kwargs: SimpleNamespace(payload=args, trace=[]),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            lambda _name, args, callback, **_kwargs: callback(args),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+            lambda *_args, **_kwargs: (None, None),
+        )
+        monkeypatch.setattr(tool_executor, "_begin_tool_execution", lambda *_a, **_k: None)
+        monkeypatch.setattr(
+            relay_tools,
+            "execute",
+            lambda _name, args, callback, **_kwargs: (callback(args), args),
+        )
+
+        def invoke(args, call_id):
+            return tool_executor._run_agent_tool_execution_middleware(
+                agent,
+                function_name="patch",
+                function_args=args,
+                effective_task_id="task-1",
+                tool_call_id=call_id,
+                execute=lambda final_args: dispatched.append(final_args) or '{"ok":true}',
+            )
+
+        first = invoke({"mode": "replace", "path": "x.py"}, "call-1")
+        second = invoke(
+            {"mode": "replace", "old_string": "private", "new_string": "value"},
+            "call-2",
+        )
+        corrected = invoke(
+            {
+                "mode": "replace",
+                "path": "x.py",
+                "old_string": "old",
+                "new_string": "new",
+            },
+            "call-3",
+        )
+
+        first_payload = json.loads(first.result)
+        second_payload = json.loads(second.result)
+        assert first_payload["failure"]["class"] == "patch_contract"
+        assert (
+            second_payload["guardrail"]["code"]
+            == "structurally_equivalent_malformed_input_block"
+        )
+        assert "private" not in json.dumps(second_payload)
+        assert dispatched == [
+            {
+                "mode": "replace",
+                "path": "x.py",
+                "old_string": "old",
+                "new_string": "new",
+            }
+        ]
+        assert corrected.result == '{"ok":true}'
+
     def test_managed_tool_pipeline_allows_one_concurrent_dispatch(
         self,
         agent,

@@ -119,11 +119,11 @@ def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution()
 
 
 
-def test_second_structurally_equivalent_malformed_failure_blocks_before_execution():
+def test_second_same_class_malformed_validation_blocks_before_execution():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(hard_stop_enabled=True)
     )
-    first_args = {"mode": "replace", "old_string": "private-a", "new_string": "x"}
+    first_args = {"mode": "replace", "path": "x.py"}
     second_args = {"mode": "replace", "old_string": "private-b", "new_string": "y"}
     malformed = json.dumps(
         {
@@ -138,10 +138,9 @@ def test_second_structurally_equivalent_malformed_failure_blocks_before_executio
         }
     )
 
-    assert controller.before_call("patch", first_args).action == "allow"
-    controller.after_call("patch", first_args, malformed, failed=True)
+    assert controller.before_validated_call("patch", first_args, malformed).action == "allow"
 
-    blocked = controller.before_call("patch", second_args)
+    blocked = controller.before_validated_call("patch", second_args, malformed)
     assert blocked.action == "block"
     assert blocked.code == "structurally_equivalent_malformed_input_block"
     metadata = blocked.to_metadata()
@@ -159,10 +158,12 @@ def test_corrected_success_clears_tool_malformed_streak():
         {"error": "bad", "failure": {"kind": "malformed_input", "class": "patch_contract", "code": "patch.replace.path.invalid"}}
     )
 
-    controller.after_call("patch", bad, malformed, failed=True)
-    controller.after_call("patch", good, '{"success":true}', failed=False)
+    controller.before_validated_call("patch", bad, malformed)
+    controller.before_validated_call("patch", good, None)
 
-    assert controller.before_call("patch", {**bad, "old_string": "other"}).action == "allow"
+    assert controller.before_validated_call(
+        "patch", {**bad, "old_string": "other"}, malformed
+    ).action == "allow"
 
 
 def test_external_transient_failures_are_not_malformed():
@@ -189,18 +190,28 @@ def test_guardrail_state_updates_are_concurrency_safe():
     )
 
     def record(i):
-        controller.after_call(
-            "patch", {"mode": "replace", "old_string": str(i), "new_string": "x"}, malformed, failed=True
+        return controller.before_validated_call(
+            "patch", {"mode": "replace", "old_string": str(i), "new_string": "x"}, malformed
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        list(pool.map(record, range(32)))
+        decisions = list(pool.map(record, range(32)))
 
-    decision = controller.before_call(
-        "patch", {"mode": "replace", "old_string": "next", "new_string": "x"}
-    )
+    decision = decisions[-1]
     assert decision.action == "block"
     assert decision.count == 32
+
+
+def test_new_controller_resets_malformed_streak_for_next_turn():
+    malformed = json.dumps(
+        {"error": "bad", "failure": {"kind": "malformed_input", "class": "patch_contract", "code": "patch.replace.path.invalid"}}
+    )
+    first_turn = ToolCallGuardrailController(ToolCallGuardrailConfig(hard_stop_enabled=True))
+    first_turn.before_validated_call("patch", {"mode": "replace"}, malformed)
+    assert first_turn.before_validated_call("patch", {"mode": "replace"}, malformed).action == "block"
+
+    next_turn = ToolCallGuardrailController(ToolCallGuardrailConfig(hard_stop_enabled=True))
+    assert next_turn.before_validated_call("patch", {"mode": "replace"}, malformed).action == "allow"
 
 
 def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():

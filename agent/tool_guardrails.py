@@ -300,20 +300,6 @@ def canonical_tool_args(args: Mapping[str, Any]) -> str:
     )
 
 
-def _structural_args_hash(args: Mapping[str, Any]) -> str:
-    """Hash argument keys/container shapes and scalar types, never values."""
-    def shape(value: Any) -> Any:
-        if isinstance(value, Mapping):
-            return {str(key): shape(child) for key, child in sorted(value.items(), key=lambda item: str(item[0]))}
-        if isinstance(value, list):
-            return [shape(child) for child in value]
-        if value is None:
-            return "null"
-        return type(value).__name__
-
-    return _sha256(json.dumps(shape(args), sort_keys=True, separators=(",", ":")))
-
-
 def _malformed_failure_identity(result: str | None) -> tuple[str, str] | None:
     """Read an explicit deterministic malformed-input class from a tool result."""
     data = safe_json_loads(result or "")
@@ -381,7 +367,7 @@ class ToolCallGuardrailController:
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
         self._halt_decision: ToolGuardrailDecision | None = None
-        self._malformed_failure_counts: dict[tuple[str, str, str, str], int] = {}
+        self._malformed_failure_counts: dict[tuple[str, str], int] = {}
         # Identical-call loop-breaker state (agent.stall_guards): tracks the
         # CONSECUTIVE streak of identical (tool, canonical args) calls whose
         # results were also identical. Any different call — or a different
@@ -412,6 +398,57 @@ class ToolCallGuardrailController:
     def halt_decision(self) -> ToolGuardrailDecision | None:
         return self._halt_decision
 
+    def before_validated_call(
+        self,
+        tool_name: str,
+        args: Mapping[str, Any] | None,
+        validation_result: str | None,
+    ) -> ToolGuardrailDecision:
+        """Observe pre-dispatch contract validation and gate malformed retries.
+
+        A valid corrected call clears this tool's malformed streak. An explicit
+        malformed-input envelope increments the stable tool+failure-class count;
+        with hard stops enabled, the second malformed call is blocked before
+        handler execution even when a different field is missing.
+        """
+        with self._state_lock:
+            signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+            identity = _malformed_failure_identity(validation_result)
+            if identity is None:
+                self._malformed_failure_counts = {
+                    key: count
+                    for key, count in self._malformed_failure_counts.items()
+                    if key[0] != tool_name
+                }
+                return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
+
+            failure_class, _failure_code = identity
+            key = (tool_name, failure_class)
+            count = self._malformed_failure_counts.get(key, 0) + 1
+            self._malformed_failure_counts[key] = count
+            if self.config.hard_stop_enabled and count >= 2:
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code="structurally_equivalent_malformed_input_block",
+                    message=(
+                        f"Blocked {tool_name}: malformed input in failure class "
+                        f"{failure_class!r} already failed this turn. Correct the "
+                        "tool contract before retrying."
+                    ),
+                    tool_name=tool_name,
+                    count=count,
+                    signature=signature,
+                    failure_class=failure_class,
+                )
+                self._halt_decision = decision
+                return decision
+            return ToolGuardrailDecision(
+                tool_name=tool_name,
+                count=count,
+                signature=signature,
+                failure_class=failure_class,
+            )
+
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         with self._state_lock:
             return self._before_call_unlocked(tool_name, args)
@@ -419,31 +456,6 @@ class ToolCallGuardrailController:
     def _before_call_unlocked(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         coerced_args = _coerce_args(args)
         signature = ToolCallSignature.from_call(tool_name, coerced_args)
-
-        if self.config.hard_stop_enabled:
-            shape_hash = _structural_args_hash(coerced_args)
-            matches = [
-                (key, count)
-                for key, count in self._malformed_failure_counts.items()
-                if key[0] == tool_name and key[3] == shape_hash
-            ]
-            if matches:
-                key, count = max(matches, key=lambda item: item[1])
-                decision = ToolGuardrailDecision(
-                    action="block",
-                    code="structurally_equivalent_malformed_input_block",
-                    message=(
-                        f"Blocked {tool_name}: a structurally equivalent malformed "
-                        "tool call already failed this turn. Correct the argument "
-                        "contract before retrying."
-                    ),
-                    tool_name=tool_name,
-                    count=count,
-                    signature=signature,
-                    failure_class=key[1],
-                )
-                self._halt_decision = decision
-                return decision
 
         # ── Per-turn runaway-loop caps ──────────────────────────────────
         # These are hard ceilings on how many times a runaway-prone tool may
@@ -522,25 +534,6 @@ class ToolCallGuardrailController:
         signature = ToolCallSignature.from_call(tool_name, args)
         if failed is None:
             failed, _ = classify_tool_failure(tool_name, result)
-
-        malformed_identity = _malformed_failure_identity(result) if failed else None
-        if malformed_identity is not None:
-            failure_class, failure_code = malformed_identity
-            malformed_key = (
-                tool_name,
-                failure_class,
-                failure_code,
-                _structural_args_hash(args),
-            )
-            self._malformed_failure_counts[malformed_key] = (
-                self._malformed_failure_counts.get(malformed_key, 0) + 1
-            )
-        elif not failed:
-            self._malformed_failure_counts = {
-                key: count
-                for key, count in self._malformed_failure_counts.items()
-                if key[0] != tool_name
-            }
 
         if failed:
             exact_count = self._exact_failure_counts.get(signature, 0) + 1

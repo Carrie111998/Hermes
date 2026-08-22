@@ -599,16 +599,6 @@ def _run_agent_tool_execution_middleware(
             state["blocked"] = False
             state["args"] = final_args
 
-        # Built-in mode-dependent contracts cannot be expressed portably in
-        # provider JSON schemas. Validate them before plugin approvals,
-        # checkpoints, path resolution, or handler execution.
-        if function_name == "patch":
-            from tools.file_tools import _validate_patch_contract
-
-            contract_error = _validate_patch_contract(final_args)
-            if contract_error:
-                return contract_error
-
         def _begin() -> None:
             _begin_tool_execution(
                 agent,
@@ -660,28 +650,49 @@ def _run_agent_tool_execution_middleware(
                 else authorization_gate.run(_resolve_pre_tool_block)
             )
 
+        validation_result = None
         guardrail_decision = None
         if block_message is None:
-            guardrail_decision = agent._tool_guardrails.before_call(
-                function_name, final_args
-            )
-            if guardrail_decision.allows_execution:
-                guardrail_decision = None
+            # Provider-portable schemas cannot express every mode-dependent
+            # contract. Run built-in validation at the shared pre-dispatch
+            # boundary, then let the generic controller classify/reset its
+            # malformed-input streak before approvals, checkpoints, or handlers.
+            if function_name == "patch":
+                from tools.file_tools import _validate_patch_contract
 
-        if block_message is not None or guardrail_decision is not None:
+                validation_result = _validate_patch_contract(final_args)
+            malformed_decision = agent._tool_guardrails.before_validated_call(
+                function_name, final_args, validation_result
+            )
+            if not malformed_decision.allows_execution:
+                guardrail_decision = malformed_decision
+            elif validation_result is None:
+                guardrail_decision = agent._tool_guardrails.before_call(
+                    function_name, final_args
+                )
+                if guardrail_decision.allows_execution:
+                    guardrail_decision = None
+
+        if block_message is not None or guardrail_decision is not None or validation_result is not None:
             _advance_start_order()
             state["blocked"] = True
             if block_message is not None:
                 result = json.dumps({"error": block_message}, ensure_ascii=False)
                 error_type = block_error_type
                 error_message = block_message
-            else:
+            elif guardrail_decision is not None:
                 result = agent._guardrail_block_result(guardrail_decision)
                 error_type = "guardrail_block"
                 error_message = (
                     getattr(guardrail_decision, "message", None)
                     or "Tool blocked by guardrail policy"
                 )
+            else:
+                assert validation_result is not None
+                result = validation_result
+                error_type = "malformed_input"
+                parsed_validation = json.loads(validation_result)
+                error_message = parsed_validation.get("error", "Invalid tool arguments")
             _emit_terminal_post_tool_call(
                 agent,
                 function_name=function_name,

@@ -2371,6 +2371,11 @@ def _validate_patch_contract(args: dict) -> str | None:
                 + ", ".join(incompatible),
                 "patch.patch.incompatible_fields",
             )
+    else:
+        return _patch_contract_error(
+            "patch: 'mode' must be either 'replace' or 'patch'.",
+            "patch.mode.invalid",
+        )
     return None
 
 
