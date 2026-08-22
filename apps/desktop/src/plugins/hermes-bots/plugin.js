@@ -4080,6 +4080,29 @@ async function openStoredBotChat(name, storedId, summary) {
   return storedId
 }
 
+/** Every conversation on this bot's OWN profile — hidden rows included,
+ *  because ALL Bot Mode sessions are born hidden from the global sidebar
+ *  (hermes-agent#91740): without include_hidden the browser would list
+ *  nothing on gateways that support the flag. Newest first. Gateways too old
+ *  for include_hidden fail visibly in the dialog, never silently empty. */
+async function fetchBotProfileSessions(bot) {
+  const res = await requestForBot(bot, 'session.list', {
+    profile: bot.name,
+    limit: PROFILE_SESSION_LIST_LIMIT,
+    include_hidden: true
+  })
+  const rows = Array.isArray(res?.sessions) ? res.sessions : []
+
+  return rows.slice().sort((a, b) => (b.last_active || 0) - (a.last_active || 0))
+}
+
+/** Open identity for a listed row: exact-lookup gateways report the
+ *  compression-lineage tip as resolved_id — open the tip, same rule as the
+ *  canonical-chat adoption path below. */
+function pickSessionStorageId(row) {
+  return row?.resolved_id || row?.id
+}
+
 /** True when a session summary IS the canonical registry row. root_title is
  *  the durable lineage-root title reported by exact-lookup gateways; plain
  *  title covers windowed listings. */
@@ -5913,7 +5936,7 @@ function activeBots(roster, activeProfile, gatewayState, now = Date.now()) {
 
 // ── bot row ──────────────────────────────────────────────────────────────────
 
-function BotRow({ bot, onDelete, onEdit, onGroup }) {
+function BotRow({ bot, onDelete, onEdit, onGroup, onSessions }) {
   const activeProfile = useValue(host.state.profile)
   const focusedProfile = useValue($focusedBotProfile)
   const activeGroup = useValue($groupChatWorkspace)
@@ -6236,6 +6259,10 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
               }
             },
             children: 'New chat with this agent'
+          }),
+          jsx(ContextMenuItem, {
+            onSelect: () => onSessions?.(bot),
+            children: 'Browse sessions…'
           }),
           bot.is_default ? null : jsx(ContextMenuSeparator, {}),
           bot.is_default
@@ -8980,6 +9007,168 @@ function ActiveNowStrip({ roster, activeProfile, gatewayState, metaByName, onOpe
 /** Assign a bot to a group-chat membership without replacing its others.
  *  Existing groups are independent toggles; the input creates and joins a new
  *  one. Canonical groups + the legacy scalar projection ride ui_meta. */
+// ── per-bot session browser (right-click → Browse sessions…) ────────────────
+// Bot Mode marks every session it owns hidden=1 in the GLOBAL sidebar by
+// design (list density), but until now nothing replaced the access those
+// rows lost: only each bot's canonical chat was reachable, via roster click
+// (hermes-agent#91740). This dialog is the missing browsing path — every
+// session on the bot's own profile, newest first, click to open. Local rows
+// only: thin remote rows have no loaded profile metadata and their context
+// menu never renders.
+
+function BotSessionsDialog({ bot, onClose }) {
+  const meta = useValue($botMeta)
+  const botDisplay = displayName(bot, botRosterMeta(bot, meta))
+  const [sessions, setSessions] = useState(null)
+  const [loadError, setLoadError] = useState(null)
+  const [openingId, setOpeningId] = useState(null)
+  const [attempt, setAttempt] = useState(0)
+
+  useEffect(() => {
+    let cancelled = false
+
+    setSessions(null)
+    setLoadError(null)
+    setOpeningId(null)
+    fetchBotProfileSessions(bot)
+      .then(rows => {
+        if (!cancelled) {
+          setSessions(rows)
+        }
+      })
+      .catch(error => {
+        if (!cancelled) {
+          setLoadError(error)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [bot?.name, attempt])
+
+  const openRow = async row => {
+    if (openingId) {
+      return
+    }
+
+    const storageId = pickSessionStorageId(row)
+
+    if (!storageId) {
+      return
+    }
+
+    setOpeningId(storageId)
+
+    try {
+      // Same activation order as roster click: land on the owner backend
+      // first so the open lands on the machine that owns this profile.
+      await prepareBotSource(bot)
+      await openStoredBotChat(bot.name, storageId, row)
+      onClose()
+    } catch (error) {
+      host.notifyError?.(error, `Could not open “${row.title || 'session'}” — try again`)
+      setOpeningId(null)
+    }
+  }
+
+  return jsx(Dialog, {
+    open: Boolean(bot),
+    onOpenChange: value => {
+      if (!value) {
+        onClose()
+      }
+    },
+    children: jsxs(DialogContent, {
+      className: 'max-w-md',
+      children: [
+        jsxs(DialogHeader, {
+          children: [
+            jsx(DialogTitle, { children: `${botDisplay} — sessions` }),
+            jsx(DialogDescription, {
+              children: 'Every conversation on this agent’s profile, newest first.'
+            })
+          ]
+        }),
+        loadError
+          ? jsxs('div', {
+              className: 'grid gap-2 text-xs text-(--ui-text-tertiary)',
+              children: [
+                jsx('div', {
+                  children: `Could not list sessions: ${
+                    loadError instanceof Error ? loadError.message : 'gateway error'
+                  }. If your gateway predates hidden-session support, update Hermes and restart the gateway.`
+                }),
+                jsx(Button, {
+                  variant: 'secondary',
+                  size: 'sm',
+                  className: 'justify-self-start',
+                  onClick: () => setAttempt(count => count + 1),
+                  children: 'Retry now'
+                })
+              ]
+            })
+          : sessions === null
+            ? jsx('div', {
+                className: 'flex items-center justify-center py-6',
+                children: jsx(GlyphSpinner, { spinner: 'breathe', className: 'text-(--ui-text-tertiary)' })
+              })
+            : sessions.length
+              ? jsx(ScrollArea, {
+                  className: 'max-h-80',
+                  children: jsx('div', {
+                    className: 'grid w-full gap-0.5 pr-1',
+                    children: sessions.map(row => {
+                      const storageId = pickSessionStorageId(row)
+                      const canonical = String(row.title || '').trim() === CANONICAL_CHAT_TITLE
+
+                      return jsxs(
+                        'button',
+                        {
+                          type: 'button',
+                          disabled: !storageId || Boolean(openingId),
+                          onClick: () => void openRow(row),
+                          className: cn(
+                            'flex w-full min-w-0 items-baseline justify-between gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-(--chrome-action-hover)',
+                            openingId === storageId && 'opacity-60'
+                          ),
+                          children: [
+                            jsxs('span', {
+                              className: 'flex min-w-0 items-center gap-1.5',
+                              children: [
+                                jsx('span', { className: 'min-w-0 truncate', children: row.title || 'Untitled' }),
+                                canonical
+                                  ? jsx('span', {
+                                      className:
+                                        'shrink-0 rounded bg-(--chrome-action-hover) px-1 font-mono text-[0.625rem] text-(--ui-text-quaternary)',
+                                      children: 'canonical'
+                                    })
+                                  : null
+                              ]
+                            }),
+                            row.last_active
+                              ? jsx('span', {
+                                  className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary)',
+                                  children: relativeTime(row.last_active * 1000)
+                                })
+                              : null
+                          ]
+                        },
+                        storageId || row.title
+                      )
+                    })
+                  })
+                })
+              : jsx(EmptyState, {
+                  icon: 'comment-discussion',
+                  title: 'No conversations yet',
+                  description: 'Say hi in this bot’s chat to start one.'
+                })
+      ]
+    })
+  })
+}
+
 function GroupDialog({ bot, onClose }) {
   const meta = useValue($botMeta)
   const [name, setName] = useState('')
@@ -10856,6 +11045,7 @@ function BotsPane() {
   const [deleting, setDeleting] = useState(null)
   const [deletingGroup, setDeletingGroup] = useState(null)
   const [grouping, setGrouping] = useState(null)
+  const [browsing, setBrowsing] = useState(null)
   const [query, setQuery] = useState('')
   const activityToasts = useValue($activityToasts)
   const groupChatName = useValue($groupChatWorkspace)
@@ -11193,7 +11383,13 @@ function BotsPane() {
                           )
                         : jsx(
                             BotRow,
-                            { bot: row.bot, onDelete: setDeleting, onEdit: setEditing, onGroup: setGrouping },
+                            {
+                              bot: row.bot,
+                              onDelete: setDeleting,
+                              onEdit: setEditing,
+                              onGroup: setGrouping,
+                              onSessions: setBrowsing
+                            },
                             botRosterKey(row.bot)
                           )
                     )
@@ -11233,6 +11429,7 @@ function BotsPane() {
         }
       }),
       grouping ? jsx(GroupDialog, { bot: grouping, onClose: () => setGrouping(null) }) : null,
+      browsing ? jsx(BotSessionsDialog, { bot: browsing, onClose: () => setBrowsing(null) }) : null,
       jsx(ConfirmDialog, {
         open: Boolean(deleting),
         title: 'Delete bot and profile?',
