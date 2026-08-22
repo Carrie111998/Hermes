@@ -207,3 +207,75 @@ describe('ProviderConfigPanel', () => {
     expect(container.querySelector('section')).toBeNull()
   })
 })
+
+describe('ProviderConfigPanel locale localization', () => {
+  function hindsightSchema(): MemoryProviderConfig {
+    return {
+      name: 'hindsight',
+      label: 'Hindsight',
+      docs_url: '',
+      fields: [
+        {
+          key: 'api_key',
+          label: 'API key',
+          kind: 'secret',
+          value: '',
+          description: 'Used to authenticate with the Hindsight API.',
+          placeholder: 'Enter Hindsight API key',
+          is_set: false,
+          inline: true,
+          group: 'Connection',
+          options: []
+        },
+        {
+          key: 'recall_budget',
+          label: 'Recall budget',
+          kind: 'select',
+          value: 'mid',
+          description: '',
+          placeholder: '',
+          is_set: true,
+          inline: true,
+          group: 'Connection',
+          options: [
+            { value: 'low', label: 'low', description: '' },
+            { value: 'mid', label: 'mid', description: '' },
+            { value: 'high', label: 'high', description: '' }
+          ]
+        }
+      ]
+    }
+  }
+
+  async function renderPanelZh(provider = 'hindsight') {
+    const { I18nProvider } = await import('@/i18n/context')
+    const { ProviderConfigPanel } = await import('./provider-config-panel')
+
+    return render(
+      <I18nProvider configClient={null} initialLocale="zh">
+        <ProviderConfigPanel provider={provider} />
+      </I18nProvider>
+    )
+  }
+
+  it('renders provider settings in Chinese when the locale is zh', async () => {
+    getMemoryProviderConfig.mockResolvedValue(hindsightSchema())
+
+    await renderPanelZh()
+
+    // Panel title, secret pill, localized field label + description + placeholder.
+    expect(await screen.findByRole('button', { name: /Hindsight 设置/ })).toBeTruthy()
+    expect(screen.getByText('API 密钥 尚未设置')).toBeTruthy()
+    expect(screen.getByText('API 密钥')).toBeTruthy()
+    expect(screen.getByText('用于通过 Hindsight API 进行身份验证。')).toBeTruthy()
+    expect(screen.getByPlaceholderText('输入 Hindsight API 密钥')).toBeTruthy()
+  })
+
+  it('overlays zh option labels on select fields', async () => {
+    getMemoryProviderConfig.mockResolvedValue(hindsightSchema())
+
+    await renderPanelZh()
+
+    expect(await screen.findByText('召回预算')).toBeTruthy()
+  })
+})

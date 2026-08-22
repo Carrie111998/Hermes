@@ -448,6 +448,62 @@ export const zh: Translations = {
         agentFailed: '智能体插件安装失败',
         desktopFailed: '桌面插件安装失败',
         missingEnv: vars => `缺少环境变量：${vars}。请在设置 → 密钥中添加。`
+      },
+      builtin: {
+        accent: {
+          name: '强调色选择器',
+          description: '在状态栏的 OKLCH 颜色选择器中挑选主题强调色，调色板即时重新生成。作者工具——颜色不会持久保存。'
+        },
+        'hermes-bots': {
+          name: '机器人',
+          description:
+            '机器人模式——每个代理一个聊天的话务员花名册，支持头像、例行任务、群聊与机器人间互发消息。随应用内置；不需要时可在此禁用。'
+        },
+        kanban: {
+          name: '看板',
+          description: '多代理任务看板——看板页面、侧边栏入口，以及状态栏中的实时进行中计数。'
+        }
+      }
+    },
+    memoryProvider: {
+      settingsTitle: label => `${label} 设置`,
+      fullConfig: '完整配置…',
+      loading: '正在加载记忆提供程序设置…',
+      loadFailed: '记忆提供程序设置加载失败',
+      retry: '重试',
+      fieldSet: label => `${label} 已设置`,
+      fieldNotSet: label => `${label} 尚未设置`,
+      fullTitle: label => `${label} — 完整配置`,
+      fullEmptyDesc: (label, profile) => `为 ${profile} 配置档案设置每个${label}选项。`,
+      fullFallbackDesc: '留空则回退到已解析的主机或内置默认值。',
+      docsRef: label => `${label} 配置参考`,
+      cancel: '取消',
+      saveChanges: '保存更改',
+      savedTitle: label => `${label} 已保存`,
+      savedMessage: '记忆提供程序配置已更新。',
+      saveFailed: label => `保存 ${label} 设置失败`,
+      leaveBlank: '留空以保留当前值',
+      setBadge: '已设置',
+      aboutField: label => `关于 ${label}`,
+      fieldOverrides: {
+        'hindsight.mode': '模式',
+        'hindsight.api_key': 'API 密钥',
+        'hindsight.api_url': 'API URL',
+        'hindsight.bank_id': 'Bank ID',
+        'hindsight.recall_budget': '召回预算'
+      },
+      descOverrides: {
+        'hindsight.mode': 'Hermes 如何连接 Hindsight。',
+        'hindsight.api_key': '用于通过 Hindsight API 进行身份验证。'
+      },
+      placeholderOverrides: {
+        'hindsight.api_key': '输入 Hindsight API 密钥'
+      },
+      optionOverrides: {
+        'hindsight.mode.cloud': '云端',
+        'hindsight.mode.cloud.desc': 'Hindsight 云 API（轻量级，仅需 API 密钥）',
+        'hindsight.mode.local_external': '本地外部',
+        'hindsight.mode.local_external.desc': '连接到现有 Hindsight 实例'
       }
     },
     notifications: {
@@ -2428,6 +2484,37 @@ export const zh: Translations = {
     statusDivider: {
       working: '进行中',
       done: '已完成'
+    },
+    filters: {
+      grouping: '分组方式',
+      ordering: '排序方式',
+      show: '显示',
+      filters: '筛选',
+      status: '状态',
+      pullRequest: '拉取请求',
+      profile: '配置档案',
+      project: '项目',
+      updated: '最近更新',
+      created: '创建时间',
+      tokens: 'Token 数',
+      cost: '费用',
+      manual: '手动',
+      preview: '预览',
+      pr: 'PR',
+      open: '开启',
+      draft: '草稿',
+      merged: '已合并',
+      closed: '已关闭',
+      noPr: '无 PR',
+      needsInput: '需要输入',
+      working: '进行中',
+      unread: '未读',
+      idle: '空闲',
+      inboxStyle: '收件箱样式',
+      archived: '已归档',
+      resetToDefaults: '恢复默认',
+      expandAll: '全部展开',
+      collapseAll: '全部折叠'
     },
     markAllRead: '全部标记为已读'
   },

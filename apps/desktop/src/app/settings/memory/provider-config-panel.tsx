@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { PageLoader } from '@/components/page-loader'
 import { Button } from '@/components/ui/button'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
+import { useI18n } from '@/i18n'
 import { getMemoryProviderConfig, saveMemoryProviderConfig } from '@/hermes'
 import { SlidersHorizontal } from '@/lib/icons'
 import { notifyError } from '@/store/notifications'
@@ -11,6 +12,7 @@ import type { MemoryProviderConfig, MemoryProviderField } from '@/types/hermes'
 import { ListRow, Pill } from '../primitives'
 
 import { FieldControl, FieldTitle } from './field-control'
+import { localizeFields } from './localize-provider'
 import { ProviderConfigModal } from './provider-config-modal'
 
 // Inline fields only: the compact panel must never re-write modal-owned keys.
@@ -21,6 +23,8 @@ function seedValues(config: MemoryProviderConfig): Record<string, string> {
 }
 
 export function ProviderConfigPanel({ profile = null, provider }: { profile?: null | string; provider: string }) {
+  const { t } = useI18n()
+  const mk = t.settings.memoryProvider
   const [config, setConfig] = useState<MemoryProviderConfig | null>(null)
   const [loadError, setLoadError] = useState<null | string>(null)
   const [values, setValues] = useState<Record<string, string>>({})
@@ -87,20 +91,24 @@ export function ProviderConfigPanel({ profile = null, provider }: { profile?: nu
       return (
         <div className="flex items-center justify-between gap-3 py-2">
           <span className="text-[length:var(--conversation-caption-font-size)] text-muted-foreground">
-            Memory provider settings failed to load: {loadError}
+            {mk.loadFailed}: {loadError}
           </span>
           <Button onClick={() => void refresh()} size="sm" type="button" variant="secondary">
-            Retry
+            {mk.retry}
           </Button>
         </div>
       )
     }
 
-    return <PageLoader className="min-h-24" label="Loading memory provider settings..." />
+    return <PageLoader className="min-h-24" label={mk.loading} />
   }
 
-  const inlineFields = config.fields.filter(field => field.inline)
-  const secretFields = config.fields.filter(field => field.kind === 'secret')
+  const inlineFields = localizeFields(provider, config.fields.filter(field => field.inline), mk)
+  const secretFields = localizeFields(
+    provider,
+    config.fields.filter(field => field.kind === 'secret'),
+    mk
+  )
   const hasFullConfig = config.fields.some(field => !field.inline)
 
   return (
@@ -114,16 +122,16 @@ export function ProviderConfigPanel({ profile = null, provider }: { profile?: nu
         >
           <DisclosureCaret open={expanded} />
           <span className="text-[length:var(--conversation-text-font-size)] font-medium text-foreground">
-            {config.label} settings
+            {mk.settingsTitle(config.label)}
           </span>
           {secretFields.map(field => (
-            <Pill key={field.key}>{field.is_set ? `${field.label} set` : `${field.label} not set`}</Pill>
+            <Pill key={field.key}>{field.is_set ? mk.fieldSet(field.label) : mk.fieldNotSet(field.label)}</Pill>
           ))}
         </button>
         {hasFullConfig && (
           <Button onClick={() => setShowModal(true)} size="sm" type="button" variant="secondary">
             <SlidersHorizontal className="size-3.5" />
-            Full config…
+            {mk.fullConfig}
           </Button>
         )}
       </div>

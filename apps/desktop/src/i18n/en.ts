@@ -461,6 +461,63 @@ export const en: Translations = {
         agentFailed: 'Agent plugin install failed',
         desktopFailed: 'Desktop plugin install failed',
         missingEnv: vars => `Missing env vars: ${vars}. Add them in Settings → Keys.`
+      },
+      builtin: {
+        accent: {
+          name: 'Accent Picker',
+          description:
+            'Pick the theme accent from an OKLCH color picker in the status bar; the palette re-derives live. Authoring tool — the color is not persisted.'
+        },
+        'hermes-bots': {
+          name: 'Bots',
+          description:
+            'Bot Mode — a one-chat-per-agent roster with avatars, routines, group chats, and bot-to-bot messaging. Ships with the app; disable here if unwanted.'
+        },
+        kanban: {
+          name: 'Kanban',
+          description: 'Multi-agent task board — board page, sidebar entry, and a live in-flight count in the status bar.'
+        }
+      }
+    },
+    memoryProvider: {
+      settingsTitle: label => `${label} settings`,
+      fullConfig: 'Full config…',
+      loading: 'Loading memory provider settings...',
+      loadFailed: 'Memory provider settings failed to load',
+      retry: 'Retry',
+      fieldSet: label => `${label} set`,
+      fieldNotSet: label => `${label} not set`,
+      fullTitle: label => `${label} — full configuration`,
+      fullEmptyDesc: (label, profile) => `Every ${label} option for the ${profile} profile.`,
+      fullFallbackDesc: 'Blank fields fall back to the resolved host or built-in default.',
+      docsRef: label => `${label} configuration reference`,
+      cancel: 'Cancel',
+      saveChanges: 'Save changes',
+      savedTitle: label => `${label} saved`,
+      savedMessage: 'Memory provider configuration updated.',
+      saveFailed: label => `Failed to save ${label} settings`,
+      leaveBlank: 'Leave blank to keep current value',
+      setBadge: 'set',
+      aboutField: label => `About ${label}`,
+      fieldOverrides: {
+        'hindsight.mode': 'Mode',
+        'hindsight.api_key': 'API key',
+        'hindsight.api_url': 'API URL',
+        'hindsight.bank_id': 'Bank ID',
+        'hindsight.recall_budget': 'Recall budget'
+      },
+      descOverrides: {
+        'hindsight.mode': 'How Hermes connects to Hindsight.',
+        'hindsight.api_key': 'Used to authenticate with the Hindsight API.'
+      },
+      placeholderOverrides: {
+        'hindsight.api_key': 'Enter Hindsight API key'
+      },
+      optionOverrides: {
+        'hindsight.mode.cloud': 'Cloud',
+        'hindsight.mode.cloud.desc': 'Hindsight Cloud API (lightweight, just needs an API key)',
+        'hindsight.mode.local_external': 'Local External',
+        'hindsight.mode.local_external.desc': 'Connect to an existing Hindsight instance'
       }
     },
     notifications: {
@@ -2245,6 +2302,37 @@ export const en: Translations = {
     statusDivider: {
       working: 'Working',
       done: 'Done'
+    },
+    filters: {
+      grouping: 'Grouping',
+      ordering: 'Ordering',
+      show: 'Show',
+      filters: 'Filters',
+      status: 'Status',
+      pullRequest: 'Pull request',
+      profile: 'Profile',
+      project: 'Project',
+      updated: 'Updated',
+      created: 'Created',
+      tokens: 'Tokens',
+      cost: 'Cost',
+      manual: 'Manual',
+      preview: 'Preview',
+      pr: 'PR',
+      open: 'Open',
+      draft: 'Draft',
+      merged: 'Merged',
+      closed: 'Closed',
+      noPr: 'No PR',
+      needsInput: 'Needs input',
+      working: 'Working',
+      unread: 'Unread',
+      idle: 'Idle',
+      inboxStyle: 'Inbox style',
+      archived: 'Archived',
+      resetToDefaults: 'Reset to defaults',
+      expandAll: 'Expand all',
+      collapseAll: 'Collapse all'
     },
     markAllRead: 'Mark all as read'
   },

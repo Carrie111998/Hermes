@@ -402,6 +402,37 @@ export interface Translations {
         desktopFailed: string
         missingEnv: (vars: string) => string
       }
+      /** Bundled desktop plugin display names, keyed by plugin id. */
+      builtin: Record<string, { name: string; description: string }>
+    }
+    memoryProvider: {
+      settingsTitle: (label: string) => string
+      fullConfig: string
+      loading: string
+      loadFailed: string
+      retry: string
+      fieldSet: (label: string) => string
+      fieldNotSet: (label: string) => string
+      fullTitle: (label: string) => string
+      fullEmptyDesc: (label: string, profile: string) => string
+      fullFallbackDesc: string
+      docsRef: (label: string) => string
+      cancel: string
+      saveChanges: string
+      savedTitle: (label: string) => string
+      savedMessage: string
+      saveFailed: (label: string) => string
+      leaveBlank: string
+      setBadge: string
+      aboutField: (label: string) => string
+      /** Overrides for known provider field labels, keyed by `provider.fieldKey`. */
+      fieldOverrides: Record<string, string>
+      /** Overrides for known provider field descriptions, keyed by `provider.fieldKey`. */
+      descOverrides: Record<string, string>
+      /** Overrides for known provider field placeholders, keyed by `provider.fieldKey`. */
+      placeholderOverrides: Record<string, string>
+      /** Overrides for known provider select option labels, keyed by `provider.fieldKey.optionValue`. */
+      optionOverrides: Record<string, string>
     }
     notifications: {
       title: string
@@ -1914,6 +1945,37 @@ export interface Translations {
     statusDivider: {
       working: string
       done: string
+    }
+    filters: {
+      grouping: string
+      ordering: string
+      show: string
+      filters: string
+      status: string
+      pullRequest: string
+      profile: string
+      project: string
+      updated: string
+      created: string
+      tokens: string
+      cost: string
+      manual: string
+      preview: string
+      pr: string
+      open: string
+      draft: string
+      merged: string
+      closed: string
+      noPr: string
+      needsInput: string
+      working: string
+      unread: string
+      idle: string
+      inboxStyle: string
+      archived: string
+      resetToDefaults: string
+      expandAll: string
+      collapseAll: string
     }
     markAllRead: string
   }
