@@ -270,7 +270,7 @@ class ToolGuardrailDecision:
 
     @property
     def should_halt(self) -> bool:
-        return self.action in {"block", "halt"}
+        return self.action == "halt"
 
     def to_metadata(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -440,7 +440,6 @@ class ToolCallGuardrailController:
                     signature=signature,
                     failure_class=failure_class,
                 )
-                self._halt_decision = decision
                 return decision
             return ToolGuardrailDecision(
                 tool_name=tool_name,
@@ -484,7 +483,6 @@ class ToolCallGuardrailController:
                 count=exact_count,
                 signature=signature,
             )
-            self._halt_decision = decision
             return decision
 
         if self._is_idempotent(tool_name):
@@ -504,7 +502,6 @@ class ToolCallGuardrailController:
                         count=repeat_count,
                         signature=signature,
                     )
-                    self._halt_decision = decision
                     return decision
 
         return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
@@ -782,7 +779,6 @@ class ToolCallGuardrailController:
                     count=self._turn_web_search_count,
                     signature=signature,
                 )
-                self._halt_decision = decision
                 return decision
             self._turn_web_search_count += 1
             return None
@@ -811,7 +807,6 @@ class ToolCallGuardrailController:
                     count=self._turn_subagent_count,
                     signature=signature,
                 )
-                self._halt_decision = decision
                 return decision
             self._turn_subagent_count += spawn_count
             return None

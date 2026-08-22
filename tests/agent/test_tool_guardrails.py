@@ -197,9 +197,9 @@ def test_guardrail_state_updates_are_concurrency_safe():
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         decisions = list(pool.map(record, range(32)))
 
-    decision = decisions[-1]
-    assert decision.action == "block"
-    assert decision.count == 32
+    assert {decision.count for decision in decisions} == set(range(1, 33))
+    assert max(decision.count for decision in decisions) == 32
+    assert {decision.action for decision in decisions} == {"allow", "block"}
 
 
 def test_new_controller_resets_malformed_streak_for_next_turn():
@@ -261,8 +261,14 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     decision = controller.before_call("web_search", {"query": "q4"})
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
-    assert decision.should_halt is True
+    assert decision.should_halt is False
 
+
+def test_only_explicit_halt_decisions_terminate_the_turn():
+    from agent.tool_guardrails import ToolGuardrailDecision
+
+    assert ToolGuardrailDecision(action="block").should_halt is False
+    assert ToolGuardrailDecision(action="halt").should_halt is True
 
 
 
