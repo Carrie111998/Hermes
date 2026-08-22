@@ -1,5 +1,6 @@
 """Tests for tools/tool_result_storage.py -- 3-layer tool result persistence."""
 
+import json
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -10,6 +11,7 @@ from tools.budget_config import (
 )
 from tools.tool_result_storage import (
     HEREDOC_MARKER,
+    COMPRESSED_OUTPUT_TAG,
     PERSISTED_OUTPUT_TAG,
     PERSISTED_OUTPUT_CLOSING_TAG,
     STORAGE_DIR,
@@ -499,3 +501,140 @@ class TestRecoveryHint:
         assert msg.startswith(PERSISTED_OUTPUT_TAG)
         assert msg.endswith(PERSISTED_OUTPUT_CLOSING_TAG)
         assert "read_file" in msg
+
+
+# ── reversible semantic compression ───────────────────────────────────
+
+class TestSemanticCompression:
+    def test_enabled_json_minification_persists_original_and_preserves_values(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        content = "{\n" + (" " * 1_000) + '"count": 1000, "ratio": 1.25, "items": [1, 2, 3]\n}'
+        config = BudgetConfig(
+            semantic_compress=True,
+            semantic_compress_threshold=20,
+            semantic_compress_min_reduction=1,
+        )
+
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_json_minify",
+            env=None,
+            config=config,
+        )
+
+        assert json.loads(result.split("Compressed content:\n", 1)[1].split("\n</compressed-tool-output>", 1)[0]) == json.loads(content)
+        assert (get_spillover_dir() / "tc_json_minify.txt").read_text(encoding="utf-8") == content
+        assert "algorithm: json-minify" in result
+
+    def test_repeated_adjacent_log_lines_fold_only_after_minimum_reduction(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        content = "connected\n" * 100 + "complete\n"
+        config = BudgetConfig(
+            semantic_compress=True,
+            semantic_compress_threshold=20,
+            semantic_compress_min_reduction=10,
+        )
+
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_log_fold",
+            env=None,
+            config=config,
+        )
+
+        assert "[repeated 100 times]" in result
+        assert "algorithm: log-line-fold" in result
+        assert (get_spillover_dir() / "tc_log_fold.txt").read_text(encoding="utf-8") == content
+
+    def test_compression_marker_must_reduce_context_content(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        content = "connected\n" * 5
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_marker_overhead",
+            env=None,
+            config=BudgetConfig(
+                semantic_compress=True,
+                semantic_compress_threshold=20,
+                semantic_compress_min_reduction=1,
+            ),
+        )
+        assert result == content
+        assert not (get_spillover_dir() / "tc_marker_overhead.txt").exists()
+
+    @pytest.mark.parametrize("tool_name", ["read_file", "spreadsheet_read", "office_extract", "reviewer_evidence"])
+    def test_protected_tools_are_never_semantically_compressed(self, tool_name):
+        content = "connected\n" * 5
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name=tool_name,
+            tool_use_id=f"tc_{tool_name}",
+            env=None,
+            config=BudgetConfig(
+                semantic_compress=True,
+                semantic_compress_threshold=20,
+                semantic_compress_min_reduction=1,
+            ),
+        )
+        assert result == content
+
+    @pytest.mark.parametrize("content", [
+        "=SUM(A1:A2)\n" * 5,
+        "Smith et al. (2024) [1]\n" * 5,
+        "Revenue: $1,000\n" * 5,
+        "def calculate():\n" * 5,
+    ])
+    def test_sensitive_evidence_and_source_like_content_are_never_compressed(self, content):
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_sensitive",
+            env=None,
+            config=BudgetConfig(
+                semantic_compress=True,
+                semantic_compress_threshold=20,
+                semantic_compress_min_reduction=1,
+            ),
+        )
+        assert result == content
+
+    def test_disabled_below_threshold_or_nonfresh_content_are_not_candidates(self):
+        repeated = "connected\n" * 5
+        cases = [
+            (repeated, BudgetConfig(semantic_compress=False, semantic_compress_threshold=20, semantic_compress_min_reduction=1)),
+            (repeated, BudgetConfig(semantic_compress=True, semantic_compress_threshold=len(repeated), semantic_compress_min_reduction=1)),
+            (PERSISTED_OUTPUT_TAG + "\n" + repeated, BudgetConfig(semantic_compress=True, semantic_compress_threshold=20, semantic_compress_min_reduction=1)),
+        ]
+        for content, config in cases:
+            assert maybe_persist_tool_result(content, "terminal", "tc_skip", config=config) == content
+
+    def test_json_minification_keeps_numeric_lexemes_unchanged(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        content = "{\n" + (" " * 1_000) + '"negative_zero": -0, "exponent": 1.00e+02, "integer": 1000\n}'
+        result = maybe_persist_tool_result(
+            content, "terminal", "tc_numeric", config=BudgetConfig(
+                semantic_compress=True, semantic_compress_threshold=20, semantic_compress_min_reduction=1,
+            ),
+        )
+        compressed = result.split("Compressed content:\n", 1)[1].split("\n</compressed-tool-output>", 1)[0]
+        assert compressed == '{"negative_zero":-0,"exponent":1.00e+02,"integer":1000}'
+        assert f"original_chars: {len(content)}" in result
+        assert f"compressed_chars: {len(compressed)}" in result
+        assert "sha256:" in result
+
+    def test_invalid_json_falls_open_to_existing_persistence(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        content = "{" * 100
+        result = maybe_persist_tool_result(
+            content, "terminal", "tc_invalid_json", config=BudgetConfig(
+                default_result_size=50,
+                semantic_compress=True,
+                semantic_compress_threshold=20,
+                semantic_compress_min_reduction=1,
+            ),
+        )
+        assert PERSISTED_OUTPUT_TAG in result
+        assert COMPRESSED_OUTPUT_TAG not in result

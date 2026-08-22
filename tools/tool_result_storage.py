@@ -43,6 +43,7 @@ Defense against context-window overflow operates at three levels:
 """
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -60,6 +61,8 @@ from tools.budget_config import (
 logger = logging.getLogger(__name__)
 PERSISTED_OUTPUT_TAG = "<persisted-output>"
 PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
+COMPRESSED_OUTPUT_TAG = "<compressed-tool-output>"
+COMPRESSED_OUTPUT_CLOSING_TAG = "</compressed-tool-output>"
 STORAGE_DIR = "/tmp/hermes-results"
 SPILLOVER_SUBDIR = "cache/spillover"
 SPILLOVER_MAX_AGE_HOURS = 24
@@ -67,6 +70,14 @@ HEREDOC_MARKER = "HERMES_PERSIST_EOF"
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
+_PROTECTED_SEMANTIC_COMPRESSION_TOOL_TOKENS = (
+    "read_file", "spreadsheet", "office", "reviewer", "evidence",
+)
+_SENSITIVE_SEMANTIC_CONTENT_RE = re.compile(
+    r"(?im)^\s*=[A-Z_]+\(|\bet al\.|\bdoi:|^\s*\[\d+(?:,\s*\d+)*\]\s*$|"
+    r"[$€£¥]\s*\d|\b(revenue|ebitda|irr|npv|valuation|cash flow|financial)\b|"
+    r"^\s*(def|class|function|import|from|const|let|var|package)\b|^\s*#include\b|```"
+)
 
 _spillover_prune_lock = threading.Lock()
 _spillover_pruned_once = False
@@ -311,6 +322,126 @@ def extract_persisted_path(content: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+def _minify_json(content: str) -> str:
+    """Validate strict JSON then remove whitespace outside string literals.
+
+    Token text is retained rather than serializing a parsed object, so numeric
+    lexemes (including exponent spelling and negative zero) cannot change.
+    """
+    json.loads(content, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    for char in content:
+        if in_string:
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+            out.append(char)
+        elif char not in " \t\r\n":
+            out.append(char)
+    return "".join(out)
+
+
+def _fold_repeated_log_lines(content: str) -> str:
+    """Fold only adjacent, byte-for-byte identical log lines."""
+    lines = content.splitlines(keepends=True)
+    folded: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        end = index + 1
+        while end < len(lines) and lines[end] == line:
+            end += 1
+        count = end - index
+        folded.append(line)
+        if count > 1:
+            folded.append(f"[repeated {count} times]\n")
+        index = end
+    return "".join(folded)
+
+
+def _persist_semantic_original(content: str, filename: str, env) -> str | None:
+    """Persist a semantic-compression original using the normal spillover path."""
+    host_path = _write_to_spillover(content, filename)
+    if host_path is None:
+        return None
+    if _is_host_side_env(env):
+        return host_path
+    if env is None:
+        return None
+    visible = _sandbox_visible_spillover_path(host_path, env)
+    if visible is not None:
+        return visible
+    remote_path = f"{_resolve_storage_dir(env)}/{filename}"
+    try:
+        return remote_path if _write_to_sandbox(content, remote_path, env) else None
+    except Exception as exc:
+        logger.debug("Semantic-compression sandbox write failed: %s", exc)
+        return None
+
+
+def _build_compressed_message(
+    compressed: str,
+    original: str,
+    file_path: str,
+    algorithm: str,
+) -> str:
+    digest = hashlib.sha256(original.encode("utf-8")).hexdigest()
+    return (
+        f"{COMPRESSED_OUTPUT_TAG}\n"
+        f"Original output saved to: {file_path}\n"
+        f"sha256: {digest}\n"
+        f"original_chars: {len(original)}\n"
+        f"compressed_chars: {len(compressed)}\n"
+        f"algorithm: {algorithm}\n"
+        f"Compressed content:\n{compressed}\n"
+        f"{COMPRESSED_OUTPUT_CLOSING_TAG}"
+    )
+
+
+def _maybe_semantic_compress(content: str, tool_name: str, tool_use_id: str, env, config: BudgetConfig) -> str | None:
+    """Return a reversible JSON-compressed replacement, or None to fail open."""
+    if (
+        not config.semantic_compress
+        or any(token in tool_name.lower() for token in _PROTECTED_SEMANTIC_COMPRESSION_TOOL_TOKENS)
+        or _SENSITIVE_SEMANTIC_CONTENT_RE.search(content) is not None
+        or len(content) <= config.semantic_compress_threshold
+        or PERSISTED_OUTPUT_TAG in content
+        or COMPRESSED_OUTPUT_TAG in content
+    ):
+        return None
+    try:
+        if content.lstrip().startswith(("{", "[")):
+            compressed = _minify_json(content)
+            algorithm = "json-minify"
+        else:
+            compressed = _fold_repeated_log_lines(content)
+            algorithm = "log-line-fold"
+    except Exception as exc:
+        logger.debug("Semantic compression skipped for %s: %s", tool_name, exc)
+        return None
+    if len(content) - len(compressed) <= config.semantic_compress_min_reduction:
+        return None
+    # An empty path is a lower bound for any real recovery marker, so avoid
+    # writing a spill file when the marker itself cannot reduce context.
+    if len(content) - len(_build_compressed_message(compressed, content, "", algorithm)) <= config.semantic_compress_min_reduction:
+        return None
+    path = _persist_semantic_original(content, _safe_result_filename(tool_use_id), env)
+    if path is None:
+        return None
+    replacement = _build_compressed_message(compressed, content, path, algorithm)
+    if len(content) - len(replacement) <= config.semantic_compress_min_reduction:
+        return None
+    return replacement
+
+
 def maybe_persist_tool_result(
     content: str,
     tool_name: str,
@@ -340,6 +471,10 @@ def maybe_persist_tool_result(
 
     if effective_threshold == float("inf"):
         return content
+
+    compressed = _maybe_semantic_compress(content, tool_name, tool_use_id, env, config)
+    if compressed is not None:
+        return compressed
 
     if len(content) <= effective_threshold:
         return content

@@ -66,6 +66,19 @@ class TestBudgetConfigDefaults:
         """DEFAULT_BUDGET should equal a freshly constructed BudgetConfig."""
         assert DEFAULT_BUDGET == BudgetConfig()
 
+    def test_semantic_compression_is_disabled_by_default(self):
+        assert BudgetConfig().semantic_compress is False
+
+    def test_tool_budget_config_enables_semantic_compression(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            "tool_budget:\n  semantic_compress: true\n  semantic_compress_threshold_chars: 30000\n  semantic_compress_min_reduction_chars: 600\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        config = budget_for_context_window(None)
+        assert config.semantic_compress is True
+        assert config.semantic_compress_threshold == 30_000
+        assert config.semantic_compress_min_reduction == 600
+
 
 # ---------------------------------------------------------------------------
 # Immutability (frozen=True)
