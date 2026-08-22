@@ -401,7 +401,7 @@ def test_in_process_cron_policy_crosses_scheduler_thread_boundary(
         enter_non_dispatcher_owned_context,
         exit_non_dispatcher_owned_context,
     )
-    from gateway.session_context import clear_session_vars, set_session_vars
+    from gateway.session_context import reset_session_vars, set_session_vars
 
     env = _spawn_worker_env(monkeypatch, tmp_path, {})
     _enter_worker_process(monkeypatch, env)
@@ -426,7 +426,11 @@ def test_in_process_cron_policy_crosses_scheduler_thread_boundary(
             ).result(timeout=5)
     finally:
         exit_non_dispatcher_owned_context(owner_token)
-        clear_session_vars(session_tokens)
+        # reset, not clear: clear_session_vars pins the vars to "" which
+        # suppresses the os.environ fallback in get_session_env for the rest
+        # of the process, breaking later env-var-only cron tests.
+        del session_tokens
+        reset_session_vars()
 
     assert all(result["approved"] is expected_approved for result in results)
     if expected_policy:
