@@ -453,6 +453,33 @@ resolve_install_layout() {
     INSTALL_DIR="$HERMES_HOME/hermes-agent"
 }
 
+# Return a reason (on stdout, exit 0) when node/npm/npx symlinks must NOT be
+# written into the user's real command dir, or exit 1 when linking is fine.
+#
+# The test suite sandboxes HERMES_HOME but deliberately NOT HOME (see the note
+# in tests/conftest.py), so a test that reaches a real install would overwrite
+# the developer's own ~/.local/bin/{node,npm,npx} with links into a pytest
+# tmpdir that is deleted seconds later — leaving node/npx unresolvable until
+# manually repaired. Mirrors the same safety belt in hermes_cli/gateway.py,
+# which refuses to write a systemd unit that references a pytest tmpdir.
+node_links_blocked_reason() {
+    if [ "${HERMES_NODE_SKIP_LINKS:-0}" = "1" ]; then
+        echo "HERMES_NODE_SKIP_LINKS=1"
+        return 0
+    fi
+    if [ -n "${HERMES_TEST_ISOLATION:-}" ]; then
+        echo "test isolation active (HERMES_TEST_ISOLATION)"
+        return 0
+    fi
+    case "${HERMES_HOME:-}" in
+        */pytest-of-*|*/hermes_test|*/hermes_test/*)
+            echo "HERMES_HOME is a pytest sandbox (${HERMES_HOME})"
+            return 0
+            ;;
+    esac
+    return 1
+}
+
 get_command_link_dir() {
     if is_termux && [ -n "${PREFIX:-}" ]; then
         echo "$PREFIX/bin"
@@ -976,10 +1003,15 @@ install_node() {
 
     local node_link_dir
     node_link_dir="$(get_command_link_dir)"
-    mkdir -p "$node_link_dir"
-    ln -sf "$HERMES_HOME/node/bin/node" "$node_link_dir/node"
-    ln -sf "$HERMES_HOME/node/bin/npm"  "$node_link_dir/npm"
-    ln -sf "$HERMES_HOME/node/bin/npx"  "$node_link_dir/npx"
+    local node_link_skip
+    if node_link_skip="$(node_links_blocked_reason)"; then
+        log_warn "Skipping node/npm/npx symlinks in $node_link_dir — $node_link_skip"
+    else
+        mkdir -p "$node_link_dir"
+        ln -sf "$HERMES_HOME/node/bin/node" "$node_link_dir/node"
+        ln -sf "$HERMES_HOME/node/bin/npm"  "$node_link_dir/npm"
+        ln -sf "$HERMES_HOME/node/bin/npx"  "$node_link_dir/npx"
+    fi
 
     configure_managed_node_npm_prefix
 

@@ -62,6 +62,37 @@ _nb_get_link_dir() {
 # PATH and wiped on every Node upgrade. Scoped to the managed Node via its
 # prefix-local global npmrc; the user's other Node installs / ~/.npmrc are
 # untouched. Idempotent no-op when there's no managed npm.
+# Return a reason (on stdout, exit 0) when node/npm/npx symlinks must NOT be
+# written into the user's real link dir, or exit 1 when linking is fine.
+#
+# HERMES_NODE_SKIP_LINKS=1: the caller only wants the private managed tree
+# (e.g. the EBADENGINE recovery provisioning a runtime alongside a working
+# system Node). Skipping the links keeps the user's own node/npm first on PATH
+# instead of shadowing them with ours.
+#
+# The pytest-sandbox cases below are a safety belt: the test suite sandboxes
+# HERMES_HOME but deliberately NOT HOME, so a test reaching a real install
+# would overwrite the developer's ~/.local/bin/{node,npm,npx} with links into
+# a tmpdir deleted seconds later. Same belt as hermes_cli/gateway.py's refusal
+# to write a systemd unit referencing a pytest tmpdir.
+_nb_node_links_blocked_reason() {
+    if [ "${HERMES_NODE_SKIP_LINKS:-0}" = "1" ]; then
+        echo "HERMES_NODE_SKIP_LINKS=1"
+        return 0
+    fi
+    if [ -n "${HERMES_TEST_ISOLATION:-}" ]; then
+        echo "test isolation active (HERMES_TEST_ISOLATION)"
+        return 0
+    fi
+    case "${HERMES_HOME:-}" in
+        */pytest-of-*|*/hermes_test|*/hermes_test/*)
+            echo "HERMES_HOME is a pytest sandbox (${HERMES_HOME})"
+            return 0
+            ;;
+    esac
+    return 1
+}
+
 _nb_configure_npm_prefix() {
     [ -x "$HERMES_HOME/node/bin/npm" ] || return 0
     local _link_dir
@@ -302,11 +333,10 @@ _nb_install_bundled_node() {
 
     local _link_dir
     _link_dir="$(_nb_get_link_dir)"
-    # HERMES_NODE_SKIP_LINKS=1: the caller only wants the private managed tree
-    # (e.g. the EBADENGINE recovery provisioning a runtime alongside a working
-    # system Node). Skipping the links keeps the user's own node/npm first on
-    # PATH instead of shadowing them with ours.
-    if [ "${HERMES_NODE_SKIP_LINKS:-0}" != "1" ]; then
+    local _skip_reason
+    if _skip_reason="$(_nb_node_links_blocked_reason)"; then
+        _nb_warn "Skipping node/npm/npx symlinks in $_link_dir — $_skip_reason"
+    else
         mkdir -p "$_link_dir"
         ln -sf "$HERMES_HOME/node/bin/node" "$_link_dir/node"
         ln -sf "$HERMES_HOME/node/bin/npm"  "$_link_dir/npm"
