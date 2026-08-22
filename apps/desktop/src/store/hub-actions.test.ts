@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { atom } from 'nanostores'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 // A failed hub action (non-zero subprocess exit) must REJECT so callers toast
 // it — the Aug 2026 report shape was a scan-gated/failed `hermes skills

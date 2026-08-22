@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from 'vitest'
 import { atom } from 'nanostores'
+import { describe, expect, it, vi } from 'vitest'
 
 // The store wires itself to gateway/profile atoms and the REST layer at import
 // time paths; mock the seams (same shape as updates.test.ts) so this test only
