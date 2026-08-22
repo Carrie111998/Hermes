@@ -1516,7 +1516,7 @@ delegation:
 # Display
 # =============================================================================
 display:
-  # Use compact banner mode (hides the ASCII-art banner, shows a single line).
+  # Use compact startup banner mode (display.tui_compact controls the Ink TUI's full reduced-output mode).
   #   true:  Compact single-line banner
   #   false: Full ASCII banner with tool/skill summary (default)
   compact: false
