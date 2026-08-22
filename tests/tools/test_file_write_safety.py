@@ -544,10 +544,10 @@ class TestProtectedInstructionFiles:
         assert not res.get("error"), res
         assert approvals["calls"] == []
 
-    def test_real_hermes_home_not_gated_by_this_check(
+    def test_regular_file_in_real_hermes_home_not_gated_by_this_check(
         self, tmp_path, approvals, monkeypatch
     ):
-        """~/.hermes itself is governed by existing guards, not this gate."""
+        """Ordinary ~/.hermes files remain governed by the existing guards."""
         import tools.file_tools as ft
         fake_home = tmp_path / ".hermes"
         (fake_home / "notes").mkdir(parents=True)
@@ -557,6 +557,42 @@ class TestProtectedInstructionFiles:
         res = self._write(fake_home / "notes" / "scratch.txt", "ok")
         assert not res.get("error"), res
         assert approvals["calls"] == []
+
+    def test_protected_basename_in_real_hermes_home_is_gated(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        import tools.file_tools as ft
+        fake_home = tmp_path / ".hermes"
+        fake_home.mkdir()
+        monkeypatch.setattr(
+            ft, "_get_real_hermes_home", lambda: str(fake_home.resolve())
+        )
+        approvals["answer"] = "deny"
+
+        res = self._write(fake_home / "SOUL.md")
+
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert not (fake_home / "SOUL.md").exists()
+
+    def test_extra_pattern_in_real_hermes_home_is_gated(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        import tools.file_tools as ft
+        fake_home = tmp_path / ".hermes"
+        scripts = fake_home / "scripts"
+        scripts.mkdir(parents=True)
+        monkeypatch.setattr(
+            ft, "_get_real_hermes_home", lambda: str(fake_home.resolve())
+        )
+        monkeypatch.setattr(
+            ft, "_protected_instruction_config", lambda: (True, ["*_prerun.py"])
+        )
+        approvals["answer"] = "deny"
+
+        res = self._write(scripts / "nightly_prerun.py")
+
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert not (scripts / "nightly_prerun.py").exists()
 
     # ---- patch tool -----------------------------------------------------
 

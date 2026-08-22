@@ -805,15 +805,16 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     except (OSError, ValueError, RuntimeError):
         resolved = os.path.realpath(normalized)
 
-    # The authoritative ~/.hermes home is governed by its own guards
-    # (config.yaml hard-block, cross-profile guard, write_approval); this
-    # gate targets PROJECT-LOCAL instruction files only. Checked before the
-    # ``.hermes`` component rule below, which would otherwise match the
-    # home directory itself.
+    # The authoritative ~/.hermes home is governed by its own guards for
+    # ordinary files. Only exempt it from the broad ``.hermes`` parent rule
+    # below; protected basenames and configured patterns must still apply to
+    # live instruction files and pre-run scripts inside the active home.
     real_home = _get_real_hermes_home()
-    if real_home and (resolved == real_home
-                      or resolved.startswith(real_home + os.sep)):
-        return None
+    in_real_home = bool(
+        real_home
+        and (resolved == real_home
+             or resolved.startswith(real_home + os.sep))
+    )
 
     import fnmatch
     for candidate in (normalized, resolved):
@@ -824,6 +825,8 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         for pattern in extra_patterns:
             if fnmatch.fnmatch(base_lower, pattern.lower()):
                 return base
+        if in_real_home:
+            continue
         # Project-local .hermes config dirs (e.g. <repo>/.hermes/config.yaml)
         # are loaded as project context and steer behavior the same way.
         # Scope: the file's IMMEDIATE parent must be ``.hermes`` — matching
