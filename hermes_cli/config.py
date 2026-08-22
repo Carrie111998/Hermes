@@ -966,6 +966,21 @@ DEFAULT_CONFIG = {
         # Set a positive value in config.yaml only if you explicitly want a
         # grace window on /restart (and keep it well under TimeoutStopSec).
         "restart_drain_timeout": 0,
+        # Bounded keepalive window (seconds) granted to in-flight cron jobs
+        # at gateway shutdown BEFORE the global tool-subprocess sweep. The
+        # shutdown path calls process_registry.kill_all() as a catch-all
+        # (graceful path AND drain-timeout path) with no per-job targeting —
+        # it kills EVERY tool subprocess, including one still owned by a
+        # long-running cron job (e.g. a long LLM verdict/analysis run). This
+        # is a general failure mode for any long cron job, not job-specific.
+        # The #60432 interrupted-marking only makes the killed run fail
+        # HONESTLY; it does not preserve the subprocess. This grace lets the
+        # job's tool subprocess finish naturally before the sweep, so a job
+        # that completes within the window survives shutdown intact. The
+        # sweep + interrupted-marking still run as a bounded fallback for
+        # jobs that do NOT finish within the grace. 0 = no grace (immediate
+        # sweep, legacy behaviour). Keep well under systemd TimeoutStopSec.
+        "cron_shutdown_grace_s": 30,
         # Upper bound (seconds) a submitted prompt waits for the deferred
         # agent build (MCP discovery, model metadata, skills scan) before
         # failing with a visible error (#63078). The gateway's wait is

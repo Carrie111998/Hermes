@@ -67,6 +67,104 @@ class TestActiveCronJobCount:
             assert runner._active_cron_job_count() == 0
 
 
+class TestGrantCronShutdownGrace:
+    """Keepalive hardening: in-flight cron jobs get a bounded window to
+    finish BEFORE the global tool-subprocess sweep amputates their subprocess
+    (general shutdown failure mode reported for the T24-verdict one-shot).
+    The grace is one-shot per shutdown and no-ops when no cron job is in
+    flight or the grace is 0.
+    """
+
+    @pytest.mark.asyncio
+    async def test_noop_when_no_cron_jobs_in_flight(self, monkeypatch):
+        import cron.scheduler as sched
+
+        runner, _adapter = make_restart_runner()
+        runner._load_cron_shutdown_grace = lambda: 30.0
+        sched._running_job_ids.clear()
+
+        # Should return immediately without waiting (nothing in flight).
+        await asyncio.wait_for(runner._grant_cron_shutdown_grace(), timeout=1.0)
+        assert getattr(runner, "_cron_grace_granted", False) is False
+
+    @pytest.mark.asyncio
+    async def test_noop_when_grace_disabled(self, monkeypatch):
+        import cron.scheduler as sched
+
+        runner, _adapter = make_restart_runner()
+        runner._load_cron_shutdown_grace = lambda: 0.0
+        sched._running_job_ids.add("job-1")
+
+        await asyncio.wait_for(runner._grant_cron_shutdown_grace(), timeout=1.0)
+        # Flag stays unset: a zero grace must not consume the one-shot guard.
+        assert getattr(runner, "_cron_grace_granted", False) is False
+
+    @pytest.mark.asyncio
+    async def test_waits_for_in_flight_cron_job_to_finish(self):
+        """A cron job that clears within the grace must be allowed to finish
+        naturally (its tool subprocess survives) instead of being swept."""
+        import cron.scheduler as sched
+
+        runner, _adapter = make_restart_runner()
+        runner._load_cron_shutdown_grace = lambda: 5.0
+        sched._running_job_ids.add("job-1")
+
+        async def finish_job():
+            await asyncio.sleep(0.15)
+            sched._running_job_ids.discard("job-1")
+
+        task = asyncio.create_task(finish_job())
+        # Completes promptly (well under the 5s grace) once the job clears.
+        await asyncio.wait_for(runner._grant_cron_shutdown_grace(), timeout=2.0)
+        await task
+
+        assert "job-1" not in sched._running_job_ids
+        # One-shot guard consumed so the sweep path doesn't wait again.
+        assert getattr(runner, "_cron_grace_granted", False) is True
+
+    @pytest.mark.asyncio
+    async def test_returns_after_grace_when_job_never_finishes(self):
+        """A job that outlives the grace must NOT be waited on forever — the
+        bounded fallback (sweep + interrupted-marking) still runs for it."""
+        import cron.scheduler as sched
+
+        runner, _adapter = make_restart_runner()
+        runner._load_cron_shutdown_grace = lambda: 0.2
+        sched._running_job_ids.add("job-1")
+
+        start = asyncio.get_running_loop().time()
+        await runner._grant_cron_shutdown_grace()
+        elapsed = asyncio.get_running_loop().time() - start
+
+        # Bounded by the grace, not forever.
+        assert elapsed >= 0.15
+        assert elapsed < 5.0
+        assert "job-1" in sched._running_job_ids  # still in flight for the fallback
+
+    @pytest.mark.asyncio
+    async def test_one_shot_guard_skips_second_wait(self):
+        """The grace is granted at most once per shutdown; a second call (e.g.
+        the final-cleanup sweep after a post-interrupt sweep) must not wait
+        again."""
+        import cron.scheduler as sched
+
+        runner, _adapter = make_restart_runner()
+        runner._load_cron_shutdown_grace = lambda: 0.2
+        sched._running_job_ids.add("job-1")
+
+        start = asyncio.get_running_loop().time()
+        await runner._grant_cron_shutdown_grace()
+        first_elapsed = asyncio.get_running_loop().time() - start
+
+        # Second call returns immediately (guard consumed).
+        start2 = asyncio.get_running_loop().time()
+        await asyncio.wait_for(runner._grant_cron_shutdown_grace(), timeout=0.5)
+        second_elapsed = asyncio.get_running_loop().time() - start2
+
+        assert first_elapsed >= 0.15
+        assert second_elapsed < 0.15
+
+
 class TestDrainWaitsForCronWork:
     @pytest.mark.asyncio
     async def test_drain_returns_immediately_when_nothing_active(self):
@@ -183,3 +281,57 @@ class TestKillToolSubprocessesMarksCronInterrupted:
             await runner.stop()
 
         mock_mark.assert_not_called()
+
+
+class TestCronShutdownGracePreservesSubprocess:
+    """Integration: the grace window must actually prevent the global
+    tool-subprocess sweep from amputating an in-flight cron job's
+    subprocess when that job clears (and its tool subprocess exits)
+    within the grace.
+
+    End-to-end guarantee the T24-verdict regression exercised: a
+    long-running cron tool subprocess that finishes during the grace must
+    survive ``_kill_tool_subprocesses("final-cleanup")`` instead of being
+    reaped with an interrupted mark (#60432 amputation).
+    """
+
+    @pytest.mark.asyncio
+    async def test_subprocess_survives_final_cleanup_via_grace(self, monkeypatch):
+        import sys
+        import cron.scheduler as sched
+        import tools.process_registry as _pr
+
+        runner = make_restart_runner()[0]
+        runner._load_cron_shutdown_grace = lambda: 5.0
+
+        # Spawn a REAL short-lived subprocess tracked by the process
+        # registry, so a global kill_all sweep would actually reap it if
+        # the grace did not run first.
+        session = _pr.process_registry.spawn_local(
+            command=f"{sys.executable!r} -c 'import time; time.sleep(0.3)'",
+            task_id="cron-verdict",
+        )
+        assert session is not None
+        sched._running_job_ids.add("cron-verdict")
+
+        async def _release_after_subprocess_exits():
+            # Mirror the real cron completion path: the scheduler drops the
+            # in-flight job id once run_one_job() returns (which happens
+            # after the tool subprocess it owns exits).
+            await asyncio.to_thread(session.process.wait, 5)
+            sched._running_job_ids.discard("cron-verdict")
+
+        releaser = asyncio.create_task(_release_after_subprocess_exits())
+        try:
+            # The grace must WAIT for the cron job to clear rather than
+            # returning immediately, so the subprocess gets to finish.
+            await asyncio.wait_for(runner._grant_cron_shutdown_grace(), timeout=5.0)
+            await releaser
+
+            assert "cron-verdict" not in sched._running_job_ids
+            # Final-cleanup sweep now finds nothing to reap — the job's
+            # tool subprocess exited on its own, surviving the shutdown.
+            assert _pr.process_registry.kill_all() == 0
+        finally:
+            _pr.process_registry.kill_all()
+
