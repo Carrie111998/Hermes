@@ -78,6 +78,10 @@ export const EmbeddedHubPicker = memo(function EmbeddedHubPicker({
   // every visit. Same contract as DetailPane, including the "seed collapsed
   // once, then the user's own choice always wins" defaultCollapsed pattern:
   // only a profile that has NEVER touched this pane gets the collapsed seed.
+  // Safe against a returning user's expanded choice only because $paneStates
+  // (store/panes.ts) hydrates from localStorage synchronously at module load,
+  // not in an effect — the check below always sees the real persisted value,
+  // never a pre-hydration placeholder.
   useEffect(() => {
     if ($paneState(HUB_PANE_ID).get() === undefined) {
       setPaneHeightOverride(HUB_PANE_ID, 0)

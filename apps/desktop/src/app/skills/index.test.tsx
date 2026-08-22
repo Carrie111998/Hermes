@@ -291,6 +291,21 @@ describe('SkillsView toolset management', () => {
     expect(document.querySelector('iframe')).toBeTruthy()
   })
 
+  it('hub picker leaves an existing pane preference alone — no re-collapse on mount', async () => {
+    // A profile that already expanded the hub (persisted height override)
+    // must NOT get silently re-collapsed by the seed-once effect — only a
+    // pane with NO saved state at all gets the collapsed default.
+    $paneStates.set({ 'capabilities-hub': { open: true, heightOverride: 400 } })
+    const { EmbeddedHubPicker } = await import('./embedded-hub-picker')
+
+    await act(async () => {
+      render(<EmbeddedHubPicker installedNames={new Set()} profile={null} />)
+    })
+
+    expect(document.querySelector('iframe')).toBeTruthy()
+    expect($paneStates.get()['capabilities-hub']?.heightOverride).toBe(400)
+  })
+
   it('hub picker refuses to reinstall an already-installed skill', async () => {
     const { notify } = await import('@/store/notifications')
     const { EmbeddedHubPicker } = await import('./embedded-hub-picker')
