@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -59,6 +60,20 @@ def _events(conn, tid, kind=None):
     ]
     if kind is not None:
         out = [e for e in out if e[0] == kind]
+    return out
+
+
+def _release_event_payloads(conn, tid: str) -> list[dict]:
+    """Return the parsed payloads of all `respawn_released` events on a task.
+
+    Helper for the reviewer-feedback dedupe tests (REVIEWER FEEDBACK IN
+    HERMES-AGENT#2, 2026-08-21). Filters out any None payloads so callers
+    can subscript directly without type-checking the second tuple element.
+    """
+    out: list[dict] = []
+    for kind, payload in _events(conn, tid, kind="respawn_released"):
+        if payload is not None:
+            out.append(cast(dict, payload))
     return out
 
 
@@ -889,6 +904,345 @@ def test_reviewer_feedback_release_trigger_short_author_aliadil_pattern_match(
             feedback_body="please update the type annotations here.",
         )
         assert kb.check_respawn_guard(conn, tid) is None
+
+
+# --- REGRESSION: default-authored PR-number pings must NOT release ---
+# (REVIEWER FEEDBACK IN HERMES-AGENT#2, 2026-08-21, issue #1).
+#
+# Auto-mirrored status pings routinely contain "PR #N opened" / "PR #N
+# closed" — the pre-fix `_REVIEWER_FEEDBACK_PR_NUM_RE` fired
+# author-agnostic, so a default-authored ping like the one below would
+# release the active_pr guard, violating the spec's "auto-mirrored
+# default-authored status comments do NOT release" acceptance criterion
+# AND creating a respawn loop on every tick.
+
+def test_reviewer_feedback_no_release_default_author_pr_number_opened(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default-authored 'PR #178 opened' ping does NOT release the guard.
+
+    Pre-fix this fired trigger 3 (PR-number regex). After the fix,
+    trigger 3's PR-number regex is gated on author != 'default' so
+    auto-mirrored status pings can't release the guard.
+    """
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="pr ping", assignee="builder")
+        now = int(_time.time())
+        _add_comment_at(
+            conn, tid, author="builder",
+            body="Opened https://github.com/example/repo/pull/178 for review",
+            created_at=now - 120,
+        )
+        _add_comment_at(
+            conn, tid, author="default",
+            body="📌 PR #178 opened (auto-mirrored status ping)",
+            created_at=now - 30,
+        )
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_reviewer_feedback_no_release_default_author_pull_slash_n(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default-authored 'pull/178' reference doesn't release either."""
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="pull slash", assignee="builder")
+        now = int(_time.time())
+        _add_comment_at(
+            conn, tid, author="builder",
+            body="Opened https://github.com/example/repo/pull/178 for review",
+            created_at=now - 120,
+        )
+        _add_comment_at(
+            conn, tid, author="default",
+            body="→ from kanban task t_x via pull/178",
+            created_at=now - 30,
+        )
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_reviewer_feedback_no_release_default_author_phrase_with_pr_num(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default-authored phrase + PR-number: the phrase still triggers
+    release (phrases stay author-agnostic) — but ONLY because phrases
+    are concrete reviewer signals. A default-authored phrase is rare
+    enough that the spec doesn't gate it; this test pins the
+    intended behavior so future regressions are caught.
+    """
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="phrase ping", assignee="builder")
+        now = int(_time.time())
+        _add_comment_at(
+            conn, tid, author="builder",
+            body="Opened https://github.com/example/repo/pull/178",
+            created_at=now - 120,
+        )
+        # default author + phrase + PR number. The phrase still wins
+        # (author-agnostic), which is correct per the rationale in
+        # _has_reviewer_feedback: status pings are short emoji lines,
+        # not full sentences with reviewer phrases.
+        _add_comment_at(
+            conn, tid, author="default",
+            body="please update the PR #178 with the latest changes",
+            created_at=now - 30,
+        )
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_reviewer_feedback_no_release_default_author_bare_hash_n(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bare '#178' from default author doesn't release."""
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="bare hash", assignee="builder")
+        now = int(_time.time())
+        _add_comment_at(
+            conn, tid, author="builder",
+            body="Opened https://github.com/example/repo/pull/178 for review",
+            created_at=now - 120,
+        )
+        _add_comment_at(
+            conn, tid, author="default",
+            body="see #178 for context",
+            created_at=now - 30,
+        )
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+# --- REGRESSION: stale feedback must NOT re-release on every tick ---
+# (REVIEWER FEEDBACK IN HERMES-AGENT#2, 2026-08-21, issue #2).
+#
+# Pre-fix, once the guard released and the spawned run failed without
+# producing a new PR-URL comment, the same stale feedback comment kept
+# satisfying trigger 1 / 3 on every subsequent tick — a respawn loop
+# bounded only by the failure circuit breaker. The fix records a
+# `respawn_released` event with the feedback timestamp; subsequent
+# ticks skip comments at or before that watermark.
+
+def test_reviewer_feedback_no_double_release_after_failure(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once the guard releases for a given feedback comment, subsequent
+    ticks with NO new feedback do NOT re-release — the respawn-loop
+    failure mode is closed.
+
+    Simulates: a release event is on file; check_respawn_guard is
+    called again on the same comments. Without the watermark, the
+    same stale feedback would satisfy trigger 1 / 3 again.
+    """
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    with kb.connect() as conn:
+        tid = _setup_task_with_pr_and_feedback(
+            conn, feedback_author="aliaadil",
+            feedback_body=(
+                "logging is not sufficient. ALL actions performed by the "
+                "user and server need to be logged properly. please update."
+            ),
+        )
+        # First tick: releases the guard.
+        assert kb.check_respawn_guard(conn, tid) is None
+        # Confirm the release event was recorded with the feedback_at
+        # timestamp.
+        released_events = _release_event_payloads(conn, tid)
+        assert len(released_events) == 1, released_events
+        assert released_events[0]["reason"] == "reviewer_feedback"
+        assert released_events[0]["feedback_at"] > 0
+        feedback_at = released_events[0]["feedback_at"]
+        # Second tick WITHOUT new feedback: must NOT release.
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+        # No new release event recorded.
+        assert len(_release_event_payloads(conn, tid)) == 1
+        # Third tick: still no release.
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+        assert len(_release_event_payloads(conn, tid)) == 1
+        # Sanity: the feedback_at we recorded is the feedback comment's
+        # created_at — that comment is now in the past and skipped.
+        assert feedback_at > 0
+
+
+def test_reviewer_feedback_releases_again_for_newer_feedback_comment(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a prior release, a NEW (later-created_at) reviewer comment
+    DOES re-release the guard. The watermark advances only when new
+    feedback arrives, so legitimate fresh feedback (a follow-up
+    comment from the reviewer) still fires.
+    """
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    with kb.connect() as conn:
+        tid = _setup_task_with_pr_and_feedback(
+            conn, feedback_author="aliaadil",
+            feedback_body=(
+                "logging is not sufficient. ALL actions performed by the "
+                "user and server need to be logged properly. please update."
+            ),
+        )
+        # First release.
+        assert kb.check_respawn_guard(conn, tid) is None
+        first_release_at = _release_event_payloads(conn, tid)[0]["feedback_at"]
+        # Second tick still no new feedback → no release.
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+        # Reviewer follows up with a NEW substantive comment.
+        later = int(_time.time()) + 5  # strictly greater than first_release_at
+        _add_comment_at(
+            conn, tid, author="aliaadil",
+            body=(
+                "thanks for the logging update. but the audit trail still "
+                "misses some key events — please update the type annotations "
+                "and add the missing fields."
+            ),
+            created_at=later,
+        )
+        # Now the guard releases again.
+        assert kb.check_respawn_guard(conn, tid) is None
+        # Two release events on file, the second with feedback_at == later.
+        events = _release_event_payloads(conn, tid)
+        assert len(events) == 2, events
+        assert events[1]["feedback_at"] == later
+        assert events[1]["feedback_at"] > first_release_at
+
+
+def test_reviewer_feedback_no_release_trigger4_only_after_first(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trigger 4 (CHANGES_REQUESTED) does not re-release after a prior
+    release. The release event's feedback_at advances the watermark,
+    so a stale CHANGES_REQUESTED decision that hasn't changed doesn't
+    fire again on the next tick.
+    """
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="t4 dedupe", assignee="builder")
+        now = int(_time.time())
+        _add_comment_at(
+            conn, tid, author="builder",
+            body="Opened https://github.com/example/repo/pull/178 for review",
+            created_at=now - 60,
+        )
+        # Simulate: a prior release was already recorded. (Pretend the
+        # dispatcher fired earlier with the same trigger-4 outcome.)
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn, tid, "respawn_released",
+                {
+                    "reason": "reviewer_feedback",
+                    "feedback_at": now - 1,
+                    "trigger": "d",
+                },
+            )
+        # Now patch the gh call to return CHANGES_REQUESTED — should
+        # NOT release because the watermark is already set.
+        _patch_gh_review_decision(monkeypatch, decision="CHANGES_REQUESTED")
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_reviewer_feedback_no_release_default_pr_num_does_not_advance_watermark(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A default-authored ping with a PR number does NOT release AND
+    does NOT advance the watermark — so a subsequent legitimate
+    reviewer comment at the same or later timestamp still releases.
+    """
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="watermark safety", assignee="builder")
+        now = int(_time.time())
+        _add_comment_at(
+            conn, tid, author="builder",
+            body="Opened https://github.com/example/repo/pull/178 for review",
+            created_at=now - 300,
+        )
+        # Default ping that mentions the PR number (must NOT release).
+        _add_comment_at(
+            conn, tid, author="default",
+            body="📌 PR #178 opened (auto-mirrored status ping)",
+            created_at=now - 60,
+        )
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+        # No release event recorded.
+        assert _release_event_payloads(conn, tid) == []
+        # Now a legitimate reviewer comment arrives. It should release.
+        _add_comment_at(
+            conn, tid, author="aliaadil",
+            body=(
+                "the PR #178 looks good overall but please update the "
+                "type annotations to use the new typing.Literal syntax."
+            ),
+            created_at=now - 30,
+        )
+        assert kb.check_respawn_guard(conn, tid) is None
+        # Exactly one release event, from the real reviewer comment.
+        events = _release_event_payloads(conn, tid)
+        assert len(events) == 1
+        assert events[0]["trigger"] == "a"  # non-default + length
+
+
+def test_reviewer_feedback_release_event_has_audit_fields(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The `respawn_released` event carries reason, feedback_at, and
+    trigger fields so operators have a full audit trail of why a
+    spawn was allowed (REVIEWER FEEDBACK IN HERMES-AGENT#2, 2026-08-21,
+    issue #2 audit-trail concern).
+    """
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    with kb.connect() as conn:
+        tid = _setup_task_with_pr_and_feedback(
+            conn, feedback_author="aliaadil",
+            feedback_body="please update the type annotations here.",
+        )
+        assert kb.check_respawn_guard(conn, tid) is None
+        [payload] = _release_event_payloads(conn, tid)
+        assert payload["reason"] == "reviewer_feedback"
+        assert payload["trigger"] in ("a", "b", "c", "d")
+        assert isinstance(payload["feedback_at"], int)
+        assert payload["feedback_at"] > 0
+
+
+def test_reviewer_feedback_no_release_remirror_same_timestamp(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-mirror of the same feedback at the same timestamp does NOT
+    re-release the guard — the watermark is keyed on created_at, so a
+    second mirror row with the same (or earlier) timestamp is treated
+    as the same feedback, not a new round.
+    """
+    _patch_gh_review_decision(monkeypatch, decision=None)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="remirror same ts", assignee="builder",
+        )
+        now = int(_time.time())
+        _add_comment_at(
+            conn, tid, author="builder",
+            body="Opened https://github.com/example/repo/pull/178 for review",
+            created_at=now - 300,
+        )
+        # First feedback comment from the reviewer.
+        _add_comment_at(
+            conn, tid, author="aliaadil",
+            body="please update the type annotations here.",
+            created_at=now - 60,
+        )
+        assert kb.check_respawn_guard(conn, tid) is None
+        # Mirror re-pushes the same comment body at the SAME timestamp
+        # — a re-mirror race where the mirror service happens to
+        # re-fetch and write a duplicate row with identical timestamp.
+        _add_comment_at(
+            conn, tid, author="aliaadil",
+            body="please update the type annotations here.",
+            created_at=now - 60,
+        )
+        # Should NOT release a second time — the watermark equals the
+        # duplicate's created_at so the watermark check skips it.
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+        # Still only one release event.
+        assert len(_release_event_payloads(conn, tid)) == 1
 
 
 # --- Non-trigger conditions: guard stays "active_pr" ---

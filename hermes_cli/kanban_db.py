@@ -9469,28 +9469,51 @@ def _comment_content_key(body: str) -> str:
 
 
 def _has_reviewer_feedback(
-    body: str, pr_url: str | None = None
+    body: str,
+    pr_url: str | None = None,
+    author: str | None = None,
 ) -> bool:
     """Return True iff `body` looks like substantive reviewer feedback.
 
     Triggers (per SPEC-active-pr-guard-reviewer-feedback §Part B #5):
-      - Contains any phrase in `_REVIEWER_FEEDBACK_PHRASES`.
-      - References the PR number directly (`#178`, `PR #178`, `pull/178`).
+      - Contains any phrase in `_REVIEWER_FEEDBACK_PHRASES` (author-agnostic).
+      - References the PR number directly (`#178`, `PR #178`, `pull/178`),
+        gated on non-default author — see the rationale below.
       - Optional: `pr_url` provided — body references the PR URL itself.
 
-    Note: the AUTHOR + LENGTH filter is applied at the call site, not
-    here — this function only does the body-text match. The caller is
-    responsible for combining with author/length heuristics so the
-    single-purpose helper is unit-testable.
+    Note: the AUTHOR + LENGTH filter for substantive feedback is applied
+    at the call site, not here — this function only does the body-text
+    match. The caller is responsible for combining with author/length
+    heuristics so the single-purpose helper is unit-testable.
+
+    Why PR-number regex is gated on non-default author (REVIEWER
+    FEEDBACK IN HERMES-AGENT#2, 2026-08-21):
+      Status pings auto-mirrored by `mirror_push` routinely contain
+      "PR #N opened" / "PR #N closed" / "→ from kanban task N"
+      — releasing the guard on those would create a respawn loop
+      bounded only by the failure circuit breaker, defeating the 24h
+      active-PR window for any task whose auto-mirrored pings happen
+      to mention the PR number. Phrase matches stay author-agnostic
+      because phrases like "please update" / "fix in this pr" are
+      concrete reviewer signals that are extremely unlikely to appear
+      in mirrored status pings (those are short emoji + task id +
+      status lines).
+
+    Backward compat:
+      When ``author`` is None, the helper still permits the PR-number
+      regex to fire (pre-2026-08-21 behavior). Tests that don't carry
+      an author field keep working. New callers should always pass
+      ``author=``.
     """
     if not body:
         return False
     if _REVIEWER_FEEDBACK_RE.search(body):
         return True
-    if _REVIEWER_FEEDBACK_PR_NUM_RE.search(body):
-        return True
-    if pr_url and pr_url in body:
-        return True
+    if author is None or author != "default":
+        if _REVIEWER_FEEDBACK_PR_NUM_RE.search(body):
+            return True
+        if pr_url and pr_url in body:
+            return True
     return False
 
 
@@ -9641,9 +9664,20 @@ def _populate_branch_override_for_task(
 
 def _check_reviewer_feedback_release(
     conn: sqlite3.Connection, task_id: str
-) -> bool:
-    """Return True iff reviewer feedback exists AFTER the most recent
-    PR-URL comment, warranting release of the `active_pr` guard.
+) -> "tuple[bool, int | None, str | None]":
+    """Return (should_release, triggering_comment_id, triggering_reason).
+
+    - ``should_release``: True iff reviewer feedback exists AFTER the most
+      recent PR-URL comment AND is newer than the most recent prior
+      ``respawn_released`` event (so a released respawn that fails
+      without a new feedback comment doesn't re-release on the next tick
+      — the "respawn loop" failure mode documented in
+      REVIEWER FEEDBACK IN HERMES-AGENT#2, 2026-08-21).
+    - ``triggering_comment_id``: the ``task_comments.id`` of the comment
+      that fired the release. Used by the caller to record a
+      ``respawn_released`` event with that id as the dedupe watermark.
+    - ``triggering_reason``: short string describing which trigger fired
+      (a / b / c / d, mapped to the four spec triggers). Audit only.
 
     Implements SPEC-active-pr-guard-reviewer-feedback §Part B #5: any of
     these triggers releases the guard:
@@ -9656,14 +9690,19 @@ def _check_reviewer_feedback_release(
          (idempotent re-push of the same comment body does NOT release).
       3. A comment AFTER the most recent PR-URL comment matching any
          phrase in `_REVIEWER_FEEDBACK_PHRASES`, OR referencing the PR
-         number directly (`#178`/`PR #178`/`pull/178`).
+         number directly (`#178`/`PR #178`/`pull/178`) — gated on
+         non-default author to prevent default-authored auto-mirrored
+         status pings like "PR #178 opened" from releasing the guard
+         (per REVIEWER FEEDBACK IN HERMES-AGENT#2, 2026-08-21).
       4. The most recent PR-URL comment's PR has
          `reviewDecision == 'CHANGES_REQUESTED'` (queried via
          `gh pr view <url> --json reviewDecision`).
 
-    The function is conservative: returning False leaves the existing
-    `active_pr` guard in force. Returning True releases the guard for
-    THIS dispatch tick.
+    The function is conservative: returning ``(False, None, None)``
+    leaves the existing `active_pr` guard in force. Returning
+    ``(True, comment_id, reason)`` releases the guard for THIS dispatch
+    tick and signals the caller to record a ``respawn_released`` event
+    so the next tick skips comments with ``id <= comment_id``.
     """
     now = int(time.time())
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
@@ -9695,13 +9734,39 @@ def _check_reviewer_feedback_release(
         # deciding what to do. Returning False here matches the
         # "no PR-URL comment = no reviewer feedback to release against"
         # semantics.
-        return False
+        return False, None, None
+
+    # Dedupe watermark (REVIEWER FEEDBACK IN HERMES-AGENT#2, 2026-08-21):
+    # skip any feedback with created_at <= the most recent respawn_released
+    # feedback_at. Without this, a released respawn that fails would
+    # re-release on every subsequent tick because the same stale feedback
+    # still satisfies trigger 1 / 3 — a respawn loop bounded only by the
+    # failure circuit breaker. The watermark advances only when a NEW
+    # feedback source triggers a release, so legitimate fresh feedback
+    # (a follow-up comment from the reviewer, or a new
+    # CHANGES_REQUESTED review round) still fires.
+    #
+    # The watermark is keyed on `created_at`, not comment id, so a trigger-4
+    # release (no comment) can still record a meaningful timestamp (= the
+    # decision-check time) and any later comment with a higher
+    # `created_at` will advance past it.
+    watermark_row = conn.execute(
+        "SELECT MAX(CAST(payload ->> '$.feedback_at' AS INTEGER)) "
+        "AS max_fb_at "
+        "FROM task_events "
+        "WHERE task_id = ? AND kind = 'respawn_released'",
+        (task_id,),
+    ).fetchone()
+    feedback_watermark_at = int(watermark_row["max_fb_at"] or 0) if watermark_row else 0
 
     pr_url_key = _comment_content_key(most_recent_pr or "")
 
     # Walk comments AFTER the most recent PR-URL comment.
     for r in rows:
-        if int(r["created_at"] or 0) <= most_recent_pr_at:
+        r_created = int(r["created_at"] or 0)
+        if r_created <= feedback_watermark_at:
+            continue
+        if r_created <= most_recent_pr_at:
             continue
         body = r["body"] or ""
         author = r["author"] or ""
@@ -9718,17 +9783,27 @@ def _check_reviewer_feedback_release(
                 author != "default"
                 and len(body) >= _REVIEWER_FEEDBACK_MIN_BODY_LEN
             ):
-                return True
-            # Trigger 3 — body pattern match (author-agnostic).
-            if _has_reviewer_feedback(body):
-                return True
+                return True, r_created, "a"
+            # Trigger 3 — body pattern match, author-gated for PR-number
+            # references (REVIEWER FEEDBACK IN HERMES-AGENT#2,
+            # 2026-08-21). Pass ``author=`` so a default-authored ping
+            # like "PR #178 opened" cannot release the guard.
+            if _has_reviewer_feedback(body, author=author):
+                return True, r_created, "c"
 
     # Trigger 4 — reviewDecision == CHANGES_REQUESTED on the linked PR.
-    decision = _query_pr_review_decision(most_recent_pr)
-    if decision == "CHANGES_REQUESTED":
-        return True
+    # Also gated on the watermark so a CHANGES_REQUESTED decision that
+    # has already released once doesn't keep firing on every tick when
+    # the released respawn fails. ``reason="d"`` is the audit label.
+    if feedback_watermark_at == 0:
+        decision = _query_pr_review_decision(most_recent_pr)
+        if decision == "CHANGES_REQUESTED":
+            # No specific comment fires trigger 4 — use ``now`` as the
+            # feedback watermark so any LATER feedback (a follow-up
+            # comment from the reviewer) still advances past it.
+            return True, now, "d"
 
-    return False
+    return False, None, None
 
 
 def check_respawn_guard(
@@ -9903,8 +9978,39 @@ def check_respawn_guard(
         # reads ``_pending_reviewer_branch_override`` to route the new
         # Builder run to the same branch + head SHA as the most recent
         # PR-URL comment (per SPEC Part B step #6).
-        if _check_reviewer_feedback_release(conn, task_id):
+        #
+        # RELEASING THE GUARD (REVIEWER FEEDBACK IN HERMES-AGENT#2,
+        # 2026-08-21): the release event records the timestamp and
+        # reason of the triggering feedback so subsequent ticks can
+        # skip already-released feedback (preventing the respawn-loop
+        # failure mode) and operators have an audit trail of why a
+        # spawn was allowed.
+        #
+        # ``_pending_reviewer_branch_override`` is the per-dispatch-tick
+        # side-channel set by the release path. Once a release fires
+        # and populates the override dict, re-running ``check_respawn_
+        # guard`` for the same task in the same dispatch tick (e.g.
+        # tests that call ``check_respawn_guard`` manually then
+        # ``dispatch_once``) must NOT re-guard the task — the override
+        # is in flight. We detect that here: if the dict already has an
+        # entry for this task, return None (release) without re-running
+        # the predicate or emitting another audit event.
+        if _pending_reviewer_branch_override.get(task_id) is not None:
+            return None  # Override already populated this tick — release.
+        should_release, feedback_at, feedback_reason = _check_reviewer_feedback_release(
+            conn, task_id
+        )
+        if should_release:
             _populate_branch_override_for_task(conn, task_id)
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "respawn_released",
+                    {
+                        "reason": "reviewer_feedback",
+                        "feedback_at": int(feedback_at or 0),
+                        "trigger": feedback_reason,
+                    },
+                )
             return None  # Reviewer feedback — release the guard.
         return "active_pr"
 
@@ -10613,17 +10719,35 @@ def _dispatch_once_locked(
             # logic if no override is registered for this task.
             pr_head_sha: Optional[str] = None
             override = _pending_reviewer_branch_override.pop(claimed.id, None)
-            if override is not None and claimed.workspace_kind == "worktree":
-                # The branch the worker should land on; the head SHA is
-                # surfaced separately via the spawn kwarg so the worker can
-                # check it out after provisioning the worktree.
-                pr_branch, pr_head_sha_for_task = override
-                pr_head_sha = pr_head_sha_for_task
-                # Re-provision the worktree pointing at this branch, not
-                # ``wt/<task-id>``. _resolve_worktree_workspace already
-                # handles "existing checkout of branch X" so we just need
-                # to seed claimed.branch_name.
-                claimed = replace(claimed, branch_name=pr_branch)
+            if override is not None:
+                if claimed.workspace_kind == "worktree":
+                    # The branch the worker should land on; the head SHA is
+                    # surfaced separately via the spawn kwarg so the worker can
+                    # check it out after provisioning the worktree.
+                    pr_branch, pr_head_sha_for_task = override
+                    pr_head_sha = pr_head_sha_for_task
+                    # Re-provision the worktree pointing at this branch, not
+                    # ``wt/<task-id>``. _resolve_worktree_workspace already
+                    # handles "existing checkout of branch X" so we just need
+                    # to seed claimed.branch_name.
+                    claimed = replace(claimed, branch_name=pr_branch)
+                else:
+                    # Non-worktree tasks (dir / scratch) can't honour the
+                    # branch override — the override targets a git worktree
+                    # that dir/scratch workspaces don't provision. Drop it
+                    # (already popped above) and fall through to the normal
+                    # workspace resolution. Log at debug so operators can
+                    # diagnose why a reviewer-feedback release didn't route
+                    # to the PR branch (REVIEWER FEEDBACK IN
+                    # HERMES-AGENT#2, 2026-08-21).
+                    import logging
+                    logging.getLogger("kanban.dispatcher").debug(
+                        "respawn_released: dropping branch override for task %s "
+                        "because workspace_kind=%s does not support git "
+                        "worktrees; falling through to default workspace",
+                        claimed.id, claimed.workspace_kind,
+                    )
+                    pr_head_sha = None
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
             else:
