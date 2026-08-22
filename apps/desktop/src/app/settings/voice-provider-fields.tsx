@@ -62,9 +62,10 @@ export function VoiceProviderFields({ section, providerKey }: { section: 'tts' |
     }
   }, [loadedConfig])
 
-  // eslint-disable-next-line no-restricted-syntax -- lastRev is a plain mutable
-  // ref carrying the save-request's revision forward, not a reactive-value
-  // mirror; it's written once the async save resolves, not synced from a store.
+  // lastRev is a plain mutable ref carrying the save-request's revision
+  // forward, not a reactive-value mirror; it's written once the async save
+  // resolves, not synced from a store.
+  // eslint-disable-next-line no-restricted-syntax
   useEffect(() => {
     if (!config || saveVersion === 0) {
       return
