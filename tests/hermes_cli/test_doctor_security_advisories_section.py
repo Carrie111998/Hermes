@@ -15,8 +15,6 @@ import types
 from argparse import Namespace
 from pathlib import Path
 
-import pytest
-
 import hermes_cli.doctor as doctor_mod
 
 
@@ -66,7 +64,6 @@ def _run_doctor():
     return buf.getvalue()
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Symlink setup is Unix-only")
 class TestSecurityAdvisoriesSectionWording:
     def test_section_is_scoped_to_supply_chain_not_all_security(self, monkeypatch, tmp_path):
         _setup_doctor_env(monkeypatch, tmp_path)
