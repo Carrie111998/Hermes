@@ -9,3 +9,4 @@ provides_tools:
   - contrib_screen_index
   - contrib_screen_search
   - contrib_screen_voice
+  - contrib_screen_claim
