@@ -290,10 +290,11 @@ himalaya message reply 42 \
   --cc teammate@example.com \
   --body "Looping everyone in." --send
 
-# Custom quote headline (default is "On {date}, {from} wrote:")
+# Custom quote headline (default: empty — v2.0.0 performs no placeholder
+# substitution; the headline string is taken verbatim)
 himalaya message reply 42 --from you@example.com --quote-headline "Replying inline:" --body "..." --send
 
-# Change posting style (top | bottom | inline)
+# Change posting style (top | bottom)
 himalaya message reply 42 --from you@example.com --posting-style bottom --body "..." --send
 ```
 
