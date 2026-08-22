@@ -71,6 +71,12 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
 
 CASES = {
     "docs-only → nothing heavy": (["README.md", "docs/guide.md"], _lanes()),
+    # The repository context-budget test reads AGENTS.md, so edits to that
+    # governing file must run pytest without enabling product build lanes.
+    "root AGENTS.md → python tests": (
+        ["AGENTS.md"],
+        _lanes(python=True, python_prod=False),
+    ),
     "python source → python": (["run_agent.py"], _lanes(python=True, scan=True)),
     "dep manifest → python": (["pyproject.toml"], _lanes(python=True, scan=True, deps=True, uv_lock=True)),
     "uv.lock → python": (["uv.lock"], _lanes(python=True, uv_lock=True)),

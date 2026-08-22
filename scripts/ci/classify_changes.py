@@ -67,6 +67,8 @@ _NIX_FILES = {"flake.nix", "flake.lock"} # base nix files
 _SITE = ("website/", "skills/", "optional-skills/")  # docs site + skill pages
 # Prose/frontend trees that can't touch Python. skills/ is excluded on purpose.
 _PY_SKIP = ("docs/", "website/") + _FRONTEND
+# Documentation files covered by Python behavior contracts.
+_PY_RELEVANT_DOC_FILES = {"AGENTS.md"}
 # Published artifacts that live under website/ but that Python asserts about.
 # The OAuth Client ID Metadata Document is cross-checked against the pinned
 # callback ports in tools/mcp_oauth.py, so editing it alone must still run the
@@ -127,7 +129,7 @@ def _is_nix(p: str) -> bool:
 
 
 def _py_irrelevant(p: str) -> bool:
-    if p.startswith(_PY_RELEVANT_SITE):
+    if p in _PY_RELEVANT_DOC_FILES or p.startswith(_PY_RELEVANT_SITE):
         return False
     return (
         _is_docs(p)
@@ -147,7 +149,7 @@ def _py_test_only(p: str) -> bool:
     NOT test-only: they are runner infrastructure, and a bad edit there can
     mask real failures, so they stay conservative (python_prod=true).
     """
-    return p.startswith("tests/")
+    return p.startswith("tests/") or p in _PY_RELEVANT_DOC_FILES
 
 
 def _is_scan(p: str) -> bool:
