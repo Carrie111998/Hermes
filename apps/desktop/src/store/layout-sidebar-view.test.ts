@@ -4,11 +4,13 @@ import {
   $sidebarGrouping,
   $sidebarOrdering,
   $sidebarRowMeta,
+  $sidebarSessionOrderIds,
   $sidebarSessionOrderIdsByProfile,
   $sidebarViewCustomized,
   resetSidebarView,
   setSidebarGrouping,
   setSidebarOrdering,
+  setSidebarSessionOrderIds,
   setSidebarSessionOrderIdsForProfile,
   toggleSidebarRowMeta,
   toggleSidebarStatusFilter
@@ -37,6 +39,8 @@ describe('the sidebar as it ships', () => {
 
   it('is what reset puts back — every knob, not just the filters', () => {
     setSidebarGrouping('project')
+    setSidebarOrdering('manual')
+    setSidebarSessionOrderIdsForProfile('alpha', ['a2', 'a1'])
     setSidebarOrdering('cost')
     toggleSidebarRowMeta('updated')
     toggleSidebarRowMeta('cost')
@@ -46,6 +50,7 @@ describe('the sidebar as it ships', () => {
 
     expect($sidebarGrouping.get()).toBe('date')
     expect($sidebarOrdering.get()).toBe('updated')
+    expect($sidebarSessionOrderIdsByProfile.get()).toEqual({})
     expect($sidebarRowMeta.get()).toEqual(['preview', 'updated'])
     expect($sidebarViewCustomized.get()).toBe(false)
   })
@@ -107,12 +112,26 @@ describe('the sidebar as it ships', () => {
     })
   })
 
-  it('clears every per-profile manual order when leaving Manual mode', () => {
+  it('restores every per profile manual order after using another ordering', () => {
     setSidebarOrdering('manual')
+    setSidebarSessionOrderIds(['legacy-2', 'legacy-1'])
     setSidebarSessionOrderIdsForProfile('alpha', ['a2', 'a1'])
+    setSidebarSessionOrderIdsForProfile('beta', ['b2', 'b1'])
 
     setSidebarOrdering('updated')
+    expect($sidebarOrdering.get()).toBe('updated')
+    expect($sidebarSessionOrderIds.get()).toEqual([])
+    expect($sidebarSessionOrderIdsByProfile.get()).toEqual({
+      alpha: ['a2', 'a1'],
+      beta: ['b2', 'b1']
+    })
 
-    expect($sidebarSessionOrderIdsByProfile.get()).toEqual({})
+    setSidebarOrdering('manual')
+    expect($sidebarOrdering.get()).toBe('manual')
+    expect($sidebarSessionOrderIds.get()).toEqual([])
+    expect($sidebarSessionOrderIdsByProfile.get()).toEqual({
+      alpha: ['a2', 'a1'],
+      beta: ['b2', 'b1']
+    })
   })
 })

@@ -643,11 +643,11 @@ export function setSidebarOrdering(ordering: SidebarOrdering) {
     return
   }
 
-  // Picking a sort key is the only way back out of a hand-dragged order, so it
-  // has to drop the saved sequence as well as the flag.
+  // A sort key temporarily takes over rendering, but the profile scoped manual
+  // sequences remain persisted so returning to Manual restores the user's work.
+  // The legacy global list is migration input only and keeps its old lifecycle.
   setSidebarSessionOrderManual(false)
   setSidebarSessionOrderIds([])
-  $sidebarSessionOrderIdsByProfile.set({})
   $sidebarSortKey.set(ordering)
 }
 
@@ -689,8 +689,8 @@ function clearSidebarFilters() {
   $sidebarShowArchived.set(false)
 }
 
-/** Every knob the filter menu owns, back to the sidebar as it ships. Ordering
- *  goes through its setter so a hand-dragged sequence is dropped along with it. */
+/** Every knob the filter menu owns, back to the sidebar as it ships. Reset is
+ *  the explicit destructive action for saved manual sequences. */
 export function resetSidebarView() {
   setSidebarGrouping(SIDEBAR_DEFAULT_GROUPING)
   // Both scopes, not just the one on screen: each keeps its own grouping (and
@@ -701,6 +701,7 @@ export function resetSidebarView() {
   $sidebarFlatAgentsGrouped.set(false)
   $sidebarAllProfilesAgentsGrouped.set(false)
   setSidebarOrdering(SIDEBAR_DEFAULT_ORDERING)
+  $sidebarSessionOrderIdsByProfile.set({})
   $sidebarRowMeta.set(SIDEBAR_DEFAULT_ROW_META)
   $sidebarCardRows.set(false)
   clearSidebarFilters()
