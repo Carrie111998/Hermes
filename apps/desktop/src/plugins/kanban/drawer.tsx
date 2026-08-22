@@ -397,7 +397,9 @@ function DescriptionSection({ body, onSave }: { body: null | string | undefined;
           </Button>
         </div>
       ) : body ? (
-        <p className="whitespace-pre-wrap text-[0.8125rem] text-(--ui-text-secondary)">{body}</p>
+        <p className="whitespace-pre-wrap text-[0.8125rem] text-(--ui-text-secondary)">
+          <LinkifiedFilePath text={body} />
+        </p>
       ) : (
         <p className="text-[0.8125rem] text-(--ui-text-quaternary)">{k.noDescription}</p>
       )}
