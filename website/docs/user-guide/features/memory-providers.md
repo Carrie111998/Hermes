@@ -670,11 +670,11 @@ Self-hosted hybrid memory: vector, lexical, temporal and graph retrieval over yo
 **Setup:**
 ```bash
 pip install hermes-mnemostack
-hermes-mnemostack install   # hermes-agent 0.19 only; 0.20+ finds it by entry point
+hermes-mnemostack install   # only on Hermes releases without entry-point discovery
 hermes memory setup mnemostack
 ```
 
-`hermes-mnemostack doctor` reports what configuration is in effect, whether Hermes would activate the provider, and whether the service on the other end is reachable and healthy. It is read-only and never prints the API key.
+`hermes-mnemostack doctor` reports what configuration is in effect, whether Hermes would activate the provider, and whether the service on the other end is reachable and healthy — including whether the extra `install` step is needed here, which it answers by running Hermes's own discovery rather than by comparing version numbers. It is read-only and never prints the API key.
 
 ---
 
@@ -691,7 +691,7 @@ hermes memory setup mnemostack
 | **ByteRover** | Local/Cloud | Free/Paid | 3 | `brv` CLI | Pre-compression extraction |
 | **Supermemory** | Cloud/Self-hosted | Free/Paid | 4 | `supermemory` | Context fencing + session graph ingest + multi-container |
 | **Memori** | Cloud | Free/Paid | 5 | `hermes-memori` | Tool-aware memory + structured recall |
-| **MnemoStack** | Self-hosted | Free | 3 | `hermes-mnemostack` + Qdrant | Hybrid vector/lexical/temporal/graph + event-time capture |
+| **MnemoStack** | Self-hosted | Free | 3 | `hermes-mnemostack` + mnemostack service or Qdrant | Hybrid vector/lexical/temporal/graph + event-time capture |
 
 ## Profile Isolation
 
