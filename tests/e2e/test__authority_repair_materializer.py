@@ -1,9 +1,10 @@
 """Temporary read-only compiler for one authority-repair branch.
 
 The upstream PR e2e checkout is the available complete repository. This test
-executes the branch's sole ``one-shot-fix-*.yml`` carrier with every push
-intercepted, then emits the exact tested product diff as a gzip/base64 failure
-artifact. The compiler and workflow carriers are excluded from that artifact.
+executes every literal shell step in the branch's sole ``one-shot-fix-*.yml``
+carrier with every push intercepted, then emits the exact tested product diff
+as a gzip/base64 failure artifact. Compiler and workflow-carrier files are
+excluded from that artifact.
 """
 
 from __future__ import annotations
@@ -28,6 +29,12 @@ BRANCH_BY_CARRIER = {
     "one-shot-fix-85644.yml": "campaign/webhook-delivery-callbacks",
     "one-shot-fix-89252.yml": "fix/88715-canonical-multiplex-identity",
 }
+EXTRA_ENV_BY_CARRIER = {
+    "one-shot-fix-85644.yml": {
+        "ORIGINAL_FEATURE_HEAD": "2255348955a1e621e1f8f0f9e5c57948b5ae1d9d",
+        "PAYLOAD_COMMIT": "5beca04e0bdf6097ae562550caffcd256826931d",
+    },
+}
 
 
 def _carrier() -> Path:
@@ -37,23 +44,37 @@ def _carrier() -> Path:
     return candidates[0]
 
 
-def _run_block(path: Path) -> str:
-    """Extract the carrier's sole final run block without parsing heredocs.
+def _run_blocks(path: Path) -> list[str]:
+    """Extract every literal ``run: |`` block without parsing heredocs.
 
-    Carrier payloads intentionally contain raw heredoc/triple-quoted lines
-    that are not valid YAML indentation. The run block is the final field in
-    every one-shot carrier, so consume to EOF and remove the YAML content
-    indent only where it is actually present.
+    Raw heredoc/triple-quoted lines may be intentionally unindented and are
+    therefore not valid input to a YAML parser. A block ends only at the next
+    step-list item (six-space ``- ...``) or EOF.
     """
     lines = path.read_text().splitlines()
     starts = [i for i, line in enumerate(lines) if line.strip() == "run: |"]
-    assert len(starts) == 1
-    start = starts[0]
-    key_indent = len(lines[start]) - len(lines[start].lstrip())
-    prefix = " " * (key_indent + 2)
-    body = [line[len(prefix) :] if line.startswith(prefix) else line for line in lines[start + 1 :]]
-    assert body
-    return "\n".join(body) + "\n"
+    assert starts, f"no literal run blocks in {path}"
+    blocks: list[str] = []
+    for start in starts:
+        key_indent = len(lines[start]) - len(lines[start].lstrip())
+        prefix = " " * (key_indent + 2)
+        end = len(lines)
+        for index in range(start + 1, len(lines)):
+            line = lines[index]
+            stripped = line.lstrip()
+            indent = len(line) - len(stripped)
+            if indent == 6 and stripped.startswith("- "):
+                end = index
+                break
+        body = [
+            line[len(prefix) :] if line.startswith(prefix) else line
+            for line in lines[start + 1 : end]
+        ]
+        while body and not body[-1].strip():
+            body.pop()
+        assert body
+        blocks.append("\n".join(body) + "\n")
+    return blocks
 
 
 def _install_read_only_git(tmp_path: Path) -> Path:
@@ -111,15 +132,21 @@ def _product_diff() -> tuple[bytes, dict[str, object]]:
 
 def test_materialize_exact_authority_repair_tree(tmp_path: Path) -> None:
     carrier = _carrier()
-    script = tmp_path / "carrier.sh"
-    script.write_text(_run_block(carrier))
-    subprocess.run(["bash", "-n", str(script)], check=True)
-
+    blocks = _run_blocks(carrier)
     env = os.environ.copy()
     env["PATH"] = f"{_install_read_only_git(tmp_path)}:{env['PATH']}"
     env["CURRENT_MAIN"] = CURRENT_MAIN
     env["BRANCH"] = BRANCH_BY_CARRIER[carrier.name]
-    subprocess.run(["bash", str(script)], check=True, env=env, timeout=1800)
+    env["TRIGGER_HEAD"] = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], text=True
+    ).strip()
+    env.update(EXTRA_ENV_BY_CARRIER.get(carrier.name, {}))
+
+    for index, body in enumerate(blocks):
+        script = tmp_path / f"carrier-{index}.sh"
+        script.write_text(body)
+        subprocess.run(["bash", "-n", str(script)], check=True)
+        subprocess.run(["bash", str(script)], check=True, env=env, timeout=1800)
 
     artifact, manifest = _product_diff()
     digest = hashlib.sha256(artifact).hexdigest()
