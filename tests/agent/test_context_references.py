@@ -177,6 +177,31 @@ async def test_permissions_deny_relative_rule_blocks_file_reference(
 
 
 @pytest.mark.asyncio
+async def test_permissions_deny_globbed_directory_blocks_descendant_reference(
+    tmp_path: Path,
+):
+    from agent.context_references import preprocess_context_references_async
+
+    private = tmp_path / "private1"
+    private.mkdir()
+    secret = private / "notes.txt"
+    secret.write_text("GLOBBED DIRECTORY SECRET", encoding="utf-8")
+
+    with patch(
+        "agent.deny_policy.permissions_deny_paths",
+        return_value=[str(tmp_path / "private?")],
+    ):
+        result = await preprocess_context_references_async(
+            "inspect @file:private1/notes.txt",
+            cwd=tmp_path,
+            context_length=100_000,
+        )
+
+    assert "GLOBBED DIRECTORY SECRET" not in result.message
+    assert any("permissions.deny.paths" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("reference", "patterns"),
     [

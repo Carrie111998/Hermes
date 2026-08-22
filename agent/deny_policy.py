@@ -337,12 +337,12 @@ def _fixed_width_search_prefix_compatible(
         pattern_parts = normalized.strip("/").split("/") if normalized.strip("/") else []
         compatible = True
         for index, pattern_part in enumerate(pattern_parts):
-            if "*" in pattern_part:
+            if pattern_part == "**":
                 break
             if index >= len(candidate_parts):
                 break
             candidate_part = candidate_parts[index]
-            if any(char in pattern_part for char in "?["):
+            if any(char in pattern_part for char in "*?["):
                 if not fnmatch.fnmatchcase(candidate_part, pattern_part):
                     compatible = False
                     break
@@ -363,6 +363,22 @@ def _path_matches_normalized_pattern(candidate: str, pat: str) -> bool:
         return False
     if fnmatch.fnmatchcase(candidate, pat):
         return True
+
+    # A rule that matches a directory also denies everything below it, even
+    # when the directory spelling contains glob metacharacters. Without this,
+    # ``private?`` blocks ``private1`` itself but permits
+    # ``private1/SOUL.md`` and explicit file references beneath it. Plain
+    # directory rules already have descendant semantics below; globbed
+    # directory rules must preserve the same invariant.
+    ancestor = candidate.rstrip("/")
+    while "/" in ancestor:
+        ancestor = ancestor.rsplit("/", 1)[0]
+        if not ancestor:
+            ancestor = "/"
+        if fnmatch.fnmatchcase(ancestor, pat):
+            return True
+        if ancestor == "/":
+            break
 
     # Treat a plain directory pattern as "that directory and everything below".
     has_glob = any(ch in pat for ch in "*?[")

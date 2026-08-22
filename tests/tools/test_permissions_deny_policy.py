@@ -63,6 +63,19 @@ class TestPermissionsDenyPathMatching:
         assert match is not None
         assert match.pattern == str(secret_dir)
 
+    def test_globbed_directory_pattern_matches_children(self, tmp_path):
+        secret_dir = tmp_path / "private1"
+        target = secret_dir / "nested" / "file.txt"
+
+        match = deny_policy.match_permissions_deny_path(
+            str(target),
+            patterns=[str(tmp_path / "private?")],
+            canonicalize=False,
+        )
+
+        assert match is not None
+        assert match.pattern == str(tmp_path / "private?")
+
     def test_windows_style_glob_normalizes_separators(self):
         match = deny_policy.match_permissions_deny_path(
             r"C:\Users\alice\obsidian\Daedalus\capsule.md",
@@ -259,6 +272,29 @@ class TestPermissionsDenyPathMatching:
             canonicalize=False,
         )
 
+        assert disjoint is None
+        assert matching is not None
+
+    def test_segment_local_star_search_overlap_is_precise_after_fixed_segment(self):
+        pattern = "/workspace/?/foo*"
+
+        ancestor = deny_policy.match_permissions_deny_search_root(
+            "/workspace/a",
+            patterns=[pattern],
+            canonicalize=False,
+        )
+        disjoint = deny_policy.match_permissions_deny_search_root(
+            "/workspace/a/bar",
+            patterns=[pattern],
+            canonicalize=False,
+        )
+        matching = deny_policy.match_permissions_deny_search_root(
+            "/workspace/a/foobar",
+            patterns=[pattern],
+            canonicalize=False,
+        )
+
+        assert ancestor is not None
         assert disjoint is None
         assert matching is not None
 

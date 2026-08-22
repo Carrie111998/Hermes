@@ -914,6 +914,26 @@ class TestBuildContextFilesPrompt:
 
         mock_ensure.assert_not_called()
 
+    def test_permissions_deny_globbed_profile_home_blocks_soul(self, tmp_path):
+        from unittest.mock import patch
+
+        profile_home = tmp_path / "private1"
+        profile_home.mkdir()
+        (profile_home / "SOUL.md").write_text(
+            "GLOBBED PROFILE SOUL SECRET",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "agent.deny_policy.permissions_deny_paths",
+            return_value=[str(tmp_path / "private?")],
+        ):
+            from agent.prompt_builder import load_soul_md
+
+            result = load_soul_md(home_override=profile_home)
+
+        assert result is None
+
     # --- .hermes.md / HERMES.md discovery ---
 
 
