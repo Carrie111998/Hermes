@@ -482,6 +482,89 @@ async def test_unconfigured_static_route_keeps_safe_profile_and_toolset_defaults
 
 
 @pytest.mark.asyncio
+async def test_ordinary_webhook_keeps_distinct_unsigned_delivery_ids(served_profiles):
+    adapter = _adapter(
+        {
+            "secret": "relay-secret",
+            "profile": "dispatcher",
+            "prompt": "Task: {task}",
+            "deliver": "discord",
+        }
+    )
+    events: list[MessageEvent] = []
+
+    async def capture(event: MessageEvent):
+        events.append(event)
+
+    adapter.handle_message = capture
+    body = json.dumps({"task": "ordinary repeated body"}).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Hub-Signature-256": _signature(body, "relay-secret"),
+    }
+    async with TestClient(TestServer(_app(adapter))) as client:
+        first = await client.post(
+            "/p/dispatcher/webhooks/relay",
+            data=body,
+            headers={**headers, "X-Request-ID": "ordinary-A"},
+        )
+        second = await client.post(
+            "/p/dispatcher/webhooks/relay",
+            data=body,
+            headers={**headers, "X-Request-ID": "ordinary-B"},
+        )
+        assert first.status == 202
+        assert second.status == 202
+
+    await asyncio.sleep(0.05)
+    assert [event.message_id for event in events] == ["ordinary-A", "ordinary-B"]
+
+
+@pytest.mark.asyncio
+async def test_handoff_requires_signed_delivery_id(served_profiles):
+    adapter = _adapter(_trusted_route())
+    adapter.handle_message = pytest.fail
+    payload = {
+        "_hermes": {"target_profile": "market-analysis", "handoff_depth": 1},
+        "task": "do work",
+    }
+    body = json.dumps(payload).encode()
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/p/dispatcher/webhooks/relay",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Hub-Signature-256": _signature(body, "relay-secret"),
+            },
+        )
+        assert response.status == 403
+        assert "delivery_id" in (await response.json())["error"]
+
+
+@pytest.mark.asyncio
+async def test_gitlab_token_cannot_authorize_trusted_handoff(served_profiles):
+    adapter = _adapter(_trusted_route())
+    adapter.handle_message = pytest.fail
+    payload = {
+        "_hermes": {
+            "target_profile": "market-analysis",
+            "handoff_depth": 1,
+            "delivery_id": "gitlab-token-only",
+        },
+        "task": "do work",
+    }
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/p/dispatcher/webhooks/relay",
+            json=payload,
+            headers={"X-Gitlab-Token": "relay-secret"},
+        )
+        assert response.status == 403
+        assert "body-binding signature" in (await response.json())["error"]
+
+
+@pytest.mark.asyncio
 async def test_handoff_requires_authenticated_static_route(served_profiles):
     adapter = _adapter(_trusted_route(secret=_INSECURE_NO_AUTH))
     adapter.handle_message = pytest.fail
