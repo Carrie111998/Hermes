@@ -295,13 +295,74 @@ def _doctor_tool_availability_detail(toolset: str) -> str:
     return ""
 
 
+def _doctor_unrunnable_web_backend_detail(capability: str) -> str:
+    """Detail for a web capability whose backend cannot run at all, else ``""``.
+
+    *capability* is ``"search"`` or ``"extract"``. An empty return means the
+    selection is dispatchable and the registry rows decide readiness as usual.
+
+    Anthropic's native ``web_search`` / ``web_fetch`` are not a client-side
+    provider and never register one: they execute inside the Anthropic Messages
+    API request itself, so they are runnable only while the configured model is
+    served by Anthropic. The registry cannot see any of that — ``anthropic`` is
+    not a registered backend, so ``get_active_*_provider()`` treats the
+    selection as unresolvable, falls through to the availability walk and then
+    to the keyless free tier, and hands the rows below a perfectly healthy
+    provider that this install will never actually reach. Doctor would then
+    print a green tick for a capability that is switched off (the ``web``
+    toolset itself is gated on ``tools.web_tools.check_web_api_key``, which
+    reports False for this configuration) — precisely the false green #78412
+    asked these rows to prevent.
+
+    The runnability tests are imported from ``tools.web_tools`` rather than
+    redone here so the tool gate, the ``hermes tools`` picker and doctor all
+    answer from one predicate.
+    """
+    try:
+        from tools.web_tools import (
+            _anthropic_native_endpoint_selected,
+            _get_extract_backend,
+            _get_search_backend,
+            _is_backend_available,
+        )
+
+        backend = (
+            _get_search_backend() if capability == "search" else _get_extract_backend()
+        )
+        if backend != "anthropic":
+            return ""
+        # Two ways this selection cannot run, with different remedies, so they
+        # get different details rather than one vague line. Runnability is the
+        # question -- not the endpoint alone: an Anthropic-served model with no
+        # Anthropic credential also leaves the toolset off, and reporting that
+        # row green would be the same false tick one config over.
+        if not _anthropic_native_endpoint_selected():
+            return (
+                "(anthropic selected; its web tools run only inside "
+                "Anthropic-served model requests -- switch the model to "
+                "Anthropic or pick another backend with `hermes tools`)"
+            )
+        if not _is_backend_available("anthropic"):
+            return (
+                "(anthropic selected, but no Anthropic credential was found -- "
+                "set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN, or pick "
+                "another backend with `hermes tools`)"
+            )
+    except Exception:
+        # Diagnostics must never be the thing that breaks doctor.
+        return ""
+    return ""
+
+
 def _doctor_web_capability_rows() -> list[tuple[str, str, str]]:
     """Return doctor rows for web search/extract provider readiness (#78412).
 
     Each row is ``(status, label, detail)`` where *status* is ``ok`` or ``warn``.
     Uses the same active-provider resolvers as the tools, but reports readiness
     from ``is_available()`` so an explicitly selected but unconfigured backend
-    does not look healthy.
+    does not look healthy. A selection that no provider can execute at all is
+    caught before the resolvers run — see
+    :func:`_doctor_unrunnable_web_backend_detail`.
     """
     rows: list[tuple[str, str, str]] = []
     try:
@@ -319,10 +380,14 @@ def _doctor_web_capability_rows() -> list[tuple[str, str, str]]:
     except Exception:
         return rows
 
-    for capability, getter in (
-        ("web search", get_active_search_provider),
-        ("web extract", get_active_extract_provider),
+    for capability, selector, getter in (
+        ("web search", "search", get_active_search_provider),
+        ("web extract", "extract", get_active_extract_provider),
     ):
+        unrunnable = _doctor_unrunnable_web_backend_detail(selector)
+        if unrunnable:
+            rows.append(("warn", capability, unrunnable))
+            continue
         try:
             provider = getter()
         except Exception:
