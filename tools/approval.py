@@ -2976,6 +2976,13 @@ def save_permanent_allowlist(patterns: set):
     This does not make a revocation take effect the instant the file changes —
     nothing re-reads the file on the approval hot path, and adding a stat there
     is a separate change. It makes the next write stop undoing it.
+
+    Consequence for callers, which is not obvious from the signature:
+    ``patterns`` may only ADD. An entry left out of it is not removed, because
+    the on-disk list wins for anything this process did not approve itself.
+    Entries are removed by editing ``command_allowlist`` in config.yaml. A
+    future `allowlist remove` command must delete the line there, not pass a
+    smaller set here.
     """
     global _permanent_baseline
     try:
