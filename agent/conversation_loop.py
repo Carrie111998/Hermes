@@ -4401,6 +4401,17 @@ def run_conversation(
                     # `prefill_messages` if present.  Mirrors the ASCII
                     # codec recovery below.
                     _surrogates_found = _sanitize_messages_surrogates(messages)
+                    if _surrogates_found:
+                        # The sanitizer just popped _DB_PERSISTED_MARKER from
+                        # one or more already-flushed dicts in `messages` (in
+                        # place, same identity) to force their sanitized
+                        # content to be re-persisted. The bounded flush-scan
+                        # cursor assumes no live dict loses the marker this
+                        # way and would otherwise skip past it unexamined —
+                        # invalidate it so the next flush re-scans from the
+                        # start. See run_agent.py's _DB_PERSISTED_MARKER
+                        # contract comment (#92231).
+                        agent._db_flush_scan_prefix = None
                     if isinstance(api_messages, list):
                         if _sanitize_messages_surrogates(api_messages):
                             _surrogates_found = True
@@ -4439,6 +4450,13 @@ def run_conversation(
                         # loop, which may contain extra fields like
                         # reasoning_content that are not in `messages`).
                         _messages_sanitized = _sanitize_messages_non_ascii(messages)
+                        if _messages_sanitized:
+                            # See the surrogate-recovery branch above: popping
+                            # _DB_PERSISTED_MARKER from an already-flushed
+                            # dict in `messages` in place requires
+                            # invalidating the bounded flush-scan cursor too,
+                            # or the sanitized content is never re-persisted.
+                            agent._db_flush_scan_prefix = None
                         if isinstance(api_messages, list):
                             _sanitize_messages_non_ascii(api_messages)
                         # Also sanitize the last api_kwargs if already built,
@@ -4618,6 +4636,13 @@ def run_conversation(
                 ):
                     agent._vision_supported = False
                     _imgs_removed = _strip_images_from_messages(messages)
+                    if _imgs_removed:
+                        # See the surrogate-recovery branch above: popping
+                        # _DB_PERSISTED_MARKER from an already-flushed dict
+                        # in `messages` in place requires invalidating the
+                        # bounded flush-scan cursor too, or the
+                        # image-stripped content is never re-persisted.
+                        agent._db_flush_scan_prefix = None
                     if isinstance(api_messages, list):
                         _strip_images_from_messages(api_messages)
                     agent._vprint(
