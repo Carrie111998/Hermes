@@ -126,7 +126,7 @@ def _replace_cli_exec_import(content: str, old: str, new: str) -> str:
         f"{handler.count(old)}"
     )
     handler = handler.replace(old, new, 1)
-    return content[:staru} + handler + content[end:]
+    return content[:start] + handler + content[end:]
 
 
 def _apply_materializer(
@@ -185,7 +185,9 @@ def _sha256(data: bytes) -> str:
 
 def _archive_product(root: Path, paths: set[str], receipt: dict) -> bytes:
     buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w:gz", format=tarfile.PAX_FORMAT) as archive:
+    with tarfile.open(
+        fileobj=buffer, mode="w:gz", format=tarfile.PAX_FORMAT
+    ) as archive:
         receipt_bytes = (
             json.dumps(receipt, indent=2, sort_keys=True).encode("utf-8") + b"\n"
         )
