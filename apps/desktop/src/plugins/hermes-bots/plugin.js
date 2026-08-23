@@ -1638,12 +1638,7 @@ async function sweepBotProfileSessions() {
     // back to the active gateway's own profile list (local bots; remote
     // sources get covered by the next sweep once the roster cache exists).
     try {
-      const route = await activeBotRoute()
-      const res = await requestForBot(
-        route ? { name: route.profile, sourceScoped: true, route } : { name: 'default' },
-        'profiles.list',
-        {}
-      )
+      const res = await host.request('profiles.list', {})
       roster = Array.isArray(res?.profiles) ? res.profiles : []
     } catch {
       return
@@ -3904,15 +3899,12 @@ function useRoster() {
       // a write can only carry pre-write ui_meta. (Issue time is the
       // conservative bound — the server answered no earlier than this.)
       const issuedAt = Date.now()
-      // Rich rows (last_session, canonical_session, ui_meta, has_avatar)
-      // come from the ACTIVE gateway's profiles.list — the canonical Bot
-      // Chat is resolved server-side by NAME (the "Bot Chat" registry row),
-      // so the roster never sends session pointers.
-      const route = await activeBotRoute()
-      const activeBot = route
-        ? { name: route.profile, sourceScoped: true, route }
-        : { name: String(host.state.profile?.get?.() || 'default').trim() || 'default' }
-      const local = await requestForBot(activeBot, 'profiles.list', {})
+      // Rich rows come from the ACTIVE gateway's profiles.list. host.request
+      // is already that socket — do not wait on activeBotRoute() /
+      // host.profileRoutes() → refreshProfiles() (60s /api/profiles budget)
+      // or first paint sits on the spinner even after the write-lock fix.
+      // Other connections still arrive via host.agents() below.
+      const local = await host.request('profiles.list', {})
       // Newer backends inject the teammate-messaging protocol into every
       // session's system prompt (agent.bot_mode_protocol) — SOUL.md must not
       // carry a second copy. Older gateways lack the flag: keep appending.
