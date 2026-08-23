@@ -817,6 +817,43 @@ class TestDockerContainerMediaPathTranslation:
             "/output/report.pdf"
         ) == str(media.resolve())
 
+    def test_windows_drive_volume_mount_translates_on_windows(self, tmp_path, monkeypatch):
+        """Windows host drive syntax must not be split at its drive colon."""
+        import json
+
+        host_out = tmp_path / "documents"
+        host_out.mkdir()
+        media = host_out / "report.pdf"
+        media.write_bytes(b"%PDF-1.4")
+        windows_host = str(host_out).replace("\\", "/")
+        monkeypatch.setenv(
+            "TERMINAL_DOCKER_VOLUMES",
+            json.dumps([f"{windows_host}:/output"]),
+        )
+
+        assert BasePlatformAdapter.validate_media_delivery_path(
+            "/output/report.pdf"
+        ) == str(media.resolve())
+
+    def test_container_posix_paths_are_not_rejected_by_windows_path_flavor(
+        self, tmp_path, monkeypatch
+    ):
+        """Path('/output') is relative on Windows; use POSIX semantics for mounts."""
+        import json
+
+        host_out = tmp_path / "documents"
+        host_out.mkdir()
+        media = host_out / "report.pdf"
+        media.write_bytes(b"%PDF-1.4")
+        monkeypatch.setenv(
+            "TERMINAL_DOCKER_VOLUMES",
+            json.dumps([f"{host_out}:/output"]),
+        )
+
+        assert BasePlatformAdapter.validate_media_delivery_path(
+            "/output/report.pdf"
+        ) == str(media.resolve())
+
     def test_longest_prefix_wins(self, tmp_path, monkeypatch):
         import json
 
