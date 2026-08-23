@@ -42,6 +42,7 @@ from agent.message_metadata import append_message
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
+    cli_live_message_timestamp,
     compose_user_api_content,
     reanchor_current_turn_user_idx,
 )
@@ -2231,6 +2232,9 @@ def run_conversation(
                         api_msg.get("content", ""),
                         _ext_prefetch_cache,
                         _plugin_user_context,
+                        live_timestamp=cli_live_message_timestamp(
+                            agent, msg.get("timestamp")
+                        ),
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed
