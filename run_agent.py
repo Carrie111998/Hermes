@@ -8330,6 +8330,13 @@ class AIAgent:
         original single-path dispatch; mixed batches execute segment by
         segment in emission order so safe subsets still run concurrently
         while side-effect ordering is preserved.
+
+        Oversized parallel runs are additionally capped at
+        ``HERMES_MAX_PARALLEL_TOOLS`` (default 3) calls per segment and split
+        into consecutive chunks: very large single-shot batches have been
+        observed to lose ALL their results on delivery back into context
+        (NousResearch/hermes-agent#93251), so they are executed as several
+        smaller concurrent waves in emission order instead.
         """
         tool_calls = assistant_message.tool_calls
 
@@ -8345,6 +8352,7 @@ class AIAgent:
             _active_env = get_active_env(effective_task_id)
             _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
             segments = _plan_tool_batch_segments(tool_calls, execution_cwd=_exec_cwd)
+            segments = _cap_parallel_segment_size(segments)
 
             if len(segments) == 1:
                 kind = segments[0][0]

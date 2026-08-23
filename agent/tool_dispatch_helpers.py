@@ -114,6 +114,38 @@ def _is_mcp_tool_parallel_safe(tool_name: str) -> bool:
         return False
 
 
+def _cap_parallel_segment_size(
+    segments: List[tuple], max_size: Optional[int] = None
+) -> List[tuple]:
+    """Cap each parallel segment at ``HERMES_MAX_PARALLEL_TOOLS`` calls.
+
+    Very large parallel batches have been observed to lose ALL their results
+    on delivery back into context (#93251). This splits oversized parallel
+    runs into consecutive chunks executed as several smaller waves, preserving
+    emission order and side-effect boundaries. Default cap is 3; set the env
+    var to override (0 disables capping).
+    """
+    if max_size is None:
+        try:
+            max_size = int(os.environ.get("HERMES_MAX_PARALLEL_TOOLS", "3"))
+        except ValueError:
+            max_size = 3
+    if max_size <= 0:
+        return segments
+
+    capped: List[tuple] = []
+    for kind, calls in segments:
+        if kind != "parallel" or len(calls) <= max_size:
+            capped.append((kind, calls))
+            continue
+        for i in range(0, len(calls), max_size):
+            chunk = calls[i : i + max_size]
+            # A trailing 1-call parallel chunk gains nothing from concurrency;
+            # demote it so the sequential executor owns its richer inline path.
+            capped.append(("parallel", chunk) if len(chunk) > 1 else ("sequential", [chunk[0]]))
+    return capped
+
+
 def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = None) -> List[tuple]:
     """Split a tool-call batch into ordered ``(kind, calls)`` segments.
 
